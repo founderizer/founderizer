@@ -836,10 +836,13 @@ def mcp_call(argv, tool, timeout=20, popen=subprocess.Popen):
 
 
 def browser_connected(exe):
-    """Whether the Chrome of this Mac answers Claude Code's account: True or False, or None when nothing says. It is
-    the runtime's own list of the browsers connected to its account, from its own Chrome server: no model runs, so a
-    status report can read it. Only the login session opens the runtime's credential, so a run outside it reads False
-    for a Mac that is signed in: it is read by the helper and the server service alone."""
+    """Whether a Chrome answers Claude Code's account: True or False, or None when nothing says. It is the runtime's own
+    list of the browsers connected to its account, from its own Chrome server: no model runs, so a status report can
+    read it. Only the login session opens the runtime's credential, so a run outside it reads False for a Mac that is
+    signed in: it is read by the helper and the server service alone. A lone browser may stand on another Mac of the
+    same account: `onThisComputer` comes only from a desktop app's hints, and `isLocal` says only that the operating
+    systems match (31 October 2026, an agent worked in another Mac's Chrome). What ties a browser to this Mac is a page
+    that only this Mac reaches: the installer's and the hub's proofs."""
     said = mcp_call([exe, "--claude-in-chrome-mcp"], "list_connected_browsers")
     if said is None:
         return None
@@ -851,7 +854,7 @@ def browser_connected(exe):
         return None
     if not isinstance(browsers, list):
         return None
-    # Another Chrome on the same account does not answer for this Mac: the field says where each one is, when it knows.
+    # With several browsers on the account, the field says where each one is when the runtime knows.
     return any(not isinstance(b, dict) or b.get("onThisComputer", b.get("isLocal", True)) is not False
                for b in browsers)
 
