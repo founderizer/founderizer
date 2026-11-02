@@ -26,10 +26,15 @@ Standard library only, and it reads no credential of a model provider.
     python3 hubsetup.py check --address IP [--port N] [--kit PATH]
                                                     the end checks on this machine: selftest.py and GET /health
     python3 hubsetup.py fleet-id [--db PATH]        this fleet's own id in the hub's key store, made once
-    python3 hubsetup.py central-vault --owner-key KEY [--hub-user fleet] [--fleet ID]
-                                                    as root on the hub's machine: the central vault, its own user and
-                                                    service, which the hub's user can ask and neither read nor replace;
-                                                    a second run with a newer kit is how it is updated
+    python3 hubsetup.py kit-clone [--hub-user fleet] [--source URL]
+                                                    as root on the hub's machine: root's own clone of the published
+                                                    repository at /usr/local/lib/founderizer-kit, at the revision of
+                                                    the hub's signed release.json and never older; safe to run again
+    python3 /usr/local/lib/founderizer-kit/hubsetup.py central-vault --owner-key KEY [--hub-user fleet] [--fleet ID]
+                                                    as root on the hub's machine, from that clone only: the central
+                                                    vault, its own user and service, which the hub's user can ask and
+                                                    neither read nor replace; kit-clone and a second run of it are how
+                                                    it is updated
 
 Why the claim exists. The owner is a Tailscale address and no token (hub.py `allowed("owner")`), so a hub with the
 wrong `addresses.owner` serves the owner's pages to the wrong machine, and one with none serves them to nobody. The
@@ -58,6 +63,7 @@ import secrets
 import shlex
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -69,6 +75,7 @@ import zoneinfo
 import hub
 import lifecycle
 import onboard
+import releases
 
 KIT = os.path.dirname(os.path.abspath(__file__))
 CODE_LENGTH = 12                # hub.LINK_ALPHABET: 12 characters, 60 bits, as a join code
@@ -102,7 +109,9 @@ HELPER = "/usr/local/sbin/fleet-agent-user"         # one of the two root comman
 VAULT_UPDATE = "/usr/local/sbin/fleet-vault-program"    # the other: the broker's program, and nothing else
 SUDOERS = "/etc/sudoers.d/fleet-agents"             # what that service may do, and nothing more
 EXPORT_OK = "git-daemon-export-ok"                  # git daemon serves a repository only when this file is in it
-CENTRAL_USER = "fleet-vault-central"                # the central vault's own user: no login, no shell, no home
+# The central vault's own user: no login, no shell, no home. Not a fleet-* name, because the hub's user can put any
+# fleet-* user into the agents' group (fleet-agent-user), and this user must be one that it cannot move (DevOps plan V2).
+CENTRAL_USER = "founderizer-vault"
 CENTRAL_SERVICE = "fleet-vault-central"
 CENTRAL_LIB = "/usr/local/lib/fleet-vault-central"  # its program, root-owned 644, outside every checkout
 CENTRAL_CONF_DIR = "/etc/fleet-vault-central"
@@ -110,6 +119,11 @@ CENTRAL_CONF = CENTRAL_CONF_DIR + "/vault.json"     # root with mode 644, and no
 CENTRAL_STATE = "/var/lib/fleet-vault-central"      # its key, the store's key, the store and the pins: its user alone
 CENTRAL_UNIT = "/etc/systemd/system/fleet-vault-central.service"
 FLEET_ID = re.compile(r"[0-9a-f]{16}")              # hub.fleet_id(): sixteen lowercase hex characters
+# Root's own clone of the published repository on the hub's machine, at the revision of a signed release (kit_clone).
+# The owner's app runs central-vault as root from here and from nowhere else, so it never runs a program that the
+# hub's user can change, or a path that the hub names (DevOps plan V2).
+ROOT_KIT = "/usr/local/lib/founderizer-kit"
+RELEASE_FILE = "release.json"                       # the signed manifest of the release a checkout runs (plan 0.1)
 PRIVATE = re.compile(r"100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.(?:[0-9]{1,3})\.(?:[0-9]{1,3})$")
 
 
@@ -864,13 +878,109 @@ def keep_fleet_id(db=None):
         hub.DB = kept
 
 
+# ---------------------------------------------------------------- root's own clone (DevOps plan V2)
+#
+# The central vault is installed and updated as root, so the program that does it must be one that the hub's user
+# cannot change: the hub's own checkout is that user's, and a hub that is broken into could put anything there. So
+# root keeps a clone of the published repository of its own, in one fixed place (ROOT_KIT), at the revision of the
+# release that the hub runs, whose manifest (release.json on the configuration ref) one of the release keys signed.
+# The keys are the clone's own, at its current revision, or, the first time, those of the copy of this program that
+# runs (the day of the cut-over, when the hub is trusted once). A revision that does not descend from the clone's own
+# is refused, so no old release comes back. A second run with nothing new changes nothing.
+
+def git_root(*args, cwd=None, timeout=releases.GIT_WAIT):
+    """(exit status, stdout, stderr) of one git command as root, with no prompt and no hooks of anybody's."""
+    try:
+        r = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "transfer.fsckObjects=true", *args],
+                           cwd=cwd, capture_output=True, text=True, timeout=timeout,
+                           env={"PATH": ROOT_PATH, "GIT_TERMINAL_PROMPT": "0", "HOME": "/nonexistent"})
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, "", str(e)
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def root_owned(path):
+    """True when root owns the path, and no group or other user can write it or anything in it."""
+    for folder, dirs, files in os.walk(path):
+        for one in [folder] + [os.path.join(folder, f) for f in files]:
+            info = os.lstat(one)
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                return False
+    return os.path.isdir(path)
+
+
+def give_to_root(path):
+    """Every file of the clone root's, and writable by no one else."""
+    code, out, err = _shell(f"chown -R root:root {shlex.quote(path)} && chmod -R go-w {shlex.quote(path)}")
+    if code != 0 or not root_owned(path):
+        raise Stop(f"root's own clone could not be given to root: {(err or out).strip()[-200:]}")
+
+
+def kit_clone(hub_user="fleet", source=None, root_kit=None, checkout=None, git=None, own=None, keys=None):
+    """As root on the hub's machine: root's own clone of the published repository at the revision of the hub's signed
+    release.json (the section above). Returns {"revision", "version", "state": "made"|"moved"|"there"}.
+
+    checkout: the hub's own checkout, where release.json is read (default: the hub user's ~/fleet-pilot). source: the
+    published repository (releases.DEFAULT_UPSTREAM); the signature names the commit, so it is the same commit from
+    any source. git, own and keys are for the tests: git_root, the step that gives the clone to root, and the release
+    keys a run trusts when it cannot read them from the clone itself."""
+    git, root_kit = git or git_root, root_kit or ROOT_KIT
+    source = source or releases.DEFAULT_UPSTREAM
+    checkout = checkout or os.path.join(hub_account(hub_user)["home"], "fleet-pilot")
+    try:
+        # The hub's user writes this folder: root reads a plain file of it, never a link or a pipe of that user's
+        fd = os.open(os.path.join(checkout, RELEASE_FILE), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+                raise ValueError("not a plain file")
+            raw = json.loads(os.read(fd, 65537).decode("utf-8"))
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
+        raise Stop(f"the hub's checkout {checkout} carries no {RELEASE_FILE} that can be read, so no release is signed "
+                   f"for it yet: the hub writes one with the release it takes") from None
+    there = os.path.isdir(os.path.join(root_kit, ".git"))
+    trusted = releases.read_keys(root_kit) if there else (keys if keys is not None else releases.read_keys(KIT))
+    try:
+        manifest = releases.check(raw, trusted)
+    except releases.Untrusted as e:
+        raise Stop(f"the hub's {RELEASE_FILE} is not a release that this clone can trust: {e}") from None
+    revision = manifest["revision"]
+    if there:
+        code, current, _ = git("rev-parse", "HEAD", cwd=root_kit)
+        if code != 0:
+            raise Stop(f"root's own clone in {root_kit} names no revision: remove it, and run kit-clone again")
+        if current == revision and not git("status", "--porcelain", cwd=root_kit)[1]:
+            say(f"root's own clone is at release {manifest['version']} already ({revision[:12]})")
+            return {"revision": revision, "version": manifest["version"], "state": "there"}
+        code, _, err = git("fetch", "-q", source, cwd=root_kit)
+        if code != 0:
+            raise Stop(f"root's own clone could not fetch {source}: {err[-200:]}")
+        if git("merge-base", "--is-ancestor", current, revision, cwd=root_kit)[0] != 0:
+            raise Stop(f"release {manifest['version']} ({revision[:12]}) does not descend from the revision that root's "
+                       f"own clone holds ({current[:12]}), so it is not taken: an older release never comes back")
+    else:
+        code, _, err = git("clone", "-q", "--no-checkout", source, root_kit)
+        if code != 0:
+            raise Stop(f"root's own clone of {source} could not be made: {err[-200:]}")
+    code, _, err = git("checkout", "-q", "--force", "--detach", revision, cwd=root_kit)
+    if code != 0 or git("rev-parse", "HEAD", cwd=root_kit)[1] != revision:
+        raise Stop(f"root's own clone could not take release {manifest['version']} ({revision[:12]}): {err[-200:]}")
+    git("clean", "-q", "-f", "-d", "-x", cwd=root_kit)
+    (own or give_to_root)(root_kit)
+    say(f"root's own clone is at release {manifest['version']} ({revision[:12]}) in {root_kit}")
+    return {"revision": revision, "version": manifest["version"], "state": "moved" if there else "made"}
+
+
 # ---------------------------------------------------------------- the central vault (owner feature central_vault)
 #
 # One vault on the hub's machine that holds every secret of the fleet, as a service of its own user. The hub's user
 # may ask it over its socket and can neither read its files nor replace its program, and it seals a copy only to a
 # machine key, and its backup only to a recovery key, that the owner signed with the key named here. So this is a
-# root step, run by the owner (his app does it over his own SSH), and a second run with a newer kit is how the vault
-# is updated: there is no sudoers line and no root helper that lets the hub's user install or change it.
+# root step, run by the owner (his app does it over his own SSH) from root's own clone (ROOT_KIT), and kit-clone and a
+# second run of it are how the vault is updated: there is no sudoers line and no root helper that lets the hub's user
+# install or change it.
 
 def owner_public_key(value):
     """The owner's public key as his app gives it: the base64 of a 65-byte uncompressed P-256 point (0x04, X, Y).
@@ -1011,7 +1121,12 @@ def central_status(run, hub_user, fleet):
     return {"recipient": keys[0], "store_recipient": keys[1], "fleet": fleet}
 
 
-def central_install(owner_key, hub_user="fleet", fleet=None, kit=None, run=None, read=None, account=None, db=None):
+class OtherOwner(Stop):
+    """central-vault --keep-owner on a machine whose central vault holds another owner key: nothing was changed."""
+
+
+def central_install(owner_key, hub_user="fleet", fleet=None, kit=None, run=None, read=None, account=None, db=None,
+                    keep_owner=False):
     """The central vault on the hub's machine, as root (HUB-INSTALL.md, "The central vault"): age, its own user, the
     kit's vault.py as a root-owned program, its configuration, its own key, the store's key and the empty store, its
     service, and then its status, asked as the hub's user.
@@ -1019,8 +1134,10 @@ def central_install(owner_key, hub_user="fleet", fleet=None, kit=None, run=None,
     Safe to run again, and that is how it is updated: each step reads first, the service is restarted only when
     something changed, and a key, a store or a state file that is there is never replaced (age-keygen behind
     `test -s`, and `vault.py store-init`, which keeps what it finds). The configuration is written whole on every run
-    that changes it, with this run's owner key as the only one (central_config). The fleet id is the one given, else
-    the hub's own (hub_fleet). Returns {"state": "made"|"there", "recipient", "store_recipient", "fleet"}: public
+    that changes it, with this run's owner key as the only one (central_config). keep_owner: the owner's app runs it
+    by itself, so a vault whose configuration names another owner key, or cannot be read, is left as it is
+    (OtherOwner): only the owner's own Set up takes a vault over. The fleet id is the one given, else the hub's own
+    (hub_fleet). Returns {"state": "made"|"there", "recipient", "store_recipient", "fleet"}: public
     keys only, because nothing here reads or prints a key file."""
     run = run or _shell
     read = read or (lambda path: pathlib.Path(path).read_text(encoding="utf-8"))
@@ -1037,8 +1154,12 @@ def central_install(owner_key, hub_user="fleet", fleet=None, kit=None, run=None,
     before = kv(run(central_reading())[1])
     try:
         current = json.loads(read(CENTRAL_CONF))
-    except (OSError, ValueError):
+    except OSError:
         current = None
+    except ValueError:
+        current = False                 # there, and not readable: another owner's, for keep_owner
+    if keep_owner and current is not None and not (isinstance(current, dict) and key in (current.get("owner_keys") or [])):
+        raise OtherOwner("the central vault on this machine holds another owner key")
     try:
         unit_now = read(CENTRAL_UNIT)
     except OSError:
@@ -1456,8 +1577,15 @@ def cmd_central_vault(args):
         if platform.system() != "Linux":
             raise Stop("the central vault runs on the hub's Linux server, and this machine is not one.")
         if os.geteuid() != 0:
-            raise Stop("run it as root on the hub's machine: sudo python3 hubsetup.py central-vault --owner-key <key>")
-        done = central_install(args.owner_key, hub_user=args.hub_user, fleet=args.fleet)
+            raise Stop(f"run it as root on the hub's machine: sudo python3 {ROOT_KIT}/hubsetup.py central-vault "
+                       f"--owner-key <key>")
+        if os.path.realpath(KIT) != ROOT_KIT or not root_owned(ROOT_KIT):
+            raise Stop(f"the central vault is installed only from root's own clone, {ROOT_KIT}, which kit-clone makes: "
+                       f"never from a folder that the hub's user can change")
+        done = central_install(args.owner_key, hub_user=args.hub_user, fleet=args.fleet, keep_owner=args.keep_owner)
+    except OtherOwner as e:             # the app's own install reads this line and changes nothing
+        print(json.dumps({"ok": False, "owner": "other", "error": str(e)}), flush=True)
+        raise
     except Stop as e:
         print(json.dumps({"ok": False, "error": str(e)}), flush=True)
         raise
@@ -1467,6 +1595,15 @@ def cmd_central_vault(args):
         raise Stop(f"the central vault could not be installed ({type(e).__name__}).") from None
     print(json.dumps({"ok": True, "recipient": done["recipient"], "store_recipient": done["store_recipient"],
                       "fleet": done["fleet"]}), flush=True)
+
+
+def cmd_kit_clone(args):
+    """kit-clone, as root on the hub's machine (kit_clone)."""
+    if platform.system() != "Linux":
+        raise Stop("root's own clone is for the hub's Linux server, and this machine is not one.")
+    if os.geteuid() != 0:
+        raise Stop("run it as root on the hub's machine: sudo python3 hubsetup.py kit-clone")
+    kit_clone(hub_user=args.hub_user, source=args.source)
 
 
 def cmd_check(args):
@@ -1516,10 +1653,16 @@ def main(argv=None):
     fid = sub.add_parser("fleet-id")
     fid.add_argument("--db", default=DB_PATH, help="the hub's own records; the default is where hub.py keeps them")
     fid.set_defaults(fn=cmd_fleet_id)
+    kc = sub.add_parser("kit-clone")
+    kc.add_argument("--hub-user", default="fleet", help="the user the hub runs as: its checkout holds release.json")
+    kc.add_argument("--source", help="the published repository; default: " + releases.DEFAULT_UPSTREAM)
+    kc.set_defaults(fn=cmd_kit_clone)
     cv = sub.add_parser("central-vault")
     cv.add_argument("--owner-key", required=True, help="the owner's public key, as his app gives it (base64)")
     cv.add_argument("--hub-user", default="fleet", help="the user the hub runs as: the one the central vault answers")
     cv.add_argument("--fleet", help="this fleet's id; default: the one in the hub's own records")
+    cv.add_argument("--keep-owner", action="store_true", help="leave a central vault that another owner key holds as "
+                                                               "it is: the app's own install, which takes nothing over")
     cv.set_defaults(fn=cmd_central_vault)
     one = sub.add_parser("repository")
     for what, why in (("tree", "the copy of Founderizer that this installer runs from"),

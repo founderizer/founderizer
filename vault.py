@@ -10,13 +10,14 @@ agent's pinned handover key from the hub's confirmation of the job, never from t
 A broker opens its logins from one of two stores, which its configuration chooses:
 
   - **the fleet's own store** (store, store_key): one age-encrypted file on this machine. No Bitwarden account, no
-    organization and no network. The owner puts a login in it with  store-put  and sees its names with  store-list ;
-    store-init  makes the key and the empty store. The key is an age identity in the broker's state folder, mode 600,
-    which only the vault user can read; an agent never reads the store, the key or a value.
-  - **a Bitwarden Secrets Manager project** (region, token_file, bws, bws_config): what the pilot used, unchanged.
-
-The operation set is the same for both, and so is every answer: an outcome, or a copy that only the receiving
-machine's broker can open. A fresh fleet needs no Bitwarden account; a fleet that has one keeps it.
+    organization and no network. A value reaches it only from the central vault, sealed to this broker's pinned key
+    (deposit); its names are listed with  store-list , and  store-init  makes the key and the empty store. The key is
+    an age identity in the broker's state folder, mode 600, which only the vault user can read; an agent never reads
+    the store, the key or a value.
+  - **a Bitwarden Secrets Manager project** (region, token_file, bws, bws_config): what the pilot used. Since the
+    DevOps plan's track B (2 November 2026) no server keeps a Bitwarden token: load_config refuses such a
+    configuration, so an installed program that has one keeps running the old program (fleet-vault-program), and the
+    central vault is the one way a value reaches a server.
 
 A broker belongs to a machine and not to one agent: `worker_group` is the group of that machine's agent users, so an
 agent the owner adds later, or one whose OS user changed, reaches it with no change to its configuration. Such a
@@ -41,8 +42,9 @@ A Linux broker also gives a session start the API keys that the owner lets the c
 names them, and the broker reads each value and registers its fingerprints before it gives it to the worker's user.
 
 With the fleet's own store, a Linux broker also takes a key or a login that the owner typed into Founderizer on his
-Mac (deposit): the app seals the value to this broker's pinned key, the hub carries the sealed copy, and the broker
-opens it, has the hub compare the value's fingerprints with the owner's, and saves it under the same reference.
+Mac (deposit): the central vault seals the value to this broker's pinned key, for a grant that the owner signed, the
+hub carries the sealed copy, and the broker opens it, has the hub compare the value's fingerprints with the owner's,
+and saves it under the same reference.
 
 With the fleet's own store, a Linux broker also gives such a delivered secret back (withdraw) when no agent of its
 machine holds it any more: the hub names the reference for one confirmed job, and the broker removes the item only when
@@ -59,8 +61,9 @@ the key, the variable and the target for one confirmed job; the broker takes not
 With `"central": true` in its configuration, the same program is the fleet's **central vault** on the hub's server:
 one store that holds every secret of the fleet, which answers only the hub's user, never calls the hub and needs no
 network. It takes a value that the owner sealed to its key in his app (intake), and it seals a copy of a value only to
-a machine key that the owner signed (pin, unpin, seal), and its backup only to a recovery key that the owner signed
-(recovery, export). The owner signs with an ECDSA P-256 key of his Mac and the vault verifies every statement itself,
+a machine key that the owner signed (pin, unpin, seal), only for a grant of that value to an agent of that machine
+that the owner signed, or for a value that he signed into the grantable pool (grant, ungrant, pool, unpool), and its
+backup only to a recovery key that the owner signed (recovery, export). The owner signs with an ECDSA P-256 key of his Mac and the vault verifies every statement itself,
 so a hub that is broken into cannot add a machine of its own and pull every secret in one call. It runs as its own
 user (CENTRAL_UNIT), and only root installs or updates it (`hubsetup.py central-vault`): no release reaches it.
 
@@ -70,8 +73,6 @@ configuration, Bitwarden settings and programs, because an agent can change ever
     python3 vault.py unit --config /etc/fleet-vault/vault.json --user fleet-vault --group <worker group>
     python3 /usr/local/lib/fleet-vault/vault.py store-init --config /etc/fleet-vault/vault.json \\
         --user fleet-vault                                       (as root; the fleet's own store, safe to run again)
-    sudo -u fleet-vault python3 /usr/local/lib/fleet-vault/vault.py store-put --config /etc/fleet-vault/vault.json \\
-        --title "<name>" < login.json                            (the owner's own login; the value on standard input)
     python3 /usr/local/lib/fleet-vault/vault.py sdk-install --config /etc/fleet-vault/vault.json \\
         --manifest <folder>/vault-sdk.json --project <Bitwarden project UUID>   (as root; Bitwarden's write setup)
     python3 vault.py unit --central --config /etc/fleet-vault-central/vault.json --group <the hub user's group>
@@ -139,7 +140,8 @@ BITWARDEN_KEYS = {"region", "token_file", "bws", "bws_config"}
 AGENT_NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 CALLER_KEY = re.compile(r"[A-Za-z0-9_-]{43}")          # an agent key (owner API 1.12): 256 bits, base64url
 # The central vault's own operations, beside status: a central vault serves only these, and a machine's broker none.
-CENTRAL_OPERATIONS = ("intake", "pin", "unpin", "recovery", "seal", "inventory", "export")
+CENTRAL_OPERATIONS = ("intake", "pin", "unpin", "recovery", "grant", "ungrant", "pool", "unpool", "seal", "inventory",
+                      "export")
 OPERATIONS = ("status", "signin", "handover", "probe", "create", "request", "cancel", "read", "deposit", "place",
               "withdraw") + CENTRAL_OPERATIONS
 ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,59}")         # read: the variable name of an API key, as the hub checks it
@@ -238,12 +240,21 @@ OWNER_KEYS = 8                                      # the most owner keys that m
 MACHINE = re.compile(r"[a-z][a-z0-9-]{0,62}")       # a machine of a pin
 STATE = 1                                           # the format of the central vault's state file
 # The fields of each statement that the owner signs: all of them, and no other.
+# grant: the owner gives this secret to this agent, whose vault is on this machine, so the vault may seal it to that
+# machine's pin; ungrant takes that back. pool: the owner lets the manager hand this secret out (team.json
+# "resources"), so the vault may seal it to any pinned machine; unpool takes that back.
 STATEMENTS = {"pin": {"v", "kind", "fleet", "machine", "recipient", "at"},
               "unpin": {"v", "kind", "fleet", "machine", "at"},
-              "recovery": {"v", "kind", "fleet", "recipient", "at"}}
+              "recovery": {"v", "kind", "fleet", "recipient", "at"},
+              "grant": {"v", "kind", "fleet", "login", "agent", "machine", "at"},
+              "ungrant": {"v", "kind", "fleet", "login", "agent", "at"},
+              "pool": {"v", "kind", "fleet", "login", "at"},
+              "unpool": {"v", "kind", "fleet", "login", "at"}}
 COPY_MAX = 16384            # characters of one sealed copy that the owner gives, as the hub's DEPOSIT_COPY_MAX
 CENTRAL_LINE = 65536        # bytes of one request line to the central vault: an intake carries a sealed copy
-CENTRAL_USER = "fleet-vault-central"
+# The central vault's own user. Not a fleet-* name: the hub's user may put any fleet-* user into the agents' group
+# (fleet-agent-user), and this user must never be one that the hub's user can move.
+CENTRAL_USER = "founderizer-vault"
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -292,6 +303,10 @@ def load_config(path):
     if isinstance(conf, dict) and "central" in conf:        # the central vault's own form; every other one as before
         return central_config(conf)
     given = set(conf) if isinstance(conf, dict) else set()
+    if given & (BITWARDEN_KEYS | WRITE_KEYS):
+        raise SystemExit("A server keeps no Bitwarden token: this broker's configuration names a Bitwarden project ("
+                         + ", ".join(sorted(given & (BITWARDEN_KEYS | WRITE_KEYS))) + "). Give it the fleet's own "
+                         "store (store, store_key, made by store-init); its values come from the central vault.")
     stores = [group for group in (STORE_KEYS, BITWARDEN_KEYS) if given & group]
     if not isinstance(conf, dict) or given - KEYS - CALLER_KEYS - STORE_KEYS - BITWARDEN_KEYS - WRITE_KEYS \
             - {REQUEST_KEY, PLACE_KEY, "agent"} or \
@@ -723,8 +738,7 @@ def probe(conf, job):
 
 
 def delivered(text, item):
-    """The value in a delivered copy, read as store-put reads the owner's own (store_item): a login needs its address,
-    and an API key keeps one when it has it. It refuses, and never exits, because the broker serves the next request."""
+    """The value in a delivered copy: a login needs its address, and an API key keeps one when it has it. It refuses, and never exits, because the broker serves the next request."""
     try:
         given = json.loads(text)
     except ValueError:
@@ -735,7 +749,7 @@ def delivered(text, item):
 
 
 def deposit(conf, number):
-    """deposit (owner feature secret_deliveries): save in this machine's own store one key or login that the owner's
+    """deposit (owner feature central_vault): save in this machine's own store one key or login that the central
     vault sealed to this broker's pinned key. The helper names only the delivery. The hub gives the sealed copy, the
     secret's reference, title and kind, and the salts of its fingerprints; the copy is opened here with the handover
     key, and the hub compares the value's fingerprints with the ones that the owner's vault registered under that
@@ -863,7 +877,7 @@ class LocalStore:
     half of the store key, and opened with that key. A value goes to age on its standard input, never in an argument
     or the environment, and a locked store that still holds a value in plain is not written. The store is read again
     for every request, so a removed key or a replaced file counts at once, and a save takes the store's lock, because
-    the broker and the owner's own store-put both write this one file.
+    two requests of the broker can write this one file at the same time.
     """
     LIMIT = 4 * 1024 * 1024         # the most bytes of the opened store, as the journal's limit
 
@@ -2196,8 +2210,8 @@ def canonical(value):
 
 
 def owner_statement(conf, req, kind):
-    """The owner's statement of this kind ({v, kind, fleet, at, and its machine, its recipient or both}), after its
-    form, its fleet and its signature. The statement must be the canonical text of what it holds, so the vault checks
+    """The owner's statement of this kind ({v, kind, fleet, at, and its machine, recipient, login and agent as
+    STATEMENTS says}), after its form, its fleet and its signature. The statement must be the canonical text of what it holds, so the vault checks
     the very bytes that the app signed; and it must name this fleet, so a statement of another fleet is no use here."""
     statement, signature = req.get("statement"), req.get("signature")
     if not isinstance(statement, str) or not isinstance(signature, str):
@@ -2210,9 +2224,11 @@ def owner_statement(conf, req, kind):
         raise Refused("the statement is not in its canonical form")
     if set(said) != STATEMENTS[kind] or said["kind"] != kind or type(said["v"]) is not int or said["v"] != 1 \
             or type(said["at"]) is not int or said["at"] < 0 or not isinstance(said["fleet"], str) \
-            or not all(isinstance(said.get(k, ""), str) for k in ("machine", "recipient")) \
+            or not all(isinstance(said.get(k, ""), str) for k in ("machine", "recipient", "login", "agent")) \
             or ("machine" in said and not MACHINE.fullmatch(said["machine"])) \
-            or ("recipient" in said and not RECIPIENT.fullmatch(said["recipient"])):
+            or ("recipient" in said and not RECIPIENT.fullmatch(said["recipient"])) \
+            or ("login" in said and not (SECRET_REF.fullmatch(said["login"]) and said["login"] == said["login"].lower())) \
+            or ("agent" in said and not AGENT_NAME.match(said["agent"])):
         raise Refused(f"the statement is not a valid {kind} statement")
     if said["fleet"] != conf["fleet"]:
         raise Refused("the statement is for another fleet")
@@ -2257,18 +2273,41 @@ def kept_record(record, unpinned=False):
         or unpinned and record["recipient"] is None)
 
 
+def kept_grant(record):
+    """One grant record of the state: {machine, at}, with no machine after an ungrant."""
+    return isinstance(record, dict) and set(record) == {"machine", "at"} and type(record["at"]) is int and (
+        record["machine"] is None or isinstance(record["machine"], str) and MACHINE.fullmatch(record["machine"]))
+
+
+def kept_pool(record):
+    """One pool record of the state: {in, at}."""
+    return isinstance(record, dict) and set(record) == {"in", "at"} and type(record["at"]) is int and \
+        isinstance(record["in"], bool)
+
+
 def central_state(conf):
     """The owner's signed records, read again for every request: {"v": 1, "pins": {machine: {recipient, at}},
-    "recovery": {recipient, at} or None}. An unpin keeps its machine's record, with no recipient, so a pin of that
-    machine that is older than the unpin, which the hub could send again, is refused as old. No file is no record."""
+    "recovery": {recipient, at} or None, "grants": {login: {agent: {machine, at}}}, "pool": {login: {in, at}}}. An
+    unpin keeps its machine's record, with no recipient, and an ungrant and an unpool keep theirs too, so a statement
+    older than them, which the hub could send again, is refused as old. No file is no record, and a state of the
+    format before grants has none."""
     if not os.path.lexists(conf["state"]):
-        return {"v": STATE, "pins": {}, "recovery": None}
+        return {"v": STATE, "pins": {}, "recovery": None, "grants": {}, "pool": {}}
     try:
         data = json.loads(read_private(conf["state"], "state"))
-        good = isinstance(data, dict) and set(data) == {"v", "pins", "recovery"} and data["v"] == STATE \
-            and isinstance(data["pins"], dict) \
+        if isinstance(data, dict):
+            data.setdefault("grants", {})
+            data.setdefault("pool", {})
+        good = isinstance(data, dict) and set(data) == {"v", "pins", "recovery", "grants", "pool"} \
+            and data["v"] == STATE and isinstance(data["pins"], dict) \
             and all(MACHINE.fullmatch(m) and kept_record(x, unpinned=True) for m, x in data["pins"].items()) \
-            and (data["recovery"] is None or kept_record(data["recovery"]))
+            and (data["recovery"] is None or kept_record(data["recovery"])) \
+            and isinstance(data["grants"], dict) and all(
+                SECRET_REF.fullmatch(ref) and isinstance(held, dict) and all(
+                    AGENT_NAME.match(agent) and kept_grant(x) for agent, x in held.items())
+                for ref, held in data["grants"].items()) \
+            and isinstance(data["pool"], dict) and all(SECRET_REF.fullmatch(ref) and kept_pool(x)
+                                                       for ref, x in data["pool"].items())
     except ValueError:
         good = False
     if not good:
@@ -2312,7 +2351,8 @@ def central_status(conf):
     return {"ok": True, "v": PROTOCOL, "central": True, "recipient": public_key(conf["age_key"], "key"),
             "store_recipient": store.recipient, "fleet": conf["fleet"], "owner_keys": len(conf["owner_keys"]),
             "pins": pins(state), "recovery": state["recovery"]["recipient"] if state["recovery"] else None,
-            "items": len(store.opened()), "source": conf.get("_source")}
+            "grants": granted(state), "pool": pooled(state), "items": len(store.opened()),
+            "source": conf.get("_source")}
 
 
 def fingerprint_list(items):
@@ -2355,42 +2395,78 @@ def intake(conf, req):
 
 
 def central_signed(conf, req, kind):
-    """pin, unpin and recovery: keep one statement that the owner signed. A statement must be newer (its `at`) than
-    the record of its machine, or of the recovery key, so an old one cannot be sent again; the exact statement of the
-    record answers "same", so a retry is no error. A pin's key is what seal locks a copy to, and the recovery key is
-    what export locks the store's key to."""
+    """pin, unpin, recovery, grant, ungrant, pool and unpool: keep one statement that the owner signed. A statement must
+    be newer (its `at`) than the record of its machine, of the recovery key, of its grant (one secret to one agent) or
+    of its secret in the pool, so an old one cannot be sent again; the exact statement of the record answers "same",
+    so a retry is no error. A pin's key is what seal locks a copy to, a grant or the pool is what lets seal lock that
+    secret at all, and the recovery key is what export locks the store's key to."""
     said = owner_statement(conf, req, kind)
     state = central_state(conf)
-    new = {"recipient": said.get("recipient"), "at": said["at"]}       # an unpin keeps its time, with no recipient
-    old = state["recovery"] if kind == "recovery" else state["pins"].get(said["machine"])
-    if old == new:          # the same record is the same statement: its v, kind, fleet and machine are fixed
+    if kind in ("grant", "ungrant"):
+        held = state["grants"].setdefault(said["login"], {})
+        new, old = {"machine": said.get("machine"), "at": said["at"]}, held.get(said["agent"])
+        was = old is not None and old["machine"] is not None
+    elif kind in ("pool", "unpool"):
+        new, old = {"in": kind == "pool", "at": said["at"]}, state["pool"].get(said["login"])
+        was = old is not None and old["in"]
+    else:
+        new = {"recipient": said.get("recipient"), "at": said["at"]}       # an unpin keeps its time, with no recipient
+        old = state["recovery"] if kind == "recovery" else state["pins"].get(said["machine"])
+        was = old is not None and old["recipient"] is not None
+    if old == new:          # the same record is the same statement: its v, kind, fleet and the rest are fixed
         saved = "same"
     elif old is not None and new["at"] <= old["at"]:
         raise Refused("the vault holds a statement that is as new or newer, so nothing changed")
     else:
-        saved = "removed" if kind == "unpin" else "replaced" if old and old["recipient"] else "new"
+        saved = "removed" if kind in ("unpin", "ungrant", "unpool") else "replaced" if was else "new"
         if kind == "recovery":
             state["recovery"] = new
+        elif kind in ("grant", "ungrant"):
+            state["grants"][said["login"]][said["agent"]] = new
+        elif kind in ("pool", "unpool"):
+            state["pool"][said["login"]] = new
         else:
             state["pins"][said["machine"]] = new
         keep_state(conf, state)
     log(f"{kind} statement of the owner: {saved}")
     answer = {"ok": True, "kind": kind, "saved": saved}
-    answer.update({k: said[k] for k in ("machine", "recipient") if k in said})
+    answer.update({k: said[k] for k in ("machine", "recipient", "login", "agent") if k in said})
     return answer
+
+
+def granted(state):
+    """[{login, agent, machine}]: the grants that the owner signed and has not taken back, in a fixed order."""
+    return [{"login": ref, "agent": agent, "machine": x["machine"]} for ref, held in sorted(state["grants"].items())
+            for agent, x in sorted(held.items()) if x["machine"]]
+
+
+def pooled(state):
+    """The secrets that the owner signed into the grantable pool and has not taken out, sorted."""
+    return sorted(ref for ref, x in state["pool"].items() if x["in"])
+
+
+def sealable(state, ref, machine):
+    """True when the owner signed that this secret may reach this machine: a grant of it to an agent there, or the
+    secret in the grantable pool, which the manager may hand to an agent on any machine."""
+    return any(g["login"] == ref and g["machine"] == machine for g in granted(state)) or ref in pooled(state)
 
 
 def seal(conf, req):
     """seal: one stored value, locked to the key that the owner pinned for one machine, for the hub to carry to that
-    machine's broker (a deposit). Nothing is sealed to a machine without a pin, and a copy that holds a value in plain
-    is not given."""
+    machine's broker (a deposit). Nothing is sealed to a machine without a pin, nor without the owner's signed grant
+    of that value to an agent of that machine or his signed word that it is in the grantable pool (sealable), and a
+    copy that holds a value in plain is not given."""
     ref, machine = req.get("login"), req.get("machine")
     m = SECRET_REF.fullmatch(ref) if isinstance(ref, str) else None
     if not (m and isinstance(machine, str) and MACHINE.fullmatch(machine)):
         raise Refused("a seal request needs a login and a machine")
-    pin = pins(central_state(conf)).get(machine)
+    state = central_state(conf)
+    pin = pins(state).get(machine)
     if not pin:
         raise Refused("the owner has not pinned a key for this machine, so nothing is sealed for it")
+    if not sealable(state, ref.lower(), machine):
+        raise Refused("the owner has signed no grant of this secret to an agent of this machine and has not put it "
+                      "into the grantable pool, so nothing is sealed for it")
     found = LocalStore(conf).opened().get(m.group(1).lower())
     if not found:
         raise Refused("the central vault has no such login")
@@ -2437,7 +2513,7 @@ def central(conf, req):
         return central_status(conf)
     if op == "intake":
         return intake(conf, req)
-    if op in ("pin", "unpin", "recovery"):
+    if op in ("pin", "unpin", "recovery", "grant", "ungrant", "pool", "unpool"):
         return central_signed(conf, req, op)
     if op == "seal":
         return seal(conf, req)
@@ -2845,7 +2921,7 @@ def store_init(config, user=None, keygen="age-keygen"):
 
     For a central vault it also makes the vault's own key (age_key), to which the owner seals a new value, and keeps
     that one too when it is there. With no user named, the user is the one that the service runs as: fleet-vault, or
-    fleet-vault-central for a central vault."""
+    founderizer-vault (CENTRAL_USER) for a central vault."""
     conf = load_config(config)
     if backend(conf) != "store":
         raise SystemExit("This broker's configuration names a Bitwarden project. Name store and store_key instead, "
@@ -2906,40 +2982,6 @@ def store_init(config, user=None, keygen="age-keygen"):
     owned_by(store, info, 0o600)
     return dict({"store": store, "store_key": key, "user": user, "made": made, "public_key": m.group(1)},
                 **({"age_key": conf["age_key"], "recipient": own.group(1)} if central else {}))
-
-
-def store_item(text):
-    """One item that the owner gives the store: a login ({username, password, url[, totp]}) or a key to read in a
-    session ({password[, totp]}). The text is read once and never logged, answered or kept anywhere else."""
-    try:
-        given = json.loads(text)
-    except ValueError:
-        raise SystemExit("Give the item as one JSON object on standard input.") from None
-    if isinstance(given, dict) and "url" not in given:
-        return check_value(text)        # an API key: it needs no address
-    return check_login(given)
-
-
-def store_put(config, title, text, note=""):
-    """Save one login or key of the owner's in the fleet's own store, and give its name. The value is read from
-    standard input, so it never stands in an argument, and no answer repeats it. Run it as the vault user."""
-    conf = load_config(config)
-    if backend(conf) != "store":
-        raise SystemExit("This broker opens a Bitwarden project, so the owner saves a login there.")
-    if os.geteuid() == 0:
-        raise SystemExit("Run store-put as the vault user, never as root: sudo -u <vault user> python3 "
-                         f"{os.path.abspath(__file__)} store-put --config {config} --title \"<name>\"")
-    if not plain_line(title, 60):
-        raise SystemExit("--title must be the name of the item: 1 to 60 characters on one line.")
-    if not plain_line(note, 200) and note != "":
-        raise SystemExit("--note must be 1 to 200 characters on one line.")
-    try:
-        value = json.dumps(store_item(text), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        sid = LocalStore(conf).add(title, value, note)
-    except Refused as e:
-        raise SystemExit(str(e)) from None
-    return {"ok": True, "login": f"bws://{sid}", "title": title,
-            "next": "register it with the hub: python3 fleet.py register bws://" + sid}
 
 
 def store_list(config):
@@ -3029,11 +3071,6 @@ def main(argv=None):
     p.add_argument("--user", help="the vault user: it owns the key and the store; default: fleet-vault, and "
                                   + CENTRAL_USER + " for a central vault")
     p.add_argument("--keygen", default="age-keygen", help="the age-keygen program; default: the one on the PATH")
-    p = sub.add_parser("store-put", help="Save one login or key of the owner's in the fleet's own store, as the "
-                                         "vault user: the item as JSON on standard input, and its name comes back")
-    p.add_argument("--config", required=True)
-    p.add_argument("--title", required=True, help="the name of the item, as the owner will see it")
-    p.add_argument("--note", default="", help="an optional line about the item; never a value")
     p = sub.add_parser("store-list", help="The references and titles in the fleet's own store, as the vault user. "
                                           "Never a value")
     p.add_argument("--config", required=True)
@@ -3050,14 +3087,12 @@ def main(argv=None):
         sdk_test(args.library)
         print("ok")
         return 0
-    if args.cmd in ("store-init", "store-put", "store-list"):
+    if args.cmd in ("store-init", "store-list"):
         unchangeable(os.path.realpath(__file__), "The vault broker program")     # the installed copy, not a checkout
         if args.cmd == "store-init":
             if os.geteuid() != 0:
                 raise SystemExit("Run store-init as root: the key and the store belong to the vault user.")
             print(json.dumps(dict(store_init(args.config, args.user, args.keygen), ok=True)))
-        elif args.cmd == "store-put":
-            print(json.dumps(store_put(args.config, args.title, sys.stdin.read(), args.note)))
         else:
             print(json.dumps(store_list(args.config), indent=2))
         return 0

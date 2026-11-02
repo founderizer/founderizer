@@ -183,25 +183,23 @@ to its configuration. That is the one thing to get right, because a broker that
 admits one user ID was left unreachable by the move to one OS user for each agent --
 running, current, and serving nobody.
 
-**A machine with no broker gets the fleet's own store**: one `age` file on that
-machine (`store`, `store_key`), made by `vault.py store-init`, with no Bitwarden
-account, no organization and no token. So installing a machine needs nothing of the
-owner's, and the one thing that cannot be automatic does not arise. A machine whose
-broker opens a **Bitwarden project** keeps it, token and write setup included: the
-install changes only who may ask it. A broker opens one store or the other, never
-both, so a machine with the fleet's own store cannot open a secret of a Bitwarden
-project, and the owner's existing brokers are left as they are.
+**A machine's broker opens the fleet's own store**: one `age` file on that machine
+(`store`, `store_key`), made by `vault.py store-init`, with no Bitwarden account, no
+organization and no token. So installing a machine needs nothing of the owner's, and the
+one thing that cannot be automatic does not arise. Since the DevOps plan's track B (2
+November 2026) **no server keeps a Bitwarden token**: a broker refuses a configuration that
+names a Bitwarden project, so a broker installed with one keeps running its old program
+until its configuration names the fleet's own store, and `python3 fleet.py check <agent>`
+shows `backend` in its status.
 
-**The owner's keys reach that store by delivery.** A key or a login that the owner
-types into Founderizer is saved in the vault of his Mac, which no worker reads. So
-the app also seals the value to each machine's pinned vault key, the hub carries the
-sealed copy, which it cannot open, and the broker opens it, has the hub compare the
-value's fingerprints with the ones the owner's vault registered, and saves it in its
-own store under the same `bws://` reference (owner feature `secret_deliveries`). It
-takes a broker whose `vault.py` has the `deposit` operation (its status says
-`"deposits": true`) and a helper that reports the feature `secret_deposits`; the
-Secrets page says, for each machine, whether it can take one and what is missing. A
-broker that opens a Bitwarden project takes none.
+**The owner's keys reach that store from the central vault only** (HUB-INSTALL.md, "The
+central vault"). It seals a value to a machine's pinned vault key, only for a grant of it to
+an agent of that machine, or a place in the grantable pool, that the owner signed. The hub
+carries the sealed copy, which it cannot open, and the broker opens it, has the hub compare
+the value's fingerprints with the ones the owner's vault registered, and saves it in its own
+store under the same `bws://` reference. It takes a broker whose `vault.py` has the `deposit`
+operation (its status says `"deposits": true`) and a helper that reports the feature
+`secret_deposits`. `vault.py store-put` is gone: no value reaches a server's store by hand.
 
 **The configuration is root with mode 644 and holds no secret.** Do not make it
 `root:fleet-vault` 640: the service sets `Group=`, so the vault user's own group is

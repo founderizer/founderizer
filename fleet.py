@@ -5298,8 +5298,8 @@ class Helper:
         self.say(f"{task}: {extra.get('action')} {'confirmed' if confirmed else 'NOT confirmed'}: {detail}")
 
     def deposit(self, extra):
-        """A key or a login that the owner sealed in his app for this machine's vault (owner feature
-        secret_deliveries). The helper passes only the delivery's number: the broker takes the sealed copy from the hub,
+        """A key or a login that the central vault sealed for this machine's vault (owner feature
+        central_vault). The helper passes only the delivery's number: the broker takes the sealed copy from the hub,
         opens it with its own key, has the hub compare the value's fingerprints with the owner's and saves it in its
         own store. Nothing of the copy or the value passes this process. The outcome goes back to the hub, which drops
         the copy; if the hub cannot be told, the event stays pending and the next poll asks again, which is the same
@@ -5760,7 +5760,7 @@ def cmd_check(args):
                         "\"Vault broker (macOS)\")" if sys.platform == "darwin" else
                         "as root: /usr/local/sbin/fleet-vault-program (WORKER-INSTALL.md, \"When a release "
                         "changes vault.py\")")
-            if store == "store":            # owner feature secret_deliveries: the owner's keys reach this store,
+            if store == "store":            # owner feature central_vault: the owner's keys reach this store,
                 # so this is the line that says whether this broker is new enough to take one
                 line(status.get("deposits") is True or None, "vault broker takes the keys the owner delivers",
                      catch_up)

@@ -215,9 +215,13 @@ def named_in_the_moment(name, corpus):
     return any(re.search(shape, text) for text in corpus)
 
 
+# studio holds the one login that vps hands over to it below: a handover goes only to an agent that holds its login
+# already (DevOps plan V1). A grant adds no tool, so the tool sets of these checks stay the hub's own.
 HUB_PROC, HUB = start_hub("main", {"vps": "", "mac-studio": "", "owner": ""},
                           "--silence", "6", "--question-wait", "60", "--manager-silence", "12", "--stop-after", "3",
-                          "--tick", "1", "--hook-wait", "4", "--job-wait", "3")
+                          "--tick", "1", "--hook-wait", "4", "--job-wait", "3",
+                          agents={"studio": dict(REFERENCE["studio"],
+                                                 secrets={"bws://22222222-2222-4222-8222-222222222222": "use"})})
 fails, count = [], [0]
 
 
@@ -792,29 +796,19 @@ text, err = tool("manager", "raise_needs_you", base=hubS, title="Vault token", w
 check("a Needs-you item that sends the owner to his own app passes", not err and "N-3" in text, text)
 code, _, text = owner_ui("/ui/needs/3/secret", {"decline": ""}, base=hubS)
 check("an item that asks for no secret takes no secure answer", code == 409, text)
-# Owner feature secret_deliveries: the app seals a value to each machine's pinned vault key and the hub carries the
-# sealed copy to that machine's broker. The hub's side only: a broker that opens a copy needs age, a store and a vault
-# user of its own, which is what a machine is for.
+# DevOps plan V1: the central vault is the one way a value reaches a server. The owner's own sealed copies to each
+# machine are gone (secret_deliveries), the app signs each grant (signed_grants), and no secret comes in while no
+# central vault answers: this hub has none.
 state = json.loads(raw("GET", "/ui/state", base=hubS)[2])
-check("the hub offers secret_deliveries", "secret_deliveries" in state["ui_features"], state["ui_features"])
+check("the hub offers signed_grants and no longer secret_deliveries",
+      "signed_grants" in state["ui_features"] and "secret_deliveries" not in state["ui_features"], state["ui_features"])
 code, _, text = raw("GET", f"/ui/secrets/machines?db={state['db']}&login={urllib.parse.quote(STRIPE)}", base=hubS)
-got = {m["machine"]: m for m in json.loads(text)["machines"]} if code == 200 else {}
-check("a machine whose agents have no broker access is offered no key to seal to",
-      got.get("mac-studio", {}).get("missing") == ["no_broker_access"] and got["mac-studio"]["recipient"] is None
-      and got["mac-studio"]["deposit"] is None and set(got) == {"vps", "mac-studio"}, text)
-armored = base64.b64encode(b"age-encryption.org/v1\n-> X25519 " + b"A" * 43 + b"\n" + b"B" * 43 + b"\n--- " +
-                           b"C" * 43 + b"\n" + os.urandom(48)).decode()
-COPY = "-----BEGIN AGE ENCRYPTED FILE-----\n" + "".join(armored[i:i + 64] + "\n" for i in range(0, len(armored), 64)) + \
-    "-----END AGE ENCRYPTED FILE-----\n"
-KEY = "age1" + "q" * 58
-code, _, text = owner_ui("/ui/secrets/deliver", {"login": STRIPE, "copies": [
-    {"machine": "mac-studio", "recipient": KEY, "ciphertext": COPY}]}, base=hubS)
-check("a copy for a machine that takes none is refused, with why", code == 409 and "no_broker_access" in text, text)
-code, _, text = owner_ui("/ui/secrets/deliver", {"login": STRIPE, "copies": [
-    {"machine": "mac-studio", "recipient": KEY, "ciphertext": '{"password": "sk_live_0123456789abcdef"}'}]}, base=hubS)
-check("the hub takes a sealed copy and nothing else", code == 400 and "age file" in text, text)
-code, _, text = owner_ui("/ui/secrets/deliver", {"login": STRIPE, "value": "x", "copies": []}, base=hubS)
-check("...and no value beside it", code == 400 and "unknown field" in text, text)
+check("the owner's copies to each machine are gone", code == 404, text)
+code, _, text = owner_ui("/ui/secrets/deliver", {"login": STRIPE, "copies": []}, base=hubS)
+check("...and so is the route that took them", code == 404, text)
+code, _, text = owner_ui("/ui/secrets/add", {"login": "bws://99999999-2222-4333-8444-555555555555", "title": "NEW_KEY",
+                                             "kind": "api_key", "env": "NEW_KEY"}, base=hubS)
+check("no secret is added while no central vault answers", code == 503 and "central vault" in text, text)
 # Owner feature live_changes: the apps wait on GET /ui/wait and read the moment something they show changes (the owner,
 # 25 October 2026: "it needs to be immediate"). Last on this hub, so the write it makes moves no later check.
 state = json.loads(raw("GET", "/ui/state", base=hubS)[2])
