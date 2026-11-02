@@ -1035,8 +1035,8 @@ check("a name whose machine has no address is refused, not taken from anybody", 
 # PRODUCT.md 4.8: this hub is the case, so it is also the proof. It started on the file, it answered /health above,
 # and it says the rule it breaks. The rule itself is not asserted here: which one comes first depends on the
 # team.json this checkout has (test_servers.py TeamAtStartup pins the line on a fixture of its own).
-check("a hub started with a team.json that validate_team refuses starts and says so on its board",
-      "team.json does not validate" in raw("GET", "/board", base=hub2)[2])
+check("a hub started with a team.json that validate_team refuses starts, and its board answers the owner's machine only",
+      refused(raw("GET", "/board", base=hub2)[0]))      # TeamAtStartup reads the rule on the owner's board
 check("another worker's name is refused from a machine that is not its own", refused(rpc("vps", "ping", base=hub2)[0]))
 check("team tools under another machine's name are refused", refused(rpc("studio", "tools/list", base=hub2)[0]))
 check("another machine's messages cannot be read", refused(raw("GET", "/events/studio?after=0&wait=0", base=hub2)[0]))
@@ -1046,9 +1046,6 @@ check("only the owner's machine can say which logins to watch for", refused(raw(
 check("a key cannot be registered under another machine's name", refused(raw("POST", "/keys/studio", {"pubkey": "age1" + "q" * 58}, base=hub2)[0]))
 check("a permission prompt cannot be raised under another machine's name", refused(raw("POST", "/hook/permission/studio/T-1", {"tool_name": "Bash", "tool_input": {"command": "ls"}}, base=hub2)[0]))
 check("a handover cannot be sent under another machine's name", refused(raw("POST", "/sealed", {"sender": "studio", "recipient": "vps", "ciphertext": "-----BEGIN AGE ENCRYPTED FILE-----"}, base=hub2)[0]))
-b2 = raw("GET", "/board", base=hub2)[2]
-check("the board counts the calls the machine rule refused, and nothing else",
-      f"from the wrong machine</td><td>{len(wrong_machine)}<" in b2, b2[-900:])
 import http.client
 conn = http.client.HTTPConnection("127.0.0.1", int(hub2.rsplit(":", 1)[1]), timeout=10)
 ping = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"})
@@ -1064,7 +1061,7 @@ proc2.terminate()
 
 # 12 two agents on one address: the address alone names nobody, so a session sends its own credential (owner API 1.12)
 proc3, hub3 = start_hub("shared", {"hub": "127.0.0.1", "vps": "127.0.0.1", "mac-studio": "127.0.0.77",
-                                   "owner": "127.0.0.78"}, "--tick", "1")
+                                   "owner": "127.0.0.1"}, "--tick", "1")        # the owner reads this hub's board
 code, _, resp = rpc("manager", "tools/list", base=hub3)
 check("on a shared address a name alone is refused, with the reason",
       code == 403 and (resp or {}).get("auth") == "credential_required", f"{code} {resp}")
@@ -1072,6 +1069,12 @@ check("the other agent of that address is refused as well", rpc("vps", "ping", b
 b3 = raw("GET", "/board", base=hub3)[2]
 check("a refusal on a credential is not counted as a wrong machine",
       "from the wrong machine</td><td>0<" in b3 and "credential did not match</td><td>2<" in b3, b3[-900:])
+wrong_machine.clear()
+check("a name is refused from a machine that is not its own", refused(rpc("studio", "ping", base=hub3)[0]))
+b3 = raw("GET", "/board", base=hub3)[2]
+check("the board counts the calls the machine rule refused, and nothing else",
+      f"from the wrong machine</td><td>{len(wrong_machine)}<" in b3 and "credential did not match</td><td>2<" in b3,
+      b3[-900:])
 proc3.terminate()
 
 shutil.rmtree(TMP, ignore_errors=True)

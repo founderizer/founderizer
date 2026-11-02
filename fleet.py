@@ -5914,7 +5914,7 @@ def cmd_say(args):
 
 def cmd_board(args):
     code, data = http("GET", "/board.txt")
-    print(data.get("text", data))
+    print(data.get("text") or data.get("error", data))
 
 
 def cmd_hub(args):

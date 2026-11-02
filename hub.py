@@ -34176,9 +34176,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_artifacts(parts[2], query, binary=parts[3] == "artifact")
         if len(parts) == 4 and parts[:2] == ["ui", "tasks"] and parts[3] == "events":
             return self.ui_events(parts[2], query)
-        if not parts or parts == ["board"]:
+        if not parts or parts == ["board"]:          # the owner's machine only, his words of 2 November 2026
+            if not self.allowed("owner"):
+                return
             return self.send(200, board_html(), "text/html; charset=utf-8")
         if parts == ["board.txt"]:
+            if not self.allowed("owner"):
+                return
             return self.send(200, overview_text() + "\n", "text/plain; charset=utf-8")
         if parts == ["health"]:
             return self.json(200, {"ok": True, "agents": list(agents())})
