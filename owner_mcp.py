@@ -1025,7 +1025,8 @@ def tools():
                              "secret:bws://<uuid> use|read, drive:<email> "
                              "read|write|write_shared, gmail:<email> read|write|send, tool:<name> use. The grant is "
                              "the authorization: the agent then does what that access allows, and the hub records "
-                             "who gave what to whom.",
+                             "who gave what to whom. A repository that the hub's GitHub App does not reach comes back "
+                             "with unreached: the GitHub page where the owner adds it to the App.",
              {"resource": S["text"], "agent": S["text"], "level": S["level"], **rid},
              ("resource", "agent", "level"), grant_access),
         tool("share_resource", "The owner's standing for one resource in the grantable pool: the manager may hand it "

@@ -25059,9 +25059,9 @@ def validate_team(team):
                                                                and EFFORT_NAME.fullmatch(screen["effort"]))):
                 raise ValueError(f"agent {name}: screen must be {{model, effort}} with a model name and an effort name")
         repos, tools = a.get("repos", {}), a.get("tools", [])      # owner feature integrations
-        if not isinstance(repos, dict) or len(repos) > 32 or not all(
+        if not isinstance(repos, dict) or len(repos) > 64 or not all(
                 isinstance(r, str) and REPO_NAME.fullmatch(r) and v in REPO_ACCESS for r, v in repos.items()):
-            raise ValueError(f"agent {name}: repos must map up to 32 GitHub repositories (owner/name in lower case) "
+            raise ValueError(f"agent {name}: repos must map up to 64 GitHub repositories (owner/name in lower case) "
                              f"to {', '.join(REPO_ACCESS)}")
         if not isinstance(tools, list) or not all(isinstance(t, str) and t in catalog for t in tools) or \
                 len(set(tools)) != len(tools):
@@ -27202,6 +27202,113 @@ def github_tokens(repos):
     return tokens, errors
 
 
+# What the hub's GitHub App reaches (owner feature integrations): the repositories of each of its installations, read
+# with that installation's own token. A repository grant outside them is marked in GET /ui/team, GET /ui/resources and
+# the receipt of POST /ui/team/repos, with the GitHub page where the owner adds it. An App cannot add a repository to
+# its own installation: GitHub lets only a person do that. So the hub marks the grant and does not refuse it, and an
+# agent's clone no longer fails later with nobody told why (2 November 2026: 32 of 34 new grants were outside the App).
+# A reading counts GITHUB_REACH_FRESH seconds, and an older one starts the next in a thread of its own, so no answer
+# under LOCK waits for GitHub. A read that failed marks nothing.
+GITHUB_REACH_FRESH = 60         # seconds: the owner who added a repository on GitHub sees its mark go within a minute
+GITHUB_REACH_WAIT = 4           # seconds that a repository grant waits for a reading, outside LOCK: the app waits 10
+GITHUB_REACH_PAGES = 30         # pages of 100 repositories that the hub reads of one installation, at most
+GITHUB_LOGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}")
+GITHUB_SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,99}")
+GITHUB_REACH = {"at": None, "reach": None, "reading": False}
+GITHUB_REACH_DONE = threading.Condition()
+
+
+def github_reach_read():
+    """What the hub's GitHub App reaches now, from GitHub, every name in lower case: {"pages": {account: the settings
+    page of its installation}, "all": {account whose installation has all its repositories}, "repos": {owner/name},
+    "install": the page that installs the App on another account}. None while the hub has no App. The pages are built
+    here from the account and the installation, never taken from GitHub's answer."""
+    app = github_app()
+    if app is None:
+        return None
+    jwt = github_jwt(*app)
+    slug = github_call("GET", "/app", jwt).get("slug")
+    installs = github_call("GET", "/app/installations?per_page=100", jwt)
+    if not isinstance(installs, list):
+        raise GitHubError("GitHub gave no list of the App's installations")
+    reach = {"pages": {}, "all": set(), "repos": set(),
+             "install": f"https://github.com/apps/{slug}/installations/new"
+             if isinstance(slug, str) and GITHUB_SLUG.fullmatch(slug) else None}
+    for one in installs:
+        account = one.get("account") or {}
+        iid, login = one.get("id"), account.get("login")
+        if isinstance(iid, bool) or not isinstance(iid, int) or not isinstance(login, str) or \
+                not GITHUB_LOGIN.fullmatch(login):
+            continue
+        reach["pages"][login.lower()] = (f"https://github.com/organizations/{login}/settings/installations/{iid}"
+                                         if account.get("type") == "Organization" else
+                                         f"https://github.com/settings/installations/{iid}")
+        if one.get("suspended_at"):
+            continue        # it reaches nothing until the owner lets it work again, on that same page
+        if one.get("repository_selection") == "all":
+            reach["all"].add(login.lower())
+            continue
+        token = github_call("POST", f"/app/installations/{iid}/access_tokens", jwt,
+                            {"permissions": {"metadata": "read"}}).get("token")
+        if not isinstance(token, str) or not GITHUB_TOKEN.fullmatch(token):
+            raise GitHubError("GitHub gave no valid token")
+        for page in range(1, GITHUB_REACH_PAGES + 1):
+            got = github_call("GET", f"/installation/repositories?per_page=100&page={page}", token)
+            names = [r.get("full_name") for r in got.get("repositories") or [] if isinstance(r, dict)]
+            reach["repos"].update(n.lower() for n in names if isinstance(n, str))
+            if len(names) < 100:
+                break
+        else:
+            reach["all"].add(login.lower())     # more than the hub reads: it marks none of this account's
+    return reach
+
+
+def github_reach(wait=0):
+    """The newest reading of what the hub's GitHub App reaches (github_reach_read), or None: before the first, while
+    the hub has no App, and after a read that failed. A reading older than GITHUB_REACH_FRESH starts the next one in a
+    thread of its own. wait: the seconds to wait for it, which only a caller outside LOCK may give."""
+    with GITHUB_REACH_DONE:
+        at = GITHUB_REACH["at"]
+        if not GITHUB_REACH["reading"] and (at is None or now() - at >= GITHUB_REACH_FRESH):
+            GITHUB_REACH["reading"] = True
+            threading.Thread(target=github_reach_refresh, name="github-reach", daemon=True).start()
+        if wait:
+            GITHUB_REACH_DONE.wait_for(lambda: not GITHUB_REACH["reading"], wait)
+        return GITHUB_REACH["reach"]
+
+
+def github_reach_refresh():
+    reach = None
+    try:
+        reach = github_reach_read()
+    except (GitHubError, AttributeError, TypeError):
+        pass            # GitHub did not answer, or gave an answer of another shape: no reading, so no mark
+    finally:
+        with GITHUB_REACH_DONE:
+            GITHUB_REACH.update(at=now(), reach=reach, reading=False)
+            GITHUB_REACH_DONE.notify_all()
+
+
+def github_unreached(repos):
+    """{owner/name: the GitHub page where the owner adds it} of each of these repositories that the hub's GitHub App
+    does not reach, from the newest reading (github_reach); {} without one."""
+    repos = sorted(set(repos))
+    reach = github_reach() if repos else None
+    if not reach:
+        return {}
+    pages = {repo: reach["pages"].get(repo.split("/")[0]) or reach["install"] for repo in repos
+             if repo not in reach["repos"] and repo.split("/")[0] not in reach["all"]}
+    return {repo: page for repo, page in pages.items() if page}
+
+
+def save_repo_reached(body, _waited):
+    """POST /ui/team/repos: save_repo, and in its receipt `unreached`, the page where the owner adds the repository,
+    when the hub's GitHub App does not reach it. The route waited for a reading first, outside LOCK."""
+    result = save_repo(body)
+    page = github_unreached([body["repo"]]).get(body["repo"]) if body["access"] else None
+    return dict(result, unreached=page) if page else result
+
+
 # Custom MCP servers (owner feature mcp)
 MCP_FILE = os.path.expanduser("~/.fleet/mcp.json")
 MCP_PENDING = 900               # seconds that a Connect waits for its finish
@@ -27604,7 +27711,8 @@ def integrations_view(team, lines):
                          if k in ("title", "command", "args", "url", "runtimes", "custom", "auth")},
                         needs=tool_needs(tool), **state.get(name, {}))
              for name, tool in tool_catalog(team).items()}
-    return {"tools": tools, "github": {"app": app, "app_id": app_id, "problem": problem},
+    unreached = github_unreached(r for line in lines for r in line["repos"]) if app else {}
+    return {"tools": tools, "github": {"app": app, "app_id": app_id, "problem": problem, "unreached": unreached},
             "google": google_view(team)}
 
 
@@ -31035,7 +31143,8 @@ class Handler(BaseHTTPRequestHandler):
                 named = ", ".join(f'"{x}"' for x in REPO_ACCESS[:-1]) + f' or "{REPO_ACCESS[-1]}"'
                 raise ValueError(f"access must map agent names to {named}; {{}} removes the repository")
             return {"base_sha256": base, "repo": repo.strip().lower(), "access": dict(sorted(access.items()))}
-        return self.ui_command("team/repos", read, save_repo)
+        return self.ui_command("team/repos", read, save_repo_reached,
+                               outside=lambda body: github_reach(GITHUB_REACH_WAIT if body["access"] else 0))
 
     def ui_team_tool(self):
         """POST /ui/team/tools (owner feature integrations): the agents that get one tool of the catalog."""
@@ -31799,6 +31908,8 @@ class Handler(BaseHTTPRequestHandler):
             except Refusal as e:
                 return self.json(e.status, {"error": str(e)})
             result = dict(resources_view(team), db=generation, revision=rev, sha256=sha)
+            result["github"] = {"unreached": github_unreached(r["what"] for r in result["resources"]
+                                                              if r["kind"] == "repo")}
         return self.json(200, scrub(result), {"Cache-Control": "no-store"})
 
     def ui_resource(self):
