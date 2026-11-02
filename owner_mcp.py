@@ -64,6 +64,14 @@ SSH_HOST = re.compile(r"[A-Za-z0-9._:-]{1,255}")        # a host name or an addr
 SSH_USER = re.compile(r"[A-Za-z_][A-Za-z0-9._-]{0,31}")  # hub.py SSH_USER
 CLAIM_CODE = re.compile(r"[A-Z2-9-]{12,20}")            # hubsetup.py: 12 characters of LINK_ALPHABET, in three groups
 KIT = "/root/fleet-kit"                 # INSTALL-PROMPT.md A2: where the code goes on the server
+
+
+def take_line(kit):
+    """The shell that moves a checkout on a server onto its own ref: fetched, and taken only where `lifecycle.py
+    may-take` of that checkout lets it (DevOps plan 0.1). A refusal leaves the code where it is, and says why. The ref is
+    read once, as one commit: the commit checked is the commit taken."""
+    return (f"git -C {kit} fetch -q origin && t=$(git -C {kit} rev-parse --verify -q '@{{upstream}}^{{commit}}') && "
+            f"python3 {kit}/lifecycle.py may-take {kit} \"$t\" && git -C {kit} merge -q --ff-only \"$t\"")
 LOG = "/root/fleet-install.log"         # INSTALL-PROMPT.md A5
 AUTHKEY = "/root/fleet-authkey"         # INSTALL-PROMPT.md A4: the key on the server, mode 600, removed at the end
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -676,7 +684,7 @@ def install_hub(args):
         'command -v git >/dev/null 2>&1 || { DEBIAN_FRONTEND=noninteractive apt-get -q update && '
         'DEBIAN_FRONTEND=noninteractive apt-get -y -q install git; }'), timeout=600)
     steps["code"] = ssh(host, user, root + "sh -c " + shlex.quote(
-        f"if test -d {KIT}/.git; then git -C {KIT} pull -q --ff-only; "
+        f"if test -d {KIT}/.git; then {take_line(KIT)}; "
         f"else git clone -q -- {shlex.quote(source.strip())} {KIT}; fi"), timeout=600)
     steps["revision"] = ssh(host, user, root + "sh -c " + shlex.quote(f"git -C {KIT} rev-parse --short HEAD; ls {KIT}/hub.sh"))
     if steps["revision"]["exit"] != 0:

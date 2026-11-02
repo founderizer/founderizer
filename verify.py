@@ -868,7 +868,8 @@ class Verify:
             said.append((f"This server does not know {_names(shown_name(a) for a in unknown)} yet, so "
                          f"{_one(unknown, 'it is', 'they are')} not checked here.",
                          "Bring this server up to date with the hub.",
-                         f"git -C {self.kit} fetch origin && git -C {self.kit} merge --ff-only origin/{CONFIG_BRANCH}"))
+                         f"cd {self.kit} && git fetch origin && python3 lifecycle.py may-take . origin/{CONFIG_BRANCH} "
+                         f"&& git merge --ff-only origin/{CONFIG_BRANCH}"))
         return said
 
     def and_agents(self, found):

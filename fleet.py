@@ -62,10 +62,11 @@ import uuid
 
 from threads import MARKER, THREAD_ID, CodexFiles, Tailer, Translator, complete_rows, manager_transcript, text_of
 from usage import Collector, local_model, timestamp
-from lifecycle import (GITHUB_TOKEN, MCP_PROGRAM, REPO_ACCESS, REPO_NAME, RUNTIMES, TOOL_CATALOG, Lifecycle,
-                       Updating, app_server_task, exe, facts_now, follow_config_ref, mcp_variable, no_sign_in,
-                       reuse_settings, runtime_fact, runtimes_with, session_reuse, skills_text, tool_catalog,
-                       tool_needs)
+import lifecycle
+from lifecycle import (CHECK_FILE, FLOOR_FILE, GITHUB_TOKEN, MCP_PROGRAM, REPO_ACCESS, REPO_NAME, RUNTIMES,
+                       TOOL_CATALOG, Lifecycle, Updating, app_server_task, check_store, exe, facts_now, follow_config_ref,
+                       key_env, mcp_variable, no_sign_in, reuse_settings, runtime_fact, runtimes_with, screen_program,
+                       session_reuse, skills_text, start_form, tool_catalog, tool_needs)
 from desktop import Publisher
 from onboard import CLAUDE_UPDATES_OFF
 
@@ -270,8 +271,8 @@ def env_prefix(agent, window, values):
 ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,59}")         # an API key's variable name (owner feature secrets)
 PLACE_PUBLIC = re.compile(r"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}")   # a vault's key for servers
 # The names that the start of a session sets or that its runtime reads itself; the hub refuses them for an API key.
-ENV_RESERVED = re.compile(r"(?:FLEET|BWS|LD|DYLD|ANTHROPIC|CLAUDE|CODEX|XAI)_[A-Z0-9_]*|PATH|HOME|SHELL|USER|LOGNAME|"
-                          r"TMPDIR|TERM|PWD|IFS|ENV|BASH_ENV|ZDOTDIR|NODE_OPTIONS|PYTHONPATH|PYTHONHOME")
+# One list for the hub and the helper (lifecycle.key_env, DevOps plan 0.2).
+ENV_RESERVED = lifecycle.ENV_RESERVED
 
 
 def session_env(agent, conf, kind):
@@ -304,8 +305,7 @@ def read_env(agent, conf, kind):
               f"{e if isinstance(e, Refused) else type(e).__name__}", flush=True)
         return {}
     given = done.get("env") if isinstance(done.get("env"), dict) else {}
-    env = {k: v for k, v in given.items() if isinstance(k, str) and ENV_NAME.fullmatch(k) and not ENV_RESERVED.fullmatch(k)
-           and isinstance(v, str) and v and "\0" not in v}
+    env = {k: v for k, v in given.items() if key_env(k) and isinstance(v, str) and v and "\0" not in v}   # plan 0.2
     missing = [x for x in done.get("missing") or [] if isinstance(x, str) and ENV_NAME.fullmatch(x)]
     if missing:
         print(time.strftime("%H:%M:%S"), f"{kind}: the vault did not give {', '.join(missing)}", flush=True)
@@ -783,6 +783,8 @@ def integration_env(agent, conf, keys=None):
                           " The owner gives the agent that API key on the Secrets page."))
         elif tool.get("command") and not exe(tool["command"]):
             notes.append(f"The tool {name} is not loaded: {tool['command']} is not installed on this machine.")
+        elif not all(key_env(var) for var in tool.get("env") or {}):
+            notes.append(f"The tool {name} is not loaded: its variables must be names of keys.")      # plan 0.2
         else:
             values.update({var: have[source] for var, source in (tool.get("env") or {}).items()})
             tools.append(name)
@@ -962,6 +964,19 @@ def stable_start(conf, needs, opening, rules):
         and runtime_fact(runtime, "driver") == "terminal" and not app_server_task(conf, needs)
 
 
+def checked_start(conf):
+    """The agent's start of team.json, which a session runs as a command line, when it is one of Fleet's own forms
+    (lifecycle.start_forms, DevOps plan 0.2): the hub writes team.json, so no other line runs. An acp runtime with no
+    start takes the form of its entry."""
+    runtime = conf.get("runtime")
+    start = conf.get("start") or (runtime_fact(runtime, "acp_command") if runtime_fact(runtime, "driver") == "acp"
+                                  else None)
+    if not start_form(runtime, start):
+        raise Refused(f"this agent's start in team.json is not one of Fleet's own forms for "
+                      f"{runtime_fact(runtime, 'label', runtime)}, so no session starts with it")
+    return start
+
+
 def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, generation="", session="", token=None,
                     resume=False, env=None, opening=None, rules=None):
     """token: the session credential (owner API 1.12); None starts the session as before, without one. resume: the
@@ -995,10 +1010,11 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         # Its own command comes from team.json, else from its entry (lifecycle.RUNTIMES "acp_command").
         if not task or not generation or not session:
             raise Refused(f"a {runtime_fact(runtime, 'label', runtime)} agent runs managed task sessions only")
+        start = checked_start(conf)
         return prefix + shlex.join(["env", f"FLEET_ATTEMPT={attempt}", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}",
                            f"FLEET_AGENT={agent}", f"FLEET_TASK={task}", sys.executable,
                            os.path.join(KIT, "acp_runner.py"), "--agent-command",
-                           conf.get("start") or runtime_fact(runtime, "acp_command"),
+                           start,
                            "--runtime", runtime, "--mcp-url", f"{HUB}/mcp/{agent}/{generation}/{task}/{attempt}",
                            "--session", session, "--prompt", prompt])
     if app_server_task(conf, needs):
@@ -1047,7 +1063,7 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     elif conf.get("runtime") == "claude":
         core = rules_file()                                 # the folder's CLAUDE.md loads no more
         first = " ".join(x for x in ("--append-system-prompt-file " + shlex.quote(core) if core else "", first) if x)
-    cmd = conf["start"].format(prompt=" ".join(x for x in (flags, first) if x),
+    cmd = checked_start(conf).format(prompt=" ".join(x for x in (flags, first) if x),
                                chrome="--chrome" if needs == "browser" else "",
                                settings=settings_arg(agent, conf, task, tools, needs))
     if conf.get("runtime") == "codex" and "--no-daemon" not in cmd:
@@ -2479,11 +2495,14 @@ def _no_constant(name):
     raise ValueError(f"{name} is not a number")
 
 
-def run_check(extra, kit=KIT, agent=None, keys=None):
-    """Run one approved check outside every AI session: the verified bytes of the pinned commit (never the working
-    tree), or of an agent's saved code from the hub (owner API 1.10), in a new process group, in an empty folder that
-    is also its HOME, with no Fleet value or token in its environment. keys: the agent's own read keys (plan P4), the
-    ones its sessions read, as variables. Returns the result body for the hub, without the token."""
+def run_check(extra, kit=KIT, agent=None, keys=None, store=None):
+    """Run one approved check outside every AI session, in a new process group, in an empty folder that is also its
+    HOME, with no Fleet value or token in its environment: a check of the code, read at this checkout's own HEAD
+    (never the working tree), or an agent's saved check from this machine's own store. The hub gives only the path or
+    the SHA-256 and never the code (DevOps plan 0.2): what runs is code that a signed release brought, or code that the
+    agent's own session put on its own machine (`store`, lifecycle.check_store of this user's home). keys: the agent's
+    own read keys (plan P4), the ones its sessions read, as variables. Returns the result body for the hub, without
+    the token."""
     started = time.monotonic()
 
     def result(**body):
@@ -2492,35 +2511,32 @@ def run_check(extra, kit=KIT, agent=None, keys=None):
     def fail(code, detail, tail=""):
         return result(ok=False, error=code, detail=detail[:200], **({"tail": tail} if tail else {}))
 
-    if extra.get("code") == "saved":        # an agent's saved code: from the hub, for this open claim only
+    sha = extra.get("sha256")
+    if not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)):
+        return fail("missing", "the hub named no SHA-256 for this check")
+    if extra.get("code") == "saved":        # an agent's saved check: from this machine's own store, by its SHA-256
+        path = os.path.join(store or check_store(os.path.expanduser("~")), sha + ".py")
         try:
-            code, got = http("GET", f"/helper/trigger/{urllib.parse.quote(agent or '')}/{int(extra['run'])}/code?" +
-                             urllib.parse.urlencode({"token": extra["token"]}), timeout=15)
-        except (urllib.error.URLError, OSError):
-            code, got = 0, {}
-        if code != 200 or not isinstance(got.get("source"), str):
-            return fail("missing", "the hub gave no saved code for this run")
-        data = got["source"].encode("utf-8")
-        if len(data) > CHECK_SOURCE_MAX or hashlib.sha256(data).hexdigest() != extra["sha256"]:
-            return fail("changed", "the saved code does not have the approved SHA-256")
-        return run_source(extra, data.decode("utf-8"), result, fail, keys)
-    spec = f"{extra['commit']}:{extra['path']}"
-    data = git_blob(kit, spec)
-    if data is None:                    # a commit that this checkout does not have yet
-        try:
-            subprocess.run(["git", "-C", kit, "fetch", "-q", "origin"], capture_output=True, timeout=60,
-                           stdin=subprocess.DEVNULL)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        data = git_blob(kit, spec)
-    if data is None:
-        return fail("missing", f"{extra['path']} at {extra['commit'][:12]} is not in this checkout")
-    if len(data) > CHECK_SOURCE_MAX or hashlib.sha256(data).hexdigest() != extra["sha256"]:
-        return fail("changed", f"{extra['path']} at {extra['commit'][:12]} does not have the approved SHA-256")
+            with open(path, "rb") as f:
+                data = f.read(CHECK_SOURCE_MAX + 1)
+        except OSError:
+            return fail("missing", f"this machine has no saved check {sha[:12]}: its agent saves it again, from a "
+                                   f"session on this machine")
+        if len(data) > CHECK_SOURCE_MAX or hashlib.sha256(data).hexdigest() != sha:
+            return fail("changed", f"the saved check {sha[:12]} on this machine does not have that SHA-256")
+    else:
+        name = extra.get("path")
+        if not (isinstance(name, str) and CHECK_FILE.fullmatch(name)):
+            return fail("missing", "the hub named no check file of this checkout")
+        data = git_blob(kit, f"HEAD:{name}")
+        if data is None:
+            return fail("missing", f"{name} is not in the revision this checkout runs")
+        if len(data) > CHECK_SOURCE_MAX or hashlib.sha256(data).hexdigest() != sha:
+            return fail("changed", f"{name} in the revision this checkout runs does not have the approved SHA-256")
     try:
         source = data.decode("utf-8")
     except UnicodeDecodeError:
-        return fail("changed", f"{extra['path']} is not UTF-8 text")
+        return fail("changed", "the check is not UTF-8 text")
     return run_source(extra, source, result, fail, keys)
 
 
@@ -3100,7 +3116,7 @@ class Helper:
         """Before a task session starts, the helper brings this folder onto the configuration ref and up to date with
         it (fast-forward only), so that the agent reads the current RULES.md, its profile, the owner's knowledge and
         team.json without pulling, and a read-only task changes no file itself. A failure is only logged."""
-        problem = follow_config_ref(KIT)
+        problem = follow_config_ref(KIT, floor=os.path.join(HOME, FLOOR_FILE))     # DevOps plan 0.1: may_take
         if problem:
             self.say("checkout not brought up to date before the task: " + problem)
 
@@ -5430,7 +5446,7 @@ def cmd_run(args):
     print(f"helper for {agent} is running; persistent inbox delivery; sessions in {h.session}", flush=True)
     collector = Collector(KIT, agent, conf["runtime"],
                           lambda payload: http("POST", f"/helper/usage/{agent}", payload, timeout=5),
-                          screen_command=conf.get("screen_command"), local=local_model(conf),
+                          screen_command=screen_program(conf), local=local_model(conf),
                           previous=next(iter(conf.get("runtime_policies") or {}), None))   # owner feature runtime_switch
     h.collector = collector         # a sign-in on this machine makes it read the account again (account_changed)
     threading.Thread(target=collector.run, name="usage-collector", daemon=True).start()
@@ -5439,7 +5455,8 @@ def cmd_run(args):
                             vault=lambda: vault_status(agent), probe=lambda job: probe_logins(agent, job),
                             legacy=h.legacy_windows, switch=h.switch_state,
                             runtimes_busy=h.runtimes_busy, say=h.say,       # it updates this user's runtimes
-                            slow_file=os.path.join(HOME, "slow-%s.json" % agent))
+                            slow_file=os.path.join(HOME, "slow-%s.json" % agent),
+                            floor=os.path.join(HOME, FLOOR_FILE))     # DevOps plan 0.1: every move under may_take
     threading.Thread(target=h.lifecycle.run_forever, name="machine-status", daemon=True).start()
     threading.Thread(target=h.tailer.run, name="thread-records", daemon=True).start()
     threading.Thread(target=h.presence, name="presence", daemon=True).start()      # plan C2

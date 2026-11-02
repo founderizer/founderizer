@@ -100,10 +100,20 @@ reach() {
 Tailscale is connected, and the Tailscale access rules for the hub's ports 8765 and 9418."
 }
 
+take() {        # $1: the checkout; $2: how to run a command as the user of the service. The checkout's own ref, fetched,
+                # and taken only where `lifecycle.py may-take` lets it (DevOps plan 0.1): the data that the hub writes,
+                # or a release that a release key signed. A refusal leaves the checkout where it is, and says why.
+                # The ref is read once, as one commit: the commit checked is the commit taken.
+    "$2" git -C "$1" fetch -q origin </dev/null || return 1
+    target=$("$2" git -C "$1" rev-parse --verify -q "@{upstream}^{commit}" </dev/null) || return 1
+    "$2" python3 "$1/lifecycle.py" may-take "$1" "$target" </dev/null || return 1
+    "$2" git -C "$1" merge -q --ff-only "$target" </dev/null
+}
+
 checkout() {    # $1: the folder; $2: how to run a command as the user of the service
     if [ -d "$1/.git" ]; then
         say "the Founderizer repository in $1: up to date"
-        "$2" git -C "$1" pull -q --ff-only </dev/null || say "$1 could not update; it stays as it is"
+        take "$1" "$2" || say "$1 could not update; it stays as it is"
     else
         say "the Founderizer repository in $1"
         # On the configuration ref, which is the branch the hub writes and every machine's checkout stands on. A hub
@@ -117,7 +127,7 @@ port 9418."
 
 current() {     # $1: the checkout; $2: how to run a command as the user of the service. The join put this machine in
                 # the fleet's team.json, so the checkout takes that commit before anything reads it.
-    "$2" git -C "$1" pull -q --ff-only </dev/null || say "$1 could not take the hub's newest commit; it stays as it is"
+    take "$1" "$2" || say "$1 could not take the hub's newest commit; it stays as it is"
 }
 
 agent_helper() { # $1: the checkout. The two root commands of this machine, and the sudoers file that says who may

@@ -48,9 +48,10 @@ import urllib.error
 import urllib.request
 
 # The configuration ref and the baseline of selftest.py belong to other packages; this module reads them and
-# changes neither, so the three can never disagree about what "up to date" or "a pass" means.
-from lifecycle import CONFIG_BRANCH
-from verify import OWNER_STEPS, SELFTEST_BASELINE
+# changes neither, so the three can never disagree about what "up to date" or "a pass" means. It reads them where it
+# uses them and not at the top, so that the check of a release (check and what it calls) imports nothing but the
+# standard library: the root-owned copy that a machine's vault program checks a release with is this file alone
+# (hubsetup.vault_program_script), and `lifecycle.may_take` imports this module from inside lifecycle.
 
 # Where a release comes from, and where the manifest is asked for. Both are defaults: the hub overrides them from
 # its own configuration (hub.releases region), because P7 settles the host of the channel and the address of the
@@ -223,7 +224,8 @@ MAX_KEYS = 4            # how many keys one file may hold: two while a key is be
 
 
 def read_keys(kit, name=KEY_FILE):
-    """The public keys of this checkout, a tuple in the file's own order, and empty when it carries none yet.
+    """The public keys of this checkout, a tuple in the file's own order, and empty when it carries none yet
+    (parse_keys says how the file is read).
 
     The file holds one base64 line for each 32-byte Ed25519 public key; lines that start with # are for the reader.
     **It is a set, and every key in it is trusted.** That is the whole of a rotation: the release that brings the
@@ -237,9 +239,15 @@ def read_keys(kit, name=KEY_FILE):
     path = os.path.join(kit, name)
     try:
         with open(path, encoding="utf-8") as f:
-            lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
-    except OSError:
+            return parse_keys(f.read())
+    except (OSError, ValueError):
         return ()
+
+
+def parse_keys(text):
+    """The keys of one key file's text, as read_keys reads the file: a tuple, empty when the text carries none or
+    cannot be read whole. `lifecycle.may_take` reads the text out of a commit, never from a working tree."""
+    lines = [line.strip() for line in (text or "").split("\n") if line.strip() and not line.strip().startswith("#")]
     if not lines or len(lines) > MAX_KEYS:
         return ()
     keys = []
@@ -433,11 +441,12 @@ def latest(channel, keys, token=None, *, fetch=_fetch, timeout=CHANNEL_TIMEOUT, 
 
 # ---------------------------------------------------------------- the update
 
-def _run(argv, timeout=GIT_WAIT, cwd=None):
-    """One command. It never raises: a step that cannot run is a step that failed, with its reason."""
+def _run(argv, timeout=GIT_WAIT, cwd=None, input=None):
+    """One command, with `input` as its standard input when given. It never raises: a step that cannot run is a step
+    that failed, with its reason."""
     try:
         done = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout,
-                              stdin=subprocess.DEVNULL)
+                              **({"input": input} if input is not None else {"stdin": subprocess.DEVNULL}))
         return done.returncode, done.stdout.strip(), done.stderr.strip()
     except (OSError, subprocess.SubprocessError) as e:
         return 1, "", str(e)[:300]
@@ -461,6 +470,7 @@ def selftest_summary(out):
     """(passed, of, everything it failed, the failures that are not in the baseline) from selftest.py's own last
     line, or None when it printed no summary. The baseline is COORDINATION.md rule 5, read from verify.py so that
     the release check and `fleet.py verify` cannot drift apart about what a pass is."""
+    from verify import SELFTEST_BASELINE
     for line in reversed([one for one in (out or "").split("\n") if one.strip()]):
         found = re.search(r"(\d+) of (\d+) checks passed\.(?:\s*FAILED:\s*(\[.*\]))?\s*$", line)
         if not found:
@@ -483,28 +493,19 @@ def schema_summary(out):
     return None
 
 
-# The owner's own files, which a release never moves: the paths `hub.CONFIG_FILES` lets the hub write. The
-# published repository carries a `team.json`, profiles and a `knowledge/services.md` of its own, and a customer's
-# fleet carries theirs, so without this a release would replace the fleet it was meant to update. The merge takes the
-# code; these paths come back exactly as the pinned revision has them. All of `knowledge/` is here, and not only
-# `knowledge/owner/`: an agent writes the knowledge files its profile lists (hub.write_knowledge), so a release that
-# replaced them would revert what the fleet learned. An install still seeds them, the way it seeds the manager's
-# profile; only an update leaves them alone. `skills/` is each agent's own procedures (hub.write_skill), for the same
-# reason.
-OWNER_PATHS = ("team.json", "profiles", "knowledge", "skills")
-
-
-def _owner_file(path):
-    """Is this path one of the owner's own files? `hub.CONFIG_FILES` is the other half: the hub writes these paths
-    and no others, so a commit that touches nothing else is a commit of the owner's own configuration."""
-    return any(path == one or path.startswith(one + "/") for one in OWNER_PATHS)
+# The fleet's own data, which a release never moves: `lifecycle.data_path`, the owner's files that the hub writes
+# (`lifecycle.CONFIG_FILES`: team.json, profiles, knowledge and skills) and the files of a task's output. The published
+# repository carries a `team.json`, profiles and a `knowledge/services.md` of its own, and a customer's fleet carries
+# theirs, so without this a release would replace the fleet it was meant to update. An install still seeds them, the
+# way it seeds the manager's profile; only an update leaves them alone. Every other path is the release's own, byte
+# for byte (Update.merge), which is what lets each machine prove what it takes (`lifecycle.may_take`).
 
 
 # What an update run says about itself. The app shows the state and the line; nothing else reads them.
 KEPT, ROLLED_BACK, DONE, FAILED = "kept", "rolled_back", "done", "failed"
 STATES = (KEPT, ROLLED_BACK, DONE, FAILED)
 STEPS = ("hold", "branch", "clean", "pinned", "fetch", "have", "already", "minimum", "clone", "merge", "keep",
-         "schema", "selftest", "verify", "push", "follow")
+         "schema", "selftest", "verify", "take", "push", "follow")
 
 
 class Update:
@@ -520,13 +521,18 @@ class Update:
 
     `database` is a copy of this fleet's own database, which the released code's schema is run against inside the
     clone before anything moves (the `schema` check). Without one that check is skipped, which is what a test of
-    the merge wants and what a hub with no records to risk would get anyway."""
+    the merge wants and what a hub with no records to risk would get anyway.
 
-    def __init__(self, kit, manifest, *, origin=None, upstream=None, branch=CONFIG_BRANCH, remote=REMOTE,
+    `floor` is the hub user's release floor (`lifecycle.floor_path`): the run checks what it would push with the
+    same `lifecycle.may_take` that every machine runs before it moves, and the hub's checkout follows under it."""
+
+    def __init__(self, kit, manifest, *, origin=None, upstream=None, branch=None, remote=REMOTE,
                  run=_run, python=None, database=None, selftest_wait=SELFTEST_WAIT, verify_wait=VERIFY_WAIT,
-                 schema_wait=SCHEMA_WAIT):
+                 schema_wait=SCHEMA_WAIT, floor=None):
+        from lifecycle import CONFIG_BRANCH
         self.kit, self.manifest, self.origin, self.upstream = kit, manifest, origin, upstream
-        self.branch, self.remote, self.run, self.database = branch, remote, run, database
+        self.branch, self.remote, self.run, self.database = branch or CONFIG_BRANCH, remote, run, database
+        self.floor = floor
         self.python = python or sys.executable
         self.selftest_wait, self.verify_wait, self.schema_wait = selftest_wait, verify_wait, schema_wait
         # pinned: the revision this fleet runs and keeps. reached: the revision that got onto the configuration
@@ -616,7 +622,7 @@ class Update:
         code, merged, _ = self.git("rev-parse", "HEAD", cwd=self.clone, timeout=60)
         if code != 0 or not REVISION.fullmatch(merged):
             return self.answer(ROLLED_BACK, "merge", "the merge left no commit")
-        answer = self.checks()
+        answer = self.checks() or self.take(self.pinned, merged)
         if answer:
             return answer
         return self.publish(merged)
@@ -625,58 +631,72 @@ class Update:
         return self.git(*args, cwd=self.clone, timeout=timeout)
 
     def merge(self, base=None):
-        """The release's code into this fleet's configuration ref, in the clone, with the owner's own files kept.
+        """The release onto this fleet's configuration ref, in the clone: one commit whose parents are `base` and the
+        released revision, and whose tree is the release's own outside the fleet's data, the data as `base` has it,
+        and the signed manifest as `release.json` (lifecycle.RELEASE_FILE).
 
-        The owner's files are configuration, not code. The published repository carries a `team.json`, profiles and
-        owner knowledge of its own, and the fleet being updated carries the owner's: taking ours would replace the
-        team, the agents and their instructions with a stranger's. And because the owner changes exactly those
-        files, a release that touched one of them would otherwise conflict with every fleet there is.
+        The data is configuration, not code (`lifecycle.data_path`). The published repository carries a `team.json`,
+        profiles and owner knowledge of its own, and the fleet being updated carries the owner's: taking ours would
+        replace the team, the agents and their instructions with a stranger's. Every other path is the release's own,
+        byte for byte, so a line of code that reached the ref without a release does not survive one, and every
+        machine can prove what it takes: `lifecycle.may_take` finds the signed manifest and that revision's own
+        tree. So there is nothing to conflict, and a release fits every fleet.
 
-        So the merge is made without a commit, every path of OWNER_PATHS comes back as the base revision has it,
-        and a conflict that is still there afterwards is a real one: that release does not fit this fleet.
-
-        `base` is the commit the merge stands on: the pinned revision, or the configuration ref's own new tip when
+        `base` is the commit the release goes onto: the pinned revision, or the configuration ref's own new tip when
         the ref moved under the push and this run follows it (`catch_up`)."""
+        import lifecycle
         base = base or self.pinned
-        version, author = self.manifest["version"], ["-c", "user.name=Founderizer",
-                                                     "-c", "user.email=releases@founderizer.invalid"]
-        _code, out, err = self.run(["git", "-C", self.clone, *author, "merge", "--no-commit", "--no-ff",
-                                    self.manifest["revision"]])
-        if self.clone_git("rev-parse", "--verify", "--quiet", "MERGE_HEAD")[0] != 0:
-            return self.answer(ROLLED_BACK, "merge", f"release {version} could not be merged into this fleet: "
-                                                     f"{_line(err or out)}. The fleet stays at {self.pinned[:12]}.")
-        answer = self.keep_configuration(base)
-        if answer:
-            return answer
-        left = self.clone_git("diff", "--name-only", "--diff-filter=U")[1]
-        if left:
-            self.clone_git("merge", "--abort")
-            return self.answer(ROLLED_BACK, "merge", f"release {version} does not merge into this fleet's own "
-                                                     f"changes: {_line(left)}. The fleet stays at "
-                                                     f"{self.pinned[:12]}.")
-        code, out, err = self.run(["git", "-C", self.clone, *author, "commit", "-q", "--allow-empty", "-m",
-                                   f"Take release {version} ({self.manifest['revision'][:12]})"], timeout=60)
-        if code != 0:
-            return self.answer(ROLLED_BACK, "merge", f"the merge of release {version} could not be committed: "
-                                                     f"{_line(err or out)}")
-        if self.clone_git("diff", "--quiet", base, "HEAD", "--", *OWNER_PATHS)[0] != 0:
-            return self.answer(ROLLED_BACK, "keep", f"release {version} changes this fleet's own configuration "
-                                                    f"({', '.join(OWNER_PATHS)}), which a release never does. The "
-                                                    f"fleet stays at {self.pinned[:12]}.")
+        version, revision = self.manifest["version"], self.manifest["revision"]
+        author = ["-c", "user.name=Founderizer", "-c", "user.email=releases@founderizer.invalid"]
+        entries = []
+        for rev, data in ((revision, False), (base, True)):
+            code, out, err = self.clone_git("ls-tree", "-r", "-z", "--full-tree", rev)
+            if code != 0:
+                return self.answer(ROLLED_BACK, "merge", f"release {version} could not be read: {_line(err)}. The "
+                                                         f"fleet stays at {self.pinned[:12]}.")
+            for line in out.split("\0"):
+                path = line.partition("\t")[2]
+                if path and path != lifecycle.RELEASE_FILE and lifecycle.data_path(path) == data:
+                    entries.append(line)
+        for args, given in ((["hash-object", "-w", "--stdin"], self.release_text()), (["read-tree", "--empty"], None)):
+            code, out, err = self.run(["git", "-C", self.clone, *args], timeout=60, input=given)
+            if code != 0:
+                return self.answer(ROLLED_BACK, "merge", f"release {version} could not be put together: "
+                                                         f"{_line(err or out)}. The fleet stays at {self.pinned[:12]}.")
+            if given is not None:
+                entries.append(f"{lifecycle.DATA_MODE} blob {out}\t{lifecycle.RELEASE_FILE}")
+        code, out, err = self.run(["git", "-C", self.clone, "update-index", "-z", "--index-info"], timeout=60,
+                                  input="".join(one + "\0" for one in entries))
+        tree = self.clone_git("write-tree")[1] if code == 0 else ""
+        commit = self.run(["git", "-C", self.clone, *author, "commit-tree", tree, "-p", base, "-p", revision, "-m",
+                           f"Take release {version} ({revision[:12]})"], timeout=60)[1] if REVISION.fullmatch(tree) \
+            else ""
+        if not REVISION.fullmatch(commit) or self.clone_git("reset", "-q", "--hard", commit)[0] != 0:
+            return self.answer(ROLLED_BACK, "merge", f"release {version} could not be committed onto this fleet: "
+                                                     f"{_line(err or out) or 'git made no commit'}. The fleet stays "
+                                                     f"at {self.pinned[:12]}.")
+        code, names, _ = self.clone_git("diff", "--no-renames", "--name-only", "-z", base, "HEAD")
+        if code != 0 or any(lifecycle.data_path(one) for one in names.split("\0") if one):
+            return self.answer(ROLLED_BACK, "keep", f"release {version} changes this fleet's own configuration, which "
+                                                    f"a release never does. The fleet stays at {self.pinned[:12]}.")
         return None
 
-    def keep_configuration(self, base):
-        """Inside the unfinished merge: every path of OWNER_PATHS exactly as the base revision has it. A file the
-        release brought that this fleet does not have goes out with the rest."""
-        for path in OWNER_PATHS:
-            self.clone_git("checkout", "-q", base, "--", path)              # none at base: nothing to restore
-        ours = set(self.clone_git("ls-tree", "-r", "--name-only", base, "--", *OWNER_PATHS)[1].split("\n"))
-        listed = self.clone_git("ls-files", "--", *OWNER_PATHS)[1]
-        extra = sorted({one for one in listed.split("\n") if one and one not in ours})
-        if extra and self.clone_git("rm", "-f", "-q", "--", *extra)[0] != 0:
-            return self.answer(ROLLED_BACK, "keep", f"release {self.manifest['version']} brings files this fleet "
-                                                    f"does not have ({', '.join(extra[:4])}) and they could not "
-                                                    f"be left out")
+    def release_text(self):
+        """`release.json`: the signed manifest, field for field as the channel gave it, so that every machine checks
+        the very signature this hub checked."""
+        return json.dumps({key: self.manifest[key] for key in ("revision", "version", "notes", "minimum", "hold",
+                                                                "signature")}, indent=2, sort_keys=True) + "\n"
+
+    def take(self, base, merged):
+        """`lifecycle.may_take` on what this run would push, read from the revision it goes onto, under the hub
+        user's floor: every machine of this fleet runs that check before it moves, so a commit that the check would
+        refuse never reaches the ref, where no machine could take it."""
+        import lifecycle
+        problem = lifecycle.may_take(self.clone, merged, self.run, self.floor, head=base)
+        if problem:
+            return self.answer(ROLLED_BACK, "take", f"release {self.manifest['version']} passed every check, and the "
+                                                    f"check of each machine refuses it: {_line(problem)}. The fleet "
+                                                    f"stays at {self.pinned[:12]}.")
         return None
 
     def schema_check(self):
@@ -722,6 +742,7 @@ class Update:
         """The schema against a copy of this fleet's records, then `selftest.py` and `fleet.py verify`, all three
         in the clone, so they read the released code and not this hub's. Any one failing keeps the fleet where it
         is. The schema goes first because it takes a second and the other two take minutes."""
+        from verify import OWNER_STEPS
         answer = self.schema_check()
         if answer:
             return answer
@@ -799,7 +820,9 @@ class Update:
             if answer:
                 return answer
         self.reached = merged           # it is on the ref now, so every machine of this fleet follows it
-        if self.git("fetch", "-q", "origin")[0] != 0 or self.git("merge", "-q", "--ff-only", merged)[0] != 0:
+        import lifecycle
+        # The hub's own checkout moves as every other does: under lifecycle.may_take, with its floor raised after.
+        if self.git("fetch", "-q", "origin")[0] != 0 or lifecycle.take(self.kit, merged, self.run, self.floor):
             return self.answer(FAILED, "follow", f"release {version} is on {self.branch} as {merged[:12]}, and this "
                                                  f"hub's own checkout did not move onto it. Bring it up to date by "
                                                  f"hand: git -C {self.kit} merge --ff-only {merged[:12]}")
@@ -828,20 +851,16 @@ class Update:
 
         **The checks are not run a second time, and this is the one place where "it passed" and "it is what will
         run" could come apart, so the sameness is proved and not argued.** The second merge is compared with the
-        one the checks read: every path that differs must be one of the owner's own files. If that holds, the
-        tree that will run is the tree `selftest.py`, `fleet.py verify` and the schema check read, file for file,
-        and running them again would answer a question already answered while the ref moves once more.
+        one the checks read: every path that differs must be the fleet's own data (`lifecycle.data_path`). If that
+        holds, the tree that will run is the tree `selftest.py`, `fleet.py verify` and the schema check read, file
+        for file, and running them again would answer a question already answered while the ref moves once more.
 
-        It holds for what the hub puts on that ref while a run is going. `hub.commit_kit_file` writes `team.json`,
-        a profile or the owner's knowledge and refuses every other path (`hub.CONFIG_FILES`), and this merge takes
-        those paths from the base and never from the release, so such a commit changes nothing the checks read.
-        Those files themselves are not re-checked and do not need to be: the fleet already runs them. The hub
-        committed them and moved its own checkout onto them before this run reached the push, so they are in force
-        whether this release is taken or not.
-
-        Anything else that reached the ref — code, a task's output, a commit made by hand — is a different tree
-        from the one that passed. Then this run pushes nothing: it rolls back to the pinned revision and names the
-        path, and the owner's next press merges that commit and checks it like any other."""
+        It holds by construction: a merge takes every other path from the release and the data from its base, so
+        what reached the ref meanwhile — the owner's files that `hub.commit_kit_file` writes, a task's output, or
+        code that some commit put there by hand — changes nothing the checks read, and code that came without a
+        release does not survive this one. The data itself is not re-checked and does not need to be: the fleet
+        already runs it, whether this release is taken or not. The comparison stays as the proof, and so does the
+        check of each machine (`take`) on the commit that is pushed."""
         version, pinned = self.manifest["version"], self.pinned[:12]
         if self.clone_git("reset", "-q", "--hard", tip)[0] != 0:
             return self.answer(ROLLED_BACK, "push", f"release {version} passed every check, and {self.branch} "
@@ -853,12 +872,13 @@ class Update:
         code, again, _ = self.clone_git("rev-parse", "HEAD")
         if code != 0 or not REVISION.fullmatch(again):
             return self.answer(ROLLED_BACK, "merge", "the second merge left no commit"), checked
-        code, names, _ = self.clone_git("diff", "--name-only", checked, again)
+        code, names, _ = self.clone_git("diff", "--no-renames", "--name-only", checked, again)
         if code != 0:
             return self.answer(ROLLED_BACK, "push", f"release {version} passed every check, and what the second "
                                                     f"merge of it holds could not be read. The fleet stays at "
                                                     f"{pinned}."), checked
-        changed = sorted(one for one in names.split("\n") if one and not _owner_file(one))
+        import lifecycle
+        changed = sorted(one for one in names.split("\n") if one and not lifecycle.data_path(one))
         if changed:
             return self.answer(ROLLED_BACK, "push", f"release {version} passed every check, and while it was "
                                                     f"pushed {self.branch} gained a commit that changes "
@@ -866,4 +886,4 @@ class Update:
                                                     f"configuration, so what passed the checks is no longer what "
                                                     f"would run. The fleet stays at {pinned}. Press Update again "
                                                     f"to check the release against it."), checked
-        return None, again
+        return self.take(tip, again), again

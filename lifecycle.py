@@ -617,11 +617,7 @@ MCP_RUNTIMES = tuple(sorted(runtimes_with("mcp_servers")))   # the runtimes whos
 # once and no refresh token ever leaves the hub), or an API key that the agent reads (owner feature secret_grants).
 MCP_AUTH = ("none", "oauth", "key")
 MCP_PROGRAM = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")    # a stdio server's program, on PATH or in ~/.local/bin
-MCP_ARG = re.compile(r"[ -~]{1,200}")
-MCP_VAR = re.compile(r"[A-Z][A-Z0-9_]{0,59}")        # a variable name, as the secrets feature writes it
-MCP_RESERVED = re.compile(r"(?:FLEET|BWS|LD|DYLD|ANTHROPIC|CLAUDE|CODEX)_[A-Z0-9_]*|PATH|HOME|SHELL|USER|LOGNAME|"
-                          r"TMPDIR|TERM|PWD|IFS|ENV|BASH_ENV|ZDOTDIR|NODE_OPTIONS|PYTHONPATH|PYTHONHOME")
-MCP_FIELDS = {"title", "url", "command", "args", "env", "auth", "key", "runtimes"}
+MCP_FIELDS = {"title", "url", "command", "env", "auth", "key", "runtimes"}     # no args: DevOps plan 0.2
 
 
 def desktop_path(home):
@@ -668,8 +664,10 @@ def mcp_address(value):
 def mcp_server(name, entry):
     """One server of team.json "mcp" as a catalog entry (TOOL_CATALOG's shape, with custom and auth), or ValueError
     with the reason. A url server has url and, for auth "oauth" or "key", bearer: the session variable that holds its
-    token. A stdio server has command, args and env ({the server's variable: the session variable whose value it
-    gets}). A session that lacks one of these variables gets no such server."""
+    token. A stdio server has command and env ({the server's variable: the session variable whose value it gets}), and
+    no arguments (DevOps plan 0.2: a command line that team.json writes is code), so its args are always []. Each
+    variable has the shape of a key's name (key_env). A session that lacks one of these variables gets no such
+    server."""
     if not isinstance(name, str) or not MCP_NAME.fullmatch(name):
         raise ValueError(f"the MCP server name {name!r} must be 1 to 31 characters a-z 0-9 - that start with a letter")
     if name in TOOL_CATALOG or name == "fleet":
@@ -688,10 +686,10 @@ def mcp_server(name, entry):
         raise ValueError(f"the MCP server {name}: runtimes must be different names of {', '.join(MCP_RUNTIMES)}")
     variables = entry.get("env") or {}
     if not isinstance(variables, dict) or len(variables) > 8 or not all(
-            isinstance(k, str) and MCP_VAR.fullmatch(k) and isinstance(v, str) and MCP_VAR.fullmatch(v)
-            and not MCP_RESERVED.fullmatch(v) for k, v in variables.items()):
+            key_env(k) and key_env(v) for k, v in variables.items()):
         raise ValueError(f"the MCP server {name}: env maps up to 8 of its own variable names to the names of API keys "
-                         f"that the agent reads (A-Z 0-9 _, and not a name that a session sets itself)")
+                         f"that the agent reads, each the name of a key (A-Z 0-9 _, ending in "
+                         f"{', '.join(KEY_SUFFIXES)}) and not a name that a session sets itself")
     made = {"title": title.strip(), "runtimes": sorted(runtimes), "custom": True, "auth": auth}
     if ("url" in entry) == ("command" in entry):
         raise ValueError(f"the MCP server {name} needs a url (a remote server) or a command (a program on the "
@@ -700,14 +698,12 @@ def mcp_server(name, entry):
         if not mcp_address(entry["url"]):
             raise ValueError(f"the MCP server {name}: url must be an https address (http only on 127.0.0.1) with a "
                              f"host, no user part and no #fragment, at most 300 characters")
-        if "args" in entry:
-            raise ValueError(f"the MCP server {name}: args is for a command server")
         made["url"] = entry["url"]
         if auth == "oauth":
             made["bearer"] = mcp_variable(name)
         elif auth == "key":
             key = entry.get("key")
-            if not (isinstance(key, str) and MCP_VAR.fullmatch(key) and not MCP_RESERVED.fullmatch(key)):
+            if not key_env(key):
                 raise ValueError(f"the MCP server {name}: auth \"key\" needs key, the name of an API key that the "
                                  f"agent reads in its sessions")
             made["bearer"] = key
@@ -718,13 +714,10 @@ def mcp_server(name, entry):
             raise ValueError(f"the MCP server {name}: a command server has no auth; give its key in env")
         if "key" in entry:
             raise ValueError(f"the MCP server {name}: key is for a url server with auth \"key\"")
-        args = entry.get("args", [])
         if not isinstance(entry["command"], str) or not MCP_PROGRAM.fullmatch(entry["command"]):
             raise ValueError(f"the MCP server {name}: command must be the name of a program on the machine (1 to 64 "
                              f"characters A-Z a-z 0-9 . _ -), which the machine has on its PATH or in ~/.local/bin")
-        if not isinstance(args, list) or len(args) > 16 or not all(isinstance(a, str) and MCP_ARG.fullmatch(a) for a in args):
-            raise ValueError(f"the MCP server {name}: args must be up to 16 arguments of 1 to 200 visible characters")
-        made.update(command=entry["command"], args=list(args), env=dict(sorted(variables.items())))
+        made.update(command=entry["command"], args=[], env=dict(sorted(variables.items())))
     return made
 
 
@@ -1186,13 +1179,216 @@ def skills_text(kit, agent):
                                                 f"what it is for."] if left else [])) + "\n"
 
 
-def follow_config_ref(kit, run=None):
-    """Bring this checkout onto the configuration ref and up to date with it, fast-forward only. The hub commits the
-    owner's team.json, profiles and knowledge there and nothing else writes it, so an agent reads the current
-    RULES.md, its profile and the owner's knowledge, while the code branch reaches this machine only with a
-    deployment. Returns None when the checkout follows the ref, else the one reason why it stays as it is: a
-    checkout with its own changes is never touched. An origin without the ref is a Fleet before the split of
-    2026-10-17, and is brought up to date as it was before."""
+# ---------------------------------------------------------------- signed code (DevOps plan v44, track 0)
+#
+# One check stands before every move of a Fleet checkout, wherever the move is made: `may_take`. The hub writes the
+# configuration ref, so without it one bug in the hub could put code there that every machine then runs. A checkout
+# moves onto what the hub writes only when that is data: the owner's own files and the files of a task's output, each
+# a plain file (DATA_MODE). Any other move needs a release that a release key signed: its manifest on the ref as
+# RELEASE_FILE, a revision that descends from the one this checkout runs and from this user's floor, and a tree that is
+# that revision's own outside the data. The keys are the ones of the checkout's own HEAD, never the target's, so a
+# target cannot bring the key that signs it. The floor is the newest release this OS user took, kept in its ~/.fleet
+# outside every checkout, so a checkout that was put back or cloned again is not a way to an older release.
+RELEASE_FILE = "release.json"       # the signed manifest of the release on the configuration ref (releases.Update)
+RELEASE_KEYS = "release-key.pub"    # releases.KEY_FILE, read at this checkout's own HEAD
+FLOOR_FILE = "release-floor"        # in ~/.fleet: the newest release that this user's checkouts took
+# What the hub may write on the configuration ref: the owner's own files. knowledge/ is all of it, and not only
+# knowledge/owner/, because an agent writes the knowledge files its profile lists (hub.write_knowledge) and a file the
+# hub can write but a release can replace is drift by construction. publish.py calls all of knowledge/ the fleet's own
+# (OWNER_FILES). skills/ is each agent's own (design v4 D1): skills/<agent>/<name>/SKILL.md and the few small files
+# beside it, at most two folders deep and never hidden.
+CONFIG_FILES = re.compile(r"(?!.*\.\.)(?:team\.json|profiles/[A-Za-z0-9._-]+\.md|knowledge/[A-Za-z0-9._/-]+\.md|"
+                          rf"{SKILLS}/[a-z][a-z0-9-]{{1,30}}/{SKILL_NAME}/{SKILL_FILE})\Z")
+OUTPUTS = "outputs/"                # the files of a delivered task, which the hub commits (hub.commit_outputs)
+DATA_MODE = "100644"                # a plain file: no program, no link and no submodule
+GONE = "000000"                     # the mode git gives a path that a commit does not have
+COMMIT = re.compile(r"[0-9a-f]{40}")
+
+
+def data_path(path):
+    """True for a path of the configuration ref that is data and never code: what a release leaves as the fleet has it
+    (releases.Update), and what a checkout may take from the hub with no release."""
+    return bool(CONFIG_FILES.match(path)) or (path.startswith(OUTPUTS) and ".." not in path.split("/"))
+
+
+def _git(kit, run, *args, timeout=60):
+    code, out, err = (run or _run)(["git", "-C", kit, *args], timeout=timeout)
+    return code, out or "", (err or "").strip()
+
+
+def _commit(kit, run, name):
+    """The full commit id that `name` names in this repository, or None."""
+    code, out, _ = _git(kit, run, "rev-parse", "--verify", "--quiet", f"{name}^{{commit}}")
+    return out.strip() if code == 0 and COMMIT.fullmatch(out.strip()) else None
+
+
+def _blob(kit, run, rev, path):
+    """The text of one file of a commit, or None when the commit does not have it."""
+    if _git(kit, run, "cat-file", "-e", f"{rev}:{path}")[0] != 0:
+        return None
+    code, out, _ = _git(kit, run, "cat-file", "blob", f"{rev}:{path}")
+    return out if code == 0 else None
+
+
+def _descends(kit, run, older, newer):
+    """True when commit `older` is `newer` or in its history."""
+    return older == newer or _git(kit, run, "merge-base", "--is-ancestor", older, newer)[0] == 0
+
+
+def changed_paths(kit, run, old, new):
+    """[(path, its mode in `new`)] of every path that differs between two commits, GONE for a path `new` does not
+    have, or None when git cannot compare them. A rename is a path that went and a path that came."""
+    code, out, _ = _git(kit, run, "diff", "--no-renames", "--raw", "-z", old, new)
+    if code != 0:
+        return None
+    found, parts = [], out.split("\0")
+    for at in range(0, len(parts) - 1, 2):
+        if not parts[at].startswith(":"):
+            break
+        found.append((parts[at + 1], parts[at][1:].split()[1]))
+    return found
+
+
+def released(text):
+    """The revision and version that a release.json names, or (None, None) when it names none."""
+    try:
+        said = json.loads(text)
+    except ValueError:
+        return None, None
+    revision = said.get("revision") if isinstance(said, dict) else None
+    if not (isinstance(revision, str) and COMMIT.fullmatch(revision)):
+        return None, None
+    version = said.get("version")
+    return revision, version if isinstance(version, str) else None
+
+
+def floor_path(home):
+    """This user's floor: the newest release that its checkouts took."""
+    return os.path.join(home, FLEET_DIR, FLOOR_FILE)
+
+
+def read_floor(floor):
+    """(the floor's revision or None, the reason it cannot be read or None). No file is no floor."""
+    if not floor:
+        return None, None
+    try:
+        with open(floor, encoding="utf-8") as f:
+            revision, _ = released(f.read())
+    except FileNotFoundError:
+        return None, None
+    except OSError as e:
+        return None, f"the release floor {floor} cannot be read: {e}"
+    return (revision, None) if revision else (None, f"the release floor {floor} names no release")
+
+
+def keep_floor(kit, floor, run=None, head="HEAD"):
+    """Raise this user's floor to the release that the checkout runs at `head`. It is never lowered: a release that does
+    not descend from the floor leaves it as it is, and so does a floor that cannot be read, because may_take then says
+    why. Called around every move, so the floor follows what each checkout took."""
+    if not floor:
+        return
+    text = _blob(kit, run, head, RELEASE_FILE)
+    revision, version = released(text) if text is not None else (None, None)
+    if not revision:
+        return
+    current, problem = read_floor(floor)
+    if problem or revision == current or (current and not _descends(kit, run, current, revision)):
+        return
+    with contextlib.suppress(OSError):
+        os.makedirs(os.path.dirname(floor), mode=0o700, exist_ok=True)
+        temp = f"{floor}.{os.getpid()}"
+        with open(temp, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"revision": revision, "version": version}) + "\n")
+        os.replace(temp, floor)
+
+
+def may_take(kit, target, run=None, floor=None, head="HEAD"):
+    """None when the checkout `kit` may move from `head` to `target`, else the one reason why it stays where it is.
+
+    A move that changes data only (data_path) passes when each file it brings is a plain file. Any other move passes
+    only onto a release: `target` carries a release.json that a key of `head`'s release-key.pub signed, which is not
+    held; its revision descends from the release that `head` runs and from the floor, and a `head` with no release
+    takes one only while this user has no floor; and `target` is that revision's own tree outside the data. Every
+    mover of a checkout calls this first: the helper's update and task-start sync, the server service, the hub, both
+    installers, onboard.py and the owner's MCP server (the shell ones as `lifecycle.py may-take`)."""
+    import releases                     # here and not at the top: releases imports this module
+    old, new = _commit(kit, run, head), _commit(kit, run, target)
+    if not old or not new:
+        return f"{target if old else head} is not a commit of this checkout"
+    if old == new:
+        return None
+    changed = changed_paths(kit, run, old, new)
+    if changed is None:
+        return f"git could not compare {old[:12]} with {new[:12]}"
+    plain = [path for path, mode in changed if data_path(path) and mode not in (DATA_MODE, GONE)]
+    if plain:
+        return f"{new[:12]} brings {plain[0]}, which is not a plain file"
+    if all(data_path(path) for path, _ in changed):
+        return None
+    text = _blob(kit, run, new, RELEASE_FILE)
+    if text is None:
+        return f"{new[:12]} changes Fleet's code and carries no signed release"
+    try:
+        manifest = releases.check(json.loads(text), releases.parse_keys(_blob(kit, run, old, RELEASE_KEYS) or ""))
+    except ValueError:
+        return f"the {RELEASE_FILE} of {new[:12]} cannot be read"
+    except releases.Untrusted as e:
+        return f"the release of {new[:12]} is refused: {e}"
+    revision, version = manifest["revision"], manifest["version"]
+    if manifest["hold"]:
+        return f"release {version} is held: no fleet takes it"
+    if not _commit(kit, run, revision):
+        return f"the revision {revision[:12]} of release {version} is not in this repository"
+    mine = _blob(kit, run, old, RELEASE_FILE)
+    runs = released(mine)[0] if mine is not None else None
+    if mine is not None and not runs:
+        return f"the {RELEASE_FILE} that this checkout runs cannot be read"
+    if runs and not _descends(kit, run, runs, revision):
+        return f"release {version} does not descend from the release this checkout runs ({runs[:12]})"
+    lowest, problem = read_floor(floor)
+    if problem:
+        return problem
+    if lowest and not runs:
+        return f"this checkout runs no signed release, and this user took release {lowest[:12]} already"
+    if lowest and not (_commit(kit, run, lowest) and _descends(kit, run, lowest, revision)):
+        return f"release {version} does not descend from the newest release this user took ({lowest[:12]})"
+    apart = changed_paths(kit, run, revision, new)
+    if apart is None:
+        return f"git could not compare {new[:12]} with release {version}"
+    other = [path for path, _ in apart if path != RELEASE_FILE and not data_path(path)]
+    if other:
+        return f"{new[:12]} is not release {version}: it differs in {other[0]}"
+    return None
+
+
+def take(kit, target, run=None, floor=None, room=False):
+    """Move this checkout onto `target` when may_take lets it: a fast-forward, and the floor raised to the release it
+    then runs. `target` is read once, as one commit, and that commit is the one checked and the one taken, so a fetch
+    in between moves nothing unchecked. room: first remove the outputs that it brings back tracked (give_way_to).
+    None, or the reason why the checkout stays where it is."""
+    keep_floor(kit, floor, run)
+    commit = _commit(kit, run, target)
+    if not commit:
+        return f"{target} is not a commit of this checkout"
+    problem = may_take(kit, commit, run, floor)
+    if problem:
+        return problem
+    if room:
+        give_way_to(kit, commit, run)
+    code, out, err = _git(kit, run, "merge", "-q", "--ff-only", commit, timeout=120)
+    if code != 0:
+        return "git merge failed: " + (err or out.strip())[-200:]
+    keep_floor(kit, floor, run)
+    return None
+
+
+def follow_config_ref(kit, run=None, floor=None):
+    """Bring this checkout onto the configuration ref and up to date with it, fast-forward only, and only where
+    may_take lets it. The hub commits the owner's team.json, profiles and knowledge there, so an agent reads the
+    current RULES.md, its profile and the owner's knowledge, while code reaches this machine only with a signed
+    release. Returns None when the checkout follows the ref, else the one reason why it stays as it is: a checkout
+    with its own changes is never touched. An origin without the ref is a Fleet before the split of 2026-10-17, and
+    is brought up to date as it was before, under the same check."""
     run = run or _run
 
     def git(*args, timeout=60):
@@ -1202,27 +1398,112 @@ def follow_config_ref(kit, run=None):
     code, _, err = git("fetch", "-q", "origin")
     if code != 0:
         return "git fetch failed: " + err[-200:]
-    if git("rev-parse", "--verify", "--quiet", "refs/remotes/origin/" + CONFIG_BRANCH)[0] != 0:
-        code, out, err = git("pull", "-q", "--ff-only")
-        return None if code == 0 else "git pull failed: " + (err or out)[-200:]
     if git("status", "--porcelain", "--untracked-files=no")[1]:
         return "the checkout has its own changes, so it stays where it is"
+    if git("rev-parse", "--verify", "--quiet", "refs/remotes/origin/" + CONFIG_BRANCH)[0] != 0:
+        return take(kit, "@{upstream}", run, floor)
     if checkout_branch(kit, run) != CONFIG_BRANCH:
         here = git("rev-parse", "--verify", "--quiet", "refs/heads/" + CONFIG_BRANCH)[0] == 0
+        keep_floor(kit, floor, run)
+        # one commit, checked and then checked out, as take() does
+        commit = _commit(kit, run, CONFIG_BRANCH if here else "origin/" + CONFIG_BRANCH)
+        problem = may_take(kit, commit, run, floor) if commit else "the ref is not a commit of this checkout"
+        if problem:
+            return f"the checkout did not move onto {CONFIG_BRANCH}: {problem}"
         code, out, err = git("checkout", "-q", CONFIG_BRANCH) if here else \
-            git("checkout", "-q", "-b", CONFIG_BRANCH, "--track", "origin/" + CONFIG_BRANCH)
+            git("checkout", "-q", "-b", CONFIG_BRANCH, commit)
+        if code == 0 and not here:
+            code, out, err = git("branch", "-q", "--set-upstream-to=origin/" + CONFIG_BRANCH, CONFIG_BRANCH)
         if code != 0:
             return f"the checkout did not move onto {CONFIG_BRANCH}: " + (err or out)[-200:]
-    give_way_to(kit, "origin/" + CONFIG_BRANCH, run)
-    code, out, err = git("merge", "-q", "--ff-only", "origin/" + CONFIG_BRANCH)
-    return None if code == 0 else "git merge failed: " + (err or out)[-200:]
+    return take(kit, "origin/" + CONFIG_BRANCH, run, floor, room=True)
+
+
+# ---------------------------------------------------------------- data stops being code (DevOps plan v44, step 0.2)
+#
+# team.json is data that the hub writes, so no field of it may become code on a machine: each field that names a
+# command line, a program or a variable is one of a fixed set that this module holds, and the machine refuses anything
+# else where it uses it, whatever the hub let through. A closed start (support plan F1) is one more start form here.
+
+LOCAL_PROVIDERS = ("ollama", "lmstudio")     # the local model servers that a local_model start may name
+
+
+def start_forms(runtime):
+    """Every start that team.json may give an agent of this runtime: Fleet's own forms (RUNTIMES full_access,
+    manager_access and first_worker), each with and without Chrome's place before {settings} (hub.with_desktop), the
+    full-access form with the runtime's local_model flag, alone or with one of LOCAL_PROVIDERS (the model is the
+    agent's model setting, never a word of the start), a Codex form also without --no-daemon (the helper adds it), the
+    agent command of an acp runtime, and APP_SERVER where the fleet speaks app-server to the runtime."""
+    entry = RUNTIMES.get(runtime) or {}
+    forms = {form["start"] for form in (entry.get("full_access"), entry.get("manager_access"))
+             if form and form.get("start")}
+    flag, full = entry.get("local_model"), (entry.get("full_access") or {}).get("start")
+    if flag and full and " " in full:
+        program, rest = full.split(" ", 1)
+        forms |= {f"{program} {flag}{local} {rest}" for local in
+                  ["", *(f" --local-provider {one}" for one in LOCAL_PROVIDERS)]}
+    forms |= {one for one in (entry.get("first_worker"), entry.get("acp_command")) if one}
+    forms |= {one.replace("{settings}", "{chrome} {settings}", 1) for one in forms
+              if "{settings}" in one and "{chrome}" not in one}
+    forms |= {one.replace("{chrome} ", "", 1) for one in forms}
+    forms |= {one.replace(" --no-daemon", "", 1) for one in forms}
+    if entry.get("app_server"):
+        forms.add(APP_SERVER)
+    return frozenset(forms)
+
+
+def start_form(runtime, start):
+    """True when `start` is one of this runtime's start forms (start_forms)."""
+    return isinstance(start, str) and start in start_forms(runtime)
+
+
+# The program of an agent's screen runtime (team.json screen_command): Codex with Computer Use, which the ChatGPT app
+# keeps on a Mac (hub.with_desktop). One of these paths and no other is ever run as a screen runtime.
+SCREEN_COMMANDS = ("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",)
+
+
+def screen_program(conf):
+    """The screen runtime's program of an agent's settings when it is one of SCREEN_COMMANDS, else None."""
+    command = conf.get("screen_command") if isinstance(conf, dict) else None
+    return command if command in SCREEN_COMMANDS else None
+
+
+# The name of an API key in a session's environment. A team setting names these variables (a login's env, an MCP
+# server's env), so a name must have the shape of a key's name and be none that a session's start or a runtime sets or
+# reads itself: then no team setting can give a session a model address, a proxy or any other setting that a runtime
+# or a tool reads as configuration. The helper keeps no other name (fleet.read_env, fleet.integration_env), and the
+# hub takes no other.
+KEY_ENV = re.compile(r"[A-Z][A-Z0-9_]{0,59}")
+KEY_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_PAT")
+ENV_RESERVED = re.compile(r"(?:FLEET|BWS|LD|DYLD|ANTHROPIC|CLAUDE|CODEX|XAI)_[A-Z0-9_]*|PATH|HOME|SHELL|USER|LOGNAME|"
+                          r"TMPDIR|TERM|PWD|IFS|ENV|BASH_ENV|ZDOTDIR|NODE_OPTIONS|PYTHONPATH|PYTHONHOME")
+
+
+def key_env(name):
+    """True for the name of an API key in a session's environment: it ends in _KEY, _TOKEN, _SECRET, _PASSWORD or _PAT,
+    and it is not reserved (ENV_RESERVED)."""
+    return isinstance(name, str) and bool(KEY_ENV.fullmatch(name)) and name.endswith(KEY_SUFFIXES) \
+        and not ENV_RESERVED.fullmatch(name)
+
+
+# Where a machine keeps the saved checks that its own sessions wrote, by the SHA-256 of their bytes: ~/.fleet/checks/
+# <sha256>.py. The hub keeps a saved check's text for the owner to read, and gives the helper only its SHA-256, so the
+# code that runs is code that the agent's own session put on its own machine (fleet.run_check).
+CHECK_STORE = "checks"
+CHECK_FILE = re.compile(r"checks/[a-z0-9_]{1,64}\.py")      # a check of the code itself (hub.CHECK_PATH), never data
+
+
+def check_store(home):
+    return os.path.join(home, FLEET_DIR, CHECK_STORE)
 
 
 class Lifecycle:
     def __init__(self, kit, agent, conf, post, busy, restart=None, run=_run, clock=time.time,
                  platform_name=sys.platform, home=None, vault=None, probe=None, models=codex_model_list, legacy=None,
-                 switch=None, which=None, monotonic=time.monotonic, runtimes_busy=None, say=print, slow_file=None):
+                 switch=None, which=None, monotonic=time.monotonic, runtimes_busy=None, say=print, slow_file=None,
+                 floor=None):
         self.kit, self.agent, self.conf, self.post, self.busy = kit, agent, conf, post, busy
+        self.floor = floor              # this user's release floor (floor_path); None: no floor, as for a reading
         # () -> True while a session of this OS user may be using a runtime: its updates wait for False
         # (update_runtimes). None: this process updates no runtime, as for the server service's readings.
         self.runtimes_busy = runtimes_busy
@@ -1546,13 +1827,13 @@ class Lifecycle:
     def read_screen_models(self, force=False):
         """The screen runtime's own model options (its Codex account), as read_models: model/list only, no thread and
         no turn. None without a screen runtime."""
-        command = self.conf.get("screen_command")
-        if not command:
+        if not self.conf.get("screen_command"):
             return None
+        command = screen_program(self.conf)             # one of the fixed paths (DevOps plan 0.2)
         if not force and self.screen_models and self.clock() - self.screen_models["read_at"] < MODELS_EVERY:
             return self.screen_models
-        options, error = self.codex_models(command) if os.path.isfile(command) else \
-            (None, "the screen runtime is not installed")
+        options, error = self.codex_models(command) if command and os.path.isfile(command) else \
+            (None, "the screen runtime is not installed" if command else "the screen runtime is not one of Fleet's own")
         self.screen_models = {"runtime": APP_SERVER_RUNTIME, "ok": options is not None, "read_at": self.clock(),
                               "source": "codex app-server model/list", "other_names": False,
                               "error": None if options is not None else error, "options": options or []}
@@ -1783,10 +2064,10 @@ class Lifecycle:
             code, out, err = self.run(["git", "-C", self.kit, "fetch", "-q", "origin"], timeout=120)
             if code != 0:
                 return self.fail("The checkout could not fetch: " + (err or out).strip()[-300:])
-            give_way_to(self.kit, target, self.run)       # the files of a task that this machine delivered
-            code, out, err = self.run(["git", "-C", self.kit, "merge", "-q", "--ff-only", target], timeout=120)
-            if code != 0:
-                return self.fail("The checkout could not merge: " + (err or out).strip()[-300:])
+            # The one check of every move (may_take), and the files of a task that this machine delivered.
+            problem = take(self.kit, target, self.run, self.floor, room=True)
+            if problem:
+                return self.fail("The checkout did not move: " + problem[-300:])
         if desired and not (self.revision() or "").startswith(desired) and not self.has(desired):
             return self.fail("The checkout is not at the requested revision.")
         with self.lock:
@@ -2050,3 +2331,30 @@ class Lifecycle:
         code, out, _ = self.run([exe, "--version"])
         found = VERSION.search(out) if code == 0 else None
         return found.group(0) if found else None
+
+
+def main(argv=None):
+    """`python3 lifecycle.py may-take [--floor FILE] KIT TARGET`: may_take for a mover written in shell (join.sh,
+    hub.sh, and what onboard.py and owner_mcp.py run on a machine). It raises this user's floor to the release that KIT
+    runs, then answers with its exit status: 0 when KIT may move onto TARGET, else 1 and the one reason on standard
+    error. The caller makes the move itself, with `git merge --ff-only TARGET`."""
+    import argparse
+    parser = argparse.ArgumentParser(prog="lifecycle.py", description="The one check of every move of a checkout")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    check = sub.add_parser("may-take", help="may this checkout move onto that commit?")
+    check.add_argument("--floor", default=floor_path(os.path.expanduser("~")),
+                       help="this user's release floor (default ~/.fleet/release-floor)")
+    check.add_argument("kit", help="the checkout")
+    check.add_argument("target", help="the commit it would move onto")
+    args = parser.parse_args(argv)
+    kit = os.path.abspath(args.kit)
+    keep_floor(kit, args.floor)
+    problem = may_take(kit, args.target, floor=args.floor)
+    if problem:
+        print(f"lifecycle.py may-take: {problem}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

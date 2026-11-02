@@ -36,7 +36,7 @@ REFERENCE = {
     "studio": {"role": "worker", "machine": "mac-studio", "runtime": "claude",
                "can": ["shell", "web", "browser", "screen"],
                "screen_command": "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
-               "start": "claude --permission-mode acceptEdits {chrome} {settings} {prompt}"},
+               "start": "claude --permission-mode dontAsk {chrome} {settings} {prompt}"},
 }
 
 
@@ -499,11 +499,11 @@ check("a worker's tools are the ones RULES.md names", not wdiff, wdiff)
 # a lead, whose tools nothing ever listed, and a worker with Google, whose start text names the tools its levels
 # give (the clause renders them from GOOGLE_TOOLS, so only the real text proves they are there).
 MOMENT = {"pa": {"role": "lead", "machine": "pa", "runtime": "claude", "can": ["shell", "web"],
-                 "start": "claude --permission-mode bypassPermissions {prompt}"},
+                 "start": "claude --permission-mode bypassPermissions --tools default {settings} {prompt}"},
           "gw": {"role": "worker", "machine": "gw", "runtime": "claude", "can": ["shell", "web"],
                  "google": {"gmail": {"account": "a@b.com", "level": "send"},
                             "drive": {"account": "a@b.com", "level": "write"}},
-                 "start": "claude --permission-mode bypassPermissions {prompt}"}}
+                 "start": "claude --permission-mode bypassPermissions --tools default {settings} {prompt}"}}
 procL, hubL = start_hub("moment", {"vps": "", "mac-studio": "", "owner": ""}, "--tick", "1", agents=MOMENT)
 lt = [t["name"] for t in rpc("pa", "tools/list", base=hubL)[2]["result"]["tools"]]
 ldiff = tool_set(lt, LEAD_TOOLS)

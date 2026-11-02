@@ -118,6 +118,25 @@ CENTRAL_CONF_DIR = "/etc/fleet-vault-central"
 CENTRAL_CONF = CENTRAL_CONF_DIR + "/vault.json"     # root with mode 644, and no secret in it
 CENTRAL_STATE = "/var/lib/fleet-vault-central"      # its key, the store's key, the store and the pins: its user alone
 CENTRAL_UNIT = "/etc/systemd/system/fleet-vault-central.service"
+# DevOps plan 0.3: what the vault program checks a release with, root-owned beside the broker's program and put there
+# by the root step of a machine (agent_helper) and never by a release, and the floor of the releases it took.
+RELEASE_CHECK = VAULT_LIB + "/releases.py"          # this checkout's releases.py, the one check of a release
+RELEASE_KEYS = VAULT_LIB + "/release-key.pub"       # the release keys that this machine pinned
+VAULT_FLOOR = VAULT_LIB + "/release-floor"          # the newest release whose vault.py the broker took
+RESERVED_USERS = (VAULT_USER, CENTRAL_USER)         # this machine's own users, which never become an agent's
+# The check itself, run by root as python3 -I -S with the root-owned copy first on its path: the revision of a
+# release.json that a pinned key signed, and nothing for one that is held or that no such key signed.
+VAULT_CHECK = ("import json, sys\n"
+               "sys.path.insert(0, sys.argv[1])\n"
+               "import releases\n"
+               "try:\n"
+               "    with open(sys.argv[2], encoding='utf-8') as f:\n"
+               "        m = releases.check(json.load(f), releases.read_keys(sys.argv[1]))\n"
+               "except (ValueError, releases.Untrusted) as e:\n"
+               "    sys.exit('fleet-vault-program: the release on the configuration ref is refused: ' + str(e))\n"
+               "if m['hold']:\n"
+               "    sys.exit('fleet-vault-program: release ' + m['version'] + ' is held')\n"
+               "print(m['revision'])\n")
 FLEET_ID = re.compile(r"[0-9a-f]{16}")              # hub.fleet_id(): sixteen lowercase hex characters
 # Root's own clone of the published repository on the hub's machine, at the revision of a signed release (kit_clone).
 # The owner's app runs central-vault as root from here and from nowhere else, so it never runs a program that the
@@ -279,7 +298,12 @@ def user_script(user):
     kept after logout, and a home of mode 700 that belongs to it. Lingering is the one line that can fail on a
     machine without loginctl, and it is reported instead of stopping the install, because nothing of the agent runs
     as that user until the fleet moves its session there."""
-    return ("id -u %(u)s >/dev/null 2>&1 || useradd --create-home --shell /bin/bash --user-group %(u)s\n"
+    return (  # DevOps plan 0.3: any user of this machine outside the agents, and the vault's own, stay as they are
+            "if id -u %(u)s >/dev/null 2>&1 && ! id -nG %(u)s | tr ' ' '\\n' | grep -qx %(g)s; then"
+            " echo \"fleet: %(u)s is an OS user of this machine and no agent's, so it stays as it is\" >&2; exit 3; fi\n"
+            "case %(u)s in %(reserved)s) echo \"fleet: %(u)s is a user of this machine's vault, never an agent's\" >&2;"
+            " exit 3;; esac\n"
+            "id -u %(u)s >/dev/null 2>&1 || useradd --create-home --shell /bin/bash --user-group %(u)s\n"
             "passwd -l %(u)s >/dev/null\n"
             "groupadd -f %(g)s\n"
             "usermod -aG %(g)s %(u)s\n"
@@ -287,7 +311,7 @@ def user_script(user):
             "chmod 700 /home/%(u)s\n"
             "for g in sudo admin wheel; do gpasswd -d %(u)s $g >/dev/null 2>&1 || true; done\n"
             "loginctl enable-linger %(u)s 2>/dev/null || echo \"fleet: no lingering for %(u)s\"") % {
-                "u": user, "g": AGENT_GROUP}
+                "u": user, "g": AGENT_GROUP, "reserved": "|".join(RESERVED_USERS)}
 
 
 def _shell(script, timeout=120):
@@ -408,15 +432,13 @@ def vault_program_script(repo, branch=lifecycle.CONFIG_BRANCH):
     handover key are never read here, and the handover key is never remade, because a new one would turn every
     agent's access into `vault_store_mismatch`.
 
-    **What root's own clone proves, and what it does not.** It proves that nobody below root on this machine wrote
-    those bytes. It does not prove they are the bytes the owner meant: whoever can push the configuration ref can
-    put a program here, and this one runs as the vault's own user, which holds the store key. The agents' code
-    already comes from that ref, so the ref could always run code as every agent -- but never as the vault user,
-    and that is the step this adds. What closes it is a signature over the released revision, verified here before
-    the blob becomes the program, with the public half pinned root-owned at install; `release-key.pub` already
-    carries the release key and its private half is on the website host and never on a hub, so the key exists and
-    what is missing is a signature this program can check with a stock tool. Until then the trust in this command
-    is the trust in that ref, which is the honest way to read it.
+    **What root's own clone proves, and the signature proves the rest** (DevOps plan 0.3). Root's own clone proves
+    that nobody below root on this machine wrote those bytes. That they are the bytes the owner meant is the release
+    signature: the ref's `release.json` is checked with root-owned copies of the check (`releases.py`, RELEASE_CHECK)
+    and of the release keys (RELEASE_KEYS), which the root step of the machine put in place and no release changes,
+    its revision must come after the floor of the releases this broker took (VAULT_FLOOR), and `vault.py` is read out
+    of that signed revision and never out of the ref's own tree. So whoever can push the configuration ref still
+    cannot put a program here: a release whose signature or floor is refused leaves the broker on its program.
 
     Nothing is fetched into a working tree and nothing of the fetched repository is ever run: the program is read
     out of the fetch with `git cat-file`, so no hook, filter or submodule of it executes as root.
@@ -459,15 +481,29 @@ def vault_program_script(repo, branch=lifecycle.CONFIG_BRANCH):
             'test -n "$repo" || { echo "fleet-vault-program: this machine has no address for the fleet\'s'
             ' configuration ref. Run the join line again." >&2; exit 3; }\n'
             "umask 077\n"
-            'new=$(mktemp); old=$(mktemp)\n'
-            "trap 'rm -f \"$new\" \"$old\"' EXIT\n"
+            'new=$(mktemp); old=$(mktemp); manifest=$(mktemp)\n'
+            "trap 'rm -f \"$new\" \"$old\" \"$manifest\"' EXIT\n"
             "test -d %(source)s || git init -q --bare %(source)s\n"
             # Into a ref of its own and not FETCH_HEAD: what a fetch leaves unreachable is what the next
             # housekeeping run throws away, and then every catch-up downloads the whole repository again.
             'git -C %(source)s fetch -q --no-tags "$repo" %(refspec)s\n'
-            "git -C %(source)s cat-file blob %(local)s:vault.py > \"$new\"\n"
-            'test -s "$new" || { echo "fleet-vault-program: the configuration ref carries no vault.py" >&2;'
-            " exit 4; }\n"
+            # DevOps plan 0.3: the release that the ref carries, checked with this machine's own root-owned copy of
+            # the check and of the release keys, after the floor of the releases this broker took, and vault.py from
+            # that signed revision and from nowhere else.
+            "git -C %(source)s cat-file blob %(local)s:release.json > \"$manifest\" 2>/dev/null || {"
+            ' echo "fleet-vault-program: the configuration ref carries no signed release, so the broker keeps its'
+            ' program" >&2; exit 4; }\n'
+            'revision=$(python3 -I -S -c %(check)s %(lib)s "$manifest") || exit 6\n'
+            "floor=$(cat %(floor)s 2>/dev/null || true)\n"
+            'if [ -n "$floor" ] && ! git -C %(source)s merge-base --is-ancestor "$floor" "$revision" 2>/dev/null\n'
+            "then\n"
+            '    echo "fleet-vault-program: release $revision does not come after the release this broker took'
+            ' ($floor)" >&2\n'
+            "    exit 7\n"
+            "fi\n"
+            'git -C %(source)s cat-file blob "$revision:vault.py" > "$new" 2>/dev/null || :\n'
+            'test -s "$new" || { echo "fleet-vault-program: the signed release carries no vault.py" >&2; exit 4; }\n'
+            "printf '%%s\\n' \"$revision\" > %(floor)s\n"
             'want=$(sha256sum "$new" | cut -d\' \' -f1)\n'
             "have=$(sha256sum %(program)s | cut -d' ' -f1)\n"
             'if [ "$want" = "$have" ]; then\n'
@@ -498,7 +534,8 @@ def vault_program_script(repo, branch=lifecycle.CONFIG_BRANCH):
                 "sudoers": SUDOERS, "lib": VAULT_LIB, "conf": VAULT_CONF, "program": VAULT_LIB + "/vault.py",
                 "source": VAULT_SOURCE, "repo": shlex.quote(repo or ""), "path": ROOT_PATH,
                 "refspec": shlex.quote(f"+{branch}:refs/heads/{branch}"),
-                "local": shlex.quote(f"refs/heads/{branch}"), "settle": VAULT_SETTLE}
+                "local": shlex.quote(f"refs/heads/{branch}"), "settle": VAULT_SETTLE,
+                "check": shlex.quote(VAULT_CHECK), "floor": VAULT_FLOOR}
 
 
 def sudoers_text(service_user):
@@ -532,20 +569,26 @@ def sudoers_text(service_user):
                 "group": AGENT_GROUP, "user": service_user, "helper": HELPER, "vault": VAULT_UPDATE}
 
 
-def helper_install_script(helper_from, vault_from, sudoers_from):
-    """The shell that puts the group, the two root helpers and the sudoers file in place. `visudo -c` reads the new
-    file before it is moved in, because a file that sudo cannot parse takes sudo away from the whole machine."""
+def helper_install_script(helper_from, vault_from, sudoers_from, check_from, keys_from):
+    """The shell that puts the group, the two root helpers, the sudoers file and the root-owned copies of the release
+    check and the release keys in place. `visudo -c` reads the new file before it is moved in, because a file that sudo
+    cannot parse takes sudo away from the whole machine."""
     return ("groupadd -f %(group)s\n"
+            "install -d -o root -g root -m 755 %(lib)s\n"
+            "install -o root -g root -m 644 %(check_from)s %(check)s\n"
+            "install -o root -g root -m 644 %(keys_from)s %(keys)s\n"
             "install -o root -g root -m 755 %(helper_from)s %(helper)s\n"
             "install -o root -g root -m 755 %(vault_from)s %(vault)s\n"
             "visudo -cqf %(sudoers_from)s\n"
             "install -o root -g root -m 440 %(sudoers_from)s %(sudoers)s\n") % {
                 "group": AGENT_GROUP, "helper_from": shlex.quote(helper_from), "helper": HELPER,
                 "vault_from": shlex.quote(vault_from), "vault": VAULT_UPDATE,
-                "sudoers_from": shlex.quote(sudoers_from), "sudoers": SUDOERS}
+                "sudoers_from": shlex.quote(sudoers_from), "sudoers": SUDOERS, "lib": VAULT_LIB,
+                "check_from": shlex.quote(check_from), "check": RELEASE_CHECK,
+                "keys_from": shlex.quote(keys_from), "keys": RELEASE_KEYS}
 
 
-def agent_helper(service_user="fleet", repo=None, check=False, run=None, read=None):
+def agent_helper(service_user="fleet", repo=None, check=False, run=None, read=None, kit=KIT):
     """The group, the two root helpers and the sudoers file that the agent-add path, the vault broker and `verify`
     need on this machine.
 
@@ -565,8 +608,12 @@ def agent_helper(service_user="fleet", repo=None, check=False, run=None, read=No
     run = run or _shell
     read = read or (lambda path: pathlib.Path(path).read_text(encoding="utf-8"))
     helper, vault, sudoers = helper_script(), vault_program_script(repo), sudoers_text(service_user)
+    # DevOps plan 0.3: the vault program checks a release with root's own copies of this checkout's check and keys
+    release_check = pathlib.Path(kit, "releases.py").read_text(encoding="utf-8")
+    release_keys = pathlib.Path(kit, "release-key.pub").read_text(encoding="utf-8")
     try:
-        there = read(HELPER) == helper and read(VAULT_UPDATE) == vault and read(SUDOERS) == sudoers
+        there = read(HELPER) == helper and read(VAULT_UPDATE) == vault and read(SUDOERS) == sudoers and \
+            read(RELEASE_CHECK) == release_check and read(RELEASE_KEYS) == release_keys
     except OSError:
         there = False
     if there:
@@ -582,11 +629,11 @@ def agent_helper(service_user="fleet", repo=None, check=False, run=None, read=No
     folder = tempfile.mkdtemp(prefix="fleet-agent-helper-")
     try:
         one, two = os.path.join(folder, "fleet-agent-user"), os.path.join(folder, "fleet-vault-program")
-        three = os.path.join(folder, "sudoers")
-        for path, text in ((one, helper), (two, vault), (three, sudoers)):
+        three, four, five = (os.path.join(folder, name) for name in ("sudoers", "releases.py", "release-key.pub"))
+        for path, text in ((one, helper), (two, vault), (three, sudoers), (four, release_check), (five, release_keys)):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(text)
-        code, out, err = run(helper_install_script(one, two, three))
+        code, out, err = run(helper_install_script(one, two, three, four, five))
         if code != 0:
             raise Stop(f"the root helpers of this machine's agents and its vault broker could not be put in place: "
                        f"{(err or out).strip()[-300:]}")
@@ -696,7 +743,7 @@ def vault_key_script(user=VAULT_USER):
             "chmod 600 %(key)s\n") % {"u": user, "key": VAULT_STATE + "/age.key"}
 
 
-def vault_config(hub_address, group=AGENT_GROUP, before=None):
+def vault_config(hub_address, group=AGENT_GROUP, before=None, owner_keys=None, fleet=None):
     """The broker's own configuration, which holds no secret: what it opens, where its keys are, and who may ask it.
 
     A machine that has no broker yet gets **the fleet's own store** (`store`, `store_key`): one age file on this
@@ -719,14 +766,17 @@ def vault_config(hub_address, group=AGENT_GROUP, before=None):
     # its start, as such an age does. Added once, and a path that is there is kept.
     conf.setdefault("curl", "/usr/bin/curl")
     conf["worker_group"] = group
-    # The ssh client that the broker writes a key into a target with (place_secret, owner feature secret_targets).
-    # A broker whose machine has none says so in its log and writes to no target; nothing else changes.
-    conf.setdefault("ssh", "/usr/bin/ssh")
+    # place left the broker (DevOps plan 0.3), and with it the ssh client it wrote a key into a target with.
+    conf.pop("ssh", None)
+    # The owner's keys and the fleet's ID (DevOps plan 0.3): the broker hands a login over only to a recipient that
+    # the owner signed a pin for, checked with these. Given by the root step of the machine, and kept after it.
+    if owner_keys:
+        conf.update(owner_keys=list(owner_keys), fleet=fleet)
     return conf
 
 
 def vault_install(kit=None, hub_address=None, user=VAULT_USER, group=AGENT_GROUP, check=False, run=None, read=None,
-                  system=None):
+                  system=None, owner_keys=None, fleet=None):
     """This machine's vault broker, as a step of installing the machine instead of a page of commands the owner runs
     by hand (WORKER-INSTALL.md, "Vault broker").
 
@@ -767,7 +817,7 @@ def vault_install(kit=None, hub_address=None, user=VAULT_USER, group=AGENT_GROUP
         current = current if isinstance(current, dict) else None
     except (OSError, ValueError):
         current = None
-    conf = vault_config(hub_address, group, current)
+    conf = vault_config(hub_address, group, current, owner_keys, fleet)
     store = "the fleet's own store" if "store" in conf else "a Bitwarden project"
     try:
         program = hashlib.sha256(pathlib.Path(os.path.join(kit, "vault.py")).read_bytes()).hexdigest()
@@ -1547,7 +1597,10 @@ def cmd_agent_helper(args):
 
 
 def cmd_vault(args):
-    vault_install(kit=args.kit or KIT, hub_address=args.hub, check=args.check, system=platform.system())
+    if bool(args.owner_key) != bool(args.fleet) or (args.fleet and not FLEET_ID.fullmatch(args.fleet)):
+        raise Stop("--owner-key and --fleet go together: the owner's public keys and the fleet's 16-character ID")
+    vault_install(kit=args.kit or KIT, hub_address=args.hub, check=args.check, system=platform.system(),
+                  owner_keys=args.owner_key, fleet=args.fleet)
 
 
 def cmd_firewall(args):
@@ -1632,6 +1685,10 @@ def main(argv=None):
     va = sub.add_parser("vault")
     va.add_argument("--hub", required=True, help="the hub's address, for example http://100.80.1.2:8765")
     va.add_argument("--kit", help="the checkout whose vault.py is installed; default: this one")
+    va.add_argument("--owner-key", action="append", help="one public key of the owner (base64 of 65 bytes, as the "
+                                                         "app shows it); with --fleet, a handover goes only to a key "
+                                                         "that the owner signed a pin for")
+    va.add_argument("--fleet", help="the fleet's ID, 16 lowercase hex characters")
     va.add_argument("--check", action="store_true")
     va.set_defaults(fn=cmd_vault)
     fw = sub.add_parser("firewall")

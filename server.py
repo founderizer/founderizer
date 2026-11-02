@@ -309,7 +309,7 @@ def cmd_run(args):
         print("This server has not joined your fleet; its Founderizer service waits.", flush=True)
         while True:
             time.sleep(600)
-    Service(conf, Hub(conf["hub"], key)).loop()
+    Service(conf, Hub(conf["hub"], key), floor=lifecycle.floor_path(HOME)).loop()
 
 
 class Service:
@@ -321,8 +321,9 @@ class Service:
     # clock steps (NTP correcting a drifted server, a VM's host setting it back), and a step backwards would stop
     # this service's five-minute reading for the whole of the step while the hub went on showing the last one.
     def __init__(self, conf, hub, kit=KIT, home=HOME, run=None, clock=time.monotonic, sleep=time.sleep,
-                 platform=sys.platform, life=None, popen=subprocess.Popen, users=account, lives=None):
+                 platform=sys.platform, life=None, popen=subprocess.Popen, users=account, lives=None, floor=None):
         self.name, self.repo, self.hub, self.kit, self.home = conf["name"], conf.get("repo"), hub, kit, home
+        self.floor = floor              # this user's release floor (lifecycle.floor_path), under which its checkout moves
         self.run, self.popen = run or self.command, popen
         self.clock, self.sleep, self.platform = clock, sleep, platform
         self.users = users              # (OS user) -> (uid, home) or None: which agent user this machine has
@@ -747,6 +748,15 @@ class Service:
                 raise failed("checkout", f"{self.name} could not get the Founderizer repository. Try again.",
                              err or out)
             self.mark(folder, agent, user)
+            # DevOps plan 0.2: a new checkout starts at this machine's own checked revision, the one this service
+            # took under lifecycle.may_take, and not at whatever the hub's repository holds; from there it moves
+            # under the same check. A commit is named by its content, so the clone's objects cannot change it.
+            here = self.revision()
+            code, out, err = self.run(self.as_agent(user, ["git", "-C", folder, "reset", "-q", "--hard",
+                                                           here or "missing"]))
+            if not here or code != 0:
+                raise failed("checkout", f"{shown_name(agent)}'s copy of Founderizer could not start at this "
+                                         f"server's own revision. Try again.", err or out)
         # an origin from before the split stays as it was
         problem = lifecycle.follow_config_ref(folder, self.agent_run(user))
         if problem:
@@ -934,11 +944,15 @@ class Service:
         if self.run(["git", "-C", self.kit, "fetch", "-q", "origin"], timeout=120)[0] != 0:
             return                      # no network: this revision keeps its try for the next round
         code, out, _ = self.run(["git", "-C", self.kit, "diff", "--name-only", self.loaded or "HEAD", desired])
-        if code != 0 or lifecycle.follow_config_ref(self.kit, self.run) or \
-                self.run(["git", "-C", self.kit, "merge", "-q", "--ff-only", desired], timeout=120)[0] != 0:
+        # Every move under the one check (lifecycle.may_take): onto the ref, and onto the hub's revision.
+        problem = "git diff failed" if code != 0 else \
+            lifecycle.follow_config_ref(self.kit, self.run, self.floor) or \
+            lifecycle.take(self.kit, desired, self.run, self.floor)
+        if problem:
             self.stuck = desired
             print(f"Fleet could not fast-forward {lifecycle.checkout_branch(self.kit, self.run) or 'this checkout'} "
-                  f"to {desired[:12]}; this server keeps {str(self.loaded)[:12]}.", file=sys.stderr, flush=True)
+                  f"to {desired[:12]}: {problem}; this server keeps {str(self.loaded)[:12]}.", file=sys.stderr,
+                  flush=True)
             return
         if any(p.endswith(".py") or p == "team.json" for p in out.split()):
             self.restart()

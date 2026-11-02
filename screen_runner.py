@@ -494,7 +494,7 @@ def main():
     # names it as the owner reads it.
     label = lifecycle.runtime_fact(lifecycle.APP_SERVER_RUNTIME, "label", lifecycle.APP_SERVER_RUNTIME)
     if args.needs == "screen":
-        command = conf.get("screen_command")
+        command = lifecycle.screen_program(conf)        # one of the fixed paths, never a program team.json names
         if not command or not Path(command).is_file():
             fleet.die(f"the configured {label} screen runner is not installed")
     else:                               # the primary runtime: the executable of the helper's own runtime status

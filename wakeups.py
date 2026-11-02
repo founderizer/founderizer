@@ -837,7 +837,9 @@ TOOL_SPECS = (
      "run in a row wakes the agent with the end of its error output. The program gets one argument, the JSON "
      "{\"trigger\", \"run\", \"args\"}, and runs with "
      "python3 -I in an empty folder. Never put a secret in the code or the args. In a change, a check without code "
-     "keeps the saved code, and \"check\": null removes it.",
+     "keeps the saved code, and \"check\": null removes it. Your machine runs the code only from its own store, "
+     "never from the hub: also write the program, byte for byte, to ~/.fleet/checks/<its SHA-256>.py on your "
+     "machine; the answer names that file.",
      obj({"request_id": REQUEST_ID, "trigger_id": TRIGGER_ID, "base_revision": BASE,
           "agent": {"type": "string", "description": "The agent that the rule wakes. Default: you."},
           "schedule": {"type": "object", "description": "When the rule runs. See the forms above."},

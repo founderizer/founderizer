@@ -61,6 +61,12 @@ else
     act push -q origin "HEAD:refs/heads/$CONFIG_BRANCH"
 fi
 
+# DevOps plan 0.1: the checkout moves onto the ref only where `lifecycle.py may-take` lets it.
+if git rev-parse --verify --quiet "refs/remotes/origin/$CONFIG_BRANCH" >/dev/null; then
+    python3 ./lifecycle.py may-take . "origin/$CONFIG_BRANCH" ||
+        stop "this checkout may not move onto origin/$CONFIG_BRANCH: the line above says why"
+fi
+
 if [ "$branch" = "$CONFIG_BRANCH" ]; then
     act merge -q --ff-only "origin/$CONFIG_BRANCH"
 elif git rev-parse --verify --quiet "refs/heads/$CONFIG_BRANCH" >/dev/null; then

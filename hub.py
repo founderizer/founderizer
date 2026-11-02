@@ -60,6 +60,9 @@ from lifecycle import (APP_SERVER, APP_SERVER_RUNTIME, DEPLOY_APP_NOTE, GITHUB_T
                        app_server_task, mcp_server, mcp_variable, no_sign_in, reuse_value, runtime_fact,
                        runtimes_with, shown_name, switch_target, tool_catalog, tool_needs)
 from lifecycle import SKILL_FILE, SKILL_NAME, SKILLS, skill_front, skill_rows, skills_text   # design v4 D: agents' skills
+from lifecycle import CONFIG_FILES, floor_path, keep_floor, may_take    # DevOps plan 0.1: the check of every move
+from lifecycle import SCREEN_COMMANDS, key_env, start_form              # DevOps plan 0.2: data stops being code
+import lifecycle
 
 DESKTOP = Frames()
 
@@ -677,9 +680,8 @@ TAG = re.compile(r"[a-z0-9-]{1,30}")                      # expertise tags and a
 BWS_REF = re.compile(r"bws://[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 SECRET_KINDS = ("login", "api_key")       # owner feature secrets: the two kinds of the catalog
 ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,59}")       # the variable name of an API key; it is also its title
-# Names that the start of a session or its runtime reads itself: no API key takes one of them.
-ENV_RESERVED = re.compile(r"(?:FLEET|BWS|LD|DYLD|ANTHROPIC|CLAUDE|CODEX|XAI)_[A-Z0-9_]*|PATH|HOME|SHELL|USER|LOGNAME|"
-                          r"TMPDIR|TERM|PWD|IFS|ENV|BASH_ENV|ZDOTDIR|NODE_OPTIONS|PYTHONPATH|PYTHONHOME")
+# Names that the start of a session or its runtime reads itself: no API key takes one of them (lifecycle.key_env).
+ENV_RESERVED = lifecycle.ENV_RESERVED
 
 
 def accounts():
@@ -695,8 +697,10 @@ def logins():
 
 
 def env_name(value):
-    """True for a variable name that an API key can have."""
-    return isinstance(value, str) and bool(ENV_NAME.fullmatch(value)) and not ENV_RESERVED.fullmatch(value)
+    """True for a variable name that an API key can have: the name of a key, and none that a session's start or a
+    runtime reads itself (lifecycle.key_env, DevOps plan 0.2), so no setting can give a session a model address or a
+    proxy."""
+    return key_env(value)
 
 
 def secret_grants(agent, team=None):
@@ -6237,7 +6241,12 @@ def t_save_trigger(agent, a):
     else:
         t = trigger_edit(plan["trigger_id"], plan["base_revision"], body, agent, t0, created_by=plan["by"],
                          source=plan["source"], command=command, saved_in=saved_in)
-    return wakeups.receipt_text(wakeups.receipt(plan["op"], t["id"], t["revision"]))
+    said = wakeups.receipt_text(wakeups.receipt(plan["op"], t["id"], t["revision"]))
+    saved = body.get("check") or {}
+    if saved.get("code") == "saved":        # DevOps plan 0.2: the hub gives the helper only the SHA-256
+        said += (f"\nThe check runs only from your machine's own store: write its program, byte for byte, to "
+                 f"~/.fleet/checks/{saved['sha256']}.py on the machine of {runner_of(t)}, if it is not there yet.")
+    return said
 
 
 def save_provenance(agent):
@@ -8393,9 +8402,26 @@ def statement_kind(statement):
 
 def central_statement(body):
     """POST /ui/vault/pin, /recovery and /grant: the owner's signed statement and its signature, as they came, to the
-    central vault's op of the statement's own kind. The hub keeps no copy of the owner's key. Never under LOCK."""
+    central vault's op of the statement's own kind. The hub keeps no copy of the owner's key. Never under LOCK.
+
+    A pin that the central vault took is kept as it came too (owner_pin), so that a machine's broker can check with the
+    owner's own keys that a handover goes to a key the owner pinned (DevOps plan 0.3); an unpin ends it."""
     kind = statement_kind(body["statement"])
-    return dict(central_call(kind, {"statement": body["statement"], "signature": body["signature"]}), kind=kind)
+    answer = dict(central_call(kind, {"statement": body["statement"], "signature": body["signature"]}), kind=kind)
+    machine = answer.get("machine")
+    if kind in ("pin", "unpin") and isinstance(machine, str) and re.fullmatch(r"[a-z][a-z0-9-]{0,62}", machine):
+        with LOCK:
+            kv_set(f"owner_pin:{machine}", json.dumps({"statement": body["statement"], "signature": body["signature"]})
+                   if kind == "pin" else None)
+    return answer
+
+
+def owner_pin(agent):
+    """The owner's signed pin of the machine of this agent, {statement, signature} as the app sent it and the central
+    vault took it, or None: what a giving broker checks a handover's recipient with (vault.owner_pinned)."""
+    machine = (agents().get(agent) or {}).get("machine")
+    kept = kv_get(f"owner_pin:{machine}") if machine else None
+    return json.loads(kept) if kept else None
 
 
 def withdrawal_waiting(wid, agent):
@@ -12341,14 +12367,30 @@ def request_update(agent, desired):
     return "requested"
 
 
-# What the hub may write on the configuration ref: the owner's own files. knowledge/ is all of it, and not only
-# knowledge/owner/, because an agent writes the knowledge files its profile lists (write_knowledge) and a file the hub
-# can write but a release can replace is drift by construction. publish.py already calls all of knowledge/ the fleet's
-# own (OWNER_FILES), and releases.OWNER_PATHS is the other half of this line. skills/ is each agent's own (design v4
-# D1): skills/<agent>/<name>/SKILL.md and the few small files beside it, at most two folders deep and never hidden. It
-# is in all three lists a release before the tool that writes it, so no release ever reverts a skill.
-CONFIG_FILES = re.compile(r"(?!.*\.\.)(?:team\.json|profiles/[A-Za-z0-9._-]+\.md|knowledge/[A-Za-z0-9._/-]+\.md|"
-                          rf"{SKILLS}/[a-z][a-z0-9-]{{1,30}}/{SKILL_NAME}/{SKILL_FILE})\Z")
+# What the hub may write on the configuration ref, the owner's own files, is lifecycle.CONFIG_FILES: the same pattern
+# that a release keeps as the fleet's data (lifecycle.data_path) and that a checkout takes with no release
+# (lifecycle.may_take), so the three can never disagree.
+
+
+def kit_floor():
+    """The hub user's release floor (lifecycle.floor_path), or None for a hub imported as a module (tests), which
+    keeps none: main() sets it."""
+    return CFG.get("release_floor")
+
+
+def move_kit(target):
+    """Fast-forward the hub checkout onto `target` under the one check of every move (lifecycle.may_take), with the
+    hub user's floor raised after it. None, or the reason the checkout stays where it is."""
+    folder, floor = kit_dir(), kit_floor()
+    keep_floor(folder, floor)
+    problem = may_take(folder, target, floor=floor)
+    if problem:
+        return problem
+    code, out, err = git_kit("merge", "-q", "--ff-only", target, folder=folder)
+    if code != 0:
+        return "the fast-forward failed: " + (err or out)[-200:]
+    keep_floor(folder, floor)
+    return None
 
 
 def commit_kit_file(path, data, message, more=None, author=None, allow=None):
@@ -12386,8 +12428,9 @@ def commit_kit_file(path, data, message, more=None, author=None, allow=None):
         if not (ahead and same_code(rev, remote)):
             raise Refusal(409, f"origin/{branch} " + ("carries changes that the hub does not run" if ahead else
                                                       "lacks commits that the hub has"))
-        if git_kit("merge", "-q", "--ff-only", remote)[0] != 0:
-            raise Refusal(409, f"the hub could not take in origin/{branch}")
+        problem = move_kit(remote)
+        if problem:
+            raise Refusal(409, f"the hub could not take in origin/{branch}: {problem}")
         rev = kit_revision(fresh=True)
         if rev != remote:
             raise Refusal(409, f"the hub checkout did not reach origin/{branch}")
@@ -12423,7 +12466,7 @@ def commit_kit_file(path, data, message, more=None, author=None, allow=None):
         raise Refusal(502, "git did not answer in time")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    if git_kit("fetch", "-q", "origin", timeout=60)[0] != 0 or git_kit("merge", "-q", "--ff-only", commit)[0] != 0:
+    if git_kit("fetch", "-q", "origin", timeout=60)[0] != 0 or move_kit(commit):
         raise Refusal(500, f"{path} is in origin as {commit[:12]}, but the hub checkout did not fast-forward")
     kit_revision(fresh=True)
     changed()                   # a profile, a knowledge file or team.json: not in the database (live_changes)
@@ -25145,6 +25188,15 @@ def validate_team(team):
                for runtime, p in [(a["runtime"], a), *stored.items()]):
             raise ValueError(f"agent {name}: the start policy app-server is only for a "
                              f"{runtime_label(APP_SERVER_RUNTIME)} worker or lead, with no allow")
+        # DevOps plan 0.2: a start is a command line that every machine of this agent runs, so it is one of Fleet's
+        # own forms (lifecycle.start_forms), and a screen runtime's program is one of the fixed paths. The helper
+        # refuses anything else where it uses it; this says why at the owner's write.
+        for runtime, p in [(a["runtime"], a), *stored.items()]:
+            if "start" in p and not start_form(runtime, p["start"]):
+                raise ValueError(f"agent {name}: its {runtime_label(runtime)} start must be one of Fleet's own forms "
+                                 f"for that runtime")
+        if a.get("screen_command") is not None and a["screen_command"] not in SCREEN_COMMANDS:
+            raise ValueError(f"agent {name}: screen_command must be {' or '.join(SCREEN_COMMANDS)}")
         screen = a.get("screen")
         if screen is not None:
             if not a.get("screen_command"):
@@ -25382,9 +25434,9 @@ def reload_team(revision):
     if busy:
         raise Refusal(409, "agents with open tasks cannot be removed or changed: " + ", ".join(busy))
     if head != full:
-        code, _, err = git_kit("merge", "-q", "--ff-only", full)
-        if code != 0:
-            raise Refusal(500, "the fast-forward failed: " + err[-200:])
+        problem = move_kit(full)
+        if problem:
+            raise Refusal(500 if problem.startswith("the fast-forward failed") else 409, problem)
     apply_team(new)
     learn_tailnet_names()           # devops task 1.1: a hub that started without its names has them after a reload
     log("owner", f"team reloaded at {full[:12]}: added {added}, changed {changed}, removed {removed}")
@@ -25994,7 +26046,7 @@ Written by the owner. Agents cannot change it.
 # A Mac server comes with its desktop (the owner, 28 October 2026: "a mac studio server should come by default with
 # computer and browser use"): Google Chrome for a browser task, and for a screen task Codex with Computer Use, which
 # the ChatGPT app keeps here. A Linux server has neither.
-MAC_SCREEN_COMMAND = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
+MAC_SCREEN_COMMAND = SCREEN_COMMANDS[0]      # lifecycle.SCREEN_COMMANDS: the one program a screen runtime may be
 
 
 def desktop_defaults(team, machine, runtime):
@@ -27063,8 +27115,7 @@ def finish_machine_rename(t0):
             rev = kit_revision(fresh=True)          # origin ahead by the rename's team.json, and by no other code
             code, out, _ = git_kit("diff", "--name-only", rev, remote)
             if git_kit("merge-base", "--is-ancestor", rev, remote)[0] != 0 or code != 0 or \
-                    any(fleet_code(p) for p in out.split() if p != "team.json") or \
-                    git_kit("merge", "-q", "--ff-only", remote)[0] != 0:
+                    any(fleet_code(p) for p in out.split() if p != "team.json") or move_kit(remote):
                 return
             team, _, _ = team_view(kit_revision(fresh=True))
     if new in team["addresses"] and old not in team["addresses"]:
@@ -29675,7 +29726,7 @@ def machine_rows():
 #   - the merge and all three checks happen in a temporary clone, so the fleet keeps the pinned revision until
 #     the released code's schema against a copy of this fleet's database, `selftest.py` and `fleet.py verify`
 #     have all passed on the released code;
-#   - a release never moves the owner's own team.json, profiles or knowledge (releases.OWNER_PATHS);
+#   - a release never moves the owner's own team.json, profiles or knowledge (lifecycle.data_path);
 #   - a manifest that does not verify against the key shipped in this checkout is not acted on at all;
 #   - a `hold` in the signed manifest stops every fleet, whatever a fleet's own settings say.
 #
@@ -30066,7 +30117,8 @@ def release_work(applying, automatic=False, fetch=None):
             # plan P0: a release that no run has tried yet waits for the turns that run now, and no new session starts
             # meanwhile (release_holds_starts). One that the run would refuse before it touches anything is answered
             # now instead, as the run would answer it, so that nothing waits for it.
-            refused = releases.Update(kit_dir(), manifest, origin=origin, upstream=release_upstream()).before()
+            refused = releases.Update(kit_dir(), manifest, origin=origin, upstream=release_upstream(),
+                                      floor=kit_floor()).before()
             with LOCK:
                 if refused:
                     kv_set("release_waits", None)
@@ -30093,7 +30145,7 @@ def release_work(applying, automatic=False, fetch=None):
                                    f"for the schema check, so no release is taken: {e}", automatic)
                 return
             result = releases.Update(kit_dir(), manifest, origin=origin, upstream=release_upstream(),
-                                     database=path).apply()
+                                     database=path, floor=kit_floor()).apply()
         finally:
             shutil.rmtree(folder, ignore_errors=True)
         with LOCK:
@@ -31296,33 +31348,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(409, {"error": "this claim is obsolete"})
             answer = check_result(t, r, body, now(), stored)
         return self.json(200, dict(answer, replayed=False))
-
-    def helper_trigger_code(self, agent, run_id, query):
-        """The saved code of a check run, for its runner, only while the run's claim is open (WAKEUPS-INTERFACE.md)."""
-        if agent not in agents():
-            return self.json(404, {"error": "unknown agent"})
-        if not self.allowed(agent):
-            return
-        with LOCK:
-            r = q1("SELECT * FROM trigger_runs WHERE id=?", (run_id,))
-            t = trigger_row(r["trigger_id"]) if r else None
-            spec = json.loads(t["check_spec"]) if t and t["check_spec"] else {}
-            if spec.get("code") != "saved" or runner_of(t) != agent:
-                return self.json(404, {"error": "no such saved check run for this agent"})
-            t0 = now()
-            if r["state"] != "sent" or r["token"] != query.get("token") or r["revision"] != t["revision"]:
-                return self.json(409, {"error": "this claim is not open"})
-            valid, why = wakeups.still_valid(wake_org(), trigger_view(t, t0))    # the grant now, before the code runs
-            if not valid:
-                with transaction():
-                    DB.execute("UPDATE trigger_runs SET state='not_started', reason=?, retry_at=NULL, finished=? "
-                               "WHERE id=?", (why, t0, r["id"]))
-                    pause_trigger(t["id"], "hub", why, t0)
-                return self.json(409, {"error": why})
-            code = q1("SELECT source FROM trigger_code WHERE sha256=?", (spec["sha256"],))
-        if not code:
-            return self.json(409, {"error": "the hub has no code with this SHA-256"})
-        return self.json(200, {"sha256": spec["sha256"], "source": code["source"]})
 
     def ui_trigger_state(self, trigger_id):
         def read(data):
@@ -34053,8 +34078,6 @@ class Handler(BaseHTTPRequestHandler):
             return self.helper_desktop(parts[2], parts[3], query)
         if len(parts) == 4 and parts[:2] == ["helper", "login"]:        # owner feature machine_signin
             return self.machine_login(parts[2], parts[3], post=False)
-        if len(parts) == 5 and parts[:2] == ["helper", "trigger"] and parts[4] == "code" and parts[3].isdigit():
-            return self.helper_trigger_code(parts[2], int(parts[3]), query)
         if parts == ["ui", "state"]:
             return self.ui_state()
         if parts == ["ui", "wait"]:                     # owner feature live_changes
@@ -35596,7 +35619,7 @@ class Handler(BaseHTTPRequestHandler):
                 target = row["target"] or ""
                 if agents().get(target, {}).get("vault") != "broker" or not handover_key(target):
                     return self.json(409, {"error": f"{target} has no vault broker with a pinned handover key"})
-                answer.update(target=target, recipient=handover_key(target))
+                answer.update(target=target, recipient=handover_key(target), pin=owner_pin(target))
             if made:        # the hub cannot prove the creation: the vault compares this with its own record, then opens
                 answer["created_by"] = {"request_id": made["request_id"], "db": kv_get("db_id"), "agent": agent,
                                         "attempt": made["attempt"], "label": made["label"],
@@ -36389,6 +36412,7 @@ def main():
                request_wait=args.request_wait,
                stop_after=args.stop_after, offline_after=args.offline_after, tick=args.tick)
     CFG["team_path"] = os.path.abspath(args.team)
+    CFG["release_floor"] = floor_path(os.path.expanduser("~"))      # DevOps plan 0.1: lifecycle.may_take's floor
     CFG["central_vault"] = CENTRAL_SOCKET       # owner feature central_vault: its socket, which hubsetup.py makes
     with open(args.team, encoding="utf-8") as f:
         TEAM.update(json.load(f))

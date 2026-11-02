@@ -53,6 +53,11 @@ EXECUTOR_VERSION = "1.3.2"
 CAPABILITIES = ["existing_machine", "prepare_runtime"]
 WORKER_USER = "fleet"
 CONFIG_BRANCH = "config"     # the hub's configuration ref: a team.json change belongs there, never on the code branch
+# How a checkout on a worker takes its ref, in its own folder: fetched, and taken only where `lifecycle.py may-take`
+# lets it (DevOps plan 0.1). A refusal leaves the checkout where it is, as a failed pull did. The ref is read once, as
+# one commit: the commit checked is the commit taken.
+TAKE = ('git fetch -q origin && t=$(git rev-parse --verify -q "@{upstream}^{commit}") && '
+        'python3 lifecycle.py may-take . "$t" && git merge -q --ff-only "$t"')
 # Hub ports 8765 and 9418 for tag:claude-code-dev; the owner's SSH to workers for tag:terminal-relay-worker.
 DEFAULT_TAGS = "tag:claude-code-dev,tag:terminal-relay-worker"
 TAG_RE = re.compile(r"^tag:[A-Za-z][A-Za-z0-9-]*$")
@@ -1196,10 +1201,17 @@ class Onboarding:
         token = self.state.setdefault("checkout_token", uuid.uuid4().hex)
         self.save()                                   # the mark exists before the folder
         mark = '"$HOME/%s/.git/fleet-onboarding"' % folder
+        # DevOps plan 0.2: the new checkout starts at the machine's own checked revision, the one that its first
+        # agent's checkout ~/fleet-pilot took under lifecycle.may_take, and not at whatever the hub's repository holds;
+        # from there it moves under the same check. A machine with no such checkout takes the clone as its first one.
+        # A clone that cannot start there is removed again: this run made it a moment before.
         code, out, err = self.worker(
             'if [ -e "$HOME/%(f)s" ]; then echo fleet-checkout=exists; echo mark=$(cat %(m)s 2>/dev/null || true); '
-            'exit 0; fi; { git clone -q -b %(b)s %(repo)s "$HOME/%(f)s" || git clone -q %(repo)s "$HOME/%(f)s"; } '
-            '&& echo %(t)s > %(m)s && echo fleet-checkout=cloned'
+            'exit 0; fi; here=$(git -C "$HOME/fleet-pilot" rev-parse -q --verify HEAD 2>/dev/null || true); '
+            '{ git clone -q -b %(b)s %(repo)s "$HOME/%(f)s" || git clone -q %(repo)s "$HOME/%(f)s"; } || exit 1; '
+            'if [ -n "$here" ] && ! git -C "$HOME/%(f)s" reset -q --hard "$here"; then rm -rf "$HOME/%(f)s"; '
+            'echo "the new checkout could not start at this machine\'s own revision $here" >&2; exit 1; fi; '
+            'echo %(t)s > %(m)s && echo fleet-checkout=cloned'
             % {"f": folder, "m": mark, "b": CONFIG_BRANCH, "repo": shlex.quote(self.repo), "t": token}, timeout=300)
         info = kv(out)
         if code != 0 or info.get("fleet-checkout") not in ("exists", "cloned"):
@@ -1293,8 +1305,8 @@ class Onboarding:
                      '"gui/$(id -u)" "$HOME/Library/LaunchAgents/com.agentfleet.%s.plist"; fi' % (job, job, self.name))
         else:
             start = "systemctl --user enable --now fleet-%s.service" % self.name
-        code, out, err = self.worker('cd "$HOME/fleet-%s"; git pull -q --ff-only; %spython3 fleet.py service %s '
-                                     '>/dev/null; %s; echo started=yes' % (self.name, trust, shlex.quote(self.name), start),
+        code, out, err = self.worker('cd "$HOME/fleet-%s"; %s; %spython3 fleet.py service %s >/dev/null; %s; '
+                                     'echo started=yes' % (self.name, TAKE, trust, shlex.quote(self.name), start),
                                      timeout=300)
         info = kv(out)
         if info.get("trust") == "kept":
@@ -1456,8 +1468,8 @@ class Onboarding:
         if self.service_active():
             return "skipped", "fleet-%s.service is active." % self.name
         self.must(as_worker("test -d $HOME/fleet-pilot || git clone -q %s $HOME/fleet-pilot; cd $HOME/fleet-pilot; "
-                            "git pull -q --ff-only; python3 worker_install.py --agent %s --start"
-                            % (shlex.quote(self.repo), shlex.quote(self.name))), "Worker installation", timeout=600)
+                            "%s; python3 worker_install.py --agent %s --start"
+                            % (shlex.quote(self.repo), TAKE, shlex.quote(self.name))), "Worker installation", timeout=600)
         if not self.service_active():
             raise StepFailed("fleet-%s.service is not active." % self.name)
         return "done", "fleet-%s.service is active." % self.name

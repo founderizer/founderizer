@@ -111,6 +111,18 @@ as_user() {     # the command as the user of the services, from its home folder,
         PATH="$home/.local/bin:/usr/local/bin:/usr/bin:/bin" sh -c 'cd "$HOME" && exec "$@"' sh "$@"
 }
 
+take() {        # $1: a checkout; the rest: how to run a command as its user. The checkout's own ref, fetched, and taken
+                # only where `lifecycle.py may-take` lets it (DevOps plan 0.1): the data that the hub writes, or a
+                # release that a release key signed. A refusal leaves the checkout where it is, and says why.
+    taking=$1
+    shift
+    "$@" git -C "$taking" fetch -q origin </dev/null || return 1
+    # the ref read once, as one commit: the commit checked is the commit taken
+    target=$("$@" git -C "$taking" rev-parse --verify -q "@{upstream}^{commit}" </dev/null) || return 1
+    "$@" python3 "$taking/lifecycle.py" may-take "$taking" "$target" </dev/null || return 1
+    "$@" git -C "$taking" merge -q --ff-only "$target" </dev/null
+}
+
 as_agent() {    # $1: an agent's own OS user; the rest: the command, as that user, from that user's own home
     agent_as=$1
     shift
@@ -382,8 +394,7 @@ write its service with fleet.py service <agent>, and enable and start it in that
 lingering: loginctl show-user $user -p Linger"
         folder="/home/$user/fleet-$agent"
         if [ -d "$folder/.git" ]; then
-            as_agent "$user" git -C "$folder" pull -q --ff-only </dev/null \
-                || say "  $folder could not update; it stays as it is"
+            take "$folder" as_agent "$user" || say "  $folder could not update; it stays as it is"
         else
             as_agent "$user" git clone -q -b config "git://$address/fleet-pilot.git" "$folder" </dev/null \
                 || stop "The checkout of $agent could not be cloned from git://$address/fleet-pilot.git. Check that \
