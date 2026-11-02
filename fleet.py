@@ -2770,6 +2770,21 @@ class Helper:
             self.tailer = Tailer(conf.get("runtime", ""), self.manager_windows, self.report_limit,
                                  requested={"model": conf.get("model"), "effort": conf.get("effort")})
 
+    def moved_away(self):
+        """The owner moved this agent to another server (hub.move_agent): its sessions here end, and so does this
+        helper's own service, which never starts again on this machine. Its files stay where they are."""
+        self.say("the owner moved this agent to another server: its sessions and its service here end")
+        tmux("kill-session", "-t", self.session)
+        if sys.platform == "darwin":
+            plist = os.path.join(HOME, "Library", "LaunchAgents", f"com.agentfleet.{self.agent}.plist")
+            with contextlib.suppress(OSError):
+                os.remove(plist)
+            argv = ["launchctl", "bootout", f"gui/{os.getuid()}/com.agentfleet.{self.agent}"]
+        else:
+            argv = ["systemctl", "--user", "--no-block", "disable", "--now", f"fleet-{self.agent}.service"]
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(argv, capture_output=True, timeout=30)
+
     def say(self, text):
         print(time.strftime("%H:%M:%S"), text, flush=True)
 
@@ -5370,6 +5385,29 @@ class Helper:
                  f": {'done' if ok else 'outcome not known' if unknown else 'refused: ' + text[:120]}")
 
 
+def ensure_ops():
+    """The door's `ops` command on this box (DevOps plan C1): a wrapper of this checkout's ops.py in ~/.local/bin,
+    which the helper's PATH and so every session's carries. Nothing changes when it is there already, and a box whose
+    fleet has no door gets the one line that says so."""
+    path = os.path.join(os.path.expanduser("~"), ".local", "bin", "ops")
+    text = f'#!/bin/sh\nexec python3 "{os.path.join(KIT, "ops.py")}" "$@"\n'
+    try:
+        with open(path, encoding="utf-8") as f:
+            if f.read() == text:
+                return False
+    except OSError:
+        pass
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".new", "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(path + ".new", 0o755)
+        os.replace(path + ".new", path)
+    except OSError:
+        return False
+    return True
+
+
 def cmd_run(args):
     agent, conf = args.agent, agent_conf(args.agent)
     if not shutil.which("tmux"):
@@ -5387,6 +5425,7 @@ def cmd_run(args):
     # loop below until the hub answers; a session that runs already, or one closed later, is left as it is.
     ready_runtime_config()          # before the first session: nobody is there to answer the runtime's first screen
     ready_codex_trust(conf.get("runtime"))      # and Codex's own; a switch to Codex starts a new helper too
+    ensure_ops()                    # DevOps plan C1: the door's command on this box
     h.manager_due = conf.get("role") == "manager" and h.manager_first()
     print(f"helper for {agent} is running; persistent inbox delivery; sessions in {h.session}", flush=True)
     collector = Collector(KIT, agent, conf["runtime"],
@@ -5430,6 +5469,9 @@ def cmd_run(args):
             held = ",".join(str(j) for j in list(h.jobs_held) if isinstance(j, int))    # plan C7: the jobs it holds
             checks = ",".join(str(r) for r in list(h.check_runs) if isinstance(r, int))  # C12: its check runs
             code, data = http("GET", f"/events/{agent}?delivery=1&after=0&wait=8&{listed}&jobs={held}&checks={checks}")
+            if code == 403 and data.get("auth") == "moved":
+                h.moved_away()          # agent_move: the owner moved this agent to another server
+                return
             if code == 403 and data.get("auth") == "no_key" and load_agent_key(agent):
                 os.remove(key_file(agent))      # the owner removed this agent's key: legacy again until it enrolls
                 keyed, enrolled_at = False, 0.0

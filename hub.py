@@ -306,6 +306,12 @@ CREATE TABLE IF NOT EXISTS server_status(server TEXT PRIMARY KEY, data TEXT NOT 
 CREATE TABLE IF NOT EXISTS server_jobs(id INTEGER PRIMARY KEY, server TEXT NOT NULL, kind TEXT NOT NULL, agent TEXT,
   runtime TEXT, state TEXT NOT NULL, step TEXT, detail TEXT, prompt TEXT, created REAL NOT NULL, updated REAL NOT NULL,
   was TEXT);
+-- DevOps plan C4: the door's record as the hub read it (no content, no value), and the sealed copies that wait for the
+-- door to fetch them from its own address
+CREATE TABLE IF NOT EXISTS door_record(n INTEGER PRIMARY KEY, ts REAL NOT NULL, caller TEXT NOT NULL, target TEXT,
+  action TEXT, kind TEXT NOT NULL, outcome TEXT NOT NULL, why TEXT);
+CREATE TABLE IF NOT EXISTS door_copies(id INTEGER PRIMARY KEY, login TEXT NOT NULL, sealed TEXT NOT NULL,
+  created REAL NOT NULL, fetched REAL, sha256 TEXT);
 -- A sign-in that the owner drives (machine_signin; PRODUCT.md 4.5 names this table). The row carries its state and
 -- nothing of the sign-in itself:
 -- the provider's link, the code it shows and the code the owner pastes live in memory only (LIVE_LOGINS) and are
@@ -768,7 +774,9 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "signed_grants", "agent_rename", "agent_memory", "live_changes",
                "settings", "standing", "history", "costs",
                "server_names",      # the owner, 30 October 2026: a server's name is its name in Tailscale
-               "mac_setup"]         # the owner, 31 October 2026: one sitting at a new Mac
+               "mac_setup",         # the owner, 31 October 2026: one sitting at a new Mac
+               "agent_move",        # DevOps plan C7, 2 November 2026: an agent moves to an empty server
+               "server_access"]     # DevOps plan C4: Read or Fix on a server, through the door
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -2047,6 +2055,10 @@ def holdings_parts(agent):
     parts += google_clauses(agent)
     if a.get("tools"):
         parts.append("MCP servers " + named_few(sorted(a["tools"])))
+    if a.get("servers"):        # DevOps plan C4: through the door, with the one command that reaches it
+        parts.append("servers through the door, each with `ops <server> <action>` (`ops <server> help` lists its "
+                     "forms, `ops status` what the door gives you): " +
+                     named_few(f"{h} ({v})" for h, v in sorted(a["servers"].items())))
     keys = [name for _, name in read_secrets(agent)]
     if keys:
         parts.append("API keys in this session: " + named_few(keys))
@@ -7412,6 +7424,8 @@ def t_request_secret(agent, a):
         raise ToolError(f'give_to maps up to {SECRET_GIVE_MAX} agents to "use" or "read", for example '
                         f'{{"studio": "read"}}.')
     for name, level in give.items():
+        if name == "door" and TEAM.get("door") and level == "use" and not worker:
+            continue                # DevOps plan C4: a key that only the door uses, as its holder
         if role_of(name) not in ("worker", "lead"):
             raise ToolError(f"give_to names workers and leads, because a secret reaches task sessions: {name} is "
                             f"not one. Agents: {', '.join(n for n in agents() if role_of(n) in ('worker', 'lead'))}.")
@@ -17061,16 +17075,19 @@ def skill_remove(agent, name):
 # resource_grants and a line of the hub's log, and the owner takes any of it back in one step.
 # The levels of each kind run from the lowest to the highest, so a policy's max can be compared.
 GRANT_WHY_MAX = 300          # the manager's own line about one grant, in the owner's record of it
+SERVER_LEVELS = ("read", "fix")         # DevOps plan C4: a server through the door ("the door and server access")
+SERVER_HOST = re.compile(r"[a-z0-9][a-z0-9.-]{0,62}")     # a host's name, as Tailscale and the door's access file give it
 RESOURCE_LEVELS = {"secret": ("use", "read"), "repo": REPO_ACCESS, "drive": GOOGLE_LEVELS["drive"],
-                   "gmail": GOOGLE_LEVELS["gmail"], "tool": ("use",)}
+                   "gmail": GOOGLE_LEVELS["gmail"], "tool": ("use",), "server": SERVER_LEVELS}
 # What each kind is, in one word for a sentence, and the heading of its group on the owner's Access page.
 RESOURCE_WORDS = {"secret": "secret", "repo": "GitHub repository", "drive": "Google Drive", "gmail": "Gmail",
-                  "tool": "MCP server"}
+                  "tool": "MCP server", "server": "server"}
 RESOURCE_TITLES = {"secret": "Data sources and deploy routes", "repo": "Repositories", "drive": "Drive accounts",
-                   "gmail": "Mail accounts", "tool": "MCP servers"}
+                   "gmail": "Mail accounts", "tool": "MCP servers", "server": "Servers"}
 # What a duty uses each kind for, for the owner's Access page.
 RESOURCE_NEEDS = {"secret": "a data source or a deploy route", "repo": "a repository to change",
-                  "drive": "files", "gmail": "a mail account", "tool": "an MCP server"}
+                  "drive": "files", "gmail": "a mail account", "tool": "an MCP server",
+                  "server": "a server to read or fix through the door"}
 RESOURCE_AUDIENCE = "workers"       # a policy's "to": its one audience, any worker or lead
 RESOURCE_LIMIT = 256                # entries of team.json "resources"
 RESOURCE_HISTORY = 10               # grants of one resource that GET /ui/resources carries
@@ -17099,6 +17116,8 @@ def resource_known(kind, what, team):
         return what in tool_catalog(team)
     if kind == "repo":
         return bool(REPO_NAME.fullmatch(what))
+    if kind == "server":
+        return bool(SERVER_HOST.fullmatch(what))
     return bool(google_account(what))
 
 
@@ -17112,6 +17131,8 @@ def resource_entry(rid, entry, team):
     if not resource_known(kind, what, team):
         raise ValueError(f"resource {rid!r}: {what!r} is no email address" if kind in ("drive", "gmail") else
                          f"resource {rid!r}: {what!r} is no {RESOURCE_WORDS[kind]} that this team has")
+    if kind == "server":
+        raise ValueError(f"resource {rid!r}: a server is the owner's alone to give, in the Servers group")
     if not isinstance(entry, dict) or not entry or set(entry) - {"max", "to"}:
         raise ValueError(f"resource {rid!r} needs max, with an optional to")
     levels = RESOURCE_LEVELS[kind]
@@ -17159,6 +17180,8 @@ def resource_holders(kind, what, team=None):
             level = (a.get("secrets") or {}).get(what)
         elif kind == "repo":
             level = (a.get("repos") or {}).get(what)
+        elif kind == "server":
+            level = (a.get("servers") or {}).get(what)
         elif kind == "tool":
             level = "use" if what in (a.get("tools") or []) else None
         else:
@@ -17177,6 +17200,8 @@ def resource_uses(kind, what, team=None):
         return [what], "vault"
     if kind == "repo":
         return [], "github_app"
+    if kind == "server":
+        return [], "door"
     if kind in ("drive", "gmail"):
         return [], "google"
     entry = tool_catalog(team or TEAM).get(what) or {}
@@ -17250,7 +17275,7 @@ def resources_view(team):
     accounts = {a["email"]: bool(a["connected"]) for a in google_view(team)["accounts"]}
     return {"kinds": [{"kind": kind, "title": RESOURCE_TITLES[kind], "word": RESOURCE_WORDS[kind],
                        "levels": list(levels), "needs": RESOURCE_NEEDS[kind]}
-                      for kind, levels in RESOURCE_LEVELS.items()],
+                      for kind, levels in RESOURCE_LEVELS.items() if kind != "server"],     # the Servers group's
             "audience": RESOURCE_AUDIENCE, "limit": RESOURCE_LIMIT,
             "resources": [resource_view(rid, team, accounts) for rid in resource_ids(team, accounts)]}
 
@@ -17297,6 +17322,9 @@ def take_resource(body):
         raise Refusal(404, "no such agent")
     if not resource_known(kind, what, TEAM):
         raise Refusal(404, f"the fleet does not hold {rid}")
+    if kind == "server":        # DevOps plan C4: No access in the Servers group, which takes the host's parts too
+        raise Refusal(409, "A server is taken back with No access in the Servers group, which removes its parts from "
+                           "the host too.")
     phrase = resource_phrase(kind, what)
     held = next((h["level"] for h in resource_holders(kind, what) if h["agent"] == agent), None)
     result = grant_resource("owner", rid, agent, None, phrase)
@@ -17347,6 +17375,9 @@ def grant_check(agent, rid, level):
     if a.get("role") not in ("worker", "lead"):
         raise ToolError(f"{agent} is the {a.get('role')}: a repository, a tool, a Google service and a secret reach "
                         f"task sessions, so only a worker or a lead gets one. You never grant to yourself.")
+    if kind == "server":        # DevOps plan C4: given only by the owner
+        return (f"A server is the owner's alone to give, in the Servers group of the app. Ask the owner with "
+                f"raise_needs_you for {what} at the level the work needs.")
     entry = resource_pool().get(rid) or {}
     if not entry.get("max"):
         phrase = resource_phrase(kind, what)        # only its first letter: capitalize() would unmake MCP and a name
@@ -17386,14 +17417,15 @@ def grant_resource(by, rid, agent, level, phrase):
         def change(team):
             known_agents(team, [agent])
             a = team["agents"][agent]
-            if kind == "repo":
-                repos = dict(a.get("repos") or {})
-                if repos.get(what) == level:
+            if kind in ("repo", "server"):
+                field = "repos" if kind == "repo" else "servers"
+                held = dict(a.get(field) or {})
+                if held.get(what) == level:
                     return False
-                repos.pop(what, None)
+                held.pop(what, None)
                 if level:
-                    repos[what] = level
-                put(a, "repos", dict(sorted(repos.items())))
+                    held[what] = level
+                put(a, field, dict(sorted(held.items())))
                 return True
             if kind == "tool":
                 tools = set(a.get("tools") or [])
@@ -18486,7 +18518,7 @@ def t_decide_report(agent, a):
 HISTORY_WINDOW = 30             # days, by default
 HISTORY_WINDOW_MAX = 365
 HISTORY_ROWS = 12               # rows of one group in one mode
-HISTORY_MODES = ("agents", "duties", "questions", "refusals", "accounts", "costs")
+HISTORY_MODES = ("agents", "duties", "questions", "refusals", "accounts", "costs", "door")
 HISTORY_DETAIL = 60             # characters of a refusal that make it the same refusal
 
 
@@ -19012,7 +19044,7 @@ def t_see_history(agent, a):
     days, start, before = history_window(a)
     lines = {"agents": history_agents, "duties": history_duties, "questions": history_questions,
              "refusals": history_refusals, "accounts": history_accounts,
-             "costs": history_costs}[what](a, days, start, before)
+             "costs": history_costs, "door": history_door}[what](a, days, start, before)
     if not manager:
         return "\n".join(lines + ['see_history with window=<days>'
                                   + (', agent="<name>" of your team.' if len(scope) > 1 else ".")])
@@ -25134,6 +25166,7 @@ def validate_team(team):
                              f"servers: {', '.join(catalog)}")
         if a["role"] == "manager" and (repos or tools):
             raise ValueError("the manager has no repos or tools: they reach task sessions only")
+        server_holds(name, a)               # DevOps plan C4: Read or Fix on a server, through the door
         grants = a.get("google")            # owner feature google: a missing service is no access
         if "google" in a and (a["role"] not in ("worker", "lead") or not isinstance(grants, dict) or not grants or not all(
                 s in GOOGLE_LEVELS and isinstance(g, dict) and set(g) == {"account", "level"} and
@@ -25212,6 +25245,7 @@ def validate_team(team):
     # in is read as it is: the key is not checked, not written and not read anywhere. The same holds for "targets"
     # and an agent's "targets" since Targets left the hub (the owner, 24 October 2026).
     validate_resources(team)        # owner feature resource_grants: the grantable pool and the owner's ceiling
+    validate_door(team)             # DevOps plan C4: the door, when this fleet has one
     validate_chat_apps(team)
     check_lines({n: (a["role"], a.get("reports_to")) for n, a in team["agents"].items()})
     return team
@@ -26574,6 +26608,9 @@ def add_server_agent(server, body):
         here = server_agents(server, team)
         if here:
             raise Refusal(409, f"{server} has an agent already: {', '.join(here)}")
+        if fix_holders(team, server):       # DevOps plan C4: root there through the door would reach the new agent
+            raise Refusal(409, f"{', '.join(fix_holders(team, server))} holds Fix on {server}: a new agent goes to a "
+                               f"server where no other agent has root.")
         boss = team["agents"].get(parent) if parent else None
         if parent and (boss is None or boss.get("role") not in ("manager", "lead")):
             raise Refusal(400, "reports_to must be the manager or a lead")
@@ -26836,6 +26873,108 @@ def rename_agent(agent, body):
             "sha256": hashlib.sha256(data).hexdigest()}
 
 
+# ---- an agent moves to an empty server (owner feature agent_move, DevOps plan C7)
+#
+# One step for any agent, the manager too, and the same step for every customer: one commit of team.json puts the
+# agent on the new server, the new server's service gets the install job that a new agent gets (its user, runtime,
+# checkout, service and sign-in), and its old session ends. From the commit on, the hub refuses the old machine for
+# that agent, and its refusal says `moved`, on which the old helper ends the agent's sessions and its own service
+# (fleet.py `moved_away`). Its tasks, messages, notes, memory, history, duties and grants stay with it on the hub. Its
+# vault belonged to the old machine, so it starts with none there, as a new agent does: default_access_sweep gives a
+# worker or a lead the new machine's vault once that vault can serve it. What the old box holds stays there.
+MOVED = "moved_from:"           # kv: the machine an agent left in its newest move, whose calls get the answer `moved`
+
+
+def moved_away(who, src):
+    """True when this caller is the machine that `who` left in its newest move and is not `who`'s machine now."""
+    old = kv_get(MOVED + who) if who in agents() else None
+    return bool(old) and old != agents()[who].get("machine") and address_of_machine(old) == src
+
+
+def move_agent(agent, body):
+    """POST /ui/team/agents/<agent>/move: the agent on an empty server, which runs a server service and sent a reading
+    in the last ten minutes. Not while a turn of it runs, or while it has an open sign-in. A Mac agent moves to a Mac
+    and a Linux agent to Linux, because what an agent holds there (a browser, a screen) belongs to that kind. The same
+    command for an agent that is on that server already, whose install there failed, gives the install job again."""
+    server, t0 = body["server"], now()
+    rev = kit_revision(fresh=True)
+    team, current, _ = team_view(rev)
+    if body["base_sha256"] != current:
+        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+    a = team["agents"].get(agent)
+    if a is None:
+        raise Refusal(404, "no such agent")
+    if server not in server_names(team):
+        raise Refusal(404, "no such server")
+    if not q1("SELECT 1 FROM server_keys WHERE server=?", (server,)):
+        raise Refusal(409, f"{server} has no server service: it did not join with a join code")
+    expire_server_jobs(t0)
+    last = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (server,))
+    if last and last["state"] in JOB_OPEN:
+        raise job_busy(server, last)
+    if a.get("machine") == server:
+        if not last or last["kind"] != "install" or last["agent"] != agent or last["state"] != "failed":
+            raise Refusal(409, f"{shown_name(agent)} runs on {server} already.")
+    elif server == (team.get("hub") or {}).get("machine"):
+        raise Refusal(409, "No agent runs on the hub's server.")
+    elif server_agents(server, team):
+        raise Refusal(409, f"{server} has an agent already: {', '.join(server_agents(server, team))}")
+    elif [n for n in fix_holders(team, server) if n != agent]:
+        raise Refusal(409, f"{', '.join(n for n in fix_holders(team, server) if n != agent)} holds Fix on {server}: "
+                           f"an agent goes to a server where no other agent has root.")
+    reading = server_reading(server, [])
+    if reading is None or reading["stale"]:
+        raise Refusal(409, f"{server} sent no reading in the last 10 minutes: check that it is on")
+    old = a.get("machine")
+    kinds = (server_kind_of(team, old), server_kind_of(team, server)) if old != server else (None, None)
+    if None not in kinds and kinds[0] != kinds[1]:
+        raise Refusal(409, f"{shown_name(agent)} runs on a {'Mac' if kinds[0] == 'mac' else 'Linux server'}, and "
+                           f"{server} is {'a Mac' if kinds[1] == 'mac' else 'Linux'}: an agent moves to a server of "
+                           f"its own kind.")
+    if running_turns(owner=agent, t0=t0):
+        raise Refusal(409, f"{shown_name(agent)} is in the middle of a turn. Move it when the turn ends.")
+    if open_login(agent):
+        raise Refusal(409, f"{shown_name(agent)} has an open sign-in. Finish it or let it run out, then try again.")
+    commit, digest = rev, current
+    if old != server:
+        a["machine"] = server
+        if server in (a.get("servers") or {}):      # its own server now: free root there, and no door grant
+            a["servers"] = {h: v for h, v in a["servers"].items() if h != server}
+            if not a["servers"]:
+                del a["servers"]
+        if a.get("vault", "none") != "none":
+            a["vault"] = "none"             # its vault was the old machine's (the comment above)
+        a.pop("vault_recipient", None)
+        try:
+            validate_team(team)
+        except ValueError as e:
+            raise Refusal(400, str(e)) from None
+        data = (json.dumps(team, indent=2) + "\n").encode()
+        commit = commit_kit_file("team.json", data, f"Owner moved agent {agent} from {old} to server {server}")
+        digest = hashlib.sha256(data).hexdigest()
+    with transaction():
+        if old != server:
+            revoke_sessions(agent, t0)
+            DB.execute("DELETE FROM agent_keys WHERE agent=?", (agent,))   # its helper there enrolls its own key
+            for table in ("machine_status", "machine_updates"):
+                DB.execute(f"DELETE FROM {table} WHERE agent=?", (agent,))
+            DB.execute("DELETE FROM kv WHERE k=?", (f"default_vault:{agent}",))
+            DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                       (MOVED + agent, old))
+        job = DB.execute("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated) VALUES(?,?,?,?,?,?,?)",
+                         (server, "install", agent, a["runtime"], "queued", t0, t0)).lastrowid
+        if old != server:
+            event_rows([(manager_name(), "say", None, f"[hub] The owner moved {agent} from {old} to the server "
+                                                      f"{server}. Its tasks, memory and duties stay with it. Its "
+                                                      f"session there starts when {server} has installed it and it "
+                                                      f"is signed in.", None)], t0)
+        log_row("owner", f"moved agent {agent} from {old} to server {server} in {commit[:12]}: job {job}"
+                if old != server else f"asked server {server} again to install {agent}: job {job}")
+    if old != server:
+        apply_team(team)
+    return {"agent": agent, "server": server, "was": old, "job": job, "revision": commit, "sha256": digest}
+
+
 # ---- a machine's name is its name in Tailscale
 
 # Every column that holds a machine's name. A rename moves each one in one transaction, so a server keeps its key, its
@@ -27022,6 +27161,8 @@ def save_grant(body, by="owner"):
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     ref, agent, grant = body["login"], body["agent"], body["grant"]
+    if agent == "door":         # DevOps plan C4: the door is one more holder of the central vault
+        return save_door_grant(team, rev, current, ref, grant, by)
     a = team["agents"].get(agent)
     if a is None:
         raise Refusal(404, "no such agent")
@@ -27235,7 +27376,7 @@ def github_hint(access, step, status, names):
     return f"; the GitHub App must be installed on {', '.join(names)}"
 
 
-def github_tokens(repos):
+def github_tokens(repos, agent=None):
     """([{token, expires_at, access, repos}], [{repos, error}]) for an agent's {owner/name: read | write | deploy}: one
     installation token for each account and access, limited to those repositories and that access. A token lasts
     one hour (GitHub's rule). A group that GitHub refuses is an error; the other groups still get their tokens.
@@ -27243,6 +27384,8 @@ def github_tokens(repos):
     The highest access comes first, because the session's GH_TOKEN is the first group's (fleet.py integration_env):
     a deploy token does everything a write token does and more, so the most capable one is the one that gh and the
     GitHub tool get, and no repository loses what its own level allows."""
+    if door_conf() is not None:         # DevOps plan C4: a hub with a door asks it, and keeps no key of its own
+        return door_github_tokens(agent, repos)
     app = github_app()
     if app is None:
         raise GitHubError("the hub has no GitHub App yet: the owner puts its file in place first")
@@ -27935,6 +28078,304 @@ def record_status(agent, data):
         # switch of this manager is open, so that no end of a switch would use it.
         answer["handover_done"] = released or not manager_held(agent)
     return answer
+
+
+# ---------------------------------------------------------------- the door and server access (DevOps plan C4)
+#
+# A server is one more thing that an agent can use, as a repository is: server:<name>, at Read or Fix, and only the
+# owner gives it, in the Servers group of his app. Read is the host's fixed reads through the door; Fix adds ops-root,
+# whose mode file limits a Fleet machine (the hub's server among them) to the rule calls, so agents patch and reboot
+# those and cannot open other agents. Fix on the agent's own server is its free root, with no door, so it is no grant.
+# The hub only records a grant (team.json agents.<name>.servers): the app puts the host's parts on the host over the
+# owner's own SSH and writes the door's access file as root, so the hub can neither name an agent to the door nor add
+# a grant there.
+#
+# A fleet with a door (team.json "door": {address, port}) asks it for its agents' GitHub tokens with the first of the
+# hub's two door secrets, and a fleet with no door keeps its own App key. The second secret reads the door's record,
+# which the hub keeps each minute for the manager (see_history what="door"). The door is one more holder of the central
+# vault: the secrets of team.json "door".secrets are sealed to the door's pinned key, and the door fetches each copy
+# from its own address (GET /door/sealed), which nobody else is answered on.
+DOOR_SECRETS_FILE = os.path.expanduser("~/.fleet/door.json")   # {"token", "record"}, written as root (plan step X2)
+DOOR_PORT = 9431
+DOOR_WAIT = 30                  # seconds one call to the door may take
+DOOR_READ_EVERY = 60            # seconds between two reads of the door's record
+DOOR_PAGE = 500
+DOOR = {"read_at": 0.0, "error": None}      # what the record timer last saw, in this process only
+
+
+def server_holds(name, a):
+    """team.json agents.<name>.servers: up to 32 hosts, each at read or fix, for a worker or a lead, and never its own
+    machine, where it has free root with no door. ValueError with the reason."""
+    held = a.get("servers", {})
+    if not isinstance(held, dict) or len(held) > 32 or not all(
+            isinstance(h, str) and SERVER_HOST.fullmatch(h) and v in SERVER_LEVELS for h, v in held.items()):
+        raise ValueError(f"agent {name}: servers must map up to 32 hosts to read or fix")
+    if held and a.get("role") not in ("worker", "lead"):
+        raise ValueError(f"agent {name}: a server through the door is for a worker or a lead")
+    if a.get("machine") in held:
+        raise ValueError(f"agent {name} has free root on its own server, {a['machine']}: no door grant there")
+
+
+def validate_door(team):
+    """team.json "door": {address, port, secrets}: the door's address on the private network, its port, and the
+    secrets of the catalog that the door holds (the central vault seals them to the door's pinned key)."""
+    import ipaddress
+    door = team.get("door")
+    if door is None:
+        return
+    if not isinstance(door, dict) or set(door) - {"address", "port", "secrets"}:
+        raise ValueError("door must be {address, port, secrets}")
+    try:
+        ipaddress.ip_address(door.get("address"))
+    except (ValueError, TypeError):
+        raise ValueError("door.address is the door's address on the private network") from None
+    if door["address"] in (team.get("addresses") or {}).values():
+        raise ValueError("the door runs on a server of its own, which is no machine of the fleet")
+    port = door.get("port", DOOR_PORT)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("door.port is a port number")
+    held = door.get("secrets", [])
+    if not isinstance(held, list) or len(set(held)) != len(held) or not all(
+            ref in (team.get("logins") or {}) for ref in held):
+        raise ValueError("door.secrets names secrets of the catalog, each once")
+
+
+def fix_holders(team, server):
+    """The agents that hold Fix on this server through the door."""
+    return [n for n, a in (team.get("agents") or {}).items() if (a.get("servers") or {}).get(server) == "fix"]
+
+
+def server_mode(team, server):
+    """rule-only on a machine of the fleet (the hub's server among them), fix elsewhere: code decides it, so it needs
+    no control. A CI host that two businesses share is rule-only too, which the app's access file says."""
+    return "rule-only" if server in (team.get("addresses") or {}) else "fix"
+
+
+def grant_server(body):
+    """POST /ui/servers/grant: the owner gives one agent Read or Fix on one server, or takes it back (level null). One
+    commit of team.json, a record and a line of the log, as every grant; the app then puts the host's parts in place
+    and writes the door's access file."""
+    agent, server, level = body["agent"], body["server"], body["level"]
+    a = agents().get(agent)
+    if a is None:
+        raise Refusal(404, "no such agent")
+    if a.get("role") not in ("worker", "lead"):
+        raise Refusal(409, f"{shown_name(agent)} is the {a.get('role')}: a server through the door is for a worker or "
+                           f"a lead.")
+    if a.get("machine") == server:
+        raise Refusal(409, f"{server} is {shown_name(agent)}'s own server, where it has free root with no door.")
+    rid = f"server:{server}"
+    phrase = resource_phrase("server", server)
+    result = grant_resource("owner", rid, agent, level, phrase)
+    if result["changed"] or resource_recorded(rid, agent) != level:
+        with transaction():
+            resource_record(rid, agent, level, "owner", result["revision"])
+    return {"agent": agent, "server": server, "level": level, "mode": server_mode(TEAM, server),
+            **{k: result[k] for k in ("revision", "sha256", "changed")}}
+
+
+def door_conf():
+    """{address, port, token, record} of this fleet's door, or None when it has none: team.json gives the address,
+    and the hub's own file the two secrets."""
+    door = TEAM.get("door")
+    if not isinstance(door, dict) or not door.get("address"):
+        return None
+    try:
+        with open(CFG.get("door_secrets") or DOOR_SECRETS_FILE, encoding="utf-8") as f:
+            held = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not (isinstance(held, dict) and isinstance(held.get("token"), str) and isinstance(held.get("record"), str)):
+        return None
+    return {"address": door["address"], "port": door.get("port", DOOR_PORT), "token": held["token"],
+            "record": held["record"]}
+
+
+def door_call(conf, method, path, secret, body=None):
+    """One call to the door with one of the hub's two secrets: (status, answer). Never under LOCK."""
+    if LOCK._is_owned():
+        raise RuntimeError("the door is asked while LOCK is held: ask it before or after, never under it")
+    host = conf["address"] if ":" not in conf["address"] else f"[{conf['address']}]"
+    req = urllib.request.Request(f"http://{host}:{conf['port']}{path}", method=method,
+                                 data=None if body is None else json.dumps(body).encode(),
+                                 headers={"Authorization": "Bearer " + secret, "Content-Type": "application/json"})
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=DOOR_WAIT) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except ValueError:
+            return e.code, {}
+    except (urllib.error.URLError, OSError, ValueError):
+        return None, {"error": "the door does not answer"}
+
+
+def door_github_tokens(agent, repos):
+    """The tokens of a task session from the door, which makes one only for a grant in its own access file."""
+    conf = door_conf()
+    status, answer = door_call(conf, "POST", "/github/token", conf["token"], {"agent": agent, "repos": repos})
+    if status != 200 or not isinstance(answer, dict):
+        raise GitHubError("the door gave no GitHub token" + (f": {answer.get('error')}" if isinstance(answer, dict)
+                                                            and answer.get("error") else ""))
+    tokens = [t for t in answer.get("tokens") or [] if isinstance(t, dict) and isinstance(t.get("token"), str)
+              and GITHUB_TOKEN.fullmatch(t["token"])]
+    return tokens, [e for e in answer.get("errors") or [] if isinstance(e, dict)]
+
+
+def door_sweep(t0=None):
+    """The door's record since the hub's last line, each minute. A door that does not answer is said once, to the
+    manager, which raises Needs-you; the next answer says it is back."""
+    t0 = t0 or now()
+    conf = door_conf()
+    if conf is None or t0 - DOOR["read_at"] < DOOR_READ_EVERY:
+        return None
+    DOOR["read_at"] = t0
+    last = q1("SELECT MAX(n) n FROM door_record")["n"] or 0
+    status, answer = door_call(conf, "GET", f"/record?after={last}", conf["record"])
+    if status != 200 or not isinstance(answer, dict):
+        if DOOR["error"] is None:
+            DOOR["error"] = t0
+            emit(manager_name(), "say", "[hub] The door does not answer: no host read and no write happens, and no "
+                                        "new GitHub token is made. Raise Needs-you for the owner.")
+        return None
+    if DOOR["error"] is not None:
+        DOOR["error"] = None
+        emit(manager_name(), "say", "[hub] The door answers again.")
+    rows = [e for e in answer.get("entries") or [] if isinstance(e, dict) and isinstance(e.get("n"), int)]
+    with transaction():
+        for e in rows[:DOOR_PAGE]:
+            DB.execute("INSERT OR IGNORE INTO door_record(n,ts,caller,target,action,kind,outcome,why) "
+                       "VALUES(?,?,?,?,?,?,?,?)", (e["n"], float(e.get("ts") or t0), str(e.get("caller"))[:64],
+                                                   str(e.get("target"))[:120], str(e.get("action"))[:40],
+                                                   str(e.get("kind"))[:16], str(e.get("outcome"))[:16],
+                                                   str(e.get("why") or "")[:300]))
+    return len(rows)
+
+
+DOOR_PIN = "door"               # the name under which the owner pins the door's vault key in the central vault
+
+
+def door_reconcile():
+    """Each secret that the door holds, that the owner signed for the door (a grant to the machine "door", as for an
+    agent's machine: central_signatures) and that the door has no copy of yet, sealed by the central vault to the key
+    that the owner pinned for the door, waits for the door to fetch it. Only while the central vault is ok, never
+    under LOCK."""
+    if not central_ok():
+        return []
+    with CENTRAL_LOCK:
+        pin = central_pins(CENTRAL["status"]).get(DOOR_PIN)
+        granted, _pooled = central_signatures(CENTRAL["status"])
+    held = [ref for ref in ((TEAM.get("door") or {}).get("secrets")) or [] if (ref.lower(), DOOR_PIN) in granted]
+    made = []
+    for ref in held if pin else []:
+        if q1("SELECT 1 FROM door_copies WHERE login=?", (ref,)):
+            continue
+        try:
+            text = central_sealed(central_call("seal", {"login": ref, "machine": DOOR_PIN}), ref, DOOR_PIN, pin)
+        except Refusal as e:
+            central_said(f"the central vault did not seal {ref} for the door: {e}")
+            continue
+        made.append(door_deliver(ref, text))
+    return made
+
+
+def door_timer():
+    while True:
+        time.sleep(CFG["tick"])
+        for step in (door_sweep, door_reconcile):
+            try:
+                step()
+            except Exception:
+                traceback.print_exc()
+
+
+def history_door(a, days, start, before):
+    """see_history what="door": the door's record over the window, as the manager reads it for the owner's weekly
+    message: calls by kind and outcome, what the judge passed, and the refusals."""
+    rows = q("SELECT * FROM door_record WHERE ts>=? ORDER BY n", (start,))
+    if not rows:
+        return [f"The door's record holds no call in the last {days} days." if door_conf() else
+                "This fleet has no door."]
+    counts = {}
+    for r in rows:
+        counts[(r["kind"], r["outcome"])] = counts.get((r["kind"], r["outcome"]), 0) + 1
+    lines = [f"The door, last {days} days: " + ", ".join(f"{n} {k} {o}" for (k, o), n in sorted(counts.items()))]
+    lines += [f"judged and allowed: {r['caller']} {r['target']} {r['action']}" for r in rows
+              if r["kind"] == "judged" and r["outcome"] == "done"][-20:]
+    lines += [f"refused: {r['caller']} {r['target']} {r['action']}: {r['why']}" for r in rows
+              if r["kind"] == "refused"][-20:]
+    return lines
+
+
+def save_door_grant(team, rev, current, ref, grant, by):
+    """POST /ui/secrets/grant with agent "door": the door holds this secret (use) or no longer does (null). The central
+    vault seals it to the door's pinned key, and the door fetches the copy; no agent's box ever gets the value."""
+    door = team.get("door")
+    if not isinstance(door, dict):
+        raise Refusal(409, "this fleet has no door")
+    entry = (team.get("logins") or {}).get(ref)
+    if entry is None:
+        raise Refusal(404, "no such secret")
+    if grant not in ("use", None):
+        raise Refusal(400, "the door uses a secret; nobody reads it there")
+    held = list(door.get("secrets") or [])
+    receipt = {"login": ref, "agent": "door", "grant": grant, "revision": rev, "sha256": current, "changed": False,
+               "vault": None, "updates_requested": []}
+    if (ref in held) == (grant == "use"):
+        return receipt
+    door["secrets"] = sorted(set(held) | {ref}) if grant else [r for r in held if r != ref]
+    if not door["secrets"]:
+        del door["secrets"]
+    try:
+        validate_team(team)
+    except ValueError as e:
+        raise Refusal(400, str(e)) from None
+    data = (json.dumps(team, indent=2) + "\n").encode()
+    done = f"gave {entry['title']} to the door" if grant else f"took {entry['title']} back from the door"
+    commit = commit_kit_file("team.json", data, by.capitalize() + " " + done)
+    apply_team(team)
+    with transaction():
+        if grant is None:
+            DB.execute("DELETE FROM door_copies WHERE login=? AND fetched IS NULL", (ref,))
+        resource_record(f"secret:{ref}", "door", grant, by, commit)
+    central_due()
+    log(by, f"{done} ({ref}) in {commit[:12]}")
+    return dict(receipt, revision=commit, sha256=hashlib.sha256(data).hexdigest(), changed=True)
+
+
+def door_sealed(src):
+    """GET /door/sealed: the copies that wait for the door, answered only to the door's own address."""
+    door = TEAM.get("door") or {}
+    if not door.get("address") or src != door["address"]:
+        raise Refusal(403, "this is the door's route")
+    return {"copies": [{"id": r["id"], "login": r["login"], "sealed": r["sealed"]}
+                       for r in q("SELECT id, login, sealed FROM door_copies WHERE fetched IS NULL ORDER BY id")]}
+
+
+def door_fetched(src, copy, digest):
+    """POST /door/sealed/<id>: the door opened that copy. The sealed copy goes, and the hub keeps the value's
+    SHA-256, which the vault's own fingerprints can be checked against."""
+    door = TEAM.get("door") or {}
+    if not door.get("address") or src != door["address"]:
+        raise Refusal(403, "this is the door's route")
+    if not (isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)):
+        raise Refusal(400, "sha256 is 64 hex characters")
+    if not q1("SELECT 1 FROM door_copies WHERE id=? AND fetched IS NULL", (copy,)):
+        raise Refusal(404, "no such copy")
+    q("UPDATE door_copies SET fetched=?, sha256=?, sealed='' WHERE id=?", (now(), digest, copy))
+    return {"id": copy, "fetched": True}
+
+
+def door_deliver(login, sealed):
+    """A copy that the central vault sealed to the door's pinned key, for the door to fetch: the central vault's
+    reconciler calls this for each secret of team.json "door".secrets. An older copy of the same secret goes."""
+    if login not in ((TEAM.get("door") or {}).get("secrets") or []) or not sealed_copy(sealed):
+        raise Refusal(409, "the door holds no such secret, or this is no sealed copy")
+    with transaction():
+        DB.execute("DELETE FROM door_copies WHERE login=? AND fetched IS NULL", (login,))
+        return DB.execute("INSERT INTO door_copies(login,sealed,created) VALUES(?,?,?)",
+                          (login, sealed, now())).lastrowid
 
 
 # ---------------------------------------------------------------- health and backups (owner API 1.5)
@@ -29886,7 +30327,8 @@ class Handler(BaseHTTPRequestHandler):
             log("hub", f"REFUSED a call from {src} that claimed to be {who}")
             self.json(403, {"error": f"{src} is not {who}'s machine. See \"addresses\" in team.json." if want else
                                      f"{who}'s machine has no address, so the hub cannot tell who is calling. "
-                                     f"See \"addresses\" in team.json."})
+                                     f"See \"addresses\" in team.json.",
+                            **({"auth": "moved"} if want and moved_away(who, src) else {})})   # agent_move
             return False
         if who == "owner" or who not in agents():
             return True
@@ -30509,6 +30951,29 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("runtime must be codex or claude")
             return {"server": server, "agent": agent, "runtime": runtime}
         return self.ui_command(f"servers/{server}/prepare", read, lambda body: prepare_server_agent(server, body))
+
+    def ui_servers_grant(self):
+        """POST /ui/servers/grant (owner feature server_access): Read or Fix on one server for one agent, or null."""
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "agent", "server", "level"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            agent, server, level = data.get("agent"), data.get("server"), data.get("level")
+            if not (isinstance(agent, str) and AGENT_NAME.fullmatch(agent)):
+                raise ValueError("agent must be the name of an agent")
+            if not (isinstance(server, str) and SERVER_HOST.fullmatch(server)):
+                raise ValueError("server must be a host's name, as Tailscale gives it")
+            if level is not None and level not in SERVER_LEVELS:
+                raise ValueError("level must be read, fix or null")
+            return {"agent": agent, "server": server, "level": level}
+        return self.ui_command("servers/grant", read, grant_server)
+
+    def door_route(self, act):
+        """A route of the door's own (DevOps plan C4): answered only to the door's address, which act() checks."""
+        try:
+            return self.json(200, act())
+        except Refusal as e:
+            return self.json(e.status, {"error": str(e)})
 
     def ui_server_remove(self, server):
         """POST /ui/servers/<server>/remove: a server with no agent leaves Fleet."""
@@ -33629,6 +34094,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.mac_setup_page(parts[1])
         if len(parts) == 3 and parts[0] == "server" and parts[2] == "jobs":
             return self.server_jobs(parts[1])
+        if parts == ["door", "sealed"]:              # DevOps plan C4: the door fetches its copies
+            return self.door_route(lambda: door_sealed(self.client_address[0]))
         if parts == ["ui", "profiles"]:
             return self.ui_profiles(query)
         if parts == ["ui", "knowledge"]:
@@ -34141,6 +34608,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_agent_key(parts[3])
         if len(parts) == 5 and parts[:3] == ["ui", "team", "agents"] and parts[4] == "rename" and AGENT_NAME.fullmatch(parts[3]):
             return self.ui_agent_rename(parts[3])
+        if len(parts) == 5 and parts[:3] == ["ui", "team", "agents"] and parts[4] == "move" and AGENT_NAME.fullmatch(parts[3]):
+            return self.ui_agent_move(parts[3])
         if parts == ["ui", "team", "logins"]:
             return self.ui_team_login()
         if parts == ["ui", "secrets", "fingerprints"]:
@@ -34225,6 +34694,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_release_entitlement()
         if parts == ["ui", "servers", "join"]:
             return self.ui_servers_join()
+        if parts == ["ui", "servers", "grant"]:      # DevOps plan C4
+            return self.ui_servers_grant()
+        if len(parts) == 3 and parts[:2] == ["door", "sealed"] and re.fullmatch(r"[1-9][0-9]{0,17}", parts[2]):
+            return self.door_route(lambda: door_fetched(self.client_address[0], int(parts[2]),
+                                                        self.form().get("sha256")))
         if len(parts) == 4 and parts[:2] == ["ui", "servers"] and parts[3] in ("agents", "remove"):
             return self.ui_server_agent(parts[2]) if parts[3] == "agents" else self.ui_server_remove(parts[2])
         if len(parts) == 4 and parts[:2] == ["ui", "servers"] and parts[3] == "prepare":
@@ -34758,7 +35232,7 @@ class Handler(BaseHTTPRequestHandler):
         repos, tools, tokens, errors = dict(a.get("repos") or {}), list(a.get("tools") or []), [], []
         if repos:
             try:            # outside the hub's lock: GitHub can take seconds
-                tokens, errors = github_tokens(repos)
+                tokens, errors = github_tokens(repos, agent)
             except GitHubError as e:
                 errors = [{"repos": sorted(repos), "error": str(e)}]
             log(agent, "GitHub tokens for a task session: " + ("; ".join(
@@ -34896,6 +35370,20 @@ class Handler(BaseHTTPRequestHandler):
                                  "or hub")
             return {"agent": agent, "base_sha256": base, "name": name}
         return self.ui_command(f"team/agents/{agent}/rename", read, lambda body: rename_agent(agent, body))
+
+    def ui_agent_move(self, agent):
+        """POST /ui/team/agents/<agent>/move (owner feature agent_move): the agent on an empty server."""
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "base_sha256", "server"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            base, server = data.get("base_sha256"), data.get("server")
+            if not (isinstance(base, str) and re.fullmatch(r"[0-9a-f]{64}", base)):
+                raise ValueError("base_sha256 must be the SHA-256 of team.json")
+            if not (isinstance(server, str) and SERVER_NAME.fullmatch(server)):
+                raise ValueError("server must be the name of a server")
+            return {"agent": agent, "base_sha256": base, "server": server}
+        return self.ui_command(f"team/agents/{agent}/move", read, lambda body: move_agent(agent, body))
 
     def helper_vault_fingerprints(self, agent):
         """A broker registers salted fingerprints of a login that it opened for a confirmed, still open job, before
@@ -35944,6 +36432,7 @@ def main():
     kv_set("tick_ok", now())
     threading.Thread(target=timers, daemon=True).start()
     threading.Thread(target=central_timer, name="central-vault", daemon=True).start()
+    threading.Thread(target=door_timer, name="door-record", daemon=True).start()       # DevOps plan C4
     threading.Thread(target=knowledge_refresher, name="knowledge-pages", daemon=True).start()
     threading.Thread(target=ping_sender, name="pings", daemon=True).start()
     # AUTONOMY.md P6: the records written before this start, into the history, a short step at a time (the backfill)

@@ -87,6 +87,8 @@ NOT_TOOLS = {
     "/ui/needs/{}/secret": "a secret request's answer, which the app's secure form gives once the value is in a vault",
     "/ui/vault/intake": "a value sealed to the central vault, which only the owner's own vault makes",
     "/ui/vault/pin": "a statement signed with the owner's own key, which only his app on his Mac holds",
+    "/ui/servers/grant": "a server is given in the app's Servers group, which also puts the host's parts in place and "
+                         "writes the door's access file over the owner's own SSH (DevOps plan C4)",
     "/ui/vault/recovery": "a statement signed with the owner's own key, which only his app on his Mac holds",
     "/ui/vault/grant": "a statement signed with the owner's own key, which only his app on his Mac holds",
     "/ui/restore": "a whole fleet restored over this one, from a file this server would have to carry",
@@ -524,6 +526,9 @@ def grant_access(args):
     a whole map are read from `GET /ui/team` first, so only the named agent moves."""
     rid, agent, level = args.get("resource"), args.get("agent"), args.get("level")
     kind, _, what = str(rid or "").partition(":")
+    if kind == "server":            # DevOps plan C4: the app's Servers group, which also sets up the host
+        raise Refused("A server is given in the app's Servers group, which also puts the host's parts in place and "
+                      "writes the door's access file. Nothing here gives it.")
     if kind not in GRANTS or not what:
         raise Refused("resource must be <kind>:<what>, with a kind of " + ", ".join(sorted(GRANTS)) +
                       " — for example repo:acme/web, secret:bws://<uuid>, gmail:a@b.com or tool:github.")
@@ -938,6 +943,13 @@ def tools():
                              "manager, and not while the agent has an open task. Read servers to see the job end.",
              {"agent": S["text"], "name": S["text"], **rid}, ("agent", "name"),
              with_base("/ui/team/agents/{agent}/rename", ("name",), "the new name of this agent")),
+        tool("move_agent", "Move an agent to an empty server of its own kind, which joined with a join code: one "
+                           "commit of team.json, the install job there and the end of its old session. Its tasks, "
+                           "chat, memory, duties and grants stay with it; its vault starts again on the new server, "
+                           "and it signs in there. Not while a turn of it runs. Read servers to see the job end; the "
+                           "same call again gives a failed install there once more.",
+             {"agent": S["text"], "server": S["text"], **rid}, ("agent", "server"),
+             with_base("/ui/team/agents/{agent}/move", ("server",), "the server this agent moves to")),
         tool("agent_settings", "One agent's model, effort, capabilities, title, expertise, account or screen model. "
                                "Each of vault, runtime and vault_create is a command of its own, and has a tool of "
                                "its own here: vault_access, switch_runtime and login_creation.",
@@ -1026,7 +1038,9 @@ def tools():
                              "read|write|write_shared, gmail:<email> read|write|send, tool:<name> use. The grant is "
                              "the authorization: the agent then does what that access allows, and the hub records "
                              "who gave what to whom. A repository that the hub's GitHub App does not reach comes back "
-                             "with unreached: the GitHub page where the owner adds it to the App.",
+                             "with unreached: the GitHub page where the owner adds it to the App. A server "
+                             "(server:<name> read|fix) is not given here: the app's Servers group gives it, because it "
+                             "also puts the host's parts in place.",
              {"resource": S["text"], "agent": S["text"], "level": S["level"], **rid},
              ("resource", "agent", "level"), grant_access),
         tool("share_resource", "The owner's standing for one resource in the grantable pool: the manager may hand it "
