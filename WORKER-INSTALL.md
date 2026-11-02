@@ -133,6 +133,27 @@ systemctl --user daemon-reload
 
 These commands keep the repository, outputs, usage records and runtime login.
 
+## SSH over the private network only (Linux)
+
+Both installers and the setup executor let incoming traffic in on `tailscale0` only,
+SSH included, and open no port to the internet (`hubsetup.py firewall`). After the
+install, reach a machine at its Tailscale address: the address `team.json` gives it,
+which is the one the app uses too. The provider's own firewall stays the outer layer.
+
+**A machine installed before 2 November 2026 keeps the public SSH rule** that those
+installers added (`22/tcp ALLOW IN Anywhere`, comment `fleet ssh`), because a
+release reaches no root-owned file. As root in that machine's own checkout, once:
+
+```bash
+python3 hubsetup.py firewall --check
+python3 hubsetup.py firewall
+```
+
+It runs only on a machine that is on the private network, removes only the rules
+with that comment (IPv4 and IPv6), and keeps every other rule and the defaults. Run
+it over the private network: a session that came in over the public address keeps
+going, and a new one does not.
+
 ## Vault broker (Linux, V3)
 
 **The join line installs it.** `join.sh` runs `python3 hubsetup.py vault --hub <hub>`

@@ -21,6 +21,8 @@ Standard library only, and it reads no credential of a model provider.
     python3 hubsetup.py vault --hub URL [--kit PATH] [--check]
                                                     this machine's vault broker: its own user keeps the store's key
                                                     and the handover key, so no agent of the machine can read either
+    python3 hubsetup.py firewall [--check]          as root: incoming traffic over the private network only, SSH
+                                                    included, and no public SSH rule of an earlier installer
     python3 hubsetup.py check --address IP [--port N] [--kit PATH]
                                                     the end checks on this machine: selftest.py and GET /health
     python3 hubsetup.py fleet-id [--db PATH]        this fleet's own id in the hub's key store, made once
@@ -583,6 +585,59 @@ def agent_helper(service_user="fleet", repo=None, check=False, run=None, read=No
         say(f"  this run had no address for the configuration ref, so {VAULT_UPDATE} refuses until the join line "
             f"is run again; a release that changes vault.py then leaves this machine's broker behind")
     return "made"
+
+
+def firewall_script():
+    """The shell that sets this machine's firewall, as root. Everything on the private network comes in, SSH included,
+    and nothing else does: no public SSH rule is added, and the one that the installers before 2 November 2026 added
+    (comment `fleet ssh`, port 22 from anywhere) is removed. It is found by that comment, so a rule of the owner's own
+    stays, and deleted from the highest number down, so that each number still names the rule it was read for. An
+    active firewall keeps its defaults. A session that came in over the public address keeps going: only a new one
+    is refused."""
+    return ("set -eu\n"
+            "active=no\n"
+            "ufw status 2>/dev/null | grep -q '^Status: active' && active=yes\n"
+            'if [ "$active" = no ]; then\n'
+            "    ufw default deny incoming >/dev/null\n"
+            "    ufw default allow outgoing >/dev/null\n"
+            "fi\n"
+            "ufw allow in on tailscale0 comment 'fleet tailscale' >/dev/null\n"
+            '[ "$active" = yes ] || ufw --force enable >/dev/null\n'
+            "removed=0\n"
+            "for n in $(ufw status numbered | sed -n 's/^\\[ *\\([0-9][0-9]*\\)\\].*# fleet ssh *$/\\1/p' | sort -rn); do\n"
+            '    ufw --force delete "$n" >/dev/null\n'
+            "    removed=$((removed + 1))\n"
+            "done\n"
+            "ufw status | grep -q '^Status: active' || { echo 'the firewall did not turn on' >&2; exit 1; }\n"
+            "if ufw status | grep -q '# fleet ssh *$'; then echo 'the public SSH rule is still there' >&2; exit 1; fi\n"
+            'echo "removed=$removed"\n')
+
+
+def firewall(check=False, run=None):
+    """The firewall of this Linux machine: incoming traffic over the private network only, SSH included (the owner's
+    words, 2 November 2026: SSH reachable only over Tailscale after setup). Both installers call it as their firewall
+    step, and a machine that an earlier installer set up takes it as root in its own checkout, once.
+
+    It runs only on a machine that is on the private network, because a firewall that lets SSH in over Tailscale
+    alone leaves no way in to a machine that is not on it. Safe to run again. Returns "set" or "would set"."""
+    run = run or _shell
+    _code, out, _err = run("tailscale ip -4 2>/dev/null | head -n 1")
+    ip = (out or "").strip()
+    if not PRIVATE.match(ip):
+        raise Stop("this machine is not on the private network (tailscale ip -4 gave none of its addresses), so its "
+                   "firewall stays as it is: one that lets SSH in over the private network only would leave no way "
+                   "in. Connect Tailscale, then run this again.")
+    if check:
+        say(f"  would let everything on tailscale0 in, deny other incoming traffic, remove the public SSH rule of an "
+            f"earlier Founderizer, and turn the firewall on: SSH then reaches this machine at {ip} only")
+        return "would set"
+    code, out, err = run(firewall_script())
+    if code != 0:
+        raise Stop(f"the firewall could not be set: {(err or out).strip()[-300:]}")
+    removed = kv(out).get("removed", "0")
+    say(f"the firewall is on: incoming traffic over the private network only, SSH included, at {ip}"
+        + (f"; the public SSH rule of an earlier Founderizer is removed ({removed} lines)" if removed != "0" else ""))
+    return "set"
 # ---------------------------------------------------------------- the machine's vault broker (PRODUCT.md P5)
 
 def vault_reading(user=VAULT_USER, group=AGENT_GROUP):
@@ -1374,6 +1429,10 @@ def cmd_vault(args):
     vault_install(kit=args.kit or KIT, hub_address=args.hub, check=args.check, system=platform.system())
 
 
+def cmd_firewall(args):
+    firewall(check=args.check)
+
+
 def cmd_agent_list(args):
     """One line for each agent of this machine: its name, its runtime and its OS user. The installers read it, so
     it prints nothing else."""
@@ -1438,6 +1497,9 @@ def main(argv=None):
     va.add_argument("--kit", help="the checkout whose vault.py is installed; default: this one")
     va.add_argument("--check", action="store_true")
     va.set_defaults(fn=cmd_vault)
+    fw = sub.add_parser("firewall")
+    fw.add_argument("--check", action="store_true", help="say what it would do, change nothing")
+    fw.set_defaults(fn=cmd_firewall)
     ah = sub.add_parser("agent-helper")
     ah.add_argument("--user", default="fleet", help="the user that runs this machine's Founderizer services")
     ah.add_argument("--repo", help="the address of the fleet's configuration ref, which the vault helper fetches "

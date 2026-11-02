@@ -102,6 +102,10 @@ Keep these in shell variables of your own session, so that no secret is in a com
 Every command below runs over SSH from this machine. If you are already running on the server
 itself, leave out the `ssh "$SSHUSER@$HOST"` part and run the rest as root.
 
+**The server lets SSH in over the private network only once it is installed.** So the first thing
+both jobs do is put it on that network, and from then on every command goes to the address it gets
+there: `HOST` changes once, and only at the step that says so.
+
 ## Job A: install a new hub
 
 ### A1. Read the server
@@ -116,7 +120,25 @@ install needs one of those three systems. Tell the owner, and ask nothing else.
 If SSH itself fails, stop and give the owner the error as it came. Do not try another user, another
 port or another key.
 
-### A2. Put the Founderizer code on the server
+### A2. Put the server on the fleet's private network
+
+    ssh "$SSHUSER@$HOST" 'command -v tailscale >/dev/null 2>&1 || curl -fsSL https://tailscale.com/install.sh | sh'
+    ssh "$SSHUSER@$HOST" 'umask 077; cat > /root/fleet-authkey' < "$KEYFILE"
+    ssh "$SSHUSER@$HOST" 'tailscale status >/dev/null 2>&1 || tailscale up --auth-key=file:/root/fleet-authkey --accept-dns=false; rm -f /root/fleet-authkey; tailscale ip -4'
+
+Check: the last command prints an address that starts with `100.`. If `tailscale up` refuses the
+key, stop and give the owner the error as it came; a key is used once unless they made it
+reusable, and an advertised tag must exist in their own Tailscale policy.
+
+Then set `HOST` to that address, and reach the server there for every step after this one:
+
+    HOST=<the address the last command printed>
+    ssh -o BatchMode=yes "$SSHUSER@$HOST" 'id -u'
+
+If this SSH fails, stop and tell the owner: their Tailscale access rules must let this machine
+reach the server's port 22, because after the install SSH comes in over the private network only.
+
+### A3. Put the Founderizer code on the server
 
     ssh "$SSHUSER@$HOST" 'command -v git >/dev/null 2>&1 || { DEBIAN_FRONTEND=noninteractive apt-get -q update && DEBIAN_FRONTEND=noninteractive apt-get -y -q install git; }'
     ssh "$SSHUSER@$HOST" "if test -d /root/fleet-kit/.git; then git -C /root/fleet-kit pull -q --ff-only; else git clone -q -- '$SOURCE' /root/fleet-kit; fi"
@@ -126,7 +148,7 @@ Check: the last command prints a commit and the path of `hub.sh`. If the clone a
 or a user name, stop: the repository address needs a credential you do not have. Ask the owner for
 the exact command their download page gives, and use that command and no other.
 
-### A3. Read the plan, and show it to the owner
+### A4. Read the plan, and show it to the owner
 
     ssh "$SSHUSER@$HOST" 'sh /root/fleet-kit/hub.sh --check'
 
@@ -134,21 +156,13 @@ This changes nothing. It prints every step the install would take. Read it, and 
 steps as a short list. If it says the system is not one of the three, or that the copy is not a
 Founderizer repository, stop there.
 
-### A4. Give the auth key to the server, on standard input
-
-    ssh "$SSHUSER@$HOST" 'umask 077; cat > /root/fleet-authkey' < "$KEYFILE"
-    ssh "$SSHUSER@$HOST" 'test -s /root/fleet-authkey && stat -c %a /root/fleet-authkey'
-
-Check: it prints `600`. The key is now in one file that only root can read, and it is never in a
-command, a log or your answer. If the file is empty, stop and ask the owner to check their key
-file.
-
 ### A5. Start the install, and keep its output
 
 The install waits up to 30 minutes for the owner's Mac to claim the hub, so it runs on its own and
-writes to a log you read:
+writes to a log you read. The server is on the private network already (A2), so the installer asks
+for no key:
 
-    ssh "$SSHUSER@$HOST" 'setsid sh -c "sh /root/fleet-kit/hub.sh < /root/fleet-authkey > /root/fleet-install.log 2>&1; rm -f /root/fleet-authkey" > /dev/null 2>&1 &'
+    ssh "$SSHUSER@$HOST" 'setsid sh -c "sh /root/fleet-kit/hub.sh < /dev/null > /root/fleet-install.log 2>&1" > /dev/null 2>&1 &'
 
 Then read the log every 20 seconds, until it holds the line that starts with `FLEET_CLAIM=`:
 
@@ -209,6 +223,14 @@ Check: the last command prints an address that starts with `100.`. If `tailscale
 key, stop and give the owner the error as it came; a key is used once unless they made it
 reusable, and an advertised tag must exist in their own Tailscale policy.
 
+Then set `HOST` to that address, and reach the server there from now on, as in A2:
+
+    HOST=<the address the last command printed>
+    ssh -o BatchMode=yes "$SSHUSER@$HOST" 'id -u'
+
+If this SSH fails, stop and tell the owner: their Tailscale access rules must let this machine
+reach the server's port 22, because the join lets SSH in over the private network only.
+
 ### B3. Run the join line of the app
 
 Run the line the owner gave you, unchanged, on the server:
@@ -217,7 +239,8 @@ Run the line the owner gave you, unchanged, on the server:
 
 It fetches the join script from their own hub and joins the server: base packages, the service
 user, the checkout, the join itself with the one-time code on standard input, security updates,
-the firewall, one OS user for each agent this server already has, and `verify` at the end.
+the firewall (SSH over the private network only), one OS user for each agent this server already
+has, and `verify` at the end.
 
 Check: it prints `this machine is the server <name>`, then `the server service runs`, then the
 lines of `verify`.

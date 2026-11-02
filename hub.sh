@@ -279,25 +279,16 @@ Tailscale admin console, then run the line again."; }
     esac
 }
 
-firewall() {    # before the claim: the owner's Mac must reach port $port while the install runs
-    heading "the firewall: SSH and the private network only"
-    ports=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -u)
-    [ -n "$ports" ] || ports=22
+firewall() {    # before the claim: the owner's Mac must reach port $port while the install runs. SSH too comes in over
+                # the private network only, which this machine joined in the step before (hubsetup.py firewall).
+    heading "the firewall: the private network only"
     if [ "$check" = yes ]; then
-        plan "allow SSH ($(printf '%s' "$ports" | tr '\n' ' ' | sed 's/ $//')) and everything on tailscale0, deny \
-other incoming traffic, and turn the firewall on"
+        plan "let everything on tailscale0 in, deny other incoming traffic, remove the public SSH rule of an earlier \
+Founderizer, and turn the firewall on: SSH then reaches this server over the private network only"
         return 0
     fi
-    active=no
-    ufw status 2>/dev/null | grep -q '^Status: active' && active=yes
-    if [ "$active" = no ]; then
-        ufw default deny incoming >/dev/null
-        ufw default allow outgoing >/dev/null
-    fi
-    for p in $ports; do ufw allow "$p/tcp" comment 'fleet ssh' >/dev/null; done
-    ufw allow in on tailscale0 comment 'fleet tailscale' >/dev/null
-    [ "$active" = yes ] || ufw --force enable >/dev/null
-    say "  the firewall is on: SSH ($(printf '%s' "$ports" | tr '\n' ' ' | sed 's/ $//')) and the private network only"
+    python3 "$tree/hubsetup.py" firewall \
+        || stop "the firewall of this server could not be set: the line above says why. Run the line again."
 }
 
 repository() {
@@ -324,6 +315,8 @@ that Mac sends the code back; its address becomes addresses.owner"
         plan "commit team.json on config and push it to $bare"
         return 0
     fi
+    ports=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -u)     # the SSH port team.json records
+    [ -n "$ports" ] || ports=22
     zone=""
     [ -z "$timezone" ] || zone="--timezone $timezone"
     more=""

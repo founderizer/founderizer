@@ -3,7 +3,8 @@
 # owner runs it with the one line from Founderizer (Servers, Add server); FLEET_JOIN holds the one-time join code.
 #
 #   A VPS (Ubuntu 22.04 or 24.04, or Debian 12), as root: base packages, the user fleet, then the join, security
-#   updates and the firewall. The line has joined the private network (Tailscale) before this script.
+#   updates and the firewall. The line has joined the private network (Tailscale) before this script, and after it
+#   SSH reaches the machine over that network only.
 #   A Mac (macOS 14 or later, with Tailscale and Homebrew), as the user that will run the agents: tmux and Python
 #   with Homebrew, then the join, then this Mac's vault, the one step that asks for that user's password, then
 #   Claude's extension for Chrome. The Founderizer installer runs the same line as root behind macOS's own password
@@ -72,7 +73,7 @@ linux() {
     printf '%s\n' "$code" | as_worker python3 "/home/$WORKER/fleet-server/server.py" join --hub "$HUB" --kind linux \
         --ssh-port "${first:-22}"
     updates
-    firewall "${ports:-22}"
+    firewall "/home/$WORKER/fleet-server"
     current "/home/$WORKER/fleet-server" as_worker
     agent_helper "/home/$WORKER/fleet-server"
     agent_users "/home/$WORKER/fleet-server"
@@ -259,18 +260,11 @@ updates() {     # unattended security updates on, then the pending ones once; ne
     [ ! -f /var/run/reboot-required ] || say "this server needs a restart for its updates; restart it when it has no work"
 }
 
-firewall() {    # $1: the SSH ports. Incoming traffic only to SSH and on the private network. An active firewall keeps
-                # its other rules and its defaults.
-    active=no
-    ufw status 2>/dev/null | grep -q '^Status: active' && active=yes
-    if [ "$active" = no ]; then
-        ufw default deny incoming >/dev/null
-        ufw default allow outgoing >/dev/null
-    fi
-    for port in $1; do ufw allow "$port/tcp" comment 'fleet ssh' >/dev/null; done
-    ufw allow in on tailscale0 comment 'fleet tailscale' >/dev/null
-    [ "$active" = yes ] || ufw --force enable >/dev/null
-    say "the firewall is on: SSH ($(printf '%s' "$1" | tr '\n' ' ' | sed 's/ $//')) and the private network only"
+firewall() {    # $1: the checkout. Incoming traffic over the private network only, SSH included: this machine joined it
+                # before this script, and SSH from anywhere else is closed (hubsetup.py firewall). An active firewall
+                # keeps its other rules and its defaults.
+    python3 "$1/hubsetup.py" firewall </dev/null \
+        || stop "The firewall of this machine could not be set: the line above says why. Run the line again."
 }
 
 mac() {

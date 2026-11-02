@@ -4,8 +4,9 @@
 Runs on the owner Mac, outside the app sandbox, started by the signed local setup
 helper. It prepares one fresh Linux VPS as a Fleet worker: pinned host keys, a
 managed admin key, packages, security updates, a dedicated worker user, Tailscale,
-a firewall that keeps SSH open, registration on the hub, the agent runtime and the
-worker service.
+a firewall that lets SSH in over Tailscale only, registration on the hub, the agent
+runtime and the worker service. From the firewall on, every connection of the run
+goes to the server's Tailscale address.
 
 With --existing-machine (owner API 1.12) it adds one inactive agent with no
 credential access to a machine that the hub has ready: its own checkout, agent key
@@ -48,7 +49,7 @@ import uuid
 from pathlib import Path
 
 PROTOCOL = 1
-EXECUTOR_VERSION = "1.3.1"
+EXECUTOR_VERSION = "1.3.2"
 CAPABILITIES = ["existing_machine", "prepare_runtime"]
 WORKER_USER = "fleet"
 CONFIG_BRANCH = "config"     # the hub's configuration ref: a team.json change belongs there, never on the code branch
@@ -651,6 +652,12 @@ class Onboarding:
         return int(self.state["port"])
 
     @property
+    def address(self):
+        """Where this run reaches the server: the address it was given, until the firewall step lets SSH in over
+        Tailscale only (executor 1.3.2); from then on, and on every resume after it, the Tailscale address."""
+        return self.state["tailscale_ip"] if self.state.get("ssh_private") else self.state["host"]
+
+    @property
     def key_path(self):
         """The managed admin key. A preparation uses the key of the machine that this Mac set up."""
         return fleet_home() / "ssh" / ("%s_admin" % (self.state["machine"] if self.preparing else self.name))
@@ -673,7 +680,7 @@ class Onboarding:
             script = "FLEET_INPUT=$(cat <<'FLEET_EOF'\n%s\nFLEET_EOF\n)\n%s" % (input, script)
         if root and login != "root":
             script = "sudo -n bash -s <<'FLEET_ROOT'\nset -eu\n%s\nFLEET_ROOT" % script
-        return self.sys.ssh(host or self.host, self.port, login, script, auth="managed", identity=self.key_path,
+        return self.sys.ssh(host or self.address, self.port, login, script, auth="managed", identity=self.key_path,
                             timeout=timeout)
 
     def root(self, script, input=None, timeout=300, host=None):
@@ -697,12 +704,12 @@ class Onboarding:
                 self.provider_secret = self.ch.secret("provider_password")
                 # An existing machine keeps its own access, so every one of its at most five connections uses it.
                 self.askpass = AskpassServer(self.provider_secret, uses=8 if self.existing else 3)
-            return self.sys.ssh(self.host, self.port, self.state["login"], script, auth="password",
+            return self.sys.ssh(self.address, self.port, self.state["login"], script, auth="password",
                                 askpass=self.askpass, timeout=timeout)
         if mode == "identity":
-            return self.sys.ssh(self.host, self.port, self.state["login"], script, auth="identity",
+            return self.sys.ssh(self.address, self.port, self.state["login"], script, auth="identity",
                                 identity=self.auth.get("identity_file"), timeout=timeout)
-        return self.sys.ssh(self.host, self.port, self.state["login"], script, auth="agent", timeout=timeout)
+        return self.sys.ssh(self.address, self.port, self.state["login"], script, auth="agent", timeout=timeout)
 
     # ---- hub
     def hub_state(self):
@@ -760,22 +767,22 @@ class Onboarding:
         return ("skipped" if ours else "done"), "The hub offers machine onboarding; %s is free." % self.name
 
     def s_host_key(self):
-        keys = self.scan(self.host)
+        keys = self.scan(self.address)
         pinned = {k["sha256"] for k in self.state.get("host_keys", [])}
         if pinned:
             changed = [k for k in keys if k["sha256"] not in pinned]
             if changed:
                 raise Abort("The server host key changed since it was confirmed (%s). Stop and check the server."
                             % ", ".join(k["sha256"] for k in changed))
-            self.pin(self.host, self.port, keys)
+            self.pin(self.address, self.port, keys)
             return "skipped", "The pinned host keys match."
-        answer = self.ch.prompt("confirm_host_key", {"host": self.host, "port": self.port,
+        answer = self.ch.prompt("confirm_host_key", {"host": self.address, "port": self.port,
                                                      "fingerprints": [{"algorithm": k["type"], "sha256": k["sha256"]}
                                                                       for k in keys]})
         if answer is not True:
             raise Abort("The owner did not confirm the host key.")
         self.state["host_keys"] = [{"type": k["type"], "blob": k["blob"], "sha256": k["sha256"]} for k in keys]
-        self.pin(self.host, self.port, keys)
+        self.pin(self.address, self.port, keys)
         return "done", "%d host keys pinned." % len(keys)
 
     def ensure_key(self):
@@ -792,7 +799,7 @@ class Onboarding:
 
     def s_provider_login(self):
         pub = self.ensure_key()
-        if self.proof(self.host):
+        if self.proof(self.address):
             info = kv(self.root(OS_CHECK)[1])
             self.check_os(info)
             return "skipped", "The managed key already works; provider access was not needed."
@@ -818,7 +825,7 @@ class Onboarding:
         self.state["root_via"] = info.get("root")
 
     def s_managed_key(self):
-        if not self.proof(self.host):
+        if not self.proof(self.address):
             raise StepFailed("A fresh connection with only the managed key failed.")
         code, out, _ = self.root("id -u")
         if code != 0 or out.strip() != "0":
@@ -954,33 +961,45 @@ class Onboarding:
         write_ssh_config(self.name, ip, self.state["login"], self.port, self.key_path)
 
     def s_firewall(self):
-        """The setup arms a rollback that turns the firewall off after five minutes; only fresh SSH proofs on both
-        addresses cancel it. A rollback that an earlier run armed and did not cancel (a failed proof, or a stop) is
-        cancelled after the same proofs. A firewall with no armed rollback gets no change."""
+        """Incoming traffic over Tailscale only, SSH included (executor 1.3.2): no public SSH rule is added, and the one
+        that executors before it added (`fleet ssh`) is removed. The firewall changes only after a fresh SSH proof on
+        the Tailscale address and over that address, so a tailnet that does not let this Mac in leaves the server as it
+        was. The run then saves that it moved, so a resume never goes back to the public address. The setup arms a
+        rollback that turns the firewall off after five minutes; only a second fresh proof on the Tailscale address
+        cancels it. A rollback that an earlier run armed and did not cancel (a failed proof, or a stop) is cancelled
+        after the same proof. A firewall with no armed rollback gets no change."""
         ip = self.state.get("tailscale_ip")
+        if not ip:
+            raise StepFailed("The server has no Tailscale address, so the firewall stays as it is: one that lets SSH in "
+                             "over Tailscale only would leave no way in.")
         check = ("ufw status verbose 2>/dev/null | grep -q '^Status: active' && echo active=yes || echo active=no\n"
-                 "ufw status 2>/dev/null | grep -qE '^%s/tcp +ALLOW' && echo ssh=yes || echo ssh=no\n"
+                 "ufw status 2>/dev/null | grep -q '# fleet ssh *$' && echo public=yes || echo public=no\n"
                  "ufw status 2>/dev/null | grep -qE 'on tailscale0 +ALLOW|ALLOW IN +Anywhere on tailscale0' && echo ts=yes || echo ts=no\n"
-                 "systemctl is-active --quiet fleet-ufw-rollback.timer && echo rollback=armed || echo rollback=none"
-                 % self.port)
-        want = {"active": "yes", "ssh": "yes", "ts": "yes"}
+                 "systemctl is-active --quiet fleet-ufw-rollback.timer && echo rollback=armed || echo rollback=none")
+        want = {"active": "yes", "public": "no", "ts": "yes"}
         info = kv(self.root(check)[1])
-        proved = {k: info.get(k) for k in want} == want and self.proof(self.host) and ip and self.proof(ip)
+        proved = {k: info.get(k) for k in want} == want and self.proof(ip)
         if proved and info.get("rollback") != "armed":
-            return "skipped", "Firewall active; SSH and Tailscale allowed."
+            self.state["ssh_private"] = True
+            return "skipped", "Firewall active; SSH comes in over Tailscale only."
         if not proved:
-            self.must(FIREWALL % {"port": self.port}, "Firewall setup")
-            public_ok = self.proof(self.host)
-            private_ok = bool(ip) and self.proof(ip)
-            if not (public_ok and private_ok):
-                raise StepFailed("A fresh SSH proof failed (public %s, Tailscale %s). The firewall turns itself off "
-                                 "within five minutes." % (public_ok, private_ok))
+            if not self.proof(ip):
+                raise StepFailed("SSH does not reach the server on its Tailscale address %s, so the firewall stays as it "
+                                 "is: it lets SSH in over Tailscale alone. Let this Mac reach %s on port %d in the "
+                                 "tailnet policy, then resume." % (ip, ip, self.port))
+            self.state["ssh_private"] = True        # from here, every connection goes to the Tailscale address
+            self.save()
+            self.must(FIREWALL, "Firewall setup")
+            if not self.proof(ip):
+                raise StepFailed("A fresh SSH proof on the Tailscale address %s failed. The firewall turns itself off "
+                                 "within five minutes." % ip)
         self.must("systemctl stop fleet-ufw-rollback.timer", "Rollback cancel")
         info = kv(self.root(check)[1])
         if {k: info.get(k) for k in want} != want or info.get("rollback") != "none":
             raise StepFailed("Firewall rules are not as required: %s" % info)
-        return "done", ("Firewall active; SSH proved on both addresses; the rollback that an earlier run armed is "
-                        "cancelled." if proved else "Firewall active; SSH proved on both addresses; rollback cancelled.")
+        return "done", ("Firewall active; SSH proved on the Tailscale address; the rollback that an earlier run armed is "
+                        "cancelled." if proved else "Firewall active; SSH comes in over Tailscale only, proved there; "
+                        "rollback cancelled.")
 
     def s_hub_reach(self):
         out = self.must(as_worker("curl -fsS -m 10 %s/health >/dev/null && echo health=yes; "
@@ -1446,8 +1465,6 @@ class Onboarding:
     def s_verify(self):
         problems = []
         ip = self.state.get("tailscale_ip")
-        if not self.proof(self.host):
-            problems.append("managed key on the public address")
         if not (ip and self.proof(ip)):
             problems.append("managed key on the Tailscale address")
         info = kv(self.root(VERIFY)[1])
@@ -1785,14 +1802,18 @@ if ! command -v tailscale >/dev/null; then
 fi
 systemctl enable --now tailscaled"""
 
+# SSH comes in over tailscale0 alone, which the third line allows; the public SSH rule of an earlier executor goes,
+# found by its comment, from the highest number down (hubsetup.firewall_script does the same).
 FIREWALL = """ufw default deny incoming >/dev/null
 ufw default allow outgoing >/dev/null
-ufw allow %(port)s/tcp comment 'fleet ssh' >/dev/null
 ufw allow in on tailscale0 comment 'fleet tailscale' >/dev/null
 systemctl stop fleet-ufw-rollback.timer >/dev/null 2>&1 || true
 systemctl reset-failed fleet-ufw-rollback.timer fleet-ufw-rollback.service >/dev/null 2>&1 || true
 systemd-run --quiet --unit=fleet-ufw-rollback --on-active=300 /usr/sbin/ufw --force disable
-ufw --force enable >/dev/null"""
+ufw --force enable >/dev/null
+for n in $(ufw status numbered | sed -n 's/^\\[ *\\([0-9][0-9]*\\)\\].*# fleet ssh *$/\\1/p' | sort -rn); do
+  ufw --force delete "$n" >/dev/null
+done"""
 
 # The same count as the helper's report: security lines of a simulated upgrade.
 SECURITY_STATUS = """sim=$(apt-get -s -o Debug::NoLocking=1 upgrade) || exit 1

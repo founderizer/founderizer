@@ -409,7 +409,7 @@ class Verify:
         return self.answer(OK, f"{self.address} is up, and it is {self.machine}'s address.")
 
     def firewall(self):
-        """The firewall is on: only SSH and the private network reach this machine."""
+        """The firewall is on: only the private network reaches this machine, SSH included."""
         state, _how = self.firewall_state()
         mac = self.platform == "darwin"
         if state is True:
