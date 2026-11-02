@@ -28096,10 +28096,11 @@ def record_status(agent, data):
 # vault: the secrets of team.json "door".secrets are sealed to the door's pinned key, and the door fetches each copy
 # from its own address (GET /door/sealed), which nobody else is answered on.
 DOOR_SECRETS_FILE = os.path.expanduser("~/.fleet/door.json")   # {"token", "record"}, written as root (plan step X2)
-DOOR_PORT = 9431
+DOOR_PORT = 8766
 DOOR_WAIT = 30                  # seconds one call to the door may take
 DOOR_READ_EVERY = 60            # seconds between two reads of the door's record
 DOOR_PAGE = 500
+DOOR_COPY_WAIT = DEPOSIT_WAIT   # seconds a sealed copy waits for the door before it goes; the next pass seals it again
 DOOR = {"read_at": 0.0, "error": None}      # what the record timer last saw, in this process only
 
 
@@ -28267,6 +28268,9 @@ def door_reconcile():
         pin = central_pins(CENTRAL["status"]).get(DOOR_PIN)
         granted, _pooled = central_signatures(CENTRAL["status"])
     held = [ref for ref in ((TEAM.get("door") or {}).get("secrets")) or [] if (ref.lower(), DOOR_PIN) in granted]
+    with transaction():         # a copy that waited too long, and every copy of a grant that ended, go
+        DB.execute("DELETE FROM door_copies WHERE fetched IS NULL AND created<?", (now() - DOOR_COPY_WAIT,))
+        DB.execute(f"DELETE FROM door_copies WHERE login NOT IN ({','.join('?' * len(held))})", held)
     made = []
     for ref in held if pin else []:
         if q1("SELECT 1 FROM door_copies WHERE login=?", (ref,)):
@@ -28349,8 +28353,13 @@ def door_sealed(src):
     door = TEAM.get("door") or {}
     if not door.get("address") or src != door["address"]:
         raise Refusal(403, "this is the door's route")
+    with CENTRAL_LOCK:
+        granted = central_signatures(CENTRAL["status"])[0] if CENTRAL["status"] is not None else None
+    keep = None if granted is None else sorted(      # unknown while the vault does not answer: the door keeps all
+        ref for ref in door.get("secrets") or [] if (ref.lower(), DOOR_PIN) in granted)
     return {"copies": [{"id": r["id"], "login": r["login"], "sealed": r["sealed"]}
-                       for r in q("SELECT id, login, sealed FROM door_copies WHERE fetched IS NULL ORDER BY id")]}
+                       for r in q("SELECT id, login, sealed FROM door_copies WHERE fetched IS NULL ORDER BY id")],
+            "keep": keep}
 
 
 def door_fetched(src, copy, digest):
