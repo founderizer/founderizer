@@ -28264,7 +28264,8 @@ def door_call(conf, method, path, secret, body=None):
 
 
 def door_github_tokens(agent, repos):
-    """The tokens of a task session from the door, which makes one only for a grant in its own access file."""
+    """The tokens of a task session from the door. The hub names each grant; the door makes a token only for a grant
+    in its own access file, or for one inside the agent's business pool, at no more than the pool's level."""
     conf = door_conf()
     status, answer = door_call(conf, "POST", "/github/token", conf["token"], {"agent": agent, "repos": repos})
     if status != 200 or not isinstance(answer, dict):
