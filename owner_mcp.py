@@ -92,7 +92,8 @@ NOT_TOOLS = {
     "/ui/mcp/finish": "the authorization code of that flow",
     "/ui/secrets/add": "the value of a login",
     "/ui/secrets/fingerprints": "the owner's own secret catalog",
-    "/ui/needs/{}/secret": "a secret request's answer, which the app's secure form gives once the value is in a vault",
+    "/ui/needs/{}/secret": "a secret request's answer with a login, which the app's secure form gives once the value "
+                           "is in a vault; its decline carries no value, and decline_secret_request sends that",
     "/ui/vault/intake": "a value sealed to the central vault, which only the owner's own vault makes",
     "/ui/vault/pin": "a statement signed with the owner's own key, which only his app on his Mac holds",
     "/ui/servers/grant": "a server is given in the app's Servers group, which also puts the host's parts in place and "
@@ -427,6 +428,13 @@ def write_message(args):
 def answer_need(args):
     body = {k: args[k] for k in ("answer", "choice") if args.get(k) is not None}
     return command(f"/ui/needs/{int(args.get('need') or 0)}", body, "the answer", args.get("request_id"))
+
+
+def decline_secret(args):
+    """The decline half of a secret request's answer (POST /ui/needs/<id>/secret): no value comes in or goes out, so
+    it is a tool here. The answer with a login stays the app's secure form, which puts the value into a vault first."""
+    return command(f"/ui/needs/{int(args.get('need') or 0)}/secret", {"decline": args.get("reason") or ""},
+                   "the decline", args.get("request_id"))
 
 
 def plain(route, fields, what, rid_from_args=True):
@@ -1220,6 +1228,12 @@ def tools():
         tool("answer_needs_you", "Answer one Needs-you item: the words, or choice, the index of one option the item "
                                  "offers.",
              {"need": S["int"], "answer": S["text"], "choice": S["int"], **rid}, ("need",), answer_need),
+        tool("decline_secret_request", "Decline one Needs-you item that asks for a secret, a key or a login: the "
+                                       "request ends, and the agent that asked reads that it is not given, with "
+                                       "the reason if there is one. A decline carries no value. A value goes in "
+                                       "only through Founderizer's secure form. The agent reads the reason, so it "
+                                       "never holds a key.",
+             {"need": S["int"], "reason": S["text"], **rid}, ("need",), decline_secret),
         tool("control_task", "Pause, stop or resume one task, with its subtasks.",
              {"task": S["int"], "action": {"type": "string", "enum": ["pause", "stop", "resume", "resume_check"]},
               "note": S["note"], **rid}, ("task", "action"),

@@ -160,6 +160,7 @@ would read as an empty fleet instead of as a mistake.
 | `reload_team` | `/ui/team/reload` | Apply `team.json` from a pushed revision without restarting the hub. |
 | `send_message` | `/ui/messages` | Say something to an agent. **This is how a goal or a duty is set.** |
 | `answer_needs_you` | `/ui/needs/<id>` | Answer a Needs-you item, in words or by choosing an option. A secret request takes neither: the app's secure form answers it. |
+| `decline_secret_request` | `/ui/needs/<id>/secret` | Decline a secret request, with a reason or none. A decline carries no value, so this server sends it; an answer with a value stays the app's secure form. |
 | `control_task` / `steer_task` | `/ui/tasks/<id>/control`, `/steer` | Pause, stop, resume; steer an open task. |
 | `goal_state` / `duty_state` / `trigger_state` | `/ui/goals/<id>/state` and the two beside it | Pause, resume, finish, drop. |
 | `end_standing` | `/ui/standing/<id>/end` | End one standing instruction or target of any agent. `fleet_read(page="standing")` lists them. |
@@ -182,7 +183,8 @@ server is not allowed to carry.
    fleet (`POST /ui/releases/entitlement`), the GitHub App's private key, a chat app's bot token,
    Google's Connect, a vault login (also the one an agent asks for with `request_secret`, whose
    answer, `POST /ui/needs/<id>/secret`, only the app's secure form gives, once the value is in the
-   vault) and the Tailscale auth key itself. Each is the owner's account,
+   vault; its decline carries no value, so `decline_secret_request` sends that one) and the
+   Tailscale auth key itself. Each is the owner's account,
    the owner's money and the owner's liability (RULES.md, "Access that the fleet already holds"),
    and the value would have to pass through a tool. So the owner does these in the app, and this
    server hands out only what the fleet already holds. The Tailscale key is the one it touches,
