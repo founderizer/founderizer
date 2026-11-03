@@ -60,6 +60,7 @@ REPORT_EVERY = 300              # seconds between readings
 JOB_HEARTBEAT = "job_heartbeat"
 NAMES_FEATURE = "server_names"  # it takes a new name from the hub (adopt): hub.NAMES_FEATURE
 KEY_FEATURE = "rename_key"      # its rename job moves the agent's key file (carry_key): hub.KEY_FEATURE
+INSTALL_KEY = "install_key"     # its install job registers the new agent's key (key_step): hub.INSTALL_KEY
 POLL = 5                        # seconds between looks for a job
 CHROME_SETTLES = 30             # seconds from Chrome's start to the reading that says whether it answers
 SIGN_IN_WAIT = 900              # seconds a sign-in may take
@@ -440,7 +441,7 @@ class Service:
         return {"revision": self.loaded, "os": life.os_info(), "security": life.security(),
                 "runtimes": self.runtimes(),
                 "access": dict(life.access(), user=pwd.getpwuid(os.getuid()).pw_name),
-                "features": [JOB_HEARTBEAT, NAMES_FEATURE, KEY_FEATURE]}
+                "features": [JOB_HEARTBEAT, NAMES_FEATURE, KEY_FEATURE, INSTALL_KEY]}
 
     def runtimes(self):
         """Codex and Claude Code as this server's agent reads them: as its own OS user, in its own home and on its own
@@ -461,7 +462,7 @@ class Service:
     def agents_here(self):
         """[(agent, its team.json entry)] of this server, in team order, from the team.json of this service's own
         checkout: it stands on the fleet's configuration ref, where the hub writes it (update), and the join's
-        agent-users step reads the same file. The hub gives a server one agent for now (hub.add_server_agent)."""
+        agent-users step reads the same file. A server can have several agents (hub.add_server_agent)."""
         try:
             with open(os.path.join(self.kit, "team.json"), encoding="utf-8") as f:
                 agents = json.load(f).get("agents") or {}
@@ -586,6 +587,7 @@ class Service:
         user = self.user_step(job, agent)
         exe = self.runtime_step(job, runtime, user)
         folder = self.checkout_step(job, agent, user)
+        self.key_step(job, agent, folder, user)
         self.service_step(job, agent, runtime, folder, user)
         if job.get("sign_in") != "at_the_mac":      # the installer leads this sign-in, at this Mac's own screen
             self.sign_in_step(job, agent, runtime, exe, user)
@@ -830,6 +832,29 @@ class Service:
                                                            f"fleet-{agent}.service"]))
         if code != 0:
             raise failed("service", f"The service of {shown_name(agent)} did not start. Try again.", err or out)
+
+    def key_step(self, job, agent, folder, user=None):
+        """The agent's key, before its helper first starts: `fleet.py key` makes it in that agent's own home (mode 600)
+        when it has none and prints only its SHA-256, which goes to the hub with this job (hub.install_key). A helper
+        registers its own key only while it is alone on its machine, so without this the second agent of a server would
+        never reach the hub. The key itself never leaves that home, and is never on a command line."""
+        argv, cwd = self.in_folder(user, folder, [sys.executable, "fleet.py", "key", agent])
+        code, out, err = self.run(argv, cwd=cwd)
+        digest = (out.strip().splitlines() or [""])[-1]
+        if code != 0 or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise failed("service", f"{shown_name(agent)}'s key could not be made. Try again.", err or out)
+        for again in range(3):          # a hub that did not answer is asked again, as a heartbeat would be
+            status, answer = self.hub.call("POST", f"/server/{self.name}/jobs/{job['id']}",
+                                           {"state": "running", "step": "service", "prompt": None,
+                                            "detail": f"Starting {shown_name(agent)}.", "key_sha256": digest})
+            if (status != 0 and status < 500) or again == 2:
+                break
+            self.sleep(5)
+        if status == 404 or (status == 409 and str(answer.get("error") or "").startswith("the job is")):
+            raise Gone()
+        if status != 200:
+            raise failed("service", f"The hub did not take {shown_name(agent)}'s key. Try again.",
+                         str(answer.get("error") or status))
 
     def codex_trust(self, folder, step, user=None, agent=None):
         """Codex's trust of the agent's checkout, with the worker installer's function, so that a Codex session there

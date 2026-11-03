@@ -26123,9 +26123,11 @@ def save_access(body):
 # A server is a machine of team.json "addresses", except the owner's own computer ("owner"), and it can have no agent.
 # A server that joined with a join code (POST /join) has an entry in "servers" ({kind, user}), a server key (the hub
 # keeps only its SHA-256) and a server service (server.py): it sends the server's reading and installs agents, one
-# server job at a time. For now one agent runs on one server: a server is available when it has no agent, no open job
-# and a current reading of its own service. A second job kind prepares the other runtime of an agent on its server
-# before the owner switches it (owner feature runtime_switch), with no SSH from the owner's computer.
+# server job at a time. A server takes as many agents as the owner adds: it is available when it has no open job and a
+# current reading of its own service, and, once it has an agent, when that service gives a new agent its key
+# (INSTALL_KEY: on a machine with several agents a helper cannot register its own, helper_key) and no agent holds Fix
+# there through the door (fix_holders, DevOps plan C4). A second job kind prepares the other runtime of an agent on its
+# server before the owner switches it (owner feature runtime_switch), with no SSH from the owner's computer.
 
 SERVER_NAME = re.compile(r"[a-z][a-z0-9-]{1,30}")
 SERVER_KINDS = ("linux", "mac")
@@ -26139,6 +26141,7 @@ TAILNET_TAG = re.compile(r"tag:[a-z0-9][a-z0-9-]{0,62}")    # a tag as the app r
 JOB_OPEN = ("queued", "running", "needs_owner")
 JOB_STEPS = ("user", "runtime", "checkout", "service", "sign_in")       # `user`: the agent's own OS user, on Linux
 JOB_SILENT = 1800               # seconds after which an open job of a server without the job heartbeat has failed
+INSTALL_KEY = "install_key"     # a server service whose install job registers the new agent's key: server.INSTALL_KEY
 CODEX_SIGN_IN = RUNTIMES["codex"]["sign_in"]["url"]     # the link of its own device sign-in (sign_in_prompt)
 # A new agent's profile names no browser and no screen: what it holds is in its start text, from team.json
 # (holdings_start_text), and the agents of a Mac hold both (desktop_defaults). The words "It has no browser and no
@@ -26430,6 +26433,12 @@ def server_kind(reading):
     return "mac" if name.startswith("macOS") else "linux" if name else None
 
 
+def server_features(name):
+    """The features of the newest reading of this server's own service, [] without one."""
+    row = q1("SELECT data FROM server_status WHERE server=?", (name,))
+    return (json.loads(row["data"]).get("features") or []) if row else []
+
+
 def server_reading(name, here):
     """The newest reading of a server: its server service's, else the reading of the first of its agents whose helper
     reported one (a machine from before the servers feature). None without any."""
@@ -26574,6 +26583,19 @@ def server_watch_sweep(t0):
         kv_set("server_watch", json.dumps(kept, sort_keys=True) if kept else None)
 
 
+def not_shareable(team, here):
+    """The agents of a server that a second agent there would lock out: on a machine that agents share, a helper needs
+    its own agent key (allowed), and a broker that serves several callers (broker_serves). An agent alone on its
+    server may have neither, and nothing gives it one when another agent arrives."""
+    return [n for n in here if not agent_key(n) or
+            ((team["agents"].get(n) or {}).get("vault") == "broker" and not broker_serves(n, team))] if here else []
+
+
+def installing(job, agent):
+    """This server's newest job installs this agent now: the job gives it its key (install_key)."""
+    return bool(job and job["state"] in JOB_OPEN and job["kind"] == "install" and job["agent"] == agent)
+
+
 def servers_view():
     """GET /ui/servers: each server with its kind, address, agents, newest reading, availability (why: the codes of
     what stops a new agent) and newest job; and the state of the newest join code."""
@@ -26588,7 +26610,12 @@ def servers_view():
         if reading:                     # the reading's Fleet files are the hub's: same_code, as for a helper
             reading["current"] = same_code(reading["revision"], desired) if reading["revision"] and desired else None
         job = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (name,))
-        why = (["hub_machine"] if name == hub_machine else []) + (["has_agent"] if here else [])
+        # An agent there already: a new one needs a service that gives it its key, and a server where nobody else has
+        # root (add_server_agent).
+        why = (["hub_machine"] if name == hub_machine else []) + \
+            (["has_agent"] if here and INSTALL_KEY not in server_features(name) else
+             ["agent_not_ready"] if [n for n in not_shareable(team, here) if not installing(job, n)] else []) + \
+            (["fix_holder"] if fix_holders(team, name) else [])
         if name not in keys:
             why.append("no_service")
         elif reading is None or reading["source"] != "server":
@@ -26775,8 +26802,9 @@ def sign_in_prompt(prompt):
 
 
 def job_input(data):
-    """A server's report on one of its jobs: its state, step and detail, and the owner's sign-in while it waits."""
-    state, step, detail, prompt = (data.get(k) for k in ("state", "step", "detail", "prompt"))
+    """A server's report on one of its jobs: its state, step and detail, the owner's sign-in while it waits, and the
+    SHA-256 of the new agent's key (INSTALL_KEY)."""
+    state, step, detail, prompt, key = (data.get(k) for k in ("state", "step", "detail", "prompt", "key_sha256"))
     if state not in ("running", "needs_owner", "done", "failed"):
         raise ValueError("state must be running, needs_owner, done or failed")
     if step is not None and step not in JOB_STEPS:
@@ -26788,7 +26816,28 @@ def job_input(data):
     if prompt is not None and not sign_in_prompt(prompt):
         raise ValueError("prompt must be {kind: open_url, purpose: codex_login, url, code} or {kind: signin, "
                          "purpose: claude_login, agent, login}")
-    return {"state": state, "step": step, "detail": detail.strip() if detail else None, "prompt": prompt}
+    if key is not None and not (isinstance(key, str) and re.fullmatch(r"[0-9a-f]{64}", key) and state == "running"):
+        raise ValueError("key_sha256 must be 64 lowercase hex characters, with state running")
+    return {"state": state, "step": step, "detail": detail.strip() if detail else None, "prompt": prompt,
+            "key_sha256": key}
+
+
+def install_key(row, digest):
+    """The key of the agent that this open install job installs, from its server's own service (INSTALL_KEY), which
+    made it in that agent's own home: the agent's first key, or the same one again. Its helper cannot register one on a
+    machine that other agents share (Handler.helper_key), and nobody else may: a second key stays the owner's."""
+    if row["kind"] != "install":
+        raise Refusal(409, "only an install job gives an agent its key")
+    # An agent that moved away during its install, or was removed: the key of this server is no longer its key.
+    if (agents().get(row["agent"]) or {}).get("machine") != row["server"]:
+        raise Refusal(409, f"{row['agent']} does not run on {row['server']} any more")
+    known = agent_key(row["agent"])
+    if known:
+        if not hmac.compare_digest(known["sha256"], digest):
+            raise Refusal(409, f"{row['agent']} already has another key; only the owner replaces it")
+        return
+    ins("INSERT INTO agent_keys(agent,sha256,created,source) VALUES(?,?,?,'server')", (row["agent"], digest, now()))
+    log("hub", f"server {row['server']} registered {row['agent']}'s agent key (job {row['id']})")
 
 
 def start_server_login(server, agent, runtime):
@@ -26853,10 +26902,10 @@ def server_agent_entry(team, agent, server, runtime, role, parent):
 
 
 def add_server_agent(server, body):
-    """POST /ui/servers/<server>/agents: a new agent on an available server. The hub registers it in team.json with its
-    profile, inactive and with no credential access, and gives the server's service the job to install it. The same
-    command for the agent on this server whose last install or rename failed gives that job again, and changes
-    nothing else."""
+    """POST /ui/servers/<server>/agents: a new agent on an available server, beside the agents it has. The hub registers
+    it in team.json with its profile, inactive and with no credential access, and gives the server's service the job to
+    install it under its own OS user (a Mac's agents share one), which also gives it its agent key. The same command for
+    the agent on this server whose last install or rename failed gives that job again, and changes nothing else."""
     agent, runtime, role, parent, t0 = body["agent"], body["runtime"], body["role"], body["reports_to"], now()
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
@@ -26882,11 +26931,15 @@ def add_server_agent(server, body):
         kind, was = last["kind"], last["was"]
     else:
         here = server_agents(server, team)
-        if here:
-            raise Refusal(409, f"{server} has an agent already: {', '.join(here)}")
+        if here and INSTALL_KEY not in server_features(server):
+            raise Refusal(409, f"{server} runs an older Founderizer that cannot add a second agent. Update Founderizer "
+                               f"on {server}, then try again.")
         if fix_holders(team, server):       # DevOps plan C4: root there through the door would reach the new agent
             raise Refusal(409, f"{', '.join(fix_holders(team, server))} holds Fix on {server}: a new agent goes to a "
                                f"server where no other agent has root.")
+        if not_shareable(team, here):       # its helper or its vault would stop answering beside a second agent
+            raise Refusal(409, f"{', '.join(shown_name(n) for n in not_shareable(team, here))} on {server} cannot share "
+                               f"it yet: an agent beside another needs its own agent key and a vault that serves both.")
         boss = team["agents"].get(parent) if parent else None
         if parent and (boss is None or boss.get("role") not in ("manager", "lead")):
             raise Refusal(400, "reports_to must be the manager or a lead")
@@ -27188,6 +27241,10 @@ def move_agent(agent, body):
     last = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (server,))
     if last and last["state"] in JOB_OPEN:
         raise job_busy(server, last)
+    # Nor while its own server works on a job: an install there would still give it that server's key (install_key).
+    here = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (a.get("machine"),))
+    if a.get("machine") != server and here and here["state"] in JOB_OPEN:
+        raise job_busy(a.get("machine"), here)
     if a.get("machine") == server:
         if not last or last["kind"] != "install" or last["agent"] != agent or last["state"] != "failed":
             raise Refusal(409, f"{shown_name(agent)} runs on {server} already.")
@@ -30983,7 +31040,7 @@ class Handler(BaseHTTPRequestHandler):
                 usage = q1("SELECT data FROM agent_usage WHERE name=?", (name,))
                 lim = active_limit(name)
                 result["agents"].append(dict(name=name, role=config["role"], runtime=config["runtime"],
-                    active=agent_active(name),
+                    title=config.get("title"), active=agent_active(name),
                     can=config.get("can", []), usage=json.loads(usage["data"]) if usage else None,
                     reports_to=None if config["role"] == "manager" else
                     (config["reports_to"] if config.get("reports_to") in agents() else manager_name()),
@@ -31440,6 +31497,11 @@ class Handler(BaseHTTPRequestHandler):
             if prompt.get("kind") == "signin" and (prompt["agent"] != row["agent"] or not q1(
                     "SELECT id FROM signin_jobs WHERE id=? AND agent=?", (prompt["login"], row["agent"]))):
                 return self.json(409, {"error": "that sign-in is not this job's agent's"})
+            if update["key_sha256"]:
+                try:
+                    install_key(row, update["key_sha256"])
+                except Refusal as e:
+                    return self.json(e.status, {"error": str(e)})
             q("UPDATE server_jobs SET state=?, step=?, detail=?, prompt=?, updated=? WHERE id=?",
               (update["state"], update["step"], update["detail"],
                json.dumps(update["prompt"]) if update["prompt"] else None, now(), job))
