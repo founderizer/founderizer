@@ -1112,7 +1112,7 @@ def check_need_options(given):
         return None
     if len(out) < 2 or len(out) > NEED_OPTIONS_MAX:
         raise ToolError(f"Give 2 to {NEED_OPTIONS_MAX} options, or none at all. An item with one option is not a "
-                        f"choice, and the owner can always write his own answer instead.")
+                        f"choice, and the owner can always write their own answer instead.")
     for x in out:
         if not x:
             raise ToolError("An option cannot be empty.")
@@ -2258,7 +2258,7 @@ def allowance_start_text(agent, task_id):
 # altogether (asking_and_waiting): an agent that is merely unsure had to choose between stopping its work and
 # guessing, and rule 4 forbids the guess, so the cheapest thing it could do was the forbidden one.
 SECRET_SELF = (" Only a key or a login that the fleet does not hold you ask the owner for yourself, with "
-               "request_secret: this task waits for his answer.")
+               "request_secret: this task waits for the owner's answer.")
 RULE_FOUR = (" Never contact the owner from here: if you are blocked, use ask_my_requester, and your line takes the "
              "question up as far as it must go, the owner last. If you are only UNSURE and not "
              "blocked, ask anyway and say in default what you will go on with: the task does not pause, your "
@@ -5312,8 +5312,8 @@ def pass_notice(qu, t, by, up, reader, passed, note):
             (access_route(qu["asker"], qu["access"], reader, qu["access_level"], restarter(t)) + " "
              if qu["access"] else "") +
             f"-- {tref(t['id'])} waits for the answer. Answer with answer(question_id=\"Q-{qid}\", text=...)" +
-            (f", or, when only the owner can settle it, take it to him with raise_needs_you(..., "
-             f"question_id=\"Q-{qid}\"): his answer goes back to {qu['asker']} by itself." if manager else
+            (f", or, when only the owner can settle it, take it to them with raise_needs_you(..., "
+             f"question_id=\"Q-{qid}\"): their answer goes back to {qu['asker']} by itself." if manager else
              f", or pass it up once more with answer(question_id=\"Q-{qid}\", pass_up=true).") +
             f" {', '.join(passed)} passed it and may still answer it: the first answer wins.")
 
@@ -5334,9 +5334,9 @@ def pass_question(agent, qid, note):
         if not qu:
             raise ToolError(f"There is no question Q-{qid}.")
         if role_of(agent) == "manager":
-            raise ToolError(f"Nobody stands above you but the owner. Answer Q-{qid} yourself, or, when only he can "
-                            f"settle it, take it to him with raise_needs_you(..., question_id=\"Q-{qid}\"): his "
-                            f"answer goes back to {qu['asker']} by itself.")
+            raise ToolError(f"Nobody stands above you but the owner. Answer Q-{qid} yourself, or, when only the owner "
+                            f"can settle it, take it to them with raise_needs_you(..., question_id=\"Q-{qid}\"): "
+                            f"their answer goes back to {qu['asker']} by itself.")
         if agent in question_passers(qu):
             raise ToolError(f"You passed Q-{qid} up already, and it is with {qu['requester']} now: a question passes "
                             f"each level once. You may still answer it while nobody above you has.")
@@ -6140,7 +6140,7 @@ def capacity_text(view, filters, needs, restricted=False, parent=None, caller=No
         if not pool:
             out.append("  none. Every resource is the owner's to give until it makes one grantable: ask with "
                        "raise_needs_you, and say what the work needs it for. A key or a login the fleet does not "
-                       "hold at all: request_secret, and he types it into the vault.")
+                       "hold at all: request_secret, and the owner types it into the vault.")
     # The caller's own account is in none of the blocks above: it reads the capacity of the agents it may give work
     # to, and it is not one of them. Its own allowance is what every one of those placements costs a turn of, so it
     # belongs in the tool it calls before each one -- said as its own spending and not as a fact about an agent.
@@ -7223,11 +7223,11 @@ def need_is_notice(*texts):
     if not hit:
         return None
     return (f'Not raised: this item says "{hit.group(0)}", so it is a notice and not a Needs-you item. Needs you is '
-            f"only for what the owner must do or decide now: a change only he can make, a sign-in only he can "
-            f"complete, money, or a choice he kept. A warning, a status or an FYI goes to tell_owner, which posts "
-            f"it with no notification, or nowhere. If you will carry on with a default when he says nothing, it "
-            f"does not need him: go on with it, and tell_owner what you chose if he would want to read it. If he "
-            f"truly must do or decide something now, raise it again saying only that.")
+            f"only for what the owner must do or decide now: a change only they can make, a sign-in only they can "
+            f"complete, money, or a choice they kept. A warning, a status or an FYI goes to tell_owner, which posts "
+            f"it with no notification, or nowhere. If you will carry on with a default when the owner says nothing, "
+            f"it does not need them: go on with it, and tell_owner what you chose if they would want to read it. If "
+            f"the owner truly must do or decide something now, raise it again saying only that.")
 
 
 # A key, a password or a token is never asked for in words (owner feature secret_requests). The hub masks only the
@@ -7251,8 +7251,8 @@ def need_asks_secret(*texts):
     return (f'Not raised: this item asks the owner to "{hit.group(0)}", and a key, a password or a token is never '
             f"sent in words. The hub masks only the values it already knows, so it would be in your conversation and "
             f"in these records before anything could mask it. Ask for it with request_secret: the owner types it "
-            f"into a secure form in Founderizer on his Mac, it goes straight into the vault, and his answer gives "
-            f"you its name and its reference, never the value. If this item is about something else, say it "
+            f"into a secure form in Founderizer on their Mac, it goes straight into the vault, and their answer "
+            f"gives you its name and its reference, never the value. If this item is about something else, say it "
             f"without asking for the value itself.")
 
 
@@ -7284,10 +7284,11 @@ def t_raise_needs_you(agent, a):
     emit("owner", "notify", f"Needs you N-{nid}: {title}")
     ping_need(nid)                                      # owner feature push: the phone rings, also when it is closed
     picks = (" The owner sees your options and presses one: " + ", ".join(json.loads(options)) +
-             ". His answer is the words of the one he presses, or anything else he writes instead.") if options else ""
-    linked = (f" It is for Q-{qu['id']}: his answer goes to {qu['asker']} as the answer of Q-{qu['id']} by itself, "
-              f"and if Q-{qu['id']} is answered another way or {tref(qu['task'])} ends first, N-{nid} closes by "
-              f"itself." if qu else "")
+             ". The owner's answer is the words of the one they press, or anything else they write "
+             "instead.") if options else ""
+    linked = (f" It is for Q-{qu['id']}: the owner's answer goes to {qu['asker']} as the answer of Q-{qu['id']} by "
+              f"itself, and if Q-{qu['id']} is answered another way or {tref(qu['task'])} ends first, N-{nid} "
+              f"closes by itself." if qu else "")
     return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{linked}{picks}"
 
 
@@ -7314,7 +7315,7 @@ def need_question(agent, ref):
         raise ToolError(f"{tref(qu['task'])} has ended, so nothing waits for Q-{qid} any more.")
     other = q1("SELECT id FROM needs WHERE question=? AND answer IS NULL", (qid,))
     if other:
-        raise ToolError(f"N-{other['id']} already takes Q-{qid} to the owner: his answer goes to {qu['asker']} by "
+        raise ToolError(f"N-{other['id']} already takes Q-{qid} to the owner: their answer goes to {qu['asker']} by "
                         f"itself.")
     return qu
 
@@ -7366,14 +7367,14 @@ def secret_reply(agent, reply):
     try:
         reply = str(uuid.UUID(str(reply or "")))
     except ValueError:
-        raise ToolError("in_reply_to is the request_id of the owner's message that you answer: ask him for a secret "
-                        "only in reply to what he wrote.") from None
+        raise ToolError("in_reply_to is the request_id of the owner's message that you answer: ask them for a secret "
+                        "only in reply to what they wrote.") from None
     newest = q1("SELECT u.request_id, u.created, u.origin FROM ui_requests u JOIN events e ON e.id=u.event_id "
                 "WHERE u.recipient=? AND u.kind='message' AND u.need_id IS NULL AND e.read_at IS NOT NULL "
                 "ORDER BY e.id DESC LIMIT 1", (agent,))
     if not newest or newest["request_id"] != reply:
         raise ToolError("in_reply_to must name the owner's newest message to you: call read_messages first, then "
-                        "reply to his newest message.")
+                        "reply to their newest message.")
     return newest
 
 
@@ -7437,7 +7438,7 @@ def t_request_secret(agent, a):
     why = str(a.get("why") or "").strip()
     if not why or len(why) > SECRET_WHY_MAX:
         raise ToolError(f"why is what the work needs it for, in 1 to {SECRET_WHY_MAX} characters: the owner reads "
-                        f"it before he types the value.")
+                        f"it before they type the value.")
     give = {agent: "use"} if worker else a.get("give_to") or {}
     if not isinstance(give, dict) or len(give) > SECRET_GIVE_MAX:
         raise ToolError(f'give_to maps up to {SECRET_GIVE_MAX} agents to "use" or "read", for example '
@@ -7473,8 +7474,8 @@ def t_request_secret(agent, a):
             raise ToolError(f"The fleet already holds the API key {env}, as {have}, so there is nothing to type: "
                             f"{route}. If its value is wrong or was revoked, tell the owner with raise_needs_you that "
                             f"{have} must be removed on the Secrets page; then request_secret asks for the new one.")
-    waits = ("This task waits for his answer: end your turn. If he saves it, this session goes on once your machine's "
-             "vault has it; if he declines, his words come here.")
+    waits = ("This task waits for the owner's answer: end your turn. If they save it, this session goes on once your "
+             "machine's vault has it; if they decline, their words come here.")
     if tid:
         # One request of an agent for one thing that tasks wait on: a task joins it while it is open, or saved for
         # this agent and on its way to its machine, so his one answer reaches every task of it and rings him once
@@ -7522,10 +7523,10 @@ def t_request_secret(agent, a):
                        (agent, r["answered"])) or
                     q1("SELECT 1 FROM events WHERE agent=? AND kind='say' AND json_extract(extra, '$.steer') IS NOT "
                        "NULL AND created>? LIMIT 1", (agent, r["answered"]))):
-                raise ToolError(f"He declined N-{r['id']}: {r['answer']} " +
-                                ("Ask again only after he writes to you again." if chat else
-                                 "Go on without it, or deliver what you can; ask again only after he writes to you "
-                                 "or steers this task."))
+                raise ToolError(f"The owner declined N-{r['id']}: {r['answer']} " +
+                                ("Ask again only after they write to you again." if chat else
+                                 "Go on without it, or deliver what you can; ask again only after they write to you "
+                                 "or steer this task."))
             break
     # Each agent's own requests only: another agent's is neither counted nor named, because its answer goes to that
     # agent, so no agent waits on it; the chat's own requests and the tasks' are each their own place. The manager's
@@ -7535,20 +7536,20 @@ def t_request_secret(agent, a):
         old = need_secret(r)
         if bool(old.get("tasks")) != bool(tid) or not secret_same(old, kind, env, site):
             continue
-        return (f"N-{r['id']} already asks the owner for {secret_asked(old)}, so nothing was raised again. His "
-                f"answer {'comes to this chat' if chat else 'arrives as a message in this session'}.")
+        return (f"N-{r['id']} already asks the owner for {secret_asked(old)}, so nothing was raised again. The "
+                f"owner's answer {'comes to this chat' if chat else 'arrives as a message in this session'}.")
     if len(waiting) >= SECRET_REQUESTS_OPEN:
         raise ToolError(f"{len(waiting)} of your secret requests already wait for the owner: "
                         + ", ".join(f"N-{r['id']}" for r in waiting)
-                        + (". Tell him in this chat which one you need first." if chat else
+                        + (". Tell the owner in this chat which one you need first." if chat else
                            ". Go on with what does not need them, or deliver what you can." if tid else
-                           ". Wait for his answers before you ask for more."))
+                           ". Wait for the owner's answers before you ask for more."))
     # One message of his answers at most five requests, answered and declined ones too: by the message they cite, so
     # an older message cited while a newer one was unread uses up nothing of the newer one
     if chat and sum(need_secret(r).get("reply") == reply["request_id"] for r in
                     q("SELECT * FROM needs WHERE kind='secret' AND by=?", (agent,))) >= SECRET_ASKS_PER_MESSAGE:
-        raise ToolError(f"{SECRET_ASKS_PER_MESSAGE} requests already answer his newest message: tell him what else you "
-                        f"need, and ask for it when he writes again.")
+        raise ToolError(f"{SECRET_ASKS_PER_MESSAGE} requests already answer the owner's newest message: tell them "
+                        f"what else you need, and ask for it when they write again.")
     if tid and q1("SELECT COUNT(*) n FROM needs n, json_each(n.secret, '$.tasks') j WHERE n.kind='secret' AND "
                   "j.value=?", (tid,))["n"] >= SECRET_ASKS_PER_TASK:
         raise ToolError(f"This task has asked the owner for {SECRET_ASKS_PER_TASK} secrets already: deliver what you "
@@ -7565,19 +7566,19 @@ def t_request_secret(agent, a):
     emit("owner", "notify", f"Needs you N-{nid}: {title}")
     ping_need(nid)
     if tid:
-        return f"Asked the owner for {secret_asked(spec)} as N-{nid}. {waits} Never ask him for it in words."
+        return f"Asked the owner for {secret_asked(spec)} as N-{nid}. {waits} Never ask the owner for it in words."
     if worker:
         # A chat app shows no form, so the agent sends him one line there. Under the app's chat the form is right below
         # its reply, and a sentence about it is one he removes (UI-PATTERNS.md): these words give it none to copy.
-        line = (' He wrote from a chat app, where the form cannot show: send him this line there, "The form is in '
-                'Founderizer on your Mac. Never send it here."' if reply["origin"] else "")
-        return (f"Asked the owner for {secret_asked(spec)} as N-{nid}.{line} His answer comes to this chat as a message "
-                f"that needs no reply. Open the work that needs it with start_task only after his answer: a task "
-                f"session that starts before it does not have it. Never ask him for it in words.")
-    return (f"Asked the owner for {secret_asked(spec)} as N-{nid}. He types it into the secure form of N-{nid} in "
-            f"Founderizer on his Mac: it goes straight into the vault, and neither you nor any other agent ever sees "
-            f"it. His answer arrives as a message in this session with its name, its reference and who holds it, "
-            f"never its value. Never ask him for it in words in the meantime.")
+        line = (' The owner wrote from a chat app, where the form cannot show: send them this line there, "The form '
+                'is in Founderizer on your Mac. Never send it here."' if reply["origin"] else "")
+        return (f"Asked the owner for {secret_asked(spec)} as N-{nid}.{line} The owner's answer comes to this chat as "
+                f"a message that needs no reply. Open the work that needs it with start_task only after their answer: "
+                f"a task session that starts before it does not have it. Never ask the owner for it in words.")
+    return (f"Asked the owner for {secret_asked(spec)} as N-{nid}. They type it into the secure form of N-{nid} in "
+            f"Founderizer on their Mac: it goes straight into the vault, and neither you nor any other agent ever "
+            f"sees it. The owner's answer arrives as a message in this session with its name, its reference and who "
+            f"holds it, never its value. Never ask the owner for it in words in the meantime.")
 
 
 def secret_answer_text(ref, entry, spec, worker=False, task=False):
@@ -7642,7 +7643,7 @@ def answer_secret(body, request_id, client):
             # until then one quiet line, which wakes nobody. A decline, or a save that gives it nothing, goes on now.
             # the next step of a task that goes on without it, in its own events and never in his bubble
             note = "" if gave else (" Go on without it, or deliver what you can." if ref is None else
-                                    " He does not give it to you: go on without it, or deliver what you can.")
+                                    " The owner does not give it to you: go on without it, or deliver what you can.")
             event_id = owner_message_rows(request_id, "answer", need, text, client, need["by"], None, t0,
                                           task=waiters[0] if waiters else None, quiet=gave or not waiters, note=note)
             if ref is not None:
@@ -7717,7 +7718,7 @@ def secret_woken_words(r, spec):
     head = f"[hub] N-{r['id']}: the owner saved {'the API key' if entry.get('kind') == 'api_key' else 'the login'} " \
         f"{name} as {ref}"
     if not level:
-        return head + ", and he does not give it to you: go on without it, or ask your requester."
+        return head + ", and they do not give it to you: go on without it, or ask your requester."
     if level == "read":
         return head + (f", and your machine's vault has it. A session reads ${name} when it starts, so this one does "
                        f"not have it: ask your requester with ask_my_requester to start this task again.")
@@ -8120,7 +8121,7 @@ def central_down_news(t0, error):
                                         f"{int((t0 - down['since']) // 60)} minutes: {error}. Until it answers, the owner "
                                         f"cannot save a new secret and no new grant reaches a server; running agents "
                                         f"keep the keys they have. Only the owner can start it again, so raise "
-                                        f"Needs-you for him with raise_needs_you.")
+                                        f"Needs-you for the owner with raise_needs_you.")
             log("hub", f"told {manager_name()} that the central vault does not answer: {error}")
             down["told"] = True
         kv_set(CENTRAL_DOWN, json.dumps(down))
@@ -8384,7 +8385,8 @@ def central_intake(ref, text):
               for r in q("SELECT hash, len FROM secrets WHERE label=? ORDER BY id", (label,))]
     if not prints:
         raise Refusal(409, "the owner's vault registered no fingerprint of this secret, so the central vault could "
-                           "not tell that it holds his value: POST /ui/secrets/add with its fingerprints comes first")
+                           "not tell that it holds their value: POST /ui/secrets/add with its fingerprints comes "
+                           "first")
     answer = central_call("intake", {"login": ref, "title": entry["title"], "item": entry.get("kind") or "login",
                                      "ciphertext": text, "fingerprints": prints,
                                      "salts": {kind: fingerprint_salt(label) for kind, label in labels.items()}})
@@ -8561,7 +8563,7 @@ def t_start_task(agent, a):
     busy = desktop_refusal(agent, "none", requester)               # the task needs no browser and no screen
     if busy:
         raise ToolError(busy)
-    details = "The owner asked for this in his own words, in " + agent + "'s chat: " + clip(source["text"] or "", 2000)
+    details = HISTORY_OWNER_TASK + agent + "'s chat: " + clip(source["text"] or "", 2000)
     why = f"The owner asked {agent} for it in its own chat."
     guard(agent, details, why)
     t0 = now()
@@ -8572,11 +8574,11 @@ def t_start_task(agent, a):
                                      "follows": None, "case_id": None, "why": why})
         text = (f"Opened {tref(tid)} ({title}) for you, with {requester} as its requester. It starts in its own task "
                 f"session; tell the owner with tell_owner that it started, and do the work there, not here. Its "
-                f"result comes back into this chat by itself when it ends: then tell him with message_owner.")
+                f"result comes back into this chat by itself when it ends: then tell the owner with message_owner.")
         keep_command(command, {"task": tid, "text": text}, t0)
     emit(requester, "say", f"[hub] The owner asked {agent} for work in its own chat, and {agent} opened {tref(tid)} "
                            f"({title}). You are its requester: check its result when it comes. The result also goes "
-                           f"back into {agent}'s chat by itself, so do not pass it on to him.", task=tid,
+                           f"back into {agent}'s chat by itself, so do not pass it on to the owner.", task=tid,
          extra=QUIET_SAY)
     log(agent, f"opened {tref(tid)} from the owner's message {source['request_id']}")
     return text
@@ -8595,7 +8597,7 @@ def t_tell_owner(agent, a):
             # The one moment an agent is already reaching for the owner with nothing of his to answer, which is
             # what message_owner is for. Nothing else an agent reads named it.
             raise ToolError("Reply with in_reply_to set to the owner request UUID from read_messages. To write to "
-                            "the owner first, with no message of his to answer, use message_owner: short and rare.")
+                            "the owner first, with no message of theirs to answer, use message_owner: short and rare.")
     # **A manager's answer is linked to the message it answers.** Its own owner messages carry no request id — a
     # worker's do, and that is what a worker names — so the manager cannot name one however it tries, and every
     # reply of its own landed beside the owner's message instead of under it. The hub reads the chat the way the
@@ -10928,7 +10930,7 @@ def chat_result(task_id):
     said = (f"[hub] {tref(task_id)} ({clip(t['title'] or '', 120)}), which you opened from the owner's message "
             f"{source} in this chat, is {t['state']}: {clip(t['what'] or '', 3000)}"
             + (f" Where: {clip(t['where_'], 300)}" if t["where_"] else "") +
-            " Tell him in a few words what came of it, with message_owner. It needs no other reply.")
+            " Tell the owner in a few words what came of it, with message_owner. It needs no other reply.")
     emit(t["owner"], "chat", said, extra={"generation": kv_get("db_id"), "task_result": task_id})
     log(t["owner"], f"the result of {tref(task_id)} went back into its owner chat")
 
@@ -11825,8 +11827,8 @@ def t_see_goals(agent, a):
             f'with search="<words>" over every goal, or with goal="G-<id>" for one in full and how it was managed.'
             if closed else 'see_goals with goal="G-<id>" gives one goal in full, with how it was managed.')
     if not rows:
-        return ("No goal is open. A goal comes from the owner's own words: when he says in chat what he wants the "
-                "fleet to reach, write it down with update_goal (no goal, with title and text). Chat is still no "
+        return ("No goal is open. A goal comes from the owner's own words: when they say in chat what they want "
+                "the fleet to reach, write it down with update_goal (no goal, with title and text). Chat is still no "
                 "task.\n" + back)
     out = []
     for g in rows:
@@ -15920,7 +15922,8 @@ HISTORY_TOKEN = re.compile(r"[^\W_]+")      # the letters and digits that FTS5's
 HISTORY_REF = re.compile(r"(?i)^\s*(TR|CR|AM|CM|OM|OR|UP|N|Q|T|M|I)-?([1-9][0-9]{0,17})\s*$")
 HISTORY_DUTY_REF = re.compile(r"(?i)^\s*R-?([1-9][0-9]{0,17})(?:\s*/\s*C-?([1-9][0-9]{0,17}))?\s*$")
 HISTORY_CASE = re.compile(r"R-\d+/C-\d+")
-HISTORY_OWNER_TASK = "The owner asked for this in his own words, in "     # how t_start_task's details begin
+HISTORY_OWNER_TASK = "The owner asked for this in their own words, in "   # how t_start_task's details begin
+HISTORY_OWNER_TASK_BEFORE = "The owner asked for this in his own words, in "    # and began before 3 November 2026
 # A fleet tool call that acted outside the hub's own rows, which no other stream has: what it was given is the record.
 HISTORY_CALLS = tuple(t for t in OUTWARD_TOOLS if t not in ("message_owner", "reply", "message_contact")) + \
     ("write_knowledge", "write_skill", "save_trigger", "change_trigger", "set_reminder")
@@ -16077,7 +16080,7 @@ def history_task(t):
     text = "\n".join(x for x in (f"{tref(t['id'])} {t['title'] or ''}", t["details"] or "",
                                  f"Done when: {t['done_when']}" if t["done_when"] else "",
                                  f"Why: {t['why']}" if t["why"] else "") if x)
-    owners = str(t["details"] or "").startswith(HISTORY_OWNER_TASK)
+    owners = str(t["details"] or "").startswith((HISTORY_OWNER_TASK, HISTORY_OWNER_TASK_BEFORE))
     return [history_rec(a, "task", tref(t["id"]), text, t["created"], person=other, task=t["id"], owner_chat=owners)
             for a, other in history_pairs(t["owner"], t["requester"])]
 
@@ -19463,7 +19466,7 @@ def allowance_sweep(t0):
     emit(mgr, "say", f"[hub] YOUR OWN ALLOWANCE: {said} Every question, every result and every permission prompt of "
          f"this fleet waits for you, so when it is gone the fleet stops with you. Until the reset, work in fewer and "
          f"bigger steps, and put off what can wait. This is a warning for you and not a Needs-you item: the owner "
-         f"is not paged about a limit. If he would want to know what you will put off, say it once with "
+         f"is not paged about a limit. If they would want to know what you will put off, say it once with "
          f"tell_owner, which posts it with no notification. This is your own allowance and not a reason to move "
          f"work to an agent with more left: suitability comes first, as it always does. The hub says this once for "
          f"this window, and again only if it gets worse.", extra=QUIET_SAY)
@@ -19551,7 +19554,8 @@ def resume_lines(t0):
     mine = allowance_ahead(manager_name())[0]
     if mine:
         out.append(f"YOUR OWN ALLOWANCE: {mine} Fewer and bigger turns until the reset. It is a warning, not a "
-                   f"Needs-you item: tell_owner, with no notification, if he would want to know what you put off.")
+                   f"Needs-you item: tell_owner, with no notification, if the owner would want to know what you "
+                   f"put off.")
     return out
 
 
@@ -19743,7 +19747,7 @@ TOOLS = [
      "Say something upward that your task does not cover, without stopping it: this changes no state and counts as a "
      "step, so use it instead of blocking yourself with ask_my_requester when you are not blocked. It goes to the "
      "one who gave you the task, never past it and never to the owner; only a proposal, which needs the owner, goes "
-     "to the fleet manager's weekly list for him. about names what it is about (an open task, "
+     "to the fleet manager's weekly list for them. about names what it is about (an open task, "
      "an open case, a goal, a duty or an agent), and severity=\"now\" reaches your requester at once only when the "
      "hub can confirm that what about names is live.",
      S({"task_id": TASK_ID, "request_id": {"type": "string", "description": "A new UUID for each report"},
@@ -19861,7 +19865,7 @@ TOOLS = [
      "does. A lead that cannot passes it up with pass_up=true, and a note in text if that helps: it moves to the "
      "lead's own requester, the asker's task keeps waiting, and the lead's own work goes on. Whoever passed a question "
      "may still answer it, and the first answer wins. The manager passes nothing up: what only the owner can settle "
-     "goes to him with raise_needs_you and question_id, and his answer goes back to the asker by itself.",
+     "goes to them with raise_needs_you and question_id, and their answer goes back to the asker by itself.",
      S({"question_id": {"type": "string", "description": "Question id, for example Q-4"},
         "text": {"type": "string", "description": "The answer; with pass_up, an optional note for the level above"},
         "pass_up": {"type": "boolean", "description": "Pass the question to your own requester instead of answering "
@@ -19952,7 +19956,7 @@ TOOLS = [
         "closed": {"type": "boolean", "description": "The goals that are done or dropped, the newest first"},
         "search": {"type": "string", "description": "Words to look for in every goal, open or closed"}})),
     ("manager", "update_goal", t_update_goal,
-     "Write a goal down, or keep one moving. The owner sets no goal in the app: when he says in chat what he wants "
+     "Write a goal down, or keep one moving. The owner sets no goal in the app: when they say in chat what they want "
      "the fleet to reach, record it here with title, text and a request_id, and leave goal out. With goal: write "
      "its plan, set its next step (and the task that carries it) or a wake_at date when you look at it again, add a "
      "short review note, or close it with result when its work is done and checked.\n"
@@ -19966,7 +19970,7 @@ TOOLS = [
      "back whole.",
      S({"goal": {"type": "string", "description": "Goal id, for example G-3. Leave it out for a new goal"},
         "title": {"type": "string", "description": "A new goal's name in one line, in the owner's own sense"},
-        "text": {"type": "string", "description": "A new goal: what the owner wants reached, in his own words"},
+        "text": {"type": "string", "description": "A new goal: what the owner wants reached, in their own words"},
         "request_id": {"type": "string", "description": "A new UUID, for a new goal"}, "next_step": STR,
         "next_task": {"type": "string", "description": "The task of the next step, for example T-7"},
         "step": {"type": "string", "description": "One step of the plan in your own words: a new one, or new words "
@@ -19985,14 +19989,14 @@ TOOLS = [
         "what": STR, "task": {"type": "string", "description": "The task that spends it, for example T-7"}},
        ["goal", "amount", "currency", "what"])),
     ("manager", "raise_needs_you", t_raise_needs_you,
-     "Ask the owner for something that only he can do or decide, and that the work needs now: a change only he "
-     "can make, a sign-in only he can complete, new money or a new credential, or a choice he kept. It rings his "
+     "Ask the owner for something that only they can do or decide, and that the work needs now: a change only they "
+     "can make, a sign-in only they can complete, new money or a new credential, or a choice they kept. It rings their "
      "phone, so it is never for a warning, a status, a risk or an FYI, and never for something you will go on with "
-     "by default when he says nothing: those go to tell_owner, which posts with no notification, or nowhere. The "
-     "hub refuses an item whose own words say nothing is needed. Use rarely. When you ask him to choose, give the "
-     "choices in options: he presses one, and its words come back as the answer. Never ask for a key, a password or "
-     "a token here: request_secret is how the value reaches the vault without passing you. Its title, why and options "
-     "are plain words with no codes (T-61, R-3).",
+     "by default when they say nothing: those go to tell_owner, which posts with no notification, or nowhere. The "
+     "hub refuses an item whose own words say nothing is needed. Use rarely. When you ask the owner to choose, give "
+     "the choices in options: they press one, and its words come back as the answer. Never ask for a key, a password "
+     "or a token here: request_secret is how the value reaches the vault without passing you. Its title, why and "
+     "options are plain words with no codes (T-61, R-3).",
      S({"title": STR, "why": STR,
         "what_to_do": {"type": "string", "description": "The one thing that only the owner can do or decide now. "
                                                         "If there is none, do not raise the item."},
@@ -20000,19 +20004,19 @@ TOOLS = [
                     "description": f"The answers to offer, 2 to {NEED_OPTIONS_MAX}, each a short sentence of at "
                                    f"most {NEED_OPTION_CHARS} characters, because the app draws one row for each. "
                                    f"Leave it out for a question that is not a choice; the owner can always write "
-                                   f"his own answer instead."},
+                                   f"their own answer instead."},
         "question_id": {"type": "string", "description": "The question with you that only the owner can settle, "
-                        "for example Q-4: the item quotes its asker, his answer goes back to it as the answer, and "
-                        "the item closes by itself when the question is answered another way or its task ends"}},
+                        "for example Q-4: the item quotes its asker, the owner's answer goes back to it as the answer, "
+                        "and the item closes by itself when the question is answered another way or its task ends"}},
        ["title", "why", "what_to_do"])),
     ("manager", "request_secret", t_request_secret,
-     "Ask the owner for a secret that the fleet does not hold: an API key or a login. It is a Needs-you item that he "
-     "answers in a secure form in Founderizer on his Mac, so the value goes straight into the vault and never "
-     "passes you, your runtime or a chat: a key he typed in words would be in your conversation before anything "
-     "could mask it, so never ask for one in words. His answer arrives as a message in this session with the "
+     "Ask the owner for a secret that the fleet does not hold: an API key or a login. It is a Needs-you item that they "
+     "answer in a secure form in Founderizer on their Mac, so the value goes straight into the vault and never "
+     "passes you, your runtime or a chat: a key they typed in words would be in your conversation before anything "
+     "could mask it, so never ask for one in words. The owner's answer arrives as a message in this session with the "
      "secret's name, its reference (bws://...) and the agents that hold it now, never the value. Propose in "
-     "give_to the agents the work needs it for; he chooses. A key the catalog already has is refused, with how to "
-     "give it instead.",
+     "give_to the agents the work needs it for; the owner chooses. A key the catalog already has is refused, with how "
+     "to give it instead.",
      S({"kind": {"type": "string", "enum": list(SECRET_KINDS),
                  "description": "api_key (the default): a key an agent reads as a variable or its vault sends with "
                                 "call_api. login: a user name and a password the vault signs in with."},
@@ -20021,22 +20025,23 @@ TOOLS = [
         "site": {"type": "string", "description": "The address where it is used, with https://: a login's sign-in "
                                                   "page (required for a login), or the API an agent calls with it"},
         "why": {"type": "string", "description": "What the work needs it for, in a sentence or two: the owner "
-                                                 "reads it before he types the value"},
+                                                 "reads it before they type the value"},
         "give_to": {"type": "object", "additionalProperties": {"type": "string", "enum": ["use", "read"]},
                     "description": "The agents you propose should get it: use (its vault uses it, and the agent "
                                    "never sees it) or, for an API key, read (the key is in its sessions as env). "
-                                   "The owner can change this before he saves."}},
+                                   "The owner can change this before they save."}},
        ["why"])),
     # A worker's and a lead's own entry: in its owner chat, in reply to the owner's message, and in a task session
     # that no contact drives (tools_for), where the task waits for his answer
     ("worker", "request_secret", t_request_secret,
-     "Ask the owner for a key or a login that the fleet does not hold: one that he wants you to use, in your owner "
-     "chat in reply to his newest message to you, or one that your task needs, in its session. He types it into a "
-     "secure form, so the value goes straight into the vault and never passes you, your runtime or a chat: never ask "
-     "him for one in words. Your request proposes only you as its holder, and he chooses in his form. His answer names "
-     "it, its reference (bws://...) and who holds it, never the value. In your chat it comes as a message that needs "
-     "no reply, and you open the work that needs it with start_task only after it. In a task, the task waits for it: "
-     "end your turn, and if he saves it, this session goes on once your machine's vault has it.",
+     "Ask the owner for a key or a login that the fleet does not hold: one that they want you to use, in your owner "
+     "chat in reply to their newest message to you, or one that your task needs, in its session. The owner types it "
+     "into a secure form, so the value goes straight into the vault and never passes you, your runtime or a chat: "
+     "never ask them for one in words. Your request proposes only you as its holder, and the owner chooses in their "
+     "form. The owner's answer names it, its reference (bws://...) and who holds it, never the value. In your chat it "
+     "comes as a message that needs no reply, and you open the work that needs it with start_task only after it. In a "
+     "task, the task waits for it: end your turn, and if the owner saves it, this session goes on once your machine's "
+     "vault has it.",
      S({"kind": {"type": "string", "enum": list(SECRET_KINDS),
                  "description": "api_key (the default): a key that your vault sends with call_api. login: a user name "
                                 "and a password that your vault signs in with."},
@@ -20044,7 +20049,7 @@ TOOLS = [
         "site": {"type": "string", "description": "The address where it is used, with https://: a login's sign-in "
                                                   "page, or the API that your vault sends the key to (required)"},
         "why": {"type": "string", "description": "What the work needs it for, in a sentence or two: the owner "
-                                                 "reads it before he types the value"},
+                                                 "reads it before they type the value"},
         "in_reply_to": {"type": "string", "description": "In your owner chat: the request_id of the owner's newest "
                                                          "message to you"}},
        ["why", "site"])),
@@ -20199,8 +20204,8 @@ TOOLS = [
     ("all", "write_knowledge", t_write_knowledge,
      "Write one of the fleet's shared knowledge files, knowledge/<name>.md: a fact with no repository, such as an "
      "account, a customer or a supplier, that another agent may need. You write it directly, without asking; the "
-     "owner's own files (knowledge/owner/ and knowledge/services.md) are his alone. text is the file's whole new "
-     "content, so read it "
+     "owner's own files (knowledge/owner/ and knowledge/services.md) are the owner's alone. text is the file's whole "
+     "new content, so read it "
      "in your checkout first, change what you must and give all of it back. It becomes one commit of the "
      "configuration ref with your name and your why on it, which the owner reads and reverts in one step. What you "
      "yourself learned goes in remember instead, and a fact about a product goes in that product's repository.",
@@ -20364,7 +20369,7 @@ TOOLS = [
                                                    "tasks it came from"},
         "in_reply_to": STR}, ["text"])),
     ("all", "message_owner", t_message_owner,
-     "Write to the owner first, for example the result of work he asked you for, or a question about his own "
+     "Write to the owner first, for example the result of work they asked you for, or a question about their own "
      "request. Keep it short and rare. It goes to the chat app where the owner last wrote to you, else to your own "
      "WhatsApp number or Discord bot; without one it stays in the app. Answer an owner message with tell_owner "
      "instead. One request_id is one message: the same request_id again sends nothing more. Never put a login in the "
@@ -20372,11 +20377,11 @@ TOOLS = [
      S({"request_id": {"type": "string", "description": "A new UUID for each message"},
         "text": {"type": "string", "description": "The message, 1 to 4,000 characters"}}, ["request_id", "text"])),
     ("worker", "start_task", t_start_task,
-     "Only in your owner chat, and only when the owner asks you in his own words to do work: open it as a task of "
+     "Only in your owner chat, and only when the owner asks you in their own words to do work: open it as a task of "
      "your own. It runs in its own task session, with your line as its requester (the manager, or your lead), which "
      "checks the result; tell the owner with tell_owner that it started. Its result comes back into this chat by "
-     "itself when it ends: tell him then with message_owner. Give in_reply_to, the request UUID of his message: one "
-     "message is one task, and a message from another agent starts nothing.",
+     "itself when it ends: tell them then with message_owner. Give in_reply_to, the request UUID of the owner's "
+     "message: one message is one task, and a message from another agent starts nothing.",
      S({"title": STR, "done_when": {"type": "string", "description": "The line a stranger could test the result "
                                                                    "against"},
         "in_reply_to": {"type": "string", "description": "The request UUID of the owner's message that asks for the "
@@ -20827,7 +20832,7 @@ def overview_text():
     out.append("")
     # AUTONOMY.md P3: report_up's proposals wait here for the weekly list that the fleet manager takes to the owner
     out.append("PROPOSALS FOR THE OWNER. Decide a weak one yourself with decide_report (noted or wrong); every other one "
-               "goes on your weekly list to him, and only his yes makes it goal, with that goal named in note.")
+               "goes on your weekly list to the owner, and only their yes makes it goal, with that goal named in note.")
     rows = q("SELECT * FROM reports WHERE kind='proposal' AND decided IS NULL AND collapsed_into IS NULL ORDER BY id")
     out += [report_line(r) for r in rows] or ["  none"]
     out.append("")
@@ -24520,7 +24525,7 @@ def knowledge_add(path, content, attachment=None):
     owner = [k for k in knowledge_entries() if k["scope"] == "owner"]
     if len(owner) >= files or sum(k["bytes"] for k in owner) + len(content) > in_all:
         raise Refusal(413, f"the owner's knowledge has room for {files} files and {in_all // MIB} MiB")
-    said = f"Owner added {path}" + (f" from the file he attached (A-{attachment})" if attachment else "")
+    said = f"Owner added {path}" + (f" from the file they attached (A-{attachment})" if attachment else "")
     commit = commit_kit_file(path, content, said)
     log("owner", f"added {path} in {commit[:12]}" + (f" from A-{attachment}" if attachment else ""))
     title, source = knowledge_heading(content.decode())
@@ -36582,12 +36587,12 @@ def rpc(agent, m, headers, context=None, credential=None):
                                        f"You are '{agent}' in its direct owner chat. Read messages without a task id; "
                                        "reply to the owner with tell_owner using the request UUID in in_reply_to, and "
                                        "to an agent with message_agent and its AM id in in_reply_to. Discussion only; "
-                                       "no task execution here: when the owner asks you in his own words to do work, "
-                                       "open it with start_task and the request UUID of his message, and it runs in "
+                                       "no task execution here: when the owner asks you in their own words to do work, "
+                                       "open it with start_task and the request UUID of their message, and it runs in "
                                        "its own task session; its result comes back here by itself, and you tell "
-                                       "him with message_owner. A key or a login that he wants you to use and the "
-                                       "fleet does not hold: ask him with request_secret, in reply to his message, "
-                                       "never in words."
+                                       "them with message_owner. A key or a login that the owner wants you to use and "
+                                       "the fleet does not hold: ask them with request_secret, in reply to their "
+                                       "message, never in words."
                                        if chat_context(agent, context) else
                                        f"Team tools of Founderizer. You are '{agent}'. Execution work is a task; follow RULES.md.")}
         elif method == "ping":
