@@ -26136,7 +26136,7 @@ MAC_JOIN_LIFE = 7200            # a bare Mac installs its tools before the join,
 JOIN_TRIES = 5                  # wrong join codes from one address in JOIN_WINDOW seconds; then the address waits
 JOIN_WINDOW = 600
 JOIN_CODE = re.compile(r"[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{12}")       # LINK_ALPHABET: 12 characters, 60 bits
-FLEET_TAG = "tag:founderizer"  # the tag of the servers of a fleet whose hub has none (the app's PrivateNetwork.tag)
+FLEET_TAG = "tag:founderizer"  # the app's PrivateNetwork.tag: asked for where the hub has no tag and the tailnet has it
 TAILNET_TAG = re.compile(r"tag:[a-z0-9][a-z0-9-]{0,62}")    # a tag as the app reads one (PolicyFile.isTag)
 JOB_OPEN = ("queued", "running", "needs_owner")
 JOB_STEPS = ("user", "runtime", "checkout", "service", "sign_in")       # `user`: the agent's own OS user, on Linux
@@ -26637,35 +26637,46 @@ def hub_tags(status):
     server of the fleet joins with: the owner's tailnet policy gives the fleet's machines their rights by these tags,
     whoever the owner is, so the product names no tag of one owner's tailnet (the owner, 3 November 2026: "this app
     needs to work for ANY user"). None when the status says nothing, else the tags that the app would take from the
-    line, or FLEET_TAG when the hub has none: a fleet whose hub the app put on the network carries that tag already."""
+    line. A hub with none asks for FLEET_TAG only where a machine of the tailnet already carries it, which proves that
+    the policy defines it (the app writes it there with the owner's Tailscale credential), and else for no tag at all:
+    Tailscale refuses a tag that the policy does not define, and a hub that hub.sh put on the network with the owner's
+    own key carries none."""
     me = (status or {}).get("Self") if isinstance(status, dict) else None
     if not isinstance(me, dict):
         return None
     tags = me.get("Tags") if isinstance(me.get("Tags"), list) else []
-    return [t for t in tags if isinstance(t, str) and TAILNET_TAG.fullmatch(t)] or [FLEET_TAG]
+    tags = [t for t in tags if isinstance(t, str) and TAILNET_TAG.fullmatch(t)]
+    if tags:
+        return tags
+    peers = status.get("Peer") if isinstance(status.get("Peer"), dict) else {}
+    carried = any(isinstance(p, dict) and isinstance(p.get("Tags"), list) and FLEET_TAG in p["Tags"]
+                  for p in peers.values())
+    return [FLEET_TAG] if carried else []
 
 
 def join_tags():
-    """Outside LOCK, because the status may take 5 seconds: the hub's tags now, else the ones it read last
-    (TAILNET_NAMES), else FLEET_TAG."""
+    """Outside LOCK, because the status may take 5 seconds: hub_tags now, else what it gave last (TAILNET_NAMES), else
+    no tag."""
     tags = hub_tags(tailnet_status())
-    if tags:
+    if tags is not None:
         TAILNET_NAMES["tags"] = tags
-    return tags or TAILNET_NAMES.get("tags") or [FLEET_TAG]
+        return tags
+    return TAILNET_NAMES.get("tags") or []
 
 
 def join_line(code, kind, tags=None):
     """The one line that the owner pastes on the new server. A Mac has Tailscale already. A VPS gets it from Tailscale's
-    own installer and joins the private network with the tags of the hub's own machine (hub_tags; one sign-in link,
-    or none with a key that the app makes), under the name its provider gave it, which becomes its name in Fleet. Then
-    the line runs this hub's join script, with the code in that script's environment: never in a URL."""
+    own installer and joins the private network with the tags of hub_tags, and with no --advertise-tags when it gives
+    none (one sign-in link, or none with a key that the app makes), under the name its provider gave it, which becomes
+    its name in Fleet. Then the line runs this hub's join script, with the code in that script's environment: never in
+    a URL."""
     ip, port = hub_address()
     join = f"curl -fsS http://{ip}:{port}/join | FLEET_JOIN={code} sh"
     if kind == "mac":
         return join
-    tagged = ",".join(tags or [FLEET_TAG])
+    up = "tailscale up" + (f" --advertise-tags={','.join(tags)}" if tags else "") + " --accept-dns=false"
     return ("command -v tailscale >/dev/null || curl -fsSL https://tailscale.com/install.sh | sh; tailscale status "
-            f">/dev/null 2>&1 || tailscale up --advertise-tags={tagged} --accept-dns=false; " + join)
+            f">/dev/null 2>&1 || {up}; " + join)
 
 
 def new_join_code(kind, label="", agent=None, runtime=None, tags=None):

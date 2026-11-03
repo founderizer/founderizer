@@ -49,7 +49,7 @@ import uuid
 from pathlib import Path
 
 PROTOCOL = 1
-EXECUTOR_VERSION = "1.3.2"
+EXECUTOR_VERSION = "1.3.3"
 CAPABILITIES = ["existing_machine", "prepare_runtime"]
 WORKER_USER = "fleet"
 CONFIG_BRANCH = "config"     # the hub's configuration ref: a team.json change belongs there, never on the code branch
@@ -58,11 +58,12 @@ CONFIG_BRANCH = "config"     # the hub's configuration ref: a team.json change b
 # one commit: the commit checked is the commit taken.
 TAKE = ('git fetch -q origin && t=$(git rev-parse --verify -q "@{upstream}^{commit}") && '
         'python3 lifecycle.py may-take . "$t" && git merge -q --ff-only "$t"')
-# The tags of a new run's machine when the run names none: the product's own (hub.FLEET_TAG, the app's
-# PrivateNetwork.tag). A tailnet whose policy gives the fleet's machines their rights by other tags names them with
-# --tailscale-tag or the config file; the hub's join line takes the hub's own tags by itself (hub.hub_tags).
-DEFAULT_TAGS = "tag:founderizer"
+# The tags of a new run's machine when the run names none come from network_tags, by the rule of the hub's join line
+# (hub.hub_tags): the hub's own, else the product's own tag where the tailnet has it, else none. A tailnet whose policy
+# gives the fleet's machines their rights by other tags names them with --tailscale-tag or the config file.
+FLEET_TAG = "tag:founderizer"       # hub.FLEET_TAG, the app's PrivateNetwork.tag
 TAG_RE = re.compile(r"^tag:[A-Za-z][A-Za-z0-9-]*$")
+TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"      # the command on a Mac, as the hub reads it
 # Both at least 7 days old on 10 October 2026. A Codex version stays until someone installs another one. The Claude
 # version is only the first build: Claude Code's own installation updates itself (see CLAUDE_CHANNEL).
 RUNTIME_PINS = {"codex": "0.160.0", "claude": "2.1.287"}
@@ -601,11 +602,36 @@ def claude_login_command(config, ip, login, checkout='"$HOME/fleet-pilot"', exe=
 
 
 def tailscale_tags(value):
-    """The --advertise-tags value of a new run: one or more tag:<name>, separated by commas. A saved run keeps its own."""
+    """The --advertise-tags value of a new run: one or more tag:<name>, separated by commas, or "" for none. A saved run
+    keeps its own."""
+    if not str(value or "").strip():
+        return ""
     tags = [t.strip() for t in str(value).split(",")]
     if not all(TAG_RE.match(t) for t in tags) or len(set(tags)) != len(tags):
-        raise Abort("A Tailscale tag list is tag:<name>[,tag:<name>...], for example %s." % DEFAULT_TAGS)
+        raise Abort("A Tailscale tag list is tag:<name>[,tag:<name>...], for example %s." % FLEET_TAG)
     return ",".join(tags)
+
+
+def network_tags(hub):
+    """The tags of a new run that names none, as this computer's own Tailscale sees the tailnet, by the rule of the
+    hub's join line (hub.hub_tags): the tags of the hub's machine; where it carries none, FLEET_TAG only when a
+    machine of the tailnet carries it already, which proves that the policy defines it; else "" for none, because
+    Tailscale refuses a tag that the policy does not define. "" also when nothing says."""
+    host = urllib.parse.urlparse(hub).hostname
+    ts = shutil.which("tailscale") or (TAILSCALE_APP if os.path.exists(TAILSCALE_APP) else None)
+    if not ts or not host:
+        return ""
+    try:
+        done = subprocess.run([ts, "status", "--json"], capture_output=True, text=True, timeout=5,
+                              stdin=subprocess.DEVNULL)
+        status = json.loads(done.stdout) if done.returncode == 0 else {}
+        nodes = [status.get("Self") or {}] + list((status.get("Peer") or {}).values())
+        tagged = [n.get("Tags") or [] for n in nodes]
+        own = next((t for n, t in zip(nodes, tagged) if host in (n.get("TailscaleIPs") or [])), [])
+        own = [t for t in own if isinstance(t, str) and TAG_RE.match(t)]
+        return ",".join(own) if own else FLEET_TAG if any(FLEET_TAG in t for t in tagged) else ""
+    except (OSError, ValueError, AttributeError, TypeError, subprocess.SubprocessError):
+        return ""
 
 
 def as_worker(cmd):
@@ -931,8 +957,9 @@ class Onboarding:
             self.pin_tailscale(ip)
             return "skipped", "Joined as %s." % ip
         self.must(TAILSCALE_INSTALL, "Tailscale installation", timeout=900)
-        tag = self.state.get("tailscale_tag") or DEFAULT_TAGS
-        up = "tailscale up --advertise-tags=%s --accept-dns=false --ssh=false" % shlex.quote(tag)   # its own name
+        tag = self.state.get("tailscale_tag") or ""
+        tags = " --advertise-tags=%s" % shlex.quote(tag) if tag else ""
+        up = "tailscale up%s --accept-dns=false --ssh=false" % tags        # its own name
         if self.auth.get("tailscale") == "auth_key":
             key = self.ch.secret("tailscale_auth_key")
             self.must("printf '%%s\\n' \"$FLEET_INPUT\" | install -m 600 /dev/stdin /run/fleet-ts-authkey\n"
@@ -1016,7 +1043,7 @@ class Onboarding:
         info = kv(out)
         if info.get("health") != "yes" or info.get("git") != "yes":
             raise StepFailed("The worker cannot reach the hub over Tailscale. Check the access rule for "
-                             "%s to the hub ports 8765 and 9418." % (self.state.get("tailscale_tag") or DEFAULT_TAGS))
+                             "%s to the hub ports 8765 and 9418." % (self.state.get("tailscale_tag") or "this machine"))
         return "done", "The worker reaches the hub and its Git repository."
 
     def s_register(self):
@@ -2009,7 +2036,7 @@ def main(argv=None):
             raise Abort("Give --hub and --repo, a --config file, or run from a Fleet kit checkout.")
         pins = dict(RUNTIME_PINS)
         pins.update(config.get("runtime_pins") or {})
-        tag = tailscale_tags(args.tailscale_tag or config.get("tailscale_tag") or DEFAULT_TAGS)
+        tag = tailscale_tags(args.tailscale_tag or config.get("tailscale_tag"))
         state_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(str(state_dir), 0o700)
         path = state_dir / ("%s.json" % name)
@@ -2036,7 +2063,8 @@ def main(argv=None):
                 state = {"name": name, "host": args.host, "port": 22 if args.port is None else args.port,
                          "login": args.login, "runtime": args.runtime,
                          "runtime_version": args.runtime_version or pins.get(args.runtime),
-                         "tailscale_tag": tag, "created": time.time(), "executor": EXECUTOR_VERSION}
+                         "tailscale_tag": tag or network_tags(hub), "created": time.time(),
+                         "executor": EXECUTOR_VERSION}
         auth = {"mode": args.auth, "identity_file": args.identity_file, "tailscale": args.tailscale or "login_url"}
         state["auth"] = {"mode": args.auth, "identity_file": args.identity_file}
         ob = Onboarding(ch, System(fleet_home() / "ssh" / "known_hosts"), path, state, auth, hub, repo)
