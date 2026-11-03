@@ -1,0 +1,214 @@
+#!/usr/bin/python3 -IS
+"""ops-read: the login shell and the forced command of `ops-agent` on a host that the door manages (DevOps plan,
+section 2, "The host login"). The second sshd lets only the door's key in, so this is all that the door can run here.
+
+The door sends one base64 JSON request as the SSH command, which sshd hands over in SSH_ORIGINAL_COMMAND:
+
+    {"v": 1, "op": <form>, "args": [<text>, ...]}
+
+A fixed read runs here, as ops-agent, which is in the log groups and reads no path outside the logs. Every other form
+goes to `sudo -n /usr/local/sbin/ops-root` with the same request and this session's stdin; on a host that gives the
+door reads only there is no sudoers line, and sudo refuses. No shell, no pager, no option of the caller's own.
+"""
+import base64
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+
+ROOT = ""                           # a prefix for the log folder, which only the tests set
+LOGS = "/var/log"
+OPS_ROOT = "/usr/local/sbin/ops-root"
+PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ENV = {"PATH": PATH, "LANG": "C.UTF-8", "SYSTEMD_PAGER": "", "PAGER": "cat", "SYSTEMD_COLORS": "0"}
+OUT_MAX = 256 * 1024
+LINES_MAX = 5000
+ALERTS = "http://127.0.0.1:9093/api/v2/alerts"
+UNIT = re.compile(r"[A-Za-z0-9][A-Za-z0-9@_.:-]{0,99}")
+SINCE = re.compile(r"\d{4}-\d\d-\d\d( \d\d:\d\d(:\d\d)?)?|-?[1-9][0-9]{0,3} ?(s|sec|min|m|h|hours?|d|days?)( ago)?|"
+                   r"today|yesterday|now")
+PRIORITY = re.compile(r"[0-7]|emerg|alert|crit|err|warning|notice|info|debug")
+
+
+class Refused(Exception):
+    pass
+
+
+def pairs(args, allowed):
+    """{key: value} of key=value arguments, each key at most once and one of `allowed`."""
+    out = {}
+    for a in args:
+        key, sep, value = a.partition("=")
+        if not sep or key not in allowed or key in out or not value:
+            raise Refused(f"this read takes {', '.join(k + '=' for k in allowed)} and nothing else")
+        out[key] = value
+    return out
+
+
+def lines_of(value, default=200):
+    if value is None:
+        return default
+    if not re.fullmatch(r"[1-9][0-9]{0,3}", value) or int(value) > LINES_MAX:
+        raise Refused(f"lines is 1 to {LINES_MAX}")
+    return int(value)
+
+
+def unit_of(value):
+    if not UNIT.fullmatch(value) or ".." in value:
+        raise Refused(f"{value!r} is not a unit name")
+    return value
+
+
+def read_journal(args):
+    got = pairs(args, ("unit", "lines", "since", "until", "priority"))
+    argv = ["journalctl", "--no-pager", "-o", "short-iso", "-n", str(lines_of(got.get("lines")))]
+    if "unit" in got:
+        argv += ["-u", unit_of(got["unit"])]
+    for key in ("since", "until"):
+        if key in got:
+            if not SINCE.fullmatch(got[key]):
+                raise Refused(f"{key} is a date, a time or a span like -2h")
+            argv += [f"--{key}", got[key]]
+    if "priority" in got:
+        if not PRIORITY.fullmatch(got["priority"]):
+            raise Refused("priority is 0 to 7 or its name")
+        argv += ["-p", got["priority"]]
+    return argv
+
+
+def check_log(args):
+    """The arguments of log, as text: a path that stays under /var/log, and the lines. The host checks the real path
+    of the file again before it reads it."""
+    if not args or len(args) > 2 or not args[0].startswith(LOGS + "/") or \
+            not os.path.normpath(args[0]).startswith(LOGS + "/") or ".." in args[0].split("/"):
+        raise Refused(f"{args[0] if args else 'log'} is not a file under {LOGS}")
+    lines_of(args[1] if len(args) == 2 else None)
+
+
+def none_given(args, name):
+    if args:
+        raise Refused(f"{name} takes no arguments")
+
+
+def log_file(args):
+    """The last lines of one file under /var/log: its real path stays there, and it is read as ops-agent."""
+    check_log(args)
+    path = os.path.realpath(ROOT + args[0])
+    if not path.startswith(ROOT + LOGS + "/") or not os.path.isfile(path):
+        raise Refused(f"{args[0]} is not a file under {LOGS}")
+    n = lines_of(args[1] if len(args) == 2 else None)
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        f.seek(max(0, f.tell() - OUT_MAX))
+        data = f.read()
+    return b"\n".join(data.splitlines()[-n:]).decode("utf-8", "replace")
+
+
+def status_of(args):
+    if len(args) != 1:
+        raise Refused("status takes one unit")
+    return ["systemctl", "status", "--no-pager", "--lines=50", "--", unit_of(args[0])]
+
+
+def du_of(args):
+    if len(args) != 1 or not args[0].startswith("/") or "\0" in args[0]:
+        raise Refused("du takes one absolute path")
+    return ["du", "-sh", "--", os.path.normpath(args[0])]
+
+
+def none(name):
+    def check(args):
+        if args:
+            raise Refused(f"{name} takes no arguments")
+        return READS[name]["argv"]
+    return check
+
+
+def alerts(args):
+    if args:
+        raise Refused("alerts takes no arguments")
+    try:
+        with urllib.request.urlopen(ALERTS, timeout=10) as r:
+            found = json.loads(r.read())
+    except (OSError, ValueError):
+        return "no Alertmanager answers on this host"
+    return "\n".join(f"{a.get('labels', {}).get('alertname')}\t{a.get('labels', {}).get('severity')}\t"
+                     f"{a.get('status', {}).get('state')}" for a in found if isinstance(a, dict)) or "no alert"
+
+
+READS = {
+    "journal": {"check": read_journal, "help": "journalctl: unit= lines= since= until= priority="},
+    "log": {"text": log_file, "check": lambda a: check_log(a), "help": "the last lines of a file under /var/log: "
+                                                                        "<path> [lines]"},
+    "status": {"check": lambda a: status_of(a), "help": "systemctl status <unit>"},
+    "units": {"argv": ["systemctl", "list-units", "--no-pager", "--all"], "help": "systemctl list-units"},
+    "timers": {"argv": ["systemctl", "list-timers", "--no-pager", "--all"], "help": "systemctl list-timers"},
+    "failed": {"argv": ["systemctl", "list-units", "--no-pager", "--failed"], "help": "the failed units"},
+    "df": {"argv": ["df", "-h"], "help": "df -h"},
+    "free": {"argv": ["free", "-m"], "help": "free -m"},
+    "uptime": {"argv": ["uptime"], "help": "uptime"},
+    "ps": {"argv": ["ps", "-eo", "pid,user,comm"], "help": "ps -eo pid,user,comm"},
+    "listen": {"argv": ["ss", "-tln"], "help": "ss -tln"},
+    "packages": {"argv": ["dpkg", "-l"], "help": "dpkg -l"},
+    "upgradable": {"argv": ["apt", "list", "--upgradable"], "help": "apt list --upgradable"},
+    "du": {"check": du_of, "help": "du -sh <path>"},
+    "lsblk": {"argv": ["lsblk"], "help": "lsblk"},
+    "findmnt": {"argv": ["findmnt"], "help": "findmnt"},
+    "swap": {"argv": ["swapon", "--show"], "help": "swapon --show"},
+    "alerts": {"text": alerts, "check": lambda a: none_given(a, "alerts"), "help": "the local Alertmanager's alerts"},
+}
+for _name, _read in READS.items():
+    if "argv" in _read:
+        _read["check"] = none(_name)
+
+
+def check_read(op, args):
+    """The argv of one read, or the reader of its text; Refused otherwise. The door classifies with this too."""
+    if op not in READS:
+        raise Refused(f"{op!r} is no read")
+    if not isinstance(args, list) or len(args) > 8 or any(not isinstance(a, str) or len(a) > 512 or "\0" in a or
+                                                           "\n" in a for a in args):
+        raise Refused("the arguments are at most 8 short lines of text")
+    checked = READS[op]["check"](args)
+    return None if "text" in READS[op] else checked
+
+
+def answer(req, stdin):
+    op, args = req["op"], req.get("args", [])
+    if op in READS:
+        argv = check_read(op, args)
+        if argv is None:
+            print(READS[op]["text"](args)[-OUT_MAX:])
+            return 0
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           env=ENV, timeout=120)
+        sys.stdout.write(r.stdout[-OUT_MAX:].decode("utf-8", "replace"))
+        return 0 if r.returncode in (0, 3) else 1          # status 3: a unit that is not active is still a read
+    # every other form is ops-root's, through the one sudoers line (a Fix host only)
+    encoded = base64.b64encode(json.dumps(req).encode()).decode()
+    r = subprocess.run(["sudo", "-n", OPS_ROOT, encoded], stdin=stdin, env=ENV)
+    return r.returncode
+
+
+def main():
+    text = os.environ.get("SSH_ORIGINAL_COMMAND", "")
+    try:
+        try:
+            req = json.loads(base64.b64decode(text.strip(), validate=True)) if text else None
+        except ValueError:
+            req = None
+        if not isinstance(req, dict) or req.get("v") != 1 or not isinstance(req.get("op"), str):
+            raise Refused("this login takes the door's requests only")
+        return answer(req, sys.stdin)
+    except Refused as e:
+        print(f"refused: {e}")
+        return 3
+    except subprocess.TimeoutExpired:
+        print("failed: the read took longer than two minutes")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

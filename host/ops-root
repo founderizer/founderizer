@@ -1,0 +1,1200 @@
+#!/usr/bin/python3 -IS
+"""ops-root: the one root path on a host that the door manages (DevOps plan, section 2, "The host login").
+
+The second sshd lets only the door's key in, as `ops-agent`, and its forced command (`ops-read`) gives the fixed reads
+itself and passes every other form here, through one sudoers line:
+
+    ops-agent ALL=(root) NOPASSWD: /usr/local/sbin/ops-root
+
+    sudo -n /usr/local/sbin/ops-root <base64 of {"v": 1, "op": <form>, "args": [<text>, ...], "sha256": <hex>}>
+
+Standard library only, the same file on every host, and its own check of each form: the door classifies a call with
+this very table (door_targets.py loads this file), and this file refuses on its own what the door should never have
+sent, so a door bug passes nothing that the table refuses. Stdin is closed except for a file's bytes, which must have
+the request's SHA-256; there is no TTY and the environment is empty. A root-owned mode file, written at install, says
+`fix` or `rule-only`: on the hub, a Fleet machine and a CI host that two businesses share it says `rule-only`, and
+then judged forms and file installs are refused here. A judged command runs in a transient service that hides the
+host's app trees, the Docker and containerd sockets and its secret paths; a package install and a file install run
+outside it. A write holds the host's one lock, so a second write waits. A new version of this file comes only from a
+release that the release key signed (`self-update`), and never an older one.
+
+Exit status: 0 done, 3 refused (the one line says why), 1 failed.
+"""
+import base64
+import contextlib
+import fcntl
+import fnmatch
+import grp
+import hashlib
+import json
+import os
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+VERSION = 1                 # the floor: self-update takes only a file whose VERSION is not lower
+ROOT = ""                   # a prefix for every path below, which only the tests set
+ETC = "/etc/ops-root"
+MODE_FILE = ETC + "/mode"                   # fix | rule-only
+KEY_FILE = ETC + "/release-key.pub"         # the release keys, as release-key.pub of the repository
+HIDDEN_FILE = ETC + "/hidden"               # this host's app trees and secret paths, one absolute path a line
+KIT_FILE = ETC + "/fleet-kit"               # a Fleet machine's checkout, whose root helper the form fleet-helper runs
+POOL_FILE = ETC + "/pool"                   # a CI host's pool volume (an LVM path) for grow-pool
+BUILD_FILE = ETC + "/build-file"            # a CI host's build file (sparse ext4 on a loop device) for grow-file
+RUNNER_USER_FILE = ETC + "/runner-user"     # a CI host's rootless Docker user: each of its containers is a runner
+RELEASE_FILE = ETC + "/release"             # the release revision this file came from
+STATE = "/var/lib/ops-root"
+LOCK_FILE = "/run/ops-root.lock"
+SELF = "/usr/local/sbin/ops-root"
+LIB = "/usr/local/lib/ops-root"
+INVENTORY = LIB + "/inventory"
+READER = LIB + "/ops-read"
+SSHD_UNIT = "ops-sshd.service"              # the second sshd
+TIMER_UNIT = "ops-root-rollback"            # the 600-second rollback timer
+ROLLBACK_AFTER = 600
+PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ENV = {"PATH": PATH, "LANG": "C.UTF-8", "SYSTEMD_PAGER": "", "PAGER": "cat", "DEBIAN_FRONTEND": "noninteractive"}
+OUT_MAX = 64 * 1024          # bytes of output that go back to the door
+FILE_MAX = 1024 * 1024       # bytes of one file install
+ARGS_MAX = 64
+ARG_MAX = 4096
+VACUUM = "500M"              # journalctl --vacuum-size, fixed
+BUILDER_KEEP = "10GB"        # docker builder prune --keep-storage, the cap
+GROW_MAX = 100               # GiB that one grow-pool or grow-file may add
+GROW_KEEP = 20               # GiB that a build file's file system keeps free beyond all that the file may still take
+GIB = 1024 ** 3
+PURGE_MAX = 20               # packages that one purge may remove, by apt's own dry run
+# What no purge removes: the door's way in (the second sshd, sudo, Python, Tailscale, systemd), the firewall, the
+# patching, apt itself and the libraries under them.
+KEEP_PACKAGES = ("openssh-server", "openssh-sftp-server", "sudo", "python3", "python3-minimal", "python3.*",
+                 "libpython3*", "tailscale*", "systemd", "systemd-*", "libsystemd*", "udev", "dbus*", "apt", "dpkg",
+                 "libc6", "libc-bin", "coreutils", "util-linux", "login", "passwd", "ufw", "nftables", "iptables",
+                 "netplan.io", "unattended-upgrades", "ca-certificates", "openssl", "libssl*")
+
+# What a judged command may never run: shells, interpreters and every program that runs another one, reads a raw
+# disk, changes namespaces or credentials, or talks to the container runtimes (DevOps plan, "Always refused").
+REFUSED_PROGRAMS = {
+    "sh", "bash", "dash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "busybox", "toybox", "rbash", "screen", "tmux",
+    "script", "expect", "python", "python2", "python3", "perl", "ruby", "irb", "node", "nodejs", "deno", "bun", "php",
+    "lua", "luajit", "tclsh", "wish", "guile", "gawk", "awk", "mawk", "nawk", "sed", "ed", "ex", "vi", "vim", "nvim",
+    "nano", "emacs", "less", "more", "most", "man", "pager", "env", "xargs", "nohup", "timeout", "nice", "ionice",
+    "stdbuf", "chrt", "taskset", "flock", "watch", "time", "strace", "ltrace", "gdb", "perf", "bpftool", "bpftrace",
+    "base64", "base32", "basenc", "xxd", "uuencode", "openssl", "gpg", "debugfs", "setpriv", "capsh", "systemd-run",
+    "systemd-nspawn", "nsenter", "unshare", "chroot", "sudo", "su", "runuser", "pkexec", "doas", "sg", "newgrp",
+    "login", "ssh", "scp", "sftp", "rsync", "nc", "ncat", "netcat", "socat", "telnet", "mount", "umount", "losetup",
+    "dmsetup", "kexec", "insmod", "rmmod", "modprobe", "docker", "dockerd", "podman", "ctr", "nerdctl", "crictl",
+    "containerd", "runc", "kubectl", "k3s", "helm", "crontab", "at", "batch", "chpasswd", "chsh", "dd", "hexdump",
+    "od", "strings", "make", "cmake", "gcc", "cc", "ld", "tar", "cpio", "zip", "unzip", "git", "apt", "apt-get",
+    "snap", "pip", "pip3", "npm", "npx", "yarn", "pnpm", "cargo", "go", "java", "dotnet", "mono", "R", "Rscript",
+    "julia", "swipl", "visudo", "ops-root", "tailscale"}
+REFUSED_ARGS = {"-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls", "--exec"}
+# Paths that no file install writes and that a judged command sees read-only: this file and its own, ops-agent's
+# files, the second sshd, the login files and the preload list (DevOps plan, "The host login").
+PROTECTED = ("/usr/local/sbin/ops-root", LIB + "/", ETC + "/", STATE + "/", "/var/lib/ops-agent/",
+             "/etc/sudoers.d/ops-agent", "/etc/passwd", "/etc/shadow", "/etc/group", "/etc/gshadow", "/etc/sudoers",
+             "/etc/ld.so.preload", "/etc/pam.d/", "/etc/ssh/", "/etc/security/",
+             "/etc/systemd/system/" + SSHD_UNIT, "/etc/systemd/system/" + SSHD_UNIT + ".d/")
+# The app trees and secret paths of every host, beside the host's own list (HIDDEN_FILE).
+HIDDEN = ("/var/www", "/srv", "/opt", "/home", "/root", "/etc/letsencrypt", "/etc/ssl/private", "/etc/credstore",
+          "/etc/founderizer", "/var/lib/docker", "/var/lib/containerd", "/var/lib/postgresql", "/var/lib/mysql",
+          "/var/lib/redis", "/run/docker.sock", "/var/run/docker.sock", "/run/containerd", "/run/podman",
+          "/var/lib/fleet-vault", "/var/lib/tailscale", "/etc/tailscale", "/var/backups")
+# Changes that can cut the door off: each arms the rollback timer first.
+TIMED_PATHS = ("/etc/ufw/", "/etc/default/ufw", "/etc/nftables.conf", "/etc/nftables.d/", "/etc/default/tailscaled",
+               "/etc/iptables/", "/etc/systemd/system/tailscaled.service.d/", "/etc/netplan/")
+TIMED_PROGRAMS = {"ufw", "nft", "iptables", "ip6tables", "iptables-restore", "ip6tables-restore", "netplan"}
+# What the timer restores: the firewall's files and the sshd configuration, as they were when it was armed.
+SNAPSHOT = ("/etc/ssh", "/etc/ufw", "/etc/default/ufw", "/etc/nftables.conf", "/etc/default/tailscaled")
+CAPS_DROPPED = ("CAP_SYS_ADMIN", "CAP_SYS_PTRACE", "CAP_DAC_READ_SEARCH", "CAP_SETUID", "CAP_SETGID",
+                "CAP_SYS_MODULE", "CAP_SYS_RAWIO", "CAP_MKNOD", "CAP_BPF")
+
+UNIT = re.compile(r"[A-Za-z0-9][A-Za-z0-9@_.:-]{0,99}")
+APP = re.compile(r"[a-z0-9][a-z0-9-]{0,40}")
+PACKAGE = re.compile(r"[a-z0-9][a-z0-9+.-]{0,99}(=[A-Za-z0-9.+~:-]{1,100})?")
+RUNNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+class Refused(Exception):
+    """A form that this file does not run: the door's answer is this one line."""
+
+
+class Failed(Exception):
+    """A form that ran and failed."""
+
+
+def P(path):
+    return ROOT + path
+
+
+def run(argv, stdin=None, timeout=900, env=None):
+    """(status, output): one program with the fixed environment, its output and errors together, cut to OUT_MAX."""
+    try:
+        r = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
+                           env=dict(ENV, **(env or {})), stdin=None if stdin is not None else subprocess.DEVNULL)
+    except FileNotFoundError:
+        return 127, f"{argv[0]} is not on this host"
+    except subprocess.TimeoutExpired:
+        return 124, f"{os.path.basename(argv[0])} took longer than {timeout} seconds"
+    return r.returncode, r.stdout[-OUT_MAX:].decode("utf-8", "replace")
+
+
+def read(path, default=""):
+    try:
+        with open(P(path), encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+def mode():
+    """fix or rule-only. A missing or unknown mode file is rule-only: the strict reading."""
+    found = read(MODE_FILE).strip()
+    return found if found in ("fix", "rule-only") else "rule-only"
+
+
+# ---------------------------------------------------------------- the forms
+#
+# Each form: its kind (rule: code passes it; judged: the door's model passed it; refused never comes here), whether
+# it writes, its window class (the door refuses a write of that class inside a window, DevOps plan section 4) and
+# whether it is reboot-class (one at a time in each business). check() turns the arguments into the form's own,
+# or raises Refused; run() does it.
+
+FORMS = {}
+
+
+def form(name, kind="rule", write=True, window=None, reboot=False, help=""):
+    def put(f):
+        FORMS[name] = {"name": name, "kind": kind, "write": write, "window": window, "reboot": reboot, "run": f,
+                       "help": help}
+        return f
+    return put
+
+
+def unit_name(text, kinds=("service",)):
+    """A systemd unit of one of these kinds: a bare name is a service. Never an option, a path or a target."""
+    if not isinstance(text, str) or not UNIT.fullmatch(text) or ".." in text:
+        raise Refused(f"{text!r} is not a unit name")
+    suffix = text.rsplit(".", 1)[1] if "." in text else None
+    if suffix not in kinds:
+        if suffix in ("target", "mount", "automount", "swap", "path", "slice", "scope", "device", "socket", "timer",
+                      "service"):
+            raise Refused(f"{text} is a .{suffix} unit, and this form takes a {' or '.join(kinds)}")
+        text += ".service"
+    return text
+
+
+def no_args(args, name):
+    if args:
+        raise Refused(f"{name} takes no arguments")
+    return []
+
+
+def one(args, name, what):
+    if len(args) != 1:
+        raise Refused(f"{name} takes one argument: {what}")
+    return args[0]
+
+
+def systemctl(*words):
+    return run(["systemctl", "--no-pager", "--no-ask-password", *words])
+
+
+def check_args(op, args):
+    """The arguments of one form, checked; Refused with the reason otherwise. The door calls this with the same
+    table before it asks a host, and this file calls it again on the host."""
+    if op not in FORMS:
+        raise Refused(f"{op!r} is no form of a host; `help` lists them")
+    if not isinstance(args, list) or len(args) > ARGS_MAX or \
+            any(not isinstance(a, str) or len(a) > ARG_MAX or "\0" in a or "\n" in a for a in args):
+        raise Refused("the arguments must be at most 64 lines of text")
+    return CHECKS.get(op, lambda a: no_args(a, op))(args)
+
+
+def check_unit(args, kinds=("service",), name="this form"):
+    unit = unit_name(one(args, name, "a unit"), kinds)
+    if unit == SSHD_UNIT:
+        raise Refused("the door's own sshd is not a unit of this form")
+    return [unit]
+
+
+def check_rollback(args):
+    app = one(args, "rollback", "the app")
+    if not APP.fullmatch(app):
+        raise Refused(f"{app!r} is not an app name")
+    return [app]
+
+
+def check_runner(args, name):
+    runner = one(args, name, "the runner")
+    if not RUNNER.fullmatch(runner):
+        raise Refused(f"{runner!r} is not a runner name")
+    return [runner]
+
+
+def check_grow(args, name="grow-pool"):
+    size = one(args, name, "the GiB to add")
+    if not re.fullmatch(r"[1-9][0-9]{0,2}", size) or int(size) > GROW_MAX:
+        raise Refused(f"{name} adds 1 to {GROW_MAX} GiB at a time")
+    return [size]
+
+
+def check_user(args):
+    user = one(args, "passwd-lock", "the user")
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user) or user in ("root", "ops-agent"):
+        raise Refused(f"{user!r} is not a user whose password the door locks")
+    return [user]
+
+
+def check_purge(args):
+    if not args or len(args) > 20:
+        raise Refused("purge takes 1 to 20 package names")
+    for a in args:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9+.-]{0,99}", a):
+            raise Refused(f"{a!r} is not a package name: no version, pattern or option")
+    return list(args)
+
+
+def check_paths(args, name, n):
+    if len(args) != n or any(not a.startswith("/") or "\0" in a for a in args):
+        raise Refused(f"{name} takes {n} absolute paths")
+    return [os.path.normpath(a) for a in args]
+
+
+def check_timer(args):
+    word = one(args, "timer", "arm, cancel or status")
+    if word not in ("arm", "cancel", "status"):
+        raise Refused("timer takes arm, cancel or status")
+    return [word]
+
+
+def check_exec(args):
+    """A judged command: an argv with no shell. Never a shell, an interpreter or a program that runs another one,
+    never an option that runs one, and never a write to a protected path."""
+    if not args:
+        raise Refused("exec needs a command")
+    program = os.path.basename(args[0])
+    if program in REFUSED_PROGRAMS or re.fullmatch(r"(python|perl|ruby|php|lua|pypy|node)[0-9.]*", program):
+        raise Refused(f"{program} is a shell, an interpreter or a program that runs others: never through the door")
+    if any(a in REFUSED_ARGS or a.startswith("--exec") for a in args[1:]):
+        raise Refused("an option that runs a command is never passed")
+    if program == "dpkg" and (len(args) < 2 or args[1] not in ("--configure", "--audit", "-l", "-L", "-s", "-S")):
+        raise Refused("dpkg runs here only to --configure, --audit, -l, -L, -s and -S: a package comes by install")
+    if program == "find" and any(a == "-delete" or a.startswith("-fprint") for a in args[1:]):
+        raise Refused("find runs here without -delete and without -fprint")
+    if program == "nginx" and any(a in ("-T", "-c", "-g", "-p") or a.startswith(("-T", "-c", "-g", "-p"))
+                                   for a in args[1:]):
+        raise Refused("nginx runs here without -T, -c, -g and -p")
+    for a in args[1:]:
+        path = a.split("=", 1)[1] if a.startswith("-") and "=" in a else a
+        if "/proc/" in path and re.search(r"/proc/[^/]+/(environ|mem|maps|fd|root|cwd|cmdline|auxv)|/proc/kcore", path):
+            raise Refused("a process's environment, memory and files are never read")
+        if path.startswith("/") and protected(path):
+            raise Refused(f"{path} is protected on this host")
+        if path.startswith("/") and any(path == h or path.startswith(h.rstrip("/") + "/") for h in hidden_paths()):
+            raise Refused(f"{path} is an app tree or a secret path, which no judged command reads")
+    return list(args)
+
+
+def check_install(args):
+    if not args or len(args) > 20:
+        raise Refused("install takes 1 to 20 package names")
+    for a in args:
+        if not PACKAGE.fullmatch(a):
+            raise Refused(f"{a!r} is not a package name: a package path or an option is never installed")
+    return list(args)
+
+
+def check_file(args):
+    """file <path> <mode> <owner>[:<group>]: the bytes come on stdin with the request's sha256."""
+    if len(args) != 3:
+        raise Refused("file takes the path, the mode (like 0644) and the owner (like root or root:adm)")
+    path, mode_text, owner = args
+    if not path.startswith("/") or os.path.normpath(path) != path or path.endswith("/"):
+        raise Refused(f"{path!r} is not a normal absolute path")
+    if not re.fullmatch(r"0?[0-7]{3}", mode_text) or int(mode_text, 8) & 0o7000:
+        raise Refused("the mode is three octal digits, with no setuid, setgid or sticky bit")
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}(:[a-z_][a-z0-9_-]{0,31})?", owner):
+        raise Refused("the owner is a user, or user:group")
+    if protected(path):
+        raise Refused(f"{path} is protected: no file install writes it")
+    return [path, mode_text, owner]
+
+
+def protected(path):
+    """True when the path, or where it really leads, is one that no install and no judged command writes."""
+    names = {os.path.normpath(path)}
+    with contextlib.suppress(OSError):
+        names.add(os.path.realpath(P(path))[len(ROOT):] if ROOT else os.path.realpath(path))
+    for name in names:
+        base = os.path.basename(name)
+        if base.startswith("authorized_keys"):
+            return True
+        for p in PROTECTED:
+            if name == p.rstrip("/") or (p.endswith("/") and name.startswith(p)):
+                return True
+    return False
+
+
+CHECKS = {
+    "restart": lambda a: check_unit(a, name="restart"),
+    "reload": lambda a: check_unit(a, name="reload"),
+    "enable": lambda a: check_unit(a, ("service", "timer", "socket"), "enable"),
+    "rollback": check_rollback,
+    "runner-restart": lambda a: check_runner(a, "runner-restart"),
+    "runner-prune": lambda a: check_runner(a, "runner-prune"),
+    "runner-register": lambda a: check_runner(a, "runner-register"),
+    "grow-pool": check_grow,
+    "grow-file": lambda a: check_grow(a, "grow-file"),
+    "passwd-lock": check_user,
+    "purge": check_purge,
+    "same": lambda a: check_paths(a, "same", 2),
+    "covers": lambda a: check_paths(a, "covers", 2),
+    "drop": lambda a: check_paths(a, "drop", 1),
+    "timer": check_timer,
+    "exec": check_exec,
+    "install": check_install,
+    "file": check_file,
+    "place": lambda a: check_place(a),
+}
+
+
+# ---- rule forms
+
+@form("help", write=False, help="the forms of this host")
+def do_help(req, data):
+    lines = [f"{f['name']:<17} {f['kind']:<6} {f['help']}" for f in FORMS.values()]
+    return f"ops-root {VERSION}, mode {mode()}\n" + "\n".join(lines)
+
+
+@form("upgrade", window="upgrade", help="security upgrades (unattended-upgrade), which go on if the session ends")
+def do_upgrade(req, data):
+    return detached("upgrade", ["unattended-upgrade", "-v"])
+
+
+@form("restart", window="restart", help="systemctl restart <service>")
+def do_restart(req, data):
+    return checked(systemctl("restart", req["args"][0]), f"{req['args'][0]} restarted")
+
+
+@form("reload", window="restart", help="systemctl reload <service>")
+def do_reload(req, data):
+    return checked(systemctl("reload", req["args"][0]), f"{req['args'][0]} reloaded")
+
+
+@form("daemon-reload", help="systemctl daemon-reload")
+def do_daemon_reload(req, data):
+    return checked(systemctl("daemon-reload"), "systemd read its units again")
+
+
+@form("enable", help="systemctl enable <service | timer | socket>")
+def do_enable(req, data):
+    return checked(systemctl("enable", req["args"][0]), f"{req['args'][0]} enabled")
+
+
+@form("renew-certs", help="certbot renew, with no hook")
+def do_renew(req, data):
+    return checked(run(["certbot", "renew", "--no-random-sleep-on-renew", "--non-interactive"]), "certbot renewed")
+
+
+@form("rollback", window="deploy", help="the app's own helper: /usr/local/sbin/<app>-deploy rollback")
+def do_rollback(req, data):
+    helper = f"/usr/local/sbin/{req['args'][0]}-deploy"
+    try:
+        st = os.stat(P(helper))
+    except OSError:
+        raise Refused(f"{helper} is not on this host") from None
+    if st.st_uid != 0 or st.st_mode & 0o022 or not stat.S_ISREG(st.st_mode):
+        raise Refused(f"{helper} is not a root-owned file that only root can change")
+    return checked(run([helper, "rollback"]), f"{req['args'][0]} rolled back")
+
+
+@form("reboot", window="reboot", reboot=True, help="reboot in 5 seconds")
+def do_reboot(req, data):
+    status, out = run(["systemd-run", "--on-active=5", "--unit=ops-root-reboot", "--collect", "--quiet",
+                       "/usr/bin/systemctl", "reboot"])
+    return checked((status, out), "the host reboots in 5 seconds")
+
+
+@form("timer", help="the 600-second rollback timer: arm, cancel or status")
+def do_timer(req, data):
+    word = req["args"][0]
+    if word == "arm":
+        return arm_timer()
+    if word == "cancel":
+        return cancel_timer()
+    status, out = systemctl("is-active", TIMER_UNIT + ".timer")
+    return "armed" if out.strip() == "active" else "not armed"
+
+
+@form("tailscale-upgrade", window="tailscale", reboot=True, help="upgrade Tailscale, under the rollback timer")
+def do_tailscale(req, data):
+    said = arm_timer()
+    return said + "\n" + detached("tailscale", ["apt-get", "install", "-y", "--only-upgrade",
+                                                "-o", "DPkg::Lock::Timeout=600", "tailscale"])
+
+
+@form("fleet-helper", help="Fleet's root helper, from this machine's signed checkout")
+def do_fleet_helper(req, data):
+    kit = read(KIT_FILE).strip()
+    if not kit.startswith("/") or not os.path.isfile(P(os.path.join(kit, "hubsetup.py"))):
+        raise Refused("this host names no Fleet checkout")
+    return checked(run(["python3", "-I", os.path.join(kit, "hubsetup.py"), "agent-helper"]), "Fleet's helper ran")
+
+
+@form("journal-vacuum", help=f"journalctl --vacuum-size={VACUUM}")
+def do_vacuum(req, data):
+    return checked(run(["journalctl", f"--vacuum-size={VACUUM}"]), "journal vacuumed")
+
+
+@form("logrotate", help="logrotate -f /etc/logrotate.conf")
+def do_logrotate(req, data):
+    return checked(run(["logrotate", "-f", "/etc/logrotate.conf"]), "logs rotated")
+
+
+@form("apt-clean", help="apt-get clean")
+def do_apt_clean(req, data):
+    return checked(run(["apt-get", "clean"]), "apt's cache is empty")
+
+
+@form("image-prune", help="docker image prune -f")
+def do_image_prune(req, data):
+    return checked(run(["docker", "image", "prune", "-f"]), "unused images removed")
+
+
+@form("builder-prune", help=f"docker builder prune -f --keep-storage {BUILDER_KEEP}")
+def do_builder_prune(req, data):
+    return checked(run(["docker", "builder", "prune", "-f", "--keep-storage", BUILDER_KEEP]), "build cache pruned")
+
+
+@form("monitoring-reload", help="promtool check config, then reload Prometheus")
+def do_monitoring(req, data):
+    status, out = run(["promtool", "check", "config", "/etc/prometheus/prometheus.yml"])
+    if status != 0:
+        raise Failed("promtool refused the configuration, and nothing was reloaded:\n" + out)
+    return checked(systemctl("reload", "prometheus.service"), "Prometheus reloaded")
+
+
+@form("runner-status", write=False, help="the CI runners of this host")
+def do_runner_status(req, data):
+    lines = [f"{name}\t{'busy' if busy else 'idle'}\t{unit}" for name, unit, _dir, busy in runners()]
+    lines += [f"{name}\t{'busy' if busy else 'idle' if state == 'running' else state}\tcontainer"
+              for name, state, busy in container_runners()]
+    return "\n".join(lines) or "no runner"
+
+
+@form("runner-restart", window="restart", help="restart one idle runner: a runner service, or a container of the "
+                                               "runners' rootless Docker, which gets its lost network back")
+def do_runner_restart(req, data):
+    name = req["args"][0]
+    for runner, _state, busy in container_runners():
+        if runner == name:
+            if busy:
+                raise Refused(f"{name} runs a job now: only an idle runner")
+            checked(rootless("restart", "--time", "60", name), None)
+            return f"{name} restarted" + network_back(name)
+    unit = idle_runner(name)[0]
+    return checked(systemctl("restart", unit), f"{name} restarted")
+
+
+@form("runner-prune", help="empty the work folder of one idle runner")
+def do_runner_prune(req, data):
+    unit, folder = idle_runner(req["args"][0])
+    work = os.path.join(folder, "_work")
+    if os.path.isdir(P(work)):
+        for entry in os.listdir(P(work)):
+            target = os.path.join(P(work), entry)
+            if os.path.isdir(target) and not os.path.islink(target):
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                with contextlib.suppress(OSError):
+                    os.remove(target)
+    return f"the work folder of {req['args'][0]} is empty"
+
+
+@form("runner-register", help="register one runner, with the token on stdin (the door's)")
+def do_runner_register(req, data):
+    unit, folder = idle_runner(req["args"][0])
+    token = (data or b"").decode("ascii", "replace").strip()
+    url = read(os.path.join(folder, ".runner")).strip()
+    if not re.fullmatch(r"[A-Z0-9]{20,100}", token):
+        raise Refused("runner-register needs the registration token on stdin")
+    try:
+        found = json.loads(url).get("gitHubUrl")
+    except ValueError:
+        found = None
+    if not isinstance(found, str) or not found.startswith("https://github.com/"):
+        raise Refused("this runner names no GitHub address")
+    user = os.stat(P(folder)).st_uid
+    status, out = run(["runuser", "-u", pwd.getpwuid(user).pw_name, "--", os.path.join(folder, "config.sh"),
+                       "--unattended", "--replace", "--url", found, "--token", token, "--name", req["args"][0]])
+    return checked((status, out.replace(token, "<token>")), f"{req['args'][0]} registered")
+
+
+@form("grow-pool", help=f"grow the pool volume from free space, at most {GROW_MAX} GiB at a time")
+def do_grow(req, data):
+    volume = read(POOL_FILE).strip()
+    if not re.fullmatch(r"/dev/[A-Za-z0-9/_.-]{1,100}", volume):
+        raise Refused("this host names no pool volume")
+    return checked(run(["lvextend", "-r", "-L", f"+{req['args'][0]}G", volume]),
+                   f"the pool grew by {req['args'][0]} GiB")
+
+
+@form("grow-file", help=f"grow the runners' build file from free space, at most {GROW_MAX} GiB at a time: a sparse "
+                        "ext4 file on a loop device, online")
+def do_grow_file(req, data):
+    """truncate, losetup --set-capacity and resize2fs, as the owner grew it by hand. The file is sparse, so the file
+    system that holds it must keep GROW_KEEP GiB free beyond all that the file may still take: a full build file
+    stops the runners, and a full file system under it stops the host."""
+    path = read(BUILD_FILE).strip()
+    if not path.startswith("/") or os.path.normpath(path) != path or protected(path):
+        raise Refused("this host names no build file")
+    try:
+        st = os.stat(P(path))
+    except OSError:
+        raise Refused(f"{path} is not on this host") from None
+    if not stat.S_ISREG(st.st_mode):
+        raise Refused(f"{path} is not a file")
+    status, out = run(["losetup", "--associated", path])
+    loops = re.findall(r"^(/dev/loop[0-9]{1,4}):", out, re.M)
+    if status != 0 or len(loops) != 1:
+        raise Refused(f"{path} is on no one loop device")
+    status, out = run(["findmnt", "--noheadings", "--output", "FSTYPE", "--source", loops[0]])
+    if status != 0 or out.split()[:1] != ["ext4"]:
+        raise Refused(f"{loops[0]} is no mounted ext4 file system: only that grows online")
+    new = st.st_size + int(req["args"][0]) * GIB
+    held = os.statvfs(os.path.dirname(P(path)))
+    free, room = held.f_bavail * held.f_frsize, new - st.st_blocks * 512
+    if room + GROW_KEEP * GIB > free:
+        raise Refused(f"the file could then take {room / GIB:.0f} GiB more, and its file system has "
+                      f"{free / GIB:.0f} GiB free: it keeps {GROW_KEEP} GiB beyond that")
+    os.truncate(P(path), new)
+    checked(run(["losetup", "--set-capacity", loops[0]]), None)
+    checked(run(["resize2fs", loops[0]], timeout=3600), None)
+    return f"{path} grew to {new / GIB:.0f} GiB, and its file system with it"
+
+
+@form("same", write=False, help="yes when two files hold the same bytes")
+def do_same(req, data):
+    a, b = (file_digest(p) for p in req["args"])
+    said = "yes" if a is not None and a == b else "no"
+    if said == "yes":
+        remember_yes(req["args"][0], a)
+    return said
+
+
+@form("covers", write=False, help="yes when every line of the old file is in the new one")
+def do_covers(req, data):
+    old, new = req["args"]
+    try:
+        with open(P(old), "rb") as f:
+            old_lines = set(f.read().splitlines())
+        with open(P(new), "rb") as f:
+            new_lines = set(f.read().splitlines())
+    except OSError:
+        return "no"
+    said = "yes" if old_lines <= new_lines else "no"
+    if said == "yes":
+        remember_yes(old, file_digest(old))
+    return said
+
+
+@form("drop", help="delete a file that same or covers said yes for, while it is unchanged")
+def do_drop(req, data):
+    path = req["args"][0]
+    yes = json.loads(read(STATE + "/yes.json", "{}") or "{}")
+    digest = file_digest(path)
+    if digest is None or yes.get(path) != digest:
+        raise Refused(f"{path} had no yes from same or covers in its present form")
+    if protected(path):
+        raise Refused(f"{path} is protected on this host")
+    os.remove(P(path))
+    yes.pop(path, None)
+    write_state("yes.json", json.dumps(yes))
+    return f"{path} deleted"
+
+
+@form("pro-attach", help="attach Ubuntu Pro with the door's token on stdin")
+def do_pro(req, data):
+    token = (data or b"").decode("ascii", "replace").strip()
+    if not re.fullmatch(r"[A-Za-z0-9]{10,100}", token):
+        raise Refused("pro-attach needs the token on stdin")
+    with tempfile.NamedTemporaryFile("w", dir=P(STATE), delete=True) as f:
+        os.chmod(f.name, 0o600)
+        f.write(f"token: {token}\n")
+        f.flush()
+        status, out = run(["pro", "attach", "--attach-config", f.name])
+    return checked((status, out.replace(token, "<token>")), "Ubuntu Pro attached")
+
+
+@form("place", help="a new value of a key where the old one is: <file> <NAME> <sha256 of the old value>, the new "
+                   "value on stdin (the door's)")
+def do_place(req, data):
+    path, name, old = req["args"]
+    value = (data or b"").decode("utf-8", "replace").strip()
+    if not value or "\n" in value or len(value) > 4096:
+        raise Refused("place needs the new value on stdin, one line")
+    try:
+        st = os.stat(P(path))
+        with open(P(path), encoding="utf-8") as f:
+            lines = f.read().split("\n")
+    except (OSError, UnicodeDecodeError):
+        raise Refused(f"{path} cannot be read here") from None
+    hits = [i for i, line in enumerate(lines) if line.startswith(name + "=") and
+            hashlib.sha256(line[len(name) + 1:].strip().strip('"').encode()).hexdigest() == old]
+    if len(hits) != 1:
+        raise Refused(f"{path} has no one line {name}= whose value has that hash: nothing was placed")
+    lines[hits[0]] = f"{name}={value}"
+    fd, temp = tempfile.mkstemp(dir=os.path.dirname(P(path)), prefix=".ops-root-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        os.chown(temp, st.st_uid, st.st_gid)
+        os.chmod(temp, stat.S_IMODE(st.st_mode))
+        os.replace(temp, P(path))
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(temp)
+    return f"{name} in {path} has its new value"
+
+
+def check_place(args):
+    if len(args) != 3:
+        raise Refused("place takes the file, the variable's name and the sha256 of its old value")
+    path, name, old = args
+    if not path.startswith("/") or os.path.normpath(path) != path or protected(path):
+        raise Refused(f"{path!r} is not a file that a key is placed in")
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", name) or not SHA256.fullmatch(old):
+        raise Refused("the name is like B2_ACCOUNT_KEY, and the old value is its sha256")
+    return [path, name, old]
+
+
+@form("inventory", write=False, help="runtimes, listeners, vhosts, certificates, users and the firmware, as JSON")
+def do_inventory(req, data):
+    status, out = run([P(INVENTORY)])
+    return checked((status, out), out)
+
+
+# ---- judged forms
+
+@form("exec", kind="judged", window="restart", help="one command, no shell, in a service that hides the app trees")
+def do_exec(req, data):
+    args = req["args"]
+    said = ""
+    if os.path.basename(args[0]) in TIMED_PROGRAMS:
+        said = arm_timer() + "\n"
+    props = ["PrivateDevices=yes", "NoNewPrivileges=yes", "ProtectKernelModules=yes", "ProtectKernelTunables=yes",
+             "ProtectControlGroups=yes", "RestrictSUIDSGID=yes", "LockPersonality=yes",
+             "CapabilityBoundingSet=~" + " ".join(CAPS_DROPPED)]
+    props += [f"InaccessiblePaths=-{p}" for p in hidden_paths()]
+    props += [f"ReadOnlyPaths=-{p.rstrip('/')}" for p in PROTECTED]
+    argv = ["systemd-run", "--pipe", "--wait", "--collect", "--quiet", "--unit", f"ops-root-exec-{os.getpid()}"]
+    for p in props:
+        argv += ["--property", p]
+    status, out = run(argv + ["--", *args])
+    return said + checked((status, out), out or "done")
+
+
+@form("install", kind="judged", help="apt-get install of packages by name, which goes on if the session ends")
+def do_install(req, data):
+    return detached("install", ["apt-get", "install", "-y", "--no-install-recommends", "-o", "DPkg::Lock::Timeout=600",
+                                "-o", "Dpkg::Options::=--force-confold", *req["args"]])
+
+
+@form("purge", kind="judged", help="apt-get purge of packages by name, when apt's own dry run removes no package of "
+                                   "the door's way in")
+def do_purge(req, data):
+    status, out = run(["apt-get", "--simulate", "purge", *req["args"]], timeout=300)
+    if status != 0:
+        raise Failed("apt's dry run refused it:\n" + out)
+    gone = [name.split(":")[0] for name in re.findall(r"^(?:Purg|Remv) (\S+)", out, re.M)]
+    if not gone:
+        return "nothing to purge"
+    if len(gone) > PURGE_MAX:
+        raise Refused(f"the purge would remove {len(gone)} packages: {PURGE_MAX} at most")
+    keep = next((p for p in gone if any(fnmatch.fnmatchcase(p, k) for k in KEEP_PACKAGES)), None)
+    if keep:
+        raise Refused(f"the purge would remove {keep}, which the door's way in needs")
+    return detached("purge", ["apt-get", "purge", "-y", "-o", "DPkg::Lock::Timeout=600", *req["args"]])
+
+
+@form("passwd-lock", kind="judged", help="passwd -l of one user, never root's or ops-agent's")
+def do_passwd_lock(req, data):
+    user = req["args"][0]
+    try:
+        uid = pwd.getpwnam(user).pw_uid
+    except KeyError:
+        raise Refused(f"{user} is no user of this host") from None
+    if uid == 0:
+        raise Refused(f"{user} is root")
+    return checked(run(["passwd", "-l", user]), f"the password of {user} is locked")
+
+
+@form("file", kind="judged", help="install a file: its bytes on stdin, with their sha256")
+def do_file(req, data):
+    path, mode_text, owner = req["args"]
+    if data is None or len(data) > FILE_MAX:
+        raise Refused(f"a file install takes 1 MiB at most, on stdin")
+    if not SHA256.fullmatch(str(req.get("sha256") or "")) or hashlib.sha256(data).hexdigest() != req["sha256"]:
+        raise Refused("the bytes do not have the request's sha256")
+    parent = os.path.dirname(path)
+    if not os.path.isdir(P(parent)) or os.path.islink(P(path)):
+        raise Refused(f"{parent} is no folder here, or {path} is a link")
+    if protected(path) or protected(os.path.realpath(P(parent))[len(ROOT):] + "/" + os.path.basename(path)):
+        raise Refused(f"{path} is protected: no file install writes it")
+    said = ""
+    if any(path == p.rstrip("/") or path.startswith(p) for p in TIMED_PATHS):
+        said = arm_timer() + "\n"
+    user, _, group = owner.partition(":")
+    try:
+        uid = pwd.getpwnam(user).pw_uid
+        gid = pwd.getpwnam(user).pw_gid if not group else grp.getgrnam(group).gr_gid
+    except KeyError:
+        raise Refused(f"{owner} is no user or group here") from None
+    fd, temp = tempfile.mkstemp(dir=P(parent), prefix=".ops-root-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.chown(temp, uid, gid)
+        os.chmod(temp, int(mode_text, 8))
+        if parent.rstrip("/") == "/etc/sudoers.d":
+            status, out = run(["visudo", "-c", "-q", "-f", temp])
+            if status != 0:
+                raise Refused("visudo refused this sudoers file:\n" + out)
+        os.replace(temp, P(path))
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(temp)
+    return said + f"{path} installed ({len(data)} bytes)"
+
+
+# ---- release: a new version of this file, from a signed release only
+
+@form("self-update", help="a new ops-root from a signed release, never an older one (the door sends it)")
+def do_self_update(req, data):
+    try:
+        bundle = json.loads((data or b"").decode())
+    except ValueError:
+        raise Refused("self-update needs the release bundle on stdin") from None
+    files = verify_bundle(bundle)
+    new = files["ops-root"]
+    found = re.search(rb"^VERSION = ([0-9]{1,6})\b", new, re.M)
+    if not found:
+        raise Refused("the new ops-root names no VERSION")
+    if int(found.group(1)) < VERSION:
+        raise Refused(f"ops-root {int(found.group(1))} is older than {VERSION}: never an older one")
+    for name, target, mode_bits in (("ops-root", SELF, 0o755), ("ops-read", READER, 0o755),
+                                    ("inventory", INVENTORY, 0o755)):
+        if name in files:
+            replace(target, files[name], mode_bits)
+    replace(RELEASE_FILE, (bundle["manifest"]["revision"] + "\n").encode(), 0o644)
+    return f"ops-root {int(found.group(1))} from release {bundle['manifest']['version']}"
+
+
+# ---------------------------------------------------------------- what the forms share
+
+def checked(result, done):
+    status, out = result
+    if status != 0:
+        raise Failed(out.strip() or f"it ended with status {status}")
+    return done if done is not None else out
+
+
+def detached(name, argv):
+    """A long step that must outlive the session: a transient service that the session only watches. If the session
+    ends, the step goes on to its end, and the next call reads what it did in the journal."""
+    unit = f"ops-root-{name}-{int(time.time())}"
+    # --no-block: systemd-run returns once the start is queued, where a oneshot unit would hold it to its very end. A
+    # unit that ended well is unloaded by itself, and one that failed stays failed until reset-failed below.
+    status, out = run(["systemd-run", "--no-block", "--unit", unit, "--quiet", "--property=Type=oneshot",
+                       "--property=TimeoutStartSec=3600", *(f"--setenv={k}={v}" for k, v in ENV.items()), "--",
+                       *argv], timeout=60)
+    if status != 0:
+        raise Failed(out.strip() or "systemd-run could not start it")
+    while True:
+        time.sleep(2)
+        status, out = run(["systemctl", "show", "--property=ActiveState,Result", unit + ".service"], timeout=30)
+        states = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        if states.get("ActiveState") not in ("activating", "active", "reloading", "deactivating"):
+            break
+    _, log = run(["journalctl", "--no-pager", "-o", "cat", "-n", "200", "-u", unit + ".service"], timeout=60)
+    if states.get("ActiveState") == "failed" or states.get("Result") not in ("success", None):
+        run(["systemctl", "reset-failed", unit + ".service"], timeout=30)
+        raise Failed(f"{name} failed ({states.get('Result')}):\n{log[-4000:]}")
+    return f"{name} done\n{log[-4000:]}"
+
+
+def hidden_paths():
+    extra = [line.strip() for line in read(HIDDEN_FILE).splitlines() if line.strip().startswith("/")]
+    return sorted(set(HIDDEN) | {os.path.normpath(p) for p in extra if ".." not in p})
+
+
+def file_digest(path):
+    try:
+        with open(P(path), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def remember_yes(path, digest):
+    yes = json.loads(read(STATE + "/yes.json", "{}") or "{}")
+    yes[path] = digest
+    if len(yes) > 1000:
+        yes = dict(list(yes.items())[-1000:])
+    write_state("yes.json", json.dumps(yes))
+
+
+def write_state(name, text):
+    os.makedirs(P(STATE), mode=0o700, exist_ok=True)
+    replace(os.path.join(STATE, name), text.encode(), 0o600)
+
+
+def replace(path, data, mode_bits):
+    fd, temp = tempfile.mkstemp(dir=os.path.dirname(P(path)), prefix=".ops-root-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.chmod(temp, mode_bits)
+        os.replace(temp, P(path))
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(temp)
+
+
+def runners():
+    """[(name, unit, folder, busy)] of the GitHub runners' units here: actions.runner.<...>.<name>.service."""
+    status, out = systemctl("list-units", "--all", "--plain", "--no-legend", "actions.runner.*")
+    found = []
+    for line in out.splitlines() if status == 0 else []:
+        unit = line.split()[0] if line.split() else ""
+        if not unit.startswith("actions.runner.") or not unit.endswith(".service"):
+            continue
+        name = unit[:-len(".service")].rsplit(".", 1)[-1]
+        _, shown = systemctl("show", "--property=WorkingDirectory,MainPID", unit)
+        props = dict(l.split("=", 1) for l in shown.splitlines() if "=" in l)
+        pid, folder = props.get("MainPID", "0"), props.get("WorkingDirectory", "")
+        _, tree = run(["ps", "-o", "comm=", "--ppid", pid]) if pid.isdigit() and pid != "0" else (0, "")
+        busy = "Runner.Worker" in tree or any("Runner.Worker" in line for line in run(
+            ["pgrep", "-a", "-f", "Runner.Worker"])[1].splitlines() if folder and folder in line)
+        found.append((name, unit, folder, busy))
+    return found
+
+
+def rootless(*words, timeout=300):
+    """(status, output) of docker in the runner user's rootless daemon, as that user."""
+    user = read(RUNNER_USER_FILE).strip()
+    try:
+        pw = pwd.getpwnam(user) if re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user) else None
+    except KeyError:
+        pw = None
+    if pw is None or pw.pw_uid == 0:
+        raise Refused("this host names no rootless runner user")
+    runtime = f"/run/user/{pw.pw_uid}"
+    return run(["runuser", "-u", user, "--", "env", f"HOME={pw.pw_dir}", f"XDG_RUNTIME_DIR={runtime}",
+                f"DOCKER_HOST=unix://{runtime}/docker.sock", "docker", *words], timeout=timeout)
+
+
+def container_runners():
+    """[(name, state, busy)] of the runner containers: every container of the runner user's rootless daemon. A host
+    that names no runner user has none."""
+    if not read(RUNNER_USER_FILE).strip():
+        return []
+    status, out = rootless("ps", "--all", "--format", "{{.Names}}\t{{.State}}")
+    if status != 0:
+        raise Failed("the runners' rootless Docker does not answer: " + out.strip()[-300:])
+    found = []
+    for line in out.splitlines():
+        name, _, state = line.partition("\t")
+        if RUNNER.fullmatch(name):
+            busy = state == "running" and rootless("exec", name, "pgrep", "-f", "Runner.Worker", timeout=60)[0] == 0
+            found.append((name, state, busy))
+    return found
+
+
+def network_back(name):
+    """A full disk lost a container's saved network once, and Docker started it with no endpoint: a runner with no
+    eth0 cannot reach GitHub. Such a container on the default bridge is connected to it again."""
+    status, out = rootless("inspect", "--format", "{{.HostConfig.NetworkMode}} "
+                           "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", name)
+    words = out.split()
+    if status != 0:
+        return f", but its network could not be read: {out.strip()[-200:]}"
+    if not words or words[0] not in ("bridge", "default") or len(words) > 1:
+        return ""
+    checked(rootless("network", "connect", "bridge", name), None)
+    return ", and its lost network is back"
+
+
+def idle_runner(name):
+    for runner, unit, folder, busy in runners():
+        if runner == name:
+            if busy:
+                raise Refused(f"{name} runs a job now: only an idle runner")
+            if not folder.startswith("/"):
+                raise Refused(f"{name} names no folder")
+            return unit, folder
+    raise Refused(f"{name} is not a runner of this host")
+
+
+# ---- the rollback timer
+
+def arm_timer():
+    """Save the firewall's and sshd's files and the Tailscale version as they are now, and start the timer that puts
+    them back in ROLLBACK_AFTER seconds unless `timer cancel` comes first. Armed already: it starts again."""
+    folder = P(STATE + "/rollback")
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    present = [p for p in SNAPSHOT if os.path.exists(P(p))]
+    status, out = run(["tar", "-C", P("/") or "/", "-cpf", os.path.join(folder, "snapshot.tar"),
+                       *[p.lstrip("/") for p in present]])
+    if status != 0:
+        raise Failed("the rollback timer could not save the files it restores: " + out)
+    _, version = run(["dpkg-query", "-W", "-f=${Version}", "tailscale"])
+    with open(os.path.join(folder, "tailscale"), "w") as f:
+        f.write(version.strip() if re.fullmatch(r"[A-Za-z0-9.+~:-]{1,60}", version.strip()) else "")
+    systemctl("stop", TIMER_UNIT + ".timer")
+    status, out = run(["systemd-run", f"--on-active={ROLLBACK_AFTER}", f"--unit={TIMER_UNIT}", "--collect",
+                       "--quiet", SELF, "--fire"])
+    if status != 0:
+        raise Failed("the rollback timer could not start: " + out)
+    return f"the rollback timer is armed: in {ROLLBACK_AFTER} seconds it restores the firewall, sshd and Tailscale"
+
+
+def cancel_timer():
+    systemctl("stop", TIMER_UNIT + ".timer")
+    shutil.rmtree(P(STATE + "/rollback"), ignore_errors=True)
+    return "the rollback timer is off"
+
+
+def fire():
+    """The timer fired: systemd's failed states first (one past revert failed on the start limit), then the files,
+    the Tailscale version and the services."""
+    folder = P(STATE + "/rollback")
+    run(["systemctl", "reset-failed"])
+    if os.path.isfile(os.path.join(folder, "snapshot.tar")):
+        run(["tar", "-C", "/", "-xpf", os.path.join(folder, "snapshot.tar")])
+    version = read(STATE + "/rollback/tailscale").strip()
+    if version:
+        _, now = run(["dpkg-query", "-W", "-f=${Version}", "tailscale"])
+        if now.strip() != version:
+            run(["apt-get", "install", "-y", "--allow-downgrades", "-o", "DPkg::Lock::Timeout=600",
+                 f"tailscale={version}"], timeout=1800)
+    for unit in ("ssh.service", "ufw.service", "nftables.service", "tailscaled.service", SSHD_UNIT):
+        if systemctl("is-enabled", unit)[1].strip() in ("enabled", "static"):
+            systemctl("restart", unit)
+    with contextlib.suppress(OSError):
+        run(["ufw", "reload"])
+    shutil.rmtree(folder, ignore_errors=True)
+
+
+# ---- a signed bundle from a release
+
+def release_keys():
+    keys = []
+    for line in read(KEY_FILE).splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            try:
+                key = base64.b64decode(line, validate=True)
+            except ValueError:
+                return []
+            if len(key) != 32:
+                return []
+            keys.append(key)
+    return keys[:4]
+
+
+def signed_text(m):
+    return b"\n".join([b"founderizer-release-1", m["revision"].encode(), m["version"].encode(),
+                       (m.get("notes") or "").encode(), (m.get("minimum") or "").encode(),
+                       b"true" if m.get("hold") else b"false"]) + b"\n"
+
+
+def git_object(kind, body):
+    return hashlib.sha1(kind.encode() + b" " + str(len(body)).encode() + b"\0" + body).hexdigest()
+
+
+def tree_entries(body):
+    """{name: (mode, sha1)} of a raw git tree object."""
+    entries, i = {}, 0
+    while i < len(body):
+        space, nul = body.index(b" ", i), body.index(b"\0", i)
+        mode_bits, name = body[i:space].decode(), body[space + 1:nul].decode("utf-8", "replace")
+        entries[name] = (mode_bits, body[nul + 1:nul + 21].hex())
+        i = nul + 21
+    return entries
+
+
+def verify_bundle(bundle):
+    """{name: bytes} of the host files in a bundle that a release key signed. The bundle carries the release's
+    manifest, its commit object, the root tree, the tree of host/ and each file: each object's git hash is checked
+    from the signed revision down, so the bytes are those of host/<name> at that release, or nothing is taken."""
+    try:
+        m = bundle["manifest"]
+        signature = base64.b64decode(m["signature"] + "=" * (-len(m["signature"]) % 4))
+        commit, root, folder = (base64.b64decode(bundle[k]) for k in ("commit", "root", "host"))
+        files = {k: base64.b64decode(v) for k, v in bundle["files"].items()}
+        if not re.fullmatch(r"[0-9a-f]{40}", m["revision"]) or not isinstance(m["version"], str):
+            raise ValueError
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise Refused("the release bundle is not well formed") from None
+    if not any(verify_signature(key, signed_text(m), signature) for key in release_keys()):
+        raise Refused("no release key of this host signed this release")
+    if git_object("commit", commit) != m["revision"]:
+        raise Refused("the commit is not the signed revision")
+    tree = re.match(rb"tree ([0-9a-f]{40})\n", commit)
+    if not tree or git_object("tree", root) != tree.group(1).decode():
+        raise Refused("the root tree is not the signed revision's")
+    host = tree_entries(root).get("host")
+    if not host or git_object("tree", folder) != host[1]:
+        raise Refused("host/ is not the signed revision's")
+    listed = tree_entries(folder)
+    for name, body in files.items():
+        if name not in ("ops-root", "ops-read", "inventory") or listed.get(name, ("", ""))[1] != \
+                git_object("blob", body):
+            raise Refused(f"host/{name} is not the signed revision's")
+    if "ops-root" not in files:
+        raise Refused("the bundle carries no ops-root")
+    return files
+
+
+# Ed25519 (RFC 8032), verify only: the same code as releases.py, here so that this file stands alone.
+_P = 2 ** 255 - 19
+_Q = 2 ** 252 + 27742317777372353535851937790883648493
+
+
+def _inv(x):
+    return pow(x, _P - 2, _P)
+
+
+_D = -121665 * _inv(121666) % _P
+_SQRT_M1 = pow(2, (_P - 1) // 4, _P)
+
+
+def _recover_x(y, sign):
+    if y >= _P:
+        return None
+    x2 = (y * y - 1) * _inv(_D * y * y + 1) % _P
+    if x2 == 0:
+        return None if sign else 0
+    x = pow(x2, (_P + 3) // 8, _P)
+    if (x * x - x2) % _P != 0:
+        x = x * _SQRT_M1 % _P
+    if (x * x - x2) % _P != 0:
+        return None
+    if (x & 1) != sign:
+        x = _P - x
+    return x
+
+
+def _add(a, b):
+    p = (a[1] - a[0]) * (b[1] - b[0]) % _P
+    q = (a[1] + a[0]) * (b[1] + b[0]) % _P
+    r = 2 * a[3] * b[3] * _D % _P
+    s = 2 * a[2] * b[2] % _P
+    e, f, g, h = q - p, s - r, s + r, q + p
+    return (e * f % _P, g * h % _P, f * g % _P, e * h % _P)
+
+
+def _mul(n, point):
+    found = (0, 1, 1, 0)
+    while n > 0:
+        if n & 1:
+            found = _add(found, point)
+        point = _add(point, point)
+        n >>= 1
+    return found
+
+
+def _same(a, b):
+    return (a[0] * b[2] - b[0] * a[2]) % _P == 0 and (a[1] * b[2] - b[1] * a[2]) % _P == 0
+
+
+_GY = 4 * _inv(5) % _P
+_GX = _recover_x(_GY, 0)
+_G = (_GX, _GY, 1, _GX * _GY % _P)
+
+
+def _decompress(blob):
+    if len(blob) != 32:
+        return None
+    y = int.from_bytes(blob, "little")
+    sign, y = y >> 255, y & ((1 << 255) - 1)
+    x = _recover_x(y, sign)
+    return None if x is None else (x, y, 1, x * y % _P)
+
+
+def verify_signature(public, message, signature):
+    if not (isinstance(public, bytes) and len(public) == 32 and isinstance(signature, bytes) and len(signature) == 64):
+        return False
+    try:
+        point, given = _decompress(public), _decompress(signature[:32])
+        scalar = int.from_bytes(signature[32:], "little")
+        if point is None or given is None or scalar >= _Q or point[0] % _P == 0 or \
+                not _same(_mul(_Q, point), (0, 1, 1, 0)):
+            return False
+        h = int.from_bytes(hashlib.sha512(signature[:32] + public + message).digest(), "little") % _Q
+        return _same(_mul(scalar, _G), _add(given, _mul(h, point)))
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+# ---------------------------------------------------------------- one call
+
+def decode(text):
+    try:
+        req = json.loads(base64.b64decode(text, validate=True))
+    except (ValueError, TypeError):
+        raise Refused("the request is not base64 JSON") from None
+    if not isinstance(req, dict) or req.get("v") != 1 or not isinstance(req.get("op"), str):
+        raise Refused("the request is not {v: 1, op, args}")
+    req.setdefault("args", [])
+    return req
+
+
+def call(req, data=None):
+    """The answer to one request, as text; Refused or Failed otherwise."""
+    op = req["op"]
+    req["args"] = check_args(op, req["args"])
+    f = FORMS[op]
+    if f["kind"] == "judged" and mode() != "fix":
+        raise Refused("this host is rule-only: no judged form and no file install")
+    if data is not None and op not in ("file", "self-update", "pro-attach", "runner-register", "place"):
+        raise Refused(f"{op} takes nothing on stdin")
+    if not f["write"]:
+        return f["run"](req, data)
+    os.makedirs(os.path.dirname(P(LOCK_FILE)) or "/", exist_ok=True)
+    with open(P(LOCK_FILE), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)         # a second write on this host waits here
+        return f["run"](req, data)
+
+
+def main(argv):
+    if len(argv) == 2 and argv[1] == "--fire":
+        if os.getppid() != 1:
+            print("refused: --fire is the rollback timer's own")
+            return 3
+        fire()
+        return 0
+    try:
+        if len(argv) != 2:
+            raise Refused("ops-root takes one argument: the request")
+        req = decode(argv[1])
+        data = None if sys.stdin is None or sys.stdin.isatty() else sys.stdin.buffer.read(FILE_MAX * 2 + 1) or None
+        print(call(req, data)[-OUT_MAX:])
+        return 0
+    except Refused as e:
+        print(f"refused: {e}"[:2000])
+        return 3
+    except Failed as e:
+        print(f"failed: {e}"[-OUT_MAX:])
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

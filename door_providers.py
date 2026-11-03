@@ -1,0 +1,760 @@
+"""The door's provider targets (DevOps plan, section 2 and step C6), in the plan's order: Backblaze, Cloudflare,
+GitHub, Hetzner, then AWS, Azure and Tailscale. Standard library only.
+
+Each provider has its listed reads (no path on the list returns a token), its rule calls, which code passes, and its
+judged calls; anything else is refused. decide() turns one call into a plan of steps, and execute() runs a plan with
+the token that the door holds for that account. A token never leaves the door: no answer carries one, and a key that
+the door mints stays on the door until it places it on a host itself, through that host's ops-root (`place`), where
+the old value is, found by its hash.
+
+    ops backblaze:<account> buckets | keys | files <bucket-id> [prefix]
+    ops backblaze:<account> key-mint <host> <bucket-id>            rule: a key for one host, its name as the prefix,
+                                                                   no delete right
+    ops backblaze:<account> key-place <host> <file> <key-id> <NAME>=id:<sha256> <NAME>=key:<sha256>
+    ops backblaze:<account> key-revoke <key-id>                    rule for a key that the door minted, else judged
+    ops cloudflare:<account> zones | records <zone> | tunnels | rulesets <zone>
+    ops cloudflare:<account> cname <zone> <name> <tunnel-id>       rule: a new CNAME to a tunnel of that account
+    ops cloudflare:<account> tunnel-route <tunnel-id> <hostname> <port>   rule: a new hostname, the host's own origin
+    ops cloudflare:<account> purge <zone> <host or url> ...        rule
+    ops cloudflare:<account> change <METHOD> <path>                judged, for the products the plan lists
+    ops github:<owner> runs|failed|alerts|code-alerts|secret-alerts|runners <repo>
+    ops github:<owner> workflow <repo> <workflow> [name=value ...] rule for a health workflow, judged for bootstrap
+    ops github:<owner> secret <repo> <NAME> <key-id> id|key        rule: a value that the door rotated
+    ops github:<owner> pull-request <repo> <head> <base> <title>   rule
+    ops hetzner:<project> servers | server <name> | firewalls | volumes | ips
+    ops hetzner:<project> power-cycle <server>                     rule, for a server that the agent holds
+    ops hetzner:<project> change <METHOD> <path>                   judged: a held server's firewall, protection, name
+    ops aws:<account> instances | groups | stacks
+    ops aws:<account> start|stop|reboot <instance-id>              rule, for a tagged instance
+    ops aws:<account> ingress|change-set|key-off ...               judged
+    ops azure:<subscription> get <path>                            listed reads and metrics
+    ops azure:<subscription> sql-firewall|app-setting ...          judged
+    ops tailscale:<tailnet> devices | device <id>
+    ops tailscale:<tailnet> key-expiry-off <id> | rename <id> <name>   rule, for a device of the fleet
+    ops tailscale:<tailnet> delete <id> | oauth-client <tag>       judged
+"""
+import base64
+import datetime
+import hashlib
+import hmac
+import json
+import re
+import subprocess
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from door_targets import Decision, refused, vendor
+
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,99}")
+SHA = re.compile(r"[0-9a-f]{64}")
+HOSTNAME = re.compile(r"(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
+INPUT = re.compile(r"[A-Za-z0-9._/:@+-]{1,200}")
+BODY_MAX = 64 * 1024
+B2_AUTHORIZE = "https://api.backblazeb2.com/b2api/v3/b2_authorize_account"
+
+
+def plan(kind, why, account, steps, **more):
+    """A decision whose plan is a list of steps for execute()."""
+    return Decision(kind, why, target=f"{more.pop('provider')}:{account}",
+                    plan={"provider": more.get("provider_name"), "account": account, "steps": steps}, **more)
+
+
+def read_plan(provider, account, steps, why):
+    return Decision("read", why, target=f"{provider}:{account}", write=False,
+                    plan={"provider": provider, "account": account, "steps": steps})
+
+
+def step(method, path, body=None, keep=None, need=None, query=None):
+    """One request. keep: what the door keeps from the answer instead of passing it on. need: a condition on an
+    earlier answer, which execute() checks before it sends this one."""
+    return {"method": method, "path": path, "body": body, "keep": keep, "need": need, "query": query}
+
+
+def held_servers(access, agent):
+    return set(((access.get("agents") or {}).get(agent) or {}).get("servers") or {})
+
+
+def account_of(access, provider, account):
+    return (access.get("credentials") or {}).get(f"{provider}:{account}") or {}
+
+
+# ---------------------------------------------------------------- Backblaze B2
+
+def backblaze(access, agent, account, op, args, content, lookups):
+    p = {"provider": "backblaze"}
+    if op == "buckets" and not args:
+        return read_plan("backblaze", account, [step("POST", "b2_list_buckets", {"accountId": "{account_id}"})],
+                         "a listed read")
+    if op == "keys" and not args:
+        return read_plan("backblaze", account, [step("POST", "b2_list_keys", {"accountId": "{account_id}",
+                                                                              "maxKeyCount": 1000})], "a listed read")
+    if op == "files" and len(args) in (1, 2) and ID.fullmatch(args[0]):
+        body = {"bucketId": args[0], "maxFileCount": 1000}
+        if len(args) == 2:
+            body["prefix"] = args[1]
+        return read_plan("backblaze", account, [step("POST", "b2_list_file_names", body)], "a listed read")
+    if op == "key-mint":
+        if len(args) != 2 or args[0] not in held_servers(access, agent) or not ID.fullmatch(args[1]):
+            return refused("key-mint takes a host that this agent holds and the bucket's id")
+        host = args[0]
+        return Decision("rule", "a key for one host: its name as the prefix, no delete right",
+                        target=f"backblaze:{account}", plan={"provider": "backblaze", "account": account, "steps": [
+                            step("POST", "b2_create_key", {
+                                "accountId": "{account_id}", "keyName": host, "bucketId": args[1],
+                                "namePrefix": f"{host}/",
+                                "capabilities": ["listBuckets", "listFiles", "readFiles", "writeFiles"]},
+                                keep="minted")]})
+    if op == "key-revoke":
+        if len(args) != 1 or not ID.fullmatch(args[0]):
+            return refused("key-revoke takes the key's id")
+        mine = (lookups.get("minted") or (lambda k: False))(args[0])
+        return Decision("rule" if mine else "judged", "a key that the door minted" if mine else
+                        "revoking a key that the door did not mint", target=f"backblaze:{account}",
+                        plan={"provider": "backblaze", "account": account,
+                              "steps": [step("POST", "b2_delete_key", {"applicationKeyId": args[0]},
+                                             keep="revoked")]})
+    if op == "key-place":
+        return key_place(access, agent, "backblaze", account, args, lookups)
+    return refused(f"{op} is not listed for Backblaze")
+
+
+def key_place(access, agent, provider, account, args, lookups):
+    """The two parts of a key that the door minted, each where its old value is on a host the agent holds at Fix,
+    through that host's ops-root: <host> <file> <key-id> <NAME>=id:<sha256> [<NAME>=key:<sha256>]."""
+    if len(args) < 4:
+        return refused("key-place takes the host, the file, the key's id and NAME=id:<sha256> or NAME=key:<sha256>")
+    host, path, key_id, pairs = args[0], args[1], args[2], args[3:]
+    me = (access.get("agents") or {}).get(agent) or {}
+    if (me.get("servers") or {}).get(host) != "fix":
+        return refused(f"{agent} holds no Fix on {host}")
+    if (access.get("hosts") or {}).get(host, {}).get("kind") == "fleet":
+        return refused("a key is never placed on a Fleet machine")
+    if not (lookups.get("minted") or (lambda k: False))(key_id):
+        return refused(f"{key_id} is no key that the door minted")
+    places = []
+    for pair in pairs:
+        m = re.fullmatch(r"([A-Z][A-Z0-9_]{0,63})=(id|key):([0-9a-f]{64})", pair)
+        if not m:
+            return refused(f"{pair!r} is not NAME=id:<sha256> or NAME=key:<sha256>")
+        places.append({"host": host, "file": path, "name": m.group(1), "part": m.group(2), "old": m.group(3)})
+    return Decision("rule", "a minted key where the old value is", target=f"{provider}:{account}", host=host,
+                    plan={"provider": provider, "account": account, "place": places, "key": key_id})
+
+
+# ---------------------------------------------------------------- Cloudflare
+
+CF_JUDGED = (r"/zones/[0-9a-f]{32}/dns_records/[0-9a-f]{32}", r"/zones/[0-9a-f]{32}/dns_records",
+             r"/zones/[0-9a-f]{32}/rulesets(/[0-9a-f]{32})?(/rules(/[0-9a-f]{32})?)?",
+             r"/zones/[0-9a-f]{32}/rulesets/phases/[a-z_]+/entrypoint",
+             r"/accounts/[0-9a-f]{32}/r2/buckets(/[a-z0-9-]{3,63})?(/domains/custom(/[a-z0-9.-]+)?)?",
+             r"/accounts/[0-9a-f]{32}/challenges/widgets(/[A-Za-z0-9_-]+)?",
+             r"/accounts/[0-9a-f]{32}/workers/scripts/[a-z0-9-]+(/[a-z-]+)?",
+             r"/zones/[0-9a-f]{32}/email/routing(/[a-z/]+)?(/[0-9a-f]{32})?",
+             r"/zones/[0-9a-f]{32}/cache/[a-z_]+",
+             r"/accounts/[0-9a-f]{32}/cfd_tunnel/[0-9a-f-]{36}/configurations")
+
+
+def cloudflare(access, agent, account, op, args, content, lookups):
+    zone = args[0] if args else ""
+    if op == "zones" and not args:
+        return read_plan("cloudflare", account, [step("GET", "/zones", query={"per_page": "50"})], "a listed read")
+    if op == "records" and len(args) == 1 and re.fullmatch(r"[0-9a-f]{32}", zone):
+        return read_plan("cloudflare", account, [step("GET", f"/zones/{zone}/dns_records",
+                                                      query={"per_page": "500"})], "a listed read")
+    if op == "tunnels" and not args:
+        return read_plan("cloudflare", account, [step("GET", "/accounts/{account_id}/cfd_tunnel",
+                                                      query={"is_deleted": "false"})], "a listed read")
+    if op == "rulesets" and len(args) == 1 and re.fullmatch(r"[0-9a-f]{32}", zone):
+        return read_plan("cloudflare", account, [step("GET", f"/zones/{zone}/rulesets")], "a listed read")
+    if op == "cname":
+        if len(args) != 3 or not re.fullmatch(r"[0-9a-f]{32}", zone) or not HOSTNAME.fullmatch(args[1]) or \
+                not re.fullmatch(r"[0-9a-f-]{36}", args[2]):
+            return refused("cname takes the zone's id, the full name and the tunnel's id")
+        if args[2] in (account_of(access, "cloudflare", account).get("judged_tunnels") or []):
+            return refused("that tunnel's names are judged: use change")
+        return Decision("rule", "a new CNAME to a tunnel of this account", target=f"cloudflare:{account}",
+                        plan={"provider": "cloudflare", "account": account, "steps": [
+                            step("GET", "/accounts/{account_id}/cfd_tunnel/" + args[2], keep="tunnel"),
+                            step("GET", f"/zones/{zone}/dns_records", query={"name": args[1]}, need="none"),
+                            step("POST", f"/zones/{zone}/dns_records", {
+                                "type": "CNAME", "name": args[1], "content": f"{args[2]}.cfargotunnel.com",
+                                "proxied": True, "comment": "the door"})]})
+    if op == "tunnel-route":
+        if len(args) != 3 or not re.fullmatch(r"[0-9a-f-]{36}", args[0]) or not HOSTNAME.fullmatch(args[1]) or \
+                not re.fullmatch(r"[1-9][0-9]{0,4}", args[2]):
+            return refused("tunnel-route takes the tunnel's id, the full name and the host's own port")
+        if args[0] in (account_of(access, "cloudflare", account).get("judged_tunnels") or []):
+            return refused("that tunnel is judged: use change")
+        return Decision("rule", "a new tunnel hostname with the host's own origin", target=f"cloudflare:{account}",
+                        plan={"provider": "cloudflare", "account": account, "steps": [
+                            step("GET", f"/accounts/{{account_id}}/cfd_tunnel/{args[0]}/configurations",
+                                 keep="ingress"),
+                            step("PUT", f"/accounts/{{account_id}}/cfd_tunnel/{args[0]}/configurations",
+                                 {"add": {"hostname": args[1], "service": f"http://localhost:{args[2]}"}},
+                                 need="new_hostname")]})
+    if op == "purge":
+        if len(args) < 2 or len(args) > 31 or not re.fullmatch(r"[0-9a-f]{32}", zone):
+            return refused("purge takes the zone's id and 1 to 30 names or addresses")
+        urls = [a for a in args[1:] if a.startswith("https://")]
+        hosts = [a for a in args[1:] if HOSTNAME.fullmatch(a)]
+        if len(urls) + len(hosts) != len(args) - 1:
+            return refused("purge takes full names or https addresses")
+        return Decision("rule", "a cache purge", target=f"cloudflare:{account}",
+                        plan={"provider": "cloudflare", "account": account, "steps": [
+                            step("POST", f"/zones/{zone}/purge_cache",
+                                 {"files": urls} if urls and not hosts else {"hosts": hosts} if hosts and not urls
+                                 else {"files": urls, "hosts": hosts})]})
+    if op == "change":
+        if len(args) != 2 or args[0] not in ("POST", "PUT", "PATCH", "DELETE"):
+            return refused("change takes the method and the path, with the body as content")
+        path = args[1]
+        if not any(re.fullmatch(p, path) for p in CF_JUDGED):
+            return refused(f"{path} is not a product that the door changes on Cloudflare")
+        body = json_body(content) if args[0] != "DELETE" else None
+        if body is False:
+            return refused("the body is JSON of at most 64 KiB")
+        if re.search(r'"service"\s*:\s*"(ssh|tcp|rdp|smb|unix|unix\+tls)://', json.dumps(body or {})):
+            return refused("a tunnel to ssh://, tcp://, rdp://, smb:// or a socket is never the door's")
+        return Decision("judged", f"a change of {path.split('/')[3] if path.count('/') > 2 else path}",
+                        target=f"cloudflare:{account}",
+                        plan={"provider": "cloudflare", "account": account, "steps": [step(args[0], path, body)]})
+    return refused(f"{op} is not listed for Cloudflare")
+
+
+def json_body(content):
+    if not content or len(content) > BODY_MAX:
+        return False
+    try:
+        return json.loads(content)
+    except ValueError:
+        return False
+
+
+# ---------------------------------------------------------------- GitHub
+
+def github(access, agent, owner, op, args, content, lookups):
+    repo = args[0] if args else ""
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", repo or "-"):
+        return refused("the repository is its name under this owner")
+    full = f"{owner}/{repo}"
+    if vendor(full):
+        return refused(f"{full} is never a target of the door")
+    reads = {"runs": f"/repos/{full}/actions/runs", "failed": f"/repos/{full}/actions/runs",
+             "alerts": f"/repos/{full}/dependabot/alerts", "code-alerts": f"/repos/{full}/code-scanning/alerts",
+             "secret-alerts": f"/repos/{full}/secret-scanning/alerts", "runners": f"/repos/{full}/actions/runners"}
+    if op in reads and len(args) == 1:
+        query = {"per_page": "50"}
+        if op == "failed":
+            query["status"] = "failure"
+        if op == "secret-alerts":
+            query["hide_secret"] = "true"           # the alert, never the secret it found
+        return read_plan("github", owner, [step("GET", reads[op], query=query)], "a listed read")
+    if op == "jobs" and len(args) == 2 and args[1].isdigit():
+        return read_plan("github", owner, [step("GET", f"/repos/{full}/actions/runs/{args[1]}/jobs")],
+                         "a listed read")
+    if op == "workflow":
+        if len(args) < 2 or not re.fullmatch(r"[A-Za-z0-9._-]{1,100}\.ya?ml", args[1]):
+            return refused("workflow takes the repository, the workflow's file name and name=value inputs")
+        lists = (access.get("workflows") or {}).get(full) or {}
+        inputs = {}
+        for pair in args[2:]:
+            key, sep, value = pair.partition("=")
+            if not sep or not re.fullmatch(r"[a-z][a-z0-9_-]{0,40}", key) or not INPUT.fullmatch(value):
+                return refused(f"{pair!r} is not an input that code can check")
+            inputs[key] = value
+        kind = "rule" if args[1] in (lists.get("health") or []) else \
+            "judged" if args[1] in (lists.get("bootstrap") or []) else None
+        if kind is None:
+            return refused(f"{args[1]} is not a listed workflow of {full}")
+        ref = lists.get("ref") or (lookups.get("default_branch") or (lambda name: None))(full)
+        if not ref:
+            return refused(f"the door could not read the default branch of {full}")
+        return Decision(kind, f"a {'health' if kind == 'rule' else 'bootstrap'} workflow", target=f"github:{owner}",
+                        plan={"provider": "github", "account": owner, "steps": [
+                            step("POST", f"/repos/{full}/actions/workflows/{args[1]}/dispatches",
+                                 {"ref": ref, "inputs": inputs})]})
+    if op == "secret":
+        if len(args) != 4 or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,99}", args[1]) or args[3] not in ("id", "key") or \
+                not (lookups.get("minted") or (lambda k: False))(args[2]):
+            return refused("secret takes the repository, the secret's name, the id of a key the door rotated, and id "
+                           "or key: which part of it")
+        return Decision("rule", "a new value of a secret that the door rotated", target=f"github:{owner}",
+                        plan={"provider": "github", "account": owner, "secret": {"repo": full, "name": args[1],
+                                                                                 "key": args[2], "part": args[3]}})
+    if op == "pull-request":
+        if len(args) < 4 or not all(re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", b) for b in args[1:3]):
+            return refused("pull-request takes the repository, the head branch, the base branch and the title")
+        return Decision("rule", "a pull request", target=f"github:{owner}",
+                        plan={"provider": "github", "account": owner, "steps": [
+                            step("POST", f"/repos/{full}/pulls", {"head": args[1], "base": args[2],
+                                                                   "title": " ".join(args[3:])[:200]})]})
+    return refused(f"{op} is not listed for GitHub")
+
+
+# ---------------------------------------------------------------- Hetzner Cloud
+
+HZ_JUDGED = (r"/firewalls/[0-9]{1,12}/actions/(set_rules|apply_to_resources|remove_from_resources)",
+             r"/servers/[0-9]{1,12}/actions/change_protection", r"/servers/[0-9]{1,12}")
+
+
+def hetzner(access, agent, project, op, args, content, lookups):
+    reads = {"servers": "/servers", "firewalls": "/firewalls", "volumes": "/volumes", "ips": "/primary_ips"}
+    if op in reads and not args:
+        return read_plan("hetzner", project, [step("GET", reads[op], query={"per_page": "50"})], "a listed read")
+    if op == "server" and len(args) == 1 and NAME.fullmatch(args[0]):
+        return read_plan("hetzner", project, [step("GET", "/servers", query={"name": args[0]})], "a listed read")
+    if op == "power-cycle":
+        if len(args) != 1 or args[0] not in held_servers(access, agent):
+            return refused("power-cycle takes a server that this agent holds")
+        return Decision("rule", "a power cycle of a server that the agent holds", target=f"hetzner:{project}",
+                        host=args[0], reboot=True, window="reboot",
+                        plan={"provider": "hetzner", "account": project, "steps": [
+                            step("GET", "/servers", query={"name": args[0]}, keep="server_id", need="one_server"),
+                            step("POST", "/servers/{server_id}/actions/reset")]})
+    if op == "change":
+        if len(args) != 3 or args[0] not in ("POST", "PUT") or args[2] not in held_servers(access, agent):
+            return refused("change takes the method, the path and the server it is for, which this agent holds")
+        if "rescue" in args[1]:
+            return refused("Rescue is never booted")
+        if not any(re.fullmatch(p, args[1]) for p in HZ_JUDGED):
+            return refused(f"{args[1]} is not a firewall, protection or name change")
+        body = json_body(content)
+        if body is False:
+            return refused("the body is JSON of at most 64 KiB")
+        return Decision("judged", "a firewall, protection or name of a held server", target=f"hetzner:{project}",
+                        host=args[2], plan={"provider": "hetzner", "account": project, "steps": [
+                            step("GET", "/servers", query={"name": args[2]}, keep="server_id", need="one_server"),
+                            step(args[0], args[1], body, need="server_path")]})
+    return refused(f"{op} is not listed for Hetzner")
+
+
+# ---------------------------------------------------------------- AWS
+
+def aws(access, agent, account, op, args, content, lookups):
+    tag = account_of(access, "aws", account).get("tag", "door")
+    reads = {"instances": ("ec2", "DescribeInstances"), "groups": ("ec2", "DescribeSecurityGroups"),
+             "stacks": ("cloudformation", "DescribeStacks")}
+    if op in reads and not args:
+        return read_plan("aws", account, [{"aws": reads[op], "params": {}}], "a listed read")
+    if op in ("start", "stop", "reboot"):
+        if len(args) != 1 or not re.fullmatch(r"i-[0-9a-f]{8,17}", args[0]):
+            return refused(f"{op} takes one instance id")
+        action = {"start": "StartInstances", "stop": "StopInstances", "reboot": "RebootInstances"}[op]
+        return Decision("rule", f"{op} of a tagged instance", target=f"aws:{account}", reboot=True, window="reboot",
+                        plan={"provider": "aws", "account": account, "steps": [
+                            {"aws": ("ec2", "DescribeInstances"), "params": {
+                                "InstanceId.1": args[0], "Filter.1.Name": "tag-key", "Filter.1.Value.1": tag},
+                             "need": "tagged"},
+                            {"aws": ("ec2", action), "params": {"InstanceId.1": args[0]}}]})
+    if op == "ingress":
+        if len(args) != 5 or args[0] not in ("add", "remove") or not re.fullmatch(r"sg-[0-9a-f]{8,17}", args[1]) or \
+                args[2] not in ("tcp", "udp") or not re.fullmatch(r"[0-9]{1,5}", args[3]) or \
+                not re.fullmatch(r"[0-9.]{7,15}/[0-9]{1,2}", args[4]):
+            return refused("ingress takes add or remove, the group, tcp or udp, the port and an IPv4 range")
+        action = "AuthorizeSecurityGroupIngress" if args[0] == "add" else "RevokeSecurityGroupIngress"
+        return Decision("judged", "a security group of a tagged instance", target=f"aws:{account}",
+                        plan={"provider": "aws", "account": account, "steps": [
+                            {"aws": ("ec2", "DescribeInstances"), "params": {
+                                "Filter.1.Name": "instance.group-id", "Filter.1.Value.1": args[1],
+                                "Filter.2.Name": "tag-key", "Filter.2.Value.1": tag}, "need": "tagged"},
+                            {"aws": ("ec2", action), "params": {
+                                "GroupId": args[1], "IpPermissions.1.IpProtocol": args[2],
+                                "IpPermissions.1.FromPort": args[3], "IpPermissions.1.ToPort": args[3],
+                                "IpPermissions.1.IpRanges.1.CidrIp": args[4]}}]})
+    if op == "change-set":
+        if len(args) != 2 or not NAME.fullmatch(args[0]) or not NAME.fullmatch(args[1]) or not content:
+            return refused("change-set takes the stack, the change set's name and the template as content")
+        return Decision("judged", "a CloudFormation change set", target=f"aws:{account}",
+                        plan={"provider": "aws", "account": account, "steps": [
+                            {"aws": ("cloudformation", "CreateChangeSet"), "params": {
+                                "StackName": args[0], "ChangeSetName": args[1],
+                                "TemplateBody": content.decode("utf-8", "replace")}}]})
+    if op == "key-off":
+        if len(args) != 2 or not NAME.fullmatch(args[0]) or not re.fullmatch(r"AKIA[0-9A-Z]{16}", args[1]):
+            return refused("key-off takes the user and the access key id")
+        return Decision("judged", "deactivating an IAM key that shows no use", target=f"aws:{account}",
+                        plan={"provider": "aws", "account": account, "steps": [
+                            {"aws": ("iam", "GetAccessKeyLastUsed"), "params": {"AccessKeyId": args[1]},
+                             "need": "unused"},
+                            {"aws": ("iam", "UpdateAccessKey"), "params": {
+                                "UserName": args[0], "AccessKeyId": args[1], "Status": "Inactive"}}]})
+    return refused(f"{op} is not listed for AWS")
+
+
+# ---------------------------------------------------------------- Azure
+
+AZ_READS = (r"/subscriptions/[0-9a-f-]{36}/resourceGroups(/[A-Za-z0-9._()-]+)?",
+            r"/subscriptions/[0-9a-f-]{36}/resourceGroups/[A-Za-z0-9._()-]+/providers/Microsoft\.(Sql|Web)/"
+            r"[A-Za-z/]+(/[A-Za-z0-9._-]+)?",
+            r"/subscriptions/[0-9a-f-]{36}/resourceGroups/[A-Za-z0-9._()-]+/providers/[A-Za-z.]+/[A-Za-z]+/"
+            r"[A-Za-z0-9._-]+/providers/Microsoft\.Insights/metrics")
+
+
+def azure(access, agent, account, op, args, content, lookups):
+    conf = account_of(access, "azure", account)
+    if op == "get" and len(args) == 1:
+        if not any(re.fullmatch(p, args[0]) for p in AZ_READS) or re.search(r"/(config|listKeys|publishxml)", args[0],
+                                                                            re.I):
+            return refused(f"{args[0]} is not a listed read")
+        return read_plan("azure", account, [step("GET", args[0])], "a listed read")
+    if op == "sql-firewall":
+        if len(args) != 4 or args[0] not in (conf.get("sql_servers") or []) or not NAME.fullmatch(args[1]) or \
+                not all(re.fullmatch(r"[0-9.]{7,15}", ip) for ip in args[2:]):
+            return refused("sql-firewall takes a listed SQL server, the rule's name and the first and last address")
+        return Decision("judged", "a firewall rule on a listed SQL server", target=f"azure:{account}",
+                        plan={"provider": "azure", "account": account, "steps": [step(
+                            "PUT", f"{args[0]}/firewallRules/{args[1]}",
+                            {"properties": {"startIpAddress": args[2], "endIpAddress": args[3]}})]})
+    if op == "app-setting":
+        if len(args) != 3 or args[0] not in (conf.get("sites") or []) or \
+                not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,99}", args[1]) or len(args[2]) > 2000:
+            return refused("app-setting takes a listed site, the setting's name and its value")
+        return Decision("judged", "an App Service setting", target=f"azure:{account}",
+                        plan={"provider": "azure", "account": account, "app_setting": {
+                            "site": args[0], "name": args[1], "value": args[2]}})
+    return refused(f"{op} is not listed for Azure")
+
+
+# ---------------------------------------------------------------- Tailscale
+
+def tailscale(access, agent, tailnet, op, args, content, lookups):
+    fleet_tags = account_of(access, "tailscale", tailnet).get("fleet_tags") or []
+    if op == "devices" and not args:
+        return read_plan("tailscale", tailnet, [step("GET", "/tailnet/-/devices")], "a listed read")
+    if op == "device" and len(args) == 1 and ID.fullmatch(args[0]):
+        return read_plan("tailscale", tailnet, [step("GET", f"/device/{args[0]}")], "a listed read")
+    if op in ("key-expiry-off", "rename"):
+        if not args or not ID.fullmatch(args[0]) or (op == "rename" and (len(args) != 2 or not re.fullmatch(
+                r"[a-z0-9][a-z0-9-]{0,62}", args[1]))) or (op != "rename" and len(args) != 1):
+            return refused("key-expiry-off takes a device id; rename takes a device id and a name")
+        last = step("POST", f"/device/{args[0]}/key", {"keyExpiryDisabled": True}) if op == "key-expiry-off" else \
+            step("POST", f"/device/{args[0]}/name", {"name": args[1]})
+        return Decision("rule", "a device of the fleet", target=f"tailscale:{tailnet}",
+                        plan={"provider": "tailscale", "account": tailnet, "steps": [
+                            step("GET", f"/device/{args[0]}", need="fleet_device"), last],
+                              "fleet_tags": fleet_tags})
+    if op == "delete" and len(args) == 1 and ID.fullmatch(args[0]):
+        return Decision("judged", "deleting a device", target=f"tailscale:{tailnet}",
+                        plan={"provider": "tailscale", "account": tailnet,
+                              "steps": [step("DELETE", f"/device/{args[0]}")]})
+    if op == "oauth-client" and len(args) == 2 and args[0] in ("make", "revoke") and \
+            re.fullmatch(r"tag:[a-z0-9-]{1,50}|[A-Za-z0-9]{6,40}", args[1]):
+        steps = [step("POST", "/tailnet/-/keys", {"keyType": "client", "scopes": ["devices:core"],
+                                                   "tags": [args[1]]}, keep="minted")] if args[0] == "make" else \
+            [step("DELETE", f"/tailnet/-/keys/{args[1]}")]
+        return Decision("judged", f"{args[0]} an OAuth client for one tag", target=f"tailscale:{tailnet}",
+                        plan={"provider": "tailscale", "account": tailnet, "steps": steps})
+    if op in ("tags", "acl", "policy"):
+        return refused("a device's tags and the policy file are never the door's")
+    return refused(f"{op} is not listed for Tailscale")
+
+
+PROVIDERS = {"backblaze": backblaze, "cloudflare": cloudflare, "github": github, "hetzner": hetzner, "aws": aws,
+             "azure": azure, "tailscale": tailscale}
+
+
+def decide(access, agent, kind, name, op, args, content, lookups):
+    for a in args:
+        if len(a) > 2000 or "\n" in a or "\0" in a:
+            return refused("each argument is one line of text")
+    d = PROVIDERS[kind](access, agent, name, op, args, content, lookups)
+    d.target = d.target or f"{kind}:{name}"
+    return d
+
+
+# ---------------------------------------------------------------- execute a plan
+#
+# ctx gives what a plan needs: http(method, url, headers, body) -> (status, answer), the secret of this account
+# (credentials), keep(kind, value) for what the door keeps (a minted key's secret), minted_secret(key_id), and
+# host(host, op, args, stdin) for a call through a host's ops-root. Tests give a stub ctx.
+
+BASES = {"cloudflare": "https://api.cloudflare.com/client/v4", "github": "https://api.github.com",
+         "hetzner": "https://api.hetzner.cloud/v1", "tailscale": "https://api.tailscale.com/api/v2",
+         "azure": "https://management.azure.com"}
+
+
+class Stop(Exception):
+    """A step that cannot go on: its condition failed, or the provider refused."""
+
+
+def execute(plan, ctx):
+    """Run one plan and give the text the agent reads: the provider's answers, with what the door keeps taken out."""
+    provider, conf = plan["provider"], ctx["credentials"]
+    if "place" in plan:
+        return place(plan, ctx)
+    if "secret" in plan:
+        return github_secret(plan, ctx)
+    if "app_setting" in plan:
+        return azure_setting(plan, ctx)
+    session = open_session(provider, conf, ctx)
+    said, kept = [], {}
+    for s in plan["steps"]:
+        if provider == "aws":
+            status, answer = aws_call(s["aws"], s["params"], conf, ctx)
+        else:
+            path = s["path"].format(**dict(session.get("fill", {}), **kept))
+            status, answer = send(provider, s, path, session, ctx, kept, plan)
+        if status >= 400:
+            raise Stop(f"{provider} answered {status}: {short(answer)}")
+        need = s.get("need")
+        if need:
+            check_need(need, answer, plan, kept)
+        if s.get("keep") == "minted":
+            ctx["keep"]("minted", answer)
+            if provider == "backblaze":
+                key_works(answer, ctx)
+            said.append(f"minted {answer.get('applicationKeyId') or answer.get('id')}: the door keeps its secret" +
+                        (", and the new key works" if provider == "backblaze" else ""))
+            continue
+        if s.get("keep") == "server_id":
+            kept["server_id"] = answer["servers"][0]["id"]
+            continue
+        if s.get("keep") in ("tunnel", "ingress"):
+            kept[s["keep"]] = answer
+            continue
+        said.append(short(answer, 4000))
+    return "\n".join(said) or "done"
+
+
+def check_need(need, answer, plan, kept):
+    if need == "none" and (answer.get("result") or []):
+        raise Stop("a record of that name exists: a change of it is judged")
+    if need == "one_server" and len(answer.get("servers") or []) != 1:
+        raise Stop("no one server has that name in this project")
+    if need == "tagged" and not any(r.get("instancesSet") for r in answer.get("reservations", [{}])) and \
+            not answer.get("tagged"):
+        raise Stop("that instance or group has no instance with the door's tag")
+    if need == "unused" and (answer.get("AccessKeyLastUsed") or {}).get("LastUsedDate"):
+        raise Stop("that key shows use: it stays active")
+    if need == "fleet_device" and not set(answer.get("tags") or []) & set(plan.get("fleet_tags") or []):
+        raise Stop("that device has no tag of the fleet")
+
+
+def short(answer, limit=2000):
+    text = answer if isinstance(answer, str) else json.dumps(answer, sort_keys=True)
+    return text[:limit]
+
+
+def open_session(provider, conf, ctx):
+    """What every request of this provider carries: its base and its authorization."""
+    secret = ctx["secret"](conf.get("secret"))
+    if provider == "backblaze":
+        key_id, _, key = secret.partition(":")
+        status, answer = ctx["http"]("GET", B2_AUTHORIZE,
+                                     {"Authorization": "Basic " + base64.b64encode(f"{key_id}:{key}".encode())
+                                      .decode()}, None)
+        if status != 200:
+            raise Stop(f"Backblaze refused the door's key ({status})")
+        return {"base": answer["apiInfo"]["storageApi"]["apiUrl"] + "/b2api/v3/",
+                "headers": {"Authorization": answer["authorizationToken"]},
+                "fill": {"account_id": answer["accountId"]}}
+    if provider == "github":
+        return {"base": BASES["github"], "headers": {"Authorization": "Bearer " + github_token(conf, ctx),
+                                                     "Accept": "application/vnd.github+json",
+                                                     "X-GitHub-Api-Version": "2022-11-28"}}
+    if provider == "azure":
+        status, answer = ctx["http"]("POST", f"https://login.microsoftonline.com/{conf['tenant']}/oauth2/v2.0/token",
+                                     {"Content-Type": "application/x-www-form-urlencoded"},
+                                     urllib.parse.urlencode({"grant_type": "client_credentials",
+                                                             "client_id": conf["client_id"], "client_secret": secret,
+                                                             "scope": "https://management.azure.com/.default"}).encode())
+        if status != 200:
+            raise Stop(f"Azure refused the door's principal ({status})")
+        return {"base": BASES["azure"], "headers": {"Authorization": "Bearer " + answer["access_token"]},
+                "query": {"api-version": conf.get("api_version", "2023-08-01")}}
+    if provider == "aws":
+        return {}
+    if provider == "tailscale":
+        # an OAuth client: its secret buys an access token of an hour, which the calls carry (client credentials)
+        client = conf.get("client_id") or (secret.split("-")[2] if secret.startswith("tskey-client-") else "")
+        status, answer = ctx["http"]("POST", BASES["tailscale"] + "/oauth/token",
+                                     {"Content-Type": "application/x-www-form-urlencoded"},
+                                     urllib.parse.urlencode({"client_id": client, "client_secret": secret}).encode())
+        if status != 200 or not isinstance(answer, dict) or not isinstance(answer.get("access_token"), str):
+            raise Stop(f"Tailscale refused the door's OAuth client ({status})")
+        return {"base": BASES["tailscale"], "headers": {"Authorization": "Bearer " + answer["access_token"]}}
+    return {"base": BASES[provider], "headers": {"Authorization": "Bearer " + secret},
+            "fill": {"account_id": conf.get("account_id", "")}}
+
+
+def send(provider, s, path, session, ctx, kept, plan):
+    headers = dict(session["headers"])
+    query = dict(session.get("query") or {}, **(s.get("query") or {}))
+    body = s.get("body")
+    if provider == "backblaze":
+        body = json.loads(json.dumps(body).replace("{account_id}", session["fill"]["account_id"]))
+        url = session["base"] + path
+    else:
+        url = session["base"] + path
+    if s.get("need") == "new_hostname":        # Cloudflare: the tunnel's ingress with one new hostname before the end
+        ingress = ((kept.get("ingress") or {}).get("result") or {}).get("config", {}).get("ingress") or []
+        add = body["add"]
+        if any(rule.get("hostname") == add["hostname"] for rule in ingress):
+            raise Stop("that hostname is in the tunnel already: a change of it is judged")
+        body = {"config": dict(((kept.get("ingress") or {}).get("result") or {}).get("config") or {},
+                               ingress=[r for r in ingress if r.get("hostname")] + [add] +
+                               [r for r in ingress if not r.get("hostname")] or [add, {"service": "http_status:404"}])}
+    if s.get("need") == "server_path" and not path.startswith(f"/servers/{kept.get('server_id')}") and \
+            not path.startswith("/firewalls/"):
+        raise Stop("that path is not the named server's")
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode()
+    return ctx["http"](s["method"], url, headers, data)
+
+
+def github_token(conf, ctx):
+    """An installation token of the door's App for this owner, from the App's key, signed by openssl."""
+    jwt = app_jwt(conf["app_id"], ctx["secret"](conf["secret"]), ctx.get("sign"))
+    status, answer = ctx["http"]("GET", f"{BASES['github']}/orgs/{conf['owner']}/installation" if conf.get("org", True)
+                                 else f"{BASES['github']}/users/{conf['owner']}/installation",
+                                 {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json"}, None)
+    if status != 200:
+        raise Stop(f"GitHub gave no installation of the door's App ({status})")
+    status, answer = ctx["http"]("POST", f"{BASES['github']}/app/installations/{answer['id']}/access_tokens",
+                                 {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json"}, b"{}")
+    if status != 201:
+        raise Stop(f"GitHub gave the door no token ({status})")
+    return answer["token"]
+
+
+def app_jwt(app_id, key_pem, sign=None):
+    def part(data):
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+    t0 = int(time.time())
+    signed = part(json.dumps({"alg": "RS256", "typ": "JWT"}).encode()) + "." + \
+        part(json.dumps({"iat": t0 - 60, "exp": t0 + 540, "iss": int(app_id)}).encode())
+    if sign is None:
+        def sign(text, pem):
+            import tempfile
+            with tempfile.NamedTemporaryFile("w", delete=True) as f:
+                f.write(pem)
+                f.flush()
+                r = subprocess.run(["openssl", "dgst", "-sha256", "-sign", f.name], input=text.encode(),
+                                   capture_output=True, timeout=20)
+            if r.returncode != 0:
+                raise Stop("openssl could not sign with the door's App key")
+            return r.stdout
+    return signed + "." + part(sign(signed, key_pem))
+
+
+def github_secret(plan, ctx):
+    """A secret of a repository, set to the value of a key that the door rotated, with gh's own sealing. The value
+    goes on gh's stdin and never into an argument or an answer."""
+    s = plan["secret"]
+    token = github_token(ctx["credentials"], ctx)
+    value = minted_part(ctx, s["key"], s["part"])
+    status, out = ctx["run"](["gh", "secret", "set", s["name"], "--repo", s["repo"]], value.encode(),
+                             {"GH_TOKEN": token})
+    if status != 0:
+        raise Stop(f"gh could not set {s['name']}: {out[-300:]}")
+    return f"{s['name']} of {s['repo']} has the rotated value"
+
+
+def minted_part(ctx, key_id, part):
+    """One part of a key that the door minted: its id, or the key itself."""
+    minted_id, _, key = ctx["minted_secret"](key_id).partition(":")
+    return minted_id if part == "id" else key
+
+
+def key_works(answer, ctx):
+    """A Backblaze key that the door just minted signs in, before anything uses it. One that does not is kept, so
+    that key-revoke can end it."""
+    status, _ = ctx["http"]("GET", B2_AUTHORIZE, {"Authorization": "Basic " + base64.b64encode(
+        f"{answer.get('applicationKeyId')}:{answer.get('applicationKey')}".encode()).decode()}, None)
+    if status != 200:
+        raise Stop(f"the new key {answer.get('applicationKeyId')} does not sign in ({status}): end it with key-revoke")
+
+
+def azure_setting(plan, ctx):
+    """One App Service setting: the site's settings are read, one changed, and written back whole."""
+    s, conf = plan["app_setting"], ctx["credentials"]
+    session = open_session("azure", conf, ctx)
+    q = "?" + urllib.parse.urlencode(session["query"])
+    status, answer = ctx["http"]("POST", f"{session['base']}{s['site']}/config/appsettings/list{q}",
+                                 session["headers"], None)
+    if status != 200:
+        raise Stop(f"Azure answered {status}")
+    props = dict(answer.get("properties") or {}, **{s["name"]: s["value"]})
+    status, answer = ctx["http"]("PUT", f"{session['base']}{s['site']}/config/appsettings{q}",
+                                 dict(session["headers"], **{"Content-Type": "application/json"}),
+                                 json.dumps({"properties": props}).encode())
+    if status >= 400:
+        raise Stop(f"Azure answered {status}")
+    return f"{s['name']} is set on {s['site'].rsplit('/', 1)[-1]}"
+
+
+def place(plan, ctx):
+    """Each part of a minted key where its old value is, through the host's ops-root, which finds that line by the
+    old value's hash. The new value goes on stdin only."""
+    minted = ctx["minted_secret"](plan["key"])
+    key_id, _, key = minted.partition(":")
+    said = []
+    for p in plan["place"]:
+        value = key_id if p["part"] == "id" else key
+        status, out = ctx["host"](p["host"], "place", [p["file"], p["name"], p["old"]], value.encode())
+        if status != 0:
+            raise Stop(f"{p['name']} in {p['file']} on {p['host']}: {out.strip()[-300:]}")
+        said.append(out.strip())
+    return "\n".join(said)
+
+
+# ---- AWS signature version 4
+
+AWS_HOSTS = {"ec2": "ec2.{region}.amazonaws.com", "cloudformation": "cloudformation.{region}.amazonaws.com",
+             "iam": "iam.amazonaws.com"}
+AWS_VERSIONS = {"ec2": "2016-11-15", "cloudformation": "2010-05-15", "iam": "2010-05-08"}
+
+
+def aws_call(service_action, params, conf, ctx, now=None):
+    """One query API call, signed with SigV4. The answer is XML; the door gives it on as text, and the conditions
+    read it as text too."""
+    service, action = service_action
+    region = "us-east-1" if service == "iam" else conf.get("region", "us-east-1")
+    host = AWS_HOSTS[service].format(region=region)
+    body = urllib.parse.urlencode(sorted(dict(params, Action=action, Version=AWS_VERSIONS[service]).items())).encode()
+    t = now or datetime.datetime.now(datetime.timezone.utc)
+    amz, day = t.strftime("%Y%m%dT%H%M%SZ"), t.strftime("%Y%m%d")
+    secret = ctx["secret"](conf["secret"])
+    key_id, _, key = secret.partition(":")
+    headers = {"Content-Type": "application/x-www-form-urlencoded; charset=utf-8", "Host": host, "X-Amz-Date": amz}
+    signed = "content-type;host;x-amz-date"
+    canonical = "\n".join(["POST", "/", "", f"content-type:{headers['Content-Type']}", f"host:{host}",
+                           f"x-amz-date:{amz}", "", signed, hashlib.sha256(body).hexdigest()])
+    scope = f"{day}/{region}/{service}/aws4_request"
+    to_sign = "\n".join(["AWS4-HMAC-SHA256", amz, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+    k = hmac.new(("AWS4" + key).encode(), day.encode(), hashlib.sha256).digest()
+    for part in (region, service, "aws4_request"):
+        k = hmac.new(k, part.encode(), hashlib.sha256).digest()
+    signature = hmac.new(k, to_sign.encode(), hashlib.sha256).hexdigest()
+    headers["Authorization"] = f"AWS4-HMAC-SHA256 Credential={key_id}/{scope}, SignedHeaders={signed}, " \
+                               f"Signature={signature}"
+    status, answer = ctx["http"]("POST", f"https://{host}/", headers, body)
+    text = answer if isinstance(answer, str) else json.dumps(answer)
+    if action == "DescribeInstances" and status == 200:
+        return status, {"tagged": "<instanceId>" in text, "text": text}
+    if action == "GetAccessKeyLastUsed" and status == 200:
+        return status, {"AccessKeyLastUsed": {"LastUsedDate": "<LastUsedDate>" in text or None}}
+    return status, text
+
+
+def http(method, url, headers, data, timeout=30):
+    """The door's own HTTPS call: (status, the answer as JSON, or text when it is not JSON)."""
+    req = urllib.request.Request(url, data=data, method=method, headers=dict(headers, **{"User-Agent": "fleet-door"}))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw, status = r.read(4 * 1024 * 1024), r.status
+    except urllib.error.HTTPError as e:
+        raw, status = e.read(64 * 1024), e.code
+    except (urllib.error.URLError, OSError) as e:
+        return 599, f"cannot reach {urllib.parse.urlsplit(url).hostname}: {e}"
+    try:
+        return status, json.loads(raw or b"{}")
+    except ValueError:
+        return status, raw.decode("utf-8", "replace")

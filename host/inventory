@@ -1,0 +1,97 @@
+#!/usr/bin/python3 -IS
+"""inventory: what a managed host runs, as JSON, with no arguments (DevOps plan, section 2). ops-root runs it as a
+rule call. It prints runtimes by unit, listeners, vhosts, certificates, users and the firmware flag, and never a value
+of a file: a certificate by its names and dates, a user by its name and shell, a unit by its program's path."""
+import glob
+import json
+import os
+import pwd
+import re
+import subprocess
+
+ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8",
+       "SYSTEMD_PAGER": ""}
+
+
+def out(argv):
+    try:
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           env=ENV, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+
+
+def runtimes():
+    """{unit: program} of each running service: the real path of its main process's program."""
+    found = {}
+    for line in out(["systemctl", "list-units", "--type=service", "--state=running", "--plain", "--no-legend",
+                     "--no-pager"]).splitlines():
+        unit = line.split()[0] if line.split() else ""
+        pid = out(["systemctl", "show", "--property=MainPID", "--value", unit]).strip()
+        if pid.isdigit() and pid != "0":
+            try:
+                found[unit] = os.path.realpath(f"/proc/{pid}/exe")
+            except OSError:
+                pass
+    return found
+
+
+def listeners():
+    found = []
+    for line in out(["ss", "-tlnpH"]).splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            program = re.search(r'users:\(\("([^"]+)"', line)
+            found.append({"address": parts[3], "program": program.group(1) if program else None})
+    return found
+
+
+def vhosts():
+    names = set()
+    for path in glob.glob("/etc/nginx/sites-enabled/*") + glob.glob("/etc/nginx/conf.d/*.conf"):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for m in re.finditer(r"^\s*server_name\s+([^;]+);", f.read(), re.M):
+                    names.update(n for n in m.group(1).split() if n != "_")
+        except OSError:
+            pass
+    return sorted(names)
+
+
+def certificates():
+    found = []
+    for path in sorted(glob.glob("/etc/letsencrypt/live/*/cert.pem")):
+        text = out(["openssl", "x509", "-noout", "-subject", "-enddate", "-ext", "subjectAltName", "-in", path])
+        end = re.search(r"notAfter=(.+)", text)
+        found.append({"name": os.path.basename(os.path.dirname(path)), "ends": end.group(1).strip() if end else None,
+                      "names": sorted(set(re.findall(r"DNS:([^,\s]+)", text)))})
+    return found
+
+
+def users():
+    found = []
+    for u in pwd.getpwall():
+        if u.pw_uid == 0 or u.pw_uid >= 1000 or not u.pw_shell.endswith(("nologin", "false")):
+            found.append({"name": u.pw_name, "uid": u.pw_uid, "shell": u.pw_shell})
+    return found
+
+
+def release():
+    try:
+        with open("/etc/os-release", encoding="utf-8") as f:
+            return {k: v.strip().strip('"') for k, _, v in (line.partition("=") for line in f)
+                    if k in ("ID", "VERSION_ID")}
+    except OSError:
+        return {}
+
+
+def main():
+    print(json.dumps({"runtimes": runtimes(), "listeners": listeners(), "vhosts": vhosts(),
+                      "certificates": certificates(), "users": users(),
+                      "firmware": "uefi" if os.path.isdir("/sys/firmware/efi") else "bios", "release": release()},
+                     indent=1, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
