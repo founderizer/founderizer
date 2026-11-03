@@ -793,7 +793,7 @@ check("a declined secret request reaches the manager in the owner's words",
       code == 200 and "Not given: Use the test account first" in said, text + said)
 text, err = tool("manager", "raise_needs_you", base=hubS, title="Vault token", why="Fleet Vault has none",
                  what_to_do="Paste the Bitwarden access token into Fleet Vault on your Mac.")
-check("a Needs-you item that sends the owner to his own app passes", not err and "N-3" in text, text)
+check("a Needs-you item that sends the owner to their own app passes", not err and "N-3" in text, text)
 code, _, text = owner_ui("/ui/needs/3/secret", {"decline": ""}, base=hubS)
 check("an item that asks for no secret takes no secure answer", code == 409, text)
 # DevOps plan V1: the central vault is the one way a value reaches a server. The owner's own sealed copies to each

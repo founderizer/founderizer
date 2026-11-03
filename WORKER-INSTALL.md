@@ -373,7 +373,7 @@ configuration ref, or the broker did not come up on the new program and kept the
 that was serving. The warning says it in the owner's words, with no command ("The
 vault on vps-2 has not taken the last update." and "It updates itself within ten
 minutes; tell us if it does not."): the command above, and the `agent-helper` step for
-a machine that does not have it, are this page's, for whoever he asks.
+a machine that does not have it, are this page's, for whoever the owner asks.
 `journalctl -u fleet-vault -n 30` says which of the four it is.
 
 The checksum is read once, when the broker starts, so a copy installed under a

@@ -1195,7 +1195,7 @@ def owner_public_key(value):
     except (ValueError, TypeError):
         raw = b""
     if len(raw) != 65 or raw[0] != 4 or base64.b64encode(raw).decode() != value:
-        raise Stop("--owner-key is the base64 of the owner's 65-byte P-256 public key, as his app gives it.")
+        raise Stop("--owner-key is the base64 of the owner's 65-byte P-256 public key, as their app gives it.")
     return value
 
 
@@ -1881,7 +1881,7 @@ def main(argv=None):
     kc.add_argument("--source", help="the published repository; default: " + releases.DEFAULT_UPSTREAM)
     kc.set_defaults(fn=cmd_kit_clone)
     cv = sub.add_parser("central-vault")
-    cv.add_argument("--owner-key", required=True, help="the owner's public key, as his app gives it (base64)")
+    cv.add_argument("--owner-key", required=True, help="the owner's public key, as their app gives it (base64)")
     cv.add_argument("--hub-user", default="fleet", help="the user the hub runs as: the one the central vault answers")
     cv.add_argument("--fleet", help="this fleet's id; default: the one in the hub's own records")
     cv.add_argument("--keep-owner", action="store_true", help="leave a central vault that another owner key holds as "

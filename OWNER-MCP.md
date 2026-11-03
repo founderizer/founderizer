@@ -8,7 +8,7 @@ access from the pool, says a goal, reads every check, takes releases and backups
 Needs-you item.
 No person clicks anything.
 
-It is for the owner's own agent: his Claude, or any MCP client. It is not for the fleet's agents —
+It is for the owner's own agent: their Claude, or any MCP client. It is not for the fleet's agents —
 they have their own server, the `fleet` tools of `hub.py` (RULES.md). This one is the owner's side.
 **OWNER-MCP-BOUNDARY.md** is why that sentence holds in the code and not only here: what stops this
 server becoming a tool the manager can grant, why nothing refuses it by name, and where the
@@ -52,10 +52,10 @@ from nothing and end up holding the authority, without a second mechanism being 
 
 What follows from this is the whole security model, and it is the owner's own:
 
-- **The grant is the authorization.** The owner's words, 17 October 2026: "If I grant access to a
-  repo/database/system/server is for the relevant agent to take full responsability". So after the
-  owner has put this server in his agent's configuration, it acts. It asks for no per-call
-  confirmation, and it builds no second approval in front of a hub route.
+- **The grant is the authorization.** A grant of a repository, a database, a system or a server makes
+  the agent that holds it fully responsible for it. So after the owner has put this server in their
+  agent's configuration, it acts. It asks for no per-call confirmation, and it builds no second
+  approval in front of a hub route.
 - **Its authority is what it holds, not what it is told.** It holds the owner's Mac. That is the
   boundary, and it is the same boundary the Mac app has. A prompt, a web page or a machine's log
   cannot widen it: text that comes back from the hub, from an install log or from a server is
@@ -148,7 +148,7 @@ would read as an empty fleet instead of as a mistake.
 | `save_person` / `person_handle` | `/ui/people`, `/ui/people/<id>/handles` | The people who may write to an agent, and their chat handles. |
 | `save_role` | `/ui/roles` | The roles those people hold: a name, a prompt in the owner's words, tools on or off, a daily limit for a closed role. A held role is not deleted. |
 | `save_settings` | `/ui/settings` | The fleet's settings in `team.json`, such as `contacts.v2`, and the runtime facts the owner changes (`cache_seconds`, `compact_tokens`, `token_weights`, `routine`); null gives each its default. |
-| `person_code` / `remove_owner_handle` | `/ui/people/codes`, `/ui/people/handles` | Link the owner's own chat account; remove one of his handles. |
+| `person_code` / `remove_owner_handle` | `/ui/people/codes`, `/ui/people/handles` | Link the owner's own chat account; remove one of their handles. |
 | `control_conversation` | `/ui/conversations/<id>` | Pause one conversation with a person, or let it run again. |
 | `save_chat_account` | `/ui/team/chat-apps` | One chat app account. The account, never its bot token. |
 | `pause_chat_apps` | `/ui/chat-apps/pause` | Pause all: every inbound message and every outbound item at once. |
@@ -169,7 +169,7 @@ would read as an empty fleet instead of as a mistake.
 | `take_backup` | `/ui/backup`, `/ui/backups/confirm` | A copy of the fleet into a file on this Mac, checked. |
 
 **A goal and a duty have no form.** UI-API.md version 1.20 took the owner's own writers out of the
-hub on the owner's direction: he says in chat what he wants the fleet to reach, and the manager
+hub on the owner's direction: they say in chat what they want the fleet to reach, and the manager
 writes it down with `update_goal`, or a duty with `set_duty`. So this server sets a goal with
 `send_message` and nothing else, and `goal_state` and `duty_state` are the state changes that
 stayed.
@@ -219,7 +219,7 @@ the file are where that repetition lives — `NOT_TOOLS` (the routes left out, e
 | A **new owner route** | The owner asks for it, the agent has no tool, and nobody knows the route exists | Every `ui_command` route of `hub.py` must be a tool here or named in `NOT_TOOLS` |
 | A **new field** on a route that is already a tool | The worst one: `plain` and `with_base` send exactly the fields their own tuple names, so the call still succeeds and the setting is simply **not there** | Every field a route takes must be sendable by one of its tools |
 | A **new value** of an enum | The agent is told the old values and refuses a good one, or sends a stale one | Every entry of `FROM_THE_HUB` must equal the hub's own constant |
-| A **tool nobody wrote down** | The owner never learns he has it, and the table below goes stale both ways | Every tool must be named in this file, and every tool the table names must exist |
+| A **tool nobody wrote down** | The owner never learns they have it, and the table below goes stale both ways | Every tool must be named in this file, and every tool the table names must exist |
 
 **All of them run in `selftest.py`**, section 0, from the source alone — no hub, no network, nothing started. That is
 the point: `selftest.py` is what a release runs, and nothing excuses a failure in it (COORDINATION.md rule 5). So a
@@ -277,14 +277,14 @@ and a tool was taken out of this file's own table, and every check failed naming
   runs.
 
 **Live, 20 October 2026,** against a real fleet's own hub from its owner's Mac, with a real MCP client over standard input and output. `which_hub` said
-`reads_owner_api: true`. Every read answered with his own fleet: four machines, each agent's
-repositories, the people, the chat apps, capacity, health (`ok: true`), the checks, the duties, his
-phone and the four profiles. `check_mcp_server` asked `mac-studio` about a program and **his Studio
-answered for itself** (`missing`, "no notes-mcp on its PATH or in ~/.local/bin"), so the machine half
-of that check is live on his fleet, which UI-API.md still calls not deployed. Three writes were made
-and each was undone: an MCP server added (`f053582`) and removed (`bb07f77`); Pause all on and off
-again; and a knowledge file added (`b2f3e8b`) and removed (`fb208c7`). His catalog, his Pause all and
-his knowledge files are exactly as they were, and nothing else on his fleet was changed.
+`reads_owner_api: true`. Every read answered with that owner's own fleet: four machines, each agent's
+repositories, the people, the chat apps, capacity, health (`ok: true`), the checks, the duties, the
+owner's phone and the four profiles. `check_mcp_server` asked `mac-studio` about a program and **the
+Studio answered for itself** (`missing`, "no notes-mcp on its PATH or in ~/.local/bin"), so the machine
+half of that check is live on that fleet, which UI-API.md still calls not deployed. Three writes were
+made and each was undone: an MCP server added (`f053582`) and removed (`bb07f77`); Pause all on and
+off again; and a knowledge file added (`b2f3e8b`) and removed (`fb208c7`). The owner's catalog, Pause
+all and knowledge files are exactly as they were, and nothing else on that fleet was changed.
 
 **Not proved:** no Linux server was provisioned and no provider was signed in to, so the install's
 `apt`, `git clone`, `hub.sh` and `verify` steps are proved as the commands the server sends and
