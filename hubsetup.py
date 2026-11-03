@@ -1106,8 +1106,11 @@ def central_reading():
 
 def central_user_script():
     """The central vault's user and folders, each line safe to run again. Its state folder is made here, because its
-    own key goes in before the service first starts."""
+    own key goes in before the service first starts. A state folder that is there already is given to this user
+    whole: a vault installed before the user's name left fleet-* (fleet-vault-central, DevOps plan V2) keeps its keys,
+    its store and the owner's pins and recovery key in files of the old user, which the vault reads only as its own."""
     return ("id -u %(u)s >/dev/null 2>&1 || useradd --system --home-dir %(state)s --shell /usr/sbin/nologin %(u)s\n"
+            "if test -d %(state)s; then chown -R %(u)s:%(u)s %(state)s; fi\n"
             "install -d -o root -g root -m 755 %(lib)s %(conf)s\n"
             "install -d -o %(u)s -g %(u)s -m 700 %(state)s\n") % {
                 "u": CENTRAL_USER, "lib": CENTRAL_LIB, "conf": CENTRAL_CONF_DIR, "state": CENTRAL_STATE}
