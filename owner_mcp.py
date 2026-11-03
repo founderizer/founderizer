@@ -1107,10 +1107,11 @@ def tools():
               "delete": S["bool"], **rid}, ("machine",),
              with_base("/ui/team/access", ("machine", "ssh_user", "ssh_port", "screen_sharing", "delete"),
                        "how the fleet reaches this machine")),
-        tool("save_knowledge", "The owner's own knowledge files, which agents read and never write. Four shapes: "
-                               "{title, text, source} for a file of text, {url} for a page the hub fetches and "
-                               "keeps as Markdown, {attachment} to keep a file the owner attached, or "
-                               "{path, delete: true} to remove one. One commit in knowledge/owner/ for each change.",
+        tool("save_knowledge", "The owner's own knowledge files, which agents read and never write. Five shapes: "
+                               "{title, text, source} for a file of text, {path, text} for new text in a file that "
+                               "is there (it keeps its path, title and source), {url} for a page the hub fetches and "
+                               "keeps as Markdown, {attachment} to keep a file the owner attached, or {path, delete: "
+                               "true} to remove one. One commit in knowledge/owner/ for each change.",
              {"title": S["text"], "text": S["text"], "source": S["text"], "url": S["text"],
               "attachment": S["int"], "path": S["text"], "delete": S["bool"], **rid}, (),
              plain("/ui/knowledge", ("title", "text", "source", "url", "attachment", "path", "delete"),

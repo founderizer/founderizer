@@ -24270,13 +24270,15 @@ def knowledge_slug(words):
     return slug or "file-" + hashlib.sha256(words.encode()).hexdigest()[:8]
 
 
-def knowledge_content(title, source, how, text):
+def knowledge_content(title, source, how, text, heading=None):
     """The one form of an owner knowledge file: its title, the line "Source: <source> · <how> <date>" and the text.
-    Refused when it is larger than an owner file can be, or when it holds a registered login."""
+    heading: the title and Source lines of a file that keeps its own (knowledge_replace). Refused when it is larger
+    than an owner file can be, or when it holds a registered login."""
     text = LINE_CONTROL.sub(" ", text.replace("\r\n", "\n").replace("\r", "\n")).strip()
     if not text:
         raise Refusal(400, "the text is empty")
-    content = f"# {title}\n\nSource: {source} · {how} {time.strftime('%Y-%m-%d', time.gmtime())}\n\n{text}\n".encode()
+    heading = heading or f"# {title}\n\nSource: {source} · {how} {time.strftime('%Y-%m-%d', time.gmtime())}"
+    content = f"{heading}\n\n{text}\n".encode()
     if len(content) > KNOWLEDGE_LIMITS["owner"][1]:
         raise Refusal(413, f"the file is larger than {KNOWLEDGE_LIMITS['owner'][1] // MIB} MiB of Markdown")
     if secret_hit(content.decode()):
@@ -24548,6 +24550,31 @@ def knowledge_delete(path):
     commit = commit_kit_file(path, None, f"Owner deleted {path}")
     log("owner", f"deleted {path} in {commit[:12]}")
     return {"path": path, "deleted": True, "commit": commit}
+
+
+def knowledge_replace(path, text):
+    """Commit new text for one owner knowledge file, under its own title and Source lines: the same path in one
+    commit, so every profile that lists it keeps it and nothing is deleted on the way."""
+    rev = kit_revision(fresh=True)
+    if not rev:
+        raise Refusal(503, "the hub cannot read its own revision")
+    before = git_blob(rev, path)
+    if before is None:
+        raise Refusal(404, f"{path} is not in the repository")
+    parts = before.decode("utf-8", "replace").split("\n\n", 2)
+    if len(parts) < 3 or not parts[0].startswith("# ") or not parts[1].startswith("Source: "):
+        raise Refusal(409, f"{path} has no title and Source lines to keep. Delete it, then add it again.")
+    content = knowledge_content(None, None, None, text, heading="\n\n".join(parts[:2]))
+    if content == before:
+        raise Refusal(409, f"{path} has this text already.")
+    in_all = KNOWLEDGE_LIMITS["owner"][2]
+    if sum(k["bytes"] for k in knowledge_entries() if k["scope"] == "owner") - len(before) + len(content) > in_all:
+        raise Refusal(413, f"the owner's knowledge has room for {in_all // MIB} MiB")
+    commit = commit_kit_file(path, content, f"Owner changed {path}")
+    log("owner", f"changed {path} in {commit[:12]}")
+    title, source = knowledge_heading(content.decode())
+    return {"path": path, "title": title, "scope": "owner", "bytes": len(content), "source": source, "commit": commit,
+            "read_by": knowledge_readers(path, rev)}
 
 
 KNOWLEDGE_REFRESH = 24 * 3600       # seconds between two reads of the page of an owner file that came from a URL
@@ -27178,7 +27205,10 @@ def rename_agent(agent, body):
     last = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (server,))
     if last and last["state"] in JOB_OPEN:
         raise job_busy(server, last)
-    if last and last["kind"] == "install" and last["agent"] == agent and last["state"] == "failed":
+    # An install that stopped at its sign-in, its last step, is done once a later sign-in of that runtime ended done:
+    # its user, runtime, checkout, key and service are there (server.py install), and the agent runs.
+    if last and last["kind"] == "install" and last["agent"] == agent and last["state"] == "failed" and not (
+            last["step"] == "sign_in" and (finished_sign_in(agent, last["runtime"]) or 0) > last["updated"]):
         raise Refusal(409, f"The install of {agent} stopped. Try it again before you rename it.")
     reading = server_reading(server, [])
     if reading is None or reading["stale"]:
@@ -33031,22 +33061,30 @@ class Handler(BaseHTTPRequestHandler):
 
     def ui_knowledge_change(self):
         """The owner's knowledge files (owner feature owner_knowledge): add a file's text {title, text, source}, add a
-        page {url}, keep a file he attached {attachment, title?} (attachment_knowledge), or delete one file
-        {path, delete: true}. One commit in knowledge/owner/ for each change. The hub reads a page, and an
-        attachment's own bytes, before it takes the lock; the body that a repeat compares keeps the text's digest
-        only."""
+        page {url}, keep a file he attached {attachment, title?} (attachment_knowledge), give a file new text in
+        place {path, text}, or delete one file {path, delete: true}. One commit in knowledge/owner/ for each change.
+        The hub reads a page, and an attachment's own bytes, before it takes the lock; the body that a repeat
+        compares keeps the text's digest only."""
         made = {}
+
+        def owner_path(path):
+            if not (isinstance(path, str) and re.fullmatch(r"knowledge/owner/[A-Za-z0-9._/-]+\.md", path)
+                    and ".." not in path.split("/")):
+                raise ValueError("path must be a Markdown file in knowledge/owner/")
+            return path
 
         def read(data):
             fields = set(data) - {"request_id", "db"}
             if "delete" in data:
-                path = data.get("path")
                 if fields != {"path", "delete"} or data["delete"] is not True:
                     raise ValueError("a delete sends only path and delete: true")
-                if not (isinstance(path, str) and re.fullmatch(r"knowledge/owner/[A-Za-z0-9._/-]+\.md", path)
-                        and ".." not in path.split("/")):
-                    raise ValueError("path must be a Markdown file in knowledge/owner/")
-                return {"path": path, "delete": True}
+                return {"path": owner_path(data.get("path")), "delete": True}
+            if "path" in data:
+                if fields != {"path", "text"} or not isinstance(data["text"], str):
+                    raise ValueError("a change sends only path and the file's new text")
+                made["text"] = data["text"]
+                return {"path": owner_path(data["path"]), "replace": True,
+                        "sha256": hashlib.sha256(data["text"].encode()).hexdigest()}
             if "url" in data:
                 if fields != {"url"}:
                     raise ValueError(f"unknown field {sorted(fields - {'url'})[0]}")
@@ -33088,6 +33126,8 @@ class Handler(BaseHTTPRequestHandler):
         def act(body):
             if body.get("delete"):
                 return knowledge_delete(body["path"])
+            if body.get("replace"):
+                return knowledge_replace(body["path"], made["text"])
             if body.get("attachment"):
                 # read() ran before the lock, as the {url} shape's fetch does, so the row is checked again here:
                 # between the two the sweep may have taken it, or another command may have kept it.
