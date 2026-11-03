@@ -216,9 +216,12 @@ CREATE TABLE IF NOT EXISTS responsibilities(id INTEGER PRIMARY KEY, agent TEXT N
   marker_kind TEXT, marker_since REAL, marker_detail TEXT);
 CREATE TABLE IF NOT EXISTS duty_cases(id INTEGER PRIMARY KEY, responsibility INTEGER NOT NULL, key TEXT NOT NULL,
   title TEXT NOT NULL, source TEXT NOT NULL, state TEXT NOT NULL, opened REAL NOT NULL, by TEXT NOT NULL,
-  first_step REAL, closed REAL, closed_by TEXT, outcome TEXT, note TEXT, repeated INTEGER NOT NULL DEFAULT 0);
+  first_step REAL, closed REAL, closed_by TEXT, outcome TEXT, note TEXT, repeated INTEGER NOT NULL DEFAULT 0,
+  opened_in INTEGER);
 CREATE UNIQUE INDEX IF NOT EXISTS duty_case_open ON duty_cases(responsibility, key) WHERE state='open';
 CREATE INDEX IF NOT EXISTS duty_case_key ON duty_cases(responsibility, key, state);
+CREATE TABLE IF NOT EXISTS duty_joins(duty_case INTEGER NOT NULL, responsibility INTEGER NOT NULL, ts REAL NOT NULL,
+  PRIMARY KEY(duty_case, responsibility));
 CREATE TABLE IF NOT EXISTS duty_steps(id INTEGER PRIMARY KEY, duty_case INTEGER NOT NULL, key TEXT NOT NULL,
   text TEXT NOT NULL, task INTEGER, by TEXT NOT NULL, ts REAL NOT NULL);
 CREATE UNIQUE INDEX IF NOT EXISTS duty_step_key ON duty_steps(duty_case, key);
@@ -1697,6 +1700,8 @@ def migrate():
         "chat_out": {"recipient": "TEXT"},          # chat apps round 2: a Discord user ID when chat is null
         "triggers": {"failures": "INTEGER NOT NULL DEFAULT 0", "created_by": "TEXT NOT NULL DEFAULT 'owner'",
                      "responsibility": "INTEGER", "watch": "TEXT"},         # owner API 1.13: a duty's watch
+        # the task that open_case opened the case in: a task that opened two carries neither (t_open_case)
+        "duty_cases": {"opened_in": "INTEGER"},
         "memories": {"responsibility": "INTEGER", "prevents_key": "TEXT",      # the duty and key
                      "contradicted": "INTEGER NOT NULL DEFAULT 0", "contradicted_at": "REAL",
                      # and the other side of the evidence: the agent's own word that a lesson held again
@@ -5032,7 +5037,7 @@ def check_task(agent, a):
         # refused as unknown, and a case's work went out as a plain task that no result of it could close.
         duty_case = case_ref(case_id)
         r = duty_row(duty_case["responsibility"])
-        if not r or not duty_read_allowed(agent, r):
+        if not r or not case_reader(agent, duty_case, r):
             raise ToolError(f"{cref(duty_case)} is not a case of a duty you may read.")
         if duty_case["state"] != "open":
             raise ToolError(f"{cref(duty_case)} is closed ({duty_case['outcome']}). A new event is a new case.")
@@ -14267,6 +14272,7 @@ def duty_view(r, t0=None):
             "repeats_prev_30d": len([c for c in before if c["repeated"]]),
             "last_case": duty_case_view(cases[-1]) if cases else None,
             "cases": [duty_case_view(c) for c in live],
+            "joined": [duty_case_view(c) for c in duty_joined_open(r["id"])],
             "marker": {"kind": r["marker_kind"], "since": r["marker_since"], "detail": r["marker_detail"]}
             if r["marker_kind"] else None}
 
@@ -14292,10 +14298,6 @@ DUTY_REPEAT_CASE = ("SELECT * FROM duty_cases WHERE responsibility=? AND key=? A
 
 def duty_repeat_args(duty_id, key, t0):
     return duty_id, key, t0 - DUTY_REPEAT_DAYS * 86400
-
-
-def duty_open_count(duty_id):
-    return q1("SELECT COUNT(*) n FROM duty_cases WHERE responsibility=? AND state='open'", (duty_id,))["n"]
 
 
 def duty_block(t, due, t0):
@@ -14463,8 +14465,10 @@ def duty_case_text(c, r):
     """One case, for an agent's eyes."""
     tasks = ", ".join(f"{tref(t['id'])} {t['state']}" for t in duty_case_tasks(c["id"])) or "none"
     steps = duty_steps_of(c["id"])
+    joins = ", ".join(f"{rref(j['id'])} of {j['agent']}" for j in case_joins(c["id"]))
     out = [f"  {cref(c)} [{c['state']}" + (f" {c['outcome']}" if c["outcome"] else "") + f"] {c['title']}",
-           f"    Key: {c['key']} (from {c['source']})" + (". It came back inside 30 days." if c["repeated"] else "."),
+           f"    Key: {c['key']} (from {c['source']})" + (". It came back inside 30 days." if c["repeated"] else ".")
+           + (f" {joins} works in it too." if joins else ""),
            f"    Opened {goal_time(c['opened'])}; first step "
            + (goal_time(c["first_step"]) if c["first_step"] else "none yet") + f". Tasks: {tasks}."]
     if steps:
@@ -14502,8 +14506,19 @@ def duty_text(r, t0, every_case=False):
     else:
         for c in q("SELECT * FROM duty_cases WHERE responsibility=? AND state='open' ORDER BY id", (r["id"],)):
             out += duty_case_text(c, r)
+    joined = duty_joined_open(r["id"])
+    if joined:
+        out.append(f"  Open cases of other duties that it works in ({len(joined)}), one event each:")
+        for c in joined:
+            out += duty_case_text(c, duty_row(c["responsibility"]))
     out.append("  Duty: " + r["text"])
     return out
+
+
+def duty_joined_open(duty_id):
+    """The open cases of other duties that this duty joined (open_case of a key that one of them had open)."""
+    return q("SELECT c.* FROM duty_joins j JOIN duty_cases c ON c.id=j.duty_case WHERE j.responsibility=? AND "
+             "c.state='open' ORDER BY c.id", (duty_id,))
 
 
 def duty_managed_text(duty_id):
@@ -14659,8 +14674,25 @@ def t_open_case(agent, a):
     if open_case:
         raise ToolError(f"{cref(open_case)} is already open for the key '{key}': {open_case['title']}. Work in that "
                         f"case, or use another key.")
-    n = duty_open_count(r["id"])
     t0 = now()
+    # One event is one case, in the whole fleet: a key that another duty has open is that duty's event, so this duty
+    # joins its case instead of keeping a copy that goes stale beside it (3 November 2026: ac-lead's R-7 held 25
+    # copies of amura-devops's R-6 cases, and one was closed before its fix while the case it copied stayed open).
+    other = q1("SELECT c.* FROM duty_cases c JOIN responsibilities d ON d.id=c.responsibility WHERE c.key=? AND "
+               "c.state='open' AND c.responsibility<>? AND d.state<>'retired' ORDER BY c.id LIMIT 1", (key, r["id"]))
+    if other:
+        holder = duty_row(other["responsibility"])
+        with transaction():
+            if DB.execute("INSERT OR IGNORE INTO duty_joins(duty_case,responsibility,ts) VALUES(?,?,?)",
+                          (other["id"], r["id"], t0)).rowcount:
+                duty_history_row(r["id"], agent, "case_joined", f"{cref(other)}: {other['title']}", t0)
+            text = (f"{cref(other)} of {holder['agent']} ({duty_name(holder['text'])}) is already open for the key "
+                    f"'{key}': {other['title']}. One event is one case, so this opens no second one: {rref(r['id'])} "
+                    f"works in {cref(other)} now. record_step and close_case take it from you, create_task case_id "
+                    f"gives its work, and see_responsibilities lists it under {rref(r['id'])}. If this is another "
+                    f"event, open it again with another key.")
+            keep_command(command, {"case": other["id"], "text": text}, t0)
+        return text
     back = q1(DUTY_REPEAT_CASE, duty_repeat_args(r["id"], key, t0))
     if back and not repeat:
         raise ToolError(f"{cref(back)} already had the key '{key}' ({back['title']}) and closed "
@@ -14670,16 +14702,27 @@ def t_open_case(agent, a):
                         f"earlier action did not hold. If this is another event, give it another key.")
     with transaction():
         case_id = duty_new_case(r, key, title, f"{agent} with open_case", agent, t0)
+        several = False
         if tid is not None:
-            DB.execute("UPDATE tasks SET responsibility=?, duty_case=? WHERE id=? AND duty_case IS NULL",
-                       (r["id"], case_id, tid))
-            DB.execute("UPDATE duty_cases SET first_step=? WHERE id=?", (t0, case_id))
+            # A task carries the one case that it opened, and its completed result closes that case. A task that
+            # opens a second one -- a wake-up with several new lines -- is the work of none of them, so it carries
+            # neither: its result closed whichever case it had opened first, before that case's fix (R-7/C-363).
+            several = DB.execute("SELECT 1 FROM duty_cases WHERE opened_in=? LIMIT 1", (tid,)).fetchone() is not None
+            if several:
+                DB.execute("UPDATE tasks SET duty_case=NULL WHERE id=? AND duty_case IN (SELECT id FROM duty_cases "
+                           "WHERE opened_in=?)", (tid, tid))
+            else:
+                DB.execute("UPDATE tasks SET responsibility=?, duty_case=? WHERE id=? AND duty_case IS NULL",
+                           (r["id"], case_id, tid))
+            DB.execute("UPDATE duty_cases SET first_step=?, opened_in=? WHERE id=?", (t0, tid, case_id))
         DB.execute("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,?,'case_opened',?)",
                    (r["id"], t0, agent, f"R-{r['id']}/C-{case_id}: {title}"))
         text = (f"Opened R-{r['id']}/C-{case_id} of {rref(r['id'])}. "
                 + ("This key came back inside the last 30 days, so say in the preventive step why the earlier action "
                    "did not hold. " if back else "")
-                + "Record each close-out step with record_step, and close it with close_case.")
+                + "Record each close-out step with record_step, and close it with close_case."
+                + (f" {tref(tid)} opened more than one case, so its result closes none of them: close each one "
+                   f"yourself." if several else ""))
         keep_command(command, {"case": case_id, "text": text}, t0)
     return text
 
@@ -14691,11 +14734,25 @@ def case_worker(agent, c):
     return bool(q1(f"SELECT 1 FROM tasks WHERE duty_case=? AND owner=? AND {OPEN_TASK} LIMIT 1", (c["id"], agent)))
 
 
+def case_joins(case_id):
+    """The other duties that work in this case: each one opened the same key while this case was open (open_case).
+    A retired one works in nothing any more."""
+    return [r for j in q("SELECT responsibility FROM duty_joins WHERE duty_case=? ORDER BY ts", (case_id,))
+            if (r := duty_row(j["responsibility"])) and r["state"] != "retired"]
+
+
+def case_reader(agent, c, r):
+    """Who works in a case and gives its work (create_task case_id): whoever reads its duty, and whoever reads a duty
+    that joined it. One event is one case, so the agent that answers for its fix works in the case itself, and no
+    copy of it in a duty of its own goes stale beside it (3 November 2026: 25 such copies)."""
+    return duty_read_allowed(agent, r) or any(duty_read_allowed(agent, j) for j in case_joins(c["id"]))
+
+
 def t_record_step(agent, a):
     """One record of a case: one real step of the work, in one line, under a short label of the agent's own."""
     c = case_ref(a.get("case"))
     r = duty_row(c["responsibility"])
-    if not duty_read_allowed(agent, r) and not case_worker(agent, c):
+    if not case_reader(agent, c, r) and not case_worker(agent, c):
         raise ToolError(f"{cref(c)} is not a case of your duties.")
     if c["state"] != "open":
         raise ToolError(f"{cref(c)} is closed. A closed case keeps its records; a new event is a new case.")
@@ -14720,8 +14777,10 @@ def t_record_step(agent, a):
             DB.execute("UPDATE duty_cases SET first_step=? WHERE id=?", (t0, c["id"]))
         DB.execute("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,?,'step',?)",
                    (r["id"], t0, agent, f"{cref(c)} {step}: {text}"))
+        carried = tid is not None and DB.execute("SELECT 1 FROM tasks WHERE id=? AND duty_case=?",
+                                                 (tid, c["id"])).fetchone()
         text_out = (f"Recorded '{step}' for {cref(c)}. Record another line for each further step. close_case ends "
-                    f"the case, or deliver your task and the hub closes it as handled.")
+                    f"the case" + (", or deliver your task and the hub closes it as handled." if carried else "."))
         keep_command(command, {"case": c["id"], "step": step, "text": text_out}, t0)
     return text_out
 
@@ -14730,7 +14789,7 @@ def t_close_case(agent, a):
     """End one case: handled, no_action or failed."""
     c = case_ref(a.get("case"))
     r = duty_row(c["responsibility"])
-    if not duty_read_allowed(agent, r) and not case_worker(agent, c):
+    if not case_reader(agent, c, r) and not case_worker(agent, c):
         raise ToolError(f"{cref(c)} is not a case of your duties.")
     outcome = str(a.get("outcome") or "").strip().lower()
     if outcome not in DUTY_OUTCOMES:
@@ -15832,8 +15891,8 @@ HISTORY_OUTPUTS = ("execute", "fetch", "edit", "delete", "move", "other")
 HISTORY_CALL_CACHE = collections.OrderedDict()     # (task, attempt, session, tool_call_id) -> that call's record
 HISTORY_CALL_CACHE_MAX = 4096
 HISTORY_DUTY_WORDS = {"created": "written", "edited": "changed", "case_opened": "case opened",
-                      "case_closed": "case closed", "step": "step", "pause": "paused", "resume": "resumed",
-                      "retire": "retired", "reopen": "reopened", "watch_attached": "watch attached",
+                      "case_closed": "case closed", "case_joined": "case joined", "step": "step", "pause": "paused",
+                      "resume": "resumed", "retire": "retired", "reopen": "reopened", "watch_attached": "watch attached",
                       "watch_detached": "watch detached"}
 
 
@@ -16046,7 +16105,8 @@ def history_duty(h):
     the line. A lesson learned in a case is the memory stream's."""
     if h["kind"] == "learned":
         return []
-    kind = "case" if h["kind"] in ("case_opened", "case_closed") else "step" if h["kind"] == "step" else "duty"
+    kind = "case" if h["kind"] in ("case_opened", "case_closed", "case_joined") else "step" if h["kind"] == "step" \
+        else "duty"
     case = HISTORY_CASE.match(h["detail"] or "")
     text = f"{rref(h['responsibility'])} {HISTORY_DUTY_WORDS.get(h['kind'], h['kind'])} by {h['by']}: " \
            f"{h['detail'] or ''}"
@@ -19967,7 +20027,9 @@ TOOLS = [
     ("all", "open_case", t_open_case,
      "Open a case of one of your duties for an event that you found yourself. One key is one event, so the same "
      f"event never starts the work two times: while its case is open, and for {DUTY_REPEAT_DAYS} days after it "
-     "closed, the same key opens no second case.",
+     "closed, the same key opens no second case. A key that another duty has open is that duty's case: your duty "
+     "joins it, and you work in it and close it there. A task that opens a second case carries neither, so close "
+     "each one yourself.",
      S({"request_id": {"type": "string", "description": "A new UUID for each write"},
         "responsibility": {"type": "string", "description": "Responsibility id, for example R-1"},
         "key": {"type": "string", "description": "The name of the event, which makes it one thing: a thread, an "
