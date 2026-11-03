@@ -330,9 +330,9 @@ CREATE TABLE IF NOT EXISTS owner_device_codes(id INTEGER PRIMARY KEY, device TEX
   created REAL NOT NULL, expires REAL NOT NULL, used REAL);
 CREATE TABLE IF NOT EXISTS owner_device_tries(id INTEGER PRIMARY KEY, device TEXT NOT NULL, ts REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS owner_device_contacts(device TEXT PRIMARY KEY, ts REAL NOT NULL, auth TEXT);
--- Pings to the owner's devices (MOBILE-APP.md 9, owner feature push): the push token that each device gave, and one
--- row for each ping. A ping row holds no text, and it is sent once: queued, sending, then sent, failed, skipped or
--- unknown.
+-- Pings to the owner's devices (MOBILE-APP.md 9, owner feature push): the push token that each device gave, with its
+-- seal key (sealed_push, a column that migrate adds), and one row for each ping. A ping row holds no text, and it is
+-- sent once: queued, sending, then sent, failed, skipped or unknown.
 CREATE TABLE IF NOT EXISTS owner_device_push(device TEXT PRIMARY KEY, token TEXT NOT NULL, environment TEXT NOT NULL,
   updated REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS pings(id INTEGER PRIMARY KEY, device TEXT NOT NULL, kind TEXT NOT NULL,
@@ -783,7 +783,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "server_names",      # the owner, 30 October 2026: a server's name is its name in Tailscale
                "mac_setup",         # the owner, 31 October 2026: one sitting at a new Mac
                "agent_move",        # DevOps plan C7, 2 November 2026: an agent moves to an empty server
-               "server_access"]     # DevOps plan C4: Read or Fix on a server, through the door
+               "server_access",     # DevOps plan C4: Read or Fix on a server, through the door
+               "sealed_push"]       # the owner, 3 November 2026: a ping says nothing to founderizer.com or Apple
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -943,8 +944,9 @@ def device_rows(source):
 
 # ---------------------------------------------------------------- Pings to the owner's phone (owner feature push)
 
-PUSH_ENVIRONMENTS = tuple(push.HOSTS)   # the app's own build: production from TestFlight, development from Xcode
+PUSH_ENVIRONMENTS = push.ENVIRONMENTS   # the app's own build: production from TestFlight, development from Xcode
 PUSH_TEXT = 178         # characters of an item's title in a ping: about four lines of a notification
+PUSH_BANNER = "Needs you"   # all that a ping says to a phone that cannot open its sealed part
 # Characters that an answer button shows whole; an item with a longer option opens the app. iOS 27 draws a button
 # title on three lines at most and cuts the rest: on an iPhone 18 Pro, about 70 characters at the default text size
 # and about 60 at extra-extra-large (measured in the simulator, 20 October 2026).
@@ -954,20 +956,13 @@ PING_EVERY = 30         # seconds between two looks at the queue when nothing wo
 PING_WAKE = threading.Event()
 
 
-def push_folder():
-    """The folder of the APNs key that the owner copied (MOBILE-APP.md 6.2): push/ next to the records, which is
-    ~/.fleet/push with the default --db, so a test hub with its own --db never finds the owner's key."""
-    if CFG.get("push_dir"):
-        return CFG["push_dir"]
-    return os.path.join(os.path.dirname(CFG["db_path"]), "push") if CFG.get("db_path") else None
-
-
-def save_push_token(device, token, environment):
-    """POST /ui/owner/devices/<device>/push: the token that Apple gave this phone, which the app sends at each start.
-    A new token replaces the old one, and removing the device removes it."""
-    q("INSERT INTO owner_device_push(device,token,environment,updated) VALUES(?,?,?,?) ON CONFLICT(device) DO UPDATE "
-      "SET token=excluded.token, environment=excluded.environment, updated=excluded.updated",
-      (device, token, environment, now()))
+def save_push_token(device, token, environment, seal=None):
+    """POST /ui/owner/devices/<device>/push: the token that Apple gave this phone, which the app sends at each start,
+    and the phone's own key that seals what a ping says (sealed_push; an app from before it sends none). A new token
+    replaces the old one with its key, and removing the device removes both."""
+    q("INSERT INTO owner_device_push(device,token,environment,updated,seal) VALUES(?,?,?,?,?) ON CONFLICT(device) DO "
+      "UPDATE SET token=excluded.token, environment=excluded.environment, updated=excluded.updated, seal=excluded.seal",
+      (device, token, environment, now(), seal))
     log("owner", f"the owner device {device} gave its push token ({environment})")      # never the token itself
     return {"device": device, "push": True, "environment": environment}
 
@@ -987,25 +982,33 @@ def ping_need(nid):
     PING_WAKE.set()
 
 
-def ping_payload(need, generation):
-    """What Apple carries to the phone for one Needs-you item: its number, its title and its options, and nothing
-    else of it. The options go only when each one fits a button whole, because a label that is cut can be pressed
-    for the wrong answer: an item without them opens the app. The text passes the screening of /ui/state.
+def ping_payload(need, generation, seal=None):
+    """What a ping carries for one Needs-you item. **Sealed** (the owner, 3 November 2026): our side and Apple carry
+    the item's number, the hub's generation and a sealed part, and no word of the item. The banner that they see,
+    "Needs you", is all that a phone shows when it cannot open that part; a device that gave no key, an app from
+    before the seal, gets that banner alone, and a tap opens the app.
 
-    **The banner's title is the agent that asks** (T-39): "Atlas", as the apps name it, over its question, so he
-    sees who asks before he opens anything. "Needs you" only for an item that names no agent."""
+    The sealed part is what the phone's notification service extension shows instead, with the phone's own key:
+    **the agent that asks** (T-39), "Atlas" as the apps name it, over the item's title, so he sees who asks before
+    he opens anything ("Needs you" for an item that names no agent); and its options, only when each one fits a
+    button whole, because a label that is cut can be pressed for the wrong answer. Its text passes the screening of
+    /ui/state. The part names the item and the generation again, and the phone answers the item that it names."""
+    payload = {"need": need["id"], "db": generation,
+               "aps": {"alert": {"title": PUSH_BANNER}, "sound": "default", "thread-id": "needs"}}
+    if not seal:
+        return payload
     title = scrub(need["title"] or "")
     if len(title) > PUSH_TEXT:
         title = title[:PUSH_TEXT - 1].rstrip() + "…"
-    asker = shown_name(need["by"]) or "Needs you"
-    aps = {"alert": {"title": asker, "body": title}, "sound": "default", "thread-id": "needs"}
-    payload = {"need": need["id"], "db": generation}
+    said = {"need": need["id"], "db": generation, "title": shown_name(need["by"]) or PUSH_BANNER, "body": title}
     options = need_options(need)
     if 2 <= len(options) <= NEED_OPTIONS_MAX and all(len(o) <= PUSH_BUTTON for o in options) \
             and scrub(options) == options:
-        aps["category"] = "need"          # the phone's notification content extension draws one button for each
-        payload["options"] = options
-    return dict(payload, aps=aps)
+        said["options"] = options         # the phone's notification content extension draws one button for each
+    sealed = push.seal(push.seal_key(seal), json.dumps(said, ensure_ascii=False, separators=(",", ":")).encode())
+    payload["sealed"] = base64.b64encode(sealed).decode()
+    payload["aps"]["mutable-content"] = 1
+    return payload
 
 
 def settle_pings():
@@ -1027,8 +1030,10 @@ def ping_sender():
 
 
 def send_ping():
-    """Sends the oldest queued ping. False when none waits. Apple's answer decides its state, and a token that Apple
-    calls gone is dropped, so that phone gets no ping until the app gives a new one at its next start."""
+    """Sends the oldest queued ping, through our side with this fleet's entitlement (push.py). False when none
+    waits. Apple's answer decides its state, and a token that Apple calls gone is dropped, so that phone gets no ping
+    until the app gives a new one at its next start. A fleet with no entitlement, or one that our side refuses, sends
+    nothing: the ping fails with the one line that says why."""
     with LOCK:
         row = q1("SELECT * FROM pings WHERE state='queued' ORDER BY id LIMIT 1")
         if not row:
@@ -1036,7 +1041,7 @@ def send_ping():
         q("UPDATE pings SET state='sending' WHERE id=?", (row["id"],))
         need = q1("SELECT * FROM needs WHERE id=?", (row["item"],))
         device = q1("SELECT * FROM owner_device_push WHERE device=?", (row["device"],))
-        generation = kv_get("db_id")
+        generation, channel, entitlement = kv_get("db_id"), release_channel(), entitlement_token()
     state, status, error = "skipped", None, None
     if not device or row["device"] not in owner_devices():
         error = "the device has no push token now"
@@ -1046,12 +1051,9 @@ def send_ping():
         error = "the item was answered before the ping went"
     else:
         try:
-            found = push.key(push_folder())
-            if not found:
-                raise push.PushError(f"no APNs key on the hub machine: the owner copies it to {push_folder()}")
-            status, reason = push.send(device["token"], ping_payload(need, generation), device["environment"],
-                                       *found, collapse=f"need-{need['id']}", expires=now() + PUSH_KEEP,
-                                       base=CFG.get("push_url"))
+            status, reason = push.send(channel, entitlement, device["token"],
+                                       ping_payload(need, generation, device["seal"]), device["environment"],
+                                       collapse=f"need-{need['id']}", expires=now() + PUSH_KEEP)
             state, error = ("sent" if status == 200 else "unknown" if status == 0 else "failed"), reason or None
         except push.PushError as e:
             state, error = "failed", str(e)
@@ -1698,6 +1700,7 @@ def migrate():
         "owner_reports": {"agent": "TEXT NOT NULL DEFAULT 'manager'", "in_reply_to": "TEXT",
                           "pushed": "INTEGER NOT NULL DEFAULT 0"},     # chat apps round 2: message_owner
         "chat_out": {"recipient": "TEXT"},          # chat apps round 2: a Discord user ID when chat is null
+        "owner_device_push": {"seal": "TEXT"},      # sealed_push: the phone's own key for what a ping says, base64
         "triggers": {"failures": "INTEGER NOT NULL DEFAULT 0", "created_by": "TEXT NOT NULL DEFAULT 'owner'",
                      "responsibility": "INTEGER", "watch": "TEXT"},         # owner API 1.13: a duty's watch
         # the task that open_case opened the case in: a task that opened two carries neither (t_open_case)
@@ -30740,20 +30743,29 @@ class Handler(BaseHTTPRequestHandler):
                                keep=hide_device_code)
 
     def ui_owner_device_push(self, device):
-        """POST /ui/owner/devices/<device>/push (owner feature push): the phone's push token, from that phone itself.
-        The owner's Mac has no push token, and one device never sets another's."""
+        """POST /ui/owner/devices/<device>/push (owner feature push): the phone's push token, from that phone itself,
+        and its own key for what a ping says (sealed_push). The owner's Mac has no push token, and one device never
+        sets another's. The hub keeps the key once, with the token: the command's record keeps only its SHA-256."""
+        given = {}
+
         def read(data):
-            self.only(data, ("token", "environment"))
+            self.only(data, ("token", "environment", "seal"))
             if owner_device_at(self.client_address[0]) != device:
                 raise Refusal(403, "a device gives its own push token, from its own address")
-            token, environment = data.get("token"), data.get("environment")
+            token, environment, seal = data.get("token"), data.get("environment"), data.get("seal")
             if not isinstance(token, str) or not push.DEVICE_TOKEN.fullmatch(token):
                 raise ValueError("token must be the device token that Apple gave the app, in lowercase hexadecimal")
             if environment not in PUSH_ENVIRONMENTS:
                 raise ValueError("environment must be production or development")
-            return {"device": device, "token": token, "environment": environment}
+            body = {"device": device, "token": token, "environment": environment}
+            if seal is not None:
+                push.seal_key(seal)
+                given["seal"] = seal
+                body["seal"] = hashlib.sha256(seal.encode()).hexdigest()
+            return body
         return self.ui_command(f"owner/devices/{device}/push", read,
-                               lambda body: save_push_token(device, body["token"], body["environment"]))
+                               lambda body: save_push_token(device, body["token"], body["environment"],
+                                                            given.get("seal")))
 
     def ui_owner_enroll(self):
         """POST /ui/owner/enroll: the device takes its key with the one-time code that the owner read on the Mac. It

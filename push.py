@@ -1,138 +1,167 @@
 #!/usr/bin/env python3
-"""Pings to the owner's phone through Apple's push service (MOBILE-APP.md 9, owner feature push). Python standard
-library only.
+"""Pings to the owner's phone (MOBILE-APP.md 9, owner feature push). Python standard library only.
 
-Apple takes a push only over HTTP/2, with a JSON web token signed with ES256, and the standard library has
-neither. The hub machine has both in two programs that every Ubuntu and Debian server carries: openssl signs and
-curl sends. curl gets its whole request on standard input, never in its arguments, because another user of the
-machine can read the arguments of every process.
+Apple takes a push for the iPhone app only from a holder of an APNs key of the app's team, and such a key pushes to the
+app on every phone, so no hub holds one: every hub, the owner's own too, hands its pings to our side's push route
+(`POST <channel>/api/push`, the release channel's address), with the fleet's entitlement as the bearer, and our side
+sends them to Apple while the subscription stands (PRODUCT.md 3).
 
-The key is the one the owner copied to the hub machine, exactly as Apple downloads it: `AuthKey_<key id>.p8`, a
-file of the hub user with mode 600, alone in its folder. Its name carries its key id, so nothing else is set up.
-This module hands its path to openssl and never reads, logs or returns the key.
+What a ping says goes sealed. The phone gives the hub a key of its own with its push token, and the hub seals the
+agent's name, the item's title and its options with it (ChaCha20-Poly1305, RFC 8439, which the phone opens with
+CryptoKit). Our side and Apple carry the item's number and the sealed bytes, and never a word of the item.
 """
 import base64
 import json
 import os
 import re
-import stat
-import subprocess
-import time
+import struct
+import urllib.error
+import urllib.request
 
-TEAM = "6EBZ756H9Q"                     # the team of the iPhone app: Apple takes its pushes signed for that team
-TOPIC = "com.founderizer.mobile"        # the iPhone app itself
-HOSTS = {"production": "https://api.push.apple.com", "development": "https://api.sandbox.push.apple.com"}
-KEY_NAME = re.compile(r"AuthKey_([A-Z0-9]{10})\.p8")
+ENVIRONMENTS = ("production", "development")    # the app's own build: production from TestFlight, development from Xcode
 DEVICE_TOKEN = re.compile(r"[0-9a-f]{64,200}")
-TOKEN_LIFE = 45 * 60    # Apple refuses a token older than an hour, and one that is renewed more often than 20 minutes
-TIMEOUT = 15            # seconds for one push
-NOT_SENT = {6, 7, 35}   # curl could not resolve, connect or shake hands: nothing left the machine
-_tokens = {}            # (key id, path, modified, team) -> (token, made)
+SEAL_KEY = re.compile(r"[A-Za-z0-9+/]{43}=")    # 32 bytes in base64
+TIMEOUT = 45            # seconds for one ping: our side waits up to 15 for Apple's connection and 15 for its answer
 
 
 class PushError(Exception):
     """Nothing was sent. The message is safe to show and to log: it never holds a key, a token or a payload."""
 
 
-def key(folder):
-    """(key id, path) of the APNs key in folder, or None while the owner has put none there."""
+# ---------------------------------------------------------------- the seal (RFC 8439)
+
+def _rotl(v, c):
+    return ((v << c) & 0xffffffff) | (v >> (32 - c))
+
+
+def _quarter(s, a, b, c, d):
+    s[a] = (s[a] + s[b]) & 0xffffffff
+    s[d] = _rotl(s[d] ^ s[a], 16)
+    s[c] = (s[c] + s[d]) & 0xffffffff
+    s[b] = _rotl(s[b] ^ s[c], 12)
+    s[a] = (s[a] + s[b]) & 0xffffffff
+    s[d] = _rotl(s[d] ^ s[a], 8)
+    s[c] = (s[c] + s[d]) & 0xffffffff
+    s[b] = _rotl(s[b] ^ s[c], 7)
+
+
+def _block(key, counter, nonce):
+    state = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574, *struct.unpack("<8L", key), counter,
+             *struct.unpack("<3L", nonce)]
+    work = state[:]
+    for _ in range(10):
+        _quarter(work, 0, 4, 8, 12)
+        _quarter(work, 1, 5, 9, 13)
+        _quarter(work, 2, 6, 10, 14)
+        _quarter(work, 3, 7, 11, 15)
+        _quarter(work, 0, 5, 10, 15)
+        _quarter(work, 1, 6, 11, 12)
+        _quarter(work, 2, 7, 8, 13)
+        _quarter(work, 3, 4, 9, 14)
+    return struct.pack("<16L", *((w + s) & 0xffffffff for w, s in zip(work, state)))
+
+
+def _chacha20(key, nonce, data):
+    out = bytearray()
+    for at in range(0, len(data), 64):
+        out += bytes(x ^ y for x, y in zip(data[at:at + 64], _block(key, 1 + at // 64, nonce)))
+    return bytes(out)
+
+
+def _tag(key, nonce, sealed):
+    """The Poly1305 tag over the sealed bytes, with no additional data (RFC 8439 2.8)."""
+    one_time = _block(key, 0, nonce)[:32]
+    r = int.from_bytes(one_time[:16], "little") & 0x0ffffffc0ffffffc0ffffffc0fffffff
+    s = int.from_bytes(one_time[16:], "little")
+    data = sealed + b"\0" * (-len(sealed) % 16) + struct.pack("<QQ", 0, len(sealed))
+    p, acc = (1 << 130) - 5, 0
+    for at in range(0, len(data), 16):
+        acc = (acc + int.from_bytes(data[at:at + 16] + b"\x01", "little")) * r % p
+    return ((acc + s) & ((1 << 128) - 1)).to_bytes(16, "little")
+
+
+def seal(key, plaintext, nonce=None):
+    """The nonce, the sealed bytes and the tag in one, as CryptoKit's `ChaChaPoly.SealedBox(combined:)` reads them."""
+    if len(key) != 32:
+        raise ValueError("a seal key is 32 bytes")
+    nonce = nonce or os.urandom(12)
+    sealed = _chacha20(key, nonce, plaintext)
+    return nonce + sealed + _tag(key, nonce, sealed)
+
+
+def open_sealed(key, combined):
+    """The other half of seal, for the tests: the plaintext, or ValueError when the tag does not stand."""
+    if len(key) != 32 or len(combined) < 28:
+        raise ValueError("not a sealed ping")
+    nonce, sealed, tag = combined[:12], combined[12:-16], combined[-16:]
+    if not _equal(_tag(key, nonce, sealed), tag):
+        raise ValueError("the tag does not stand")
+    return _chacha20(key, nonce, sealed)
+
+
+def _equal(a, b):
+    return len(a) == len(b) and not sum(x ^ y for x, y in zip(a, b))
+
+
+def seal_key(text):
+    """The 32 bytes of a seal key as the phone sends it, in base64, or ValueError."""
+    if not isinstance(text, str) or not SEAL_KEY.fullmatch(text):
+        raise ValueError("seal must be the phone's 32-byte key, in base64")
+    return base64.b64decode(text)
+
+
+# ---------------------------------------------------------------- the send
+
+def _refusal(status, text):
     try:
-        names = sorted(n for n in os.listdir(folder) if KEY_NAME.fullmatch(n))
-    except (FileNotFoundError, NotADirectoryError, TypeError):
-        return None
-    if not names:
-        return None
-    if len(names) > 1:
-        raise PushError(f"{len(names)} APNs keys are in {folder}; keep one")
-    path = os.path.join(folder, names[0])
-    st = os.lstat(path)
-    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
-        raise PushError("the APNs key of the hub must be a regular file of the hub user with mode 600")
-    return KEY_NAME.fullmatch(names[0]).group(1), path
+        says = json.loads(text).get("says")
+    except (ValueError, AttributeError):
+        says = None
+    if status == 401:
+        return "founderizer.com refused this fleet's entitlement, so it sends no pings for it"
+    if status == 402:
+        return "this fleet's subscription does not stand, so founderizer.com sends no pings for it"
+    if status == 502:
+        return "founderizer.com could not reach Apple's push service"
+    if status == 503:
+        return "founderizer.com sends no pings yet"
+    return f"founderizer.com answered {status}" + (f": {str(says)[:200]}" if says else "")
 
 
-def _part(data):
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
-
-
-def raw_signature(der):
-    """The 64 bytes of r and s that ES256 asks for, from the DER signature that openssl writes for a P-256 key."""
-    if len(der) < 8 or der[0] != 0x30 or der[1] != len(der) - 2:
-        raise ValueError("not a DER signature")
-    values, at = [], 2
-    for _ in range(2):
-        if der[at] != 0x02:
-            raise ValueError("not a DER signature")
-        size = der[at + 1]
-        values.append(int.from_bytes(der[at + 2:at + 2 + size], "big"))
-        at += 2 + size
-    if at != len(der) or any(v.bit_length() > 256 for v in values):
-        raise ValueError("not a P-256 signature")
-    return b"".join(v.to_bytes(32, "big") for v in values)
-
-
-def provider_token(key_id, path, team=TEAM):
-    """Apple's provider token for this key, signed by openssl with the key file and kept for 45 minutes."""
-    mark = (key_id, path, os.stat(path).st_mtime_ns, team)
-    kept = _tokens.get(mark)
-    if kept and time.time() - kept[1] < TOKEN_LIFE:
-        return kept[0]
-    t0 = int(time.time())
-    signed = _part(json.dumps({"alg": "ES256", "kid": key_id}).encode()) + "." + \
-        _part(json.dumps({"iss": team, "iat": t0}).encode())
-    try:
-        r = subprocess.run(["openssl", "dgst", "-sha256", "-sign", path], input=signed.encode(), capture_output=True,
-                           timeout=20)
-    except (OSError, subprocess.TimeoutExpired):
-        r = None
-    if not r or r.returncode != 0 or not r.stdout:
-        raise PushError("openssl could not sign with the APNs key of the hub")
-    try:
-        token = signed + "." + _part(raw_signature(r.stdout))
-    except (ValueError, IndexError):
-        raise PushError("the APNs key of the hub is not the P-256 key that Apple gives") from None
-    _tokens.clear()
-    _tokens[mark] = (token, t0)
-    return token
-
-
-def quoted(text):
-    """One value of a curl config line: in double quotes, with its backslashes and quotes escaped."""
-    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def send(device_token, payload, environment, key_id, path, collapse=None, expires=None, base=None, team=TEAM,
-         topic=TOPIC):
-    """One push to one device. (status, reason): Apple's HTTP status and its reason, or (0, why) when no answer came,
-    so that the push may or may not have arrived. PushError when nothing left the machine."""
+def send(channel, entitlement, device_token, payload, environment, collapse=None, expires=None, timeout=None):
+    """One ping through our side. (status, reason): Apple's HTTP status and its reason, or (0, why) when no answer
+    came, so that the ping may or may not have arrived. PushError when nothing left: no entitlement, or our side
+    refused the ping or could not be reached."""
+    if not entitlement:
+        raise PushError("this fleet holds no subscription, and pings go out through founderizer.com with it")
     if not isinstance(device_token, str) or not DEVICE_TOKEN.fullmatch(device_token):
         raise PushError("that is not a device token")
-    if environment not in HOSTS:
+    if environment not in ENVIRONMENTS:
         raise PushError("the environment is production or development")
-    headers = {"authorization": "bearer " + provider_token(key_id, path, team), "apns-topic": topic,
-               "apns-push-type": "alert", "apns-priority": "10", "content-type": "application/json"}
-    if expires is not None:
-        headers["apns-expiration"] = str(int(expires))
+    body = {"token": device_token, "environment": environment, "payload": payload}
     if collapse:
-        headers["apns-collapse-id"] = collapse
-    lines = [f"url = {quoted((base or HOSTS[environment]) + '/3/device/' + device_token)}", "http2", "silent",
-             "show-error", f"max-time = {TIMEOUT}", "output = -", 'write-out = "\\n%{http_code}"']
-    lines += [f"header = {quoted(name + ': ' + value)}" for name, value in headers.items()]
-    lines.append(f"data-binary = {quoted(json.dumps(payload, separators=(',', ':')))}")
+        body["collapse"] = collapse
+    if expires is not None:
+        body["expires"] = int(expires)
+    request = urllib.request.Request(channel.rstrip("/") + "/api/push", data=json.dumps(body).encode(), method="POST",
+                                     headers={"Authorization": "Bearer " + entitlement, "Accept": "application/json",
+                                              "Content-Type": "application/json", "User-Agent": "founderizer-hub"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        r = subprocess.run(["curl", "--config", "-"], input=("\n".join(lines) + "\n").encode(), capture_output=True,
-                           timeout=TIMEOUT + 10)
-    except FileNotFoundError:
-        raise PushError("curl is not installed on the hub machine") from None
-    except subprocess.TimeoutExpired:
-        return 0, "Apple gave no answer in time"
-    if r.returncode in NOT_SENT:
-        raise PushError(f"Apple's push service cannot be reached (curl {r.returncode})")
-    if r.returncode != 0:
-        return 0, f"the push stopped before Apple answered (curl {r.returncode})"
-    body, _, code = r.stdout.decode("utf-8", "replace").rpartition("\n")
+        with opener.open(request, timeout=timeout or TIMEOUT) as answer:
+            text = answer.read(65536).decode("utf-8", "replace")
+    except urllib.error.HTTPError as answer:
+        with answer:
+            raise PushError(_refusal(answer.code, answer.read(65536).decode("utf-8", "replace"))) from None
+    except urllib.error.URLError as e:          # the request did not get out: no connection, no name, no TLS
+        raise PushError(f"founderizer.com cannot be reached: {str(e.reason)[:200]}") from None
+    except (OSError, ValueError):               # it went, and the answer did not come back
+        return 0, "founderizer.com gave no answer in time"
     try:
-        reason = str((json.loads(body) if body.strip() else {}).get("reason") or "")[:100]
-    except (ValueError, AttributeError):
-        reason = ""
-    return (int(code) if code.isdigit() else 0), reason
+        got = json.loads(text)
+        status, reason = got["status"], got.get("reason") or ""
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return 0, "founderizer.com answered with something other than Apple's answer"
+    if isinstance(status, bool) or not isinstance(status, int):
+        return 0, "founderizer.com answered with something other than Apple's answer"
+    return status, str(reason)[:100]
