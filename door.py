@@ -965,6 +965,7 @@ def cmd_update(args):
     target = os.path.join(P(CODE), revision)
     if not os.path.isdir(target):
         temp = tempfile.mkdtemp(dir=P(CODE), prefix=".new-")
+        os.chmod(temp, 0o755)       # mkdtemp makes it 0700, and the door's own user runs the code in it
         for argv in (["git", "init", "-q", temp], ["git", "-C", temp, "fetch", "-q", UPSTREAM, revision],
                      ["git", "-C", temp, "checkout", "-q", "--detach", "FETCH_HEAD"]):
             status, out = run_program(argv, None, {}, timeout=600)
