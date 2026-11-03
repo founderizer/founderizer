@@ -6245,7 +6245,8 @@ def t_save_trigger(agent, a):
     saved = body.get("check") or {}
     if saved.get("code") == "saved":        # DevOps plan 0.2: the hub gives the helper only the SHA-256
         said += (f"\nThe check runs only from your machine's own store: write its program, byte for byte, to "
-                 f"~/.fleet/checks/{saved['sha256']}.py on the machine of {runner_of(t)}, if it is not there yet.")
+                 f"~/{lifecycle.CHECK_STORE}/{saved['sha256']}.py on the machine of {runner_of(t)}, if it is not "
+                 f"there yet.")
     return said
 
 

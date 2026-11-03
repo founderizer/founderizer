@@ -63,10 +63,10 @@ import uuid
 from threads import MARKER, THREAD_ID, CodexFiles, Tailer, Translator, complete_rows, manager_transcript, text_of
 from usage import Collector, local_model, timestamp
 import lifecycle
-from lifecycle import (CHECK_FILE, FLOOR_FILE, GITHUB_TOKEN, MCP_PROGRAM, REPO_ACCESS, REPO_NAME, RUNTIMES,
-                       TOOL_CATALOG, Lifecycle, Updating, app_server_task, check_store, exe, facts_now, follow_config_ref,
-                       key_env, mcp_variable, no_sign_in, reuse_settings, runtime_fact, runtimes_with, screen_program,
-                       session_reuse, skills_text, start_form, tool_catalog, tool_needs)
+from lifecycle import (CHECK_FILE, CHECK_STORE, FLOOR_FILE, GITHUB_TOKEN, MCP_PROGRAM, REPO_ACCESS, REPO_NAME,
+                       RUNTIMES, TOOL_CATALOG, Lifecycle, Updating, app_server_task, check_stores, exe, facts_now,
+                       follow_config_ref, key_env, mcp_variable, no_sign_in, reuse_settings, runtime_fact,
+                       runtimes_with, screen_program, session_reuse, skills_text, start_form, tool_catalog, tool_needs)
 from desktop import Publisher
 from onboard import CLAUDE_UPDATES_OFF
 
@@ -2495,14 +2495,44 @@ def _no_constant(name):
     raise ValueError(f"{name} is not a number")
 
 
+def saved_check(sha, stores):
+    """The bytes of the saved check `sha` from the first of `stores` that holds them, and None; or None and the
+    (error, detail) of the run. A file is read only when it is a plain file and no link, and with no wait, because the
+    sessions of the agent write that folder (a FIFO there would hold a check slot for ever), and it is taken only when
+    its bytes have that SHA-256."""
+    changed = False
+    for store in stores:
+        try:
+            fd = os.open(os.path.join(store, sha + ".py"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            continue
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                changed = True
+                continue
+            with os.fdopen(os.dup(fd), "rb") as f:
+                data = f.read(CHECK_SOURCE_MAX + 1)
+        except OSError:
+            continue
+        finally:
+            os.close(fd)
+        if len(data) <= CHECK_SOURCE_MAX and hashlib.sha256(data).hexdigest() == sha:
+            return data, None
+        changed = True
+    if changed:
+        return None, ("changed", f"the saved check {sha[:12]} on this machine does not have that SHA-256")
+    return None, ("missing", f"no saved check here: its agent writes it, byte for byte, to ~/{CHECK_STORE}/{sha}.py "
+                             f"from a session on this machine")
+
+
 def run_check(extra, kit=KIT, agent=None, keys=None, store=None):
     """Run one approved check outside every AI session, in a new process group, in an empty folder that is also its
     HOME, with no Fleet value or token in its environment: a check of the code, read at this checkout's own HEAD
     (never the working tree), or an agent's saved check from this machine's own store. The hub gives only the path or
     the SHA-256 and never the code (DevOps plan 0.2): what runs is code that a signed release brought, or code that the
-    agent's own session put on its own machine (`store`, lifecycle.check_store of this user's home). keys: the agent's
-    own read keys (plan P4), the ones its sessions read, as variables. Returns the result body for the hub, without
-    the token."""
+    agent's own session put on its own machine (saved_check: from `store`, or else lifecycle.check_stores of this
+    user's home). keys: the agent's own read keys (plan P4), the ones its sessions read, as variables. Returns the
+    result body for the hub, without the token."""
     started = time.monotonic()
 
     def result(**body):
@@ -2515,15 +2545,9 @@ def run_check(extra, kit=KIT, agent=None, keys=None, store=None):
     if not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)):
         return fail("missing", "the hub named no SHA-256 for this check")
     if extra.get("code") == "saved":        # an agent's saved check: from this machine's own store, by its SHA-256
-        path = os.path.join(store or check_store(os.path.expanduser("~")), sha + ".py")
-        try:
-            with open(path, "rb") as f:
-                data = f.read(CHECK_SOURCE_MAX + 1)
-        except OSError:
-            return fail("missing", f"this machine has no saved check {sha[:12]}: its agent saves it again, from a "
-                                   f"session on this machine")
-        if len(data) > CHECK_SOURCE_MAX or hashlib.sha256(data).hexdigest() != sha:
-            return fail("changed", f"the saved check {sha[:12]} on this machine does not have that SHA-256")
+        data, problem = saved_check(sha, [store] if store else check_stores(os.path.expanduser("~")))
+        if problem:
+            return fail(*problem)
     else:
         name = extra.get("path")
         if not (isinstance(name, str) and CHECK_FILE.fullmatch(name)):

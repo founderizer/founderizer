@@ -1486,15 +1486,20 @@ def key_env(name):
         and not ENV_RESERVED.fullmatch(name)
 
 
-# Where a machine keeps the saved checks that its own sessions wrote, by the SHA-256 of their bytes: ~/.fleet/checks/
-# <sha256>.py. The hub keeps a saved check's text for the owner to read, and gives the helper only its SHA-256, so the
-# code that runs is code that the agent's own session put on its own machine (fleet.run_check).
-CHECK_STORE = "checks"
+# Where a machine keeps the saved checks that its own sessions wrote, by the SHA-256 of their bytes:
+# ~/fleet-checks/<sha256>.py, a folder of the agent's own user that its sessions may write. ~/.fleet holds the agent's
+# key and its sessions' files, and Fleet's deny list keeps every session out of it (fleet.DENY). The hub keeps a saved
+# check's text for the owner to read, and gives the helper only its SHA-256, so the code that runs is code that the
+# agent's own session put on its own machine (fleet.run_check). The first store, ~/.fleet/checks/, is still read, so
+# the checks that are there stay.
+CHECK_STORE = "fleet-checks"
+FIRST_CHECK_STORE = os.path.join(FLEET_DIR, "checks")
 CHECK_FILE = re.compile(r"checks/[a-z0-9_]{1,64}\.py")      # a check of the code itself (hub.CHECK_PATH), never data
 
 
-def check_store(home):
-    return os.path.join(home, FLEET_DIR, CHECK_STORE)
+def check_stores(home):
+    """The folders that the helper reads a saved check from, in that order."""
+    return [os.path.join(home, CHECK_STORE), os.path.join(home, FIRST_CHECK_STORE)]
 
 
 class Lifecycle:
