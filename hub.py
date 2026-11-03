@@ -2001,7 +2001,8 @@ def chat_team_once(agent):
 START_READ = ("The start of this task attempt: the text that this session began with, so it is not repeated here. "
               "list_my_tasks gives the task again.")
 OWNER_CHAT_GUIDANCE = ("Owner-chat guidance: answer greetings and casual questions naturally with tell_owner. Do not "
-                       "turn a greeting into tasks or list tests, task inventories or pilot history unless asked.\n\n")
+                       "turn a greeting into tasks or list tests, task inventories or pilot history unless asked. Name a "
+                       "task, a duty or a case by what it is about, never by its code (T-61, R-3).\n\n")
 
 
 # ---------------------------------------------------------------- what an agent holds, and what it has left
@@ -19892,7 +19893,8 @@ TOOLS = [
      "by default when he says nothing: those go to tell_owner, which posts with no notification, or nowhere. The "
      "hub refuses an item whose own words say nothing is needed. Use rarely. When you ask him to choose, give the "
      "choices in options: he presses one, and its words come back as the answer. Never ask for a key, a password or "
-     "a token here: request_secret is how the value reaches the vault without passing you.",
+     "a token here: request_secret is how the value reaches the vault without passing you. Its title, why and options "
+     "are plain words with no codes (T-61, R-3).",
      S({"title": STR, "why": STR,
         "what_to_do": {"type": "string", "description": "The one thing that only the owner can do or decide now. "
                                                         "If there is none, do not raise the item."},
@@ -20254,7 +20256,8 @@ TOOLS = [
                      "change_trigger": t_change_trigger}[name], desc, schema) for name, desc, schema in wakeups.TOOL_SPECS],
     ("all", "tell_owner", t_tell_owner,
      "Send a concise reply to this agent's owner chat. Worker chat replies require in_reply_to from read_messages. "
-     "Task workers still report through their task tools; managers may also post checked results. No notification.",
+     "Task workers still report through their task tools; managers may also post checked results. No notification. "
+     "Plain words: name a task or a duty by what it is about, never by its code (T-61, R-3); a code goes in about.",
      S({"text": STR,
         "about": {"type": "string", "description": "What this reply is about, for the owner's own record: the "
                                                    "message you are answering (M-<id>), the goal (G-<id>) and the "
@@ -20265,7 +20268,7 @@ TOOLS = [
      "request. Keep it short and rare. It goes to the chat app where the owner last wrote to you, else to your own "
      "WhatsApp number or Discord bot; without one it stays in the app. Answer an owner message with tell_owner "
      "instead. One request_id is one message: the same request_id again sends nothing more. Never put a login in the "
-     "text.",
+     "text. Name a task or a duty by what it is about, never by its code (T-61, R-3).",
      S({"request_id": {"type": "string", "description": "A new UUID for each message"},
         "text": {"type": "string", "description": "The message, 1 to 4,000 characters"}}, ["request_id", "text"])),
     ("worker", "start_task", t_start_task,
