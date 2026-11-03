@@ -4550,7 +4550,7 @@ def commit_outputs(agent, t, files):
     title = " ".join(str(t["title"] or "").split())[:200]
     message = (f"{agent} delivered {ref}: {len(changed)} file{'' if len(changed) == 1 else 's'} of its output\n\n"
                f"{title}\n\nThe agent's helper sent the files of outputs/{ref}/ when the agent delivered, and the hub "
-               f"commits only those (the owner, 25 October 2026): a checkout over git:// cannot push.")
+               f"commits only those: a checkout over git:// cannot push.")
     first, *rest = changed
     for attempt in range(3):
         try:
@@ -16892,8 +16892,8 @@ def t_write_knowledge(agent, a):
     if stored:
         return stored["text"]
     message = (f"{agent} changed {path}: {why}\n\n"
-               f"An agent writes the fleet's shared knowledge files, directly and without asking (the owner, 26 "
-               f"October 2026: no unnecessary gates); the owner's own files are his alone. A fact with no repository "
+               f"An agent writes the fleet's shared knowledge files, directly and without asking; it never writes the "
+               f"owner's own files. A fact with no repository "
                f"has no other home, and a loop that asks for approval of each fact is not a loop. The owner reads "
                f"this commit in the configuration ref and reverts it in one step.")
     try:
@@ -16984,9 +16984,8 @@ def skill_message(agent, name, why, retired):
     trailers = ([f"Fleet-Task: {tref(task)}"] if task else []) + \
         ([f"Fleet-Outside-Reads: {reads}"] if reads is not None else [])
     return (f"{agent} {'retired' if retired else 'wrote'} the skill {name}: {why}\n\n"
-            f"Written {where}. An agent writes its own skills, directly and without asking (the owner, 29 October "
-            f"2026: each agent's own). The owner reads this commit in the configuration ref and reverts it in one "
-            f"step." + ("\n\n" + "\n".join(trailers) if trailers else "") + "\n")
+            f"Written {where}. An agent writes its own skills, directly and without asking: each agent's skills are "
+            f"its own. The owner reads this commit in the configuration ref and reverts it in one step." + ("\n\n" + "\n".join(trailers) if trailers else "") + "\n")
 
 
 def t_write_skill(agent, a):
