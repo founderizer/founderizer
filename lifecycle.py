@@ -11,6 +11,7 @@ works: the vendor's own update, a check of the new version, and the previous ver
 """
 import contextlib
 import fcntl
+import glob
 import json
 import os
 import plistlib
@@ -34,6 +35,75 @@ RETRY_MAX = 30              # seconds at most between the tries of a status repo
 # What `tailscale status --json` can say of itself. `Starting` is up, as for Tailscale's own command: it lasts until the
 # first live peer or relay. Any other state says neither.
 TAILSCALE_UP, TAILSCALE_DOWN = ("Running", "Starting"), ("Stopped", "NeedsLogin", "NeedsMachineAuth")
+# The server's own hardening, which the join sets (hubsetup.harden) and each reading reads again as any user, because
+# `sshd -T` needs root: sshd's own files, npm's file for every user, and apt's record of its last good upgrade, which
+# apt.systemd.daily writes only after unattended-upgrade ended well.
+SSHD_CONFIG = "/etc/ssh/sshd_config"
+NPMRC = "/etc/npmrc"
+NPM_DAYS = 7
+UPGRADE_STAMP = "/var/lib/apt/periodic/upgrade-stamp"
+SSHD_PASSWORDS = ("passwordauthentication", "kbdinteractiveauthentication")     # sshd's default for each is yes
+
+
+def sshd_settings(path, wanted, found, depth=0):
+    """The first value of each wanted setting in sshd's file and the files it includes, in sshd's own order: sshd takes
+    the first value it reads, an Include reads its files where it stands, and a Match block applies only to some
+    connections, so the rest of its file is not read. False when a file that could still set one cannot be read."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        words = re.split(r"[\s=]+", line.strip(), maxsplit=1)
+        key = words[0].lower()
+        if not key or key.startswith("#") or len(words) < 2:
+            continue
+        if key == "match":
+            return True
+        if key == "include" and depth < 8:
+            for pattern in words[1].split():
+                folder = os.path.dirname(SSHD_CONFIG)
+                for one in sorted(glob.glob(pattern if pattern.startswith("/") else os.path.join(folder, pattern))):
+                    if not sshd_settings(one, wanted, found, depth + 1):
+                        if any(w not in found for w in wanted):
+                            return False
+        elif key in wanted and key not in found:
+            found[key] = words[1].split()[0].strip('"').lower()
+    return True
+
+
+def sshd_keys_only(path=SSHD_CONFIG):
+    """Whether sshd lets nobody in with a password: True, False, or None when its files cannot say (none, or one that
+    this user cannot read before both settings are found)."""
+    found = {}
+    if not os.path.exists(path) or not sshd_settings(path, SSHD_PASSWORDS, found):
+        return None
+    return all(found.get(key, "yes") == "no" for key in SSHD_PASSWORDS)
+
+
+def npm_rule(path=NPMRC, system="/usr/local/bin:/usr/bin:/bin"):
+    """Whether npm's file for every user holds back a package version newer than NPM_DAYS: True, False (no such line, or
+    fewer days), or None when it cannot be read or the system has no npm, which then has nothing to hold back."""
+    if not shutil.which("npm", path=system):
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    days = re.findall(r"(?m)^\s*min-release-age\s*=\s*(\d+)\s*$", text)
+    return bool(days) and int(days[-1]) >= NPM_DAYS
+
+
+def upgraded_at(path=UPGRADE_STAMP):
+    """When apt's daily run last ended a security upgrade well, or None when it has not yet."""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
 OWNER_ONLY = re.compile(r"(?:^|/)(?:test_[^/]*|ui_fixture|selftest|verify|pilot|vault|place)\.py$")  # never loaded here
 TICK = 15                   # seconds between idle checks
 RESTART_GRACE = 120         # seconds this process may live on after it asked for its own restart
@@ -1610,6 +1680,10 @@ class Lifecycle:
             if code == 0:
                 s["pending_security"] = len(re.findall(r"^Inst .*[Ss]ecurity", out, re.M))
             s["reboot_required"] = os.path.exists("/var/run/reboot-required")
+            # OpenSSH that does not run lets nobody in with a password (a server that Tailscale's own SSH serves)
+            code, out, _ = self.run(["systemctl", "is-active", "ssh.service", "ssh.socket"])
+            s.update(ssh_keys_only=sshd_keys_only() if "active" in out.split() else None, npm_rule=npm_rule(),
+                     upgraded_at=upgraded_at())
             try:
                 with open("/etc/ufw/ufw.conf") as f:
                     m = re.search(r"^ENABLED=(\w+)", f.read(), re.M)

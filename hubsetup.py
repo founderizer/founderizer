@@ -23,6 +23,9 @@ Standard library only, and it reads no credential of a model provider.
                                                     and the handover key, so no agent of the machine can read either
     python3 hubsetup.py firewall [--check]          as root: incoming traffic over the private network only, SSH
                                                     included, and no public SSH rule of an earlier installer
+    python3 hubsetup.py harden [--user NAME] [--check]
+                                                    as root: SSH takes keys only with no X11 forwarding, npm takes no
+                                                    package version newer than seven days, Tailscale updates itself
     python3 hubsetup.py check --address IP [--port N] [--kit PATH]
                                                     the end checks on this machine: selftest.py and GET /health
     python3 hubsetup.py fleet-id [--db PATH]        this fleet's own id in the hub's key store, made once
@@ -52,12 +55,14 @@ says that the manager holds no credential of ours.
 """
 import argparse
 import base64
+import glob
 import hashlib
 import http.server
 import json
 import os
 import pathlib
 import platform
+import pwd
 import re
 import secrets
 import shlex
@@ -699,6 +704,156 @@ def firewall(check=False, run=None):
     say(f"the firewall is on: incoming traffic over the private network only, SSH included, at {ip}"
         + (f"; the public SSH rule of an earlier Founderizer is removed ({removed} lines)" if removed != "0" else ""))
     return "set"
+# ---------------------------------------------------------------- the server's own hardening (join.sh)
+
+SSHD_DIR = "/etc/ssh/sshd_config.d"
+SSHD_HARDENING = SSHD_DIR + "/10-fleet-hardening.conf"
+# sshd takes the first value that it reads of a setting, and sshd_config reads this folder before its own settings on
+# every system the join takes (Ubuntu 22.04 to 26.04, Debian 12), so these lines come before the system's own and a
+# provider's later file.
+SSHD_TEXT = ("# Founderizer's join writes this file (hubsetup.py harden): SSH takes keys only, and no X11 forwarding.\n"
+             "PasswordAuthentication no\n"
+             "KbdInteractiveAuthentication no\n"
+             "X11Forwarding no\n")
+SSHD_WANTED = {"passwordauthentication": "no", "kbdinteractiveauthentication": "no", "x11forwarding": "no"}
+# Where an account of the server keeps the keys it logs in with over SSH (sshd's default AuthorizedKeysFile).
+KEY_FILES = ("/root/.ssh/authorized_keys", "/root/.ssh/authorized_keys2", "/home/*/.ssh/authorized_keys",
+             "/home/*/.ssh/authorized_keys2")
+NPMRC = "/etc/npmrc"                    # npm's file for every user of the system on Debian and Ubuntu
+NPM_RULE = "min-release-age=7"          # npm takes no package version that was published less than seven days ago
+NPM_RULE_LINE = re.compile(r"^\s*min-release-age\s*=", re.M)
+
+
+def put_file(path, text, mode, uid=None, gid=None):
+    """The whole file at once, as root: a new file beside it, then renamed over it, so a reader never sees half."""
+    folder = os.path.dirname(path)
+    fd, temp = tempfile.mkstemp(dir=folder, prefix=".fleet-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(temp, mode)
+        if uid is not None:
+            os.chown(temp, uid, gid)
+        os.replace(temp, path)
+    except BaseException:
+        if os.path.exists(temp):
+            os.remove(temp)
+        raise
+
+
+def has_ssh_key(root=""):
+    """Whether an account of this server logs in with an SSH key: a key line in root's authorized_keys or in that of a
+    user in /home. Without one, a server whose SSH takes keys only would let nobody in."""
+    for pattern in KEY_FILES:
+        for path in glob.glob(root + pattern):
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    if any(line.strip() and not line.lstrip().startswith("#") for line in f):
+                        return True
+            except OSError:
+                continue
+    return False
+
+
+def harden_ssh(check, run, root=""):
+    """SSH takes keys only, with no X11 forwarding, through one file in sshd's own folder. sshd checks the new file
+    (sshd -t) before it reloads, and a file that it refuses is taken back. The words of what it did."""
+    _code, out, _err = run("systemctl is-active ssh.service ssh.socket")
+    if "active" not in out.split():
+        return "SSH: OpenSSH does not run on this server, so no password lets anybody in through it"
+    if not has_ssh_key(root):
+        return ("SSH keeps password login: no account on this server has an SSH key, and a server that takes keys only "
+                "would let nobody in")
+    if not os.path.isdir(root + SSHD_DIR):
+        return "SSH keeps its settings: this system has no folder for sshd's own files"
+    path = root + SSHD_HARDENING
+    try:
+        with open(path, encoding="utf-8") as f:
+            before = f.read()
+    except OSError:
+        before = None
+    if check:
+        return "would make SSH take keys only, with no X11 forwarding" if before != SSHD_TEXT \
+            else "SSH takes keys only already, with no X11 forwarding"
+    if before != SSHD_TEXT:
+        put_file(path, SSHD_TEXT, 0o644, *((0, 0) if not root else ()))
+        code, out, err = run("sshd -t")
+        if code != 0:
+            if before is None:
+                os.remove(path)
+            else:
+                put_file(path, before, 0o644, *((0, 0) if not root else ()))
+            return f"SSH keeps its settings: sshd refused the new file ({(err or out).strip()[-200:]})"
+    run("systemctl try-reload-or-restart ssh.service")      # a session that is open keeps going
+    code, out, _ = run("sshd -T")
+    seen = dict(line.split(" ", 1) for line in out.lower().splitlines() if " " in line)
+    still = [key for key, value in SSHD_WANTED.items() if seen.get(key) != value]
+    if code != 0 or still:
+        return "SSH does not take keys only yet: " + ("an earlier file of sshd sets " + ", ".join(still)
+                                                      if code == 0 else "sshd -T did not answer")
+    return "SSH takes keys only, with no X11 forwarding"
+
+
+def harden_npm(service_user, check, root="", account=None):
+    """npm takes no package version that is newer than seven days: for every user of the system (/etc/npmrc) and for
+    the service user (its ~/.npmrc), each where no min-release-age line is yet, so a line of the owner's own stays. A
+    new /etc/npmrc holds that one line and nothing else. The words of what it did."""
+    if account is None:
+        try:
+            entry = pwd.getpwnam(service_user)
+            account = (entry.pw_dir, entry.pw_uid, entry.pw_gid)
+        except KeyError:
+            account = None
+    files = [(root + NPMRC, 0o644, None if root else 0, None if root else 0)]
+    if account:
+        files.append((root + os.path.join(account[0], ".npmrc"), 0o600, account[1], account[2]))
+    added = []
+    for path, mode, uid, gid in files:
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except FileNotFoundError:
+            text = None
+        except OSError:
+            continue
+        if text is not None and NPM_RULE_LINE.search(text):
+            continue
+        added.append(path[len(root):])
+        if check:
+            continue
+        if text is None:
+            put_file(path, NPM_RULE + "\n", mode, uid, gid)
+        else:
+            st = os.stat(path)
+            put_file(path, text + ("" if not text or text.endswith("\n") else "\n") + NPM_RULE + "\n",
+                     stat.S_IMODE(st.st_mode), st.st_uid if not root else None, st.st_gid if not root else None)
+    if not added:
+        return "npm takes no package version newer than seven days already"
+    return ("would make" if check else "made") + " npm take no package version newer than seven days (" + \
+        ", ".join(added) + ")"
+
+
+def harden_tailscale(check, run):
+    """Tailscale updates itself, which is its own setting for a new device of a new tailnet. The words of what it did."""
+    if check:
+        return "would turn on Tailscale's own updates"
+    code, out, err = run("tailscale set --auto-update")
+    if code != 0:
+        return f"Tailscale's own updates stay as they are: {(err or out).strip()[-200:] or 'tailscale did not answer'}"
+    return "Tailscale updates itself"
+
+
+def harden(service_user="fleet", check=False, run=None, root="", account=None):
+    """The server's own hardening, which the join takes after its firewall (the owner, 3 November 2026: Add server
+    ends at the baseline, for any user): SSH takes keys only with no X11 forwarding, npm takes no package version
+    newer than seven days, and Tailscale updates itself. Each part checks first, so a second run changes nothing. A
+    part that cannot be done says why and leaves the server as it was: none of them stops the join, and the server's
+    own reading (lifecycle.Lifecycle.security) tells the hub what holds. Returns the lines that it said."""
+    run = run or _shell
+    said = [harden_ssh(check, run, root), harden_npm(service_user, check, root, account), harden_tailscale(check, run)]
+    for line in said:
+        say(line)
+    return said
 # ---------------------------------------------------------------- the machine's vault broker (PRODUCT.md P5)
 
 def vault_reading(user=VAULT_USER, group=AGENT_GROUP):
@@ -1610,6 +1765,10 @@ def cmd_firewall(args):
     firewall(check=args.check)
 
 
+def cmd_harden(args):
+    harden(service_user=args.user, check=args.check)
+
+
 def cmd_agent_list(args):
     """One line for each agent of this machine: its name, its runtime and its OS user. The installers read it, so
     it prints nothing else."""
@@ -1697,6 +1856,10 @@ def main(argv=None):
     fw = sub.add_parser("firewall")
     fw.add_argument("--check", action="store_true", help="say what it would do, change nothing")
     fw.set_defaults(fn=cmd_firewall)
+    hd = sub.add_parser("harden")
+    hd.add_argument("--user", default="fleet", help="the user that runs this machine's Founderizer services")
+    hd.add_argument("--check", action="store_true", help="say what it would do, change nothing")
+    hd.set_defaults(fn=cmd_harden)
     ah = sub.add_parser("agent-helper")
     ah.add_argument("--user", default="fleet", help="the user that runs this machine's Founderizer services")
     ah.add_argument("--repo", help="the address of the fleet's configuration ref, which the vault helper fetches "

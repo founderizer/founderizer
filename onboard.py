@@ -58,8 +58,10 @@ CONFIG_BRANCH = "config"     # the hub's configuration ref: a team.json change b
 # one commit: the commit checked is the commit taken.
 TAKE = ('git fetch -q origin && t=$(git rev-parse --verify -q "@{upstream}^{commit}") && '
         'python3 lifecycle.py may-take . "$t" && git merge -q --ff-only "$t"')
-# Hub ports 8765 and 9418 for tag:claude-code-dev; the owner's SSH to workers for tag:terminal-relay-worker.
-DEFAULT_TAGS = "tag:claude-code-dev,tag:terminal-relay-worker"
+# The tags of a new run's machine when the run names none: the product's own (hub.FLEET_TAG, the app's
+# PrivateNetwork.tag). A tailnet whose policy gives the fleet's machines their rights by other tags names them with
+# --tailscale-tag or the config file; the hub's join line takes the hub's own tags by itself (hub.hub_tags).
+DEFAULT_TAGS = "tag:founderizer"
 TAG_RE = re.compile(r"^tag:[A-Za-z][A-Za-z0-9-]*$")
 # Both at least 7 days old on 10 October 2026. A Codex version stays until someone installs another one. The Claude
 # version is only the first build: Claude Code's own installation updates itself (see CLAUDE_CHANNEL).

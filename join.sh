@@ -3,8 +3,9 @@
 # owner runs it with the one line from Founderizer (Servers, Add server); FLEET_JOIN holds the one-time join code.
 #
 #   A VPS (Ubuntu 22.04, 24.04 or 26.04, or Debian 12), as root: base packages, the user fleet, then the join, security
-#   updates and the firewall. The line has joined the private network (Tailscale) before this script, and after it
-#   SSH reaches the machine over that network only.
+#   updates, the firewall and the server's own hardening (SSH keys only, npm's seven days, Tailscale's own updates).
+#   The line has joined the private network (Tailscale) before this script, and after it SSH reaches the machine over
+#   that network only.
 #   A Mac (macOS 14 or later, with Tailscale and Homebrew), as the user that will run the agents: tmux and Python
 #   with Homebrew, then the join, then this Mac's vault, the one step that asks for that user's password, then
 #   Claude's extension for Chrome. The Founderizer installer runs the same line as root behind macOS's own password
@@ -74,6 +75,7 @@ linux() {
         --ssh-port "${first:-22}"
     updates
     firewall "/home/$WORKER/fleet-server"
+    harden "/home/$WORKER/fleet-server"
     current "/home/$WORKER/fleet-server" as_worker
     agent_helper "/home/$WORKER/fleet-server"
     agent_users "/home/$WORKER/fleet-server"
@@ -255,7 +257,10 @@ verify_step() { # $1: the checkout; $2: how to run a command as the user of the 
     fi
 }
 
-updates() {     # unattended security updates on, then the pending ones once; never a restart of the server
+updates() {     # unattended security updates on, then the pending ones once; never a restart of the server. They run as
+                # apt's own two daily services, so apt records the run as its timers do (upgrade-stamp, which the
+                # server's own reading gives the hub as the time of its last good security update): a bare
+                # unattended-upgrade installs the same and records nothing until the first daily run.
     printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n' \
         > /etc/apt/apt.conf.d/20auto-upgrades
     systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
@@ -266,7 +271,8 @@ updates() {     # unattended security updates on, then the pending ones once; ne
     fi
     say "security updates are on; installing the pending ones (this can take some minutes)"
     apt-get -o DPkg::Lock::Timeout=600 -q install </dev/null >/dev/null 2>&1 || true
-    unattended-upgrade </dev/null >/dev/null 2>&1 || say "some security updates did not install now; the daily run tries again"
+    systemctl start apt-daily.service apt-daily-upgrade.service </dev/null >/dev/null 2>&1 \
+        || say "some security updates did not install now; the daily run tries again"
     [ ! -f /var/run/reboot-required ] || say "this server needs a restart for its updates; restart it when it has no work"
 }
 
@@ -275,6 +281,14 @@ firewall() {    # $1: the checkout. Incoming traffic over the private network on
                 # keeps its other rules and its defaults.
     python3 "$1/hubsetup.py" firewall </dev/null \
         || stop "The firewall of this machine could not be set: the line above says why. Run the line again."
+}
+
+harden() {      # $1: the checkout. SSH takes keys only with no X11 forwarding, npm takes no package version newer than
+                # seven days, and Tailscale updates itself (hubsetup.py harden). Each part checks first and says what
+                # it did. A part that cannot be done leaves the server as it was and does not stop the join: the
+                # server's own reading tells the hub what holds.
+    python3 "$1/hubsetup.py" harden --user "$WORKER" </dev/null \
+        || say "the hardening of this server did not finish: the lines above say why"
 }
 
 mac() {

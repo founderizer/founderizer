@@ -23652,6 +23652,7 @@ def tick():
             default_access_sweep(t0)        # the owner, 28 October 2026: every agent's vault, and a Mac's desktop
             machine_names_sweep(t0)         # the owner, 30 October 2026: a machine's name is its name in Tailscale
             mac_setup_sweep(t0)             # the owner, 31 October 2026: one sitting at a new Mac
+            server_watch_sweep(t0)          # the owner, 3 November 2026: each server against its own baseline
             mac_desktop_sweep()             # what only hands at a Mac can put right
         except Exception:
             traceback.print_exc()           # a goal or database check must not stop the timers below
@@ -24775,6 +24776,10 @@ def validate_status(data):
     state = _optional(up.get("state"), str, 20)
     if state not in (None, "waiting_idle", "updating", "failed"):
         raise ValueError("update state must be waiting_idle, updating, failed or null")
+    upgraded = sec.get("upgraded_at")            # the server's own hardening (hubsetup.harden, server_watch_sweep)
+    if upgraded is not None and not (isinstance(upgraded, (int, float)) and not isinstance(upgraded, bool)
+                                     and math.isfinite(upgraded)):
+        raise ValueError("upgraded_at must be a time or null")
     vault = sec.get("vault")
     if vault is not None:
         if not isinstance(vault, dict):
@@ -24862,7 +24867,11 @@ def validate_status(data):
                          "pending_security": _optional(sec.get("pending_security"), int),
                          "reboot_required": _optional(sec.get("reboot_required"), bool),
                          "firewall": firewall, "tailscale": _optional(sec.get("tailscale"), bool), "vault": vault,
-                         "desktop": desktop_status(sec.get("desktop"))},
+                         "desktop": desktop_status(sec.get("desktop")),
+                         # only what the helper sent: an older one sends none of these, and a null is a reading
+                         **{k: v for k, v in (("ssh_keys_only", _optional(sec.get("ssh_keys_only"), bool)),
+                                              ("npm_rule", _optional(sec.get("npm_rule"), bool)),
+                                              ("upgraded_at", upgraded)) if k in sec}},
             "runtime": {"name": _optional(rt.get("name"), str, 40), "version": _optional(rt.get("version"), str, 120),
                         "signed_in": _optional(rt.get("signed_in"), bool)},
             "update": {"state": state, "detail": _optional(up.get("detail"), str, 500)},
@@ -26025,7 +26034,8 @@ MAC_JOIN_LIFE = 7200            # a bare Mac installs its tools before the join,
 JOIN_TRIES = 5                  # wrong join codes from one address in JOIN_WINDOW seconds; then the address waits
 JOIN_WINDOW = 600
 JOIN_CODE = re.compile(r"[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{12}")       # LINK_ALPHABET: 12 characters, 60 bits
-JOIN_TAGS = "tag:claude-code-dev,tag:terminal-relay-worker"     # onboard.DEFAULT_TAGS: the hub's ports, the owner's SSH
+FLEET_TAG = "tag:founderizer"  # the tag of the servers of a fleet whose hub has none (the app's PrivateNetwork.tag)
+TAILNET_TAG = re.compile(r"tag:[a-z0-9][a-z0-9-]{0,62}")    # a tag as the app reads one (PolicyFile.isTag)
 JOB_OPEN = ("queued", "running", "needs_owner")
 JOB_STEPS = ("user", "runtime", "checkout", "service", "sign_in")       # `user`: the agent's own OS user, on Linux
 JOB_SILENT = 1800               # seconds after which an open job of a server without the job heartbeat has failed
@@ -26377,6 +26387,89 @@ def join_view(row, t0):
             "state": state, "server": (machine_at(row["address"]) or None) if row["used"] else None}
 
 
+# The servers' own baseline, watched by the hub (the owner, 3 November 2026: Add server ends at the baseline, and "this
+# app needs to work for ANY user", so no monitoring host and no Telegram route of one owner's). Each server's reading
+# says what holds, and the manager hears once of each thing that stops holding and once when it holds again.
+WATCH_EVERY = 60                # seconds between two passes of server_watch_sweep
+SERVER_QUIET = 1800             # seconds without a reading after which a server with no agent is quiet
+UPDATES_STALLED = 3 * 86400     # seconds since its last good security update after which a server's updates stopped
+RESTART_WAIT = 7 * 86400        # seconds that a server may wait for its restart before the manager hears of it
+WATCH = {"at": 0.0}
+WATCH_WORDS = {                 # what stopped holding, and what holds again
+    "quiet": ("it has sent no reading for 30 minutes", "it sends its readings again"),
+    "firewall": ("its firewall is off", "its firewall is on"),
+    "network": ("it is off the private network", "it is on the private network"),
+    "ssh": ("its SSH lets passwords in", "its SSH takes keys only"),
+    "npm": ("npm has no seven-day rule", "npm has its seven-day rule"),
+    "updates_off": ("its automatic security updates are off", "its automatic security updates are on"),
+    "updates": ("no security update has ended well on it for 3 days", "its security updates run again"),
+    "restart": ("it has waited 7 days for a restart", "it no longer waits for a restart"),
+}
+
+
+def server_troubles(reading, joined, restart_since, t0):
+    """What of the baseline a Linux server's reading says does not hold, as WATCH_WORDS keys. A fact that the reading
+    does not carry (an older helper) or cannot read says nothing. A server with no good update yet counts from its
+    join."""
+    sec = reading.get("security") or {}
+    found = [key for key, bad in (("firewall", sec.get("firewall") == "inactive"),
+                                  ("network", sec.get("tailscale") is False),
+                                  ("ssh", sec.get("ssh_keys_only") is False),
+                                  ("npm", sec.get("npm_rule") is False),
+                                  ("updates_off", sec.get("unattended_upgrades") is False)) if bad]
+    if sec.get("unattended_upgrades") and "upgraded_at" in sec:
+        last = sec["upgraded_at"] if sec["upgraded_at"] is not None else joined
+        if last is not None and t0 - last > UPDATES_STALLED:
+            found.append("updates")
+    if restart_since is not None and t0 - restart_since > RESTART_WAIT:
+        found.append("restart")
+    return found
+
+
+def server_watch_sweep(t0):
+    """Inside LOCK, once a minute: each joined Linux server against its own baseline (server_troubles), from its
+    newest reading. A server with no agent whose reading stops is quiet; one with agents is offline_sweep's. The
+    manager hears once when something stops holding and once when it holds again, and gives it first to the agent
+    whose duty covers that server (the coordinator of the DevOps plan, 3 November 2026: the owner asked why he gets so
+    many Needs-you items)."""
+    if t0 - WATCH["at"] < WATCH_EVERY:
+        return
+    WATCH["at"] = t0
+    joined = {r["server"]: r["created"] for r in q("SELECT server, created FROM server_keys")}
+    state = json.loads(kv_get("server_watch") or "{}")
+    kept = {}
+    for name in server_names():
+        if name not in joined:
+            continue
+        here = server_agents(name)
+        reading = server_reading(name, here)
+        if reading is None or server_kind(reading) != "linux":
+            continue
+        was = state.get(name) or {}
+        told, since = set(was.get("told") or []), was.get("restart")
+        if reading["source"] == "server" and t0 - max(reading["reported_at"], STARTED) > SERVER_QUIET:
+            now_found = (told - {"quiet"}) | ({"quiet"} if not here else set())    # nothing else is read while quiet
+        else:
+            sec = reading.get("security") or {}
+            since = (since or t0) if sec.get("reboot_required") else None
+            now_found = set(server_troubles(reading, joined[name], since, t0))
+        new, ended = sorted(now_found - told), sorted(told - now_found)
+        if new:
+            emit(manager_name(), "say", f"[hub] The server {name} needs care: "
+                                        f"{'; '.join(WATCH_WORDS[k][0] for k in new)}. Give it to the agent whose duty "
+                                        f"covers this server; fix it yourself when no duty covers it; raise Needs-you "
+                                        f"only for a step that no agent can take.")
+            log("hub", f"the server {name} needs care ({', '.join(new)}); the manager was told")
+        if ended:
+            emit(manager_name(), "say", f"[hub] The server {name} is in order again: "
+                                        f"{'; '.join(WATCH_WORDS[k][1] for k in ended)}.")
+            log("hub", f"the server {name} is in order again ({', '.join(ended)})")
+        if now_found or since:
+            kept[name] = {"told": sorted(now_found), "restart": since}
+    if kept != state:
+        kv_set("server_watch", json.dumps(kept, sort_keys=True) if kept else None)
+
+
 def servers_view():
     """GET /ui/servers: each server with its kind, address, agents, newest reading, availability (why: the codes of
     what stops a new agent) and newest job; and the state of the newest join code."""
@@ -26408,20 +26501,43 @@ def servers_view():
             "join": join_view(q1("SELECT * FROM join_codes ORDER BY id DESC LIMIT 1"), t0)}
 
 
-def join_line(code, kind):
+def hub_tags(status):
+    """The tags of the hub's own machine in Tailscale, out of its `tailscale status --json` (tailnet_status), which every
+    server of the fleet joins with: the owner's tailnet policy gives the fleet's machines their rights by these tags,
+    whoever the owner is, so the product names no tag of one owner's tailnet (the owner, 3 November 2026: "this app
+    needs to work for ANY user"). None when the status says nothing, else the tags that the app would take from the
+    line, or FLEET_TAG when the hub has none: a fleet whose hub the app put on the network carries that tag already."""
+    me = (status or {}).get("Self") if isinstance(status, dict) else None
+    if not isinstance(me, dict):
+        return None
+    tags = me.get("Tags") if isinstance(me.get("Tags"), list) else []
+    return [t for t in tags if isinstance(t, str) and TAILNET_TAG.fullmatch(t)] or [FLEET_TAG]
+
+
+def join_tags():
+    """Outside LOCK, because the status may take 5 seconds: the hub's tags now, else the ones it read last
+    (TAILNET_NAMES), else FLEET_TAG."""
+    tags = hub_tags(tailnet_status())
+    if tags:
+        TAILNET_NAMES["tags"] = tags
+    return tags or TAILNET_NAMES.get("tags") or [FLEET_TAG]
+
+
+def join_line(code, kind, tags=None):
     """The one line that the owner pastes on the new server. A Mac has Tailscale already. A VPS gets it from Tailscale's
-    own installer and joins the private network with the tags of the hub's ports (one sign-in link), under the name its
-    provider gave it, which becomes its name in Fleet. Then the line runs this hub's join script, with the code in that
-    script's environment: never in a URL."""
+    own installer and joins the private network with the tags of the hub's own machine (hub_tags; one sign-in link,
+    or none with a key that the app makes), under the name its provider gave it, which becomes its name in Fleet. Then
+    the line runs this hub's join script, with the code in that script's environment: never in a URL."""
     ip, port = hub_address()
     join = f"curl -fsS http://{ip}:{port}/join | FLEET_JOIN={code} sh"
     if kind == "mac":
         return join
+    tagged = ",".join(tags or [FLEET_TAG])
     return ("command -v tailscale >/dev/null || curl -fsSL https://tailscale.com/install.sh | sh; tailscale status "
-            f">/dev/null 2>&1 || tailscale up --advertise-tags={JOIN_TAGS} --accept-dns=false; " + join)
+            f">/dev/null 2>&1 || tailscale up --advertise-tags={tagged} --accept-dns=false; " + join)
 
 
-def new_join_code(kind, label="", agent=None, runtime=None):
+def new_join_code(kind, label="", agent=None, runtime=None, tags=None):
     """POST /ui/servers/join: a one-time code for one new server, for 30 minutes, and for a Mac two hours. The server
     gets its name at the join, from Tailscale; the label is the name an older app typed, kept only for that app. The hub
     keeps only the code's SHA-256, and a new code cancels the open one. agent and runtime: the first agent of a new Mac,
@@ -26435,7 +26551,7 @@ def new_join_code(kind, label="", agent=None, runtime=None):
                    (hashlib.sha256(raw.encode()).hexdigest(), label, kind, t0, t0 + life, agent, runtime))
     log("owner", f"made a join code for a {kind} server")
     code = "-".join(raw[i:i + 4] for i in (0, 4, 8))
-    return {"name": label, "kind": kind, "expires_at": t0 + life, "code": code, "line": join_line(code, kind)}
+    return {"name": label, "kind": kind, "expires_at": t0 + life, "code": code, "line": join_line(code, kind, tags)}
 
 
 def join_input(data):
@@ -30984,8 +31100,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("agent is a new first agent of a Mac, with a runtime that works in Chrome")
             return {"kind": kind, "name": label if isinstance(label, str) and SERVER_NAME.fullmatch(label) else "",
                     "agent": agent, "runtime": runtime if agent else None}
+        tags = join_tags()          # before LOCK: the status may take 5 seconds
         return self.ui_command("servers/join", read,
-                               lambda body: new_join_code(body["kind"], body["name"], body["agent"], body["runtime"]),
+                               lambda body: new_join_code(body["kind"], body["name"], body["agent"], body["runtime"],
+                                                          tags),
                                keep=lambda result: dict(result, code=None, line=None))
 
     def ui_server_agent(self, server):
