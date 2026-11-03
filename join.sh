@@ -2,7 +2,7 @@
 # Founderizer join script (owner feature servers). The hub serves it at GET /join with its own address in HUB and REPO. The
 # owner runs it with the one line from Founderizer (Servers, Add server); FLEET_JOIN holds the one-time join code.
 #
-#   A VPS (Ubuntu 22.04 or 24.04, or Debian 12), as root: base packages, the user fleet, then the join, security
+#   A VPS (Ubuntu 22.04, 24.04 or 26.04, or Debian 12), as root: base packages, the user fleet, then the join, security
 #   updates and the firewall. The line has joined the private network (Tailscale) before this script, and after it
 #   SSH reaches the machine over that network only.
 #   A Mac (macOS 14 or later, with Tailscale and Homebrew), as the user that will run the agents: tmux and Python
@@ -42,8 +42,8 @@ linux() {
     # shellcheck disable=SC1091
     . /etc/os-release
     case "${ID:-} ${VERSION_ID:-}" in
-        "ubuntu 22.04"|"ubuntu 24.04"|"debian 12") ;;
-        *) stop "This system is ${ID:-unknown} ${VERSION_ID:-}. Use Ubuntu 22.04 or 24.04, or Debian 12." ;;
+        "ubuntu 22.04"|"ubuntu 24.04"|"ubuntu 26.04"|"debian 12") ;;
+        *) stop "This system is ${ID:-unknown} ${VERSION_ID:-}. Use Ubuntu 22.04, 24.04 or 26.04, or Debian 12." ;;
     esac
     command -v systemctl >/dev/null 2>&1 || stop "systemd is required."
     reach
@@ -332,7 +332,7 @@ main() {
     case "$(uname -s)" in
         Linux) linux ;;
         Darwin) mac ;;
-        *) stop "This system is not supported. Use Ubuntu 22.04 or 24.04, Debian 12, or macOS 14 or later." ;;
+        *) stop "This system is not supported. Use Ubuntu 22.04, 24.04 or 26.04, Debian 12, or macOS 14 or later." ;;
     esac
     [ "$ready" = yes ] || exit 1
 }
