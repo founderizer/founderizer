@@ -103,6 +103,8 @@ NOT_TOOLS = {
     "/ui/restore": "a whole fleet restored over this one, from a file this server would have to carry",
     "/ui/owner/devices/{}/push": "the phone's own push token, which the route takes from the phone only",
     "/ui/owner/enroll": "the phone's own call, before it has a key",
+    "/ui/owner/devices/code": "a code for a new phone, which its camera reads from the Mac app's screen; the owner's "
+                              "agent adds a phone with owner_device and device_code",
 }
 
 # What this file repeats from the hub because it cannot import it: this server runs on the owner's Mac with the

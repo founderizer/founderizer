@@ -784,7 +784,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "mac_setup",         # the owner, 31 October 2026: one sitting at a new Mac
                "agent_move",        # DevOps plan C7, 2 November 2026: an agent moves to an empty server
                "server_access",     # DevOps plan C4: Read or Fix on a server, through the door
-               "sealed_push"]       # the owner, 3 November 2026: a ping says nothing to founderizer.com or Apple
+               "sealed_push",       # the owner, 3 November 2026: a ping says nothing to founderizer.com or Apple
+               "device_by_code"]    # the owner, 3 November 2026: Add device shows the QR at once, with no fields
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -865,6 +866,25 @@ def new_device_code(device):
             "expires": t0 + DEVICE_CODE_LIFE}
 
 
+NEW_DEVICE = ""                 # owner_device_codes.device of a code for a phone that team.json does not hold yet
+
+
+def new_phone_code():
+    """POST /ui/owner/devices/code (owner feature device_by_code; the owner, 3 November 2026: Add device shows the QR
+    at once, with no fields): one code for a phone that team.json does not hold yet, ten minutes, once. The phone that
+    brings it to POST /ui/owner/enroll is added with the address it calls from (enroll_new_device). One such code is
+    open at a time, and the hub keeps only its SHA-256."""
+    if len(owner_devices()) >= OWNER_DEVICE_LIMIT:
+        raise Refusal(409, f"a fleet has at most {OWNER_DEVICE_LIMIT} devices; remove one first")
+    t0, raw = now(), "".join(secrets.choice(LINK_ALPHABET) for _ in range(8))
+    with transaction():
+        DB.execute("DELETE FROM owner_device_codes WHERE device=? AND used IS NULL", (NEW_DEVICE,))
+        DB.execute("INSERT INTO owner_device_codes(device,sha256,created,expires) VALUES(?,?,?,?)",
+                   (NEW_DEVICE, hashlib.sha256(raw.encode()).hexdigest(), t0, t0 + DEVICE_CODE_LIFE))
+    log("owner", "made an enrollment code for a new owner device")
+    return {"device": None, "code": f"{raw[:4]}-{raw[4:]}", "expires": t0 + DEVICE_CODE_LIFE}
+
+
 def hide_device_code(result):
     """What the hub keeps of an enrollment command: no code. A repeat gives code null; make a new code."""
     return dict(result, code=None)
@@ -892,6 +912,36 @@ def enroll_device(device, code):
         raise Refusal(403, "that code is not valid")
     log("owner", f"the owner device {device} took its key")       # never the key itself
     return {"device": device, "label": owner_devices()[device]["label"], "key": key, "since": t0}
+
+
+def enroll_new_device(address, code):
+    """POST /ui/owner/enroll from an address that no owner device has (device_by_code): the open code for a new phone
+    adds it to team.json as "iPhone" (then "iPhone 2", ...) with the address it calls from, and then gives its key as
+    enroll_device does. validate_team refuses the address of a machine of the fleet, so no agent's machine becomes an
+    owner device; a refusal leaves the code open. Wrong codes count against the address, five in an hour. Run under
+    LOCK: the team.json write and the code are one step."""
+    raw = re.sub(r"[^A-Z0-9]", "", code.upper()) if isinstance(code, str) else ""
+    t0, tries = now(), "@" + address
+    if q1("SELECT COUNT(*) n FROM owner_device_tries WHERE device=? AND ts>?", (tries, t0 - 3600))["n"] >= DEVICE_TRIES:
+        raise Refusal(429, "too many wrong codes; wait an hour, then make a new code on the owner's Mac")
+    row = q1("SELECT id FROM owner_device_codes WHERE device=? AND sha256=? AND used IS NULL AND expires>?",
+             (NEW_DEVICE, hashlib.sha256(raw.encode()).hexdigest(), t0)) if raw else None
+    if not row:
+        ins("INSERT INTO owner_device_tries(device,ts) VALUES(?,?)", (tries, t0))
+        raise Refusal(403, f"{address} is not an owner device, and that is not a code for a new one")
+    taken, number = owner_devices(), 1
+    while ("iphone" if number == 1 else f"iphone-{number}") in taken:
+        number += 1
+    device, label = ("iphone", "iPhone") if number == 1 else (f"iphone-{number}", f"iPhone {number}")
+
+    def change(team):
+        team["owner_devices"] = dict(sorted(dict(team.get("owner_devices") or {},
+                                                 **{device: {"label": label, "address": address}}).items()))
+        return True
+    save_integration(None, change, f"Owner added the device {device} with a code")
+    q("UPDATE owner_device_codes SET device=? WHERE id=?", (device, row["id"]))
+    q("DELETE FROM owner_device_tries WHERE device=?", (tries,))
+    return enroll_device(device, code)
 
 
 def save_owner_device(body):
@@ -30835,6 +30885,14 @@ class Handler(BaseHTTPRequestHandler):
             return {"base_sha256": base, "device": device, "label": label.strip(), "address": address.strip()}
         return self.ui_command("owner/devices", read, save_owner_device)
 
+    def ui_owner_new_code(self):
+        """POST /ui/owner/devices/code (owner feature device_by_code): one enrollment code for a phone that team.json
+        does not hold yet. The hub keeps no code, so a repeat gives code null."""
+        def read(data):
+            self.only(data, ())
+            return {}
+        return self.ui_command("owner/devices/code", read, lambda body: new_phone_code(), keep=hide_device_code)
+
     def ui_owner_device_code(self, device):
         """POST /ui/owner/devices/<device>/code: one enrollment code for that device. The hub keeps no code."""
         def read(data):
@@ -30876,7 +30934,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("Origin"):
             return self.json(403, {"error": "browser origins are not accepted"})
         device = owner_device_at(self.client_address[0])
-        if device is None:
+        if device is None and not q1("SELECT 1 FROM owner_device_codes WHERE device=? AND used IS NULL AND expires>?",
+                                     (NEW_DEVICE, now())):
             return self.json(403, {"error": f"{self.client_address[0]} is not an owner device. See "
                                             f'"owner_devices" in team.json.'})
         if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
@@ -30884,7 +30943,11 @@ class Handler(BaseHTTPRequestHandler):
         if len(self.body()) > 4096:
             return self.json(413, {"error": "request is too large"})
         try:
-            result = enroll_device(device, self.form().get("code"))
+            if device is None:          # a phone that the owner's Mac added with a code alone (device_by_code)
+                with LOCK:
+                    result = enroll_new_device(self.client_address[0], self.form().get("code"))
+            else:
+                result = enroll_device(device, self.form().get("code"))
         except Refusal as e:
             return self.json(e.status, {"error": str(e)})
         return self.json(200, result, {"Cache-Control": "no-store"})
@@ -34943,6 +35006,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_attachment_keep(parts[2])
         if parts == ["ui", "owner", "devices"]:
             return self.ui_owner_device()
+        if parts == ["ui", "owner", "devices", "code"]:
+            return self.ui_owner_new_code()
         if len(parts) == 5 and parts[:3] == ["ui", "owner", "devices"] and parts[4] == "code":
             return self.ui_owner_device_code(parts[3])
         if len(parts) == 5 and parts[:3] == ["ui", "owner", "devices"] and parts[4] == "push":
