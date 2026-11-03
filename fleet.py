@@ -534,11 +534,34 @@ def shows_question(screen):
     return bool((PICKED.search(tail) or YES_FIRST.search(tail)) and len(CHOICE.findall(tail)) >= 2)
 
 
+# A lost Enter (3 November 2026): the first line typed into a new Claude Code session stayed in its input box, because
+# the Enter that followed it 0.6 seconds later never reached the session, and the task waited 1 h 40 min with nothing
+# to show it. A steer typed nothing either, because no new line goes while the last one is not taken (Helper.signal).
+# So after the Enter the helper reads the screen, and while the input line still holds the typed line and no turn runs,
+# it presses Enter again: ENTER_AGAIN times at most, ENTER_WAIT seconds apart.
+ENTER_AGAIN, ENTER_WAIT = 3, 1.0
+INPUT_LINE = re.compile(r"^[ \t\u2502]*[\u276f\u203a>][ \t]?(.*?)[ \t\u2502]*$", re.M)  # "❯ x", "› x", "│ > x │"
+
+
+def holds_line(screen, line):
+    """True when the input line of `screen`, its last prompt line, still starts with `line` and no turn runs: the
+    session has not taken the line."""
+    tail = "\n".join(screen.rstrip().split("\n")[-15:])
+    if WORKING.search(tail):
+        return False
+    shown = INPUT_LINE.findall(tail)
+    have, want = (" ".join(shown[-1].split()) if shown else ""), " ".join(line.split())[:24]
+    n = min(len(have), len(want))
+    return n >= 8 and have[:n] == want[:n]
+
+
 def type_into(session, name, text, asks=True):
     """Type one line into a session. Returns "typed"; "asks" when the session shows a question of its own
     (a stray key there could answer it); "reading" when someone is scrolled back in its window (keys would
     not reach the session); or "gone" when the session is not there. asks=False for a runner's window, which prints
-    its agent's own words and never asks on its screen, so a "1. Yes" there is no question (runtime gaps review)."""
+    its agent's own words and never asks on its screen, so a "1. Yes" there is no question (runtime gaps review).
+    A session's input box that still holds the line after its Enter gets the Enter again (holds_line); a runner's
+    window has no input box, and its terminal takes the line with the Enter."""
     target = f"{session}:={name}"
     r = tmux("display-message", "-p", "-t", target, "#{pane_in_mode}")
     if r.returncode != 0:
@@ -562,6 +585,12 @@ def type_into(session, name, text, asks=True):
         r = tmux("send-keys", "-t", target, *keys)
         if r.returncode != 0:
             return "reading" if r.returncode == 124 else "gone"
+    for _ in range(ENTER_AGAIN if asks else 0):
+        time.sleep(ENTER_WAIT)
+        r = tmux("capture-pane", "-p", "-t", target)
+        if r.returncode != 0 or shows_question(r.stdout) or not holds_line(r.stdout, line):
+            break
+        tmux("send-keys", "-t", target, "Enter")
     return "typed"
 
 
