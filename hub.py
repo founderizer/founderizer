@@ -14051,6 +14051,8 @@ def duty_reviews(t0):
         if duty_review_open(last):
             continue
         news = duty_news(agent, float(last.get("at") or 0), set(last.get("seen") or []))
+        names = duty_name_news(agent)
+        news += [line for mark, line in names if mark not in set(last.get("names") or [])]
         lessons = memory_review_items(agent)
         fresh = [line for mark, line in lessons if mark not in set(last.get("lessons") or [])]
         if not news and not fresh:
@@ -14059,19 +14061,20 @@ def duty_reviews(t0):
         if route is None:
             continue            # nobody could follow its review; the duty sweep still tells the manager of its marks
         with transaction():
-            duty_review_rows(agent, route, news, t0, lessons, agent in holders)
+            duty_review_rows(agent, route, news, t0, lessons, agent in holders, names)
         log("hub", f"review of {agent}: " + "; ".join(news + fresh))
 
 
-def duty_review_rows(agent, route, news, t0, lessons=(), duties=True):
+def duty_review_rows(agent, route, news, t0, lessons=(), duties=True, names=()):
     """Inside the caller's transaction: one review on the agent's wake-up route (wakeups.wake_route), with the news that
     started it, and the record of it that the next review starts from. `lessons` are what the review lists of its
-    memory (memory_review_items); an agent that holds no duty gets a review of its lessons alone."""
+    memory (memory_review_items); an agent that holds no duty gets a review of its lessons alone. `names` are the old
+    agent names in its duties' words (duty_name_news), which no later review lists again."""
     in_transaction("duty_review_rows")
     seen = [f"{r['id']}:{r['marker_kind']}" for r in read_rows(
         "SELECT id, marker_kind FROM responsibilities WHERE agent=? AND state='active' AND marker_kind IS NOT NULL",
         (agent,))]
-    record = {"at": t0, "seen": seen, "lessons": [mark for mark, _ in lessons]}
+    record = {"at": t0, "seen": seen, "lessons": [mark for mark, _ in lessons], "names": [mark for mark, _ in names]}
     listed = "\n".join(line for _, line in lessons)
     duties = duties and bool(news)          # news of its lessons alone is a review of its lessons alone
     if route["kind"] == "message":
@@ -14398,6 +14401,35 @@ def case_left_open_text(c):
             f"again with create_task case_id=\"{cref(c)}\".")
 
 
+def agent_old_names():
+    """(old, new) for every rename whose old name is no agent now. The rename job keeps the old name in `was`, and its
+    `agent` follows every later rename (AGENT_COLUMNS)."""
+    current = agents()
+    return [(j["was"], j["agent"]) for j in q("SELECT DISTINCT was, agent FROM server_jobs WHERE kind='rename' AND "
+                                              "was IS NOT NULL ORDER BY was")
+            if j["was"] != j["agent"] and j["was"] not in current and j["agent"] in current]
+
+
+def duty_old_names(text, renames=None):
+    """(old, new) for each agent that a duty's words name by a name it no longer has. A rename moves every record of
+    an agent and leaves words as they were written, so a duty that routes its work to "ac-lead" goes on naming an
+    agent that is gone (3 November 2026: ten agents took new names). A name inside another, such as the OS user
+    fleet-<name> that a renamed agent keeps, is not the agent."""
+    return [(old, new) for old, new in (agent_old_names() if renames is None else renames)
+            if re.search(rf"(?<![A-Za-z0-9-]){re.escape(old)}(?![A-Za-z0-9-])", text, re.IGNORECASE)]
+
+
+def duty_name_news(agent):
+    """(mark, line) for each old name in the words of the agent's active duties: news for its review once for each
+    duty and name, as a lesson is (duty_reviews). see_responsibilities says it for as long as the words keep it."""
+    renames = agent_old_names()
+    return [(f"{r['id']}:{old}", f"{rref(r['id'])} {duty_name(r['text'])}: its words name {old}, which is {new} now. "
+                                 f"Write them again with set_duty, with the names the agents have now.")
+            for r in (q("SELECT id, text FROM responsibilities WHERE agent=? AND state='active' ORDER BY id", (agent,))
+                      if renames else ())
+            for old, new in duty_old_names(r["text"], renames)]
+
+
 def duty_marker(r, t0):
     """Why a duty is not in order, the first reason that applies, or (None, None). The sweep writes it: no AI turn."""
     if r["state"] != "active":
@@ -14497,6 +14529,10 @@ def duty_text(r, t0, every_case=False):
                   if v["cases_prev_30d"] else "."))
     if v["marker"]:
         out.append(f"  NOT IN ORDER: {v['marker']['kind'].replace('_', ' ')}. {v['marker']['detail']}")
+    old = duty_old_names(r["text"])
+    if old and r["state"] != "retired":
+        out.append("  Its words name " + ", ".join(f"{was}, which is {new} now" for was, new in old)
+                   + ": write them again with set_duty, with the names the agents have now.")
     if every_case:
         rows = q("SELECT * FROM duty_cases WHERE responsibility=? ORDER BY id DESC", (r["id"],))
         for c in rows[:DUTY_LOOK_BACK]:
