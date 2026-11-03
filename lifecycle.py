@@ -1307,8 +1307,11 @@ def may_take(kit, target, run=None, floor=None, head="HEAD"):
 
     A move that changes data only (data_path) passes when each file it brings is a plain file. Any other move passes
     only onto a release: `target` carries a release.json that a key of `head`'s release-key.pub signed, which is not
-    held; its revision descends from the release that `head` runs and from the floor, and a `head` with no release
-    takes one only while this user has no floor; and `target` is that revision's own tree outside the data. Every
+    held; its revision descends from the release that `head` runs and from the floor; and `target` is that revision's
+    own tree outside the data. **A `head` with no release takes one that comes after the floor**: on a machine whose
+    checkouts share one user (its agents and its server service), the first that took a signed release wrote the
+    floor, and the others take theirs after it. They stayed where they were for every release after that (3 November
+    2026: the Mac Studio's server service and Hgr-Support on worker-1, at the revisions of that morning). Every
     mover of a checkout calls this first: the helper's update and task-start sync, the server service, the hub, both
     installers, onboard.py and the owner's MCP server (the shell ones as `lifecycle.py may-take`)."""
     import releases                     # here and not at the top: releases imports this module
@@ -1348,8 +1351,6 @@ def may_take(kit, target, run=None, floor=None, head="HEAD"):
     lowest, problem = read_floor(floor)
     if problem:
         return problem
-    if lowest and not runs:
-        return f"this checkout runs no signed release, and this user took release {lowest[:12]} already"
     if lowest and not (_commit(kit, run, lowest) and _descends(kit, run, lowest, revision)):
         return f"release {version} does not descend from the newest release this user took ({lowest[:12]})"
     apart = changed_paths(kit, run, revision, new)
