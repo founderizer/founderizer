@@ -26456,6 +26456,9 @@ WATCH_EVERY = 60                # seconds between two passes of server_watch_swe
 SERVER_QUIET = 1800             # seconds without a reading after which a server with no agent is quiet
 UPDATES_STALLED = 3 * 86400     # seconds since its last good security update after which a server's updates stopped
 RESTART_WAIT = 7 * 86400        # seconds that a server may wait for its restart before the manager hears of it
+# Seconds after its join in which a server is still being set up: its service reads it as soon as it starts, which is
+# before the join's updates, firewall and hardening (join.sh), so a reading of that time is no news.
+JOIN_GRACE = 3600
 WATCH = {"at": 0.0}
 WATCH_WORDS = {                 # what stopped holding, and what holds again
     "quiet": ("it has sent no reading for 30 minutes", "it sends its readings again"),
@@ -26490,7 +26493,8 @@ def server_troubles(reading, joined, restart_since, t0):
 
 def server_watch_sweep(t0):
     """Inside LOCK, once a minute: each joined Linux server against its own baseline (server_troubles), from its
-    newest reading. A server with no agent whose reading stops is quiet; one with agents is offline_sweep's. The
+    newest reading, once its join is JOIN_GRACE old. A server with no agent whose reading stops is quiet; one with
+    agents is offline_sweep's. The
     manager hears once when something stops holding and once when it holds again, and gives it first to the agent
     whose duty covers that server (the coordinator of the DevOps plan, 3 November 2026: the owner asked why he gets so
     many Needs-you items)."""
@@ -26501,7 +26505,7 @@ def server_watch_sweep(t0):
     state = json.loads(kv_get("server_watch") or "{}")
     kept = {}
     for name in server_names():
-        if name not in joined:
+        if name not in joined or t0 - joined[name] < JOIN_GRACE:
             continue
         here = server_agents(name)
         reading = server_reading(name, here)
