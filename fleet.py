@@ -5644,7 +5644,7 @@ def cmd_addresses(args):
     for name in known:
         print(f"  {name:12} {table.get(name) or 'NOT SET'}")
     url = hub_url(team)
-    print(f"  hub          {url or 'NOT SET'}" + (f"   board: {url}/board" if url else ""))
+    print(f"  hub          {url or 'NOT SET'}" + (f"   board, from the owner's machine: {url}/board" if url else ""))
     missing = [m for m in known if not table.get(m)]
     if missing:
         print(f"Still to set: {', '.join(missing)}. Until then the hub takes those names from any address.")
