@@ -26630,8 +26630,12 @@ def mac_setup_prove(row):
     browser = "browser" in can
     task = check_task(manager_name(), {
         "owner": row["agent"], "needs": "browser" if browser else "screen", "title": "Open the last page of this Mac's setup",
-        "details": f"Open {url} in Google Chrome with your {'browser tools' if browser else 'Computer Use'}, and wait "
-                   f"until the page says Done. Use no other tool.",
+        # A screen agent's Codex once tried Chrome's browser access, which needs OpenAI's extension that the sitting
+        # skips, and stopped to ask its manager (4 November 2026): its words say how, with the screen alone.
+        "details": f"Open {url} in Google Chrome with your browser tools, and wait until the page says Done. Use no "
+                   f"other tool." if browser else
+                   f"In Google Chrome, with Computer Use's mouse and keyboard alone, click the address bar, type {url} "
+                   f"and press Return, then wait until the page says Done. Use no browser access and no other tool.",
         "done_when": "The page says Done."})
     with transaction():
         tid = admit_task(manager_name(), task)
