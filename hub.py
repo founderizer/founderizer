@@ -31980,9 +31980,11 @@ class Handler(BaseHTTPRequestHandler):
         return server
 
     def join_script(self):
-        """GET /join: the join script, with this hub's address in it, and the fleet's id and release channel, from
-        which a Mac takes its signed vault (the id is no secret: every Mac's vault updater keeps it in a file anyone
-        reads). It holds no code and no secret. kv_get and not fleet_id(): this GET writes nothing."""
+        """GET /join: the join script, with this hub's address in it, and the fleet's id, release channel and track,
+        from which a Mac takes its signed vault (the id is no secret: every Mac's vault updater keeps it in a file
+        anyone reads). The track is early for a fleet whose setting releases.early is on, as the hub's own releases
+        are (PRODUCT.md 4.3, "Two tracks"). It holds no code and no secret. kv_get and not fleet_id(): this GET writes
+        nothing."""
         ip, port = hub_address()
         data = git_blob(kit_revision(), "join.sh")
         if data is None:
@@ -31990,6 +31992,7 @@ class Handler(BaseHTTPRequestHandler):
         text = data.decode().replace("__FLEET_HUB__", f"http://{ip}:{port}").replace(
             "__FLEET_REPO__", f"git://{ip}/fleet-pilot.git").replace(
             "__FLEET_ID__", kv_get("fleet_id") or "").replace("__FLEET_CHANNEL__", release_channel().rstrip("/"))
+        text = text.replace("__FLEET_TRACK__", "early" if setting("releases.early") else "approved")
         return self.send(200, text, "text/plain; charset=utf-8", {"Cache-Control": "no-store"})
 
     def join(self):

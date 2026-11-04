@@ -28,6 +28,7 @@ HUB="__FLEET_HUB__"
 REPO="__FLEET_REPO__"
 FLEET="__FLEET_ID__"            # the fleet's id at its release channel, where a Mac takes its signed vault
 CHANNEL="__FLEET_CHANNEL__"
+TRACK="__FLEET_TRACK__"         # the fleet's track there: early when its setting releases.early is on, else approved
 WORKER=fleet
 PACKAGES="git tmux python3 curl ca-certificates ufw unattended-upgrades sudo"
 MAC_USER=""     # the user that will run a Mac's agents
@@ -172,7 +173,9 @@ VAULT_CONFIG="/Library/Application Support/Fleet Vault/config.json"
 VAULT_APP="build/Founderizer.app/Contents/Library/Fleet Vault.app"     # in an unpacked Mac build
 # The root half of mac_vault, run once with sudo. The vault is copied into a folder of root's own and checked there, and
 # only then is the install.py that it carries run, from that copy: nothing that this user can change runs as root.
-# $1 the vault, $2 the Mac user, $3 this Mac's name, $4 the hub, $5 the fleet's id, $6 the channel, $7 the requirement.
+# $1 the vault, $2 the Mac user, $3 this Mac's name, $4 the hub, $5 the fleet's id, $6 the channel, $7 the requirement,
+# $8 the track. Only an early fleet passes --track: the vault's updater then takes each vault of the early track. An
+# approved fleet passes nothing, because the install.py of an approved build may be older than --track and refuse it.
 # shellcheck disable=SC2016
 VAULT_ROOT_STEP='set -eu
 stage=$(mktemp -d /tmp/fleet-vault-root.XXXXXX)
@@ -182,8 +185,10 @@ chown -R root:wheel "$stage"
 codesign --verify --deep --strict -R "=$7" "$stage/Fleet Vault.app"
 installer="$stage/Fleet Vault.app/Contents/Resources/install.py"
 [ -f "$installer" ] || { echo "the vault of the release channel carries no installer yet" >&2; exit 1; }
+early=""
+[ "$8" != early ] || early=yes
 /usr/bin/python3 "$installer" --app "$stage/Fleet Vault.app" --user "$2" --agent "$3" --hub "$4" --store \
-    --fleet "$5" --channel "$6" >/dev/null'
+    --fleet "$5" --channel "$6" ${early:+--track early} >/dev/null'
 
 mac_vault() {   # This Mac's vault, which every agent of it reaches (the owner, 28 October 2026: "it is essential that
                 # they all have access to secrets"): the signed Fleet Vault that the release channel's newest Mac build
@@ -209,7 +214,7 @@ mac_vault() {   # This Mac's vault, which every agent of it reaches (the owner, 
     else
         say "this Mac's vault: macOS asks once for the password of $MAC_USER, because only root installs it"
         if sudo /bin/sh -c "$VAULT_ROOT_STEP" sh "$work/$VAULT_APP" "$MAC_USER" "$name" "$HUB" "$FLEET" "$CHANNEL" \
-                "$VAULT_REQUIREMENT" </dev/null; then
+                "$VAULT_REQUIREMENT" "$TRACK" </dev/null; then
             say "this Mac's vault: installed, with the fleet's own store; it updates itself every hour"
         else
             ready=no
@@ -220,9 +225,12 @@ mac_vault() {   # This Mac's vault, which every agent of it reaches (the owner, 
 }
 
 vault_build() { # $1: an empty folder. The release channel's newest Mac build, as the vault's own updater takes it: this
-                # fleet's manifest, then the zip that it names on the channel's own host, by its SHA-256, unpacked.
+                # fleet's manifest, of its track (only the exact word early asks for the early track), then the zip
+                # that it names on the channel's own host, by its SHA-256, unpacked.
+    manifest="$CHANNEL/releases/app"
+    [ "$TRACK" != early ] || manifest="$manifest?track=early"
     curl -fsS --proto '=https' --max-time 60 -H "Founderizer-Fleet: $FLEET" -o "$1/manifest.json" \
-        "$CHANNEL/releases/app" </dev/null || return 1
+        "$manifest" </dev/null || return 1
     url=$(plutil -extract url raw -o - "$1/manifest.json" 2>/dev/null || true)
     digest=$(plutil -extract sha256 raw -o - "$1/manifest.json" 2>/dev/null || true)
     case "$url" in "$CHANNEL"/*) ;; *) return 1 ;; esac

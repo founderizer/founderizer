@@ -256,11 +256,12 @@ shut, and the ciphertext alone opens nothing. The handover key is a separate key
 rotating one does not orphan the other's values.
 
 **A Mac's join line installs it** (since 28 October 2026, `join.sh` `mac_vault`): it takes the
-signed vault of the release channel's newest Mac build, checks it against our Developer ID,
-and runs the `install.py` that the vault carries as root, named after the Mac, with the
-fleet's own store. macOS asks for the Mac user's password once, at that step. A Mac that
-joined before then, or one whose step failed, gets it from the join line run again, or by
-hand from the app repository (`miguelpieras/agents`), with the signed build:
+signed vault of the release channel's newest Mac build of the fleet's track (see "The track"
+below), checks it against our Developer ID, and runs the `install.py` that the vault carries
+as root, named after the Mac, with the fleet's own store. macOS asks for the Mac user's
+password once, at that step. A Mac that joined before then, or one whose step failed, gets
+it from the join line run again, or by hand from the app repository (`miguelpieras/agents`),
+with the signed build:
 
 ```sh
 sudo python3 app/Vault/install.py --app "<build>/Fleet Vault.app" --user <mac user> --agent <agent> --hub http://100.80.1.2:8765 --store --fleet <fleet id>
@@ -278,6 +279,16 @@ change to the app or its configuration:
 ```sh
 sudo python3 app/Vault/install.py --updater-only --fleet <fleet id>
 ```
+
+**The track.** The updater reads the fleet's track from the root-owned `update.json` beside
+it, which only `install.py` writes: the early track only when the install was given
+`--track early`, and the approved track otherwise. A fleet whose setting `releases.early` is
+on (`early` of `GET /ui/releases`) takes the early track: its join line asks the channel for
+that track's build and gives `install.py` `--track early`, and both commands above take
+`--track early` too. On a Mac of such a fleet whose updater takes the approved track, the
+`--updater-only` command with `--track early` moves it to the early track. Every other
+fleet gives no `--track`, because the `install.py` of an approved build may be older than
+that flag and refuses it.
 
 Nothing else is needed: the helper makes the store key, the handover key and an empty
 store at its first request, and `create_login` works on that store with no project and

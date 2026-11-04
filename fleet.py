@@ -6113,10 +6113,12 @@ def cmd_check(args):
             # takes no argument (WORKER-INSTALL.md, "When a release changes vault.py"). A Mac's vault is the signed
             # Fleet Vault app, which its own root updater replaces within the hour of an app release that carries a
             # newer one; a Mac set up before that updater gets it once, as root (WORKER-INSTALL.md, "Vault broker
-            # (macOS)").
+            # (macOS)"). A Mac of a fleet whose setting releases.early is on gets the early track with it.
+            stored = TEAM.get("settings")
+            track = " --track early" if isinstance(stored, dict) and stored.get("releases.early") is True else ""
             catch_up = ("Fleet Vault's updater puts the newer vault in place within the hour; a Mac without it, as "
-                        "root: python3 app/Vault/install.py --updater-only --fleet <fleet id> (WORKER-INSTALL.md, "
-                        "\"Vault broker (macOS)\")" if sys.platform == "darwin" else
+                        f"root: python3 app/Vault/install.py --updater-only --fleet <fleet id>{track} "
+                        "(WORKER-INSTALL.md, \"Vault broker (macOS)\")" if sys.platform == "darwin" else
                         "as root: /usr/local/sbin/fleet-vault-program (WORKER-INSTALL.md, \"When a release "
                         "changes vault.py\")")
             if store == "store":            # owner feature central_vault: the owner's keys reach this store,
