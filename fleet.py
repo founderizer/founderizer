@@ -609,6 +609,10 @@ NO_TIMERS = "CLAUDE_CODE_DISABLE_CRON=1"
 # frozen runtime from a working one, so a task or manager session starts with both off: this variable wins over the
 # machine's own axScreenReader, and settings_arg's --settings over its own prefersReducedMotion.
 MOTION = "CLAUDE_AX_SCREEN_READER=0"
+# Claude Code offers its task list (TaskCreate, TaskUpdate, TaskList, TaskGet) to the models of its own list only, the
+# Claude 3 and 4 models up to Opus 4.7, and to a newer model only with this variable (2.1.312, 4 November 2026). A
+# task session keeps its plan there (RULES.md), which the owner's app shows while the task runs (threads.py).
+TODO_TOOLS = "CLAUDE_CODE_ENABLE_TODO_TOOLS=1"
 PRESENCE = 30           # seconds between two presence pings while the main loop is inside one step (Helper.presence)
 # Fleet's deny list for worker and lead Claude sessions.
 DENY = ["Read(~/.fleet/**)", "Edit(~/.fleet/**)", "Bash(*.fleet/*)"] + UNSEEN_TOOLS
@@ -1124,7 +1128,7 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         cmd = cmd.replace("codex ", "codex resume ", 1)     # last, so that it comes first: codex resume [options] <thread>
     env = f"FLEET_ATTEMPT={attempt} FLEET_GENERATION={shlex.quote(generation)} FLEET_HUB={shlex.quote(HUB)} FLEET_AGENT={shlex.quote(agent)} FLEET_TASK={shlex.quote(task or '')}"
     if conf.get("runtime") == "claude":
-        env += f" {NO_TIMERS} {MOTION}"
+        env += f" {NO_TIMERS} {MOTION}" + (f" {TODO_TOOLS}" if task else "")
     if not task and conf.get("runtime") == "claude":
         env += f" CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"
     return f"{prefix}env {env} {cmd}"
