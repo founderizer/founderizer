@@ -10,8 +10,9 @@ Standard library only, and it reads no credential of a model provider.
     python3 hubsetup.py claim --address IP --out PATH [--port N] [--timezone Z] [--wait S] [--reclaim] [--commit]
                                                     the owner claim, then write team.json, and commit it on the ref
     python3 hubsetup.py runtime --runtime claude|codex
-                                                    install the manager's runtime, so that the owner can sign in to
-                                                    their own account from the app (it signs in to nothing itself)
+                                                    install the runtime of an agent of this machine, so that the owner
+                                                    can sign in to their own account from the app (it signs in to
+                                                    nothing itself); a new hub has no agent, so hub.sh runs it for none
     python3 hubsetup.py agent-users --team PATH --machine NAME [--check]
                                                     one OS user for each agent of this machine, so that no agent's
                                                     user can read another agent's home
@@ -194,9 +195,14 @@ def machine_timezone():
 
 
 def template(hub_ip, port=8765, timezone=None, owner=None, runtime="claude", ssh_user="fleet", ssh_port=22):
-    """The first team.json of a new hub: one manager on the hub machine, this machine's address, and the owner's Mac
-    when the claim has proved it. Nothing here holds a credential: `"vault": "none"` says that the manager has no
-    vault access, because its runtime is the customer's own subscription, signed in by the customer."""
+    """The first team.json of a new hub: one manager, this machine's address, and the owner's Mac when the claim has
+    proved it. Nothing here holds a credential: `"vault": "none"` says that the manager has no vault access, because
+    its runtime is the customer's own subscription, signed in by the customer.
+
+    The manager has no server yet (`"placed": false`, hub.unplaced): no agent runs on the hub's server, so this install
+    makes the fleet and nothing else, and the manager's own setup page in the app gives it a server of its own, then
+    its provider and its sign-in. Until then its `machine` names this machine only so that the hub finds an address for
+    it, and `runtime` is the provider that page offers first."""
     if runtime not in STARTS:
         raise Stop(f"the manager runs claude or codex, not {runtime!r}.")
     try:
@@ -215,6 +221,7 @@ def template(hub_ip, port=8765, timezone=None, owner=None, runtime="claude", ssh
             "manager": {
                 "role": "manager",
                 "machine": "hub",
+                "placed": False,
                 "runtime": runtime,
                 "can": ["shell", "web"],
                 "vault": "none",
@@ -225,7 +232,7 @@ def template(hub_ip, port=8765, timezone=None, owner=None, runtime="claude", ssh
 
 
 def install_runtime(runtime):
-    """The manager's runtime, from the vendor's own installer at the version Founderizer pins, into ~/.local/bin. It
+    """An agent's runtime, from the vendor's own installer at the version Founderizer pins, into ~/.local/bin. It
     installs the program and nothing else: no sign-in, no key, no token. The owner signs in to their own account
     afterwards, from the app (UI-API.md, "Sign a machine in"), and only they can.
 
@@ -280,9 +287,10 @@ def agent_user(agent, conf=None):
 
 def agents_of(team, machine):
     """The agents that team.json gives this machine, in the order their users are made. An agent the owner has
-    turned off keeps its user: the owner turns it on again from the app, and no install runs in between."""
+    turned off keeps its user: the owner turns it on again from the app, and no install runs in between. A manager
+    with no server yet is on no machine (hub.unplaced), so a new hub makes no user, runtime or service for it."""
     return sorted(name for name, conf in ((team or {}).get("agents") or {}).items()
-                  if isinstance(conf, dict) and conf.get("machine") == machine)
+                  if isinstance(conf, dict) and conf.get("machine") == machine and conf.get("placed") is not False)
 
 
 def user_reading(user):

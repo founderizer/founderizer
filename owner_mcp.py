@@ -967,9 +967,13 @@ def tools():
                            "commit of team.json, the install job there and the end of its old session. Its tasks, "
                            "chat, memory, duties and grants stay with it; its vault starts again on the new server, "
                            "and it signs in there. Not while a turn of it runs. Read servers to see the job end; the "
-                           "same call again gives a failed install there once more.",
-             {"agent": S["text"], "server": S["text"], **rid}, ("agent", "server"),
-             with_base("/ui/team/agents/{agent}/move", ("server",), "the server this agent moves to")),
+                           "same call again gives a failed install there once more. A new fleet's manager has no "
+                           "server yet (placed false in state): this gives it its first one, of any kind, and runtime "
+                           "its AI provider; any other agent keeps its own.",
+             {"agent": S["text"], "server": S["text"],
+              "runtime": {"type": "string", "enum": list(FROM_THE_HUB["lifecycle.SWITCH_RUNTIMES"])}, **rid},
+             ("agent", "server"),
+             with_base("/ui/team/agents/{agent}/move", ("server", "runtime"), "the server this agent moves to")),
         tool("agent_settings", "One agent's model, effort, capabilities, title, expertise, account or screen model. "
                                "Each of vault, runtime and vault_create is a command of its own, and has a tool of "
                                "its own here: vault_access, switch_runtime and login_creation.",

@@ -14,6 +14,12 @@
 # the fleet-hub and fleet-git user services, each agent of this machine under its own OS user (its checkout,
 # its runtime and its service), the end checks, this fleet's own id, security updates, and verify.
 #
+# It makes the fleet and no agent: no agent runs on the hub's server, because an agent has a shell and the central
+# vault on this server holds every key. The first team.json gives the manager no server yet ("placed": false), and
+# its own setup page in the app gives it one, then its AI provider and its sign-in; each agent installs only its own
+# AI, on its own server. So on a new hub the two agent steps find no agent, and they install only the agents that a
+# hub from before keeps on this machine, when the line runs there again.
+#
 # Each agent's session runs as its own user, `fleet-<agent>`, so its checkout, its runtime, that runtime's
 # credential and its vault token are in a home of mode 700 that no other agent of this machine can open
 # (PRODUCT.md 4.1).
@@ -29,8 +35,9 @@
 # It is safe to run again: every step checks first, nothing is destroyed, and a second run on a working hub changes
 # nothing. A step that failed can be repeated by running the line again.
 #
-# IT TOUCHES NO MODEL PROVIDER CREDENTIAL. It installs the runtime and signs in to nothing: it never signs in to a
-# provider, never writes, copies or refreshes a provider token, and makes no vault entry. It never touches that login.
+# IT TOUCHES NO MODEL PROVIDER CREDENTIAL. It installs no runtime for a new fleet and signs in to nothing: it never
+# signs in to a provider, never writes, copies or refreshes a provider token, and makes no vault entry.
+# It never touches that login.
 # The owner signs in to their own account afterwards, from the app (UI-API.md, "Sign a machine in"): the app gives
 # them the provider's own link, they authenticate in their own browser, and the code they get back is typed into the
 # sign-in running on this server, which is where the provider's client writes the credential. That is the condition on
@@ -321,8 +328,8 @@ every worker and joined server of this fleet fetches from"
 first_team() {
     heading "the first team.json, and the owner's own Mac"
     if [ "$check" = yes ]; then
-        plan "write $kit/team.json: the hub machine at $address, one manager agent on it with runtime $runtime and \
-\"vault\": \"none\", and no credential of any kind"
+        plan "write $kit/team.json: the hub machine at $address, and one manager with no server yet (\"placed\": \
+false), runtime $runtime until its setup in the app chooses one, \"vault\": \"none\", and no credential of any kind"
         plan "make a one-time claim code, print the line for the owner's Mac, and serve it on $address:$port until \
 that Mac sends the code back; its address becomes addresses.owner"
         plan "commit team.json on config and push it to $bare"
@@ -377,6 +384,7 @@ agents() {      # each agent of this machine under its own OS user: its checkout
         plan "for each agent, as its own user fleet-<agent>: clone git://$address/fleet-pilot.git on the \
 configuration ref into /home/fleet-<agent>/fleet-<agent>, install its runtime into that user's own ~/.local/bin, \
 write its service with fleet.py service <agent>, and enable and start it in that user's own systemd manager"
+        plan "find none on a new hub: the manager gets a server of its own in its setup in the app"
         plan "sign in to nothing: the owner signs each agent in from the app, and only they can"
         return 0
     fi
@@ -385,6 +393,12 @@ write its service with fleet.py service <agent>, and enable and start it in that
     trap "rm -f $list" EXIT INT TERM
     python3 "$kit/hubsetup.py" agent-list --team "$kit/team.json" > "$list" \
         || stop "The agents of this machine could not be read from $kit/team.json."
+    if [ ! -s "$list" ]; then
+        rm -f "$list"
+        trap - EXIT INT TERM
+        say "  no agent runs on this server: each agent gets a server of its own in Founderizer"
+        return 0
+    fi
     while read -r agent agent_runtime user; do
         [ -n "$agent" ] || continue
         say "  $agent, as the user $user"
@@ -523,11 +537,12 @@ done_text() {
     printf '\n    http://%s:%s\n\n' "$address" "$port"
     say "what is left, and only you can do it, all of it in Founderizer:"
     printf '%s\n' \
-        "  1. Sign in to your own $runtime account: Settings, Servers, this server, Sign in." \
-        "     The app gives you a link, you authenticate in your own browser, and you paste the code it gives you" \
-        "     back into the app. The sign-in happens on this server, and nothing of it is stored by Founderizer." \
+        "  1. Set up your manager on its page: a server of its own first (a VPS that joins with one line, or a Mac)," \
+        "     then its AI provider, then sign in to your own account of that provider. The app gives you a link," \
+        "     you authenticate in your own browser, and you paste the code it gives you back into the app. The" \
+        "     sign-in happens on the manager's server, and nothing of it is stored by Founderizer." \
         "     Nobody can do this for you, and the same button signs you in again when the login expires." \
-        "  2. Add your agents: the + at the top of the sidebar, Add agent. Each one is signed in the same way," \
+        "  2. Add your agents: the + at the top of the sidebar, Add agent. Each one is set up the same way," \
         "     on its own server." \
         ""
 }

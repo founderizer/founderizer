@@ -633,6 +633,16 @@ def agent_active(name):
     return (agents().get(name) or {}).get("active", True) is not False
 
 
+def unplaced(name, team=None):
+    """True for an agent that has no server of its own yet (owner feature manager_server): the manager of a new fleet,
+    whose team.json entry says `"placed": false`. No agent runs on the hub's server (the owner, 2 November 2026: an
+    agent has a shell, and the central vault there holds every key), so hub.sh makes the fleet and nothing else, and
+    the manager's own setup page gives it its server (the owner, 4 November 2026). Until then its `machine` names the
+    hub's machine only so that every reader of `machine` still finds one with an address: the hub lists it on no server,
+    reads no machine of it, answers no caller as it, and no installer installs it anywhere."""
+    return ((team or TEAM).get("agents") or {}).get(name, {}).get("placed") is False
+
+
 def runtime_label(runtime):
     """What the owner is shown for a runtime (lifecycle.RUNTIMES), or the name itself for one the fleet does not
     know."""
@@ -792,7 +802,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "sealed_push",       # the owner, 3 November 2026: a ping says nothing to founderizer.com or Apple
                "device_by_code",    # the owner, 3 November 2026: Add device shows the QR at once, with no fields
                "door_calls",        # DevOps plan 5.4: the owner's signed yes lets one door call through, once
-               "server_ai_choice"]  # the owner, 1 November 2026: "why are we asking for chatgpt AND claude login"
+               "server_ai_choice",  # the owner, 1 November 2026: "why are we asking for chatgpt AND claude login"
+               "manager_server"]    # the owner, 4 November 2026: a new fleet's manager gets its server in its setup
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -23938,6 +23949,7 @@ def tick():
             mac_setup_sweep(t0)             # the owner, 31 October 2026: one sitting at a new Mac
             server_watch_sweep(t0)          # the owner, 3 November 2026: each server against its own baseline
             mac_desktop_sweep()             # what only hands at a Mac can put right
+            first_message_sweep(t0)         # the owner, 4 November 2026: a new fleet's manager writes first, once
         except Exception:
             traceback.print_exc()           # a goal or database check must not stop the timers below
         # close sessions of finished tasks
@@ -25495,6 +25507,11 @@ def validate_team(team):
                              f"{runtime_label(a['runtime'])} agent has no persistent session yet")
         if a.get("machine") not in addresses:
             raise ValueError(f"agent {name} has no machine address")
+        # owner feature manager_server: a new fleet's manager, before the owner gives it its server, and nobody else
+        if "placed" in a and (a["placed"] is not False or a["role"] != "manager"
+                              or a["machine"] != hub_conf.get("machine")):
+            raise ValueError(f"agent {name}: placed is false for a manager that has no server yet, which names the "
+                             f"hub's machine until it has one, or absent")
         # An entry that says nothing about an agent means "none", no credential access (PRODUCT.md P5), which is
         # the word fleet.vault_mode answers on the agent's own machine. A default of "file" pointed a new agent at
         # a Bitwarden token file that a fresh fleet has not got, and made the hub refuse it broker access.
@@ -26722,8 +26739,10 @@ def server_names(team=None):
 
 
 def server_agents(name, team=None):
-    """The agents on this server, in team order."""
-    return [n for n, a in ((team or TEAM).get("agents") or {}).items() if a.get("machine") == name]
+    """The agents on this server, in team order. An agent with no server yet is on none (unplaced), also not on the
+    hub's machine that its entry names until it has one."""
+    return [n for n, a in ((team or TEAM).get("agents") or {}).items()
+            if a.get("machine") == name and a.get("placed") is not False]
 
 
 def server_key_matches(name, token):
@@ -27611,7 +27630,12 @@ def move_agent(agent, body):
     """POST /ui/team/agents/<agent>/move: the agent on an empty server, which runs a server service and sent a reading
     in the last ten minutes. Not while a turn of it runs, or while it has an open sign-in. A Mac agent moves to a Mac
     and a Linux agent to Linux, because what an agent holds there (a browser, a screen) belongs to that kind. The same
-    command for an agent that is on that server already, whose install there failed, gives the install job again."""
+    command for an agent that is on that server already, whose install there failed, gives the install job again.
+
+    It is also how a new fleet's manager gets its first server (owner feature manager_server): an agent with no server
+    yet (unplaced) left no machine, so nothing of the move's old side applies to it, any kind of server takes it, and
+    `runtime` gives it the provider that the owner chose on its setup page, in the same commit, because nothing ever
+    ran on the one that its entry named. Every other agent keeps its runtime: a switch is a command of its own."""
     server, t0 = body["server"], now()
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
@@ -27620,6 +27644,10 @@ def move_agent(agent, body):
     a = team["agents"].get(agent)
     if a is None:
         raise Refusal(404, "no such agent")
+    placing = unplaced(agent, team)
+    runtime = body.get("runtime") or a["runtime"]
+    if runtime != a["runtime"] and not placing:
+        raise Refusal(409, f"A move keeps {shown_name(agent)}'s AI provider. Switch it with a command of its own.")
     if server not in server_names(team):
         raise Refusal(404, "no such server")
     if not q1("SELECT 1 FROM server_keys WHERE server=?", (server,)):
@@ -27628,11 +27656,12 @@ def move_agent(agent, body):
     last = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (server,))
     if last and last["state"] in JOB_OPEN:
         raise job_busy(server, last)
+    where = None if placing else a.get("machine")       # the machine it leaves: none for an agent with no server
     # Nor while its own server works on a job: an install there would still give it that server's key (install_key).
-    here = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (a.get("machine"),))
-    if a.get("machine") != server and here and here["state"] in JOB_OPEN:
-        raise job_busy(a.get("machine"), here)
-    if a.get("machine") == server:
+    here = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (where,)) if where else None
+    if where != server and here and here["state"] in JOB_OPEN:
+        raise job_busy(where, here)
+    if where == server:
         if not last or last["kind"] != "install" or last["agent"] != agent or last["state"] != "failed":
             raise Refusal(409, f"{shown_name(agent)} runs on {server} already.")
     elif server == (team.get("hub") or {}).get("machine"):
@@ -27645,8 +27674,8 @@ def move_agent(agent, body):
     reading = server_reading(server, [])
     if reading is None or reading["stale"]:
         raise Refusal(409, f"{server} sent no reading in the last 10 minutes: check that it is on")
-    old = a.get("machine")
-    kinds = (server_kind_of(team, old), server_kind_of(team, server)) if old != server else (None, None)
+    old = where
+    kinds = (server_kind_of(team, old), server_kind_of(team, server)) if old not in (None, server) else (None, None)
     if None not in kinds and kinds[0] != kinds[1]:
         raise Refusal(409, f"{shown_name(agent)} runs on a {'Mac' if kinds[0] == 'mac' else 'Linux server'}, and "
                            f"{server} is {'a Mac' if kinds[1] == 'mac' else 'Linux'}: an agent moves to a server of "
@@ -27665,12 +27694,21 @@ def move_agent(agent, body):
         if a.get("vault", "none") != "none":
             a["vault"] = "none"             # its vault was the old machine's (the comment above)
         a.pop("vault_recipient", None)
+        if placing:
+            del a["placed"]
+            if runtime != a["runtime"]:     # the manager's own form of that runtime, as the installer writes it
+                stored = dict(a.get("runtime_policies") or {})
+                policy = json.loads(json.dumps(stored.pop(runtime, None) or MANAGER_ACCESS[runtime]))
+                for key in ("start", "allow", "model", "effort", "account", "runtime_policies"):
+                    a.pop(key, None)        # what belonged to the runtime it never ran
+                a.update(policy, runtime=runtime, **({"runtime_policies": stored} if stored else {}))
         try:
             validate_team(team)
         except ValueError as e:
             raise Refusal(400, str(e)) from None
         data = (json.dumps(team, indent=2) + "\n").encode()
-        commit = commit_kit_file("team.json", data, f"Owner moved agent {agent} from {old} to server {server}")
+        commit = commit_kit_file("team.json", data, f"Owner gave agent {agent} its server {server}, with {runtime}"
+                                 if placing else f"Owner moved agent {agent} from {old} to server {server}")
         digest = hashlib.sha256(data).hexdigest()
     with transaction():
         if old != server:
@@ -27679,20 +27717,74 @@ def move_agent(agent, body):
             for table in ("machine_status", "machine_updates"):
                 DB.execute(f"DELETE FROM {table} WHERE agent=?", (agent,))
             DB.execute("DELETE FROM kv WHERE k=?", (f"default_vault:{agent}",))
+        if old not in (None, server):       # an agent with no server left no machine whose calls get `moved`
             DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                        (MOVED + agent, old))
+        if placing:         # its chat starts on that server: the manager writes first, once (first_message_sweep)
+            DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO NOTHING", (FIRST_MESSAGE, "placed"))
         job = DB.execute("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated) VALUES(?,?,?,?,?,?,?)",
                          (server, "install", agent, a["runtime"], "queued", t0, t0)).lastrowid
-        if old != server:
+        if old not in (None, server):
             event_rows([(manager_name(), "say", None, f"[hub] The owner moved {agent} from {old} to the server "
                                                       f"{server}. Its tasks, memory and duties stay with it. Its "
                                                       f"session there starts when {server} has installed it and it "
                                                       f"is signed in.", None)], t0)
-        log_row("owner", f"moved agent {agent} from {old} to server {server} in {commit[:12]}: job {job}"
+        log_row("owner", f"gave agent {agent} its server {server} with {a['runtime']} in {commit[:12]}: job {job}"
+                if placing else f"moved agent {agent} from {old} to server {server} in {commit[:12]}: job {job}"
                 if old != server else f"asked server {server} again to install {agent}: job {job}")
     if old != server:
         apply_team(team)
-    return {"agent": agent, "server": server, "was": old, "job": job, "revision": commit, "sha256": digest}
+    return {"agent": agent, "server": server, "was": old, "runtime": a["runtime"], "job": job, "revision": commit,
+            "sha256": digest}
+
+
+# ---- the manager writes first (owner feature manager_server)
+#
+# The owner's onboarding of 4 November 2026: when a new fleet's manager can answer for the first time, and nobody has
+# written yet, it sends the owner ONE short message: the fleet is ready, its checks passed (only when they did), and
+# what should it look after first. Once per fleet, and never after the owner has written. The manager writes it itself
+# with message_owner, because a message from a session that took a turn is the proof that the fleet answers; the hub
+# only says when, and what is true. The state runs from the manager's first server (move_agent) to its end, so a fleet
+# from before this, whose manager never lacked a server, never gets it:
+#
+#   placed      the manager has its server; its standing session has not listed its tools yet
+#   check:<id>  its session runs with its tools, and the setup check that the hub asked for then has no answer yet
+#   told        the manager was asked for the message; none: somebody wrote first, so nothing is asked
+FIRST_MESSAGE = "first_message"     # kv: where the manager's first message stands
+
+
+def first_message_sweep(t0):
+    """One step of the manager's first message, from what the hub reads; nothing waits on a clock. The check is the
+    setup check of version 1.9, with no AI turn, started when the manager's standing session first listed its tools:
+    its checks passed when every item that an activation requires is ok, as the activation itself judges them."""
+    state, mgr = kv_get(FIRST_MESSAGE), manager_name()
+    if not state or state in ("told", "none") or unplaced(mgr):
+        return
+    if q1("SELECT 1 FROM ui_requests WHERE recipient=? LIMIT 1", (mgr,)) or \
+            q1("SELECT 1 FROM owner_reports WHERE agent=? LIMIT 1", (mgr,)):
+        return kv_set(FIRST_MESSAGE, "none")
+    # Its chat can answer: it is signed in, and a standing session has its tools. Both, because a helper starts that
+    # session at the install's service step, before the owner has signed it in.
+    if not int(kv_get(f"listed:{mgr}:manager") or 0) or signed_in_now(mgr, agents()[mgr].get("runtime")) is not True:
+        return
+    if state == "placed":
+        return kv_set(FIRST_MESSAGE, f"check:{start_machine_check(mgr)['check']['id']}")
+    c = q1("SELECT * FROM machine_checks WHERE id=?", (int(state.split(":", 1)[1]),))
+    if c and c["state"] == "requested":
+        return                          # settle_checks gives every check an answer within CHECK_WAIT
+    passed = bool(c and c["state"] == "completed" and c["verify"] is not None and
+                  all(i["state"] == "ok" for i in json.loads(c["verify"]) if item_required(mgr, i)))
+    server = agents()[mgr].get("machine")
+    text = (f"[hub] The fleet is set up: you run on {server}" + (", and your setup check passed" if passed else "")
+            + ". The owner and you have not written to each other yet. Send the owner ONE short message now with "
+              "message_owner, and nothing else: that the fleet is ready"
+            + (", that its checks passed," if passed else "") + " and ask what you should look after first. If the "
+              "owner has written to you meanwhile, answer that message instead.")
+    with transaction():                 # the ask and its mark land together, so a restart never asks twice
+        event_rows([(mgr, "say", None, text, None)], t0)
+        DB.execute("UPDATE kv SET v='told' WHERE k=?", (FIRST_MESSAGE,))
+        log_row("hub", f"asked {mgr} for its first message to the owner"
+                + (": its setup check passed" if passed else ": its setup check did not pass, so it does not say so"))
 
 
 # ---- a machine's name is its name in Tailscale
@@ -29856,6 +29948,8 @@ def health_view():
              "Restart the hub's server, and tell us if this comes back.", agent=on_the_hub)
     helpers = []
     for name in agents():
+        if unplaced(name):          # no server yet, so no helper that could be silent (manager_server)
+            continue
         row = q1("SELECT last_seen FROM agents WHERE name=?", (name,))
         seen = row["last_seen"] if row else None
         offline = not seen or quiet_for(seen, t0) > CFG.get("offline_after", 90)
@@ -30390,6 +30484,8 @@ def machine_rows():
                                         "vault")}
     rows = []
     for name, a in agents().items():
+        if unplaced(name):          # owner feature manager_server: no server yet, so no machine to read
+            continue
         st = q1("SELECT data, reported FROM machine_status WHERE agent=?", (name,))
         data = json.loads(st["data"]) if st else {}
         up = q1("SELECT * FROM machine_updates WHERE agent=?", (name,))
@@ -31105,6 +31201,8 @@ class Handler(BaseHTTPRequestHandler):
         absent. A name whose machine has no address at all is refused on a hub that checks addresses
         (address_checked), because then the hub cannot tell this caller from any other. Otherwise answers 403 and
         returns False."""
+        if unplaced(who):
+            return self.no_server(who)
         want, src = address_of(who), self.client_address[0]
         if (want and src != want) or (not want and address_checked()):
             log("hub", f"REFUSED a call from {src} that claimed to be {who}")
@@ -31136,6 +31234,8 @@ class Handler(BaseHTTPRequestHandler):
         route. A call without any credential only while the agent is alone on its address: a session that started
         before its credential. A credential that is sent but does not match is refused, never taken as absent. An
         agent whose machine has no address is refused on a hub that checks addresses (address_checked)."""
+        if unplaced(agent):
+            return self.no_server(agent)
         want, src = address_of(agent), self.client_address[0]
         if (want and src != want) or (not want and address_checked()):
             log("hub", f"REFUSED a call from {src} that claimed to be {agent}")
@@ -31155,6 +31255,14 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return self.refuse(agent, "credential_invalid", "this session's credential is not valid for this route; the "
                                                         "session must start again")
+
+    def no_server(self, agent):
+        """403 for every call as an agent that has no server yet (owner feature manager_server). Its entry names the
+        hub's own machine until the owner gives it one, and no process of that machine may answer as an agent: the
+        central vault holds every key there. False, as the gates that ask it return."""
+        log("hub", f"REFUSED a call from {self.client_address[0]} as {agent}, which has no server yet")
+        self.json(403, {"error": f"{shown_name(agent)} has no server yet. Give it one in its setup in the app."})
+        return False
 
     def ui_allowed(self):
         # The native app uses the existing owner machine identity. Fail closed if unset.
@@ -31521,6 +31629,9 @@ class Handler(BaseHTTPRequestHandler):
                     # Owner feature chat_warm: whether its owner chat can answer now, so the app shows "Setting up"
                     # in place of a chat that cannot yet (chat_ready_now).
                     chat_ready=chat_ready_now(name, row["alive"] if row else None),
+                    # Owner feature manager_server: false while it has no server of its own, so the app's setup of
+                    # a new fleet's manager starts with its server.
+                    placed=not unplaced(name),
                     limit=dict(since=lim["since"], until=lim["until"], reset_known=bool(lim["reset_known"]),
                                task=lim["task"]) if lim else None, **(dict(row) if row else
                     dict(last_seen=None, alive=None, alive_ts=None, client=None, client_seen=None))))
@@ -36226,17 +36337,20 @@ class Handler(BaseHTTPRequestHandler):
         return self.ui_command(f"team/agents/{agent}/rename", read, lambda body: rename_agent(agent, body))
 
     def ui_agent_move(self, agent):
-        """POST /ui/team/agents/<agent>/move (owner feature agent_move): the agent on an empty server."""
+        """POST /ui/team/agents/<agent>/move (owner feature agent_move): the agent on an empty server. runtime (owner
+        feature manager_server): the AI provider of an agent that gets its first server, which the owner chose."""
         def read(data):
-            extra = sorted(set(data) - {"request_id", "db", "base_sha256", "server"})
+            extra = sorted(set(data) - {"request_id", "db", "base_sha256", "server", "runtime"})
             if extra:
                 raise ValueError(f"unknown field {extra[0]}")
-            base, server = data.get("base_sha256"), data.get("server")
+            base, server, runtime = data.get("base_sha256"), data.get("server"), data.get("runtime")
             if not (isinstance(base, str) and re.fullmatch(r"[0-9a-f]{64}", base)):
                 raise ValueError("base_sha256 must be the SHA-256 of team.json")
             if not (isinstance(server, str) and SERVER_NAME.fullmatch(server)):
                 raise ValueError("server must be the name of a server")
-            return {"agent": agent, "base_sha256": base, "server": server}
+            if runtime is not None and runtime not in SWITCH_RUNTIMES:
+                raise ValueError("runtime must be codex or claude")
+            return {"agent": agent, "base_sha256": base, "server": server, "runtime": runtime}
         return self.ui_command(f"team/agents/{agent}/move", read, lambda body: move_agent(agent, body))
 
     def helper_vault_fingerprints(self, agent):

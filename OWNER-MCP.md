@@ -126,7 +126,7 @@ would read as an empty fleet instead of as a mistake.
 | `activate_agent` / `agent_settings` | `/ui/team/agents/<a>` | Turn an agent on or off; its model, effort, capabilities. |
 | `agent_key` | `/ui/team/agents/<a>/key` | Register, replace or remove an agent's key, by its SHA-256. Never a key. |
 | `rename_agent` | `/ui/team/agents/<a>/rename` | A new name for an agent: everything it has moves with it, and nobody signs in again. |
-| `move_agent` | `/ui/team/agents/<a>/move` | An agent onto an empty server of its own kind: the install job there, and its old session ends. |
+| `move_agent` | `/ui/team/agents/<a>/move` | An agent onto an empty server of its own kind: the install job there, and its old session ends. A new fleet's manager onto its first server, with `runtime` its AI provider. |
 | `switch_runtime` | `/ui/team/agents/<a>` | Switch one agent to its other runtime. A command of its own. |
 | `vault_access` | `/ui/team/agents/<a>` | Give one agent its machine's vault broker, or take it away. |
 | `login_creation` | `/ui/team/agents/<a>` | Let one agent make new logins in the vault, or stop it. |

@@ -20,9 +20,15 @@ a second run on a working hub changes nothing.
 **The owner signs in to Claude themselves, from the app.** That is not a convenience,
 it is the condition on which an operator may host the unmodified Claude Code at all:
 each end user signs in through Anthropic's own flow, and the operator never collects,
-stores or intermediates the credential. So the installer installs the runtime and
-signs in to nothing, and `"vault": "none"` in the first `team.json` says that the
-manager holds no credential of Founderizer's. See "The sign-in, and renewing it" below.
+stores or intermediates the credential. So the installer signs in to nothing, and
+`"vault": "none"` in the first `team.json` says that the manager holds no credential of
+Founderizer's. See "The sign-in, and renewing it" below.
+
+**It makes the fleet, and no agent.** No agent runs on the hub's server: an agent has a
+shell, and the central vault on that server holds every key. The manager is the first
+agent, and its own setup page in the app gives it a server of its own (a VPS that joins
+with one line, or a Mac), then its AI provider and the sign-in (UI-API.md 1.82). Each
+agent installs only its own AI, on its own server.
 
 ## Before you run it
 
@@ -74,7 +80,7 @@ sh /root/fleet-kit/hub.sh --check
 ```
 
 Other options: `--port N` (default 8765), `--timezone Z` (default the server's own),
-`--runtime claude|codex` for the manager, `--hostname NAME` for the Tailscale name
+`--runtime claude|codex` for the manager's first AI provider, which its setup page may change, `--hostname NAME` for the Tailscale name
 (default: the name its provider gave the machine, which becomes its name in Fleet), `--claim-wait SECONDS`
 (default 1800) and `--reclaim`.
 
@@ -107,8 +113,9 @@ Other options: `--port N` (default 8765), `--timezone Z` (default the server's o
    configuration ref — the branch the hub writes and nothing else writes (PILOT.md,
    "The configuration ref"). Both refs start at the commit of the copy you ran, so the
    code the hub serves is the code it runs.
-7. **The first `team.json`, and the owner's own Mac.** One manager agent on the hub
-   machine, this machine's address, `"vault": "none"`, and no credential of any kind.
+7. **The first `team.json`, and the owner's own Mac.** One manager with no server yet
+   (`"placed": false`: its `machine` names this machine only until its setup gives it
+   one), this machine's address, `"vault": "none"`, and no credential of any kind.
    Then the claim, below. The file is committed on `config` and pushed to the hub's own
    repository, so the record starts at the first minute.
 8. **The two root commands of this machine**, below:
@@ -120,9 +127,9 @@ Other options: `--port N` (default 8765), `--timezone Z` (default the server's o
     own user, in the next step.
 11. **Each agent of this machine, under its own OS user**, below: its checkout cloned
     over `git://` on the configuration ref, its runtime in its own `~/.local/bin`, and
-    its service in its own systemd manager. The manager runs from the first minute with
-    its runtime signed out, and reports that to the app, which is what lets you sign in
-    from there.
+    its service in its own systemd manager. A new hub has none, and says so: the manager
+    runs on a server of its own. A hub from before keeps its manager on this machine,
+    and a second run of the line installs it there as before.
 12. **The checks** the owner can act on, below.
 13. **This fleet's own id**, below: sixteen hex characters in the hub's key store, made
     once and never again.
@@ -136,8 +143,8 @@ Other options: `--port N` (default 8765), `--timezone Z` (default the server's o
 `join.sh` and `hub.sh` make one OS user for each agent the fleet's `team.json` gives
 this machine: `fleet-<agent>`, with a locked password, out of `sudo`, `admin` and
 `wheel`, lingering on, and the home `/home/fleet-<agent>` of mode 700 that belongs to
-it alone. On a new hub that is the manager, and `verify` names the agents of a machine,
-so a second run of the line makes the user of an agent that was added since.
+it alone. A new hub has no agent, and `verify` names the agents of a machine, so a
+second run of the line makes the user of an agent that was added since.
 
 It is the step that gives each agent's own files somewhere no other agent's user can
 read: a runtime credential, a vault token, a session record. The one command behind
@@ -260,26 +267,28 @@ install ends at `verify`, and nothing of a subscription is in it.
 and the installer prints every line it answers:
 
 ```
-  ok    services: fleet-hub, fleet-git, fleet-manager are active and enabled
-  ok    hub_answers: The hub answers http://100.80.1.2:8765/health for manager
+  ok    services: The hub and the git service are running.
+  ok    hub_answers: The hub answers at http://100.80.1.2:8765 for Manager.
   ok    owner_claimed: The owner of this hub is the Mac at 100.80.1.3
   ...
-  fail  runtime_signed_in: Manager is not signed in to claude  (fix: Sign this server in from the app: Settings, Servers, this server, Sign in)
-NOT READY: runtime_signed_in
+READY
 ```
 
 An install that half worked therefore says which check failed and what fixes it, instead
 of looking finished, and the line itself ends in failure, so the agent or the app that
-ran it knows. A `warn` is not a failure. Until the owner signs the machine in,
-`runtime_signed_in` fails on purpose: that is the one step only they can take.
+ran it knows. A `warn` is not a failure. A new hub has no agent, so no check of it waits
+for a sign-in: the manager's own server answers for the manager, and until the owner
+signs it in there, that server's `runtime_signed_in` fails on purpose, because that is
+the one step only they can take.
 
 The same command is the right first question at any later moment, and the app shows the
 same array as the owner's checklist.
 
 ## The sign-in, and renewing it
 
-One thing is left after the install, and it is done in the app: **sign in to your own
-Claude account.** Settings → Servers → this server → **Sign in**.
+One thing is left after the install, and it is done in the app: **set up the manager
+and sign in to your own Claude account.** The manager's page asks for its server first,
+then its AI provider, and then for the sign-in, which happens on that server.
 
 What happens, in order (UI-API.md, "Sign a machine in"):
 

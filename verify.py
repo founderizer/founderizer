@@ -219,8 +219,9 @@ class Verify:
         self.named = self.machine_of(self.agent)            # the machine team.json gives that agent
         self.machine = self.named or self.machine_here()    # which machine of team.json this is, or None
         self.is_hub = self.machine == self.hub_machine() if self.machine else self.hub_service_here()
+        # A manager with no server yet names the hub's machine and runs nowhere (hub.unplaced): not an agent here.
         here = [(name, conf) for name, conf in sorted((self.conf.get("agents") or {}).items())
-                if self.machine and conf.get("machine") == self.machine]
+                if self.machine and conf.get("machine") == self.machine and conf.get("placed") is not False]
         self.agents = [name for name, conf in here if conf.get("active", True) is not False]
         # The agents team.json places here and keeps inactive: a new agent until the owner signs it in and
         # activates it, and one the owner switched off. Their service, runtime and credential need not be there,

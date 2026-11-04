@@ -199,9 +199,9 @@ Give the owner:
 
 - every line `verify` printed, as it is, and whether it ended with `READY`;
 - the hub's address, to paste in the Founderizer window that waits for it;
-- the two things only they can do: sign each server in to their own provider account
-  (`Settings`, `Servers`, the server, `Sign in`), and add their agents (the `+` at the top of
-  the sidebar, `Add agent`).
+- the two things only they can do: set up their manager on its own page, which asks for a server
+  of its own (no agent runs on the hub's server), its AI provider and their own sign-in to it;
+  and add their agents (the `+` at the top of the sidebar, `Add agent`), each on its own server.
 
 If the last line is `NOT READY`, each failing check carries its own fix in the same line. Tell the
 owner what failed and what the fix says. Run a fix only when it is one of the commands in this
@@ -252,8 +252,8 @@ make a code yourself.
 ### B4. Report
 
 Give the owner the lines `verify` printed, whether it ended with `READY`, and the next step in the
-app: the `+` at the top of the sidebar, `Add agent`, and then `Sign in` on that server's page
-(`Settings`, `Servers`).
+app: the manager's own page, while the manager waits for its server; else the `+` at the top of the
+sidebar, `Add agent`, and then `Sign in` on that server's page (`Settings`, `Servers`).
 
 ## When you are finished
 
