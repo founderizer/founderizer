@@ -674,7 +674,7 @@ class Service:
             self.run(self.as_agent(user, ["rm", "-f", os.path.join(self.home_of(user), ".config", "systemd", "user",
                                                                    unit)]))
             self.run(self.as_agent(user, ["systemctl", "--user", "daemon-reload"]))
-        self.run(self.as_agent(user, ["tmux", "kill-session", "-t", f"fleet-{was}"]))
+        self.run(self.as_agent(user, ["tmux", "kill-session", "-t", f"=fleet-{was}:"]))
 
     def runtime_step(self, job, runtime, user=None):
         """The runtime of this agent, in the home of its own user: the credential the vendor's client writes lives

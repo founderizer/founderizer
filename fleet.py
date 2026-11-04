@@ -197,6 +197,10 @@ def me(args=None):
 # ---------------------------------------------------------------- tmux
 
 def tmux(*args, check=False, timeout=15):
+    """Every target names its session whole, "=fleet-ivy:" or "=fleet-ivy:=T-1". When no session has the name, tmux
+    takes it as the start of another one ("fleet-ivy" found "fleet-ivy-lead"), and the agents of a Mac share one tmux
+    server. "=fleet-ivy" without its colon is read as a window, and its session still matches by its start (tmux 3.4
+    and 3.6a)."""
     try:
         return subprocess.run(["tmux", *args], capture_output=True, text=True, check=check, timeout=timeout)
     except subprocess.TimeoutExpired:       # tmux can wait for ever on a pane someone is scrolled back in
@@ -204,7 +208,7 @@ def tmux(*args, check=False, timeout=15):
 
 
 def windows(session, *, checked=False):
-    r = tmux("list-windows", "-t", session, "-F", "#{window_name}")
+    r = tmux("list-windows", "-t", f"={session}:", "-F", "#{window_name}")
     if checked and r.returncode != 0:
         raise Refused(f"cannot read windows in {session}; nothing was started")
     return [w for w in r.stdout.split("\n") if w] if r.returncode == 0 else []
@@ -212,7 +216,7 @@ def windows(session, *, checked=False):
 
 def ensure_session(session):
     """Make this agent's tmux session if it is not there. True when it had to be made."""
-    if tmux("has-session", "-t", session).returncode == 0:
+    if tmux("has-session", "-t", f"={session}:").returncode == 0:
         return False
     tmux("new-session", "-d", "-s", session, "-n", "home", "-c", KIT, check=True)
     return True
@@ -366,12 +370,12 @@ def start_window(session, name, command, options=None):
     With options, a start that tmux does not answer in time raises too (CalledProcessError 124): it can have started
     or not, and that caller reads which. Task and chat windows go on as before, without that check."""
     then = [a for option, value in (options or {}).items()
-            for a in (";", "set-option", "-w", "-t", f"{session}:={name}", option, value)]
-    started = tmux("new-window", "-d", "-t", session + ":", "-n", name, "-c", KIT, in_checkout(command), *then, check=True)
+            for a in (";", "set-option", "-w", "-t", f"={session}:={name}", option, value)]
+    started = tmux("new-window", "-d", "-t", f"={session}:", "-n", name, "-c", KIT, in_checkout(command), *then, check=True)
     if options and started.returncode == 124:
         raise subprocess.CalledProcessError(124, ["tmux", "new-window"], "", "timed out")
-    tmux("set-option", "-w", "-t", f"{session}:={name}", "automatic-rename", "off")
-    tmux("set-option", "-w", "-t", f"{session}:={name}", "allow-rename", "off")
+    tmux("set-option", "-w", "-t", f"={session}:={name}", "automatic-rename", "off")
+    tmux("set-option", "-w", "-t", f"={session}:={name}", "allow-rename", "off")
 
 
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")      # typed into a terminal, these would act as keys
@@ -562,7 +566,7 @@ def type_into(session, name, text, asks=True):
     its agent's own words and never asks on its screen, so a "1. Yes" there is no question (runtime gaps review).
     A session's input box that still holds the line after its Enter gets the Enter again (holds_line); a runner's
     window has no input box, and its terminal takes the line with the Enter."""
-    target = f"{session}:={name}"
+    target = f"={session}:={name}"
     r = tmux("display-message", "-p", "-t", target, "#{pane_in_mode}")
     if r.returncode != 0:
         return "gone"
@@ -2041,7 +2045,7 @@ def manager_window(session):
     """(@fleet_session, program) of the standing manager window in a tmux session, from one window list; program is ""
     when its start command cannot be read. None without that window. Refused when tmux gives no list: an unknown
     reading is never "no window"."""
-    r = tmux("list-windows", "-t", session, "-F", "#{window_name}\t#{@fleet_session}\t#{pane_start_command}")
+    r = tmux("list-windows", "-t", f"={session}:", "-F", "#{window_name}\t#{@fleet_session}\t#{pane_start_command}")
     if r.returncode != 0:
         raise Refused(f"cannot read windows in {session}")
     for line in r.stdout.splitlines():
@@ -2847,7 +2851,7 @@ class Helper:
         """The owner moved this agent to another server (hub.move_agent): its sessions here end, and so does this
         helper's own service, which never starts again on this machine. Its files stay where they are."""
         self.say("the owner moved this agent to another server: its sessions and its service here end")
-        tmux("kill-session", "-t", self.session)
+        tmux("kill-session", "-t", f"={self.session}:")
         if sys.platform == "darwin":
             plist = os.path.join(HOME, "Library", "LaunchAgents", f"com.agentfleet.{self.agent}.plist")
             with contextlib.suppress(OSError):
@@ -2883,14 +2887,14 @@ class Helper:
         is told as "limit", which the hold covers. The manager's session and an owner chat or a conversation window
         that stand still at a question close once instead (stuck_manager, close_stuck), and a window of the same name
         that replaces a closed one starts with a watch of its own."""
-        r = tmux("list-windows", "-t", self.session, "-F", "#{window_name}\t#{window_id}\t#{@fleet_attempt}")
+        r = tmux("list-windows", "-t", f"={self.session}:", "-F", "#{window_name}\t#{window_id}\t#{@fleet_attempt}")
         live = {name: (wid, attempt) for name, wid, attempt in
                 ((line.split("\t") + ["", ""])[:3] for line in (r.stdout.split("\n") if r.returncode == 0 else []))
                 if name and name != "home"}
         for window in [w for w in self.screens if w not in live]:
             self.last_class[window] = self.screens.pop(window).get("class")     # for report_start
         for window, (wid, attempt) in live.items():
-            r = tmux("capture-pane", "-p", "-t", f"{self.session}:={window}")
+            r = tmux("capture-pane", "-p", "-t", f"={self.session}:={window}")
             if r.returncode != 0:
                 continue
             seen = self.screens.get(window)
@@ -2899,7 +2903,7 @@ class Helper:
             number = attempt.rpartition(":")[2]
             attempt = int(number) if re.fullmatch(r"T-\d+", window) and re.fullmatch(r"[1-9]\d{0,8}", number) else None
             reading = screen_class(r.stdout)
-            if reading == "question" and window not in STANDING_WINDOWS and self.runner(f"{self.session}:={window}"):
+            if reading == "question" and window not in STANDING_WINDOWS and self.runner(f"={self.session}:={window}"):
                 # The review of 29 October 2026: a runner prints its agent's own words as they come, and nothing in it
                 # asks on its screen, so a "1. Yes" or an "Esc to cancel" there is no question
                 reading = "unknown"
@@ -3076,7 +3080,7 @@ class Helper:
                 self.window_runtime("manager") != self.conf.get("runtime"):
             return False
         with contextlib.suppress(subprocess.CalledProcessError, Refused):
-            tmux("kill-window", "-t", f"{self.session}:=manager")
+            tmux("kill-window", "-t", f"={self.session}:=manager")
         self.stuck_closed["manager"], self.manager_due = time.time(), True
         self.say("manager: its session stood at a question on its screen, which nobody reads, so it starts again on "
                  "the same conversation")
@@ -3097,7 +3101,7 @@ class Helper:
                 hook_waits(self.agent, "conversation"):
             return False                # plan C7: the hub carries this question as a permission prompt
         with contextlib.suppress(subprocess.CalledProcessError, Refused):
-            tmux("kill-window", "-t", f"{self.session}:={window}")
+            tmux("kill-window", "-t", f"={self.session}:={window}")
         self.stuck_closed[window] = time.time()
         if window == "owner-chat":      # a new conversation with the hub's recap, and no start that ended
             self.chat_fresh, self.chat_started = True, None
@@ -3116,7 +3120,7 @@ class Helper:
             if not step:
                 continue
             body = {"step": step[0], "task": step[1], "age": round(time.monotonic() - step[2])}
-            r = tmux("list-windows", "-t", self.session, "-F", "#{window_name}")
+            r = tmux("list-windows", "-t", f"={self.session}:", "-F", "#{window_name}")
             if r.returncode == 0:
                 body["alive"] = ",".join(w for w in r.stdout.split("\n") if w and w != "home")
             try:
@@ -3129,7 +3133,7 @@ class Helper:
 
     def look_known(self):
         """The windows, or None when tmux did not answer: a list that cannot be read is no list (plan C6)."""
-        r = tmux("list-windows", "-t", self.session, "-F", "#{window_name}")
+        r = tmux("list-windows", "-t", f"={self.session}:", "-F", "#{window_name}")
         return [w for w in r.stdout.split("\n") if w and w != "home"] if r.returncode == 0 else None
 
     def report_start(self, task, reason):
@@ -3180,9 +3184,9 @@ class Helper:
     def started(self):
         """{window: start command} of this agent's windows, home excluded: {} when tmux says that it has no such
         session, None when it gives no answer (a reading that failed is unknown, never empty)."""
-        r = tmux("list-windows", "-t", self.session, "-F", "#{window_name}\t#{pane_start_command}")
+        r = tmux("list-windows", "-t", f"={self.session}:", "-F", "#{window_name}\t#{pane_start_command}")
         if r.returncode != 0:
-            gone = tmux("has-session", "-t", self.session)
+            gone = tmux("has-session", "-t", f"={self.session}:")
             missing = gone.returncode == 1 and any(w in gone.stderr for w in ("can't find session", "no server running",
                                                                              "error connecting"))
             return {} if missing else None
@@ -3306,7 +3310,7 @@ class Helper:
         and the switch read it there)."""
         if again:
             with contextlib.suppress(subprocess.CalledProcessError):
-                tmux("set-option", "-w", "-t", f"{self.session}:=manager", "@fleet_session", session, check=True)
+                tmux("set-option", "-w", "-t", f"={self.session}:=manager", "@fleet_session", session, check=True)
         self.say("manager: session started" + (f" ({note})" if note else ""))
 
     def outdated(self):
@@ -3340,14 +3344,14 @@ class Helper:
             else:
                 start_window(self.session, name, command)
             try:
-                tmux("set-option", "-w", "-t", f"{self.session}:={name}", "@fleet_attempt", f"{generation}:{attempt}", check=True)
+                tmux("set-option", "-w", "-t", f"={self.session}:={name}", "@fleet_attempt", f"{generation}:{attempt}", check=True)
                 account = account_now(self.agent, self.conf.get("runtime"))
                 if account:             # the account it starts on, which the session reuse rule compares
-                    tmux("set-option", "-w", "-t", f"{self.session}:={name}", "@fleet_account", account)
+                    tmux("set-option", "-w", "-t", f"={self.session}:={name}", "@fleet_account", account)
                 if needs:               # every task window says what it runs; runner() and task_windows() rely on it
-                    tmux("set-option", "-w", "-t", f"{self.session}:={name}", "@fleet_needs", needs, check=True)
+                    tmux("set-option", "-w", "-t", f"={self.session}:={name}", "@fleet_needs", needs, check=True)
                 if session and not standing:    # after @fleet_needs: the record reader takes a window with a session
-                    tmux("set-option", "-w", "-t", f"{self.session}:={name}", "@fleet_session", session, check=True)
+                    tmux("set-option", "-w", "-t", f"={self.session}:={name}", "@fleet_session", session, check=True)
             finally:
                 if needs and session and app_server_task(self.conf, needs):
                     # The runner started. It can end at once, also before its window has these options, and then no
@@ -3370,7 +3374,7 @@ class Helper:
         publishers = self.__dict__.setdefault("publishers", {})
         if not (self.worker and "screen" in self.conf.get("can", []) and sys.platform == "darwin"):
             return
-        r = tmux("list-windows", "-t", self.session, "-F", "#{window_name}\t#{@fleet_attempt}\t#{@fleet_needs}")
+        r = tmux("list-windows", "-t", f"={self.session}:", "-F", "#{window_name}\t#{@fleet_attempt}\t#{@fleet_needs}")
         live = set()
         for line in r.stdout.splitlines() if r.returncode == 0 else []:
             name, attempt, needs = (line.split("\t") + ["", ""])[:3]
@@ -3425,7 +3429,7 @@ class Helper:
         runs (STANDING_WINDOWS): it reads once more at the end of the turn. A new window (its tmux id) knows nothing
         of earlier lines. A manager session that a message finds cold and long is not told at all: it starts again
         on a new conversation, and that one is told (restart_fresh)."""
-        target = f"{self.session}:={window}"
+        target = f"={self.session}:={window}"
         if not self.first_line_due(window):
             return
         r = tmux("display-message", "-p", "-t", target, "#{window_id}")
@@ -3585,11 +3589,11 @@ class Helper:
                 # A chat of another hub generation cannot answer this hub, and no message of his could reach the
                 # app's chat to replace it (handle): it closes, and a new one starts. A chat of this generation goes
                 # on, unless its tools changed (restart_chat_for_tools).
-                r = tmux("show-options", "-wv", "-t", f"{self.session}:={window}", "@fleet_attempt")
+                r = tmux("show-options", "-wv", "-t", f"={self.session}:={window}", "@fleet_attempt")
                 if r.returncode != 0 or not r.stdout.strip() or self.other_runtime_windows():
                     return
                 if r.stdout.strip() != f"{generation}:1":
-                    tmux("kill-window", "-t", f"{self.session}:={window}", check=True)
+                    tmux("kill-window", "-t", f"={self.session}:={window}", check=True)
                 elif not self.restart_chat_for_tools(generation):
                     return
             elif self.other_runtime_windows():      # the previous runtime's chat closes first (retire_old_chat)
@@ -3610,7 +3614,7 @@ class Helper:
         its helper kept them: it starts again too. Never a chat that this helper started with the poll's tools, also
         when its record could not be written; only between two turns, never while a turn runs or a question waits on
         its screen; and never a chat without a record of this generation, whose conversation could not be continued."""
-        runtime, target = self.conf.get("runtime"), f"{self.session}:=owner-chat"
+        runtime, target = self.conf.get("runtime"), f"={self.session}:=owner-chat"
         tools = chat_tools(getattr(self, "chat_served", None))
         if tools is None or runtime not in MANAGER_RUNTIMES or getattr(self, "chat_tools_for", None) == tools:
             return False                # an older hub, a runtime without records, or this helper started it so
@@ -3640,9 +3644,9 @@ class Helper:
             if self.other_runtime_windows():         # the hub holds chats until the old runtime's chat is closed
                 raise Refused("the owner chat of the previous runtime is still open")
             if window in self.look():
-                existing = tmux("show-options", "-wv", "-t", f"{self.session}:={window}", "@fleet_attempt").stdout.strip()
+                existing = tmux("show-options", "-wv", "-t", f"={self.session}:={window}", "@fleet_attempt").stdout.strip()
                 if existing != expected:
-                    tmux("kill-window", "-t", f"{self.session}:={window}", check=True)
+                    tmux("kill-window", "-t", f"={self.session}:={window}", check=True)
             if window not in self.look():
                 self.start_chat(extra["generation"])
             else:
@@ -3655,11 +3659,11 @@ class Helper:
                 raise Refused("invalid conversation event")
             window, expected = f"C-{cid}", f"{extra['generation']}:{cid}"
             if window in self.look():
-                existing = tmux("show-options", "-wv", "-t", f"{self.session}:={window}", "@fleet_attempt").stdout.strip()
+                existing = tmux("show-options", "-wv", "-t", f"={self.session}:={window}", "@fleet_attempt").stdout.strip()
                 # a window that started another way than the hub runs this conversation now gets no new message:
                 # the person's next turn would run with the tools of before, a shell among them (AUTONOMY.md P2)
                 if existing != expected or self.conversation_switched(window):
-                    tmux("kill-window", "-t", f"{self.session}:={window}", check=True)
+                    tmux("kill-window", "-t", f"={self.session}:={window}", check=True)
             if window not in self.look():
                 if len([w for w in self.look() if CONVERSATION_WINDOW.fullmatch(w)]) >= CONVERSATION_WINDOWS and \
                         not self.free_conversation_slot(window):
@@ -3694,7 +3698,7 @@ class Helper:
                         raise
                     self.start(window, command, cid, extra["generation"])
                 if data.get("mode"):        # how it started, which Helper.retire_conversations holds to the hub's
-                    tmux("set-option", "-w", "-t", f"{self.session}:={window}", "@fleet_conversation", data["mode"])
+                    tmux("set-option", "-w", "-t", f"={self.session}:={window}", "@fleet_conversation", data["mode"])
                 self.conversation_seen[window] = time.monotonic()
                 tools = " with the agent's own tools" if data.get("closed") is False else ""
                 self.say(f"{window}: conversation session started{tools}; the agent's read and reply are still pending")
@@ -3704,9 +3708,9 @@ class Helper:
             expected = f"{extra.get('generation','')}:{extra.get('attempt',1)}"
             needs = extra.get("needs") or "none"
             if task in self.look():
-                existing = tmux("show-options", "-wv", "-t", f"{self.session}:={task}", "@fleet_attempt").stdout.strip()
+                existing = tmux("show-options", "-wv", "-t", f"={self.session}:={task}", "@fleet_attempt").stdout.strip()
                 if existing != expected:
-                    tmux("kill-window", "-t", f"{self.session}:={task}", check=True)
+                    tmux("kill-window", "-t", f"={self.session}:={task}", check=True)
             if task not in self.look() and app_server_task(self.conf, needs) and \
                     self.screen_attempts.get(task, ("",))[0] == expected:
                 # The runner of this attempt ended: it stops itself after an error that a new turn cannot
@@ -3774,7 +3778,7 @@ class Helper:
                 raise Refused(f"{task}: its turn after the delivery runs; the window closes at its end")
             before = self.task_work(task, generation, keep_runtime=False) if desktop and generation else {}
             if task in self.look():
-                tmux("kill-window", "-t", f"{self.session}:={task}", check=True)
+                tmux("kill-window", "-t", f"={self.session}:={task}", check=True)
                 self.say(f"{task}: finished, session closed")
             if desktop and generation:
                 quiet, ended, left = self.quiesce(task, generation, keep_runtime=False, also=before)
@@ -3906,13 +3910,13 @@ class Helper:
                     out_command = runtime_logout_command(runtime, program)
                 except Refused as e:
                     return report("failed", detail=str(e))
-                tmux("kill-session", "-t", session)
+                tmux("kill-session", "-t", f"={session}:")
                 ensure_session(session)
                 start_window(session, "logout", out_command)
                 deadline = time.monotonic() + LOGOUT_WAIT
                 while time.monotonic() < deadline and self.signed_in(runtime):
                     time.sleep(3)
-                tmux("kill-session", "-t", session)
+                tmux("kill-session", "-t", f"={session}:")
                 if self.signed_in(runtime):
                     return report("failed", detail=f"{label} did not sign out on this machine, so its account was "
                                                    f"not changed. Sign out there yourself, then sign in.")
@@ -3926,7 +3930,7 @@ class Helper:
             # here, once, for both halves; it says so when it had to write them again.
             if ready_runtime_config():
                 self.say(f"sign-in L-{lid}: wrote {label}'s own first-run answers again")
-            tmux("kill-session", "-t", session)          # a sign-in that was given up leaves no window behind
+            tmux("kill-session", "-t", f"={session}:")          # a sign-in that was given up leaves no window behind
             ensure_session(session)
             start_window(session, "login", command)
             url = shown = None
@@ -3951,7 +3955,7 @@ class Helper:
                     seen, asking = here, login_prompt_line(screen)
                     answered.append(asking)
                     self.say(f"sign-in L-{lid}: answering {label}'s own first-run question")
-                    tmux("send-keys", "-t", f"{session}:=login", "Enter")
+                    tmux("send-keys", "-t", f"={session}:=login", "Enter")
             if not url:
                 # Which screen, and not "printed no link": the one thing the owner could act on.
                 waiting = login_prompt_line(login_screen(session))
@@ -3995,7 +3999,7 @@ class Helper:
             except Exception:
                 pass
         finally:
-            tmux("kill-session", "-t", session)
+            tmux("kill-session", "-t", f"={session}:")
 
     def restart_for_tools(self):
         """**A new team tool reaches the standing session only when it starts.** The hub hands a session its tool
@@ -4012,7 +4016,7 @@ class Helper:
             return
         if self.manager_due or self.manager_left or self.manager_retiring is not None or self.outdated():
             return                      # a start or a switch is already going to give it the current list
-        target = f"{self.session}:=manager"
+        target = f"={self.session}:=manager"
         if self.window_runtime("manager") is None or self.working(target) or self.background_open("manager"):
             return                      # nothing to close, a turn runs, or a workflow or a command: at a later round
         with contextlib.suppress(subprocess.CalledProcessError, Refused):
@@ -4210,7 +4214,7 @@ class Helper:
         if self.conf.get("role") != "manager":
             return
         with contextlib.suppress(subprocess.CalledProcessError, Refused):
-            tmux("kill-window", "-t", f"{self.session}:=manager")
+            tmux("kill-window", "-t", f"={self.session}:=manager")
         self.manager_due = True
         self.say("manager: signed in, so its session starts again")
 
@@ -4363,7 +4367,7 @@ class Helper:
         conversation's session with the agent's tools (AUTONOMY.md P2) has a session id too, and its window C-<id>
         and its conversation as the attempt: the hub files its records under that conversation's tasks. A closed
         one has none, and keeps its records on this machine."""
-        r = tmux("list-windows", "-t", self.session, "-F",
+        r = tmux("list-windows", "-t", f"={self.session}:", "-F",
                  "#{window_name}\t#{@fleet_attempt}\t#{@fleet_session}\t#{@fleet_needs}")
         found = []
         for line in r.stdout.splitlines() if r.returncode == 0 else []:
@@ -4377,7 +4381,7 @@ class Helper:
 
     def manager_windows(self):
         """The manager session, by its session id; a session started before session ids is found by its prompt."""
-        r = tmux("list-windows", "-t", self.session, "-F", "#{window_name}\t#{@fleet_session}")
+        r = tmux("list-windows", "-t", f"={self.session}:", "-F", "#{window_name}\t#{@fleet_session}")
         rows = dict(line.split("\t", 1) for line in r.stdout.splitlines() if "\t" in line) if r.returncode == 0 else {}
         if "manager" not in rows:
             self.manager_session = None
@@ -4465,7 +4469,7 @@ class Helper:
             return True
         turns, at = self.hub_turns
         for window in windows:
-            target = f"{self.session}:={window}"
+            target = f"={self.session}:={window}"
             if window in turns or self.typed_at.get(window, float("-inf")) >= at or self.runner(target) or \
                     self.working(target):
                 return True
@@ -4484,7 +4488,7 @@ class Helper:
             if not session.startswith("fleet-") or window == "home":
                 continue
             if session.startswith(LOGIN_SESSION % "") or re.fullmatch(r"T-\d+", window) or \
-                    self.working(f"{session}:={window}"):
+                    self.working(f"={session}:={window}"):
                 return True
         return False
 
@@ -4494,7 +4498,7 @@ class Helper:
         missing window with exit status 0 and no output."""
         if window not in self.look():
             return None
-        r = tmux("display-message", "-p", "-t", f"{self.session}:={window}", "#{pane_start_command}")
+        r = tmux("display-message", "-p", "-t", f"={self.session}:={window}", "#{pane_start_command}")
         try:
             words = launch_words(r.stdout) if r.returncode == 0 else []
         except ValueError:
@@ -4504,7 +4508,7 @@ class Helper:
         return os.path.basename(words[0]) if words else ""
 
     def window_generation(self, window):
-        return tmux("show-options", "-wv", "-t", f"{self.session}:={window}", "@fleet_attempt").stdout.strip().rpartition(":")[0]
+        return tmux("show-options", "-wv", "-t", f"={self.session}:={window}", "@fleet_attempt").stdout.strip().rpartition(":")[0]
 
     def chat_binding(self, runtime, generation):
         """The conversation file that this generation's owner chat on one runtime is recorded with, or None: then a
@@ -4846,7 +4850,7 @@ class Helper:
             if not self.unbegun_record(window):
                 return False            # a start of the manager session runs now: read again at the next round
             return self.release_manager(False)      # no such session any more, or none of the previous runtime
-        (session, old), target = window, f"{self.session}:=manager"
+        (session, old), target = window, f"={self.session}:=manager"
         keeps = self.manager_keeps(old, session) if old else None
         # Seen before the lock is tried: its end starts the new runtime's session also when no lock is held then. Not
         # a window whose program cannot be read, which can be the agent's own runtime.
@@ -5003,7 +5007,7 @@ class Helper:
     def conversation_kind(self, window):
         """How a conversation window started (AUTONOMY.md P2): "tools", "closed", or "" for one from before
         contacts.v2, from its tmux option @fleet_conversation."""
-        r = tmux("show-options", "-wv", "-t", f"{self.session}:={window}", "@fleet_conversation")
+        r = tmux("show-options", "-wv", "-t", f"={self.session}:={window}", "@fleet_conversation")
         return r.stdout.strip() if r.returncode == 0 else ""
 
     def conversation_switched(self, window):
@@ -5034,7 +5038,7 @@ class Helper:
         for window in [w for w in self.conversation_seen if w not in open_windows]:
             self.conversation_seen.pop(window, None)
         for window in open_windows:
-            if self.conversation_switched(window) and not self.working(f"{self.session}:={window}"):
+            if self.conversation_switched(window) and not self.working(f"={self.session}:={window}"):
                 why = "its conversation runs another way now"
             elif self.conversations is not None:
                 if int(window[2:]) in self.conversations:
@@ -5046,7 +5050,7 @@ class Helper:
                 if quiet <= CONVERSATION_IDLE:
                     continue
                 why = f"{CONVERSATION_IDLE // 60} quiet minutes"
-            tmux("kill-window", "-t", f"{self.session}:={window}")
+            tmux("kill-window", "-t", f"={self.session}:={window}")
             self.conversation_seen.pop(window, None)
             self.say(f"{window}: closed, {why}; the next message of this person starts a new window")
 
@@ -5058,7 +5062,7 @@ class Helper:
         if not quiet:
             return False
         window = min(quiet, key=lambda w: max(self.conversation_seen.get(w, 0), self.signalled.get(w, 0)))
-        tmux("kill-window", "-t", f"{self.session}:={window}")
+        tmux("kill-window", "-t", f"={self.session}:={window}")
         self.conversation_seen.pop(window, None)
         self.say(f"{window}: closed for {wanted}, which waited for a window; it was idle with nothing unread")
         return True
@@ -5076,7 +5080,7 @@ class Helper:
                 self.say("owner-chat: the processes of the previous runtime's chat have ended")
                 self.lifecycle.report()
             return
-        old, target = self.window_runtime("owner-chat"), f"{self.session}:=owner-chat"
+        old, target = self.window_runtime("owner-chat"), f"={self.session}:=owner-chat"
         if old in (None, self.conf.get("runtime")) or self.working(target):
             self.retiring = None
             return
@@ -5138,7 +5142,7 @@ class Helper:
         """Stop the running turn with Esc, at most three times. Confirmed at once for a session with no running turn,
         and for a Claude session when its records show the turn's end after the Esc (plan C5); for another runtime
         when the screen shows no running turn and its record file has been quiet for 5 seconds."""
-        target = f"{self.session}:={window}"
+        target = f"={self.session}:={window}"
         if window not in self.look():
             return True, "no session was running"
         if tmux("display-message", "-p", "-t", target, "#{pane_in_mode}").stdout.strip() not in ("", "0"):
@@ -5214,7 +5218,7 @@ class Helper:
         binaries on macOS, whose environment is hidden), every process whose environment names the task (also
         re-parented ones on Linux), and still-running processes of an earlier snapshot. A paused session keeps
         its own runtime."""
-        target = f"{self.session}:={window}"
+        target = f"={self.session}:={window}"
         rows = process_table(window, generation)
         args_of = {pid: args for pid, _, args, _ in rows}
         pane = self.pane(target)[0] if window in self.look() else None
@@ -5359,7 +5363,7 @@ class Helper:
             confirmed, ended, left = self.quiesce(task, generation, keep_runtime=True)
             detail = detail if confirmed else f"processes of the task still run: {left}"
         if confirmed and stop and task in self.look():
-            tmux("kill-window", "-t", f"{self.session}:={task}")
+            tmux("kill-window", "-t", f"={self.session}:={task}")
             time.sleep(1)
             confirmed = task not in self.look()
             detail = ("the session window did not close" if not confirmed else
@@ -6639,7 +6643,7 @@ def whole_link(screen, pattern):
 def login_screen(session):
     """What the sign-in window shows now, as its lines. `capture-pane -p` gives the text without escapes; -J joins
     a link that the terminal wrapped over two lines."""
-    r = tmux("capture-pane", "-p", "-J", "-t", f"{session}:=login")
+    r = tmux("capture-pane", "-p", "-J", "-t", f"={session}:=login")
     return SCREEN_CONTROL.sub(" ", r.stdout) if r.returncode == 0 else ""
 
 
@@ -6648,7 +6652,7 @@ def type_login_code(session, code):
     only: anything else would act as keys in that terminal. The code is never printed or kept."""
     if not LOGIN_CODE.fullmatch(code or ""):
         raise Refused("that is not a sign-in code")
-    target = f"{session}:=login"
+    target = f"={session}:=login"
     for keys in (("-l", "--", code), ("Enter",)):
         if keys == ("Enter",):
             time.sleep(0.6)             # let the window take the text in before the Enter
@@ -6827,7 +6831,7 @@ def cmd_leakcheck(args):
         hits.append("the git history of this folder")
     r = tmux("list-panes", "-a", "-F", "#{session_name}:#{window_name}.#{pane_index}") if shutil.which("tmux") else None
     for pane in [p for p in (r.stdout.split("\n") if r else []) if p.startswith("fleet-")]:
-        cap = tmux("capture-pane", "-p", "-J", "-S", "-", "-t", pane.replace(":", ":=", 1))
+        cap = tmux("capture-pane", "-p", "-J", "-S", "-", "-t", "=" + pane.replace(":", ":=", 1))
         if login["password"] in cap.stdout:
             hits.append(f"tmux screen {pane}")
     try:
