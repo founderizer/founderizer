@@ -5,7 +5,8 @@ Each provider has its listed reads (no path on the list returns a token), its ru
 judged calls; anything else is refused. decide() turns one call into a plan of steps, and execute() runs a plan with
 the token that the door holds for that account. A token never leaves the door: no answer carries one, and a key that
 the door mints stays on the door until it places it on a host itself, through that host's ops-root (`place`), where
-the old value is, found by its hash.
+the old value is, found by its hash. An AWS account holds no key at all: the door assumes that account's role with
+its own bot's web identity token.
 
     ops backblaze:<account> buckets | keys | files <bucket-id> [prefix]
     ops backblaze:<account> key-mint <host> <bucket-id>            rule: a key for one host, its name as the prefix,
@@ -24,9 +25,13 @@ the old value is, found by its hash.
     ops hetzner:<project> servers | server <name> | firewalls | volumes | ips
     ops hetzner:<project> power-cycle <server>                     rule, for a server that the agent holds
     ops hetzner:<project> change <METHOD> <path>                   judged: a held server's firewall, protection, name
-    ops aws:<account> instances | groups | stacks
+    ops aws:<account> instances | groups | stacks | identity
     ops aws:<account> start|stop|reboot <instance-id>              rule, for a tagged instance
     ops aws:<account> ingress|change-set|key-off ...               judged
+    ops aws:<account> eks-allowlist <cluster> <ipv4-range> ...     judged: the EKS public endpoint's new list
+    ops aws:<account> call <service> <Action> [<region>]           judged: any other call inside the role's rights,
+                                                                   its parameters as JSON content
+    ops aws:<account> call eks <METHOD> <path> [<region>]          judged, the same for a REST API
     ops azure:<subscription> get <path>                            listed reads and metrics
     ops azure:<subscription> sql-firewall|app-setting ...          judged
     ops tailscale:<tailnet> devices | device <id>
@@ -332,11 +337,45 @@ def hetzner(access, agent, project, op, args, content, lookups):
 
 
 # ---------------------------------------------------------------- AWS
+#
+# The door's rights in an AWS account are a role there that only the door's own Teleport bot assumes (plan 5.4): the
+# bot writes a short JWT-SVID, the door trades it at STS for an hour's session, and no AWS key is stored anywhere.
+
+# service: (protocol, host, API version or JSON target prefix). A service that is not here is not listed; the role's
+# own policy decides which calls of a listed service work.
+AWS_SERVICES = {
+    "ec2": ("query", "ec2.{region}.amazonaws.com", "2016-11-15"),
+    "iam": ("query", "iam.amazonaws.com", "2010-05-08"),
+    "sts": ("query", "sts.{region}.amazonaws.com", "2011-06-15"),
+    "cloudformation": ("query", "cloudformation.{region}.amazonaws.com", "2010-05-15"),
+    "rds": ("query", "rds.{region}.amazonaws.com", "2014-10-31"),
+    "elasticache": ("query", "elasticache.{region}.amazonaws.com", "2015-02-02"),
+    "monitoring": ("query", "monitoring.{region}.amazonaws.com", "2010-08-01"),
+    "ecr": ("json", "api.ecr.{region}.amazonaws.com", "AmazonEC2ContainerRegistry_V20150921"),
+    "logs": ("json", "logs.{region}.amazonaws.com", "Logs_20140328"),
+    "eks": ("rest", "eks.{region}.amazonaws.com", None),
+}
+# Never, judged or not (plan section 2, "Always refused"): an answer that is a secret or a credential, a shell or code
+# on a host, a person's or a program's access, IAM beyond the listed key form, and the account itself.
+AWS_NEVER = re.compile(
+    r"(sts|iam|organizations|account|secretsmanager|kms|lambda|ec2-instance-connect):.*"
+    r"|ssm:(Get|Send|Start|Resume).*|ecr:(GetAuthorizationToken|GetDownloadUrlForLayer|InitiateLayerUpload"
+    r"|UploadLayerPart|CompleteLayerUpload)"
+    r"|ec2:(GetPasswordData|DescribeInstanceAttribute|ModifyInstanceAttribute|GetLaunchTemplateData"
+    r"|DescribeLaunchTemplateVersions|CreateLaunchTemplate.*|GetConsoleOutput|GetConsoleScreenshot"
+    r"|CreateKeyPair|ImportKeyPair)", re.I)
+CALL_SERVICES = [name for name in AWS_SERVICES if not AWS_NEVER.fullmatch(f"{name}:Any")]
+AWS_NEVER_PATH = re.compile(r"/(access-entries|access-policies|pod-identity-associations|identity-provider-configs)"
+                            r"(/|$)")
+REGION = re.compile(r"[a-z]{2}(-[a-z]+)+-[0-9]")
+CIDR4 = re.compile(r"(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})(\.(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})){3}/([0-9]|[12][0-9]|3[0-2])")
+AWS_COST = ". A call that adds cost goes to the owner through your line, as a Needs-you item with the exact command (D11)."
+
 
 def aws(access, agent, account, op, args, content, lookups):
     tag = account_of(access, "aws", account).get("tag", "door")
     reads = {"instances": ("ec2", "DescribeInstances"), "groups": ("ec2", "DescribeSecurityGroups"),
-             "stacks": ("cloudformation", "DescribeStacks")}
+             "stacks": ("cloudformation", "DescribeStacks"), "identity": ("sts", "GetCallerIdentity")}
     if op in reads and not args:
         return read_plan("aws", account, [{"aws": reads[op], "params": {}}], "a listed read")
     if op in ("start", "stop", "reboot"):
@@ -381,7 +420,66 @@ def aws(access, agent, account, op, args, content, lookups):
                              "need": "unused"},
                             {"aws": ("iam", "UpdateAccessKey"), "params": {
                                 "UserName": args[0], "AccessKeyId": args[1], "Status": "Inactive"}}]})
+    if op == "eks-allowlist":
+        if not 2 <= len(args) <= 41 or not NAME.fullmatch(args[0]) or not all(CIDR4.fullmatch(a) for a in args[1:]):
+            return refused("eks-allowlist takes the cluster and its new list: one to 40 IPv4 ranges")
+        if any(a.endswith("/0") for a in args[1:]):
+            return refused("an EKS endpoint open to every address is never the door's to set")
+        return Decision("judged", "a change of the EKS public endpoint allowlist", target=f"aws:{account}",
+                        plan={"provider": "aws", "account": account, "steps": [
+                            {"aws": ("eks", "DescribeCluster"), "method": "GET", "path": f"/clusters/{args[0]}"},
+                            {"aws": ("eks", "UpdateClusterConfig"), "method": "POST",
+                             "path": f"/clusters/{args[0]}/update-config",
+                             "params": {"resourcesVpcConfig": {"publicAccessCidrs": args[1:]}}}]})
+    if op == "call":
+        return aws_any(account, args, content)
     return refused(f"{op} is not listed for AWS")
+
+
+def aws_any(account, args, content):
+    """Any other call inside the role's rights, judged (the plan's AWS row): `call <service> <Action> [<region>]` with
+    its parameters as one JSON object of content (flat for a query service), or `call eks <METHOD> <path> [<region>]`
+    with an optional JSON body. The role's own deny list and the judge hold the rest."""
+    service = args[0] if args else ""
+    protocol = (AWS_SERVICES.get(service) or ("",))[0]
+    rest = protocol == "rest"
+    region = args[3 if rest else 2] if len(args) == (4 if rest else 3) else None
+    if service not in CALL_SERVICES or len(args) not in ((3, 4) if rest else (2, 3)) or \
+            (region and not REGION.fullmatch(region)):
+        return refused(f"call takes a service of {', '.join(CALL_SERVICES)}, its action (for eks a method and a "
+                       f"path) and a region")
+    try:
+        params = json.loads(content) if content else None
+    except ValueError:
+        return refused("the parameters are one JSON object")
+    if params is not None and not isinstance(params, dict):
+        return refused("the parameters are one JSON object")
+    if rest:
+        method, path = args[1], args[2]
+        if method not in ("GET", "POST", "PUT", "DELETE") or \
+                not re.fullmatch(r"/[A-Za-z0-9._~/-]{1,300}(\?[A-Za-z0-9._~=&-]{1,500})?", path) or ".." in path:
+            return refused("the call takes GET, POST, PUT or DELETE and a path")
+        if AWS_NEVER_PATH.search(path.partition("?")[0]):
+            return refused("a person's or a program's access to a cluster is never the door's")
+        s = {"aws": (service, f"{method} {path.partition('?')[0]}"), "method": method, "path": path, "params": params}
+    else:
+        action = args[1]
+        if not re.fullmatch(r"[A-Z][A-Za-z0-9]{1,80}", action):
+            return refused("the action is a name like DescribeVolumes")
+        if AWS_NEVER.fullmatch(f"{service}:{action}"):
+            return refused(f"{service}:{action} is never the door's: its answer is a secret, it opens a shell or "
+                           f"code on a host, or it gives access")
+        if protocol == "query" and params and (len(params) > 200 or any(
+                not re.fullmatch(r"[A-Za-z0-9.]{1,100}", k) or not isinstance(v, (str, int, bool))
+                for k, v in params.items())):
+            return refused("a query service's parameters are flat: names like Filter.1.Name, and text values")
+        s = {"aws": (service, action), "params": {k: str(v).lower() if isinstance(v, bool) else str(v)
+                                                  for k, v in params.items()} if protocol == "query" and params
+             else params or {}}
+    if region:
+        s["region"] = region
+    return Decision("judged", f"a call of {service} inside the role's rights", target=f"aws:{account}",
+                    plan={"provider": "aws", "account": account, "steps": [s]})
 
 
 # ---------------------------------------------------------------- Azure
@@ -493,7 +591,7 @@ def execute(plan, ctx):
     said, kept = [], {}
     for s in plan["steps"]:
         if provider == "aws":
-            status, answer = aws_call(s["aws"], s["params"], conf, ctx)
+            status, answer = aws_call(s, conf, ctx)
         else:
             path = s["path"].format(**dict(session.get("fill", {}), **kept))
             status, answer = send(provider, s, path, session, ctx, kept, plan)
@@ -539,7 +637,10 @@ def short(answer, limit=2000):
 
 
 def open_session(provider, conf, ctx):
-    """What every request of this provider carries: its base and its authorization."""
+    """What every request of this provider carries: its base and its authorization. AWS has no secret: each call is
+    signed with the session of the account's role (aws_session)."""
+    if provider == "aws":
+        return {}
     secret = ctx["secret"](conf.get("secret"))
     if provider == "backblaze":
         key_id, _, key = secret.partition(":")
@@ -565,8 +666,6 @@ def open_session(provider, conf, ctx):
             raise Stop(f"Azure refused the door's principal ({status})")
         return {"base": BASES["azure"], "headers": {"Authorization": "Bearer " + answer["access_token"]},
                 "query": {"api-version": conf.get("api_version", "2023-08-01")}}
-    if provider == "aws":
-        return {}
     if provider == "tailscale":
         # an OAuth client: its secret buys an access token of an hour, which the calls carry (client credentials)
         client = conf.get("client_id") or (secret.split("-")[2] if secret.startswith("tskey-client-") else "")
@@ -705,37 +804,78 @@ def place(plan, ctx):
     return "\n".join(said)
 
 
-# ---- AWS signature version 4
+# ---- AWS: the role's session, and signature version 4
 
-AWS_HOSTS = {"ec2": "ec2.{region}.amazonaws.com", "cloudformation": "cloudformation.{region}.amazonaws.com",
-             "iam": "iam.amazonaws.com"}
-AWS_VERSIONS = {"ec2": "2016-11-15", "cloudformation": "2010-05-15", "iam": "2010-05-08"}
+def aws_session(conf, ctx):
+    """(key id, key, session token) of the role that this account names: STS AssumeRoleWithWebIdentity with the
+    JWT-SVID that the door's own bot writes. The session lasts an hour and stays in the door's memory only; a new one
+    comes five minutes before it ends."""
+    role = conf.get("role", "")
+    cache = ctx.get("aws_sessions")
+    held = (cache or {}).get(role)
+    if held and held[3] - time.time() > 300:
+        return held[:3]
+    region = conf.get("region", "us-east-1")
+    body = urllib.parse.urlencode({"Action": "AssumeRoleWithWebIdentity", "Version": "2011-06-15", "RoleArn": role,
+                                   "RoleSessionName": "fleet-door", "WebIdentityToken": ctx["aws_token"]()}).encode()
+    status, answer = ctx["http"]("POST", f"https://sts.{region}.amazonaws.com/",
+                                 {"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"}, body)
+    text = answer if isinstance(answer, str) else json.dumps(answer)
+    got = {k: re.search(f"<{k}>([^<]+)</{k}>", text) for k in ("AccessKeyId", "SecretAccessKey", "SessionToken",
+                                                                 "Expiration", "Code", "Message")}
+    if status != 200 or not all(got[k] for k in ("AccessKeyId", "SecretAccessKey", "SessionToken", "Expiration")):
+        said = ": ".join(got[k].group(1)[:200] for k in ("Code", "Message") if got[k])
+        raise Stop(f"AWS STS gave the door no session of {role} ({status}{', ' + said if said else ''})")
+    ends = datetime.datetime.strptime(got["Expiration"].group(1)[:19], "%Y-%m-%dT%H:%M:%S")
+    held = tuple(got[k].group(1) for k in ("AccessKeyId", "SecretAccessKey", "SessionToken")) + \
+        (ends.replace(tzinfo=datetime.timezone.utc).timestamp(),)
+    if cache is not None:
+        cache[role] = held
+    return held[:3]
 
 
-def aws_call(service_action, params, conf, ctx, now=None):
-    """One query API call, signed with SigV4. The answer is XML; the door gives it on as text, and the conditions
-    read it as text too."""
-    service, action = service_action
-    region = "us-east-1" if service == "iam" else conf.get("region", "us-east-1")
-    host = AWS_HOSTS[service].format(region=region)
-    body = urllib.parse.urlencode(sorted(dict(params, Action=action, Version=AWS_VERSIONS[service]).items())).encode()
+def aws_sign(method, host, path, query, headers, body, service, region, session, now=None):
+    """The headers of one request, signed with SigV4 by the role's session, its token among the signed headers."""
+    key_id, key, token = session
     t = now or datetime.datetime.now(datetime.timezone.utc)
     amz, day = t.strftime("%Y%m%dT%H%M%SZ"), t.strftime("%Y%m%d")
-    secret = ctx["secret"](conf["secret"])
-    key_id, _, key = secret.partition(":")
-    headers = {"Content-Type": "application/x-www-form-urlencoded; charset=utf-8", "Host": host, "X-Amz-Date": amz}
-    signed = "content-type;host;x-amz-date"
-    canonical = "\n".join(["POST", "/", "", f"content-type:{headers['Content-Type']}", f"host:{host}",
-                           f"x-amz-date:{amz}", "", signed, hashlib.sha256(body).hexdigest()])
+    headers = dict(headers, **{"Host": host, "X-Amz-Date": amz, "X-Amz-Security-Token": token})
+    lines = sorted((name.lower(), str(value).strip()) for name, value in headers.items())
+    signed = ";".join(name for name, _ in lines)
+    canonical = "\n".join([method, path, query, "".join(f"{n}:{v}\n" for n, v in lines), signed,
+                           hashlib.sha256(body).hexdigest()])
     scope = f"{day}/{region}/{service}/aws4_request"
     to_sign = "\n".join(["AWS4-HMAC-SHA256", amz, scope, hashlib.sha256(canonical.encode()).hexdigest()])
     k = hmac.new(("AWS4" + key).encode(), day.encode(), hashlib.sha256).digest()
     for part in (region, service, "aws4_request"):
         k = hmac.new(k, part.encode(), hashlib.sha256).digest()
-    signature = hmac.new(k, to_sign.encode(), hashlib.sha256).hexdigest()
     headers["Authorization"] = f"AWS4-HMAC-SHA256 Credential={key_id}/{scope}, SignedHeaders={signed}, " \
-                               f"Signature={signature}"
-    status, answer = ctx["http"]("POST", f"https://{host}/", headers, body)
+                               f"Signature={hmac.new(k, to_sign.encode(), hashlib.sha256).hexdigest()}"
+    return headers
+
+
+def aws_call(s, conf, ctx, now=None):
+    """One call of a plan's step, in its service's protocol: a query API (the answer is XML, which the door gives on
+    as text, and the conditions read it as text too), a JSON API, or a REST API with a path."""
+    service, action = s["aws"]
+    protocol, host, version = AWS_SERVICES[service]
+    region = "us-east-1" if service == "iam" else s.get("region") or conf.get("region", "us-east-1")
+    host = host.format(region=region)
+    method, path, query, params = s.get("method", "POST"), "/", "", s.get("params")
+    if protocol == "query":
+        body = urllib.parse.urlencode(sorted(dict(params or {}, Action=action, Version=version).items())).encode()
+        headers = {"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"}
+    elif protocol == "json":
+        body, headers = json.dumps(params or {}).encode(), {"Content-Type": "application/x-amz-json-1.1",
+                                                            "X-Amz-Target": f"{version}.{action}"}
+    else:
+        path, _, query = s["path"].partition("?")
+        query = "&".join(sorted(query.split("&"))) if query else ""
+        body = b"" if params is None else json.dumps(params).encode()
+        headers = {"Content-Type": "application/json"} if params is not None else {}
+    headers = aws_sign(method, host, path, query, headers, body, service, region, aws_session(conf, ctx), now)
+    status, answer = ctx["http"](method, f"https://{host}{path}" + (f"?{query}" if query else ""), headers,
+                                 body if method != "GET" else None)
     text = answer if isinstance(answer, str) else json.dumps(answer)
     if action == "DescribeInstances" and status == 200:
         return status, {"tagged": "<instanceId>" in text, "text": text}

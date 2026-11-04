@@ -66,6 +66,7 @@ MINTED_FILE = STATE + "/minted.json"        # ids of the keys this door minted (
 SECRETS_DIR = STATE + "/secrets"            # opened values, one file each, mode 600, this user only
 VAULT_KEY = STATE + "/vault.key"            # the door's own age identity (its recipient is pinned in the vault)
 SSH_KEY = STATE + "/ssh/id_ed25519"         # the door's SSH key to the second sshd of each host
+AWS_TOKEN_FILE = "/opt/machine-id/jwt_svid"  # the door's own Teleport bot writes its JWT-SVID here (plan 5.4)
 UPSTREAM = "https://github.com/miguelpieras/founderizer-fleet.git"
 JUDGE_URL = "https://api.anthropic.com/v1/messages"
 JUDGE_VERSION = "2026-10-21"
@@ -85,6 +86,7 @@ GITHUB_ACCESS = {"read": {"contents": "read", "pull_requests": "read", "metadata
 NAME = re.compile(r"[a-z][a-z0-9-]{1,30}")
 HOST = re.compile(r"[a-z0-9][a-z0-9.-]{0,62}")
 REF = re.compile(r"bws://[0-9a-f-]{36}", re.I)
+ROLE = re.compile(r"arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,128}")
 HOST_KEY = re.compile(r"ssh-ed25519 [A-Za-z0-9+/=]{60,100}")
 WINDOW_CLASSES = ("upgrade", "restart", "reboot", "deploy", "tailscale")
 JUDGE_SYSTEM = (
@@ -172,7 +174,10 @@ def validate_access(data):
         kind, _, name = key.partition(":")
         if kind not in tuple(door_providers.PROVIDERS) + ("model",) or (kind != "model" and not name):
             raise ValueError(f"credential {key!r} is not <provider>:<account> or model")
-        if not isinstance(c, dict) or not REF.fullmatch(str(c.get("secret", ""))):
+        if kind == "aws":       # no AWS key is stored: the door assumes the account's role with its bot's token
+            if not isinstance(c, dict) or "secret" in c or not ROLE.fullmatch(str(c.get("role", ""))):
+                raise ValueError(f"credential {key} names its role (arn:aws:iam::<account>:role/<name>) and no secret")
+        elif not isinstance(c, dict) or not REF.fullmatch(str(c.get("secret", ""))):
             raise ValueError(f"credential {key} names its secret by bws://<uuid>")
     seen = {hub["address"]: "the hub"}
     for name, a in (data.get("agents") or {}).items():
@@ -302,6 +307,7 @@ class Door:
         self.lock = threading.Lock()
         self.host_locks, self.business_locks = {}, {}
         self.access_cache = (None, None)
+        self.aws_sessions = {}          # each AWS role's session of an hour, in memory only (door_providers.aws_session)
 
     # ---- the files
     def access(self):
@@ -336,6 +342,17 @@ class Door:
 
     def minted(self, key_id):
         return key_id in read_json(MINTED_FILE, {})
+
+    def aws_token(self):
+        """The JWT-SVID of the door's own bot, which tbot renews; the door trades it at STS for a role's session."""
+        try:
+            with open(P(AWS_TOKEN_FILE), encoding="utf-8") as f:
+                token = f.read().strip()
+        except OSError:
+            token = ""
+        if not token:
+            raise door_providers.Stop(f"the door's bot has written no AWS token in {AWS_TOKEN_FILE}")
+        return token
 
     def keep_minted(self, answer):
         """A key that the door minted: its id goes in the minted list, and its secret into the door's own secrets,
@@ -381,7 +398,8 @@ class Door:
         if d.kind == "judged":
             allowed, why = self.judge(agent, access, d, op, args, content)
             if not allowed:
-                d = door_targets.refused(why, target=d.target)
+                d = door_targets.refused(why + (door_providers.AWS_COST if target.startswith("aws:") else ""),
+                                         target=d.target)
         sha = hashlib.sha256(json.dumps([target, op, args], sort_keys=True).encode() + (content or b"")).hexdigest()
         if d.kind == "refused":
             n = self.record.add(caller=agent, target=target, action=op, kind="refused", outcome="refused",
@@ -475,7 +493,7 @@ class Door:
         return {"credentials": dict((access.get("credentials") or {}).get(target) or {},
                                     owner=target.partition(":")[2]),
                 "http": self.http, "secret": self.secret, "keep": lambda kind, answer: self.keep_minted(answer),
-                "minted_secret": self.minted_secret,
+                "minted_secret": self.minted_secret, "aws_token": self.aws_token, "aws_sessions": self.aws_sessions,
                 "host": lambda host, op, args, stdin: self.ssh(access["hosts"][host],
                                                                {"v": 1, "op": op, "args": args}, stdin),
                 "run": lambda argv, stdin, env: run_program(argv, stdin, env)}
