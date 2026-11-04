@@ -108,6 +108,7 @@ install -d -m 0700 -o root -g root "$STATE"
 install -m 0755 -o root -g root "$HERE/ops-read" "$LIB/ops-read"
 install -m 0755 -o root -g root "$HERE/inventory" "$LIB/inventory"
 install -m 0644 -o root -g root "$HERE/release-key.pub" "$ETC/release-key.pub"
+[ ! -f "$HERE/early-key.pub" ] || install -m 0644 -o root -g root "$HERE/early-key.pub" "$ETC/early-key.pub"
 
 # ops-agent: no password and not locked (UsePAM no refuses a locked account), its login shell is ops-read, and it
 # reads the logs

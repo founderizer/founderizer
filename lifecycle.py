@@ -1257,10 +1257,12 @@ def skills_text(kit, agent):
 # a plain file (DATA_MODE). Any other move needs a release that a release key signed: its manifest on the ref as
 # RELEASE_FILE, a revision that descends from the one this checkout runs and from this user's floor, and a tree that is
 # that revision's own outside the data. The keys are the ones of the checkout's own HEAD, never the target's, so a
-# target cannot bring the key that signs it. The floor is the newest release this OS user took, kept in its ~/.fleet
+# target cannot bring the key that signs it, and both of its key files: a fleet that takes releases early took one that
+# the early key signed (releases.every_key). The floor is the newest release this OS user took, kept in its ~/.fleet
 # outside every checkout, so a checkout that was put back or cloned again is not a way to an older release.
 RELEASE_FILE = "release.json"       # the signed manifest of the release on the configuration ref (releases.Update)
 RELEASE_KEYS = "release-key.pub"    # releases.KEY_FILE, read at this checkout's own HEAD
+EARLY_KEYS = "early-key.pub"        # releases.EARLY_KEY_FILE, read there too
 FLOOR_FILE = "release-floor"        # in ~/.fleet: the newest release that this user's checkouts took
 # What the hub may write on the configuration ref: the owner's own files. knowledge/ is all of it, and not only
 # knowledge/owner/, because an agent writes the knowledge files its profile lists (hub.write_knowledge) and a file the
@@ -1376,7 +1378,7 @@ def may_take(kit, target, run=None, floor=None, head="HEAD"):
     """None when the checkout `kit` may move from `head` to `target`, else the one reason why it stays where it is.
 
     A move that changes data only (data_path) passes when each file it brings is a plain file. Any other move passes
-    only onto a release: `target` carries a release.json that a key of `head`'s release-key.pub signed, which is not
+    only onto a release: `target` carries a release.json that a key of `head`'s two key files signed, which is not
     held; its revision descends from the release that `head` runs and from the floor; and `target` is that revision's
     own tree outside the data. **A `head` with no release takes one that comes after the floor**: on a machine whose
     checkouts share one user (its agents and its server service), the first that took a signed release wrote the
@@ -1402,7 +1404,8 @@ def may_take(kit, target, run=None, floor=None, head="HEAD"):
     if text is None:
         return f"{new[:12]} changes Fleet's code and carries no signed release"
     try:
-        manifest = releases.check(json.loads(text), releases.parse_keys(_blob(kit, run, old, RELEASE_KEYS) or ""))
+        manifest = releases.check(json.loads(text), releases.parse_keys(_blob(kit, run, old, RELEASE_KEYS) or "")
+                                  + releases.parse_keys(_blob(kit, run, old, EARLY_KEYS) or ""))
     except ValueError:
         return f"the {RELEASE_FILE} of {new[:12]} cannot be read"
     except releases.Untrusted as e:

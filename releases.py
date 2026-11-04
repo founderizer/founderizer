@@ -12,9 +12,15 @@ costs nothing.
     Update(kit, manifest, origin=url).apply()       the update, with its own roll-back
 
 **The signature is the whole trust.** A manifest that no public key in the repository verifies is not read, not
-recorded and not applied. The private keys live only on the website (PRODUCT.md 4.2), so a hub can check a release
-and can never make one. The key file holds a set, so a key can be replaced without stranding a fleet that skipped
-the release which brought the new one (4.3, "How a signing key is replaced").
+recorded and not applied. The private keys live only on the owner's Mac and in the owner's own vault (PRODUCT.md
+4.3, "Who signs a release"), so a hub can check a release and can never make one. The key file holds a set, so a key
+can be replaced without stranding a fleet that skipped the release which brought the new one (4.3, "How a signing
+key is replaced").
+
+**Two tracks.** A fleet takes from the channel only a release that a key of KEY_FILE signed, which the owner signs
+with Touch ID, unless the fleet takes releases early (the hub's setting `releases.early`, the owner's own fleet):
+then it asks the channel for the early track and trusts the keys of EARLY_KEY_FILE too, which sign each release as
+it is published. A release that a fleet already took is checked against both files (every_key).
 
 **Nothing happens in the hub's own checkout until every check passed.** The merge, the released code's schema
 against a copy of this fleet's own database, `selftest.py` and `fleet.py verify` all run in a temporary clone,
@@ -61,6 +67,7 @@ DEFAULT_UPSTREAM = "https://github.com/miguelpieras/founderizer-fleet.git"
 REMOTE = "upstream"                 # PRODUCT.md 4.3: "every hub carries [it] as the git remote `upstream`"
 MOVED = "refs/founderizer/moved"    # where the clone keeps the ref's own tip when a push lost to it
 KEY_FILE = "release-key.pub"        # the release public keys, shipped in the repository beside this file
+EARLY_KEY_FILE = "early-key.pub"    # the keys of the early track, which a fleet that takes releases early trusts too
 ENTITLEMENT_KEY_FILE = "entitlement-key.pub"    # the entitlement public keys: another key, and its own file (4.2)
 
 CHANNEL_TIMEOUT = 10        # seconds for GET /releases/latest: a channel that does not answer changes nothing
@@ -190,7 +197,7 @@ def public_key(secret):
 
 
 def sign(secret, message):
-    """The 64-byte detached signature of `message`. Never called on a hub: the key lives only on the website."""
+    """The 64-byte detached signature of `message`. Never called on a hub: no hub holds a private key."""
     if not isinstance(secret, bytes) or len(secret) != 32:
         raise ValueError("an Ed25519 seed is 32 bytes")
     scalar, prefix = _expand(secret)
@@ -260,6 +267,13 @@ def parse_keys(text):
             return ()
         keys.append(key)
     return tuple(keys)
+
+
+def every_key(kit):
+    """The keys of both files, KEY_FILE and EARLY_KEY_FILE: what checks a release that a fleet already took
+    (lifecycle.may_take and the root copies of the check), because a fleet that takes releases early took one that
+    the early key signed. Which releases a fleet takes from the channel is the hub's own setting (hub.release_keys)."""
+    return read_keys(kit) + read_keys(kit, EARLY_KEY_FILE)
 
 
 def trusted(keys):
@@ -403,7 +417,7 @@ def _fetch(url, token=None, timeout=CHANNEL_TIMEOUT):
         return 0, str(getattr(e, "reason", e))[:300], {}
 
 
-def latest(channel, keys, token=None, *, fetch=_fetch, timeout=CHANNEL_TIMEOUT, revision=None):
+def latest(channel, keys, token=None, *, fetch=_fetch, timeout=CHANNEL_TIMEOUT, revision=None, early=False):
     """Poll the release channel once.
 
     Returns {"status", "manifest", "says", "entitlement"}: the manifest when one verified, else None with the one
@@ -411,8 +425,11 @@ def latest(channel, keys, token=None, *, fetch=_fetch, timeout=CHANNEL_TIMEOUT, 
     (4.5: "Near expiry the hub asks for a fresh one with the old one"). It never raises.
 
     With `revision` it asks for that one release, `GET /releases/<revision>`: the release that a newer one names as
-    its minimum (hub.poll_release). A manifest of any other revision is not taken."""
-    url = (channel or DEFAULT_CHANNEL).rstrip("/") + "/releases/" + (revision or "latest")
+    its minimum (hub.poll_release). A manifest of any other revision is not taken.
+
+    With `early` it asks for the early track (`?track=early`), whose releases the early key signs as they are
+    published; `keys` must then hold the early keys too, or every early release is refused."""
+    url = (channel or DEFAULT_CHANNEL).rstrip("/") + "/releases/" + (revision or "latest") + ("?track=early" if early else "")
     status, body, _headers = fetch(url, token, timeout)
     if status == 0:
         return {"status": 0, "manifest": None, "entitlement": None, "says": "the release channel did not answer: " + body}

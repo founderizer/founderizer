@@ -42,6 +42,7 @@ ROOT = ""                   # a prefix for every path below, which only the test
 ETC = "/etc/ops-root"
 MODE_FILE = ETC + "/mode"                   # fix | rule-only
 KEY_FILE = ETC + "/release-key.pub"         # the release keys, as release-key.pub of the repository
+EARLY_FILE = ETC + "/early-key.pub"         # and the early ones, as early-key.pub, when the bundle had them
 HIDDEN_FILE = ETC + "/hidden"               # this host's app trees and secret paths, one absolute path a line
 KIT_FILE = ETC + "/fleet-kit"               # a Fleet machine's checkout, whose root helper the form fleet-helper runs
 POOL_FILE = ETC + "/pool"                   # a CI host's pool volume (an LVM path) for grow-pool
@@ -995,8 +996,14 @@ def fire():
 # ---- a signed bundle from a release
 
 def release_keys():
+    """The keys of both files: a fleet that takes releases early runs a release that the early key signed. A file that
+    is not read whole gives no key, as releases.parse_keys reads one."""
+    return file_keys(KEY_FILE) + file_keys(EARLY_FILE)
+
+
+def file_keys(path):
     keys = []
-    for line in read(KEY_FILE).splitlines():
+    for line in read(path).splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
             try:

@@ -1,0 +1,11 @@
+# The Founderizer early release public key (PRODUCT.md 4.3, "Two tracks").
+#
+# The early key signs every release as it is published, with nobody pressing anything, for the fleets that take
+# each release first: the owner's own fleet, whose setting `releases.early` is on. Every other fleet takes a
+# release only once the approve key of release-key.pub signed it, which needs the owner's Touch ID. So only a fleet
+# with that setting asks the channel for early releases and trusts this file there; what a fleet already took is
+# checked against both files everywhere (lifecycle.may_take, the vault program, the door and ops-root).
+#
+# The private half is in the Secure Enclave of the owner's Mac and never leaves it. Same format as release-key.pub:
+# one base64 line for each 32-byte Ed25519 public key, at most four, and lines that start with # are for the reader.
+VxNkV9MNGrcPp62dGE9/mQjXsfgq7WAfWfnNzWSGZe4=

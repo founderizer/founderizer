@@ -49,6 +49,7 @@ install -d -m 0750 -o root -g door /etc/fleet-door
 install -d -m 0700 -o door -g door /var/lib/fleet-door /var/lib/fleet-door/ssh /var/lib/fleet-door/secrets
 install -d -m 0755 -o root -g root /opt/fleet-door
 install -m 0644 -o root -g root "$HERE/release-key.pub" /etc/fleet-door/release-key.pub
+[ ! -f "$HERE/early-key.pub" ] || install -m 0644 -o root -g root "$HERE/early-key.pub" /etc/fleet-door/early-key.pub
 
 # the door's own keys: made here, by its own user, and never copied anywhere
 [ -f /var/lib/fleet-door/vault.key ] || runuser -u door -- age-keygen -o /var/lib/fleet-door/vault.key 2>/dev/null

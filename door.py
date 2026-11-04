@@ -59,6 +59,7 @@ ACCESS_FILE = ETC + "/access.json"          # root writes it; the door's user re
 CONF_FILE = ETC + "/door.json"              # door.sh writes it: the address, the judge's limits
 HUB_FILE = ETC + "/hub.json"                # the SHA-256 of the hub's two secrets
 KEY_FILE = ETC + "/release-key.pub"         # the release keys, pinned at install
+EARLY_FILE = ETC + "/early-key.pub"         # and the early ones (releases.every_key), when the install had them
 FLOOR_FILE = ETC + "/floor"                 # the revision the door runs; update never moves below it
 RECORD_FILE = STATE + "/record.jsonl"
 REFUSED_FILE = STATE + "/refused.json"      # judged calls the model refused, by hash
@@ -1085,14 +1086,15 @@ def cmd_hub_secrets(args):
 
 
 def cmd_update(args):
-    """root: a signed release manifest on stdin. The release key pinned at install checks it, the floor refuses an
-    older revision, and the public repository is cloned at that revision beside the code that runs; then `current`
+    """root: a signed release manifest on stdin. The release keys pinned at install, of either file, check it (a fleet
+    that takes releases early runs one that the early key signed), the floor refuses an older revision, and the public repository is cloned at that revision beside the code that runs; then `current`
     points at it and the service starts again."""
     import releases
     if os.geteuid() != 0 and not os.environ.get("FLEET_DOOR_ROOT"):
         sys.exit("door.py update runs as root")
     try:
-        manifest = releases.check(json.loads(sys.stdin.read(65536)), releases.read_keys(P(ETC), "release-key.pub"))
+        manifest = releases.check(json.loads(sys.stdin.read(65536)), releases.read_keys(P(ETC), "release-key.pub")
+                                  + releases.read_keys(P(ETC), "early-key.pub"))
     except (ValueError, releases.Untrusted) as e:
         sys.exit(f"refused: {e}")
     revision = manifest["revision"]

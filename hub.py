@@ -25252,6 +25252,10 @@ SETTINGS = {
                                                      "seconds."),
     "checks.output_bytes": (16384, setting_int(1024, 1024 * 1024), "The largest output of one run of a check that "
                                                                    "prints lines, in bytes."),
+    # PRODUCT.md 4.3, "Two tracks": the owner's own fleet takes each release first, and every other fleet waits for
+    # the owner's approval of it (hub.release_keys)
+    "releases.early": (False, setting_bool, "This fleet takes each release as soon as it is published, signed by the "
+                                            "early key, before the owner approves it for every other fleet."),
 }
 
 
@@ -30390,8 +30394,12 @@ def release_keys():
     """The release public keys shipped in this checkout, a tuple, and empty when it carries none. Every key in the
     file is trusted, which is what lets one be replaced without stranding a fleet that skipped a release
     (PRODUCT.md 4.3, "How a signing key is replaced"). With none, every manifest is refused, which is the right
-    answer: a fleet that cannot check a release takes none."""
-    return releases.read_keys(kit_dir())
+    answer: a fleet that cannot check a release takes none.
+
+    A fleet whose setting `releases.early` is on trusts the early keys too, and only such a fleet: the channel's
+    early track is signed with no person there, and every other fleet takes only a release that the owner approved
+    with the keys of release-key.pub (PRODUCT.md 4.3, "Two tracks")."""
+    return releases.every_key(kit_dir()) if setting("releases.early") else releases.read_keys(kit_dir())
 
 
 def entitlement_keys():
@@ -30617,7 +30625,7 @@ def release_view(limit=RELEASE_ROWS):
     idle, busy = fleet_idle()
     checked = kv_get("releases_checked")
     return {"revision": kit_revision(), "branch": config_branch(), "channel": release_channel(),
-            "upstream": release_upstream(), "automatic": releases_automatic(),
+            "upstream": release_upstream(), "automatic": releases_automatic(), "early": setting("releases.early"),
             "have_release_key": bool(release_keys()), "idle": idle, "open_tasks": busy,
             "running": release_running(),
             "last_check": {"at": float(checked) if checked else None, "says": kv_get("releases_said") or None,
@@ -30658,6 +30666,7 @@ def poll_release(fetch=None):
     commit, COORDINATION.md "Readiness"). The rows are recorded oldest first, as the releases came."""
     token = entitlement_token()
     ask = {"fetch": fetch} if fetch else {}
+    ask["early"] = setting("releases.early")            # PRODUCT.md 4.3 "Two tracks": which track this fleet asks
     answer = releases.latest(release_channel(), release_keys(), token, **ask)
     chain, missed = [answer["manifest"]] if answer["manifest"] else [], None
     while chain and len(chain) < RELEASE_WALK and not chain[-1]["hold"] and chain[-1]["minimum"] and \

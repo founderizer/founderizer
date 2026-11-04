@@ -127,16 +127,18 @@ CENTRAL_UNIT = "/etc/systemd/system/fleet-vault-central.service"
 # by the root step of a machine (agent_helper) and never by a release, and the floor of the releases it took.
 RELEASE_CHECK = VAULT_LIB + "/releases.py"          # this checkout's releases.py, the one check of a release
 RELEASE_KEYS = VAULT_LIB + "/release-key.pub"       # the release keys that this machine pinned
+EARLY_KEYS = VAULT_LIB + "/early-key.pub"           # and the early ones: a fleet that takes releases early took one
 VAULT_FLOOR = VAULT_LIB + "/release-floor"          # the newest release whose vault.py the broker took
 RESERVED_USERS = (VAULT_USER, CENTRAL_USER)         # this machine's own users, which never become an agent's
 # The check itself, run by root as python3 -I -S with the root-owned copy first on its path: the revision of a
-# release.json that a pinned key signed, and nothing for one that is held or that no such key signed.
+# release.json that a pinned key of either file signed, and nothing for one that is held or that no such key signed.
 VAULT_CHECK = ("import json, sys\n"
                "sys.path.insert(0, sys.argv[1])\n"
                "import releases\n"
                "try:\n"
                "    with open(sys.argv[2], encoding='utf-8') as f:\n"
-               "        m = releases.check(json.load(f), releases.read_keys(sys.argv[1]))\n"
+               "        m = releases.check(json.load(f), releases.read_keys(sys.argv[1])\n"
+               "                           + releases.read_keys(sys.argv[1], 'early-key.pub'))\n"
                "except (ValueError, releases.Untrusted) as e:\n"
                "    sys.exit('fleet-vault-program: the release on the configuration ref is refused: ' + str(e))\n"
                "if m['hold']:\n"
@@ -574,14 +576,15 @@ def sudoers_text(service_user):
                 "group": AGENT_GROUP, "user": service_user, "helper": HELPER, "vault": VAULT_UPDATE}
 
 
-def helper_install_script(helper_from, vault_from, sudoers_from, check_from, keys_from):
+def helper_install_script(helper_from, vault_from, sudoers_from, check_from, keys_from, early_from):
     """The shell that puts the group, the two root helpers, the sudoers file and the root-owned copies of the release
-    check and the release keys in place. `visudo -c` reads the new file before it is moved in, because a file that sudo
+    check and of both release key files in place. `visudo -c` reads the new file before it is moved in, because a file that sudo
     cannot parse takes sudo away from the whole machine."""
     return ("groupadd -f %(group)s\n"
             "install -d -o root -g root -m 755 %(lib)s\n"
             "install -o root -g root -m 644 %(check_from)s %(check)s\n"
             "install -o root -g root -m 644 %(keys_from)s %(keys)s\n"
+            "install -o root -g root -m 644 %(early_from)s %(early)s\n"
             "install -o root -g root -m 755 %(helper_from)s %(helper)s\n"
             "install -o root -g root -m 755 %(vault_from)s %(vault)s\n"
             "visudo -cqf %(sudoers_from)s\n"
@@ -590,7 +593,8 @@ def helper_install_script(helper_from, vault_from, sudoers_from, check_from, key
                 "vault_from": shlex.quote(vault_from), "vault": VAULT_UPDATE,
                 "sudoers_from": shlex.quote(sudoers_from), "sudoers": SUDOERS, "lib": VAULT_LIB,
                 "check_from": shlex.quote(check_from), "check": RELEASE_CHECK,
-                "keys_from": shlex.quote(keys_from), "keys": RELEASE_KEYS}
+                "keys_from": shlex.quote(keys_from), "keys": RELEASE_KEYS,
+                "early_from": shlex.quote(early_from), "early": EARLY_KEYS}
 
 
 def agent_helper(service_user="fleet", repo=None, check=False, run=None, read=None, kit=KIT):
@@ -616,9 +620,10 @@ def agent_helper(service_user="fleet", repo=None, check=False, run=None, read=No
     # DevOps plan 0.3: the vault program checks a release with root's own copies of this checkout's check and keys
     release_check = pathlib.Path(kit, "releases.py").read_text(encoding="utf-8")
     release_keys = pathlib.Path(kit, "release-key.pub").read_text(encoding="utf-8")
+    early_keys = pathlib.Path(kit, releases.EARLY_KEY_FILE).read_text(encoding="utf-8")
     try:
         there = read(HELPER) == helper and read(VAULT_UPDATE) == vault and read(SUDOERS) == sudoers and \
-            read(RELEASE_CHECK) == release_check and read(RELEASE_KEYS) == release_keys
+            read(RELEASE_CHECK) == release_check and read(RELEASE_KEYS) == release_keys and read(EARLY_KEYS) == early_keys
     except OSError:
         there = False
     if there:
@@ -634,11 +639,13 @@ def agent_helper(service_user="fleet", repo=None, check=False, run=None, read=No
     folder = tempfile.mkdtemp(prefix="fleet-agent-helper-")
     try:
         one, two = os.path.join(folder, "fleet-agent-user"), os.path.join(folder, "fleet-vault-program")
-        three, four, five = (os.path.join(folder, name) for name in ("sudoers", "releases.py", "release-key.pub"))
-        for path, text in ((one, helper), (two, vault), (three, sudoers), (four, release_check), (five, release_keys)):
+        three, four, five, six = (os.path.join(folder, name) for name in ("sudoers", "releases.py", "release-key.pub",
+                                                                          releases.EARLY_KEY_FILE))
+        for path, text in ((one, helper), (two, vault), (three, sudoers), (four, release_check), (five, release_keys),
+                           (six, early_keys)):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(text)
-        code, out, err = run(helper_install_script(one, two, three, four, five))
+        code, out, err = run(helper_install_script(one, two, three, four, five, six))
         if code != 0:
             raise Stop(f"the root helpers of this machine's agents and its vault broker could not be put in place: "
                        f"{(err or out).strip()[-300:]}")
@@ -1196,7 +1203,7 @@ def kit_clone(hub_user="fleet", source=None, root_kit=None, checkout=None, git=N
         raise Stop(f"the hub's checkout {checkout} carries no {RELEASE_FILE} that can be read, so no release is signed "
                    f"for it yet: the hub writes one with the release it takes") from None
     there = os.path.isdir(os.path.join(root_kit, ".git"))
-    trusted = releases.read_keys(root_kit) if there else (keys if keys is not None else releases.read_keys(KIT))
+    trusted = releases.every_key(root_kit) if there else (keys if keys is not None else releases.every_key(KIT))
     try:
         manifest = releases.check(raw, trusted)
     except releases.Untrusted as e:

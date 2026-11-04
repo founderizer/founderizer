@@ -1,8 +1,9 @@
-# The Founderizer release public keys (PRODUCT.md 4.2 and 4.3).
+# The Founderizer release public keys (PRODUCT.md 4.2 and 4.3): the keys that sign a release for every fleet.
 #
-# One base64 line for each 32-byte Ed25519 public key, and lines that start with # are for the reader. The private
-# halves live only on the website host that issues releases, and never on a hub: a fleet can check a release and
-# can never make one.
+# One base64 line for each 32-byte Ed25519 public key, and lines that start with # are for the reader. No private
+# half is on any server or hub: the approve key is in the Secure Enclave of the owner's Mac and signs only after the
+# owner's Touch ID, and the spare is in the owner's own password manager. A fleet can check a release and can never
+# make one. A fleet that takes each release early trusts the keys of early-key.pub as well.
 #
 # **This file holds a set, and every key in it is trusted.** That is what makes a key replaceable: the release
 # that brings the next key is signed with the key it replaces, every release after it is signed with the new one,
@@ -11,12 +12,8 @@
 # At most four lines; a line that is not a 32-byte key makes the whole file carry nothing, because a key file that
 # is half read is a mistake and a fleet that cannot say which keys it trusts takes no release.
 #
-# The first release must publish **two** keys: the one that signs it and a spare whose private half is kept off
-# the website host. Without that spare, a lost private key ends the update path of every fleet in the field, and
-# the only way out is a console on each customer's machine.
-#
-# This file carries no key yet, because P7 (the shop and the channel) makes the key pairs on that host and commits
-# the public halves here. Until then `releases.read_keys` answers an empty set, every manifest is refused with
-# "this checkout carries no release key", and no fleet can be updated from the channel. That is the safe state,
-# not a gap: a fleet that cannot check a release takes none.
+# The lines, in order: the website's old key, which signs nothing after this release and which the next release
+# removes; the approve key; the spare, which signs the release that replaces a lost key.
 Rx2H3IQWLleJlIx+4x2ckg0JN4d+CGjfF0Zkeon6vmg=
+8Gc80zgZcWqA7nX3+lChW09v2cOSi0lfjf4OzFiY2Ao=
+pQ2RwJ1nL5KXI7dv6Pt71GHMqk61hMA0NQmPUwlSFiY=
