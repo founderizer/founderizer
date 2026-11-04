@@ -25253,7 +25253,7 @@ SETTINGS = {
                       "Session reuse (on), its growth factor (growth) and its margin in seconds (margin): a standing "
                       "session is told of a new message only while its cache is warm, its context has grown by at "
                       "most the growth factor and there is room before compaction; otherwise it starts again with "
-                      "the hub's brief."),
+                      "the hub's brief. A task's own session is not started again for its growth alone."),
     # AUTONOMY.md P10 (lane L2): what a closed conversation runs on, whatever the agent's own runtime is
     "conversations.closed_runtime": (CLOSED_RUNTIMES[0], closed_runtime_check,
                                      "The runtime that runs a closed conversation (a role with tools off), for every "

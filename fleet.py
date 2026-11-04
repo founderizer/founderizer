@@ -4140,19 +4140,23 @@ class Helper:
             typed = time.time() - (time.monotonic() - self.typed_at.get(window, float("-inf")))
             seen = seen[:2] + (max(seen[2], typed),) + seen[3:]
         team = checkout_team()
+        settings = reuse_settings(team)
+        if re.fullmatch(r"T-\d+", window):
+            # The owner, 4 November 2026: a task's session grows with its work, and a fresh one did that work again.
+            settings = dict(settings, growth=None)
         reuse, why = session_reuse(runtime, seen,
                                    dict(started_runs(start, runtime), account=account or None)
                                    if start.strip() else None,
                                    dict(self.runs(), runtime=runtime, account=account_now(self.agent, runtime)),
-                                   reuse_settings(team), facts=facts_now(team, runtime))
+                                   settings, facts=facts_now(team, runtime))
         return reuse, why, int(attempt)
 
     def fresh_task(self, target, window):
         """True when the hub started this task window's task fresh (plan P9.10, helper feature fresh_tasks): the
-        session reuse rule found its session cold, grown past its start or on another runtime, model, effort or
-        account, and the hub made a new attempt with its short brief, whose start replaces this window at the next
-        poll. Between two turns of a terminal session only; anything unknown, and a refusal of the hub, tells the
-        session as before."""
+        session reuse rule found its session cold, without room before its compaction or on another runtime, model,
+        effort or account (its growth alone is no reason), and the hub made a new attempt with its short brief, whose
+        start replaces this window at the next poll. Between two turns of a terminal session only; anything unknown,
+        and a refusal of the hub, tells the session as before."""
         decided = self.window_reuse(target, window)
         if decided is None or decided[0]:
             return False

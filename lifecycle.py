@@ -437,7 +437,8 @@ RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manage
 
 # The session reuse rule (AUTONOMY.md P9.10) and its setting (section 4), one object in team.json "settings":
 # "session_reuse": {"on", "growth", "margin"} -- on, the growth factor of a context since its start, and the margin in
-# seconds before the provider's cache lifetime ends. hub.SETTINGS checks the owner's value (reuse_value).
+# seconds before the provider's cache lifetime ends. hub.SETTINGS checks the owner's value (reuse_value). A task's own
+# session is not started again for its growth (fleet.Helper.window_reuse; the owner, 4 November 2026).
 REUSE_SETTINGS = {"on": True, "growth": 2, "margin": 60}
 REUSE_LIMITS = {"growth": (1, 10), "margin": (0, 3600)}
 REUSE_ROOM = 0.8                # the share of the compaction point that a reused session's context may fill
@@ -485,7 +486,8 @@ def session_reuse(runtime, context, started, now_runs, settings=None, at=None, f
     None), or None for a session that made no call yet, which has no context to read again. started and now_runs:
     {"runtime", "model", "effort", "account"} that it started with and that the agent has now; started is None when its
     start cannot be read, and then nothing is compared; an account that either of them does not name is not compared.
-    facts: the runtime's facts as the owner set them (facts_now), else the table's."""
+    facts: the runtime's facts as the owner set them (facts_now), else the table's. A growth of None in settings makes
+    growth no reason: a task's own session grows with its work."""
     settings = dict(REUSE_SETTINGS, **(settings or {}))
     if not settings["on"]:
         return True, ""
@@ -504,7 +506,7 @@ def session_reuse(runtime, context, started, now_runs, settings=None, at=None, f
     if lifetime is not None and idle > lifetime - settings["margin"]:
         return False, (f"its cache is cold after {idle / 60:.0f} quiet minutes, and a new session costs only its "
                        f"start")
-    if first and tokens > settings["growth"] * first:
+    if settings["growth"] and first and tokens > settings["growth"] * first:
         return False, f"its context grew from {first // 1000}K to {tokens // 1000}K tokens since its start"
     room = facts.get("compact_tokens")
     if room and tokens > REUSE_ROOM * room:
