@@ -71,6 +71,7 @@ AWS_TOKEN_FILE = "/opt/machine-id/jwt_svid"  # the door's own Teleport bot write
 APPROVALS_FILE = STATE + "/approvals.json"  # the owner's signed yeses for exact judged calls, from the hub
 APPROVED_FILE = STATE + "/approved.json"    # the yeses that were used: each lets its one call through once
 APPROVAL_DAYS = 7                           # a signed yes older than this lets nothing through
+DEVICES_FILE = STATE + "/devices.json"      # the owner's phones whose signing key his owner key certified
 UPSTREAM = "https://github.com/miguelpieras/founderizer-fleet.git"
 JUDGE_URL = "https://api.anthropic.com/v1/messages"
 JUDGE_VERSION = "2026-10-21"
@@ -245,11 +246,37 @@ def validate_access(data):
     return data
 
 
-def approval(access, statement, signature):
+def device_keys(access, items):
+    """{device: key} of the owner's phones whose signing key his owner key certified: {v: 1, kind: "owner-device",
+    fleet, device, key, at} in its canonical form, signed by one of the owner keys of the access file. The hub serves
+    the phones of now, so a removed phone's certificate goes with it: the hub can hold one back and forge none."""
+    keys, fleet, out = access.get("owner_keys"), access.get("fleet"), {}
+    for item in (items or [])[:20] if keys and fleet else []:
+        statement = item.get("statement") if isinstance(item, dict) else None
+        try:
+            said = json.loads(statement) if isinstance(statement, str) else None
+        except (ValueError, RecursionError):
+            said = None
+        if not isinstance(said, dict) or set(said) != {"v", "kind", "fleet", "device", "key", "at"} or \
+                vault.canonical(said) != statement or said["kind"] != "owner-device" or said["fleet"] != fleet or \
+                type(said["v"]) is not int or said["v"] != 1 or not NAME.fullmatch(str(said["device"])) or \
+                type(said["at"]) is not int:
+            continue
+        try:
+            vault.owner_key(said["key"])
+        except ValueError:
+            continue
+        if vault.owner_signed({"owner_keys": keys}, statement, item.get("signature")):
+            out[said["device"]] = said["key"]
+    return out
+
+
+def approval(access, statement, signature, devices=None):
     """(call, need) of the owner's signed yes to one exact call, or None. The statement is {v: 1, kind: "door-call",
     fleet, need, call, at} in its canonical form: of this fleet, at most APPROVAL_DAYS old, and signed by one of the
-    owner keys of the access file, with the central vault's own check. call is the call's hash, which the door gave
-    with its refusal; need is the Needs-you item that took it to him."""
+    owner keys of the access file, with the central vault's own check, or by one of his phones' certified keys
+    (device_keys). call is the call's hash, which the door gave with its refusal; need is the Needs-you item that took
+    it to him."""
     keys, fleet = access.get("owner_keys"), access.get("fleet")
     if not keys or not fleet or not isinstance(statement, str) or not isinstance(signature, str):
         return None
@@ -265,7 +292,8 @@ def approval(access, statement, signature):
             said["need"] < 1 or type(said["at"]) is not int or \
             not now() - APPROVAL_DAYS * 86400 <= said["at"] <= now() + 300:
         return None
-    if not vault.owner_signed({"owner_keys": keys}, statement, signature):
+    if not vault.owner_signed({"owner_keys": keys}, statement, signature) and \
+            not (devices and vault.owner_signed({"owner_keys": sorted(devices.values())}, statement, signature)):
         return None
     return said["call"], said["need"]
 
@@ -399,7 +427,8 @@ class Door:
         """The owner's signed yes to this exact call, now used, or None: each yes lets its one call through once."""
         with self.lock:
             entry = read_json(APPROVALS_FILE, {}).get(sha)
-            if not isinstance(entry, dict) or approval(access, entry.get("statement"), entry.get("signature")) is None:
+            if not isinstance(entry, dict) or approval(access, entry.get("statement"), entry.get("signature"),
+                                                       read_json(DEVICES_FILE, {})) is None:
                 return None
             used = read_json(APPROVED_FILE, {})
             key = hashlib.sha256(entry["statement"].encode()).hexdigest()
@@ -1013,12 +1042,15 @@ def fetch_approvals(door):
                                {"X-Fleet-Client": "door"}, None)
     if status != 200 or not isinstance(answer, dict) or not isinstance(answer.get("approvals"), list):
         return 0
+    devices = device_keys(access, answer.get("devices") if isinstance(answer.get("devices"), list) else [])
     kept = {}
     for item in answer["approvals"][:200]:
-        found = approval(access, item.get("statement"), item.get("signature")) if isinstance(item, dict) else None
+        found = approval(access, item.get("statement"), item.get("signature"), devices) \
+            if isinstance(item, dict) else None
         if found:
             kept[found[0]] = {"need": found[1], "statement": item["statement"], "signature": item["signature"]}
     with door.lock:
+        write_json(DEVICES_FILE, devices)
         write_json(APPROVALS_FILE, kept)
     return len(kept)
 

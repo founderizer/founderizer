@@ -49,6 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from usage import IDENTITY_CHANGED, IDENTITY_ERRORS, SIGN_IN_REQUIRED, local_model, validate_usage
 from lifecycle import EDITABLE_FACTS, TOKEN_KINDS, facts_now, token_price     # AUTONOMY.md P8, P10: lane L7
+from vault import owner_signed      # owner feature door_calls: a phone's yes, with the central vault's own check
 import wakeups
 from desktop import Frames
 import google
@@ -330,6 +331,10 @@ CREATE TABLE IF NOT EXISTS owner_device_codes(id INTEGER PRIMARY KEY, device TEX
   created REAL NOT NULL, expires REAL NOT NULL, used REAL);
 CREATE TABLE IF NOT EXISTS owner_device_tries(id INTEGER PRIMARY KEY, device TEXT NOT NULL, ts REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS owner_device_contacts(device TEXT PRIMARY KEY, ts REAL NOT NULL, auth TEXT);
+-- DevOps plan 5.4 (owner feature door_calls): a phone's own signing key, which it sends at enrollment with the HMAC
+-- of the one-time value in the Mac's QR, and the owner key's certificate of it, which the Mac signs.
+CREATE TABLE IF NOT EXISTS owner_device_signing(device TEXT PRIMARY KEY, key TEXT NOT NULL, binding TEXT NOT NULL,
+  created REAL NOT NULL, statement TEXT, signature TEXT);
 -- Pings to the owner's devices (MOBILE-APP.md 9, owner feature push): the push token that each device gave, with its
 -- seal key (sealed_push, a column that migrate adds), and one row for each ping. A ping row holds no text, and it is
 -- sent once: queued, sending, then sent, failed, skipped or unknown.
@@ -891,9 +896,55 @@ def hide_device_code(result):
     return dict(result, code=None)
 
 
-def enroll_device(device, code):
+def device_signing(form):
+    """The phone's own signing key and the HMAC that binds it to the one-time value of the Mac's QR (owner feature
+    door_calls), from its enrollment, or None. Both come, or neither."""
+    key, binding = form.get("signing_key"), form.get("binding")
+    if key is None and binding is None:
+        return None
+    try:
+        raw, mac = base64.b64decode(key, validate=True), base64.b64decode(binding, validate=True)
+    except (TypeError, ValueError):
+        raise Refusal(400, "signing_key and binding are base64") from None
+    if len(raw) != 65 or raw[0] != 4 or len(mac) != 32:
+        raise Refusal(400, "signing_key is an uncompressed P-256 point and binding an HMAC-SHA256")
+    return {"key": key, "binding": binding}
+
+
+def certify_device(device, statement, signature):
+    """POST /ui/owner/devices/<device>/certify: the owner key's certificate of a phone's signing key, {v: 1, kind:
+    "owner-device", fleet, device, key, at} in its canonical form, for the key that this phone sent at enrollment.
+    The door checks the signature; the hub keeps the certificate and serves it to the door (door_approvals)."""
+    row = q1("SELECT key FROM owner_device_signing WHERE device=?", (device,))
+    if not row:
+        raise Refusal(404, "this device sent no signing key at its enrollment")
+    try:
+        said = json.loads(statement)
+    except (ValueError, RecursionError):
+        said = None
+    if not isinstance(said, dict) or set(said) != {"v", "kind", "fleet", "device", "key", "at"} or \
+            json.dumps(said, sort_keys=True, separators=(",", ":"), ensure_ascii=False) != statement or \
+            said["v"] != 1 or said["kind"] != "owner-device" or said["device"] != device or \
+            said["key"] != row["key"] or said["fleet"] != kv_get("fleet_id"):
+        raise Refusal(400, "the statement is not the owner's certificate of this phone's key")
+    q("UPDATE owner_device_signing SET statement=?, signature=? WHERE device=?", (statement, signature, device))
+    log("owner", f"certified the signing key of the owner device {device}")
+    return {"device": device, "certified": True}
+
+
+def phone_signed(device, statement, signature):
+    """True when this phone's own signing key signed the statement and the owner's Mac certified that key (owner
+    feature door_calls). The door counts a phone's yes only through that certificate, so the hub records no other:
+    a key that the Mac has not certified yet, or one that the phone replaced, would let nothing through."""
+    row = q1("SELECT key FROM owner_device_signing WHERE device=? AND statement IS NOT NULL", (device,))
+    return bool(row) and owner_signed({"owner_keys": [row["key"]]}, statement, signature)
+
+
+def enroll_device(device, code, signing=None):
     """POST /ui/owner/enroll, from the device's own address: one unused code gives one key, once. The hub keeps only
-    the SHA-256, and a new key replaces the device's old one. A lost answer burns the code: make another one."""
+    the SHA-256, and a new key replaces the device's old one. A lost answer burns the code: make another one. A phone's
+    own signing key (device_signing) replaces its old one, which loses its certificate; an enrollment with none drops
+    it."""
     raw = re.sub(r"[^A-Z0-9]", "", code.upper()) if isinstance(code, str) else ""
     t0, key = now(), None
     if q1("SELECT COUNT(*) n FROM owner_device_tries WHERE device=? AND ts>?", (device, t0 - 3600))["n"] >= DEVICE_TRIES:
@@ -908,6 +959,13 @@ def enroll_device(device, code):
                        "ON CONFLICT(device) DO UPDATE SET sha256=excluded.sha256, created=excluded.created, "
                        "last_seen=NULL", (device, hashlib.sha256(key.encode()).hexdigest(), t0))
             DB.execute("DELETE FROM owner_device_tries WHERE device=?", (device,))
+            if signing:
+                DB.execute("INSERT INTO owner_device_signing(device,key,binding,created) VALUES(?,?,?,?) "
+                           "ON CONFLICT(device) DO UPDATE SET key=excluded.key, binding=excluded.binding, "
+                           "created=excluded.created, statement=NULL, signature=NULL",
+                           (device, signing["key"], signing["binding"], t0))
+            else:
+                DB.execute("DELETE FROM owner_device_signing WHERE device=?", (device,))
     if key is None:                   # the record of a wrong code comes after the transaction, which rolls back
         ins("INSERT INTO owner_device_tries(device,ts) VALUES(?,?)", (device, t0))
         raise Refusal(403, "that code is not valid")
@@ -915,7 +973,7 @@ def enroll_device(device, code):
     return {"device": device, "label": owner_devices()[device]["label"], "key": key, "since": t0}
 
 
-def enroll_new_device(address, code):
+def enroll_new_device(address, code, signing=None):
     """POST /ui/owner/enroll from an address that no owner device has (device_by_code): the open code for a new phone
     adds it to team.json as "iPhone" (then "iPhone 2", ...) with the address it calls from, and then gives its key as
     enroll_device does. validate_team refuses the address of a machine of the fleet, so no agent's machine becomes an
@@ -942,7 +1000,7 @@ def enroll_new_device(address, code):
     save_integration(None, change, f"Owner added the device {device} with a code")
     q("UPDATE owner_device_codes SET device=? WHERE id=?", (device, row["id"]))
     q("DELETE FROM owner_device_tries WHERE device=?", (tries,))
-    return enroll_device(device, code)
+    return enroll_device(device, code, signing)
 
 
 def save_owner_device(body):
@@ -970,7 +1028,7 @@ def save_owner_device(body):
     if body.get("delete"):
         with transaction():
             for table in ("owner_devices", "owner_device_codes", "owner_device_tries", "owner_device_contacts",
-                          "owner_device_push"):
+                          "owner_device_push", "owner_device_signing"):
                 DB.execute(f"DELETE FROM {table} WHERE device=?", (device,))
     return dict(result, device=device, deleted=bool(body.get("delete")))
 
@@ -985,11 +1043,14 @@ def device_rows(source):
         row = q1("SELECT last_seen FROM owner_devices WHERE device=?", (name,))
         seen = q1("SELECT ts, auth FROM owner_device_contacts WHERE device=?", (name,))
         pings = q1("SELECT 1 FROM owner_device_push WHERE device=?", (name,))
+        signing = q1("SELECT key, binding, statement FROM owner_device_signing WHERE device=?", (name,))
         out.append({"device": name, "label": d["label"], "address": d["address"], "key": key is not None,
                     "since": key["created"] if key else None, "last_seen": row["last_seen"] if row else None,
                     "last_contact": seen["ts"] if seen else None, "last_answer": seen["auth"] if seen else None,
                     "code_expires": code["expires"] if code else None, "this_device": d["address"] == source,
-                    "push": pings is not None})
+                    "push": pings is not None, "signing_key": signing["key"] if signing else None,
+                    "binding": signing["binding"] if signing else None,
+                    "certified": bool(signing and signing["statement"])})
     return out
 
 
@@ -1151,6 +1212,7 @@ def need_view(row):
     call that his yes lets through once, which the app signs (door_call_statement); his signed yes stays out."""
     view = dict(row, options=need_options(row), secret=need_secret(row))
     view.pop("approval", None)
+    view["door_fleet"] = kv_get("fleet_id") if view.get("door_call") else None   # what a phone's statement names
     return view
 
 
@@ -28958,7 +29020,11 @@ def door_approvals(src):
         raise Refusal(403, "this is the door's route")
     rows = q("SELECT id, approval FROM needs WHERE approval IS NOT NULL AND answered > ? ORDER BY id",
              (now() - DOOR_APPROVAL_DAYS * 86400,))
-    return {"approvals": [dict(json.loads(r["approval"]), need=r["id"]) for r in rows]}
+    phones, devices = q("SELECT device, statement, signature FROM owner_device_signing WHERE statement IS NOT NULL "
+                        "ORDER BY device"), owner_devices()
+    return {"approvals": [dict(json.loads(r["approval"]), need=r["id"]) for r in rows],
+            "devices": [{"device": r["device"], "statement": r["statement"], "signature": r["signature"]}
+                        for r in phones if r["device"] in devices]}
 
 
 def door_fetched(src, copy, digest):
@@ -31085,6 +31151,21 @@ class Handler(BaseHTTPRequestHandler):
         return self.ui_command(f"owner/devices/{device}/code", read, lambda body: new_device_code(device),
                                keep=hide_device_code)
 
+    def ui_owner_device_certify(self, device):
+        """POST /ui/owner/devices/<device>/certify (owner feature door_calls): the owner key's certificate of that
+        phone's signing key, which the owner's Mac signs once the HMAC of its QR's one-time value matched the key. A
+        phone cannot call it: its one write under /ui/owner/devices is its push token."""
+        def read(data):
+            self.only(data, ("statement", "signature"))
+            if not ENTRY_ID.fullmatch(device):
+                raise ValueError("device must be a name of 2 to 31 characters: a-z, 0-9 and -")
+            if not isinstance(data.get("statement"), str) or not isinstance(data.get("signature"), str) or \
+                    len(data["statement"]) > 2048 or len(data["signature"]) > 512:
+                raise ValueError("statement and signature are the owner's certificate of the phone's key")
+            return {"statement": data["statement"], "signature": data["signature"]}
+        return self.ui_command(f"owner/devices/{device}/certify", read,
+                               lambda body: certify_device(device, body["statement"], body["signature"]))
+
     def ui_owner_device_push(self, device):
         """POST /ui/owner/devices/<device>/push (owner feature push): the phone's push token, from that phone itself,
         and its own key for what a ping says (sealed_push). The owner's Mac has no push token, and one device never
@@ -31125,11 +31206,12 @@ class Handler(BaseHTTPRequestHandler):
         if len(self.body()) > 4096:
             return self.json(413, {"error": "request is too large"})
         try:
+            signing = device_signing(self.form())      # checked first, so that a wrong one burns no code
             if device is None:          # a phone that the owner's Mac added with a code alone (device_by_code)
                 with LOCK:
-                    result = enroll_new_device(self.client_address[0], self.form().get("code"))
+                    result = enroll_new_device(self.client_address[0], self.form().get("code"), signing)
             else:
-                result = enroll_device(device, self.form().get("code"))
+                result = enroll_device(device, self.form().get("code"), signing)
         except Refusal as e:
             return self.json(e.status, {"error": str(e)})
         return self.json(200, result, {"Cache-Control": "no-store"})
@@ -33675,9 +33757,11 @@ class Handler(BaseHTTPRequestHandler):
                                                                "statement")
                     if wrong:
                         return self.json(400, {"error": wrong})
-                elif choice == 0 and ("door_call" in need.keys() and need["door_call"]):
-                    # a yes that lets a door call through counts only when the owner key signed it: unsigned, it is
-                    # not recorded, and the item stays open
+                phone = owner_device_at(self.client_address[0]) if yes is not None else None
+                if choice == 0 and ("door_call" in need.keys() and need["door_call"]) and \
+                        (yes is None or phone is not None and not phone_signed(phone, yes, signed)):
+                    # a yes that lets a door call through counts only when the owner key signed it, or a phone's own
+                    # key that the Mac certified (phone_signed): otherwise it is not recorded, and the item stays open
                     return self.json(409, {"error": "This yes lets a door call through, so it needs the signature of "
                                                     "the owner key on the Mac. Answer it in Founderizer on the Mac."})
                 if choice is not None:      # the owner pressed a button: its own words become the answer
@@ -35216,6 +35300,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_owner_device_code(parts[3])
         if len(parts) == 5 and parts[:3] == ["ui", "owner", "devices"] and parts[4] == "push":
             return self.ui_owner_device_push(parts[3])
+        if len(parts) == 5 and parts[:3] == ["ui", "owner", "devices"] and parts[4] == "certify":
+            return self.ui_owner_device_certify(parts[3])
         if parts == ["ui", "owner", "enroll"]:
             return self.ui_owner_enroll()
         if parts == ["bridge", "inbound"]:

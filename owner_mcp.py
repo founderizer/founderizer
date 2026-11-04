@@ -100,6 +100,8 @@ NOT_TOOLS = {
                          "writes the door's access file over the owner's own SSH (DevOps plan C4)",
     "/ui/vault/recovery": "a statement signed with the owner's own key, which only their app on their Mac holds",
     "/ui/vault/grant": "a statement signed with the owner's own key, which only their app on their Mac holds",
+    "/ui/owner/devices/{}/certify": "a statement signed with the owner's own key, which only their app on their Mac "
+                                    "holds, once the phone's key matches the one-time value of that app's QR",
     "/ui/restore": "a whole fleet restored over this one, from a file this server would have to carry",
     "/ui/owner/devices/{}/push": "the phone's own push token, which the route takes from the phone only",
     "/ui/owner/enroll": "the phone's own call, before it has a key",
