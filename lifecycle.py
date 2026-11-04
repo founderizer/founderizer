@@ -834,9 +834,14 @@ def offer_extension(home):
 
 def chrome_extension(home):
     """Claude's extension, from each Chrome profile's own record: True when a profile has it on, False when it is
-    there and off, None when no profile has it. A newer Chrome keeps only the reasons it is off."""
+    there and off, None when no profile has it or macOS will not list Chrome's folder (4 November 2026: after an
+    update it refused the server service, which then stopped). A newer Chrome keeps only the reasons it is off."""
     chrome, found = os.path.join(home, "Library", "Application Support", "Google", "Chrome"), None
-    for profile in os.listdir(chrome) if os.path.isdir(chrome) else ():
+    try:
+        profiles = os.listdir(chrome) if os.path.isdir(chrome) else ()
+    except OSError:
+        return None
+    for profile in profiles:
         try:
             with open(os.path.join(chrome, profile, "Secure Preferences"), encoding="utf-8") as f:
                 entry = json.load(f)["extensions"]["settings"][CLAUDE_EXTENSION]
