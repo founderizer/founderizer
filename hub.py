@@ -3024,11 +3024,13 @@ def fresh_refusal(t, attempt):
 def fresh_attempt(t, why):
     """Start the task of row `t` once more in a new session (plan P9.10): its start is the hub's short brief of what
     the attempt before it did (attempt_event), and its unread messages wait for it, the owner's steers included
-    (carry_steers). Not a restart that counts, because nothing was lost. Check fresh_refusal first. Returns the new
-    attempt."""
-    new_attempt(t, FRESH_REASON, note=f"Its session was {why}, so this session starts fresh, with what the attempt "
-                                      f"before it did.")
-    log("hub", f"{tref(t['id'])} starts fresh in attempt {t['attempt'] + 1}: its session was {why}")
+    (carry_steers). Not a restart that counts, because nothing was lost. Check fresh_refusal first. why: what the
+    reuse rule said of that session, a clause from lifecycle.session_reuse ("its cache is cold after ..."), or a state
+    from an older helper or none ("cold"). Returns the new attempt."""
+    why = why if why.split(" ", 1)[0] in ("it", "its") else f"it was {why}"
+    new_attempt(t, FRESH_REASON, note=f"The session before this one was not used again, because {why}. This session "
+                                      f"starts fresh, with what the attempt before it did.")
+    log("hub", f"{tref(t['id'])} starts fresh in attempt {t['attempt'] + 1}, because {why}")
     return t["attempt"] + 1
 
 
@@ -4070,7 +4072,8 @@ def warm_follows(follows):
 
 def warm_attempt(t):
     """The opening of a new session of the same task, after a lost one, a usage limit or restart_task: what the
-    attempt before it did. Rule 9 becomes a thing the agent is handed, not a thing it must reconstruct."""
+    attempt before it did, and the last words its session said. Rule 9 becomes a thing the agent is handed, not a
+    thing it must reconstruct."""
     attempt = t["attempt"]
     notes = attempt_notes(t["id"], attempt)
     if notes:
@@ -4095,6 +4098,11 @@ def warm_attempt(t):
                        "m.waits=1 AND m.wait_end IS NULL AND m.read_at IS NOT NULL ORDER BY m.id", (t["id"],)):
         lines.append(f"It read AM-{m['id']} from {m['sender']}, which waits for the answer, and did not answer it: "
                      f'answer with message_agent(in_reply_to="AM-{m["id"]}").')
+    # Its last words often say where it stopped when no note does (4 November 2026: a fresh session got the notes and
+    # the last command, and not the summary that its session ended with). Last, so that the cap cuts them first.
+    said = (turn_state(t["id"], attempt) or {}).get("said")
+    if said:
+        lines.append(f'Its last words: "{clip(said, TURN_SAID)}"')
     return "\n\n" + "\n".join(capped(lines) + [
         f'Read the rest yourself: see_earlier_work with attempt={attempt} gives that attempt in full, with no '
         f'argument names every attempt before this one, and with search="<words>" looks over them.'])
