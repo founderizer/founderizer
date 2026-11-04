@@ -22812,11 +22812,19 @@ def item_required(agent, item):
     return False
 
 
-def verify_view(agent):
+def verify_view(agent, desired=None):
+    """The latest completed check. Given the hub's revision, `holds` (owner API 1.80) says whether the activation takes
+    this check now, as activation_missing judges it: its age and check_holds. The app follows it, because it cannot
+    judge check_holds without the git history: its own copy of the rule refused the check after each unrelated commit
+    that the machine took, a task output or another agent's activation (4 November 2026)."""
     c = q1("SELECT * FROM machine_checks WHERE agent=? AND state='completed' AND verify IS NOT NULL "
            "ORDER BY id DESC LIMIT 1", (agent,))
-    return {"check": c["id"], "checked_at": c["completed"], "revision": c["revision"],
-            "items": [dict(i, required=item_required(agent, i)) for i in json.loads(c["verify"])]} if c else None
+    if not c:
+        return None
+    holds = None if desired is None else \
+        now() - c["completed"] <= ACTIVATION_CHECK_AGE and check_holds(agent, c["revision"], desired)
+    return {"check": c["id"], "checked_at": c["completed"], "revision": c["revision"], "holds": holds,
+            "items": [dict(i, required=item_required(agent, i)) for i in json.loads(c["verify"])]}
 
 
 def reported_model(agent, screen=False):
@@ -30253,7 +30261,9 @@ def machine_rows():
                      "settings": dict(data["settings"], screen=data.get("screen_settings"),
                                       runtime=(data.get("runtime") or {}).get("name"))
                      if data.get("settings") is not None else None, "settings_pending": settings_pending(name),
-                     "models": data.get("models"), "screen_models": data.get("screen_models"), "verify": verify_view(name),
+                     "models": data.get("models"), "screen_models": data.get("screen_models"),
+                     # holds for an agent in setup only: no other is activated, and each answer can cost a git diff
+                     "verify": verify_view(name, None if agent_active(name) else desired),
                      "runtimes": runtimes_now, "other_runtime_windows": data.get("other_runtime_windows"),
                      "owner_chat_bound": data.get("owner_chat_bound"), "manager_bound": data.get("manager_bound"),
                      "use": data.get("use"),          # what its own processes use (lifecycle.agent_use)
