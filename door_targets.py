@@ -60,7 +60,6 @@ MANIFEST_REFUSED = {
     "a webhook": r"^kind\s*:\s*(Mutating|Validating)WebhookConfiguration\s*$",
     "a new LoadBalancer": r"\btype\s*:\s*LoadBalancer\b", "a Secret object": r"^kind\s*:\s*Secret\s*$",
     "RBAC": r"^kind\s*:\s*(Role|ClusterRole|RoleBinding|ClusterRoleBinding)\s*$",
-    "a k3s upgrade Plan": r"^apiVersion\s*:\s*upgrade\.cattle\.io/",
     "a Tailscale operator setting": r"tailscale\.com/tags\s*:|^kind\s*:\s*ProxyClass\s*$",
 }
 NPM_AGE = 7 * 86400          # min-release-age=7, which npm ci does not check on a lockfile: the door does
@@ -362,11 +361,20 @@ def manifest_refusal(old_text, new_text):
     for what, pattern in MANIFEST_REFUSED.items():
         if len(re.findall(pattern, new_text, re.M)) > len(re.findall(pattern, old_text, re.M)):
             return what
+    if plan_channels(new_text) > plan_channels(old_text):
+        return "a k3s upgrade channel"
     if sa_changed(old_text, new_text):
         return "a changed serviceAccountName"
     if storage_grew(old_text, new_text):
         return "a bigger volume claim"
     return None
+
+
+def plan_channels(text):
+    """The channel lines of k3s upgrade Plans. A Plan names one version, so each k3s upgrade is one judged commit
+    (DevOps plan 5.5), and a channel, which upgrades with no commit, is never the door's."""
+    return sum(len(re.findall(r"^\s*channel\s*:\s*\S", doc, re.M)) for doc in re.split(r"^---\s*$", text, flags=re.M)
+               if re.search(r"^apiVersion\s*:\s*upgrade\.cattle\.io/", doc, re.M))
 
 
 def sa_changed(old_text, new_text):
