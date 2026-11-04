@@ -1375,11 +1375,17 @@ def desktop_refusal(owner, needs, caller):
     other task's ID."""
     if needs not in ("browser", "screen"):
         return None
+    machine = agents()[owner].get("machine")
+    if needs == "screen":
+        # Screen control on them could press Agree on terms that are the owner's to accept (4 November 2026).
+        st = q1("SELECT data FROM server_status WHERE server=?", (machine,))
+        if st and ((json.loads(st["data"]).get("security") or {}).get("desktop") or {}).get("setup"):
+            return f"The setup screens of macOS are open on {machine}; a screen task waits until they are finished."
     busy = desktop_busy(owner, needs)
     if busy is None:
         return None
     which = tref(busy["id"]) if caller == manager_name() else "another browser or screen task"
-    return f"The desktop of {agents()[owner].get('machine')} is busy with {which}; wait until it ends."
+    return f"The desktop of {machine} is busy with {which}; wait until it ends."
 
 
 def know(agent):
@@ -25114,7 +25120,19 @@ def desktop_status(value):
         return None
     if not isinstance(value, dict):
         raise ValueError("desktop must be an object or null")
-    return {k: _optional(value.get(k), bool) for k in ("locked", "chrome", "extension", "browser", "chatgpt")}
+    return {k: _optional(value.get(k), bool) for k in ("locked", "setup", "chrome", "extension", "browser", "chatgpt")}
+
+
+def macos_update_status(value):
+    """A Mac's reading of its own updates (lifecycle.macos_update): {"auto", "waiting"}, or None."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("macos_update must be an object or null")
+    waiting = _optional(value.get("waiting"), str, 20)
+    if waiting is not None and not re.fullmatch(r"\d+(\.\d+){0,3}", waiting):
+        raise ValueError("macos_update waiting must be a macOS version or null")
+    return {"auto": _optional(value.get("auto"), bool), "waiting": waiting}
 
 
 def validate_status(data):
@@ -25228,7 +25246,9 @@ def validate_status(data):
                          # only what the helper sent: an older one sends none of these, and a null is a reading
                          **{k: v for k, v in (("ssh_keys_only", _optional(sec.get("ssh_keys_only"), bool)),
                                               ("npm_rule", _optional(sec.get("npm_rule"), bool)),
-                                              ("upgraded_at", upgraded)) if k in sec}},
+                                              ("upgraded_at", upgraded),
+                                              ("macos_update", macos_update_status(sec.get("macos_update"))))
+                            if k in sec}},
             "runtime": {"name": _optional(rt.get("name"), str, 40), "version": _optional(rt.get("version"), str, 120),
                         "signed_in": _optional(rt.get("signed_in"), bool)},
             "update": {"state": state, "detail": _optional(up.get("detail"), str, 500)},
@@ -26721,7 +26741,9 @@ def mac_desktop_sweep():
         screen = any("screen" in (agents()[a].get("can") or []) for a in active)
         if not desktop or not (browser or screen) or (setup and setup["state"] in ("add", "waiting")):
             continue
-        words = ("its screen is locked" if desktop.get("locked") else
+        words = ("the setup screens of macOS are open on its screen, as after a macOS update"
+                 if desktop.get("setup") else
+                 "its screen is locked" if desktop.get("locked") else
                  "Claude's extension is off in Chrome" if browser and desktop.get("extension") is False else
                  "Chrome does not run" if browser and desktop.get("extension") and desktop.get("chrome") is False else
                  "Claude's extension in Chrome is signed out" if browser and desktop.get("browser") is False else
@@ -26853,6 +26875,7 @@ WATCH_EVERY = 60                # seconds between two passes of server_watch_swe
 SERVER_QUIET = 1800             # seconds without a reading after which a server with no agent is quiet
 UPDATES_STALLED = 3 * 86400     # seconds since its last good security update after which a server's updates stopped
 RESTART_WAIT = 7 * 86400        # seconds that a server may wait for its restart before the manager hears of it
+MACOS_UPDATE_WAIT = 14 * 86400  # seconds that a Mac's macOS update may wait before the manager hears of it
 # Seconds after its join in which a server is still being set up: its service reads it as soon as it starts, which is
 # before the join's updates, firewall and hardening (join.sh), so a reading of that time is no news.
 JOIN_GRACE = 3600
@@ -26868,6 +26891,8 @@ WATCH_WORDS = {                 # what stopped holding, and what holds again
     "restart": ("it has waited 7 days for a restart", "it no longer waits for a restart"),
     "disk": ("its disk is {share}% full ({used} of {total} GB)", "its disk is under 85% full"),
     "memory": ("{share}% of its memory is in use ({used} of {total} GB)", "its memory in use is under 85%"),
+    "macos_update": ("a macOS update has waited 14 days: macOS has not installed it, and only the owner can, by Screen "
+                     "Sharing with the Mac user's password", "its macOS update is installed"),
 }
 # Percent of a server's disk or memory (lifecycle.machine_load): it needs care from the first, and holds again under the
 # second, so a figure that moves about 90 is said once (the owner, 4 November 2026: the manager must "see if there are
@@ -26943,9 +26968,17 @@ def server_watch_sweep(t0):
             continue
         load = server_load(name, reading, t0)
         was = state.get(name) or {}
-        told, since = set(was.get("told") or []), was.get("restart")
+        told, since, macos = set(was.get("told") or []), was.get("restart"), was.get("macos")
         if reading is None or kind == "mac":        # its load alone: the baseline is a joined Linux server's
             now_found = set(load_troubles(load, told, memory=kind != "mac"))
+            update = (reading.get("security") or {}).get("macos_update") if reading else None
+            if update is None:          # an older helper, or no file to read, says nothing: what was said holds
+                waited = "macos_update" in told
+            else:                       # since it was first seen waiting, a newer one in its place included
+                macos = (macos or t0) if update.get("waiting") else None
+                waited = macos is not None and t0 - macos >= MACOS_UPDATE_WAIT
+            if waited:
+                now_found.add("macos_update")
         elif reading["source"] == "server" and t0 - max(reading["reported_at"], STARTED) > SERVER_QUIET:
             now_found = (told - {"quiet"}) | ({"quiet"} if not here else set())    # nothing else is read while quiet
         else:
@@ -26966,8 +26999,8 @@ def server_watch_sweep(t0):
             emit(manager_name(), "say", f"[hub] The server {name} is in order again: "
                                         f"{'; '.join(watch_words(k, None, ended=True) for k in ended)}.")
             log("hub", f"the server {name} is in order again ({', '.join(ended)})")
-        if now_found or since:
-            kept[name] = {"told": sorted(now_found), "restart": since}
+        if now_found or since or macos:
+            kept[name] = dict({"told": sorted(now_found), "restart": since}, **({"macos": macos} if macos else {}))
     if kept != state:
         kv_set("server_watch", json.dumps(kept, sort_keys=True) if kept else None)
 

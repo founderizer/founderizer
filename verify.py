@@ -516,8 +516,8 @@ class Verify:
         failed = [detail for kind, ref, state, detail in items
                   if state == "failed" and (kind != "capability" or ref in wanted)]      # as the hub's activation counts
         open_ = [detail for kind, _ref, state, detail in items if state == "not_verified" and kind == "mac"]
-        if failed:
-            return self.answer(FAIL, " ".join(failed)[:300], "Put this right at this Mac's own screen.")
+        if failed:      # each sentence once: macOS's setup screens fail the session, the browser and the screen
+            return self.answer(FAIL, " ".join(dict.fromkeys(failed))[:300], "Put this right at this Mac's own screen.")
         if open_:
             return self.answer(WARN, " ".join(open_)[:300], "Look at this at this Mac's own screen.")
         return self.answer(OK, "This Mac stays awake, logs in by itself, and Chrome is ready for its agents.")

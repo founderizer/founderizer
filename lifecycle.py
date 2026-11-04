@@ -955,12 +955,50 @@ def console_session(run):
                   if isinstance(u, dict) and u.get("kCGSSessionOnConsoleKey")), None), root.get("IOConsoleLocked"))
 
 
+SETUP_SCREENS = "The setup screens of macOS are open on this Mac: finish them at this Mac or with Screen Sharing."
+SOFTWARE_UPDATE = "/Library/Preferences/com.apple.SoftwareUpdate.plist"     # macOS's own record of its updates
+
+
+def setup_screens(run):
+    """Whether macOS's own setup screens are open (True, False, or None when nothing says): after macOS installed an
+    update by itself and restarted, "Setup Assistant" stayed open on a Mac that nobody watched (4 November 2026), and
+    while it is open the screen is not the session's, and launchd starts none of the user's own jobs."""
+    code, _, _ = run(["pgrep", "-x", "Setup Assistant"])
+    return True if code == 0 else False if code == 1 else None
+
+
+def macos_update(installed, path=SOFTWARE_UPDATE):
+    """What macOS itself says of its updates, from the file that its update service keeps (mode 644: no root, and no
+    scan of our own): {"auto": whether it installs them by itself, "waiting": the newest update of the installed major
+    version that it offers, or None}, or None when the file cannot be read. A new major version never waits: nobody
+    has to take one."""
+    try:
+        with open(path, "rb") as f:
+            data = plistlib.load(f)
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    def number(version):
+        return tuple(int(x) for x in re.findall(r"\d+", version))
+    have = number(installed or "")
+    offered = [str(u.get("Display Version") or "") for u in data.get("RecommendedUpdates") or []
+               if isinstance(u, dict) and u.get("MobileSoftwareUpdate") is True]
+    waiting = [v for v in offered if re.fullmatch(r"\d+(\.\d+){0,3}", v) and have and number(v)[0] == have[0]
+               and number(v) > have]
+    auto = data.get("AutomaticallyInstallMacOSUpdates")
+    return {"auto": auto if isinstance(auto, bool) else None, "waiting": max(waiting, key=number) if waiting else None}
+
+
 def session_item(run, user):
     """macOS: who is at the console, and whether its screen is locked. A heartbeat cannot show this."""
     reading = console_session(run)
     if reading is None:
         return ("mac", "session", "not_verified", "The console session could not be read.")
     console, locked = reading
+    if setup_screens(run):
+        return ("mac", "session", "failed", SETUP_SCREENS)
     if not console:
         return ("mac", "session", "failed", "No one is logged in at the console.")
     if console != user:
@@ -1008,13 +1046,14 @@ def desktop_items(run, home, user, tabs, connected=None):
     browser_connected read in the login session, None where nobody read it."""
     session = session_item(run, user)
     ready = session[2] == "ok"
+    setup = session[3] if session[3] == SETUP_SCREENS else None         # the screens cover the session's own screen
     chrome = any(os.path.isdir(p) for p in ("/Applications/Google Chrome.app",
                                              os.path.join(home, "Applications", "Google Chrome.app")))
     extension = chrome_extension(home) if tabs else True
     usable = chrome and ready and extension and (not tabs or connected is not False)
     return [("capability", "browser", "ok" if usable else "failed",
              "Google Chrome is installed, and the session is ready." if usable else
-             "Google Chrome is not installed." if not chrome else
+             "Google Chrome is not installed." if not chrome else setup if setup else
              f"The browser needs {user} at the console with the screen unlocked." if not ready else
              "Claude's extension is off: press Enable Extension in Chrome on this Mac." if extension is False else
              "Claude's extension is not in Chrome on this Mac: restart Chrome, then press Enable Extension."
@@ -1023,7 +1062,7 @@ def desktop_items(run, home, user, tabs, connected=None):
             ("capability", "screen", "not_verified" if ready else "failed",
              "The session is ready, but Fleet cannot check the macOS screen recording and accessibility "
              "permissions that screen control needs." if ready else
-             f"Screen control needs {user} at the console with the screen unlocked."),
+             setup or f"Screen control needs {user} at the console with the screen unlocked."),
             autologin_item(run, user), awake_item(run), session]
 
 
@@ -1795,6 +1834,8 @@ class Lifecycle:
             if self.agent is None:      # one reading for each Mac: the server service's, and no agent's
                 s["desktop"] = self.desktop()
                 self.remember_browser(s["desktop"]["browser"])
+                code, out, _ = self.run(["sw_vers", "-productVersion"])
+                s["macos_update"] = macos_update(out.strip() if code == 0 else None)
         else:
             code, out, _ = self.run(["systemctl", "is-enabled", "unattended-upgrades"])
             if out.strip():
@@ -1821,15 +1862,16 @@ class Lifecycle:
         return s
 
     def desktop(self):
-        """What only hands at this Mac can put right: its lock, Chrome, Claude's extension and the ChatGPT app's sign-in,
-        with no AI."""
+        """What only hands at this Mac can put right: its lock, macOS's own setup screens, Chrome, Claude's extension
+        and the ChatGPT app's sign-in, with no AI."""
         console = console_session(self.run)
         code, _, _ = self.run(["pgrep", "-x", "Google Chrome"])
         extension = chrome_extension(self.home)
         # Its answer means something only for a runtime that is signed in: a signed-out one reads no browser at all.
         claude = self.exe("claude") if extension and self.runtime("claude")["signed_in"] else None
-        return {"locked": console[1] if console else None, "chrome": code == 0, "extension": extension,
-                "browser": browser_connected(claude) if claude else None, "chatgpt": self.chatgpt()}
+        return {"locked": console[1] if console else None, "setup": setup_screens(self.run), "chrome": code == 0,
+                "extension": extension, "browser": browser_connected(claude) if claude else None,
+                "chatgpt": self.chatgpt()}
 
     def chatgpt(self):
         """Whether the ChatGPT app of this Mac is signed in: the copy of Codex it carries, which Computer Use runs
