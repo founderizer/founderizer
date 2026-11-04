@@ -29,3 +29,6 @@ fleet and the live records of it. None of that is needed to run a fleet, and non
 **License.** The Functional Source License, Version 1.1, ALv2 Future License (FSL-1.1-ALv2), in `LICENSE.md`. You
 may use, change and share this code for any purpose except a Competing Use, which `LICENSE.md` defines. Two years
 after we make a version available, that version is also under the Apache License, Version 2.0.
+
+**Changes from outside.** We do not take pull requests. This repository is a copy that we publish from our own
+repository, so a pull request cannot be merged here. To report a problem or to ask for a change, open an issue.
