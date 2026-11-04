@@ -1642,7 +1642,7 @@ class Lifecycle:
         head = self.revision()
         if head and self.loaded and head != self.loaded:
             code, out, _ = self.run(["git", "-C", self.kit, "diff", "--name-only", self.loaded, head])
-            if code == 0 and not any((p.endswith(".py") and not OWNER_ONLY.search(p)
+            if code == 0 and not any((p.endswith(".py") and not OWNER_ONLY.search(p) and not p.startswith(OUTPUTS)
                                       and not p.startswith(SKILLS + "/")) or p == "team.json" for p in out.split()):
                 self.loaded = head
         return self.loaded or head

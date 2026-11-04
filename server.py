@@ -979,8 +979,8 @@ class Service:
                   f"to {desired[:12]}: {problem}; this server keeps {str(self.loaded)[:12]}.", file=sys.stderr,
                   flush=True)
             return
-        if any(p.endswith(".py") or p == "team.json" for p in out.split()):
-            self.restart()
+        if any((p.endswith(".py") and not p.startswith(lifecycle.OUTPUTS)) or p == "team.json" for p in out.split()):
+            self.restart()              # a task's output is no code that this service loads
         self.loaded = desired
 
     def vault_program(self):

@@ -12339,8 +12339,11 @@ def same_code(rev, desired):
 
 def fleet_code(path):
     """A file whose change a machine must take (same_code). A skill's script is no Fleet code either (design v4 D1): no
-    helper runs it, so a checkout without the skill an agent wrote a minute ago is not behind."""
-    return bool(FLEET_FILES.search(path)) and not OWNER_ONLY.search(path) and not path.startswith(SKILLS + "/")
+    helper runs it, so a checkout without the skill an agent wrote a minute ago is not behind. Nor is a task's output
+    (4 November 2026): T-124 delivered four .py files, and every machine stood "behind" on the owner's System status
+    until a release asked them all to update."""
+    return bool(FLEET_FILES.search(path)) and not OWNER_ONLY.search(path) and not path.startswith(SKILLS + "/") \
+        and not path.startswith(lifecycle.OUTPUTS)
 
 
 def contains_revision(rev, target):
