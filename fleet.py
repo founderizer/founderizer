@@ -279,13 +279,14 @@ PLACE_PUBLIC = re.compile(r"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{4
 ENV_RESERVED = lifecycle.ENV_RESERVED
 
 
-def session_env(agent, conf, kind):
+def session_env(agent, conf, kind, place=None):
     """{NAME: value} for the environment of a session of this agent that starts now (kind: task, chat or manager). Each
     session start uses this one hook: the API keys that the owner lets this agent read (read_env), and for a task
     session its GitHub repositories, their credentials and its tools (integration_env, owner feature integrations). A
-    tool that needs one of the read keys gets it, so the keys come first."""
+    tool that needs one of the read keys gets it, so the keys come first. place: the folder of the task's own clones
+    (task_place), or None for the shared clones of before."""
     keys = read_env(agent, conf, kind)
-    return dict(keys, **(integration_env(agent, conf, keys) if kind == "task" else {}))
+    return dict(keys, **(integration_env(agent, conf, keys, place) if kind == "task" else {}))
 
 
 def read_env(agent, conf, kind):
@@ -739,6 +740,42 @@ def settings_arg(agent, conf, task, tools=(), needs="none"):
 
 
 WORK = os.path.expanduser("~/fleet-work")      # the agents' GitHub repositories on this machine: WORK/<owner>/<name>
+TASK_WINDOW = re.compile(r"[TC]-[1-9][0-9]{0,11}")     # a task's window, or a conversation's (task_place)
+GENERATION = re.compile(r"[0-9a-f]{12}")        # the hub's database generation (kv db_id)
+PLACE_AGENT = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+PLACES_EVERY = 600      # seconds between two sweeps of the task clones that no open task holds (Helper.sweep_places)
+PLACES_TOLD = set()     # the task places whose clones could not keep their commits, told once (drop_place)
+
+
+def task_work():
+    """The folder of every task's own clones, WORK/.tasks: no GitHub owner's name starts with a dot."""
+    return os.path.join(WORK, ".tasks")
+
+
+def task_place(agent, generation, window):
+    """The folder of one task's own clones, <task_work>/<agent>/<generation>/<window>, or None for the shared clones of
+    before. Each task (T-<id>), and each conversation with the agent's tools (C-<id>), works in its own clone of each
+    repository there, so two sessions of one machine never share a working tree (the owner, 4 November 2026: "Build
+    all four"; on 3 November T-71 changed the lockfile and the node_modules of T-84). The hub's database generation
+    keeps the T-1 of a new database from finding the T-1 of the one before."""
+    if not (isinstance(agent, str) and PLACE_AGENT.fullmatch(agent) and isinstance(generation, str)
+            and GENERATION.fullmatch(generation) and isinstance(window, str) and TASK_WINDOW.fullmatch(window)):
+        return None
+    return os.path.join(task_work(), agent, generation, window)
+
+
+@contextlib.contextmanager
+def repo_lock(repo):
+    """One git command at a time on the shared clone of a repository: on a Mac all the helpers of one user share WORK,
+    and a fetch must not run beside a clone from it or a push to it."""
+    path = os.path.join(task_work(), ".locks", *repo.split("/")) + ".lock"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def checkout_conf(agent):
@@ -763,13 +800,14 @@ def team_catalog():
         return tool_catalog(TEAM)
 
 
-def integration_env(agent, conf, keys=None):
+def integration_env(agent, conf, keys=None, place=None):
     """A task session's GitHub repositories and tools, as the hub gives them at its start (owner feature integrations):
     FLEET_REPOS, GH_TOKEN and git's credentials for them (FLEET_GIT_TOKENS, GIT_CONFIG_*), FLEET_TOOLS with the
     tools' own variables, and FLEET_GITHUB_NOTE for what the session lacks. First the helper fetches each repository
-    into WORK, or clones it there. The helper asks the hub only when team.json gives the agent repos or tools; {} for
-    an agent without them, and from a hub without the route. keys: the API keys of this session (read_env), which a
-    tool of the owner may need; they are already in the session's environment, so they are not given again."""
+    into WORK, or clones it there, and with a place (task_place) makes the task's own clone of it there, which
+    FLEET_WORK names. The helper asks the hub only when team.json gives the agent repos or tools; {} for an agent
+    without them, and from a hub without the route. keys: the API keys of this session (read_env), which a tool of the
+    owner may need; they are already in the session's environment, so they are not given again."""
     mine = checkout_conf(agent)
     if conf.get("role") not in ("worker", "lead") or not (mine.get("repos") or mine.get("tools")):
         return {}
@@ -799,7 +837,9 @@ def integration_env(agent, conf, keys=None):
         if others:
             notes.append(f"GH_TOKEN (gh and the GitHub tool) works for {', '.join(groups[0]['repos'])}; for "
                          f"{', '.join(others)} use git only.")
-    for repo, problem in prepare_repos(repos, values).items():
+    if repos and place:
+        values["FLEET_WORK"] = place
+    for repo, problem in prepare_repos(repos, values, place).items():
         notes.append(f"{repo} was not fetched or cloned: {problem}.")
     # The access token of each oauth MCP server that the hub gave for this session (owner feature mcp): it goes into
     # the session's mode-600 env file, as GH_TOKEN does, and it stops when the server's token life ends.
@@ -852,42 +892,187 @@ def git_credentials():
 GIT_STALLED = 600       # seconds a git transfer may move no data before git ends it (prepare_repos)
 
 
-def prepare_repos(repos, values):
+def prepare_repos(repos, values, place=None):
     """Fetch each repository in WORK/<owner>/<name>, or clone a missing one there, with the session's own
-    credentials and never a prompt. The working tree stays as the last task left it. {repo: problem} of the failures."""
+    credentials and never a prompt. {repo: problem} of the failures. With a place (task_place), the session works in
+    the task's own clone, <place>/<owner>/<name>: the task's first session makes it from the shared clone (own_clone),
+    and each later one only fetches it, so every attempt finds what the one before it left. The shared clone is then
+    only fetched, never worked in."""
     problems, env = {}, {**os.environ, **values, "GIT_TERMINAL_PROMPT": "0"}     # values has it too
+    # plan C6: no wall clock, because a large first clone is healthy work. git's own rule ends only a transfer that
+    # moves less than a byte a second for GIT_STALLED seconds: a dead one.
+    stalled = ["-c", "http.lowSpeedLimit=1", "-c", f"http.lowSpeedTime={GIT_STALLED}"]
     for repo in sorted(repos):
         folder = os.path.join(WORK, *repo.split("/"))
-        # plan C6: no wall clock, because a large first clone is healthy work. git's own rule ends only a transfer
-        # that moves less than a byte a second for GIT_STALLED seconds: a dead one.
-        stalled = ["-c", "http.lowSpeedLimit=1", "-c", f"http.lowSpeedTime={GIT_STALLED}"]
-        if os.path.isdir(os.path.join(folder, ".git")):
-            args = ["git", *stalled, "-C", folder, "fetch", "--quiet", "--prune", "origin"]
-        elif os.path.lexists(folder):
-            problems[repo] = f"{folder} is there, but it is not a git clone"
-            continue
-        else:
-            os.makedirs(os.path.dirname(folder), exist_ok=True)
-            args = ["git", *stalled, "clone", "--quiet", f"https://github.com/{repo}.git", folder]
+        own = os.path.join(place, *repo.split("/")) if place else None
         try:
-            r = subprocess.run(args, env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
-            if r.returncode != 0:
-                problems[repo] = " ".join((r.stderr or r.stdout).split())[-200:] or f"git ended with {r.returncode}"
+            if own and os.path.isdir(os.path.join(own, ".git")):
+                problem = git_problem(["git", *stalled, "-C", own, "fetch", "--quiet", "--prune", "origin"], env)
+            else:
+                with repo_lock(repo):
+                    problem = shared_clone(repo, folder, stalled, env)
+                    if not problem and own:
+                        problem = own_clone(repo, folder, place, env)
         except OSError:
-            problems[repo] = "git could not run"
+            problem = "git could not run"
+        if problem:
+            problems[repo] = problem
     return problems
+
+
+def git_problem(args, env):
+    """None when this git command succeeded, else what it said, in at most 200 characters."""
+    try:
+        r = subprocess.run(args, env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    except OSError:
+        return "git could not run"
+    if r.returncode == 0:
+        return None
+    return " ".join((r.stderr or r.stdout).split())[-200:] or f"git ended with {r.returncode}"
+
+
+def git_out(args, env=None):
+    """What a git command printed, or None when it failed."""
+    try:
+        r = subprocess.run(args, env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    except OSError:
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def shared_clone(repo, folder, stalled, env):
+    """The fetch of a repository's shared clone in WORK, or its first clone: under repo_lock. gc runs in the
+    foreground, so that no repack of it runs while a task's clone takes its packs."""
+    nodetach = ["-c", "gc.autoDetach=false"]
+    if os.path.isdir(os.path.join(folder, ".git")):
+        return git_problem(["git", *stalled, *nodetach, "-C", folder, "fetch", "--quiet", "--prune", "origin"], env)
+    if os.path.lexists(folder):
+        return f"{folder} is there, but it is not a git clone"
+    os.makedirs(os.path.dirname(folder), exist_ok=True)
+    return git_problem(["git", *stalled, *nodetach, "clone", "--quiet", f"https://github.com/{repo}.git", folder], env)
+
+
+def default_branch(clone, env):
+    """The name of origin's default branch in a clone, or None: origin/HEAD, which git sets at a clone, asked of the
+    remote once (remote set-head origin --auto) when it is missing or names a branch that is gone."""
+    for asked in (False, True):
+        name = git_out(["git", "-C", clone, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+                       env) or ""
+        if name.startswith("origin/") and git_out(["git", "-C", clone, "rev-parse", "--verify", "--quiet",
+                                                   f"refs/remotes/{name}"], env) is not None:
+            return name[len("origin/"):]
+        if not asked:
+            git_problem(["git", "-C", clone, "remote", "set-head", "origin", "--auto"], env)
+    return None
+
+
+def own_clone(repo, shared, place, env):
+    """A task's own clone of a repository, made from its shared clone with no download: git clone --local links the
+    packs, origin is GitHub's address with the shared clone's origin/* branches, and the clone is on origin's default
+    branch. It is built in <place>/.new and renamed into place, so no session finds half a clone. A problem, or None.
+    A folder in its place that is not a clone is said, never deleted."""
+    own = os.path.join(place, *repo.split("/"))
+    if os.path.lexists(own):
+        return f"{own} is there, but it is not a git clone"
+    branch = default_branch(shared, env)
+    if not branch:
+        return "the default branch of origin is not known"
+    new = os.path.join(place, ".new", *repo.split("/"))
+    shutil.rmtree(new, ignore_errors=True)          # a start that stopped half way
+    os.makedirs(os.path.dirname(new), exist_ok=True)
+    problem = git_problem(["git", "clone", "--quiet", "--local", "--no-checkout", shared, new], env)
+    first = None if problem else git_out(["git", "-C", new, "symbolic-ref", "--quiet", "--short", "HEAD"], env)
+    for args in ([] if problem else [
+            ["remote", "set-head", "origin", "--delete"],
+            ["fetch", "--quiet", "--prune", shared, "+refs/remotes/origin/*:refs/remotes/origin/*"],
+            ["remote", "set-head", "origin", branch],
+            ["remote", "set-url", "origin", f"https://github.com/{repo}.git"],
+            ["config", "gc.auto", "0"],
+            ["checkout", "--quiet", "-B", branch, f"origin/{branch}"]] +
+            ([["branch", "--quiet", "-D", first]] if first and first != branch else [])):
+        problem = git_problem(["git", "-C", new, *args], env)
+        if problem:
+            break
+    if problem:
+        shutil.rmtree(new, ignore_errors=True)
+        return problem
+    os.makedirs(os.path.dirname(own), exist_ok=True)
+    os.rename(new, own)
+    with contextlib.suppress(OSError):
+        os.removedirs(os.path.dirname(new))         # .new/<owner> and .new, when nothing else is in them
+    return None
+
+
+def drop_place(place, say):
+    """A task's own clones once the task has ended: its files that were not committed go with it, each commit that no
+    branch of origin holds is kept in the shared clone, as refs/fleet-kept/<generation>/<window>/<branch>, and the
+    folder goes. True when it went. Never raises: a clone whose commits could not be kept stays, said once, and the
+    next sweep tries again."""
+    try:
+        agent, generation, window = place.split(os.sep)[-3:]
+        kept = True
+        for own in sorted(glob.glob(os.path.join(place, "*", "*", ".git"))):
+            own = os.path.dirname(own)
+            repo = "/".join(own.split(os.sep)[-2:])
+            dirty = git_out(["git", "-C", own, "status", "--porcelain"]) or ""
+            if dirty:
+                say(f"{window}: {len(dirty.splitlines())} file(s) of {repo} that it did not commit go with the task")
+            ahead = (git_out(["git", "-C", own, "rev-list", "--branches", "--not", "--remotes"]) or "").split()
+            if not ahead:
+                continue
+            shared = os.path.join(WORK, *repo.split("/"))
+            with repo_lock(repo):
+                problem = git_problem(["git", "-C", own, "push", "--quiet", "--force", shared,
+                                       f"refs/heads/*:refs/fleet-kept/{generation}/{window}/*"], None)
+            if problem:
+                kept = False
+                if place not in PLACES_TOLD:
+                    PLACES_TOLD.add(place)
+                    say(f"{window}: its clone of {repo} stays: {len(ahead)} commit(s) that no branch of origin has "
+                        f"could not be kept ({problem})")
+            else:
+                say(f"{window}: {len(ahead)} commit(s) of {repo} that no branch of origin has are kept as "
+                    f"refs/fleet-kept/{generation}/{window}/ in its shared clone: "
+                    f"{' '.join(c[:12] for c in ahead[:5])}")
+        if not kept:
+            return False
+        trash = os.path.join(task_work(), agent, ".trash")
+        os.makedirs(trash, exist_ok=True)
+        gone = os.path.join(trash, f"{generation}.{window}.{secrets.token_hex(4)}")
+        os.rename(place, gone)
+        threading.Thread(target=shutil.rmtree, args=(gone, True), name="drop-place", daemon=True).start()
+        PLACES_TOLD.discard(place)
+        return True
+    except Exception as e:          # the next stop or sweep tries again
+        say(f"the clones in {place} stay for now: {type(e).__name__}")
+        return False
+
+
+def empty_trash(agent):
+    """What drop_place left to delete when its helper stopped: at the helper's start, in a thread of its own."""
+    shutil.rmtree(os.path.join(task_work(), agent, ".trash"), ignore_errors=True)
 
 
 def github_text(values, tools):
     """The part of a task's start text for its GitHub repositories and tools (owner feature integrations)."""
     repos = [r.rsplit(":", 1) for r in values.get("FLEET_REPOS", "").split()]
     text = ""
-    if repos:
+    if repos and values.get("FLEET_WORK"):
+        # The same words for every task of the agent ($FLEET_WORK and not its path), so the start's cached part
+        # stays the same from one task to the next (AUTONOMY.md P9.2).
+        text += ("Your GitHub repositories are this task's own clones, in $FLEET_WORK: " +
+                 ", ".join(f"{r} ({access}) in $FLEET_WORK/{r}" for r, access in repos) +
+                 ". Your helper made each from origin's default branch and fetches it before each session, without "
+                 "installed dependencies or build output; every attempt of this task finds what the last one left, "
+                 "until the task ends. Work, install and build only there, and clone a missing one there with git; "
+                 "never change the shared clones in ~/fleet-work. ")
+    elif repos:
         text += ("Your GitHub repositories are clones on this machine: " +
                  ", ".join(f"{r} ({access}) in ~/fleet-work/{r}" for r, access in repos) +
-                 ". Your helper fetched them just before this session; clone a missing one there with git. In each "
-                 "repository, work on the default branch of origin: git pull --rebase, commit your change, and push "
-                 "it to that branch. Do not make a branch, and do not open a pull request. Give your commit in "
+                 ". Your helper fetched them just before this session; clone a missing one there with git. ")
+    if repos:
+        text += ("In each repository, work on the default branch of origin: git pull --rebase, commit your change, and "
+                 "push it to that branch. Do not make a branch, and do not open a pull request. Give your commit in "
                  "where_output_is. A task that asks for something else wins. ")
     if any(access == "deploy" for _, access in repos):
         text += ("deploy is write and the repository's own deployment: its .github/workflows files, which a write "
@@ -2822,6 +3007,9 @@ class Helper:
         self.conversations = False      # the ids of this agent's open conversations, from the hub's last poll;
                                         # False before the first, None from a hub that does not say
         self.conversation_modes = False     # {id: "tools" or "closed"}, with contacts.v2 (P2); False before the poll
+        # the unfinished tasks of this agent (T-<id>) and the hub's database generation, from the hub's last poll:
+        # False before the first, None from a hub that does not say (sweep_places)
+        self.open_tasks, self.poll_db, self.places_at = False, None, 0.0
         self.outside, self.outside_lock = 0, threading.Lock()      # checks and login jobs that run now
         self.logins = set()             # the sign-ins that run now, by id (begin_signin)
         self.loop_wake = threading.Event()      # ends the loop's pause, so an owner's request acts at once
@@ -3139,6 +3327,35 @@ class Helper:
         """The windows, or None when tmux did not answer: a list that cannot be read is no list (plan C6)."""
         r = tmux("list-windows", "-t", f"={self.session}:", "-F", "#{window_name}")
         return [w for w in r.stdout.split("\n") if w and w != "home"] if r.returncode == 0 else None
+
+    def sweep_places(self):
+        """At most every PLACES_EVERY seconds, the task clones of this agent that nothing holds (drop_place): those of
+        another generation of the hub's database, of a task that is not open, and of a conversation that is not open.
+        Never one of an open window, and nothing that a list which is not known would decide (False before the first
+        poll, None from a hub that does not say)."""
+        if time.monotonic() - self.places_at < PLACES_EVERY or not isinstance(self.poll_db, str):
+            return
+        self.places_at = time.monotonic()
+        root = os.path.join(task_work(), self.agent)
+        names = self.look_known() if os.path.isdir(root) else None
+        if names is None:
+            return
+        tasks = set(self.open_tasks) if isinstance(self.open_tasks, list) else None
+        talks = {f"C-{c}" for c in self.conversations} if isinstance(self.conversations, list) else None
+        for generation in sorted(os.listdir(root)):
+            if not GENERATION.fullmatch(generation):
+                continue                # .trash, and nothing of another kind
+            folder = os.path.join(root, generation)
+            for window in sorted(os.listdir(folder)) if os.path.isdir(folder) else ():
+                if not TASK_WINDOW.fullmatch(window) or window in names:
+                    continue
+                ended = (generation != self.poll_db or
+                         (tasks is not None and window.startswith("T-") and window not in tasks) or
+                         (talks is not None and window.startswith("C-") and window not in talks))
+                if ended:
+                    drop_place(os.path.join(folder, window), self.say)
+            with contextlib.suppress(OSError):
+                os.rmdir(folder)        # only when it is empty
 
     def report_start(self, task, reason):
         """Why the start of a task's session failed (plan C6), told to the hub once for each distinct reason: the hub
@@ -3688,8 +3905,10 @@ class Helper:
                     session = str(uuid.uuid4())
                     self.start(window, lambda: conversation_work_command(
                         self.agent, self.run_conf(), extra["generation"], cid, data.get("token"), data.get("prompt"),
-                        session, env=session_env(self.agent, self.conf, "task"), opening=data.get("opening"),
-                        rules=data.get("rules")), cid, extra["generation"], session, needs="none")
+                        session, env=session_env(self.agent, self.conf, "task",
+                                                 task_place(self.agent, extra["generation"], window)),
+                        opening=data.get("opening"), rules=data.get("rules")), cid, extra["generation"], session,
+                        needs="none")
                 else:
                     try:
                         command = conversation_command(self.agent, self.run_conf(), extra["generation"], cid,
@@ -3741,7 +3960,9 @@ class Helper:
                 self.start(task, lambda: session_command(self.agent, self.conf if runner else self.run_conf(),
                     ev["text"], task=task,
                     needs=needs, attempt=extra.get("attempt",1), generation=extra.get("generation",""),
-                    session=session, token=token, env=session_env(self.agent, self.conf, "task"),
+                    session=session, token=token,
+                    env=session_env(self.agent, self.conf, "task",
+                                    task_place(self.agent, extra.get("generation"), task)),
                     opening=extra.get("opening"), rules=extra.get("rules")),
                     extra.get("attempt",1), extra.get("generation",""), session, needs=needs)
                 self.say(f"{task}: session started, attempt {extra.get('attempt',1)}")
@@ -3790,6 +4011,12 @@ class Helper:
                     raise Refused(f"processes of {task} still run: {left}")
                 if ended:
                     self.say(f"{task}: ended {ended} process(es) that the finished task left")
+            place = task_place(self.agent, generation, task)
+            if place and os.path.isdir(place):
+                names = self.look_known()
+                if names is None or task in names:      # its session may still write there: the event comes again
+                    raise Refused(f"{task}: its clones wait until its window is gone")
+                drop_place(place, self.say)
         elif kind in JOB_KINDS:
             # plan C7: the ack comes first, so a helper that starts again never runs this job a second time, and the
             # job is in each poll's list from here until the hub took its report
@@ -5505,6 +5732,7 @@ def cmd_run(args):
         die(f"another {agent} helper is already running")
     claim_checkout(agent)
     h = Helper(agent, conf)
+    threading.Thread(target=empty_trash, args=(agent,), name="empty-trash", daemon=True).start()
     ensure_session(h.session)
     # The helper's start runs the manager session once. With a key it needs its credential, so the start waits in the
     # loop below until the hub answers; a session that runs already, or one closed later, is left as it is.
@@ -5573,7 +5801,10 @@ def cmd_run(args):
             h.conversation_modes = data.get("conversation_modes") \
                 if isinstance(data.get("conversation_modes"), dict) else None
             h.keep_chat(data.get("chat"), data.get("db"))
+            h.open_tasks = data.get("open_tasks") if isinstance(data.get("open_tasks"), list) else None
+            h.poll_db = data.get("db")
             h.handle_events(data.get("events", []))
+            h.sweep_places()
             h.doing("screen watch")
             h.watch_screens()
             h.step = None

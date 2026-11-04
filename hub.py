@@ -35442,6 +35442,11 @@ class Handler(BaseHTTPRequestHandler):
                 # plan C5: a conversation window closes when its conversation is not open any more
                 "conversations": [r["id"] for r in q("SELECT id FROM conversations WHERE agent=? AND state='open'",
                                                      (agent,))] if worker else None,
+                # 4 November 2026: each task works in its own clones, which the helper deletes once the task is no
+                # longer open (fleet.Helper.sweep_places)
+                "open_tasks": [tref(r["id"]) for r in q(f"SELECT id FROM tasks WHERE owner=? AND state NOT IN "
+                                                        f"({','.join('?' * len(TERMINAL))}) ORDER BY id",
+                                                        (agent, *TERMINAL))] if worker else None,
                 # AUTONOMY.md P2: how each open conversation runs now, with contacts.v2; a window that started another
                 # way closes, because its tools were fixed at its start
                 "conversation_modes": conversation_modes(agent) if worker and contacts_v2() else None,
