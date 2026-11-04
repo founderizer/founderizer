@@ -278,7 +278,7 @@ updates() {     # unattended security updates on, then the pending ones once; ne
 
 firewall() {    # $1: the checkout. Incoming traffic over the private network only, SSH included: this machine joined it
                 # before this script, and SSH from anywhere else is closed (hubsetup.py firewall). An active firewall
-                # keeps its other rules and its defaults.
+                # keeps its other rules and its defaults; one that was off keeps open the ports that answered before.
     python3 "$1/hubsetup.py" firewall </dev/null \
         || stop "The firewall of this machine could not be set: the line above says why. Run the line again."
 }

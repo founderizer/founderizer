@@ -136,7 +136,9 @@ These commands keep the repository, outputs, usage records and runtime login.
 ## SSH over the private network only (Linux)
 
 Both installers and the setup executor let incoming traffic in on `tailscale0` only,
-SSH included, and open no port to the internet (`hubsetup.py firewall`). After the
+SSH included, and open no new port to the internet (`hubsetup.py firewall`). A server whose
+firewall was off keeps open each port that answered from the internet before the install, with
+the comment `fleet kept`, so a website on it stays up; SSH moves to the private network. After the
 install, reach a machine at its Tailscale address: the address `team.json` gives it,
 which is the one the app uses too. The provider's own firewall stays the outer layer.
 

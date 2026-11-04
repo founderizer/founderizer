@@ -93,8 +93,10 @@ Other options: `--port N` (default 8765), `--timezone Z` (default the server's o
    then `tailscale up --auth-key=file:<a root-only file> --accept-dns=false` (with
    `--hostname NAME` only when it is given). This hub's address is what `tailscale ip -4` then gives.
 5. **The firewall** (`ufw`, `hubsetup.py firewall`): incoming traffic on `tailscale0` only,
-   SSH included, outgoing allowed. No port is open to the internet, so after this step SSH
-   reaches the server at its Tailscale address only. It comes before the claim, because the
+   SSH included, outgoing allowed. SSH is open to the internet no more, so after this step SSH
+   reaches the server at its Tailscale address only. A firewall that was off keeps open each
+   port that answered from the internet before the install (a website on that server stays up),
+   with the comment `fleet kept`. It comes before the claim, because the
    owner's Mac must reach port 8765 while the install still runs. A firewall that is already
    active keeps its own rules, and loses only the public SSH rule (`fleet ssh`) that an
    installer before 2 November 2026 added.

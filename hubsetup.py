@@ -653,17 +653,58 @@ def agent_helper(service_user="fleet", repo=None, check=False, run=None, read=No
     return "made"
 
 
-def firewall_script():
+KEPT_SPEC = re.compile(r"[0-9]{1,5}/(?:tcp|udp)$")
+# A client's own port, which the server only receives answers on: DHCP over IPv4 and over IPv6.
+CLIENT_PORTS = {("udp", "68"), ("udp", "546")}
+
+
+def public_listeners(text, ssh_ports=("22",)):
+    """The ports this machine answers on from the internet before its firewall goes on, read from `ss -H -ltnup` as
+    root, as "80/tcp", "443/tcp", "41641/udp". A VPS whose firewall is off serves them today, so the firewall step
+    keeps them open, and a website on that VPS stays up: only SSH moves to the private network (the owner, 4 November
+    2026, of a VPS that a customer already uses: "it needs to work"). Left out: SSH on each of its ports, by its port
+    and by its process, because a socket that systemd holds for sshd names systemd; what listens on loopback,
+    link-local or Tailscale's own addresses; and a DHCP client's port. None of them is a service that the internet
+    reaches today."""
+    ssh = {str(port) for port in ssh_ports}
+    kept = set()
+    for line in (text or "").splitlines():
+        fields = line.split()
+        if len(fields) < 5 or fields[0] not in ("tcp", "udp"):
+            continue
+        address, _, port = fields[4].rpartition(":")
+        address = address.split("%", 1)[0].strip("[]").lower()
+        if not port.isdigit() or port in ssh or '"sshd' in " ".join(fields[5:]) or (fields[0], port) in CLIENT_PORTS:
+            continue
+        if (address.startswith(("127.", "::ffff:127.", "fe80:", "fd7a:115c:a1e0:")) or address == "::1"
+                or PRIVATE.match(address)):
+            continue
+        kept.add(f"{port}/{fields[0]}")
+    return sorted(kept, key=lambda spec: (int(spec.split("/")[0]), spec))
+
+
+def firewall_script(kept=()):
     """The shell that sets this machine's firewall, as root. Everything on the private network comes in, SSH included,
     and nothing else does: no public SSH rule is added, and the one that the installers before 2 November 2026 added
     (comment `fleet ssh`, port 22 from anywhere) is removed. It is found by that comment, so a rule of the owner's own
     stays, and deleted from the highest number down, so that each number still names the rule it was read for. An
     active firewall keeps its defaults. A session that came in over the public address keeps going: only a new one
-    is refused."""
+    is refused.
+
+    A firewall that was off gets one rule for each port in `kept` (`public_listeners`) before its incoming default
+    turns to deny, comment `fleet kept`, so that what the machine served before the install it serves after it. An
+    active firewall gets none: its own rules already say what may come in."""
+    for spec in kept:
+        if not KEPT_SPEC.match(spec):
+            raise ValueError(f"not a port of the firewall: {spec!r}")
+    keep = "".join(f"    ufw allow {spec} comment 'fleet kept' >/dev/null\n"
+                   f'    kept="$kept {spec}"\n' for spec in kept)
     return ("set -eu\n"
             "active=no\n"
             "ufw status 2>/dev/null | grep -q '^Status: active' && active=yes\n"
+            "kept=\n"
             'if [ "$active" = no ]; then\n'
+            + keep +
             "    ufw default deny incoming >/dev/null\n"
             "    ufw default allow outgoing >/dev/null\n"
             "fi\n"
@@ -676,7 +717,8 @@ def firewall_script():
             "done\n"
             "ufw status | grep -q '^Status: active' || { echo 'the firewall did not turn on' >&2; exit 1; }\n"
             "if ufw status | grep -q '# fleet ssh *$'; then echo 'the public SSH rule is still there' >&2; exit 1; fi\n"
-            'echo "removed=$removed"\n')
+            'echo "removed=$removed"\n'
+            'echo "kept=$kept"\n')
 
 
 def firewall(check=False, run=None):
@@ -685,7 +727,9 @@ def firewall(check=False, run=None):
     step, and a machine that an earlier installer set up takes it as root in its own checkout, once.
 
     It runs only on a machine that is on the private network, because a firewall that lets SSH in over Tailscale
-    alone leaves no way in to a machine that is not on it. Safe to run again. Returns "set" or "would set"."""
+    alone leaves no way in to a machine that is not on it. A machine whose firewall was off keeps open the ports that
+    answered from the internet before (`public_listeners`): a VPS that a customer already uses keeps its website.
+    Safe to run again. Returns "set" or "would set"."""
     run = run or _shell
     _code, out, _err = run("tailscale ip -4 2>/dev/null | head -n 1")
     ip = (out or "").strip()
@@ -693,15 +737,21 @@ def firewall(check=False, run=None):
         raise Stop("this machine is not on the private network (tailscale ip -4 gave none of its addresses), so its "
                    "firewall stays as it is: one that lets SSH in over the private network only would leave no way "
                    "in. Connect Tailscale, then run this again.")
+    _code, listening, _err = run("ss -H -ltnup 2>/dev/null")
+    _code, ports, _err = run("sshd -T 2>/dev/null | sed -n 's/^port //p'")
+    kept = public_listeners(listening, ssh_ports={"22", *(ports or "").split()})
     if check:
         say(f"  would let everything on tailscale0 in, deny other incoming traffic, remove the public SSH rule of an "
-            f"earlier Founderizer, and turn the firewall on: SSH then reaches this machine at {ip} only")
+            f"earlier Founderizer, and turn the firewall on: SSH then reaches this machine at {ip} only"
+            + (f"; a firewall that is off now keeps open the ports that answer now: {', '.join(kept)}" if kept else ""))
         return "would set"
-    code, out, err = run(firewall_script())
+    code, out, err = run(firewall_script(kept))
     if code != 0:
         raise Stop(f"the firewall could not be set: {(err or out).strip()[-300:]}")
-    removed = kv(out).get("removed", "0")
+    said = kv(out)
+    removed, stayed = said.get("removed", "0"), said.get("kept", "").split()
     say(f"the firewall is on: incoming traffic over the private network only, SSH included, at {ip}"
+        + (f"; these ports stay open as they were: {', '.join(stayed)}" if stayed else "")
         + (f"; the public SSH rule of an earlier Founderizer is removed ({removed} lines)" if removed != "0" else ""))
     return "set"
 # ---------------------------------------------------------------- the server's own hardening (join.sh)

@@ -296,7 +296,8 @@ firewall() {    # before the claim: the owner's Mac must reach port $port while 
     heading "the firewall: the private network only"
     if [ "$check" = yes ]; then
         plan "let everything on tailscale0 in, deny other incoming traffic, remove the public SSH rule of an earlier \
-Founderizer, and turn the firewall on: SSH then reaches this server over the private network only"
+Founderizer, and turn the firewall on: SSH then reaches this server over the private network only; a firewall that \
+is off now keeps open the ports that answer from the internet now"
         return 0
     fi
     python3 "$tree/hubsetup.py" firewall \
