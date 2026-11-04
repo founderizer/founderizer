@@ -12595,6 +12595,9 @@ DRIVE_TYPES = {DRIVE_FOLDER: "folder", DRIVE_DOC: "Google Doc", DRIVE_SHEET: "Go
 DRIVE_EXPORTS = {DRIVE_DOC: ".md", DRIVE_SHEET: ".xlsx", DRIVE_SLIDES: ".pdf", DRIVE_DRAWING: ".png"}
 DRIVE_KINDS = {"doc": "Google Doc", "sheet": "Google Sheet", "folder": "folder", "file": "file"}
 GOOGLE_PROBLEM = "Google refused the saved access. Connect again."
+GOOGLE_TESTING = ("Google refused the saved access. If your Google Cloud client is in Testing, publish it, because "
+                  "Google ends its sign-ins after 7 days. Then connect again.")
+GOOGLE_TESTING_AGE = 7 * 86400 - 3600   # Google's refresh tokens for a client in Testing last 7 days
 GOOGLE_STALE = "This Connect expired, or another one took its place. Start Connect again."
 GOOGLE_NO_CLIENT = "The owner has not set up Google yet. Ask your requester."
 GOOGLE_SHARED = ("This file or folder is shared with other people. A write to it reaches them, so it needs Drive "
@@ -12729,6 +12732,15 @@ def google_why(e):
     return e.reason or str(e) or "no answer"
 
 
+def google_refused(email, problem):
+    """A tool's error for an account whose refresh Google refused, with the owner's step that its problem names."""
+    if problem == GOOGLE_TESTING:
+        return (f"Google refused the saved access of {email}. If the owner's Google Cloud client is in Testing, "
+                f"Google ends its sign-ins after 7 days: the owner must publish that client, then connect {email} "
+                f"again. Ask your requester.")
+    return f"Google refused the saved access of {email}. The owner must connect it again. Ask your requester."
+
+
 def google_grant(agent, service):
     """(account, level) of one service of the agent in team.json now, or (None, None)."""
     g = ((agents().get(agent) or {}).get("google") or {}).get(service)
@@ -12757,9 +12769,9 @@ def google_access(email, service):
     if not entry:
         raise ToolError(f"The Google account {email} is not connected. Ask your requester.")
     with GOOGLE_LOCK:
-        if GOOGLE["problems"].get(email):
-            raise ToolError(f"Google refused the saved access of {email}. The owner must connect it again. Ask your "
-                            f"requester.")
+        problem = GOOGLE["problems"].get(email)
+    if problem:
+        raise ToolError(google_refused(email, problem))
     if GOOGLE_SCOPES[service] not in google_scopes(entry):
         raise ToolError(f"The Google account {email} does not allow {GOOGLE_NAMES[service]}. Ask your requester.")
     source = hashlib.sha256(str(entry["refresh_token"]).encode()).hexdigest()
@@ -12772,13 +12784,14 @@ def google_access(email, service):
     except google.GoogleError as e:
         if e.reason != "invalid_grant":
             raise ToolError(f"Not done: Google gave no access now ({google_why(e)}). Try again later.") from None
+        at = entry.get("connected_at")
+        problem = GOOGLE_TESTING if isinstance(at, int) and now() - at >= GOOGLE_TESTING_AGE else GOOGLE_PROBLEM
         with GOOGLE_LOCK:
             GOOGLE["tokens"].pop(email, None)
-            GOOGLE["problems"][email] = GOOGLE_PROBLEM
+            GOOGLE["problems"][email] = problem
         changed()
         log("hub", f"Google refused the saved access of {email} (invalid_grant)")
-        raise ToolError(f"Google refused the saved access of {email}. The owner must connect it again. Ask your "
-                        f"requester.") from None
+        raise ToolError(google_refused(email, problem)) from None
     with GOOGLE_LOCK:
         GOOGLE["tokens"][email] = {"access": access, "for": source, "expires": expires}
     return access
