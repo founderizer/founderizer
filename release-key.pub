@@ -12,8 +12,8 @@
 # At most four lines; a line that is not a 32-byte key makes the whole file carry nothing, because a key file that
 # is half read is a mistake and a fleet that cannot say which keys it trusts takes no release.
 #
-# The lines, in order: the website's old key, which signs nothing after this release and which the next release
-# removes; the approve key; the spare, which signs the release that replaces a lost key.
-Rx2H3IQWLleJlIx+4x2ckg0JN4d+CGjfF0Zkeon6vmg=
+# The lines, in order: the approve key, and the spare, which signs the release that replaces a lost key. The website's
+# own key signed every release up to 2026.11.200, which brought these two, and is no longer here: no fleet that took
+# this release trusts it again.
 8Gc80zgZcWqA7nX3+lChW09v2cOSi0lfjf4OzFiY2Ao=
 pQ2RwJ1nL5KXI7dv6Pt71GHMqk61hMA0NQmPUwlSFiY=
