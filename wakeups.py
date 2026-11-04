@@ -44,6 +44,10 @@ LINE_FORM = "lines"         # plan P4: the `form` of a check that prints lines
 SAVED = ("code", "sha256", "bytes")       # the fields of a stored saved check that come from its code
 PROGRESS = re.compile(r"progress[ \t]+([-+]?(?:\d+(?:\.\d*)?|\.\d+))")    # AUTONOMY.md 6.5: a target's progress line
 REQUEST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,63}")
+UUID_FORM = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
+REQUEST_RULE = ("request_id must be a new id for each new call: 8 to 64 letters, digits, '.', '_', ':' or '-', "
+                "the first a letter or a digit, for example a UUID. Send the same request_id again only to repeat the "
+                "same call.")
 OWNER, FLEET, SELF, NONE = 3, 2, 1, 0       # levels; OWNER is only the owner's own rules
 OPS = {">": "more than", ">=": "at least", "<": "less than", "<=": "at most", "==": "equal to", "!=": "not equal to"}
 
@@ -524,16 +528,25 @@ def plan_change(org, caller, args, rule):
     return {"op": action, "trigger_id": tid, "base_revision": base, "by": caller}
 
 
+def request_ref(value):
+    """The stored form of an agent's request_id, or None for one that the rule refuses. One rule for every agent tool
+    (the owner, 4 November 2026: "Build all four"): 8 to 64 letters, digits, '.', '_', ':' or '-', the first a letter
+    or a digit. A UUID is kept in lower case, as agent_write always kept one; any other id exactly as given, as the
+    wake-up tools always kept one. So each command kept before the rule still answers its own repeat."""
+    if not isinstance(value, str) or not REQUEST.fullmatch(value):
+        return None
+    return value.lower() if UUID_FORM.fullmatch(value) else value
+
+
 def command_identity(caller, tool, args):
     """(request_id, digest): the persisted identity of one write by an agent tool. The hub keeps (caller, request_id,
     tool, digest, receipt) in the same transaction as the write. An exact repeat (the same caller, request_id, tool
     and digest) gets the stored receipt again and changes nothing, also after the rule is done or deleted and after a
     restart. The same request_id with another tool or other fields is refused. A refused command stores nothing, so
     its request_id can be used again. The digest covers every field except request_id and task_id."""
-    rid = args.get("request_id") if isinstance(args, dict) else None
-    if not isinstance(rid, str) or not REQUEST.fullmatch(rid):
-        raise Refused("request_id is required: a new text of 8 to 64 letters, digits, '.', '_', ':' or '-' for each "
-                      "change, for example a UUID. Send the same request_id again only to repeat the same change.")
+    rid = request_ref(args.get("request_id") if isinstance(args, dict) else None)
+    if rid is None:
+        raise Refused(REQUEST_RULE)
     body = {k: v for k, v in args.items() if k not in ("request_id", "task_id")}
     digest = hashlib.sha256(json.dumps([tool, body], sort_keys=True, separators=(",", ":"), ensure_ascii=False,
                                        default=str).encode("utf-8")).hexdigest()
@@ -808,9 +821,10 @@ TASK_ID = {"type": "string", "description": "In a task session: your task, for e
 TRIGGER_ID = {"type": "integer", "description": "The trigger number, for example 7."}
 BASE = {"type": "integer", "description": "The revision of the trigger that see_triggers shows. A trigger that "
                                           "changed meanwhile is refused: read it again."}
-REQUEST_ID = {"type": "string", "description": "A new unique text for each change (8 to 64 letters, digits, '.', '_', "
-                                               "':' or '-'), for example a UUID. Repeat it only to repeat the same "
-                                               "change: you get the first answer again."}
+REQUEST_ID = {"type": "string",
+              "description": "A new id for each new call, which you make up: 8 to 64 letters, digits, '.', '_', ':' or "
+                             "'-', the first a letter or a digit, for example a UUID. The same id with the same fields "
+                             "again repeats that call: you get its first answer, and nothing is done twice."}
 
 TOOL_SPECS = (
     ("see_triggers",

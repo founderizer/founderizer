@@ -6884,13 +6884,7 @@ def save_job(agent, a, kind):
     both tools: the same call again gives that job's outcome, an unknown outcome is only looked for again, and no
     request changes its tool or its values."""
     tid = parse_task(a.get("task_id"))
-    request = a.get("request_id")
-    try:
-        if not isinstance(request, str) or str(uuid.UUID(request)) != request.lower():
-            raise ValueError()
-    except (ValueError, AttributeError):
-        raise ToolError("request_id must be a UUID. Use a new one for each new login.") from None
-    request = request.lower()
+    request = vault_request(agent, request_ref(a))
     label, username, url = plain_line(a.get("label"), 60), plain_line(a.get("username"), 200), site_url(a.get("url"))
     if label is None:
         raise ToolError("label must be one line of 1 to 60 characters without control or format characters: the name "
@@ -7181,13 +7175,7 @@ def t_call_api(agent, a):
     agent gives the method, the path and a JSON body; the site comes only from the saved login, and the key is no
     argument. One job for one request_id: the same call again gives its stored answer, and nothing is sent twice."""
     tid = parse_task(a.get("task_id"))
-    request = a.get("request_id")
-    try:
-        if not isinstance(request, str) or str(uuid.UUID(request)) != request.lower():
-            raise ValueError()
-    except (ValueError, AttributeError):
-        raise ToolError("request_id must be a UUID. Use a new one for each new request.") from None
-    request = request.lower()
+    request = vault_request(agent, request_ref(a))
     login, method, path, body, auth = (a.get(k) for k in ("login", "method", "path", "body", "auth"))
     if not isinstance(login, str) or not BWS_REF.fullmatch(login.strip()):
         raise ToolError("login must be the name of a saved login: bws://<secret-id>.")
@@ -9408,18 +9396,28 @@ def day_start(t0):
                                                                           microsecond=0).timestamp()
 
 
+def request_ref(a):
+    """The stored form of this call's request_id, by the one rule of every agent tool (wakeups.request_ref)."""
+    rid = wakeups.request_ref(a.get("request_id") if isinstance(a, dict) else None)
+    if rid is None:
+        raise ToolError(wakeups.REQUEST_RULE)
+    return rid
+
+
+def vault_request(agent, rid):
+    """The id that a machine's vault keeps a job by: the request_id itself when it is a UUID, else a UUID made from the
+    agent and the id. vault.canonical_id and the Mac vault take only a UUID, and this name never changes, so a repeat
+    of the call finds its job."""
+    if wakeups.UUID_FORM.fullmatch(rid):
+        return rid
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"fleet-request:{agent}/{rid}"))
+
+
 def agent_write(agent, tool, a, fields):
-    """(command, stored answer or None) of an agent's write with a request_id (a UUID): an exact repeat (the same agent,
-    request_id, tool and fields) gets its first answer again and changes nothing; other fields with the same request_id
-    are refused. keep_command stores the answer with the write."""
-    rid = a.get("request_id")
-    try:
-        if not isinstance(rid, str) or str(uuid.UUID(rid)) != rid.lower():
-            raise ValueError()
-    except (ValueError, AttributeError):
-        raise ToolError("request_id must be a new UUID for each message. Send the same request_id again only to repeat "
-                        "the same call.") from None
-    rid = rid.lower()
+    """(command, stored answer or None) of an agent's write with a request_id (request_ref): an exact repeat (the same
+    agent, request_id, tool and fields) gets its first answer again and changes nothing; other fields with the same
+    request_id are refused. keep_command stores the answer with the write."""
+    rid = request_ref(a)
     digest = hashlib.sha256(json.dumps([tool, fields], sort_keys=True, separators=(",", ":"),
                                        ensure_ascii=False).encode()).hexdigest()
     old = q1("SELECT * FROM tool_commands WHERE agent=? AND request_id=?", (agent, rid))
@@ -13109,7 +13107,7 @@ def gmail_unknown(t, rid, title):
 
 def google_receipt(agent, tool, a, old, t, title=None):
     """A repeat of a write with the same request_id and fields: its first receipt, and no new Google call."""
-    rid, state = a["request_id"].lower(), old.get("state")
+    rid, state = request_ref(a), old.get("state")
     if state == "done":
         return old["text"]
     if state == "failed":
@@ -15129,7 +15127,7 @@ def t_set_duty(agent, a):
     if stored:
         return stored["text"]
     try:
-        r = duty_save(dict(body, request_id=str(a.get("request_id") or "").lower()), agent, now(),
+        r = duty_save(dict(body, request_id=command[1]), agent, now(),
                       duty_id=duty_id, command=command)
     except Refusal as e:
         raise ToolError(str(e)) from None
@@ -19773,6 +19771,7 @@ def S(props, required=()):
 
 STR = {"type": "string"}
 TASK_ID = {"type": "string", "description": "Task id, for example T-7"}
+REQUEST_ID = wakeups.REQUEST_ID         # one rule for every agent tool's request_id (wakeups.request_ref)
 
 TOOLS = [
     ("all", "read_messages", t_read_messages,
@@ -19849,7 +19848,7 @@ TOOLS = [
      "the password, and you never see it. Nothing is sent to a site: afterwards open the site's form and call sign_in "
      "with the name that this tool returns. One request_id is one login: call again with the same request_id to check "
      "an outcome that is not known. You have this tool only when the owner allowed it.",
-     S({"task_id": TASK_ID, "request_id": {"type": "string", "description": "A new UUID for each new login"},
+     S({"task_id": TASK_ID, "request_id": REQUEST_ID,
         "label": {"type": "string", "description": "The name of the login in the vault, 1 to 60 characters"},
         "username": {"type": "string", "description": "The user name or email of the new account"},
         "url": {"type": "string", "description": "The http or https address of the site"}},
@@ -19862,7 +19861,7 @@ TOOLS = [
      "with its path, query and fragment: source_url, or url without it. A key from one site for use on another is used "
      "only with the owner's grant. One request_id is one key: call again with the same request_id to check an outcome "
      "that is not known. You have this tool only when the owner allowed it.",
-     S({"task_id": TASK_ID, "request_id": {"type": "string", "description": "A new UUID for each new key"},
+     S({"task_id": TASK_ID, "request_id": REQUEST_ID,
         "label": {"type": "string", "description": "The name of the key in the vault, 1 to 60 characters"},
         "username": {"type": "string", "description": "The account or the name of the key at the service"},
         "url": {"type": "string", "description": "The http or https address where the key is used: the saved address"},
@@ -19877,7 +19876,7 @@ TOOLS = [
      "twice. A request that is still running after a moment answers so, and its outcome comes to this task as a "
      "message. If the outcome is not known, check the service before you send anything new, and record what you "
      "found with resolve_outcome.",
-     S({"task_id": TASK_ID, "request_id": {"type": "string", "description": "A new UUID for each new request"},
+     S({"task_id": TASK_ID, "request_id": REQUEST_ID,
         "login": {"type": "string", "description": "bws://<secret-id>: the saved login whose site and key are used"},
         "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]},
         "path": {"type": "string", "description": "The path on that site, from the first /; a query after ? is allowed"},
@@ -19923,7 +19922,7 @@ TOOLS = [
      "to the fleet manager's weekly list for them. about names what it is about (an open task, "
      "an open case, a goal, a duty or an agent), and severity=\"now\" reaches your requester at once only when the "
      "hub can confirm that what about names is live.",
-     S({"task_id": TASK_ID, "request_id": {"type": "string", "description": "A new UUID for each report"},
+     S({"task_id": TASK_ID, "request_id": REQUEST_ID,
         "kind": {"type": "string", "enum": list(REPORT_KINDS),
                  "description": "; ".join(f"{k}: {v}" for k, v in REPORT_KINDS.items())},
         "text": {"type": "string", "description": "What you found, in your own words"},
@@ -19984,7 +19983,7 @@ TOOLS = [
      "as the answer: the way to ask them to decide.",
      S({"task_id": TASK_ID, "person": {"type": "string", "description": "P-<id>, or the person's exact name"},
         "text": {"type": "string", "description": "What the person reads, 1 to 4000 characters of plain text"},
-        "request_id": {"type": "string", "description": "A new UUID for each message"},
+        "request_id": REQUEST_ID,
         "waits": {"type": "boolean", "description": "true: this task waits for their next message, which is the "
                                                     "answer"}},
        ["person", "text", "request_id"])),
@@ -20027,7 +20026,7 @@ TOOLS = [
      "and its owner first checks what its last actions did, so nothing it already did is repeated. No count refuses "
      "it. It is refused while the task waits for a usage limit, a permission decision or access it does not hold "
      "yet: settle that first. It repairs no browser extension.",
-     S({"task_id": TASK_ID, "request_id": {"type": "string", "description": "A new UUID for each restart"},
+     S({"task_id": TASK_ID, "request_id": REQUEST_ID,
         "expected_attempt": {"type": "integer", "description": "The attempt the task is at now: the one that failed, "
                                                                 "or the one that waits at the ask for access"},
         "reason": {"type": "string", "description": "Why it starts again, in 1 to 300 characters: what the owner of "
@@ -20145,7 +20144,8 @@ TOOLS = [
      S({"goal": {"type": "string", "description": "Goal id, for example G-3. Leave it out for a new goal"},
         "title": {"type": "string", "description": "A new goal's name in one line, in the owner's own sense"},
         "text": {"type": "string", "description": "A new goal: what the owner wants reached, in their own words"},
-        "request_id": {"type": "string", "description": "A new UUID, for a new goal"}, "next_step": STR,
+        "request_id": dict(REQUEST_ID, description="Only for a new goal. " + REQUEST_ID["description"]),
+        "next_step": STR,
         "next_task": {"type": "string", "description": "The task of the next step, for example T-7"},
         "step": {"type": "string", "description": "One step of the plan in your own words: a new one, or new words "
                                                   "for the step that step_id names"},
@@ -20251,7 +20251,7 @@ TOOLS = [
      "closed, the same key opens no second case. A key that another duty has open is that duty's case: your duty "
      "joins it, and you work in it and close it there. A task that opens a second case carries neither, so close "
      "each one yourself.",
-     S({"request_id": {"type": "string", "description": "A new UUID for each write"},
+     S({"request_id": REQUEST_ID,
         "responsibility": {"type": "string", "description": "Responsibility id, for example R-1"},
         "key": {"type": "string", "description": "The name of the event, which makes it one thing: a thread, an "
                                                  "alert fingerprint, an order number"},
@@ -20264,7 +20264,7 @@ TOOLS = [
      "\"fixed\", \"released\", \"told the customer\", \"stops it next time\"). The same label again replaces "
      "that line. Nothing is required: the duty's own words say which steps this case needs, and the records are "
      "what the owner reads afterwards.",
-     S({"request_id": {"type": "string", "description": "A new UUID for each write"},
+     S({"request_id": REQUEST_ID,
         "case": {"type": "string", "description": "Case id, for example R-1/C-3"},
         "step": {"type": "string", "description": "A short label for this step, at most 60 characters"},
         "text": {"type": "string", "description": "What you did, in one line of at most 500 characters"},
@@ -20276,7 +20276,7 @@ TOOLS = [
      "it in learned when there is something: it is kept for your own next sessions, and because it names this "
      "case's key, the work itself can later show it was wrong. A wall you hit on the way goes in tried: that one "
      "takes no key, because it is not a claim about this event coming back.",
-     S({"request_id": {"type": "string", "description": "A new UUID for each write"},
+     S({"request_id": REQUEST_ID,
         "case": {"type": "string", "description": "Case id, for example R-1/C-3"},
         "outcome": {"type": "string", "description": "handled, no_action or failed"},
         "note": {"type": "string", "description": "The result in one line"},
@@ -20296,7 +20296,7 @@ TOOLS = [
      "order that works, the check that catches the mistake you make, the thing that always takes longer than you "
      "think. Your next task session starts with it, so write what a competent stranger doing your job would need, "
      "not a diary. " + NOTES_RULE + " Every version is kept and the owner reads all of them.",
-     S({"request_id": {"type": "string", "description": "A new UUID for each write"},
+     S({"request_id": REQUEST_ID,
         "text": {"type": "string", "description": f"The whole notes, which replace the ones before, at most "
                  f"{NOTES_MAX} characters"},
         "why": {"type": "string", "description": "One line: what you changed and what taught you"},
@@ -20305,7 +20305,7 @@ TOOLS = [
      "Make one of your own wake-up rules a watch of one of your duties, so that every event it finds becomes a case "
      "of that duty. You build the mechanism with what you have (save_trigger, saved code, your integrations); the hub "
      "holds the duty, the cases and the scheduler. detach takes the rule off the duty again.",
-     S({"request_id": {"type": "string", "description": "A new UUID for each write"},
+     S({"request_id": REQUEST_ID,
         "responsibility": {"type": "string", "description": "Responsibility id, for example R-1"},
         "trigger": {"type": "integer", "description": "The number of your wake-up rule (see_triggers)"},
         "detach": {"type": "boolean", "description": "True to take the rule off the duty"}, "task_id": TASK_ID},
@@ -20320,7 +20320,7 @@ TOOLS = [
      "key. When you already hold lessons close to this one, remember writes nothing and answers with them: if it is "
      "one of them again, or replaces it, call it again with instead_of=\"M-<id>\" (that one is removed, and this one "
      "stands, dated today, with its claim); if it is a different lesson, with new=true.",
-     S({"request_id": {"type": "string", "description": "A new UUID for each write"},
+     S({"request_id": REQUEST_ID,
         "text": {"type": "string", "description": f"The lesson, at most {MEMORY_TEXT} characters"},
         "about": {"type": "string", "description": "Your own short tag: a product, a tool, a person, the fleet"},
         "prevents": {"type": "string", "description": "What you expect this lesson to prevent, in one line"},
@@ -20351,7 +20351,7 @@ TOOLS = [
      "Remove one of your lessons that is wrong or no longer true, with the reason: what it told you to do, and what "
      "happened instead. A wrong lesson compounds. It leaves your memory — no start and no recall shows it again — and "
      "your history keeps it with the reason (search_history).",
-     S({"request_id": {"type": "string", "description": "A new UUID for each write"},
+     S({"request_id": REQUEST_ID,
         "memory": {"type": "string", "description": "The lesson to remove, for example M-1"},
         "reason": {"type": "string", "description": "Why it no longer stands, in one line"}, "task_id": TASK_ID},
        ["request_id", "memory", "reason"])),
@@ -20387,7 +20387,7 @@ TOOLS = [
      "in your checkout first, change what you must and give all of it back. It becomes one commit of the "
      "configuration ref with your name and your why on it, which the owner reads and reverts in one step. What you "
      "yourself learned goes in remember instead, and a fact about a product goes in that product's repository.",
-     S({"request_id": {"type": "string", "description": "A new UUID for each write"},
+     S({"request_id": REQUEST_ID,
         "path": {"type": "string", "description": "A shared knowledge file, knowledge/<name>.md, for example "
                                                   "knowledge/suppliers.md"},
         "text": {"type": "string", "description": "The file's whole new content, as Markdown"},
@@ -20403,7 +20403,7 @@ TOOLS = [
      "SKILL.md's whole text and files the skill's other files, each whole: read them in your checkout first. Left "
      "out, files stay as they are. Each write is one commit with your name and your why, which the owner reads and "
      "reverts in one step. How you work in general goes in write_notes, and a lesson in remember.",
-     S({"request_id": {"type": "string", "description": "A new UUID for each write"},
+     S({"request_id": REQUEST_ID,
         "name": {"type": "string", "description": "The skill's folder and name: a-z, 0-9 and -, for example "
                                                   "deploy-acme-web"},
         "description": {"type": "string", "description": "One line, at most 300 characters: what the skill does "
@@ -20431,7 +20431,7 @@ TOOLS = [
      "there is no other field. A watch becomes a wake-up rule, so you write no schedule, and the agent builds the "
      "mechanism that finds the event. The holder starts on it at once: a new duty, a moved one and new words start "
      "a review task of its duties.",
-     S({"request_id": {"type": "string", "description": "A new UUID for each write"},
+     S({"request_id": REQUEST_ID,
         "responsibility": {"type": "string", "description": "The duty to change, for example R-1. Leave it out for a "
                                                             "new duty."},
         "agent": {"type": "string", "description": "The one agent that holds the duty"},
@@ -20450,7 +20450,7 @@ TOOLS = [
      "request_secret; for anything else, raise_needs_you. The agent gets it in its "
      "next task session. Each grant is written into the owner's chat with you, with your own why, because you answer "
      "for giving it.",
-     S({"request_id": {"type": "string", "description": "A new UUID for each write"},
+     S({"request_id": REQUEST_ID,
         "agent": {"type": "string", "description": "The worker or lead that gets the access"},
         "resource": {"type": "string", "description": "The resource, <kind>:<what>: repo:acme/web, "
                      "secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com or tool:<MCP server>"},
@@ -20465,7 +20465,7 @@ TOOLS = [
      "its cases stay as history, so a duty that nothing needs any more is yours to retire without asking. "
      "see_responsibilities names every retired duty, so reopen brings one back. The reach is the one set_duty "
      "has: the manager any agent of the fleet, a lead its own team.",
-     S({"request_id": {"type": "string", "description": "A new UUID for each write"},
+     S({"request_id": REQUEST_ID,
         "responsibility": {"type": "string", "description": "Responsibility id, for example R-1"},
         "action": {"type": "string", "description": "pause, resume, retire or reopen"}, "note": {"type": "string"},
         "task_id": TASK_ID}, ["request_id", "responsibility", "action"])),
@@ -20552,7 +20552,7 @@ TOOLS = [
      "WhatsApp number or Discord bot; without one it stays in the app. Answer an owner message with tell_owner "
      "instead. One request_id is one message: the same request_id again sends nothing more. Never put a login in the "
      "text. Name a task or a duty by what it is about, never by its code (T-61, R-3).",
-     S({"request_id": {"type": "string", "description": "A new UUID for each message"},
+     S({"request_id": REQUEST_ID,
         "text": {"type": "string", "description": "The message, 1 to 4,000 characters"}}, ["request_id", "text"])),
     ("worker", "start_task", t_start_task,
      "Only in your owner chat, and only when the owner asks you in their own words to do work: open it as a task of "
@@ -20576,7 +20576,7 @@ TOOLS = [
      "not come, and nothing nudges the task while it waits. Two agents that send each other 20 messages with no work "
      "of either between them send no more until one of them works; an answer to a message that waits is never "
      "refused. One request_id is one message: the same request_id again sends nothing more.",
-     S({"request_id": {"type": "string", "description": "A new UUID for each message"},
+     S({"request_id": REQUEST_ID,
         "agent": {"type": "string", "description": "The agent that gets the message"},
         "text": {"type": "string", "description": "The message, 1 to 8,000 characters"},
         "in_reply_to": {"type": "string", "description": "The id of the message that this one answers, for example "
@@ -20606,7 +20606,7 @@ TOOLS = [
      "Drive, or give a file new content (file_id). upload: true gives a one-time upload link: the write happens when "
      "you send the file to it. Without folder_id a new item goes to the root of My Drive. One request_id is one "
      "write: the same request_id again gives the first result and writes nothing.",
-     S({"task_id": TASK_ID, "request_id": {"type": "string", "description": "A new UUID for each write"},
+     S({"task_id": TASK_ID, "request_id": REQUEST_ID,
         "kind": {"type": "string", "enum": list(DRIVE_KINDS), "description": "A new item: doc, sheet, folder or file"},
         "name": {"type": "string", "description": "The new item's name, 1 to 255 characters"},
         "folder_id": {"type": "string", "description": "The folder of the new item"},
@@ -20617,7 +20617,7 @@ TOOLS = [
     ("worker", "drive_sheet", t_drive_sheet,
      "Write cells of a Google Sheet: the rows at range, or with append: true after the last row of range. One "
      "request_id is one write: the same request_id again gives the first result and writes nothing.",
-     S({"task_id": TASK_ID, "request_id": {"type": "string", "description": "A new UUID for each write"},
+     S({"task_id": TASK_ID, "request_id": REQUEST_ID,
         "file_id": {"type": "string", "description": "The Sheet's ID"},
         "range": {"type": "string", "description": "A range in A1 form, for example Costs!A1:F200"},
         "rows": {"type": "array", "items": {"type": "array", "items": {"type": "string"}},
@@ -20628,7 +20628,7 @@ TOOLS = [
     ("worker", "drive_move", t_drive_move,
      "Rename a Drive file or folder (name), move it to another folder (folder_id), or move it to the trash and back "
      "(trash). One request_id is one write: the same request_id again gives the first result and writes nothing.",
-     S({"task_id": TASK_ID, "request_id": {"type": "string", "description": "A new UUID for each write"},
+     S({"task_id": TASK_ID, "request_id": REQUEST_ID,
         "file_id": {"type": "string", "description": "The file's or folder's ID"},
         "name": {"type": "string", "description": "The new name"},
         "folder_id": {"type": "string", "description": "The new folder"},
@@ -20649,7 +20649,7 @@ TOOLS = [
      "Write a plain-text draft in the owner's Drafts folder: a new email, an answer in the thread of reply_to, or new "
      "content for a draft that you made (draft_id). Nothing is sent. One request_id is one write: the same request_id "
      "again gives the first result and writes nothing.",
-     S({"task_id": TASK_ID, "request_id": {"type": "string", "description": "A new UUID for each write"},
+     S({"task_id": TASK_ID, "request_id": REQUEST_ID,
         "to": {"type": "array", "items": {"type": "string"}, "description": "Addresses: name <a@b.c> or a@b.c"},
         "cc": {"type": "array", "items": {"type": "string"}}, "bcc": {"type": "array", "items": {"type": "string"}},
         "subject": {"type": "string"}, "body": {"type": "string", "description": "Plain text"},
@@ -20660,7 +20660,7 @@ TOOLS = [
      "Change the labels of 1 to 100 emails: add or remove INBOX (remove it to archive), UNREAD, STARRED, IMPORTANT or "
      "the owner's label names (a new name in add makes that label), or move them to the trash and back (trash). One "
      "request_id is one write: the same request_id again gives the first result and writes nothing.",
-     S({"task_id": TASK_ID, "request_id": {"type": "string", "description": "A new UUID for each write"},
+     S({"task_id": TASK_ID, "request_id": REQUEST_ID,
         "message_ids": {"type": "array", "items": {"type": "string"}},
         "add": {"type": "array", "items": {"type": "string"}}, "remove": {"type": "array", "items": {"type": "string"}},
         "trash": {"type": "boolean", "description": "true: to the trash; false: out of the trash"}},
@@ -20669,7 +20669,7 @@ TOOLS = [
      "Send one plain-text email from the owner's address: a new email, or an answer in the thread of reply_to. It "
      "reaches other people at once and cannot be taken back. One request_id is one email: the same "
      "request_id again never sends again.",
-     S({"task_id": TASK_ID, "request_id": {"type": "string", "description": "A new UUID for each email"},
+     S({"task_id": TASK_ID, "request_id": REQUEST_ID,
         "to": {"type": "array", "items": {"type": "string"}, "description": "Addresses: name <a@b.c> or a@b.c"},
         "cc": {"type": "array", "items": {"type": "string"}}, "bcc": {"type": "array", "items": {"type": "string"}},
         "subject": {"type": "string"}, "body": {"type": "string", "description": "Plain text"},
@@ -20738,7 +20738,7 @@ def google_described(agent, name, desc):
     return f"{desc} It uses the Google {GOOGLE_NAMES[service]} of {google_grant(agent, service)[0]}."
 
 
-def gate(task_id, name, args):
+def gate(agent, task_id, name, args):
     """A held task takes only reads. Unknown outcomes block completion and login work until they are checked."""
     hold = active_hold(task_id)
     if hold and name not in ("read_messages", "list_my_tasks"):
@@ -20748,13 +20748,15 @@ def gate(task_id, name, args):
     if name in ("sign_in", "hand_over", "create_login", "save_key", "call_api", "gmail_send") or completing:
         left = q("SELECT id, title FROM outcomes WHERE task=? AND state='unknown' ORDER BY id", (task_id,))
         # call_api: a request that reads (GET) is a way to check, and the same request_id only asks for its answer.
-        if left and name == "call_api" and (args.get("method") == "GET" or q1(
+        # A request_id that the rule refuses is no repeat: the tool's own refusal answers it.
+        rid = wakeups.request_ref(args.get("request_id"))
+        if left and name == "call_api" and (args.get("method") == "GET" or rid and q1(
                 "SELECT id FROM jobs WHERE task=? AND kind='request' AND request_id=?",
-                (task_id, str(args.get("request_id") or "").lower()))):
+                (task_id, vault_request(agent, rid)))):
             left = []
         # gmail_send: the same request_id as an unknown email only gives its text again; it never sends.
-        if left and name == "gmail_send" and q1("SELECT id FROM outcomes WHERE task=? AND tool_call_id=?",
-                                                (task_id, f"gmail-{str(args.get('request_id') or '').lower()}")):
+        if left and name == "gmail_send" and rid and q1("SELECT id FROM outcomes WHERE task=? AND tool_call_id=?",
+                                                        (task_id, f"gmail-{rid}")):
             left = []
         if left:
             raise ToolError("STOP: first find out whether these earlier actions took effect, without repeating them: " +
@@ -20865,7 +20867,7 @@ def call_tool(agent, name, args, context=None):
             attempt = t["attempt"]
             if not team:
                 args["task_id"] = tref(tid)
-            gate(tid, name, args)
+            gate(agent, tid, name, args)
             # task_id is the session's field and not the tool's: every call of a task session is fenced by it,
             # whether or not the tool's own schema lists it (message_agent does not). So it is never the caller's
             # mistake here, and the check below must not read it as one.
