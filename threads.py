@@ -46,6 +46,15 @@ READ_ONLY_MCP = ("read", "get", "list", "find", "search", "see_", "tabs_context"
 # Codex code mode: exec scripts call tools.exec_command({cmd: "..."}) and tools.write_stdin({session_id: N, chars: ""}).
 EXEC_CMD = re.compile(r"""exec_command\(\{\s*cmd\s*:\s*(["'`])((?:\\.|(?!\1).)*)\1""", re.S)
 STDIN = re.compile(r"""write_stdin\(\{\s*session_id\s*:\s*(\d+)\s*(?:,\s*chars\s*:\s*(["'`])((?:\\.|(?!\2).)*)\2)?""", re.S)
+# And its plan: tools.update_plan({plan: [{step: "...", status: "in_progress"}]}), whose argument is read as a literal
+# (Codex 0.163 sends it only there: its rollout has no plan event of its own).
+PLAN_CALL = re.compile(r"\btools\.update_plan\s*\(")
+JS_COMMENT = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
+JS_GAP = re.compile(r"(?:\s|//[^\n]*|/\*.*?\*/)*", re.S)        # what may stand between two tokens
+JS_NAME = re.compile(r"[A-Za-z_$][\w$]*")
+JS_NUMBER = re.compile(r"-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
+JS_WORDS = {"true": True, "false": False, "null": None, "undefined": None}
+JS_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
 
 
 def clip(text, limit):
@@ -89,6 +98,96 @@ def plan_entries(items, key):
             status = item.get("status") if item.get("status") in ("pending", "in_progress", "completed") else "pending"
             entries.append({"content": clip(item[key], TITLE), "status": status})
     return entries[:50]
+
+
+def js_literal(text, at, depth=0):
+    """The JavaScript literal at text[at:] and where it ends: an object, an array, a string with no ${}, a number,
+    true, false or null. ValueError for anything else, such as a name, a call or a sum."""
+    at = JS_GAP.match(text, at).end()
+    char = text[at:at + 1]
+    if depth > 20 or not char:
+        raise ValueError("no literal")
+    if char in "{[":
+        close, value, at = "]" if char == "[" else "}", [] if char == "[" else {}, at + 1
+        while True:
+            at = JS_GAP.match(text, at).end()
+            if text[at:at + 1] == close:
+                return value, at + 1
+            if char == "[":
+                item, at = js_literal(text, at, depth + 1)
+                value.append(item)
+            else:
+                name = JS_NAME.match(text, at)
+                key, at = (name.group(), name.end()) if name else js_literal(text, at, depth + 1)
+                at = JS_GAP.match(text, at).end()
+                if isinstance(key, (dict, list)) or text[at:at + 1] != ":":       # {plan} names a variable
+                    raise ValueError("no literal property")
+                value[str(key)], at = js_literal(text, at + 1, depth + 1)
+            at = JS_GAP.match(text, at).end()
+            if text[at:at + 1] == ",":
+                at += 1
+            elif text[at:at + 1] != close:
+                raise ValueError("no literal")
+    if char in "\"'`":
+        parts, at = [], at + 1
+        while text[at:at + 1] != char:
+            if not text[at:at + 1] or (text[at] == "\n" and char != "`") or (char == "`" and text.startswith("${", at)):
+                raise ValueError("no literal string")
+            if text[at] != "\\":
+                parts.append(text[at])
+                at += 1
+                continue
+            code = text[at + 1:at + 2]
+            if code == "u" and text[at + 2:at + 3] == "{":
+                end = text.find("}", at + 3)
+                if end < 0:
+                    raise ValueError("an open escape")
+                digits, at = text[at + 3:end], end + 1
+            elif code in ("u", "x"):
+                size = 4 if code == "u" else 2
+                digits, at = text[at + 2:at + 2 + size], at + 2 + size
+            else:
+                digits, at = None, at + 2
+                if code == "\r" and text[at:at + 1] == "\n":
+                    at += 1
+            parts.append(chr(int(digits, 16)) if digits is not None else
+                         "" if code in ("\r", "\n") else JS_ESCAPES.get(code, code))      # a line continuation is none
+        return "".join(parts).encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace"), at + 1
+    word = JS_NAME.match(text, at)
+    if word and word.group() in JS_WORDS:
+        return JS_WORDS[word.group()], word.end()
+    number = JS_NUMBER.match(text, at)
+    if number and not JS_NAME.match(text, number.end()):
+        return float(number.group()), number.end()
+    raise ValueError("no literal")
+
+
+def code_plans(code):
+    """The plans that a Codex code-mode script keeps with tools.update_plan, as plan records in their order, and
+    whether the script does nothing else (then it is its plan alone, not a call). A plan that is no literal, such as
+    {plan: steps}, is none, and the script stays a call."""
+    if "update_plan" not in code:
+        return [], False
+    plans, rest, last = [], [], 0
+    for match in PLAN_CALL.finditer(code):
+        if match.start() < last:
+            continue                # inside the plan before it, as its text
+        try:
+            args, end = js_literal(code, match.end())
+        except (ValueError, OverflowError):
+            continue
+        end = JS_GAP.match(code, end).end()
+        if code[end:end + 1] == ",":
+            end = JS_GAP.match(code, end + 1).end()
+        if not isinstance(args, dict) or not isinstance(args.get("plan"), list) or code[end:end + 1] != ")":
+            continue                # Codex refuses a call with no plan list, so the plan stays as it was
+        plans.append({"type": "plan", "entries": plan_entries(args.get("plan"), "step")})
+        rest.append(code[last:match.start()])
+        last = end + 1
+    if not plans:
+        return [], False
+    left = re.sub(r"\bawait\b", "", JS_COMMENT.sub("", "".join(rest) + code[last:]))
+    return plans, re.fullmatch(r"[\s;]*(?:text\s*\(\s*\)[\s;]*)*", left) is not None
 
 
 def mcp_kind(tool):
@@ -677,15 +776,21 @@ class Translator:
     def codex_call(self, payload):
         call, name = clip(payload["call_id"], 100), str(payload.get("name") or "tool")
         raw = payload.get("arguments") if payload.get("type") == "function_call" else payload.get("input")
+        plans = []
         if name == "exec" and isinstance(raw, str):
+            plans, alone = code_plans(raw)
+            if alone:
+                self.silent.add(call)       # a script that only keeps its plan shows as the plan, not as a call
+                return plans
             commands = [m.group(2).replace("\\" + m.group(1), m.group(1)) for m in EXEC_CMD.finditer(raw)]
             if commands:
                 self.commands[call] = commands
             waits = STDIN.findall(raw)
             if waits and not commands and "tools.mcp__" not in raw and all(not chars for _, _, chars in waits):
                 self.open.add(call)        # only a wait on running commands: it changes nothing by itself
-                return [{"type": "tool_call", "tool_call_id": call, "kind": "read", "status": "in_progress", "server": None,
-                         "title": clip("Wait: background session " + ", ".join(session for session, _, _ in waits), TITLE)}]
+                return plans + [{"type": "tool_call", "tool_call_id": call, "kind": "read", "status": "in_progress",
+                                 "server": None, "title": clip("Wait: background session " +
+                                                               ", ".join(session for session, _, _ in waits), TITLE)}]
         if name == "spawn_agent":
             try:
                 args = json.loads(raw) if isinstance(raw, str) else raw
@@ -715,8 +820,9 @@ class Translator:
         label = f"{payload['namespace']}.{name}" if payload.get("namespace") else name
         detail = first_line(raw if isinstance(raw, str) else "")
         self.open.add(call)
-        return [{"type": "tool_call", "tool_call_id": call, "title": clip(f"{label}: {detail}" if detail else label, TITLE),
-                 "kind": CODEX_KINDS.get(name, "other"), "status": "in_progress", "server": None}]
+        return plans + [{"type": "tool_call", "tool_call_id": call, "title": clip(f"{label}: {detail}" if detail else label,
+                                                                             TITLE),
+                         "kind": CODEX_KINDS.get(name, "other"), "status": "in_progress", "server": None}]
 
     def codex_item(self, item):
         itype, ident = item.get("type"), clip(item.get("id") or "", 100)

@@ -347,6 +347,10 @@ CODEX_NO_ASKING = ["-c", "tools.experimental_request_user_input.enabled=false"]
 CODEX_UNATTENDED = CODEX_NO_ASKING + ["-c", "notice.hide_rate_limit_model_nudge=true",
                                       "-c", "notice.hide_gpt5_1_migration_prompt=true",
                                       "-c", "skills.include_instructions=false", "-c", "skills.bundled.enabled=false"]
+# Codex 0.163 offers its plan tool, update_plan, only with this option: a turn without it said that it had no such
+# tool (4 November 2026). A task keeps its plan there (RULES.md), which the owner's app shows while the task runs
+# (threads.py), in the terminal and in the app-server (screen_runner.py). A standing session is no task.
+CODEX_PLAN = ["-c", "tools.update_plan.enabled=true"]
 
 
 def in_checkout(command):
@@ -1106,8 +1110,8 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     if conf.get("runtime") == "codex" and "--no-daemon" not in cmd:
         cmd = cmd.replace("codex ", "codex --no-daemon ", 1)
     if conf.get("runtime") == "codex":
-        cmd = cmd.replace("codex ", "codex " + shlex.join(CODEX_NO_UPDATE_CHECK + CODEX_UNATTENDED + codex_env(env)) +
-                          " ", 1)
+        cmd = cmd.replace("codex ", "codex " + shlex.join(CODEX_NO_UPDATE_CHECK + CODEX_UNATTENDED +
+                                                           (CODEX_PLAN if task else []) + codex_env(env)) + " ", 1)
     # A task's own route; the standing session's route with its credential, and a standing Codex session's also
     # without one: Codex would otherwise use only its machine's configuration, which a runtime switch did not write.
     if task or token or conf.get("runtime") == "codex":
