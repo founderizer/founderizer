@@ -116,6 +116,10 @@ SHELL_ENDS = ("completed", "failed", "stopped", "killed")
 BACKGROUND_TOOLS = ("Bash", "Monitor", "Workflow")
 # The description in a Workflow script's meta literal, which Claude Code shows as the call's own title
 WORKFLOW_DESCRIPTION = re.compile(r"""\bdescription\s*:\s*(["'`])((?:\\.|(?!\1).)*?)\1""")
+# Claude Code's own task list, which it offers in place of TodoWrite while its tasks are on (the default in 2.1.3xx):
+# TaskCreate and TaskUpdate change it and the other two read it. Like TodoWrite, they show as the plan, not as calls.
+CLAUDE_TASK_TOOLS = ("TaskCreate", "TaskUpdate", "TaskList", "TaskGet")
+TASK_MADE = re.compile(r"\bTask #(\d{1,9}) created")    # TaskCreate's result: "Task #3 created successfully: <subject>"
 
 
 def notice_tag(notice, name):
@@ -191,6 +195,7 @@ class Translator:
         self.started = False
         self.open = set()       # tool calls with no finish yet
         self.silent = set()     # tool calls shown as a plan, not as a call
+        self.tasks = []         # Claude: its own task list (TaskCreate, TaskUpdate) in order, which is its plan
         self.limit = False      # Codex: inside a stretch where a limit is reached
         self.reset = None       # Codex: the latest reset time in its rate-limit records
         self.commands = {}      # Codex: exec call -> the commands it started, in order
@@ -361,7 +366,10 @@ class Translator:
                     out.append({"type": "user_message", "text": clip(text, TEXT)})
             elif kind == "user" and btype == "tool_result":
                 call = clip(block.get("tool_use_id"), 100)
-                if call in self.silent or call not in self.open:
+                if call in self.silent:
+                    out.extend(self.claude_task_made(call, block, row))
+                    continue
+                if call not in self.open:
                     continue
                 result = row.get("toolUseResult") if isinstance(row.get("toolUseResult"), dict) else {}
                 if call in self.agents:
@@ -425,6 +433,9 @@ class Translator:
         if name == "TodoWrite" and isinstance(args.get("todos"), list):
             self.silent.add(call)
             return [{"type": "plan", "entries": plan_entries(args["todos"], "content")}]
+        if name in CLAUDE_TASK_TOOLS:
+            self.silent.add(call)
+            return self.claude_task(call, name, args)
         server, label, kind = None, name, CLAUDE_KINDS.get(name, "other")
         if name.startswith("mcp__") and name.count("__") >= 2:
             _, server, tool = name.split("__", 2)
@@ -456,6 +467,39 @@ class Translator:
             self.agents[call] = None
             record["subagent"] = {"name": clip(args.get("subagent_type") or args.get("description") or name, 100)}
         return [record]
+
+    def claude_task(self, call, name, args):
+        """A plan record when a call changes the session's task list. A new task gets its id from its call's result
+        (claude_task_made), and an update names that id; a deleted task leaves the plan."""
+        before = plan_entries(self.tasks, "content")
+        if name == "TaskCreate" and str(args.get("subject") or "").strip():
+            self.tasks.append({"id": None, "call": call, "content": args["subject"], "status": "pending"})
+        elif name == "TaskUpdate":
+            task = next((t for t in self.tasks if t["id"] is not None and t["id"] == str(args.get("taskId"))), None)
+            if task and args.get("status") == "deleted":
+                self.tasks.remove(task)
+            elif task:
+                if args.get("status") in ("pending", "in_progress", "completed"):
+                    task["status"] = args["status"]
+                if str(args.get("subject") or "").strip():
+                    task["content"] = args["subject"]
+        after = plan_entries(self.tasks, "content")
+        return [{"type": "plan", "entries": after}] if after != before else []
+
+    def claude_task_made(self, call, block, row):
+        """A TaskCreate's result: the id that later updates name, or, when it was refused, the plan without it."""
+        task = next((t for t in self.tasks if t["call"] == call and t["id"] is None), None)
+        if task is None:
+            return []
+        made = TASK_MADE.search(text_of(block.get("content")))
+        result = row.get("toolUseResult") if isinstance(row.get("toolUseResult"), dict) else {}
+        given = result.get("task", {}).get("id") if isinstance(result.get("task"), dict) else None
+        if made or isinstance(given, (str, int)) and not isinstance(given, bool):
+            task["id"] = made.group(1) if made else str(given)
+        elif block.get("is_error"):
+            self.tasks.remove(task)
+            return [{"type": "plan", "entries": plan_entries(self.tasks, "content")}]
+        return []
 
     def claude_change(self, name, args):
         """What an edit tool changes, from its input: path, action and line counts. Never the text itself."""
