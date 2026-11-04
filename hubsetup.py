@@ -8,11 +8,14 @@ Standard library only, and it reads no credential of a model provider.
                                                     this hub's own repository: the bare one that every machine of the
                                                     fleet fetches from, and the hub's checkout on the configuration ref
     python3 hubsetup.py claim --address IP --out PATH [--port N] [--timezone Z] [--wait S] [--reclaim] [--commit]
-                                                    the owner claim, then write team.json, and commit it on the ref
+                              [--manager-later]
+                                                    the owner claim, then write team.json, and commit it on the ref;
+                                                    --manager-later: the app gives the manager a server of its own
     python3 hubsetup.py runtime --runtime claude|codex
                                                     install the runtime of an agent of this machine, so that the owner
                                                     can sign in to their own account from the app (it signs in to
-                                                    nothing itself); a new hub has no agent, so hub.sh runs it for none
+                                                    nothing itself); a hub whose manager gets a server of its own
+                                                    has no agent, so hub.sh runs it for none there
     python3 hubsetup.py agent-users --team PATH --machine NAME [--check]
                                                     one OS user for each agent of this machine, so that no agent's
                                                     user can read another agent's home
@@ -194,15 +197,18 @@ def machine_timezone():
     return "UTC"
 
 
-def template(hub_ip, port=8765, timezone=None, owner=None, runtime="claude", ssh_user="fleet", ssh_port=22):
+def template(hub_ip, port=8765, timezone=None, owner=None, runtime="claude", ssh_user="fleet", ssh_port=22,
+             placed=True):
     """The first team.json of a new hub: one manager, this machine's address, and the owner's Mac when the claim has
     proved it. Nothing here holds a credential: `"vault": "none"` says that the manager has no vault access, because
     its runtime is the customer's own subscription, signed in by the customer.
 
-    The manager has no server yet (`"placed": false`, hub.unplaced): no agent runs on the hub's server, so this install
-    makes the fleet and nothing else, and the manager's own setup page in the app gives it a server of its own, then
-    its provider and its sign-in. Until then its `machine` names this machine only so that the hub finds an address for
-    it, and `runtime` is the provider that page offers first."""
+    `placed=False` (`claim --manager-later`; hub.sh's FLEET_MANAGER_SERVER=later, which Founderizer 0.1.112 and later
+    set): the manager has no server yet (`"placed": false`, hub.unplaced), so no agent runs on the hub's server, and
+    its own setup page in the app gives it a server of its own, then its provider and its sign-in. Its `machine` names
+    this machine only so that the hub finds an address for it, and `runtime` is the provider that page offers first.
+    Without it the manager runs beside the hub, as it always did: an app from before has no page that gives the manager
+    a server, and a new hub clones the newest release, which reaches it before the app that /download gives does."""
     if runtime not in STARTS:
         raise Stop(f"the manager runs claude or codex, not {runtime!r}.")
     try:
@@ -212,22 +218,16 @@ def template(hub_ip, port=8765, timezone=None, owner=None, runtime="claude", ssh
     addresses = {"hub": address(hub_ip, "the hub's address")}
     if owner is not None:
         addresses["owner"] = address(owner, "the owner's address")
+    manager = {"role": "manager", "machine": "hub", "runtime": runtime, "can": ["shell", "web"], "vault": "none",
+               "start": STARTS[runtime]}
+    if not placed:
+        manager["placed"] = False
     return {
         "hub": {"machine": "hub", "port": int(port)},
         "goals": {"sweep_minutes": 15, "review_hour": 9, "timezone": timezone or "UTC"},
         "addresses": addresses,
         "access": {"hub": {"ssh_user": ssh_user, "ssh_port": int(ssh_port)}},
-        "agents": {
-            "manager": {
-                "role": "manager",
-                "machine": "hub",
-                "placed": False,
-                "runtime": runtime,
-                "can": ["shell", "web"],
-                "vault": "none",
-                "start": STARTS[runtime],
-            },
-        },
+        "agents": {"manager": manager},
     }
 
 
@@ -288,7 +288,7 @@ def agent_user(agent, conf=None):
 def agents_of(team, machine):
     """The agents that team.json gives this machine, in the order their users are made. An agent the owner has
     turned off keeps its user: the owner turns it on again from the app, and no install runs in between. A manager
-    with no server yet is on no machine (hub.unplaced), so a new hub makes no user, runtime or service for it."""
+    with no server yet is on no machine (hub.unplaced), so such a hub makes no user, runtime or service for it."""
     return sorted(name for name, conf in ((team or {}).get("agents") or {}).items()
                   if isinstance(conf, dict) and conf.get("machine") == machine and conf.get("placed") is not False)
 
@@ -1777,7 +1777,7 @@ def health(hub_ip, port, timeout=10):
 
 def cmd_template(args):
     print(json.dumps(template(args.address, args.port, args.timezone or machine_timezone(), args.owner,
-                              args.runtime, args.ssh_user, args.ssh_port), indent=2))
+                              args.runtime, args.ssh_user, args.ssh_port, placed=not args.manager_later), indent=2))
 
 
 def cmd_repository(args):
@@ -1796,7 +1796,7 @@ def cmd_claim(args):
     team = own_team(args.out, here, args.port) or template(args.address, args.port,
                                                            args.timezone or machine_timezone(),
                                                            runtime=args.runtime, ssh_user=args.ssh_user,
-                                                           ssh_port=args.ssh_port)
+                                                           ssh_port=args.ssh_port, placed=not args.manager_later)
     team.setdefault("addresses", {})["owner"] = owner
     write_team(args.out, team)
     say(f"{args.out} names {owner} as the owner.")
@@ -1970,6 +1970,8 @@ def main(argv=None):
         p.add_argument("--runtime", default="claude", choices=sorted(STARTS))
         p.add_argument("--ssh-user", default="fleet")
         p.add_argument("--ssh-port", type=int, default=22)
+        p.add_argument("--manager-later", action="store_true",
+                       help="the manager has no server yet: the app that installs this hub gives it one")
         if name == "template":
             p.add_argument("--owner")
         else:

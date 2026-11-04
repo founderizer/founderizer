@@ -113,9 +113,11 @@ Other options: `--port N` (default 8765), `--timezone Z` (default the server's o
    configuration ref — the branch the hub writes and nothing else writes (PILOT.md,
    "The configuration ref"). Both refs start at the commit of the copy you ran, so the
    code the hub serves is the code it runs.
-7. **The first `team.json`, and the owner's own Mac.** One manager with no server yet
-   (`"placed": false`: its `machine` names this machine only until its setup gives it
-   one), this machine's address, `"vault": "none"`, and no credential of any kind.
+7. **The first `team.json`, and the owner's own Mac.** One manager on this machine, or,
+   when the app that starts the install gives the manager its own server
+   (`FLEET_MANAGER_SERVER=later`, Founderizer 0.1.112 and later), one manager with no
+   server yet (`"placed": false`: its `machine` names this machine only until its setup
+   gives it one); this machine's address, `"vault": "none"`, and no credential of any kind.
    Then the claim, below. The file is committed on `config` and pushed to the hub's own
    repository, so the record starts at the first minute.
 8. **The two root commands of this machine**, below:
