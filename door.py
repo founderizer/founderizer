@@ -48,6 +48,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))     # python3 -I leaves the code's own folder out
 import door_providers       # noqa: E402
 import door_targets         # noqa: E402
+import vault                # noqa: E402  the central vault's own check of an owner's signed statement
 
 DOOR_PORT = 8766            # the door's service on the private network (the tailnet policy opens it, plan 2.7)
 SSHD_PORT = 2244            # the second sshd on every managed host (host/install.sh; the policy opens it to tag:door)
@@ -67,6 +68,9 @@ SECRETS_DIR = STATE + "/secrets"            # opened values, one file each, mode
 VAULT_KEY = STATE + "/vault.key"            # the door's own age identity (its recipient is pinned in the vault)
 SSH_KEY = STATE + "/ssh/id_ed25519"         # the door's SSH key to the second sshd of each host
 AWS_TOKEN_FILE = "/opt/machine-id/jwt_svid"  # the door's own Teleport bot writes its JWT-SVID here (plan 5.4)
+APPROVALS_FILE = STATE + "/approvals.json"  # the owner's signed yeses for exact judged calls, from the hub
+APPROVED_FILE = STATE + "/approved.json"    # the yeses that were used: each lets its one call through once
+APPROVAL_DAYS = 7                           # a signed yes older than this lets nothing through
 UPSTREAM = "https://github.com/miguelpieras/founderizer-fleet.git"
 JUDGE_URL = "https://api.anthropic.com/v1/messages"
 JUDGE_VERSION = "2026-10-21"
@@ -89,6 +93,8 @@ REF = re.compile(r"bws://[0-9a-f-]{36}", re.I)
 ROLE = re.compile(r"arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,128}")
 HOST_KEY = re.compile(r"ssh-ed25519 [A-Za-z0-9+/=]{60,100}")
 WINDOW_CLASSES = ("upgrade", "restart", "reboot", "deploy", "tailscale")
+APPROVAL_NOTE = (" Its call hash is {sha}: a Needs-you item that names it (raise_needs_you door_call) lets this exact "
+                 "call through once, when the owner answers yes.")
 JUDGE_SYSTEM = (
     "You are the judge of a door that runs operations on servers and cloud accounts for automated agents. One agent "
     "asks for one action. Allow it only when it is a normal, narrow operations step on that target: it must not read "
@@ -153,12 +159,22 @@ def validate_access(data):
     if not isinstance(data, dict) or data.get("v") != 1:
         raise ValueError("the access file is {v: 1, ...}")
     known = {"v", "hub", "agents", "hosts", "credentials", "windows", "never", "workflows", "exposure", "pools",
-             "images"}
+             "images", "owner_keys", "fleet"}
     if set(data) - known:
         raise ValueError(f"unknown field {sorted(set(data) - known)[0]}")
     hub = data.get("hub") or {}
     if not tailnet_address(hub.get("address", "")) or not isinstance(hub.get("port", 8765), int):
         raise ValueError("hub is {address, port}: the hub's address on the private network")
+    keys = data.get("owner_keys")       # the owner's public keys, which sign his yes to an exact call (approval)
+    if keys is not None and (not isinstance(keys, list) or not 1 <= len(keys) <= vault.OWNER_KEYS):
+        raise ValueError(f"owner_keys lists 1 to {vault.OWNER_KEYS} public keys of the owner")
+    for key in keys or []:
+        try:
+            vault.owner_key(key)
+        except ValueError:
+            raise ValueError("each of owner_keys is the base64 of an uncompressed P-256 public key") from None
+    if "fleet" in data and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", str(data["fleet"])):
+        raise ValueError("fleet is the fleet's id, which the owner's signed statements name")
     hosts = data.get("hosts") or {}
     for name, h in hosts.items():
         if not HOST.fullmatch(name) or not isinstance(h, dict):
@@ -227,6 +243,31 @@ def validate_access(data):
                 if not re.fullmatch(r"([01][0-9]|2[0-3]):[0-5][0-9]", t):
                     raise ValueError(f"{t!r} is not HH:MM")
     return data
+
+
+def approval(access, statement, signature):
+    """(call, need) of the owner's signed yes to one exact call, or None. The statement is {v: 1, kind: "door-call",
+    fleet, need, call, at} in its canonical form: of this fleet, at most APPROVAL_DAYS old, and signed by one of the
+    owner keys of the access file, with the central vault's own check. call is the call's hash, which the door gave
+    with its refusal; need is the Needs-you item that took it to him."""
+    keys, fleet = access.get("owner_keys"), access.get("fleet")
+    if not keys or not fleet or not isinstance(statement, str) or not isinstance(signature, str):
+        return None
+    try:
+        said = json.loads(statement)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(said, dict) or set(said) != {"v", "kind", "fleet", "need", "call", "at"} or \
+            vault.canonical(said) != statement:
+        return None
+    if type(said["v"]) is not int or said["v"] != 1 or said["kind"] != "door-call" or said["fleet"] != fleet or \
+            not re.fullmatch(r"[0-9a-f]{64}", str(said["call"])) or type(said["need"]) is not int or \
+            said["need"] < 1 or type(said["at"]) is not int or \
+            not now() - APPROVAL_DAYS * 86400 <= said["at"] <= now() + 300:
+        return None
+    if not vault.owner_signed({"owner_keys": keys}, statement, signature):
+        return None
+    return said["call"], said["need"]
 
 
 def in_window(spans, t):
@@ -354,6 +395,21 @@ class Door:
             raise door_providers.Stop(f"the door's bot has written no AWS token in {AWS_TOKEN_FILE}")
         return token
 
+    def approved(self, access, sha):
+        """The owner's signed yes to this exact call, now used, or None: each yes lets its one call through once."""
+        with self.lock:
+            entry = read_json(APPROVALS_FILE, {}).get(sha)
+            if not isinstance(entry, dict) or approval(access, entry.get("statement"), entry.get("signature")) is None:
+                return None
+            used = read_json(APPROVED_FILE, {})
+            key = hashlib.sha256(entry["statement"].encode()).hexdigest()
+            if key in used:
+                return None
+            used = {k: v for k, v in used.items() if v > now() - 2 * APPROVAL_DAYS * 86400}
+            used[key] = round(now())
+            write_json(APPROVED_FILE, used)
+        return entry
+
     def keep_minted(self, answer):
         """A key that the door minted: its id goes in the minted list, and its secret into the door's own secrets,
         where only the door reads it, until the door places it."""
@@ -395,16 +451,21 @@ class Door:
             why = window_refusal(access, d.host or target, d.window, self.clock())
             if why:
                 d = door_targets.refused(why, target=d.target)
-        if d.kind == "judged":
-            allowed, why = self.judge(agent, access, d, op, args, content)
-            if not allowed:
-                d = door_targets.refused(why + (door_providers.AWS_COST if target.startswith("aws:") else ""),
-                                         target=d.target)
         sha = hashlib.sha256(json.dumps([target, op, args], sort_keys=True).encode() + (content or b"")).hexdigest()
+        judged = d.kind == "judged"
+        if judged:
+            yes = self.approved(access, sha)
+            if yes:             # the owner said yes to this exact call: it runs once, with no model call
+                d.kind, d.why = "approved", f"the owner's signed yes (N-{yes['need']}) to this exact call, used once"
+            else:
+                allowed, why = self.judge(agent, access, d, op, args, content)
+                if not allowed:
+                    d = door_targets.refused(why + (door_providers.AWS_COST if target.startswith("aws:") else ".") +
+                                             APPROVAL_NOTE.format(sha=sha), target=d.target)
         if d.kind == "refused":
             n = self.record.add(caller=agent, target=target, action=op, kind="refused", outcome="refused",
                                 why=d.why[:300], sha256=sha)
-            return {"ok": False, "kind": "refused", "why": d.why, "n": n}
+            return dict({"ok": False, "kind": "refused", "why": d.why, "n": n}, **({"call": sha} if judged else {}))
         try:
             out = self.run(agent, access, d, op, args, content)
             ok, outcome = True, "done"
@@ -895,10 +956,13 @@ def item_secret(text):
 
 def vault_sweep(door, once=False):
     """The door's sealed copies, from the hub, each minute: the hub carries a copy that the central vault sealed to
-    the door's pinned key, and only this OS user opens it, with `age` and the door's own identity."""
+    the door's pinned key, and only this OS user opens it, with `age` and the door's own identity. The owner's signed
+    yeses come the same way."""
     while True:
         with contextlib.suppress(Exception):
             fetch_sealed(door)
+        with contextlib.suppress(Exception):
+            fetch_approvals(door)
         if once:
             return
         time.sleep(60)
@@ -936,6 +1000,27 @@ def fetch_sealed(door):
                   json.dumps({"sha256": hashlib.sha256(value.strip().encode()).hexdigest()}).encode())
         opened += 1
     return opened
+
+
+def fetch_approvals(door):
+    """The owner's signed yeses that the hub carries (GET /door/approvals, answered to the door's address only). The
+    hub can hold one back, and nothing more: the door checks each signature itself and keeps only the good ones."""
+    access = door.access()
+    hub = access.get("hub") or {}
+    if not hub.get("address") or not access.get("owner_keys"):
+        return 0
+    status, answer = door.http("GET", f"http://{hub['address']}:{hub.get('port', 8765)}/door/approvals",
+                               {"X-Fleet-Client": "door"}, None)
+    if status != 200 or not isinstance(answer, dict) or not isinstance(answer.get("approvals"), list):
+        return 0
+    kept = {}
+    for item in answer["approvals"][:200]:
+        found = approval(access, item.get("statement"), item.get("signature")) if isinstance(item, dict) else None
+        if found:
+            kept[found[0]] = {"need": found[1], "statement": item["statement"], "signature": item["signature"]}
+    with door.lock:
+        write_json(APPROVALS_FILE, kept)
+    return len(kept)
 
 
 # ---------------------------------------------------------------- root commands

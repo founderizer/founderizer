@@ -785,7 +785,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "agent_move",        # DevOps plan C7, 2 November 2026: an agent moves to an empty server
                "server_access",     # DevOps plan C4: Read or Fix on a server, through the door
                "sealed_push",       # the owner, 3 November 2026: a ping says nothing to founderizer.com or Apple
-               "device_by_code"]    # the owner, 3 November 2026: Add device shows the QR at once, with no fields
+               "device_by_code",    # the owner, 3 November 2026: Add device shows the QR at once, with no fields
+               "door_calls"]        # DevOps plan 5.4: the owner's signed yes lets one door call through, once
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -1146,8 +1147,11 @@ def need_secret(row):
 def need_view(row):
     """One Needs-you item for the owner: its row, with the agent's options as a list and the option that the owner
     pressed as its index. chosen is null for an answer that the owner typed. secret is what a secret request asks
-    for, which the app answers with its secure form, and null on every other item."""
-    return dict(row, options=need_options(row), secret=need_secret(row))
+    for, which the app answers with its secure form, and null on every other item. door_call is the hash of the door
+    call that his yes lets through once, which the app signs (door_call_statement); his signed yes stays out."""
+    view = dict(row, options=need_options(row), secret=need_secret(row))
+    view.pop("approval", None)
+    return view
 
 
 def check_need_options(given):
@@ -1746,7 +1750,10 @@ def migrate():
                   "options": "TEXT", "chosen": "INTEGER",     # owner feature need_options: the agent's own answers
                   "answered_by": "TEXT",      # null is the owner; "P-<id> <name>" is the deputy of that conversation
                   "secret": "TEXT",           # owner feature secret_requests: what request_secret asks for, no value
-                  "question": "INTEGER"},     # the question that the manager took to the owner (raise_needs_you)
+                  "question": "INTEGER",      # the question that the manager took to the owner (raise_needs_you)
+                  # DevOps plan 5.4 (D11, D22): the door call that the owner's yes lets through once, and his signed
+                  # yes to it, which only the door reads (GET /door/approvals)
+                  "door_call": "TEXT", "approval": "TEXT"},
         "owner_reports": {"agent": "TEXT NOT NULL DEFAULT 'manager'", "in_reply_to": "TEXT",
                           "pushed": "INTEGER NOT NULL DEFAULT 0"},     # chat apps round 2: message_owner
         "chat_out": {"recipient": "TEXT"},          # chat apps round 2: a Discord user ID when chat is null
@@ -4791,7 +4798,8 @@ def deliver_result(agent, a, files_said=None):
     elif (hard := work_was_hard(t)):
         said = (f" You recorded nothing learned and {hard}. If something would have saved that, say it in learned "
                 f"when you next deliver; if you found a wall instead, say that in tried, with how to check it again.")
-    duty_after_deliver(t, agent, outcome)       # owner API 1.13: a case whose steps are all recorded closes itself
+    # A result closes no case: a task is often one part of its case (a triage, a fix that waits for its release), and
+    # only close_case knows that the last step is done (4 November 2026: three results closed one case before its fix).
     left = case_left_open(case_id=t["duty_case"]) if t["duty_case"] else None
     left = case_left_open_text(left) + " " if left else ""
     stopped = f"Still running in its session when it delivered, so stopped with it: {'; '.join(running)}. " \
@@ -5095,8 +5103,8 @@ def check_task(agent, a):
         if duty_case["state"] != "open":
             raise ToolError(f"{cref(duty_case)} is closed ({duty_case['outcome']}). A new event is a new case.")
         details = ((details + "\n\n") if details else "") + duty_case_line(r, duty_case["id"], bool(
-            duty_case["repeated"])) + (" Record what you do in it with record_step: your completed result closes it "
-                                       "unless another task of it is still open.")
+            duty_case["repeated"])) + (" Record what you do in it with record_step, and end it with close_case once "
+                                       "its last step is done and checked.")
         case_id = None
     elif case_id and not q1("SELECT id FROM cases WHERE id=?", (case_id,)):
         raise ToolError("Unknown case_id. Give a duty's case as R-<id>/C-<id>, or the practice case the owner named.")
@@ -5181,7 +5189,7 @@ def t_create_task(agent, a):
                      "left. Never place a part on an agent that does not suit it because it is free.")
     said = f"Created {tref(tid)} for {owner}."
     if f.get("duty_case"):
-        said += f" It is work of {cref(case_row(f['duty_case']))}: its completed result closes the case."
+        said += f" It is work of {cref(case_row(f['duty_case']))}, and close_case ends that case."
     if f.get("step") is not None:
         s = q1("SELECT goal, n FROM goal_steps WHERE id=?", (f["step"],))
         others = [r for r in step_parts(f["step"]) if r["id"] != tid]
@@ -7343,6 +7351,12 @@ def t_raise_needs_you(agent, a):
                         "can do or decide now. If there is no such thing, it is not a Needs-you item; tell_owner "
                         "posts it with no notification.")
     options = check_need_options(a.get("options"))
+    door_call = a.get("door_call")
+    if door_call is not None and not (isinstance(door_call, str) and re.fullmatch(r"[0-9a-f]{64}", door_call)):
+        raise ToolError("door_call is the call hash that the door gave with its refusal: 64 hex characters.")
+    if door_call is not None and not options:
+        raise ToolError("An item with a door_call needs options, and the first one is the yes: his app signs only "
+                        "that one, for example [\"Yes, run it once\", \"No\"].")
     notice = need_is_notice(title, why, todo, *(json.loads(options) if options else ()))
     if notice:
         raise ToolError(notice)
@@ -7357,8 +7371,9 @@ def t_raise_needs_you(agent, a):
         qu = need_question(agent, a.get("question_id"))
         if qu:                  # the asker's own words, which the owner answers
             why += f" Quoting {qu['asker']} (Q-{qu['id']} on {tref(qu['task'])}): \"{clip(qu['text'], 1000)}\""
-        nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question) VALUES(?,?,?,?,?,?,?,?)",
-                  (unused_id("needs"), title, why, todo, now(), agent, options, qu["id"] if qu else None))
+        nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call) "
+                  "VALUES(?,?,?,?,?,?,?,?,?)",
+                  (unused_id("needs"), title, why, todo, now(), agent, options, qu["id"] if qu else None, door_call))
     emit("owner", "notify", f"Needs you N-{nid}: {title}")
     ping_need(nid)                                      # owner feature push: the phone rings, also when it is closed
     picks = (" The owner sees your options and presses one: " + ", ".join(json.loads(options)) +
@@ -7367,7 +7382,9 @@ def t_raise_needs_you(agent, a):
     linked = (f" It is for Q-{qu['id']}: the owner's answer goes to {qu['asker']} as the answer of Q-{qu['id']} by "
               f"itself, and if Q-{qu['id']} is answered another way or {tref(qu['task'])} ends first, N-{nid} "
               f"closes by itself." if qu else "")
-    return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{linked}{picks}"
+    door = (" When the owner answers yes, his app signs that yes to the door call, and the door lets that exact call "
+            "through once: the agent sends the same call again." if door_call else "")
+    return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{linked}{door}{picks}"
 
 
 def need_question(agent, ref):
@@ -14455,42 +14472,23 @@ def t_of_case(case_id):
     return row["id"] if row else None
 
 
-def duty_close(c, outcome, by, note=""):
-    """Close one case, in one transaction with the history line that says it closed. The caller checked the steps
-    and the open tasks. The two used to commit on their own, so a hub that died between them left a closed case the
-    owner reads with no record of its closing."""
-    t0 = now()
-    with transaction():
-        DB.execute("UPDATE duty_cases SET state='closed', closed=?, closed_by=?, outcome=?, note=? WHERE id=?",
-                   (t0, by, outcome, note[:2000] or None, c["id"]))
-        duty_history_row(c["responsibility"], by, "case_closed", f"{cref(c)} {outcome}: {note or c['title']}", t0)
-
-
-def duty_after_deliver(t, agent, outcome):
-    """A completed task of a case closes its case as handled, once no task of that case is open."""
-    c = case_row(t["duty_case"]) if t["duty_case"] else None
-    if not c or c["state"] != "open" or outcome != "completed":
-        return
-    r = duty_row(c["responsibility"])
-    if not r or q1(f"SELECT id FROM tasks WHERE duty_case=? AND {OPEN_TASK} LIMIT 1", (c["id"],)):
-        return
-    duty_close(c, "handled", agent, f"Closed with the result of {tref(t['id'])}.")
-
-
 CASE_LEFT_OPEN = ("SELECT c.*, (SELECT id FROM tasks WHERE duty_case=c.id ORDER BY id DESC LIMIT 1) last_task "
                   "FROM duty_cases c WHERE c.state='open' AND EXISTS (SELECT 1 FROM tasks WHERE duty_case=c.id) "
                   f"AND NOT EXISTS (SELECT 1 FROM tasks WHERE duty_case=c.id AND {OPEN_TASK})")
+CASE_STOPPED = " AND (SELECT state FROM tasks WHERE duty_case=c.id ORDER BY id DESC LIMIT 1)<>'completed'"
 
 
-def case_left_open(duty_id=None, case_id=None):
+def case_left_open(duty_id=None, case_id=None, stopped=False):
     """The oldest open case of this duty (or this one case) that had work and has none any more: every task of it
-    ended, and none closed it. Only a completed result closes a case by itself (duty_after_deliver), so a failed,
-    rejected or canceled one leaves it open -- and one key has at most one open case, so its watch then starts
-    nothing for that key: the duty stops reacting to the very event it exists for. A case that never had a task is
+    ended, and none closed it. Only close_case closes a case, and one key has at most one open case, so its watch
+    starts nothing for that key until somebody closes it. stopped: only a case whose last task failed, was refused or
+    was canceled, so that the duty stops reacting to the very event it exists for. After a completed one, the case
+    waits for a next step that its records name, and the result told the requester. A case that never had a task is
     the manager working its own duty in its session, and is not this."""
     if case_id is None and duty_id is None:
         return None
-    return q1(CASE_LEFT_OPEN + (" AND c.id=?" if case_id is not None else " AND c.responsibility=?")
+    return q1(CASE_LEFT_OPEN + (CASE_STOPPED if stopped else "")
+              + (" AND c.id=?" if case_id is not None else " AND c.responsibility=?")
               + " ORDER BY c.id LIMIT 1", (case_id if case_id is not None else duty_id,))
 
 
@@ -14547,7 +14545,7 @@ def duty_marker(r, t0):
                                     + (f": {last['error']}" if last else "") + ", with no valid value since.")
     if not live:
         return "no_watch", "This duty has no watch, so no event reaches its agent."
-    left = case_left_open(r["id"])
+    left = case_left_open(r["id"], stopped=True)
     if left:
         last = q1("SELECT state FROM tasks WHERE id=?", (left["last_task"],))
         return "case_left_open", (f"Its last task {tref(left['last_task'])} ended {last['state']}. "
@@ -14838,13 +14836,11 @@ def t_open_case(agent, a):
                         f"earlier action did not hold. If this is another event, give it another key.")
     with transaction():
         case_id = duty_new_case(r, key, title, f"{agent} with open_case", agent, t0)
-        several = False
         if tid is not None:
-            # A task carries the one case that it opened, and its completed result closes that case. A task that
-            # opens a second one -- a wake-up with several new lines -- is the work of none of them, so it carries
-            # neither: its result closed whichever case it had opened first, before that case's fix (R-7/C-363).
-            several = DB.execute("SELECT 1 FROM duty_cases WHERE opened_in=? LIMIT 1", (tid,)).fetchone() is not None
-            if several:
+            # A task carries the one case that it opened, and a lesson of its result takes that case's key. A task
+            # that opens a second one -- a wake-up with several new lines -- is the work of none of them, so it
+            # carries neither (R-7/C-363).
+            if DB.execute("SELECT 1 FROM duty_cases WHERE opened_in=? LIMIT 1", (tid,)).fetchone():
                 DB.execute("UPDATE tasks SET duty_case=NULL WHERE id=? AND duty_case IN (SELECT id FROM duty_cases "
                            "WHERE opened_in=?)", (tid, tid))
             else:
@@ -14856,9 +14852,7 @@ def t_open_case(agent, a):
         text = (f"Opened R-{r['id']}/C-{case_id} of {rref(r['id'])}. "
                 + ("This key came back inside the last 30 days, so say in the preventive step why the earlier action "
                    "did not hold. " if back else "")
-                + "Record each close-out step with record_step, and close it with close_case."
-                + (f" {tref(tid)} opened more than one case, so its result closes none of them: close each one "
-                   f"yourself." if several else ""))
+                + "Record each close-out step with record_step, and close it with close_case.")
         keep_command(command, {"case": case_id, "text": text}, t0)
     return text
 
@@ -14913,10 +14907,8 @@ def t_record_step(agent, a):
             DB.execute("UPDATE duty_cases SET first_step=? WHERE id=?", (t0, c["id"]))
         DB.execute("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,?,'step',?)",
                    (r["id"], t0, agent, f"{cref(c)} {step}: {text}"))
-        carried = tid is not None and DB.execute("SELECT 1 FROM tasks WHERE id=? AND duty_case=?",
-                                                 (tid, c["id"])).fetchone()
         text_out = (f"Recorded '{step}' for {cref(c)}. Record another line for each further step. close_case ends "
-                    f"the case" + (", or deliver your task and the hub closes it as handled." if carried else "."))
+                    f"the case once its last step is done and checked; your result does not.")
         keep_command(command, {"case": c["id"], "step": step, "text": text_out}, t0)
     return text_out
 
@@ -19929,8 +19921,8 @@ TOOLS = [
                                                   "the task's session is then told nothing about the goal"},
         "case_id": {"type": "string", "description": "The duty case this task is work of, as R-<id>/C-<id>: an "
                                                      "open case of a duty you may read, whose work you give to this "
-                                                     "agent. Use that exact value on every task of it; a completed "
-                                                     "result closes the case"},
+                                                     "agent. Use that exact value on every task of it; close_case "
+                                                     "ends the case"},
         "follows": {"type": "string", "description": "Earlier task id, for example T-3"},
         "step": {"type": "integer", "description": "The number of the step of goal's plan that this task is one "
                                                    "part of, when one piece of work is split across agents"},
@@ -20103,7 +20095,11 @@ TOOLS = [
                                    f"their own answer instead."},
         "question_id": {"type": "string", "description": "The question with you that only the owner can settle, "
                         "for example Q-4: the item quotes its asker, the owner's answer goes back to it as the answer, "
-                        "and the item closes by itself when the question is answered another way or its task ends"}},
+                        "and the item closes by itself when the question is answered another way or its task ends"},
+        "door_call": {"type": "string", "description": "The call hash that the door gave with its refusal of a "
+                      "judged call (for example a call that adds cost): the owner's yes then lets that exact call "
+                      "through the door once. Put the exact command in what_to_do, and give options whose first "
+                      "one is the yes."}},
        ["title", "why", "what_to_do"])),
     ("manager", "request_secret", t_request_secret,
      "Ask the owner for a secret that the fleet does not hold: an API key or a login. It is a Needs-you item that they "
@@ -27327,11 +27323,12 @@ def renamed_profile(data, old, new):
 
 
 def rename_rows(old, new, t0, key_moves=False):
-    """Inside a transaction: every record of the agent under its new name (AGENT_COLUMNS, AGENT_KV). Its session
-    credentials stop. key_moves: its server's job moves its key file (KEY_FEATURE), so its key takes the new name here
-    too and its helper is known from its first call; on a shared machine a helper cannot register a key. Else that
-    job deletes the file, so the key goes and the helper of the new name enrolls its own: the hub takes a first key
-    from the agent's own machine only, and a second key only from the owner."""
+    """Inside a transaction: every record of the agent under its new name (AGENT_COLUMNS, AGENT_KV, and the agent
+    that a saved check names inside its JSON). Its session credentials stop. key_moves: its server's job moves its key
+    file (KEY_FEATURE), so its key takes the new name here too and its helper is known from its first call; on a
+    shared machine a helper cannot register a key. Else that job deletes the file, so the key goes and the helper of
+    the new name enrolls its own: the hub takes a first key from the agent's own machine only, and a second key only
+    from the owner."""
     in_transaction("rename_rows")
     for table, column in AGENT_ROWS.items():
         DB.execute(f"DELETE FROM {table} WHERE {column}=?", (new,))
@@ -27343,6 +27340,13 @@ def rename_rows(old, new, t0, key_moves=False):
         DB.execute("DELETE FROM agent_keys WHERE agent=?", (old,))
     for table, column in AGENT_COLUMNS:
         DB.execute(f"UPDATE {table} SET {column}=? WHERE {column}=?", (new, old))
+    # A saved check names the agent that answers for its code (wakeups.code_grant), and a check from before plan P4
+    # the agent that runs it. Under the old name, the hub paused every check of the agent as another agent's code.
+    for t in DB.execute("SELECT id, check_spec FROM triggers WHERE check_spec IS NOT NULL").fetchall():
+        spec = json.loads(t["check_spec"])
+        moved = {k: new for k in ("code_by", "run_on") if spec.get(k) == old}
+        if moved:
+            DB.execute("UPDATE triggers SET check_spec=? WHERE id=?", (json.dumps(dict(spec, **moved)), t["id"]))
     for prefix in AGENT_KV:
         DB.execute("DELETE FROM kv WHERE k=?", (prefix + new,))
         DB.execute("UPDATE kv SET k=? WHERE k=?", (prefix + new, prefix + old))
@@ -28657,6 +28661,7 @@ DOOR_READ_EVERY = 60            # seconds between two reads of the door's record
 DOOR_PAGE = 500
 DOOR_COPY_WAIT = DEPOSIT_WAIT   # seconds a sealed copy waits for the door before it goes; the next pass seals it again
 DOOR = {"read_at": 0.0, "error": None}      # what the record timer last saw, in this process only
+DOOR_APPROVAL_DAYS = 7          # the days a signed yes is served to the door (door.APPROVAL_DAYS refuses older ones)
 
 
 def server_holds(name, a):
@@ -28916,6 +28921,36 @@ def door_sealed(src):
     return {"copies": [{"id": r["id"], "login": r["login"], "sealed": r["sealed"]}
                        for r in q("SELECT id, login, sealed FROM door_copies WHERE fetched IS NULL ORDER BY id")],
             "keep": keep}
+
+
+def door_call_statement(need, statement):
+    """Why the owner's signed yes does not fit this Needs-you item, or None. It is {v: 1, kind: "door-call", fleet,
+    need, call, at} in its canonical form (vault.canonical), for this item and its door call. The door checks the
+    signature against the owner keys of its own access file, so the hub can hold a yes back and forge none."""
+    call = need["door_call"] if "door_call" in need.keys() else None
+    if not call:
+        return "this Needs-you item names no door call"
+    try:
+        said = json.loads(statement)
+    except (ValueError, RecursionError):
+        said = None
+    if not isinstance(said, dict) or set(said) != {"v", "kind", "fleet", "need", "call", "at"} or \
+            json.dumps(said, sort_keys=True, separators=(",", ":"), ensure_ascii=False) != statement:
+        return "the statement is not a door-call statement in its canonical form"
+    if said["v"] != 1 or said["kind"] != "door-call" or said["need"] != need["id"] or said["call"] != call:
+        return "the statement is not the yes to this item's door call"
+    return None
+
+
+def door_approvals(src):
+    """GET /door/approvals: the owner's signed yeses to door calls of the last DOOR_APPROVAL_DAYS, answered only to
+    the door's own address. Each lets its one call through once, which the door keeps count of."""
+    door = TEAM.get("door") or {}
+    if not door.get("address") or src != door["address"]:
+        raise Refusal(403, "this is the door's route")
+    rows = q("SELECT id, approval FROM needs WHERE approval IS NOT NULL AND answered > ? ORDER BY id",
+             (now() - DOOR_APPROVAL_DAYS * 86400,))
+    return {"approvals": [dict(json.loads(r["approval"]), need=r["id"]) for r in rows]}
 
 
 def door_fetched(src, copy, digest):
@@ -33572,6 +33607,12 @@ class Handler(BaseHTTPRequestHandler):
         if (not isinstance(files, list) or len(files) > ATTACH_PER_MESSAGE or len(set(map(str, files))) != len(files)
                 or not all(isinstance(f, int) and not isinstance(f, bool) and f > 0 for f in files)):
             return self.json(400, {"error": f"attachments names at most {ATTACH_PER_MESSAGE} attachment ids, each one time"})
+        yes, signed = data.get("statement"), data.get("signature")      # his signed yes to a door call
+        if (yes is not None or signed is not None) and (need_id is None or not isinstance(yes, str) or
+                                                        not isinstance(signed, str) or len(yes) > 2048 or
+                                                        len(signed) > 512):
+            return self.json(400, {"error": "statement and signature are the owner's signed yes to the door call "
+                                            "of a Needs-you item"})
         choice = data.get("choice")         # owner feature need_options: the owner pressed one of the agent's buttons
         if choice is not None:
             if need_id is None:
@@ -33618,6 +33659,17 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json(409, {"error": SECRET_NO_WORDS.format(id=need_id)})
                 if need["conversation"] and files:      # a conversation window can open no file
                     return self.json(409, {"error": "an answer that goes into a conversation carries no file"})
+                if yes is not None:
+                    wrong = door_call_statement(need, yes) or (None if choice == 0 else
+                                                               "only the first option, the yes, carries a signed "
+                                                               "statement")
+                    if wrong:
+                        return self.json(400, {"error": wrong})
+                elif choice == 0 and ("door_call" in need.keys() and need["door_call"]):
+                    # a yes that lets a door call through counts only when the owner key signed it: unsigned, it is
+                    # not recorded, and the item stays open
+                    return self.json(409, {"error": "This yes lets a door call through, so it needs the signature of "
+                                                    "the owner key on the Mac. Answer it in Founderizer on the Mac."})
                 if choice is not None:      # the owner pressed a button: its own words become the answer
                     picks = need_options(need)
                     if not picks:
@@ -33683,6 +33735,9 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     event_id = owner_message_rows(request_id, kind, need, value, client, recipient, replaces, created,
                                                   files=rows, chosen=choice)
+                    if yes is not None:
+                        DB.execute("UPDATE needs SET approval=? WHERE id=?",
+                                   (json.dumps({"statement": yes, "signature": signed}), need["id"]))
             return self.json(200, dict(ok=True, request_id=request_id, event_id=event_id,
                 created=created, read_at=None, replayed=False, client=client, edited=edited,
                 message_request_id=previous["request_id"] if edited else request_id,
@@ -34682,6 +34737,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.server_jobs(parts[1])
         if parts == ["door", "sealed"]:              # DevOps plan C4: the door fetches its copies
             return self.door_route(lambda: door_sealed(self.client_address[0]))
+        if parts == ["door", "approvals"]:           # DevOps plan 5.4: the owner's signed yeses to door calls
+            return self.door_route(lambda: door_approvals(self.client_address[0]))
         if parts == ["ui", "profiles"]:
             return self.ui_profiles(query)
         if parts == ["ui", "knowledge"]:
