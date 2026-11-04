@@ -423,8 +423,9 @@ RUNTIMES = {
         "token_weights": None,
     },
 }
-# Claude's extension in the Chrome Web Store, the browser of a runtime with browser_tabs (join.sh mac_chrome).
+# Claude's extension in the Chrome Web Store, the browser of a runtime with browser_tabs (offer_extension).
 CLAUDE_EXTENSION = "fcoeoabgfenejglbffodgkkbkcdhcgfn"
+CHATGPT_CODEX = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
 # Every fact above in one list, so that a new entry cannot quietly leave one out (test_runtime_table).
 RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manager_access", "first_worker", "manager",
                  "owner_chat", "agent_messages", "conversation", "conversation_why", "closed_versions", "mcp_servers",
@@ -816,6 +817,17 @@ def app_server_task(conf, needs):
     return needs == "screen" or bool(runtime_fact(conf.get("runtime"), "app_server")
                                      and conf.get("start") == APP_SERVER
                                      and conf.get("role") in ("worker", "lead"))
+
+
+def offer_extension(home):
+    """Chrome's own way to take an extension from its Web Store: this file. Chrome fetches the extension at its next
+    start and asks once, on this Mac's screen, to enable it. The file stays, so a Chrome profile that is removed gets the
+    extension back at the next start (the owner, 28 October 2026: "a mac studio server should come by default with
+    computer and browser use")."""
+    folder = os.path.join(home, "Library", "Application Support", "Google", "Chrome", "External Extensions")
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, CLAUDE_EXTENSION + ".json"), "w", encoding="utf-8") as f:
+        f.write('{"external_update_url": "https://clients2.google.com/service/update2/crx"}\n')
 
 
 def chrome_extension(home):
@@ -1802,14 +1814,25 @@ class Lifecycle:
         return s
 
     def desktop(self):
-        """What only hands at this Mac can put right: its lock, Chrome and Claude's extension, with no AI."""
+        """What only hands at this Mac can put right: its lock, Chrome, Claude's extension and the ChatGPT app's sign-in,
+        with no AI."""
         console = console_session(self.run)
         code, _, _ = self.run(["pgrep", "-x", "Google Chrome"])
         extension = chrome_extension(self.home)
         # Its answer means something only for a runtime that is signed in: a signed-out one reads no browser at all.
         claude = self.exe("claude") if extension and self.runtime("claude")["signed_in"] else None
         return {"locked": console[1] if console else None, "chrome": code == 0, "extension": extension,
-                "browser": browser_connected(claude) if claude else None}
+                "browser": browser_connected(claude) if claude else None, "chatgpt": self.chatgpt()}
+
+    def chatgpt(self):
+        """Whether the ChatGPT app of this Mac is signed in: the copy of Codex it carries, which Computer Use runs
+        through, and not the one a Codex agent has in its own home. False with no app, and when it says nothing: no agent
+        gets a screen on a silence."""
+        if not os.path.exists(CHATGPT_CODEX):
+            return False
+        _, out, err = self.run([CHATGPT_CODEX, "login", "status"])
+        text = out + err
+        return "Logged in" in text and "Not logged in" not in text
 
     def remember_browser(self, connected):
         """Leave the reading of Chrome where `fleet.py verify` reads it: over SSH it cannot read it, as a sign-in

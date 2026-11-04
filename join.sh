@@ -28,7 +28,6 @@ HUB="__FLEET_HUB__"
 REPO="__FLEET_REPO__"
 FLEET="__FLEET_ID__"            # the fleet's id at its release channel, where a Mac takes its signed vault
 CHANNEL="__FLEET_CHANNEL__"
-CLAUDE_EXTENSION=fcoeoabgfenejglbffodgkkbkcdhcgfn       # Claude's extension in the Chrome Web Store
 WORKER=fleet
 PACKAGES="git tmux python3 curl ca-certificates ufw unattended-upgrades sudo"
 MAC_USER=""     # the user that will run a Mac's agents
@@ -220,17 +219,6 @@ mac_vault() {   # This Mac's vault, which every agent of it reaches (the owner, 
     rm -rf "$work"
 }
 
-mac_chrome() {  # The browser of a Mac agent on Claude (the owner, 28 October 2026: "a mac studio server should come by
-                # default with computer and browser use"). This file is Chrome's own way to take an extension from its
-                # Web Store: Chrome fetches it at its next start and asks once, on this Mac's screen, to enable it.
-                # It stays in place, so a Chrome profile that is removed gets the extension back at the next start.
-    folder="$HOME/Library/Application Support/Google/Chrome/External Extensions"
-    "$1" mkdir -p "$folder"
-    "$1" /bin/sh -c 'printf "{\"external_update_url\": \"https://clients2.google.com/service/update2/crx\"}\n" > "$1"' \
-        sh "$folder/$CLAUDE_EXTENSION.json"
-    say "Claude's extension: Chrome fetches it at its next start and asks once to enable it"
-}
-
 vault_build() { # $1: an empty folder. The release channel's newest Mac build, as the vault's own updater takes it: this
                 # fleet's manifest, then the zip that it names on the channel's own host, by its SHA-256, unpacked.
     curl -fsS --proto '=https' --max-time 60 -H "Founderizer-Fleet: $FLEET" -o "$1/manifest.json" \
@@ -330,7 +318,6 @@ mac() {
     # session, so a second user would have to be logged in at the screen. A Mac keeps one user for its agents
     # (PRODUCT.md P2), and its agents share that user's runtime credential.
     mac_vault
-    mac_chrome "$runner"
     if [ "$runner" = as_mac_user ]; then
         say "the installer goes on from here, and it runs the checks itself"    # a minute saved for the owner
         return 0

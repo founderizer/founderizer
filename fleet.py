@@ -3376,7 +3376,7 @@ class Helper:
         lease, and the hub refuses it for a held or finished task. A task in the runner (app_server_task) keeps the
         runner's own publisher."""
         publishers = self.__dict__.setdefault("publishers", {})
-        if not (self.worker and "screen" in self.conf.get("can", []) and sys.platform == "darwin"):
+        if not (self.worker and {"browser", "screen"} & set(self.conf.get("can", [])) and sys.platform == "darwin"):
             return
         r = tmux("list-windows", "-t", f"={self.session}:", "-F", "#{window_name}\t#{@fleet_attempt}\t#{@fleet_needs}")
         live = set()

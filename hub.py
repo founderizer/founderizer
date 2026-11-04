@@ -791,7 +791,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "server_access",     # DevOps plan C4: Read or Fix on a server, through the door
                "sealed_push",       # the owner, 3 November 2026: a ping says nothing to founderizer.com or Apple
                "device_by_code",    # the owner, 3 November 2026: Add device shows the QR at once, with no fields
-               "door_calls"]        # DevOps plan 5.4: the owner's signed yes lets one door call through, once
+               "door_calls",        # DevOps plan 5.4: the owner's signed yes lets one door call through, once
+               "server_ai_choice"]  # the owner, 1 November 2026: "why are we asking for chatgpt AND claude login"
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -1836,7 +1837,9 @@ def migrate():
                      "kind": "TEXT NOT NULL DEFAULT 'lesson'", "cost_minutes": "INTEGER", "recheck": "TEXT"},
         "machine_checks": {"verify": "TEXT", "revision": "TEXT"},
         "server_jobs": {"was": "TEXT"},             # owner feature agent_rename: the name a rename job moves from
-        "join_codes": {"agent": "TEXT", "runtime": "TEXT"},     # the first agent of a Mac (mac_setups)
+        # the first agent of a Mac (mac_setups), and whether its sitting has ChatGPT: null is an app from before the choice
+        "join_codes": {"agent": "TEXT", "runtime": "TEXT", "chatgpt": "INTEGER"},
+        "mac_setups": {"chatgpt": "INTEGER"},
         "session_credentials": {"ready": "REAL"},   # owner feature chat_warm: when its owner chat listed its tools
         # AUTONOMY.md P8: each session's four kinds of tokens apart, its model calls, the share of its first call that
         # came from the cache (helper feature session_kinds); and what the hub adds: its runtime, kind and task kind,
@@ -5144,7 +5147,9 @@ def check_task(agent, a):
         raise ToolError("needs must be none, browser or screen.")
     if needs != "none" and needs not in agents()[owner].get("can", []):
         able = [n for n, x in agents().items() if needs in x.get("can", []) and authority(agent, n, "task")[0]]
-        raise ToolError(f"{owner} has no {needs}. Agents with a {needs}: {', '.join(able) or 'none'}.")
+        hint = " It has a screen: give it this task with needs screen." if needs == "browser" and \
+            "screen" in agents()[owner].get("can", []) else ""
+        raise ToolError(f"{owner} has no {needs}.{hint} Agents with a {needs}: {', '.join(able) or 'none'}.")
     busy = desktop_refusal(owner, needs, agent)
     if busy:
         raise ToolError(busy)
@@ -6756,7 +6761,7 @@ def create_refusal(agent, t, confirm=False, kind="create"):
     if a.get("vault_create") is not True:
         return (f"{agent} may not make logins" if confirm else
                 "You may not make logins. Ask your requester: only the owner allows that.")
-    if kind == "capture" and "browser" not in a.get("can", []):     # the vault reads a page in Chrome for this agent
+    if kind == "capture" and not {"browser", "screen"} & set(a.get("can", [])):     # the vault reads a page in Chrome for it
         return f"{agent} has no browser" if confirm else "This machine has no browser to read a key from."
     missing = ["no_broker_access"] if a.get("vault") != "broker" else [] if confirm else create_missing(agent, kind=kind)
     if missing:
@@ -7314,7 +7319,7 @@ def helper_job(agent, tid, kind, login, target=""):
 
 def t_sign_in(agent, a):
     tid = parse_task(a.get("task_id"))
-    if "browser" not in agents()[agent].get("can", []):
+    if not {"browser", "screen"} & set(agents()[agent].get("can", [])):
         raise ToolError("This machine has no browser to sign in with.")
     return helper_job(agent, tid, "signin", a.get("login"))
 
@@ -23054,6 +23059,8 @@ def save_agent_settings(agent, body):
             a.pop(c["field"], None)
         else:
             a[c["field"]] = c["after"]
+    if "screen" in (a.get("can") or []) and not a.get("screen_command") and server_kind_of(team, a.get("machine")) == "mac":
+        a["screen_command"] = MAC_SCREEN_COMMAND        # a Mac's own screen runtime, also at his own tick
     try:
         validate_team(team)
     except ValueError as e:
@@ -23062,8 +23069,8 @@ def save_agent_settings(agent, body):
     commit = commit_kit_file("team.json", data, f"Owner changed the settings of {agent}")
     apply_team(team)
     fields = {c["field"] for c in changed}
-    if "can" in fields:
-        kv_set(f"default_desktop:{agent}", 1)   # his own capabilities: default_access_sweep adds none of its Mac's
+    if {"browser", "screen"} & set(next((c["before"] or [] for c in changed if c["field"] == "can"), [])) - set(a.get("can") or []):
+        kv_set(f"default_desktop:{agent}", 2)   # his own removal: default_access_sweep gives it none of its Mac's again
     # Also the manager's helper (lifecycle arms its update too): until it loads them, its settings stay pending, which
     # holds its runtime switch. Its running standing session keeps the settings that it started with.
     updates = [agent] if fields & {"model", "effort", "can", "screen"} and \
@@ -23377,6 +23384,8 @@ def save_runtime(agent, body):
         raise Refusal(400, str(e)) from None
     data = (json.dumps(team, indent=2) + "\n").encode()
     commit = commit_kit_file("team.json", data, f"Owner switched {agent} from {old} to {to}")
+    if str(kv_get(f"default_desktop:{agent}")) != "2":      # its new runtime can do more on its Mac, unless he took that away
+        kv_set(f"default_desktop:{agent}", None)
     apply_team(team)
     t0, lim = now(), active_limit(agent)
     hold = lim["id"] if lim and limit_route(lim) == "primary" else None
@@ -25074,7 +25083,7 @@ def desktop_status(value):
         return None
     if not isinstance(value, dict):
         raise ValueError("desktop must be an object or null")
-    return {k: _optional(value.get(k), bool) for k in ("locked", "chrome", "extension", "browser")}
+    return {k: _optional(value.get(k), bool) for k in ("locked", "chrome", "extension", "browser", "chatgpt")}
 
 
 def validate_status(data):
@@ -26107,7 +26116,8 @@ def default_access_sweep(t0):
             vault = False
         if desktop and server_kind_of(TEAM, a.get("machine")) is not None and \
                 not with_desktop(json.loads(json.dumps(a)), TEAM):
-            kv_set(f"default_desktop:{name}", 1)        # Linux, or it holds its Mac's desktop already
+            if not screen_waits(TEAM, a):
+                kv_set(f"default_desktop:{name}", 1)    # Linux, or it holds its Mac's desktop already
             desktop = False
         vault = vault and bool((vault_grant(name, TEAM) or {}).get("ready"))
         desktop = desktop and server_kind_of(TEAM, a.get("machine")) is not None
@@ -26157,7 +26167,7 @@ def give_defaults(name, vault, desktop):
     # validate_team refused ends both, and the log says why.
     if vault and a.get("vault", "none") != "none":
         kv_set(f"default_vault:{name}", 1)
-    if desktop:
+    if desktop and not screen_waits(team, a):
         kv_set(f"default_desktop:{name}", 1)
 
 
@@ -26366,7 +26376,7 @@ JOB_SILENT = 1800               # seconds after which an open job of a server wi
 INSTALL_KEY = "install_key"     # a server service whose install job registers the new agent's key: server.INSTALL_KEY
 CODEX_SIGN_IN = RUNTIMES["codex"]["sign_in"]["url"]     # the link of its own device sign-in (sign_in_prompt)
 # A new agent's profile names no browser and no screen: what it holds is in its start text, from team.json
-# (holdings_start_text), and the agents of a Mac hold both (desktop_defaults). The words "It has no browser and no
+# (holdings_start_text), and the agents of a Mac hold what that Mac can do (desktop_defaults). The words "It has no browser and no
 # screen" and "reject" such a task made ivy refuse the browser of its own Mac.
 SERVER_PROFILE = """# Profile: %(name)s
 
@@ -26388,12 +26398,32 @@ Written by the owner. Agents cannot change it.
 MAC_SCREEN_COMMAND = SCREEN_COMMANDS[0]      # lifecycle.SCREEN_COMMANDS: the one program a screen runtime may be
 
 
+def mac_desktop(machine):
+    """A Mac's own reading of what only hands there can put right, from its server service; None from any other."""
+    st = q1("SELECT data FROM server_status WHERE server=?", (machine,))
+    return (json.loads(st["data"]).get("security") or {}).get("desktop") if st else None
+
+
+def mac_chatgpt(machine):
+    """Whether this Mac's own reading says that the ChatGPT app is signed in: None from a Mac that does not say."""
+    return (mac_desktop(machine) or {}).get("chatgpt")
+
+
 def desktop_defaults(team, machine, runtime):
     """The desktop that an agent on this machine holds by default, beyond the shell and the web: none on Linux or on
-    a machine of no known kind; on a Mac, the browser and the screen that its runtime can use (RUNTIME_CAN)."""
+    a machine of no known kind; on a Mac, the browser and the screen that its runtime can use (RUNTIME_CAN). The screen
+    follows the Mac's real state: it comes when the ChatGPT app there is signed in, so a Mac that its owner set up for
+    Claude alone holds no screen, and adding ChatGPT later is that sign-in (default_access_sweep)."""
     if server_kind_of(team, machine) != "mac":
         return []
-    return [c for c in ("browser", "screen") if c in RUNTIME_CAN.get(runtime, set())]
+    return [c for c in ("browser", "screen") if c in RUNTIME_CAN.get(runtime, set())
+            and (c != "screen" or mac_chatgpt(machine) is not False)]
+
+
+def screen_waits(team, a):
+    """True for an agent of a Mac whose screen waits only for the ChatGPT app's sign-in there: its default stays open."""
+    return server_kind_of(team, a.get("machine")) == "mac" and "screen" in RUNTIME_CAN.get(a.get("runtime"), set()) and \
+        "screen" not in (a.get("can") or []) and mac_chatgpt(a.get("machine")) is False
 
 
 def with_desktop(entry, team):
@@ -26484,6 +26514,29 @@ def mac_setup_installing(row):
         mac_setup_stop(row, f"{shown_name(row['agent'])} could not be installed: {job['detail']}")
 
 
+def server_needs(server):
+    """What this server needs, from the one truth of its agents and, while a sitting runs, from the owner's choice for
+    it. browser: a runtime that works in Chrome, so its sign-in and its extension. chatgpt: the ChatGPT app and Computer
+    Use. own_copy: an agent's runtime is the app's own, so the agent's copy must be there too. state: the state of its
+    sitting, or None: a Mac that never had one. screen_task: a screen task runs there now, so the installer takes no
+    screenshot of its own. locked: its last reading found its screen locked, the one thing that says that its Lock
+    Screen setting is wrong."""
+    here = server_agents(server)
+    row = q1("SELECT * FROM mac_setups WHERE server=?", (server,))
+    open_sitting = row is not None and row["state"] != "done"
+    runtimes = {agents()[a].get("runtime") for a in here} | ({row["runtime"]} if open_sitting else set())
+    browser = any("browser" in RUNTIME_CAN.get(r, set()) for r in runtimes)
+    own_copy = any("browser" not in RUNTIME_CAN.get(r, {"browser"}) for r in runtimes)
+    chatgpt = own_copy or any("screen" in (agents()[a].get("can") or []) for a in here) or \
+        (open_sitting and row["chatgpt"] != 0)
+    desktop = mac_desktop(server) or {}
+    marks = ",".join("?" * len(here))
+    busy = bool(here) and q1(f"SELECT 1 FROM tasks WHERE needs='screen' AND owner IN ({marks}) AND state NOT IN "
+                             f"({','.join('?' * len(TERMINAL))}) LIMIT 1", (*here, *TERMINAL)) is not None
+    return {"agents": here or ([row["agent"]] if row else []), "browser": browser, "chatgpt": chatgpt, "own_copy": own_copy,
+            "state": row["state"] if row else None, "screen_task": busy, "locked": desktop.get("locked") is True}
+
+
 def mac_setup_finish(server, boot, restarts):
     """(status, answer) of the installer's last press. Pressing it again changes nothing."""
     row = q1("SELECT * FROM mac_setups WHERE server=?", (server,))
@@ -26491,10 +26544,11 @@ def mac_setup_finish(server, boot, restarts):
         return 404, {"error": f"{server} has no setup"}
     if row["state"] == "add":
         return 409, {"error": "Your hub has not added this Mac's agent yet. Try again in a minute."}
-    if row["state"] == "waiting":
+    if row["state"] in ("waiting", "stopped"):          # stopped: the owner put it right at the Mac, and tries once more
         if not (isinstance(boot, str) and boot) or not isinstance(restarts, bool):
             return 400, {"error": "boot is this boot of the Mac, and restarts is true or false"}
-        mac_setup_set(server, state="finished", boot=boot, restarts=int(restarts))
+        mac_setup_set(server, state="finished", boot=boot, restarts=int(restarts), tries=0, checks=0, token=None,
+                      task=None, seen=None)
     return 200, {"ok": True}
 
 
@@ -26507,11 +26561,14 @@ def mac_setup_returned(row):
     data = json.loads(st["data"])
     if row["restarts"] and (data.get("os") or {}).get("boot") in (None, row["boot"]):
         return False
-    if ((data.get("security") or {}).get("desktop") or {}).get("browser") is not False:
+    desktop = (data.get("security") or {}).get("desktop") or {}
+    screen_alone = "browser" not in RUNTIME_CAN.get(row["runtime"], set())
+    if desktop.get("browser") is not False and not (screen_alone and desktop.get("chatgpt") is False):
         mac_setup_set(row["server"], reported=st["reported"])
         return True                     # a reading that says nothing goes on to the real task, which is the proof
     if row["tries"] + 1 >= MAC_SETUP_READINGS:
-        mac_setup_stop(row, f"Chrome on that Mac does not answer {shown_name(row['agent'])}'s account.", hands=True)
+        mac_setup_stop(row, "ChatGPT on that Mac is signed out." if screen_alone else
+                       f"Chrome on that Mac does not answer {shown_name(row['agent'])}'s account.", hands=True)
     else:
         mac_setup_set(row["server"], reported=st["reported"], tries=row["tries"] + 1)
     return False
@@ -26525,12 +26582,12 @@ def mac_setup_check(row):
 
 def mac_setup_activate(row):
     """The check is back: the agent goes active as the owner's own Activate would, on the same conditions."""
-    check = q1("SELECT state FROM machine_checks WHERE agent=? ORDER BY id DESC LIMIT 1", (row["agent"],))
-    if not check or check["state"] == "requested":
-        return
     agent = agents().get(row["agent"])
     if agent is None:
         return mac_setup_stop(row, f"{shown_name(row['agent'])} is no longer in your fleet.")
+    check = q1("SELECT state FROM machine_checks WHERE agent=? ORDER BY id DESC LIMIT 1", (row["agent"],))
+    if not check or check["state"] == "requested":
+        return
     if agent.get("active", True) is False:
         missing, _ = activation_missing(row["agent"])
         if missing:
@@ -26553,9 +26610,20 @@ def mac_setup_prove(row):
     that never reached a real browser proves nothing, whatever its result says."""
     token, ip_port = secrets.token_urlsafe(18), hub_address()
     url = f"http://{ip_port[0]}:{ip_port[1]}/mac-setup/{token}"
+    can = (agents().get(row["agent"]) or {}).get("can") or []
+    if "browser" not in can and "screen" not in can and not kv_get(f"default_desktop:{row['agent']}"):
+        try:                            # ChatGPT's sign-in can have reached the hub just now
+            give_defaults(row["agent"], False, True)
+        except Refusal:                 # a commit that failed now: the next pass tries again
+            return
+        can = (agents().get(row["agent"]) or {}).get("can") or []
+    if "browser" not in can and "screen" not in can:
+        return mac_setup_stop(row, f"{shown_name(row['agent'])} has no browser and no screen on that Mac.", hands=True)
+    browser = "browser" in can
     task = check_task(manager_name(), {
-        "owner": row["agent"], "needs": "browser", "title": "Open the last page of this Mac's setup",
-        "details": f"Open {url} in Chrome with your browser tools, and wait until the page says Done. Use no other tool.",
+        "owner": row["agent"], "needs": "browser" if browser else "screen", "title": "Open the last page of this Mac's setup",
+        "details": f"Open {url} in Google Chrome with your {'browser tools' if browser else 'Computer Use'}, and wait "
+                   f"until the page says Done. Use no other tool.",
         "done_when": "The page says Done."})
     with transaction():
         tid = admit_task(manager_name(), task)
@@ -26608,14 +26676,16 @@ def mac_desktop_sweep():
         st = q1("SELECT data, reported FROM server_status WHERE server=?", (name,))
         desktop = ((json.loads(st["data"]).get("security") or {}).get("desktop") or {}) if st else {}
         setup = q1("SELECT state FROM mac_setups WHERE server=?", (name,))
-        working = [a for a in server_agents(name) if agents()[a].get("active", True) is not False
-                   and "browser" in (agents()[a].get("can") or []) and browser_tabs(a)]
-        if not desktop or not working or (setup and setup["state"] in ("add", "waiting")):
+        active = [a for a in server_agents(name) if agents()[a].get("active", True) is not False]
+        browser = any("browser" in (agents()[a].get("can") or []) and browser_tabs(a) for a in active)
+        screen = any("screen" in (agents()[a].get("can") or []) for a in active)
+        if not desktop or not (browser or screen) or (setup and setup["state"] in ("add", "waiting")):
             continue
         words = ("its screen is locked" if desktop.get("locked") else
-                 "Claude's extension is off in Chrome" if desktop.get("extension") is False else
-                 "Chrome does not run" if desktop.get("extension") and desktop.get("chrome") is False else
-                 "Claude's extension in Chrome is signed out" if desktop.get("browser") is False else None)
+                 "Claude's extension is off in Chrome" if browser and desktop.get("extension") is False else
+                 "Chrome does not run" if browser and desktop.get("extension") and desktop.get("chrome") is False else
+                 "Claude's extension in Chrome is signed out" if browser and desktop.get("browser") is False else
+                 "ChatGPT is signed out" if screen and desktop.get("chatgpt") is False else None)
         seen, told = kv_get(f"desktop_seen:{name}"), kv_get(f"desktop_told:{name}")
         if not words:
             if seen or told:
@@ -26629,7 +26699,7 @@ def mac_desktop_sweep():
             kv_set(f"desktop_seen:{name}", said)
         elif json.loads(seen)[1] != st["reported"]:
             kv_set(f"desktop_told:{name}", words)
-            emit(manager_name(), "say", f"[hub] On the Mac {name}, {words}. Browser tasks there wait. Only hands at that "
+            emit(manager_name(), "say", f"[hub] On the Mac {name}, {words}. Its tasks in Chrome and on its screen wait. Only hands at that "
                                         f"Mac, or the app's Screen Sharing button, can put this right: raise it for the "
                                         f"owner with raise_needs_you.")
 
@@ -26958,18 +27028,19 @@ def join_line(code, kind, tags=None):
             f">/dev/null 2>&1 || {up}; " + join)
 
 
-def new_join_code(kind, label="", agent=None, runtime=None, tags=None):
+def new_join_code(kind, label="", agent=None, runtime=None, tags=None, chatgpt=None):
     """POST /ui/servers/join: a one-time code for one new server, for 30 minutes, and for a Mac two hours. The server
     gets its name at the join, from Tailscale; the label is the name an older app typed, kept only for that app. The hub
     keeps only the code's SHA-256, and a new code cancels the open one. agent and runtime: the first agent of a new Mac,
-    which the hub adds by itself once that Mac reports (mac_setup_add)."""
+    which the hub adds by itself once that Mac reports (mac_setup_add). chatgpt: whether its sitting has ChatGPT as well
+    (server_needs), null from an app that offers no choice."""
     t0 = now()
     raw = "".join(secrets.choice(LINK_ALPHABET) for _ in range(12))
     life = MAC_JOIN_LIFE if kind == "mac" else JOIN_LIFE
     with transaction():
         DB.execute("UPDATE join_codes SET canceled=? WHERE used IS NULL AND canceled IS NULL", (t0,))
-        DB.execute("INSERT INTO join_codes(sha256,name,kind,created,expires,agent,runtime) VALUES(?,?,?,?,?,?,?)",
-                   (hashlib.sha256(raw.encode()).hexdigest(), label, kind, t0, t0 + life, agent, runtime))
+        DB.execute("INSERT INTO join_codes(sha256,name,kind,created,expires,agent,runtime,chatgpt) VALUES(?,?,?,?,?,?,?,?)",
+                   (hashlib.sha256(raw.encode()).hexdigest(), label, kind, t0, t0 + life, agent, runtime, chatgpt))
     log("owner", f"made a join code for a {kind} server")
     code = "-".join(raw[i:i + 4] for i in (0, 4, 8))
     return {"name": label, "kind": kind, "expires_at": t0 + life, "code": code, "line": join_line(code, kind, tags)}
@@ -26993,9 +27064,12 @@ def join_input(data):
     return {"code": code, "key_sha256": key, "kind": kind, "user": user, "ssh_port": port}
 
 
-def join_answer(name):
+def join_answer(name, row=None):
+    """extension: the runtime of a Mac's sitting works in Chrome, so Chrome gets the file that offers its extension
+    (server.py, join)."""
     ip, port = hub_address()
-    return {"server": name, "hub": f"http://{ip}:{port}", "repo": f"git://{ip}/fleet-pilot.git"}
+    return {"server": name, "hub": f"http://{ip}:{port}", "repo": f"git://{ip}/fleet-pilot.git",
+            "extension": row is None or "browser" in RUNTIME_CAN.get(row["runtime"], {"browser"})}
 
 
 def join_server(src, body):
@@ -27019,7 +27093,7 @@ def join_server(src, body):
                            "Add server.")
     if row["used"] is not None:
         if row["address"] == src and row["key_sha256"] == body["key_sha256"] and machine_at(src):
-            return dict(join_answer(machine_at(src)), replayed=True)
+            return dict(join_answer(machine_at(src), row), replayed=True)
         log("hub", f"REFUSED a join from {src}: the code of {row['name']} was used")
         raise Refusal(410, "This join code was already used. Make a new code in Founderizer: Settings, Servers, "
                            "Add server.")
@@ -27064,10 +27138,10 @@ def join_server(src, body):
         DB.execute("INSERT INTO server_keys(server,sha256,created) VALUES(?,?,?) ON CONFLICT(server) DO UPDATE SET "
                    "sha256=excluded.sha256, created=excluded.created", (name, body["key_sha256"], t0))
         if row["agent"]:
-            DB.execute("INSERT INTO mac_setups(server,agent,runtime,state,created,updated) VALUES(?,?,?,'add',?,?)",
-                       (name, row["agent"], row["runtime"], t0, t0))
+            DB.execute("INSERT INTO mac_setups(server,agent,runtime,chatgpt,state,created,updated) "
+                       "VALUES(?,?,?,?,'add',?,?)", (name, row["agent"], row["runtime"], row["chatgpt"], t0, t0))
     log("hub", f"server {name} joined from {src} in {commit[:12]}")
-    return dict(join_answer(name), revision=commit, replayed=False)
+    return dict(join_answer(name, row), revision=commit, replayed=False)
 
 
 def sign_in_prompt(prompt):
@@ -30324,7 +30398,8 @@ def machine_rows():
         rows.append({"agent": name, "machine": a.get("machine"), "role": a.get("role"), "access": access,
                      "check": check_view(q1("SELECT * FROM machine_checks WHERE agent=? ORDER BY id DESC LIMIT 1", (name,))),
                      "address": TEAM.get("addresses", {}).get(a.get("machine")), "revision": rev, "update": update,
-                     "security": data.get("security") or dict(empty_security),
+                     "security": dict(data.get("security") or empty_security, desktop=mac_desktop(a.get("machine"))),
+                     "needs": {k: v for k, v in server_needs(a.get("machine")).items() if k in ("browser", "chatgpt")},
                      "runtime": runtime_now or {"name": a.get("runtime"), "version": None, "signed_in": None},
                      "os": data.get("os") or {"name": None, "kernel": None},
                      "features": data.get("features") or [],
@@ -31643,19 +31718,21 @@ class Handler(BaseHTTPRequestHandler):
         server's name is its name in Tailscale, read at the join: a name that an older app sends is only the code's label,
         which that app finds the code by."""
         def read(data):
-            kind, label, agent, runtime = (data.get(k) for k in ("kind", "name", "agent", "runtime"))
+            kind, label, agent, runtime, chatgpt = (data.get(k) for k in ("kind", "name", "agent", "runtime", "chatgpt"))
             if kind not in SERVER_KINDS:
                 raise ValueError("kind must be linux or mac")
             if agent is not None and (kind != "mac" or not isinstance(agent, str) or not AGENT_NAME.match(agent)
-                                      or agent == "owner" or agent in agents() or not isinstance(runtime, str)
-                                      or not runtime_fact(runtime, "browser_tabs")):
-                raise ValueError("agent is a new first agent of a Mac, with a runtime that works in Chrome")
+                                      or agent == "owner" or agent in agents() or runtime not in SWITCH_RUNTIMES):
+                raise ValueError("agent is a new first agent of a Mac, on a runtime of a sitting")
+            if chatgpt is not None and (agent is None or not isinstance(chatgpt, bool)
+                                        or ("browser" not in RUNTIME_CAN[runtime] and not chatgpt)):
+                raise ValueError("chatgpt says whether a Mac's sitting has ChatGPT: a runtime with no browser of its own has")
             return {"kind": kind, "name": label if isinstance(label, str) and SERVER_NAME.fullmatch(label) else "",
-                    "agent": agent, "runtime": runtime if agent else None}
+                    "agent": agent, "runtime": runtime if agent else None, "chatgpt": chatgpt}
         tags = join_tags()          # before LOCK: the status may take 5 seconds
         return self.ui_command("servers/join", read,
                                lambda body: new_join_code(body["kind"], body["name"], body["agent"], body["runtime"],
-                                                          tags),
+                                                          tags, body["chatgpt"]),
                                keep=lambda result: dict(result, code=None, line=None))
 
     def ui_server_agent(self, server):
@@ -31823,6 +31900,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(404, {"error": "no such page"})
             q("UPDATE mac_setups SET seen=COALESCE(seen,?), updated=? WHERE server=?", (now(), now(), row["server"]))
         return self.json(200, {"ok": True})
+
+    def server_needs(self, name):
+        """GET /server/<name>/needs: what the agents of this Mac need, for its installer (server_needs)."""
+        name = self.server_caller(name)
+        if name is None:
+            return
+        return self.json(200, server_needs(name))
 
     def server_jobs(self, name):
         """GET /server/<name>/jobs: the open jobs of this server, oldest first. A rename job also names the agent's
@@ -34666,7 +34750,9 @@ class Handler(BaseHTTPRequestHandler):
             raise ToolError("No such task.")
         fence(agent or task["owner"], tid, (generation, tref(tid), attempt))
         key = (generation, tid, task["attempt"])
-        browser = task["needs"] == "browser" and "screen" in (agents().get(task["owner"]) or {}).get("can", [])
+        owner = agents().get(task["owner"]) or {}
+        browser = task["needs"] == "browser" and ("screen" in owner.get("can", []) or
+                                                  server_kind_of(TEAM, owner.get("machine")) == "mac")
         if (task["needs"] != "screen" and not browser) or task["state"] in TERMINAL or active_hold(tid):
             DESKTOP.drop(key)
             raise ToolError("Desktop viewing is stopped for this task.")
@@ -34836,6 +34922,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.join_script()
         if len(parts) == 2 and parts[0] == "mac-setup":
             return self.mac_setup_page(parts[1])
+        if len(parts) == 3 and parts[0] == "server" and parts[2] == "needs":
+            return self.server_needs(parts[1])
         if len(parts) == 3 and parts[0] == "server" and parts[2] == "jobs":
             return self.server_jobs(parts[1])
         if parts == ["door", "sealed"]:              # DevOps plan C4: the door fetches its copies
@@ -36309,7 +36397,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(200, {"ok": True, "job": job, "kind": "probe", "logins": logins})
             if agents()[agent].get("vault") != "broker":     # shared broker callers: only an agent with broker access
                 return self.json(409, {"error": "this agent has no broker access"})
-            if kind == "signin" and "browser" not in agents()[agent].get("can", []):
+            if kind == "signin" and not {"browser", "screen"} & set(agents()[agent].get("can", [])):
                 # The tool checked it when the job was made. The owner can take the browser away while the job waits.
                 return self.json(409, {"error": f"{agent} has no browser"})
             # The grant is checked again now: the owner can end or hold the task, or remove the login, while it waits.

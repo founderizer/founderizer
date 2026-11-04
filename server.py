@@ -222,6 +222,9 @@ def cmd_join(args):
     print(f"Founderizer: this machine is the server {name}{again}", flush=True)
     install_service()
     print("Founderizer: the server service runs", flush=True)
+    if args.kind == "mac" and answer.get("extension", True):    # a sitting for ChatGPT alone shows no Claude prompt
+        lifecycle.offer_extension(HOME)
+        print("Founderizer: Claude's extension: Chrome fetches it at its next start and asks once to enable it", flush=True)
 
 
 def install_service(run=subprocess.run, platform=sys.platform):
@@ -273,6 +276,29 @@ def cmd_finish(args):
         "boot": out.strip() if code == 0 else None, "restarts": not args.no_restart})
     if status not in (200, 404):        # 404: a Mac of the fleet from before, whose sitting the hub does not carry
         die(answer.get("error") or f"The hub did not answer ({status}).")
+
+
+def cmd_needs(args):
+    """What this Mac needs, as one line of JSON, for its installer. A hub that does not know this Mac any more answers
+    403, and the installer goes back to its link code."""
+    conf, key = load_conf(), server_key()
+    if not conf or not key:
+        die("This machine has not joined your fleet.")
+    status, answer = Hub(conf["hub"], key).call("GET", f"/server/{conf['name']}/needs")
+    print(json.dumps(dict(answer, status=status)))
+
+
+def cmd_add_claude(args):
+    """Claude Code and Chrome's offer of its extension, for the installer's Add Claude on a Mac that had no Claude."""
+    if not lifecycle.exe("claude", HOME):
+        pin = onboard.RUNTIME_PINS["claude"]
+        done = subprocess.run(["/bin/sh", "-c", 'mkdir -p "$HOME/.local/bin" && ' + onboard.runtime_install("claude", pin)],
+                              cwd=HOME, capture_output=True, text=True, timeout=900)
+        exe = lifecycle.exe("claude", HOME)
+        if done.returncode != 0 or not exe:
+            die("Claude Code did not install. Try again.")
+        subprocess.run([sys.executable, "-c", onboard.CLAUDE_CHANNEL, exe], capture_output=True, timeout=120)
+    lifecycle.offer_extension(HOME)
 
 
 def cmd_desktop(args):
@@ -1041,11 +1067,14 @@ def main():
     finish = sub.add_parser("finish")
     finish.add_argument("--no-restart", action="store_true")
     sub.add_parser("desktop")
+    sub.add_parser("needs")
+    sub.add_parser("add-claude")
     sub.add_parser("chrome-script")
     sub.add_parser("computer-use")
     args = parser.parse_args()
     {"join": cmd_join, "service": cmd_service, "run": cmd_run, "finish": cmd_finish, "desktop": cmd_desktop,
-     "chrome-script": cmd_chrome_script, "computer-use": cmd_computer_use}[args.cmd](args)
+     "needs": cmd_needs, "add-claude": cmd_add_claude, "chrome-script": cmd_chrome_script,
+     "computer-use": cmd_computer_use}[args.cmd](args)
 
 
 if __name__ == "__main__":

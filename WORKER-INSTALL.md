@@ -60,8 +60,8 @@ python3 worker_install.py --agent studio --start --authorize-screen
 The Mac service starts after the user signs in. It does not bypass FileVault or
 the lock screen. Leave a dedicated screen worker unlocked while it works.
 
-A Mac's join line also leaves the file that makes Chrome take Claude's extension from
-its Web Store (`join.sh` `mac_chrome`). Chrome fetches it at its next start and asks
+A Mac's join also leaves the file that makes Chrome take Claude's extension from its
+Web Store (`server.py join`), unless the owner chose ChatGPT alone for that Mac. Chrome fetches it at its next start and asks
 once, on that Mac's screen, to enable it. It asks on the page only on a profile that has
 started before the file arrived; on a newer one the question waits in no menu at all.
 Then sign the extension in, in that Chrome, to the Claude account of the Mac's agents.
