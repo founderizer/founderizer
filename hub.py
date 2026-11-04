@@ -21428,7 +21428,8 @@ def trigger_state_rows(trigger_id, base, action, by, t0, command=None):
 
 def trigger_action(trigger_id, base, action, by, t0, command=None):
     """One state action of the owner or an agent: (trigger, run or None). pause, resume and delete write a history
-    row; run_now (owner only) and check_now write a run."""
+    row; run_now (owner only) and check_now write a run. run_now of an agent's rule with a check runs the check and
+    decides its result as a scheduled run (owner API 1.83); of any other rule it starts the rule's task (1.7)."""
     t = trigger_row(trigger_id)
     if not t:
         raise Refusal(404, "no such trigger")
@@ -21437,7 +21438,10 @@ def trigger_action(trigger_id, base, action, by, t0, command=None):
     if t["state"] not in TRIGGER_ACTIONS[action]:
         raise Refusal(409, f"trigger {trigger_id} is {t['state']}; {action} does not apply")
     run = None
-    if action == "run_now":         # the revision stays: a run changes no setting
+    if action == "run_now" and t["check_spec"] and agent_rule(t):
+        # owner API 1.83: the check runs first, and only what is new wakes the agent, as at a due time
+        run = check_now(t, t0, command, wake=True)
+    elif action == "run_now":       # the revision stays: a run changes no setting
         run = run_trigger(t, t0, True, t0)
     elif action == "check_now":     # one execution of the check, never a task (owner API 1.8)
         run = check_now(t, t0, command)
@@ -22273,9 +22277,11 @@ def keep_command(command, receipt, t0):
 
 
 def once_done(t):
-    """Inside a transaction: a one-off trigger is done when its occurrence ends."""
+    """Inside a transaction: a one-off trigger is done when its occurrence ends. A Run task now before its time
+    (owner API 1.83) leaves it its time: its next_due is still there."""
     if json.loads(t["schedule"])["kind"] == "once":
-        DB.execute("UPDATE triggers SET state='done', next_due=NULL WHERE id=? AND state='active'", (t["id"],))
+        DB.execute("UPDATE triggers SET state='done', next_due=NULL WHERE id=? AND state='active' AND next_due IS NULL",
+                   (t["id"],))
 
 
 def dispatch_check(t, run, t0):
@@ -22383,9 +22389,11 @@ def checks_in_flight(runner):
                if runner_of(r) == runner)
 
 
-def check_now(t, t0, command=None):
+def check_now(t, t0, command=None, wake=False):
     """The owner's or an agent's Check now: one execution of the check. It never starts a task, and its end is
-    final. command: the agent's request, kept with the run."""
+    final. command: the agent's request, kept with the run. wake: Run task now of an agent's rule with a check (owner
+    API 1.83): the same one execution, whose result is decided as a scheduled run's (check_now 0), so only what is
+    new wakes the agent and its lines are accepted."""
     if not t["check_spec"]:
         raise Refusal(409, f"trigger {t['id']} has no check; use run_now")
     if not wakeups.check_known(json.loads(t["check_spec"])):
@@ -22403,7 +22411,7 @@ def check_now(t, t0, command=None):
         raise Refusal(409, f"{shown_name(runner)} cannot run this check yet. Update Founderizer on its server first.")
     with transaction():
         run = DB.execute("INSERT INTO trigger_runs(trigger_id,revision,due,manual,check_now,state,created) "
-                         "VALUES(?,?,?,1,1,'waiting',?)", (t["id"], t["revision"], t0, t0)).lastrowid
+                         "VALUES(?,?,?,1,?,'waiting',?)", (t["id"], t["revision"], t0, 0 if wake else 1, t0)).lastrowid
         dispatch_check(t, run, t0)
         keep_command(command, wakeups.receipt("check_now", t["id"], t["revision"], run), t0)
     return q1("SELECT * FROM trigger_runs WHERE id=?", (run,))
@@ -22500,7 +22508,8 @@ def check_result(t, r, body, t0, stored=None, held=None):
                 reason = (reason + " " if reason else "") + f"Its progress line was not recorded: {why}"
         if state == "started":
             found = (head, None) if lines_form else (body["value"], body.get("summary") or "")
-            line = mask_secrets(trigger_provenance(t, r["id"], r["due"], False, (spec,) + found, t0=t0, wakes=wakes))
+            line = mask_secrets(trigger_provenance(t, r["id"], r["due"], bool(r["manual"]), (spec,) + found, t0=t0,
+                                                   wakes=wakes))
             if admission:
                 answer["task"], event, parent = admit_wake(t, r["id"], admission, line, t0)
             else:
