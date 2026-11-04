@@ -439,7 +439,7 @@ class Service:
     def reading(self):
         life = self.life
         return {"revision": self.loaded, "os": life.os_info(), "security": life.security(),
-                "runtimes": self.runtimes(),
+                "runtimes": self.runtimes(), "load": lifecycle.machine_load(self.platform),
                 "access": dict(life.access(), user=pwd.getpwuid(os.getuid()).pw_name),
                 "features": [JOB_HEARTBEAT, NAMES_FEATURE, KEY_FEATURE, INSTALL_KEY]}
 
@@ -979,8 +979,9 @@ class Service:
                   f"to {desired[:12]}: {problem}; this server keeps {str(self.loaded)[:12]}.", file=sys.stderr,
                   flush=True)
             return
-        if any((p.endswith(".py") and not p.startswith(lifecycle.OUTPUTS)) or p == "team.json" for p in out.split()):
-            self.restart()              # a task's output is no code that this service loads
+        if any((p.endswith(".py") and not p.startswith((lifecycle.OUTPUTS, lifecycle.SKILLS + "/"))) or p == "team.json"
+               for p in out.split()):
+            self.restart()              # a task's output and an agent's skill are no code that this service loads
         self.loaded = desired
 
     def vault_program(self):

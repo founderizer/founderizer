@@ -1573,6 +1573,106 @@ def check_stores(home):
     return [os.path.join(home, CHECK_STORE), os.path.join(home, FIRST_CHECK_STORE)]
 
 
+# ---- what a machine and an agent use (the owner, 4 November 2026: "do we have data of cpu/memory/disk usage for the
+# different fleet servers? THAT would be useful for the Servers section, Agents AND also information that's good to
+# know to the manager", and his yes the same day to the figures on Servers and to each agent's own use on Agents)
+LOAD_KEYS = ("cpu_percent", "memory_used", "memory_total", "disk_used", "disk_total")
+DATA_VOLUME = "/System/Volumes/Data"    # a Mac's own files: its system volume is sealed, and the free space is shared
+MAC_MEMORY = ("Anonymous pages", "Pages purgeable", "Pages wired down", "Pages occupied by compressor")
+USE_SPAN = 60                           # seconds: an agent's CPU is measured over at least this long (agent_use)
+
+
+def machine_load(platform_name=sys.platform, run=None, loadavg=os.getloadavg, statvfs=os.statvfs, opener=open,
+                 cores=os.cpu_count, exists=os.path.exists):
+    """How busy and how full this machine is now: the five-minute load as a share of its cores, the memory in use and
+    the disk. A Mac's memory in use is Activity Monitor's Memory Used (app memory, wired and compressed), and its disk
+    is the data volume. A part that cannot be read is None."""
+    load = dict.fromkeys(LOAD_KEYS)
+    try:
+        load["cpu_percent"] = round(loadavg()[1] / (cores() or 1) * 100, 1)
+    except (OSError, IndexError, TypeError):
+        pass
+    try:
+        if platform_name == "darwin":
+            code, out, _ = (run or _run)(["sysctl", "-n", "hw.memsize"])
+            total = int(out.strip()) if code == 0 and out.strip().isdigit() else None
+            code, out, _ = (run or _run)(["vm_stat"])
+            page = re.search(r"page size of (\d+) bytes", out) if code == 0 else None
+            pages = dict((k, int(v)) for k, v in re.findall(r"^([^:\n]+):\s+(\d+)\.?\s*$", out, re.M)) if page else {}
+            if total and all(k in pages for k in MAC_MEMORY):
+                apps, purgeable, wired, compressed = (pages[k] for k in MAC_MEMORY)
+                load["memory_used"] = (apps - purgeable + wired + compressed) * int(page.group(1))
+                load["memory_total"] = total
+        else:
+            with opener("/proc/meminfo") as f:
+                kb = dict((k, int(v)) for k, v in re.findall(r"^(\w+):\s+(\d+) kB", f.read(), re.M))
+            if "MemTotal" in kb and "MemAvailable" in kb:
+                load["memory_used"] = (kb["MemTotal"] - kb["MemAvailable"]) * 1024
+                load["memory_total"] = kb["MemTotal"] * 1024
+    except (OSError, ValueError):
+        pass
+    try:
+        st = statvfs(DATA_VOLUME if platform_name == "darwin" and exists(DATA_VOLUME) else "/")
+        load["disk_total"] = st.f_blocks * st.f_frsize
+        load["disk_used"] = load["disk_total"] - st.f_bavail * st.f_frsize
+    except OSError:
+        pass
+    return load
+
+
+def cpu_seconds(text):
+    """The CPU time of `ps -o time=`, in seconds: macOS writes minutes and seconds ("204:56.10"), Linux
+    "[DD-]HH:MM:SS"."""
+    days, _, clock = text.rpartition("-")
+    seconds = 0.0
+    for part in clock.split(":"):
+        seconds = seconds * 60 + float(part)
+    return seconds + 86400 * int(days or 0)
+
+
+def agent_use(agent, mark=None, run=None, now=None, pid=None, cores=None):
+    """What one agent's own processes use: its helper with what it started, and every pane of its tmux session with
+    what runs there. The agents of a Mac share one user and one tmux server, so the session is what tells them apart,
+    named whole ("=fleet-ivy:"): tmux takes a name as the start of another, and "fleet-ivy" found "fleet-ivy-lead".
+
+    Returns ({cpu_percent, memory}, the mark for the next reading). memory is their resident memory now. CPU is their
+    share of the machine's cores since the mark, at most 100, and None at the first reading of a helper: each process's
+    CPU time against its own at the mark, so a process that started since counts whole. A process that started and
+    ended between two readings is not in it: no `ps` column holds the time of reaped children (macOS -S and Linux
+    --cumulative change other columns). A reading under USE_SPAN after the mark keeps the mark and its figure: a report
+    that something asked for at once says no spike of a few seconds."""
+    run = run or _run
+    now = time.monotonic() if now is None else now
+    code, out, _ = run(["tmux", "list-panes", "-s", "-t", f"=fleet-{agent}:", "-F", "#{pane_pid}"], timeout=5)
+    roots = [os.getpid() if pid is None else pid] + ([int(p) for p in out.split() if p.isdigit()] if code == 0 else [])
+    code, out, _ = run(["ps", "-A", "-o", "pid=,ppid=,rss=,time="], timeout=5)
+    table = {}
+    for line in out.splitlines() if code == 0 else []:
+        words = line.split()
+        try:
+            table[int(words[0])] = (int(words[1]), int(words[2]) * 1024, cpu_seconds(words[3]))
+        except (IndexError, ValueError):
+            continue
+    children = {}
+    for one, (parent, _, _) in table.items():
+        children.setdefault(parent, []).append(one)
+    mine, todo = set(), [p for p in roots if p in table]
+    while todo:
+        one = todo.pop()
+        if one not in mine:
+            mine.add(one)
+            todo += children.get(one, [])
+    if not mine:
+        return {"cpu_percent": None, "memory": None}, mark
+    memory = sum(table[p][1] for p in mine)
+    if mark and now - mark[0] < USE_SPAN:
+        return {"cpu_percent": mark[2], "memory": memory}, mark
+    seconds = {p: table[p][2] for p in mine}
+    cpu = min(100.0, round(sum(max(0.0, s - mark[1].get(p, 0.0)) for p, s in seconds.items()) / (now - mark[0]) /
+                           (cores or os.cpu_count() or 1) * 100, 1)) if mark else None
+    return {"cpu_percent": cpu, "memory": memory}, (now, seconds, cpu)
+
+
 class Lifecycle:
     def __init__(self, kit, agent, conf, post, busy, restart=None, run=_run, clock=time.time,
                  platform_name=sys.platform, home=None, vault=None, probe=None, models=codex_model_list, legacy=None,
@@ -1629,6 +1729,7 @@ class Lifecycle:
         self.read_mono = None           # when the runtimes of the report being made were read (reading_age)
         self.slow_file = slow_file      # where this helper keeps its slow reading for the next process of this boot
         self.slow = self.load_slow()
+        self.use_mark = None            # the CPU time of this agent's processes at its last use reading (agent_use)
 
     # ---- status
     def revision(self):
@@ -1863,7 +1964,13 @@ class Lifecycle:
                 "legacy_windows": self.legacy() if self.legacy else None,
                 **(self.switch() if self.switch else {"other_runtime_windows": [], "owner_chat_bound": None}),
                 "settings": self.settings(), "models": self.read_models(),
-                "screen_settings": self.screen_settings(), "screen_models": self.read_screen_models()}
+                "screen_settings": self.screen_settings(), "screen_models": self.read_screen_models(),
+                "use": self.use()}
+
+    def use(self):
+        """What this agent's own processes use now (agent_use)."""
+        use, self.use_mark = agent_use(self.agent, self.use_mark, self.run, self.monotonic())
+        return use
 
     def remember_signed_in(self, runtimes):
         """Leave this sign-in reading in ~/.fleet, where a later `fleet.py verify` of this machine reads it.

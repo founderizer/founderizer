@@ -6071,6 +6071,11 @@ def capacity_view(names=None, expertise=None, needs=None, login=None):
             "resources": grant_pool([a["agent"] for a in out])}
 
 
+def gb(size):
+    """Bytes as GB with one decimal, in the app's own units (1024³)."""
+    return f"{size / 1024 ** 3:.1f}"
+
+
 def capacity_text(view, filters, needs, restricted=False, parent=None, caller=None):
     """see_capacity as text. restricted (a lead): only the task IDs of its own scope appear, in every line - its
     session's task and that task's subtasks; the agent's other open work is a count."""
@@ -6126,6 +6131,11 @@ def capacity_text(view, filters, needs, restricted=False, parent=None, caller=No
         if a["logins"]["probe"]:
             facts.append(f"readable at the setup check {span(t0 - a['logins']['probe']['checked_at'])} ago (earlier "
                          f"evidence, not the grant): {len(a['logins']['probe']['readable'])}")
+        st = q1("SELECT data, reported FROM machine_status WHERE agent=?", (a["agent"],))
+        use = json.loads(st["data"]).get("use") if st and t0 - st["reported"] <= MACHINE_STALE else None
+        if use and use.get("memory") is not None:       # lifecycle.agent_use: its helper and its sessions
+            cpu = f"CPU {use['cpu_percent']:g}% and " if use["cpu_percent"] is not None else ""
+            facts.append(f"its own processes use {cpu}{gb(use['memory'])} GB of memory")
         ids = a["workload"]["tasks"]
         mine = [t for t in ids if visible(t)]
         work = (", ".join(f"T-{t}" for t in mine) or "none") + \
@@ -6179,6 +6189,24 @@ def capacity_text(view, filters, needs, restricted=False, parent=None, caller=No
                    f". {g['state']}" + (until(g) if g["state"] == "limited" else "") + f". {windows}." +
                    (f" Read {span(t0 - g['read_at'])} ago" + (" (stale)." if g["stale"] else ".") if g["read_at"] else "") +
                    (f" {g['mismatch']}" if g["mismatch"] else ""))
+    # The owner, 4 November 2026: the servers' figures are "information that's good to know to the manager to make
+    # decisions or to see if there are issues". A lead reads the servers of its own team.
+    out.append("SERVERS (CPU is the 5-minute load as a share of its cores)")
+    for machine in server_names():
+        on = server_agents(machine)
+        shown = [a for a in on if a in names] if restricted else on
+        if restricted and not shown:
+            continue
+        others = len(on) - len(shown)       # other teams' agents on a server that a lead's team shares
+        load = server_load(machine, server_reading(machine, on), t0)
+        parts = [f"CPU {load['cpu_percent']:g}%"] if load and load["cpu_percent"] is not None else []
+        for key in ("memory", "disk"):
+            used, total = (load or {}).get(f"{key}_used"), (load or {}).get(f"{key}_total")
+            if used is not None and total:
+                parts.append(f"{key} {gb(used)} of {gb(total)} GB ({round(used * 100 / total)}%)")
+        names_here = ", ".join(shown) + (f" and {others} other agent(s)" if others else "")
+        out.append(f"  {machine} ({names_here or 'no agent'}): " + (", ".join(parts) or "no reading") + "." +
+                   (f" Read {span(t0 - load['at'])} ago." if parts and t0 - load["at"] >= 60 else ""))
     if not restricted:          # grant_access is the manager's; a lead reads capacity to choose, not to grant
         pool = view.get("resources") or []
         out.append("GRANTABLE POOL (what you may give with grant_access; the owner sets each standing in the app)")
@@ -12317,7 +12345,8 @@ def profile_view(agent, rev):
 
 _code_diffs = {}
 FLEET_FILES = re.compile(r"(?:^|/)[^/]+\.py$|^team\.json$|^bws\.toml$|^profiles/|^rules/|^(?:RULES|CLAUDE|AGENTS)\.md$")
-OWNER_ONLY = re.compile(r"(?:^|/)(?:test_[^/]*|ui_fixture|selftest|verify|pilot|vault)\.py$")  # never run by helpers
+# Never run by helpers: lifecycle.OWNER_ONLY, which a helper reads, names the same files.
+OWNER_ONLY = re.compile(r"(?:^|/)(?:test_[^/]*|ui_fixture|selftest|verify|pilot|vault|place)\.py$")
 
 
 def same_code(rev, desired):
@@ -19951,8 +19980,9 @@ TOOLS = [
     ("manager", "see_capacity", t_see_capacity,
      "See who can take work now: for each agent its suitability (expertise, capabilities, logins it may use "
      "here) and why not, its availability for each runtime account (available, limited until a reset, offline, in "
-     "setup or unknown), its open tasks, and the accounts that several agents share (one allowance, counted once). "
-     "Choose by suitability first, then availability. Filters: expertise, needs, login.",
+     "setup or unknown), its open tasks and the CPU and memory that its own processes use, the accounts that several "
+     "agents share (one allowance, counted once), and each server's CPU, memory and disk with its agents. Choose by "
+     "suitability first, then availability; give heavy work to a server with room. Filters: expertise, needs, login.",
      S({"expertise": {"type": "string", "description": "An expertise tag, for example seo"},
         "needs": {"type": "string", "enum": ["none", "browser", "screen"]},
         "login": {"type": "string", "description": "A login name, bws://<uuid>, that the work needs"}})),
@@ -24938,6 +24968,29 @@ def runtime_update(value):
     return {"result": value["result"], "at": at, "detail": detail.strip()[:300]}
 
 
+def figure(value, whole=True):
+    """One figure of a machine's load or an agent's use: a number from 0 to 2⁵³, which every app reads, else None. Like
+    runtime_update, an optional field of a newer reading: a value of another shape is dropped and never refuses the
+    status."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 2 ** 53:
+        return None
+    return int(value) if whole else round(float(value), 1)
+
+
+def load_reading(value):
+    """A server's load as its service measured it (lifecycle.machine_load), or None."""
+    if not isinstance(value, dict):
+        return None
+    return {k: figure(value.get(k), k != "cpu_percent") for k in lifecycle.LOAD_KEYS}
+
+
+def use_reading(value):
+    """What an agent's own processes use, as its helper measured it (lifecycle.agent_use), or None."""
+    if not isinstance(value, dict):
+        return None
+    return {"cpu_percent": figure(value.get("cpu_percent"), False), "memory": figure(value.get("memory"))}
+
+
 READING_AGE_MAX = 120          # seconds a reading may be older than its report; a larger age is no reading's own
 
 
@@ -25077,7 +25130,8 @@ def validate_status(data):
                        "user": user},
             "check": _optional(data.get("check"), int), "features": sorted(set(features)), "settings": settings,
             "models": model_reading(data.get("models")), "verify": verify_items(data.get("verify")),
-            "reading_age": reading_age_of(data.get("reading_age"))}
+            "reading_age": reading_age_of(data.get("reading_age")),
+            "load": load_reading(data.get("load")), "use": use_reading(data.get("use"))}
 
 
 # ---------------------------------------------------------------- the fleet's settings (AUTONOMY.md section 4)
@@ -26555,7 +26609,23 @@ def server_reading(name, here):
     return {"source": source, "revision": data.get("revision"), "os": data.get("os") or {"name": None, "kernel": None},
             "security": data.get("security"), "runtimes": runtimes or {},
             "user": (data.get("access") or {}).get("user"), "reported_at": row["reported"],
-            "stale": now() - row["reported"] > MACHINE_STALE}
+            "stale": now() - row["reported"] > MACHINE_STALE, "load": data.get("load") if source == "server" else None}
+
+
+HUB_LOAD = {"at": None, "load": None}      # the hub's last measurement of its own machine (server_load)
+HUB_LOAD_KEEP = 10                          # seconds it is kept: a Mac hub runs sysctl and vm_stat for it, under LOCK
+
+
+def server_load(name, reading, t0):
+    """A server's load (lifecycle.machine_load) with when it was read, or None: the hub's own machine measured by the
+    hub itself, which needs no service there, and every other server as its own service measured it at its newest
+    reading."""
+    if name == (TEAM.get("hub") or {}).get("machine"):
+        if HUB_LOAD["at"] is None or not 0 <= t0 - HUB_LOAD["at"] < HUB_LOAD_KEEP:
+            HUB_LOAD.update(at=t0, load=lifecycle.machine_load(sys.platform))
+        return dict(HUB_LOAD["load"], at=HUB_LOAD["at"])
+    load = (reading or {}).get("load")
+    return dict(load, at=reading["reported_at"]) if isinstance(load, dict) else None
 
 
 def server_kind_of(team, machine):
@@ -26614,7 +26684,36 @@ WATCH_WORDS = {                 # what stopped holding, and what holds again
     "updates_off": ("its automatic security updates are off", "its automatic security updates are on"),
     "updates": ("no security update has ended well on it for 3 days", "its security updates run again"),
     "restart": ("it has waited 7 days for a restart", "it no longer waits for a restart"),
+    "disk": ("its disk is {share}% full ({used} of {total} GB)", "its disk is under 85% full"),
+    "memory": ("{share}% of its memory is in use ({used} of {total} GB)", "its memory in use is under 85%"),
 }
+# Percent of a server's disk or memory (lifecycle.machine_load): it needs care from the first, and holds again under the
+# second, so a figure that moves about 90 is said once (the owner, 4 November 2026: the manager must "see if there are
+# issues").
+LOAD_FULL, LOAD_EASED = 90, 85
+
+
+def load_troubles(load, told, memory=True):
+    """The disk and the memory of a server's newest reading that need care, as WATCH_WORDS keys. A Mac's memory is no
+    trouble of its own: Activity Monitor's Memory Used says nothing of memory pressure (78% used while memory_pressure
+    said 84% free), so it stays a figure on the screens."""
+    found = []
+    for key in ("disk", "memory") if memory else ("disk",):
+        used, total = ((load or {}).get(f"{key}_{part}") for part in ("used", "total"))
+        if used is None or not total:
+            found += [key] if key in told else []       # a reading that cannot say keeps what was said
+        elif used * 100 >= (LOAD_EASED if key in told else LOAD_FULL) * total:
+            found.append(key)
+    return found
+
+
+def watch_words(key, load, ended=False):
+    """The words of one WATCH_WORDS key, with the load's own figures in GB where the words carry them."""
+    words = WATCH_WORDS[key][1 if ended else 0]
+    if key in ("disk", "memory") and not ended:
+        used, total = load[f"{key}_used"], load[f"{key}_total"]
+        words = words.format(share=round(used * 100 / total), used=gb(used), total=gb(total))
+    return words
 
 
 def server_troubles(reading, joined, restart_since, t0):
@@ -26638,8 +26737,9 @@ def server_troubles(reading, joined, restart_since, t0):
 
 def server_watch_sweep(t0):
     """Inside LOCK, once a minute: each joined Linux server against its own baseline (server_troubles), from its
-    newest reading, once its join is JOIN_GRACE old. A server with no agent whose reading stops is quiet; one with
-    agents is offline_sweep's. The
+    newest reading, once its join is JOIN_GRACE old, and the disk and memory of every joined server and of the hub's
+    own machine, which may have no service, a Mac's disk only (load_troubles). A server with no agent whose reading
+    stops is quiet; one with agents is offline_sweep's. The
     manager hears once when something stops holding and once when it holds again, and gives it first to the agent
     whose duty covers that server (the coordinator of the DevOps plan, 3 November 2026: the owner asked why he gets so
     many Needs-you items)."""
@@ -26648,32 +26748,41 @@ def server_watch_sweep(t0):
     WATCH["at"] = t0
     joined = {r["server"]: r["created"] for r in q("SELECT server, created FROM server_keys")}
     state = json.loads(kv_get("server_watch") or "{}")
-    kept = {}
+    kept, hub_machine = {}, (TEAM.get("hub") or {}).get("machine")
     for name in server_names():
-        if name not in joined or t0 - joined[name] < JOIN_GRACE:
+        own = name == hub_machine       # its disk holds the hub's records: the hub measures it, joined or not
+        watched = name in joined and t0 - joined[name] >= JOIN_GRACE
+        if not watched and not own:
             continue
         here = server_agents(name)
-        reading = server_reading(name, here)
-        if reading is None or server_kind(reading) != "linux":
+        reading = server_reading(name, here) if watched else None
+        kind = ("mac" if sys.platform == "darwin" else "linux") if own else server_kind(reading)
+        if kind is None:
             continue
+        load = server_load(name, reading, t0)
         was = state.get(name) or {}
         told, since = set(was.get("told") or []), was.get("restart")
-        if reading["source"] == "server" and t0 - max(reading["reported_at"], STARTED) > SERVER_QUIET:
+        if reading is None or kind == "mac":        # its load alone: the baseline is a joined Linux server's
+            now_found = set(load_troubles(load, told, memory=kind != "mac"))
+        elif reading["source"] == "server" and t0 - max(reading["reported_at"], STARTED) > SERVER_QUIET:
             now_found = (told - {"quiet"}) | ({"quiet"} if not here else set())    # nothing else is read while quiet
         else:
             sec = reading.get("security") or {}
             since = (since or t0) if sec.get("reboot_required") else None
-            now_found = set(server_troubles(reading, joined[name], since, t0))
+            now_found = set(server_troubles(reading, joined[name], since, t0) + load_troubles(load, told))
         new, ended = sorted(now_found - told), sorted(told - now_found)
         if new:
+            names = [shown_name(a) for a in here] if {"disk", "memory"} & set(new) else []    # what runs there
+            runs = f" It runs {', '.join(names[:-1])} and {names[-1]}." if len(names) > 1 else \
+                f" It runs {names[0]}." if names else ""
             emit(manager_name(), "say", f"[hub] The server {name} needs care: "
-                                        f"{'; '.join(WATCH_WORDS[k][0] for k in new)}. Give it to the agent whose duty "
-                                        f"covers this server; fix it yourself when no duty covers it; raise Needs-you "
-                                        f"only for a step that no agent can take.")
+                                        f"{'; '.join(watch_words(k, load) for k in new)}.{runs} Give it to the agent "
+                                        f"whose duty covers this server; fix it yourself when no duty covers it; raise "
+                                        f"Needs-you only for a step that no agent can take.")
             log("hub", f"the server {name} needs care ({', '.join(new)}); the manager was told")
         if ended:
             emit(manager_name(), "say", f"[hub] The server {name} is in order again: "
-                                        f"{'; '.join(WATCH_WORDS[k][1] for k in ended)}.")
+                                        f"{'; '.join(watch_words(k, None, ended=True) for k in ended)}.")
             log("hub", f"the server {name} is in order again ({', '.join(ended)})")
         if now_found or since:
             kept[name] = {"told": sorted(now_found), "restart": since}
@@ -26705,8 +26814,10 @@ def servers_view():
     for name in server_names(team):
         here, entry = server_agents(name, team), (team.get("servers") or {}).get(name) or {}
         reading = server_reading(name, here)
+        load = server_load(name, reading, t0)       # beside the reading, which the hub's own machine may not have
         if reading:                     # the reading's Fleet files are the hub's: same_code, as for a helper
             reading["current"] = same_code(reading["revision"], desired) if reading["revision"] and desired else None
+            del reading["load"]
         job = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (name,))
         # An agent there already: a new one needs a service that gives it its key, and a server where nobody else has
         # root (add_server_agent).
@@ -26725,7 +26836,7 @@ def servers_view():
         out.append({"name": name, "kind": entry.get("kind") or server_kind(reading),
                     "address": team["addresses"][name], "user": entry.get("user") or (reading or {}).get("user"),
                     "hub": name == hub_machine, "joined": name in keys, "agents": here, "reading": reading,
-                    "available": not why, "why": why, "job": job_view(job)})
+                    "load": load, "available": not why, "why": why, "job": job_view(job)})
     return {"desired_revision": desired, "servers": out,
             "join": join_view(q1("SELECT * FROM join_codes ORDER BY id DESC LIMIT 1"), t0)}
 
@@ -28465,7 +28576,7 @@ def record_status(agent, data):
           "WHERE id=? AND agent=? AND state='requested'", (now(), json.dumps(items), data.get("revision"), check, agent))
         q("UPDATE jobs SET finished=COALESCE(finished,?) WHERE agent=? AND kind='probe' AND finished IS NULL", (now(), agent))
     old = q1("SELECT data FROM machine_status WHERE agent=?", (agent,))
-    with area("state" if not old or untimed(json.loads(old["data"])) != untimed(data) else "activity"):
+    with area("state" if not old or said(json.loads(old["data"])) != said(data) else "activity"):
         q("INSERT INTO machine_status(agent,data,reported) VALUES(?,?,?) "
           "ON CONFLICT(agent) DO UPDATE SET data=excluded.data, reported=excluded.reported", (agent, json.dumps(data), now()))
     end_signed_in_waits(agent)          # a sign-in this report says is made is over, whatever is still waiting for it
@@ -29673,10 +29784,10 @@ def health_view():
         warn("reports_undecided", f"{len(waiting)} {'report' if one else 'reports'} from your agents "
                                   f"{'waits' if one else 'wait'} for a decision.",
              f"Ask {manager} to decide {'it' if one else 'them'}.", agent=manager_name())
-    free = None
+    free = total = None
     try:
         st = os.statvfs(os.path.dirname(CFG.get("db_path") or ".") or ".")
-        free = st.f_bavail * st.f_frsize
+        free, total = st.f_bavail * st.f_frsize, st.f_blocks * st.f_frsize
     except OSError:
         pass
     if free is not None and free < DISK_LOW:
@@ -29685,8 +29796,11 @@ def health_view():
               else "Free space on the hub's own server."), agent=on_the_hub)
     pages = q1("PRAGMA page_count")[0] * q1("PRAGMA page_size")[0]
     return {"ok": not warnings, "time": t0, "revision": desired, "backups_enabled": backups_enabled(),
+            # The owner, 4 November 2026: "it is also not clear what Free Space means, and how much we're using, and
+            # where it is": the disk's size beside what is free, and the server it is on.
             "hub": {"started_at": STARTED, "python": platform.python_version(), "sqlite": sqlite3.sqlite_version,
-                    "db_bytes": pages, "disk_free_bytes": free, "integrity": integrity, "schema": schema},
+                    "db_bytes": pages, "disk_free_bytes": free, "disk_total_bytes": total, "machine": hub_machine,
+                    "integrity": integrity, "schema": schema},
             "backup": backup, "helpers": helpers, "warnings": warnings}
 
 
@@ -29836,6 +29950,12 @@ def untimed(value):
     if isinstance(value, list):
         return [untimed(v) for v in value]
     return value
+
+
+def said(reading):
+    """What a machine's or a server's reading says (untimed), without what it measures: its load and its agent's use
+    change at every reading, and the apps read them on their own clock."""
+    return untimed({k: v for k, v in reading.items() if k not in ("load", "use")})
 
 
 def machine_said(agent, runtime):
@@ -30101,6 +30221,7 @@ def machine_rows():
                      "models": data.get("models"), "screen_models": data.get("screen_models"), "verify": verify_view(name),
                      "runtimes": runtimes_now, "other_runtime_windows": data.get("other_runtime_windows"),
                      "owner_chat_bound": data.get("owner_chat_bound"), "manager_bound": data.get("manager_bound"),
+                     "use": data.get("use"),          # what its own processes use (lifecycle.agent_use)
                      "login": login_view(last_login(name)),       # owner feature machine_signin
                      "reported_at": st["reported"] if st else None,
                      "stale": (st is None) or t0 - st["reported"] > MACHINE_STALE})
@@ -31528,11 +31649,11 @@ class Handler(BaseHTTPRequestHandler):
             data = validate_status(self.form())
         except (ValueError, TypeError) as e:
             return self.json(400, {"error": f"invalid status: {e}"})
-        reading = {k: data[k] for k in ("revision", "os", "security", "runtimes", "access", "features")}
+        reading = {k: data[k] for k in ("revision", "os", "security", "runtimes", "access", "features", "load")}
         if secret_hit(json.dumps(reading)):
             return self.json(422, {"error": "registered login refused"})
         old = q1("SELECT data FROM server_status WHERE server=?", (name,))
-        with area("state" if not old or untimed(json.loads(old["data"])) != untimed(reading) else "activity"):
+        with area("state" if not old or said(json.loads(old["data"])) != said(reading) else "activity"):
             q("INSERT INTO server_status(server,data,reported) VALUES(?,?,?) ON CONFLICT(server) DO UPDATE SET "
               "data=excluded.data, reported=excluded.reported", (name, json.dumps(reading), now()))
         return self.json(200, {"ok": True, "desired_revision": kit_revision(), "server": name})
