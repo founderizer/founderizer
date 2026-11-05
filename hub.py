@@ -29650,10 +29650,10 @@ here: the day somebody reads it is the day nothing else is left.
 1. **Founderizer for Mac is at founderizer.com.** Download it there and open it. That address is the only one
    you have to know, because the app carries both ways of putting a hub on a machine and asks you for what it
    needs as it goes.
-2. **Any small Linux server becomes the hub.** Ubuntu 22.04 or 24.04, or Debian 12, with root, and nothing else
-   on port 8765; a €5 VPS is enough. You type nothing in its console: the app either installs over your own SSH
-   connection, or hands you one block to paste into the agent you already run. It claims the hub at the end,
-   which is what makes your Mac its owner, and you now have an empty fleet.
+2. **Any small Linux server becomes the hub.** Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, with root, and
+   nothing else on port 8765; a €5 VPS is enough. You type nothing in its console: the app either installs over
+   your own SSH connection, or hands you one block to paste into the agent you already run. It claims the hub at
+   the end, which is what makes your Mac its owner, and you now have an empty fleet.
 3. **Restore copy**, in the app, and give it this file. The app offers it the moment it has claimed the
    new hub, beside New fleet; afterwards it is in Settings › Backup. The app reads this file first and
    tells you what is in it before it sends anything.

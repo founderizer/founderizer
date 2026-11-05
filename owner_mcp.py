@@ -690,8 +690,9 @@ def install_hub(args):
                       f"this error.")
     root = sudo_prefix(steps["read_machine"])
     if "systemctl" not in steps["read_machine"]["out"]:
-        raise Refused(f"{host} has no systemctl. This install needs Ubuntu 22.04, Ubuntu 24.04 or Debian 12 with "
-                      f"systemd. The machine said:\n{steps['read_machine']['out']}")
+        raise Refused(f"{host} has no systemctl. This install needs systemd, on "
+                      f"Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13. The machine said:\n"
+                      f"{steps['read_machine']['out']}")
     steps["git"] = ssh(host, user, root + 'sh -c ' + shlex.quote(
         'command -v git >/dev/null 2>&1 || { DEBIAN_FRONTEND=noninteractive apt-get -q update && '
         'DEBIAN_FRONTEND=noninteractive apt-get -y -q install git; }'), timeout=600)
@@ -921,10 +922,11 @@ def tools():
         tool("use_hub", "Point this server at a hub that runs already. It proves the address by reading the owner "
                         "API from this Mac, and stores nothing but the address.",
              {"address": S["text"], "port": S["int"]}, ("address",), use_hub),
-        tool("install_hub", "Install a new hub on a Linux server the owner names (Ubuntu 22.04/24.04 or Debian 12, "
-                            "root or a user that can become root), over the owner's own SSH. Give the Tailscale auth "
-                            "key as the path of a mode-600 file on this Mac, never the key: it travels on standard "
-                            "input. Then read install_log and call claim_hub.",
+        tool("install_hub", "Install a new hub on a Linux server the owner names "
+                            "(Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, root or a user that can become root), "
+                            "over the owner's own SSH. Give the Tailscale auth key as the path of a mode-600 file on "
+                            "this Mac, never the key: it travels on standard input. Then read install_log and call "
+                            "claim_hub.",
              {"host": S["text"], "ssh_user": S["text"], "source": {"type": "string",
               "description": "The address of the Founderizer repository, from the owner's download page."},
               "authkey_file": {"type": "string", "description": "The path on this Mac of the file that holds the "

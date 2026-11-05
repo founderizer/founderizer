@@ -2,7 +2,8 @@
 # Founderizer hub installer. One line turns a fresh server into a working Founderizer hub: the one the Mac app and the iPhone app
 # connect to, and the one every worker and joined server then fetches its code from.
 #
-#   A VPS (Ubuntu 22.04 or 24.04, or Debian 12), as root, from a copy of the Founderizer repository on that server:
+#   A VPS (Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13), as root, from a copy of the Founderizer repository on
+#   that server:
 #
 #       sh hub.sh                           the install
 #       sh hub.sh --source <git url>        clone the Founderizer repository first, then install from that clone
@@ -158,14 +159,17 @@ preflight() {
         # shellcheck disable=SC1090,SC1091
         . "$root/etc/os-release"
         case "${ID:-} ${VERSION_ID:-}" in
-            "ubuntu 22.04"|"ubuntu 24.04"|"debian 12") say "  ${PRETTY_NAME:-$ID $VERSION_ID}" ;;
-            *) [ "$check" = yes ] || stop "This system is ${ID:-unknown} ${VERSION_ID:-}. Use Ubuntu 22.04 or 24.04, \
-or Debian 12."
-               say "  this system is ${ID:-unknown} ${VERSION_ID:-}; the install needs Ubuntu 22.04 or 24.04, or Debian 12" ;;
+            "ubuntu 22.04"|"ubuntu 24.04"|"ubuntu 26.04"|"debian 12"|"debian 13")
+                say "  ${PRETTY_NAME:-$ID $VERSION_ID}" ;;
+            *) [ "$check" = yes ] || stop "This system is ${ID:-unknown} ${VERSION_ID:-}. Use Ubuntu 22.04, 24.04 or \
+26.04, or Debian 12 or 13."
+               say "  this system is ${ID:-unknown} ${VERSION_ID:-}; the install needs Ubuntu 22.04, 24.04 or \
+26.04, or Debian 12 or 13" ;;
         esac
     else
-        [ "$check" = yes ] || stop "This system has no /etc/os-release. Use Ubuntu 22.04 or 24.04, or Debian 12."
-        say "  no $root/etc/os-release here; the install needs Ubuntu 22.04 or 24.04, or Debian 12"
+        [ "$check" = yes ] || stop "This system has no /etc/os-release. Use Ubuntu 22.04, 24.04 or 26.04, or Debian 12 \
+or 13."
+        say "  no $root/etc/os-release here; the install needs Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13"
     fi
     if ! command -v systemctl >/dev/null 2>&1; then
         [ "$check" = yes ] || stop "systemd is required: the hub runs as a systemd user service."

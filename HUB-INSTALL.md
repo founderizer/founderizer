@@ -11,8 +11,8 @@ A customer never types any of this in a console: the Mac app installs over SSH f
 their own Mac, or they paste `INSTALL-PROMPT.md` into the agent they already run and it
 takes the steps below for them. This file is the description of the installer itself.
 
-It needs root on a fresh Ubuntu 22.04 or 24.04, or Debian 12 server. It does not
-create a model provider account, does not sign in to one, does not write, copy or
+It needs root on a fresh Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13 server. It
+does not create a model provider account, does not sign in to one, does not write, copy or
 refresh a provider credential, does not make a vault entry, and opens no public
 port. Every step checks first, so the line is safe to run again after a failure and
 a second run on a working hub changes nothing.
@@ -32,8 +32,8 @@ agent installs only its own AI, on its own server.
 
 ## Before you run it
 
-1. **A server.** Ubuntu 22.04 or 24.04, or Debian 12, with systemd, and root. A €5
-   VPS is enough to start. Nothing else may be using port 8765.
+1. **A server.** Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, with systemd, and
+   root. A €5 VPS is enough to start. Nothing else may be using port 8765.
 2. **A Tailscale auth key** for the fleet's own tailnet, from its Tailscale admin
    console. One use is enough; a pre-authorized key saves a sign-in. The key goes to
    the installer on **standard input**, so run the line in a terminal on the server,
@@ -462,3 +462,10 @@ per-agent users decided"). What stays unproved until a real server runs it: `apt
 `tailscale up`, `ufw`, the systemd user services and the claim, because a container has
 no tailnet and makes no `/run/user/<uid>` — which step 11 waits for, so the whole line
 has still never run to its end on a machine.
+
+On 5 November 2026 it did, on new servers, from the published tree and with the app's own
+steps: `hub.sh` ended READY on Debian 13 (Python 3.13) and on Ubuntu 26.04 (Python 3.14,
+sudo-rs, chrony), each claimed from another machine of the network, and a Debian 13 server
+joined the Debian 13 hub with the hub's own line, ended READY, and then installed the
+manager as its own user, up to the owner's sign-in. The network was Tailscale with a test
+control server, not the owner's tailnet.

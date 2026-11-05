@@ -774,8 +774,8 @@ def firewall(check=False, run=None):
 SSHD_DIR = "/etc/ssh/sshd_config.d"
 SSHD_HARDENING = SSHD_DIR + "/10-fleet-hardening.conf"
 # sshd takes the first value that it reads of a setting, and sshd_config reads this folder before its own settings on
-# every system the join takes (Ubuntu 22.04 to 26.04, Debian 12), so these lines come before the system's own and a
-# provider's later file.
+# every system the join takes (Ubuntu 22.04 to 26.04, Debian 12 and 13), so these lines come before the system's own
+# and a provider's later file.
 SSHD_TEXT = ("# Founderizer's join writes this file (hubsetup.py harden): SSH takes keys only, and no X11 forwarding.\n"
              "PasswordAuthentication no\n"
              "KbdInteractiveAuthentication no\n"

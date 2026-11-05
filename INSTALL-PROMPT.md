@@ -78,8 +78,8 @@ Ask the owner for all of it in one message, and wait for the answer. Do not gues
 
 1. **Which job**: install a new hub, or join a server to a hub that runs already.
 2. **The server**: the address or host name you reach it at, and the user you reach it with. That
-   user must be `root` or must be able to become root. Ubuntu 22.04, Ubuntu 24.04 or Debian 12,
-   and a machine that stays on — never a laptop.
+   user must be `root` or must be able to become root. Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or
+   13, and a machine that stays on — never a laptop.
 3. **The Tailscale auth key of their fleet**, from their own Tailscale admin console, **written by
    them into a file on this machine** with `chmod 600`, for example `~/.founderizer-authkey`. Ask
    for the path of that file, not for the key. If they paste the key into this conversation
@@ -112,10 +112,10 @@ there: `HOST` changes once, and only at the step that says so.
 
     ssh -o BatchMode=yes "$SSHUSER@$HOST" 'id -un; id -u; sed -n "1,2p" /etc/os-release; command -v systemctl'
 
-Check: `id -u` is `0`, the system is Ubuntu 22.04, Ubuntu 24.04 or Debian 12, and `systemctl` has a
-path. If `id -u` is not `0` but the user can become root, put `sudo -i -- ` in front of the remote
+Check: `id -u` is `0`, the system is Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, and `systemctl`
+has a path. If `id -u` is not `0` but the user can become root, put `sudo -i -- ` in front of the remote
 command of every later step. If the system is another one, or there is no `systemctl`, stop: this
-install needs one of those three systems. Tell the owner, and ask nothing else.
+install needs one of those systems. Tell the owner, and ask nothing else.
 
 If SSH itself fails, stop and give the owner the error as it came. Do not try another user, another
 port or another key.

@@ -2,10 +2,10 @@
 # Founderizer join script (owner feature servers). The hub serves it at GET /join with its own address in HUB and REPO. The
 # owner runs it with the one line from Founderizer (Servers, Add server); FLEET_JOIN holds the one-time join code.
 #
-#   A VPS (Ubuntu 22.04, 24.04 or 26.04, or Debian 12), as root: base packages, the user fleet, then the join, security
-#   updates, the firewall and the server's own hardening (SSH keys only, npm's seven days, Tailscale's own updates).
-#   The line has joined the private network (Tailscale) before this script, and after it SSH reaches the machine over
-#   that network only.
+#   A VPS (Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13), as root: base packages, the user fleet, then the join,
+#   security updates, the firewall and the server's own hardening (SSH keys only, npm's seven days, Tailscale's own
+#   updates). The line has joined the private network (Tailscale) before this script, and after it SSH reaches the
+#   machine over that network only.
 #   A Mac (macOS 14 or later, with Tailscale and Homebrew), as the user that will run the agents: tmux and Python
 #   with Homebrew, then the join, then this Mac's vault, the one step that asks for that user's password, then
 #   Claude's extension for Chrome. The Founderizer installer runs the same line as root behind macOS's own password
@@ -43,8 +43,8 @@ linux() {
     # shellcheck disable=SC1091
     . /etc/os-release
     case "${ID:-} ${VERSION_ID:-}" in
-        "ubuntu 22.04"|"ubuntu 24.04"|"ubuntu 26.04"|"debian 12") ;;
-        *) stop "This system is ${ID:-unknown} ${VERSION_ID:-}. Use Ubuntu 22.04, 24.04 or 26.04, or Debian 12." ;;
+        "ubuntu 22.04"|"ubuntu 24.04"|"ubuntu 26.04"|"debian 12"|"debian 13") ;;
+        *) stop "This system is ${ID:-unknown} ${VERSION_ID:-}. Use Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13." ;;
     esac
     command -v systemctl >/dev/null 2>&1 || stop "systemd is required."
     reach
@@ -341,7 +341,8 @@ main() {
     case "$(uname -s)" in
         Linux) linux ;;
         Darwin) mac ;;
-        *) stop "This system is not supported. Use Ubuntu 22.04, 24.04 or 26.04, Debian 12, or macOS 14 or later." ;;
+        *) stop "This system is not supported. Use Ubuntu 22.04, 24.04 or 26.04, Debian 12 or 13, or macOS 14 or \
+later." ;;
     esac
     [ "$ready" = yes ] || exit 1
 }

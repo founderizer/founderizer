@@ -68,7 +68,7 @@ TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"      # th
 # version is only the first build: Claude Code's own installation updates itself (see CLAUDE_CHANNEL).
 RUNTIME_PINS = {"codex": "0.160.0", "claude": "2.1.287"}
 SECRET_MAX_BYTES = 2048
-SUPPORTED_OS = {("ubuntu", "22.04"), ("ubuntu", "24.04"), ("ubuntu", "26.04"), ("debian", "12")}
+SUPPORTED_OS = {("ubuntu", "22.04"), ("ubuntu", "24.04"), ("ubuntu", "26.04"), ("debian", "12"), ("debian", "13")}
 PACKAGES = "git tmux python3 curl ca-certificates ufw unattended-upgrades"
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 MACHINE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -850,7 +850,8 @@ class Onboarding:
         os_id = tuple((info.get("os") or " ").split(" ", 1))
         self.state["os"] = info.get("os")
         if os_id not in SUPPORTED_OS:
-            raise StepFailed("Unsupported system %s. Use Ubuntu 22.04, 24.04 or 26.04, or Debian 12." % info.get("os"))
+            raise StepFailed("Unsupported system %s. Use Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13."
+                             % info.get("os"))
         if info.get("systemd") != "yes":
             raise StepFailed("systemd is required.")
         if info.get("root") not in ("yes", "sudo"):
