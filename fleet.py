@@ -410,7 +410,8 @@ IDLE_PROMPT = re.compile(r"^\s*[\u276f>]\s*$", re.M)
 COUNTER = re.compile(r"\((?:\d+h\s*)?(?:\d+m\s*)?\d+s\b")
 FROZEN_GAP = 2
 # The helper's new-message signals (Helper.signal, plan C5). A Claude session's lines follow its own facts: its first
-# line when its session listed its tools, one untaken line at a time, and one more at its next idle screen. A runtime
+# line when its session listed its tools and its screen showed its empty input line, one untaken line at a time, its
+# Enter again while its input box still holds it (ENTER_LATER), and one more at its next idle screen. A runtime
 # whose idle screen the helper cannot read yet keeps the old clock: its first line SIGNAL_GAP seconds after its start
 # at the soonest when its tools are not listed, and a line it left unread told again after RESIGNAL_FIRST seconds,
 # doubling up to RESIGNAL_MAX.
@@ -549,6 +550,13 @@ def shows_question(screen):
 # So after the Enter the helper reads the screen, and while the input line still holds the typed line and no turn runs,
 # it presses Enter again: ENTER_AGAIN times at most, ENTER_WAIT seconds apart.
 ENTER_AGAIN, ENTER_WAIT = 3, 1.0
+# Lost again on 5 November 2026, at the end of a customer's onboarding: the manager's session started again after its
+# sign-in, its line went 3 seconds after that start (first_line_due), and every Enter fell inside the start of Claude
+# Code 2.1.311, which takes what is typed before its input box is up into that box later (its "early input"). The line
+# stayed in the box with no turn running for more than 4 minutes, until a person pressed Enter. So a line that the box
+# still holds at a later poll gets its Enter there too (Helper.signal): one at each poll, ENTER_LATER times at most, and
+# the line is never typed again. Polls count, not a clock (plan C5).
+ENTER_LATER = 3
 INPUT_LINE = re.compile(r"^[ \t\u2502]*[\u276f\u203a>][ \t]?(.*?)[ \t\u2502]*$", re.M)  # "❯ x", "› x", "│ > x │"
 
 
@@ -562,6 +570,18 @@ def holds_line(screen, line):
     have, want = (" ".join(shown[-1].split()) if shown else ""), " ".join(line.split())[:24]
     n = min(len(have), len(want))
     return n >= 8 and have[:n] == want[:n]
+
+
+def enter_again(target, line):
+    """Press Enter once more in a window whose input box still holds `line` (holds_line): no turn runs, no question of
+    the session's own shows, and nobody is scrolled back in it (an Enter would leave their view). True when pressed."""
+    r = tmux("display-message", "-p", "-t", target, "#{pane_in_mode}")
+    if r.returncode != 0 or r.stdout.strip() not in ("", "0"):
+        return False
+    r = tmux("capture-pane", "-p", "-t", target)
+    if r.returncode != 0 or shows_question(r.stdout) or not holds_line(r.stdout, line):
+        return False
+    return tmux("send-keys", "-t", target, "Enter").returncode == 0
 
 
 def type_into(session, name, text, asks=True):
@@ -596,10 +616,8 @@ def type_into(session, name, text, asks=True):
             return "reading" if r.returncode == 124 else "gone"
     for _ in range(ENTER_AGAIN if asks else 0):
         time.sleep(ENTER_WAIT)
-        r = tmux("capture-pane", "-p", "-t", target)
-        if r.returncode != 0 or shows_question(r.stdout) or not holds_line(r.stdout, line):
+        if not enter_again(target, line):
             break
-        tmux("send-keys", "-t", target, "Enter")
     return "typed"
 
 
@@ -3559,6 +3577,17 @@ class Helper:
                 self.sync_checkout()            # task windows only; never while a Fleet update runs
             if callable(command):               # a task's command reads team.json of the checkout (integration_env)
                 command = command()
+            # The first signal waits until the session can take it (first_line_due): a runtime's first screen can be
+            # its own question (Claude Code's workspace trust), and a line typed before its input box is up is not
+            # sent (ENTER_LATER). Before the window starts, so that a window whose start tmux did not confirm, and
+            # which runs (start_manager keeps it), waits too. What the screen watch read under this name was the
+            # closed window's: the sign-in thread closes the manager's (restart_after_login), and with no watch
+            # between that and this start, its idle readings made the new session's first line due at once.
+            self.signalled[name] = time.monotonic()
+            self.ready_base[name] = self.listed.get(name, 0)
+            self.lines.pop(name, None)
+            if name in self.screens:
+                self.last_class[name] = self.screens.pop(name).get("class")     # as watch_screens keeps it
             standing = name == "manager" and session      # its session id is its link to its conversation record
             if standing:
                 start_window(self.session, name, command, {"@fleet_session": session})
@@ -3581,11 +3610,6 @@ class Helper:
                     # then sends the runner's last records as those of a session that ended.
                     self.screen_attempts[name] = (f"{generation}:{attempt}", False)
                     self.tailer.register((name, generation, attempt, session, "codex_app", needs))
-        # The first signal waits until the session can take it (first_line_due): a runtime's first screen can be
-        # its own question (Claude Code's workspace trust), and a line typed before it shows would answer it.
-        self.signalled[name] = time.monotonic()
-        self.ready_base[name] = self.listed.get(name, 0)
-        self.lines.pop(name, None)
 
     def sweep_desktop(self):
         """The owner's live view of a browser task, on a Mac whose agent can show its screen: one publisher per
@@ -3612,17 +3636,23 @@ class Helper:
                 publishers[key].start()
 
     def first_line_due(self, window):
-        """True when a window that this helper started can take its first line (plan C5): the hub says its session
-        listed its tools on its own route since the start, or its screen showed its empty input line at
-        IDLE_READINGS readings in a row (a session whose Fleet tools never come: its first turn then runs without
-        them, and the turn-end check sees it). A runtime whose idle screen the helper cannot read gets it after
-        SIGNAL_GAP seconds instead. A window started before this helper ran is due at once."""
+        """True when a window that this helper started can take its first line (plan C5). A Claude session's screen
+        must show its empty input line first, at the screen watch's latest agreed reading of this window: then it is
+        due when the hub says its session listed its tools on its own route since the start, or when that line showed
+        at IDLE_READINGS readings in a row (a session whose Fleet tools never come: its first turn then runs without
+        them, and the turn-end check sees it). The listing alone is not enough: Claude Code lists its tools during its
+        start, before its input box is up, and a line typed then is not sent (ENTER_LATER). A runner's window has no
+        input box, and its listing is enough. A runtime whose idle screen the helper cannot read gets it at its
+        listing, or after SIGNAL_GAP seconds. A window started before this helper ran is due at once."""
         if window not in self.ready_base:
             return True
-        due = self.listed.get(window, 0) > self.ready_base[window] or \
-            (self.screens.get(window) or {}).get("idle_run", 0) >= IDLE_READINGS or \
-            (not reads_its_screen(self.conf.get("runtime")) and
-             time.monotonic() - self.signalled.get(window, 0) >= SIGNAL_GAP)
+        listed = self.listed.get(window, 0) > self.ready_base[window]
+        idle = (self.screens.get(window) or {}).get("idle_run", 0)
+        if reads_its_screen(self.conf.get("runtime")):
+            due = idle >= (1 if listed else IDLE_READINGS) or \
+                bool(listed and re.fullmatch(r"T-\d+", window) and self.runner(f"={self.session}:={window}"))
+        else:
+            due = listed or idle >= IDLE_READINGS or time.monotonic() - self.signalled.get(window, 0) >= SIGNAL_GAP
         if due:
             self.ready_base.pop(window)
         return due
@@ -3644,12 +3674,13 @@ class Helper:
         Each line is one more model turn over the session's whole context, so lines follow the session's own facts
         and never a clock (plan C5). Its first line goes when it can take it (first_line_due). Then one untaken line
         at a time: while the session has read nothing that its last line told and has not been idle since, no new
-        line goes, also for a new message. A line whose messages are still unread at the session's next idle point
-        is told once more, and one still not taken after that is reported to the hub once (Handler.helper_dialog,
-        kind "untaken"); nothing is typed again because of time. A standing session is not typed into while a turn
-        runs (STANDING_WINDOWS): it reads once more at the end of the turn. A new window (its tmux id) knows nothing
-        of earlier lines. A manager session that a message finds cold and long is not told at all: it starts again
-        on a new conversation, and that one is told (restart_fresh)."""
+        line goes, also for a new message; an input box that still holds that line gets its Enter once more at the
+        poll, ENTER_LATER times at most, and the line is not typed again. A line whose messages are still unread at
+        the session's next idle point is told once more, and one still not taken after that is reported to the hub
+        once (Handler.helper_dialog, kind "untaken"); nothing is typed again because of time. A standing session is
+        not typed into while a turn runs (STANDING_WINDOWS): it reads once more at the end of the turn. A new window
+        (its tmux id) knows nothing of earlier lines. A manager session that a message finds cold and long is not told
+        at all: it starts again on a new conversation, and that one is told (restart_fresh)."""
         target = f"={self.session}:={window}"
         if not self.first_line_due(window):
             return
@@ -3659,7 +3690,14 @@ class Helper:
         if line and (line["wid"] != wid or not line["ids"] <= ids):
             line = None             # a new window, or the session read what the line told: it took it
         if line and not self.idle_since(window, line["at"]):
-            return                  # its last line is not taken yet, and the session has not been idle since
+            # its last line is not taken yet, and the session has not been idle since: a box that still holds it gets
+            # its Enter at this poll (ENTER_LATER), and a runner's window, which has no box, gets nothing
+            if line["box"] and line["enters"] < ENTER_LATER and enter_again(target, line["text"]):
+                line["enters"] += 1
+                if line["enters"] == 1:
+                    self.say(f"{window}: its line is still in its input box; it gets Enter again at each poll, "
+                             f"{ENTER_LATER} times at most")
+            return
         if line and line["retold"]:
             if not line["reported"]:
                 line["reported"] = True
@@ -3684,7 +3722,8 @@ class Helper:
                 f'New fleet messages. Call read_messages(task_id="{window}") now.'
                 if self.worker and window != "owner-chat" else CHAT_SIGNAL)
         # A runner's window prints its agent's own words and never asks, so its line is typed whatever it shows
-        if re.fullmatch(r"T-\d+", window) and self.runner(target):
+        runner = bool(re.fullmatch(r"T-\d+", window) and self.runner(target))
+        if runner:
             got = type_into(self.session, window, text, asks=False)
         else:
             got = type_into(self.session, window, text)
@@ -3692,7 +3731,7 @@ class Helper:
         if got == "typed":
             self.typed_at[window] = time.monotonic()
             self.lines[window] = {"wid": wid, "ids": ids, "at": time.monotonic(), "retold": line is not None,
-                                  "reported": False}
+                                  "reported": False, "text": text, "box": not runner, "enters": 0}
         # "asks": its screen shows a question, which the screen watch tells (watch_screens). Until runtime gaps C1 this
         # told it too, before the watch could say whether the session stood still or showed its usage-limit menu.
         self.say(f"{window}: inbox signal {got}{' again' if line else ''}; only read_messages acknowledges delivery")
