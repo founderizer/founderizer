@@ -402,7 +402,10 @@ TRUST_YES = re.compile(r"^[^\w\n]*(?:[1-9]\.\s+)?Yes, (?:I trust this folder|pro
 WORKING = re.compile(r"\besc to interrupt\b|^Fleet: the agent is working\b", re.I | re.M)    # a turn is running
 # Claude Code's empty input line, between the two rules of its input box (2.1, read on a fleet machine, 26 October
 # 2026): "❯" alone on its line. Text after it is a line the session has not taken yet, and no idle prompt.
-IDLE_PROMPT = re.compile(r"^\s*[\u276f>]\s*$", re.M)
+# A new session's empty box shows a dim hint instead, "❯ Try "fix lint errors"" (2.1.311 and 2.1.318, 5 November
+# 2026), and capture-pane gives no dim: that hint is an empty input line too. Without it, every new Claude session
+# stood at its first screen and never got its first line, since that line waits for its own empty input line.
+IDLE_PROMPT = re.compile(r'^\s*[\u276f>]\s*(?:Try "[^"\n]*"\s*)?$', re.M)
 # A running Claude Code turn repaints its elapsed counters every second: the spinner line, the running command and its
 # step title (read on 2.1.285, 2.1.308 and 2.1.311 while a foreground `sleep 300` ran, 27 October 2026). So a running
 # screen that is the same FROZEN_GAP seconds later, counter included, with no new record of its session, is a runtime
