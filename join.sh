@@ -270,9 +270,31 @@ updates() {     # unattended security updates on, then the pending ones once; ne
     fi
     say "security updates are on; installing the pending ones (this can take some minutes)"
     apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" -q install </dev/null >/dev/null 2>&1 || true
-    systemctl start apt-daily.service apt-daily-upgrade.service </dev/null >/dev/null 2>&1 \
-        || say "some security updates did not install now; the daily run tries again"
+    apt_daily || say "some security updates did not install now; the daily run tries again"
     [ ! -f /var/run/reboot-required ] || say "this server needs a restart for its updates; restart it when it has no work"
+}
+
+apt_daily() {   # apt's two daily services once, to their end: true when both ended well. A systemctl start that waits
+                # holds one connection to systemd, and an update of libc6 or systemd re-executes systemd, which closes
+                # that connection with an error while the services go on (a Debian 13 join, 5 November 2026). So the
+                # join only starts them, asks every 5 seconds whether a job of theirs is still listed, and then reads
+                # the result of each. While systemd re-executes it answers no question, so an unanswered one is asked
+                # again: only 12 in a row end the wait.
+    systemctl start --no-block apt-daily.service apt-daily-upgrade.service </dev/null >/dev/null 2>&1 || return 1
+    unanswered=0
+    while [ "$unanswered" -lt 12 ]; do
+        if ! listed=$(systemctl list-jobs --no-legend apt-daily.service apt-daily-upgrade.service 2>/dev/null); then
+            unanswered=$((unanswered + 1))
+        elif [ -z "$listed" ]; then
+            [ "$(systemctl show -p Result --value apt-daily.service 2>/dev/null)" = success ] \
+                && [ "$(systemctl show -p Result --value apt-daily-upgrade.service 2>/dev/null)" = success ]
+            return
+        else
+            unanswered=0
+        fi
+        sleep 5
+    done
+    return 1
 }
 
 firewall() {    # $1: the checkout. Incoming traffic over the private network only, SSH included: this machine joined it
