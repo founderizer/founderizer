@@ -706,6 +706,14 @@ def kept_user_settings():
     return dict(kept, env=off) if off else kept
 
 
+# Claude Code's prompt suggestions, off in every session that Fleet starts (5 November 2026). From 2.1.318 a finished
+# turn puts a suggested next message into the empty input box, dim, and capture-pane gives no dim: so the screen watch
+# read "❯ The GitHub App installation now shows Actions and Workflows" in ac-lead's owner chat as a line not taken,
+# never as its empty input line, and each suggestion is one more model call on the account. 2.1.308 to 2.1.318 all
+# read this setting ("When false, prompt suggestions are disabled").
+NO_SUGGESTION = {"promptSuggestionEnabled": False}
+
+
 def settings_arg(agent, conf, task, tools=(), needs="none"):
     """Claude Code settings for one session: what runs without asking, what never runs, and the two hooks
     that carry a worker's permission prompts and activity to the hub. The owner's full-access manager has no
@@ -742,6 +750,7 @@ def settings_arg(agent, conf, task, tools=(), needs="none"):
         # on, as on Pro: that setting was the user's, which no session loads (kept_user_settings)
         settings["enableWorkflows"] = True
     settings["prefersReducedMotion"] = False        # the screen watch reads its counters (MOTION)
+    settings.update(NO_SUGGESTION)
     # AUTONOMY.md decision 41: what an agent learns is the fleet's (its notes and its memory, which the owner reads),
     # never a memory folder of Claude Code's own that a later session would load unseen
     settings["autoMemoryEnabled"] = False
@@ -1660,7 +1669,7 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
             raise Refused("a Claude chat resumes only a session id")
         # no memory folder of Claude Code's own either (AUTONOMY.md decision 41, settings_arg), and none of this
         # machine user's settings (kept_user_settings)
-        settings = dict({"autoMemoryEnabled": False,
+        settings = dict({"autoMemoryEnabled": False, **NO_SUGGESTION,
                          "permissions": {"allow": [f"mcp__fleet__{t}" for t in CHAT_TOOLS], "deny": DENY}},
                         **kept_user_settings())
         args = ["claude"] + (["--resume", resume] if resume else ["--session-id", marker] if marker else []) + \
@@ -1865,7 +1874,7 @@ def conversation_command(agent, conf, generation, conversation, url, token, prom
     # what it keeps of the user's settings (kept_user_settings); a pinned version keeps its updater off whatever their
     # env says, because --settings env would win over CLOSED_NO_UPDATES
     kept = {key: value for key, value in kept_user_settings().items() if runtime is None or key != "env"}
-    settings = dict({"autoMemoryEnabled": False,
+    settings = dict({"autoMemoryEnabled": False, **NO_SUGGESTION,
                      "permissions": {"allow": [f"mcp__fleet__{t}" for t in CONVERSATION_TOOLS], "deny": DENY}}, **kept)
     # --setting-sources "": no user, project or local settings, so no CLAUDE.md, hook or plugin of this machine, and
     # --settings still applies. --safe-mode would also drop the --mcp-config server, so the session had no tools.
