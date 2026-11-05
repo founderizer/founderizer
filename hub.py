@@ -27150,7 +27150,8 @@ def join_answer(name, row=None):
 def join_server(src, body):
     """POST /join, inside LOCK: one new server joins with a join code. Its address is the address of the call, on the
     hub's private network. It gives the server a record in team.json and a server key, and nothing else. A used code
-    from the same address with the same server key is a repeat of that join (the line again after a failed step)."""
+    from the same address with the same server key is a repeat of that join (the line again after a failed step), and
+    so is a new code from a server of the fleet with the key it joined with (the app's Try again, or a new line)."""
     t0 = now()
     if src in (address_of("owner"), hub_address()[0]):
         raise Refusal(403, "This address is %s. It cannot join as a server."
@@ -27180,6 +27181,15 @@ def join_server(src, body):
     team, _, _ = team_view(kit_revision(fresh=True))
     known = next((m for m, ip in team["addresses"].items() if ip == src), None)
     if known:
+        # A later step of join.sh can stop after the join itself (the vault step, in the proof run of 5 November
+        # 2026), and the run after it brings a new code: the server is the same while its key is the one it joined
+        # with. The code is used up, and nothing else changes.
+        joined = q1("SELECT sha256 FROM server_keys WHERE server=?", (known,))
+        if joined and joined["sha256"] == body["key_sha256"]:
+            q("UPDATE join_codes SET used=?, address=?, key_sha256=? WHERE id=?",
+              (t0, src, body["key_sha256"], row["id"]))
+            log("hub", f"server {known} joined again from {src}, with a new code")
+            return dict(join_answer(known, row), replayed=True)
         raise Refusal(409, f"This server is in your fleet already, as {known}.")
     if not name:
         raise Refusal(503, "The hub could not read this server's name in Tailscale. Run the line again in a minute; "

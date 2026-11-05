@@ -949,9 +949,15 @@ def vault_user_script(user=VAULT_USER, group=AGENT_GROUP):
                 "u": user, "g": group, "lib": VAULT_LIB, "conf_dir": VAULT_CONF_DIR, "state": VAULT_STATE}
 
 
+# Seconds that each apt-get of an install waits for the package lock. A new Ubuntu server runs its first updates for
+# about 9 minutes after its first boot, and they hold the lock: in the proof run of 5 November 2026 a wait of 5 minutes
+# stopped the vault step of a join, and the same step passed 10 minutes later. hub.sh and join.sh wait as long.
+APT_LOCK_WAIT = 1200
 AGE_INSTALL = ("export DEBIAN_FRONTEND=noninteractive\n"
-               "apt-get -o DPkg::Lock::Timeout=300 update -q </dev/null >/dev/null\n"
-               "apt-get -o DPkg::Lock::Timeout=300 install -y -q --no-install-recommends age </dev/null >/dev/null\n")
+               f"apt-get -o DPkg::Lock::Timeout={APT_LOCK_WAIT} update -q </dev/null >/dev/null\n"
+               f"apt-get -o DPkg::Lock::Timeout={APT_LOCK_WAIT} install -y -q --no-install-recommends age "
+               "</dev/null >/dev/null\n")
+AGE_INSTALL_TIME = 2 * APT_LOCK_WAIT + 300     # both of its apt-gets can wait for the lock, then do their work
 
 
 def vault_key_script(user=VAULT_USER):
@@ -1061,7 +1067,7 @@ def vault_install(kit=None, hub_address=None, user=VAULT_USER, group=AGENT_GROUP
                          (vault_key_script(user), "the broker's handover key")):
         if not script:
             continue
-        code, out, err = run(script, timeout=900)
+        code, out, err = run(script, timeout=AGE_INSTALL_TIME if script == AGE_INSTALL else 900)
         if code != 0:
             raise Stop(f"{what} could not be put in place: {(err or out).strip()[-300:]}")
     folder = tempfile.mkdtemp(prefix="fleet-vault-install-")
@@ -1448,7 +1454,7 @@ def central_install(owner_key, hub_user="fleet", fleet=None, kit=None, run=None,
                          (central_key_script(), "the central vault's own key")):
         if not script:
             continue
-        code, out, err = run(script, timeout=900)
+        code, out, err = run(script, timeout=AGE_INSTALL_TIME if script == AGE_INSTALL else 900)
         if code != 0:
             raise Stop(f"{what} could not be put in place: {(err or out).strip()[-300:]}")
     folder = tempfile.mkdtemp(prefix="fleet-vault-central-")

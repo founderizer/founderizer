@@ -54,6 +54,9 @@ PACKAGES="git tmux python3 curl ca-certificates ufw unattended-upgrades sudo"
 # profile are in the list because the manager reads them at every start: a hub without them runs but has no manager
 # worth the name.
 NEEDED="hub.py fleet.py hubsetup.py selftest.py config-ref.sh team.json RULES.md rules/lead.md rules/manager.md profiles/manager.md"
+# Seconds that each apt-get waits for the package lock: a new server runs its first updates for about 9 minutes after
+# its first boot, and they hold it (hubsetup.py's APT_LOCK_WAIT).
+APT_LOCK_WAIT=1200
 
 check=no
 source=""
@@ -183,8 +186,8 @@ or 13."
         else
             say "  installing git"
             export DEBIAN_FRONTEND=noninteractive
-            apt-get -o DPkg::Lock::Timeout=300 update -q </dev/null >/dev/null
-            apt-get -o DPkg::Lock::Timeout=300 install -y -q --no-install-recommends git </dev/null >/dev/null
+            apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" update -q </dev/null >/dev/null
+            apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" install -y -q --no-install-recommends git </dev/null >/dev/null
         fi
     fi
     if [ -n "$source" ]; then
@@ -234,9 +237,9 @@ packages() {
     fi
     say "  installing$missing"
     export DEBIAN_FRONTEND=noninteractive
-    apt-get -o DPkg::Lock::Timeout=300 update -q </dev/null >/dev/null
+    apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" update -q </dev/null >/dev/null
     # shellcheck disable=SC2086
-    apt-get -o DPkg::Lock::Timeout=300 install -y -q --no-install-recommends $missing </dev/null >/dev/null
+    apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" install -y -q --no-install-recommends $missing </dev/null >/dev/null
 }
 
 hub_user() {
@@ -474,7 +477,7 @@ updates() {     # unattended security updates on, then the pending ones once; ne
         return 0
     fi
     say "  security updates are on; installing the pending ones (this can take some minutes)"
-    apt-get -o DPkg::Lock::Timeout=600 -q install </dev/null >/dev/null 2>&1 || true
+    apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" -q install </dev/null >/dev/null 2>&1 || true
     unattended-upgrade </dev/null >/dev/null 2>&1 || say "  some security updates did not install now; the daily run \
 tries again"
     [ ! -f /var/run/reboot-required ] || say "  this server needs a restart for its updates; restart it when it has \

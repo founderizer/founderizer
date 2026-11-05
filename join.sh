@@ -34,6 +34,9 @@ PACKAGES="git tmux python3 curl ca-certificates ufw unattended-upgrades sudo"
 MAC_USER=""     # the user that will run a Mac's agents
 USER_PATH=""    # that user's PATH
 ready=yes       # what the last step, verify, answered about this machine
+# Seconds that each apt-get waits for the package lock: a new server runs its first updates for about 9 minutes after
+# its first boot, and they hold it (hubsetup.py's APT_LOCK_WAIT).
+APT_LOCK_WAIT=1200
 
 say() { printf 'Founderizer: %s\n' "$*"; }
 stop() { printf 'Founderizer join stopped: %s\n' "$*" >&2; exit 1; }
@@ -55,9 +58,9 @@ linux() {
     if [ -n "$missing" ]; then
         say "installing$missing"
         export DEBIAN_FRONTEND=noninteractive
-        apt-get -o DPkg::Lock::Timeout=300 update -q </dev/null >/dev/null
+        apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" update -q </dev/null >/dev/null
         # shellcheck disable=SC2086
-        apt-get -o DPkg::Lock::Timeout=300 install -y -q --no-install-recommends $missing </dev/null >/dev/null
+        apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" install -y -q --no-install-recommends $missing </dev/null >/dev/null
     fi
     say "the user $WORKER: locked password, no sudo, its services run after logout"
     id -u "$WORKER" >/dev/null 2>&1 || useradd --create-home --shell /bin/bash --user-group "$WORKER"
@@ -266,7 +269,7 @@ updates() {     # unattended security updates on, then the pending ones once; ne
         return 0
     fi
     say "security updates are on; installing the pending ones (this can take some minutes)"
-    apt-get -o DPkg::Lock::Timeout=600 -q install </dev/null >/dev/null 2>&1 || true
+    apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" -q install </dev/null >/dev/null 2>&1 || true
     systemctl start apt-daily.service apt-daily-upgrade.service </dev/null >/dev/null 2>&1 \
         || say "some security updates did not install now; the daily run tries again"
     [ ! -f /var/run/reboot-required ] || say "this server needs a restart for its updates; restart it when it has no work"
