@@ -1119,7 +1119,8 @@ def tools():
                        "how the fleet reaches this machine")),
         tool("save_knowledge", "The owner's own knowledge files, which agents read and never write. Five shapes: "
                                "{title, text, source} for a file of text, {path, text} for new text in a file that "
-                               "is there (it keeps its path, title and source), {url} for a page the hub fetches and "
+                               "is there (it keeps its path, title and source, its date says changed, and a page is no "
+                               "longer read again), {url} for a page the hub fetches and "
                                "keeps as Markdown, {attachment} to keep a file the owner attached, or {path, delete: "
                                "true} to remove one. One commit in knowledge/owner/ for each change.",
              {"title": S["text"], "text": S["text"], "source": S["text"], "url": S["text"],

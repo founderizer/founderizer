@@ -73,8 +73,9 @@ def start_hub(name, addresses, *flags, agents=None, extra=None):
 # worker's or a lead's owner chat has it, and its task sessions do not.
 # A count says only that something moved; a set says which tool moved, and RULES.md names every one of these.
 # The tools a grant adds are not here: start_hub drops the grants.
-EVERY_AGENT = ["read_messages", "search_knowledge", "write_knowledge", "see_responsibilities", "open_case",
-               "record_step", "close_case", "attach_watch", "see_notes", "write_notes", "remember", "recall",
+EVERY_AGENT = ["read_messages", "search_knowledge", "read_knowledge", "write_knowledge", "see_responsibilities",
+               "open_case", "record_step", "close_case", "attach_watch", "see_notes", "write_notes", "remember",
+               "recall",
                "forget", "see_triggers", "save_trigger", "change_trigger", "set_reminder",
                "message_agent",
                # AUTONOMY.md P3: standing instructions and targets, in every session with the agent's tools
@@ -89,7 +90,9 @@ MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "an
                                "message_owner", "grant_access",
                                "set_duty", "change_duty", "see_history", "decide_report",
                                # AUTONOMY.md P8: the one changer of the agents with no lead
-                               "set_agent_model"]
+                               "set_agent_model",
+                               # the owner, 5 November 2026: the summary of each knowledge file
+                               "summarize_knowledge"]
 WORKER_TOOLS = EVERY_AGENT + ["list_my_tasks", "report_progress", "read_attachment", "ask_my_requester",
                               "deliver_result", "sign_in", "hand_over", "resolve_outcome", "see_earlier_work",
                               "report_up",
