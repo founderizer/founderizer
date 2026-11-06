@@ -892,8 +892,9 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "door_calls",        # DevOps plan 5.4: the owner's signed yes lets one door call through, once
                "server_ai_choice",  # the owner, 1 November 2026: "why are we asking for chatgpt AND claude login"
                "manager_server",    # the owner, 4 November 2026: a new fleet's manager gets its server in its setup
-               "knowledge_edit"]    # the owner, 5 November 2026: the pencil of a knowledge file, whose edit says
+               "knowledge_edit",    # the owner, 5 November 2026: the pencil of a knowledge file, whose edit says
                                     # "changed" and stops a page's daily read (knowledge_replace)
+               "door_setup"]        # the owner, 6 November 2026 (DevOps D24): the app keeps the door, no hand step
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -7871,12 +7872,20 @@ def t_request_secret(agent, a):
     if not why or len(why) > SECRET_WHY_MAX:
         raise ToolError(f"why is what the work needs it for, in 1 to {SECRET_WHY_MAX} characters: the owner reads "
                         f"it before they type the value.")
-    give = {agent: "use"} if worker else a.get("give_to") or {}
+    door = str(a.get("door") or "").strip().lower()
+    if door:                # DevOps plan 13, item 3: a key that the door uses for the agent that asks, as its holder
+        if not TEAM.get("door"):
+            raise ToolError("This fleet has no door, so there is no key to ask for it. Leave door out.")
+        if kind != "api_key" or not DOOR_CREDENTIAL.fullmatch(door):
+            raise ToolError(f"door is the key's name in the door's rules: <provider>:<account> of "
+                            f"{', '.join(DOOR_PROVIDERS)} (for example cloudflare:hgr), or model, and it is an "
+                            f"API key. AWS needs no key, and a GitHub App key comes through the app.")
+    give = {"door": "use"} if door else {agent: "use"} if worker else a.get("give_to") or {}
     if not isinstance(give, dict) or len(give) > SECRET_GIVE_MAX:
         raise ToolError(f'give_to maps up to {SECRET_GIVE_MAX} agents to "use" or "read", for example '
                         f'{{"studio": "read"}}.')
     for name, level in give.items():
-        if name == "door" and TEAM.get("door") and level == "use" and not worker:
+        if name == "door" and TEAM.get("door") and level == "use" and (door or not worker):
             continue                # DevOps plan C4: a key that only the door uses, as its holder
         if role_of(name) not in ("worker", "lead"):
             raise ToolError(f"give_to names workers and leads, because a secret reaches task sessions: {name} is "
@@ -7885,7 +7894,7 @@ def t_request_secret(agent, a):
             raise ToolError(f'{name} gets "use", which lets its vault use the secret for it without it ever seeing '
                             f'it, or for an API key "read", which puts the key into its sessions as the variable.')
     spec = {"kind": kind, **({"env": env} if env else {}), **({"site": site} if site else {}),
-            **({"give": dict(sorted(give.items()))} if give else {}),
+            **({"give": dict(sorted(give.items()))} if give else {}), **({"door": door} if door else {}),
             **({"reply": reply["request_id"]} if chat else {}),         # the owner message it answers
             **({"tasks": [tid]} if tid else {})}                        # the task that waits on it
     if kind == "api_key":
@@ -8065,6 +8074,11 @@ def answer_secret(body, request_id, client):
         text = secret_answer_text(ref, entry, spec, worker=role_of(need["by"]) in ("worker", "lead"),
                                   task=bool(spec.get("tasks")))
         gave = any(h["agent"] == need["by"] for h in resource_holders("secret", ref))
+        if spec.get("door"):    # DevOps plan 13, item 3: the door holds it, and its rules name it for the asker
+            save_door_credential(spec["door"], ref, need["by"])
+            text = (f"Saved for the door as {spec['door']} ({ref}): the door holds the key and makes those calls, and "
+                    f"no agent holds it. The door's rules take it when the app next writes them, within a few "
+                    f"minutes; then `ops {spec['door']} <form>` works.")
     else:
         text = "Not given" + (f": {body['decline']}" if body["decline"] else ".") + \
             " Do not ask for it in words instead."
@@ -8074,8 +8088,9 @@ def answer_secret(body, request_id, client):
             # A save that gives the asker the secret wakes its tasks once their machine's vault has it (secret_wakes):
             # until then one quiet line, which wakes nobody. A decline, or a save that gives it nothing, goes on now.
             # the next step of a task that goes on without it, in its own events and never in his bubble
-            note = "" if gave else (" Go on without it, or deliver what you can." if ref is None else
-                                    " The owner does not give it to you: go on without it, or deliver what you can.")
+            note = "" if gave or (ref is not None and spec.get("door")) else (
+                " Go on without it, or deliver what you can." if ref is None else
+                " The owner does not give it to you: go on without it, or deliver what you can.")
             event_id = owner_message_rows(request_id, "answer", need, text, client, need["by"], None, t0,
                                           task=waiters[0] if waiters else None, quiet=gave or not waiters, note=note)
             if ref is not None:
@@ -21021,7 +21036,11 @@ TOOLS = [
         "give_to": {"type": "object", "additionalProperties": {"type": "string", "enum": ["use", "read"]},
                     "description": "The agents you propose should get it: use (its vault uses it, and the agent "
                                    "never sees it) or, for an API key, read (the key is in its sessions as env). "
-                                   "The owner can change this before they save."}},
+                                   "The owner can change this before they save."},
+        "door": {"type": "string", "description": "Only for a key that the DevOps door uses: its name in the door's "
+                                                  "rules, <provider>:<account> (cloudflare, hetzner, backblaze, "
+                                                  "azure or tailscale), or model for the door's own judge. The card "
+                                                  "gives it to the door alone, and give_to is not used."}},
        ["why"])),
     # A worker's and a lead's own entry: in its owner chat, in reply to the owner's message, and in a task session
     # that no contact drives (tools_for), where the task waits for his answer
@@ -21043,7 +21062,12 @@ TOOLS = [
         "why": {"type": "string", "description": "What the work needs it for, in a sentence or two: the owner "
                                                  "reads it before they type the value"},
         "in_reply_to": {"type": "string", "description": "In your owner chat: the request_id of the owner's newest "
-                                                         "message to you"}},
+                                                         "message to you"},
+        "door": {"type": "string", "description": "Only for a key of a provider account that the DevOps door uses "
+                                                  "for you: its name in the door's rules, <provider>:<account> "
+                                                  "(cloudflare, hetzner, backblaze, azure or tailscale). The card "
+                                                  "gives it to the door, not to you: you call it through the door "
+                                                  "with ops, and you never hold it."}},
        ["why", "site"])),
     # owner API 1.13: the standing duties of an agent (RESPONSIBILITIES.md)
     ("all", "see_responsibilities", t_see_responsibilities,
@@ -30274,6 +30298,11 @@ def record_status(agent, data):
 # from its own address (GET /door/sealed), which nobody else is answered on.
 DOOR_SECRETS_FILE = os.path.expanduser("~/.fleet/door.json")   # {"token", "record"}, written as root (plan step X2)
 DOOR_PORT = 8766
+# A key that the owner saves for the door from a key card is one credential of the door's rules (DevOps plan 13, item
+# 3): <provider>:<account>, or the door judge's own model key. AWS has no key (the door's own bot), and a GitHub App
+# key comes through the app's GitHub App rows, so neither is asked for with a card.
+DOOR_PROVIDERS = ("backblaze", "cloudflare", "hetzner", "azure", "tailscale")
+DOOR_CREDENTIAL = re.compile(r"(?:" + "|".join(DOOR_PROVIDERS) + r"):[a-z0-9][a-z0-9-]{0,39}|model")
 DOOR_WAIT = 30                  # seconds one call to the door may take
 DOOR_READ_EVERY = 60            # seconds between two reads of the door's record
 DOOR_PAGE = 500
@@ -30296,14 +30325,15 @@ def server_holds(name, a):
 
 
 def validate_door(team):
-    """team.json "door": {address, port, secrets}: the door's address on the private network, its port, and the
-    secrets of the catalog that the door holds (the central vault seals them to the door's pinned key)."""
+    """team.json "door": {address, port, secrets, credentials}: the door's address on the private network, its port,
+    the secrets of the catalog that the door holds (the central vault seals them to the door's pinned key), and the
+    name in the door's rules of each one that a key card asked for, with the agents that use it (plan 13, item 3)."""
     import ipaddress
     door = team.get("door")
     if door is None:
         return
-    if not isinstance(door, dict) or set(door) - {"address", "port", "secrets"}:
-        raise ValueError("door must be {address, port, secrets}")
+    if not isinstance(door, dict) or set(door) - {"address", "port", "secrets", "credentials"}:
+        raise ValueError("door must be {address, port, secrets, credentials}")
     try:
         ipaddress.ip_address(door.get("address"))
     except (ValueError, TypeError):
@@ -30317,6 +30347,18 @@ def validate_door(team):
     if not isinstance(held, list) or len(set(held)) != len(held) or not all(
             ref in (team.get("logins") or {}) for ref in held):
         raise ValueError("door.secrets names secrets of the catalog, each once")
+    credentials = door.get("credentials", {})
+    if not isinstance(credentials, dict):
+        raise ValueError("door.credentials maps a name of the door's rules to the secret the door uses for it")
+    for name, c in credentials.items():
+        if not isinstance(name, str) or not DOOR_CREDENTIAL.fullmatch(name):
+            raise ValueError(f"door.credentials: {name!r} is not <provider>:<account> of "
+                             f"{', '.join(DOOR_PROVIDERS)}, or model")
+        users = c.get("agents", []) if isinstance(c, dict) else None
+        if not isinstance(c, dict) or set(c) - {"secret", "agents"} or c.get("secret") not in held or \
+                not isinstance(users, list) or len(set(users)) != len(users) or \
+                not all(u in (team.get("agents") or {}) for u in users):
+            raise ValueError(f"door.credentials[{name}] names a secret that the door holds and the agents that use it")
 
 
 def fix_holders(team, server):
@@ -30368,6 +30410,58 @@ def door_conf():
         return None
     return {"address": door["address"], "port": door.get("port", DOOR_PORT), "token": held["token"],
             "record": held["record"]}
+
+
+def door_view():
+    """GET /ui/door (owner feature door_setup, DevOps plan 13, items 1 and 3): what the app needs to keep the door with
+    no step of the owner's. The door's entry, each credential of its rules with the agents that use it, and each
+    agent's machine address and OS user, as its own helper reports it. The app names a door agent as the hub does only
+    when its operator box itself shows that one OS user at that address, so the box still decides who operates and the
+    hub only gives the name. Called with LOCK held."""
+    door, addresses = TEAM.get("door") or {}, TEAM.get("addresses") or {}
+    users = {r["agent"]: ((json.loads(r["data"]) or {}).get("access") or {}).get("user")
+             for r in q("SELECT agent, data FROM machine_status")}
+    return {"door": {"address": door["address"], "port": door.get("port", DOOR_PORT)} if door.get("address") else None,
+            "credentials": {name: {"secret": c["secret"], "agents": list(c.get("agents") or [])}
+                            for name, c in sorted((door.get("credentials") or {}).items())},
+            "agents": {name: {"address": addresses[a["machine"]], "user": users.get(name)}
+                       for name, a in sorted(agents().items()) if a.get("machine") in addresses}}
+
+
+def save_door_entry(body):
+    """POST /ui/door (owner feature door_setup, DevOps plan 13, item 1): the app writes the door's entry when it finds
+    the door by its tag, and again when the door's address changes. The secrets and credentials of the entry stay."""
+    address, port = body["address"], body["port"]
+
+    def change(team):
+        door = team.setdefault("door", {})
+        if (door.get("address"), door.get("port", DOOR_PORT)) == (address, port):
+            return False
+        door.update(address=address, port=port)
+        return True
+    return save_integration(None, change, f"the door is at {address}:{port}")
+
+
+def save_door_credential(name, ref, asker):
+    """A key that the owner saved from a key card for the door (DevOps plan 13, item 3): the door's rules name it
+    `name`, for the agent that asked. The app writes both into the door's access file at its next round. A key that
+    the manager asked for names no agent: the door uses it itself (the judge's model key), or for the agent whose own
+    card names it later. A key saved again under the same name replaces the old one."""
+    users = [asker] if role_of(asker) in ("worker", "lead") else []
+
+    def change(team):
+        door = team.get("door")
+        if not isinstance(door, dict) or ref not in (door.get("secrets") or []):
+            raise Refusal(409, f"the door does not hold {ref} yet: its grant to the door comes first")
+        credentials = door.setdefault("credentials", {})
+        old = credentials.get(name) or {}
+        mates = sorted(set(old.get("agents") or []) | set(users))
+        new = dict({"secret": ref}, **({"agents": mates} if mates else {}))
+        if old == new:
+            return False
+        credentials[name] = new
+        return True
+    return save_integration(None, change, f"the door uses {ref} as {name}")
 
 
 def door_call(conf, method, path, secret, body=None):
@@ -30510,6 +30604,12 @@ def save_door_grant(team, rev, current, ref, grant, by):
     door["secrets"] = sorted(set(held) | {ref}) if grant else [r for r in held if r != ref]
     if not door["secrets"]:
         del door["secrets"]
+    if grant is None:       # a key the door no longer holds is no credential of its rules either
+        kept = {n: c for n, c in (door.get("credentials") or {}).items() if c.get("secret") != ref}
+        if kept:
+            door["credentials"] = kept
+        else:
+            door.pop("credentials", None)
     try:
         validate_team(team)
     except ValueError as e:
@@ -30573,6 +30673,23 @@ def door_approvals(src):
     return {"approvals": [dict(json.loads(r["approval"]), need=r["id"]) for r in rows],
             "devices": [{"device": r["device"], "statement": r["statement"], "signature": r["signature"]}
                         for r in phones if r["device"] in devices]}
+
+
+def door_release(src):
+    """GET /door/release: the signed manifest of the release that this hub runs, answered only to the door's own
+    address (DevOps plan 13, item 2). The door's follow timer checks it with the door's own pinned keys and takes it,
+    as every machine of the fleet takes the hub's revision, so this route only carries it."""
+    door = TEAM.get("door") or {}
+    if not door.get("address") or src != door["address"]:
+        raise Refusal(403, "this is the door's route")
+    try:
+        with open(os.path.join(kit_dir(), "release.json"), encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, ValueError):
+        manifest = None
+    if not isinstance(manifest, dict):
+        raise Refusal(404, "this hub runs no signed release")
+    return manifest
 
 
 def door_fetched(src, copy, digest):
@@ -34580,6 +34697,31 @@ class Handler(BaseHTTPRequestHandler):
             view = vault_view()
         return self.json(200, dict(view, db=kv_get("db_id")), {"Cache-Control": "no-store"})
 
+    def ui_door(self, query):
+        """GET /ui/door (owner feature door_setup): what door_view says, for the app's round that keeps the door."""
+        if not self.ui_allowed():
+            return
+        if query.get("db") != kv_get("db_id"):
+            return self.json(409, {"error": "hub generation changed; refresh state"})
+        with LOCK:
+            view = door_view()
+        return self.json(200, dict(view, db=kv_get("db_id")), {"Cache-Control": "no-store"})
+
+    def ui_door_save(self):
+        """POST /ui/door (owner feature door_setup): the door's address and port, from the app's own Tailscale view
+        of the device that has tag:door."""
+        def read(data):
+            import ipaddress
+            address, port = data.get("address"), data.get("port", DOOR_PORT)
+            try:
+                ipaddress.ip_address(address)
+            except (ValueError, TypeError):
+                raise ValueError("address is the door's address on the private network") from None
+            if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+                raise ValueError("port is a port number")
+            return {"address": address, "port": port}
+        return self.ui_command("door", read, save_door_entry)
+
     def ui_vault_intake(self):
         """POST /ui/vault/intake (owner feature central_vault): one secret of the catalog, sealed in the owner's app to
         the central vault's own key, into the central vault (central_intake). The receipt is {login, saved}. The
@@ -36435,6 +36577,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.server_jobs(parts[1])
         if parts == ["door", "sealed"]:              # DevOps plan C4: the door fetches its copies
             return self.door_route(lambda: door_sealed(self.client_address[0]))
+        if parts == ["door", "release"]:             # DevOps plan 13.2: the door takes the hub's release by itself
+            return self.door_route(lambda: door_release(self.client_address[0]))
         if parts == ["door", "approvals"]:           # DevOps plan 5.4: the owner's signed yeses to door calls
             return self.door_route(lambda: door_approvals(self.client_address[0]))
         if parts == ["ui", "profiles"]:
@@ -36451,6 +36595,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_secret_salts(query)
         if parts == ["ui", "vault"]:
             return self.ui_vault(query)
+        if parts == ["ui", "door"]:                  # DevOps plan 13, items 1 and 3: the app keeps the door
+            return self.ui_door(query)
         if parts == ["ui", "backup"]:
             return self.ui_backup(query)
         if len(parts) == 3 and parts[:2] == ["ui", "goals"] and re.fullmatch(r"[1-9][0-9]*", parts[2]):
@@ -37050,6 +37196,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_servers_join()
         if parts == ["ui", "servers", "grant"]:      # DevOps plan C4
             return self.ui_servers_grant()
+        if parts == ["ui", "door"]:                  # DevOps plan 13, item 1: the app writes the door's entry
+            return self.ui_door_save()
         if len(parts) == 3 and parts[:2] == ["door", "sealed"] and re.fullmatch(r"[1-9][0-9]{0,17}", parts[2]):
             return self.door_route(lambda: door_fetched(self.client_address[0], int(parts[2]),
                                                         self.form().get("sha256")))

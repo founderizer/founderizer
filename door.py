@@ -74,6 +74,30 @@ APPROVED_FILE = STATE + "/approved.json"    # the yeses that were used: each let
 APPROVAL_DAYS = 7                           # a signed yes older than this lets nothing through
 DEVICES_FILE = STATE + "/devices.json"      # the owner's phones whose signing key his owner key certified
 UPSTREAM = "https://github.com/miguelpieras/founderizer-fleet.git"
+SYSTEMD = "/etc/systemd/system"
+FOLLOW_UNIT = "fleet-door-follow"           # the root timer by which the door takes each signed release (plan 13.2)
+FOLLOW_SERVICE = """[Unit]
+Description=The door takes the hub's signed release (Founderizer)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /opt/fleet-door/current/door.py follow
+ProtectHome=yes
+PrivateTmp=yes
+"""
+FOLLOW_TIMER = """[Unit]
+Description=The door asks the hub for its release every 10 minutes (Founderizer)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target
+"""
 JUDGE_URL = "https://api.anthropic.com/v1/messages"
 JUDGE_VERSION = "2026-10-21"
 JUDGE_MODEL = "claude-opus-5-5"
@@ -1085,37 +1109,76 @@ def cmd_hub_secrets(args):
     print(json.dumps({"token": token, "record": record}))
 
 
-def cmd_update(args):
-    """root: a signed release manifest on stdin. The release keys pinned at install, of either file, check it (a fleet
-    that takes releases early runs one that the early key signed), the floor refuses an older revision, and the public repository is cloned at that revision beside the code that runs; then `current`
-    points at it and the service starts again."""
+def running_revision():
+    """The revision whose code `current` points at, or "" before the first update."""
+    link = os.path.join(P(CODE), "current")
+    return os.path.basename(os.path.realpath(link)) if os.path.lexists(link) else ""
+
+
+def ensure_follow_units():
+    """The root timer that takes each signed release by itself (plan 13, item 2). Every update writes it when its text
+    differs, so a door that door.sh installed before it, as worker-6's, gets it at its next update."""
+    changed = False
+    for name, text in ((FOLLOW_UNIT + ".service", FOLLOW_SERVICE), (FOLLOW_UNIT + ".timer", FOLLOW_TIMER)):
+        path = P(os.path.join(SYSTEMD, name))
+        old = None
+        with contextlib.suppress(OSError):
+            with open(path, encoding="utf-8") as f:
+                old = f.read()
+        if old != text:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path + ".new", "w", encoding="utf-8") as f:
+                f.write(text)
+            os.chmod(path + ".new", 0o644)
+            os.replace(path + ".new", path)
+            changed = True
+    if changed:
+        run_program(["systemctl", "daemon-reload"], None, {})
+    run_program(["systemctl", "enable", "--now", FOLLOW_UNIT + ".timer"], None, {})
+    return changed
+
+
+def take(raw):
+    """One signed release for the door, the same for `update` and `follow`: the release keys pinned at install, of
+    either file, check the manifest (a fleet that takes releases early runs one that the early key signed); a held
+    release and one that does not descend from the release the door runs are refused, as every machine refuses them
+    (lifecycle.may_take); the public repository is cloned at that revision beside the code that runs, `current` points
+    at it, and the service starts again. Older code folders go, but the one that ran last stays. Returns a line;
+    SystemExit refuses."""
     import releases
-    if os.geteuid() != 0 and not os.environ.get("FLEET_DOOR_ROOT"):
-        sys.exit("door.py update runs as root")
     try:
-        manifest = releases.check(json.loads(sys.stdin.read(65536)), releases.read_keys(P(ETC), "release-key.pub")
+        manifest = releases.check(raw, releases.read_keys(P(ETC), "release-key.pub")
                                   + releases.read_keys(P(ETC), "early-key.pub"))
     except (ValueError, releases.Untrusted) as e:
         sys.exit(f"refused: {e}")
-    revision = manifest["revision"]
+    if manifest.get("hold"):
+        sys.exit(f"refused: release {manifest['version']} is held")
+    revision, running = manifest["revision"], running_revision()
     floor = (open(P(FLOOR_FILE)).read().strip() if os.path.exists(P(FLOOR_FILE)) else "")
     target = os.path.join(P(CODE), revision)
-    if not os.path.isdir(target):
-        temp = tempfile.mkdtemp(dir=P(CODE), prefix=".new-")
-        os.chmod(temp, 0o755)       # mkdtemp makes it 0700, and the door's own user runs the code in it
-        for argv in (["git", "init", "-q", temp], ["git", "-C", temp, "fetch", "-q", UPSTREAM, revision],
-                     ["git", "-C", temp, "checkout", "-q", "--detach", "FETCH_HEAD"]):
+    fresh = not os.path.isdir(target)
+    repo = target
+    if fresh:
+        repo = tempfile.mkdtemp(dir=P(CODE), prefix=".new-")
+        os.chmod(repo, 0o755)       # mkdtemp makes it 0700, and the door's own user runs the code in it
+        for argv in (["git", "init", "-q", repo], ["git", "-C", repo, "fetch", "-q", UPSTREAM, revision],
+                     ["git", "-C", repo, "checkout", "-q", "--detach", "FETCH_HEAD"]):
             status, out = run_program(argv, None, {}, timeout=600)
             if status != 0:
-                shutil.rmtree(temp, ignore_errors=True)
+                shutil.rmtree(repo, ignore_errors=True)
                 sys.exit(f"the clone at {revision} failed: {out[-300:]}")
-        if floor:
-            status, _ = run_program(["git", "-C", temp, "fetch", "-q", UPSTREAM, floor], None, {}, timeout=600)
-            status, _ = run_program(["git", "-C", temp, "merge-base", "--is-ancestor", floor, revision], None, {})
-            if status != 0:
-                shutil.rmtree(temp, ignore_errors=True)
-                sys.exit(f"refused: {revision} does not descend from {floor}, the release the door runs")
-        os.rename(temp, target)
+    if floor and floor != revision:     # also for a folder of an older release that is still on the disk
+        run_program(["git", "-C", repo, "fetch", "-q", UPSTREAM, floor], None, {}, timeout=600)
+        status, _ = run_program(["git", "-C", repo, "merge-base", "--is-ancestor", floor, revision], None, {})
+        if status != 0:
+            if fresh:
+                shutil.rmtree(repo, ignore_errors=True)
+            sys.exit(f"refused: {revision} does not descend from {floor}, the release the door runs")
+    if fresh:
+        os.rename(repo, target)
+    if running == revision:
+        ensure_follow_units()
+        return f"the door runs release {manifest['version']} ({revision[:12]}) already"
     link = os.path.join(P(CODE), "current")
     with contextlib.suppress(FileNotFoundError):
         os.remove(link + ".new")
@@ -1124,7 +1187,43 @@ def cmd_update(args):
     with open(P(FLOOR_FILE), "w") as f:
         f.write(revision + "\n")
     run_program(["systemctl", "restart", "fleet-door.service"], None, {})
-    print(f"the door runs release {manifest['version']} ({revision[:12]})")
+    for name in os.listdir(P(CODE)):    # the clones of older releases: a full history each, so the disk keeps two
+        if re.fullmatch(r"[0-9a-f]{40}", name) and name not in (revision, running):
+            shutil.rmtree(os.path.join(P(CODE), name), ignore_errors=True)
+    ensure_follow_units()
+    return f"the door runs release {manifest['version']} ({revision[:12]})"
+
+
+def cmd_update(args):
+    """root: a signed release manifest on stdin. door.sh gives the first one, and the app gives one over its own SSH
+    to a door that has no follow timer yet (plan 13, item 2); the timer takes every later one (cmd_follow)."""
+    if os.geteuid() != 0 and not os.environ.get("FLEET_DOOR_ROOT"):
+        sys.exit("door.py update runs as root")
+    try:
+        raw = json.loads(sys.stdin.read(65536))
+    except ValueError as e:
+        sys.exit(f"refused: {e}")
+    print(take(raw))
+
+
+def cmd_follow(args):
+    """root, from the follow timer every 10 minutes: the hub's signed release (GET /door/release on the private
+    network, which the hub answers only to the door's address), taken as `update` takes one when it is not the release
+    that runs. The door checks it with its own pinned keys, so the hub only carries it."""
+    if os.geteuid() != 0 and not os.environ.get("FLEET_DOOR_ROOT"):
+        sys.exit("door.py follow runs as root")
+    hub = read_json(ACCESS_FILE, {}).get("hub") or {}
+    if not hub.get("address"):
+        print("the access file names no hub yet")
+        return
+    host = hub["address"] if ":" not in hub["address"] else f"[{hub['address']}]"
+    status, answer = door_providers.http("GET", f"http://{host}:{hub.get('port', 8765)}/door/release",
+                                         {"X-Fleet-Client": "door"}, None)
+    if status != 200 or not isinstance(answer, dict):
+        sys.exit(f"the hub gave no release ({status})")
+    if answer.get("revision") == running_revision():
+        return
+    print(take(answer))
 
 
 def cmd_status(args):
@@ -1139,6 +1238,7 @@ def main(argv=None):
     sub.add_parser("serve").set_defaults(fn=lambda a: serve())
     sub.add_parser("access").set_defaults(fn=cmd_access)
     sub.add_parser("update").set_defaults(fn=cmd_update)
+    sub.add_parser("follow").set_defaults(fn=cmd_follow)
     sub.add_parser("hub-secrets").set_defaults(fn=cmd_hub_secrets)
     sub.add_parser("status").set_defaults(fn=cmd_status)
     args = p.parse_args(argv)

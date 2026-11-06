@@ -7,10 +7,10 @@
 # It makes the OS user `door`, its folders, the door's own vault key (an age identity, whose recipient the owner pins in
 # the central vault) and its SSH key to the hosts' second sshd, the three root commands, the service on the private
 # network and the local patch timer, and pins the release keys of this checkout. The code comes from the public
-# repository at the manifest's revision (door.py update), never from this checkout. There is no release timer: when
-# the app sees a new release, it writes the signed manifest to `door-update` over its own SSH, and the door checks the
-# release key and the floor itself. A second run is safe, and keeps every key. It prints no secret: its last lines are
-# the vault recipient, the SSH public key and the address of the door.
+# repository at the manifest's revision (door.py update), never from this checkout. The update also installs the
+# follow timer (fleet-door-follow.timer), by which the door takes each signed release of the hub by itself, every 10
+# minutes, and checks the release key, the hold and the floor itself (plan 13, item 2). A second run is safe, and keeps
+# every key. It prints no secret: its last lines are the vault recipient, the SSH public key and the address of the door.
 set -euo pipefail
 umask 022
 
