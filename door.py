@@ -770,15 +770,19 @@ class Door:
         """What the door's GitHub Apps reach, for the hub's marks of "What the App reaches" once the hub holds no App
         key (DevOps plan 13, item 4): each installation's settings page, built here from its account and its id and
         never taken from GitHub's answer; the accounts whose installation has all their repositories; the repositories
-        of the others; and the page that installs the App on another account. Every name in lower case."""
+        of the others; the page that installs the App on another account; and the accounts that own the Apps. Every
+        name in lower case."""
         apps = sorted({(str(c["app_id"]), c["secret"]) for k, c in (self.access().get("credentials") or {}).items()
                        if k.lower().startswith("github:") and isinstance(c, dict) and c.get("app_id") and c.get("secret")})
-        pages, every, repos, install = {}, set(), set(), None
+        pages, every, repos, install, owners = {}, set(), set(), None, set()
         for app_id, ref in apps:
             headers = {"Authorization": "Bearer " + door_providers.app_jwt(app_id, self.secret(ref)),
                        "Accept": "application/vnd.github+json"}
             status, app = self.http("GET", f"{GitHub.API}/app", headers, None)
             slug = app.get("slug") if status == 200 and isinstance(app, dict) else None
+            login = ((app.get("owner") if status == 200 and isinstance(app, dict) else None) or {}).get("login")
+            if isinstance(login, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login):
+                owners.add(login.lower())       # a private App reaches only the account that made it
             if install is None and isinstance(slug, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,99}", slug):
                 install = f"https://github.com/apps/{slug}/installations/new"
             status, installs = self.http("GET", f"{GitHub.API}/app/installations?per_page=100", headers, None)
@@ -815,7 +819,8 @@ class Door:
                         break
                 else:
                     every.add(login.lower())    # more than the door reads: the hub marks none of this account's
-        return {"pages": pages, "all": sorted(every), "repos": sorted(repos), "install": install}
+        return {"pages": pages, "all": sorted(every), "repos": sorted(repos), "install": install,
+                "owners": sorted(owners)}
 
 
 class GitHub:

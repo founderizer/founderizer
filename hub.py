@@ -1927,7 +1927,8 @@ def migrate():
                   "question": "INTEGER",      # the question that the manager took to the owner (raise_needs_you)
                   # DevOps plan 5.4 (D11, D22): the door call that the owner's yes lets through once, and his signed
                   # yes to it, which only the door reads (GET /door/approvals)
-                  "door_call": "TEXT", "approval": "TEXT"},
+                  "door_call": "TEXT", "approval": "TEXT",
+                  "github_app": "TEXT"},      # plan 13, item 4: the account that the item's first option makes an App in
         "owner_reports": {"agent": "TEXT NOT NULL DEFAULT 'manager'", "in_reply_to": "TEXT",
                           "pushed": "INTEGER NOT NULL DEFAULT 0"},     # chat apps round 2: message_owner
         "chat_out": {"recipient": "TEXT"},          # chat apps round 2: a Discord user ID when chat is null
@@ -7695,6 +7696,18 @@ def t_raise_needs_you(agent, a):
     if door_call is not None and not options:
         raise ToolError("An item with a door_call needs options, and the first one is the yes: his app signs only "
                         "that one, for example [\"Yes, run it once\", \"No\"].")
+    github_app = a.get("github_app")
+    if github_app is not None:
+        if not (isinstance(github_app, str) and GITHUB_LOGIN.fullmatch(github_app)):
+            raise ToolError("github_app is the GitHub account, an organization or a user, that the new App is made "
+                            "in: its login, for example Acme.")
+        if door_call is not None or not options:
+            raise ToolError("An item with a github_app needs options, and no door_call: the first option is the yes, "
+                            "which opens GitHub's own page that makes the App, for example [\"Make the App on "
+                            "GitHub\", \"Not now\"].")
+        if not (TEAM.get("door") or {}).get("address"):
+            raise ToolError("This fleet has no door, and the new App's key goes to the door: a fleet with no door "
+                            "keeps its App on the hub, through the GitHub App rows of the owner's app.")
     notice = need_is_notice(title, why, todo, *(json.loads(options) if options else ()))
     if notice:
         raise ToolError(notice)
@@ -7709,9 +7722,10 @@ def t_raise_needs_you(agent, a):
         qu = need_question(agent, a.get("question_id"))
         if qu:                  # the asker's own words, which the owner answers
             why += f" Quoting {qu['asker']} (Q-{qu['id']} on {tref(qu['task'])}): \"{clip(qu['text'], 1000)}\""
-        nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call) "
-                  "VALUES(?,?,?,?,?,?,?,?,?)",
-                  (unused_id("needs"), title, why, todo, now(), agent, options, qu["id"] if qu else None, door_call))
+        nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,github_app) "
+                  "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                  (unused_id("needs"), title, why, todo, now(), agent, options, qu["id"] if qu else None, door_call,
+                   github_app))
     emit("owner", "notify", f"Needs you N-{nid}: {title}")
     ping_need(nid)                                      # owner feature push: the phone rings, also when it is closed
     picks = (" The owner sees your options and presses one: " + ", ".join(json.loads(options)) +
@@ -7722,6 +7736,11 @@ def t_raise_needs_you(agent, a):
               f"closes by itself." if qu else "")
     door = (" When the owner answers yes, his app signs that yes to the door call, and the door lets that exact call "
             "through once: the agent sends the same call again." if door_call else "")
+    if github_app:
+        door = (f" When the owner presses the first option in Founderizer on his Mac, it opens GitHub's own page that "
+                f"makes a private App in {github_app} with its permissions filled in. GitHub gives the App's key to his app, which gives it "
+                f"to the door, and then GitHub asks him to install the App on that account's repositories. The App's "
+                f"ID reaches the hub (GET /ui/door github_apps), and the door reads what it reaches.")
     return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{linked}{door}{picks}"
 
 
@@ -21014,7 +21033,12 @@ TOOLS = [
         "door_call": {"type": "string", "description": "The call hash that the door gave with its refusal of a "
                       "judged call (for example a call that adds cost): the owner's yes then lets that exact call "
                       "through the door once. Put the exact command in what_to_do, and give options whose first "
-                      "one is the yes."}},
+                      "one is the yes."},
+        "github_app": {"type": "string", "description": "The GitHub account, an organization or a user, that needs "
+                       "a GitHub App of its own, because no App of the door reaches it (the hub tells you when): his "
+                       "first option, pressed in Founderizer on his Mac, then makes it with GitHub's own two pages, its "
+                       "key goes to the door, and he installs it on that account's repositories. Give options whose "
+                       "first one is the yes, and say in what_to_do that he presses it on his Mac."}},
        ["title", "why", "what_to_do"])),
     ("manager", "request_secret", t_request_secret,
      "Ask the owner for a secret that the fleet does not hold: an API key or a login. It is a Needs-you item that they "
@@ -29702,7 +29726,39 @@ def door_reach_read():
             "all": {a.lower() for a in answer.get("all") or [] if isinstance(a, str) and GITHUB_LOGIN.fullmatch(a)},
             "repos": {r.lower() for r in answer.get("repos") or [] if isinstance(r, str) and
                       GITHUB_FULL_NAME.fullmatch(r.lower())},
-            "install": install if isinstance(install, str) and GITHUB_INSTALL_PAGE.fullmatch(install) else None}
+            "install": install if isinstance(install, str) and GITHUB_INSTALL_PAGE.fullmatch(install) else None,
+            "owners": {o.lower() for o in answer.get("owners") or [] if isinstance(o, str) and GITHUB_LOGIN.fullmatch(o)}}
+
+
+def github_app_asks(reach):
+    """DevOps plan 13, item 4 (plan 2.20): an account where agents hold repositories, which no App of the door reaches
+    and which owns none of them, needs a GitHub App of its own, because a private App reaches only the account that
+    made it. The hub tells the manager once for each such account, and the manager raises the one Needs-you item whose
+    first option makes it (raise_needs_you github_app). An account that is reached again may be told about again later.
+    Gives the accounts told about now."""
+    if not reach or door_conf() is None:
+        return []
+    made = set(((TEAM.get("door") or {}).get("github_apps") or {}))
+    held = {}
+    for a in agents().values():
+        for repo in a.get("repos") or {}:
+            held.setdefault(repo.split("/")[0].lower(), []).append(repo)
+    told = []
+    for owner, repos in sorted(held.items()):
+        key = f"github_app_asked:{owner}"
+        if owner in reach["pages"] or owner in reach["all"] or owner in reach.get("owners", set()) or owner in made:
+            kv_set(key, None)
+            continue
+        if kv_get(key):
+            continue
+        kv_set(key, round(now()))
+        emit(manager_name(), "say", f"[hub] No GitHub App of the door reaches {owner}, where agents hold "
+                                    f"{len(repos)} repositories, so they get no token for them. A private App reaches "
+                                    f"only the account that made it. Raise one Needs-you item with github_app "
+                                    f"\"{owner}\": its first option, pressed in Founderizer on his Mac, makes the App "
+                                    f"in {owner} with GitHub's own pages, and its key goes to the door.")
+        told.append(owner)
+    return told
 
 
 def github_reach(wait=0):
@@ -29729,6 +29785,9 @@ def github_reach_refresh():
         with GITHUB_REACH_DONE:
             GITHUB_REACH.update(at=now(), reach=reach, reading=False)
             GITHUB_REACH_DONE.notify_all()
+    if reach:
+        with LOCK:
+            github_app_asks(reach)
 
 
 def github_unreached(repos):
@@ -30149,7 +30208,8 @@ def integrations_view(team, lines):
     except GitHubError as e:
         app, app_id, problem = False, None, str(e)
     door = door_conf() is not None      # DevOps plan 13, item 4: the door mints every token, with the same App
-    app, app_id = app or door, app_id or (door_app_id() if door else None)
+    app, app_id = app or door, app_id or (door_app_id() if door else None) or \
+        next(iter(sorted(((team.get("door") or {}).get("github_apps") or {}).items())), (None, None))[1]
     state = mcp_state(team)
     tools = {name: dict({k: v for k, v in tool.items()
                          if k in ("title", "command", "args", "url", "runtimes", "custom", "auth")},
@@ -30368,8 +30428,13 @@ def validate_door(team):
     door = team.get("door")
     if door is None:
         return
-    if not isinstance(door, dict) or set(door) - {"address", "port", "secrets", "credentials"}:
-        raise ValueError("door must be {address, port, secrets, credentials}")
+    if not isinstance(door, dict) or set(door) - {"address", "port", "secrets", "credentials", "github_apps"}:
+        raise ValueError("door must be {address, port, secrets, credentials, github_apps}")
+    apps = door.get("github_apps", {})
+    if not isinstance(apps, dict) or not all(
+            isinstance(k, str) and GITHUB_LOGIN.fullmatch(k) and k == k.lower() and isinstance(v, str) and
+            re.fullmatch(r"[1-9][0-9]{0,11}", v) for k, v in apps.items()):
+        raise ValueError("door.github_apps maps a GitHub account, in lower case, to the ID of the App made in it")
     try:
         ipaddress.ip_address(door.get("address"))
     except (ValueError, TypeError):
@@ -30448,6 +30513,24 @@ def door_conf():
             "record": held["record"]}
 
 
+def save_door_github_app(body):
+    """POST /ui/door/github-app (owner feature door_setup, DevOps plan 13, item 4): the ID of a GitHub App that the
+    owner's app made with GitHub's manifest flow, for the account that owns it, once the door holds its key. The key
+    itself never reaches the hub."""
+    owner, app_id = body["owner"].lower(), body["app_id"]
+
+    def change(team):
+        door = team.get("door")
+        if not isinstance(door, dict) or not door.get("address"):
+            raise Refusal(409, "this fleet has no door")
+        apps = door.setdefault("github_apps", {})
+        if apps.get(owner) == app_id:
+            return False
+        apps[owner] = app_id
+        return True
+    return save_integration(None, change, f"the door holds the GitHub App {app_id}, made in {owner}")
+
+
 def door_app_id():
     """The ID of the App whose key the hub gave the door when it linked (save_door_secrets), or None."""
     try:
@@ -30479,7 +30562,9 @@ def door_view():
                        for name, a in sorted(agents().items()) if a.get("machine") in addresses},
             # plan 13, item 4: the hub's own App key, which the app moves to the door, and whether the hub is linked
             "github_app": {"app_id": app[0], "path": os.path.abspath(app[1])} if app else None,
-            "linked": door_conf() is not None}
+            "linked": door_conf() is not None,
+            # plan 13, item 4: the Apps that the app made with GitHub's manifest flow, whose keys the door holds
+            "github_apps": dict(sorted((door.get("github_apps") or {}).items()))}
 
 
 DOOR_PENDING = {}   # {request_id: (token, record)} of one POST /ui/door/secrets: in memory only, never in a record
@@ -34877,6 +34962,18 @@ class Handler(BaseHTTPRequestHandler):
                     "record_sha256": hashlib.sha256(record.encode()).hexdigest()}
         return self.ui_command("door/secrets", read, save_door_secrets, outside=door_mint_check)
 
+    def ui_door_github_app(self):
+        """POST /ui/door/github-app (owner feature door_setup): the ID of a GitHub App that the app made with GitHub's
+        manifest flow, and the account it was made in. The door holds its key."""
+        def read(data):
+            owner, app_id = data.get("owner"), data.get("app_id")
+            if not isinstance(owner, str) or not GITHUB_LOGIN.fullmatch(owner):
+                raise ValueError("owner is the GitHub account that the App was made in")
+            if not isinstance(app_id, str) or not re.fullmatch(r"[1-9][0-9]{0,11}", app_id):
+                raise ValueError("app_id is the App's ID, as GitHub gave it")
+            return {"owner": owner, "app_id": app_id}
+        return self.ui_command("door/github-app", read, save_door_github_app)
+
     def ui_vault_intake(self):
         """POST /ui/vault/intake (owner feature central_vault): one secret of the catalog, sealed in the owner's app to
         the central vault's own key, into the central vault (central_intake). The receipt is {login, saved}. The
@@ -37355,6 +37452,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_door_save()
         if parts == ["ui", "door", "secrets"]:       # DevOps plan 13, item 4: the hub gets its tokens from the door
             return self.ui_door_secrets()
+        if parts == ["ui", "door", "github-app"]:    # DevOps plan 13, item 4: an App made by the manifest flow
+            return self.ui_door_github_app()
         if len(parts) == 3 and parts[:2] == ["door", "sealed"] and re.fullmatch(r"[1-9][0-9]{0,17}", parts[2]):
             return self.door_route(lambda: door_fetched(self.client_address[0], int(parts[2]),
                                                         self.form().get("sha256")))
