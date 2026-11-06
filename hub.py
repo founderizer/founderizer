@@ -30115,13 +30115,16 @@ def integrations_view(team, lines):
         app, app_id, problem = found is not None, found[0] if found else None, None
     except GitHubError as e:
         app, app_id, problem = False, None, str(e)
+    door = door_conf() is not None      # DevOps plan 13, item 4: the door mints every token, with the same App
+    app = app or door
     state = mcp_state(team)
     tools = {name: dict({k: v for k, v in tool.items()
                          if k in ("title", "command", "args", "url", "runtimes", "custom", "auth")},
                         needs=tool_needs(tool), **state.get(name, {}))
              for name, tool in tool_catalog(team).items()}
     unreached = github_unreached(r for line in lines for r in line["repos"]) if app else {}
-    return {"tools": tools, "github": {"app": app, "app_id": app_id, "problem": problem, "unreached": unreached},
+    return {"tools": tools, "github": {"app": app, "app_id": app_id, "problem": problem, "unreached": unreached,
+                                       "door": door},
             "google": google_view(team)}
 
 
@@ -30421,11 +30424,83 @@ def door_view():
     door, addresses = TEAM.get("door") or {}, TEAM.get("addresses") or {}
     users = {r["agent"]: ((json.loads(r["data"]) or {}).get("access") or {}).get("user")
              for r in q("SELECT agent, data FROM machine_status")}
+    app = None
+    with contextlib.suppress(GitHubError):
+        app = github_app()
     return {"door": {"address": door["address"], "port": door.get("port", DOOR_PORT)} if door.get("address") else None,
             "credentials": {name: {"secret": c["secret"], "agents": list(c.get("agents") or [])}
                             for name, c in sorted((door.get("credentials") or {}).items())},
-            "agents": {name: {"address": addresses[a["machine"]], "user": users.get(name)}
-                       for name, a in sorted(agents().items()) if a.get("machine") in addresses}}
+            "agents": {name: {"address": addresses[a["machine"]], "user": users.get(name),
+                              "repos": dict(sorted((a.get("repos") or {}).items()))}
+                       for name, a in sorted(agents().items()) if a.get("machine") in addresses},
+            # plan 13, item 4: the hub's own App key, which the app moves to the door, and whether the hub is linked
+            "github_app": {"app_id": app[0], "path": os.path.abspath(app[1])} if app else None,
+            "linked": door_conf() is not None}
+
+
+DOOR_PENDING = {}   # {request_id: (token, record)} of one POST /ui/door/secrets: in memory only, never in a record
+
+
+def door_pending(body):
+    """The two secrets of this request, which only its SHA-256 values name in the hub's records (ui_controls, which a
+    backup copy carries); None when the hub started again in between."""
+    token, record = DOOR_PENDING.get(body["request_id"], (None, None))
+    if token is None or hashlib.sha256(token.encode()).hexdigest() != body["token_sha256"] or \
+            hashlib.sha256(record.encode()).hexdigest() != body["record_sha256"]:
+        return None
+    return token, record
+
+
+def door_mint_check(body):
+    """Before the hub uses the door for every GitHub token (DevOps plan 13, item 4), outside LOCK: one read token
+    through the door, with the two secrets that the app made there, for one granted repository of each owner. The
+    product's own repositories are left out, as the door never mints for them. {"owners", "errors"}."""
+    import door_targets
+    pending = door_pending(body)
+    if pending is None:
+        return {"owners": [], "errors": ["the hub started again while it took this command: send it again"]}
+    door = TEAM.get("door") or {}
+    conf = {"address": door.get("address"), "port": door.get("port", DOOR_PORT), "token": pending[0],
+            "record": pending[1]}
+    # an owner that the hub's own App is not installed on gets no token today either, so it does not hold the move
+    reach = github_reach()
+    installed = set(reach["pages"]) if reach else None
+    first = {}
+    for name, a in sorted(agents().items()):
+        for repo in sorted(a.get("repos") or {}):
+            owner = repo.split("/")[0].lower()
+            if not door_targets.vendor(repo) and (installed is None or owner in installed):
+                first.setdefault(owner, (name, repo))
+    errors = []
+    for owner, (name, repo) in sorted(first.items()):
+        status, answer = door_call(conf, "POST", "/github/token", conf["token"], {"agent": name, "repos": {repo: "read"}})
+        if status != 200 or not isinstance(answer, dict) or not answer.get("tokens"):
+            said = (answer.get("error") or "; ".join(str(e.get("error")) for e in answer.get("errors") or [])
+                    if isinstance(answer, dict) else str(answer))
+            errors.append(f"{owner} ({name}, {repo}): {said or status}")
+    return {"owners": sorted(first), "errors": errors}
+
+
+def save_door_secrets(body, check):
+    """POST /ui/door/secrets (owner feature door_setup, DevOps plan 13, item 4): the hub keeps the door's two secrets
+    only when the door minted for every owner (door_mint_check), and from then on it asks the door for every GitHub
+    token. Its own App key then goes, with no rotation: the door holds the same key, and the hub holds none."""
+    pending = door_pending(body)
+    DOOR_PENDING.pop(body["request_id"], None)
+    if not TEAM.get("door"):
+        raise Refusal(409, "this fleet has no door")
+    if check["errors"] or pending is None:
+        raise Refusal(409, "the door does not mint for every owner yet: " + "; ".join(check["errors"] or ["send again"]))
+    path = CFG.get("door_secrets") or DOOR_SECRETS_FILE
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"token": pending[0], "record": pending[1]}, f)
+    os.replace(path + ".new", path)
+    removed = github_app_remove()["replaced"]
+    log("owner", f"the door mints every GitHub token (owners: {', '.join(check['owners']) or 'none'})"
+                 + ("; the hub no longer holds the GitHub App key" if removed else ""))
+    return {"linked": True, "owners": check["owners"], "app_removed": removed}
 
 
 def save_door_entry(body):
@@ -34722,6 +34797,19 @@ class Handler(BaseHTTPRequestHandler):
             return {"address": address, "port": port}
         return self.ui_command("door", read, save_door_entry)
 
+    def ui_door_secrets(self):
+        """POST /ui/door/secrets (owner feature door_setup): the hub's two door secrets, which the app made on the
+        door with its root command door-hub-secrets, over its own SSH. They never show on a page."""
+        def read(data):
+            token, record = data.get("token"), data.get("record")
+            if not all(isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9_-]{32,128}", v) for v in (token, record)):
+                raise ValueError("token and record are the two secrets that door-hub-secrets printed")
+            DOOR_PENDING.clear()        # one link at a time; the record of the command names only the hashes
+            DOOR_PENDING[data["request_id"]] = (token, record)
+            return {"request_id": data["request_id"], "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+                    "record_sha256": hashlib.sha256(record.encode()).hexdigest()}
+        return self.ui_command("door/secrets", read, save_door_secrets, outside=door_mint_check)
+
     def ui_vault_intake(self):
         """POST /ui/vault/intake (owner feature central_vault): one secret of the catalog, sealed in the owner's app to
         the central vault's own key, into the central vault (central_intake). The receipt is {login, saved}. The
@@ -37198,6 +37286,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_servers_grant()
         if parts == ["ui", "door"]:                  # DevOps plan 13, item 1: the app writes the door's entry
             return self.ui_door_save()
+        if parts == ["ui", "door", "secrets"]:       # DevOps plan 13, item 4: the hub gets its tokens from the door
+            return self.ui_door_secrets()
         if len(parts) == 3 and parts[:2] == ["door", "sealed"] and re.fullmatch(r"[1-9][0-9]{0,17}", parts[2]):
             return self.door_route(lambda: door_fetched(self.client_address[0], int(parts[2]),
                                                         self.form().get("sha256")))

@@ -86,6 +86,7 @@ NOT_TOOLS = {
     "/ui/releases/entitlement": "the subscription token of this fleet",
     "/ui/github-app": "the GitHub App's private key",
     "/ui/door": "the door's address, which the app writes by itself when it finds the door by its tag",
+    "/ui/door/secrets": "the hub's two secrets for the door, which the app makes on the door by itself",
     "/ui/chat-apps/{}/token": "a Discord bot token",
     "/ui/google/connect": "Google's client secret, and a browser flow of the owner's own",
     "/ui/google/finish": "the authorization code of that flow",

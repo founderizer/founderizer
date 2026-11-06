@@ -234,7 +234,10 @@ def validate_access(data):
             if address in seen:
                 raise ValueError(f"{name} and {seen[address]} share the address {address}: the door refuses it")
             seen[address] = name
-        if not NAME.fullmatch(a.get("business", "")):
+        # An agent that only gets its GitHub tokens from the door, through the hub (plan 13, item 4), names no
+        # business: it has no address, no server, no provider and no repository of its own forms here.
+        tokens_only = address is None and not any(a.get(k) for k in ("servers", "providers", "repos"))
+        if not (tokens_only and "business" not in a) and not NAME.fullmatch(a.get("business", "")):
             raise ValueError(f"agent {name} needs its business")
         for host, level in (a.get("servers") or {}).items():
             if host not in hosts or level not in ("read", "fix"):
