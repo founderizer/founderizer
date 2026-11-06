@@ -108,6 +108,10 @@ NOT_TOOLS = {
                                     "holds, once the phone's key matches the one-time value of that app's QR",
     "/ui/restore": "a whole fleet restored over this one, from a file this server would have to carry",
     "/ui/owner/devices/{}/push": "the phone's own push token, which the route takes from the phone only",
+    "/ui/owner/devices/{}/recovery": "the recovery code, sealed on the owner's own Mac to a phone's own key once that key "
+                                     "matches the one-time value of that app's QR",
+    "/ui/owner/devices/{}/recovery/held": "the phone's own word that it holds its copy, which the route takes from the "
+                                          "phone only",
     "/ui/owner/enroll": "the phone's own call, before it has a key",
     "/ui/owner/devices/code": "a code for a new phone, which its camera reads from the Mac app's screen; the owner's "
                               "agent adds a phone with owner_device and device_code",

@@ -346,6 +346,11 @@ CREATE TABLE IF NOT EXISTS owner_device_contacts(device TEXT PRIMARY KEY, ts REA
 -- of the one-time value in the Mac's QR, and the owner key's certificate of it, which the Mac signs.
 CREATE TABLE IF NOT EXISTS owner_device_signing(device TEXT PRIMARY KEY, key TEXT NOT NULL, binding TEXT NOT NULL,
   created REAL NOT NULL, statement TEXT, signature TEXT);
+-- DevOps plan V12 (owner feature recovery_copy): the recovery code of the central vault, sealed on the owner's Mac to
+-- a phone's own recovery key (owner_device_signing.recovery_key, which migrate adds), until that phone confirms that it
+-- holds the code; then only the time it confirmed stays.
+CREATE TABLE IF NOT EXISTS owner_device_recovery(device TEXT PRIMARY KEY, sealed TEXT, created REAL NOT NULL,
+  held REAL);
 -- Pings to the owner's devices (MOBILE-APP.md 9, owner feature push): the push token that each device gave, with its
 -- seal key (sealed_push, a column that migrate adds), and one row for each ping. A ping row holds no text, and it is
 -- sent once: queued, sending, then sent, failed, skipped or unknown.
@@ -890,6 +895,7 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "sealed_push",       # the owner, 3 November 2026: a ping says nothing to founderizer.com or Apple
                "device_by_code",    # the owner, 3 November 2026: Add device shows the QR at once, with no fields
                "door_calls",        # DevOps plan 5.4: the owner's signed yes lets one door call through, once
+               "recovery_copy",     # DevOps plan V12: a phone keeps a copy of the recovery code, sealed to its key
                "server_ai_choice",  # the owner, 1 November 2026: "why are we asking for chatgpt AND claude login"
                "manager_server",    # the owner, 4 November 2026: a new fleet's manager gets its server in its setup
                "knowledge_edit",    # the owner, 5 November 2026: the pencil of a knowledge file, whose edit says
@@ -916,7 +922,8 @@ MOBILE_SEEN = 60                # seconds: a helper seen this recently is online
 DEVICE_PATHS = (("/ui/mobile", ("GET",)), ("/ui/state", ("GET",)), ("/ui/knowledge", ("GET",)),
                 ("/ui/owner/devices", ("GET",)), ("/ui/messages", ("POST",)), ("/ui/needs", ("POST",)),
                 ("/ui/tasks", ("GET", "POST")), ("/ui/wait", ("GET",)))
-DEVICE_PUSH = re.compile(r"/ui/owner/devices/[a-z][a-z0-9-]{1,30}/push")    # a device's own push token (push)
+DEVICE_PUSH = re.compile(r"/ui/owner/devices/[a-z][a-z0-9-]{1,30}/(push|recovery/held)")   # a device's own token
+#                                                       (push), and that it holds its copy of the recovery code (V12)
 
 
 def owner_devices():
@@ -1011,7 +1018,17 @@ def device_signing(form):
         raise Refusal(400, "signing_key and binding are base64") from None
     if len(raw) != 65 or raw[0] != 4 or len(mac) != 32:
         raise Refusal(400, "signing_key is an uncompressed P-256 point and binding an HMAC-SHA256")
-    return {"key": key, "binding": binding}
+    found = {"key": key, "binding": binding}
+    rkey, rbinding = form.get("recovery_key"), form.get("recovery_binding")     # plan V12, from a newer phone
+    if rkey is not None or rbinding is not None:
+        try:
+            raw, mac = base64.b64decode(rkey, validate=True), base64.b64decode(rbinding, validate=True)
+        except (TypeError, ValueError):
+            raise Refusal(400, "recovery_key and recovery_binding are base64") from None
+        if len(raw) != 65 or raw[0] != 4 or len(mac) != 32 or rkey == key:
+            raise Refusal(400, "recovery_key is a second uncompressed P-256 point and recovery_binding an HMAC-SHA256")
+        found.update(recovery_key=rkey, recovery_binding=rbinding)
+    return found
 
 
 def certify_device(device, statement, signature):
@@ -1063,12 +1080,15 @@ def enroll_device(device, code, signing=None):
                        "last_seen=NULL", (device, hashlib.sha256(key.encode()).hexdigest(), t0))
             DB.execute("DELETE FROM owner_device_tries WHERE device=?", (device,))
             if signing:
-                DB.execute("INSERT INTO owner_device_signing(device,key,binding,created) VALUES(?,?,?,?) "
-                           "ON CONFLICT(device) DO UPDATE SET key=excluded.key, binding=excluded.binding, "
-                           "created=excluded.created, statement=NULL, signature=NULL",
-                           (device, signing["key"], signing["binding"], t0))
+                DB.execute("INSERT INTO owner_device_signing(device,key,binding,created,recovery_key,recovery_binding) "
+                           "VALUES(?,?,?,?,?,?) ON CONFLICT(device) DO UPDATE SET key=excluded.key, "
+                           "binding=excluded.binding, created=excluded.created, statement=NULL, signature=NULL, "
+                           "recovery_key=excluded.recovery_key, recovery_binding=excluded.recovery_binding",
+                           (device, signing["key"], signing["binding"], t0, signing.get("recovery_key"),
+                            signing.get("recovery_binding")))
             else:
                 DB.execute("DELETE FROM owner_device_signing WHERE device=?", (device,))
+            DB.execute("DELETE FROM owner_device_recovery WHERE device=?", (device,))   # a new key holds no copy yet
     if key is None:                   # the record of a wrong code comes after the transaction, which rolls back
         ins("INSERT INTO owner_device_tries(device,ts) VALUES(?,?)", (device, t0))
         raise Refusal(403, "that code is not valid")
@@ -1131,7 +1151,7 @@ def save_owner_device(body):
     if body.get("delete"):
         with transaction():
             for table in ("owner_devices", "owner_device_codes", "owner_device_tries", "owner_device_contacts",
-                          "owner_device_push", "owner_device_signing"):
+                          "owner_device_push", "owner_device_signing", "owner_device_recovery"):
                 DB.execute(f"DELETE FROM {table} WHERE device=?", (device,))
     return dict(result, device=device, deleted=bool(body.get("delete")))
 
@@ -1146,15 +1166,44 @@ def device_rows(source):
         row = q1("SELECT last_seen FROM owner_devices WHERE device=?", (name,))
         seen = q1("SELECT ts, auth FROM owner_device_contacts WHERE device=?", (name,))
         pings = q1("SELECT 1 FROM owner_device_push WHERE device=?", (name,))
-        signing = q1("SELECT key, binding, statement FROM owner_device_signing WHERE device=?", (name,))
+        signing = q1("SELECT key, binding, statement, recovery_key, recovery_binding FROM owner_device_signing "
+                     "WHERE device=?", (name,))
+        copy = q1("SELECT sealed IS NOT NULL sealed, held FROM owner_device_recovery WHERE device=?", (name,))
         out.append({"device": name, "label": d["label"], "address": d["address"], "key": key is not None,
                     "since": key["created"] if key else None, "last_seen": row["last_seen"] if row else None,
                     "last_contact": seen["ts"] if seen else None, "last_answer": seen["auth"] if seen else None,
                     "code_expires": code["expires"] if code else None, "this_device": d["address"] == source,
                     "push": pings is not None, "signing_key": signing["key"] if signing else None,
                     "binding": signing["binding"] if signing else None,
-                    "certified": bool(signing and signing["statement"])})
+                    "certified": bool(signing and signing["statement"]),
+                    # plan V12: the key that the Mac seals the recovery code to, and whether this phone holds it
+                    "recovery_key": signing["recovery_key"] if signing else None,
+                    "recovery_binding": signing["recovery_binding"] if signing else None,
+                    "recovery": {"sealed": bool(copy["sealed"]), "held": copy["held"]} if copy else None})
     return out
+
+
+def save_recovery_copy(device, sealed):
+    """POST /ui/owner/devices/<device>/recovery (owner feature recovery_copy, DevOps plan V12): the recovery code of
+    the central vault, which the owner's Mac sealed to this phone's own recovery key once the key's HMAC of its QR's
+    one-time value matched. The hub carries the sealed box only, until the phone confirms that it holds the code."""
+    row = q1("SELECT recovery_key FROM owner_device_signing WHERE device=?", (device,))
+    if not row or not row["recovery_key"]:
+        raise Refusal(404, "this device sent no recovery key at its enrollment")
+    q("INSERT INTO owner_device_recovery(device,sealed,created,held) VALUES(?,?,?,NULL) ON CONFLICT(device) DO "
+      "UPDATE SET sealed=excluded.sealed, created=excluded.created, held=NULL", (device, sealed, now()))
+    log("owner", f"sealed the recovery code to the owner device {device}")         # never the code, never the box
+    return {"device": device, "sealed": True}
+
+
+def recovery_held(device):
+    """POST /ui/owner/devices/<device>/recovery/held, from that phone: it opened its copy and keeps it on that phone
+    alone, so the hub deletes the sealed box and keeps only the time."""
+    if not q1("SELECT 1 FROM owner_device_recovery WHERE device=? AND sealed IS NOT NULL", (device,)):
+        raise Refusal(409, "the hub holds no sealed copy for this device")
+    q("UPDATE owner_device_recovery SET sealed=NULL, held=? WHERE device=?", (now(), device))
+    log("owner", f"the owner device {device} holds its copy of the recovery code")
+    return {"device": device, "held": True}
 
 
 # ---------------------------------------------------------------- Pings to the owner's phone (owner feature push)
@@ -1928,11 +1977,14 @@ def migrate():
                   # DevOps plan 5.4 (D11, D22): the door call that the owner's yes lets through once, and his signed
                   # yes to it, which only the door reads (GET /door/approvals)
                   "door_call": "TEXT", "approval": "TEXT",
-                  "github_app": "TEXT"},      # plan 13, item 4: the account that the item's first option makes an App in
+                  "github_app": "TEXT",       # plan 13, item 4: the account that the item's first option makes an App in
+                  "add_device": "INTEGER"},   # plan V12 and 8.3: the item's first option opens the Add device picture
         "owner_reports": {"agent": "TEXT NOT NULL DEFAULT 'manager'", "in_reply_to": "TEXT",
                           "pushed": "INTEGER NOT NULL DEFAULT 0"},     # chat apps round 2: message_owner
         "chat_out": {"recipient": "TEXT"},          # chat apps round 2: a Discord user ID when chat is null
         "owner_device_push": {"seal": "TEXT"},      # sealed_push: the phone's own key for what a ping says, base64
+        # plan V12: the phone's own key that the recovery code is sealed to, and its HMAC of the QR's one-time value
+        "owner_device_signing": {"recovery_key": "TEXT", "recovery_binding": "TEXT"},
         "triggers": {"failures": "INTEGER NOT NULL DEFAULT 0", "created_by": "TEXT NOT NULL DEFAULT 'owner'",
                      "responsibility": "INTEGER", "watch": "TEXT"},         # owner API 1.13: a duty's watch
         # the task that open_case opened the case in: a task that opened two carries neither (t_open_case)
@@ -7708,6 +7760,12 @@ def t_raise_needs_you(agent, a):
         if not (TEAM.get("door") or {}).get("address"):
             raise ToolError("This fleet has no door, and the new App's key goes to the door: a fleet with no door "
                             "keeps its App on the hub, through the GitHub App rows of the owner's app.")
+    add_device = a.get("add_device")
+    if add_device is not None:
+        if add_device is not True or door_call is not None or github_app is not None or not options:
+            raise ToolError("add_device is true, with options whose first one is the yes, and no door_call or "
+                            "github_app: his first option, pressed in Founderizer on his Mac, opens the Add device "
+                            "picture, which his phone scans, for example [\"Show the picture\", \"Not now\"].")
     notice = need_is_notice(title, why, todo, *(json.loads(options) if options else ()))
     if notice:
         raise ToolError(notice)
@@ -7722,10 +7780,10 @@ def t_raise_needs_you(agent, a):
         qu = need_question(agent, a.get("question_id"))
         if qu:                  # the asker's own words, which the owner answers
             why += f" Quoting {qu['asker']} (Q-{qu['id']} on {tref(qu['task'])}): \"{clip(qu['text'], 1000)}\""
-        nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,github_app) "
-                  "VALUES(?,?,?,?,?,?,?,?,?,?)",
+        nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,github_app,add_device) "
+                  "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                   (unused_id("needs"), title, why, todo, now(), agent, options, qu["id"] if qu else None, door_call,
-                   github_app))
+                   github_app, 1 if add_device else None))
     emit("owner", "notify", f"Needs you N-{nid}: {title}")
     ping_need(nid)                                      # owner feature push: the phone rings, also when it is closed
     picks = (" The owner sees your options and presses one: " + ", ".join(json.loads(options)) +
@@ -7741,6 +7799,10 @@ def t_raise_needs_you(agent, a):
                 f"makes a private App in {github_app} with its permissions filled in. GitHub gives the App's key to his app, which gives it "
                 f"to the door, and then GitHub asks him to install the App on that account's repositories. The App's "
                 f"ID reaches the hub (GET /ui/door github_apps), and the door reads what it reaches.")
+    if add_device:
+        door = (" When the owner presses the first option in Founderizer on his Mac, it opens the Add device picture, "
+                "and his phone enrolls when it scans it: it then gets the phone's signed yes of door calls and a copy "
+                "of the recovery code (GET /ui/owner/devices: certified and recovery).")
     return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{linked}{door}{picks}"
 
 
@@ -21038,7 +21100,11 @@ TOOLS = [
                        "a GitHub App of its own, because no App of the door reaches it (the hub tells you when): his "
                        "first option, pressed in Founderizer on his Mac, then makes it with GitHub's own two pages, its "
                        "key goes to the door, and he installs it on that account's repositories. Give options whose "
-                       "first one is the yes, and say in what_to_do that he presses it on his Mac."}},
+                       "first one is the yes, and say in what_to_do that he presses it on his Mac."},
+        "add_device": {"type": "boolean", "description": "True when his phone must enroll again from the Add device "
+                       "picture: for its signed yes of door calls, or for its copy of the recovery code (the devices "
+                       "list says which phone lacks one). His first option, pressed in Founderizer on his Mac, opens "
+                       "that picture, and his phone scans it. Give options whose first one is the yes."}},
        ["title", "why", "what_to_do"])),
     ("manager", "request_secret", t_request_secret,
      "Ask the owner for a secret that the fleet does not hold: an API key or a login. It is a Needs-you item that they "
@@ -33089,6 +33155,46 @@ class Handler(BaseHTTPRequestHandler):
         return self.ui_command(f"owner/devices/{device}/certify", read,
                                lambda body: certify_device(device, body["statement"], body["signature"]))
 
+    def ui_owner_device_recovery(self, device):
+        """POST /ui/owner/devices/<device>/recovery (owner feature recovery_copy): the recovery code, sealed on the
+        owner's Mac to that phone's own recovery key. A phone cannot call it: it reads its copy and confirms it."""
+        def read(data):
+            self.only(data, ("sealed",))
+            if not ENTRY_ID.fullmatch(device):
+                raise ValueError("device must be a name of 2 to 31 characters: a-z, 0-9 and -")
+            sealed = data.get("sealed")
+            try:
+                raw = base64.b64decode(sealed, validate=True) if isinstance(sealed, str) else b""
+            except ValueError:
+                raw = b""
+            if not 65 + 12 + 16 < len(raw) <= 1024:
+                raise ValueError("sealed is the sealed copy of the recovery code, in base64")
+            return {"sealed": sealed}
+        return self.ui_command(f"owner/devices/{device}/recovery", read,
+                               lambda body: save_recovery_copy(device, body["sealed"]))
+
+    def ui_owner_device_recovery_read(self, device, query):
+        """GET /ui/owner/devices/<device>/recovery (owner feature recovery_copy): the sealed copy that waits for that
+        phone, to that phone alone, from its own address and with its own key."""
+        if not self.ui_allowed():
+            return
+        if query.get("db") != kv_get("db_id"):
+            return self.json(409, {"error": "hub generation changed; refresh state"})
+        if owner_device_at(self.client_address[0]) != device:
+            return self.json(403, {"error": "a phone reads its own copy, from its own address"})
+        row = q1("SELECT sealed FROM owner_device_recovery WHERE device=?", (device,))
+        return self.json(200, {"device": device, "sealed": row["sealed"] if row else None},
+                         {"Cache-Control": "no-store"})
+
+    def ui_owner_device_recovery_held(self, device):
+        """POST /ui/owner/devices/<device>/recovery/held (owner feature recovery_copy): that phone holds the code."""
+        def read(data):
+            self.only(data, ())
+            if owner_device_at(self.client_address[0]) != device:
+                raise Refusal(403, "a phone says this of its own copy, from its own address")
+            return {"device": device}
+        return self.ui_command(f"owner/devices/{device}/recovery/held", read, lambda body: recovery_held(device))
+
     def ui_owner_device_push(self, device):
         """POST /ui/owner/devices/<device>/push (owner feature push): the phone's push token, from that phone itself,
         and its own key for what a ping says (sealed_push). The owner's Mac has no push token, and one device never
@@ -36793,6 +36899,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_mobile_task(int(parts[3]), query)
         if parts == ["ui", "owner", "devices"]:
             return self.ui_owner_devices(query)
+        if len(parts) == 5 and parts[:3] == ["ui", "owner", "devices"] and parts[4] == "recovery":   # plan V12
+            return self.ui_owner_device_recovery_read(parts[3], query)
         if parts == ["bridge", "config"]:
             return self.bridge_config()
         if parts == ["bridge", "out"]:
@@ -37309,6 +37417,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_owner_device_push(parts[3])
         if len(parts) == 5 and parts[:3] == ["ui", "owner", "devices"] and parts[4] == "certify":
             return self.ui_owner_device_certify(parts[3])
+        if len(parts) == 5 and parts[:3] == ["ui", "owner", "devices"] and parts[4] == "recovery":   # plan V12
+            return self.ui_owner_device_recovery(parts[3])
+        if len(parts) == 6 and parts[:3] == ["ui", "owner", "devices"] and parts[4:] == ["recovery", "held"]:
+            return self.ui_owner_device_recovery_held(parts[3])
         if parts == ["ui", "owner", "enroll"]:
             return self.ui_owner_enroll()
         if parts == ["bridge", "inbound"]:
