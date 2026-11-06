@@ -322,7 +322,7 @@ CREATE TABLE IF NOT EXISTS server_keys(server TEXT PRIMARY KEY, sha256 TEXT NOT 
 CREATE TABLE IF NOT EXISTS server_status(server TEXT PRIMARY KEY, data TEXT NOT NULL, reported REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS server_jobs(id INTEGER PRIMARY KEY, server TEXT NOT NULL, kind TEXT NOT NULL, agent TEXT,
   runtime TEXT, state TEXT NOT NULL, step TEXT, detail TEXT, prompt TEXT, created REAL NOT NULL, updated REAL NOT NULL,
-  was TEXT);
+  was TEXT, timed_out INTEGER);
 -- DevOps plan C4: the door's record as the hub read it (no content, no value), and the sealed copies that wait for the
 -- door to fetch them from its own address
 CREATE TABLE IF NOT EXISTS door_record(n INTEGER PRIMARY KEY, ts REAL NOT NULL, caller TEXT NOT NULL, target TEXT,
@@ -332,9 +332,10 @@ CREATE TABLE IF NOT EXISTS door_copies(id INTEGER PRIMARY KEY, login TEXT NOT NU
 -- A sign-in that the owner drives (machine_signin; PRODUCT.md 4.5 names this table). The row carries its state and
 -- nothing of the sign-in itself:
 -- the provider's link, the code it shows and the code the owner pastes live in memory only (LIVE_LOGINS) and are
--- forgotten when they are used, when the sign-in ends and when the hub restarts.
+-- forgotten when they are used, when the sign-in ends and when the hub restarts. `timed_out` (1 or NULL): it failed
+-- only because the owner's own step did not come in time, which the app does not show as a failure.
 CREATE TABLE IF NOT EXISTS signin_jobs(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, runtime TEXT NOT NULL,
-  state TEXT NOT NULL, detail TEXT, created REAL NOT NULL, updated REAL NOT NULL);
+  state TEXT NOT NULL, detail TEXT, created REAL NOT NULL, updated REAL NOT NULL, timed_out INTEGER);
 CREATE TABLE IF NOT EXISTS owner_devices(device TEXT PRIMARY KEY, sha256 TEXT NOT NULL, created REAL NOT NULL,
   last_seen REAL);
 CREATE TABLE IF NOT EXISTS owner_device_codes(id INTEGER PRIMARY KEY, device TEXT NOT NULL, sha256 TEXT NOT NULL,
@@ -1945,7 +1946,9 @@ def migrate():
                      # a dead end: what did not work, what a repeat would cost, and how to test it again cheaply
                      "kind": "TEXT NOT NULL DEFAULT 'lesson'", "cost_minutes": "INTEGER", "recheck": "TEXT"},
         "machine_checks": {"verify": "TEXT", "revision": "TEXT"},
-        "server_jobs": {"was": "TEXT"},             # owner feature agent_rename: the name a rename job moves from
+        "server_jobs": {"was": "TEXT",              # owner feature agent_rename: the name a rename job moves from
+                        "timed_out": "INTEGER"},    # its sign-in step failed only because the owner's step did not
+        "signin_jobs": {"timed_out": "INTEGER"},    # come in time, and so did that sign-in (UI-API.md, `timed_out`)
         # the first agent of a Mac (mac_setups), and whether its sitting has ChatGPT: null is an app from before the choice
         "join_codes": {"agent": "TEXT", "runtime": "TEXT", "chatgpt": "INTEGER"},
         "mac_setups": {"chatgpt": "INTEGER"},
@@ -28159,7 +28162,7 @@ def job_view(row):
     return None if row is None else {
         "id": row["id"], "kind": row["kind"], "agent": row["agent"], "runtime": row["runtime"], "state": row["state"],
         "step": row["step"], "detail": row["detail"], "prompt": json.loads(row["prompt"]) if row["prompt"] else None,
-        "created": row["created"], "updated": row["updated"]}
+        "created": row["created"], "updated": row["updated"], "timed_out": bool(row["timed_out"])}
 
 
 def join_view(row, t0):
@@ -28570,8 +28573,11 @@ def job_input(data):
                          "purpose: claude_login, agent, login}")
     if key is not None and not (isinstance(key, str) and re.fullmatch(r"[0-9a-f]{64}", key) and state == "running"):
         raise ValueError("key_sha256 must be 64 lowercase hex characters, with state running")
+    timed_out = data.get("timed_out", False)
+    if not isinstance(timed_out, bool) or (timed_out and state != "failed"):
+        raise ValueError("timed_out is true or false, and true only with failed")
     return {"state": state, "step": step, "detail": detail.strip() if detail else None, "prompt": prompt,
-            "key_sha256": key}
+            "key_sha256": key, "timed_out": timed_out}
 
 
 def install_key(row, digest):
@@ -31503,7 +31509,8 @@ def login_view(row, live=True):
     seen = (LIVE_LOGINS.get(row["id"]) or {}) if live else {}
     return {"id": row["id"], "runtime": row["runtime"], "state": row["state"], "detail": row["detail"],
             "started_at": row["created"], "updated_at": row["updated"],
-            "url": seen.get("url"), "shows_code": seen.get("show_code"), "wants_code": bool(seen.get("wants_code"))}
+            "url": seen.get("url"), "shows_code": seen.get("show_code"), "wants_code": bool(seen.get("wants_code")),
+            "timed_out": bool(row["timed_out"])}
 
 
 def expire_logins(t0=None):
@@ -31511,8 +31518,12 @@ def expire_logins(t0=None):
     came for, and a sign-in whose link this hub no longer has."""
     t0 = t0 or now()
     for row in q(f"SELECT * FROM signin_jobs WHERE {LOGIN_OPEN} AND updated<?", (t0 - LOGIN_LIFE,)):
-        q("UPDATE signin_jobs SET state='failed', detail=?, updated=? WHERE id=?",
-          (f"The sign-in was not finished in {LOGIN_LIFE // 60} minutes. Start it again.", t0, row["id"]))
+        # **One that waited for the owner and got nothing ended for no fault** (`timed_out`): the owner, 6 November
+        # 2026, of "No code came back in 14 minutes." under the providers: "that orange message does not make sense
+        # for the user! what is that?!". Starting again is the whole of what there is to do, and the provider is that.
+        q("UPDATE signin_jobs SET state='failed', detail=?, timed_out=?, updated=? WHERE id=?",
+          (f"The sign-in was not finished in {LOGIN_LIFE // 60} minutes. Start it again.",
+           1 if row["state"] == "needs_owner" else None, t0, row["id"]))
         LIVE_LOGINS.pop(row["id"], None)
     # **A hub that restarted kept no link.** `needs_owner` is written with the link in the same breath, so a row in
     # that state with nothing live is a sign-in this hub cannot finish and the owner cannot open: the window on its
@@ -31783,7 +31794,8 @@ def login_report(agent, lid, update):
         live.update(url=url, show_code=shown, wants_code=bool(update["wants_code"]), at=now())
     else:
         LIVE_LOGINS.pop(lid, None)      # done or failed: the link and every code are forgotten here
-    q("UPDATE signin_jobs SET state=?, detail=?, updated=? WHERE id=?", (state, detail, now(), lid))
+    q("UPDATE signin_jobs SET state=?, detail=?, timed_out=?, updated=? WHERE id=?",
+      (state, detail, 1 if update["timed_out"] else None, now(), lid))
     if state in ("done", "failed"):
         log("hub", f"{agent}: sign-in L-{lid} ({row['runtime']}) {state}")
     return {"ok": True, "state": state}
@@ -31806,8 +31818,11 @@ def login_input(data):
         raise ValueError("only needs_owner carries a link or a code")
     if not isinstance(data.get("wants_code", False), bool):
         raise ValueError("wants_code is true or false")
+    timed_out = data.get("timed_out", False)
+    if not isinstance(timed_out, bool) or (timed_out and state != "failed"):
+        raise ValueError("timed_out is true or false, and true only with failed")
     return {"state": state, "detail": detail, "url": url, "shows_code": shown,
-            "wants_code": data.get("wants_code", False)}
+            "wants_code": data.get("wants_code", False), "timed_out": timed_out}
 
 
 def login_for_machine(agent, lid):
@@ -33454,9 +33469,10 @@ class Handler(BaseHTTPRequestHandler):
                     install_key(row, update["key_sha256"])
                 except Refusal as e:
                     return self.json(e.status, {"error": str(e)})
-            q("UPDATE server_jobs SET state=?, step=?, detail=?, prompt=?, updated=? WHERE id=?",
+            q("UPDATE server_jobs SET state=?, step=?, detail=?, prompt=?, timed_out=?, updated=? WHERE id=?",
               (update["state"], update["step"], update["detail"],
-               json.dumps(update["prompt"]) if update["prompt"] else None, now(), job))
+               json.dumps(update["prompt"]) if update["prompt"] else None, 1 if update["timed_out"] else None,
+               now(), job))
         if update["state"] in ("done", "failed"):
             log("hub", f"server {name}: job {job} ({row['kind']} {row['agent']}) {update['state']}")
             if row["kind"] in ("install", "prepare"):

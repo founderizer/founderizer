@@ -4476,8 +4476,9 @@ class Helper:
             typed = self.await_login_code(lid, session) if wants else True
             if typed is not True:
                 self.send_status()          # whatever the owner did on the provider's page is the machine's to say
-                if typed is None:
-                    report("failed", detail="No code came back in 14 minutes. Start the sign-in again.")
+                if typed is None:           # it waited for the owner and got nothing: no fault (UI-API.md, timed_out)
+                    report("failed", detail="No code came back in 14 minutes. Start the sign-in again.",
+                           timed_out=True)
                 return
             deadline = time.monotonic() + LOGIN_DONE_WAIT
             while time.monotonic() < deadline:
@@ -4492,7 +4493,9 @@ class Helper:
                     return
                 time.sleep(2)
             self.send_status()
-            report("failed", detail=f"{label} did not report itself signed in. Try again.")
+            # A runtime that takes no code back (Codex) waited all this time for the owner on the provider's page; one
+            # that took his code and did not sign in failed.
+            report("failed", detail=f"{label} did not report itself signed in. Try again.", timed_out=not wants)
         except Refused as e:
             self.say(f"sign-in L-{lid}: {e}")
         except Exception as e:          # never pass the detail on: the screen of that window could hold the code

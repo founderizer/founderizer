@@ -87,9 +87,10 @@ ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 class StepFailed(Exception):
-    def __init__(self, step, detail):
+    def __init__(self, step, detail, timed_out=False):
         super().__init__(detail)
         self.step = step
+        self.timed_out = timed_out      # only the owner's own step did not come in time (UI-API.md, `timed_out`)
 
 
 def failed(step, words, raw=None):
@@ -590,16 +591,18 @@ class Service:
                                    f"then try again.", f"no job {job.get('kind')!r} here")
             kind(job)
         except StepFailed as e:
-            self.post(job, "failed", e.step, str(e)[:500], quiet=True)
+            self.post(job, "failed", e.step, str(e)[:500], quiet=True, timed_out=e.timed_out)
         except Gone:
             pass
         except Exception as e:          # one bad job never stops the service
             print(f"job {job.get('id')}: {e!r}", file=sys.stderr, flush=True)
             self.post(job, "failed", None, "The server service failed. Try again.", quiet=True)
 
-    def post(self, job, state, step, detail, prompt=None, quiet=False):
-        status, answer = self.hub.call("POST", f"/server/{self.name}/jobs/{job['id']}",
-                                       {"state": state, "step": step, "detail": detail, "prompt": prompt})
+    def post(self, job, state, step, detail, prompt=None, quiet=False, timed_out=False):
+        body = {"state": state, "step": step, "detail": detail, "prompt": prompt}
+        if timed_out:
+            body["timed_out"] = True
+        status, answer = self.hub.call("POST", f"/server/{self.name}/jobs/{job['id']}", body)
         if status in (404, 409) and not quiet:
             raise Gone()
         return status
@@ -980,7 +983,8 @@ class Service:
             if life.runtime(runtime)["signed_in"] is True:
                 return
             self.sleep(2)           # the owner's sign-in shows as soon as it is made (live_changes)
-        raise StepFailed("sign_in", f"{LABELS[runtime]} did not sign in within 15 minutes. Try again in Founderizer.")
+        raise StepFailed("sign_in", f"{LABELS[runtime]} did not sign in within 15 minutes. Try again in Founderizer.",
+                         timed_out=True)
 
     # ---- updates
     def update(self):
