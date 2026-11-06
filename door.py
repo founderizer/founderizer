@@ -66,6 +66,7 @@ REFUSED_FILE = STATE + "/refused.json"      # judged calls the model refused, by
 COUNTS_FILE = STATE + "/counts.json"        # today's judged calls of each business and refusals of each agent
 MINTED_FILE = STATE + "/minted.json"        # ids of the keys this door minted (never their values)
 MADE_FILE = STATE + "/made.json"            # names of what writes through the door made, by provider account (D25)
+ACCOUNTS_FILE = STATE + "/accounts.json"    # the Cloudflare account of a token whose credential names none (plan N1)
 SECRETS_DIR = STATE + "/secrets"            # opened values, one file each, mode 600, this user only
 VAULT_KEY = STATE + "/vault.key"            # the door's own age identity (its recipient is pinned in the vault)
 SSH_KEY = STATE + "/ssh/id_ed25519"         # the door's SSH key to the second sshd of each host
@@ -533,8 +534,8 @@ class Door:
                 d.kind, d.why = "approved", f"the owner's signed yes (N-{yes['need']}) to this exact call, used once"
             else:
                 # D25: a delete of what no agent made through the door is the owner's, by code before the judge
-                unmade = [key for key in door_providers.deletes(d.plan, (access.get("credentials") or {}).get(
-                    d.target) or {}) if not self.made(d.target, key)]
+                unmade = [key for key in door_providers.deletes(d.plan, self.credential(access, d.target))
+                          if not self.made(d.target, key)]
                 if unmade:
                     d = door_targets.refused(door_providers.delete_refusal(unmade[0]) + APPROVAL_NOTE.format(sha=sha),
                                              target=d.target)
@@ -576,8 +577,10 @@ class Door:
 
     def act(self, access, d, op, args, content):
         if d.plan is None:
-            status, out = self.ssh(access["hosts"][d.host], {"v": 1, "op": op, "args": d.args},
-                                   content if op == "file" else None)
+            req = {"v": 1, "op": op, "args": d.args}
+            if op == "file":            # ops-root installs only the bytes that have the request's sha256
+                req["sha256"] = hashlib.sha256(content or b"").hexdigest()
+            status, out = self.ssh(access["hosts"][d.host], req, content if op == "file" else None)
             if status == 3:
                 raise Refused(out.strip().removeprefix("refused: "))
             if status != 0:
@@ -631,11 +634,29 @@ class Door:
                 return
             time.sleep(10)
 
+    def credential(self, access, target):
+        """The access file's credential of one provider account, with the account id that the door got for its token
+        when the file names none (keep_account)."""
+        conf = dict((access.get("credentials") or {}).get(target) or {})
+        kept = read_json(ACCOUNTS_FILE, {}).get(target) or {}
+        if not conf.get("account_id") and kept.get("account_id") and kept.get("secret") == conf.get("secret"):
+            conf["account_id"] = kept["account_id"]
+        return conf
+
+    def keep_account(self, access, target, account_id):
+        """The one account that a credential's token reaches, kept with that credential under the name of its
+        secret: a new token on the card is asked again."""
+        secret = ((access.get("credentials") or {}).get(target) or {}).get("secret")
+        with self.lock:
+            kept = read_json(ACCOUNTS_FILE, {})
+            kept[target] = {"secret": secret, "account_id": account_id}
+            write_json(ACCOUNTS_FILE, kept)
+
     def provider_ctx(self, access, target):
-        return {"credentials": dict((access.get("credentials") or {}).get(target) or {},
-                                    owner=target.partition(":")[2]),
+        return {"credentials": dict(self.credential(access, target), owner=target.partition(":")[2]),
                 "http": self.http, "secret": self.secret, "keep": lambda kind, answer: self.keep_minted(answer),
                 "made": lambda key: self.keep_made(target, key),
+                "account": lambda account_id: self.keep_account(access, target, account_id),
                 "minted_secret": self.minted_secret, "aws_token": self.aws_token, "aws_sessions": self.aws_sessions,
                 "host": lambda host, op, args, stdin: self.ssh(access["hosts"][host],
                                                                {"v": 1, "op": op, "args": args}, stdin),
@@ -840,7 +861,7 @@ class GitHub:
         conf = github_app(self.access, self.owner) or {}
         ctx = {"credentials": dict(conf, owner=self.owner), "http": self.door.http, "secret": self.door.secret}
         try:
-            token = door_providers.github_token(dict(conf, owner=self.owner), ctx)
+            token = door_providers.github_token(dict(conf, owner=self.owner), ctx, self.repo)
         except KeyError:
             raise Refused(f"the door has no App of {self.owner}") from None
         self.TOKENS[self.owner.lower()] = (token, now() + 3300)

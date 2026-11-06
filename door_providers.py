@@ -76,9 +76,11 @@ def plan(kind, why, account, steps, **more):
                     plan={"provider": more.get("provider_name"), "account": account, "steps": steps}, **more)
 
 
-def read_plan(provider, account, steps, why):
-    return Decision("read", why, target=f"{provider}:{account}", write=False,
-                    plan={"provider": provider, "account": account, "steps": steps})
+def read_plan(provider, account, steps, why, repo=None):
+    plan = {"provider": provider, "account": account, "steps": steps}
+    if repo:                    # GitHub: the repository whose installation gives the token (github_token)
+        plan["repo"] = repo
+    return Decision("read", why, target=f"{provider}:{account}", write=False, plan=plan)
 
 
 def step(method, path, body=None, keep=None, need=None, query=None):
@@ -301,10 +303,10 @@ def github(access, agent, owner, op, args, content, lookups):
             query["status"] = "failure"
         if op == "secret-alerts":
             query["hide_secret"] = "true"           # the alert, never the secret it found
-        return read_plan("github", owner, [step("GET", reads[op], query=query)], "a listed read")
+        return read_plan("github", owner, [step("GET", reads[op], query=query)], "a listed read", repo=full)
     if op == "jobs" and len(args) == 2 and args[1].isdigit():
         return read_plan("github", owner, [step("GET", f"/repos/{full}/actions/runs/{args[1]}/jobs")],
-                         "a listed read")
+                         "a listed read", repo=full)
     if op == "workflow":
         if len(args) < 2 or not re.fullmatch(r"[A-Za-z0-9._-]{1,100}\.ya?ml", args[1]):
             return refused("workflow takes the repository, the workflow's file name and name=value inputs")
@@ -323,7 +325,7 @@ def github(access, agent, owner, op, args, content, lookups):
         if not ref:
             return refused(f"the door could not read the default branch of {full}")
         return Decision(kind, f"a {'health' if kind == 'rule' else 'bootstrap'} workflow", target=f"github:{owner}",
-                        plan={"provider": "github", "account": owner, "steps": [
+                        plan={"provider": "github", "account": owner, "repo": full, "steps": [
                             step("POST", f"/repos/{full}/actions/workflows/{args[1]}/dispatches",
                                  {"ref": ref, "inputs": inputs})]})
     if op == "secret":
@@ -338,7 +340,7 @@ def github(access, agent, owner, op, args, content, lookups):
         if len(args) < 4 or not all(re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", b) for b in args[1:3]):
             return refused("pull-request takes the repository, the head branch, the base branch and the title")
         return Decision("rule", "a pull request", target=f"github:{owner}",
-                        plan={"provider": "github", "account": owner, "steps": [
+                        plan={"provider": "github", "account": owner, "repo": full, "steps": [
                             step("POST", f"/repos/{full}/pulls", {"head": args[1], "base": args[2],
                                                                    "title": " ".join(args[3:])[:200]})]})
     return refused(f"{op} is not listed for GitHub")
@@ -799,7 +801,7 @@ def execute(plan, ctx):
         return github_secret(plan, ctx)
     if "app_setting" in plan:
         return azure_setting(plan, ctx)
-    session = open_session(provider, conf, ctx)
+    session = open_session(provider, conf, ctx, plan)
     said, kept = [], {}
     for s in plan["steps"]:
         if provider == "aws":
@@ -851,8 +853,8 @@ def short(answer, limit=2000):
     return text[:limit]
 
 
-def open_session(provider, conf, ctx):
-    """What every request of this provider carries: its base and its authorization. AWS has no secret: each call is
+def open_session(provider, conf, ctx, plan=None):
+    """What every request of this plan carries: its base and its authorization. AWS has no secret: each call is
     signed with the session of the account's role (aws_session)."""
     if provider == "aws":
         return {}
@@ -868,7 +870,7 @@ def open_session(provider, conf, ctx):
                 "headers": {"Authorization": answer["authorizationToken"]},
                 "fill": {"account_id": answer["accountId"]}}
     if provider == "github":
-        return {"base": BASES["github"], "headers": {"Authorization": "Bearer " + github_token(conf, ctx),
+        return {"base": BASES["github"], "headers": {"Authorization": "Bearer " + github_token(conf, ctx, plan["repo"]),
                                                      "Accept": "application/vnd.github+json",
                                                      "X-GitHub-Api-Version": "2022-11-28"}}
     if provider == "azure":
@@ -890,8 +892,31 @@ def open_session(provider, conf, ctx):
         if status != 200 or not isinstance(answer, dict) or not isinstance(answer.get("access_token"), str):
             raise Stop(f"Tailscale refused the door's OAuth client ({status})")
         return {"base": BASES["tailscale"], "headers": {"Authorization": "Bearer " + answer["access_token"]}}
-    return {"base": BASES[provider], "headers": {"Authorization": "Bearer " + secret},
-            "fill": {"account_id": conf.get("account_id", "")}}
+    session = {"base": BASES[provider], "headers": {"Authorization": "Bearer " + secret},
+               "fill": {"account_id": conf.get("account_id") or ""}}
+    if provider == "cloudflare" and not session["fill"]["account_id"] and \
+            any("{account_id}" in s["path"] for s in (plan or {}).get("steps") or []):
+        session["fill"]["account_id"] = cloudflare_account(session, ctx)
+    return session
+
+
+def cloudflare_account(session, ctx):
+    """The one account that a Cloudflare token reaches, for a credential that names none: a key card gives the door
+    the token only (plan N1). A token that reaches no account, or more than one, stops the call. The door keeps the
+    id with the credential (ctx["account"]), so that the next call and the names of deletes() have it too."""
+    status, answer = ctx["http"]("GET", session["base"] + "/accounts?per_page=50", session["headers"], None)
+    found = answer.get("result") if status == 200 and isinstance(answer, dict) else None
+    if not isinstance(found, list):
+        raise Stop(f"Cloudflare gave no list of the token's accounts ({status})")
+    if len(found) != 1:
+        raise Stop("the token reaches no Cloudflare account" if not found else
+                   "the token reaches more than one Cloudflare account: its credential must name its account_id")
+    account = found[0].get("id") if isinstance(found[0], dict) else None
+    if not isinstance(account, str) or not re.fullmatch(r"[0-9a-f]{32}", account):
+        raise Stop("Cloudflare gave no account id that the door can use")
+    if ctx.get("account"):
+        ctx["account"](account)
+    return account
 
 
 def send(provider, s, path, session, ctx, kept, plan):
@@ -923,11 +948,12 @@ def send(provider, s, path, session, ctx, kept, plan):
     return ctx["http"](s["method"], url, headers, data)
 
 
-def github_token(conf, ctx):
-    """An installation token of the door's App for this owner, from the App's key, signed by openssl."""
+def github_token(conf, ctx, repo):
+    """An installation token of the door's App for this owner, from the App's key, signed by openssl. The App's
+    installation is the one of the call's repository, which GitHub gives for a personal account and an organization
+    alike (plan N1), as for the hub's tokens (door.py, github_tokens)."""
     jwt = app_jwt(conf["app_id"], ctx["secret"](conf["secret"]), ctx.get("sign"))
-    status, answer = ctx["http"]("GET", f"{BASES['github']}/orgs/{conf['owner']}/installation" if conf.get("org", True)
-                                 else f"{BASES['github']}/users/{conf['owner']}/installation",
+    status, answer = ctx["http"]("GET", f"{BASES['github']}/repos/{repo}/installation",
                                  {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json"}, None)
     if status != 200:
         raise Stop(f"GitHub gave no installation of the door's App ({status})")
@@ -962,7 +988,7 @@ def github_secret(plan, ctx):
     """A secret of a repository, set to the value of a key that the door rotated, with gh's own sealing. The value
     goes on gh's stdin and never into an argument or an answer."""
     s = plan["secret"]
-    token = github_token(ctx["credentials"], ctx)
+    token = github_token(ctx["credentials"], ctx, s["repo"])
     value = minted_part(ctx, s["key"], s["part"])
     status, out = ctx["run"](["gh", "secret", "set", s["name"], "--repo", s["repo"]], value.encode(),
                              {"GH_TOKEN": token})
