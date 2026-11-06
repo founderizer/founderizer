@@ -307,6 +307,9 @@ def github(access, agent, owner, op, args, content, lookups):
     if op == "jobs" and len(args) == 2 and args[1].isdigit():
         return read_plan("github", owner, [step("GET", f"/repos/{full}/actions/runs/{args[1]}/jobs")],
                          "a listed read", repo=full)
+    if op in ("workflow", "secret", "pull-request") and not holds(access, agent, full):
+        return refused(f"{full} is no repository that this agent holds: a GitHub write of the door reaches only those "
+                       f"(new-projects plan N2)")
     if op == "workflow":
         if len(args) < 2 or not re.fullmatch(r"[A-Za-z0-9._-]{1,100}\.ya?ml", args[1]):
             return refused("workflow takes the repository, the workflow's file name and name=value inputs")
@@ -344,6 +347,14 @@ def github(access, agent, owner, op, args, content, lookups):
                             step("POST", f"/repos/{full}/pulls", {"head": args[1], "base": args[2],
                                                                    "title": " ".join(args[3:])[:200]})]})
     return refused(f"{op} is not listed for GitHub")
+
+
+def holds(access, agent, repo):
+    """True when the access file gives this agent the repository: a grant of the hub (`github`) or a target of its
+    own (`repos`), in whatever case the names come."""
+    me = (access.get("agents") or {}).get(agent) or {}
+    want = repo.lower()
+    return any(name.lower() == want for name in list(me.get("github") or {}) + list(me.get("repos") or {}))
 
 
 # ---------------------------------------------------------------- Hetzner Cloud
@@ -948,20 +959,68 @@ def send(provider, s, path, session, ctx, kept, plan):
     return ctx["http"](s["method"], url, headers, data)
 
 
-def github_token(conf, ctx, repo):
-    """An installation token of the door's App for this owner, from the App's key, signed by openssl. The App's
-    installation is the one of the call's repository, which GitHub gives for a personal account and an organization
-    alike (plan N1), as for the hub's tokens (door.py, github_tokens)."""
+# New-projects plan N2 (the owner's "Yes, as written", 6 November 2026): every token of the door asks for its
+# permissions by name. Its own work needs these: its commits and pull requests, the runs and dispatches of workflows,
+# the secrets that it sets to a key it rotated, and its reads of runners (Administration at read) and of alerts.
+# Administration at write goes only into a token of its own for one call (repo-new, repo-delete, a runner's
+# registration), which the door never keeps. GitHub refuses a token that asks for more than the installation holds, so
+# a token asks for each of these only as far as the installation holds it.
+DOOR_PERMISSIONS = {"metadata": "read", "contents": "write", "pull_requests": "write", "actions": "write",
+                    "workflows": "write", "administration": "read", "security_events": "read",
+                    "vulnerability_alerts": "read", "secret_scanning_alerts": "read", "secrets": "write"}
+
+
+def named_permissions(want, held):
+    """want, as far as the installation holds it: a permission that it lacks is left out, and one that it holds at
+    read only is asked at read. An installation that names no permissions gets want as it is."""
+    if not isinstance(held, dict):
+        return dict(want)
+    out = {}
+    for name, level in want.items():
+        has = held.get(name)
+        if has in ("write", "admin") or (has == "read" and level == "read"):
+            out[name] = level
+        elif has == "read":
+            out[name] = "read"
+    return out
+
+
+def github_token(conf, ctx, repo, permissions=None):
+    """An installation token of the door's App for this owner, from the App's key, signed by openssl, with its
+    permissions by name (plan N2). The App's installation is the one of the call's repository, which GitHub gives for a
+    personal account and an organization alike (plan N1), as for the hub's tokens (door.py, github_tokens)."""
     jwt = app_jwt(conf["app_id"], ctx["secret"](conf["secret"]), ctx.get("sign"))
     status, answer = ctx["http"]("GET", f"{BASES['github']}/repos/{repo}/installation",
                                  {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json"}, None)
     if status != 200:
         raise Stop(f"GitHub gave no installation of the door's App ({status})")
+    asked = named_permissions(permissions or DOOR_PERMISSIONS, answer.get("permissions"))
+    short = sorted(name for name, level in (permissions or {}).items() if asked.get(name) != level)
+    if short:                       # a one-call token needs each of its permissions as it asks them
+        raise Stop(permission_pages(answer, short))
     status, answer = ctx["http"]("POST", f"{BASES['github']}/app/installations/{answer['id']}/access_tokens",
-                                 {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json"}, b"{}")
+                                 {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json",
+                                  "Content-Type": "application/json"}, json.dumps({"permissions": asked}).encode())
     if status != 201:
         raise Stop(f"GitHub gave the door no token ({status})")
     return answer["token"]
+
+
+def permission_pages(installation, short):
+    """The words of a one-call token that the installation cannot give (plan N2): what it lacks, and GitHub's two
+    pages where the owner gives it, the App's permissions and the installation's acceptance. GitHub has no API that
+    changes an App's permissions, so the Operator reports it and the manager raises one Needs-you item with both."""
+    account = installation.get("account") if isinstance(installation.get("account"), dict) else {}
+    login, slug, iid = account.get("login"), installation.get("app_slug"), installation.get("id")
+    words = f"the App's installation does not hold {', '.join(short)} as this call needs"
+    if not (isinstance(login, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login) and isinstance(slug, str)
+            and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,99}", slug) and isinstance(iid, int)):
+        return words + ": the owner gives it on the App's page on GitHub, and then accepts it on its installation"
+    org = account.get("type") == "Organization"
+    where = f"organizations/{login}/settings" if org else "settings"
+    return (f"{words}. The owner gives it on GitHub's two pages: the App's permissions, "
+            f"https://github.com/{where}/apps/{slug}/permissions, and then the installation's acceptance, "
+            f"https://github.com/{where}/installations/{iid}")
 
 
 def app_pem(value):
