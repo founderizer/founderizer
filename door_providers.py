@@ -376,6 +376,28 @@ def github(access, agent, owner, op, args, content, lookups):
 APP_NAME = re.compile(r"[a-z][a-z0-9-]{0,23}")  # new-projects plan N4: the name of an app, its users and its repository
 REPO_NEW = {"administration": "write", "repository_creation": "write", "metadata": "read"}   # plan N2: one call
 REPO_DELETE = {"administration": "write", "metadata": "read"}
+RUNNER_TOKENS = {"administration": "write", "metadata": "read"}    # plan N6: a runner's registration and remove tokens
+RUNNER_RELEASE = "https://api.github.com/repos/actions/runner/releases/latest"
+
+
+def runner_release(answer):
+    """(version, {x64, arm64: sha256}) of the runner's release, from GitHub's answer: each archive's own digest, and
+    the SHA lines of the release's notes, which must agree when both are there (new-projects plan N6)."""
+    tag, body = answer.get("tag_name"), answer.get("body") if isinstance(answer.get("body"), str) else ""
+    if not isinstance(tag, str) or not re.fullmatch(r"v[0-9]{1,3}\.[0-9]{1,4}\.[0-9]{1,4}", tag):
+        raise Stop("the runner's latest release has no version")
+    version, sums = tag[1:], {}
+    for arch in ("x64", "arm64"):
+        name = f"actions-runner-linux-{arch}-{version}.tar.gz"
+        asset = next((a for a in answer.get("assets") or [] if isinstance(a, dict) and a.get("name") == name), None)
+        digest = str((asset or {}).get("digest") or "")
+        listed = digest[7:] if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) else None
+        noted = re.search(rf"<!-- BEGIN SHA linux-{arch} -->([0-9a-f]{{64}})<!-- END SHA linux-{arch} -->", body)
+        noted = noted.group(1) if noted else None
+        if asset is None or not (listed or noted) or (listed and noted and listed != noted):
+            raise Stop(f"GitHub publishes no one SHA-256 for {name}")
+        sums[arch] = listed or noted
+    return version, sums
 
 
 def holds(access, agent, repo):

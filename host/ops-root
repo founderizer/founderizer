@@ -37,6 +37,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 
 VERSION = 1                 # the floor: self-update takes only a file whose VERSION is not lower
 ROOT = ""                   # a prefix for every path below, which only the tests set
@@ -135,10 +137,13 @@ def P(path):
 
 
 def run(argv, stdin=None, timeout=900, env=None):
-    """(status, output): one program with the fixed environment, its output and errors together, cut to OUT_MAX."""
+    """(status, output): one program with the fixed environment, its output and errors together, cut to OUT_MAX.
+    stdin is bytes, or an open file that the program reads as it is."""
+    stream = stdin if hasattr(stdin, "fileno") else None
     try:
-        r = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
-                           env=dict(ENV, **(env or {})), stdin=None if stdin is not None else subprocess.DEVNULL)
+        r = subprocess.run(argv, input=None if stream else stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=timeout, env=dict(ENV, **(env or {})),
+                           stdin=stream or (None if stdin is not None else subprocess.DEVNULL))
     except FileNotFoundError:
         return 127, f"{argv[0]} is not on this host"
     except subprocess.TimeoutExpired:
@@ -368,6 +373,7 @@ CHECKS = {
     "unit-new": lambda a: [check_app_name(one(a, "unit-new", "the app's name"))],
     "env-new": lambda a: check_env(a, "env-new"),
     "env-add": lambda a: check_env(a, "env-add"),
+    "runner-new": lambda a: [check_app_name(one(a, "runner-new", "the app's name"))],
 }
 
 
@@ -1226,6 +1232,144 @@ def do_env_new(req, data):
                                      "random|key, the value on stdin (the door's), on a fix host only")
 def do_env_add(req, data):
     return add_setting(req, data)
+
+
+# ---- the app's runner (new-projects plan N6)
+#
+# runner-new <app> makes the app's own GitHub runner as its deploy user: the door sends a registration token and a
+# remove token of the repository that it made for the app, the repository's address, the runner's name and the
+# runner's latest release with the SHA-256 that GitHub publishes for each archive, all on stdin. Root downloads the
+# archive and checks it, the deploy user unpacks it from root's stream and registers it, with the token in
+# ACTIONS_RUNNER_INPUT_TOKEN and never in an argument, and root writes the unit itself. Nothing in the runner's folder
+# runs as root. A step that fails after the registration takes it back with the remove token, so a retry can run.
+
+RUNNER_MAX = 512 * 1024 * 1024          # bytes of the runner's archive
+RUNNER_ARCH = {"x86_64": "x64", "aarch64": "arm64"}
+RUNNER_RELEASES = "https://github.com/actions/runner/releases/download"
+RUNNER_TOKEN = re.compile(r"[A-Z0-9]{20,100}")
+
+
+def machine():
+    return os.uname().machine
+
+
+def runner_folder(app):
+    return f"/home/{app}-deploy/actions-runner"
+
+
+def runner_input(data):
+    "The door's JSON on stdin, checked: {token, remove, url, name, version, sha256: {x64, arm64}}."
+    try:
+        got = json.loads(data or b"")
+        ok = isinstance(got, dict) and set(got) == {"token", "remove", "url", "name", "version", "sha256"} and \
+            all(isinstance(got[k], str) and RUNNER_TOKEN.fullmatch(got[k]) for k in ("token", "remove")) and \
+            re.fullmatch(r"https://github\.com/[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}", str(got["url"])) and \
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}", str(got["name"])) and \
+            re.fullmatch(r"[0-9]{1,3}\.[0-9]{1,4}\.[0-9]{1,4}", str(got["version"])) and \
+            isinstance(got["sha256"], dict) and set(got["sha256"]) == set(RUNNER_ARCH.values()) and \
+            all(isinstance(v, str) and SHA256.fullmatch(v) for v in got["sha256"].values())
+    except (ValueError, TypeError, RecursionError):
+        ok = False
+    if not ok:
+        raise Refused("runner-new needs the door's tokens, the repository and the runner's release on stdin")
+    return got
+
+
+def fetch(url, path, limit):
+    """The bytes at url into path (root's own file), with their SHA-256; at most limit bytes."""
+    digest, size = hashlib.sha256(), 0
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(urllib.request.Request(url, headers={"User-Agent": "ops-root"}), timeout=120) as r, \
+                open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+            while True:
+                chunk = r.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > limit:
+                    raise Refused(f"the runner's archive is over {limit // 1024 ** 2} MiB")
+                digest.update(chunk)
+                f.write(chunk)
+    except (OSError, urllib.error.URLError) as e:
+        raise Failed(f"the runner's archive did not download: {e}") from None
+    return digest.hexdigest()
+
+
+@form("runner-new", help="the app's own GitHub runner, as its deploy user: <app>, the door's tokens and the runner's "
+                         "release on stdin (the door's), on a fix host only")
+def do_runner_new(req, data):
+    app = req["args"][0]
+    n, given = app_names(app), runner_input(data)
+    user, folder = f"{app}-deploy", runner_folder(app)
+    if not os.path.isfile(P(n["settings"])):
+        raise Refused(f"{app} is no app of this host: app-new makes it first")
+    try:
+        pw = pwd.getpwnam(user)
+    except KeyError:
+        raise Refused(f"{user} is not a user here: app-new makes it") from None
+    arch = RUNNER_ARCH.get(machine())
+    if arch is None:
+        raise Refused(f"the runner has no archive for {machine()}")
+    scope = re.sub(r"[^A-Za-z0-9_-]", "-", given["url"].removeprefix("https://github.com/").replace("/", "-"))
+    unit = f"actions.runner.{scope}.{given['name']}.service"
+    if not UNIT.fullmatch(unit):
+        raise Refused(f"{unit} is not a unit's name")
+    taken = [p for p in (folder, f"/etc/systemd/system/{unit}") if os.path.lexists(P(p))] + \
+        [u for _, u, _, _ in runners() if u.endswith(f".{given['name']}.service")]
+    if taken:
+        raise Refused(f"{', '.join(taken)} exists already: runner-new makes the app's one runner")
+    if "libicuuc.so" not in run(["ldconfig", "-p"], timeout=60)[1]:
+        raise Refused("the runner needs ICU, which this host lacks: the install form installs its libicu first")
+    secrets = (given["token"], given["remove"])
+
+    def as_user(*argv, token=None, stdin=None):
+        env = {"ACTIONS_RUNNER_INPUT_TOKEN": token} if token else None
+        status, out = run(["runuser", "-u", user, "--", *argv], stdin=stdin, timeout=900, env=env)
+        for secret in secrets:
+            out = out.replace(secret, "<token>")
+        return status, out
+
+    archive = P(f"{STATE}/runner-{app}.tar.gz")
+    registered = False
+    try:
+        os.makedirs(os.path.dirname(archive), exist_ok=True)
+        name = f"actions-runner-linux-{arch}-{given['version']}.tar.gz"
+        if fetch(f"{RUNNER_RELEASES}/v{given['version']}/{name}", archive, RUNNER_MAX) != given["sha256"][arch]:
+            raise Refused(f"{name} does not have the SHA-256 that GitHub publishes with it")
+        os.mkdir(P(folder), 0o750)
+        if os.geteuid() == 0:
+            os.chown(P(folder), pw.pw_uid, pw.pw_gid)
+        os.chmod(P(folder), 0o750)
+        with open(archive, "rb") as stream:     # the deploy user unpacks the bytes that root checked, from root's stream
+            checked(as_user("tar", "-xzf", "-", "-C", folder, "--no-same-owner", stdin=stream), None)
+        registered = True
+        checked(as_user(f"{folder}/config.sh", "--unattended", "--url", given["url"], "--name", given["name"],
+                        "--labels", app, "--work", "_work", token=given["token"]), None)
+        checked(as_user("cp", f"{folder}/bin/runsvc.sh", f"{folder}/runsvc.sh"), None)
+        replace(f"/etc/systemd/system/{unit}", (
+            f"[Unit]\nDescription=GitHub Actions Runner ({scope}.{given['name']})\nAfter=network-online.target\n"
+            f"Wants=network-online.target\n\n[Service]\nExecStart={folder}/runsvc.sh\nUser={user}\n"
+            f"WorkingDirectory={folder}\nKillMode=process\nKillSignal=SIGTERM\nTimeoutStopSec=5min\n\n"
+            f"[Install]\nWantedBy=multi-user.target\n").encode(), 0o644)
+        checked(systemctl("daemon-reload"), None)
+        checked(systemctl("enable", "--now", unit), None)
+    except (Refused, Failed, OSError) as e:
+        if registered:
+            as_user(f"{folder}/config.sh", "remove", token=given["remove"])
+        with contextlib.suppress(OSError):
+            os.remove(P(f"/etc/systemd/system/{unit}"))
+        systemctl("daemon-reload")
+        shutil.rmtree(P(folder), ignore_errors=True)
+        said = str(e)
+        for secret in secrets:
+            said = said.replace(secret, "<token>")
+        raise (Refused if isinstance(e, Refused) else Failed)(
+            f"runner-new stopped, and it took back what it made: {said}") from None
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(archive)
+    return f"{given['name']} runs as {user} ({unit}), with the labels self-hosted, linux, {arch} and {app}"
 
 # ---------------------------------------------------------------- what the forms share
 

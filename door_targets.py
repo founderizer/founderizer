@@ -81,7 +81,9 @@ class Decision:
         self.business = more.get("business")
         self.write = more.get("write", kind in ("rule", "judged"))
         self.plan = more.get("plan")            # what the door runs: a provider's requests, a commit, a deploy
-        self.value = more.get("value")          # (random, None) or (key, app:<app>:<NAME>): what the door sends
+        # what the door sends on the host's stdin: (random, None) or (key, app:<app>:<NAME>) for a setting (N4), and
+        # (runner, <owner>/<repo>, <runner name>) for a runner (N6)
+        self.value = more.get("value")
 
     def __repr__(self):
         return f"Decision({self.kind}, {self.why!r})"
@@ -129,7 +131,7 @@ def decide(access, agent, target, op, args, content=None, lookups=None):
     never = access.get("never") or {}
     kind, _, name = target.partition(":")
     if not name:
-        return decide_host(access, agent, me, target, op, args, never, content)
+        return decide_host(access, agent, me, target, op, args, never, content, lookups or {})
     if kind in ("commit", "deploy", "gitops"):
         if vendor(name) or name.lower() in {r.lower() for r in never.get("repos") or []}:
             return refused(f"{name} is never a target of the door")
@@ -150,7 +152,7 @@ def decide(access, agent, target, op, args, content=None, lookups=None):
 
 # ---------------------------------------------------------------- hosts
 
-def decide_host(access, agent, me, host, op, args, never, content=None):
+def decide_host(access, agent, me, host, op, args, never, content=None, lookups=None):
     h = (access.get("hosts") or {}).get(host)
     if h is None or host in (never.get("hosts") or []):
         return refused(f"{host} is no host of the door" if h is None else f"{host} is never a target of the door")
@@ -185,6 +187,15 @@ def decide_host(access, agent, me, host, op, args, never, content=None):
                 return refused(f"no key of yours is saved for the door as {name}: ask the owner for it with "
                                f"request_secret, with door {name}", **common)
             value = ("key", name)
+    elif op == "runner-new":        # N6: only the repository that the door made for this app, by its own record
+        if content:
+            return refused("runner-new takes no content: the door sends its tokens", **common)
+        mine = [r for r in ((lookups or {}).get("made_app") or (lambda app: []))(checked[0])
+                if isinstance(r, dict) and r.get("agent") == agent and REPO.fullmatch(str(r.get("repo")))]
+        if len(mine) != 1:
+            return refused(f"the door made no repository {checked[0]} for this agent, so it makes no runner for it",
+                           **common)
+        value = ("runner", mine[0]["repo"], re.sub(r"[^a-z0-9-]", "-", f"{host}-{checked[0]}")[:64])
     elif op in HOST_CONTENT and not content:
         return refused(f"{op} takes its bytes as the call's content", **common)
     f = OPS_ROOT.FORMS[op]
@@ -218,7 +229,7 @@ DEPLOY_CONTRACT = (
     "<artifact>.tar.gz.sha256, the output of sha256sum for it. The deploy job runs on the app's own runner, downloads "
     "that artifact and gives it to the release helper, which checks its SHA-256, unpacks it as current and restarts "
     "the app's unit. The app listens on 127.0.0.1 at the port in PORT, reads its settings from its environment, and "
-    "its health path answers 200 with RELEASE_SHA, the commit's sha, in its body. Every other job runs on GitHub's "
+    "its health path answers 200 with APP_RELEASE_SHA, the commit's sha, in its body. Every other job runs on GitHub's "
     "runners (ubuntu-latest), with no job-level uses, no secret but GITHUB_TOKEN, no id-token write, and no trigger "
     "pull_request_target or workflow_run. The door commits each workflow as JSON, which GitHub reads as YAML.")
 DOWNLOAD = (
@@ -295,7 +306,8 @@ def workflow_problem(path, workflow, app):
     if path == DEPLOY_PATH:
         env = workflow.get("env") if isinstance(workflow.get("env"), dict) else {}
         artifact = env.get("ARTIFACT")
-        if not isinstance(artifact, str) or not ARTIFACT.fullmatch(artifact) or workflow != deploy_workflow(app, artifact):
+        if not isinstance(artifact, str) or not ARTIFACT.fullmatch(artifact) or \
+                workflow != deploy_workflow(app, artifact):
             return (f"{DEPLOY_PATH} is the product's deploy workflow, with only the app's name and the artifact's "
                     f"name filled in: `ops commit:<owner>/{app} deploy-template <artifact>` gives its text")
         return None

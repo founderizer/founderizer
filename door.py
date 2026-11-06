@@ -462,6 +462,31 @@ class Door:
             raise Refused(f"{name} names a key that the door uses for something else: it goes in no app")
         return self.secret(ref).encode()
 
+    def runner_input(self, access, value):
+        """What runner-new sends on the host's stdin (new-projects plan N6): a registration token and a remove token
+        of the repository that the door made, from a token of the door's own for that one call, the repository's
+        address, the runner's name, and the runner's latest release with the SHA-256 that GitHub publishes for it."""
+        _, full, name = value
+        owner = full.split("/")[0]
+        conf = dict(github_app(access, owner) or {}, owner=owner)
+        if not conf.get("app_id") or not conf.get("secret"):
+            raise Refused(f"the door has no App of {owner}")
+        ctx = {"credentials": conf, "http": self.http, "secret": self.secret}
+        _, token = door_providers.one_call(conf, ctx, full, door_providers.RUNNER_TOKENS)
+        got = {}
+        for kind in ("registration", "remove"):
+            status, answer = door_providers.gh(ctx, token, "POST", f"/repos/{full}/actions/runners/{kind}-token")
+            if status != 201 or not isinstance(answer, dict) or not isinstance(answer.get("token"), str):
+                raise door_providers.Stop(f"GitHub gave no {kind} token of {full} ({status})")
+            got[kind] = answer["token"]
+        status, release = self.http("GET", door_providers.RUNNER_RELEASE, {"Accept": "application/vnd.github+json"},
+                                    None)
+        if status != 200 or not isinstance(release, dict):
+            raise door_providers.Stop(f"GitHub gave no release of the runner ({status})")
+        version, sums = door_providers.runner_release(release)
+        return json.dumps({"token": got["registration"], "remove": got["remove"], "url": f"https://github.com/{full}",
+                           "name": name, "version": version, "sha256": sums}).encode()
+
     def minted(self, key_id):
         return key_id in read_json(MINTED_FILE, {})
 
@@ -603,9 +628,13 @@ class Door:
         """What a decision runs: a host form through its second sshd, or a provider's plan. A write on one host waits
         for the one before it, and a reboot-class call holds its business until the host answers again. A repo-new or
         a repo-delete holds its repository's lock (new-projects plan N3)."""
-        repo = ((d.plan or {}).get("repo_new") or (d.plan or {}).get("repo_delete") or {}).get("name")
+        repo = ((d.plan or {}).get("repo_new") or (d.plan or {}).get("repo_delete") or {}).get("name") or \
+            (d.value[1] if d.value and d.value[0] == "runner" else None)
         if repo:
             with self.held(self.repo_locks, repo.lower()):
+                if d.host and d.write:          # runner-new (N6): its repository's lock, then its host's
+                    with self.held(self.host_locks, d.host):
+                        return self.act(access, d, op, args, content)
                 return self.act(access, d, op, args, content)
         if d.host and d.write:
             with self.held(self.host_locks, d.host):
@@ -629,7 +658,7 @@ class Door:
             if stdin is not None:       # ops-root installs only the bytes that have the request's sha256
                 req["sha256"] = hashlib.sha256(stdin).hexdigest()
             if d.value:
-                stdin = self.setting(access, d.value)
+                stdin = self.runner_input(access, d.value) if d.value[0] == "runner" else self.setting(access, d.value)
             status, out = self.ssh(access["hosts"][d.host], req, stdin)
             if status == 3:
                 raise Refused(out.strip().removeprefix("refused: "))
@@ -656,7 +685,9 @@ class Door:
         state of the default branch, a repository's default branch."""
         kind, _, repo = target.partition(":") if isinstance(target, str) else ("", "", "")
         facts = {"minted": self.minted, "default_branch": lambda name: GitHub(self, access, name).branch(),
-                 "made_repo": lambda name: self.repo_record("made", name)}
+                 "made_repo": lambda name: self.repo_record("made", name),
+                 "made_app": lambda app: [r for r in (read_json(REPOS_FILE, {}).get("made") or {}).values()
+                                          if isinstance(r, dict) and r.get("app") == app]}
         if kind not in ("commit", "gitops", "deploy") or not door_targets.REPO.fullmatch(repo):
             return facts
         hub = GitHub(self, access, repo)
