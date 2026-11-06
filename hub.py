@@ -30782,6 +30782,8 @@ def door_view():
     app = None
     with contextlib.suppress(GitHubError):
         app = github_app()
+    with CENTRAL_LOCK:      # LOCK, then CENTRAL_LOCK, as vault_view takes them
+        status = CENTRAL["status"]
     return {"door": {"address": door["address"], "port": door.get("port", DOOR_PORT)} if door.get("address") else None,
             "credentials": {name: {"secret": c["secret"], "agents": list(c.get("agents") or [])}
                             for name, c in sorted((door.get("credentials") or {}).items())},
@@ -30792,7 +30794,11 @@ def door_view():
             "github_app": {"app_id": app[0], "path": os.path.abspath(app[1])} if app else None,
             "linked": door_conf() is not None,
             # plan 13, item 4: the Apps that the app made with GitHub's manifest flow, whose keys the door holds
-            "github_apps": dict(sorted((door.get("github_apps") or {}).items()))}
+            "github_apps": dict(sorted((door.get("github_apps") or {}).items())),
+            # plan 13, items 3 and 4: the key that the central vault holds pinned under the name door, to which alone
+            # the hub seals the door's keys, or null; the app pins the door's own when it is another or none
+            "vault_pin": central_pins(status).get(DOOR_PIN) if status is not None else None,
+            "vault_read": status is not None}
 
 
 DOOR_PENDING = {}   # {request_id: (token, record)} of one POST /ui/door/secrets: in memory only, never in a record

@@ -207,7 +207,7 @@ def cloudflare(access, agent, account, op, args, content, lookups):
         if args[0] in (account_of(access, "cloudflare", account).get("judged_tunnels") or []):
             return refused("that tunnel is judged: use change")
         return Decision("rule", "a new tunnel hostname with the host's own origin", target=f"cloudflare:{account}",
-                        plan={"provider": "cloudflare", "account": account, "steps": [
+                        plan={"provider": "cloudflare", "account": account, "tunnel": args[0], "steps": [
                             step("GET", f"/accounts/{{account_id}}/cfd_tunnel/{args[0]}/configurations",
                                  keep="ingress"),
                             step("PUT", f"/accounts/{{account_id}}/cfd_tunnel/{args[0]}/configurations",

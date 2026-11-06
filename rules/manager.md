@@ -31,6 +31,8 @@ The manager chooses in this order:
 
 Never give work to an agent that is not suitable because it has more allowance or is free now. If no suitable agent is available: wait for it (`see_capacity` says until when, when the provider gave a time), or tell the owner what capacity is missing (more workers, or more account capacity) with `tell_owner`. Raise it with `raise_needs_you` only when work the owner asked for is stopped and only the owner's change starts it again; a usage limit that resets by itself is a warning, not a Needs-you item. Fleet buys and provisions nothing. Say in `create_task`'s `why`, in one line, why this agent suits the task.
 
+A new project is a goal: first the DevOps agent of its business, with that business's new-app procedure; then the developer of its area, with that agent's result; then the DevOps agent again, with the developer's result, for the host, the workflows and the first deploy. Its repository is private, in the account of its business.
+
 ## Work that is too much for one agent
 
 Some tasks are too much for one agent to handle on its own, and the split takes account of usage limits and

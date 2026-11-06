@@ -413,7 +413,7 @@ class Door:
         self.clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
         self.record = Record()
         self.lock = threading.Lock()
-        self.host_locks, self.business_locks, self.repo_locks = {}, {}, {}
+        self.host_locks, self.business_locks, self.repo_locks, self.tunnel_locks = {}, {}, {}, {}
         self.access_cache = (None, None)
         self.aws_sessions = {}          # each AWS role's session of an hour, in memory only (door_providers.aws_session)
 
@@ -627,7 +627,12 @@ class Door:
     def run(self, agent, access, d, op, args, content):
         """What a decision runs: a host form through its second sshd, or a provider's plan. A write on one host waits
         for the one before it, and a reboot-class call holds its business until the host answers again. A repo-new or
-        a repo-delete holds its repository's lock (new-projects plan N3)."""
+        a repo-delete holds its repository's lock (new-projects plan N3), runner-new its repository's and then its
+        host's (N6), and a tunnel route its tunnel's (N7)."""
+        tunnel = (d.plan or {}).get("tunnel")
+        if tunnel:          # N7: a tunnel's whole configuration, which a route reads and writes, one call at a time
+            with self.held(self.tunnel_locks, tunnel.lower()):
+                return self.act(access, d, op, args, content)
         repo = ((d.plan or {}).get("repo_new") or (d.plan or {}).get("repo_delete") or {}).get("name") or \
             (d.value[1] if d.value and d.value[0] == "runner" else None)
         if repo:

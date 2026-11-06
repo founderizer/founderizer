@@ -44,7 +44,7 @@ VENDOR_REPOS = ("miguelpieras/founderizer-fleet", "miguelpieras/founderizer-web"
 DOOR_ONLY = {"self-update", "place", "pro-attach", "runner-register"}
 # Host forms whose content goes to the host on stdin, with its sha256 (the judge reads it first), and the forms whose
 # value the door itself sends there (new-projects plan N4): never the caller's.
-HOST_CONTENT = ("file", "unit-new")
+HOST_CONTENT = ("file", "unit-new", "vhost-new")
 DOOR_VALUE = ("env-new", "env-add")
 TARGET = re.compile(r"[a-z0-9][a-z0-9.-]{0,62}|[a-z]+:[A-Za-z0-9][A-Za-z0-9._/-]{0,99}")
 REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")

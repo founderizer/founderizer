@@ -374,6 +374,7 @@ CHECKS = {
     "env-new": lambda a: check_env(a, "env-new"),
     "env-add": lambda a: check_env(a, "env-add"),
     "runner-new": lambda a: [check_app_name(one(a, "runner-new", "the app's name"))],
+    "vhost-new": lambda a: [check_app_name(one(a, "vhost-new", "the app's name"))],
 }
 
 
@@ -861,7 +862,7 @@ def account_exists(name):
 
 
 def ports_taken():
-    "The TCP ports that something listens on, and the port of every app's settings."
+    "The TCP ports that something listens on, and the ports of every app's settings: its own and its vhost's."
     status, out = run(["ss", "-ltnH"], timeout=30)
     if status != 0:
         raise Failed("ss could not list the listeners")
@@ -874,7 +875,8 @@ def ports_taken():
         for entry in os.listdir(P(APPS)):
             with contextlib.suppress(OSError, ValueError, TypeError, KeyError):
                 with open(P(f"{APPS}/{entry}")) as f:
-                    taken.add(int(json.load(f)["port"]))
+                    got = json.load(f)
+                taken |= {int(got[k]) for k in ("port", "vhost_port") if k in got}
     return taken
 
 
@@ -1370,6 +1372,193 @@ def do_runner_new(req, data):
         with contextlib.suppress(OSError):
             os.remove(archive)
     return f"{given['name']} runs as {user} ({unit}), with the labels self-hosted, linux, {arch} and {app}"
+
+
+# ---- the app's vhost (new-projects plan N7)
+#
+# vhost-new <app> installs /etc/nginx/sites-available/<app> and its link in sites-enabled, judged, once code has read
+# it. It holds server blocks only. It listens only on 127.0.0.1 and [::1], at one port of its own that is not 80, 443
+# or the app's own port, and that no listener and no other app has. No other vhost serves its server_name. It sends
+# requests only to the app's own port on loopback, serves files only from the app's own tree, includes only nginx's
+# own snippets, and writes logs only to /var/log/nginx, because nginx opens those files as root. Then the judge reads
+# it. nginx -t must pass with no warning that was not there before, and nginx reloads. The two folders' immutable bit
+# goes back as it was in a finally block, and a step that fails takes the vhost back, so nginx stays as it was. The
+# tunnel then sends the app's hostname to that port (cloudflare tunnel-route).
+
+NGINX = "/etc/nginx"
+VHOST_MAX = 64 * 1024
+VHOST_REFUSED = ("fastcgi_pass", "uwsgi_pass", "scgi_pass", "grpc_pass", "memcached_pass", "proxy_store",
+                 "load_module", "include_by_lua", "perl", "perl_modules", "perl_require", "js_import", "js_include",
+                 "js_path", "js_content", "js_set", "upstream", "map", "geo", "split_clients")
+VHOST_PATHS = ("client_body_temp_path", "proxy_temp_path", "fastcgi_temp_path", "uwsgi_temp_path",
+               "scgi_temp_path", "auth_basic_user_file", "ssl_certificate", "ssl_certificate_key",
+               "ssl_trusted_certificate", "ssl_client_certificate", "ssl_dhparam", "ssl_password_file")
+VHOST_TOKEN = re.compile(r'#[^\n]*|"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|[{};]|[^\s{};"\']+')
+HOSTNAME = re.compile(r"(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
+
+
+def nginx_directives(text):
+    """[(name, args, blocks)] of every directive of an nginx text, at any depth, where blocks names the blocks that
+    hold it; None when its braces or semicolons do not close. Quotes are taken off the arguments."""
+    out, words, stack = [], [], []
+    for token in VHOST_TOKEN.findall(text):
+        if token.startswith("#"):
+            continue
+        if token in (";", "{"):
+            if not words:
+                return None
+            out.append((words[0], [w[1:-1] if w[:1] in "\"'" else w for w in words[1:]], tuple(stack)))
+            if token == "{":
+                stack.append(words[0])
+            words = []
+        elif token == "}":
+            if words or not stack:
+                return None
+            stack.pop()
+        else:
+            words.append(token)
+    return out if not words and not stack else None
+
+
+def vhost_problem(app, text, port):
+    """(problem, vhost port, server names): the first thing that code refuses in an app's vhost, or None."""
+    directives = nginx_directives(text)
+    if directives is None or re.search(r"[\x00-\x08\x0b-\x1f\x7f]", text):
+        return "the vhost does not parse: each directive ends with ; and each block closes", None, []
+    tree, ports, names = f"{WWW}/{app}", set(), []
+    for name, args, blocks in directives:
+        if not blocks and name != "server":
+            return f"the vhost holds server blocks only, and {name} is not one", None, []
+        if name in VHOST_REFUSED or name.startswith(("perl", "js_", "lua_")) or "_by_lua" in name:
+            return f"{name} is not a directive of an app's vhost", None, []
+        if any("$" in a for a in args) and name in ("proxy_pass", "root", "alias", "include", "access_log",
+                                                     "error_log", *VHOST_PATHS):
+            return f"{name} names its target with no variable", None, []
+        if name == "listen":
+            found = re.fullmatch(r"(127\.0\.0\.1|\[::1\]):([1-9][0-9]{0,4})", args[0]) if len(args) == 1 else None
+            if not found:
+                return "the vhost listens only on 127.0.0.1:<port> and [::1]:<port>, with nothing more", None, []
+            ports.add(int(found.group(2)))
+        elif name == "server_name":
+            names += args
+        elif name == "proxy_pass":
+            if len(args) != 1 or not re.fullmatch(rf"http://(127\.0\.0\.1|\[::1\]|localhost):{port}(/[^\s]*)?",
+                                                  args[0]):
+                return f"proxy_pass sends requests only to the app's own port, http://127.0.0.1:{port}", None, []
+        elif name in ("root", "alias"):
+            if len(args) != 1 or os.path.normpath(args[0]) != args[0].rstrip("/") or \
+                    not (args[0] + "/").startswith(tree + "/"):
+                return f"{name} serves files from {tree} only", None, []
+        elif name == "include":
+            if len(args) != 1 or not (args[0] in (f"{NGINX}/proxy_params", f"{NGINX}/mime.types") or
+                                      re.fullmatch(rf"{NGINX}/snippets/[A-Za-z0-9._-]+\.conf", args[0])):
+                return "include takes nginx's own proxy_params, mime.types or a file of its snippets", None, []
+        elif name in ("access_log", "error_log"):
+            if not args or not (args[0] == "off" or re.fullmatch(r"/var/log/nginx/[A-Za-z0-9._-]+", args[0])):
+                return f"{name} writes to /var/log/nginx only, or is off", None, []
+        elif name in VHOST_PATHS:
+            return f"{name} names a file that nginx opens as root, which an app's vhost does not", None, []
+    if len(ports) != 1:
+        return "the vhost listens on one port of its own, on 127.0.0.1 and [::1]", None, []
+    vport = ports.pop()
+    if vport in (80, 443, port) or not 1024 <= vport <= 65535:
+        return (f"the vhost's port is a port of its own from 1024 to 65535: never 80, 443 or the app's own port "
+                f"{port}"), None, []
+    hostnames = [n.lower() for n in names if n != "_"]
+    if not hostnames or not all(HOSTNAME.fullmatch(n) for n in hostnames):
+        return "server_name names the app's hostnames, like app.example.com", None, []
+    return None, vport, hostnames
+
+
+def served_names(skip):
+    "The server_name of every other vhost that nginx reads: sites-enabled and conf.d."
+    names = set()
+    for folder, pattern in ((f"{NGINX}/sites-enabled", "*"), (f"{NGINX}/conf.d", "*.conf")):
+        with contextlib.suppress(OSError):
+            for entry in sorted(os.listdir(P(folder))):
+                if entry == skip or not fnmatch.fnmatchcase(entry, pattern):
+                    continue
+                for name, args, _ in nginx_directives(read(f"{folder}/{entry}")) or []:
+                    if name == "server_name":
+                        names |= {a.lower() for a in args}
+    return names
+
+
+def immutable(path):
+    "True when the folder has its immutable bit (lsattr -d), which a write must lift first and set back after."
+    status, out = run(["lsattr", "-d", P(path)], timeout=30)
+    return status == 0 and "i" in (out.split() or [""])[0]
+
+
+def nginx_warnings():
+    "(status, output, the warning lines) of nginx -t."
+    status, out = run(["nginx", "-t"], timeout=120)
+    return status, out, {line.strip() for line in out.splitlines() if "[warn]" in line or "[emerg]" in line}
+
+
+@form("vhost-new", kind="judged", window="restart", help="an app's nginx vhost on a loopback port of its own: <app>, "
+                                                         "the vhost on stdin with its sha256, on a fix host only")
+def do_vhost_new(req, data):
+    app = req["args"][0]
+    n = app_names(app)
+    try:
+        settings = json.loads(read(n["settings"]))
+        port = int(settings["port"])
+    except (ValueError, TypeError, KeyError):
+        raise Refused(f"{app} is no app of this host: app-new makes it first") from None
+    if data is None or len(data) > VHOST_MAX:
+        raise Refused(f"vhost-new takes the vhost on stdin, at most {VHOST_MAX // 1024} KiB")
+    if not SHA256.fullmatch(str(req.get("sha256") or "")) or hashlib.sha256(data).hexdigest() != req["sha256"]:
+        raise Refused("the bytes do not have the request's sha256")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refused("the vhost is UTF-8 text") from None
+    problem, vport, hostnames = vhost_problem(app, text, port)
+    if problem:
+        raise Refused(problem)
+    available, enabled = f"{NGINX}/sites-available/{app}", f"{NGINX}/sites-enabled/{app}"
+    if os.path.lexists(P(available)) or os.path.lexists(P(enabled)) or "vhost_port" in settings:
+        raise Refused(f"{app} has a vhost already: vhost-new installs a new one only")
+    if vport in ports_taken():
+        raise Refused(f"something listens on port {vport}, or another app has it")
+    taken = sorted(set(hostnames) & served_names(app))
+    if taken:
+        raise Refused(f"another vhost serves {taken[0]} already")
+    status, out, before = nginx_warnings()
+    if status != 0:
+        raise Refused("nginx -t fails before this vhost, so nothing is installed:\n" + out[-2000:])
+    folders = [f"{NGINX}/sites-available", f"{NGINX}/sites-enabled"]
+    held = [f for f in folders if immutable(f)]
+    made = []
+    try:
+        for folder in held:
+            checked(run(["chattr", "-i", P(folder)], timeout=30), None)
+        replace(available, data, 0o644)
+        made.append(available)
+        os.symlink(available, P(enabled))
+        made.append(enabled)
+        status, out, after = nginx_warnings()
+        if status != 0 or after - before:
+            raise Refused("nginx -t did not pass with no new warning, and the vhost is taken back:\n" + out[-2000:])
+        replace(n["settings"], (json.dumps(dict(settings, vhost_port=vport), sort_keys=True) + "\n").encode(),
+                0o644)
+        made.append("settings")
+        checked(systemctl("reload", "nginx"), None)
+    except (Refused, Failed, OSError) as e:
+        if "settings" in made:
+            replace(n["settings"], (json.dumps(settings, sort_keys=True) + "\n").encode(), 0o644)
+        for path in reversed([p for p in made if p != "settings"]):
+            with contextlib.suppress(OSError):
+                os.remove(P(path))
+        if isinstance(e, Refused):
+            raise
+        raise Failed(f"vhost-new stopped, and it took the vhost back: {e}") from None
+    finally:
+        for folder in held:
+            run(["chattr", "+i", P(folder)], timeout=30)
+    return (f"{app}'s vhost serves {', '.join(hostnames)} on 127.0.0.1:{vport} and [::1]:{vport}: "
+            f"tunnel-route sends the hostname there")
 
 # ---------------------------------------------------------------- what the forms share
 
