@@ -8823,7 +8823,15 @@ def vault_view(t0=None):
     central pin and what keeps the reconciler from it; and what each machine's vault holds by the hub's own records.
     No call to the vault and never a value. It names no path: the app installs the vault from the root-owned clone at
     its one fixed place (hubsetup.ROOT_KIT), never from a folder that the hub names (DevOps plan V2). Called with LOCK
-    held."""
+    held.
+
+    program: the SHA-256 of the vault.py of the release this hub runs (vault_source), or None. The central vault's
+    status names the program it runs as its `source`; where the two differ, the owner's app brings the vault up to
+    date by itself, with the root step of its install (kit-clone, then central-vault), as a machine's server service
+    brings its broker up to date. Nothing here can make root run another program: kit-clone takes only a release that
+    a release key signed, and never an older one. hub: the machine of the central vault, which is the hub's own
+    (team.json hub.machine), its address and how the fleet reaches it (its access record, or None): the app runs that
+    root step there, and no agent need run on that machine for the app to find it."""
     t0 = t0 or now()
     with CENTRAL_LOCK:
         status, read_at, error = CENTRAL["status"], CENTRAL["read_at"], CENTRAL["error"]
@@ -8836,8 +8844,12 @@ def vault_view(t0=None):
         machines.append({"machine": name, "carrier": m["carrier"], "broker_recipient": key, "pinned": pinned,
                          "matches": pinned is not None and pinned == key, "missing": missing})
     held = dict({m["machine"]: [] for m in machines}, **central_held(None if status is None else pins))
+    own = (TEAM.get("hub") or {}).get("machine")
+    ways = (TEAM.get("access") or {}).get(own) or {}
+    reach = {"machine": own, "address": (TEAM.get("addresses") or {}).get(own),
+             "ssh": {"user": ways["ssh_user"], "port": ways.get("ssh_port", 22)} if ways.get("ssh_user") else None}
     return {"fleet": fleet_id(), "central": status, "read_at": read_at, "error": error, "machines": machines,
-            "held": held}
+            "held": held, "program": vault_source(kit_revision()), "hub": reach if own else None}
 
 
 def central_intake(ref, text):

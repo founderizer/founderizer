@@ -406,6 +406,10 @@ object: `{"ok": true, "recipient", "store_recipient", "fleet"}`, or `{"ok": fals
 **Running the two again is how it is updated**: `kit-clone` takes the newer signed release,
 and `central-vault` reads first in each step, starts the service again only when something
 changed, and never replaces a key, the store or the owner's statements that are there. The
+owner's app runs them again by itself when the program that the vault runs is not the
+`vault.py` of the hub's release (UI-API.md, version 1.87). In root's clone of a hub installed
+before the key change of 4 November 2026, which has no `early-key.pub`, it first writes its own
+release keys into `release-key.pub`, so that the clone's own `kit-clone` can check the release. The
 owner's key is the one exception: each run writes the key it is given as the only one, so a
 run from a new Mac replaces the key of a lost one. Root on this machine is the owner's own
 authority, and that is why this is a root step.
