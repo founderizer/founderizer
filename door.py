@@ -639,6 +639,8 @@ class Door:
         plan = d.plan
         if plan.get("provider"):
             return door_providers.execute(plan, self.provider_ctx(access, d.target))
+        if "text" in plan:              # a text that the door gives, such as the product's deploy workflow (N5)
+            return plan["text"]
         hub = GitHub(self, access, plan["repo"])
         if "files" in plan:
             return hub.commit(plan)

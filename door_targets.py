@@ -134,7 +134,7 @@ def decide(access, agent, target, op, args, content=None, lookups=None):
         if vendor(name) or name.lower() in {r.lower() for r in never.get("repos") or []}:
             return refused(f"{name} is never a target of the door")
         if kind == "commit":
-            return decide_commit(access, me, name, op, args, content, lookups or {})
+            return decide_commit(access, agent, me, name, op, args, content, lookups or {})
         if kind == "deploy":
             return decide_deploy(access, me, name, op, args, lookups or {})
         return decide_gitops(access, me, name, op, args, content, lookups or {})
@@ -196,6 +196,165 @@ def decide_host(access, agent, me, host, op, args, never, content=None):
     return Decision("rule" if f["write"] else "read", f"{op} is a rule call", **more)
 
 
+# ---------------------------------------------------------------- workflow files (new-projects plan N5)
+#
+# The developer of a repository that the door made holds write, and GitHub refuses a push with write that changes
+# .github/workflows on any branch. So those files come only through the door, for the Operator that made the
+# repository, by the door's own record and not by the hub's grants. The door reads each workflow as JSON, which GitHub
+# reads as YAML too, so that its checks see what GitHub runs, and it commits its own serialization of what it checked.
+# The deploy workflow is the product's template with the app's name and the artifact's name. Every other job runs on
+# GitHub's runners, with no job-level uses, no secret but GITHUB_TOKEN, no id-token write, and no trigger
+# pull_request_target or workflow_run. With these checks, such a commit is a rule call.
+
+WORKFLOW = re.compile(r"\.github/workflows/[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.ya?ml")
+DEPLOY_PATH = ".github/workflows/deploy.yml"
+ARTIFACT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+GITHUB_RUNNERS = ("ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04")
+WORKFLOW_KEYS = {"name", "run-name", "on", "permissions", "env", "defaults", "concurrency", "jobs"}
+REFUSED_TRIGGERS = ("pull_request_target", "workflow_run")
+DEPLOY_CONTRACT = (
+    "The deploy workflow runs after each green run of the workflow named CI for a push to the default branch. That "
+    "run uploads one artifact named <artifact> that holds <artifact>.tar.gz, the tree of the release, and "
+    "<artifact>.tar.gz.sha256, the output of sha256sum for it. The deploy job runs on the app's own runner, downloads "
+    "that artifact and gives it to the release helper, which checks its SHA-256, unpacks it as current and restarts "
+    "the app's unit. The app listens on 127.0.0.1 at the port in PORT, reads its settings from its environment, and "
+    "its health path answers 200 with RELEASE_SHA, the commit's sha, in its body. Every other job runs on GitHub's "
+    "runners (ubuntu-latest), with no job-level uses, no secret but GITHUB_TOKEN, no id-token write, and no trigger "
+    "pull_request_target or workflow_run. The door commits each workflow as JSON, which GitHub reads as YAML.")
+DOWNLOAD = (
+    'set -euo pipefail\n'
+    'dir="$RUNNER_TEMP/release-$RUN_ID"\n'
+    'rm -rf "$dir" && mkdir -p "$dir"\n'
+    'list="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?name=$ARTIFACT"\n'
+    'url=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$list" | '
+    'python3 -c \'import json, sys; a = [x for x in json.load(sys.stdin)["artifacts"] if not x["expired"]]; '
+    'print(a[0]["archive_download_url"] if len(a) == 1 else "")\')\n'
+    'test -n "$url"\n'
+    'curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -o "$dir/artifact.zip" "$url"\n'
+    'python3 -c \'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])\' "$dir/artifact.zip" '
+    '"$dir"\n')
+
+
+def deploy_workflow(app, artifact):
+    """The product's deploy workflow: after a green CI run of a push to the default branch, it downloads that run's
+    artifact on the app's own runner and gives it to the release helper. It checks out nothing and runs no action."""
+    run = "${{ github.event.workflow_run.id }}"
+    folder = "$RUNNER_TEMP/release-$RUN_ID/$ARTIFACT.tar.gz"
+    return {
+        "name": "Deploy",
+        "on": {"workflow_run": {"workflows": ["CI"], "types": ["completed"]}},
+        "permissions": {"actions": "read"},
+        "concurrency": {"group": "deploy", "cancel-in-progress": False},
+        "env": {"APP": app, "ARTIFACT": artifact},
+        "jobs": {"deploy": {
+            "if": "github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && "
+                  "github.event.workflow_run.head_branch == github.event.repository.default_branch && "
+                  "github.event.workflow_run.head_repository.full_name == github.repository",
+            "runs-on": ["self-hosted", app],
+            "timeout-minutes": 30,
+            "steps": [
+                {"name": "Download the artifact of the CI run",
+                 "env": {"GH_TOKEN": "${{ github.token }}", "RUN_ID": run}, "run": DOWNLOAD},
+                {"name": "Release it",
+                 "env": {"RUN_ID": run, "SHA": "${{ github.event.workflow_run.head_sha }}"},
+                 "run": f'sudo -n "/usr/local/sbin/$APP-deploy" deploy "{folder}" "{folder}.sha256" "$SHA"\n'}]}}}
+
+
+def canonical(workflow):
+    "The bytes that the door commits for a workflow that it checked: JSON, which GitHub reads as YAML."
+    return (json.dumps(workflow, indent=2, ensure_ascii=False) + "\n").encode()
+
+
+def secret_use(node, key=None):
+    """The first use of a secret other than GITHUB_TOKEN: in a ${{ }} expression, in an if (an expression with no
+    marks), or a secrets key (a called workflow's or a trigger's)."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "secrets":
+                return "a secrets key"
+            found = secret_use(v, k)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for v in node:
+            found = secret_use(v, key)
+            if found:
+                return found
+    elif isinstance(node, str):
+        for text in re.findall(r"\$\{\{(.*?)\}\}", node, re.S) + ([node] if key == "if" else []):
+            if re.search(r"\bsecrets\b", re.sub(r"\bsecrets\s*\.\s*GITHUB_TOKEN\b", "", text, flags=re.I), re.I):
+                return f"the secret in {text.strip()[:80]!r}"
+    return None
+
+
+def workflow_problem(path, workflow, app):
+    """What code refuses in one workflow file of a repository that the door made, or None."""
+    jobs = workflow.get("jobs") if isinstance(workflow, dict) else None
+    if not isinstance(jobs, dict) or not jobs or not all(isinstance(j, dict) for j in jobs.values()):
+        return f"{path} is a workflow: an object with its jobs, each an object"
+    if path == DEPLOY_PATH:
+        env = workflow.get("env") if isinstance(workflow.get("env"), dict) else {}
+        artifact = env.get("ARTIFACT")
+        if not isinstance(artifact, str) or not ARTIFACT.fullmatch(artifact) or workflow != deploy_workflow(app, artifact):
+            return (f"{DEPLOY_PATH} is the product's deploy workflow, with only the app's name and the artifact's "
+                    f"name filled in: `ops commit:<owner>/{app} deploy-template <artifact>` gives its text")
+        return None
+    if set(workflow) - WORKFLOW_KEYS:
+        return f"{path}: {sorted(set(workflow) - WORKFLOW_KEYS)[0]} is not a key of a workflow"
+    on = workflow.get("on")
+    triggers = [on] if isinstance(on, str) else list(on) if isinstance(on, (list, dict)) else None
+    if not triggers or not all(isinstance(t, str) for t in triggers):
+        return f"{path}: on names the workflow's triggers"
+    for trigger in triggers:
+        if trigger in REFUSED_TRIGGERS:
+            return f"{path}: no workflow of a repository that the door made has the trigger {trigger}"
+    asks = [("the workflow", workflow.get("permissions"))] + [(f"the job {k}", j.get("permissions"))
+                                                              for k, j in jobs.items()]
+    for where, permissions in asks:
+        if permissions == "write-all" or (isinstance(permissions, dict) and permissions.get("id-token") == "write"):
+            return f"{path}: {where} asks for id-token write, which no workflow of a repository that the door made has"
+    for name, job in jobs.items():
+        if "uses" in job:
+            return f"{path}: the job {name} calls a workflow with uses, which the door does not read"
+        if job.get("runs-on") not in GITHUB_RUNNERS and job.get("runs-on") not in [[r] for r in GITHUB_RUNNERS]:
+            return (f"{path}: the job {name} runs on one of GitHub's runners ({', '.join(GITHUB_RUNNERS)}): only "
+                    f"the deploy workflow runs on the app's own runner")
+    found = secret_use(workflow)
+    if found:
+        return f"{path}: {found}: a repository that the door made has no secret but GITHUB_TOKEN"
+    return None
+
+
+def decide_workflows(repo, made, files, message):
+    """A commit of workflow files only, for the Operator that made the repository through the door."""
+    app, target, out = made.get("app") or repo.split("/", 1)[1], f"commit:{repo}", []
+    for path, data, mode in files:
+        if data is None:
+            out.append((path, None, mode))
+            continue
+        try:
+            workflow = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            return refused(f"{path}: the door reads a workflow as JSON, which GitHub reads as YAML too. Write it as "
+                           f"JSON, with the same keys", target=target)
+        why = workflow_problem(path, workflow, app)
+        if why:
+            return refused(why, target=target)
+        out.append((path, canonical(workflow), "100644"))
+    return Decision("rule", "workflow files of a repository that the door made, checked by code", target=target,
+                    plan={"repo": repo, "files": out, "message": message, "branch": None})
+
+
+def decide_template(repo, made, args):
+    if len(args) != 1 or not ARTIFACT.fullmatch(args[0]):
+        return refused("deploy-template takes the artifact's name: letters, digits, dots, hyphens and underscores")
+    app = made.get("app") or repo.split("/", 1)[1]
+    text = canonical(deploy_workflow(app, args[0])).decode()
+    return Decision("read", "the product's deploy workflow", target=f"commit:{repo}", write=False,
+                    plan={"text": json.dumps({"path": DEPLOY_PATH, "text": text, "contract": DEPLOY_CONTRACT},
+                                             indent=2)})
+
+
 # ---------------------------------------------------------------- commits
 
 def repo_entry(me, name, kinds):
@@ -224,12 +383,25 @@ def commit_files(content):
         return None, "the content of a commit is {message, files: [{path, content (base64)} or {path, delete}]}"
 
 
-def decide_commit(access, me, repo, op, args, content, lookups):
+def decide_commit(access, agent, me, repo, op, args, content, lookups):
     """A commit that the door makes. devops: any file outside the commit rules and scripts/ is a rule call, and
     scripts/ is judged. app: a checked lockfile fix, a checked image, a replica count or a dated scan exception is a
-    rule call, and other paths are judged. gitops goes through gitops:<repo>."""
+    rule call, and other paths are judged. gitops goes through gitops:<repo>. The workflow files of a repository that
+    the door made go only through decide_workflows, for the agent that made it (N5)."""
+    made = (lookups.get("made_repo") or (lambda name: None))(repo)
+    mine = isinstance(made, dict) and made.get("agent") == agent
+    if op == "deploy-template":
+        return decide_template(repo, made, args) if mine else \
+            refused(f"{repo} is no repository that the door made for this agent", target=f"commit:{repo}")
     if op != "push":
         return refused("a commit target takes push, with the files as content")
+    if mine:
+        files, message = commit_files(content)
+        if files is not None and any(WORKFLOW.fullmatch(p) for p, _, _ in files):
+            if not all(WORKFLOW.fullmatch(p) and m == "100644" for p, _, m in files):
+                return refused("a commit of workflow files holds only workflow files (.github/workflows/<name>.yml, "
+                               "mode 100644), with no other file", target=f"commit:{repo}")
+            return decide_workflows(repo, made, files, message)
     entry = repo_entry(me, repo, ("devops", "app"))
     if entry is None:
         return refused(f"the door commits nothing on {repo} for this agent")
