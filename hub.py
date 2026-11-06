@@ -7805,7 +7805,9 @@ def t_raise_needs_you(agent, a):
         door = (" When the owner presses the first option in Founderizer on his Mac, it opens the Add device picture, "
                 "and his phone enrolls when it scans it: it then gets the phone's signed yes of door calls and a copy "
                 "of the recovery code (GET /ui/owner/devices: certified and recovery).")
-    return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{linked}{door}{picks}"
+    later = "" if qu else (" If nothing needs it any more before the owner answers, close it at once with "
+                           "withdraw_need.")
+    return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{linked}{later}{door}{picks}"
 
 
 def need_question(agent, ref):
@@ -7834,6 +7836,50 @@ def need_question(agent, ref):
         raise ToolError(f"N-{other['id']} already takes Q-{qid} to the owner: their answer goes to {qu['asker']} by "
                         f"itself.")
     return qu
+
+
+def t_withdraw_need(agent, a):
+    """withdraw_need (the manager): one open Needs-you item that this manager raised leaves the owner's Needs you,
+    because nothing in it is needed now: a plan change replaced it, the fix is live, or the work found another route.
+    The owner's plan of 6 November 2026 (B1): "An item that is no longer necessary leaves Needs you by itself, with its
+    reason." Before it only the owner could close an item, so a stale one stayed on his phone until he declined it: 18
+    of the first 36 needed nothing from him at the end.
+
+    No notification goes. The reason is the item's answer, where an answered item keeps the owner's words, and
+    answered_by names the manager, so the record says who closed it and why. An item that takes a question to the
+    owner closes when the question is answered, an item of a conversation is that person's answer, and a secret request
+    that tasks wait on closes with them or with the owner's answer: those three are refused here."""
+    nid = parse_id(a.get("need"), "Needs-you item")
+    why = str(a.get("why") or "").strip()
+    if not why:
+        raise ToolError("Say in why what made the item unnecessary: a plan change, a fix that is live, or another "
+                        "route. It stays in the item's record.")
+    guard(agent, why)
+    with LOCK, transaction():
+        need = DB.execute("SELECT * FROM needs WHERE id=?", (nid,)).fetchone()
+        if not need:
+            raise ToolError(f"There is no Needs-you item N-{nid}.")
+        if need["by"] != agent:
+            raise ToolError(f"N-{nid} is {need['by']}'s: only the agent that raised an item withdraws it.")
+        if need["answer"] is not None:
+            raise ToolError(f"N-{nid} is closed already: {clip(need['answer'], 200)}")
+        if need["question"]:
+            raise ToolError(f"N-{nid} takes Q-{need['question']} to the owner. Answer Q-{need['question']} with "
+                            f"answer instead, and N-{nid} closes by itself.")
+        if need["conversation"]:
+            raise ToolError(f"N-{nid} is a question of a conversation, and the person waits for its answer.")
+        waiters = [t for t in (need_secret(need) or {}).get("tasks") or []
+                   if DB.execute(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (t,)).fetchone()]
+        if waiters:
+            raise ToolError(f"{', '.join(tref(t) for t in waiters)} wait on N-{nid}: it closes with them, or with the "
+                            f"owner's answer.")
+        t0 = now()
+        DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
+                   (f"Withdrawn by {agent}: {why}", t0, agent, nid))
+        DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)",
+                   (t0, agent, f"withdrew N-{nid} {clip(need['title'] or '', 80)}: {clip(why, 240)}"))
+    return (f"Withdrew N-{nid}. It left the owner's Needs you with no notification, and its record keeps your reason. "
+            f"Raise a new item only when the owner must do or decide something now.")
 
 
 # ---------------------------------------------------------------- secret requests (owner feature secret_requests)
@@ -21121,7 +21167,10 @@ TOOLS = [
      "hub refuses an item whose own words say nothing is needed. Use rarely. When you ask the owner to choose, give "
      "the choices in options: they press one, and its words come back as the answer. Never ask for a key, a password "
      "or a token here: request_secret is how the value reaches the vault without passing you. Its title, why and "
-     "options are plain words with no codes (T-61, R-3).",
+     "options are plain words with no codes (T-61, R-3). Read before you raise: an item about a server, a version or "
+     "a deploy rests on a reading that is newer than the last change to it, made by you, by an agent that can read "
+     "it, or by the next run of its watch, and why says how old that reading is. Raise it only when that reading still "
+     "shows the problem. When an item of yours is not needed any more, withdraw_need closes it.",
      S({"title": STR, "why": STR,
         "what_to_do": {"type": "string", "description": "The one thing that only the owner can do or decide now. "
                                                         "If there is none, do not raise the item."},
@@ -21147,6 +21196,15 @@ TOOLS = [
                        "list says which phone lacks one). His first option, pressed in Founderizer on his Mac, opens "
                        "that picture, and his phone scans it. Give options whose first one is the yes."}},
        ["title", "why", "what_to_do"])),
+    ("manager", "withdraw_need", t_withdraw_need,
+     "Close an open Needs-you item that you raised and that nothing needs any more: a plan change replaced it, the "
+     "fix is live, or the work found another route. It leaves the owner's Needs you with no notification, and why "
+     "stays in its record as its answer. Do it as soon as you know, so the owner never answers an item that needs "
+     "nothing. An item that takes a question to the owner closes when you answer that question, and a secret request "
+     "that tasks wait on closes with them.",
+     S({"need": {"type": "string", "description": "The item, for example N-12"},
+        "why": {"type": "string", "description": "What made it unnecessary, in plain words"}},
+       ["need", "why"])),
     ("manager", "request_secret", t_request_secret,
      "Ask the owner for a secret that the fleet does not hold: an API key or a login. It is a Needs-you item that they "
      "answer in a secure form in Founderizer on their Mac, so the value goes straight into the vault and never "

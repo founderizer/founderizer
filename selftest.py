@@ -88,7 +88,8 @@ EVERY_AGENT = ["read_messages", "search_knowledge", "read_knowledge", "write_kno
                "join_report"]
 MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "answer", "check_result",
                                "decide_permission", "see_team", "see_capacity", "see_goals",
-                               "update_goal", "record_spend", "raise_needs_you", "request_secret", "tell_owner",
+                               "update_goal", "record_spend", "raise_needs_you", "withdraw_need", "request_secret",
+                               "tell_owner",
                                "message_owner", "grant_access",
                                "set_duty", "change_duty", "see_history", "decide_report",
                                # AUTONOMY.md P8: the one changer of the agents with no lead
