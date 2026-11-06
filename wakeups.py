@@ -707,12 +707,12 @@ def is_lines(check):
 def check_known(check):
     """True when this release reads a stored check (plan P0): the value form, which has no `form` and has the
     condition and the repeat rule that the hub decides a value with, or the line form of plan P4 (saved code with
-    "form": "lines"). A check of any other form reads as quiet: the hub opens no run of it and starts nothing from
-    it."""
+    "form": "lines", and since support plan F5 a file of checks/ pinned by its path and SHA-256). A check of any other
+    form reads as quiet: the hub opens no run of it and starts nothing from it."""
     if not isinstance(check, dict):
         return False
     if "form" in check:
-        return is_lines(check) and check.get("code") == "saved"
+        return is_lines(check) and (check.get("code") == "saved" or isinstance(check.get("path"), str))
     if "repeat_minutes" not in check:
         return False
     cond = check.get("condition")

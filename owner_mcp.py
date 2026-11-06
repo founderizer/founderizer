@@ -116,7 +116,7 @@ NOT_TOOLS = {
 FROM_THE_HUB = {
     "hub.CAPABILITIES": ("shell", "web", "browser", "screen"),
     "lifecycle.SWITCH_RUNTIMES": ("codex", "claude"),
-    "lifecycle.MCP_AUTH": ("none", "oauth", "key"),
+    "lifecycle.MCP_AUTH": ("none", "oauth", "key", "mint"),
     "lifecycle.REPO_ACCESS": ("read", "write", "deploy"),
     "hub.HISTORY_KINDS": ("conversation", "owner_chat", "message", "task", "result", "note", "question", "report",
                           "case", "step", "duty", "memory", "standing", "tool"),
@@ -872,7 +872,10 @@ MCP_ENTRY = {
     "description": "The server itself. title, and then either url (a remote server) or command with args (a program "
                    "on the agent's own machine) — never both. A url server with auth \"oauth\" gets its token from "
                    "the hub's Connect, which is the app's and not a tool here; one with auth \"key\" names in key an "
-                   "API key of the Secrets page. A command server has no auth, and env maps its own variable names "
+                   "API key of the Secrets page; one with auth \"mint\" names in key the API key whose login makes a "
+                   "token for each task session, in mint the path at that key's site that makes it, and in mint_field "
+                   "the field that names the task's case (the session never reads that key). A command server has no "
+                   "auth, and env maps its own variable names "
                    "to the names of API keys the agent reads. runtimes limits which runtimes load it. key and env "
                    "are names of keys, never a key.",
     "properties": {"title": {"type": "string"}, "url": {"type": "string"}, "command": {"type": "string"},
@@ -880,6 +883,9 @@ MCP_ENTRY = {
                    "env": {"type": "object", "additionalProperties": {"type": "string"}},
                    "auth": {"type": "string", "enum": list(FROM_THE_HUB["lifecycle.MCP_AUTH"])},
                    "key": {"type": "string", "description": "The name of an API key the agent reads, never a key."},
+                   "mint": {"type": "string", "description": "With auth \"mint\": the path that makes a token."},
+                   "mint_field": {"type": "string", "description": "With auth \"mint\": the field of the case key, "
+                                                                   "or \"\" for an empty body."},
                    "runtimes": {"type": "array", "items": {"type": "string"}}},
     "additionalProperties": False,
 }

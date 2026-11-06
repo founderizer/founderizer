@@ -83,7 +83,9 @@ EVERY_AGENT = ["read_messages", "search_knowledge", "read_knowledge", "write_kno
                # AUTONOMY.md P6: everything an agent took part in, searched and read back
                "search_history", "read_history",
                # design v4 D2: an agent's own skills
-               "write_skill"]
+               "write_skill",
+               # support plan F4: a typed report that reached a duty of the agent joins one of its cases
+               "join_report"]
 MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "answer", "check_result",
                                "decide_permission", "see_team", "see_capacity", "see_goals",
                                "update_goal", "record_spend", "raise_needs_you", "request_secret", "tell_owner",

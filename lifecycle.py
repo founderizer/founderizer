@@ -154,7 +154,11 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "stable_skills",    # a session's stable text lists the agent's own skills (skills_text, design v4 D3)
             # its usage report gives each session's tokens by model, its sub-agents' and workflow agents' with them,
             # and each scan reads only what the transcripts gained (plan P8, decision 41)
-            "session_models"]
+            "session_models",
+            # support plan F1: a task session of an agent whose Shell box is off starts closed (fleet.shell_off): the
+            # pinned Claude Code, the built-in tools that the hub names, its own MCP servers only, and no key; and
+            # F3: an MCP server of auth "mint" gets a token for that one session through the vault (mint_tokens)
+            "shell_box"]
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and
@@ -687,10 +691,15 @@ MCP_NAME = re.compile(r"[a-z][a-z0-9-]{0,30}")       # the server's name, which 
 MCP_LIMIT = 32                                       # the most servers that team.json holds
 MCP_RUNTIMES = tuple(sorted(runtimes_with("mcp_servers")))   # the runtimes whose task sessions load a server
 # How a url server proves who it is: nothing (a public server), the hub's own OAuth tokens (the owner connects it
-# once and no refresh token ever leaves the hub), or an API key that the agent reads (owner feature secret_grants).
-MCP_AUTH = ("none", "oauth", "key")
+# once and no refresh token ever leaves the hub), an API key that the agent reads (owner feature secret_grants), or a
+# short-lived token that the vault mints for each task session with a key that the session never sees (support plan
+# F3, "mint"): the vault sends POST <mint> to the site of that key's login, with {<mint_field>: the task's case key},
+# and only the "token" of the answer reaches that session's MCP file.
+MCP_AUTH = ("none", "oauth", "key", "mint")
 MCP_PROGRAM = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")    # a stdio server's program, on PATH or in ~/.local/bin
-MCP_FIELDS = {"title", "url", "command", "env", "auth", "key", "runtimes"}     # no args: DevOps plan 0.2
+MCP_FIELDS = {"title", "url", "command", "env", "auth", "key", "runtimes", "mint", "mint_field"}    # no args: plan 0.2
+MINT_PATH = re.compile(r"/[A-Za-z0-9._~!$&'()*+,;=:@%/-]{0,199}")      # the mint's path at the key's site, no query
+MINT_FIELD = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,39}")                  # the field of its body that names the case
 
 
 def desktop_path(home):
@@ -780,6 +789,21 @@ def mcp_server(name, entry):
                 raise ValueError(f"the MCP server {name}: auth \"key\" needs key, the name of an API key that the "
                                  f"agent reads in its sessions")
             made["bearer"] = key
+        elif auth == "mint":
+            key, path, field = entry.get("key"), entry.get("mint"), entry.get("mint_field", "case")
+            field = None if field == "" else field          # "": an empty body, for a token that names no case
+            if not key_env(key):
+                raise ValueError(f"the MCP server {name}: auth \"mint\" needs key, the name of the API key whose "
+                                 f"login mints the token; the session never reads it")
+            if not (isinstance(path, str) and MINT_PATH.fullmatch(path)):
+                raise ValueError(f"the MCP server {name}: mint must be the path at that key's site that makes a "
+                                 f"token, beginning with / and with no query, at most 200 characters")
+            if not (field is None or isinstance(field, str) and MINT_FIELD.fullmatch(field)):
+                raise ValueError(f"the MCP server {name}: mint_field must be a field name of 1 to 40 characters "
+                                 f"A-Z a-z 0-9 _ that starts with a letter, or \"\" for an empty body")
+            made.update(bearer=mcp_variable(name), mint={"key": key, "path": path, "field": field})
+        if auth != "mint" and ("mint" in entry or "mint_field" in entry):
+            raise ValueError(f"the MCP server {name}: mint and mint_field are for auth \"mint\"")
         if variables:
             raise ValueError(f"the MCP server {name}: env is for a command server; a url server uses key")
     else:
@@ -787,6 +811,8 @@ def mcp_server(name, entry):
             raise ValueError(f"the MCP server {name}: a command server has no auth; give its key in env")
         if "key" in entry:
             raise ValueError(f"the MCP server {name}: key is for a url server with auth \"key\"")
+        if "mint" in entry or "mint_field" in entry:
+            raise ValueError(f"the MCP server {name}: mint and mint_field are for a url server with auth \"mint\"")
         if not isinstance(entry["command"], str) or not MCP_PROGRAM.fullmatch(entry["command"]):
             raise ValueError(f"the MCP server {name}: command must be the name of a program on the machine (1 to 64 "
                              f"characters A-Z a-z 0-9 . _ -), which the machine has on its PATH or in ~/.local/bin")
@@ -796,8 +822,10 @@ def mcp_server(name, entry):
 
 def tool_needs(tool):
     """The session variables that one catalog entry needs: the variables of a stdio server, and the bearer variable of
-    a url server. A session that lacks one of them gets no such server."""
-    return sorted(set((tool.get("env") or {}).values()) | ({tool["bearer"]} if tool.get("bearer") else set()))
+    a url server. A session that lacks one of them gets no such server. A mint server's token is made at the start of
+    each task session (fleet.mint_tokens), which drops the server when it gets none."""
+    return sorted(set((tool.get("env") or {}).values()) |
+                  ({tool["bearer"]} if tool.get("bearer") and not tool.get("mint") else set()))
 
 
 def tool_catalog(team):

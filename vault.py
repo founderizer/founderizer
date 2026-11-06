@@ -708,13 +708,15 @@ def handover(conf, job):
     return {"ok": True, "v": PROTOCOL, "job": job, "to": confirmed["target"], "label": label, "ciphertext": r.stdout}
 
 
-def read(conf):
+def read(conf, purpose=None):
     """read (owner feature secrets): the API keys that the calling agent reads in its sessions, as {variable name:
     value}. The hub names them for this agent now; the broker reads each value itself and registers its fingerprints
     before it gives it, so that the hub masks it in texts. The worker's user may read exactly these values. A value
-    that the broker cannot read or protect is left out, and its name is in missing."""
+    that the broker cannot read or protect is left out, and its name is in missing. purpose: "check" or "session", which
+    the hub is told: it gives no key to a session of an agent whose Shell box is off (support plan F1)."""
     store = opened_store(conf)
-    code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}/read", {})
+    code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}/read",
+                     {"for": purpose} if purpose in ("check", "session") else {})
     found = data.get("secrets") if isinstance(data, dict) else None
     if code != 200 or not isinstance(found, list) or data.get("ok") is not True or len(found) > READS:
         reason = data.get("error") if isinstance(data, dict) else None
@@ -2374,7 +2376,7 @@ def handle(conf, line, uid):
     if op == "signin":
         raise Refused("signing in needs a browser: only the Mac vault helper signs in")
     if op == "read":
-        return read(conf)
+        return read(conf, req.get("for"))
     if op == "probe":
         job = req.get("job")
         if not isinstance(job, int) or isinstance(job, bool) or job < 1:

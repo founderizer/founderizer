@@ -279,14 +279,27 @@ PLACE_PUBLIC = re.compile(r"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{4
 ENV_RESERVED = lifecycle.ENV_RESERVED
 
 
-def session_env(agent, conf, kind, place=None):
+def session_env(agent, conf, kind, place=None, closed=False):
     """{NAME: value} for the environment of a session of this agent that starts now (kind: task, chat or manager). Each
     session start uses this one hook: the API keys that the owner lets this agent read (read_env), and for a task
     session its GitHub repositories, their credentials and its tools (integration_env, owner feature integrations). A
     tool that needs one of the read keys gets it, so the keys come first. place: the folder of the task's own clones
-    (task_place), or None for the shared clones of before."""
+    (task_place), or None for the shared clones of before.
+
+    Support plan F1: a session of an agent whose Shell box is off gets no key and no GitHub token. A task session of
+    it gets only what its own MCP servers need, which closed_task_command writes into its MCP file, never into its
+    environment. closed: the hub's start says the Shell box is off, whatever this checkout's team.json says yet."""
+    if closed or shell_off(conf):
+        return integration_env(agent, conf, {}, closed=True) if kind == "task" else {}
     keys = read_env(agent, conf, kind)
     return dict(keys, **(integration_env(agent, conf, keys, place) if kind == "task" else {}))
+
+
+def shell_off(conf):
+    """True for a worker or a lead whose Shell box is off (support plan F1, H1): no session of it gets a shell, a file
+    tool or a key, and its task sessions start closed (closed_task_command). The boxes are team.json "can"."""
+    conf = conf or {}
+    return conf.get("role") in ("worker", "lead") and isinstance(conf.get("can"), list) and "shell" not in conf["can"]
 
 
 def read_env(agent, conf, kind):
@@ -303,8 +316,11 @@ def read_env(agent, conf, kind):
         grants = (TEAM["agents"].get(agent) or {}).get("secrets") or {}
     if "read" not in grants.values() or vault_mode(agent) == "none":
         return {}
+    # what the keys are for: the hub gives none for a session of an agent whose Shell box is off (support plan F1)
+    purpose = "check" if kind == "check" else "session"
     try:
-        done = broker_job_request(agent, {"op": "read"}, timeout=60) if vault_mode(agent) == "broker" else read_values(agent)
+        done = broker_job_request(agent, {"op": "read", "for": purpose}, timeout=60) if vault_mode(agent) == "broker" \
+            else read_values(agent, purpose)
     except Exception as e:          # the session starts in every case
         print(time.strftime("%H:%M:%S"), f"{kind}: the session starts without its read variables: "
               f"{e if isinstance(e, Refused) else type(e).__name__}", flush=True)
@@ -830,16 +846,17 @@ def team_catalog():
         return tool_catalog(TEAM)
 
 
-def integration_env(agent, conf, keys=None, place=None):
+def integration_env(agent, conf, keys=None, place=None, closed=False):
     """A task session's GitHub repositories and tools, as the hub gives them at its start (owner feature integrations):
     FLEET_REPOS, GH_TOKEN and git's credentials for them (FLEET_GIT_TOKENS, GIT_CONFIG_*), FLEET_TOOLS with the
     tools' own variables, and FLEET_GITHUB_NOTE for what the session lacks. First the helper fetches each repository
     into WORK, or clones it there, and with a place (task_place) makes the task's own clone of it there, which
     FLEET_WORK names. The helper asks the hub only when team.json gives the agent repos or tools; {} for an agent
     without them, and from a hub without the route. keys: the API keys of this session (read_env), which a tool of the
-    owner may need; they are already in the session's environment, so they are not given again."""
+    owner may need; they are already in the session's environment, so they are not given again. closed: a session of
+    an agent whose Shell box is off (support plan F1), which gets its MCP servers and no repository or GitHub token."""
     mine = checkout_conf(agent)
-    if conf.get("role") not in ("worker", "lead") or not (mine.get("repos") or mine.get("tools")):
+    if conf.get("role") not in ("worker", "lead") or not (mine.get("tools") or (mine.get("repos") and not closed)):
         return {}
     try:
         code, data = http("POST", f"/helper/integrations/{agent}", {}, timeout=90)
@@ -850,7 +867,8 @@ def integration_env(agent, conf, keys=None, place=None):
             return {}
         print(time.strftime("%H:%M:%S"), f"GitHub: the hub gave no repositories or tools ({code})", flush=True)
         return {"FLEET_GITHUB_NOTE": "The hub gave no GitHub access at this start."}
-    repos = {r: v for r, v in data["repos"].items() if isinstance(r, str) and REPO_NAME.fullmatch(r) and v in REPO_ACCESS}
+    repos = {r: v for r, v in data["repos"].items() if isinstance(r, str) and REPO_NAME.fullmatch(r) and v in REPO_ACCESS
+             and not closed}
     groups = [{"token": t["token"], "repos": [r for r in t["repos"] if isinstance(r, str) and r in repos]}
               for t in data.get("tokens") or [] if isinstance(t, dict) and isinstance(t.get("token"), str)
               and GITHUB_TOKEN.fullmatch(t["token"]) and isinstance(t.get("repos"), list)]
@@ -1120,14 +1138,17 @@ def github_text(values, tools):
     return "\n\n" + text.strip() if text else ""
 
 
-def claude_server(name, catalog=None):
-    """A catalog tool as a Claude Code MCP server: its variables come from the session's own (${NAME})."""
-    tool = (catalog or TOOL_CATALOG)[name]
+def claude_server(name, catalog=None, values=None):
+    """A catalog tool as a Claude Code MCP server: its variables come from the session's own (${NAME}), or, for a
+    variable in values, the value itself, which then reaches the session's mode-600 MCP file only: a mint server's
+    token (support plan F3), and every value of a closed session (closed_task_command)."""
+    tool, values = (catalog or TOOL_CATALOG)[name], values or {}
+    value = lambda var: values[var] if var in values else "${%s}" % var
     if tool.get("url"):
         return dict({"type": "http", "url": tool["url"]},
-                    **({"headers": {"Authorization": "Bearer ${%s}" % tool["bearer"]}} if tool.get("bearer") else {}))
+                    **({"headers": {"Authorization": "Bearer " + value(tool["bearer"])}} if tool.get("bearer") else {}))
     return {"type": "stdio", "command": exe(tool["command"]) or tool["command"], "args": list(tool.get("args") or []),
-            "env": {var: "${%s}" % var for var in tool.get("env") or {}}}
+            "env": {var: value(var) for var in tool.get("env") or {}}}
 
 
 def codex_server(name, catalog=None):
@@ -1163,14 +1184,52 @@ STABLE_WHERE = {"read": ("The task is the first answer of read_messages.",
 CODEX_RULES_BYTES = 32 * 1024   # Codex's own default project_doc_max_bytes, which a longer AGENTS.md would be cut at
 
 
-def stable_text(agent, opening, parts, head=None, skills=True):
+PROFILE_SECTION = re.compile(r"^\*\*([^*\n]+?)\.\*\*[ \t]*(.*)$")        # hub.SECTION_LINE: one section's title line
+KNOWLEDGE_LINE = re.compile(r"[-*] (knowledge/[A-Za-z0-9._/-]+\.md)")    # one line of it (hub.knowledge_list)
+KNOWLEDGE_FILE_MAX = 65536      # characters of one knowledge file that a closed start carries
+
+
+def knowledge_texts(agent):
+    """Support plan F1: the files that the "Knowledge files" section of this agent's profile lists, each whole, as a
+    closed session reads them in its start: it has no file tool. A file that this checkout lacks, or one longer than
+    KNOWLEDGE_FILE_MAX, says so in its place."""
+    try:
+        with open(os.path.join(KIT, "profiles", f"{agent}.md"), encoding="utf-8") as f:
+            lines = f.read().replace("\r\n", "\n").split("\n")
+    except OSError:
+        return []
+    paths, inside = [], False
+    for line in lines:
+        title = PROFILE_SECTION.match(line)
+        if title:
+            inside = title.group(1).strip().lower() == "knowledge files"
+            line = title.group(2)
+        found = KNOWLEDGE_LINE.fullmatch(line.strip()) if inside else None
+        if found and ".." not in found.group(1).split("/") and found.group(1) not in paths:
+            paths.append(found.group(1))
+    texts = []
+    for path in paths[:32]:
+        try:
+            with open(os.path.join(KIT, path), encoding="utf-8") as f:
+                text = f.read().strip()
+        except (OSError, UnicodeDecodeError):
+            text = f"({path} is not in this checkout.)"
+        if len(text) > KNOWLEDGE_FILE_MAX:
+            text = text[:KNOWLEDGE_FILE_MAX] + f"\n\n({path} goes on beyond what a start carries.)"
+        texts.append(f"Knowledge file {path}:\n\n{text}")
+    return texts
+
+
+def stable_text(agent, opening, parts, head=None, skills=True, knowledge=False):
     """The stable start of a session of `agent` whose runtime reads its rules by `opening` (plan P9.2), or None when
     this checkout cannot give it: a file is missing, or for a session that reads RULES.md as its folder's AGENTS.md,
     that AGENTS.md is not RULES.md byte for byte (a checkout of the code repository, whose AGENTS.md is the
     developers'). head: what comes first, a task session's line by default, the owner chat's instructions, or ""
     for the standing manager session, whose first prompt says who it is. The same files give the same bytes.
     skills: the list of the agent's own skills comes last (design v4 D3, helper feature stable_skills), so a new
-    skill leaves the rules and the profile in the cache; the owner chat, which reads no file, has none."""
+    skill leaves the rules and the profile in the cache; the owner chat, which reads no file, has none. knowledge:
+    the text of each file that the profile's "Knowledge files" lists comes after the profile (knowledge_texts), for a
+    session that reads no file itself."""
     def read(name):
         with open(os.path.join(KIT, name), encoding="utf-8") as f:
             return f.read().strip()
@@ -1182,6 +1241,7 @@ def stable_text(agent, opening, parts, head=None, skills=True):
             [read(f"rules/{part}.md") for part in RULES_PARTS if part in parts] + [read(f"profiles/{agent}.md")]
     except OSError:
         return None
+    texts += knowledge_texts(agent) if knowledge else []
     listed = skills_text(KIT, agent) if skills else ""
     texts += [listed.strip()] if listed else []
     where, rules = STABLE_WHERE[opening]
@@ -1234,26 +1294,33 @@ def checked_start(conf):
 
 
 def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, generation="", session="", token=None,
-                    resume=False, env=None, opening=None, rules=None):
+                    resume=False, env=None, opening=None, rules=None, closed=None, minted=None):
     """token: the session credential (owner API 1.12); None starts the session as before, without one. resume: the
     standing session continues its conversation `session` and gets no first prompt: Claude's session (--resume, never
     with a new --session-id) or Codex's thread (codex resume). Everything else is the command of a new start: the same
     settings, MCP configuration and credential. A new Codex session ends its prompt with its session id as a marker,
     by which the helper finds its rollout. env: {NAME: value} of session_env, which the session gets as the
     credential, from a file that its window reads and removes. opening and rules: how the hub said this task's
-    session starts (stable_start); with them, `prompt` is the task's own block and comes last."""
+    session starts (stable_start); with them, `prompt` is the task's own block and comes last. closed: what the hub
+    said of a closed start (support plan F1), and minted: {server: token} of its mint servers (F3, mint_tokens)."""
     if resume and (task or conf.get("runtime") not in MANAGER_RUNTIMES or not session):
         raise Refused("only the standing Claude or Codex session continues a conversation")
-    values = dict(env or {})
+    if task and (shell_off(conf) or isinstance(closed, dict)):     # this checkout's box, or the hub's start says so
+        return closed_task_command(agent, conf, prompt, task, needs, attempt, generation, session, token, env, opening,
+                                   rules, closed, minted)
+    values, minted = dict(env or {}), dict(minted or {})
     if token and (runtime_fact(conf.get("runtime"), "token_in_env", True) or needs == "screen"):
         values["FLEET_SESSION_TOKEN"] = token
-    prefix = env_prefix(agent, task or "manager", values)
     # The catalog tools that this session loads (owner feature integrations): a runtime whose entry loads servers
-    # (lifecycle.RUNTIMES "mcp_servers"), in a terminal only.
+    # (lifecycle.RUNTIMES "mcp_servers"), in a terminal only. A mint server loads with its token only (F3): Claude
+    # reads it from the MCP file, and Codex, which has no such file, from its variable.
     catalog = team_catalog()
     runtime = conf.get("runtime")
+    if runtime == "codex":
+        values.update({catalog[t]["bearer"]: v for t, v in minted.items() if t in catalog})
+    prefix = env_prefix(agent, task or "manager", values)
     tools = [] if not runtime_fact(runtime, "mcp_servers") or app_server_task(conf, needs) else \
-        [t for t in values.get("FLEET_TOOLS", "").split() if t in catalog]
+        [t for t in values.get("FLEET_TOOLS", "").split() if t in catalog and (t in minted or not catalog[t].get("mint"))]
     if task:
         stable = stable_text(agent, opening, rules) if stable_start(conf, needs, opening, rules) else None
     else:           # the standing manager session (helper feature stable_standing): its first prompt stays its own
@@ -1336,7 +1403,8 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
                               (CODEX_BEARER if token else "") + ("" if task else CODEX_APPROVE) +
                               "".join(codex_server(t, catalog) for t in tools), 1)
         else:
-            servers = {t: claude_server(t, catalog) for t in tools}
+            servers = {t: claude_server(t, catalog, {catalog[t]["bearer"]: minted[t]} if t in minted else None)
+                       for t in tools}
             config = mcp_config_file(agent, task or "manager", url, token, servers) if token else \
                 json.dumps({"mcpServers": dict({"fleet": {"type": "http", "url": url}}, **servers)})
             # Only this configuration: the standing session not the folder's fleet server without a credential, and a
@@ -1355,6 +1423,141 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     if not task and conf.get("runtime") == "claude":
         env += f" CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"
     return f"{prefix}env {env} {cmd}"
+
+
+# Support plan F1: the built-in tools that a closed task session can have, by the Tools box that allows each. Every
+# other built-in tool -- a shell, a file tool, an agent, a plan, a question, a timer -- is outside its --tools. The Web
+# box gives web search and never a page fetch: an address that the model writes can carry data to any site's log
+# (support plan H4), so a closed session reads pages only through a server of its own.
+CLOSED_BUILT_INS = {"web": ("WebSearch",)}
+# What a closed browser task never runs of the tools that --chrome adds (DevOps plan B2): a local file to a page.
+CLOSED_CHROME_DENY = ("mcp__claude-in-chrome__file_upload",)
+
+
+def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, session, token, env, opening, rules,
+                        closed=None, minted=None):
+    """The start of a task session of an agent whose Shell box is off (support plan F1, H1), as a closed conversation
+    starts: the Claude Code version of closed sessions, which passed the lockdown test, with its updater off; no
+    setting source of this machine; --tools with only the built-in tools that the hub names and the boxes allow (the
+    Web box: web search, unless the task's duty names none); only Fleet's MCP server, whose tools the
+    hub fixes (hub.shell_tools), and the agent's own catalog servers (--strict-mcp-config); no key, no GitHub token and
+    nothing of the session's own in its environment, so the values that its servers need are in its mode-600 MCP file
+    only; in dontAsk, which refuses whatever its allow list does not name. closed: {runtime, version, built_ins} from
+    the hub's start event (hub.closed_extra); without it, the first tested version and the Web box's tools. Codex and
+    the screen runner are refused: Fleet's own lockdown test shows that Codex cannot be held to a list of tools. task
+    "conversation" is a conversation with the agent's own tools (conversation_work_command): its route is the
+    conversation's, and attempt is its id."""
+    tested = lifecycle.runtime_fact(conf.get("runtime"), "closed_versions") or ()
+    if not tested:
+        raise Refused(f"an agent whose Shell box is off runs only on a runtime whose sessions passed the lockdown "
+                      f"test: {runtime_fact(conf.get('runtime'), 'label', conf.get('runtime'))} cannot be held to a "
+                      f"fixed list of tools")
+    if needs == "screen" or app_server_task(conf, needs):
+        raise Refused("an agent whose Shell box is off has no screen task: its screen runs on Codex, which cannot be "
+                      "held to a fixed list of tools")
+    if not (token and session and generation):
+        raise Refused("a closed task session needs its credential, its session id and its generation")
+    closed = closed if isinstance(closed, dict) else {}
+    program = closed_program(closed.get("runtime") or conf.get("runtime"), closed.get("version") or tested[0])
+    allowed = [name for box, names in CLOSED_BUILT_INS.items() if box in (conf.get("can") or []) for name in names]
+    named = closed.get("built_ins")
+    built_ins = [name for name in allowed if not isinstance(named, list) or name in named]
+    values, minted = dict(env or {}), dict(minted or {})
+    catalog = team_catalog()
+    values.update({catalog[t]["bearer"]: v for t, v in minted.items() if t in catalog})
+    servers = closed.get("servers")         # the duty's own: only those; without it, no server of a session's token
+    tools = [t for t in values.get("FLEET_TOOLS", "").split()
+             if t in catalog and conf.get("runtime") in catalog[t]["runtimes"] and
+             (t in servers if isinstance(servers, list) else not catalog[t].get("mint")) and
+             (t in minted or not catalog[t].get("mint"))]
+    servers = {t: claude_server(t, catalog, values) for t in tools}
+    url = f"{HUB}/mcp/{agent}/{generation}/{task}/{attempt}"
+    allow = ["mcp__fleet__*"] + [f"mcp__{t}__*" for t in tools] + built_ins
+    deny = list(DENY)
+    if needs == "browser":
+        allow.append(CHROME_TOOLS)
+        deny += CLOSED_CHROME_DENY
+    hook = f"{shlex.quote(sys.executable)} {shlex.quote(os.path.join(KIT, 'fleet.py'))} hook"
+    settings = dict({"autoMemoryEnabled": False, "prefersReducedMotion": False,
+                     "permissions": {"allow": allow, "deny": deny},
+                     # the activity of its tool calls for the hub's views, as every task session sends it (C7)
+                     "hooks": {"PostToolUse": [{"hooks": [{"type": "command", "async": True, "timeout": 10,
+                                                           "command": f"{hook} activity {agent} {task}"}]}]}},
+                    **{k: v for k, v in kept_user_settings().items() if k != "env"})   # the pinned version's updater
+    # its rules, its profile and its knowledge files in its start, because it reads no file; no skill list, whose
+    # SKILL.md it could not open either. A start without that text would tell it to read files: none is made.
+    text = stable_text(agent, opening, rules, skills=False, knowledge=True) \
+        if stable_start(conf, needs, opening, rules) else None
+    if text is None:
+        raise Refused("a session whose Shell box is off starts only with its rules, its profile and its knowledge "
+                      "files in its start, and this start has not got them")
+    first = ["--append-system-prompt-file", session_file(agent, task, "md", text + github_text(values, tools))]
+    args = [program, "--setting-sources", "", "--session-id", session, "--permission-mode", "dontAsk",
+            "--tools", ",".join(built_ins), "--strict-mcp-config", "--mcp-config",
+            session_file(agent, task, "json", json.dumps({"mcpServers": dict({"fleet": {
+                "type": "http", "url": url, "headers": {"Authorization": f"Bearer {token}"}}}, **servers)})),
+            "--settings", json.dumps(settings)] + (["--chrome"] if needs == "browser" else []) + first + \
+        shlex.split(model_flags(conf))
+    words = ["env", f"FLEET_ATTEMPT={attempt}", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}",
+             f"FLEET_AGENT={agent}", f"FLEET_TASK={task}", NO_TIMERS, MOTION, CLOSED_NO_UPDATES] + \
+        [f"{name}={values[name]}" for name in ("CLAUDE_CODE_AUTO_COMPACT_WINDOW",) if name in values]   # a window
+    return shlex.join(words + args)
+
+
+def mint_tokens(agent, task, attempt, env, closed=None):
+    """Support plan F3: {server: token} for the mint servers among this task session's tools (lifecycle.mcp_server,
+    auth "mint"). For each one the hub makes one request job of the task's attempt, with the server's mint path and the
+    task's case key, and this machine's vault sends it to the site of the server's key, with that key: the key never
+    comes here. The token goes into the session's MCP file and nowhere else, and the hub gets the status of the answer
+    and not its body. A task with no case gets no token, and its session starts without that server; a refused or
+    failed mint stops the start, which the helper tries again and reports (plan C6). closed: the hub's start of a
+    Shell-off session ({} when only this checkout says so): it mints only for the servers that its duty names."""
+    catalog, out = team_catalog(), {}
+    named = (closed or {}).get("servers") if isinstance(closed, dict) else None
+    for name in [t for t in (env or {}).get("FLEET_TOOLS", "").split() if (catalog.get(t) or {}).get("mint") and
+                 (closed is None or (isinstance(named, list) and t in named))]:
+        code, data = http("POST", f"/helper/mint/{agent}", {"task": task, "attempt": attempt, "tool": name}, timeout=30)
+        if code == 200 and data.get("job") is None:
+            continue                    # no case for a token: the session starts without this server
+        if code != 200 or not isinstance(data.get("job"), int):
+            raise Refused(f"the hub made no token request for {name} ({code}): {str(data.get('error') or '')[:160]}")
+        try:
+            report = do_request(agent, data["job"])
+        except Unknown as e:
+            report = {"ok": False, "unknown": True, "text": str(e)}
+        except Refused as e:
+            report = {"ok": False, "text": str(e)}
+        token = minted_token(report) if report.get("ok") else None
+        kept = {k: v for k, v in report.items() if k not in ("body", "truncated", "withheld")}    # never the token
+        if report.get("ok"):            # the service answered: the hub ends the task on a 4xx other than 429
+            kept["minted"] = token is not None
+        if report.get("ok") and token is None:
+            kept["text"] = f"HTTP {report['status']}, with no token in its answer"
+        for pause in (0, 2, 5):         # the job's report, as post_job sends one: the vault keeps no answer
+            time.sleep(pause)
+            try:
+                if http("POST", f"/helper/job/{agent}/{data['job']}", kept, timeout=15)[0] in (200, 409):
+                    break
+            except (OSError, ValueError):
+                continue
+        if token is None:
+            raise Refused(f"no token for {name}: {kept.get('text') or 'the vault did not send the request'}")
+        out[name] = token
+    return out
+
+
+MINTED = re.compile(r"[A-Za-z0-9._~+/=-]{8,4096}")     # a minted token: one word, as an Authorization header takes it
+
+
+def minted_token(report):
+    """The token of a mint's answer: a 2xx answer whose JSON body has "token", one word; None otherwise."""
+    if not 200 <= report.get("status", 0) <= 299 or not isinstance(report.get("body"), str):
+        return None
+    try:
+        found = json.loads(report["body"]).get("token")
+    except (ValueError, AttributeError):
+        return None
+    return found if isinstance(found, str) and MINTED.fullmatch(found) else None
 
 
 # The runtimes whose standing session continues its own conversation (lifecycle.RUNTIMES "manager").
@@ -1643,6 +1846,19 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
               'A terminal answer alone does not reach the app. Reply once per request, then read_messages once more '
               'and wait for a signal. No polling. A correction is new context, never automatic replay of earlier work. '
               'Never read or reveal credentials. Pass only login names.')
+    if shell_off(conf):         # support plan F1: its owner chat names only the tools that it has (hub.SHELL_OFF_CHAT)
+        prompt = (f'You are {agent}, speaking directly with the owner in this agent\'s chat. '
+                  'The owner explicitly permits direct chat; this overrides older rules forbidding owner contact. '
+                  'This session is discussion only, and your Shell box is off: here you open no work, write to no '
+                  'other agent and ask for no key. Work goes to your line: when the owner asks you for work, tell him '
+                  'that your lead or the fleet manager gives it to you. A message from another agent may arrive here; '
+                  'you cannot answer it here. '
+                  'Call fleet read_messages now and whenever signalled. Each owner message includes request_id. '
+                  'Reply naturally to each unreplied owner message with fleet tell_owner(text, in_reply_to=request_id). '
+                  'Use fleet message_owner to write to the owner first; keep it short and rare. Fleet '
+                  'see_responsibilities says what you answer for, and fleet recall gives your own lessons. '
+                  'A terminal answer alone does not reach the app. Reply once per request, then read_messages once '
+                  'more and wait for a signal. No polling. Never read or reveal credentials.')
     opening = standing_opening(conf, rules)
     stable = stable_text(agent, opening, rules, head=prompt, skills=False) if opening else None
     if stable is None:
@@ -1894,7 +2110,7 @@ CLOSED_NO_UPDATES = "DISABLE_AUTOUPDATER=1"     # Claude Code's own updater, off
 
 
 def conversation_work_command(agent, conf, generation, conversation, token, prompt, session, env=None, opening=None,
-                              rules=None):
+                              rules=None, closed=None):
     """The start of a conversation with the agent's own tools (AUTONOMY.md P2: a role with tools on): this agent's own
     runtime, settings, hooks, keys and catalog tools, in this checkout, exactly as a task session starts
     (session_command), on the conversation's own MCP address, whose route is `conversation` and whose attempt is the
@@ -1912,7 +2128,8 @@ def conversation_work_command(agent, conf, generation, conversation, token, prom
     if conf.get("runtime") == "claude":     # a window that stays open across messages: a bounded context, as a closed one
         env = dict(env or {}, CLAUDE_CODE_AUTO_COMPACT_WINDOW=str(STANDING_COMPACT))
     return session_command(agent, conf, prompt, task="conversation", needs="none", attempt=int(conversation),
-                           generation=generation, session=session, token=token, env=env, opening=opening, rules=rules)
+                           generation=generation, session=session, token=token, env=env, opening=opening, rules=rules,
+                           closed=closed)
 
 
 def chat_record_file(agent, runtime="codex", kind="chat"):
@@ -3957,9 +4174,11 @@ class Helper:
                     self.start(window, lambda: conversation_work_command(
                         self.agent, self.run_conf(), extra["generation"], cid, data.get("token"), data.get("prompt"),
                         session, env=session_env(self.agent, self.conf, "task",
-                                                 task_place(self.agent, extra["generation"], window)),
-                        opening=data.get("opening"), rules=data.get("rules")), cid, extra["generation"], session,
-                        needs="none")
+                                                 task_place(self.agent, extra["generation"], window),
+                                                 closed=isinstance(data.get("shell_off"), dict)),
+                        opening=data.get("opening"), rules=data.get("rules"),
+                        closed=data.get("shell_off")),     # support plan F1
+                        cid, extra["generation"], session, needs="none")
                 else:
                     try:
                         command = conversation_command(self.agent, self.run_conf(), extra["generation"], cid,
@@ -4008,14 +4227,19 @@ class Helper:
                 # an app-server task's runner reads the account's list itself at its start (screen_runner
                 # default_model), which is fresher than this helper's reading of up to six hours
                 runner = app_server_task(self.conf, needs)
-                self.start(task, lambda: session_command(self.agent, self.conf if runner else self.run_conf(),
-                    ev["text"], task=task,
-                    needs=needs, attempt=extra.get("attempt",1), generation=extra.get("generation",""),
-                    session=session, token=token,
-                    env=session_env(self.agent, self.conf, "task",
-                                    task_place(self.agent, extra.get("generation"), task)),
-                    opening=extra.get("opening"), rules=extra.get("rules")),
-                    extra.get("attempt",1), extra.get("generation",""), session, needs=needs)
+
+                def command():          # after the checkout's sync, which Helper.start runs first
+                    env = session_env(self.agent, self.conf, "task",
+                                      task_place(self.agent, extra.get("generation"), task),
+                                      closed=isinstance(extra.get("shell_off"), dict))
+                    return session_command(self.agent, self.conf if runner else self.run_conf(), ev["text"],
+                        task=task, needs=needs, attempt=extra.get("attempt",1), generation=extra.get("generation",""),
+                        session=session, token=token, env=env, opening=extra.get("opening"), rules=extra.get("rules"),
+                        closed=extra.get("shell_off"),    # support plan F1: the hub's closed start
+                        minted=mint_tokens(self.agent, task, extra.get("attempt", 1), env,      # F3
+                                           closed=extra["shell_off"] if isinstance(extra.get("shell_off"), dict)
+                                           else {} if shell_off(self.conf) else None))
+                self.start(task, command, extra.get("attempt",1), extra.get("generation",""), session, needs=needs)
                 self.say(f"{task}: session started, attempt {extra.get('attempt',1)}")
                 # plan C6: the ack says only "started once"; the event stays pending until the session reads it
                 try:
@@ -4565,7 +4789,8 @@ class Helper:
         """The agent's own read keys for its checks (plan P4): the API keys that its sessions read (read_env), read
         from the vault once and kept in memory, and read again after a failed run or when the agent's grants in
         team.json change. A check runs only on its own agent's machine, so these are that agent's keys and no
-        other's. Its sessions already hold the same keys, shell and network, so a check adds no capability."""
+        other's. Its sessions already hold the same keys, shell and network, so a check adds no capability; the
+        sessions of an agent whose Shell box is off hold none of them, and the hub gives them only to its checks."""
         grants = check_grants(self.agent)
         with self.check_env_lock:
             if self.check_env is None or grants != self.check_env_grants:
@@ -6500,11 +6725,13 @@ def bws_get(secret_id):
     return login_from_item(bws_item(secret_id), secret_id)
 
 
-def read_values(agent):
+def read_values(agent, purpose=None):
     """read in file mode (owner feature secrets): the hub names the API keys that this agent reads in its sessions;
     this helper reads each with its own token, as for a sign-in, and registers the value's fingerprint at the hub
-    before a session gets it. {"env": {NAME: value}, "missing": [NAME]}."""
-    code, data = http("POST", f"/helper/vault/{agent}/read", {}, timeout=15)
+    before a session gets it. {"env": {NAME: value}, "missing": [NAME]}. purpose: "check" or "session", which the hub
+    is told as the broker tells it (read_env)."""
+    code, data = http("POST", f"/helper/vault/{agent}/read", {"for": purpose} if purpose in ("check", "session") else {},
+                      timeout=15)
     found = data.get("secrets") if isinstance(data, dict) else None
     if code != 200 or not isinstance(found, list) or data.get("ok") is not True:
         reason = data.get("error") if isinstance(data, dict) else None
