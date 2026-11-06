@@ -537,7 +537,7 @@ def aws_any(account, args, content):
     if region:
         s["region"] = region
     return Decision("judged", f"a call of {service} inside the role's rights", target=f"aws:{account}",
-                    plan={"provider": "aws", "account": account, "steps": [s]})
+                    plan={"provider": "aws", "account": account, "steps": [s], "call": True})
 
 
 # ---------------------------------------------------------------- Azure
@@ -663,11 +663,13 @@ B2_MADE = ("b2_copy_file", "b2_start_large_file", "b2_finish_large_file")
 B2_DELETE = {"b2_delete_bucket": ("bucket", "bucketId"), "b2_delete_file_version": ("file", "fileId"),
              "b2_cancel_large_file": ("file", "fileId"), "b2_delete_key": ("key", "applicationKeyId")}
 AZ_DELETE_ACTION = re.compile(r"(?i)(delete|purge|remove|reimage|wipe|clear|truncate|empty)[a-z]*")
-# The coordinator's word of 6 November 2026 on D25: every AWS delete is the owner's, decided by the action's name, with
-# no record of what an agent made there (an AWS answer names the resources that a call read, too, so a record would
-# take them for made). Delete, Terminate, Remove, Deregister, Revoke and Purge, as he named them, and the ones of the
-# listed services that remove something under another name: BatchDelete (ECR's images), Release (an Elastic IP or a
-# dedicated host), Cancel (a spot fleet's cancel can end its instances), and three that delete by a rule.
+# The coordinator's word of 6 November 2026 on D25: every AWS delete through the generic `call` is the owner's, decided
+# by the action's name, with no record of what an agent made there (an AWS answer names the resources that a call read,
+# too, so a record would take them for made). Delete, Terminate, Remove, Deregister, Revoke and Purge, as he named them,
+# and the ones of the listed services that remove something under another name: BatchDelete (ECR's images), Release (an
+# Elastic IP or a dedicated host), Cancel (a spot fleet's cancel can end its instances), and three that delete by a
+# rule. The listed form `ingress remove` stays with the judge, as before D25: it closes access and deletes nothing, and
+# the exposure duty needs it fast to close an open port.
 AWS_DELETE = re.compile(r"(Delete|BatchDelete|Terminate|Remove|Deregister|Revoke|Purge|Release|Cancel)[A-Z][A-Za-z0-9]*")
 AWS_DELETE_OTHER = ("logs:PutRetentionPolicy",          # a shorter retention deletes the older logs
                     "ecr:PutLifecyclePolicy",           # its rules delete images
@@ -714,15 +716,16 @@ def deletes(plan, conf):
     and each provider's delete calls that use another method (B2's b2_delete_*, b2_hide_file and b2_cancel_large_file,
     Cloudflare's batch and bulk deletes, Hetzner's disable_backup, which deletes the server's backups, and Azure's
     delete, purge and reimage actions). A key is made when the door minted it. A delete whose target the door cannot
-    name gets a name that nothing made, so it goes to the owner, and so does every AWS delete (AWS_DELETE), by its
-    action's name or the REST API's DELETE method."""
+    name gets a name that nothing made, so it goes to the owner, and so does every AWS delete of the generic `call`
+    (AWS_DELETE), by its action's name or the REST API's DELETE method."""
     provider, out = (plan or {}).get("provider"), []
     for s in (plan or {}).get("steps") or []:
         method, path = s.get("method"), s.get("path") or ""
         body = s.get("body") if isinstance(s.get("body"), dict) else {}
         if provider == "aws":
             service, action = s.get("aws") or ("", "")
-            if method == "DELETE" or AWS_DELETE.fullmatch(action) or f"{service}:{action}" in AWS_DELETE_OTHER:
+            if plan.get("call") and (method == "DELETE" or AWS_DELETE.fullmatch(action) or
+                                     f"{service}:{action}" in AWS_DELETE_OTHER):
                 out.append(f"aws:{service}:{action}")
             continue
         if provider == "backblaze":
