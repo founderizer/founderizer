@@ -29631,10 +29631,11 @@ def github_reach_read():
     """What the hub's GitHub App reaches now, from GitHub, every name in lower case: {"pages": {account: the settings
     page of its installation}, "all": {account whose installation has all its repositories}, "repos": {owner/name},
     "install": the page that installs the App on another account}. None while the hub has no App. The pages are built
-    here from the account and the installation, never taken from GitHub's answer."""
+    here from the account and the installation, never taken from GitHub's answer. A hub that holds no App key and is
+    linked to its door takes the door's reading (door_reach_read)."""
     app = github_app()
     if app is None:
-        return None
+        return door_reach_read()
     jwt = github_jwt(*app)
     slug = github_call("GET", "/app", jwt).get("slug")
     installs = github_call("GET", "/app/installations?per_page=100", jwt)
@@ -29670,6 +29671,38 @@ def github_reach_read():
         else:
             reach["all"].add(login.lower())     # more than the hub reads: it marks none of this account's
     return reach
+
+
+GITHUB_ORG_PAGE = re.compile(r"https://github\.com/organizations/([A-Za-z0-9][A-Za-z0-9-]{0,38})/settings/installations/"
+                             r"[0-9]{1,15}")
+GITHUB_USER_PAGE = re.compile(r"https://github\.com/settings/installations/[0-9]{1,15}")
+GITHUB_INSTALL_PAGE = re.compile(r"https://github\.com/apps/[a-z0-9][a-z0-9-]{0,99}/installations/new")
+GITHUB_FULL_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,38}/[a-z0-9._-]{1,100}")
+
+
+def door_reach_read():
+    """github_reach_read for a hub linked to its door, which holds the App key (DevOps plan 13, item 4): the door
+    reads the App's installations, and the hub keeps a page only in one of GitHub's own forms, so the app's marks open
+    GitHub and nothing else. None while the hub has no door."""
+    conf = door_conf()
+    if conf is None:
+        return None
+    status, answer = door_call(conf, "GET", "/github/reach", conf["token"])
+    if status != 200 or not isinstance(answer, dict) or not isinstance(answer.get("pages"), dict):
+        raise GitHubError("the door gave no reading of what its App reaches")
+    pages = {}
+    for login, page in answer["pages"].items():
+        org = GITHUB_ORG_PAGE.fullmatch(page) if isinstance(page, str) else None
+        if isinstance(login, str) and GITHUB_LOGIN.fullmatch(login) and (
+                (org and org.group(1).lower() == login.lower()) or (isinstance(page, str) and
+                                                                     GITHUB_USER_PAGE.fullmatch(page))):
+            pages[login.lower()] = page
+    install = answer.get("install")
+    return {"pages": pages,
+            "all": {a.lower() for a in answer.get("all") or [] if isinstance(a, str) and GITHUB_LOGIN.fullmatch(a)},
+            "repos": {r.lower() for r in answer.get("repos") or [] if isinstance(r, str) and
+                      GITHUB_FULL_NAME.fullmatch(r.lower())},
+            "install": install if isinstance(install, str) and GITHUB_INSTALL_PAGE.fullmatch(install) else None}
 
 
 def github_reach(wait=0):
@@ -30116,7 +30149,7 @@ def integrations_view(team, lines):
     except GitHubError as e:
         app, app_id, problem = False, None, str(e)
     door = door_conf() is not None      # DevOps plan 13, item 4: the door mints every token, with the same App
-    app = app or door
+    app, app_id = app or door, app_id or (door_app_id() if door else None)
     state = mcp_state(team)
     tools = {name: dict({k: v for k, v in tool.items()
                          if k in ("title", "command", "args", "url", "runtimes", "custom", "auth")},
@@ -30415,6 +30448,17 @@ def door_conf():
             "record": held["record"]}
 
 
+def door_app_id():
+    """The ID of the App whose key the hub gave the door when it linked (save_door_secrets), or None."""
+    try:
+        with open(CFG.get("door_secrets") or DOOR_SECRETS_FILE, encoding="utf-8") as f:
+            held = json.load(f)
+    except (OSError, ValueError):
+        return None
+    app_id = held.get("app_id") if isinstance(held, dict) else None
+    return app_id if isinstance(app_id, str) and re.fullmatch(r"[1-9][0-9]{0,11}", app_id) else None
+
+
 def door_view():
     """GET /ui/door (owner feature door_setup, DevOps plan 13, items 1 and 3): what the app needs to keep the door with
     no step of the owner's. The door's entry, each credential of its rules with the agents that use it, and each
@@ -30492,10 +30536,13 @@ def save_door_secrets(body, check):
     if check["errors"] or pending is None:
         raise Refusal(409, "the door does not mint for every owner yet: " + "; ".join(check["errors"] or ["send again"]))
     path = CFG.get("door_secrets") or DOOR_SECRETS_FILE
+    held = None
+    with contextlib.suppress(GitHubError):
+        held = github_app()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd = os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump({"token": pending[0], "record": pending[1]}, f)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:     # the App's ID stays for the App rows: the door has its key
+        json.dump(dict({"token": pending[0], "record": pending[1]}, **({"app_id": held[0]} if held else {})), f)
     os.replace(path + ".new", path)
     removed = github_app_remove()["replaced"]
     log("owner", f"the door mints every GitHub token (owners: {', '.join(check['owners']) or 'none'})"

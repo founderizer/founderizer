@@ -12,19 +12,22 @@ its own bot's web identity token.
     ops backblaze:<account> key-mint <host> <bucket-id>            rule: a key for one host, its name as the prefix,
                                                                    no delete right
     ops backblaze:<account> key-place <host> <file> <key-id> <NAME>=id:<sha256> <NAME>=key:<sha256>
-    ops backblaze:<account> key-revoke <key-id>                    rule for a key that the door minted, else judged
+    ops backblaze:<account> key-revoke <key-id>                    rule for a key that the door minted, else the
+                                                                   owner's (a delete of what no agent made)
+    ops backblaze:<account> change <b2 call>                       judged (D25), its body as content
     ops cloudflare:<account> zones | records <zone> | tunnels | rulesets <zone>
     ops cloudflare:<account> cname <zone> <name> <tunnel-id>       rule: a new CNAME to a tunnel of that account
     ops cloudflare:<account> tunnel-route <tunnel-id> <hostname> <port>   rule: a new hostname, the host's own origin
     ops cloudflare:<account> purge <zone> <host or url> ...        rule
-    ops cloudflare:<account> change <METHOD> <path>                judged, for the products the plan lists
+    ops cloudflare:<account> change <METHOD> <path>                judged (D25), its body as content
     ops github:<owner> runs|failed|alerts|code-alerts|secret-alerts|runners <repo>
     ops github:<owner> workflow <repo> <workflow> [name=value ...] rule for a health workflow, judged for bootstrap
     ops github:<owner> secret <repo> <NAME> <key-id> id|key        rule: a value that the door rotated
     ops github:<owner> pull-request <repo> <head> <base> <title>   rule
     ops hetzner:<project> servers | server <name> | firewalls | volumes | ips
     ops hetzner:<project> power-cycle <server>                     rule, for a server that the agent holds
-    ops hetzner:<project> change <METHOD> <path>                   judged: a held server's firewall, protection, name
+    ops hetzner:<project> change <METHOD> <path> <server>          judged: a held server's firewall, protection, name
+    ops hetzner:<project> change <METHOD> <path>                   judged (D25)
     ops aws:<account> instances | groups | stacks | identity
     ops aws:<account> start|stop|reboot <instance-id>              rule, for a tagged instance
     ops aws:<account> ingress|change-set|key-off ...               judged
@@ -34,9 +37,14 @@ its own bot's web identity token.
     ops aws:<account> call eks <METHOD> <path> [<region>]          judged, the same for a REST API
     ops azure:<subscription> get <path>                            listed reads and metrics
     ops azure:<subscription> sql-firewall|app-setting ...          judged
+    ops azure:<subscription> change <METHOD> <path> <api-version>  judged (D25)
     ops tailscale:<tailnet> devices | device <id>
     ops tailscale:<tailnet> key-expiry-off <id> | rename <id> <name>   rule, for a device of the fleet
     ops tailscale:<tailnet> delete <id> | oauth-client <tag>       judged
+    ops tailscale:<tailnet> change <METHOD> <path>                 judged (D25)
+
+A judged delete passes to the judge only when the door's own record shows that an agent made its target through the
+door (made_keys, deletes); any other delete goes to the owner as a Needs-you item with the exact call.
 """
 import base64
 import datetime
@@ -232,6 +240,8 @@ WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 CF_PATH = re.compile(r"/(zones|accounts)/([0-9a-f]{32}|\{account_id\})(/[A-Za-z0-9._~:@-]+){1,10}")
 CF_NEVER = ((r"/tokens(/|$)", "an API token's answer is its secret: never the door's"),
             (r"/cfd_tunnel/[^/]+/token$", "a tunnel's token is a secret: never the door's"),
+            (r"^POST \S*/(cfd_tunnel|warp_connector)$", "a new tunnel's answer carries its token: never the door's"),
+            (r"/(stream|images/v1)/keys(/|$)", "a signing key's answer is its private part: never the door's"),
             (r"/temp-access-credentials", "R2 credentials are secrets: never the door's"),
             (r"/service_tokens", "a service token's answer is its secret: never the door's"))
 
@@ -247,8 +257,8 @@ def judged_write(provider, account, args, content, path, never, why, host=None, 
     method, where = args[0], args[1]
     if ".." in where or not path.fullmatch(where):
         return refused(f"{where} is not a path of this {provider} account that the door changes")
-    for pattern, words in never:
-        if re.search(pattern, where):
+    for pattern, words in never:                # each pattern reads "<METHOD> <path>"
+        if re.search(pattern, f"{method} {where}"):
             return refused(words)
     body = None
     if content and method != "DELETE":
@@ -379,7 +389,8 @@ def hetzner(access, agent, project, op, args, content, lookups):
 HZ_PATH = re.compile(r"/(servers|firewalls|volumes|primary_ips|floating_ips|networks|load_balancers|certificates|"
                      r"ssh_keys|placement_groups|images)(/[0-9]{1,12})?(/actions/[a-z_]{2,40})?")
 HZ_NEVER = ((r"rescue", "Rescue is never booted"),
-            (r"/actions/(reset_password|request_console)$", "its answer is a password or a console: never the door's"))
+            (r"/actions/(reset_password|request_console|rebuild)$",
+             "its answer is a password or a console: never the door's"))
 
 
 # ---------------------------------------------------------------- AWS
@@ -571,9 +582,12 @@ def azure(access, agent, account, op, args, content, lookups):
 
 
 AZ_PATH = re.compile(r"/subscriptions/[0-9a-f-]{36}(/[A-Za-z0-9._()~-]+){1,16}")
-AZ_NEVER = ((r"(?i)/(list[a-z]*|regenerate[a-z]*|publishxml|getpublishingcredentials|publishingcredentials)$",
-             "its answer is a key, a password, a connection string or a setting: ARM gives those only to a list "
-             "action, and they are never the door's"),)
+AZ_NEVER = ((r"(?i)^POST \S*/(list[a-z]*|regenerate[a-z]*|generate[a-z]*|get[a-z]*|reset[a-z]*|rotate[a-z]*|"
+             r"begingetaccess|createquerykey/[^/]+|publishxml|[a-z]*(token|credentials?|sas|password|secrets?|keys?))$",
+             "its answer can be a key, a password, a token, a connection string or a setting, which ARM gives only "
+             "to an action like this one: never the door's"),
+            (r"(?i)/(keys|functionkeys|hostkeys|systemkeys|secrets)(/[^/]+)?$",
+             "a key or a secret of a resource is never the door's"))
 
 
 # ---------------------------------------------------------------- Tailscale
@@ -614,7 +628,10 @@ def tailscale(access, agent, tailnet, op, args, content, lookups):
 
 
 TS_PATH = re.compile(r"/(tailnet/-|device/[0-9A-Za-z]{6,40})(/[A-Za-z0-9._-]+){0,4}")
-TS_NEVER = ((r"/keys(/|$)", "a key's answer is its secret: the door's oauth-client makes one and keeps it"),)
+TS_NEVER = ((r"/keys(/|$)", "a key's answer is its secret: the door's oauth-client makes one and keeps it"),
+            (r"/(acl|tags)(/|$)", "a device's tags and the policy file are never the door's"),
+            (r"/webhooks(/|$)", "a webhook's answer is its secret: never the door's"),
+            (r"-invites(/|$)", "an invite's answer is a link that lets anybody in: never the door's"))
 
 
 PROVIDERS = {"backblaze": backblaze, "cloudflare": cloudflare, "github": github, "hetzner": hetzner, "aws": aws,
@@ -628,6 +645,107 @@ def decide(access, agent, kind, name, op, args, content, lookups):
     d = PROVIDERS[kind](access, agent, name, op, args, content, lookups)
     d.target = d.target or f"{kind}:{name}"
     return d
+
+
+# ---------------------------------------------------------------- what an agent made, and what a delete removes
+#
+# The coordinator's change to D25 (6 November 2026): "a delete of what no agent made" is a code check, and not only a
+# rule of the judge, because the judge can miss a crafted call. The door keeps the names of what writes through it
+# made (made_keys, from the provider's answer); a judged call that deletes anything else (deletes) goes to the owner as
+# a Needs-you item with the exact call, as a refusal of the judge does, and his signed yes lets it through once.
+
+HZ_ONE = {"servers": "server", "firewalls": "firewall", "volumes": "volume", "primary_ips": "primary_ip",
+          "floating_ips": "floating_ip", "networks": "network", "load_balancers": "load_balancer",
+          "certificates": "certificate", "ssh_keys": "ssh_key", "placement_groups": "placement_group"}
+MADE_NAME = re.compile(r"[A-Za-z0-9._:@~-]{1,200}")
+B2_MADE = ("b2_copy_file", "b2_start_large_file", "b2_finish_large_file")
+B2_DELETE = {"b2_delete_bucket": ("bucket", "bucketId"), "b2_delete_file_version": ("file", "fileId"),
+             "b2_cancel_large_file": ("file", "fileId"), "b2_delete_key": ("key", "applicationKeyId")}
+AZ_DELETE_ACTION = re.compile(r"(?i)(delete|purge|remove|reimage|wipe|clear|truncate|empty)[a-z]*")
+
+
+def made_keys(provider, method, path, status, answer):
+    """The names of what one write made, from the provider's own answer: a new object of a collection (its id, or its
+    name for an R2 bucket), a new Hetzner object or image, an Azure resource that a PUT created (201), a B2 bucket or
+    file. A write that changed something that was there makes nothing."""
+    if status >= 300 or not isinstance(answer, dict):
+        return []
+    if provider == "cloudflare" and method == "POST":
+        result = answer.get("result")
+        if path.endswith("/dns_records/batch") and isinstance(result, dict):
+            return [f"{path.removesuffix('/batch')}/{r['id']}" for r in result.get("posts") or []
+                    if isinstance(r, dict) and isinstance(r.get("id"), str) and MADE_NAME.fullmatch(r["id"])]
+        if isinstance(result, dict):
+            return [f"{path}/{result[k]}" for k in ("id", "uuid", "name")
+                    if isinstance(result.get(k), str) and MADE_NAME.fullmatch(result[k])]
+    if provider == "hetzner" and method == "POST":
+        if path.strip("/") in HZ_ONE:
+            one, where = answer.get(HZ_ONE[path.strip("/")]), path
+        elif re.fullmatch(r"/servers/[0-9]{1,12}/actions/create_image", path):
+            one, where = answer.get("image"), "/images"
+        else:
+            one, where = None, ""
+        if isinstance(one, dict) and isinstance(one.get("id"), int):
+            return [f"{where}/{one['id']}"]
+    if provider == "azure" and method == "PUT" and status == 201:
+        return [path.lower()]
+    if provider == "backblaze":
+        if path == "b2_create_bucket" and isinstance(answer.get("bucketId"), str):
+            return [f"bucket:{answer['bucketId']}"]
+        if path in B2_MADE:
+            return ([f"file:{answer['fileId']}"] if isinstance(answer.get("fileId"), str) else []) + \
+                ([f"name:{answer['bucketId']}/{answer['fileName']}"]
+                 if isinstance(answer.get("bucketId"), str) and isinstance(answer.get("fileName"), str) else [])
+    return []
+
+
+def deletes(plan, conf):
+    """The names of what a plan deletes, as made_keys names them, or [] when it deletes nothing: the DELETE method,
+    and each provider's delete calls that use another method (B2's b2_delete_*, b2_hide_file and b2_cancel_large_file,
+    Cloudflare's batch and bulk deletes, Hetzner's disable_backup, which deletes the server's backups, and Azure's
+    delete, purge and reimage actions). A key is made when the door minted it. A delete whose target the door cannot
+    name gets a name that nothing made, so it goes to the owner."""
+    provider, out = (plan or {}).get("provider"), []
+    for s in (plan or {}).get("steps") or []:
+        method, path = s.get("method"), s.get("path") or ""
+        body = s.get("body") if isinstance(s.get("body"), dict) else {}
+        if provider == "backblaze":
+            if path == "b2_hide_file":
+                out.append(f"name:{body.get('bucketId')}/{body.get('fileName')}")
+            elif path in B2_DELETE:
+                out.append(f"{B2_DELETE[path][0]}:{body.get(B2_DELETE[path][1])}")
+            elif re.match(r"b2_(delete|hide|cancel)_", path):
+                out.append(f"{path}:?")
+            continue
+        if provider not in ("cloudflare", "hetzner", "azure", "tailscale"):
+            continue
+        if provider == "cloudflare":
+            path = path.replace("{account_id}", str(conf.get("account_id") or ""))
+        if provider == "azure":
+            path = path.lower()
+        if method == "DELETE":
+            key = re.fullmatch(r"/tailnet/-/keys/([A-Za-z0-9]{1,100})", path) if provider == "tailscale" else None
+            out.append(f"key:{key.group(1)}" if key else path)
+        elif method != "POST":
+            continue
+        elif provider == "hetzner" and re.fullmatch(r"/servers/[0-9]{1,12}/actions/disable_backup", path):
+            out.append(path.partition("/actions/")[0])
+        elif provider == "azure" and AZ_DELETE_ACTION.fullmatch(path.rsplit("/", 1)[-1]):
+            out.append(path.rsplit("/", 1)[0])
+        elif provider == "cloudflare" and path.endswith("/dns_records/batch"):
+            base = path.removesuffix("/batch")
+            out += [f"{base}/{d['id']}" if isinstance(d, dict) and isinstance(d.get("id"), str) else f"{base}/?"
+                    for d in body.get("deletes") or []]
+        elif provider == "cloudflare" and re.search(r"/(bulk/)?delete$", path):
+            out.append(re.sub(r"/(bulk/)?delete$", "", path))
+    return out
+
+
+def named(key):
+    """A name of deletes() in words."""
+    kind, _, rest = key.partition(":")
+    words = {"bucket": "the bucket", "file": "the file version", "name": "the file", "key": "the key"}
+    return f"{words[kind]} {rest}" if kind in words and not key.startswith("/") else key
 
 
 # ---------------------------------------------------------------- execute a plan
@@ -664,6 +782,9 @@ def execute(plan, ctx):
             status, answer = send(provider, s, path, session, ctx, kept, plan)
         if status >= 400:
             raise Stop(f"{provider} answered {status}: {short(answer)}")
+        if provider != "aws" and ctx.get("made"):
+            for key in made_keys(provider, s["method"], path, status, answer):
+                ctx["made"](key)
         need = s.get("need")
         if need:
             check_need(need, answer, plan, kept)

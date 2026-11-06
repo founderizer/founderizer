@@ -14,8 +14,8 @@ Who may ask. The door knows a caller by its tailnet address, which Tailscale pro
 names each agent's address and what it holds, and each business's repository pool. Only root writes that file,
 through `door.py access`, and it refuses an address that two agents share, so the hub can name no agent and add no
 grant or pool. The hub has two rights of its own, each with its own secret: ask for a GitHub token (POST /github/token)
-for a grant that it names, which the door makes inside the agent's business pool or its own grants only, and read the
-record (GET /record).
+for a grant that it names, which the door makes inside the agent's business pool or its own grants only, with the
+reading of what the door's App reaches (GET /github/reach) for the same secret, and read the record (GET /record).
 
 What it does. A call is a rule call (code passes it at once, with no model, so it works when the model is down), a
 judged call (one HTTPS call to the model with no tools and a token cap; the answer is allow or refuse, and anything
@@ -65,6 +65,7 @@ RECORD_FILE = STATE + "/record.jsonl"
 REFUSED_FILE = STATE + "/refused.json"      # judged calls the model refused, by hash
 COUNTS_FILE = STATE + "/counts.json"        # today's judged calls of each business and refusals of each agent
 MINTED_FILE = STATE + "/minted.json"        # ids of the keys this door minted (never their values)
+MADE_FILE = STATE + "/made.json"            # names of what writes through the door made, by provider account (D25)
 SECRETS_DIR = STATE + "/secrets"            # opened values, one file each, mode 600, this user only
 VAULT_KEY = STATE + "/vault.key"            # the door's own age identity (its recipient is pinned in the vault)
 SSH_KEY = STATE + "/ssh/id_ed25519"         # the door's SSH key to the second sshd of each host
@@ -109,6 +110,7 @@ REFUSED_KEEP = 5000         # refused hashes kept
 REBOOT_BACK = 900           # seconds a reboot-class call holds its business while the host comes back
 BODY_MAX = 512 * 1024
 RECORD_PAGE = 500
+GITHUB_REACH_PAGES = 30     # pages of 100 repositories that the door reads of one installation, at most
 GITHUB_ACCESS = {"read": {"contents": "read", "pull_requests": "read", "metadata": "read"},
                  "write": {"contents": "write", "pull_requests": "write", "metadata": "read"},
                  "deploy": {"contents": "write", "pull_requests": "write", "metadata": "read",
@@ -440,6 +442,21 @@ class Door:
     def minted(self, key_id):
         return key_id in read_json(MINTED_FILE, {})
 
+    def keep_made(self, target, key):
+        """A thing that a write through the door made, by its provider account: a later delete of it may go to the
+        judge (door_providers.made_keys)."""
+        with self.lock:
+            made = read_json(MADE_FILE, {})
+            made.setdefault(target, {})[key] = round(now())
+            write_json(MADE_FILE, made)
+
+    def made(self, target, key):
+        """True when the door's own record shows that an agent made this through the door: a key that it minted, or a
+        thing that a write made."""
+        if key.startswith("key:"):
+            return self.minted(key[4:])
+        return key in (read_json(MADE_FILE, {}).get(target) or {})
+
     def aws_token(self):
         """The JWT-SVID of the door's own bot, which tbot renews; the door trades it at STS for a role's session."""
         try:
@@ -515,10 +532,18 @@ class Door:
             if yes:             # the owner said yes to this exact call: it runs once, with no model call
                 d.kind, d.why = "approved", f"the owner's signed yes (N-{yes['need']}) to this exact call, used once"
             else:
-                allowed, why = self.judge(agent, access, d, op, args, content)
-                if not allowed:
-                    d = door_targets.refused(why + (door_providers.AWS_COST if target.startswith("aws:") else ".") +
-                                             APPROVAL_NOTE.format(sha=sha), target=d.target)
+                # D25: a delete of what no agent made through the door is the owner's, by code before the judge
+                unmade = [key for key in door_providers.deletes(d.plan, (access.get("credentials") or {}).get(
+                    d.target) or {}) if not self.made(d.target, key)]
+                if unmade:
+                    d = door_targets.refused(
+                        f"this call deletes {door_providers.named(unmade[0])}, which no agent made through the door, "
+                        f"and such a delete is the owner's." + APPROVAL_NOTE.format(sha=sha), target=d.target)
+                else:
+                    allowed, why = self.judge(agent, access, d, op, args, content)
+                    if not allowed:
+                        d = door_targets.refused(why + (door_providers.AWS_COST if target.startswith("aws:") else ".")
+                                                 + APPROVAL_NOTE.format(sha=sha), target=d.target)
         if d.kind == "refused":
             n = self.record.add(caller=agent, target=target, action=op, kind="refused", outcome="refused",
                                 why=d.why[:300], sha256=sha)
@@ -611,6 +636,7 @@ class Door:
         return {"credentials": dict((access.get("credentials") or {}).get(target) or {},
                                     owner=target.partition(":")[2]),
                 "http": self.http, "secret": self.secret, "keep": lambda kind, answer: self.keep_minted(answer),
+                "made": lambda key: self.keep_made(target, key),
                 "minted_secret": self.minted_secret, "aws_token": self.aws_token, "aws_sessions": self.aws_sessions,
                 "host": lambda host, op, args, stdin: self.ssh(access["hosts"][host],
                                                                {"v": 1, "op": op, "args": args}, stdin),
@@ -715,7 +741,7 @@ class Door:
         tokens, errors = [], [{"repos": [r], "error": "neither the door's access file nor the business's pool gives "
                                                       "this agent that level"} for r in refused]
         for (owner, level), names in sorted(groups.items()):
-            conf = github_app(access, owner) or {}
+            conf = github_app(access, owner) or sole_app(access) or {}
             try:
                 ctx = {"credentials": dict(conf, owner=owner), "http": self.http, "secret": self.secret}
                 jwt = door_providers.app_jwt(conf["app_id"], self.secret(conf.get("secret")))
@@ -739,6 +765,57 @@ class Door:
         self.record.add(caller="hub", target="github", action="token", kind="token",
                         outcome="done" if tokens else "failed", why=f"{agent}: {len(tokens)} tokens")
         return tokens, errors
+
+    def github_reach(self):
+        """What the door's GitHub Apps reach, for the hub's marks of "What the App reaches" once the hub holds no App
+        key (DevOps plan 13, item 4): each installation's settings page, built here from its account and its id and
+        never taken from GitHub's answer; the accounts whose installation has all their repositories; the repositories
+        of the others; and the page that installs the App on another account. Every name in lower case."""
+        apps = sorted({(str(c["app_id"]), c["secret"]) for k, c in (self.access().get("credentials") or {}).items()
+                       if k.lower().startswith("github:") and isinstance(c, dict) and c.get("app_id") and c.get("secret")})
+        pages, every, repos, install = {}, set(), set(), None
+        for app_id, ref in apps:
+            headers = {"Authorization": "Bearer " + door_providers.app_jwt(app_id, self.secret(ref)),
+                       "Accept": "application/vnd.github+json"}
+            status, app = self.http("GET", f"{GitHub.API}/app", headers, None)
+            slug = app.get("slug") if status == 200 and isinstance(app, dict) else None
+            if install is None and isinstance(slug, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,99}", slug):
+                install = f"https://github.com/apps/{slug}/installations/new"
+            status, installs = self.http("GET", f"{GitHub.API}/app/installations?per_page=100", headers, None)
+            if status != 200 or not isinstance(installs, list):
+                raise door_providers.Stop(f"GitHub gave no list of the App's installations ({status})")
+            for one in installs:
+                account = (one.get("account") if isinstance(one, dict) else None) or {}
+                iid, login = one.get("id") if isinstance(one, dict) else None, account.get("login")
+                if isinstance(iid, bool) or not isinstance(iid, int) or not isinstance(login, str) or \
+                        not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login):
+                    continue
+                pages[login.lower()] = (f"https://github.com/organizations/{login}/settings/installations/{iid}"
+                                        if account.get("type") == "Organization" else
+                                        f"https://github.com/settings/installations/{iid}")
+                if one.get("suspended_at"):
+                    continue        # it reaches nothing until the owner lets it work again, on that same page
+                if one.get("repository_selection") == "all":
+                    every.add(login.lower())
+                    continue
+                status, got = self.http("POST", f"{GitHub.API}/app/installations/{iid}/access_tokens",
+                                        dict(headers, **{"Content-Type": "application/json"}),
+                                        json.dumps({"permissions": {"metadata": "read"}}).encode())
+                token = got.get("token") if status == 201 and isinstance(got, dict) else None
+                if not isinstance(token, str):
+                    raise door_providers.Stop(f"GitHub gave no token to read {login}'s installation ({status})")
+                for page in range(1, GITHUB_REACH_PAGES + 1):
+                    status, got = self.http("GET", f"{GitHub.API}/installation/repositories?per_page=100&page={page}",
+                                            {"Authorization": "Bearer " + token,
+                                             "Accept": "application/vnd.github+json"}, None)
+                    names = [r.get("full_name") for r in (got.get("repositories") if status == 200 and
+                                                          isinstance(got, dict) else None) or [] if isinstance(r, dict)]
+                    repos.update(n.lower() for n in names if isinstance(n, str))
+                    if len(names) < 100:
+                        break
+                else:
+                    every.add(login.lower())    # more than the door reads: the hub marks none of this account's
+        return {"pages": pages, "all": sorted(every), "repos": sorted(repos), "install": install}
 
 
 class GitHub:
@@ -890,6 +967,14 @@ def github_app(access, owner):
     return next((c for k, c in (access.get("credentials") or {}).items() if k.lower() == want), None)
 
 
+def sole_app(access):
+    """The door's one GitHub App, when its file names one App only: an account that the owner installed it on after
+    the move has no line of its own yet, and GitHub's installation of the repository decides, as it did for the hub."""
+    apps = {(str(c.get("app_id")), c.get("secret")): c for k, c in (access.get("credentials") or {}).items()
+            if k.lower().startswith("github:") and isinstance(c, dict) and c.get("app_id")}
+    return next(iter(apps.values())) if len(apps) == 1 else None
+
+
 def judge_text(d, content):
     """What the judge reads as the content: a commit's files as text, each under its path and with its message, and
     any other content as it came. Never the agent's own words about it."""
@@ -962,6 +1047,13 @@ class Handler(BaseHTTPRequestHandler):
             after = urllib.parse.parse_qs(query).get("after", ["0"])[0]
             return self.answer(200, {"entries": self.door.record.after(int(after) if after.isdigit() else 0),
                                      "last": self.door.record.last})
+        if path == "/github/reach":
+            if not self.door.hub_allowed(self.source(), self.bearer(), "token_sha256"):
+                return self.answer(403, {"error": "what the App reaches is the hub's to read, with its token secret"})
+            try:
+                return self.answer(200, self.door.github_reach())
+            except (Refused, door_providers.Stop) as e:
+                return self.answer(502, {"error": str(e)})
         self.answer(404, {"error": "no such route"})
 
     def do_POST(self):
