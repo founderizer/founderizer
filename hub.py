@@ -7949,6 +7949,56 @@ def t_door_rollout(agent, a):
     return text
 
 
+def t_door_hold(agent, a):
+    """door_hold (the manager, new-projects plan N8 (b)): team.json door.holds[host]. parts: the app puts no door parts
+    on the server, and nobody gets it through the door. judged: it gets its parts and its Operator, and the door's file
+    holds it as rule-only, so the door runs no judged call there. none ends the hold. The coordinator's word of
+    6 November 2026: hel1-1 waits for plan 2.23, and the judged calls of five servers for 2.14 to 2.17."""
+    host = str(a.get("host") or "").strip().lower()
+    hold = a.get("hold")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", host):
+        raise ToolError("host is the server's name, as Tailscale gives it, for example hel1-1.")
+    if hold not in DOOR_HOLDS + ("none",):
+        raise ToolError("hold is parts (no door parts and no grant), judged (its parts, and no judged call there) or "
+                        "none (the hold ends).")
+    why = str(a.get("why") or "").strip()
+    if not why or len(why) > GRANT_WHY_MAX:
+        raise ToolError(f"why is the plan step or the reason, in 1 to {GRANT_WHY_MAX} characters: the record keeps it.")
+    guard(agent, why)
+    command, stored = agent_write(agent, "door_hold", a, {"host": host, "hold": hold, "why": why})
+    if stored:
+        return stored["text"]
+    if not isinstance(TEAM.get("door"), dict) or not TEAM["door"].get("address"):
+        raise ToolError("This fleet has no door, so there is nothing to hold.")
+
+    def change(team):
+        door = team.get("door") or {}
+        holds = dict(door.get("holds") or {})
+        if holds.get(host) == (None if hold == "none" else hold):
+            return False
+        if hold == "none":
+            holds.pop(host, None)
+        else:
+            holds[host] = hold
+        if holds:
+            door["holds"] = dict(sorted(holds.items()))
+        else:
+            door.pop("holds", None)
+        return True
+    try:
+        result = save_integration(None, change, f"the door holds {host}: {hold} ({why})", by=agent)
+    except Refusal as e:
+        raise ToolError(f"The hub refused it: {e}") from None
+    text = {"parts": f"{host} gets no door parts, and nobody gets it through the door, until you end the hold.",
+            "judged": f"{host} gets its parts and its Operator, and the door runs no judged call there until you end "
+                      f"the hold.",
+            "none": f"{host} has no hold now."}[hold] + ("" if result["changed"] else " It was so already.") + \
+        " This Mac's app writes the door's file at its next round."
+    with transaction():
+        keep_command(command, {"text": text}, now())
+    return text
+
+
 def secret_site_host(site):
     """The host of a request's address, for its title: "dashboard.stripe.com" of "https://dashboard.stripe.com/login".
     It keeps the subdomain, because that is the page the owner will recognise."""
@@ -20695,6 +20745,10 @@ def resume_lines(t0):
                                                        for r in duties[:RESUME_ROWS])
                    + (f"; and {len(duties) - RESUME_ROWS} more" if len(duties) > RESUME_ROWS else "")
                    + ". see_responsibilities.")
+    waits = door_waits_after()
+    if waits:
+        out.append(f"The door's parts wait after {waits}, whose door check passed: once its Operator's normal work "
+                   f"there through the door passed (test 6), call door_rollout with go true.")
     tasks = q(f"SELECT * FROM tasks WHERE {OPEN_TASK} ORDER BY id")
     if tasks:
         out.append("Open tasks:")
@@ -21259,6 +21313,16 @@ TOOLS = [
                                                  "further server gets them"},
         "why": {"type": "string", "description": "What made you decide: the Operator's result, in a line"}},
        ["request_id", "go", "why"])),
+    ("manager", "door_hold", t_door_hold,
+     "Keep the door from one server while a plan step waits. parts: the app puts no door parts on it, and nobody gets "
+     "it through the door. judged: it gets its parts and its Operator, and the door runs no judged call there, only "
+     "rule calls. none ends the hold, once the step's check passed.",
+     S({"request_id": REQUEST_ID,
+        "host": {"type": "string", "description": "The server's name, as Tailscale gives it"},
+        "hold": {"type": "string", "enum": ["parts", "judged", "none"],
+                 "description": "parts, judged, or none to end the hold"},
+        "why": {"type": "string", "description": "The plan step that it waits for, or the reason, in a line"}},
+       ["request_id", "host", "hold", "why"])),
     ("manager", "request_secret", t_request_secret,
      "Ask the owner for a secret that the fleet does not hold: an API key or a login. It is a Needs-you item that they "
      "answer in a secure form in Founderizer on their Mac, so the value goes straight into the vault and never "
@@ -30707,10 +30771,15 @@ def validate_door(team):
     door = team.get("door")
     if door is None:
         return
-    if not isinstance(door, dict) or set(door) - {"address", "port", "secrets", "credentials", "github_apps", "rollout"}:
-        raise ValueError("door must be {address, port, secrets, credentials, github_apps, rollout}")
+    if not isinstance(door, dict) or \
+            set(door) - {"address", "port", "secrets", "credentials", "github_apps", "rollout", "holds"}:
+        raise ValueError("door must be {address, port, secrets, credentials, github_apps, rollout, holds}")
     if not isinstance(door.get("rollout", False), bool):
         raise ValueError("door.rollout is true or false: the manager's door_rollout sets it")
+    holds = door.get("holds", {})
+    if not isinstance(holds, dict) or not all(isinstance(k, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", k) and
+                                              v in DOOR_HOLDS for k, v in holds.items()):
+        raise ValueError(f"door.holds maps a server's name to {' or '.join(DOOR_HOLDS)}: the manager's door_hold sets it")
     apps = door.get("github_apps", {})
     if not isinstance(apps, dict) or not all(
             isinstance(k, str) and GITHUB_LOGIN.fullmatch(k) and k == k.lower() and isinstance(v, str) and
@@ -30854,7 +30923,10 @@ def door_view():
             "vault_read": status is not None,
             # new-projects plan N8 (b): the manager's door_rollout, after which the app puts the door's parts on the
             # servers after the first one
-            "rollout": door.get("rollout") is True}
+            "rollout": door.get("rollout") is True,
+            # N8 (b): the servers that a plan step holds, from the manager's door_hold: parts (none, and no grant) or
+            # judged (the door's file holds them as rule-only, so the door runs no judged call there)
+            "holds": dict(sorted((door.get("holds") or {}).items()))}
 
 
 DOOR_PENDING = {}   # {request_id: (token, record)} of one POST /ui/door/secrets: in memory only, never in a record
@@ -30940,6 +31012,23 @@ def save_door_entry(body):
 
 
 DOOR_HOST_STATES = ("installed", "passed", "failed")
+DOOR_HOLDS = ("parts", "judged")       # N8 (b): what the manager's door_hold keeps from one server
+
+
+def door_waits_after():
+    """The canary, while its door check passed and no other server has a word yet, and the manager has not called
+    door_rollout; else None. The manager's resume names door_rollout for it until then (the coordinator's word: a tool
+    that no prompt names when it is needed is never used). A rollout that the manager stopped after other servers is
+    not named again."""
+    if (TEAM.get("door") or {}).get("rollout") is True:
+        return None
+    rows = q("SELECT k, v FROM kv WHERE k LIKE 'door_host:%'")
+    if len(rows) != 1:
+        return None
+    with contextlib.suppress(ValueError, TypeError, AttributeError):
+        if json.loads(rows[0]["v"]).get("state") == "passed":
+            return rows[0]["k"][len("door_host:"):]
+    return None
 
 
 def door_host_report(body):
@@ -30965,7 +31054,10 @@ def door_host_report(body):
                                         f"(test 6: an update, a restart, a deploy, a restic run, an nginx edit, a "
                                         f"reload and a restore). When that work passed, call door_rollout with go "
                                         f"true: the app then puts the parts on the other servers, one each round, "
-                                        f"and checks each one the same way.")
+                                        f"and checks each one the same way. Before that, give door_hold to each "
+                                        f"server that a plan step keeps from the door: parts (it gets none, and no "
+                                        f"grant) or judged (it gets its parts, and the door runs no judged call "
+                                        f"there).")
         elif state == "failed":
             emit(manager_name(), "say", f"[hub] The door's parts did not go on {host}, or the door's check of it "
                                         f"failed: {said} The app puts the parts on no other server until a new release "
