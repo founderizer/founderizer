@@ -8001,14 +8001,15 @@ def t_request_secret(agent, a):
     if not why or len(why) > SECRET_WHY_MAX:
         raise ToolError(f"why is what the work needs it for, in 1 to {SECRET_WHY_MAX} characters: the owner reads "
                         f"it before they type the value.")
-    door = str(a.get("door") or "").strip().lower()
+    door = door_key_name(a.get("door"))
     if door:                # DevOps plan 13, item 3: a key that the door uses for the agent that asks, as its holder
         if not TEAM.get("door"):
             raise ToolError("This fleet has no door, so there is no key to ask for it. Leave door out.")
         if kind != "api_key" or not DOOR_CREDENTIAL.fullmatch(door):
             raise ToolError(f"door is the key's name in the door's rules: <provider>:<account> of "
-                            f"{', '.join(DOOR_PROVIDERS)} (for example cloudflare:hgr), or model, and it is an "
-                            f"API key. AWS needs no key, and a GitHub App key comes through the app.")
+                            f"{', '.join(DOOR_PROVIDERS)} (for example cloudflare:hgr), model, or app:<app>:<NAME> "
+                            f"for one setting of an app on a host (for example app:shop:STRIPE_SECRET_KEY), and it "
+                            f"is an API key. AWS needs no key, and a GitHub App key comes through the app.")
     give = {"door": "use"} if door else {agent: "use"} if worker else a.get("give_to") or {}
     if not isinstance(give, dict) or len(give) > SECRET_GIVE_MAX:
         raise ToolError(f'give_to maps up to {SECRET_GIVE_MAX} agents to "use" or "read", for example '
@@ -8205,9 +8206,11 @@ def answer_secret(body, request_id, client):
         gave = any(h["agent"] == need["by"] for h in resource_holders("secret", ref))
         if spec.get("door"):    # DevOps plan 13, item 3: the door holds it, and its rules name it for the asker
             save_door_credential(spec["door"], ref, need["by"])
-            text = (f"Saved for the door as {spec['door']} ({ref}): the door holds the key and makes those calls, and "
-                    f"no agent holds it. The door's rules take it when the app next writes them, within a few "
-                    f"minutes; then `ops {spec['door']} <form>` works.")
+            app_key = spec["door"].split(":") if spec["door"].startswith("app:") else None
+            text = (f"Saved for the door as {spec['door']} ({ref}): the door holds the key, and no agent holds it. "
+                    f"The door's rules take it when the app next writes them, within a few minutes; then " +
+                    (f"`ops <host> env-new {app_key[1]} {app_key[2]} key` puts it in the app's settings."
+                     if app_key else f"`ops {spec['door']} <form>` works."))
     else:
         text = "Not given" + (f": {body['decline']}" if body["decline"] else ".") + \
             " Do not ask for it in words instead."
@@ -21228,7 +21231,8 @@ TOOLS = [
                                    "The owner can change this before they save."},
         "door": {"type": "string", "description": "Only for a key that the DevOps door uses: its name in the door's "
                                                   "rules, <provider>:<account> (cloudflare, hetzner, backblaze, "
-                                                  "azure or tailscale), or model for the door's own judge. The card "
+                                                  "azure or tailscale), model for the door's own judge, or "
+                                                  "app:<app>:<NAME> for one setting of an app on a host. The card "
                                                   "gives it to the door alone, and give_to is not used."}},
        ["why"])),
     # A worker's and a lead's own entry: in its owner chat, in reply to the owner's message, and in a task session
@@ -21252,11 +21256,14 @@ TOOLS = [
                                                  "reads it before they type the value"},
         "in_reply_to": {"type": "string", "description": "In your owner chat: the request_id of the owner's newest "
                                                          "message to you"},
-        "door": {"type": "string", "description": "Only for a key of a provider account that the DevOps door uses "
-                                                  "for you: its name in the door's rules, <provider>:<account> "
-                                                  "(cloudflare, hetzner, backblaze, azure or tailscale). The card "
-                                                  "gives it to the door, not to you: you call it through the door "
-                                                  "with ops, and you never hold it."}},
+        "door": {"type": "string", "description": "Only for a key that the DevOps door uses for you: its name in "
+                                                  "the door's rules. <provider>:<account> (cloudflare, hetzner, "
+                                                  "backblaze, azure or tailscale) is a provider account that you "
+                                                  "call through the door with ops. app:<app>:<NAME> is one setting "
+                                                  "of an app on a host, for example app:shop:STRIPE_SECRET_KEY, "
+                                                  "which `ops <host> env-new <app> <NAME> key` puts in the app's "
+                                                  "settings. The card gives it to the door, not to you, and you "
+                                                  "never hold it."}},
        ["why", "site"])),
     # owner API 1.13: the standing duties of an agent (RESPONSIBILITIES.md)
     ("all", "see_responsibilities", t_see_responsibilities,
@@ -30580,9 +30587,11 @@ DOOR_SECRETS_FILE = os.path.expanduser("~/.fleet/door.json")   # {"token", "reco
 DOOR_PORT = 8766
 # A key that the owner saves for the door from a key card is one credential of the door's rules (DevOps plan 13, item
 # 3): <provider>:<account>, or the door judge's own model key. AWS has no key (the door's own bot), and a GitHub App
-# key comes through the app's GitHub App rows, so neither is asked for with a card.
+# key comes through the app's GitHub App rows, so neither is asked for with a card. app:<app>:<NAME> is a key for one
+# setting of one app on a host (new-projects plan N4), which the door's env-new puts in that app's settings file.
 DOOR_PROVIDERS = ("backblaze", "cloudflare", "hetzner", "azure", "tailscale")
-DOOR_CREDENTIAL = re.compile(r"(?:" + "|".join(DOOR_PROVIDERS) + r"):[a-z0-9][a-z0-9-]{0,39}|model")
+DOOR_APP_KEY = r"app:[a-z][a-z0-9-]{0,23}:[A-Z][A-Z0-9_]{0,63}"
+DOOR_CREDENTIAL = re.compile(r"(?:" + "|".join(DOOR_PROVIDERS) + r"):[a-z0-9][a-z0-9-]{0,39}|model|" + DOOR_APP_KEY)
 DOOR_WAIT = 30                  # seconds one call to the door may take
 DOOR_READ_EVERY = 60            # seconds between two reads of the door's record
 DOOR_PAGE = 500
@@ -30638,7 +30647,7 @@ def validate_door(team):
     for name, c in credentials.items():
         if not isinstance(name, str) or not DOOR_CREDENTIAL.fullmatch(name):
             raise ValueError(f"door.credentials: {name!r} is not <provider>:<account> of "
-                             f"{', '.join(DOOR_PROVIDERS)}, or model")
+                             f"{', '.join(DOOR_PROVIDERS)}, model, or app:<app>:<NAME>")
         users = c.get("agents", []) if isinstance(c, dict) else None
         if not isinstance(c, dict) or set(c) - {"secret", "agents"} or c.get("secret") not in held or \
                 not isinstance(users, list) or len(set(users)) != len(users) or \
@@ -30831,6 +30840,17 @@ def save_door_entry(body):
         door.update(address=address, port=port)
         return True
     return save_integration(None, change, f"the door is at {address}:{port}")
+
+
+def door_key_name(text):
+    """A key card's door name as the door's rules write it: lower case, but for the setting's NAME of
+    app:<app>:<NAME>, which the app reads in its own case."""
+    text = str(text or "").strip()
+    kind, _, rest = text.partition(":")
+    if kind.lower() == "app" and rest.count(":") == 1:
+        app, _, name = rest.partition(":")
+        return f"app:{app.lower()}:{name}"
+    return text.lower()
 
 
 def save_door_credential(name, ref, asker):

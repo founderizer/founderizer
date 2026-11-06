@@ -120,6 +120,8 @@ GITHUB_ACCESS = {"read": {"contents": "read", "pull_requests": "read", "metadata
 NAME = re.compile(r"[a-z][a-z0-9-]{1,30}")
 HOST = re.compile(r"[a-z0-9][a-z0-9.-]{0,62}")
 REF = re.compile(r"bws://[0-9a-f-]{36}", re.I)
+# new-projects plan N4: a key that the owner saved for one setting of one app, app:<app>:<NAME>
+APP_KEY = re.compile(r"app:" + door_targets.OPS_ROOT.APP_NAME.pattern + ":" + door_targets.OPS_ROOT.ENV_NAME.pattern)
 ROLE = re.compile(r"arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,128}")
 HOST_KEY = re.compile(r"ssh-ed25519 [A-Za-z0-9+/=]{60,100}")
 WINDOW_CLASSES = ("upgrade", "restart", "reboot", "deploy", "tailscale")
@@ -218,6 +220,11 @@ def validate_access(data):
     credentials = data.get("credentials") or {}
     for key, c in credentials.items():
         kind, _, name = key.partition(":")
+        if kind == "app":       # new-projects plan N4: a key that the owner saved for one setting of one app
+            if not APP_KEY.fullmatch(key) or not isinstance(c, dict) or set(c) != {"secret"} or \
+                    not REF.fullmatch(str(c["secret"])):
+                raise ValueError(f"credential {key!r} is app:<app>:<NAME> and names its secret by bws://<uuid>")
+            continue
         if kind not in tuple(door_providers.PROVIDERS) + ("model",) or (kind != "model" and not name):
             raise ValueError(f"credential {key!r} is not <provider>:<account> or model")
         if kind == "aws":       # no AWS key is stored: the door assumes the account's role with its bot's token
@@ -441,6 +448,20 @@ class Door:
         except OSError:
             raise Refused(f"the door does not hold {ref} yet: the owner grants it to the door") from None
 
+    def setting(self, access, value):
+        """The value of an app's new setting (new-projects plan N4), as bytes for the host's stdin: 32 random bytes in
+        base64, or the key that the owner saved for the door as app:<app>:<NAME>, and never a provider's key."""
+        source, name = value
+        if source == "random":
+            return base64.b64encode(secrets.token_bytes(32))
+        credentials = access.get("credentials") or {}
+        ref = (credentials.get(name) or {}).get("secret")
+        if not ref:
+            raise Refused(f"the door holds no key as {name}")
+        if any(isinstance(c, dict) and c.get("secret") == ref for k, c in credentials.items() if k != name):
+            raise Refused(f"{name} names a key that the door uses for something else: it goes in no app")
+        return self.secret(ref).encode()
+
     def minted(self, key_id):
         return key_id in read_json(MINTED_FILE, {})
 
@@ -604,9 +625,12 @@ class Door:
     def act(self, access, d, op, args, content):
         if d.plan is None:
             req = {"v": 1, "op": op, "args": d.args}
-            if op == "file":            # ops-root installs only the bytes that have the request's sha256
-                req["sha256"] = hashlib.sha256(content or b"").hexdigest()
-            status, out = self.ssh(access["hosts"][d.host], req, content if op == "file" else None)
+            stdin = content if op in door_targets.HOST_CONTENT else None
+            if stdin is not None:       # ops-root installs only the bytes that have the request's sha256
+                req["sha256"] = hashlib.sha256(stdin).hexdigest()
+            if d.value:
+                stdin = self.setting(access, d.value)
+            status, out = self.ssh(access["hosts"][d.host], req, stdin)
             if status == 3:
                 raise Refused(out.strip().removeprefix("refused: "))
             if status != 0:
@@ -1083,6 +1107,11 @@ def judge_text(d, content):
     """What the judge reads as the content: a commit's files as text, each under its path and with its message, and
     any other content as it came. Never the agent's own words about it."""
     plan = d.plan or {}
+    if d.value:             # the door's own words: the value never reaches the judge, the agent or the record
+        return (f"The door adds the setting {d.args[1]} to the root-owned settings file of the app {d.args[0]}. "
+                + ("Its value is 32 random bytes that the door makes." if d.value[0] == "random" else
+                   f"Its value is the key that the owner saved for the door as {d.value[1]}, for this app and this "
+                   "setting alone.") + " The agent never sees the value.")
     if plan.get("files"):
         parts = [f"commit message: {plan.get('message', '')}"]
         for path, data, mode in plan["files"]:

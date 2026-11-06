@@ -30,6 +30,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -364,6 +365,9 @@ CHECKS = {
     "place": lambda a: check_place(a),
     "app-new": lambda a: check_app_new(a),
     "app-check": lambda a: [check_app_name(one(a, "app-check", "the app's name"))],
+    "unit-new": lambda a: [check_app_name(one(a, "unit-new", "the app's name"))],
+    "env-new": lambda a: check_env(a, "env-new"),
+    "env-add": lambda a: check_env(a, "env-add"),
 }
 
 
@@ -808,7 +812,7 @@ def do_self_update(req, data):
 # port and health path; and the product's release helper as /usr/local/sbin/<app>-deploy, a link to the one signed file
 # that self-update keeps current, whose deploy verb is all that the deploy user reaches through sudo.
 
-APP = re.compile(r"[a-z][a-z0-9-]{0,23}")
+APP_NAME = re.compile(r"[a-z][a-z0-9-]{0,23}")        # an app of app-new; rollback keeps its own APP above
 WWW = "/var/www"
 APPS = ETC + "/apps"                        # one settings file for each app: {"app", "port", "health"}
 RELEASE_HELPER = LIB + "/app-release"       # the product's release helper (host/app-release)
@@ -816,7 +820,7 @@ PLAN_WRITES = ("app-new", "unit-new", "env-new", "env-add", "runner-new", "vhost
 
 
 def check_app_name(name):
-    if not isinstance(name, str) or not APP.fullmatch(name):
+    if not isinstance(name, str) or not APP_NAME.fullmatch(name):
         raise Refused("an app's name starts with a letter and holds lowercase letters, digits and hyphens, at most 24")
     return name
 
@@ -838,7 +842,8 @@ def app_names(name):
             "helper": f"/usr/local/sbin/{name}-deploy", "sudoers": f"/etc/sudoers.d/95-app-{name}",
             "settings": f"{APPS}/{name}.json", "env": f"{tree}/shared/.env",
             "folders": [tree] + [f"{tree}/{d}" for d in ("releases", "artifacts", "artifacts/incoming", "shared")],
-            "blocklists": [f"{tree}/release-blocklist", f"{tree}/security-blocked-releases.tsv"]}
+            "blocklists": [f"{tree}/release-blocklist", f"{tree}/security-blocked-releases.tsv"],
+            "system": [f"{d}/{name}" for d in SYSTEM_DIRS]}
 
 
 def account_exists(name):
@@ -880,7 +885,10 @@ def do_app_new(req, data):
     name, port, health = req["args"]
     n = app_names(name)
     taken = [u for u in n["users"] + [name] if account_exists(u)] + \
-        [p for p in (n["tree"], n["unit"], n["helper"], n["sudoers"], n["settings"]) if os.path.lexists(P(p))]
+        [p for p in (n["tree"], n["unit"], n["helper"], n["sudoers"], n["settings"], *n["system"])
+         if os.path.lexists(P(p))]
+    if unit_known(f"{name}.service"):           # systemd's own view: nginx.service lives in /usr/lib, not /etc
+        taken.append(f"{name}.service")
     if taken:
         raise Refused(f"{', '.join(taken)} exists already: app-new makes a new app only")
     if not os.path.isfile(P(RELEASE_HELPER)):
@@ -957,6 +965,267 @@ def do_app_check(req, data):
     out["runner"] = ("active" if "running" in said else "not running") if said.strip() else "none"
     return json.dumps(out, sort_keys=True)
 
+
+# ---- the app's unit and its settings (new-projects plan N4)
+#
+# unit-new installs /etc/systemd/system/<app>.service once code has read each line of it: the sections [Unit],
+# [Service] and [Install] only, and each key from a short list. The unit runs as the app's own user with no new
+# privileges. Its one settings file is the app's own, because systemd reads that file as root and a second one could
+# read another app's. Its ExecStart runs the release under current, and no command has a prefix that runs it with
+# privileges. It pulls in no unit beyond the network, a database and the app's own, a bind mount stays inside the
+# app's own folders (a bind skips the modes of the folders above a file), and no folder that systemd makes for it
+# changes the owner of anything that is not the app's. Then the judge reads it. env-new and env-add add one setting to
+# that file, with the value that the door sends on stdin, which no answer shows: never a name that the unit sets.
+
+UNIT_MAX = 16 * 1024
+SYSTEM_DIRS = ("/etc", "/var/lib", "/var/cache", "/var/log", "/run", "/opt", "/srv", "/usr/lib", "/usr/share")
+UNIT_DIRS = {"StateDirectory": "/var/lib", "CacheDirectory": "/var/cache", "LogsDirectory": "/var/log",
+             "RuntimeDirectory": "/run"}
+UNIT_KEYS = {
+    "Unit": {"Description", "Documentation", "After", "Before", "Wants", "Requires", "BindsTo", "PartOf",
+             "ConditionPathExists", "ConditionPathIsDirectory", "AssertPathExists", "StartLimitIntervalSec",
+             "StartLimitBurst"},
+    "Service": {"Type", "User", "Group", "WorkingDirectory", "EnvironmentFile", "Environment", "ExecStart",
+                "ExecStartPre", "ExecStartPost", "ExecReload", "ExecStop", "ExecStopPost", "ExecCondition",
+                "Restart", "RestartSec", "RestartPreventExitStatus", "SuccessExitStatus", "RemainAfterExit",
+                "TimeoutSec", "TimeoutStartSec", "TimeoutStopSec", "KillMode", "KillSignal", "SendSIGKILL",
+                "WatchdogSec", "NotifyAccess", "UMask", "LimitNOFILE", "MemoryMax", "MemoryHigh", "MemorySwapMax",
+                "CPUQuota", "CPUWeight", "TasksMax", "IOWeight", "StandardOutput", "StandardError",
+                "SyslogIdentifier", "NoNewPrivileges", "PrivateTmp", "PrivateDevices", "PrivateUsers",
+                "ProtectSystem", "ProtectHome", "ProtectKernelTunables", "ProtectKernelModules", "ProtectKernelLogs",
+                "ProtectControlGroups", "ProtectClock", "ProtectHostname", "ProtectProc", "ProcSubset",
+                "RestrictSUIDSGID", "RestrictRealtime", "RestrictNamespaces", "RestrictAddressFamilies",
+                "LockPersonality", "MemoryDenyWriteExecute", "SystemCallFilter", "SystemCallArchitectures",
+                "SystemCallErrorNumber", "CapabilityBoundingSet", "ReadWritePaths", "ReadOnlyPaths",
+                "InaccessiblePaths", "BindPaths", "BindReadOnlyPaths", "StateDirectory", "CacheDirectory",
+                "LogsDirectory", "RuntimeDirectory", "StateDirectoryMode", "CacheDirectoryMode", "LogsDirectoryMode",
+                "RuntimeDirectoryMode", "RemoveIPC", "IPAddressAllow", "IPAddressDeny", "DevicePolicy"},
+    "Install": {"WantedBy"},
+}
+UNIT_PULLS = ("network.target", "network-online.target", "nss-lookup.target", "time-sync.target",
+              "postgresql.service", "redis-server.service")
+UNIT_TYPES = ("simple", "exec", "notify", "oneshot")
+UNIT_OUTPUT = ("journal", "null", "inherit")
+YES = ("1", "yes", "true", "on")
+LOOPBACK = ("127.0.0.1", "::1", "localhost")
+ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+ENV_REFUSED = ("PORT", "HOST", "HOSTNAME", "BIND_HOST", "NODE_ENV", "NODE_OPTIONS", "PATH")
+ENV_SOURCES = ("random", "key")
+VALUE_MAX = 4096
+VALUE_PLAIN = re.compile(r"[A-Za-z0-9+/=._:@%,~-]+")
+
+
+def unit_known(unit):
+    "True when systemd has a unit of that name anywhere, or cannot say: only not-found is free."
+    status, out = systemctl("show", "--property=LoadState", "--value", unit)
+    return not (status == 0 and out.strip() == "not-found")
+
+
+def check_env(args, name):
+    if len(args) != 3:
+        raise Refused(f"{name} takes the app's name, the setting's name and where its value comes from: random or "
+                      "key")
+    app, key, source = check_app_name(args[0]), args[1], args[2]
+    if not ENV_NAME.fullmatch(key) or key in ENV_REFUSED or key.startswith("LD_"):
+        raise Refused(f"the setting's name is like STRIPE_SECRET_KEY, and never {', '.join(ENV_REFUSED)} or LD_*: "
+                      "the unit sets those")
+    if source not in ENV_SOURCES:
+        raise Refused(f"the value comes from the door: random (32 random bytes, in base64) or key (the key that the "
+                      f"owner saved for the door as app:{app}:{key})")
+    return [app, key, source]
+
+
+def app_roots(app):
+    return [f"{WWW}/{app}"] + [f"{d}/{app}" for d in UNIT_DIRS.values()]
+
+
+def inside(path, roots):
+    return os.path.normpath(path) == path and any(path == r or path.startswith(r + "/") for r in roots)
+
+
+def unit_problem(app, text, port):
+    """The first thing that code refuses in an app's unit, or None. systemd reads the same lines: a line that goes on
+    to the next one, a section or a key that is not on the list, and a control character are refused."""
+    user, current = f"{app}-app", f"{WWW}/{app}/current"
+    env = f"{WWW}/{app}/shared/.env"
+    if re.search(r"[\x00-\x08\x0b-\x1f\x7f]", text):
+        return "the unit is plain text, with no control character"
+    seen, section = {}, None
+    for number, line in enumerate(text.split("\n"), 1):
+        s = line.strip()
+        if s.endswith("\\"):
+            return f"line {number} goes on to the next line: write each setting on one line"
+        if not s or s[0] in "#;":
+            continue
+        if s.startswith("["):
+            section = s[1:-1] if s.endswith("]") else None
+            if section not in UNIT_KEYS:
+                return f"line {number}: an app's unit has the sections [Unit], [Service] and [Install] only"
+            continue
+        key, eq, value = s.partition("=")
+        key, value = key.strip(), value.strip()
+        if section is None or not eq:
+            return f"line {number} is not a setting of a section"
+        if key not in UNIT_KEYS[section]:
+            return f"line {number}: {key} is not a setting that an app's unit has in [{section}]"
+        seen.setdefault(key, []).append(value)
+    get = lambda key: seen.get(key, [])    # noqa: E731
+    if not get("User") or set(get("User")) != {user} or set(get("Group")) - {user}:
+        return f"the unit runs as {user}, and as no other user or group"
+    if not get("NoNewPrivileges") or set(v.lower() for v in get("NoNewPrivileges")) - set(YES):
+        return "the unit has NoNewPrivileges=true"
+    if env not in get("EnvironmentFile") or set(get("EnvironmentFile")) - {env, f"-{current}/.release.env"}:
+        return f"the unit reads {env}, and beside it only -{current}/.release.env"
+    if len(get("ExecStart")) != 1:
+        return "the unit has one ExecStart"
+    for key in ("ExecStart", "ExecStartPre", "ExecStartPost", "ExecReload", "ExecStop", "ExecStopPost",
+                "ExecCondition"):
+        for value in get(key):
+            if not value.lstrip("-@:").startswith("/") or ";" in value.split():
+                return f"{key} runs one program by its absolute path, with no prefix that gives it privileges"
+    if not any(inside(w.strip("'\""), [current]) for w in get("ExecStart")[0].split()):
+        return f"ExecStart runs the release under {current}"
+    for value in get("WorkingDirectory"):
+        if not inside(value.removeprefix("-"), [current]):
+            return f"WorkingDirectory is {current} or a folder in it"
+    for value in get("Environment"):
+        try:
+            words = shlex.split(value)
+        except ValueError:
+            return "an Environment line has a quote that does not close"
+        for word in words:
+            name, eq, said = word.partition("=")
+            if not eq:
+                return f"Environment sets NAME=value, and {word!r} is not that"
+            if name == "PORT" and said != str(port):
+                return f"PORT is {port}, the port of the app's settings"
+            if name in ("HOST", "HOSTNAME", "BIND_HOST") and said not in LOOPBACK:
+                return f"{name} is a loopback address: the app answers on this host only"
+    for key in ("Wants", "Requires", "BindsTo", "PartOf"):
+        for word in " ".join(get(key)).split():
+            if word not in UNIT_PULLS and word != f"{app}.service" and \
+                    not (word.startswith(f"{app}-") and word.endswith(".service") and UNIT.fullmatch(word)):
+                return f"{key} pulls in {word}: an app's unit pulls in only the network, its database and its own units"
+    for word in " ".join(get("After") + get("Before")).split():
+        if not UNIT.fullmatch(word):
+            return f"{word!r} is not the name of a unit"
+    if not get("WantedBy") or set(" ".join(get("WantedBy")).split()) != {"multi-user.target"}:
+        return "the unit is wanted by multi-user.target, and by nothing else"
+    for key in UNIT_DIRS:
+        for word in " ".join(get(key)).split():
+            if not inside(word, [app]):
+                return f"{key} is {app} or a folder in it"
+    for key in ("BindPaths", "BindReadOnlyPaths"):
+        for word in " ".join(get(key)).split():
+            parts = word.lstrip("-").split(":")
+            if len(parts) > 3 or not all(inside(p, app_roots(app)) for p in parts[:2]):
+                return f"{key} binds folders of the app only: {', '.join(app_roots(app))}"
+    checks = [("Type", UNIT_TYPES), ("StandardOutput", UNIT_OUTPUT), ("StandardError", UNIT_OUTPUT)]
+    for key, allowed in checks:
+        if set(get(key)) - set(allowed):
+            return f"{key} is one of {', '.join(allowed)}"
+    for key in ("StateDirectoryMode", "CacheDirectoryMode", "LogsDirectoryMode", "RuntimeDirectoryMode", "UMask"):
+        if any(not re.fullmatch(r"[0-7]{3,4}", v) for v in get(key)):
+            return f"{key} is an octal mode, like 0750"
+    return None
+
+
+def unit_folders(app, text):
+    "The folders that systemd makes for the unit and gives to its user: (key, path) of each."
+    out = []
+    for line in text.split("\n"):
+        key, eq, value = line.strip().partition("=")
+        if eq and key.strip() in UNIT_DIRS:
+            out += [(key.strip(), f"{UNIT_DIRS[key.strip()]}/{w}") for w in value.split()]
+    return out
+
+
+@form("unit-new", kind="judged", help="an app's systemd unit, /etc/systemd/system/<app>.service, installed and "
+                                      "enabled: <app>, the unit on stdin with its sha256, on a fix host only")
+def do_unit_new(req, data):
+    app = req["args"][0]
+    n = app_names(app)
+    if not os.path.isfile(P(n["settings"])):
+        raise Refused(f"{app} is no app of this host: app-new makes it first")
+    try:
+        port = int(json.loads(read(n["settings"]))["port"])
+        uid = pwd.getpwnam(f"{app}-app").pw_uid
+    except (ValueError, TypeError, KeyError):
+        raise Refused(f"{app}'s settings or its user {app}-app are not as app-new made them") from None
+    if data is None or len(data) > UNIT_MAX:
+        raise Refused(f"unit-new takes the unit on stdin, at most {UNIT_MAX // 1024} KiB")
+    if not SHA256.fullmatch(str(req.get("sha256") or "")) or hashlib.sha256(data).hexdigest() != req["sha256"]:
+        raise Refused("the bytes do not have the request's sha256")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refused("the unit is UTF-8 text") from None
+    problem = unit_problem(app, text, port)
+    if problem:
+        raise Refused(problem)
+    unit = f"{app}.service"
+    taken = [p for p in (n["unit"], f"/etc/systemd/system/{unit}.d", f"/run/systemd/system/{unit}.d")
+             if os.path.lexists(P(p))]
+    if taken or unit_known(unit):
+        raise Refused(f"{', '.join(taken) or unit} exists already: unit-new installs a new unit only")
+    for key, path in unit_folders(app, text):
+        with contextlib.suppress(FileNotFoundError):
+            if os.lstat(P(path)).st_uid != uid:
+                raise Refused(f"{path} of {key} exists and is not {app}-app's: systemd would give it to the app")
+    replace(n["unit"], data, 0o644)
+    try:
+        checked(systemctl("daemon-reload"), None)
+        checked(systemctl("enable", unit), None)
+    except Failed as e:
+        with contextlib.suppress(OSError):
+            os.remove(P(n["unit"]))
+        systemctl("daemon-reload")
+        raise Failed(f"unit-new stopped, and it took the unit back: {e}") from None
+    return f"{unit} is installed and enabled: the app's first release starts it"
+
+
+def add_setting(req, data):
+    app, name, source = req["args"]
+    n = app_names(app)
+    if not os.path.isfile(P(n["settings"])):
+        raise Refused(f"{app} is no app of this host: app-new makes it first")
+    try:
+        value = (data or b"").decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refused("the value is UTF-8 text") from None
+    if not value or len(value) > VALUE_MAX or re.search(r"[\x00-\x1f\x7f]", value):
+        raise Refused(f"the value comes on stdin, one line of at most {VALUE_MAX} characters")
+    try:
+        st = os.lstat(P(n["env"]))
+        with open(P(n["env"]), encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        raise Refused(f"{n['env']} cannot be read here: app-new makes it") from None
+    if not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) != 0o600 or (os.geteuid() == 0 and st.st_uid != 0):
+        raise Refused(f"{n['env']} is not root's file of mode 0600: app-check says what is wrong")
+    for line in text.split("\n"):
+        s = line.strip()
+        if s and s[0] not in "#;" and s.partition("=")[0].strip() == name:
+            raise Refused(f"{name} is in {app}'s settings already: a new value of a key goes where the old one is")
+    if not VALUE_PLAIN.fullmatch(value):        # systemd's own quotes: a backslash keeps \ " ` and $ as they are
+        value = '"' + re.sub(r'([\\"`$])', r"\\\1", value) + '"'
+    replace(n["env"], (text + ("\n" if text and not text.endswith("\n") else "") + f"{name}={value}\n").encode(), 0o600)
+    said = "32 random bytes of the door" if source == "random" else f"the key that the owner saved as app:{app}:{name}"
+    return f"{name} is in {app}'s settings, from {said}: the app reads it when it next starts"
+
+
+@form("env-new", help="a new setting in an app's settings file, before its first release: <app> <NAME> random|key, "
+                      "the value on stdin (the door's), on a fix host only")
+def do_env_new(req, data):
+    if os.path.lexists(P(f"{WWW}/{req['args'][0]}/current")):
+        raise Refused(f"{req['args'][0]} has a release: env-add adds a setting now, and the judge reads it")
+    return add_setting(req, data)
+
+
+@form("env-add", kind="judged", help="a new setting in an app's settings file, after its first release: <app> <NAME> "
+                                     "random|key, the value on stdin (the door's), on a fix host only")
+def do_env_add(req, data):
+    return add_setting(req, data)
 
 # ---------------------------------------------------------------- what the forms share
 

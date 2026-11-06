@@ -42,6 +42,10 @@ OPS_READ = load("ops_read", os.path.join(HERE, "host", "ops-read"))
 VENDOR_REPOS = ("miguelpieras/founderizer-fleet", "miguelpieras/founderizer-web", "miguelpieras/agents")
 # Host forms that only the door sends, with a value of its own on stdin: never an agent's call.
 DOOR_ONLY = {"self-update", "place", "pro-attach", "runner-register"}
+# Host forms whose content goes to the host on stdin, with its sha256 (the judge reads it first), and the forms whose
+# value the door itself sends there (new-projects plan N4): never the caller's.
+HOST_CONTENT = ("file", "unit-new")
+DOOR_VALUE = ("env-new", "env-add")
 TARGET = re.compile(r"[a-z0-9][a-z0-9.-]{0,62}|[a-z]+:[A-Za-z0-9][A-Za-z0-9._/-]{0,99}")
 REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
 CONTENT_MAX = 256 * 1024     # bytes of content in one call; the judge's own cap is the door's (door.JUDGE_MAX)
@@ -77,6 +81,7 @@ class Decision:
         self.business = more.get("business")
         self.write = more.get("write", kind in ("rule", "judged"))
         self.plan = more.get("plan")            # what the door runs: a provider's requests, a commit, a deploy
+        self.value = more.get("value")          # (random, None) or (key, app:<app>:<NAME>): what the door sends
 
     def __repr__(self):
         return f"Decision({self.kind}, {self.why!r})"
@@ -124,7 +129,7 @@ def decide(access, agent, target, op, args, content=None, lookups=None):
     never = access.get("never") or {}
     kind, _, name = target.partition(":")
     if not name:
-        return decide_host(access, agent, me, target, op, args, never)
+        return decide_host(access, agent, me, target, op, args, never, content)
     if kind in ("commit", "deploy", "gitops"):
         if vendor(name) or name.lower() in {r.lower() for r in never.get("repos") or []}:
             return refused(f"{name} is never a target of the door")
@@ -145,7 +150,7 @@ def decide(access, agent, target, op, args, content=None, lookups=None):
 
 # ---------------------------------------------------------------- hosts
 
-def decide_host(access, agent, me, host, op, args, never):
+def decide_host(access, agent, me, host, op, args, never, content=None):
     h = (access.get("hosts") or {}).get(host)
     if h is None or host in (never.get("hosts") or []):
         return refused(f"{host} is no host of the door" if h is None else f"{host} is never a target of the door")
@@ -169,8 +174,21 @@ def decide_host(access, agent, me, host, op, args, never):
         checked = OPS_ROOT.check_args(op, list(args))
     except OPS_ROOT.Refused as e:
         return refused(str(e), **common)
+    value = None
+    if op in DOOR_VALUE:            # N4: 32 random bytes of the door, or the key that the owner saved for this setting
+        if content:
+            return refused(f"{op} takes no content: the door makes the value, or sends the owner's key", **common)
+        value = ("random", None)
+        if checked[2] == "key":
+            name = f"app:{checked[0]}:{checked[1]}"
+            if name not in (me.get("providers") or []) or name not in (access.get("credentials") or {}):
+                return refused(f"no key of yours is saved for the door as {name}: ask the owner for it with "
+                               f"request_secret, with door {name}", **common)
+            value = ("key", name)
+    elif op in HOST_CONTENT and not content:
+        return refused(f"{op} takes its bytes as the call's content", **common)
     f = OPS_ROOT.FORMS[op]
-    more = dict(common, form=op, args=checked, window=f["window"], reboot=f["reboot"], write=f["write"])
+    more = dict(common, form=op, args=checked, window=f["window"], reboot=f["reboot"], write=f["write"], value=value)
     if f["kind"] == "judged":
         if h.get("mode") != "fix":
             return refused(f"{host} is rule-only: no judged form and no file install", **more)
