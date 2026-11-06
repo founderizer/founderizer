@@ -84,7 +84,7 @@ case "$LEVEL" in
 esac
 [[ "$DOOR_KEY" =~ ^ssh-ed25519\ [A-Za-z0-9+/=]{60,100}(\ [A-Za-z0-9@._-]{1,64})?$ ]] || \
     die "--door-key is the door's ssh-ed25519 public key"
-for f in ops-read inventory release-key.pub; do [ -f "$HERE/$f" ] || die "$f is not beside this script"; done
+for f in ops-read inventory app-release release-key.pub; do [ -f "$HERE/$f" ] || die "$f is not beside this script"; done
 [ "$LEVEL" = read ] || [ -f "$HERE/ops-root" ] || die "ops-root is not beside this script"
 if [ -z "$ADDRESS" ]; then
     ADDRESS="$(tailscale ip -4 2>/dev/null | head -n 1 || true)"
@@ -107,6 +107,7 @@ install -d -m 0755 -o root -g root "$ETC" "$LIB"
 install -d -m 0700 -o root -g root "$STATE"
 install -m 0755 -o root -g root "$HERE/ops-read" "$LIB/ops-read"
 install -m 0755 -o root -g root "$HERE/inventory" "$LIB/inventory"
+install -m 0755 -o root -g root "$HERE/app-release" "$LIB/app-release"     # the product's release helper (plan N4)
 install -m 0644 -o root -g root "$HERE/release-key.pub" "$ETC/release-key.pub"
 [ ! -f "$HERE/early-key.pub" ] || install -m 0644 -o root -g root "$HERE/early-key.pub" "$ETC/early-key.pub"
 

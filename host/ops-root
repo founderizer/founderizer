@@ -792,7 +792,7 @@ def do_self_update(req, data):
     if int(found.group(1)) < VERSION:
         raise Refused(f"ops-root {int(found.group(1))} is older than {VERSION}: never an older one")
     for name, target, mode_bits in (("ops-root", SELF, 0o755), ("ops-read", READER, 0o755),
-                                    ("inventory", INVENTORY, 0o755)):
+                                    ("inventory", INVENTORY, 0o755), ("app-release", RELEASE_HELPER, 0o755)):
         if name in files:
             replace(target, files[name], mode_bits)
     replace(RELEASE_FILE, (bundle["manifest"]["revision"] + "\n").encode(), 0o644)
@@ -1223,7 +1223,7 @@ def verify_bundle(bundle):
         raise Refused("host/ is not the signed revision's")
     listed = tree_entries(folder)
     for name, body in files.items():
-        if name not in ("ops-root", "ops-read", "inventory") or listed.get(name, ("", ""))[1] != \
+        if name not in ("ops-root", "ops-read", "inventory", "app-release") or listed.get(name, ("", ""))[1] != \
                 git_object("blob", body):
             raise Refused(f"host/{name} is not the signed revision's")
     if "ops-root" not in files:
