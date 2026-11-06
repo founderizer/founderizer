@@ -2594,7 +2594,8 @@ def start_text(agent, task_id, resume=False, note="", row=None, opening=None, fi
         + memory_start_text(agent, task_id)                             #    and the matching lessons (L6)
         + ("" if shell_off(agent) else knowledge_start_text(agent))     #    and the knowledge files it may read
         # (support plan F1: a closed start carries the words of its own knowledge files, and has no read_knowledge)
-        + checks_start_text(agent, task_id)                             # 5. the agent's checks (L4)
+        + ("" if shell_off(agent) else checks_start_text(agent, task_id))  # 5. the agent's checks (L4)
+        # (F1: its line keeps the watches of a Shell-off agent, which has no see_triggers and saves no check)
     )
 
 
@@ -14374,7 +14375,11 @@ def duty_toolbox(agent):
 
 def duty_mechanism_text(body):
     """What the agent does when its duty has no watch that finds the event cheaply. The hub holds the duty, the case
-    and the scheduler; the agent builds the mechanism from its own tools (owner direction, 16 October 2026)."""
+    and the scheduler; the agent builds the mechanism from its own tools (owner direction, 16 October 2026). "" for a
+    holder whose sessions hold neither save_trigger nor attach_watch (session_holds: a Shell-off agent, support plan
+    F1), whose watch its line builds: the toolbox names keys and logins that never reach such a session."""
+    if not (session_holds(body["agent"], None, "save_trigger") and session_holds(body["agent"], None, "attach_watch")):
+        return ""
     return (f"{duty_toolbox(body['agent'])} If no watch of this duty finds the event by itself, build the mechanism "
             f"yourself with what you have — saved code for anything that needs no login (save_trigger: it runs on "
             f"your own machine, as your own user, when your runtime runs any command without asking), a wake-up "
@@ -14393,13 +14398,30 @@ def duty_task_text(body, watch):
         lines.append("You hold this duty yourself. For each case, decide again: do the work in this session, or give "
                      "it to the agent that suits it with create_task (see_capacity first, as RULES.md says) and keep "
                      "the case. The duty stays yours either way.")
-    lines.append(duty_mechanism_text(body))
-    lines.append("Call see_responsibilities first. Handle this case end to end. Record what you did with record_step, "
-                 "one short line for each real step, so the owner can read the chain afterwards: what you found, what "
-                 "you changed, who you told, what stops it happening again. The duty's own words say which of those "
-                 "this case needs. Then close_case. Ask your requester only when the duty does not cover a step, the "
-                 "step needs a decision that is not yours, or you are blocked.")
+    mechanism = duty_mechanism_text(body)
+    if mechanism:
+        lines.append(mechanism)
+    holds = lambda name: session_holds(body["agent"], None, name)       # support plan F1: only its own tools
+    lines.append(("Call see_responsibilities first. " if holds("see_responsibilities") else "") +
+                 "Handle this case end to end. Record what you did with record_step, one short line for each real "
+                 "step, so the owner can read the chain afterwards: what you found, what you changed, who you told, "
+                 "what stops it happening again. The duty's own words say which of those this case needs. Then "
+                 "close_case." + (" Ask your requester only when the duty does not cover a step, the step needs a "
+                                  "decision that is not yours, or you are blocked."
+                                  if holds("ask_my_requester") else ""))
     return "\n".join(lines)[:8000]
+
+
+def watch_details(t, task):
+    """The details of the task that rule t starts. A watch that the hub keeps for a duty (DUTY_WATCHES) takes its
+    duty's text as it stands now (duty_task_text), so that the holder's boxes, keys and logins of now reach the next
+    case, and not those of the duty's last save (support plan F1: a Shell-off holder whose watch was saved before);
+    any other rule its own stored details. Reads only: the run's transaction calls it."""
+    if t["responsibility"] and t["watch"] in DUTY_WATCHES:
+        r = read_row("SELECT * FROM responsibilities WHERE id=?", (t["responsibility"],))
+        if r:
+            return duty_task_text(duty_stored(r), None)
+    return task["details"]
 
 
 def duty_watch_body(body, watch, request_id=None):
@@ -15882,7 +15904,7 @@ def report_notices(t0):
             if not case:
                 DB.execute("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,'hub','case_opened',?)",
                            (duty["id"], t0, f"R-{duty['id']}/C-{case_id}: {rep['ticket']}"))
-            details = "\n\n".join(x for x in (task["details"], said, duty_case_line(duty, case_id)) if x)
+            details = "\n\n".join(x for x in (watch_details(watch, task), said, duty_case_line(duty, case_id)) if x)
             child = dict(admission["child"], title=f"{task['title']}: {rep['ticket']}"[:200], details=details[:8000],
                          parent=None, responsibility=duty["id"], duty_case=case_id,
                          why=f"{len(fixes)} closed case(s) cover ticket {rep['ticket']}.")
@@ -22901,7 +22923,8 @@ def trigger_decision(t, manual, due, t0):
     if unknown:
         return "not_started", f"O-{unknown['id']} of {tref(last['id'])} is unknown. Settle it first."
     try:            # the create_task rules for a task that the manager requests: capability, goal, login text
-        return None, check_task(manager_name(), {"owner": agent, "title": task["title"], "details": task["details"],
+        return None, check_task(manager_name(), {"owner": agent, "title": task["title"],
+                                                 "details": watch_details(t, task),
                                                  "done_when": task["done_when"], "needs": task["needs"],
                                                  "goal": gref(task["goal_id"]) if task["goal_id"] else "",
                                                  "why": f"The owner's trigger {t['id']} names {agent}."})
@@ -22973,6 +22996,7 @@ CHECK_RUNS = "check_runs"       # the helper feature: it lists its running check
 # plan P0: what a run says when its check, or its result, has a form that this release does not read (check_known)
 NEWER_CHECK = "A check of a newer form, which this release reads as quiet."
 CHECK_TAIL = 2000               # characters of the end of a failed check's error output that its wake shows (plan P4)
+CHECK_SAID = 200               # the most of a failed fleet check's last error line in its run's detail (F5)
 TAIL_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")    # control characters, but a tail keeps its lines
 CHECK_LINES_HARD = 1024 * 1024  # bytes of a result's lines above which the hub takes it as too large, never refuses it
 WAKE_LINES_BUDGET = 4000        # characters of new lines in a wake's details; the rest goes into a message of it
@@ -23234,9 +23258,10 @@ def wake_admission(t, route, task):
     busy = desktop_refusal(owner, task["needs"], requester)
     if busy:
         raise ToolError(busy)
-    guard(requester, task["title"], task["done_when"], task["details"])
+    details = watch_details(t, task)
+    guard(requester, task["title"], task["done_when"], details)
     common = {"needs": task["needs"], "goal": goal, "goal_id": goal_id, "follows": None, "case_id": None}
-    child = dict(common, owner=owner, title=task["title"], details=task["details"], done_when=task["done_when"],
+    child = dict(common, owner=owner, title=task["title"], details=details, done_when=task["done_when"],
                  parent=None, why=f"Wake-up rule {t['id']}, set by {t['created_by']}.")
     parent = dict(common, owner=requester, needs="none", parent=None,
                   why=f"Wake-up rule {t['id']}: {owner}'s result arrives in this task.") if route["parent"] else None
@@ -23305,7 +23330,8 @@ def admit_wake(t, run, admission, line, t0):
         eid = DB.execute("INSERT INTO events(agent,kind,task,text,created,extra) VALUES(?,'say',NULL,?,?,'{}')",
                          (route["to"], mask_secrets(f"{text}\n{case_line}" if case_line else text), t0)).lastrowid
         return None, eid, None
-    child = dict(admission["child"], details=f"{task['details']}\n\n{line}" if task["details"] else line)
+    details = watch_details(t, task)
+    child = dict(admission["child"], details=f"{details}\n\n{line}" if details else line)
     if t["responsibility"]:         # before its start event, which names the duty's own tools (closed_extra)
         child.update(responsibility=t["responsibility"], duty_case=case_id)
     if case_line:
@@ -23459,7 +23485,7 @@ def check_decision(t, r, value, t0):
         return "waiting", f"{agent} is at its usage limit until {clock(lim['until'])}.", None
     try:            # the create_task rules for a task that the manager requests: capability, goal, login text
         return "started", None, check_task(manager_name(), {
-            "owner": agent, "title": task["title"], "details": task["details"], "done_when": task["done_when"],
+            "owner": agent, "title": task["title"], "details": watch_details(t, task), "done_when": task["done_when"],
             "needs": task["needs"], "goal": gref(task["goal_id"]) if task["goal_id"] else ""})
     except ToolError as e:
         return "waiting", str(e), None
@@ -23514,6 +23540,18 @@ def check_body(data):
         body = dict({k: body[k] for k in ("token", "elapsed_ms") if k in body}, ok=False, error="blocked",
                     detail="The check output contained a registered login.")
     return body
+
+
+def check_said(spec, body):
+    """The last line of the error output of a failed run of a file of checks/ (support plan F5), for the run's detail,
+    where the manager and the owner read why it failed. That file is the fleet's own code, and each of its error
+    lines is its own fixed words, such as "the address answered HTTP 404". An agent's saved code can write outside
+    text there, so its error output goes only to its own failure wake. The tail is masked already (error_tail).
+    None when there is none."""
+    if not (isinstance(spec, dict) and isinstance(spec.get("path"), str)):
+        return None
+    last = [x.strip() for x in str(body.get("tail") or "").splitlines() if x.strip()]
+    return last[-1][:CHECK_SAID] if last else None
 
 
 def error_tail(text):
@@ -23768,6 +23806,9 @@ def check_result(t, r, body, t0, stored=None, held=None):
                  else None)
     else:
         failures, error, detail = t["failures"] + 1, body["error"], body.get("detail") or None
+        said = check_said(spec, body)       # support plan F5: why a file of checks/ failed, in its own words
+        if said:
+            detail = f"{detail}: {said}" if detail else said
         state, reason, pause = "error", f"The check failed: {error}.", None
         if body.get("retry_after") and not r["check_now"]:      # its own time to try again, on fresh data
             state, retry = "waiting", t0 + body["retry_after"]
@@ -23986,7 +24027,7 @@ def case_line_rows(t, r, admission, starts, spec, t0, wakes=None):
             DB.execute("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,'hub','case_opened',?)",
                        (duty["id"], t0, f"R-{duty['id']}/C-{case_id}: {key}"))
         said = mask_secrets(trigger_provenance(t, r["id"], r["due"], False, (spec, [line], None), t0=t0, wakes=wakes))
-        details = "\n\n".join(x for x in (task["details"], said, duty_case_line(duty, case_id)) if x)
+        details = "\n\n".join(x for x in (watch_details(t, task), said, duty_case_line(duty, case_id)) if x)
         child = dict(admission["child"], title=f"{task['title']}: {key}"[:200], details=details[:8000], parent=None,
                      responsibility=duty["id"], duty_case=case_id)
         tid = admit_task(admission["route"]["requester"], child, trigger_id=t["id"],

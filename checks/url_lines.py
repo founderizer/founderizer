@@ -12,6 +12,8 @@ import urllib.parse
 import urllib.request
 
 ANSWER_MAX, LINE_MAX = 65536, 400
+# A name of its own: an edge that refuses Python's default one stops the check (Cloudflare, 6 November 2026)
+USER_AGENT = "Founderizer-Fleet/1 (check)"
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -31,7 +33,8 @@ if not parts or not parts.hostname or parts.username or parts.password or parts.
 token = os.environ.get(key) if isinstance(key, str) and key else None
 if not token:
     sys.exit(f"this agent has no key {key!r} for its checks: args.key names the variable of a key it reads")
-request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "text/plain"})
+request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "text/plain",
+                                                 "User-Agent": USER_AGENT})
 try:
     with urllib.request.build_opener(NoRedirect).open(request, timeout=30) as answer:
         body = answer.read(ANSWER_MAX + 1)

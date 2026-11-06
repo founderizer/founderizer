@@ -1944,6 +1944,8 @@ RUNTIME_VERSION = re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,6}")
 # The vendor's own release store, where its installer (claude.ai/install.sh) takes each version: <version>/manifest.json
 # names the SHA-256 of each platform's file, and <version>/<platform>/claude is that file.
 CLAUDE_RELEASES = "https://downloads.claude.ai/claude-code-releases"
+# The helper's own name at an outside site: an edge can refuse Python's default one (6 November 2026)
+OUTSIDE_AGENT = "Founderizer-Fleet/1 (helper)"
 CLOSED_INSTALLS = {}        # {version: {"thread", "error"}} of the installs that this helper started (closed_program)
 
 
@@ -1973,7 +1975,8 @@ def install_closed(version):
     downloads into a file of its own, .claude-<version>.<pid>.part, and removes one that a helper which has ended left
     behind."""
     platform = claude_platform()
-    with urllib.request.urlopen(f"{CLAUDE_RELEASES}/{version}/manifest.json", timeout=60) as r:
+    with urllib.request.urlopen(urllib.request.Request(f"{CLAUDE_RELEASES}/{version}/manifest.json",
+                                                       headers={"User-Agent": OUTSIDE_AGENT}), timeout=60) as r:
         manifest = json.loads(r.read(1 << 20))
     platforms = manifest.get("platforms") if isinstance(manifest, dict) and manifest.get("version") == version else None
     entry = platforms.get(platform) if isinstance(platforms, dict) else None
@@ -1988,7 +1991,9 @@ def install_closed(version):
                 os.remove(left)
     part, digest = os.path.join(KEPT_RUNTIMES, f".claude-{version}.{os.getpid()}.part"), hashlib.sha256()
     try:
-        with urllib.request.urlopen(f"{CLAUDE_RELEASES}/{version}/{platform}/claude", timeout=60) as r, \
+        with urllib.request.urlopen(urllib.request.Request(f"{CLAUDE_RELEASES}/{version}/{platform}/claude",
+                                                           headers={"User-Agent": OUTSIDE_AGENT}),
+                                    timeout=60) as r, \
                 open(os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700), "wb") as f:
             for block in iter(lambda: r.read(1 << 20), b""):
                 digest.update(block)

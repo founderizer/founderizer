@@ -193,6 +193,8 @@ SENT_UNKNOWN = "The request may have been sent. Its answer is not known. It is n
 CANCELED = "The request was stopped before its answer. The service can have received it. It is not sent again."
 REPEATED = "This request was already started. It is not sent again."
 NO_PROOF = "The vault cannot prove that its request ended."
+# The name that a request says at the service: an edge can refuse curl's default one (6 November 2026)
+USER_AGENT = "Founderizer-Fleet/1 (vault)"
 REQUEST_LIMIT = 60          # seconds that the curl child of a request gets when the agent names none; a test gives less
 ANSWER_LIMIT = 65536        # bytes of an answer's body that the helper gets; the child is ended when more come
 HEAD_LIMIT = 262144         # bytes of an answer before its body: the status line and the headers
@@ -1593,7 +1595,8 @@ def curl_config(call, login, body=None):
     limit = call.get("limit") or REQUEST_LIMIT
     lines = ['proto = "-all"', "silent", "globoff", "include", "no-buffer", "http1.1", 'noproxy = "*"', "max-redirs = 0",
              f"max-time = {limit}", f"connect-timeout = {min(limit, 15)}",
-             f'request = "{call["method"]}"', 'header = "Accept: application/json"']
+             f'request = "{call["method"]}"', 'header = "Accept: application/json"',
+             f'user-agent = "{USER_AGENT}"']         # an agent's own User-Agent header, below, wins
     own = call.get("headers") or {}
     if body is not None:
         if not any(n.lower() == "content-type" for n in own):   # the agent's own type wins; JSON when it named none
