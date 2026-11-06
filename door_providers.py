@@ -44,7 +44,8 @@ its own bot's web identity token.
     ops tailscale:<tailnet> change <METHOD> <path>                 judged (D25)
 
 A judged delete passes to the judge only when the door's own record shows that an agent made its target through the
-door (made_keys, deletes); any other delete goes to the owner as a Needs-you item with the exact call.
+door (made_keys, deletes); any other delete, and every AWS delete, goes to the owner as a Needs-you item with the exact
+call.
 """
 import base64
 import datetime
@@ -662,6 +663,15 @@ B2_MADE = ("b2_copy_file", "b2_start_large_file", "b2_finish_large_file")
 B2_DELETE = {"b2_delete_bucket": ("bucket", "bucketId"), "b2_delete_file_version": ("file", "fileId"),
              "b2_cancel_large_file": ("file", "fileId"), "b2_delete_key": ("key", "applicationKeyId")}
 AZ_DELETE_ACTION = re.compile(r"(?i)(delete|purge|remove|reimage|wipe|clear|truncate|empty)[a-z]*")
+# The coordinator's word of 6 November 2026 on D25: every AWS delete is the owner's, decided by the action's name, with
+# no record of what an agent made there (an AWS answer names the resources that a call read, too, so a record would
+# take them for made). Delete, Terminate, Remove, Deregister, Revoke and Purge, as he named them, and the ones of the
+# listed services that remove something under another name: BatchDelete (ECR's images), Release (an Elastic IP or a
+# dedicated host), Cancel (a spot fleet's cancel can end its instances), and three that delete by a rule.
+AWS_DELETE = re.compile(r"(Delete|BatchDelete|Terminate|Remove|Deregister|Revoke|Purge|Release|Cancel)[A-Z][A-Za-z0-9]*")
+AWS_DELETE_OTHER = ("logs:PutRetentionPolicy",          # a shorter retention deletes the older logs
+                    "ecr:PutLifecyclePolicy",           # its rules delete images
+                    "cloudformation:ExecuteChangeSet")  # it runs a change set, whose removals the call does not show
 
 
 def made_keys(provider, method, path, status, answer):
@@ -704,11 +714,17 @@ def deletes(plan, conf):
     and each provider's delete calls that use another method (B2's b2_delete_*, b2_hide_file and b2_cancel_large_file,
     Cloudflare's batch and bulk deletes, Hetzner's disable_backup, which deletes the server's backups, and Azure's
     delete, purge and reimage actions). A key is made when the door minted it. A delete whose target the door cannot
-    name gets a name that nothing made, so it goes to the owner."""
+    name gets a name that nothing made, so it goes to the owner, and so does every AWS delete (AWS_DELETE), by its
+    action's name or the REST API's DELETE method."""
     provider, out = (plan or {}).get("provider"), []
     for s in (plan or {}).get("steps") or []:
         method, path = s.get("method"), s.get("path") or ""
         body = s.get("body") if isinstance(s.get("body"), dict) else {}
+        if provider == "aws":
+            service, action = s.get("aws") or ("", "")
+            if method == "DELETE" or AWS_DELETE.fullmatch(action) or f"{service}:{action}" in AWS_DELETE_OTHER:
+                out.append(f"aws:{service}:{action}")
+            continue
         if provider == "backblaze":
             if path == "b2_hide_file":
                 out.append(f"name:{body.get('bucketId')}/{body.get('fileName')}")
@@ -744,8 +760,16 @@ def deletes(plan, conf):
 def named(key):
     """A name of deletes() in words."""
     kind, _, rest = key.partition(":")
-    words = {"bucket": "the bucket", "file": "the file version", "name": "the file", "key": "the key"}
+    words = {"bucket": "the bucket", "file": "the file version", "name": "the file", "key": "the key",
+             "aws": "the AWS call"}
     return f"{words[kind]} {rest}" if kind in words and not key.startswith("/") else key
+
+
+def delete_refusal(key):
+    """The door's words for a judged delete that is the owner's, for the first name that deletes() gave."""
+    if key.startswith("aws:"):
+        return f"this call is an AWS delete ({key[4:]}), and every AWS delete is the owner's."
+    return f"this call deletes {named(key)}, which no agent made through the door, and such a delete is the owner's."
 
 
 # ---------------------------------------------------------------- execute a plan

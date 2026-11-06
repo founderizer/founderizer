@@ -536,9 +536,8 @@ class Door:
                 unmade = [key for key in door_providers.deletes(d.plan, (access.get("credentials") or {}).get(
                     d.target) or {}) if not self.made(d.target, key)]
                 if unmade:
-                    d = door_targets.refused(
-                        f"this call deletes {door_providers.named(unmade[0])}, which no agent made through the door, "
-                        f"and such a delete is the owner's." + APPROVAL_NOTE.format(sha=sha), target=d.target)
+                    d = door_targets.refused(door_providers.delete_refusal(unmade[0]) + APPROVAL_NOTE.format(sha=sha),
+                                             target=d.target)
                 else:
                     allowed, why = self.judge(agent, access, d, op, args, content)
                     if not allowed:
