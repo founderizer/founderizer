@@ -31685,7 +31685,9 @@ LOGIN_URLS = {name: RUNTIMES[name]["sign_in"]["url"] for name in LOGIN_RUNTIMES}
 # owner had: the app would not even light its Send (21 October 2026).
 USER_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._#-]{3,200}")
 # The live part of every open sign-in, by its id: {"url", "show_code", "wants_code", "code", "at"}. In memory, on
-# purpose (see above). A hub restart drops it, which is right: the window on the machine is gone with it.
+# purpose (see above). A hub restart drops it. The provider's window on the machine stays open, and its helper
+# (feature signin_relink) sends the link again when it next looks (`send_link`); a code that was in memory then is
+# gone, and the owner sends it again.
 LIVE_LOGINS = {}
 
 
@@ -31718,11 +31720,14 @@ def expire_logins(t0=None):
            1 if row["state"] == "needs_owner" else None, t0, row["id"]))
         LIVE_LOGINS.pop(row["id"], None)
     # **A hub that restarted kept no link.** `needs_owner` is written with the link in the same breath, so a row in
-    # that state with nothing live is a sign-in this hub cannot finish and the owner cannot open: the window on its
-    # machine went with the restart. Left alone it stands for a quarter of an hour, showing a step with no link and
+    # that state with nothing live is one whose link went with a restart of this hub. A helper with signin_relink
+    # waits out the restart with the provider's window open, and sends the link again at its next look (`send_link`,
+    # login_for_machine): that sign-in goes on, and the restart takes nothing from its time (6 November 2026: two
+    # sign-ins of Iris ended because a release restarted the hub). An older helper's sign-in cannot: its window went
+    # with the restart, and left alone the row stands for a quarter of an hour, showing a step with no link and
     # refusing the next sign-in, which is what the owner met on 21 October 2026.
     for row in q("SELECT * FROM signin_jobs WHERE state='needs_owner'"):
-        if row["id"] not in LIVE_LOGINS:
+        if row["id"] not in LIVE_LOGINS and "signin_relink" not in helper_features(row["agent"]):
             q("UPDATE signin_jobs SET state='failed', detail=?, updated=? WHERE id=?",
               ("The hub restarted while this sign-in waited. Start it again.", t0, row["id"]))
     # **And a machine that restarted left no sign-in running.** A helper leaves `starting` within its own wait for
@@ -31946,7 +31951,11 @@ def give_login_code(agent, code):
     if row is None:
         raise Refusal(409, "this server has no sign-in waiting. Start one in the app.")
     live = LIVE_LOGINS.get(row["id"]) or {}
-    if row["state"] != "needs_owner" or not live.get("wants_code"):
+    # A hub that restarted has no live part until the machine sends its link again (send_link): a code the owner
+    # sends in those seconds is taken all the same when the runtime is one that waits for a code back.
+    wants = live.get("wants_code") if live.get("url") else \
+        ((RUNTIMES.get(row["runtime"]) or {}).get("sign_in") or {}).get("wants_code")
+    if row["state"] != "needs_owner" or not wants:
         raise Refusal(409, f"this sign-in is {row['state']} and is not waiting for a code.")
     if not USER_CODE.fullmatch(code or ""):
         raise Refusal(400, "the code is 4 to 41 characters of letters, digits and dashes, as the provider gave it.")
@@ -32029,7 +32038,18 @@ def login_for_machine(agent, lid):
     live = LIVE_LOGINS.get(lid) or {}
     code = live.pop("code", None)
     live.pop("code_at", None)
-    return {"stop": False, "state": row["state"], "runtime": row["runtime"], "code": code}
+    state = row["state"]
+    if state == "signing_in" and code is None:
+        # **The machine asks for a code that it never got.** It asks only while it waits for one, so the owner's code
+        # went with a restart of this hub, or with an answer that never reached the machine. The sign-in waits for
+        # him again, and he sends the code again.
+        state = "needs_owner"
+        q("UPDATE signin_jobs SET state=?, detail=NULL, updated=? WHERE id=?", (state, now(), lid))
+        log("hub", f"{agent}: sign-in L-{lid} waits for the owner's code again: his code did not reach the machine")
+    # send_link: a restart of this hub took the link of a sign-in that waits for the owner, and the machine that
+    # still has its window open sends it again (helper feature signin_relink).
+    return {"stop": False, "state": state, "runtime": row["runtime"], "code": code,
+            "send_link": state == "needs_owner" and not live.get("url")}
 
 
 def signed_in_view(agent, data):

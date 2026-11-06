@@ -59,6 +59,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from http.client import HTTPException       # only the name: `http` is this module's own call to the hub
 
 from threads import MARKER, THREAD_ID, CodexFiles, Tailer, Translator, complete_rows, manager_transcript, text_of
 from usage import Collector, local_model, timestamp
@@ -80,6 +81,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)   # the hub is never behind a proxy
 AGENT = None            # the logical agent of this process: http() sends its key (owner API 1.12)
+# What a call of http() gets from a hub that is away, as it is while it restarts to take a release: no connection
+# (URLError), a connection reset or timed out (OSError), or an answer cut short (HTTPException). A 5xx is the same news.
+HUB_AWAY = (urllib.error.URLError, OSError, HTTPException)
+HUB_RETRY = 5           # seconds between two tries of a call that the hub did not answer, as the poll loop waits
 SESSIONS = os.path.join(HOME, "sessions")       # mode-600 session credential files of this user's windows
 
 
@@ -4391,7 +4396,10 @@ class Helper:
         session = LOGIN_SESSION % self.agent
 
         def report(state, **fields):
-            code, data = http("POST", f"/helper/login/{self.agent}/{lid}", dict({"state": state}, **fields))
+            code, data = self.login_call(lid, "POST", f"/helper/login/{self.agent}/{lid}",
+                                         dict({"state": state}, **fields), until=time.monotonic() + LOGIN_LIFE)
+            if code is None:
+                raise Refused(f"the hub did not answer for {LOGIN_LIFE // 60} minutes ({data.get('error')})")
             if code != 200:
                 raise Refused(f"the hub did not take the sign-in report ({code}): {data.get('error', '')}")
 
@@ -4472,8 +4480,9 @@ class Helper:
                     detail += f" Founderizer answered {len(answered)} of its own first-run questions first."
                 return report("failed", detail=detail + " Try again.")
             wants = runtime in LOGIN_WANTS_CODE
-            report("needs_owner", url=url, shows_code=shown, wants_code=wants)
-            typed = self.await_login_code(lid, session) if wants else True
+            link = {"url": url, "shows_code": shown, "wants_code": wants}     # sent again to a hub that lost it
+            report("needs_owner", **link)
+            typed = self.await_login_code(lid, session, link) if wants else True
             if typed is not True:
                 self.send_status()          # whatever the owner did on the provider's page is the machine's to say
                 if typed is None:           # it waited for the owner and got nothing: no fault (UI-API.md, timed_out)
@@ -4481,7 +4490,7 @@ class Helper:
                            timed_out=True)
                 return
             deadline = time.monotonic() + LOGIN_DONE_WAIT
-            while time.monotonic() < deadline:
+            while True:                 # asked once more at the deadline, after a look that waited that long
                 if self.signed_in(runtime):
                     self.account_changed()
                     self.restart_after_login()
@@ -4491,6 +4500,10 @@ class Helper:
                         self.lifecycle.read_models(force=True)  # report that nothing waits for
                         self.lifecycle.report_soon()
                     return
+                if time.monotonic() >= deadline:
+                    break
+                if not wants:           # Codex waits here for the owner on its page: a restarted hub needs its link
+                    self.login_look(lid, link, deadline)
                 time.sleep(2)
             self.send_status()
             # A runtime that takes no code back (Codex) waited all this time for the owner on the provider's page; one
@@ -4502,11 +4515,10 @@ class Helper:
             self.say(f"sign-in L-{lid}: the helper hit an error ({type(e).__name__})")
             with contextlib.suppress(Exception):
                 self.send_status()
-            try:
-                http("POST", f"/helper/login/{self.agent}/{lid}",
-                     {"state": "failed", "detail": "The machine hit an error during the sign-in. Try again."})
-            except Exception:
-                pass
+            with contextlib.suppress(Exception):
+                self.login_call(lid, "POST", f"/helper/login/{self.agent}/{lid}", {
+                    "state": "failed", "detail": "The machine hit an error during the sign-in. Try again."},
+                    until=time.monotonic() + LOGIN_LIFE)
         finally:
             tmux("kill-session", "-t", f"={session}:")
 
@@ -4731,13 +4743,16 @@ class Helper:
         self.manager_due = True
         self.say("manager: signed in, so its session starts again")
 
-    def await_login_code(self, lid, session):
+    def await_login_code(self, lid, session, link=None):
         """Wait for the one code the owner pasted in the app, then type it into the sign-in window. True when it was
         typed, False when the hub ended the sign-in, None when no code came in time. The code lives in this call and
-        nowhere else. It looks every second, so his code reaches the machine as he sends it."""
+        nowhere else. It looks every second, so his code reaches the machine as he sends it. A hub that is away is
+        waited for, and one that restarted gets its link again (login_look)."""
         deadline = time.monotonic() + LOGIN_CODE_WAIT
         while time.monotonic() < deadline:
-            status, data = http("GET", f"/helper/login/{self.agent}/{lid}")
+            status, data = self.login_look(lid, link, deadline)
+            if status is None:
+                return None             # the hub was away until the deadline, so no code came in time
             if status != 200 or data.get("stop"):
                 self.say(f"sign-in L-{lid}: the hub ended it ({data.get('why', status)})")
                 return False
@@ -4750,6 +4765,48 @@ class Helper:
                 return True
             time.sleep(1)
         return None
+
+    def login_call(self, lid, method, path, data=None, *, until):
+        """One call of a sign-in to the hub: (status, answer). **A hub that is away is a wait, not the end of the
+        sign-in.** The hub restarts each time it takes a release, and on 6 November 2026 two sign-ins of Iris ended
+        as "The machine hit an error during the sign-in." while they waited for the owner's code: a release restarted
+        the hub, and the call got a URLError, then a ConnectionResetError. So no connection, a reset, a timeout or a
+        5xx (HUB_AWAY) sends the call again every HUB_RETRY seconds, and the provider's window here stays open. Only
+        the sign-in's own deadline ends that wait (`until`, a time.monotonic() value): (None, {"error": why}) when the
+        hub did not answer by then. Every other answer is the hub's, for the caller to read."""
+        away = None
+        while True:
+            try:
+                status, answer = http(method, path, data)
+            except HUB_AWAY as e:
+                why = type(e).__name__
+            else:
+                if status < 500:
+                    if away:
+                        self.say(f"sign-in L-{lid}: the hub answers again")
+                    return status, answer
+                why = f"HTTP {status}"
+            if away is None:
+                self.say(f"sign-in L-{lid}: the hub is away ({why}); the sign-in waits for it")
+            away = why
+            left = until - time.monotonic()
+            if left <= 0:
+                return None, {"error": why}
+            time.sleep(min(HUB_RETRY, left))
+
+    def login_look(self, lid, link, until):
+        """What the hub says of this sign-in now (GET /helper/login), as login_call gives it. **A hub that restarted
+        lost the link:** it keeps a sign-in's link in memory only, so after a restart the owner had nothing to open
+        and nowhere to send his code. It asks for the link again (`send_link`), and this sends it again, as this
+        machine read it from the provider's window, which is still open here (helper feature signin_relink)."""
+        path = f"/helper/login/{self.agent}/{lid}"
+        status, answer = self.login_call(lid, "GET", path, until=until)
+        if status == 200 and answer.get("send_link") and link and not answer.get("code"):
+            sent, said = self.login_call(lid, "POST", path, dict({"state": "needs_owner"}, **link), until=until)
+            self.say(f"sign-in L-{lid}: " + ("the hub restarted, so its link went to the hub again" if sent == 200
+                                              else f"the hub did not take its link again ({sent}): "
+                                                   f"{str(said.get('error') or '')[:200]}"))
+        return status, answer
 
     def signed_in(self, runtime):
         """What this machine's runtime says about itself now: the runtime's own status command, no AI turn."""
@@ -6965,6 +7022,8 @@ LOGIN_DONE_WAIT = 900                       # seconds for the runtime to report 
                                             # as the hub keeps the sign-in open (hub.LOGIN_LIFE), because the
                                             # owner is in a browser and three minutes called a real sign-in
                                             # failed. The hub ends it the moment this machine reports it.
+LOGIN_LIFE = 900                            # seconds the hub keeps a sign-in open after its last step
+                                            # (hub.LOGIN_LIFE): a report it did not answer goes again for so long
 # The sign-in a runtime's entry describes (lifecycle.RUNTIMES "sign_in"): the provider's own link as it is read
 # from the screen, the code the provider prints, and whether it waits for a code the owner pastes back.
 LOGIN_URLS = {name: e["sign_in"]["url"] for name, e in RUNTIMES.items() if e["sign_in"]}
