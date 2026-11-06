@@ -964,7 +964,21 @@ def github_token(conf, ctx, repo):
     return answer["token"]
 
 
+def app_pem(value):
+    """The PEM of a GitHub App key, as the door holds it: the app gives the central vault "pem:" and the PEM in
+    standard base64, on one line, because a vault fingerprints only a value with no white space and the central vault
+    takes no value without a fingerprint. A value that is a PEM already stays as it is."""
+    if isinstance(value, str) and value.startswith("pem:"):
+        try:
+            return base64.b64decode(value[4:], validate=True).decode()
+        except ValueError:
+            raise Stop("the door's App key is not one PEM in base64") from None
+    return value
+
+
 def app_jwt(app_id, key_pem, sign=None):
+    key_pem = app_pem(key_pem)
+
     def part(data):
         return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
     t0 = int(time.time())
