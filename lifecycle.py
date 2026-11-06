@@ -159,7 +159,10 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             # pinned Claude Code, the built-in tools that the hub names, its own MCP servers only, and no key; and
             # F3: an MCP server of auth "mint" gets a token for that one session through the vault (mint_tokens)
             "shell_box",
-            "signin_relink"]    # its sign-in waits out a hub that is away and sends its link again (send_link)
+            "signin_relink",    # its sign-in waits out a hub that is away and sends its link again (send_link)
+            # owner-contact plan B3: the manager's helper says when its start of the standing session failed twice in a
+            # row, and starts a session that left its line untaken fresh once (hub.MANAGER_START_FAILS)
+            "manager_start_fails"]
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and

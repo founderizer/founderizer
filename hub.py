@@ -25344,18 +25344,40 @@ def offline_sweep(t0):
 # long sweep of its own cannot raise it, early enough that the fleet has not been unattended for a working day.
 TICK_WARN = 60
 
+# The helper feature of owner-contact plan B3 (6 November 2026): the manager's helper tells the hub when its own start
+# of the standing session failed MANAGER_FAILS times in a row (fleet.Helper.manager_start_failed), with
+# `POST /helper/dialog/<agent>/manager` and kind start_failed. Only then does a missing window ring the owner.
+MANAGER_START_FAILS = "manager_start_fails"
+
 
 def manager_flag_update(t0):
     """The manager's own warning (`mgr_flag`), which the hub tells the owner itself. The tick runs it, and so do the
     moments its inputs change — the manager's status report, its window list, its helper's presence and its screen —
     so the banner follows at once and not at the next tick (live_changes). Every kind rests on a fact and none on a
-    message's age (plan C10): a long healthy turn of the manager raises nothing."""
+    message's age (plan C10): a long healthy turn of the manager raises nothing.
+
+    **The owner's phone rings only for what the fleet cannot put right itself** (owner-contact plan B3, 6 November
+    2026). From 24 October to 6 November it rang six times about the manager, and the two `down` rings were sessions
+    that their helper had closed itself and started again seconds later. The flag shows as before on the board, in
+    /ui/health, /ui/state and the app; only its notification can be held, and a held kind rings later in the same
+    episode, at the event that ends its hold:
+    - `down` while its helper is online: that helper starts a missing session by itself (fleet.Helper.manage), so it
+      rings when the helper says that its own start failed twice in a row (`mgr_start_failed`), or when the helper's
+      loop is inside one step with a message behind it and starts nothing. A helper without MANAGER_START_FAILS
+      never says so, and it rings at once, as before. A server that went silent with a message waiting has no helper
+      to start anything, and it rings at once.
+    - `silent` for a line told twice and not taken: the helper starts a fresh session first and says so in that
+      report (`fresh`), so it rings when the fresh session leaves its line untaken too, or as `down` when that start
+      fails. A helper loop that is stuck and a frozen screen ring at once: that loop can start nothing, and a frozen
+      screen may still move again, which no close may cut short.
+    - `signed_out` (only the owner signs in), `limited`, `screen` (a helper with stuck_screens has closed a session
+      at a question once already) and `switch_stalled` ring at once, as before."""
     mgr = manager_name()
     if not mgr:
         return
     with LOCK:
         # the one exception: the hub tells the owner itself when the manager is gone
-        kind, flag = None, None
+        kind, flag, held = None, None, False
         # A quiet one wakes nobody, so it is not a message the manager left unread; a LATER_SAY is one from its wake.
         pending = q1("SELECT MIN(created + COALESCE(json_extract(extra, '$.wake_after'), 0)) ts FROM events "
                      "WHERE agent=? AND kind='say' AND read_at IS NULL AND (NOT COALESCE(json_extract(extra, "
@@ -25364,44 +25386,55 @@ def manager_flag_update(t0):
         row = q1("SELECT * FROM agents WHERE name=?", (mgr,))
         quiet = quiet_for(row["last_seen"], t0) if row else None
         online = quiet is not None and quiet < CFG.get("offline_after", 90)
+        step = presence_of(mgr, t0)
+        stuck = bool(online and step and step.get("blocked"))     # its helper's loop is in one step, a message waits
         if pending:
             # Its helper told it the line twice, at two idle points, and it took neither (C5's untaken report).
             untaken = float(kv_get(f"untaken:{mgr}:manager") or 0)
             read = q1("SELECT MAX(read_at) m FROM events WHERE agent=?", (mgr,))["m"] or 0
-            step = presence_of(mgr, t0)
             if untaken >= pending and untaken > max(read, limit_ended(mgr), switch_ended(mgr)):
                 kind = "silent"
                 flag = "The manager did not take a message it was given twice."
-            elif online and step and step.get("blocked"):
+                # B3: its helper starts a fresh session for that line, as that same report says
+                fresh = kv_get("mgr_untaken_fresh")
+                held = fresh is not None and fresh == kv_get(f"untaken:{mgr}:manager")
+            elif stuck:
                 kind = "silent"         # the step's own name is the log's (presence_ping), not his
                 flag = f"The manager has been stuck since {owner_clock(step['since'], t0)}, and a message waits."
         frozen = kv_get("mgr_screen_frozen")
         if frozen:          # plan C2: a frozen runtime takes nothing, whether or not a message waits for it now
-            kind = "silent"
+            kind, held = "silent", False
             flag = f"The manager's session has not moved since {owner_clock(float(frozen), t0)}."
         lim = active_limit(mgr)
         if lim:             # its way on (a limit menu on its screen, which Founderizer never answers) is health_view's
-            kind = "limited"
+            kind, held = "limited", False
             flag = (f"The manager reached its usage limit. Its messages wait until "
                     f"{'' if lim['reset_known'] else 'about '}{owner_clock(lim['until'], t0)}.")
         asks, shown = kv_get("mgr_screen"), kv_get("mgr_screen_shown")
         if shown or asks:           # it stays until the question goes or the manager reads (plan C10: no 90 s life)
-            kind = "screen"
+            kind, held = "screen", False
             flag = "The manager's session shows a question on its own screen."
+        # B3: its helper's word that its start failed counts until a window list after that word shows the window
+        windows = (row["alive"] or "").split(",") if row else []
+        failed = kv_get("mgr_start_failed")
+        if failed and listed(row) and row["alive_ts"] > float(failed) and "manager" in windows:
+            with area("quiet"):
+                kv_set("mgr_start_failed", None)
+            failed = None
         # A window list from before the end of a switch can still lack the new session's window (switch_ended).
-        if listed(row) and online and "manager" not in (row["alive"] or "").split(",") and \
-                row["alive_ts"] > switch_ended(mgr):
+        if listed(row) and online and "manager" not in windows and row["alive_ts"] > switch_ended(mgr):
             kind = "down"
             flag = "The manager session is not running. Start it again."
+            held = not failed and not stuck and MANAGER_START_FAILS in helper_features(mgr)
         elif row and row["last_seen"] and not online and pending:
-            kind = "down"
+            kind, held = "down", False
             flag = f"The manager's server has been silent since {owner_clock(row['last_seen'], t0)}; a message waits."
         # Signed out, it can do nothing, so its silence, a question on its screen, a stopped session or an old limit
         # only show what that looks like, and the sign-in is the step (the owner, 25 October 2026). A switch keeps
         # its own words below.
         signed_out = not local_model(agents()[mgr]) and signed_in_now(mgr, agents()[mgr].get("runtime")) is False
         if signed_out:
-            kind = "signed_out"
+            kind, held = "signed_out", False
             flag = "The manager is not signed in."
         # Its runtime switch waits for the new session: no reader yet, so neither down nor silent. A usage limit of
         # the new session still shows. A switch stalls on a fact (plan C10): a question on the old session's screen,
@@ -25412,6 +25445,7 @@ def manager_flag_update(t0):
             why = ("waits on a question" if shown or asks else
                    "stopped: its update failed" if up and up["state"] == "failed" else
                    "waits for its sign-in" if signed_out else None)
+            held = False
             if why:
                 kind = "switch_stalled"
                 flag = f"The manager's switch to {runtime} {why}."
@@ -25422,20 +25456,21 @@ def manager_flag_update(t0):
             kv_set("mgr_flag_kind", kind)
             kv_set("mgr_flag", flag)
             kv_set("mgr_flag_since", t0 if kind else None)      # one episode per kind (manager_warning)
-            # One notification for each kind in one episode, which ends when the flag clears: a flag that turns from
-            # one kind to another and back rings once for each (plan C10). "switching" is the normal middle of a
-            # runtime switch the owner asked for himself, and it ends by itself; the event is switch_stalled. So it
-            # shows on the board, in /ui/health and on the phone, and it wakes nobody.
-            told = json.loads(kv_get("mgr_flag_told") or "[]") if kind else []
-            if flag and kind not in MANAGER_FLAG_QUIET and kind not in told:
-                told.append(kind)
-                emit("owner", "notify", f"Fleet hub: {flag}")
-                log("hub", f"told the owner: {flag}")
-            kv_set("mgr_flag_told", json.dumps(told) if told else None)
+            if not kind:
+                kv_set("mgr_flag_told", None)                   # the episode ends when the flag clears
         elif flag:
             kv_set("mgr_flag", flag)        # keep the words current
             if not kv_get("mgr_flag_since"):
                 kv_set("mgr_flag_since", t0)
+        # One notification for each kind in one episode, which ends when the flag clears: a flag that turns from one
+        # kind to another and back rings once for each (plan C10). "switching" is the normal middle of a runtime
+        # switch the owner asked for himself, and it ends by itself; the event is switch_stalled. So it shows on the
+        # board, in /ui/health and on the phone, and it wakes nobody. A held kind (B3) rings once, when its hold ends.
+        told = json.loads(kv_get("mgr_flag_told") or "[]") if kind else []
+        if flag and not held and kind not in MANAGER_FLAG_QUIET and kind not in told:
+            kv_set("mgr_flag_told", json.dumps(told + [kind]))
+            emit("owner", "notify", f"Fleet hub: {flag}")
+            log("hub", f"told the owner: {flag}")
 
 
 # The last of what turns with time alone: an agent's helper going quiet, and a machine reading going stale. No write
@@ -38015,7 +38050,11 @@ class Handler(BaseHTTPRequestHandler):
         Runtime gaps C1, from a helper with stuck_screens: "limit" is the runtime's usage-limit menu, which the hold
         of the limit covers, and "closed" the manager's session that its helper closed for a question on its screen.
         attempt is the attempt of the task window that the helper read, so a late word of an earlier window changes
-        nothing, and still says with "shown" that nothing moved since the question showed (screen_attempt)."""
+        nothing, and still says with "shown" that nothing moved since the question showed (screen_attempt).
+
+        Owner-contact plan B3, for the manager's window: "start_failed" says that its helper's own start of the
+        standing session failed twice in a row, and "untaken" with fresh that its helper starts a fresh session for
+        the line that it reports (manager_flag_update)."""
         if agent not in agents():
             return self.json(404, {"error": "unknown agent"})
         if not self.allowed(agent):
@@ -38028,6 +38067,19 @@ class Handler(BaseHTTPRequestHandler):
         if seen is not None and (isinstance(seen, bool) or not isinstance(seen, int) or seen < 1) or \
                 still is not None and not isinstance(still, bool):
             return self.json(400, {"error": "attempt is a whole number of 1 or more, and still is true or false"})
+        fresh = body.get("fresh")
+        if fresh is not None and not isinstance(fresh, bool):
+            return self.json(400, {"error": "fresh is true or false"})
+        manager_window = agent == manager_name() and task == "manager"
+        if kind == "start_failed" and manager_window:
+            # B3: the manager's down flag rings the owner from here on (manager_flag_update)
+            why = text_field(self.form().get("reason"), 300, False)
+            with area("quiet"):
+                kv_set("mgr_start_failed", now())
+            log("hub", f"{agent}'s helper could not start the manager session, twice in a row" + (f": {why}" if why
+                                                                                                    else ""))
+            manager_flag_update(now())
+            return self.json(200, {})
         if kind == "start_failed":
             # plan C6: why the start of a task's session failed, once for each distinct reason: kept for the loss
             # that it causes, and told to the requester once
@@ -38045,10 +38097,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(200, {})
         if kind == "untaken":
             # plan C5: a line told twice that the session did not take, kept for the turn-end check and the
-            # manager's flag (C9, C10); the hub types nothing itself
+            # manager's flag (C9, C10); the hub types nothing itself. B3: the same time marks a fresh start for it.
+            t0 = now()
             with area("quiet"):
-                kv_set(f"untaken:{agent}:{task}", now())
-            log("hub", f"{agent}'s {task} did not take its line, told twice")
+                kv_set(f"untaken:{agent}:{task}", t0)
+                if manager_window:
+                    kv_set("mgr_untaken_fresh", t0 if fresh else None)
+            log("hub", f"{agent}'s {task} did not take its line, told twice" +
+                ("; its helper starts a fresh session for it" if manager_window and fresh else ""))
             try:
                 t = q1("SELECT * FROM tasks WHERE id=? AND owner=?", (parse_task(task), agent))
             except ToolError:

@@ -665,6 +665,10 @@ MOTION = "CLAUDE_AX_SCREEN_READER=0"
 # task session keeps its plan there (RULES.md), which the owner's app shows while the task runs (threads.py).
 TODO_TOOLS = "CLAUDE_CODE_ENABLE_TODO_TOOLS=1"
 PRESENCE = 30           # seconds between two presence pings while the main loop is inside one step (Helper.presence)
+# Owner-contact plan B3 (6 November 2026): the failed starts of the standing manager session in a row after which its
+# helper tells the hub, whose flag then rings the owner (Helper.manager_start_failed). One failure is the helper's own
+# to try again; the second shows that its own try does not help.
+MANAGER_FAILS = 2
 # Fleet's deny list for worker and lead Claude sessions.
 DENY = ["Read(~/.fleet/**)", "Edit(~/.fleet/**)", "Bash(*.fleet/*)"] + UNSEEN_TOOLS
 CHROME_TOOLS = "mcp__claude-in-chrome__*"      # the tools that Claude Code's --chrome adds to a browser task
@@ -2391,6 +2395,11 @@ def manager_credential(agent, generation=None):
     return session_credential(agent, "standing", generation) if generation else None
 
 
+class StartBusy(Refused):
+    """Another start of the standing manager session holds its start lock: no failure of this helper's own start
+    (Helper.manager_start_failed)."""
+
+
 def hold_manager_lock(agent):
     """The per-agent start lock of the standing manager session, held: its open file, which releases it when it closes
     (also when this process ends). Refused while another start holds it."""
@@ -2400,7 +2409,7 @@ def hold_manager_lock(agent):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         lock.close()
-        raise Refused("another start of the manager session runs now; nothing was started") from None
+        raise StartBusy("another start of the manager session runs now; nothing was started") from None
     return lock
 
 
@@ -3248,6 +3257,10 @@ class Helper:
         self.fresh_at = None            # when this helper last started one so (restart_fresh)
         self.compact_restarted = False  # the session without STANDING_COMPACT was closed once (restart_fresh)
         self.manager_pending = None     # (session id, note) of a start whose tmux reading failed (start_manager)
+        # Owner-contact plan B3: its failed starts in a row and whether the hub heard of them (manager_start_failed);
+        # (tool listings, time) at the start of the session that this helper started last, until it came up
+        # (manager_came_up); and the messages for whose untaken line it started that session fresh (fresh_untaken)
+        self.manager_fails, self.manager_fail_told, self.manager_mark, self.manager_untaken = 0, False, None, None
         # {pid: args} of its processes that did not end when it closed, also from before a restart of this helper
         self.manager_left = load_closing(agent) if conf.get("role") == "manager" else {}
         self.manager_left_start = closing_start(agent) if self.manager_left else True     # due when they have ended
@@ -3775,11 +3788,14 @@ class Helper:
                 return False
         except Refused as e:            # the helper tries again
             self.say_manager(f"manager: the session does not start: {e}")
+            if not isinstance(e, StartBusy):        # another start holds the lock: not this helper's start
+                self.manager_start_failed(str(e))
             return True
         except Updating:                # a Fleet update runs now: this helper or the restarted one starts it
             return True
         except subprocess.CalledProcessError:       # tmux refused or did not answer, or its program ended at once
             self.say_manager("manager: the session did not start or ended at its start; the helper tries again")
+            self.manager_start_failed("the session did not start or ended at its start")
             return True
 
     def keep_started(self, session, note, again=False):
@@ -3789,7 +3805,34 @@ class Helper:
         if again:
             with contextlib.suppress(subprocess.CalledProcessError):
                 tmux("set-option", "-w", "-t", f"={self.session}:=manager", "@fleet_session", session, check=True)
+        self.manager_mark = (self.listed.get("manager", 0), time.monotonic())     # until it came up (B3)
         self.say("manager: session started" + (f" ({note})" if note else ""))
+
+    def manager_came_up(self):
+        """Owner-contact plan B3: the session that this helper started last came up when the hub says that it listed
+        its tools since its start, or when its screen showed its empty input line since then. Facts, and no clock: that
+        ends a run of failed starts (manager_start_failed)."""
+        mark = self.manager_mark
+        if mark and (self.listed.get("manager", 0) > mark[0] or self.idle_at.get("manager", 0) > mark[1]):
+            self.manager_mark, self.manager_fails, self.manager_fail_told = None, 0, False
+
+    def manager_start_failed(self, reason):
+        """Owner-contact plan B3 (6 November 2026): one more failed start of the standing session in a row, a start that
+        raised or a session of its start that ended before it came up. Its helper tries again either way (manage); at
+        the MANAGER_FAILS-th the hub hears it once, as start_failed of the window "manager", and the manager's flag
+        rings the owner, because the helper's own try did not help. A hub that did not take it hears it at the next
+        failure."""
+        self.manager_fails += 1
+        if self.manager_fails < MANAGER_FAILS or self.manager_fail_told:
+            return
+        try:
+            code, _ = http("POST", f"/helper/dialog/{self.agent}/manager",
+                           {"kind": "start_failed", "reason": reason[:200]}, timeout=10)
+        except (urllib.error.URLError, OSError, ValueError):
+            return
+        if code == 200:
+            self.manager_fail_told = True
+            self.say(f"manager: its start failed {self.manager_fails} times in a row; the hub knows")
 
     def outdated(self):
         """True while team.json already gives this agent another runtime than the one that this helper loaded: its
@@ -3939,12 +3982,19 @@ class Helper:
             return
         if line and line["retold"]:
             if not line["reported"]:
+                # owner-contact plan B3: the manager's session starts fresh for it first, and the report says so; a
+                # session that moves now is not closed, and a later poll reports its line, unless it takes it first
+                fresh = self.fresh_untaken(target, line["ids"]) if window == "manager" else False
+                if fresh is None:
+                    return
                 line["reported"] = True
                 try:
-                    http("POST", f"/helper/dialog/{self.agent}/{window}", {"kind": "untaken"}, timeout=10)
+                    http("POST", f"/helper/dialog/{self.agent}/{window}",
+                         {"kind": "untaken", "fresh": True} if fresh else {"kind": "untaken"}, timeout=10)
                 except (urllib.error.URLError, OSError, ValueError):
                     pass
-                self.say(f"{window}: its line was told twice and not taken; the hub knows")
+                self.say(f"{window}: its line was told twice and not taken; the hub knows" +
+                         ("; it starts again on a new conversation with the hub's brief" if fresh else ""))
             return
         if window in STANDING_WINDOWS and self.turn_runs(window, target):
             return                  # a turn runs: it reads its messages at its end, and this tells it after that
@@ -3974,6 +4024,31 @@ class Helper:
         # "asks": its screen shows a question, which the screen watch tells (watch_screens). Until runtime gaps C1 this
         # told it too, before the watch could say whether the session stood still or showed its usage-limit menu.
         self.say(f"{window}: inbox signal {got}{' again' if line else ''}; only read_messages acknowledges delivery")
+
+    def fresh_untaken(self, target, ids):
+        """Owner-contact plan B3 (6 November 2026): the manager's session left a line untaken that its helper told
+        twice, at two idle points. Its helper closes that session, which stands idle between two turns, and its watch
+        starts it again on a new conversation with the hub's brief (the start of restart_fresh), so the owner hears of
+        it only when that start fails or the fresh session leaves its line untaken too: one time until the messages of
+        that line are read (handle_events). True when it closed the window. None when not now, and a later poll asks
+        again: a session with a turn or a question on its screen or background work of its own still moves and is
+        never closed, and a start or a switch replaces it anyway. False otherwise, and the hub hears of the line as
+        before: that session is the fresh one already, it runs another runtime, or tmux gives no screen of it."""
+        if self.conf.get("role") != "manager" or self.manager_untaken is not None or \
+                self.window_runtime("manager") != self.conf.get("runtime"):
+            return False
+        if self.manager_due or self.manager_left or self.manager_retiring is not None or self.outdated() or \
+                self.background_open("manager"):
+            return None
+        screen = tmux("capture-pane", "-p", "-t", target)
+        if screen.returncode != 0:
+            return False
+        if shows_question(screen.stdout) or WORKING.search("\n".join(screen.stdout.rstrip().split("\n")[-15:])):
+            return None
+        with contextlib.suppress(subprocess.CalledProcessError, Refused):
+            tmux("kill-window", "-t", target)
+        self.manager_untaken, self.manager_due, self.manager_fresh = frozenset(ids), True, True
+        return True
 
     def turn_runs(self, window, target):
         """A standing session runs a turn only when its screen shows one and, for the manager, its own records have
@@ -4021,6 +4096,8 @@ class Helper:
                          (f"; next try in {wait} s" if ev.get("kind") == "task" else ""))
         for window in [w for w in self.lines if w not in self.wanted]:
             self.lines.pop(window)
+        if self.manager_untaken is not None and not self.manager_untaken & self.wanted.get("manager", set()):
+            self.manager_untaken = None     # B3: the messages of that line were read; a later one starts it fresh again
         for window, ids in self.wanted.items():
             try:
                 self.signal(window, ids)
@@ -5531,10 +5608,16 @@ class Helper:
         helper's start found no window, when this round finds none (manager_gone), when this helper closed the
         previous runtime's session after a switch, or when the owner pressed the control that the hub's manager_down
         warning carries (owner feature manager_start); it is tried at most each 10 seconds, and it stays due until a
-        start succeeds, also when a later step of the round fails."""
+        start succeeds, also when a later step of the round fails. A session of its start that ends before it came up
+        is a failed start too (owner-contact plan B3, manager_start_failed)."""
         self.restart_for_tools()
+        if self.conf.get("role") == "manager":
+            self.manager_came_up()
         if self.conf.get("role") == "manager" and not self.manager_due and self.manager_gone():
             self.manager_due = True
+            if self.manager_mark is not None:       # the session of its last start ended before it came up
+                self.manager_mark = None
+                self.manager_start_failed("its session ended before it came up")
             self.say_manager("manager: its session is not running; the helper starts it again")
         if self.manager_due and (self.manager_tried is None or time.monotonic() - self.manager_tried > 10):
             self.manager_tried = time.monotonic()
