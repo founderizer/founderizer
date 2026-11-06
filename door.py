@@ -1492,6 +1492,68 @@ def cmd_follow(args):
     print(take(answer))
 
 
+PROBE_WAIT = 30         # seconds that one check of probe may take; a forward that the host took runs until then
+
+
+def probe(host):
+    """Test 1 of the DevOps plan, as code (new-projects plan N8 (b), the coordinator's word of 6 November 2026): through
+    a host's second sshd, as ops-agent with the door's own key, a login with no request, a shell, a TTY, scp, a TCP
+    forward of both kinds, a Unix-socket forward and a form outside the list all fail, and a fixed read and a rule
+    form through sudo ops-root work. It reads the host's key from the access file, into a known_hosts of its own. Gives
+    [[name, ok, what it saw when not ok]]."""
+    port, target = str(host.get("port", SSHD_PORT)), f"ops-agent@{host['address']}"
+    checks = []
+    with tempfile.TemporaryDirectory(prefix="door-probe-") as folder:
+        known = os.path.join(folder, "known_hosts")
+        with open(known, "w") as f:
+            f.write(f"[{host['address']}]:{port} {host['host_key']}\n")
+        opts = ["-i", P(SSH_KEY), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", f"UserKnownHostsFile={known}",
+                "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15", "-o", "LogLevel=ERROR"]
+        ssh = ["ssh", "-p", port, *opts]
+
+        def req(op, *args):
+            return base64.b64encode(json.dumps({"v": 1, "op": op, "args": list(args)}).encode()).decode()
+
+        def check(name, argv, good):
+            status, out = run_program(argv, None, {}, timeout=PROBE_WAIT)
+            ok = bool(good(status, out))
+            checks.append([name, ok, "" if ok else f"{status}: {out.strip()[-200:]}"])
+        refused = re.compile(r"(?i)prohibited|open failed|forwarding failed")
+        check("a login with no request gets no shell", ssh + ["-T", target],
+              lambda status, out: status == 3 and "requests only" in out)
+        check("a shell command is refused", ssh + ["-T", target, "bash -i"], lambda status, out: status == 3)
+        check("no TTY", ssh + ["-tt", target, req("uptime")], lambda status, out: "PTY allocation request failed" in out)
+        check("no scp", ["scp", "-P", port, *opts, "/dev/null", f"{target}:/tmp/door-probe-scp"],
+              lambda status, out: status not in (0, 124))
+        check("no TCP forward", ssh + ["-W", "127.0.0.1:22", target],
+              lambda status, out: status not in (0, 124) and refused.search(out))
+        check("no remote TCP forward", ssh + ["-N", "-o", "ExitOnForwardFailure=yes", "-R", "127.0.0.1:0:127.0.0.1:22",
+                                              target], lambda status, out: status not in (0, 124))
+        check("no Unix-socket forward", ssh + ["-N", "-o", "ExitOnForwardFailure=yes", "-R",
+                                               "/tmp/door-probe.sock:127.0.0.1:22", target],
+              lambda status, out: status not in (0, 124))
+        check("a form outside the list is refused", ssh + ["-T", target, req("nonsense")],
+              lambda status, out: status == 3)
+        check("a fixed read works", ssh + ["-T", target, req("uptime")],
+              lambda status, out: status == 0 and "load average" in out)
+        check("sudo ops-root runs a rule form", ssh + ["-T", target, req("daemon-reload")],
+              lambda status, out: status == 0 and "systemd read its units again" in out)
+    return checks
+
+
+def cmd_probe(args):
+    """The door's user, as the owner's app runs it over its own SSH after a host got its parts (N8 (b)): probe, as one
+    JSON line {host, passed, checks}. The status is 0 only when every check passed."""
+    host = (read_json(ACCESS_FILE, {}).get("hosts") or {}).get(args.host)
+    if not isinstance(host, dict) or not tailnet_address(host.get("address", "")) or \
+            not HOST_KEY.fullmatch(host.get("host_key", "")):
+        sys.exit(f"{args.host} is no host of the access file")
+    checks = probe(host)
+    passed = all(ok for _, ok, _ in checks)
+    print(json.dumps({"host": args.host, "passed": passed, "checks": checks}))
+    sys.exit(0 if passed else 1)
+
+
 def cmd_status(args):
     access = read_json(ACCESS_FILE, {})
     print(f"door: {len(access.get('agents') or {})} agents, {len(access.get('hosts') or {})} hosts, record "
@@ -1507,6 +1569,9 @@ def main(argv=None):
     sub.add_parser("follow").set_defaults(fn=cmd_follow)
     sub.add_parser("hub-secrets").set_defaults(fn=cmd_hub_secrets)
     sub.add_parser("status").set_defaults(fn=cmd_status)
+    probing = sub.add_parser("probe")
+    probing.add_argument("host")
+    probing.set_defaults(fn=cmd_probe)
     args = p.parse_args(argv)
     args.fn(args)
 

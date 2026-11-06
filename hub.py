@@ -7909,6 +7909,46 @@ SECRET_NO_WORDS = ("N-{id} asks for a secret, so it takes no answer in words: a 
                    "the owner's Mac, whose secure form puts the value into the vault.")
 
 
+def t_door_rollout(agent, a):
+    """door_rollout (the manager, new-projects plan N8 (b)): team.json door.rollout. With it false, the app puts the
+    door's parts on the first server only; with it true, on the others too, one each round. The coordinator's word of
+    6 November 2026: the manager sets it once the Operator's normal work on the first server passed (test 6)."""
+    go = a.get("go")
+    if not isinstance(go, bool):
+        raise ToolError("go is true, to let the app put the door's parts on the other servers, or false, to stop it "
+                        "after the server it is on.")
+    why = str(a.get("why") or "").strip()
+    if not why or len(why) > GRANT_WHY_MAX:
+        raise ToolError(f"why is what made you decide, in 1 to {GRANT_WHY_MAX} characters: the record keeps it.")
+    guard(agent, why)
+    command, stored = agent_write(agent, "door_rollout", a, {"go": go, "why": why})
+    if stored:
+        return stored["text"]
+    if not isinstance(TEAM.get("door"), dict) or not TEAM["door"].get("address"):
+        raise ToolError("This fleet has no door, so there are no door parts to put on its servers.")
+
+    def change(team):
+        door = team.get("door") or {}
+        if (door.get("rollout") is True) == go:
+            return False
+        if go:
+            door["rollout"] = True
+        else:
+            door.pop("rollout", None)
+        return True
+    try:
+        result = save_integration(None, change, f"the door's parts go on {'every' if go else 'no further'} server "
+                                                f"({why})", by=agent)
+    except Refusal as e:
+        raise ToolError(f"The hub refused it: {e}") from None
+    text = ("The app now puts the door's parts on the other servers, one each round, and checks each one as it did "
+            "the first." if go else "The app puts the door's parts on no further server.") + \
+        ("" if result["changed"] else " It was so already.")
+    with transaction():
+        keep_command(command, {"text": text}, now())
+    return text
+
+
 def secret_site_host(site):
     """The host of a request's address, for its title: "dashboard.stripe.com" of "https://dashboard.stripe.com/login".
     It keeps the subdomain, because that is the page the owner will recognise."""
@@ -21208,6 +21248,17 @@ TOOLS = [
      S({"need": {"type": "string", "description": "The item, for example N-12"},
         "why": {"type": "string", "description": "What made it unnecessary, in plain words"}},
        ["need", "why"])),
+    ("manager", "door_rollout", t_door_rollout,
+     "Let the app put the door's parts on the business servers after the first one, or stop it. The app puts them on "
+     "one server first, checks that server's second sshd itself (test 1), and the hub tells you when that passed. Then "
+     "give the server's Operator normal work there through the door (test 6). When that work passed, call this with "
+     "go true: the app puts the parts on the other servers, one each round, and checks each one the same way. go "
+     "false stops it after the server that it is on.",
+     S({"request_id": REQUEST_ID,
+        "go": {"type": "boolean", "description": "true: the other servers get the door's parts too; false: no "
+                                                 "further server gets them"},
+        "why": {"type": "string", "description": "What made you decide: the Operator's result, in a line"}},
+       ["request_id", "go", "why"])),
     ("manager", "request_secret", t_request_secret,
      "Ask the owner for a secret that the fleet does not hold: an API key or a login. It is a Needs-you item that they "
      "answer in a secure form in Founderizer on their Mac, so the value goes straight into the vault and never "
@@ -30656,8 +30707,10 @@ def validate_door(team):
     door = team.get("door")
     if door is None:
         return
-    if not isinstance(door, dict) or set(door) - {"address", "port", "secrets", "credentials", "github_apps"}:
-        raise ValueError("door must be {address, port, secrets, credentials, github_apps}")
+    if not isinstance(door, dict) or set(door) - {"address", "port", "secrets", "credentials", "github_apps", "rollout"}:
+        raise ValueError("door must be {address, port, secrets, credentials, github_apps, rollout}")
+    if not isinstance(door.get("rollout", False), bool):
+        raise ValueError("door.rollout is true or false: the manager's door_rollout sets it")
     apps = door.get("github_apps", {})
     if not isinstance(apps, dict) or not all(
             isinstance(k, str) and GITHUB_LOGIN.fullmatch(k) and k == k.lower() and isinstance(v, str) and
@@ -30798,7 +30851,10 @@ def door_view():
             # plan 13, items 3 and 4: the key that the central vault holds pinned under the name door, to which alone
             # the hub seals the door's keys, or null; the app pins the door's own when it is another or none
             "vault_pin": central_pins(status).get(DOOR_PIN) if status is not None else None,
-            "vault_read": status is not None}
+            "vault_read": status is not None,
+            # new-projects plan N8 (b): the manager's door_rollout, after which the app puts the door's parts on the
+            # servers after the first one
+            "rollout": door.get("rollout") is True}
 
 
 DOOR_PENDING = {}   # {request_id: (token, record)} of one POST /ui/door/secrets: in memory only, never in a record
@@ -30881,6 +30937,41 @@ def save_door_entry(body):
         door.update(address=address, port=port)
         return True
     return save_integration(None, change, f"the door is at {address}:{port}")
+
+
+DOOR_HOST_STATES = ("installed", "passed", "failed")
+
+
+def door_host_report(body):
+    """POST /ui/door/host (owner feature door_setup, new-projects plan N8 (b)): what the app's round did on one
+    business server: the door's parts went on it (installed), the door's own check of its second sshd passed there
+    (passed: test 1, as code), or one of the two failed (failed), with its words. The hub keeps the last word of each
+    server and tells the manager of the first server that passed, which then waits for the Operator's normal work there
+    (test 6) and door_rollout, and of each failure, after which the app puts the parts on no other server until a new
+    release of the app or the door. Called with LOCK held."""
+    host, state, said = body["host"], body["state"], body["said"]
+    key = f"door_host:{host}"
+    old = json.loads(kv_get(key) or "null") or {}
+    if (old.get("state"), old.get("said")) == (state, said):
+        return {"host": host, "state": state, "changed": False}
+    rollout = (TEAM.get("door") or {}).get("rollout") is True
+    with transaction():
+        kv_set(key, json.dumps({"state": state, "said": said, "at": round(now())}))
+        if state == "passed" and not rollout:
+            emit(manager_name(), "say", f"[hub] The door's parts are on {host}, the first server, and the door's own "
+                                        f"check of its second sshd passed (test 1): no shell, no TTY, no scp, no "
+                                        f"forward and no form outside the list, and a read and a rule form through "
+                                        f"sudo ops-root work. Give its Operator normal work there through the door "
+                                        f"(test 6: an update, a restart, a deploy, a restic run, an nginx edit, a "
+                                        f"reload and a restore). When that work passed, call door_rollout with go "
+                                        f"true: the app then puts the parts on the other servers, one each round, "
+                                        f"and checks each one the same way.")
+        elif state == "failed":
+            emit(manager_name(), "say", f"[hub] The door's parts did not go on {host}, or the door's check of it "
+                                        f"failed: {said} The app puts the parts on no other server until a new release "
+                                        f"of the app or the door.")
+    log("owner", f"the door's parts on {host}: {state}" + (f": {said}" if said else ""))
+    return {"host": host, "state": state, "changed": True}
 
 
 def door_key_name(text):
@@ -35249,6 +35340,23 @@ class Handler(BaseHTTPRequestHandler):
                     "record_sha256": hashlib.sha256(record.encode()).hexdigest()}
         return self.ui_command("door/secrets", read, save_door_secrets, outside=door_mint_check)
 
+    def ui_door_host(self):
+        """POST /ui/door/host (owner feature door_setup, new-projects plan N8 (b)): the app's word about one business
+        server: installed, passed or failed, with its words."""
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "host", "state", "said"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            host, state, said = data.get("host"), data.get("state"), data.get("said", "")
+            if not isinstance(host, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", host):
+                raise ValueError("host is the server's name, as Tailscale gives it")
+            if state not in DOOR_HOST_STATES:
+                raise ValueError(f"state is one of {', '.join(DOOR_HOST_STATES)}")
+            if not isinstance(said, str) or len(said) > 600 or "\n" in said:
+                raise ValueError("said is one line of at most 600 characters")
+            return {"host": host, "state": state, "said": said}
+        return self.ui_command("door/host", read, door_host_report)
+
     def ui_door_github_app(self):
         """POST /ui/door/github-app (owner feature door_setup): the ID of a GitHub App that the app made with GitHub's
         manifest flow, and the account it was made in. The door holds its key."""
@@ -37747,6 +37855,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_door_secrets()
         if parts == ["ui", "door", "github-app"]:    # DevOps plan 13, item 4: an App made by the manifest flow
             return self.ui_door_github_app()
+        if parts == ["ui", "door", "host"]:          # new-projects plan N8 (b): the door's parts on one server
+            return self.ui_door_host()
         if len(parts) == 3 and parts[:2] == ["door", "sealed"] and re.fullmatch(r"[1-9][0-9]{0,17}", parts[2]):
             return self.door_route(lambda: door_fetched(self.client_address[0], int(parts[2]),
                                                         self.form().get("sha256")))

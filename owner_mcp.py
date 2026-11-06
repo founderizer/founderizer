@@ -89,6 +89,7 @@ NOT_TOOLS = {
     "/ui/door/secrets": "the hub's two secrets for the door, which the app makes on the door by itself",
     "/ui/door/github-app": "the ID of a GitHub App that the app made with GitHub's manifest flow, whose key the door "
                            "holds",
+    "/ui/door/host": "the app's own word about the door's parts on one server, which its round writes by itself",
     "/ui/chat-apps/{}/token": "a Discord bot token",
     "/ui/google/connect": "Google's client secret, and a browser flow of the owner's own",
     "/ui/google/finish": "the authorization code of that flow",
