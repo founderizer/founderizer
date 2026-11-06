@@ -31,6 +31,9 @@ local server:
 `install_hub` and `claim_hub` when there is no hub yet, and the server writes the address into
 `~/.founderizer/hub`. That file is the whole of its state, and it is no credential.
 
+The server runs the code of that folder, as it was when the agent's session started it. So a tool that a later
+release adds reaches the agent only when the folder holds that release and a new session starts.
+
 Nothing else is needed. There is no token to issue, no key to copy and nothing to rotate.
 
 ## How it authenticates to the hub, and why that is the whole of it
