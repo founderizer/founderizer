@@ -123,6 +123,19 @@ def backblaze(access, agent, account, op, args, content, lookups):
                                              keep="revoked")]})
     if op == "key-place":
         return key_place(access, agent, "backblaze", account, args, lookups)
+    if op == "change":                            # D25: a write of the key's own rights, judged
+        name = args[0] if len(args) == 1 else ""
+        if not re.fullmatch(r"b2_[a-z_]{3,40}", name):
+            return refused("change takes one call of the B2 API, such as b2_update_bucket, with its body as content")
+        if re.match(r"b2_(list|get|download|authorize)_", name):
+            return refused(f"{name} is a read, or its answer is a token: a read that is not listed stays refused")
+        if name == "b2_create_key":
+            return refused("a new key's answer is its secret: the door's key-mint makes one for a host and keeps it")
+        body = json_body(content) if content else {}
+        if body is False or not isinstance(body, dict):
+            return refused("the body is one JSON object of at most 64 KiB")
+        return Decision("judged", f"a call of {name} inside the key's rights", target=f"backblaze:{account}",
+                        plan={"provider": "backblaze", "account": account, "steps": [step("POST", name, body)]})
     return refused(f"{op} is not listed for Backblaze")
 
 
@@ -150,17 +163,6 @@ def key_place(access, agent, provider, account, args, lookups):
 
 
 # ---------------------------------------------------------------- Cloudflare
-
-CF_JUDGED = (r"/zones/[0-9a-f]{32}/dns_records/[0-9a-f]{32}", r"/zones/[0-9a-f]{32}/dns_records",
-             r"/zones/[0-9a-f]{32}/rulesets(/[0-9a-f]{32})?(/rules(/[0-9a-f]{32})?)?",
-             r"/zones/[0-9a-f]{32}/rulesets/phases/[a-z_]+/entrypoint",
-             r"/accounts/[0-9a-f]{32}/r2/buckets(/[a-z0-9-]{3,63})?(/domains/custom(/[a-z0-9.-]+)?)?",
-             r"/accounts/[0-9a-f]{32}/challenges/widgets(/[A-Za-z0-9_-]+)?",
-             r"/accounts/[0-9a-f]{32}/workers/scripts/[a-z0-9-]+(/[a-z-]+)?",
-             r"/zones/[0-9a-f]{32}/email/routing(/[a-z/]+)?(/[0-9a-f]{32})?",
-             r"/zones/[0-9a-f]{32}/cache/[a-z_]+",
-             r"/accounts/[0-9a-f]{32}/cfd_tunnel/[0-9a-f-]{36}/configurations")
-
 
 def cloudflare(access, agent, account, op, args, content, lookups):
     zone = args[0] if args else ""
@@ -213,20 +215,52 @@ def cloudflare(access, agent, account, op, args, content, lookups):
                                  {"files": urls} if urls and not hosts else {"hosts": hosts} if hosts and not urls
                                  else {"files": urls, "hosts": hosts})]})
     if op == "change":
-        if len(args) != 2 or args[0] not in ("POST", "PUT", "PATCH", "DELETE"):
-            return refused("change takes the method and the path, with the body as content")
-        path = args[1]
-        if not any(re.fullmatch(p, path) for p in CF_JUDGED):
-            return refused(f"{path} is not a product that the door changes on Cloudflare")
-        body = json_body(content) if args[0] != "DELETE" else None
+        return judged_write("cloudflare", account, args, content, CF_PATH, CF_NEVER,
+                            lambda method, path: f"a change of {path.split('/')[3] if path.count('/') > 2 else path}",
+                            check=lambda body: "a tunnel to ssh://, tcp://, rdp://, smb:// or a socket is never the door's"
+                            if re.search(r'"service"\s*:\s*"(ssh|tcp|rdp|smb|unix|unix\+tls)://', json.dumps(body or {}))
+                            else None)
+    return refused(f"{op} is not listed for Cloudflare")
+
+
+# The owner, 6 November 2026 (DevOps D25: "Yes, as for AWS"): for every provider account, a write that is not listed
+# goes to the judge inside the key's own rights, as AWS's `call` does; the judge refuses what spends money, deletes what
+# no agent made, gives a person access or weakens a control, and such a call comes to the owner as a Needs-you item
+# with the exact call, which his signed yes lets through once. An unlisted read stays refused, so that no read returns
+# a key, and a write whose answer is a secret is never sent: the door gives the agent the provider's answer.
+WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
+CF_PATH = re.compile(r"/(zones|accounts)/([0-9a-f]{32}|\{account_id\})(/[A-Za-z0-9._~:@-]+){1,10}")
+CF_NEVER = ((r"/tokens(/|$)", "an API token's answer is its secret: never the door's"),
+            (r"/cfd_tunnel/[^/]+/token$", "a tunnel's token is a secret: never the door's"),
+            (r"/temp-access-credentials", "R2 credentials are secrets: never the door's"),
+            (r"/service_tokens", "a service token's answer is its secret: never the door's"))
+
+
+def judged_write(provider, account, args, content, path, never, why, host=None, first=(), methods=WRITE_METHODS,
+                 query=None, check=None):
+    """D25's form `change <METHOD> <path>`, with the body as content: one write of the key's own rights, judged. A read
+    is not one, so an unlisted read stays refused. check(body): the words of a refusal of this provider's own, or
+    None, on the body as the door parsed it."""
+    if len(args) < 2 or args[0] not in methods:
+        return refused(f"change takes {', '.join(methods)} and the path, with the body as content; a read that is not "
+                       f"listed stays refused")
+    method, where = args[0], args[1]
+    if ".." in where or not path.fullmatch(where):
+        return refused(f"{where} is not a path of this {provider} account that the door changes")
+    for pattern, words in never:
+        if re.search(pattern, where):
+            return refused(words)
+    body = None
+    if content and method != "DELETE":
+        body = json_body(content)
         if body is False:
             return refused("the body is JSON of at most 64 KiB")
-        if re.search(r'"service"\s*:\s*"(ssh|tcp|rdp|smb|unix|unix\+tls)://', json.dumps(body or {})):
-            return refused("a tunnel to ssh://, tcp://, rdp://, smb:// or a socket is never the door's")
-        return Decision("judged", f"a change of {path.split('/')[3] if path.count('/') > 2 else path}",
-                        target=f"cloudflare:{account}",
-                        plan={"provider": "cloudflare", "account": account, "steps": [step(args[0], path, body)]})
-    return refused(f"{op} is not listed for Cloudflare")
+    words = check(body) if check else None
+    if words:
+        return refused(words)
+    last = step(method, where, body, **({"query": query} if query else {}))
+    return Decision("judged", why(method, where), target=f"{provider}:{account}", host=host,
+                    plan={"provider": provider, "account": account, "steps": [*first, last]})
 
 
 def json_body(content):
@@ -319,8 +353,8 @@ def hetzner(access, agent, project, op, args, content, lookups):
                         plan={"provider": "hetzner", "account": project, "steps": [
                             step("GET", "/servers", query={"name": args[0]}, keep="server_id", need="one_server"),
                             step("POST", "/servers/{server_id}/actions/reset")]})
-    if op == "change":
-        if len(args) != 3 or args[0] not in ("POST", "PUT") or args[2] not in held_servers(access, agent):
+    if op == "change" and len(args) == 3:
+        if args[0] not in ("POST", "PUT") or args[2] not in held_servers(access, agent):
             return refused("change takes the method, the path and the server it is for, which this agent holds")
         if "rescue" in args[1]:
             return refused("Rescue is never booted")
@@ -333,7 +367,19 @@ def hetzner(access, agent, project, op, args, content, lookups):
                         host=args[2], plan={"provider": "hetzner", "account": project, "steps": [
                             step("GET", "/servers", query={"name": args[2]}, keep="server_id", need="one_server"),
                             step(args[0], args[1], body, need="server_path")]})
+    if op == "change" and len(args) == 2:         # D25: a write of the project's own rights, judged
+        server_made = args[0] == "POST" and args[1] == "/servers"
+        return judged_write("hetzner", project, args, content, HZ_PATH, HZ_NEVER,
+                            lambda method, path: f"a change of {path.split('/')[1]}", methods=("POST", "PUT", "DELETE"),
+                            check=lambda body: "a server with no SSH key gives its root password in the answer: name an "
+                            "SSH key" if server_made and not (body or {}).get("ssh_keys") else None)
     return refused(f"{op} is not listed for Hetzner")
+
+
+HZ_PATH = re.compile(r"/(servers|firewalls|volumes|primary_ips|floating_ips|networks|load_balancers|certificates|"
+                     r"ssh_keys|placement_groups|images)(/[0-9]{1,12})?(/actions/[a-z_]{2,40})?")
+HZ_NEVER = ((r"rescue", "Rescue is never booted"),
+            (r"/actions/(reset_password|request_console)$", "its answer is a password or a console: never the door's"))
 
 
 # ---------------------------------------------------------------- AWS
@@ -513,7 +559,21 @@ def azure(access, agent, account, op, args, content, lookups):
         return Decision("judged", "an App Service setting", target=f"azure:{account}",
                         plan={"provider": "azure", "account": account, "app_setting": {
                             "site": args[0], "name": args[1], "value": args[2]}})
+    if op == "change":                            # D25: a write of the service principal's own rights, judged
+        if len(args) != 3 or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}(-preview)?", args[2]):
+            return refused("change takes the method, the path and the API version of its resource provider, with the "
+                           "body as content")
+        return judged_write("azure", account, args[:2], content, AZ_PATH, AZ_NEVER,
+                            lambda method, path: "a change of " + (path.split("/providers/")[-1].split("/")[0]
+                                                                   if "/providers/" in path else "a resource group"),
+                            query={"api-version": args[2]})
     return refused(f"{op} is not listed for Azure")
+
+
+AZ_PATH = re.compile(r"/subscriptions/[0-9a-f-]{36}(/[A-Za-z0-9._()~-]+){1,16}")
+AZ_NEVER = ((r"(?i)/(list[a-z]*|regenerate[a-z]*|publishxml|getpublishingcredentials|publishingcredentials)$",
+             "its answer is a key, a password, a connection string or a setting: ARM gives those only to a list "
+             "action, and they are never the door's"),)
 
 
 # ---------------------------------------------------------------- Tailscale
@@ -547,7 +607,14 @@ def tailscale(access, agent, tailnet, op, args, content, lookups):
                         plan={"provider": "tailscale", "account": tailnet, "steps": steps})
     if op in ("tags", "acl", "policy"):
         return refused("a device's tags and the policy file are never the door's")
+    if op == "change":                            # D25: a write of the client's own rights, judged
+        return judged_write("tailscale", tailnet, args, content, TS_PATH, TS_NEVER,
+                            lambda method, path: f"a change of {path.split('/')[-1]}")
     return refused(f"{op} is not listed for Tailscale")
+
+
+TS_PATH = re.compile(r"/(tailnet/-|device/[0-9A-Za-z]{6,40})(/[A-Za-z0-9._-]+){0,4}")
+TS_NEVER = ((r"/keys(/|$)", "a key's answer is its secret: the door's oauth-client makes one and keeps it"),)
 
 
 PROVIDERS = {"backblaze": backblaze, "cloudflare": cloudflare, "github": github, "hetzner": hetzner, "aws": aws,
