@@ -765,11 +765,18 @@ class Door:
             try:
                 ctx = {"credentials": dict(conf, owner=owner), "http": self.http, "secret": self.secret}
                 jwt = door_providers.app_jwt(conf["app_id"], self.secret(conf.get("secret")))
-                status, inst = self.http("GET", f"https://api.github.com/repos/{names[0]}/installation",
-                                         {"Authorization": "Bearer " + jwt,
-                                          "Accept": "application/vnd.github+json"}, None)
-                if status != 200:
-                    raise door_providers.Stop(f"GitHub gave no installation ({status})")
+                inst = self.installation(jwt, names)
+                # new-projects plan N1: a repository that the installation no longer lists (deleted on GitHub, or no
+                # longer selected) is dropped before the token, so that it does not stop the tokens of the others
+                listed = self.selected(jwt, inst)
+                if listed is not None:
+                    gone = [n for n in names if n.lower() not in listed]
+                    if gone:
+                        errors.append({"repos": gone, "error": "GitHub does not list it in the App's installation: it "
+                                                               "was deleted, or it is not selected there"})
+                    names = [n for n in names if n.lower() in listed]
+                    if not names:
+                        continue
                 status, got = self.http("POST", f"https://api.github.com/app/installations/{inst['id']}/access_tokens",
                                         {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json",
                                          "Content-Type": "application/json"},
@@ -785,6 +792,53 @@ class Door:
         self.record.add(caller="hub", target="github", action="token", kind="token",
                         outcome="done" if tokens else "failed", why=f"{agent}: {len(tokens)} tokens")
         return tokens, errors
+
+    def installation(self, jwt, names):
+        """The installation of the door's App that holds these repositories, from the first of them that GitHub
+        answers for: a repository that GitHub no longer has answers 404, and the next one asks."""
+        for name in names:
+            status, inst = self.http("GET", f"https://api.github.com/repos/{name}/installation",
+                                     {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json"}, None)
+            if status == 200 and isinstance(inst, dict) and isinstance(inst.get("id"), int) \
+                    and not isinstance(inst.get("id"), bool):
+                return inst
+        raise door_providers.Stop("GitHub gave no installation of the App for these repositories")
+
+    SELECTED = {}       # installation id -> (time, its repositories in lower case), for a minute
+
+    def selected(self, jwt, inst):
+        """The repositories of an installation that has selected repositories, in lower case and kept a minute, or
+        None for one that has all of them, or more than the door reads."""
+        if inst.get("repository_selection") != "selected":
+            return None
+        got = self.SELECTED.get(inst["id"])
+        if got and got[0] > now() - 60:
+            return got[1]
+        repos = self.installation_repos(jwt, inst["id"], inst.get("account", {}).get("login", "?"))
+        if repos is not None:
+            self.SELECTED[inst["id"]] = (now(), repos)
+        return repos
+
+    def installation_repos(self, jwt, iid, login):
+        """Every repository of one installation, in lower case, read with a token of metadata only; None when it has
+        more than the door reads."""
+        status, got = self.http("POST", f"{GitHub.API}/app/installations/{iid}/access_tokens",
+                                {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json",
+                                 "Content-Type": "application/json"},
+                                json.dumps({"permissions": {"metadata": "read"}}).encode())
+        token = got.get("token") if status == 201 and isinstance(got, dict) else None
+        if not isinstance(token, str):
+            raise door_providers.Stop(f"GitHub gave no token to read {login}'s installation ({status})")
+        repos = set()
+        for page in range(1, GITHUB_REACH_PAGES + 1):
+            status, got = self.http("GET", f"{GitHub.API}/installation/repositories?per_page=100&page={page}",
+                                    {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json"}, None)
+            names = [r.get("full_name") for r in (got.get("repositories") if status == 200 and
+                                                  isinstance(got, dict) else None) or [] if isinstance(r, dict)]
+            repos.update(n.lower() for n in names if isinstance(n, str))
+            if len(names) < 100:
+                return repos
+        return None
 
     def github_reach(self):
         """What the door's GitHub Apps reach, for the hub's marks of "What the App reaches" once the hub holds no App
@@ -822,23 +876,11 @@ class Door:
                 if one.get("repository_selection") == "all":
                     every.add(login.lower())
                     continue
-                status, got = self.http("POST", f"{GitHub.API}/app/installations/{iid}/access_tokens",
-                                        dict(headers, **{"Content-Type": "application/json"}),
-                                        json.dumps({"permissions": {"metadata": "read"}}).encode())
-                token = got.get("token") if status == 201 and isinstance(got, dict) else None
-                if not isinstance(token, str):
-                    raise door_providers.Stop(f"GitHub gave no token to read {login}'s installation ({status})")
-                for page in range(1, GITHUB_REACH_PAGES + 1):
-                    status, got = self.http("GET", f"{GitHub.API}/installation/repositories?per_page=100&page={page}",
-                                            {"Authorization": "Bearer " + token,
-                                             "Accept": "application/vnd.github+json"}, None)
-                    names = [r.get("full_name") for r in (got.get("repositories") if status == 200 and
-                                                          isinstance(got, dict) else None) or [] if isinstance(r, dict)]
-                    repos.update(n.lower() for n in names if isinstance(n, str))
-                    if len(names) < 100:
-                        break
-                else:
+                listed = self.installation_repos(headers["Authorization"][7:], iid, login)
+                if listed is None:
                     every.add(login.lower())    # more than the door reads: the hub marks none of this account's
+                else:
+                    repos.update(listed)
         return {"pages": pages, "all": sorted(every), "repos": sorted(repos), "install": install,
                 "owners": sorted(owners)}
 
