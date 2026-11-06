@@ -8391,9 +8391,10 @@ def expire_deposits(t0):
 # The hub reads its status, passes the owner's own commands through (intake, pin, recovery, and since the DevOps
 # plan's V1 his signed grants: grant, ungrant, pool, unpool), and reconciles: each pinned machine's vault gets the
 # secrets its agents hold, that the owner signed for that machine and that the central vault has, sealed there to
-# that pin and carried by the deliveries above, and gives back the ones nobody there holds any more. Its socket is
-# never asked under LOCK, which every other request needs while one call can take CENTRAL_WAIT seconds
-# (central_call).
+# that pin and carried by the deliveries above, and gives back the ones nobody there holds any more. A secret that
+# the owner took out of the catalog (Remove from Founderizer) then leaves the central vault too, once no machine's
+# vault holds a copy of it (central_removals). Its socket is never asked under LOCK, which every other request needs
+# while one call can take CENTRAL_WAIT seconds (central_call).
 CENTRAL_SOCKET = "/run/fleet-vault-central/vault.sock"     # the default of CFG["central_vault"]
 CENTRAL_WAIT = 10               # seconds one call to the central vault may take
 CENTRAL_READ_EVERY = 60         # seconds between two reads of its status
@@ -8711,20 +8712,58 @@ def central_withdraw(plan, t0):
     return made
 
 
+def central_removals(inventory, signed):
+    """The secrets that the central vault may remove now (vault.py remove), sorted: out of the catalog (Remove from
+    Founderizer, save_login), named by no grant or pool that the owner signed, and by the hub's own records held by no
+    machine's vault, with no delivery or withdrawal of them open. The order is the point: the hub takes a copy back
+    from a machine only while the central vault lists the secret (central_plan), so a secret leaves the central vault
+    only after its last copy left the machines. A machine whose vault cannot give a copy back keeps the secret in the
+    central vault until it can. Called with LOCK held."""
+    granted, pooled = signed
+    left = inventory - set(logins()) - {ref for ref, _machine in granted} - set(pooled)
+    for (_machine, ref), (d, w) in central_holdings().items():
+        if ref in left and any(vault_holds(d, w)):
+            left.discard(ref)
+    return sorted(left)
+
+
+def central_remove(removals):
+    """Ask the central vault to remove each of these secrets (central_removals), at most CENTRAL_BATCH of them, and
+    give the ones it removed or did not hold. Never under LOCK."""
+    removed = []
+    for ref in removals[:CENTRAL_BATCH]:
+        try:
+            answer = central_call("remove", {"login": ref})
+        except Refusal as e:
+            central_said(f"the central vault did not remove {ref}: {e}")
+            continue
+        if str(answer.get("login") or "").lower() != ref or answer.get("removed") not in ("removed", "absent"):
+            central_said(f"the central vault's answer to the removal of {ref} is not about it")
+            continue
+        removed.append(ref)
+        log("hub", f"the central vault no longer holds {ref} ({answer['removed']}): it is out of the catalog, and no "
+                   f"machine's vault holds it")
+    return removed
+
+
 def central_reconcile(t0=None):
-    """One pass of the reconciler, while the central status is ok. Never under LOCK: the inventory and each sealed
-    copy come from the central vault's socket, and the rows go in under LOCK between those calls, each checked again
-    there. At most CENTRAL_BATCH copies a pass, and the next pass goes on with the rest. Returns {"delivered": [ids
-    of deliveries], "withdrawn": [ids of withdrawals]}."""
+    """One pass of the reconciler, while the central status is ok. Never under LOCK: the inventory, each sealed copy
+    and each removal come from the central vault's socket, and the rows go in under LOCK between those calls, each
+    checked again there. At most CENTRAL_BATCH copies and CENTRAL_BATCH removals a pass, and the next pass goes on with
+    the rest. A central vault whose status does not say that it removes (an older program) is asked to remove
+    nothing. Returns {"delivered": [ids of deliveries], "withdrawn": [ids of withdrawals], "removed": [references]}."""
     t0 = t0 or now()
     with CENTRAL_LOCK:
         pins, signed = central_pins(CENTRAL["status"]), central_signatures(CENTRAL["status"])
+        removes = (CENTRAL["status"] or {}).get("removes") is True
     listed = central_call("inventory").get("logins")
     inventory = {ref.lower() for ref in (listed if isinstance(listed, list) else [])
                  if isinstance(ref, str) and BWS_REF.fullmatch(ref)}
     with LOCK:
         deliver, withdraw = central_plan(pins, inventory, t0, signed)
         withdrawn = central_withdraw(withdraw, t0) if withdraw else []
+        removals = central_removals(inventory, signed) if removes else []
+    removed = central_remove(removals)          # before the seals: the catalog was read under LOCK just now
     delivered = []
     for machine, ref, _carrier in deliver[:CENTRAL_BATCH]:
         try:
@@ -8737,9 +8776,9 @@ def central_reconcile(t0=None):
             did = central_deliver(machine, ref, text, pins[machine], t0)
         if did:
             delivered.append(did)
-    if len(deliver) > CENTRAL_BATCH:
-        central_due()
-    return {"delivered": delivered, "withdrawn": withdrawn}
+    if len(deliver) > CENTRAL_BATCH or len(removals) > CENTRAL_BATCH or removed:
+        central_due()                           # and after a removal, the next read counts the vault's items again
+    return {"delivered": delivered, "withdrawn": withdrawn, "removed": removed}
 
 
 def central_sweep(t0=None):
@@ -29231,7 +29270,8 @@ def save_team_entry(body, key, what, entry, busy):
 
 def save_login(body):
     """An owner label of one login reference (owner feature secrets). It never holds a value and gives no access. A
-    label stays while a profile or a grant lists the reference."""
+    label stays while a profile or a grant lists the reference. Once it is gone, the central vault's reconciler takes
+    the value out of the central vault too, after no machine's vault holds a copy (central_removals)."""
     def busy(ref):
         users = sorted(n for n in agents() if ref in granted_logins(n))
         if users:

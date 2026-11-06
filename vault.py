@@ -61,7 +61,8 @@ network. It takes a value that the owner sealed to its key in his app (intake), 
 a machine key that the owner signed (pin, unpin, seal), only for a grant of that value to an agent of that machine
 that the owner signed, or for a value that he signed into the grantable pool (grant, ungrant, pool, unpool), and its
 backup only to a recovery key that the owner signed (recovery, export). The owner signs with an ECDSA P-256 key of his Mac and the vault verifies every statement itself,
-so a hub that is broken into cannot add a machine of its own and pull every secret in one call. It runs as its own
+so a hub that is broken into cannot add a machine of its own and pull every secret in one call. It removes a value
+that the owner took out of the fleet (remove) only while no grant or pool that he signed names it. It runs as its own
 user (CENTRAL_UNIT), and only root installs or updates it (`hubsetup.py central-vault`): no release reaches it.
 
 Run a copy that the worker's user cannot change (root-owned, outside the worker's checkout), with a root-owned
@@ -142,7 +143,7 @@ AGENT_NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 CALLER_KEY = re.compile(r"[A-Za-z0-9_-]{43}")          # an agent key (owner API 1.12): 256 bits, base64url
 # The central vault's own operations, beside status: a central vault serves only these, and a machine's broker none.
 CENTRAL_OPERATIONS = ("intake", "pin", "unpin", "recovery", "grant", "ungrant", "pool", "unpool", "seal", "inventory",
-                      "export")
+                      "export", "remove")
 OPERATIONS = ("status", "signin", "handover", "probe", "create", "request", "cancel", "read", "deposit",
               "withdraw") + CENTRAL_OPERATIONS
 ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,59}")         # read: the variable name of an API key, as the hub checks it
@@ -219,6 +220,7 @@ SEALED_REF = re.compile(r"sealed:(\d{1,9})")
 RECIPIENT = re.compile(r"age1[0-9a-z]{58}")
 ARMOR = "-----BEGIN AGE ENCRYPTED FILE-----"
 DELIVERED = "delivered from the owner's vault"      # a deposit's note: only an item with it is withdrawn
+TAKEN = "taken from the owner"                      # an intake's note: only an item with it leaves the central store
 # The central vault (`"central": true`): exactly these keys. No hub, because it never calls one; no worker_uid or
 # worker_group, because only the hub's user asks it; no Bitwarden, curl, ssh or write key, because it does none of that.
 CENTRAL_KEYS = {"central", "hub_uid", "fleet", "owner_keys", "age", "age_key", "store", "store_key", "socket", "state"}
@@ -2063,18 +2065,20 @@ def kept_pool(record):
 
 def central_state(conf):
     """The owner's signed records, read again for every request: {"v": 1, "pins": {machine: {recipient, at}},
-    "recovery": {recipient, at} or None, "grants": {login: {agent: {machine, at}}}, "pool": {login: {in, at}}}. An
-    unpin keeps its machine's record, with no recipient, and an ungrant and an unpool keep theirs too, so a statement
-    older than them, which the hub could send again, is refused as old. No file is no record, and a state of the
-    format before grants has none."""
+    "recovery": {recipient, at} or None, "grants": {login: {agent: {machine, at}}}, "pool": {login: {in, at}},
+    "removed": {login: at}}. An unpin keeps its machine's record, with no recipient, and an ungrant and an unpool keep
+    theirs too, so a statement older than them, which the hub could send again, is refused as old. "removed" is not
+    the owner's: it names each login that remove took out, so that no value comes in under its name again (intake).
+    No file is no record, and a state of the format before grants, or before remove, has none."""
     if not os.path.lexists(conf["state"]):
-        return {"v": STATE, "pins": {}, "recovery": None, "grants": {}, "pool": {}}
+        return {"v": STATE, "pins": {}, "recovery": None, "grants": {}, "pool": {}, "removed": {}}
     try:
         data = json.loads(read_private(conf["state"], "state"))
         if isinstance(data, dict):
             data.setdefault("grants", {})
             data.setdefault("pool", {})
-        good = isinstance(data, dict) and set(data) == {"v", "pins", "recovery", "grants", "pool"} \
+            data.setdefault("removed", {})
+        good = isinstance(data, dict) and set(data) == {"v", "pins", "recovery", "grants", "pool", "removed"} \
             and data["v"] == STATE and isinstance(data["pins"], dict) \
             and all(MACHINE.fullmatch(m) and kept_record(x, unpinned=True) for m, x in data["pins"].items()) \
             and (data["recovery"] is None or kept_record(data["recovery"])) \
@@ -2083,7 +2087,9 @@ def central_state(conf):
                     AGENT_NAME.match(agent) and kept_grant(x) for agent, x in held.items())
                 for ref, held in data["grants"].items()) \
             and isinstance(data["pool"], dict) and all(SECRET_REF.fullmatch(ref) and kept_pool(x)
-                                                       for ref, x in data["pool"].items())
+                                                       for ref, x in data["pool"].items()) \
+            and isinstance(data["removed"], dict) and all(SECRET_REF.fullmatch(ref) and ref == ref.lower()
+                                                          and type(at) is int for ref, at in data["removed"].items())
     except ValueError:
         good = False
     if not good:
@@ -2128,7 +2134,7 @@ def central_status(conf):
             "store_recipient": store.recipient, "fleet": conf["fleet"], "owner_keys": len(conf["owner_keys"]),
             "pins": pins(state), "recovery": state["recovery"]["recipient"] if state["recovery"] else None,
             "grants": granted(state), "pool": pooled(state), "items": len(store.opened()),
-            "source": conf.get("_source")}
+            "removes": True, "source": conf.get("_source")}     # removes: this program serves remove (the hub asks)
 
 
 def fingerprint_list(items):
@@ -2145,7 +2151,9 @@ def intake(conf, req):
     gives the salts and the fingerprints that the owner registered under that reference, and the value is saved only
     when each of its own fingerprints is one of those, and its password's is there when the owner registered one: the
     rule of a deposit (the hub's helper_deposit_check), so the hub cannot put another value under a name that the
-    owner gave. It is saved under the same reference, and another value under it is refused, as a deposit is."""
+    owner gave. It is saved under the same reference, and another value under it is refused, as a deposit is. A name
+    that remove took out takes no value again: else a hub that is broken into could remove a value that nobody holds
+    yet and put its own under the owner's name, for his next grant to send."""
     ref, title, item, text, salts, given = (req.get(k) for k in ("login", "title", "item", "ciphertext", "salts",
                                                                  "fingerprints"))
     m = SECRET_REF.fullmatch(ref) if isinstance(ref, str) else None
@@ -2154,6 +2162,8 @@ def intake(conf, req):
             and all(re.fullmatch(r"[0-9a-f]{32}", str(salts.get(k))) for k in ("password", "totp"))
             and fingerprint_list(given)):
         raise Refused("the intake request is not valid")
+    if ref.lower() in central_state(conf)["removed"]:
+        raise Refused("this login was removed from the fleet, so no value is taken under its name again")
     store = LocalStore(conf)
     read_private(conf["age_key"], "key")            # owner and mode are checked before age reads it
     r = run([conf["age"], "-d", "-i", conf["age_key"]], text)
@@ -2165,7 +2175,7 @@ def intake(conf, req):
     if not (mine <= registered and (all(k[0] != "password" for k in registered)
                                     or any(k[0] == "password" for k in mine))):
         raise Refused("the value does not match what the owner registered")
-    saved = store.put(m.group(1).lower(), title, canonical(value), "taken from the owner")
+    saved = store.put(m.group(1).lower(), title, canonical(value), TAKEN)
     log(f"intake: {ref.lower()} {saved}")
     return {"ok": True, "login": ref.lower(), "saved": saved}
 
@@ -2282,6 +2292,31 @@ def export(conf):
             "recovery": recovery["recipient"], "store": text, "key": r.stdout}
 
 
+def remove(conf, req):
+    """remove: take out of the central store one value that the owner took out of the fleet (Remove from Founderizer,
+    which takes it out of the hub's catalog). The hub asks only when no machine's vault holds a copy of it any more,
+    because it takes a copy back from a machine only while this vault still lists the secret (hub.py central_plan).
+
+    It needs no statement of the owner's: a removal gives no value to anybody, so it cannot weaken what his signatures
+    guard, which is where a value may go. But it is refused while a grant or the pool that he signed names the
+    secret, so a hub that is broken into cannot take away a secret that the owner gives to an agent or to the door.
+    And the name is kept first ("removed" of the state), so no value comes in under it again (intake). "absent" when
+    the store holds no such value, so a request that is asked again ends the same way."""
+    ref = req.get("login")
+    m = SECRET_REF.fullmatch(ref) if isinstance(ref, str) else None
+    if not m:
+        raise Refused("a remove request needs a login")
+    ref, state = ref.lower(), central_state(conf)
+    if any(g["login"] == ref for g in granted(state)) or ref in pooled(state):
+        raise Refused("a grant or the pool that the owner signed still names this login, so it is not removed")
+    if ref not in state["removed"]:     # first: a removal that stops halfway still takes no new value under this name
+        state["removed"][ref] = int(time.time())
+        keep_state(conf, state)
+    removed = LocalStore(conf).remove(m.group(1).lower(), TAKEN)
+    log(f"remove: {ref} {removed}")
+    return {"ok": True, "login": ref, "removed": removed}
+
+
 def central(conf, req):
     """One request to the central vault (handle): its own operations and status, and nothing of a machine's broker."""
     op = req.get("op")
@@ -2297,6 +2332,8 @@ def central(conf, req):
         return {"ok": True, "logins": sorted("bws://" + sid for sid in LocalStore(conf).opened())}
     if op == "export":
         return export(conf)
+    if op == "remove":
+        return remove(conf, req)
     raise Refused("unknown operation")
 
 
