@@ -362,6 +362,8 @@ CHECKS = {
     "install": check_install,
     "file": check_file,
     "place": lambda a: check_place(a),
+    "app-new": lambda a: check_app_new(a),
+    "app-check": lambda a: [check_app_name(one(a, "app-check", "the app's name"))],
 }
 
 
@@ -797,6 +799,165 @@ def do_self_update(req, data):
     return f"ops-root {int(found.group(1))} from release {bundle['manifest']['version']}"
 
 
+# ---------------------------------------------------------------- a new app
+#
+# New-projects plan N4 (the owner's "Yes, as written", 6 November 2026): the product has one app shape (D4). Two users,
+# <app>-app, which runs the service and has no login, and <app>-deploy, its runner's user, with a shell and no key, both
+# locked; /var/www/<app> with releases, artifacts, artifacts/incoming and shared, all owned by root; the two blocklists of
+# both procedures; an empty root-owned shared/.env that systemd reads as root; the app's settings file with its loopback
+# port and health path; and the product's release helper as /usr/local/sbin/<app>-deploy, a link to the one signed file
+# that self-update keeps current, whose deploy verb is all that the deploy user reaches through sudo.
+
+APP = re.compile(r"[a-z][a-z0-9-]{0,23}")
+WWW = "/var/www"
+APPS = ETC + "/apps"                        # one settings file for each app: {"app", "port", "health"}
+RELEASE_HELPER = LIB + "/app-release"       # the product's release helper (host/app-release)
+PLAN_WRITES = ("app-new", "unit-new", "env-new", "env-add", "runner-new", "vhost-new")     # on a fix host only
+
+
+def check_app_name(name):
+    if not isinstance(name, str) or not APP.fullmatch(name):
+        raise Refused("an app's name starts with a letter and holds lowercase letters, digits and hyphens, at most 24")
+    return name
+
+
+def check_app_new(args):
+    if len(args) != 3:
+        raise Refused("app-new takes the app's name, its loopback port and its health path")
+    name, port, health = check_app_name(args[0]), args[1], args[2]
+    if not re.fullmatch(r"[1-9][0-9]{3,4}", port) or int(port) > 65535:
+        raise Refused("the port is a number from 1000 to 65535")
+    if not re.fullmatch(r"/[A-Za-z0-9._~/-]{0,100}", health) or "//" in health or "/." in health:
+        raise Refused("the health path is a plain absolute path, like /api/health")
+    return [name, port, health]
+
+
+def app_names(name):
+    tree = f"{WWW}/{name}"
+    return {"users": [f"{name}-app", f"{name}-deploy"], "tree": tree, "unit": f"/etc/systemd/system/{name}.service",
+            "helper": f"/usr/local/sbin/{name}-deploy", "sudoers": f"/etc/sudoers.d/95-app-{name}",
+            "settings": f"{APPS}/{name}.json", "env": f"{tree}/shared/.env",
+            "folders": [tree] + [f"{tree}/{d}" for d in ("releases", "artifacts", "artifacts/incoming", "shared")],
+            "blocklists": [f"{tree}/release-blocklist", f"{tree}/security-blocked-releases.tsv"]}
+
+
+def account_exists(name):
+    for lookup in (pwd.getpwnam, grp.getgrnam):
+        with contextlib.suppress(KeyError):
+            lookup(name)
+            return True
+    return False
+
+
+def ports_taken():
+    "The TCP ports that something listens on, and the port of every app's settings."
+    status, out = run(["ss", "-ltnH"], timeout=30)
+    if status != 0:
+        raise Failed("ss could not list the listeners")
+    taken = set()
+    for line in out.splitlines():
+        found = re.search(r":([0-9]{1,5})\s", line + " ")
+        if found:
+            taken.add(int(found.group(1)))
+    with contextlib.suppress(OSError):
+        for entry in os.listdir(P(APPS)):
+            with contextlib.suppress(OSError, ValueError, TypeError, KeyError):
+                with open(P(f"{APPS}/{entry}")) as f:
+                    taken.add(int(json.load(f)["port"]))
+    return taken
+
+
+def own_root(path, mode_bits):
+    "root:root and this mode. The tests run as their own user, under ROOT, where only the mode is set."
+    if os.geteuid() == 0:
+        os.chown(P(path), 0, 0, follow_symlinks=False)
+    os.chmod(P(path), mode_bits)
+
+
+@form("app-new", help="a new app's two users, folders, settings, release helper and sudoers line: <app> <port> "
+                       "<health path>, on a fix host only")
+def do_app_new(req, data):
+    name, port, health = req["args"]
+    n = app_names(name)
+    taken = [u for u in n["users"] + [name] if account_exists(u)] + \
+        [p for p in (n["tree"], n["unit"], n["helper"], n["sudoers"], n["settings"]) if os.path.lexists(P(p))]
+    if taken:
+        raise Refused(f"{', '.join(taken)} exists already: app-new makes a new app only")
+    if not os.path.isfile(P(RELEASE_HELPER)):
+        raise Refused("the product's release helper is not on this host yet: the next update of the door's parts "
+                      "brings it")
+    if int(port) in ports_taken():
+        raise Refused(f"something listens on port {port}, or another app has it")
+    undo = []
+    try:
+        for user, shell, home in ((f"{name}-app", "/usr/sbin/nologin", None),
+                                  (f"{name}-deploy", "/bin/bash", f"/home/{name}-deploy")):
+            where = ["--create-home", "--home-dir", home] if home else ["--no-create-home", "--home-dir", "/nonexistent"]
+            checked(run(["useradd", "--system", "--user-group", "--shell", shell, *where, user]), None)
+            undo.append(lambda u=user: run(["userdel", "--remove", u]))
+            checked(run(["passwd", "--lock", user]), None)
+        for folder in n["folders"]:
+            os.mkdir(P(folder))
+            undo.append(lambda f=folder: shutil.rmtree(P(f), ignore_errors=True))
+            own_root(folder, 0o755)
+        for path, mode_bits in [(b, 0o644) for b in n["blocklists"]] + [(n["env"], 0o600)]:
+            with open(os.open(P(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w"):
+                pass
+            own_root(path, mode_bits)
+        os.makedirs(P(APPS), exist_ok=True)
+        replace(n["settings"], (json.dumps({"app": name, "port": int(port), "health": health}, sort_keys=True) +
+                                "\n").encode(), 0o644)
+        undo.append(lambda: os.remove(P(n["settings"])))
+        os.symlink(RELEASE_HELPER, P(n["helper"]))
+        undo.append(lambda: os.remove(P(n["helper"])))
+        replace(n["sudoers"], f"{name}-deploy ALL=(root) NOPASSWD: {n['helper']} deploy *\n".encode(), 0o440)
+        undo.append(lambda: os.remove(P(n["sudoers"])))
+        checked(run(["visudo", "-cf", P(n["sudoers"])]), None)
+    except (Failed, OSError) as e:
+        for step in reversed(undo):
+            with contextlib.suppress(Exception):
+                step()
+        raise Failed(f"app-new stopped, and it took back what it made: {e}") from None
+    return f"{name}: its users, folders, settings, release helper and sudoers line are in place, on port {port}"
+
+
+@form("app-check", write=False, help="the checks of an app's shape, as root: its users, owners and modes, its release "
+                                      "helper, its service and its runner")
+def do_app_check(req, data):
+    name = req["args"][0]
+    n = app_names(name)
+    out = {}
+    for user, shell in ((f"{name}-app", "/usr/sbin/nologin"), (f"{name}-deploy", "/bin/bash")):
+        try:
+            pw = pwd.getpwnam(user)
+        except KeyError:
+            out[user] = "missing"
+            continue
+        status, said = run(["passwd", "--status", user], timeout=30)
+        locked = status == 0 and said.split()[1:2] == ["L"]
+        out[user] = "ok" if locked and pw.pw_shell == shell else "not locked" if not locked else f"shell {pw.pw_shell}"
+    wanted = [(f, 0o755) for f in n["folders"]] + [(b, 0o644) for b in n["blocklists"]] + \
+        [(n["env"], 0o600), (n["settings"], 0o644)]
+    for path, mode_bits in wanted:
+        try:
+            st = os.lstat(P(path))
+        except OSError:
+            out[path] = "missing"
+            continue
+        good = (st.st_uid == 0 or os.geteuid() != 0) and not stat.S_ISLNK(st.st_mode) and \
+            stat.S_IMODE(st.st_mode) == mode_bits
+        out[path] = "ok" if good else f"mode {stat.S_IMODE(st.st_mode):o}, owner {st.st_uid}"
+    helper_ok = os.path.islink(P(n["helper"])) and os.readlink(P(n["helper"])) == RELEASE_HELPER
+    out[n["helper"]] = "ok" if helper_ok else "not the product's release helper"
+    line = f"{name}-deploy ALL=(root) NOPASSWD: {n['helper']} deploy *\n"
+    out[n["sudoers"]] = "ok" if read(n["sudoers"]) == line else "not its one line"
+    _, said = systemctl("is-active", f"{name}.service")
+    out["service"] = said.strip() or "unknown"
+    _, said = systemctl("list-units", "--plain", "--no-legend", f"actions.runner.*{name}*.service")
+    out["runner"] = ("active" if "running" in said else "not running") if said.strip() else "none"
+    return json.dumps(out, sort_keys=True)
+
+
 # ---------------------------------------------------------------- what the forms share
 
 def checked(result, done):
@@ -1171,7 +1332,10 @@ def call(req, data=None):
     f = FORMS[op]
     if f["kind"] == "judged" and mode() != "fix":
         raise Refused("this host is rule-only: no judged form and no file install")
-    if data is not None and op not in ("file", "self-update", "pro-attach", "runner-register", "place"):
+    if op in PLAN_WRITES and mode() != "fix":        # new-projects plan N4: a new app lives on a fix host only
+        raise Refused("this host is rule-only: no form of a new app writes here")
+    if data is not None and op not in ("file", "self-update", "pro-attach", "runner-register", "place", "unit-new",
+                                       "env-new", "env-add", "runner-new", "vhost-new"):
         raise Refused(f"{op} takes nothing on stdin")
     if not f["write"]:
         return f["run"](req, data)
