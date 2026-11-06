@@ -66,6 +66,7 @@ REFUSED_FILE = STATE + "/refused.json"      # judged calls the model refused, by
 COUNTS_FILE = STATE + "/counts.json"        # today's judged calls of each business and refusals of each agent
 MINTED_FILE = STATE + "/minted.json"        # ids of the keys this door minted (never their values)
 MADE_FILE = STATE + "/made.json"            # names of what writes through the door made, by provider account (D25)
+REPOS_FILE = STATE + "/repos.json"          # the repositories that the door made, and a repo-new that is pending (N3)
 ACCOUNTS_FILE = STATE + "/accounts.json"    # the Cloudflare account of a token whose credential names none (plan N1)
 SECRETS_DIR = STATE + "/secrets"            # opened values, one file each, mode 600, this user only
 VAULT_KEY = STATE + "/vault.key"            # the door's own age identity (its recipient is pinned in the vault)
@@ -405,7 +406,7 @@ class Door:
         self.clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
         self.record = Record()
         self.lock = threading.Lock()
-        self.host_locks, self.business_locks = {}, {}
+        self.host_locks, self.business_locks, self.repo_locks = {}, {}, {}
         self.access_cache = (None, None)
         self.aws_sessions = {}          # each AWS role's session of an hour, in memory only (door_providers.aws_session)
 
@@ -450,6 +451,25 @@ class Door:
             made = read_json(MADE_FILE, {})
             made.setdefault(target, {})[key] = round(now())
             write_json(MADE_FILE, made)
+
+    def repo_record(self, kind, full, **fields):
+        """The door's record of the repositories that it made (new-projects plan N3): "pending" before a repo-new
+        is sent, "made" by the repository's id once GitHub answers, "deleted" after a repo-delete. With no fields, a
+        "pending" or "made" asks for that entry, or None."""
+        key = full.lower()
+        with self.lock:
+            held = read_json(REPOS_FILE, {"pending": {}, "made": {}})
+            if not fields and kind in ("pending", "made"):
+                return (held.get(kind) or {}).get(key)
+            if kind == "pending":
+                held.setdefault("pending", {})[key] = dict(fields, at=round(now()))
+            elif kind == "made":
+                held.setdefault("made", {})[key] = dict(fields, repo=full, at=round(now()))
+                held.setdefault("pending", {}).pop(key, None)
+            elif kind == "deleted":
+                held.setdefault("made", {}).pop(key, None)
+            write_json(REPOS_FILE, held)
+        return None
 
     def made(self, target, key):
         """True when the door's own record shows that an agent made this through the door: a key that it minted, or a
@@ -553,13 +573,19 @@ class Door:
             ok, outcome = True, "done"
         except (Refused, door_providers.Stop) as e:
             ok, outcome, out = False, "failed", str(e)
+        made = ((d.plan or {}).get("repo_new") or {}).get("name") if ok else None     # N3: what the call made
         n = self.record.add(caller=agent, target=target, action=op, kind=d.kind, outcome=outcome, why=d.why[:300],
-                            sha256=sha)
+                            sha256=sha, **({"made": made} if made else {}))
         return {"ok": ok, "kind": d.kind, "out" if ok else "why": out, "n": n}
 
     def run(self, agent, access, d, op, args, content):
         """What a decision runs: a host form through its second sshd, or a provider's plan. A write on one host waits
-        for the one before it, and a reboot-class call holds its business until the host answers again."""
+        for the one before it, and a reboot-class call holds its business until the host answers again. A repo-new or
+        a repo-delete holds its repository's lock (new-projects plan N3)."""
+        repo = ((d.plan or {}).get("repo_new") or (d.plan or {}).get("repo_delete") or {}).get("name")
+        if repo:
+            with self.held(self.repo_locks, repo.lower()):
+                return self.act(access, d, op, args, content)
         if d.host and d.write:
             with self.held(self.host_locks, d.host):
                 if d.reboot:
@@ -603,7 +629,8 @@ class Door:
         needs it: a file at the head of the branch that the commit goes to, the npm registry, a release run, the
         state of the default branch, a repository's default branch."""
         kind, _, repo = target.partition(":") if isinstance(target, str) else ("", "", "")
-        facts = {"minted": self.minted, "default_branch": lambda name: GitHub(self, access, name).branch()}
+        facts = {"minted": self.minted, "default_branch": lambda name: GitHub(self, access, name).branch(),
+                 "made_repo": lambda name: self.repo_record("made", name)}
         if kind not in ("commit", "gitops", "deploy") or not door_targets.REPO.fullmatch(repo):
             return facts
         hub = GitHub(self, access, repo)
@@ -656,6 +683,7 @@ class Door:
         return {"credentials": dict(self.credential(access, target), owner=target.partition(":")[2]),
                 "http": self.http, "secret": self.secret, "keep": lambda kind, answer: self.keep_minted(answer),
                 "made": lambda key: self.keep_made(target, key),
+                "repos": self.repo_record,
                 "account": lambda account_id: self.keep_account(access, target, account_id),
                 "minted_secret": self.minted_secret, "aws_token": self.aws_token, "aws_sessions": self.aws_sessions,
                 "host": lambda host, op, args, stdin: self.ssh(access["hosts"][host],
@@ -752,14 +780,23 @@ class Door:
         pool = (access.get("pools") or {}).get(me.get("business")) or {}
         levels = list(GITHUB_ACCESS)
         groups, refused = {}, []
+        operator, kept = bool(me.get("servers") or me.get("business")), []
         for repo, level in sorted((repos or {}).items()):
             tops = [levels.index(x) for x in (granted.get(repo), pool.get(repo)) if x in GITHUB_ACCESS]
             if door_targets.vendor(repo) or level not in GITHUB_ACCESS or not tops or levels.index(level) > max(tops):
                 refused.append(repo)
                 continue
+            # new-projects plan N3: no deploy token on a repository that the door made, and no write token on it for
+            # an Operator, whose workflow files there go through the door
+            if self.repo_record("made", repo) and (level == "deploy" or (level == "write" and operator)):
+                kept.append(repo)
+                continue
             groups.setdefault((repo.split("/")[0], level), []).append(repo)
         tokens, errors = [], [{"repos": [r], "error": "neither the door's access file nor the business's pool gives "
                                                       "this agent that level"} for r in refused]
+        errors += [{"repos": [r], "error": "the door made this repository: it makes no deploy token on it, and no write "
+                                          "token for an Operator, whose workflow files there go through the door"}
+                   for r in kept]
         for (owner, level), names in sorted(groups.items()):
             conf = github_app(access, owner) or sole_app(access) or {}
             try:

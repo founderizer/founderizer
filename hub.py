@@ -1985,6 +1985,7 @@ def migrate():
         "owner_device_push": {"seal": "TEXT"},      # sealed_push: the phone's own key for what a ping says, base64
         # plan V12: the phone's own key that the recovery code is sealed to, and its HMAC of the QR's one-time value
         "owner_device_signing": {"recovery_key": "TEXT", "recovery_binding": "TEXT"},
+        "door_record": {"made": "TEXT"},     # new-projects plan N3: what the door's call made, a repository by name
         "triggers": {"failures": "INTEGER NOT NULL DEFAULT 0", "created_by": "TEXT NOT NULL DEFAULT 'owner'",
                      "responsibility": "INTEGER", "watch": "TEXT"},         # owner API 1.13: a duty's watch
         # the task that open_case opened the case in: a task that opened two carries neither (t_open_case)
@@ -18608,6 +18609,18 @@ def grant_check(agent, rid, level):
         return (f"A server is the owner's alone to give, in the Servers group of the app. Ask the owner with "
                 f"raise_needs_you for {what} at the level the work needs.")
     entry = resource_pool().get(rid) or {}
+    if not entry.get("max") and kind == "repo" and door_made(what):
+        # new-projects plan N3: a repository that the door made is the manager's to give, up to write, to an agent that
+        # holds no server through the door; its workflow files go through the door, and nobody gets deploy there
+        if a.get("servers"):
+            return (f"{agent} holds a server through the door, and a repository that the door made goes to the "
+                    f"developer of the project: its Operator commits there through the door.")
+        levels = RESOURCE_LEVELS[kind]
+        if level not in levels:
+            raise ToolError(f"level must be one of {', '.join(levels)} for a {RESOURCE_WORDS[kind]}.")
+        if levels.index(level) > levels.index("write"):
+            return f"The door made {what}: give it at write at most, because nobody gets deploy there."
+        return None
     if not entry.get("max"):
         phrase = resource_phrase(kind, what)        # only its first letter: capitalize() would unmake MCP and a name
         return (f"{phrase[0].upper() + phrase[1:]} is not in the grantable pool, so you cannot give it. Ask "
@@ -18621,6 +18634,12 @@ def grant_check(agent, rid, level):
         return (f"The owner allows at most {entry['max']} of {resource_phrase(kind, what)}, and you asked for {level}. "
                 f"Give {entry['max']}, or ask the owner for {level}.")
     return None
+
+
+def door_made(repo):
+    """True when the hub's copy of the door's record shows that the door made this repository (new-projects plan N3)."""
+    return bool(read_rows("SELECT 1 FROM door_record WHERE made IS NOT NULL AND lower(made)=lower(?) AND "
+                          "outcome='done' LIMIT 1", (repo,)))
 
 
 def grant_resource(by, rid, agent, level, phrase):
@@ -30833,11 +30852,13 @@ def door_sweep(t0=None):
     rows = [e for e in answer.get("entries") or [] if isinstance(e, dict) and isinstance(e.get("n"), int)]
     with transaction():
         for e in rows[:DOOR_PAGE]:
-            DB.execute("INSERT OR IGNORE INTO door_record(n,ts,caller,target,action,kind,outcome,why) "
-                       "VALUES(?,?,?,?,?,?,?,?)", (e["n"], float(e.get("ts") or t0), str(e.get("caller"))[:64],
-                                                   str(e.get("target"))[:120], str(e.get("action"))[:40],
-                                                   str(e.get("kind"))[:16], str(e.get("outcome"))[:16],
-                                                   str(e.get("why") or "")[:300]))
+            made = e.get("made") if isinstance(e.get("made"), str) and GITHUB_FULL_NAME.fullmatch(
+                str(e.get("made")).lower()) else None
+            DB.execute("INSERT OR IGNORE INTO door_record(n,ts,caller,target,action,kind,outcome,why,made) "
+                       "VALUES(?,?,?,?,?,?,?,?,?)", (e["n"], float(e.get("ts") or t0), str(e.get("caller"))[:64],
+                                                     str(e.get("target"))[:120], str(e.get("action"))[:40],
+                                                     str(e.get("kind"))[:16], str(e.get("outcome"))[:16],
+                                                     str(e.get("why") or "")[:300], made))
     return len(rows)
 
 

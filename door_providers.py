@@ -346,7 +346,36 @@ def github(access, agent, owner, op, args, content, lookups):
                         plan={"provider": "github", "account": owner, "repo": full, "steps": [
                             step("POST", f"/repos/{full}/pulls", {"head": args[1], "base": args[2],
                                                                    "title": " ".join(args[3:])[:200]})]})
+    if op == "repo-new":
+        if len(args) != 1 or not APP_NAME.fullmatch(args[0]):
+            return refused("repo-new takes the app's name: a lowercase letter, then lowercase letters, digits and "
+                           "hyphens, 24 characters at most")
+        if full.lower() in [r.lower() for r in (access.get("never") or {}).get("repos") or []]:
+            return refused(f"{full} is on the never list")
+        via = sorted(r for r in ((access.get("agents") or {}).get(agent) or {}).get("github") or {}
+                     if r.lower().startswith(owner.lower() + "/"))
+        if not via:
+            return refused(f"the door makes a repository only in an account where this agent holds one already, and "
+                           f"it holds none of {owner}")
+        return Decision("rule", "a new private repository with its first commit", target=f"github:{owner}",
+                        plan={"provider": "github", "account": owner, "repo": via[0],
+                              "repo_new": {"name": full, "agent": agent}})
+    if op == "repo-delete":
+        if len(args) != 1 or not APP_NAME.fullmatch(args[0]):
+            return refused("repo-delete takes the app's name")
+        made = (lookups.get("made_repo") or (lambda name: None))(full)
+        if not made or made.get("agent") != agent:
+            return refused(f"{full} is no repository that the door made for this agent: deleting another one is the "
+                           f"owner's, through a Needs-you item")
+        return Decision("judged", "deleting a repository that the door made, which has no runner",
+                        target=f"github:{owner}", plan={"provider": "github", "account": owner, "repo": full,
+                                                         "repo_delete": {"name": full, "id": made.get("id")}})
     return refused(f"{op} is not listed for GitHub")
+
+
+APP_NAME = re.compile(r"[a-z][a-z0-9-]{0,23}")  # new-projects plan N4: the name of an app, its users and its repository
+REPO_NEW = {"administration": "write", "repository_creation": "write", "metadata": "read"}   # plan N2: one call
+REPO_DELETE = {"administration": "write", "metadata": "read"}
 
 
 def holds(access, agent, repo):
@@ -810,6 +839,10 @@ def execute(plan, ctx):
         return place(plan, ctx)
     if "secret" in plan:
         return github_secret(plan, ctx)
+    if "repo_new" in plan:
+        return repo_new(plan, ctx)
+    if "repo_delete" in plan:
+        return repo_delete(plan, ctx)
     if "app_setting" in plan:
         return azure_setting(plan, ctx)
     session = open_session(provider, conf, ctx, plan)
@@ -1055,6 +1088,107 @@ def app_jwt(app_id, key_pem, sign=None):
                 raise Stop("openssl could not sign with the door's App key")
             return r.stdout
     return signed + "." + part(sign(signed, key_pem))
+
+
+def one_call(conf, ctx, via, permissions, repositories=None):
+    """(installation, token) of a token for one call (plan N2), with exactly these permissions, which the door never
+    keeps; GitHub's two pages when the installation does not hold them. The installation is that of `via`."""
+    jwt = app_jwt(conf["app_id"], ctx["secret"](conf["secret"]), ctx.get("sign"))
+    head = {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json"}
+    status, inst = ctx["http"]("GET", f"{BASES['github']}/repos/{via}/installation", head, None)
+    if status != 200 or not isinstance(inst, dict):
+        raise Stop(f"GitHub gave no installation of the door's App ({status})")
+    asked = named_permissions(permissions, inst.get("permissions"))
+    short = sorted(name for name, level in permissions.items() if asked.get(name) != level)
+    if short:
+        raise Stop(permission_pages(inst, short))
+    body = {"permissions": permissions}
+    if repositories:
+        body["repositories"] = repositories
+    status, got = ctx["http"]("POST", f"{BASES['github']}/app/installations/{inst['id']}/access_tokens",
+                              dict(head, **{"Content-Type": "application/json"}), json.dumps(body).encode())
+    if status != 201 or not isinstance(got, dict) or not isinstance(got.get("token"), str):
+        raise Stop(f"GitHub gave the door no token for this call ({status})")
+    return inst, got["token"]
+
+
+def gh(ctx, token, method, path, body=None):
+    return ctx["http"](method, f"{BASES['github']}{path}", {"Authorization": "Bearer " + token,
+                                                           "Accept": "application/vnd.github+json",
+                                                           "X-GitHub-Api-Version": "2022-11-28",
+                                                           **({"Content-Type": "application/json"} if body else {})},
+                       json.dumps(body).encode() if body is not None else None)
+
+
+def repo_new(plan, ctx):
+    """New-projects plan N3: one private repository with a first commit, in the account of the door's App, with a
+    token of its own for this call. The door's record keeps the call pending before it is sent and, once GitHub
+    answers, the repository by its id with the agent and the app (ctx["repos"]). A retry finds a repository of that
+    name: it completes the record only when the App reads it, its one commit is the App's and GitHub made it within a
+    minute of the pending record, and refuses otherwise."""
+    conf, want = ctx["credentials"], plan["repo_new"]
+    full, agent, record = want["name"], want["agent"], ctx["repos"]
+    owner, app = full.split("/", 1)
+    inst, token = one_call(conf, ctx, plan["repo"], REPO_NEW)
+    status, there = gh(ctx, token, "GET", f"/repos/{full}")
+    if status == 200:
+        pending = record("pending", full)
+        made = isinstance(there, dict) and pending and pending.get("agent") == agent and \
+            created_within(there.get("created_at"), pending.get("at"), 60) and app_commit_only(ctx, token, full, inst)
+        if not made:
+            raise Stop(f"{full} exists, and the door's record does not show that the door made it for this agent")
+        record("made", full, id=there["id"], agent=agent, app=app)
+        return f"{full} was made by the door for {agent}, and the record now says so"
+    if status != 404:
+        raise Stop(f"GitHub did not say whether {full} exists ({status})")
+    record("pending", full, agent=agent, app=app)
+    org = ((inst.get("account") or {}).get("type") == "Organization")
+    status, answer = gh(ctx, token, "POST", f"/orgs/{owner}/repos" if org else "/user/repos",
+                        {"name": app, "private": True, "auto_init": True,
+                         "description": f"made by the door for {agent}"})
+    if status != 201 or not isinstance(answer, dict) or answer.get("full_name", "").lower() != full.lower():
+        raise Stop(f"GitHub made no repository {full} ({status}): {short(answer, 300)}")
+    record("made", full, id=answer.get("id"), agent=agent, app=app)
+    status, _ = gh(ctx, one_call(conf, ctx, plan["repo"], {"metadata": "read"})[1], "GET", f"/repos/{full}")
+    if status != 200:
+        raise Stop(f"GitHub made {full}, and the App's installation does not reach it ({status}): the new-projects plan "
+                   f"stops here and goes back to the owner with this answer")
+    return f"made {full}: private, with its first commit, and the App reaches it"
+
+
+def created_within(created, at, seconds):
+    try:
+        made = datetime.datetime.strptime(created[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(at, (int, float)) and abs(made.timestamp() - at) <= seconds
+
+
+def app_commit_only(ctx, token, full, inst):
+    """True when the repository has one commit, and the App's own bot made it (GitHub's first commit)."""
+    status, commits = gh(ctx, token, "GET", f"/repos/{full}/commits?per_page=2")
+    bot = f"{inst.get('app_slug')}[bot]"
+    return status == 200 and isinstance(commits, list) and len(commits) == 1 and \
+        ((commits[0].get("author") or {}).get("login") == bot or (commits[0].get("committer") or {}).get("login") == bot)
+
+
+def repo_delete(plan, ctx):
+    """New-projects plan N3: delete a repository that the door made, which has no runner, with a token of its own for
+    that one repository (plan N2). The judge read the call first."""
+    conf, want = ctx["credentials"], plan["repo_delete"]
+    full = want["name"]
+    _, token = one_call(conf, ctx, full, REPO_DELETE, repositories=[full.split("/", 1)[1]])
+    status, answer = gh(ctx, token, "GET", f"/repos/{full}")
+    if status != 200 or not isinstance(answer, dict) or answer.get("id") != want.get("id"):
+        raise Stop(f"{full} is not the repository that the door made ({status})")
+    status, runners = gh(ctx, token, "GET", f"/repos/{full}/actions/runners")
+    if status != 200 or not isinstance(runners, dict) or runners.get("total_count") != 0:
+        raise Stop(f"{full} has a runner, or GitHub did not say ({status}): the door deletes it only with none")
+    status, answer = gh(ctx, token, "DELETE", f"/repos/{full}")
+    if status != 204:
+        raise Stop(f"GitHub did not delete {full} ({status}): {short(answer, 300)}")
+    ctx["repos"]("deleted", full)
+    return f"deleted {full}, which the door made"
 
 
 def github_secret(plan, ctx):
