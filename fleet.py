@@ -366,9 +366,17 @@ CODEX_NO_ASKING = ["-c", "tools.experimental_request_user_input.enabled=false"]
 # bundled ones included, and none is written to $CODEX_HOME/skills/.system, so only the fleet's own words name one
 # (a SKILL.md stays readable by its path). Only as -c: Codex 0.163 warns about a key it does not know and starts,
 # where --enable, --disable or --strict-config with an unknown name stops it.
+# Each runtime's own memory stays off in every Fleet session, by a start option and not by a rule's words
+# (lifecycle.RUNTIMES "memory_off"): what an agent learns lives in the hub, where the owner reads it and where the
+# fleet counts what it came from. A memory of the runtime's own would steer later sessions where nobody sees it, and
+# on a Mac an agent's Codex reads that user's own config, which can turn Codex's memories on.
+CODEX_NO_MEMORY = [x for key, value in lifecycle.RUNTIMES["codex"]["memory_off"]["config"].items()
+                   for x in ("-c", f"{key}={json.dumps(value)}")]
+CLAUDE_NO_MEMORY = dict(lifecycle.RUNTIMES["claude"]["memory_off"]["settings"])
 CODEX_UNATTENDED = CODEX_NO_ASKING + ["-c", "notice.hide_rate_limit_model_nudge=true",
                                       "-c", "notice.hide_gpt5_1_migration_prompt=true",
-                                      "-c", "skills.include_instructions=false", "-c", "skills.bundled.enabled=false"]
+                                      "-c", "skills.include_instructions=false", "-c", "skills.bundled.enabled=false"] + \
+    CODEX_NO_MEMORY
 # Codex 0.163 offers its plan tool, update_plan, only with this option: a turn without it said that it had no such
 # tool (4 November 2026). A task keeps its plan there (RULES.md), which the owner's app shows while the task runs
 # (threads.py), in the terminal and in the app-server (screen_runner.py). A standing session is no task.
@@ -778,7 +786,7 @@ def settings_arg(agent, conf, task, tools=(), needs="none"):
     settings.update(NO_SUGGESTION)
     # AUTONOMY.md decision 41: what an agent learns is the fleet's (its notes and its memory, which the owner reads),
     # never a memory folder of Claude Code's own that a later session would load unseen
-    settings["autoMemoryEnabled"] = False
+    settings.update(CLAUDE_NO_MEMORY)
     if conf.get("role") in ("worker", "lead") and task:
         # Command hooks, because Claude Code will not send an HTTP hook to a private address.
         hook = f"{shlex.quote(sys.executable)} {shlex.quote(os.path.join(KIT, 'fleet.py'))} hook"
@@ -1343,8 +1351,10 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         if not task or not generation or not session:
             raise Refused(f"a {runtime_fact(runtime, 'label', runtime)} agent runs managed task sessions only")
         start = checked_start(conf)
+        own_memory = [f"{key}={value}" for key, value in
+                      ((runtime_fact(runtime, "memory_off") or {}).get("env") or {}).items()]    # its memory: off
         return prefix + shlex.join(["env", f"FLEET_ATTEMPT={attempt}", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}",
-                           f"FLEET_AGENT={agent}", f"FLEET_TASK={task}", sys.executable,
+                           f"FLEET_AGENT={agent}", f"FLEET_TASK={task}", *own_memory, sys.executable,
                            os.path.join(KIT, "acp_runner.py"), "--agent-command",
                            start,
                            "--runtime", runtime, "--mcp-url", f"{HUB}/mcp/{agent}/{generation}/{task}/{attempt}",
@@ -1487,7 +1497,7 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
         allow.append(CHROME_TOOLS)
         deny += CLOSED_CHROME_DENY
     hook = f"{shlex.quote(sys.executable)} {shlex.quote(os.path.join(KIT, 'fleet.py'))} hook"
-    settings = dict({"autoMemoryEnabled": False, "prefersReducedMotion": False,
+    settings = dict({**CLAUDE_NO_MEMORY, "prefersReducedMotion": False,
                      "permissions": {"allow": allow, "deny": deny},
                      # the activity of its tool calls for the hub's views, as every task session sends it (C7)
                      "hooks": {"PostToolUse": [{"hooks": [{"type": "command", "async": True, "timeout": 10,
@@ -1894,7 +1904,7 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
             raise Refused("a Claude chat resumes only a session id")
         # no memory folder of Claude Code's own either (AUTONOMY.md decision 41, settings_arg), and none of this
         # machine user's settings (kept_user_settings)
-        settings = dict({"autoMemoryEnabled": False, **NO_SUGGESTION,
+        settings = dict({**CLAUDE_NO_MEMORY, **NO_SUGGESTION,
                          "permissions": {"allow": [f"mcp__fleet__{t}" for t in CHAT_TOOLS], "deny": DENY}},
                         **kept_user_settings())
         args = ["claude"] + (["--resume", resume] if resume else ["--session-id", marker] if marker else []) + \
@@ -2104,7 +2114,7 @@ def conversation_command(agent, conf, generation, conversation, url, token, prom
     # what it keeps of the user's settings (kept_user_settings); a pinned version keeps its updater off whatever their
     # env says, because --settings env would win over CLOSED_NO_UPDATES
     kept = {key: value for key, value in kept_user_settings().items() if runtime is None or key != "env"}
-    settings = dict({"autoMemoryEnabled": False, **NO_SUGGESTION,
+    settings = dict({**CLAUDE_NO_MEMORY, **NO_SUGGESTION,
                      "permissions": {"allow": [f"mcp__fleet__{t}" for t in CONVERSATION_TOOLS], "deny": DENY}}, **kept)
     # --setting-sources "": no user, project or local settings, so no CLAUDE.md, hook or plugin of this machine, and
     # --settings still applies. --safe-mode would also drop the --mcp-config server, so the session had no tools.

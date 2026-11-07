@@ -441,8 +441,9 @@ class Runner:
             self.records = os.fdopen(fd, "a", encoding="utf-8")
         overrides = [x for name in self.off for x in ("-c", f"features.{name}=false")]     # none for a screen task
         # AUTONOMY.md decision 41: no request_user_input to refuse (decide) either, so the model never reaches for it;
-        # and the plan tool, whose turn/plan/updated is the task's plan in the owner's app
-        overrides += fleet.CODEX_NO_ASKING + fleet.CODEX_PLAN
+        # and the plan tool, whose turn/plan/updated is the task's plan in the owner's app; and no memory of Codex's own
+        # (lifecycle.RUNTIMES "memory_off"), a screen task's included
+        overrides += fleet.CODEX_NO_ASKING + fleet.CODEX_PLAN + fleet.CODEX_NO_MEMORY
         self.child = subprocess.Popen([self.command,"app-server",*overrides,"--stdio"], cwd=fleet.KIT,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, start_new_session=True)
         def stop(_signum, _frame):

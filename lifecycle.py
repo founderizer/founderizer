@@ -319,6 +319,10 @@ RUNTIMES = {
         # pricing page: the owner sets the right ones with runtime_facts. OpenAI charges no more for a cache write
         # than for input.
         "token_weights": {"default": {"input": 2.0, "cache_read": 0.1, "cache_write": 2.0, "output": 10.0}},
+        # Codex 0.163 has a memories feature that writes what it learns from a thread to $CODEX_HOME/memories and gives
+        # it to later threads. Off by default, but one config line turns it on (the owner's own Mac has it on), and an
+        # agent's Codex reads that user's config: so every Fleet session passes it off (fleet.CODEX_NO_MEMORY).
+        "memory_off": {"config": {"features.memories": False}},
     },
     "claude": {
         "label": "Claude Code",
@@ -391,6 +395,8 @@ RUNTIMES = {
                           "opus": {"input": 4.0, "cache_read": 0.2, "cache_write": 8.0, "output": 20.0},
                           "sonnet": {"input": 2.0, "cache_read": 0.2, "cache_write": 4.0, "output": 10.0},
                           "haiku": {"input": 0.1, "cache_read": 0.01, "cache_write": 0.2, "output": 0.5}},
+        # Claude Code's auto memory, in every session's settings (fleet.CLAUDE_NO_MEMORY).
+        "memory_off": {"settings": {"autoMemoryEnabled": False}},
     },
     "grok": {
         "label": "Grok",
@@ -429,6 +435,9 @@ RUNTIMES = {
         "manager_denied": None,
         "task_opening": None,
         "token_weights": None,
+        # Grok Build's memory and its automatic dreaming: off by default, and on with GROK_MEMORY=1, its config or a
+        # managed remote setting. GROK_MEMORY=0 turns it off for the whole process, whatever the others say.
+        "memory_off": {"env": {"GROK_MEMORY": "0"}},
     },
 }
 # Claude's extension in the Chrome Web Store, the browser of a runtime with browser_tabs (offer_extension).
@@ -440,7 +449,7 @@ RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manage
                  "app_server", "switch", "session_settings", "token_in_env", "model_flags", "local_model", "sign_in",
                  "sign_out", "no_sign_in", "sandbox", "screen_counter", "browser_tabs", "cache_seconds",
                  "compact_tokens", "routine", "task_denied", "task_allowed", "conversation_denied", "manager_denied",
-                 "task_opening", "token_weights")
+                 "task_opening", "token_weights", "memory_off")
 
 
 # The session reuse rule (AUTONOMY.md P9.10) and its setting (section 4), one object in team.json "settings":
