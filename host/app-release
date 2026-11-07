@@ -1,0 +1,372 @@
+#!/usr/bin/python3 -IS
+"""The product's release helper for one app (new-projects plan N4, D4; both procedures' root-owned app release helper).
+
+It runs as root, through the one sudoers line that ops-root's app-new writes:
+
+    <app>-deploy ALL=(root) NOPASSWD: /usr/local/sbin/<app>-deploy deploy *
+
+so the deploy user, whose runner the deploy job runs on, reaches only its deploy verb:
+
+    sudo /usr/local/sbin/<app>-deploy deploy <artifact> <checksum file> <release sha>
+    /usr/local/sbin/<app>-deploy rollback          root only: ops-root's rollback form
+
+The app is the name that it is called by (/usr/local/sbin/<app>-deploy is a link to this one signed file, which
+self-update keeps current), and its port and health path come from its root-owned settings (/etc/ops-root/apps/
+<app>.json), never from the caller.
+
+deploy: the artifact and its checksum file must be regular files in the deploy user's own home, where its runner's
+workspace is, and the sha the commit's 40 hex characters. Both are copied into artifacts/incoming as root, and the
+artifact's SHA-256 is checked against the checksum file before anything reads the archive. A sha on either blocklist
+is refused. The deploy user parses the archive, with Python's data filter and no link and no special file at all, and
+gives back a clean stream through a pipe; root writes the release from that stream alone, into a folder that only root
+reaches, so root never reads a file that the deploy user could change meanwhile. The release is root:root, folders
+0555, files 0444, or 0555 for a file that was executable. It writes .release.env with APP_RELEASE_SHA, the name of
+both procedures, points `previous` at the release that ran and `current` at the new one, each in one rename, restarts
+only the app's unit, and waits for the health path on the app's loopback port to answer 200 with the sha in its body.
+When that fails, `current` goes back, the unit restarts, and that release must answer too. After a healthy release,
+the oldest releases and artifacts go, five of each stay, and a pruning error is a warning that never undoes a good
+release.
+
+Standard library only. Exit status: 0 done, 3 refused (the one line says why), 1 failed.
+"""
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.error
+import urllib.request
+
+ROOT = ""                   # a prefix for every path below, which only the tests set
+WWW = "/var/www"
+APPS = "/etc/ops-root/apps"
+KEEP = 5                    # releases and artifacts that a prune keeps, beside `current` and `previous`
+ARTIFACT_MAX = 2 * 1024 ** 3
+HEALTH_WAIT = 90            # seconds that a release has to answer its health path
+APP = re.compile(r"[a-z][a-z0-9-]{0,23}")
+SHA = re.compile(r"[0-9a-f]{40}")
+ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
+# What the deploy user runs: the archive on stdin, a clean uncompressed stream of folders and regular files on stdout.
+UNPACK = ("import sys, tarfile\n"
+          "out = tarfile.open(fileobj=sys.stdout.buffer, mode='w|')\n"
+          "with tarfile.open(fileobj=sys.stdin.buffer, mode='r|*') as t:\n"
+          "    for m in t:\n"
+          "        if not (m.isfile() or m.isdir()):\n"
+          "            sys.exit('refused: ' + m.name + ' is a link or a special file')\n"
+          "        try:\n"
+          "            m = tarfile.data_filter(m, '/release')\n"
+          "        except tarfile.FilterError as e:\n"
+          "            sys.exit('refused: ' + str(e))\n"
+          "        m.uid, m.gid, m.uname, m.gname = 0, 0, '', ''\n"
+          "        out.addfile(m, t.extractfile(m) if m.isfile() else None)\n"
+          "out.close()\n")
+
+
+class Refused(Exception):
+    pass
+
+
+class Failed(Exception):
+    pass
+
+
+def P(path):
+    return ROOT + path
+
+
+def run(argv, stdin=None, timeout=300):
+    try:
+        r = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
+                           env=ENV)
+    except FileNotFoundError:
+        return 127, f"{argv[0]} is not on this host"
+    except subprocess.TimeoutExpired:
+        return 124, f"{os.path.basename(argv[0])} took longer than {timeout} seconds"
+    return r.returncode, r.stdout.decode("utf-8", "replace")
+
+
+def settings(app):
+    try:
+        with open(P(f"{APPS}/{app}.json")) as f:
+            got = json.load(f)
+        port, health = int(got["port"]), got["health"]
+    except (OSError, ValueError, KeyError, TypeError):
+        raise Refused(f"{app} has no settings on this host") from None
+    if not 1000 <= port <= 65535 or not isinstance(health, str) or \
+            not re.fullmatch(r"/[A-Za-z0-9._~/-]{0,100}", health):
+        raise Refused(f"{app}'s settings are not a port and a health path")
+    return port, health
+
+
+def home_of(user):
+    try:
+        return pwd.getpwnam(user).pw_dir
+    except KeyError:
+        raise Refused(f"{user} is not on this host") from None
+
+
+def inside(path, home):
+    """(device, inode) of a regular file of the deploy user's own home, reached with no link, or None."""
+    if not isinstance(path, str) or not path.startswith("/") or "\0" in path or os.path.normpath(path) != path:
+        return None
+    real = os.path.realpath(P(path))
+    if real != P(path) or not real.startswith(P(home).rstrip("/") + "/"):
+        return None
+    with contextlib.suppress(OSError):
+        st = os.lstat(real)
+        if stat.S_ISREG(st.st_mode):
+            return st.st_dev, st.st_ino
+    return None
+
+
+def copy_in(src, dst, seen):
+    """The file, copied as root with no link followed, and its SHA-256. The file that it opened must be the one that
+    inside() saw, so a folder of the path that changed meanwhile reaches nothing else."""
+    fd = os.open(P(src), os.O_RDONLY | os.O_NOFOLLOW)
+    digest = hashlib.sha256()
+    try:
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != seen:
+            raise Refused(f"{src} changed while it was read")
+        if not stat.S_ISREG(st.st_mode) or st.st_size > ARTIFACT_MAX:
+            raise Refused(f"{src} is not a regular file of at most {ARTIFACT_MAX // 1024 ** 3} GiB")
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(P(dst))
+        out = os.open(P(dst), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(out, "wb") as f:
+            while True:
+                piece = os.read(fd, 1024 * 1024)
+                if not piece:
+                    break
+                digest.update(piece)
+                f.write(piece)
+    finally:
+        os.close(fd)
+    return digest.hexdigest()
+
+
+def blocked(tree):
+    """The shas on the app's two blocklists: one a line, and the first column of the security list."""
+    found = set()
+    for name in ("release-blocklist", "security-blocked-releases.tsv"):
+        with contextlib.suppress(OSError):
+            with open(P(f"{tree}/{name}")) as f:
+                for line in f:
+                    word = line.split("\t")[0].split("#")[0].strip()
+                    if SHA.fullmatch(word):
+                        found.add(word)
+    return found
+
+
+def unpack_argv(user):
+    """The deploy user's own parse of the archive (UNPACK)."""
+    return ["runuser", "-u", user, "--", "/usr/bin/python3", "-I", "-c", UNPACK]
+
+
+def unpack_release(archive, release, sha, user):
+    """The release, written by root from the deploy user's clean stream into a folder that only root reaches:
+    root:root, folders 0555, files 0444, or 0555 for a file that was executable, and its .release.env."""
+    new = release + ".new"
+    shutil.rmtree(P(new), ignore_errors=True)
+    os.mkdir(P(new), 0o700)
+    files = []
+    with open(P(archive), "rb") as src, \
+            subprocess.Popen(unpack_argv(user), stdin=src, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             env=ENV) as proc:
+        try:
+            with tarfile.open(fileobj=proc.stdout, mode="r|") as t:
+                for m in t:
+                    if not (m.isfile() or m.isdir()):
+                        raise Refused(f"{m.name} is a link or a special file")
+                    t.extract(m, P(new), filter="data")
+                    if m.isfile():
+                        files.append((m.name, m.mode))
+        except (tarfile.TarError, OSError) as e:
+            proc.kill()
+            proc.wait()
+            said = (proc.stderr.read() or b"").decode("utf-8", "replace").strip().removeprefix("refused: ")
+            raise Refused(said or f"the archive did not unpack: {e}") from None
+        finally:
+            proc.stdout.close()
+        said = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()
+        if proc.wait() != 0:
+            raise Refused(said.removeprefix("refused: ") or "the archive did not unpack")
+    for name, mode in files:
+        root_owned(f"{new}/{name}", 0o555 if mode & 0o111 else 0o444)
+    with open(P(f"{new}/.release.env"), "w") as f:
+        f.write(f"APP_RELEASE_SHA={sha}\n")
+    root_owned(f"{new}/.release.env", 0o444)
+    for here, _, _ in os.walk(P(new), topdown=False):
+        root_owned(here[len(ROOT):] if ROOT else here, 0o555)
+    os.rename(P(new), P(release))
+
+
+def root_owned(path, mode_bits):
+    if os.geteuid() == 0:
+        os.chown(P(path), 0, 0, follow_symlinks=False)
+    os.chmod(P(path), mode_bits)
+
+
+def point(link, target):
+    """The link at `link` now leads to `target`, in one rename."""
+    temp = link + ".new"
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(P(temp))
+    os.symlink(target, P(temp))
+    os.replace(P(temp), P(link))
+
+
+def where(link):
+    with contextlib.suppress(OSError):
+        return os.readlink(P(link))
+    return None
+
+
+def restart(app):
+    status, out = run(["systemctl", "restart", f"{app}.service"], timeout=120)
+    return status == 0
+
+
+def healthy(port, health, sha, wait=HEALTH_WAIT):
+    """True when the app answers its health path on its loopback port with 200 and the release's sha."""
+    end = time.monotonic() + wait
+    while True:
+        with contextlib.suppress(urllib.error.URLError, OSError, ValueError):
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+                    f"http://127.0.0.1:{port}{health}", timeout=5) as r:
+                if r.status == 200 and sha in r.read(65536).decode("utf-8", "replace"):
+                    return True
+        if time.monotonic() >= end:
+            return False
+        time.sleep(2)
+
+
+@contextlib.contextmanager
+def locked(app):
+    with open(P(f"/run/{app}-deploy.lock"), "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def deploy(app, artifact, checksum, sha):
+    if not SHA.fullmatch(sha or ""):
+        raise Refused("the release sha is the commit's 40 lowercase hex characters")
+    port, health = settings(app)
+    tree, user = f"{WWW}/{app}", f"{app}-deploy"
+    home = home_of(user)
+    seen = {}
+    for path in (artifact, checksum):
+        seen[path] = inside(path, home)
+        if seen[path] is None:
+            raise Refused(f"{path} is not a regular file of {user}'s own home")
+    if sha in blocked(tree):
+        raise Refused(f"{sha} is on a blocklist of {app}")
+    with locked(app):
+        incoming = f"{tree}/artifacts/incoming"
+        copy_in(checksum, f"{incoming}/{sha}.sha256", seen[checksum])
+        with open(P(f"{incoming}/{sha}.sha256")) as f:
+            expected = (f.read(4096).split() or [""])[0].lower()
+        digest = copy_in(artifact, f"{incoming}/{sha}.tar", seen[artifact])
+        if not re.fullmatch(r"[0-9a-f]{64}", expected) or digest != expected:
+            for name in (f"{sha}.tar", f"{sha}.sha256"):
+                with contextlib.suppress(OSError):
+                    os.remove(P(f"{incoming}/{name}"))
+            raise Refused("the artifact's SHA-256 is not the one its checksum file names")
+        release = f"{tree}/releases/{sha}"
+        if not os.path.isdir(P(release)):
+            try:
+                unpack_release(f"{incoming}/{sha}.tar", release, sha, user)
+            except Refused:
+                for here, _, _ in os.walk(P(release + ".new")):
+                    os.chmod(here, 0o700)
+                shutil.rmtree(P(release + ".new"), ignore_errors=True)
+                for name in (f"{sha}.tar", f"{sha}.sha256"):
+                    with contextlib.suppress(OSError):
+                        os.remove(P(f"{incoming}/{name}"))
+                raise
+        for name in (f"{sha}.tar", f"{sha}.sha256"):
+            os.replace(P(f"{incoming}/{name}"), P(f"{tree}/artifacts/{name}"))
+        old = where(f"{tree}/current")
+        if old != release:
+            if old:
+                point(f"{tree}/previous", old)
+            point(f"{tree}/current", release)
+        if restart(app) and healthy(port, health, sha):
+            prune(tree)
+            return f"{app} runs {sha}"
+        if old and old != release:
+            point(f"{tree}/current", old)
+            if restart(app) and healthy(port, health, os.path.basename(old)):
+                raise Failed(f"{sha} did not answer its health check: {os.path.basename(old)} runs again")
+        raise Failed(f"{sha} did not answer its health check, and no earlier release answers either")
+
+
+def rollback(app):
+    port, health = settings(app)
+    tree = f"{WWW}/{app}"
+    with locked(app):
+        before, now_running = where(f"{tree}/previous"), where(f"{tree}/current")
+        if not before or not os.path.isdir(P(before)):
+            raise Refused(f"{app} has no previous release")
+        point(f"{tree}/current", before)
+        if now_running:
+            point(f"{tree}/previous", now_running)
+        if restart(app) and healthy(port, health, os.path.basename(before)):
+            return f"{app} runs {os.path.basename(before)} again"
+        raise Failed(f"{os.path.basename(before)} did not answer its health check")
+
+
+def prune(tree):
+    """The oldest releases and artifacts go, after a healthy release; a failure here is a warning only."""
+    try:
+        kept = {where(f"{tree}/current"), where(f"{tree}/previous")}
+        releases = sorted((e for e in os.scandir(P(f"{tree}/releases")) if e.is_dir(follow_symlinks=False)),
+                          key=lambda e: e.stat(follow_symlinks=False).st_mtime, reverse=True)
+        for e in releases[KEEP:]:
+            if f"{tree}/releases/{e.name}" not in kept:
+                for here, names, _ in os.walk(e.path):
+                    os.chmod(here, 0o755)
+                shutil.rmtree(e.path)
+        artifacts = sorted((e for e in os.scandir(P(f"{tree}/artifacts")) if e.is_file(follow_symlinks=False)),
+                           key=lambda e: e.stat(follow_symlinks=False).st_mtime, reverse=True)
+        keep = {os.path.basename(k or "") for k in kept}
+        for e in artifacts[2 * KEEP:]:
+            if e.name.split(".")[0] not in keep:
+                os.remove(e.path)
+    except OSError as e:
+        print(f"warning: the prune stopped: {e}")
+
+
+def main(argv):
+    name = os.path.basename(argv[0])
+    app = name[:-len("-deploy")] if name.endswith("-deploy") else ""
+    try:
+        if not APP.fullmatch(app):
+            raise Refused("this helper runs as /usr/local/sbin/<app>-deploy")
+        if len(argv) == 5 and argv[1] == "deploy":
+            print(deploy(app, argv[2], argv[3], argv[4]))
+            return 0
+        if len(argv) == 2 and argv[1] == "rollback":
+            if os.environ.get("SUDO_USER", "root") != "root":
+                raise Refused("rollback is root's, through ops-root")
+            print(rollback(app))
+            return 0
+        raise Refused("it takes: deploy <artifact> <checksum file> <release sha>, or rollback")
+    except Refused as e:
+        print(f"refused: {e}"[:2000])
+        return 3
+    except Failed as e:
+        print(f"failed: {e}"[:4000])
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
