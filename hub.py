@@ -33890,7 +33890,8 @@ def release_work(applying, automatic=False, fetch=None):
                                    f"for the schema check, so no release is taken: {e}", automatic)
                 return
             result = releases.Update(kit_dir(), manifest, origin=origin, upstream=release_upstream(),
-                                     database=path, floor=kit_floor()).apply()
+                                     database=path, floor=kit_floor(),
+                                     pushed=lambda merged: release_pushed(row["id"], merged)).apply()
         finally:
             shutil.rmtree(folder, ignore_errors=True)
         with LOCK:
@@ -33898,18 +33899,43 @@ def release_work(applying, automatic=False, fetch=None):
     except Exception:
         traceback.print_exc()
         with LOCK:
-            q("UPDATE releases SET state=?, step=?, says=?, finished=? WHERE state='updating'",
-              (releases.FAILED, "merge", "the update ended with an error in the hub; read the hub's own log",
-               now()))
+            for row in settle_releases("the update ended with an error in the hub; read the hub's own log"):
+                # This process runs the code it started with. When its checkout followed the ref before the error, the
+                # next run stops at "already" and restarts nothing, so the restart of a run that ended is done here.
+                restart_hub_soon(row["pinned"], kit_revision(fresh=True))
 
 
-def settle_releases():
-    """At the start of the hub: an update run lives in the process that started it (release_work), and its row says
-    what came of it before the hub restarts onto the release. A row that still says updating was a run that a stop
-    of the hub cut off, so it ends as a run that ended with an error, and the next run of that release finds out
-    where the checkout is."""
-    q("UPDATE releases SET state=?, step=?, says=?, finished=? WHERE state='updating'",
-      (releases.FAILED, "merge", "the hub stopped before this update ended; the next update takes it again", now()))
+def release_pushed(rid, merged):
+    """releases.Update's `pushed`: the push of this run landed, and the release is on the configuration ref as
+    `merged`. The row keeps it now and not only at finish_release, because every machine takes that ref at its next
+    sync from this moment on, and a run that is cut off before its end must still ask each one (settle_releases)."""
+    q("UPDATE releases SET reached=? WHERE id=?", (merged, rid))
+
+
+def settle_releases(says="the hub stopped before this update ended; the next update takes it again", ask=True):
+    """The runs that ended without finish_release: at the start of the hub, and after an error in release_work. An
+    update run lives in the process that started it, and its row says what came of it before the hub restarts onto
+    the release. A row that still says updating was a run that a stop of the hub or an error cut off, so it ends as a
+    run that ended with an error, and the next run of that release finds out where the checkout is.
+
+    A run whose push had landed (its `reached`, release_pushed) put the release on the configuration ref, and every
+    machine takes it at its next sync while its helper keeps the code it started with. So each is asked for its idle
+    update, as finish_release asks it, and before the row ends, so that a stop in between leaves it to the next start.
+    The next run does not ask: when this hub's checkout had followed the ref, it stops at KEPT "already". A start on
+    restored records does not ask either (`ask`): the copy's run is history, and its revision may not be on this
+    hub's ref. An ask that fails is printed and skipped, because this runs before the hub serves anything: a row
+    left at updating would meet the same failure at every later start. Returns those rows."""
+    with LOCK:
+        cut = q("SELECT pinned, reached FROM releases WHERE state='updating' AND reached IS NOT NULL")
+        for row in cut if ask else ():
+            for name in agents():
+                try:
+                    request_update(name, row["reached"])
+                except Exception:
+                    traceback.print_exc()
+        q("UPDATE releases SET state=?, step=?, says=?, finished=? WHERE state='updating'",
+          (releases.FAILED, "merge", says, now()))
+        return cut
 
 
 def finish_release(rid, state, step, says, automatic, result=None):
@@ -33917,22 +33943,22 @@ def finish_release(rid, state, step, says, automatic, result=None):
     revision asks every machine for its idle update and restarts the hub's own service; any other state leaves the
     fleet exactly as it was. A run that failed after its push (releases.FAILED at the step follow) reached the ref but
     not this hub's own checkout: every machine takes that release at its next sync anyway, so each is asked for its
-    idle update too, and its helper restarts onto what its checkout runs; the hub keeps its own process."""
+    idle update too, and its helper restarts onto what its checkout runs; the hub keeps its own process.
+
+    The machines are asked before the row ends: a stop or an error before then leaves it at updating, and
+    settle_releases asks them again (request_update asks each one once)."""
+    reached = (result or {}).get("reached")
+    # Every machine, the hub's own included: its agent's helper fast-forwards its own checkout and restarts its own
+    # user service, exactly as a worker's does (request_update). The hub process is restart_hub_soon below.
+    asked = [name for name in agents() if request_update(name, reached) == "requested"] if reached else []
     q("UPDATE releases SET state=?, step=?, says=?, pinned=COALESCE(?,pinned), reached=?, finished=?, automatic=? "
-      "WHERE id=?", (state, step, says, (result or {}).get("pinned"), (result or {}).get("reached"), now(),
-                     1 if automatic else 0, rid))
+      "WHERE id=?", (state, step, says, (result or {}).get("pinned"), reached, now(), 1 if automatic else 0, rid))
     row = q1("SELECT * FROM releases WHERE id=?", (rid,))
     log("hub" if automatic else "owner",
         f"release {row['version']} ({(row['revision'] or '')[:12]}): {state} at {step} — {says}")
     if state != releases.DONE:
-        if row["reached"]:
-            for name in agents():
-                request_update(name, row["reached"])
         return row
     kit_revision(fresh=True)
-    # Every machine, the hub's own included: its agent's helper fast-forwards its own checkout and restarts its own
-    # user service, exactly as a worker's does (request_update). The hub process is the line below.
-    asked = [name for name in agents() if request_update(name, row["reached"]) == "requested"]
     # Quiet (QUIET_SAY): it comes with the manager's next read. It woke the manager at every release, ten a day, to
     # read RULES.md and its profile again: each one a turn of the standing session and some 17,000 tokens that stayed
     # in its context, while no release changes a profile and most change no rule. So it names the sections of
@@ -40594,7 +40620,7 @@ def main():
     ensure_bridge_key()
     settle_stopped_calls()
     settle_pings()
-    settle_releases()
+    settle_releases(ask=not restored)
     settle_task_numbers()
     # The heartbeat starts here and not at the first complete pass (tick_heartbeat), so that a hub whose very first
     # pass raises -- a bad row is there before the timers are -- is visible on the owner's screen after TICK_WARN

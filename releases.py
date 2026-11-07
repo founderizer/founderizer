@@ -50,6 +50,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 import urllib.error
 import urllib.request
 
@@ -541,15 +542,20 @@ class Update:
     the merge wants and what a hub with no records to risk would get anyway.
 
     `floor` is the hub user's release floor (`lifecycle.floor_path`): the run checks what it would push with the
-    same `lifecycle.may_take` that every machine runs before it moves, and the hub's checkout follows under it."""
+    same `lifecycle.may_take` that every machine runs before it moves, and the hub's checkout follows under it.
+
+    `pushed` is called with the revision the moment the push has landed, before this checkout follows it: from then
+    on every machine of this fleet takes the release at its next sync, so the hub records it at once, and a run that
+    an error or a stop of the hub cuts off before its answer still asks each machine for its idle update. An error
+    in it is printed and stops nothing."""
 
     def __init__(self, kit, manifest, *, origin=None, upstream=None, branch=None, remote=REMOTE,
                  run=_run, python=None, database=None, selftest_wait=SELFTEST_WAIT, verify_wait=VERIFY_WAIT,
-                 schema_wait=SCHEMA_WAIT, floor=None):
+                 schema_wait=SCHEMA_WAIT, floor=None, pushed=None):
         from lifecycle import CONFIG_BRANCH
         self.kit, self.manifest, self.origin, self.upstream = kit, manifest, origin, upstream
         self.branch, self.remote, self.run, self.database = branch or CONFIG_BRANCH, remote, run, database
-        self.floor = floor
+        self.floor, self.pushed = floor, pushed
         self.python = python or sys.executable
         self.selftest_wait, self.verify_wait, self.schema_wait = selftest_wait, verify_wait, schema_wait
         # pinned: the revision this fleet runs and keeps. reached: the revision that got onto the configuration
@@ -837,6 +843,11 @@ class Update:
             if answer:
                 return answer
         self.reached = merged           # it is on the ref now, so every machine of this fleet follows it
+        if self.pushed:
+            try:
+                self.pushed(merged)
+            except Exception:           # a record only: the answer carries `reached` too, and the follow must happen
+                traceback.print_exc()
         import lifecycle
         # The hub's own checkout moves as every other does: under lifecycle.may_take, with its floor raised after.
         if self.git("fetch", "-q", "origin")[0] != 0 or lifecycle.take(self.kit, merged, self.run, self.floor):
