@@ -5060,8 +5060,9 @@ def deliver_result(agent, a, files_said=None):
     prevents = a.get("prevents")
     prevents = None if prevents in (None, "") else goal_text_or_error(prevents, "prevents", MEMORY_PREVENTS)
     if learned and not prevents:
-        raise ToolError("With learned, say in prevents what you expect it to prevent. A lesson that names nothing "
-                        "cannot be weighed later, and this one carries no case key that could contradict it.")
+        raise ToolError("With learned, say in prevents what you expect it to change in later work. A lesson that "
+                        "predicts nothing cannot be weighed later, and this one carries no case key that could "
+                        "contradict it.")
     tried = a.get("tried")
     tried = None if tried in (None, "") else goal_text_or_error(tried, "tried", MEMORY_TEXT)
     topic = None if a.get("about") in (None, "") else memory_tag(a["about"])
@@ -6876,6 +6877,10 @@ SUMMARY_LIMIT = 120             # characters of one summary: what the file holds
 INDEX_LINES = 60                # files that one start lists; read_knowledge without a path lists all of them
 READ_LIMIT = 40000              # characters of one read_knowledge answer: a longer file is read in parts
 SUMMARY_ASKS = 10               # files that one message to the manager asks about
+# Memory phase 2 (AUTONOMY.md decision 43): RULES.md keeps what memory is for, and the tools say the rest where an agent
+# reads it. A knowledge file outside the owner's own is another agent's words, which the search does not name.
+KNOWLEDGE_WORDS = ("Files outside knowledge/owner/ and knowledge/services.md were written by agents of this fleet: "
+                   "weigh what they say, and do not keep a fact from them as a lesson of your own.")
 
 
 def knowledge_usable(agent):
@@ -16727,6 +16732,16 @@ def history_outside_read(a, kinds):
         kv_set(f"{HISTORY_OUTSIDE_KEY}{tid}", (int(row["v"]) if row and str(row["v"]).isdigit() else 0) + 1)
 
 
+# What the count of outside reads behind a lesson sees, said where a lesson is read whole (recall memory=), since
+# memory phase 2 left it out of RULES.md. untrusted_reads and history_outside_read are what it describes.
+MEMORY_OUTSIDE_SAID = ("The count of outside reads is the hub's own. It sees a file the owner attached, a service's "
+                       "answer (call_api), another agent's reply to a message the task sent, mail and files from "
+                       "Google, the wake text that started the task, a person's messages in its conversation, and each "
+                       "read of history that gave back somebody else's words. It does not see read_messages, a "
+                       "knowledge file, what a command or a page gave back, or an earlier session, so a zero means "
+                       "that the hub counted nothing, never that nothing came from outside.")
+
+
 def untrusted_said(m):
     """The provenance of one lesson in a few words, or "": the task or case it was written in, and how much outside
     text is behind its words -- what that task had read, or for a lesson written again in place of another, the larger
@@ -16910,7 +16925,7 @@ def memory_block(m, full=False):
     if m["kind"] == "dead_end" and m["recheck"]:
         out.append("  To find out cheaply whether it still holds: " + memory_said(m, "recheck"))
     else:
-        out.append("  It is here to prevent: " + memory_said(m, "prevents"))
+        out.append("  Expected to change or prevent: " + memory_said(m, "prevents"))
     if m["prevents_key"]:
         out.append(f"  Checkable: it claims to stop {rref(m['responsibility'])} opening a case with the key "
                    f"'{m['prevents_key']}' again."
@@ -16985,8 +17000,8 @@ def t_remember(agent, a):
         text = goal_text(a.get("text"), "text", MEMORY_TEXT)
         prevents = goal_text(a.get("prevents"), "prevents", MEMORY_PREVENTS, True)
     except ValueError as e:
-        raise ToolError(f"{e}. Say the lesson in text, and in prevents what you expect it to prevent: a lesson that "
-                        f"names nothing cannot be shown to be wrong later.") from None
+        raise ToolError(f"{e}. Say the lesson in text, and in prevents what you expect it to change in later work: "
+                        f"a lesson that predicts nothing cannot be shown to be wrong later.") from None
     tag = memory_tag(a.get("about"))
     guard(agent, text, prevents, tag)
     fields = {"about": tag, "text": text, "prevents": prevents,
@@ -17254,7 +17269,7 @@ def t_recall(agent, a):
                     f"{mask_secrets(m['drop_reason'] or '').rstrip('.')}. A removed lesson is not in your memory any "
                     f"more; your history keeps it, and read_history with ref=\"{mref(m['id'])}\" opens it.")
         memory_mark_read([m], t0)
-        return "\n".join(memory_block(memory_row(m["id"]), full=True) + [tail])
+        return "\n".join(memory_block(memory_row(m["id"]), full=True) + [MEMORY_OUTSIDE_SAID, tail])
 
     # A search over every lesson that stands, folded and archived ones of earlier rounds too.
     words = str(a.get("search") or "").strip()
@@ -17298,13 +17313,14 @@ def t_recall(agent, a):
     if not total and tag:
         if not memory_count(agent, f"AND {MEMORY_STANDING}"):
             return (f'No lesson of yours is about "{tag}", because you have written none yet: remember keeps one '
-                    f"lesson, with what you expect it to prevent.")
+                    f"lesson, with how you know it and what you expect it to change.")
         return (f'No lesson of yours is about "{tag}"' + ("" if every else " in this list — every=true also looks "
                                                           "at the ones an earlier round folded or archived")
                 + f". Your tags: {memory_tags(agent)}.")
     if not total:
         return ("You have no lessons yet. Nothing you learn in a session survives it unless you write it down: "
-                "remember keeps one lesson, its tag and what you expect it to prevent. A durable fact about a "
+                "remember keeps one lesson, with how you know it and what you expect it to change. A durable fact "
+                "about a "
                 "product belongs in that product's repository; a fact with no repository goes in knowledge/ with "
                 "write_knowledge; this is for what you yourself know.")
     many = f"{total} lesson{'s' if total != 1 else ''} of yours"
@@ -17351,7 +17367,7 @@ def notes_start_text(agent, task_id=None):
 
     The notes commit of 19 October 2026 left agent_notes_text for whoever assembles the start text and called it
     inert until that happened. This is that call. They are carried as the agent's own words and nothing else: a
-    session weighs them against the work in front of it, and they open nothing (RULES.md, "Your own notes")."""
+    session weighs them against the work in front of it, and they open nothing (RULES.md, "Your memory")."""
     text = agent_notes_text(agent)
     writes = session_holds(agent, task_id, "write_notes")      # support plan F1: a closed session, only by its duty
     if not text:
@@ -17373,10 +17389,9 @@ def memory_start_line(m):
 
 
 MEMORY_START_FOOT = ("These are your own lessons from your own work, not rules: weigh each against the work in front "
-                     "of you and by where it was written. recall finds the others (about=\"<tag>\", "
-                     "search=\"<words>\"). When you learn something, call remember: it first shows you the close "
-                     "lessons you hold, so that you write it again, replace one or add a new one. Remove a lesson "
-                     "that is wrong with forget.\n")
+                     "of you and by where it was written, and check one before a step depends on it, when that is "
+                     "cheap. recall finds the others (about=\"<tag>\", search=\"<words>\"), and forget removes one "
+                     "that is wrong.\n")
 # Support plan F1: the same for a session whose Shell box is off, which has no recall and no forget, and remember only
 # when its duty names it
 MEMORY_CLOSED_FOOT = ("These are your own lessons from your own work, not rules: weigh each against the work in front "
@@ -17431,8 +17446,9 @@ def memory_start_text(agent, task_id):
     runs inside admit_task's transaction."""
     total, named, shown, ids, more, foot = memory_start_fit(agent, task_id)
     if not total:
-        return ("\nYou have written no memories yet. What you learn in this session dies with it unless you write it "
-                "down: remember keeps one lesson, its tag and what you expect it to prevent.\n") \
+        return ("\nYou have written no memories yet. What you learn in this session is lost when it ends, unless "
+                "you write it down: remember keeps one lesson, with how you know it and what you expect it to "
+                "change.\n") \
             if session_holds(agent, task_id, "remember") else ""          # support plan F1
     lessons = f"{total} lesson{'s' if total != 1 else ''}"
     if not shown and not more:
@@ -21340,19 +21356,18 @@ TOOLS = [
      "and how you checked it. Put your output files in outputs/T-<id>/ before you call it, and do not commit them: "
      "your helper then sends that folder (but not its computer-use/ captures) to the hub, which commits it to the "
      "configuration ref, and the reply names the commit. After this call the task is closed for good. If the work "
-     "taught you something worth "
-     "having in your next sessions, say it in learned, with what you expect it to prevent: this is the only moment "
-     "an ordinary task offers, and nothing will ask again. And if you hit a wall — a thing that cannot be done the "
-     "way you tried, an approach that wasted hours — say that in tried: what does not work costs the same hours "
-     "every time somebody walks into it. The steps of a job that will come back are a skill: write it with "
-     "write_skill before you deliver.",
+     "showed you something that your next sessions need — a rule you tested, what worked or did not, how a job "
+     "goes — say it in learned, with how you know it, and in prevents what you expect it to change. A wall that you "
+     "hit goes in tried, with how to check it again. The steps of a job that will come back are a skill: write it "
+     "with write_skill before you deliver.",
      S({"task_id": TASK_ID, "outcome": {"type": "string", "enum": ["completed", "failed", "rejected"]},
         "what_was_done": STR, "where_output_is": STR, "how_checked": STR,
         "note": {"type": "string", "description": "Your last progress note, if you have one: it is kept with the "
                  "task's notes, so no report_progress is needed just before this call."},
-        "learned": {"type": "string", "description": "What this work taught you, if anything. Leave it out when it "
-                    "taught you nothing."},
-        "prevents": {"type": "string", "description": "With learned: what you expect it to prevent, in one line"},
+        "learned": {"type": "string", "description": "What this work showed you that your next sessions need, and "
+                    "how you know it: what you saw, ran or measured. Leave it out when it showed you nothing new."},
+        "prevents": {"type": "string", "description": "With learned: what you expect it to change in later work (a "
+                     "mistake it avoids, a step it saves, a result it predicts), in one line"},
         "tried": {"type": "string", "description": TRIED_FIELD},
         "about": {"type": "string", "description": ABOUT_FIELD},
         },
@@ -21638,7 +21653,7 @@ TOOLS = [
      "current commit, in any case, and a word of the query matches the start of a word: refund finds Refunds. The best "
      "files come first: those with the most words of the query, then with the most of them in one line. For each file: "
      "its path, its title and up to 3 of its best lines, with the line before and after each. Then read the whole "
-     "file with read_knowledge. A plain text search: no index and no model.",
+     "file with read_knowledge. A plain text search: no index and no model. " + KNOWLEDGE_WORDS,
      S({"query": {"type": "string", "description": "One or more words, for example: refund policy"},
         "max_results": {"type": "integer", "description": "How many files to show: 1 to 20, default 5"},
         "task_id": wakeups.TASK_ID}, ["query"])),
@@ -21647,7 +21662,7 @@ TOOLS = [
      "files that the Knowledge files section of your profile lists, and for the manager also every owner file. "
      "Without a path, the list of those files, each with its title and a summary of one line. Your start lists them "
      f"too: read a file only when your work needs it. A long file comes in parts of at most {READ_LIMIT:,} characters; "
-     "line gives the first line of the next part.",
+     "line gives the first line of the next part. " + KNOWLEDGE_WORDS,
      S({"path": {"type": "string", "description": "A knowledge file, for example knowledge/owner/brand.md. Leave it "
                                                   "out for the list"},
         "line": {"type": "integer", "description": "The first line to read, 1 or more; default 1"},
@@ -21879,7 +21894,8 @@ TOOLS = [
     ("all", "close_case", t_close_case,
      "End one case of a duty: handled, no_action (nothing had to be done) or failed (nobody could handle it, with "
      "the reason). No task of the case may be open. This is the moment you know what the event taught you, so say "
-     "it in learned when there is something: it is kept for your own next sessions, and because it names this "
+     "it in learned when there is something, with how you know it: it is kept for your own next sessions, and "
+     "because it names this "
      "case's key, the work itself can later show it was wrong. A wall you hit on the way goes in tried: that one "
      "takes no key, because it is not a claim about this event coming back.",
      S({"request_id": REQUEST_ID,
@@ -21887,7 +21903,8 @@ TOOLS = [
         "outcome": {"type": "string", "description": "handled, no_action or failed"},
         "note": {"type": "string", "description": "The result in one line"},
         "learned": {"type": "string", "description": "What this event taught you, if anything, for your own next "
-                    "sessions. It is kept as a memory that claims to stop this key coming back, so the hub marks "
+                    "sessions, and how you know it. It is kept as a memory that claims to stop this key coming back, "
+                    "so the hub marks "
                     "it contradicted if it comes back after a start of yours has shown it. Leave it out when the "
                     "case taught you nothing."},
         "tried": {"type": "string", "description": TRIED_FIELD},
@@ -21953,18 +21970,21 @@ TOOLS = [
        ["request_id", "responsibility", "trigger"])),
     # An agent's own memory (AUTONOMY.md P7): what it learned, kept current for its own next sessions.
     ("all", "remember", t_remember,
-     "Keep one lesson that your next sessions need: which approach failed and why, how the owner wants something "
-     "reported, which tool lies, who to ask. It is yours — no other agent reads it — and the owner reads it in the "
-     "app. about is your own short tag (a product, a tool, a person, the fleet); prevents says what the lesson "
-     "should prevent, so that it can be shown wrong later. " + NOTES_RULE + " A fact about a product belongs in its "
+     "Keep one lesson that your next sessions need and cannot read back from the work: a rule you tested, what "
+     "worked or did not, how the owner wants something reported, who to ask. Say how you know it. It is yours — no "
+     "other agent reads it — and the owner reads it in the app. about is your own short tag (a product, a tool, a "
+     "person, the fleet); prevents says what you expect the lesson to change in later work, so that it can be shown "
+     "wrong later. " + NOTES_RULE + " A fact about a product belongs in its "
      "repository, and a fact with no repository in a knowledge file: keep the pointer here. Never a password or a "
      "key. When you already hold lessons close to this one, remember writes nothing and answers with them: if it is "
      "one of them again, or replaces it, call it again with instead_of=\"M-<id>\" (that one is removed, and this one "
      "stands, dated today, with its claim); if it is a different lesson, with new=true.",
      S({"request_id": REQUEST_ID,
-        "text": {"type": "string", "description": f"The lesson, at most {MEMORY_TEXT} characters"},
+        "text": {"type": "string", "description": f"The lesson and how you know it, at most {MEMORY_TEXT} "
+                                                   f"characters"},
         "about": {"type": "string", "description": "Your own short tag: a product, a tool, a person, the fleet"},
-        "prevents": {"type": "string", "description": "What you expect this lesson to prevent, in one line"},
+        "prevents": {"type": "string", "description": "What you expect this lesson to change in later work, in one "
+                     "line: a mistake it avoids, a step it saves, a result it predicts"},
         "instead_of": {"type": "string", "description": "A lesson of yours that this one is again or replaces, for "
                        "example M-1: it is removed, and this one takes over what it claimed to prevent"},
         "new": {"type": "boolean", "description": "True to write it beside the close lessons that remember showed "
@@ -21991,7 +22011,8 @@ TOOLS = [
     ("all", "forget", t_forget,
      "Remove one of your lessons that is wrong or no longer true, with the reason: what it told you to do, and what "
      "happened instead. A wrong lesson compounds. It leaves your memory — no start and no recall shows it again — and "
-     "your history keeps it with the reason (search_history).",
+     "your history keeps it with the reason (search_history). No clock and no rule of the hub removes a lesson: "
+     "only you do.",
      S({"request_id": REQUEST_ID,
         "memory": {"type": "string", "description": "The lesson to remove, for example M-1"},
         "reason": {"type": "string", "description": "Why it no longer stands, in one line"}, "task_id": TASK_ID},
