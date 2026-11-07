@@ -1517,7 +1517,8 @@ def desktop_refusal(owner, needs, caller):
         return None
     machine = agents()[owner].get("machine")
     if needs == "screen":
-        # Screen control on them could press Agree on terms that are the owner's to accept (4 November 2026).
+        # Screen control on them could press Agree on terms that are the owner's to accept (4 November 2026). The one
+        # screen task that they let through is the hub's own SETUP_CLICK (setup_click), which no agent can ask for.
         st = q1("SELECT data FROM server_status WHERE server=?", (machine,))
         if st and ((json.loads(st["data"]).get("security") or {}).get("desktop") or {}).get("setup"):
             return f"The setup screens of macOS are open on {machine}; a screen task waits until they are finished."
@@ -28423,10 +28424,66 @@ def mac_setup_sweep(t0):
             traceback.print_exc()       # one setup must not stop the others: the next pass tries it again
 
 
+# The one screen task that macOS's setup screens let through (setup_click): the owner's yes of 7 November 2026 to the
+# screen agent of a Mac pressing Continue on "Update Complete" after an update (owner-contact plan A1). Every other
+# setup screen stays the owner's, because one of them can hold terms to accept (desktop_refusal).
+SETUP_CLICK = {
+    "title": "Press Continue on macOS's Update Complete screen",
+    "details": "macOS installed an update on this Mac and restarted it, and its setup screens are open. The owner lets "
+               "you press one button on them, and no other. Look at the screen with Computer Use. While it shows "
+               "progress and no button, wait and look again. When it shows the screen titled \"Update Complete\", which "
+               "says that this Mac was updated, click its Continue button one time. On every other screen, click "
+               "nothing: terms, FileVault, Apple Account, Siri, Screen Time, appearance and all the others stay as they "
+               "are, for the owner. Type nothing, sign in to nothing, and use no shell command and no other tool. Then "
+               "say which screen shows.",
+    "done_when": "You clicked Continue on Update Complete one time, or you left another screen as it was, and your result "
+                 "names the screen that shows now.",
+    "why": "The hub gave this task: the owner lets the screen agent of a Mac press Continue on Update Complete after a "
+           "macOS update (7 November 2026). Every other setup screen stays the owner's."}
+
+
+def setup_click(name, here, desktop, reported):
+    """Before the manager hears that the setup screens of macOS are open on the Mac `name`, the Mac's own screen agent
+    gets the task SETUP_CLICK. None while that task comes first: given now, still open, or ended with no reading of the
+    Mac after its end. Then the words that name it for the manager, or "" when no agent of the Mac could take it: none
+    with a screen, ChatGPT signed out (Computer Use runs through it), the desktop held by another task (desktop_busy),
+    or a task that the hub could not give. One task each time the screens open: mac_desktop_sweep forgets it when they
+    close."""
+    key = f"desktop_click:{name}"
+    held = kv_get(key)
+    if held is None:
+        agent = next((a for a in here if "screen" in (agents()[a].get("can") or [])), None)
+        if agent is None or desktop.get("chatgpt") is False or desktop_busy(agent, "screen"):
+            return ""
+        try:
+            task = check_task(manager_name(), dict(SETUP_CLICK, owner=agent, needs="none"))
+            task["needs"] = "screen"        # check_task refuses every screen task while these screens are open
+            with transaction():
+                tid = admit_task(manager_name(), task)
+                DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                           (key, json.dumps([tid, None])))
+        except (ToolError, Refusal):
+            return ""
+        log("hub", f"the setup screens of macOS are open on {name}: {tref(tid)} presses Continue on Update Complete")
+        return None
+    tid, after = json.loads(held)
+    t = q1("SELECT owner, state FROM tasks WHERE id=?", (tid,))
+    if t and t["state"] not in TERMINAL:
+        return None
+    if after is None:                       # the next reading is the first that surely came after the task's end
+        kv_set(key, json.dumps([tid, reported]))
+        return None
+    if after == reported:
+        return None
+    who = shown_name(t["owner"]) if t else "its screen agent"
+    return (f" (still open after {who}'s task {tref(tid)}, which was to press Continue on Update Complete: its result "
+            f"names the screen that shows)")
+
+
 def mac_desktop_sweep():
     """What only hands at a Mac can put right reaches the manager once, in the second reading that shows it: a Mac that
     is reopening Chrome is no news. A Mac whose owner sits at it, and a Mac with no agent that works in its Chrome, are
-    none either."""
+    none either. macOS's setup screens go to the Mac's screen agent first (setup_click)."""
     for name in server_names():
         st = q1("SELECT data, reported FROM server_status WHERE server=?", (name,))
         desktop = ((json.loads(st["data"]).get("security") or {}).get("desktop") or {}) if st else {}
@@ -28443,6 +28500,8 @@ def mac_desktop_sweep():
                  "Chrome does not run" if browser and desktop.get("extension") and desktop.get("chrome") is False else
                  "Claude's extension in Chrome is signed out" if browser and desktop.get("browser") is False else
                  "ChatGPT is signed out" if screen and desktop.get("chatgpt") is False else None)
+        if not desktop.get("setup") and kv_get(f"desktop_click:{name}"):
+            kv_set(f"desktop_click:{name}", None)       # the screens of the next update get a task of their own
         seen, told = kv_get(f"desktop_seen:{name}"), kv_get(f"desktop_told:{name}")
         if not words:
             if seen or told:
@@ -28455,8 +28514,11 @@ def mac_desktop_sweep():
         if not seen or json.loads(seen)[0] != words:
             kv_set(f"desktop_seen:{name}", said)
         elif json.loads(seen)[1] != st["reported"]:
+            click = setup_click(name, active, desktop, st["reported"]) if desktop.get("setup") else ""
+            if click is None:
+                continue
             kv_set(f"desktop_told:{name}", words)
-            emit(manager_name(), "say", f"[hub] On the Mac {name}, {words}. Its tasks in Chrome and on its screen wait. Only hands at that "
+            emit(manager_name(), "say", f"[hub] On the Mac {name}, {words}{click}. Its tasks in Chrome and on its screen wait. Only hands at that "
                                         f"Mac, or the app's Screen Sharing button, can put this right: raise it for the "
                                         f"owner with raise_needs_you.")
 
