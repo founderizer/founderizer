@@ -6805,7 +6805,7 @@ def t_search_knowledge(agent, a):
 # to the agent as available with a super short summary, and only loaded via tool when the model thinks it needs
 # them! each document should be preprocessed by AI to have like a summary of its content - SUPER SHORT". Until then
 # RULES.md told each agent to read the files of its profile's "Knowledge files" section at every start, whole: the
-# 15.6 KB of autocontent-team.md went into five agents' sessions each time. Now a start lists the files that the agent
+# 15.6 KB of one team's file went into five agents' sessions each time. Now a start lists the files that the agent
 # may use, one line each with its path, its title and its summary, and read_knowledge gives one file when the work
 # needs it. The summary is an AI's: the manager, which may use every file, writes it with summarize_knowledge when
 # the hub asks for it (ask_for_summaries). It is kept with the git blob of the text that it was written for, so a
@@ -15536,8 +15536,8 @@ def t_open_case(agent, a):
                         f"case, or use another key.")
     t0 = now()
     # One event is one case, in the whole fleet: a key that another duty has open is that duty's event, so this duty
-    # joins its case instead of keeping a copy that goes stale beside it (3 November 2026: ac-lead's R-7 held 25
-    # copies of amura-devops's R-6 cases, and one was closed before its fix while the case it copied stayed open).
+    # joins its case instead of keeping a copy that goes stale beside it (3 November 2026: a lead's duty held 25
+    # copies of a DevOps agent's cases, and one was closed before its fix while the case it copied stayed open).
     other = q1("SELECT c.* FROM duty_cases c JOIN responsibilities d ON d.id=c.responsibility WHERE c.key=? AND "
                "c.state='open' AND c.responsibility<>? AND d.state<>'retired' ORDER BY c.id LIMIT 1", (key, r["id"]))
     if other:
@@ -21210,8 +21210,8 @@ TOOLS = [
         "task_id": wakeups.TASK_ID})),
     ("manager", "summarize_knowledge", t_summarize_knowledge,
      f"Give one knowledge file its summary: one line of at most {SUMMARY_LIMIT} characters that says what the file "
-     f"holds and when an agent needs it, for example \"Roles, repositories and deploy routes of the AutoContent team; "
-     f"read it before work on AutoContent.\" Read the file with read_knowledge first. The hub asks for it when a file "
+     f"holds and when an agent needs it, for example \"Roles, repositories and deploy routes of the web team; read it "
+     f"before work on the web apps.\" Read the file with read_knowledge first. The hub asks for it when a file "
      f"is new or its text changed, and the start of every agent that may use the file lists it with this line.",
      S({"path": {"type": "string", "description": "A knowledge file, for example knowledge/owner/brand.md"},
         "summary": {"type": "string", "description": f"One line of at most {SUMMARY_LIMIT} characters"},

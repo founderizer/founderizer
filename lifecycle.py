@@ -524,8 +524,8 @@ def session_reuse(runtime, context, started, now_runs, settings=None, at=None, f
 
 def shown_name(name):
     """A name as both apps show it, which is Swift's `capitalized`: a capital for every letter that starts the name or
-    follows a character that is not a letter, and small letters for the rest ("hgr-dev" is "Hgr-Dev", "mini-2b"
-    "Mini-2B"). Python's capitalize() gave "Hgr-dev", so one agent read two ways on one screen (review A9, 29 October
+    follows a character that is not a letter, and small letters for the rest ("web-dev" is "Web-Dev", "mini-2b"
+    "Mini-2B"). Python's capitalize() gave "Web-dev", so one agent read two ways on one screen (review A9, 29 October
     2026). For the words the owner reads, from the hub and from a server's jobs."""
     out, before = [], ""
     for c in str(name or ""):
@@ -1473,7 +1473,7 @@ def may_take(kit, target, run=None, floor=None, head="HEAD"):
     own tree outside the data. **A `head` with no release takes one that comes after the floor**: on a machine whose
     checkouts share one user (its agents and its server service), the first that took a signed release wrote the
     floor, and the others take theirs after it. They stayed where they were for every release after that (3 November
-    2026: the Mac Studio's server service and Hgr-Support on worker-1, at the revisions of that morning). Every
+    2026: the Mac Studio's server service and a support agent on worker-1, at the revisions of that morning). Every
     mover of a checkout calls this first: the helper's update and task-start sync, the server service, the hub, both
     installers, onboard.py and the owner's MCP server (the shell ones as `lifecycle.py may-take`)."""
     import releases                     # here and not at the top: releases imports this module
