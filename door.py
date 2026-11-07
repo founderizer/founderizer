@@ -661,7 +661,15 @@ class Door:
             with self.held(self.host_locks, d.host):
                 if d.reboot:
                     with self.held(self.business_locks, d.business or "-"):
-                        out = self.act(access, d, op, args, content)
+                        try:
+                            out = self.act(access, d, op, args, content)
+                        except Refused:
+                            raise                   # ops-root refused it: nothing ran on the host
+                        except Exception:
+                            # A session that ends badly can be the reboot itself, or Tailscale's own restart in its
+                            # upgrade: the host may be going down all the same, so its business waits for it.
+                            self.back(access, d.host)
+                            raise
                         self.back(access, d.host)
                         return out
                 return self.act(access, d, op, args, content)

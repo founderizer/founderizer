@@ -1523,14 +1523,18 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
     return shlex.join(words + args)
 
 
-def mint_tokens(agent, task, attempt, env, closed=None):
+def mint_tokens(agent, task, attempt, env, closed=None, held=None):
     """Support plan F3: {server: token} for the mint servers among this task session's tools (lifecycle.mcp_server,
     auth "mint"). For each one the hub makes one request job of the task's attempt, with the server's mint path and the
     task's case key, and this machine's vault sends it to the site of the server's key, with that key: the key never
     comes here. The token goes into the session's MCP file and nowhere else, and the hub gets the status of the answer
     and not its body. A task with no case gets no token, and its session starts without that server; a refused or
     failed mint stops the start, which the helper tries again and reports (plan C6). closed: the hub's start of a
-    Shell-off session ({} when only this checkout says so): it mints only for the servers that its duty names."""
+    Shell-off session ({} when only this checkout says so): it mints only for the servers that its duty names.
+
+    held: the helper's reports that the hub has not taken (Helper.jobs_held). A report that three tries did not give
+    the hub goes there, and the helper's loop sends it again until the hub takes it (send_reports): the vault keeps no
+    answer, and a job with no report stays open for ever, which the hub reads as a job its task waits on."""
     catalog, out = team_catalog(), {}
     named = (closed or {}).get("servers") if isinstance(closed, dict) else None
     for name in [t for t in (env or {}).get("FLEET_TOOLS", "").split() if (catalog.get(t) or {}).get("mint") and
@@ -1559,6 +1563,9 @@ def mint_tokens(agent, task, attempt, env, closed=None):
                     break
             except (OSError, ValueError):
                 continue
+        else:
+            if held is not None:
+                held[data["job"]] = kept
         if token is None:
             raise Refused(f"no token for {name}: {kept.get('text') or 'the vault did not send the request'}")
         out[name] = token
@@ -4365,7 +4372,7 @@ class Helper:
                         closed=extra.get("shell_off"),    # support plan F1: the hub's closed start
                         minted=mint_tokens(self.agent, task, extra.get("attempt", 1), env,      # F3
                                            closed=extra["shell_off"] if isinstance(extra.get("shell_off"), dict)
-                                           else {} if shell_off(self.conf) else None))
+                                           else {} if shell_off(self.conf) else None, held=self.jobs_held))
                 self.start(task, command, extra.get("attempt",1), extra.get("generation",""), session, needs=needs)
                 self.say(f"{task}: session started, attempt {extra.get('attempt',1)}")
                 # plan C6: the ack says only "started once"; the event stays pending until the session reads it

@@ -60,6 +60,7 @@ INVENTORY = LIB + "/inventory"
 READER = LIB + "/ops-read"
 SSHD_UNIT = "ops-sshd.service"              # the second sshd
 TIMER_UNIT = "ops-root-rollback"            # the 600-second rollback timer
+BOOT_ID = "/proc/sys/kernel/random/boot_id"  # one id for each boot of the host: a snapshot of this boot is kept
 ROLLBACK_AFTER = 600
 PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ENV = {"PATH": PATH, "LANG": "C.UTF-8", "SYSTEMD_PAGER": "", "PAGER": "cat", "DEBIAN_FRONTEND": "noninteractive"}
@@ -1717,23 +1718,41 @@ def idle_runner(name):
 
 def arm_timer():
     """Save the firewall's and sshd's files and the Tailscale version as they are now, and start the timer that puts
-    them back in ROLLBACK_AFTER seconds unless `timer cancel` comes first. Armed already: it starts again."""
+    them back in ROLLBACK_AFTER seconds unless `timer cancel` comes first. Armed again before a cancel or the fire,
+    in the same boot: the countdown starts again, and the files and the version stay those of the first arm. A
+    firewall file arms it, and so does the `ufw` or `nft` that applies that file, so a new snapshot at each arm would
+    keep the very change that locked the door out, and the timer would put that back; a start of the timer that
+    failed does not make the next arm take a new one either. After a boot the host runs every file it has, and the
+    arm came through the door, so the next arm takes a new snapshot."""
     folder = P(STATE + "/rollback")
-    os.makedirs(folder, mode=0o700, exist_ok=True)
-    present = [p for p in SNAPSHOT if os.path.exists(P(p))]
-    status, out = run(["tar", "-C", P("/") or "/", "-cpf", os.path.join(folder, "snapshot.tar"),
-                       *[p.lstrip("/") for p in present]])
-    if status != 0:
-        raise Failed("the rollback timer could not save the files it restores: " + out)
-    _, version = run(["dpkg-query", "-W", "-f=${Version}", "tailscale"])
-    with open(os.path.join(folder, "tailscale"), "w") as f:
-        f.write(version.strip() if re.fullmatch(r"[A-Za-z0-9.+~:-]{1,60}", version.strip()) else "")
-    systemctl("stop", TIMER_UNIT + ".timer")
-    status, out = run(["systemd-run", f"--on-active={ROLLBACK_AFTER}", f"--unit={TIMER_UNIT}", "--collect",
-                       "--quiet", SELF, "--fire"])
-    if status != 0:
-        raise Failed("the rollback timer could not start: " + out)
-    return f"the rollback timer is armed: in {ROLLBACK_AFTER} seconds it restores the firewall, sshd and Tailscale"
+    snapshot = os.path.join(folder, "snapshot.tar")
+    boot = read(BOOT_ID).strip()
+    kept = bool(boot) and os.path.isfile(snapshot) and read(STATE + "/rollback/boot").strip() == boot
+    try:
+        if not kept:
+            os.makedirs(folder, mode=0o700, exist_ok=True)
+            present = [p for p in SNAPSHOT if os.path.exists(P(p))]
+            status, out = run(["tar", "-C", P("/") or "/", "-cpf", snapshot, *[p.lstrip("/") for p in present]])
+            if status != 0:
+                raise Failed("the rollback timer could not save the files it restores: " + out)
+            _, version = run(["dpkg-query", "-W", "-f=${Version}", "tailscale"])
+            with open(os.path.join(folder, "tailscale"), "w") as f:
+                f.write(version.strip() if re.fullmatch(r"[A-Za-z0-9.+~:-]{1,60}", version.strip()) else "")
+            with open(os.path.join(folder, "boot"), "w") as f:
+                f.write(boot + "\n")
+        systemctl("stop", TIMER_UNIT + ".timer")
+        status, out = run(["systemd-run", f"--on-active={ROLLBACK_AFTER}", f"--unit={TIMER_UNIT}", "--collect",
+                           "--quiet", SELF, "--fire"])
+        if status != 0:
+            raise Failed("the rollback timer could not start: " + out)
+    except Failed:
+        # A first arm that did not start: the change it came before does not run, so its snapshot guards nothing and
+        # must not stay for the rest of the boot. A later arm's snapshot stays: a change of the first one is in place.
+        if not kept:
+            shutil.rmtree(folder, ignore_errors=True)
+        raise
+    return f"the rollback timer is armed: in {ROLLBACK_AFTER} seconds it restores the firewall, sshd and Tailscale" + \
+        (" as they were at its first arm" if kept else "")
 
 
 def cancel_timer():

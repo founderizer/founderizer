@@ -842,7 +842,8 @@ class Update:
         if self.git("fetch", "-q", "origin")[0] != 0 or lifecycle.take(self.kit, merged, self.run, self.floor):
             return self.answer(FAILED, "follow", f"release {version} is on {self.branch} as {merged[:12]}, and this "
                                                  f"hub's own checkout did not move onto it. Bring it up to date by "
-                                                 f"hand: git -C {self.kit} merge --ff-only {merged[:12]}")
+                                                 f"hand: git -C {self.kit} merge --ff-only {merged[:12]}, then "
+                                                 f"restart the hub's service, which runs the code it started with")
         return self.answer(DONE, "follow", f"release {version} is on {self.branch} as {merged[:12]}; this fleet "
                                            f"moved from {self.pinned[:12]}")
 

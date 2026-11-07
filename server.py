@@ -774,20 +774,30 @@ class Service:
         else:
             if not self.repo:
                 raise StepFailed("checkout", "This server has no repository address. Run the join line again.")
-            code, out, err = self.run(self.as_agent(user, ["git", "clone", "-q", self.repo, folder]), timeout=300)
+            # The clone is made beside the folder and moved into its place only once it is marked and at this server's
+            # own revision. A clone that its timeout or a stop cut off, or one whose reset failed, is then never the
+            # folder: the next try makes it again, where it found a folder with no mark, which it may not touch, or a
+            # marked one at whatever the hub's repository holds.
+            partial = folder + ".partial"
+            self.run(self.as_agent(user, ["rm", "-rf", "--", partial]))
+            code, out, err = self.run(self.as_agent(user, ["git", "clone", "-q", self.repo, partial]), timeout=300)
             if code != 0:
                 raise failed("checkout", f"{self.name} could not get the Founderizer repository. Try again.",
                              err or out)
-            self.mark(folder, agent, user)
+            self.mark(partial, agent, user)
             # DevOps plan 0.2: a new checkout starts at this machine's own checked revision, the one this service
             # took under lifecycle.may_take, and not at whatever the hub's repository holds; from there it moves
             # under the same check. A commit is named by its content, so the clone's objects cannot change it.
             here = self.revision()
-            code, out, err = self.run(self.as_agent(user, ["git", "-C", folder, "reset", "-q", "--hard",
+            code, out, err = self.run(self.as_agent(user, ["git", "-C", partial, "reset", "-q", "--hard",
                                                            here or "missing"]))
             if not here or code != 0:
                 raise failed("checkout", f"{shown_name(agent)}'s copy of Founderizer could not start at this "
                                          f"server's own revision. Try again.", err or out)
+            code, out, err = self.run(self.as_agent(user, ["mv", "--", partial, folder]))
+            if code != 0 or not self.ours(folder, agent, user):
+                raise failed("checkout", f"{shown_name(agent)}'s copy of Founderizer could not be put in its place. "
+                                         f"Try again.", err or out or f"{folder} holds no copy of Founderizer's")
         # an origin from before the split stays as it was
         problem = lifecycle.follow_config_ref(folder, self.agent_run(user))
         if problem:

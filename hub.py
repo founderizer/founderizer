@@ -31742,14 +31742,21 @@ def door_renew(t0=None):
 
 def door_sweep(t0=None):
     """The door's record since the hub's last line, each minute. A door that does not answer is said once, to the
-    manager, which raises Needs-you; the next answer says it is back."""
+    manager, which raises Needs-you; the next answer says it is back.
+
+    The hub numbers the lines as base + the door's own number, and asks again for the line that it read last. A door
+    that was built again numbers its record from 1: its newest line ("last") is below the hub's last one, or its line
+    of that number is another call (another time). Then its lines come after the hub's own, as base + n, read from
+    its first one at the next read, so none of them is skipped, whatever its count had come to meanwhile."""
     t0 = t0 or now()
     conf = door_conf()
     if conf is None or t0 - DOOR["read_at"] < DOOR_READ_EVERY:
         return None
     DOOR["read_at"] = t0
-    last = q1("SELECT MAX(n) n FROM door_record")["n"] or 0
-    status, answer = door_call(conf, "GET", f"/record?after={last}", conf["record"])
+    base = int(kv_get("door_record_base") or 0)
+    top = q1("SELECT MAX(n) n, MAX(ts) ts FROM door_record WHERE n=(SELECT MAX(n) FROM door_record)")
+    last = max((top["n"] or 0) - base, 0)
+    status, answer = door_call(conf, "GET", f"/record?after={max(last - 1, 0)}", conf["record"])
     if status != 200 or not isinstance(answer, dict):
         if DOOR["error"] is None:
             DOOR["error"] = t0
@@ -31760,12 +31767,19 @@ def door_sweep(t0=None):
         DOOR["error"] = None
         emit(manager_name(), "say", "[hub] The door answers again.")
     rows = [e for e in answer.get("entries") or [] if isinstance(e, dict) and isinstance(e.get("n"), int)]
+    newest, again = answer.get("last"), next((e for e in rows if e["n"] == last), None) if last else None
+    other = again is not None and type(again.get("ts")) in (int, float) and abs(again["ts"] - top["ts"]) > 0.001
+    if last and (type(newest) is int and 0 <= newest < last or other):
+        kv_set("door_record_base", top["n"])
+        log("hub", f"the door's record is not the one that the hub read up to line {last}: a door that was built "
+                   f"again. The hub reads it from its first line, after its own {top['n']}.")
+        return 0
     with transaction():
         for e in rows[:DOOR_PAGE]:
             made = e.get("made") if isinstance(e.get("made"), str) and GITHUB_FULL_NAME.fullmatch(
                 str(e.get("made")).lower()) else None
             DB.execute("INSERT OR IGNORE INTO door_record(n,ts,caller,target,action,kind,outcome,why,made) "
-                       "VALUES(?,?,?,?,?,?,?,?,?)", (e["n"], float(e.get("ts") or t0), str(e.get("caller"))[:64],
+                       "VALUES(?,?,?,?,?,?,?,?,?)", (base + e["n"], float(e.get("ts") or t0), str(e.get("caller"))[:64],
                                                      str(e.get("target"))[:120], str(e.get("action"))[:40],
                                                      str(e.get("kind"))[:16], str(e.get("outcome"))[:16],
                                                      str(e.get("why") or "")[:300], made))
@@ -33764,7 +33778,9 @@ def settle_releases():
 def finish_release(rid, state, step, says, automatic, result=None):
     """Inside LOCK: what came of one update run, and what the fleet does about it. A run that reached the released
     revision asks every machine for its idle update and restarts the hub's own service; any other state leaves the
-    fleet exactly as it was."""
+    fleet exactly as it was. A run that failed after its push (releases.FAILED at the step follow) reached the ref but
+    not this hub's own checkout: every machine takes that release at its next sync anyway, so each is asked for its
+    idle update too, and its helper restarts onto what its checkout runs; the hub keeps its own process."""
     q("UPDATE releases SET state=?, step=?, says=?, pinned=COALESCE(?,pinned), reached=?, finished=?, automatic=? "
       "WHERE id=?", (state, step, says, (result or {}).get("pinned"), (result or {}).get("reached"), now(),
                      1 if automatic else 0, rid))
@@ -33772,6 +33788,9 @@ def finish_release(rid, state, step, says, automatic, result=None):
     log("hub" if automatic else "owner",
         f"release {row['version']} ({(row['revision'] or '')[:12]}): {state} at {step} — {says}")
     if state != releases.DONE:
+        if row["reached"]:
+            for name in agents():
+                request_update(name, row["reached"])
         return row
     kit_revision(fresh=True)
     # Every machine, the hub's own included: its agent's helper fast-forwards its own checkout and restarts its own

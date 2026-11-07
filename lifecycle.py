@@ -1455,22 +1455,31 @@ def read_floor(floor):
 def keep_floor(kit, floor, run=None, head="HEAD"):
     """Raise this user's floor to the release that the checkout runs at `head`. It is never lowered: a release that does
     not descend from the floor leaves it as it is, and so does a floor that cannot be read, because may_take then says
-    why. Called around every move, so the floor follows what each checkout took."""
+    why. Called around every move, so the floor follows what each checkout took.
+
+    The read, the check and the write hold the floor's lock: the checkouts of one OS user (its agents' helpers, each
+    with a status thread and a task-start sync, and its server service) move at the same time, and one that read the
+    floor before another raised it would else write its older release over the newer one."""
     if not floor:
         return
     text = _blob(kit, run, head, RELEASE_FILE)
     revision, version = released(text) if text is not None else (None, None)
     if not revision:
         return
-    current, problem = read_floor(floor)
-    if problem or revision == current or (current and not _descends(kit, run, current, revision)):
-        return
     with contextlib.suppress(OSError):
         os.makedirs(os.path.dirname(floor), mode=0o700, exist_ok=True)
-        temp = f"{floor}.{os.getpid()}"
-        with open(temp, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"revision": revision, "version": version}) + "\n")
-        os.replace(temp, floor)
+        lock = os.open(floor + ".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            current, problem = read_floor(floor)
+            if problem or revision == current or (current and not _descends(kit, run, current, revision)):
+                return
+            temp = f"{floor}.{os.getpid()}"
+            with open(temp, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"revision": revision, "version": version}) + "\n")
+            os.replace(temp, floor)
+        finally:
+            os.close(lock)
 
 
 def may_take(kit, target, run=None, floor=None, head="HEAD"):
