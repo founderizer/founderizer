@@ -31106,24 +31106,26 @@ def door_host_report(body):
     if (old.get("state"), old.get("said")) == (state, said):
         return {"host": host, "state": state, "changed": False}
     rollout = (TEAM.get("door") or {}).get("rollout") is True
-    with transaction():
-        kv_set(key, json.dumps({"state": state, "said": said, "at": round(now())}))
-        if state == "passed" and not rollout:
-            emit(manager_name(), "say", f"[hub] The door's parts are on {host}, the first server, and the door's own "
-                                        f"check of its second sshd passed (test 1): no shell, no TTY, no scp, no "
-                                        f"forward and no form outside the list, and a read and a rule form through "
-                                        f"sudo ops-root work. Give its Operator normal work there through the door "
-                                        f"(test 6: an update, a restart, a deploy, a restic run, an nginx edit, a "
-                                        f"reload and a restore). When that work passed, call door_rollout with go "
-                                        f"true: the app then puts the parts on the other servers, one each round, "
-                                        f"and checks each one the same way. Before that, give door_hold to each "
-                                        f"server that a plan step keeps from the door: parts (it gets none, and no "
-                                        f"grant) or judged (it gets its parts, and the door runs no judged call "
-                                        f"there).")
-        elif state == "failed":
-            emit(manager_name(), "say", f"[hub] The door's parts did not go on {host}, or the door's check of it "
-                                        f"failed: {said} The app puts the parts on no other server until a new release "
-                                        f"of the app or the door.")
+    told = None
+    if state == "passed" and not rollout:
+        told = (f"[hub] The door's parts are on {host}, the first server, and the door's own check of its second sshd "
+                f"passed (test 1): no shell, no TTY, no scp, no forward and no form outside the list, and a read and a "
+                f"rule form through sudo ops-root work. Give its Operator normal work there through the door (test 6: "
+                f"an update, a restart, a deploy, a restic run, an nginx edit, a reload and a restore). When that work "
+                f"passed, call door_rollout with go true: the app then puts the parts on the other servers, one each "
+                f"round, and checks each one the same way. Before that, give door_hold to each server that a plan step "
+                f"keeps from the door: parts (it gets none, and no grant) or judged (it gets its parts, and the door "
+                f"runs no judged call there).")
+    elif state == "failed":
+        told = (f"[hub] The door's parts did not go on {host}, or the door's check of it failed: {said} The app puts "
+                f"the parts on no other server until a new release of the app or the door.")
+    manager, t0 = manager_name(), now()
+    task = filed_under(manager, "say", None)
+    with transaction():     # the server's word and the manager's message, together or not at all
+        DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                   (key, json.dumps({"state": state, "said": said, "at": round(t0)})))
+        if told:
+            event_rows([(manager, "say", task, told, None)], t0)
     log("owner", f"the door's parts on {host}: {state}" + (f": {said}" if said else ""))
     return {"host": host, "state": state, "changed": True}
 
