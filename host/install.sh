@@ -155,6 +155,9 @@ MaxSessions 4
 LogLevel VERBOSE
 EOF
 chmod 0644 "$ETC/sshd_config"
+# sshd -t needs its privilege separation folder, which only a running sshd's unit makes: on a host that Tailscale's own
+# SSH serves, OpenSSH is masked and the folder is not there (7 November 2026). The unit below makes it at each start.
+install -d -m 0755 -o root -g root /run/sshd
 /usr/sbin/sshd -t -f "$ETC/sshd_config"
 
 cat > "$UNIT" <<EOF
