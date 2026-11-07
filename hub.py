@@ -27195,7 +27195,7 @@ RESERVED_AGENT_NAMES = ("owner", "hub")
 AGENT_OS_USER = re.compile(r"fleet-[a-z][a-z0-9-]{1,25}")
 SSH_USER = re.compile(r"^[A-Za-z_][A-Za-z0-9._-]{0,31}$")
 REVISION = re.compile(r"^[0-9a-f]{7,40}$")
-_revision_cache = {"at": 0.0, "value": None}
+_revision_cache = {"at": 0.0, "value": None, "folder": None}       # kit_revision's last reading, and of which checkout
 
 
 def kit_dir():
@@ -27240,11 +27240,13 @@ def config_ref():
 
 
 def kit_revision(fresh=False):
-    """The hub checkout's commit on the configuration ref: the revision that every worker should run."""
-    t0 = now()
-    if fresh or t0 - _revision_cache["at"] > 30:
-        code, out, _ = git_kit("rev-parse", "HEAD")
-        _revision_cache.update(at=t0, value=out if code == 0 and REVISION.match(out) else None)
+    """The hub checkout's commit on the configuration ref: the revision that every worker should run. A reading is
+    kept for 30 seconds, and only for the checkout it was read from: kit_dir follows CFG, and a reading of another
+    checkout gave a commit that this one does not have (a test that read its own kit, then the vault page's)."""
+    t0, folder = now(), kit_dir()
+    if fresh or t0 - _revision_cache["at"] > 30 or _revision_cache.get("folder") != folder:
+        code, out, _ = git_kit("rev-parse", "HEAD", folder=folder)
+        _revision_cache.update(at=t0, value=out if code == 0 and REVISION.match(out) else None, folder=folder)
     return _revision_cache["value"]
 
 
