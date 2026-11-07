@@ -35,6 +35,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -115,8 +116,9 @@ HIDDEN = ("/var/www", "/srv", "/opt", "/home", "/root", "/etc/letsencrypt", "/et
 TIMED_PATHS = ("/etc/ufw/", "/etc/default/ufw", "/etc/nftables.conf", "/etc/nftables.d/", "/etc/default/tailscaled",
                "/etc/iptables/", "/etc/systemd/system/tailscaled.service.d/", "/etc/netplan/")
 TIMED_PROGRAMS = {"ufw", "nft", "iptables", "ip6tables", "iptables-restore", "ip6tables-restore", "netplan"}
-# What the timer restores: the firewall's files and the sshd configuration, as they were when it was armed.
-SNAPSHOT = ("/etc/ssh", "/etc/ufw", "/etc/default/ufw", "/etc/nftables.conf", "/etc/default/tailscaled")
+# What the timer restores: sshd's files and every path that arms it, each exactly as it was at the first arm.
+SNAPSHOT = ("/etc/ssh",) + tuple(p.rstrip("/") for p in TIMED_PATHS)
+UFW_INIT = "/lib/ufw/ufw-init"              # ufw.service's own program: force-stop is what `ufw disable` runs
 CAPS_DROPPED = ("CAP_SYS_ADMIN", "CAP_SYS_PTRACE", "CAP_DAC_READ_SEARCH", "CAP_SETUID", "CAP_SETGID",
                 "CAP_SYS_MODULE", "CAP_SYS_RAWIO", "CAP_MKNOD", "CAP_BPF")
 
@@ -1730,7 +1732,7 @@ ARMED = STATE + "/rollback/armed"           # a countdown runs: written before i
 BOOT_TEXT = f"""[Unit]
 Description=ops-root: the rollback whose timer a reboot ended
 ConditionPathExists={ARMED}
-ConditionPathIsExecutable={SELF}
+ConditionFileIsExecutable={SELF}
 After=network-online.target
 Wants=network-online.target
 
@@ -1774,19 +1776,20 @@ def at_boot():
     with open(P(LOCK_FILE), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if countdown_lost():
-            fire()
-            print("the reboot ended a rollback countdown: the files are back as at its first arm")
+            whole = fire()
+            print("the reboot ended a rollback countdown: " + ("the files are back as at its first arm" if whole else
+                                                              "tar could not put every file back"))
 
 
 def arm_timer():
-    """Save the firewall's and sshd's files and the Tailscale version as they are now, and start the timer that puts
-    them back in ROLLBACK_AFTER seconds unless `timer cancel` comes first; BOOT_UNIT and the mark ARMED before that,
-    so that a reboot in the countdown puts them back too. Armed again before a cancel or the fire, in the same boot:
-    the countdown starts again, and the files and the version stay those of the first arm. A firewall file arms it,
-    and so does the `ufw` or `nft` that applies that file, so a new snapshot at each arm would keep the very change
-    that locked the door out, and the timer would put that back; a start of the timer that failed does not make the
-    next arm take a new one either. After a boot the host runs every file it has, and the arm came through the door,
-    so the next arm takes a new snapshot."""
+    """Save sshd's files and every path that arms the timer (SNAPSHOT), which of them are absent, and the Tailscale
+    version as they are now, and start the timer that puts them back in ROLLBACK_AFTER seconds unless `timer cancel`
+    comes first; BOOT_UNIT and the mark ARMED before that, so that a reboot in the countdown puts them back too.
+    Armed again before a cancel or the fire, in the same boot: the countdown starts again, and the files and the
+    version stay those of the first arm. A firewall file arms it, and so does the `ufw` or `nft` that applies that
+    file, so a new snapshot at each arm would keep the very change that locked the door out, and the timer would put
+    that back; a start of the timer that failed does not make the next arm take a new one either. After a boot the
+    host runs every file it has, and the arm came through the door, so the next arm takes a new snapshot."""
     boot_unit()
     folder = P(STATE + "/rollback")
     snapshot = os.path.join(folder, "snapshot.tar")
@@ -1795,10 +1798,13 @@ def arm_timer():
     try:
         if not kept:
             os.makedirs(folder, mode=0o700, exist_ok=True)
-            present = [p for p in SNAPSHOT if os.path.exists(P(p))]
+            present = [p for p in SNAPSHOT if os.path.lexists(P(p))]
             status, out = run(["tar", "-C", P("/") or "/", "-cpf", snapshot, *[p.lstrip("/") for p in present]])
             if status != 0:
                 raise Failed("the rollback timer could not save the files it restores: " + out)
+            with open(os.path.join(folder, "snapshot.json"), "w") as f:      # what a fire removes: restore()
+                json.dump({"sha256": file_digest(STATE + "/rollback/snapshot.tar"),
+                           "absent": [p for p in SNAPSHOT if p not in present]}, f)
             _, version = run(["dpkg-query", "-W", "-f=${Version}", "tailscale"])
             with open(os.path.join(folder, "tailscale"), "w") as f:
                 f.write(version.strip() if re.fullmatch(r"[A-Za-z0-9.+~:-]{1,60}", version.strip()) else "")
@@ -1820,8 +1826,8 @@ def arm_timer():
             with contextlib.suppress(OSError):
                 os.remove(P(ARMED))
         raise
-    return f"the rollback timer is armed: in {ROLLBACK_AFTER} seconds it restores the firewall, sshd and Tailscale" + \
-        (" as they were at its first arm" if kept else "")
+    return f"the rollback timer is armed: in {ROLLBACK_AFTER} seconds it restores the firewall, the network, sshd " \
+           f"and Tailscale" + (" as they were at its first arm" if kept else "")
 
 
 def cancel_timer():
@@ -1836,23 +1842,117 @@ def cancel_timer():
 
 def fire():
     """The timer fired, or a boot found a countdown that the reboot ended: systemd's failed states first (one past
-    revert failed on the start limit), then the files, the Tailscale version and the services."""
+    revert failed on the start limit), then the files exactly as at the first arm, and what applies them. systemd reads
+    its units again (a tailscaled drop-in, and sshd's socket from its Port), and netplan applies when its files changed.
+    sshd restarts, by its socket since Ubuntu 24.04, and then the firewall: nftables first, as its restart flushes
+    every rule; ufw, whose own restart skips a ufw that its file says is not enabled, so a changed ufw.conf stops it
+    first; netfilter-persistent only when /etc/iptables changed, as its start replaces whole tables, Docker's too. Then
+    the Tailscale version, as its downgrade can need the network, and Tailscale and the door's own sshd after it. True
+    when tar put every file back."""
     folder = P(STATE + "/rollback")
+    snapshot = os.path.join(folder, "snapshot.tar")
     run(["systemctl", "reset-failed"])
-    if os.path.isfile(os.path.join(folder, "snapshot.tar")):
-        run(["tar", "-C", "/", "-xpf", os.path.join(folder, "snapshot.tar")])
+    applied = ("/etc/netplan", "/etc/ufw/ufw.conf", "/etc/iptables")
+    before = [tree_state(p) for p in applied]
+    whole = restore(snapshot) if os.path.isfile(snapshot) else True
+    netplan, ufw, iptables = (tree_state(p) != b for p, b in zip(applied, before))
+    systemctl("daemon-reload")
+    if netplan:
+        with contextlib.suppress(OSError):
+            run(["netplan", "apply"])
+    restart("ssh.service", "ssh.socket", "nftables.service")
+    if ufw:
+        with contextlib.suppress(OSError):
+            run([UFW_INIT, "force-stop"])
+    restart("ufw.service")
+    if iptables:
+        restart("netfilter-persistent.service")
     version = read(STATE + "/rollback/tailscale").strip()
     if version:
         _, now = run(["dpkg-query", "-W", "-f=${Version}", "tailscale"])
         if now.strip() != version:
             run(["apt-get", "install", "-y", "--allow-downgrades", "-o", "DPkg::Lock::Timeout=600",
                  f"tailscale={version}"], timeout=1800)
-    for unit in ("ssh.service", "ufw.service", "nftables.service", "tailscaled.service", SSHD_UNIT):
-        if systemctl("is-enabled", unit)[1].strip() in ("enabled", "static"):
-            systemctl("restart", unit)
+    restart("tailscaled.service", SSHD_UNIT)
     with contextlib.suppress(OSError):
         run(["ufw", "reload"])
     shutil.rmtree(folder, ignore_errors=True)
+    return whole
+
+
+def restart(*units):
+    for unit in units:
+        if systemctl("is-enabled", unit)[1].strip() in ("enabled", "static"):
+            systemctl("restart", unit)
+
+
+def restore(snapshot):
+    """Each path of SNAPSHOT exactly as at the arm. tar puts back what the snapshot holds and keeps what came later, so
+    first go: each path that was absent at the arm, each entry of a saved folder that the snapshot does not hold, and
+    each entry whose kind changed (a folder where it has a file, or the other way round). Only a snapshot with the
+    digest of its arm removes anything: a crash can cut one short, and an older ops-root saved fewer paths and wrote
+    no digest. tar puts back what any snapshot holds. True when it put every file back."""
+    try:
+        listed = json.loads(read(STATE + "/rollback/snapshot.json"))
+        if listed["sha256"] != file_digest(STATE + "/rollback/snapshot.tar"):
+            raise ValueError("not the snapshot of its arm")
+        absent = [p for p in listed["absent"] if p in SNAPSHOT]
+        with tarfile.open(snapshot) as archive:
+            kinds = {os.path.normpath(m.name).lstrip("/"): m.isdir() for m in archive.getmembers()}
+    except (OSError, ValueError, KeyError, TypeError, tarfile.TarError):
+        absent, kinds = [], {}
+    for path in SNAPSHOT:
+        if path in absent or path.lstrip("/") in kinds:
+            with contextlib.suppress(RecursionError):       # Python 3.12's rmtree, in a folder 1000 deep
+                prune(path, kinds)
+    status, out = run(["tar", "-C", P("/") or "/", "-xpf", snapshot])
+    if status != 0:
+        print("the rollback's tar could not put every file back: " + out.strip()[-1000:])
+    return status == 0
+
+
+def prune(path, kinds):
+    """What of `path` the snapshot does not hold goes (kinds: each name that it holds, and whether that is a folder),
+    a package's file too: one that a package put there in the countdown can hold the door's own edit, and a lockout
+    that a fire keeps is worse than a conffile that dpkg must put back (--force-confmiss). Never through a link: a
+    link goes as a link, and only a real folder is gone through."""
+    todo = [path]
+    while todo:
+        path = todo.pop()
+        full = P(path)
+        folder = os.path.isdir(full) and not os.path.islink(full)
+        if kinds.get(path.lstrip("/")) == folder:
+            if folder:
+                with contextlib.suppress(OSError):
+                    todo += [path + "/" + name for name in os.listdir(full)]
+        elif folder:
+            shutil.rmtree(full, ignore_errors=True)
+        else:
+            with contextlib.suppress(OSError):
+                os.remove(full)
+
+
+def tree_state(path):
+    """Each entry of `path` with its kind, mode, owner and bytes (a link's target, and a file larger than FILE_MAX by
+    its size and time), never through a link: two readings differ when something there changed."""
+    found, todo = [], [path]
+    while todo:
+        path = todo.pop()
+        full = P(path)
+        try:
+            st = os.lstat(full)
+        except OSError:
+            continue
+        extra = None
+        with contextlib.suppress(OSError):
+            if stat.S_ISLNK(st.st_mode):
+                extra = os.readlink(full)
+            elif stat.S_ISREG(st.st_mode):
+                extra = file_digest(path) if st.st_size <= FILE_MAX else (st.st_size, int(st.st_mtime))
+            elif stat.S_ISDIR(st.st_mode):
+                todo += [path + "/" + name for name in sorted(os.listdir(full), reverse=True)]
+        found.append((path, st.st_mode, st.st_uid, st.st_gid, extra))
+    return found
 
 
 # ---- a signed bundle from a release
