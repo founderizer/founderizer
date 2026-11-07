@@ -329,6 +329,26 @@ def user_script(user):
                 "u": user, "g": AGENT_GROUP, "reserved": "|".join(RESERVED_USERS)}
 
 
+def remove_script(user):
+    """The shell that takes one agent's user away with its home (owner feature agent_remove), each line safe to run
+    again: a user that is not there is gone already, and one outside the agents' group, or one of the vault's, stays
+    as it is. Its lingering, its sessions and its processes end first, because userdel refuses a user that still runs a
+    process; then the user, its group and its home go."""
+    return ('id -u %(u)s >/dev/null 2>&1 || { echo "fleet-agent-user: %(u)s is not there"; exit 0; }\n'
+            "if ! id -nG %(u)s | tr ' ' '\\n' | grep -qx %(g)s; then"
+            " echo \"fleet: %(u)s is an OS user of this machine and no agent's, so it stays as it is\" >&2; exit 3; fi\n"
+            "case %(u)s in %(reserved)s) echo \"fleet: %(u)s is a user of this machine's vault, never an agent's\" >&2;"
+            " exit 3;; esac\n"
+            "loginctl disable-linger %(u)s 2>/dev/null || true\n"
+            "loginctl terminate-user %(u)s 2>/dev/null || true\n"
+            "pkill -KILL -u %(u)s 2>/dev/null || true\n"
+            "for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -u %(u)s >/dev/null 2>&1 || break; sleep 1; done\n"
+            "crontab -r -u %(u)s 2>/dev/null || true\n"
+            "userdel -r %(u)s 2>/dev/null || true\n"
+            'if id -u %(u)s >/dev/null 2>&1; then echo "fleet-agent-user: %(u)s could not be removed" >&2; exit 4; fi\n'
+            "rm -rf -- /home/%(u)s") % {"u": user, "g": AGENT_GROUP, "reserved": "|".join(RESERVED_USERS)}
+
+
 def _shell(script, timeout=120):
     done = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=timeout,
                           stdin=subprocess.DEVNULL)
@@ -402,25 +422,35 @@ def agent_users(team, machine, check=False, run=None):
 
 def helper_script():
     """The one root command of this machine: `/usr/local/sbin/fleet-agent-user fleet-<agent>` makes that agent's OS
-    user and nothing else. Its only input is that one argument, and it is checked against the agent names this
-    fleet can give a user of its own before any line of `user_script` runs."""
-    name = r"fleet-[a-z][a-z0-9-]{1,%d}" % (USER_LIMIT - len(AGENT_USER % "") - 1)
+    user, and `fleet-agent-user --remove=fleet-<agent>` takes it away with its home once the owner deleted the agent
+    (owner feature agent_remove), and nothing else. Its only input is that one argument, and it is checked against a
+    closed pattern of the agent users this fleet can have, with or without `--remove=`, before any line reads it or
+    any line of `user_script` or `remove_script` runs (selftest: a root command checks its argument first)."""
+    name = r"(--remove=)?fleet-[a-z][a-z0-9-]{1,%d}" % (USER_LIMIT - len(AGENT_USER % "") - 1)
     return ("#!/bin/sh\n"
-            "# Founderizer: make the OS user of one agent, and nothing else. hubsetup.py writes this file.\n"
+            "# Founderizer: make the OS user of one agent, or remove it, and nothing else. hubsetup.py writes this file.\n"
             "#\n"
-            "# It is the one root command that this machine's service user may run (%(sudoers)s), because the\n"
-            "# server service installs an agent the owner adds in the app and has no root of its own. The user it\n"
-            "# makes has a locked password, no sudo, lingering on, the group %(group)s and a home of mode 700 that\n"
-            "# belongs to it alone. Safe to run again: every line reads first.\n"
+            "# It is the one root command that this machine's service user may run (%(sudoers)s), because\n"
+            "# the server service installs an agent the owner adds in the app, and removes one the owner deletes, and has\n"
+            "# no root of its own. The user it makes has a locked password, no sudo, lingering on, the group %(group)s\n"
+            "# and a home of mode 700 that belongs to it alone. --remove= takes away only a user of that group, with its\n"
+            "# home. Safe to run again: every line reads first.\n"
             "set -eu\n"
             'test "$(id -u)" = 0 || { echo "fleet-agent-user: this command needs root" >&2; exit 1; }\n'
-            'test "$#" = 1 || { echo "fleet-agent-user: one argument, which is fleet-<agent>" >&2; exit 2; }\n'
+            'test "$#" = 1 || { echo "fleet-agent-user: one argument, which is fleet-<agent> or --remove=fleet-<agent>"'
+            ' >&2; exit 2; }\n'
             'printf %%s "$1" | grep -qxE %(name)s || { echo "fleet-agent-user: $1 is no agent user of a fleet" >&2;'
             ' exit 2; }\n'
-            "u=$1\n"
+            "u=${1#--remove=}\n"
+            'if [ "$u" != "$1" ]; then\n'
+            "%(remove)s\n"
+            'echo "fleet-agent-user: $u is removed"\n'
+            "exit 0\n"
+            "fi\n"
             "%(script)s\n"
             'echo "fleet-agent-user: $u is the OS user of that agent"\n') % {
-                "sudoers": SUDOERS, "group": AGENT_GROUP, "name": shlex.quote(name), "script": user_script("$u")}
+                "sudoers": SUDOERS, "group": AGENT_GROUP, "name": shlex.quote(name), "script": user_script("$u"),
+                "remove": remove_script("$u")}
 
 
 def vault_program_script(repo, branch=lifecycle.CONFIG_BRANCH):

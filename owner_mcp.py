@@ -991,6 +991,14 @@ def tools():
               "runtime": {"type": "string", "enum": list(FROM_THE_HUB["lifecycle.SWITCH_RUNTIMES"])}, **rid},
              ("agent", "server"),
              with_base("/ui/team/agents/{agent}/move", ("server", "runtime"), "the server this agent moves to")),
+        tool("remove_agent", "Delete an agent: it leaves team.json with its profile and skills, the hub drops what is "
+                             "its own (keys, chat, notes, memory, rules, standing items, wake-up rules, grants; its "
+                             "duties are retired), and its server removes its service, its files and its own OS "
+                             "user, and nothing of another agent. Its tasks stay as history. Not the manager, not "
+                             "while it has an open task, not while an agent reports to it. Read servers to see the "
+                             "job end; the same call again gives a failed removal once more.",
+             {"agent": S["text"], **rid}, ("agent",),
+             with_base("/ui/team/agents/{agent}/remove", (), "the deletion of this agent")),
         tool("agent_settings", "One agent's model, effort, capabilities, title, expertise, account or screen model. "
                                "Each of vault, runtime and vault_create is a command of its own, and has a tool of "
                                "its own here: vault_access, switch_runtime and login_creation.",

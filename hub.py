@@ -329,7 +329,7 @@ CREATE TABLE IF NOT EXISTS server_keys(server TEXT PRIMARY KEY, sha256 TEXT NOT 
 CREATE TABLE IF NOT EXISTS server_status(server TEXT PRIMARY KEY, data TEXT NOT NULL, reported REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS server_jobs(id INTEGER PRIMARY KEY, server TEXT NOT NULL, kind TEXT NOT NULL, agent TEXT,
   runtime TEXT, state TEXT NOT NULL, step TEXT, detail TEXT, prompt TEXT, created REAL NOT NULL, updated REAL NOT NULL,
-  was TEXT, timed_out INTEGER);
+  was TEXT, timed_out INTEGER, user TEXT);
 -- DevOps plan C4: the door's record as the hub read it (no content, no value), and the sealed copies that wait for the
 -- door to fetch them from its own address
 CREATE TABLE IF NOT EXISTS door_record(n INTEGER PRIMARY KEY, ts REAL NOT NULL, caller TEXT NOT NULL, target TEXT,
@@ -949,7 +949,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "manager_server",    # the owner, 4 November 2026: a new fleet's manager gets its server in its setup
                "knowledge_edit",    # the owner, 5 November 2026: the pencil of a knowledge file, whose edit says
                                     # "changed" and stops a page's daily read (knowledge_replace)
-               "door_setup"]        # the owner, 6 November 2026 (DevOps D24): the app keeps the door, no hand step
+               "door_setup",        # the owner, 6 November 2026 (DevOps D24): the app keeps the door, no hand step
+               "agent_remove"]      # the owner, 7 November 2026: "an option to Delete an agent (after confirmation)"
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -2053,7 +2054,8 @@ def migrate():
                      "kind": "TEXT NOT NULL DEFAULT 'lesson'", "cost_minutes": "INTEGER", "recheck": "TEXT"},
         "machine_checks": {"verify": "TEXT", "revision": "TEXT"},
         "server_jobs": {"was": "TEXT",              # owner feature agent_rename: the name a rename job moves from
-                        "timed_out": "INTEGER"},    # its sign-in step failed only because the owner's step did not
+                        "timed_out": "INTEGER",     # its sign-in step failed only because the owner's step did not
+                        "user": "TEXT"},            # agent_remove: the OS user that a remove job takes away
         "signin_jobs": {"timed_out": "INTEGER"},    # come in time, and so did that sign-in (UI-API.md, `timed_out`)
         # the first agent of a Mac (mac_setups), and whether its sitting has ChatGPT: null is an app from before the choice
         "join_codes": {"agent": "TEXT", "runtime": "TEXT", "chatgpt": "INTEGER"},
@@ -28650,7 +28652,8 @@ JOIN_CODE = re.compile(r"[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{12}")       # LINK_A
 FLEET_TAG = "tag:founderizer"  # the app's PrivateNetwork.tag: asked for where the hub has no tag and the tailnet has it
 TAILNET_TAG = re.compile(r"tag:[a-z0-9][a-z0-9-]{0,62}")    # a tag as the app reads one (PolicyFile.isTag)
 JOB_OPEN = ("queued", "running", "needs_owner")
-JOB_STEPS = ("user", "runtime", "checkout", "service", "sign_in")       # `user`: the agent's own OS user, on Linux
+JOB_STEPS = ("user", "runtime", "checkout", "service", "sign_in",       # `user`: the agent's own OS user, on Linux
+             "files")          # agent_remove: a removal's steps are service, files and, on Linux, user
 JOB_SILENT = 1800               # seconds after which an open job of a server without the job heartbeat has failed
 INSTALL_KEY = "install_key"     # a server service whose install job registers the new agent's key: server.INSTALL_KEY
 CODEX_SIGN_IN = RUNTIMES["codex"]["sign_in"]["url"]     # the link of its own device sign-in (sign_in_prompt)
@@ -29555,7 +29558,7 @@ def job_input(data):
     if state not in ("running", "needs_owner", "done", "failed"):
         raise ValueError("state must be running, needs_owner, done or failed")
     if step is not None and step not in JOB_STEPS:
-        raise ValueError("step must be user, runtime, checkout, service, sign_in or null")
+        raise ValueError("step must be user, runtime, checkout, service, sign_in, files or null")
     if detail is not None and not (isinstance(detail, str) and len(detail) <= 500):
         raise ValueError("detail must be text of at most 500 characters, or null")
     if (prompt is not None) != (state == "needs_owner"):
@@ -29680,6 +29683,9 @@ def add_server_agent(server, body):
         commit, digest = rev, current           # the job again: the agent is in team.json already
         kind, was = last["kind"], last["was"]
     else:
+        if q1("SELECT 1 FROM agents WHERE name=?", (agent,)):     # agent_remove: its work stays under its name
+            raise Refusal(409, f"An agent named {agent} was in this fleet before, and its records are still here. "
+                               f"Choose another name.")
         here = server_agents(server, team)
         if here and INSTALL_KEY not in server_features(server):
             raise Refusal(409, f"{server} runs an older Founderizer that cannot add a second agent. Update Founderizer "
@@ -29715,7 +29721,8 @@ def add_server_agent(server, body):
 
 def job_busy(server, last):
     """The refusal for a server whose newest job is still open: one job at a time."""
-    doing = {"install": f"installs {last['agent']}", "rename": f"renames {last['was']} to {last['agent']}"}.get(
+    doing = {"install": f"installs {last['agent']}", "rename": f"renames {last['was']} to {last['agent']}",
+             "remove": f"removes {last['agent']}"}.get(
         last["kind"], f"prepares a provider for {last['agent']}")
     return Refusal(409, f"{server} {doing} now")
 
@@ -30113,6 +30120,153 @@ def move_agent(agent, body):
         apply_team(team)
     return {"agent": agent, "server": server, "was": old, "runtime": a["runtime"], "job": job, "revision": commit,
             "sha256": digest}
+
+
+# ---- an agent leaves the fleet (owner feature agent_remove)
+#
+# The owner, 7 November 2026: "There should be an option to Delete an agent (after confirmation) and clean everything
+# (only the agent! consider that an agent can be part of a server only shared with other agents)". One commit takes its
+# team.json entry, the chat app accounts that are its own, its profile and its skills. One transaction takes what is its
+# own on the hub (REMOVED_OWN), deletes its wake-up rules, ends its open sign-in and its server's open job for it, and
+# gives that server's service the job that takes its service, its files and, on Linux, its own OS user with its home
+# (server.py `remove`). Its duties are retired. Nothing of another agent changes, on the hub or on that server.
+#
+# The work it did with the fleet stays as the fleet's history: its tasks, its messages with other agents, its reports
+# and the log. While such history is there, the name stays with it (its row in `agents`), and Add agent and a rename
+# refuse that name, so a new agent never takes over an old one's work. An agent with none, like one added by mistake,
+# leaves its name free.
+REMOVED_OWN = (("agent_usage", "name"), ("agent_limits", "agent"), ("machine_checks", "agent"),
+               ("mac_setups", "agent"), ("session_tokens", "agent"), ("session_credentials", "agent"),
+               ("ui_requests", "recipient"), ("owner_reports", "agent"), ("events", "agent"),
+               ("signin_jobs", "agent"), ("agent_notes", "agent"), ("memories", "agent"), ("rules", "agent"),
+               ("standing", "agent"), ("reminders", "agent"), ("resource_grants", "agent"),
+               ("person_agents", "agent"), ("sealed", "recipient"))
+
+
+def has_history(agent):
+    """Whether the fleet's history names this agent: a task it did or asked for, a message with another agent, or a
+    row of the history search. Its name then stays with that history (remove_agent)."""
+    return bool(read_row("SELECT 1 FROM tasks WHERE owner=? OR requester=? LIMIT 1", (agent, agent)) or
+                read_row("SELECT 1 FROM agent_messages WHERE sender=? OR recipient=? LIMIT 1", (agent, agent)) or
+                read_row("SELECT 1 FROM history WHERE agent=? LIMIT 1", (agent,)))
+
+
+def removed_team(team, agent):
+    """team.json without the agent: its entry, and every chat app account of its own (an account has exactly one
+    agent, so an account of a removed agent has none, and validate_team refuses it)."""
+    out = json.loads(json.dumps(team))
+    del out["agents"][agent]
+    apps = out.get("chat_apps")
+    if isinstance(apps, dict):
+        for aid in [k for k, acc in apps.items() if isinstance(acc, dict) and acc.get("agents") == [agent]]:
+            del apps[aid]
+        if not apps:
+            del out["chat_apps"]
+    return out
+
+
+def remove_rows(agent, t0):
+    """Inside a transaction: what the hub holds of the agent itself, its wake-up rules and its open server jobs. Each
+    line deletes what is there, so a second call after a failed removal job finds nothing more to do. Its row stays
+    until its server has removed it (free_name), so the Try again of a removal never meets a new agent of that name."""
+    in_transaction("remove_rows")
+    revoke_sessions(agent, t0)
+    for table, column in REMOVED_OWN:
+        DB.execute(f"DELETE FROM {table} WHERE {column}=?", (agent,))
+    keys = [prefix + agent for prefix in AGENT_KV + (MOVED,)]
+    DB.execute(f"DELETE FROM kv WHERE k IN ({','.join('?' * len(keys))})", keys)
+    for prefix in AGENT_KV_SCOPED:
+        DB.execute("DELETE FROM kv WHERE substr(k, 1, ?)=?", (len(prefix + agent) + 1, f"{prefix}{agent}:"))
+    for t in read_rows("SELECT id, revision, state FROM triggers WHERE agent=?", (agent,)):
+        if t["state"] in TRIGGER_ACTIONS["delete"]:
+            trigger_state_rows(t["id"], t["revision"], "delete", "owner", t0)
+    DB.execute("UPDATE server_jobs SET state='canceled', prompt=NULL, updated=?, detail=? WHERE agent=? AND kind!='remove' "
+               "AND state IN ('queued','running','needs_owner')", (t0, f"{shown_name(agent)} was deleted.", agent))
+
+
+def free_name(agent):
+    """Inside a transaction: a removed agent's row goes once nothing is left of it on a server and no history names it,
+    and with it the name is free for a new agent (add_server_agent)."""
+    in_transaction("free_name")
+    if agent not in agents() and not has_history(agent):
+        DB.execute("DELETE FROM agents WHERE name=?", (agent,))
+
+
+def remove_agent(agent, body):
+    """POST /ui/team/agents/<agent>/remove: the agent leaves the fleet (see above). Not the manager, not while the agent
+    has an open task or requested one, and not while another agent reports to it. The same command for an agent whose
+    removal job failed on its server gives that job again."""
+    t0 = now()
+    rev = kit_revision(fresh=True)
+    team, current, _ = team_view(rev)
+    if body["base_sha256"] != current:
+        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+    expire_server_jobs(t0)
+    expire_logins(t0)
+    a = team["agents"].get(agent)
+    if a is None:
+        # the removal again, after its job failed on the server: the agent left team.json with the first command
+        last = q1("SELECT * FROM server_jobs WHERE agent=? AND kind='remove' ORDER BY id DESC LIMIT 1", (agent,))
+        if not last or last["state"] != "failed":
+            raise Refusal(404, "no such agent")
+        newest = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (last["server"],))
+        if newest and newest["state"] in JOB_OPEN:
+            raise job_busy(last["server"], newest)
+        with transaction():
+            remove_rows(agent, t0)
+            job = DB.execute("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated,user) "
+                             "VALUES(?,?,?,?,?,?,?,?)", (last["server"], "remove", agent, last["runtime"], "queued", t0,
+                                                         t0, last["user"])).lastrowid
+            log_row("owner", f"asked server {last['server']} again to remove {agent}: job {job}")
+        return {"agent": agent, "server": last["server"], "job": job, "revision": rev, "sha256": current}
+    if a.get("role") == "manager":
+        raise Refusal(409, "The manager stays in your fleet.")
+    if q1("SELECT 1 FROM tasks WHERE (owner=? OR requester=?) AND state NOT IN ('completed','failed','rejected',"
+          "'canceled') LIMIT 1", (agent, agent)):
+        raise Refusal(409, f"{shown_name(agent)} has open tasks. Delete it when they are done.")
+    under = sorted(n for n, x in team["agents"].items() if x.get("reports_to") == agent)
+    if under:
+        raise Refusal(409, f"{', '.join(shown_name(n) for n in under)} report{'s' if len(under) == 1 else ''} to "
+                           f"{shown_name(agent)}. Change the reporting lines first.")
+    server = a.get("machine") if not unplaced(agent, team) else None
+    serviced = bool(server) and server in server_names(team) and \
+        bool(q1("SELECT 1 FROM server_keys WHERE server=?", (server,)))
+    if serviced:
+        newest = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (server,))
+        if newest and newest["state"] in JOB_OPEN and newest["agent"] != agent:
+            raise job_busy(server, newest)
+    new = removed_team(team, agent)
+    try:
+        validate_team(new)
+    except ValueError as e:
+        raise Refusal(400, str(e)) from None
+    data = (json.dumps(new, indent=2) + "\n").encode()
+    more = {f"profiles/{agent}.md": None} if git_blob(rev, f"profiles/{agent}.md") is not None else {}
+    code, out, _ = git_kit("ls-tree", "-r", "-z", "--name-only", rev, "--", f"{SKILLS}/{agent}/")
+    for path in (p for p in out.split("\0") if p.startswith(f"{SKILLS}/{agent}/")) if code == 0 else ():
+        more[path] = None               # its skills are its own folder, as its profile is its own file
+    commit = commit_kit_file("team.json", data, f"Owner deleted agent {agent}", more=more or None)
+    for r in read_rows("SELECT * FROM responsibilities WHERE agent=? AND state!='retired'", (agent,)):
+        duty_state_change(r, "retire", "owner", note=f"{shown_name(agent)} was deleted.")
+    for row in read_rows(f"SELECT id FROM signin_jobs WHERE agent=? AND {LOGIN_OPEN}", (agent,)):
+        LIVE_LOGINS.pop(row["id"], None)
+    with transaction():
+        remove_rows(agent, t0)
+        job = DB.execute("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated,user) "
+                         "VALUES(?,?,?,?,?,?,?,?)", (server, "remove", agent, a.get("runtime"), "queued", t0, t0,
+                                                     a.get("user"))).lastrowid if serviced else None
+        event_rows([(manager_name(), "say", None, f"[hub] The owner deleted {agent}: it is no longer in the fleet. "
+                                                  f"Its duties are retired; give their work to another agent if it is "
+                                                  f"still needed.", None)], t0)
+        log_row("owner", f"deleted agent {agent} in {commit[:12]}" + (f": server {server} removes it, job {job}"
+                                                                       if job else ""))
+    apply_team(new)
+    if job is None:
+        with transaction():
+            free_name(agent)            # no server holds anything of it
+    central_due()           # the central vault takes back what only this agent held on that machine
+    return {"agent": agent, "server": server if serviced else None, "job": job, "revision": commit,
+            "sha256": hashlib.sha256(data).hexdigest()}
 
 
 # ---- the manager writes first (owner feature manager_server)
@@ -35050,12 +35204,13 @@ class Handler(BaseHTTPRequestHandler):
         name = self.server_caller(name)
         if name is None:
             return
-        rows = q("SELECT id,kind,agent,runtime,state,was FROM server_jobs WHERE server=? AND state IN "
+        rows = q("SELECT id,kind,agent,runtime,state,was,user FROM server_jobs WHERE server=? AND state IN "
                  "('queued','running','needs_owner') ORDER BY id", (name,))
         jobs = []
         for r in rows:
             job = {k: r[k] for k in ("id", "kind", "agent", "runtime", "state")}
-            user = (agents().get(r["agent"]) or {}).get("user")
+            # A remove job names the user itself: the agent is no longer in team.json (agent_remove)
+            user = r["user"] if r["kind"] == "remove" else (agents().get(r["agent"]) or {}).get("user")
             here = q1("SELECT 1 FROM mac_setups WHERE server=? AND agent=? AND state='waiting'", (name, r["agent"]))
             jobs.append(dict(job, **({"was": r["was"]} if r["was"] else {}), **({"user": user} if user else {}),
                              **({"sign_in": "at_the_mac"} if here else {})))
@@ -35112,6 +35267,9 @@ class Handler(BaseHTTPRequestHandler):
             log("hub", f"server {name}: job {job} ({row['kind']} {row['agent']}) {update['state']}")
             if row["kind"] in ("install", "prepare"):
                 status_now(row["agent"])
+            if row["kind"] == "remove" and update["state"] == "done":
+                with transaction():
+                    free_name(row["agent"])     # agent_remove: nothing of it is left on its server
         return self.json(200, {"ok": True, "state": update["state"]})
 
     def ui_team_reload(self):
@@ -38679,6 +38837,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_agent_rename(parts[3])
         if len(parts) == 5 and parts[:3] == ["ui", "team", "agents"] and parts[4] == "move" and AGENT_NAME.fullmatch(parts[3]):
             return self.ui_agent_move(parts[3])
+        if len(parts) == 5 and parts[:3] == ["ui", "team", "agents"] and parts[4] == "remove" and AGENT_NAME.fullmatch(parts[3]):
+            return self.ui_agent_remove(parts[3])
         if parts == ["ui", "team", "logins"]:
             return self.ui_team_login()
         if parts == ["ui", "secrets", "fingerprints"]:
@@ -39547,6 +39707,19 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("runtime must be codex or claude")
             return {"agent": agent, "base_sha256": base, "server": server, "runtime": runtime}
         return self.ui_command(f"team/agents/{agent}/move", read, lambda body: move_agent(agent, body))
+
+    def ui_agent_remove(self, agent):
+        """POST /ui/team/agents/<agent>/remove (owner feature agent_remove): the agent leaves the fleet, with all that
+        is its own, on the hub and on its server (remove_agent)."""
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "base_sha256"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            base = data.get("base_sha256")
+            if not (isinstance(base, str) and re.fullmatch(r"[0-9a-f]{64}", base)):
+                raise ValueError("base_sha256 must be the SHA-256 of team.json")
+            return {"agent": agent, "base_sha256": base}
+        return self.ui_command(f"team/agents/{agent}/remove", read, lambda body: remove_agent(agent, body))
 
     def helper_vault_fingerprints(self, agent):
         """A broker registers salted fingerprints of a login that it opened for a confirmed, still open job, before

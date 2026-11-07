@@ -24,7 +24,10 @@ from before the move: there every step is this service's own user, as it was. pr
 on this server, before the owner switches it, with the same runtime and sign-in steps, under that agent's own user;
 it changes no agent, checkout or service. rename: an agent the owner gave a new name (agent_rename): its checkout, its
 agent key and its service move to the new name under the OS user it already has, so it keeps its runtime and its
-sign-in. The service runs no AI session and reads no secret. Its key is
+sign-in. remove: an agent the owner deleted (agent_remove): its service and session end, then what is its own goes, and
+nothing of another agent: on Linux its own OS user with its whole home, through the same root command
+(`fleet-agent-user --remove=fleet-<agent>`); where its home is this service's own (a Mac, or an agent from before the move), its
+checkout and its files there, by name. The service runs no AI session and reads no secret. Its key is
 ~/.fleet/server.key (mode 600); the hub keeps only its SHA-256, and it opens only this server's routes.
 """
 import argparse
@@ -36,6 +39,7 @@ import plistlib
 import pwd
 import re
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -587,7 +591,8 @@ class Service:
 
     def work(self, job):
         try:
-            kind = {"install": self.install, "prepare": self.prepare, "rename": self.rename}.get(job.get("kind"))
+            kind = {"install": self.install, "prepare": self.prepare, "rename": self.rename,
+                    "remove": self.remove}.get(job.get("kind"))
             if kind is None:
                 # The job's kind is the hub's own id, not his word: a server that does not know it is older.
                 raise failed(None, f"{self.name} runs an older Founderizer that cannot do this. Update Founderizer, "
@@ -674,6 +679,69 @@ class Service:
         self.carry_key(was, agent, user)
         self.service_step(job, agent, runtime, folder, user)
         self.post(job, "done", "service", f"{shown_name(agent)} runs on {self.name}.")
+
+    # ---- an agent the owner deleted (owner feature agent_remove)
+    def remove(self, job):
+        """The agent leaves this server, and nothing of another agent is touched: its service and its tmux session end,
+        then its files go. On Linux they are its own OS user's whole home, emptied as that user, and then that user
+        goes with its home, by the one root command the installers put in place. Where its home is this service's own
+        (a Mac, or an agent from before the move), its checkout and its files there go by their names (own_files). Each
+        step reads first, so Try again repeats only what is missing."""
+        agent = job.get("agent")
+        if not NAME.fullmatch(str(agent)):
+            raise StepFailed(None, f"{self.name} runs an older Founderizer that cannot do this. Update Founderizer, "
+                                   f"then try again.")
+        user = self.agent_user(agent, job.get("user"))
+        self.post(job, "running", "service", f"Stopping {shown_name(agent)}.")
+        self.retire(job, agent, user)
+        self.post(job, "running", "files", f"Removing {shown_name(agent)}'s files.")
+        if user:
+            home = self.home_of(user)
+            self.run(self.as_agent(user, ["find", home, "-mindepth", "1", "-maxdepth", "1", "-exec", "rm", "-rf", "--",
+                                          "{}", "+"]), timeout=300)
+            self.post(job, "running", "user", f"Removing {shown_name(agent)}'s account on {self.name}.")
+            code, out, err = self.run(["sudo", "-n", AGENT_HELPER, f"--remove={user}"], timeout=120)
+            if code != 0 or self.users(user):
+                raise failed("user", f"{shown_name(agent)}'s account on {self.name} could not be removed. Run the join "
+                                     f"line again on {self.name}, then try again.", f"OS user {user}: {err or out}")
+        else:
+            left = []
+            for path in self.own_files(agent):
+                try:
+                    if os.path.isdir(path) and not os.path.islink(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    left.append(f"{path}: {e}")
+            if left:
+                raise failed("files", f"Some of {shown_name(agent)}'s files on {self.name} could not be removed. Try "
+                                      f"again.", "; ".join(left))
+        self.post(job, "done", "user" if user else "files", f"{shown_name(agent)} is removed from {self.name}.")
+
+    def own_files(self, agent):
+        """The files of one agent in this service's own home, each by its whole name, so that removing `ac` leaves the
+        files of `ac-lead`: its checkout (only one that this service made), its helper's files in ~/.fleet as fleet.py
+        names them (its key, its usage reading, its chat and manager records and locks, its log, its checkout's
+        mark), its session credentials, an onboarding record, and the transcripts that Claude Code keeps for its
+        checkout."""
+        fleet, folder = os.path.join(self.home, ".fleet"), os.path.join(self.home, f"fleet-{agent}")
+        real = os.path.realpath(folder)
+        paths = [os.path.join(fleet, name) for name in (
+            f"agent-{agent}.key", f"usage-{agent}.json", f"helper-{agent}.lock", f"{agent}.log", f"{agent}.err",
+            "checkout-" + hashlib.sha256(real.encode()).hexdigest()[:16])]
+        paths += [os.path.join(fleet, "onboarding", f"{agent}.json"),
+                  os.path.join(self.home, ".claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", real))]
+        named = ((fleet, re.compile(rf"(?:chat|manager)-{re.escape(agent)}\.[a-z.]+")),
+                 (os.path.join(fleet, "sessions"), re.compile(rf"{re.escape(agent)}\.[^/]+")))
+        for where, pattern in named:
+            with contextlib.suppress(OSError):
+                paths += [os.path.join(where, n) for n in sorted(os.listdir(where)) if pattern.fullmatch(n)]
+        if self.ours(folder, agent):
+            paths.append(folder)
+        return paths
 
     def carry_key(self, was, agent, user=None):
         """The agent's key file under its new name, as the hub's record of that key is (hub.rename_rows): after the
