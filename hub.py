@@ -62,7 +62,7 @@ from lifecycle import (APP_SERVER, APP_SERVER_RUNTIME, DEPLOY_APP_NOTE, GITHUB_T
                        runtimes_with, shown_name, switch_target, tool_catalog, tool_needs)
 from lifecycle import SKILL_FILE, SKILL_NAME, SKILLS, skill_front, skill_rows, skills_text   # design v4 D: agents' skills
 from lifecycle import CONFIG_FILES, floor_path, keep_floor, may_take    # DevOps plan 0.1: the check of every move
-from lifecycle import SCREEN_COMMANDS, key_env, start_form              # DevOps plan 0.2: data stops being code
+from lifecycle import KEY_SUFFIXES, SCREEN_COMMANDS, key_env, start_form    # DevOps plan 0.2: data stops being code
 import lifecycle
 
 DESKTOP = Frames()
@@ -8064,8 +8064,21 @@ def t_request_secret(agent, a):
     if kind not in SECRET_KINDS:
         raise ToolError('kind is "api_key", a key that an agent reads as a variable or that its vault sends with '
                         'call_api, or "login", a user name and a password that its vault signs in with.')
-    env = str(a.get("env") or "").strip()
+    door = door_key_name(a.get("door"))
+    if door:                # DevOps plan 13, item 3: a key that the door uses for the agent that asks, as its holder
+        if not TEAM.get("door"):
+            raise ToolError("This fleet has no door, so there is no key to ask for it. Leave door out.")
+        if kind != "api_key" or not DOOR_CREDENTIAL.fullmatch(door):
+            raise ToolError(f"door is the key's name in the door's rules: <provider>:<account> of "
+                            f"{', '.join(DOOR_PROVIDERS)} (for example cloudflare:acme), model, or app:<app>:<NAME> "
+                            f"for one setting of an app on a host (for example app:shop:STRIPE_SECRET_KEY), and it "
+                            f"is an API key. AWS needs no key, and a GitHub App key comes through the app.")
+    env = str(a.get("env") or "").strip() or (door_env(door) if door else "")
     if kind == "api_key" and not env_name(env):
+        if door:
+            raise ToolError(f"The vault's name for this door key would be longer than a variable name may be: give "
+                            f"env, a shorter name that ends in _KEY, _TOKEN or _SECRET, for example "
+                            f"{door_env('app:shop:API_KEY')}. No agent reads it.")
         raise ToolError("An API key needs env: the variable name an agent reads it by, A-Z, 0-9 and _, starting "
                         "with a letter, at most 60 characters, for example STRIPE_SECRET_KEY. The names a session "
                         "sets itself (FLEET_*, ANTHROPIC_*, PATH and their like) are not available.")
@@ -8092,15 +8105,6 @@ def t_request_secret(agent, a):
     if not why or len(why) > SECRET_WHY_MAX:
         raise ToolError(f"why is what the work needs it for, in 1 to {SECRET_WHY_MAX} characters: the owner reads "
                         f"it before they type the value.")
-    door = door_key_name(a.get("door"))
-    if door:                # DevOps plan 13, item 3: a key that the door uses for the agent that asks, as its holder
-        if not TEAM.get("door"):
-            raise ToolError("This fleet has no door, so there is no key to ask for it. Leave door out.")
-        if kind != "api_key" or not DOOR_CREDENTIAL.fullmatch(door):
-            raise ToolError(f"door is the key's name in the door's rules: <provider>:<account> of "
-                            f"{', '.join(DOOR_PROVIDERS)} (for example cloudflare:hgr), model, or app:<app>:<NAME> "
-                            f"for one setting of an app on a host (for example app:shop:STRIPE_SECRET_KEY), and it "
-                            f"is an API key. AWS needs no key, and a GitHub App key comes through the app.")
     give = {"door": "use"} if door else {agent: "use"} if worker else a.get("give_to") or {}
     if not isinstance(give, dict) or len(give) > SECRET_GIVE_MAX:
         raise ToolError(f'give_to maps up to {SECRET_GIVE_MAX} agents to "use" or "read", for example '
@@ -21336,7 +21340,8 @@ TOOLS = [
                  "description": "api_key (the default): a key an agent reads as a variable or its vault sends with "
                                 "call_api. login: a user name and a password the vault signs in with."},
         "env": {"type": "string", "description": "An API key's variable name, for example STRIPE_SECRET_KEY: how "
-                                                 "an agent that reads it finds it in its sessions"},
+                                                 "an agent that reads it finds it in its sessions. A door key needs "
+                                                 "none: the hub names it DOOR_<its door name>_KEY in the vault"},
         "site": {"type": "string", "description": "The address where it is used, with https://: a login's sign-in "
                                                   "page (required for a login), or the API an agent calls with it"},
         "why": {"type": "string", "description": "What the work needs it for, in a sentence or two: the owner "
@@ -21365,7 +21370,9 @@ TOOLS = [
      S({"kind": {"type": "string", "enum": list(SECRET_KINDS),
                  "description": "api_key (the default): a key that your vault sends with call_api. login: a user name "
                                 "and a password that your vault signs in with."},
-        "env": {"type": "string", "description": "An API key's variable name, for example STRIPE_SECRET_KEY"},
+        "env": {"type": "string", "description": "An API key's variable name, for example STRIPE_SECRET_KEY. A door "
+                                                 "key needs none: the hub names it DOOR_<its door name>_KEY in the "
+                                                 "vault"},
         "site": {"type": "string", "description": "The address where it is used, with https://: a login's sign-in "
                                                   "page, or the API that your vault sends the key to (required)"},
         "why": {"type": "string", "description": "What the work needs it for, in a sentence or two: the owner "
@@ -31139,6 +31146,16 @@ def door_key_name(text):
         app, _, name = rest.partition(":")
         return f"app:{app.lower()}:{name}"
     return text.lower()
+
+
+def door_env(door):
+    """The vault's name for a door key whose request gave no env (the coordinator, 7 November 2026: both first
+    requests were refused for want of one): no agent reads it, so the hub names it after the key's door name, DOOR_
+    and that name with a key ending. model gives DOOR_MODEL_KEY, cloudflare:acme DOOR_CLOUDFLARE_ACME_KEY and
+    app:shop:STRIPE_SECRET_KEY DOOR_APP_SHOP_STRIPE_SECRET_KEY. A name longer than a variable name may be is not
+    one, and the request then needs its own env."""
+    name = "DOOR_" + re.sub(r"[^A-Z0-9]+", "_", door.upper()).strip("_")
+    return name if name.endswith(KEY_SUFFIXES) else name + "_KEY"
 
 
 def save_door_credential(name, ref, asker):
