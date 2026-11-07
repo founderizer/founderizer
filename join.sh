@@ -5,7 +5,9 @@
 #   A VPS (Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13), as root: base packages, the user fleet, then the join,
 #   security updates, the firewall and the server's own hardening (SSH keys only, npm's seven days, Tailscale's own
 #   updates). The line has joined the private network (Tailscale) before this script, and after it SSH reaches the
-#   machine over that network only.
+#   machine over that network only. With FLEET_REBOOT_TIME=<HH:MM> on the line as well, the server also takes the
+#   fleet patch policy: Ubuntu's -updates as well as -security, and a restart at that time (UTC) when an update needs
+#   one. Without it, it takes security updates only and never restarts by itself.
 #   A Mac (macOS 14 or later, with Tailscale and Homebrew), as the user that will run the agents: tmux and Python
 #   with Homebrew, then the join, then this Mac's vault, the one step that asks for that user's password, then
 #   Claude's extension for Chrome. The Founderizer installer runs the same line as root behind macOS's own password
@@ -33,6 +35,7 @@ WORKER=fleet
 PACKAGES="git tmux python3 curl ca-certificates ufw unattended-upgrades sudo"
 MAC_USER=""     # the user that will run a Mac's agents
 USER_PATH=""    # that user's PATH
+REBOOT_TIME=""  # FLEET_REBOOT_TIME: this server's own restart time (UTC, HH:MM) for the fleet patch policy, or none
 ready=yes       # what the last step, verify, answered about this machine
 # Seconds that each apt-get waits for the package lock: a new server runs its first updates for about 9 minutes after
 # its first boot, and they hold it (hubsetup.py's APT_LOCK_WAIT).
@@ -48,6 +51,12 @@ linux() {
     case "${ID:-} ${VERSION_ID:-}" in
         "ubuntu 22.04"|"ubuntu 24.04"|"ubuntu 26.04"|"debian 12"|"debian 13") ;;
         *) stop "This system is ${ID:-unknown} ${VERSION_ID:-}. Use Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13." ;;
+    esac
+    case "$REBOOT_TIME" in
+        "") ;;
+        [01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9])
+            [ "${ID:-}" = ubuntu ] || stop "FLEET_REBOOT_TIME is for Ubuntu only: the fleet patch policy is Ubuntu's." ;;
+        *) stop "FLEET_REBOOT_TIME is \"$REBOOT_TIME\": give the restart time in UTC as HH:MM, for example 02:18." ;;
     esac
     command -v systemctl >/dev/null 2>&1 || stop "systemd is required."
     reach
@@ -256,22 +265,59 @@ verify_step() { # $1: the checkout; $2: how to run a command as the user of the 
     fi
 }
 
-updates() {     # unattended security updates on, then the pending ones once; never a restart of the server. They run as
-                # apt's own two daily services, so apt records the run as its timers do (upgrade-stamp, which the
-                # server's own reading gives the hub as the time of its last good security update): a bare
-                # unattended-upgrade installs the same and records nothing until the first daily run.
+updates() {     # unattended security updates on, then the pending ones once; the join itself never restarts the
+                # server. They run as apt's own two daily services, so apt records the run as its timers do
+                # (upgrade-stamp, which the server's own reading gives the hub as the time of its last good security
+                # update): a bare unattended-upgrade installs the same and records nothing until the first daily run.
+                # With FLEET_REBOOT_TIME the fleet patch policy comes last, after the pending updates, so that no
+                # restart comes in the middle of the join.
     printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n' \
         > /etc/apt/apt.conf.d/20auto-upgrades
     systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
     eval "$(apt-config shell AUTO_REBOOT Unattended-Upgrade::Automatic-Reboot/b)"
     if [ "${AUTO_REBOOT:-false}" = true ]; then
         say "security updates are on; this server restarts by itself after updates, so they install in its daily run"
-        return 0
+    else
+        say "security updates are on; installing the pending ones (this can take some minutes)"
+        apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" -q install </dev/null >/dev/null 2>&1 || true
+        apt_daily || say "some security updates did not install now; the daily run tries again"
+        [ -n "$REBOOT_TIME" ] || [ ! -f /var/run/reboot-required ] \
+            || say "this server needs a restart for its updates; restart it when it has no work"
     fi
-    say "security updates are on; installing the pending ones (this can take some minutes)"
-    apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" -q install </dev/null >/dev/null 2>&1 || true
-    apt_daily || say "some security updates did not install now; the daily run tries again"
-    [ ! -f /var/run/reboot-required ] || say "this server needs a restart for its updates; restart it when it has no work"
+    if [ -n "$REBOOT_TIME" ]; then
+        patch_policy || stop "The fleet patch policy could not be written: the line above says why. Run the line again."
+    fi
+}
+
+patch_policy() { # The fleet patch policy, as every Ubuntu server of the fleet has it: the bytes of
+                 # scripts/security/apt/52fleet-unattended-upgrades in the DevOps repository (a copy: change both
+                 # together), with this server's own time in place of @REBOOT_TIME@. apt reads it after its 50 and 51
+                 # files, so it adds -updates to the stock origins and turns the restart on, at that time (UTC) and
+                 # only when an update needs one.
+    sed "s/@REBOOT_TIME@/$REBOOT_TIME/" > /etc/apt/apt.conf.d/52fleet-unattended-upgrades <<'EOF' || return 1
+// Fleet patch policy. Installed as /etc/apt/apt.conf.d/52fleet-unattended-upgrades
+// on every Ubuntu host, with @REBOOT_TIME@ set to the host's time from
+// docs/patch-policy.md. Change this file in the repo, not on the host.
+//
+// 1. Take Ubuntu -updates as well as -security. Ubuntu can publish a fixed
+//    kernel in -updates days before -security (CVE-2026-98432, 2026-11).
+// 2. A new kernel protects a host only after a reboot, so reboot when a
+//    package needs it, at the host's own time (UTC).
+Unattended-Upgrade::Allowed-Origins {
+        "${distro_id}:${distro_codename}-updates";
+};
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "true";
+Unattended-Upgrade::Automatic-Reboot-Time "@REBOOT_TIME@";
+EOF
+    eval "$(apt-config shell AUTO_REBOOT Unattended-Upgrade::Automatic-Reboot/b \
+        AT Unattended-Upgrade::Automatic-Reboot-Time)"
+    if [ "${AUTO_REBOOT:-false}" = true ] && [ "${AT:-}" = "$REBOOT_TIME" ]; then
+        say "the fleet patch policy: -security and -updates, and a restart at $REBOOT_TIME UTC when an update needs one"
+    else
+        say "the fleet patch policy is written, but apt-config shows no restart at $REBOOT_TIME: another file in \
+/etc/apt/apt.conf.d changes it"
+    fi
 }
 
 apt_daily() {   # apt's two daily services once, to their end: true when both ended well. A systemctl start that waits
@@ -363,6 +409,7 @@ main() {
     [ -n "${FLEET_JOIN:-}" ] || stop "No join code. Copy the whole line from Founderizer: Settings, Servers, Add server."
     code=$FLEET_JOIN
     unset FLEET_JOIN
+    REBOOT_TIME=${FLEET_REBOOT_TIME:-}
     case "$(uname -s)" in
         Linux) linux ;;
         Darwin) mac ;;

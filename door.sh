@@ -109,13 +109,17 @@ if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: activ
     ufw allow in on tailscale0 to any port "$PORT" proto tcp comment 'fleet door' >/dev/null
 fi
 
-# the local patch timer: security updates every day, and a reboot at 04:30 UTC when one needs it
+# the local patch timer: updates from -security and -updates every day, as the fleet patch policy takes them (Ubuntu
+# can put a fixed kernel in -updates days before -security), and a reboot at 04:30 UTC when one needs it
 cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 EOF
 cat > /etc/apt/apt.conf.d/52fleet-door <<'EOF'
 // The door patches itself (door.sh): no agent holds it.
+Unattended-Upgrade::Allowed-Origins {
+        "${distro_id}:${distro_codename}-updates";
+};
 Unattended-Upgrade::Automatic-Reboot "true";
 Unattended-Upgrade::Automatic-Reboot-Time "04:30";
 EOF
