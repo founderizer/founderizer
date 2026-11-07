@@ -20768,7 +20768,8 @@ def resume_lines(t0):
     waits = door_waits_after()
     if waits:
         out.append(f"The door's parts wait after {waits}, whose door check passed: once its Operator's normal work "
-                   f"there through the door passed (test 6), call door_rollout with go true.")
+                   f"there through the door with rule calls passed (test 6), call door_rollout with go true. A judged "
+                   f"call refused for want of a judge key does not hold it back.")
     tasks = q(f"SELECT * FROM tasks WHERE {OPEN_TASK} ORDER BY id")
     if tasks:
         out.append("Open tasks:")
@@ -21328,9 +21329,11 @@ TOOLS = [
     ("manager", "door_rollout", t_door_rollout,
      "Let the app put the door's parts on the business servers after the first one, or stop it. The app puts them on "
      "one server first, checks that server's second sshd itself (test 1), and the hub tells you when that passed. Then "
-     "give the server's Operator normal work there through the door (test 6). When that work passed, call this with "
-     "go true: the app puts the parts on the other servers, one each round, and checks each one the same way. go "
-     "false stops it after the server that it is on.",
+     "give the server's Operator normal work there through the door with rule calls (test 6: updates, a service "
+     "restart and a reboot on a CI runner, and on an app host also a deploy, a backup run, an nginx edit and a "
+     "restore). A judged call that the door refuses for want of a judge key does not hold it back. When that work "
+     "passed, call this with go true: the app puts the parts on the other servers, one each round, and checks each "
+     "one the same way. go false stops it after the server that it is on.",
      S({"request_id": REQUEST_ID,
         "go": {"type": "boolean", "description": "true: the other servers get the door's parts too; false: no "
                                                  "further server gets them"},
@@ -31139,12 +31142,15 @@ def door_host_report(body):
     if state == "passed" and not rollout:
         told = (f"[hub] The door's parts are on {host}, the first server, and the door's own check of its second sshd "
                 f"passed (test 1): no shell, no TTY, no scp, no forward and no form outside the list, and a read and a "
-                f"rule form through sudo ops-root work. Give its Operator normal work there through the door (test 6: "
-                f"an update, a restart, a deploy, a restic run, an nginx edit, a reload and a restore). When that work "
-                f"passed, call door_rollout with go true: the app then puts the parts on the other servers, one each "
-                f"round, and checks each one the same way. Before that, give door_hold to each server that a plan step "
-                f"keeps from the door: parts (it gets none, and no grant) or judged (it gets its parts, and the door "
-                f"runs no judged call there).")
+                f"rule form through sudo ops-root work. Give its Operator normal work there through the door with "
+                f"rule calls (test 6): on a CI runner, updates, a service restart and one reboot when no build runs; "
+                f"on an app host also a deploy, a restic run, an nginx edit and reload, and a restore. A judged call "
+                f"that the door refuses because it has no judge key yet is test 4's expected result: it does not "
+                f"count against test 6 and does not hold back door_rollout, and judged work waits for the judge's "
+                f"key card. When that work passed, call door_rollout with go true: the app then puts the parts on the "
+                f"other servers, one each round, and checks each one the same way. Before that, give door_hold to "
+                f"each server that a plan step keeps from the door: parts (it gets none, and no grant) or judged (it "
+                f"gets its parts, and the door runs no judged call there).")
     elif state == "failed":
         told = (f"[hub] The door's parts did not go on {host}, or the door's check of it failed: {said} The app puts "
                 f"the parts on no other server until a new release of the app or the door.")

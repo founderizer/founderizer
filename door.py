@@ -128,6 +128,11 @@ HOST_KEY = re.compile(r"ssh-ed25519 [A-Za-z0-9+/=]{60,100}")
 WINDOW_CLASSES = ("upgrade", "restart", "reboot", "deploy", "tailscale")
 APPROVAL_NOTE = (" Its call hash is {sha}: a Needs-you item that names it (raise_needs_you door_call) lets this exact "
                  "call through once, when the owner answers yes.")
+# The coordinator, 7 November 2026: while the door holds no judge key, judged work waits for the judge's key card, and
+# nobody asks the owner to let a judged call through (test 4's expected result, which holds back no rollout)
+NO_JUDGE = ("the door has no judge key yet, so it runs no judged call: judged work waits until the owner saves the "
+            "judge's key card (the manager's request_secret with door model), and nobody asks the owner to let a "
+            "judged call through meanwhile. Rule calls work as before")
 JUDGE_SYSTEM = (
     "You are the judge of a door that runs operations on servers and cloud accounts for automated agents. One agent "
     "asks for one action. Allow it only when it is a normal, narrow operations step on that target: it must not read "
@@ -610,7 +615,8 @@ class Door:
                     allowed, why = self.judge(agent, access, d, op, args, content)
                     if not allowed:
                         d = door_targets.refused(why + (door_providers.AWS_COST if target.startswith("aws:") else ".")
-                                                 + APPROVAL_NOTE.format(sha=sha), target=d.target)
+                                                 + ("" if why == NO_JUDGE else APPROVAL_NOTE.format(sha=sha)),
+                                                 target=d.target)
         if d.kind == "refused":
             n = self.record.add(caller=agent, target=target, action=op, kind="refused", outcome="refused",
                                 why=d.why[:300], sha256=sha)
@@ -775,6 +781,8 @@ class Door:
         business = (access["agents"][agent].get("business")) or "-"
         if content is not None and len(content) > self.conf.get("judge_max", JUDGE_MAX):
             return False, f"the content is over {self.conf.get('judge_max', JUDGE_MAX) // 1024} KiB: refused, never cut"
+        if self.judge_key() is None:
+            return False, NO_JUDGE      # no model call, and no judged call of the business's day is used
         key = hashlib.sha256(json.dumps([d.target, op, args], sort_keys=True).encode() + (content or b"")).hexdigest()
         with self.lock:
             if key in read_json(REFUSED_FILE, {}):
@@ -804,11 +812,17 @@ class Door:
         return False, "the judge refused it" if verdict == "refuse" else \
             "the judge did not answer, and a judged call refuses then"
 
+    def judge_key(self):
+        """The judge's model key (the door's credential "model"), or None while the door holds none."""
+        try:
+            return self.secret(((self.access().get("credentials") or {}).get("model") or {}).get("secret"))
+        except Refused:
+            return None
+
     def ask_model(self, target, op, args, text):
         """allow, refuse or None (no answer). Raw HTTPS: the door installs nothing beside Python's standard library."""
-        try:
-            key = self.secret(((self.access().get("credentials") or {}).get("model") or {}).get("secret"))
-        except Refused:
+        key = self.judge_key()
+        if key is None:
             return None
         request = json.dumps({"target": target, "action": op, "arguments": args, "content": text},
                              ensure_ascii=False)
