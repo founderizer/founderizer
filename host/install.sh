@@ -25,6 +25,7 @@ COVERED="ubuntu:24.04 ubuntu:26.04"          # the releases whose test 5 ran on 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ETC=/etc/ops-root LIB=/usr/local/lib/ops-root SBIN=/usr/local/sbin/ops-root STATE=/var/lib/ops-root
 UNIT=/etc/systemd/system/ops-sshd.service SUDOERS=/etc/sudoers.d/ops-agent
+BOOT_UNIT=/etc/systemd/system/ops-root-rollback-at-boot.service      # ops-root's own: each arm puts it in place
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 
@@ -55,7 +56,8 @@ esac
 
 remove() {
     systemctl disable --now ops-sshd.service 2>/dev/null || true
-    rm -f "$UNIT" "$SUDOERS"
+    systemctl disable "${BOOT_UNIT##*/}" 2>/dev/null || true
+    rm -f "$UNIT" "$BOOT_UNIT" "$SUDOERS"
     rm -rf /etc/systemd/system/ops-sshd.service.d
     systemctl daemon-reload
     if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
@@ -199,8 +201,10 @@ if [ "$LEVEL" = fix ]; then
     visudo -c -q -f "$SUDOERS.new" >/dev/null
     mv -f "$SUDOERS.new" "$SUDOERS"
 else
-    # from Fix down to Read: the root path leaves, and so do the files that only ops-root reads
+    # from Fix down to Read: the root path leaves, and so do the files that only ops-root reads, the rollback's
+    # snapshot too: no ops-root fires it here, and a Fix much later must not find it at its first boot
     rm -f "$SUDOERS" "$SBIN" "$ETC/mode" "$ETC/fleet-kit" "$ETC/pool" "$ETC/build-file" "$ETC/runner-user"
+    rm -rf "$STATE/rollback"
 fi
 systemctl is-active --quiet ops-sshd.service || die "the second sshd did not start: journalctl -u ops-sshd"
 echo "installed: level $LEVEL${MODE:+, mode $MODE}, the second sshd on $ADDRESS:$PORT"

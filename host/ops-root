@@ -60,6 +60,7 @@ INVENTORY = LIB + "/inventory"
 READER = LIB + "/ops-read"
 SSHD_UNIT = "ops-sshd.service"              # the second sshd
 TIMER_UNIT = "ops-root-rollback"            # the 600-second rollback timer
+BOOT_UNIT = "ops-root-rollback-at-boot.service"     # what a reboot keeps of the timer; 25 characters, so no app's name
 BOOT_ID = "/proc/sys/kernel/random/boot_id"  # one id for each boot of the host: a snapshot of this boot is kept
 ROLLBACK_AFTER = 600
 PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -103,7 +104,8 @@ REFUSED_ARGS = {"-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-f
 PROTECTED = ("/usr/local/sbin/ops-root", LIB + "/", ETC + "/", STATE + "/", "/var/lib/ops-agent/",
              "/etc/sudoers.d/ops-agent", "/etc/passwd", "/etc/shadow", "/etc/group", "/etc/gshadow", "/etc/sudoers",
              "/etc/ld.so.preload", "/etc/pam.d/", "/etc/ssh/", "/etc/security/",
-             "/etc/systemd/system/" + SSHD_UNIT, "/etc/systemd/system/" + SSHD_UNIT + ".d/")
+             "/etc/systemd/system/" + SSHD_UNIT, "/etc/systemd/system/" + SSHD_UNIT + ".d/",
+             "/etc/systemd/system/" + BOOT_UNIT, "/etc/systemd/system/" + BOOT_UNIT + ".d/")
 # The app trees and secret paths of every host, beside the host's own list (HIDDEN_FILE).
 HIDDEN = ("/var/www", "/srv", "/opt", "/home", "/root", "/etc/letsencrypt", "/etc/ssl/private", "/etc/credstore",
           "/etc/founderizer", "/var/lib/docker", "/var/lib/containerd", "/var/lib/postgresql", "/var/lib/mysql",
@@ -228,6 +230,8 @@ def check_unit(args, kinds=("service",), name="this form"):
     unit = unit_name(one(args, name, "a unit"), kinds)
     if unit == SSHD_UNIT:
         raise Refused("the door's own sshd is not a unit of this form")
+    if unit == BOOT_UNIT:           # its start waits for the host's lock, which this form holds
+        raise Refused("the rollback's boot unit is ops-root's own, not a unit of this form")
     return [unit]
 
 
@@ -1715,15 +1719,75 @@ def idle_runner(name):
 
 
 # ---- the rollback timer
+#
+# The timer is a transient unit, and a transient unit does not outlive a reboot (nor a soft reboot, which keeps the
+# boot id), while ufw applies its files again at boot. So a lockout whose countdown a reboot cut short stayed for good.
+# While a countdown runs, the rollback folder holds the mark ARMED, and BOOT_UNIT runs `--boot` at each boot: a mark
+# whose timer runs no more is a countdown that the reboot ended, and it fires, as that timer would have.
+
+ARMED = STATE + "/rollback/armed"           # a countdown runs: written before its timer starts, gone with the folder
+
+BOOT_TEXT = f"""[Unit]
+Description=ops-root: the rollback whose timer a reboot ended
+ConditionPathExists={ARMED}
+ConditionPathIsExecutable={SELF}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={SELF} --boot
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def boot_unit():
+    """BOOT_UNIT in place and enabled, at each arm: a self-update brings this file and no unit, and only an arm leaves
+    a snapshot that a boot could find. An arm whose unit is not in place fails, and the change after it does not run."""
+    path = "/etc/systemd/system/" + BOOT_UNIT
+    try:
+        if read(path) != BOOT_TEXT:
+            os.makedirs(os.path.dirname(P(path)), exist_ok=True)
+            replace(path, BOOT_TEXT.encode(), 0o644)
+            checked(systemctl("daemon-reload"), None)
+        if systemctl("is-enabled", BOOT_UNIT)[1].strip() != "enabled":
+            checked(systemctl("enable", BOOT_UNIT), None)
+    except (Failed, OSError) as e:
+        raise Failed(f"the rollback timer could not put {BOOT_UNIT} in place: {e}") from None
+
+
+def countdown_lost():
+    """A countdown ran (its mark, which no cancel and no fire removed) and its timer runs no more."""
+    return os.path.isfile(P(ARMED)) and systemctl("is-active", TIMER_UNIT + ".timer")[1].strip() != "active"
+
+
+def at_boot():
+    """At each boot, from BOOT_UNIT: a countdown that the reboot ended fires now, as its timer would have; one that an
+    arm of this boot started runs on. The check comes again under the host's lock, which no write of an earlier boot
+    holds: an arm of this boot takes its snapshot before the check or after the fire, never while the old files go
+    back. While a countdown runs it takes no lock, so a start of the unit then waits for nothing."""
+    if not countdown_lost():
+        return
+    os.makedirs(os.path.dirname(P(LOCK_FILE)) or "/", exist_ok=True)
+    with open(P(LOCK_FILE), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if countdown_lost():
+            fire()
+            print("the reboot ended a rollback countdown: the files are back as at its first arm")
+
 
 def arm_timer():
     """Save the firewall's and sshd's files and the Tailscale version as they are now, and start the timer that puts
-    them back in ROLLBACK_AFTER seconds unless `timer cancel` comes first. Armed again before a cancel or the fire,
-    in the same boot: the countdown starts again, and the files and the version stay those of the first arm. A
-    firewall file arms it, and so does the `ufw` or `nft` that applies that file, so a new snapshot at each arm would
-    keep the very change that locked the door out, and the timer would put that back; a start of the timer that
-    failed does not make the next arm take a new one either. After a boot the host runs every file it has, and the
-    arm came through the door, so the next arm takes a new snapshot."""
+    them back in ROLLBACK_AFTER seconds unless `timer cancel` comes first; BOOT_UNIT and the mark ARMED before that,
+    so that a reboot in the countdown puts them back too. Armed again before a cancel or the fire, in the same boot:
+    the countdown starts again, and the files and the version stay those of the first arm. A firewall file arms it,
+    and so does the `ufw` or `nft` that applies that file, so a new snapshot at each arm would keep the very change
+    that locked the door out, and the timer would put that back; a start of the timer that failed does not make the
+    next arm take a new one either. After a boot the host runs every file it has, and the arm came through the door,
+    so the next arm takes a new snapshot."""
+    boot_unit()
     folder = P(STATE + "/rollback")
     snapshot = os.path.join(folder, "snapshot.tar")
     boot = read(BOOT_ID).strip()
@@ -1740,6 +1804,7 @@ def arm_timer():
                 f.write(version.strip() if re.fullmatch(r"[A-Za-z0-9.+~:-]{1,60}", version.strip()) else "")
             with open(os.path.join(folder, "boot"), "w") as f:
                 f.write(boot + "\n")
+        open(P(ARMED), "w").close()
         systemctl("stop", TIMER_UNIT + ".timer")
         status, out = run(["systemd-run", f"--on-active={ROLLBACK_AFTER}", f"--unit={TIMER_UNIT}", "--collect",
                            "--quiet", SELF, "--fire"])
@@ -1748,22 +1813,30 @@ def arm_timer():
     except Failed:
         # A first arm that did not start: the change it came before does not run, so its snapshot guards nothing and
         # must not stay for the rest of the boot. A later arm's snapshot stays: a change of the first one is in place.
+        # But no countdown runs now, so no boot fires it either.
         if not kept:
             shutil.rmtree(folder, ignore_errors=True)
+        else:
+            with contextlib.suppress(OSError):
+                os.remove(P(ARMED))
         raise
     return f"the rollback timer is armed: in {ROLLBACK_AFTER} seconds it restores the firewall, sshd and Tailscale" + \
         (" as they were at its first arm" if kept else "")
 
 
 def cancel_timer():
+    """The countdown ends and its change stays. With no snapshot left, the answer says so: a fire or a boot may have
+    put the files back before this cancel came."""
     systemctl("stop", TIMER_UNIT + ".timer")
+    waited = os.path.isdir(P(STATE + "/rollback"))
     shutil.rmtree(P(STATE + "/rollback"), ignore_errors=True)
-    return "the rollback timer is off"
+    return "the rollback timer is off" if waited else \
+        "the rollback timer is off, and no snapshot waited: its fire or a boot put the files back, or nothing armed it"
 
 
 def fire():
-    """The timer fired: systemd's failed states first (one past revert failed on the start limit), then the files,
-    the Tailscale version and the services."""
+    """The timer fired, or a boot found a countdown that the reboot ended: systemd's failed states first (one past
+    revert failed on the start limit), then the files, the Tailscale version and the services."""
     folder = P(STATE + "/rollback")
     run(["systemctl", "reset-failed"])
     if os.path.isfile(os.path.join(folder, "snapshot.tar")):
@@ -1999,11 +2072,14 @@ def call(req, data=None):
 
 
 def main(argv):
-    if len(argv) == 2 and argv[1] == "--fire":
+    if len(argv) == 2 and argv[1] in ("--fire", "--boot"):
         if os.getppid() != 1:
-            print("refused: --fire is the rollback timer's own")
+            print(f"refused: {argv[1]} is the rollback timer's own")
             return 3
-        fire()
+        if argv[1] == "--fire":
+            fire()
+        else:
+            at_boot()
         return 0
     try:
         if len(argv) != 2:
