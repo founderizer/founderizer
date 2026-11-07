@@ -1979,7 +1979,8 @@ def migrate():
                   # yes to it, which only the door reads (GET /door/approvals)
                   "door_call": "TEXT", "approval": "TEXT",
                   "github_app": "TEXT",       # plan 13, item 4: the account that the item's first option makes an App in
-                  "add_device": "INTEGER"},   # plan V12 and 8.3: the item's first option opens the Add device picture
+                  "add_device": "INTEGER",    # plan V12 and 8.3: the item's first option opens the Add device picture
+                  "github_key": "TEXT"},      # plan 13, item 4: the App owner whose key the item renews (door_renew)
         "owner_reports": {"agent": "TEXT NOT NULL DEFAULT 'manager'", "in_reply_to": "TEXT",
                           "pushed": "INTEGER NOT NULL DEFAULT 0"},     # chat apps round 2: message_owner
         "chat_out": {"recipient": "TEXT"},          # chat apps round 2: a Discord user ID when chat is null
@@ -7769,6 +7770,17 @@ def t_raise_needs_you(agent, a):
             raise ToolError("add_device is true, with options whose first one is the yes, and no door_call or "
                             "github_app: his first option, pressed in Founderizer on his Mac, opens the Add device "
                             "picture, which his phone scans, for example [\"Show the picture\", \"Not now\"].")
+    github_key = a.get("github_key")
+    if github_key is not None:      # plan 13, item 4: the two steps of the App key that the hub held (door_renew)
+        renew = door_renewal() or {}
+        if not (isinstance(github_key, str) and renew.get("step") in ("ask", "delete")
+                and github_key.lower() == str(renew.get("owner")).lower()):
+            raise ToolError("github_key is the GitHub account whose App key the hub asked you to renew, and only "
+                            "while it waits for that: the hub's message names it.")
+        if options or door_call is not None or github_app is not None or add_device is not None:
+            raise ToolError("An item with a github_key has no options, door_call, github_app or add_device: it asks "
+                            "him nothing back, and the hub closes it by itself.")
+        github_key = renew["owner"]
     notice = need_is_notice(title, why, todo, *(json.loads(options) if options else ()))
     if notice:
         raise ToolError(notice)
@@ -7783,10 +7795,10 @@ def t_raise_needs_you(agent, a):
         qu = need_question(agent, a.get("question_id"))
         if qu:                  # the asker's own words, which the owner answers
             why += f" Quoting {qu['asker']} (Q-{qu['id']} on {tref(qu['task'])}): \"{clip(qu['text'], 1000)}\""
-        nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,github_app,add_device) "
-                  "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,github_app,add_device,"
+                  "github_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                   (unused_id("needs"), title, why, todo, now(), agent, options, qu["id"] if qu else None, door_call,
-                   github_app, 1 if add_device else None))
+                   github_app, 1 if add_device else None, github_key))
     emit("owner", "notify", f"Needs you N-{nid}: {title}")
     ping_need(nid)                                      # owner feature push: the phone rings, also when it is closed
     picks = (" The owner sees your options and presses one: " + ", ".join(json.loads(options)) +
@@ -7806,8 +7818,11 @@ def t_raise_needs_you(agent, a):
         door = (" When the owner presses the first option in Founderizer on his Mac, it opens the Add device picture, "
                 "and his phone enrolls when it scans it: it then gets the phone's signed yes of door calls and a copy "
                 "of the recovery code (GET /ui/owner/devices: certified and recovery).")
-    later = "" if qu else (" If nothing needs it any more before the owner answers, close it at once with "
-                           "withdraw_need.")
+    if github_key:
+        door = (f" The hub closes N-{nid} by itself when its step is done (the door makes tokens with the new key, or "
+                f"GitHub refuses the old one), so do not withdraw it, and nobody asks him to report back.")
+    later = "" if qu or github_key else (" If nothing needs it any more before the owner answers, close it at once "
+                                         "with withdraw_need.")
     return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{linked}{later}{door}{picks}"
 
 
@@ -21296,7 +21311,10 @@ TOOLS = [
         "add_device": {"type": "boolean", "description": "True when his phone must enroll again from the Add device "
                        "picture: for its signed yes of door calls, or for its copy of the recovery code (the devices "
                        "list says which phone lacks one). His first option, pressed in Founderizer on his Mac, opens "
-                       "that picture, and his phone scans it. Give options whose first one is the yes."}},
+                       "that picture, and his phone scans it. Give options whose first one is the yes."},
+        "github_key": {"type": "string", "description": "Only when the hub asks for it: the GitHub account whose App "
+                       "key the door got from the hub, for the item that makes its new key or the one that deletes "
+                       "the old key. No options: the hub closes it by itself, and the hub's message gives its words."}},
        ["title", "why", "what_to_do"])),
     ("manager", "withdraw_need", t_withdraw_need,
      "Close an open Needs-you item that you raised and that nothing needs any more: a plan change replaced it, the "
@@ -30626,8 +30644,12 @@ def integrations_view(team, lines):
                         needs=tool_needs(tool), **state.get(name, {}))
              for name, tool in tool_catalog(team).items()}
     unreached = github_unreached(r for line in lines for r in line["repos"]) if app else {}
+    # plan 13, item 4: the GitHub App rows show their form while the item that asks for the App's new key is open
+    renew = door_renewal() or {}
+    renew = door and renew.get("step") == "ask" and q1("SELECT 1 FROM needs WHERE github_key=? AND answer IS NULL",
+                                                       (renew.get("owner"),)) is not None
     return {"tools": tools, "github": {"app": app, "app_id": app_id, "problem": problem, "unreached": unreached,
-                                       "door": door},
+                                       "door": door, "renew": renew},
             "google": google_view(team)}
 
 
@@ -31213,6 +31235,99 @@ def door_github_tokens(agent, repos):
     return tokens, [e for e in answer.get("errors") or [] if isinstance(e, dict)]
 
 
+# Plan 13, item 4 (the coordinator's yes of 7 November 2026): the door makes every GitHub token with the App key that
+# the hub held, and that key gets a successor, then goes. GitHub makes and deletes an App's keys only on its own page,
+# so each step is one Needs-you item that the manager raises with github_key, and the hub closes each one by itself:
+# "ask" waits for the door to make tokens with a new key, which the owner gives through the GitHub App rows (their
+# form shows while that item is open: GET /ui/team github.renew), and "delete" waits for GitHub to refuse the old key.
+# Nothing starts before the first task session's tokens through the door worked (kv door_first_token).
+DOOR_RENEW_EVERY = 300          # seconds between two looks, each one call to the door and one to GitHub
+DOOR_RENEW = {"at": 0.0}
+GITHUB_KEY_PRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}=")
+GITHUB_APP_PAGE = re.compile(r"https://github\.com/(?:organizations/[A-Za-z0-9][A-Za-z0-9-]{0,38}/)?settings/apps/"
+                             r"[a-z0-9][a-z0-9-]{0,99}")
+
+
+def door_renewal():
+    """The renewal of the App key that the hub held: {owner, app_id, old, fingerprint, page, step, at}, or None."""
+    with contextlib.suppress(ValueError, TypeError):
+        found = json.loads(kv_get("door_github_renew") or "null")
+        return found if isinstance(found, dict) else None
+    return None
+
+
+def close_github_key_needs(owner, why):
+    """The renewal's open Needs-you items of this owner, closed by the hub with its reason, and no notification."""
+    t0 = now()
+    with LOCK, transaction():
+        for need in DB.execute("SELECT id, title FROM needs WHERE github_key=? AND answer IS NULL", (owner,)).fetchall():
+            DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
+                       (f"Closed by the hub: {why}", t0, "hub", need["id"]))
+            DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)",
+                       (t0, "hub", f"closed N-{need['id']} {clip(need['title'] or '', 80)}: {why}"))
+
+
+def door_renew(t0=None):
+    """One look at the renewal, outside LOCK: the door says which key it uses for the hub's old App, that key's
+    fingerprint as GitHub's page shows it, and whether GitHub still takes it (POST /github/key on the door)."""
+    t0 = t0 or now()
+    conf, app_id = door_conf(), door_app_id()
+    state = door_renewal() or {}
+    if conf is None or app_id is None or state.get("step") == "done" or t0 - DOOR_RENEW["at"] < DOOR_RENEW_EVERY:
+        return None
+    if not state and not kv_get("door_first_token"):
+        return None
+    DOOR_RENEW["at"] = t0
+    asked = {"app_id": app_id, **({"ref": state["old"]} if state.get("step") == "delete" else {})}
+    status, key = door_call(conf, "POST", "/github/key", conf["token"], asked)
+    if status != 200 or not isinstance(key, dict):
+        return None             # the next look asks again; door_sweep tells the manager of a door that does not answer
+    manager = manager_name()
+    if not state:
+        if key.get("signs") is not True or not GITHUB_KEY_PRINT.fullmatch(str(key.get("fingerprint"))) or \
+                not GITHUB_APP_PAGE.fullmatch(str(key.get("page"))) or not GITHUB_LOGIN.fullmatch(str(key.get("owner"))) \
+                or not isinstance(key.get("ref"), str):
+            return None
+        state = {"owner": key["owner"], "app_id": app_id, "old": key["ref"], "fingerprint": key["fingerprint"],
+                 "page": key["page"], "step": "ask", "at": round(t0)}
+        kv_set("door_github_renew", json.dumps(state, sort_keys=True))
+        emit(manager, "say", f"[hub] The first task session's GitHub tokens through the door worked. The door makes "
+                             f"every token with the App key that the hub held (App {app_id} of {state['owner']}), so "
+                             f"that key gets a successor and then goes (DevOps plan 13, item 4). Raise one Needs-you "
+                             f"item now with raise_needs_you, github_key \"{state['owner']}\" and no options. Its "
+                             f"what_to_do: on {state['page']}, click \"Generate a private key\"; then in Founderizer on "
+                             f"his Mac, on the Apps page under GitHub, choose the file that GitHub downloaded next to "
+                             f"Private key, and click Save. The form shows there while the item is open, with the "
+                             f"App's ID in it. The hub closes the item by itself when the door makes tokens with the "
+                             f"new key, and then it tells you the second item, which deletes the old key.")
+        log("hub", f"the App key that the hub held gets a successor: App {app_id} of {state['owner']}, "
+                   f"{state['fingerprint']}")
+        return state
+    if state["step"] == "ask":
+        if key.get("signs") is not True or state["old"] in (key.get("used") or [state["old"]]):
+            return None
+        close_github_key_needs(state["owner"], "the door makes every GitHub token with the new App key now")
+        state = dict(state, step="delete", at=round(t0))
+        kv_set("door_github_renew", json.dumps(state, sort_keys=True))
+        emit(manager, "say", f"[hub] The door makes every GitHub token with the new App key of {state['owner']}, and "
+                             f"the hub closed the first item. Raise the second Needs-you item now with "
+                             f"raise_needs_you, github_key \"{state['owner']}\" and no options. Its what_to_do: on "
+                             f"{state['page']}, under Private keys, delete the key whose fingerprint is "
+                             f"{state['fingerprint']}, exactly as the page shows it, and keep the other one. The hub "
+                             f"closes the item by itself when GitHub refuses that key.")
+        log("hub", f"the door makes every GitHub token with the new App key of {state['owner']}")
+        return state
+    if key.get("signs") is not False:
+        return None
+    close_github_key_needs(state["owner"], "GitHub refuses the old App key now, so it is deleted")
+    state = dict(state, step="done", at=round(t0))
+    kv_set("door_github_renew", json.dumps(state, sort_keys=True))
+    emit(manager, "say", f"[hub] GitHub refuses the App key that the hub held ({state['fingerprint']}): the owner "
+                         f"deleted it, and the hub closed the second item. Nothing more is needed for it.")
+    log("hub", f"GitHub refuses the App key that the hub held: {state['fingerprint']}")
+    return state
+
+
 def door_sweep(t0=None):
     """The door's record since the hub's last line, each minute. A door that does not answer is said once, to the
     manager, which raises Needs-you; the next answer says it is back."""
@@ -31278,7 +31393,7 @@ def door_reconcile():
 def door_timer():
     while True:
         time.sleep(CFG["tick"])
-        for step in (door_sweep, door_reconcile):
+        for step in (door_sweep, door_reconcile, door_renew):
             try:
                 step()
             except Exception:
@@ -38597,6 +38712,11 @@ class Handler(BaseHTTPRequestHandler):
             log(agent, "GitHub tokens for a task session: " + ("; ".join(
                 f"{t['access']} {', '.join(t['repos'])}" for t in tokens) or "none") +
                 "".join(f"; refused for {', '.join(e['repos'])}: {e['error']}" for e in errors))
+            # plan 13, item 4: a token that the door made shows that its App key works, and the renewal may start (a
+            # refused repository is a grant or a reach, not the key)
+            if tokens and door_conf() is not None and not kv_get("door_first_token"):
+                kv_set("door_first_token", str(round(now())))
+                log("hub", f"the first task session's GitHub tokens through the door worked ({agent})")
         # Each oauth MCP server that this agent has gets one access token for this session (owner feature mcp): the
         # hub refreshes it from its own file, and no refresh token and no client secret leaves the hub. The hub logs
         # no token.

@@ -15,7 +15,8 @@ names each agent's address and what it holds, and each business's repository poo
 through `door.py access`, and it refuses an address that two agents share, so the hub can name no agent and add no
 grant or pool. The hub has two rights of its own, each with its own secret: ask for a GitHub token (POST /github/token)
 for a grant that it names, which the door makes inside the agent's business pool or its own grants only, with the
-reading of what the door's App reaches (GET /github/reach) for the same secret, and read the record (GET /record).
+reading of what the door's App reaches (GET /github/reach) and the state of one App key (POST /github/key: its
+fingerprint and whether GitHub takes it, never the key) for the same secret, and read the record (GET /record).
 
 What it does. A call is a rule call (code passes it at once, with no model, so it works when the model is down), a
 judged call (one HTTPS call to the model with no tools and a token cap; the answer is allow or refuse, and anything
@@ -939,6 +940,44 @@ class Door:
                 return repos
         return None
 
+    def github_key(self, app_id, ref=None):
+        """One key of an App of the door's file, for the hub's renewal of the key that it held (plan 13, item 4, the
+        coordinator's yes of 7 November 2026): the references that the file names for that App, and of ref (the first
+        of them, or another key that the door still holds) its fingerprint as GitHub's page shows it, whether GitHub
+        still takes it, and the App's settings page. No key and no token leaves the door."""
+        app_id = str(app_id or "")
+        if not re.fullmatch(r"[1-9][0-9]{0,11}", app_id):
+            raise Refused("app_id is the App's number")
+        used = sorted({c["secret"] for k, c in (self.access().get("credentials") or {}).items()
+                       if k.lower().startswith("github:") and isinstance(c, dict) and str(c.get("app_id")) == app_id
+                       and isinstance(c.get("secret"), str)})
+        if not used:
+            raise Refused(f"the door's file names no key of App {app_id}")
+        ref = ref or used[0]
+        pem = door_providers.app_pem(self.secret(ref))
+        try:
+            der = subprocess.run(["openssl", "pkey", "-pubout", "-outform", "DER"], input=pem.encode(),
+                                 capture_output=True, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            raise door_providers.Stop("openssl could not read the App key") from None
+        if der.returncode != 0 or not der.stdout:
+            raise door_providers.Stop("openssl could not read the App key")
+        out = {"used": used, "ref": ref,
+               "fingerprint": "SHA256:" + base64.b64encode(hashlib.sha256(der.stdout).digest()).decode()}
+        status, app = self.http("GET", f"{GitHub.API}/app", {"Authorization": "Bearer " + door_providers.app_jwt(
+            app_id, pem), "Accept": "application/vnd.github+json"}, None)
+        if status == 401:
+            return dict(out, signs=False)
+        if status != 200 or not isinstance(app, dict):
+            raise door_providers.Stop(f"GitHub did not say whether it takes the App key ({status})")
+        owner = app.get("owner") if isinstance(app.get("owner"), dict) else {}
+        login, slug = owner.get("login"), app.get("slug")
+        if not (isinstance(login, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login) and
+                isinstance(slug, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,99}", slug)):
+            raise door_providers.Stop("GitHub gave no account and no name of the App")
+        where = f"organizations/{login}/settings" if owner.get("type") == "Organization" else "settings"
+        return dict(out, signs=True, owner=login, page=f"https://github.com/{where}/apps/{slug}")
+
     def github_reach(self):
         """What the door's GitHub Apps reach, for the hub's marks of "What the App reaches" once the hub holds no App
         key (DevOps plan 13, item 4): each installation's settings page, built here from its account and its id and
@@ -1250,6 +1289,15 @@ class Handler(BaseHTTPRequestHandler):
             except Refused as e:
                 return self.answer(403, {"error": str(e)})
             return self.answer(200, {"tokens": tokens, "errors": errors})
+        if self.path == "/github/key":
+            if not self.door.hub_allowed(self.source(), self.bearer(), "token_sha256"):
+                return self.answer(403, {"error": "an App key's state is the hub's to read, with its token secret"})
+            try:
+                return self.answer(200, self.door.github_key(data.get("app_id"), data.get("ref")))
+            except Refused as e:
+                return self.answer(403, {"error": str(e)})
+            except door_providers.Stop as e:
+                return self.answer(502, {"error": str(e)})
         self.answer(404, {"error": "no such route"})
 
 
