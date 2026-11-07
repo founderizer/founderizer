@@ -27472,6 +27472,20 @@ def setting_int(low, high):
     return check
 
 
+REBOOT_TIME = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")    # HH:MM, UTC: the time join.sh takes
+REBOOT_TIMES_MAX = 96
+
+
+def reboot_times_check(value):
+    """servers.reboot_times: different HH:MM times, in the order that the hub gives them. Which times are free is the
+    operator's to say (the times of the hosts this hub did not make): the hub only keeps one for each server."""
+    if not isinstance(value, list) or len(value) > REBOOT_TIMES_MAX or len(set(map(str, value))) != len(value) or \
+            not all(isinstance(t, str) and REBOOT_TIME.fullmatch(t) for t in value):
+        raise ValueError(f'must be a list of up to {REBOOT_TIMES_MAX} different "HH:MM" times in UTC, for example '
+                         f'["00:04", "00:12"]')
+    return list(value)
+
+
 # Each setting of the fleet: its default, the check of a value (it gives the value back, or raises ValueError with
 # what the value must be), and what it does, in one line. team.json "settings" holds only what the owner set, and
 # GET/POST /ui/settings and the admin MCP read and write it. A lane adds its key here in the commit that reads it,
@@ -27511,6 +27525,12 @@ SETTINGS = {
     # the owner's approval of it (hub.release_keys)
     "releases.early": (False, setting_bool, "This fleet takes each release as soon as it is published, signed by the "
                                             "early key, before the owner approves it for every other fleet."),
+    # the fleet patch policy (join.sh): -updates as well as -security, and a restart at the server's own time
+    "servers.reboot_times": ([], reboot_times_check,
+                             "The restart times (UTC) that the hub gives the Linux servers that join: each new server "
+                             "gets the first one that no server of the fleet has, and its join installs the fleet "
+                             "patch policy with it. Empty: a server takes security updates only and never restarts "
+                             "by itself."),
 }
 
 
@@ -27660,10 +27680,13 @@ def validate_team(team):
             raise ValueError(f"access for {machine} has an invalid screen_sharing")
     servers = team.get("servers", {})          # owner feature servers: the facts of each server that joined
     if not isinstance(servers, dict) or not all(
-            m in addresses and m != "owner" and isinstance(s, dict) and set(s) == {"kind", "user"} and
-            s["kind"] in SERVER_KINDS and isinstance(s["user"], str) and SSH_USER.fullmatch(s["user"])
+            m in addresses and m != "owner" and isinstance(s, dict) and
+            set(s) - {"reboot_time"} == {"kind", "user"} and
+            s["kind"] in SERVER_KINDS and isinstance(s["user"], str) and SSH_USER.fullmatch(s["user"]) and
+            ("reboot_time" not in s or isinstance(s["reboot_time"], str) and REBOOT_TIME.fullmatch(s["reboot_time"]))
             for m, s in servers.items()):
-        raise ValueError('servers must map machines to {"kind": "linux" or "mac", "user": the OS user of its service}')
+        raise ValueError('servers must map machines to {"kind": "linux" or "mac", "user": the OS user of its service}, '
+                         'and each may have the "reboot_time" "HH:MM" that the hub gave it')
     devices = team.get("owner_devices", {})     # MOBILE-APP.md: the owner's phone and its other devices
     if not isinstance(devices, dict) or len(devices) > OWNER_DEVICE_LIMIT:
         raise ValueError(f"owner_devices must map up to {OWNER_DEVICE_LIMIT} device names to a label and an address")
@@ -29400,10 +29423,20 @@ def join_input(data):
 
 def join_answer(name, row=None):
     """extension: the runtime of a Mac's sitting works in Chrome, so Chrome gets the file that offers its extension
-    (server.py, join)."""
+    (server.py, join). reboot_time: the restart time that team.json keeps for this server, or None; join.sh installs
+    the fleet patch policy with it."""
     ip, port = hub_address()
     return {"server": name, "hub": f"http://{ip}:{port}", "repo": f"git://{ip}/fleet-pilot.git",
-            "extension": row is None or "browser" in RUNTIME_CAN.get(row["runtime"], {"browser"})}
+            "extension": row is None or "browser" in RUNTIME_CAN.get(row["runtime"], {"browser"}),
+            "reboot_time": ((TEAM.get("servers") or {}).get(name) or {}).get("reboot_time")}
+
+
+def free_reboot_time(team):
+    """The restart time of a Linux server that joins now: the first time of the setting servers.reboot_times that no
+    server of team.json has. None when the setting is empty or every time is taken: the join then takes security
+    updates only, as before."""
+    held = {s.get("reboot_time") for s in (team.get("servers") or {}).values() if isinstance(s, dict)}
+    return next((t for t in setting("servers.reboot_times") if t not in held), None)
 
 
 def join_server(src, body):
@@ -29462,6 +29495,9 @@ def join_server(src, body):
                            f"line again.")
     team["addresses"][name] = src
     team.setdefault("servers", {})[name] = {"kind": body["kind"], "user": body["user"]}
+    reboot = free_reboot_time(team) if body["kind"] == "linux" else None
+    if reboot:                          # its own time for the fleet patch policy, kept with the server
+        team["servers"][name]["reboot_time"] = reboot
     if body["ssh_port"]:                # the join line ran as root: the owner's "Open in Terminal"
         team.setdefault("access", {})[name] = {"ssh_user": "root", "ssh_port": body["ssh_port"]}
     try:
@@ -29484,7 +29520,8 @@ def join_server(src, body):
         if row["agent"]:
             DB.execute("INSERT INTO mac_setups(server,agent,runtime,chatgpt,state,created,updated) "
                        "VALUES(?,?,?,?,'add',?,?)", (name, row["agent"], row["runtime"], row["chatgpt"], t0, t0))
-    log("hub", f"server {name} joined from {src} in {commit[:12]}")
+    log("hub", f"server {name} joined from {src} in {commit[:12]}"
+               + (f", with the restart time {reboot}" if reboot else ""))
     return dict(join_answer(name, row), revision=commit, replayed=False)
 
 

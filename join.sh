@@ -5,9 +5,10 @@
 #   A VPS (Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13), as root: base packages, the user fleet, then the join,
 #   security updates, the firewall and the server's own hardening (SSH keys only, npm's seven days, Tailscale's own
 #   updates). The line has joined the private network (Tailscale) before this script, and after it SSH reaches the
-#   machine over that network only. With FLEET_REBOOT_TIME=<HH:MM> on the line as well, the server also takes the
-#   fleet patch policy: Ubuntu's -updates as well as -security, and a restart at that time (UTC) when an update needs
-#   one. Without it, it takes security updates only and never restarts by itself.
+#   machine over that network only. With a restart time (UTC) from the hub's answer to the join, or else with
+#   FLEET_REBOOT_TIME=<HH:MM> on the line, an Ubuntu server also takes the fleet patch policy: Ubuntu's -updates as
+#   well as -security, and a restart at that time when an update needs one. Without a time it takes security updates
+#   only and never restarts by itself.
 #   A Mac (macOS 14 or later, with Tailscale and Homebrew), as the user that will run the agents: tmux and Python
 #   with Homebrew, then the join, then this Mac's vault, the one step that asks for that user's password, then
 #   Claude's extension for Chrome. The Founderizer installer runs the same line as root behind macOS's own password
@@ -85,6 +86,7 @@ linux() {
     checkout "/home/$WORKER/fleet-server" as_worker
     printf '%s\n' "$code" | as_worker python3 "/home/$WORKER/fleet-server/server.py" join --hub "$HUB" --kind linux \
         --ssh-port "${first:-22}"
+    hub_time
     updates
     firewall "/home/$WORKER/fleet-server"
     harden "/home/$WORKER/fleet-server"
@@ -263,6 +265,24 @@ verify_step() { # $1: the checkout; $2: how to run a command as the user of the 
         ready=no
         say "this machine is NOT ready: the lines above name each check that failed and the fix it carries"
     fi
+}
+
+hub_time() {    # The restart time that the hub keeps for this server, from the hub's answer to the join (server.py
+                # writes it to server.json): a hub whose setting servers.reboot_times lists times gives one to each
+                # Linux server. It wins over FLEET_REBOOT_TIME, so that the hub's record is the server's own time.
+    given=$(as_worker python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("reboot_time") or "")' \
+        "/home/$WORKER/.fleet/server.json" </dev/null 2>/dev/null || true)
+    case "$given" in
+        [01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;;
+        *) return 0 ;;
+    esac
+    if [ "${ID:-}" != ubuntu ]; then
+        say "the hub keeps the restart time $given for this server, but only Ubuntu takes the fleet patch policy"
+        return 0
+    fi
+    [ -z "$REBOOT_TIME" ] || [ "$REBOOT_TIME" = "$given" ] \
+        || say "the hub keeps the restart time $given for this server, so FLEET_REBOOT_TIME=$REBOOT_TIME is not used"
+    REBOOT_TIME=$given
 }
 
 updates() {     # unattended security updates on, then the pending ones once; the join itself never restarts the

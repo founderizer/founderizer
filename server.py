@@ -218,7 +218,10 @@ def cmd_join(args):
     name = answer.get("server")
     if not NAME.fullmatch(str(name)) or not re.fullmatch(r"http://[0-9.:\[\]a-f]+", str(answer.get("hub"))):
         die("The hub gave an answer that Founderizer cannot use.")
-    save_conf({"name": name, "hub": answer["hub"], "repo": answer.get("repo")})
+    conf = {"name": name, "hub": answer["hub"], "repo": answer.get("repo")}
+    if re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", str(answer.get("reboot_time"))):
+        conf["reboot_time"] = answer["reboot_time"]     # join.sh: the fleet patch policy at this server's own time
+    save_conf(conf)
     again = " (it had joined already)" if answer.get("replayed") else ""
     print(f"Founderizer: this machine is the server {name}{again}", flush=True)
     install_service()
