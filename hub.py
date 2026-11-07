@@ -13299,6 +13299,93 @@ def move_kit(target):
     return None
 
 
+# kv: the commit of team.json or a profile that commit_kit_file pushes, from before its push until the hub checkout
+# has it, or until a commit that undoes it is on the ref. Every write of those files holds LOCK, so at most one is
+# open at a time. Its writes are quiet: no screen of the owner's shows it (live_changes).
+KIT_PUSHED = "kit_pushed"
+
+
+def undo_kit_push(remote):
+    """`remote`, the hub's own commit of team.json or a profile (KIT_PUSHED), is the tip of the configuration ref and
+    not in the hub checkout: the fast-forward after its push failed, or the hub stopped in between. Its write was
+    answered as failed, and its steps after the commit never ran: the team in memory, a rename's records, a server's
+    job, the machines' update requests. A commit of the hub's own that only takes the team.json and profile parts
+    back would finish half of such a write, so the hub undoes the whole commit on the ref instead: the ref then holds
+    what the hub runs, the next write takes it in as data, and the same change sent again is a new write with every
+    step. Each machine that took the commit meanwhile is asked to follow the ref again. None when it is undone (by
+    this call or by another write meanwhile), else why not."""
+    import shutil
+    import tempfile
+    with LOCK:                  # two writes never undo it at once
+        if kv_get(KIT_PUSHED) != remote:
+            return None
+        # The caller read the checkout before LOCK: a reload onto the ref (reload_team) or the end of a server's
+        # rename (finish_machine_rename) can have taken the commit in since, with its steps. That is never undone.
+        if git_kit("merge-base", "--is-ancestor", remote, "HEAD")[0] == 0:
+            with area("quiet"):
+                q("DELETE FROM kv WHERE k=? AND v=?", (KIT_PUSHED, remote))
+            return None
+        branch = config_ref()
+        code, url, _ = git_kit("remote", "get-url", "origin")
+        tmp = tempfile.mkdtemp(prefix="fleet-undo-")
+        try:
+            def tgit(*args):
+                r = subprocess.run(["git", "-C", tmp + "/kit", "-c", "user.name=Fleet hub", "-c",
+                                    "user.email=hub@fleet.invalid", *args], capture_output=True, text=True,
+                                   timeout=60, stdin=subprocess.DEVNULL)
+                return r.returncode, r.stdout.strip(), r.stderr.strip()
+            r = subprocess.run(["git", "clone", "-q", "--shared", kit_dir(), tmp + "/kit"], capture_output=True,
+                               text=True, timeout=60, stdin=subprocess.DEVNULL)
+            if r.returncode != 0 or tgit("checkout", "-q", remote)[0] != 0 or \
+                    tgit("revert", "--no-edit", remote)[0] != 0:
+                return f"the hub could not prepare the commit that undoes {remote[:12]}"
+            code, _, err = tgit("push", "-q", url, f"HEAD:{branch}")
+            if code != 0:
+                return f"the push of the commit that undoes {remote[:12]} failed: " + err[-200:]
+        except subprocess.TimeoutExpired:
+            return "git did not answer in time"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        with area("quiet"):
+            q("DELETE FROM kv WHERE k=? AND v=?", (KIT_PUSHED, remote))
+        print(f"The hub undid its own commit {remote[:12]} on the configuration ref: the hub checkout never took it "
+              f"in, so the steps of its write never ran.", flush=True)
+        if git_kit("fetch", "-q", "origin", timeout=60)[0] != 0:
+            return f"the hub took {remote[:12]} back on the ref and could not fetch the commit that undoes it"
+        code, undone, _ = git_kit("rev-parse", f"origin/{branch}")
+        for name in agents():               # a machine that has the undoing commit already is "current"
+            if code == 0 and q1("SELECT 1 FROM machine_status WHERE agent=?", (name,)):
+                request_update(name, undone)
+    return None
+
+
+def settle_kit_push():
+    """At the hub's start, before the timers and the server, and before a release run, which merges onto the ref's
+    tip: the hub's own commit of team.json or a profile that is the tip of the configuration ref and not in the hub
+    checkout (KIT_PUSHED) is undone (undo_kit_push). A mark whose commit never reached the ref, or that the checkout
+    holds, is forgotten, and only that mark: a write's new one can come meanwhile. One that cannot be checked now
+    stays for the next write. It raises nothing, because a hub that cannot start cannot be reached."""
+    mark = kv_get(KIT_PUSHED)
+    if not mark:
+        return
+    try:
+        branch, rev = config_branch(), kit_revision(fresh=True)
+        if not (branch and rev) or git_kit("fetch", "-q", "origin", timeout=60)[0] != 0:
+            print(f"WARNING: the hub could not check its own commit {mark[:12]} on the configuration ref; its next "
+                  f"write does.", flush=True)
+            return
+        code, remote, _ = git_kit("rev-parse", f"origin/{branch}")
+        if code == 0 and remote == mark != rev and git_kit("merge-base", "--is-ancestor", rev, mark)[0] == 0:
+            problem = undo_kit_push(mark)
+            if problem:
+                print(f"WARNING: {problem}. The hub's next write tries again.", flush=True)
+            return
+        with area("quiet"):
+            q("DELETE FROM kv WHERE k=? AND v=?", (KIT_PUSHED, mark))
+    except Exception:
+        traceback.print_exc()
+
+
 def commit_kit_file(path, data, message, more=None, author=None, allow=None, check=None):
     """Commit one configuration file for the owner (or its removal, with data None) in a temporary clone at the hub
     revision, push it to origin's configuration ref as a fast-forward, then fast-forward the hub checkout. Returns
@@ -13314,13 +13401,19 @@ def commit_kit_file(path, data, message, more=None, author=None, allow=None, che
     put origin ahead of the hub: that is what made every owner write answer 409 three times on 2026-10-16. Commits
     that the configuration ref gained without the hub (a task's output, a document) are taken in first, as long as
     they change no Fleet file; one that changes code the running hub does not serve is refused instead, because the
-    checkout would then move past the hub and turn every machine "behind"."""
+    checkout would then move past the hub and turn every machine "behind".
+
+    A write of team.json or a profile marks its commit (KIT_PUSHED) before the push: a fast-forward that fails after
+    the push, or a stop of the hub in between, leaves the commit on the ref and not in the checkout, and the next write
+    or the hub's start undoes it on the ref (undo_kit_push). Before that, every later write of those files was refused
+    as code that the hub does not run (7 November 2026), and the steps of the write after its commit were lost."""
     import shutil
     import tempfile
     for one in [path, *(more or {})]:
         if not (allow or CONFIG_FILES).match(one):
             raise Refusal(500, f"{one} is not a configuration file: the hub writes team.json, a profile and the "
                                "owner's knowledge, and nothing else")
+    fleet = any(fleet_code(one) for one in [path, *(more or {})])
     rev = kit_revision(fresh=True)
     if git_kit("status", "--porcelain", "--untracked-files=no")[1]:
         raise Refusal(409, "the hub checkout has local changes")
@@ -13331,6 +13424,16 @@ def commit_kit_file(path, data, message, more=None, author=None, allow=None, che
     code, remote, _ = git_kit("rev-parse", f"origin/{branch}")
     if code != 0:
         raise Refusal(409, f"origin has no {branch} ref: the hub's configuration ref is missing")
+    # The hub's own write, whose push landed and whose steps after it never ran, is taken back before anything else.
+    if remote != rev and remote == kv_get(KIT_PUSHED) and git_kit("merge-base", "--is-ancestor", rev, remote)[0] == 0:
+        problem = undo_kit_push(remote)
+        if problem:
+            raise Refusal(409, f"origin/{branch} ends with a write of the hub's own that the hub could not take back: "
+                               f"{problem}")
+        rev = kit_revision(fresh=True)
+        code, remote, _ = git_kit("rev-parse", f"origin/{branch}")
+        if code != 0:
+            raise Refusal(409, f"origin has no {branch} ref: the hub's configuration ref is missing")
     if remote != rev:
         ahead = git_kit("merge-base", "--is-ancestor", rev, remote)[0] == 0
         if not (ahead and same_code(rev, remote)):
@@ -13369,6 +13472,9 @@ def commit_kit_file(path, data, message, more=None, author=None, allow=None, che
         if not staged or tgit("commit", "-q", "-m", message)[0] != 0:
             raise Refusal(500, f"the hub could not commit {path}")
         commit = tgit("rev-parse", "HEAD")[1]
+        if fleet:               # before the push: one that lands with no answer is the hub's own all the same
+            with area("quiet"):
+                kv_set(KIT_PUSHED, commit)
         code, _, err = tgit("push", "-q", url, f"HEAD:{branch}")
         if code != 0:
             raise Refusal(409 if "rejected" in err or "non-fast-forward" in err else 502, "the push failed: " + err[-200:])
@@ -13377,7 +13483,12 @@ def commit_kit_file(path, data, message, more=None, author=None, allow=None, che
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     if git_kit("fetch", "-q", "origin", timeout=60)[0] != 0 or move_kit(commit):
-        raise Refusal(500, f"{path} is in origin as {commit[:12]}, but the hub checkout did not fast-forward")
+        raise Refusal(500, f"{path} is in origin as {commit[:12]}, but the hub checkout did not fast-forward: "
+                           + ("the hub takes that commit back, so make the change again" if fleet else
+                              "the hub takes it in at its next write"))
+    if fleet:
+        with area("quiet"):
+            q("DELETE FROM kv WHERE k=? AND v=?", (KIT_PUSHED, commit))
     kit_revision(fresh=True)
     changed()                   # a profile, a knowledge file or team.json: not in the database (live_changes)
     return commit
@@ -34249,6 +34360,9 @@ def release_work(applying, automatic=False, fetch=None):
         if not applying or row is None:
             return
         manifest = answer["manifest"]
+        # A write of the hub's own that a cut left on the ref is taken back first: the run merges onto the ref's tip,
+        # and would carry that write in without the steps it never ran. One cut during the run is not followed (own).
+        settle_kit_push()
         with LOCK:
             if row["state"] == releases.DONE:
                 return                                  # this release is already the one the fleet runs
@@ -34300,7 +34414,8 @@ def release_work(applying, automatic=False, fetch=None):
                 return
             result = releases.Update(kit_dir(), manifest, origin=origin, upstream=release_upstream(),
                                      database=path, floor=kit_floor(),
-                                     pushed=lambda merged: release_pushed(row["id"], merged)).apply()
+                                     pushed=lambda merged: release_pushed(row["id"], merged),
+                                     own=lambda tip: tip == kv_get(KIT_PUSHED)).apply()
         finally:
             shutil.rmtree(folder, ignore_errors=True)
         with LOCK:
@@ -41048,6 +41163,7 @@ def main():
     ensure_bridge_key()
     settle_stopped_calls()
     settle_pings()
+    settle_kit_push()           # before the release asks the machines, so they follow the commit that undoes it
     settle_releases(ask=not restored)
     settle_task_numbers()
     # The heartbeat starts here and not at the first complete pass (tick_heartbeat), so that a hub whose very first

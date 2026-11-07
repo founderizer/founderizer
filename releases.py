@@ -547,15 +547,19 @@ class Update:
     `pushed` is called with the revision the moment the push has landed, before this checkout follows it: from then
     on every machine of this fleet takes the release at its next sync, so the hub records it at once, and a run that
     an error or a stop of the hub cuts off before its answer still asks each machine for its idle update. An error
-    in it is printed and stops nothing."""
+    in it is printed and stops nothing.
+
+    `own` is called with a tip that the ref moved to under the push: true for a write of the hub's own whose push
+    landed while the rest of it never ran (hub.KIT_PUSHED). The run does not merge onto that tip, which the hub
+    takes back; it ends rolled back at the push, and the next run takes the release."""
 
     def __init__(self, kit, manifest, *, origin=None, upstream=None, branch=None, remote=REMOTE,
                  run=_run, python=None, database=None, selftest_wait=SELFTEST_WAIT, verify_wait=VERIFY_WAIT,
-                 schema_wait=SCHEMA_WAIT, floor=None, pushed=None):
+                 schema_wait=SCHEMA_WAIT, floor=None, pushed=None, own=None):
         from lifecycle import CONFIG_BRANCH
         self.kit, self.manifest, self.origin, self.upstream = kit, manifest, origin, upstream
         self.branch, self.remote, self.run, self.database = branch or CONFIG_BRANCH, remote, run, database
-        self.floor, self.pushed = floor, pushed
+        self.floor, self.pushed, self.own = floor, pushed, own
         self.python = python or sys.executable
         self.selftest_wait, self.verify_wait, self.schema_wait = selftest_wait, verify_wait, schema_wait
         # pinned: the revision this fleet runs and keeps. reached: the revision that got onto the configuration
@@ -870,9 +874,11 @@ class Update:
     def may_follow(self, tip, merged):
         """Is this tip one that a refused push may be merged onto and pushed again? It must hold the revision
         this fleet runs, and what was just pushed must not already hold it — a ref that is behind this merge did
-        not refuse it for moving, and a second merge would meet whatever did."""
+        not refuse it for moving, and a second merge would meet whatever did. Nor may it be a write of the hub's own
+        that the hub takes back (`own`)."""
         return (self.clone_git("merge-base", "--is-ancestor", tip, merged)[0] != 0
-                and self.clone_git("merge-base", "--is-ancestor", self.pinned, tip)[0] == 0)
+                and self.clone_git("merge-base", "--is-ancestor", self.pinned, tip)[0] == 0
+                and not (self.own and self.own(tip)))
 
     def catch_up(self, tip, checked):
         """The released revision merged again, onto the tip the configuration ref moved to, with the proof that
