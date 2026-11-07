@@ -542,14 +542,16 @@ def no_commit_inside():
 
 def commit():
     """DB.commit(), counted: every write commits through here, transaction() or committed(). Never inside an open
-    transaction() (no_commit_inside)."""
+    transaction() (no_commit_inside), and only from the thread that holds LOCK (held)."""
     no_commit_inside()
+    held("commit()")
     DB.commit()
     counted()
 
 
 def rollback():
-    """DB.rollback(): what it undid is no change."""
+    """DB.rollback(): what it undid is no change. Only from the thread that holds LOCK (held)."""
+    held("rollback()")
     DB.rollback()
     CHANGE["base"] = getattr(DB, "total_changes", None)
 
@@ -557,18 +559,20 @@ def rollback():
 @contextlib.contextmanager
 def committed():
     """`with DB:`, counted: one commit, or a rollback on an error. For the guards it is a transaction() too: a
-    *_rows writer may run inside it (in_transaction), and nothing inside it may commit (no_commit_inside)."""
-    no_commit_inside()
-    TX.open = 1
-    try:
-        with DB:
-            yield
-    except BaseException:
-        CHANGE["base"] = getattr(DB, "total_changes", None)
-        raise
-    finally:
-        TX.open = 0
-    counted()
+    *_rows writer may run inside it (in_transaction), and nothing inside it may commit (no_commit_inside). It holds
+    LOCK as transaction() does, so an open transaction always belongs to the thread that holds the lock."""
+    with LOCK:
+        no_commit_inside()
+        TX.open = 1
+        try:
+            with DB:
+                yield
+        except BaseException:
+            CHANGE["base"] = getattr(DB, "total_changes", None)
+            raise
+        finally:
+            TX.open = 0
+        counted()
 
 
 def change_token():
@@ -602,6 +606,20 @@ def in_transaction(what):
     if not getattr(TX, "open", 0):
         raise RuntimeError(f"{what} writes inside the caller's transaction, and none is open. Put the call in a "
                            f"`with transaction():` block.")
+
+
+def held(what):
+    """Refuse a write from a thread that does not hold LOCK.
+
+    Every thread writes through the one shared connection, and SQLite keeps one transaction on it. A write from a
+    thread without the lock joins whatever transaction another thread has open: that thread's commit lands it half
+    done, and its rollback takes it back with no word to anybody. LOCK is what keeps the threads apart, and a
+    docstring that says "the caller holds LOCK" does not hold it, so this does. commit() and rollback() call it, and
+    so does every writer that runs under its caller's lock without a transaction of its own. A writer inside a
+    transaction needs only in_transaction: transaction() and committed() hold LOCK."""
+    if not LOCK._is_owned():
+        raise RuntimeError(f"{what} writes with the shared connection, and this thread does not hold LOCK: another "
+                           f"thread's open transaction would take its rows. Put the call in a `with LOCK:` block.")
 
 
 def kv_get(k, default=None):
@@ -5475,12 +5493,13 @@ def admit_task(requester, f, trigger_id=None, trigger_run=None):
     in_transaction("admit_task")
     generation = DB.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()
     t0 = now()
-    tid = DB.execute("INSERT INTO tasks(title,details,done_when,needs,goal,goal_id,parent,step,owner,requester,state,"
-                     "follows,created,last_activity,case_id,trigger_id,trigger_run,why,responsibility,duty_case) "
-                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                     (f["title"], f["details"], f["done_when"], f["needs"], f["goal"], f["goal_id"], f["parent"],
-                      f.get("step"), f["owner"], requester, "submitted", f["follows"], t0, t0, f["case_id"],
-                      trigger_id, trigger_run, f.get("why"), f.get("responsibility"), f.get("duty_case"))).lastrowid
+    tid = DB.execute("INSERT INTO tasks(id,title,details,done_when,needs,goal,goal_id,parent,step,owner,requester,"
+                     "state,follows,created,last_activity,case_id,trigger_id,trigger_run,why,responsibility,duty_case) "
+                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (unused_id("tasks"), f["title"], f["details"], f["done_when"], f["needs"], f["goal"], f["goal_id"],
+                      f["parent"], f.get("step"), f["owner"], requester, "submitted", f["follows"], t0, t0,
+                      f["case_id"], trigger_id, trigger_run, f.get("why"), f.get("responsibility"),
+                      f.get("duty_case"))).lastrowid
     DB.execute("INSERT INTO attempts(task,attempt,created,reason) VALUES(?,1,?,'created')", (tid, t0))
     opening = stable_opening(f["owner"], f["needs"])
     start = start_text(f["owner"], tid, opening=opening)
@@ -5634,6 +5653,7 @@ def answer_rows(qu, t, text, by, t0):
     that is not the agent it asked; the agent that holds it hears of it when another level answered first; an ask for
     access that the asker holds now goes to the one that restarts the task, because only a new session can use it
     (only the requester of a subtask restarts it); and a Needs-you item raised for the question closes."""
+    in_transaction("answer_rows")
     qid, tid = qu["id"], qu["task"]
     if DB.execute("UPDATE questions SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
                   (text, t0, by, qid)).rowcount != 1:
@@ -8415,6 +8435,7 @@ def secret_wait(task_id):
 def secret_rewait(task_id):
     """A task that something else just released (its prompt, its question, a restart) waits on the owner's secret
     again while one of its requests is waited on. DB.execute only."""
+    in_transaction("secret_rewait")
     w = secret_wait(task_id)
     if w:
         DB.execute("UPDATE tasks SET state='input-required', waiting_on=? WHERE id=? AND state='working'",
@@ -8425,6 +8446,7 @@ def secret_wait_moved(task_id):
     """After one of this task's secret requests settled: its next request holds it, or, with none left, it goes back to
     working. Only a task whose waiting_on is a secret request, or NULL or its screen with no open question or prompt,
     is moved, as t_answer's fallback does, so a Q- or P- wait stays. DB.execute only."""
+    in_transaction("secret_wait_moved")
     t = DB.execute("SELECT state, waiting_on FROM tasks WHERE id=?", (task_id,)).fetchone()
     if not t or t["state"] != "input-required":
         return
@@ -10708,8 +10730,10 @@ def conversation_refusal(agent, person=None):
 # the highest id plus one, so once person_remove has deleted the highest ones, the next conversation would take a
 # removed person's number, and a task, an event, the history's cursor, a CM-<id> or the owner's N-<id> push that still
 # named it would reach another person. person_remove keeps the highest id that each table gave out in kv
-# row_floor:<table>.
-ID_FLOOR_TABLES = ("conversations", "conversation_messages", "needs")
+# row_floor:<table>. A task's number names its folder on the configuration ref, which outlives the records, so the
+# tasks' floor comes from there too (settle_task_numbers).
+ID_FLOOR_TABLES = ("conversations", "conversation_messages", "needs", "tasks")
+TASK_FOLDER = re.compile(r"outputs/T-([0-9]+)")
 
 
 def unused_id(table):
@@ -10720,6 +10744,25 @@ def unused_id(table):
     floor = DB.execute("SELECT v FROM kv WHERE k=?", (f"row_floor:{table}",)).fetchone()
     top = DB.execute(f"SELECT MAX(id) FROM {table}").fetchone()[0] or 0
     return max(top, int(floor[0]) if floor and str(floor[0]).isdigit() else 0) + 1
+
+
+def settle_task_numbers():
+    """At the start: a new task's number is above every task whose folder is on the configuration ref.
+
+    outputs/T-<id>/ stays on the ref when the records do not, and SQLite gives a new task the highest id plus one. So
+    after a restore of an older copy, or on a new database, the next task took a number that an earlier task had had,
+    and its files went into that task's folder: commit_outputs only adds files. The highest number on the ref is kept
+    as the tasks' floor (kv row_floor:tasks), and unused_id gives the next task one above it. A floor never goes
+    down, and a hub with no checkout has no folders to keep clear of."""
+    rev = kit_revision(fresh=True)
+    code, out, _ = git_kit("ls-tree", "--name-only", rev, "outputs/") if rev else (1, "", "")
+    if code != 0:
+        return
+    top = max((int(m[1]) for m in map(TASK_FOLDER.fullmatch, out.splitlines()) if m), default=0)
+    with transaction():
+        if top >= unused_id("tasks"):
+            DB.execute("INSERT INTO kv(k,v) VALUES('row_floor:tasks',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                       (str(top),))
 
 
 def conversation_of(person, agent, m, account, t0):
@@ -10760,6 +10803,7 @@ def conversation_signal(agent, cid, t0):
 def person_route(account, acc, person, m, t0, hit):
     """Inside chat_route's transaction: a message from a person the owner added. The checks are in order and every one
     of them fails closed. Returns stored or ignored."""
+    in_transaction("person_route")
     agent = acc["agents"][0]
     if person["blocked"] is not None:
         return "ignored"                # the owner blocked this person: nothing is stored and nothing is sent
@@ -11140,6 +11184,7 @@ def conversation_decided(conv, person, text, cm, t0):
     Their message stays their own. It is stored as the person's, read with their own header, and nothing of it is
     ever written as the owner's (conversation_answer writes the owner's row and is not called here), so no agent can
     take a person's words for the owner's."""
+    in_transaction("conversation_decided")
     if person["role"] != PERSON_DECIDES:
         return None
     need = DB.execute("SELECT * FROM needs WHERE conversation=? AND answer IS NULL ORDER BY id LIMIT 1",
@@ -11259,6 +11304,7 @@ def t_request_work(agent, a):
 def conversation_answer(need, value, t0):
     """Inside owner_message_rows' transaction: the owner's answer to a question or a work request goes back into the
     conversation, and the window reads it there. Returns the event ID."""
+    in_transaction("conversation_answer")
     cid = need["conversation"]
     event = conversation_signal(need["by"], cid, t0)
     DB.execute("INSERT INTO conversation_messages(id,conversation,who,text,created,need,event) "
@@ -11656,9 +11702,9 @@ def conversation_task_rows(conv, person, cm, t0):
     else:
         agent = conv["agent"]
         tid = DB.execute(
-            "INSERT INTO tasks(title,details,done_when,needs,owner,requester,state,created,last_activity,stop_sent,"
-            "source_conversation,source_message,why) VALUES(?,?,?,?,?,?,?,?,?,1,?,?,?)",
-            (f"Answer {person['name']} in C-{conv['id']}",
+            "INSERT INTO tasks(id,title,details,done_when,needs,owner,requester,state,created,last_activity,stop_sent,"
+            "source_conversation,source_message,why) VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
+            (unused_id("tasks"), f"Answer {person['name']} in C-{conv['id']}",
              f"A conversation task: {cm_ref(cm)} of C-{conv['id']}, with {person['name']} ({person['role']}). It runs "
              f"in that conversation's own session, and the reply ends it.",
              f"{agent_display(agent)} answered {person['name']} with reply.", "none", agent, reports_to(agent),
@@ -12095,7 +12141,7 @@ def t_message_contact(agent, a):
 
 GOAL_REF = re.compile(r"(?i)^\s*G-?(\d+)\s*$")
 CURRENCY = re.compile(r"[A-Z]{3}")
-OPEN_TASK = "state NOT IN ('completed','failed','rejected','canceled')"
+OPEN_TASK = "state NOT IN (" + ",".join(f"'{s}'" for s in TERMINAL) + ")"      # made from TERMINAL, never typed
 GOAL_ACTIONS = {"pause": (("active",), "paused"), "resume": (("paused",), "active"), "done": (("active", "paused"), "done"),
                 "drop": (("active", "paused"), "dropped"), "reopen": (("done", "dropped"), "active")}
 GOAL_OPEN = ("active", "paused")    # the goals the fleet is working on; the others are there to look back at
@@ -12386,6 +12432,7 @@ def window_shares(agent, account, reading, t0):
     (AUTONOMY.md decision 33): the window's used percent, split over the fleet's sessions in it by their list-dollar
     cost. So the shares of one window add up to its used percent, and the account's use outside the fleet is spread
     over them in proportion. Inside record_session_tokens' write."""
+    held("window_shares")
     w = main_window(reading, t0)
     if not w:
         return
@@ -16493,16 +16540,18 @@ def memory_search_probe():
 
     **And at startup, not lazily.** It was in memory_search_ready, which memory_indexed calls from inside
     t_remember's transaction, and the DB.commit() here committed that half-written lesson. That is the fourth time
-    today that a read or a write on a transaction's path has committed it; migrate runs outside every transaction."""
-    try:
-        DB.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(text, prevents, about, "
-                   "content='memories', content_rowid='id', tokenize='unicode61')")
-        commit()
-        MEMORY_FTS[0] = True
-    except sqlite3.Error as e:
-        log("hub", f"memory search runs without FTS5 on this machine: {e}")
-        MEMORY_FTS[0] = False
-    return MEMORY_FTS[0]
+    today that a read or a write on a transaction's path has committed it; migrate runs outside every transaction.
+    It holds LOCK itself, as every commit must (held)."""
+    with LOCK:
+        try:
+            DB.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(text, prevents, about, "
+                       "content='memories', content_rowid='id', tokenize='unicode61')")
+            commit()
+            MEMORY_FTS[0] = True
+        except sqlite3.Error as e:
+            log("hub", f"memory search runs without FTS5 on this machine: {e}")
+            MEMORY_FTS[0] = False
+        return MEMORY_FTS[0]
 
 
 def memory_search_ready():
@@ -17479,21 +17528,23 @@ def history_search_probe():
     """Make the index if this machine's sqlite3 has FTS5, and record which it was. Called once from migrate, for the
     reasons memory_search_probe gives: a missing FTS5 is a fact about the machine and never a refused schema step, and
     the probe commits, so it runs outside every transaction. Without the index, every history row keeps its words in
-    `text` and a search reads them linearly. An index made on a hub that had none takes in the rows it already has."""
-    try:
-        made = not DB.execute("SELECT 1 FROM sqlite_master WHERE name='history_fts'").fetchone()
-        DB.execute("CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(text, agent, content='', "
-                   "tokenize='unicode61 remove_diacritics 2')")
-        if made:
-            DB.execute("INSERT INTO history_fts(rowid, text, agent) SELECT h.id, h.text, 'a' || k.v FROM history h "
-                       "JOIN kv k ON k.k='history_agent:' || h.agent WHERE h.text IS NOT NULL")
-        commit()
-        HISTORY_FTS[0] = True
-    except sqlite3.Error as e:
-        rollback()
-        log("hub", f"history search runs without FTS5 on this machine: {e}")
-        HISTORY_FTS[0] = False
-    return HISTORY_FTS[0]
+    `text` and a search reads them linearly. An index made on a hub that had none takes in the rows it already has.
+    It holds LOCK itself, as every commit must (held)."""
+    with LOCK:
+        try:
+            made = not DB.execute("SELECT 1 FROM sqlite_master WHERE name='history_fts'").fetchone()
+            DB.execute("CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(text, agent, content='', "
+                       "tokenize='unicode61 remove_diacritics 2')")
+            if made:
+                DB.execute("INSERT INTO history_fts(rowid, text, agent) SELECT h.id, h.text, 'a' || k.v FROM history "
+                           "h JOIN kv k ON k.k='history_agent:' || h.agent WHERE h.text IS NOT NULL")
+            commit()
+            HISTORY_FTS[0] = True
+        except sqlite3.Error as e:
+            rollback()
+            log("hub", f"history search runs without FTS5 on this machine: {e}")
+            HISTORY_FTS[0] = False
+        return HISTORY_FTS[0]
 
 
 def history_key(agent, create=False):
@@ -17516,7 +17567,7 @@ def history_who(*names):
     """The agents among these names, each once: a record is in the history of every agent that took part in it."""
     out = []
     for name in names:
-        if isinstance(name, str) and AGENT_NAME.match(name) and name not in ("owner", "hub") and name not in out:
+        if isinstance(name, str) and AGENT_NAME.match(name) and name not in RESERVED_AGENT_NAMES and name not in out:
             out.append(name)
     return out
 
@@ -18045,6 +18096,7 @@ def history_drop_row(h):
     """Inside the caller's write: one history row out of the history and out of the index. Only words that the row
     keeps can leave the contentless index exactly; a tool record keeps none, and its words stay behind with no row to
     join them, so no search can reach them."""
+    in_transaction("history_drop_row")
     key = history_key(h["agent"])
     if HISTORY_FTS[0] and key and h["text"] is not None:
         DB.execute("INSERT INTO history_fts(history_fts,rowid,text,agent) VALUES('delete',?,?,?)",
@@ -23919,6 +23971,7 @@ def wake_decision(t, manual, t0, due):
 def admit_wake(t, run, admission, line, t0):
     """Inside the run's transaction: what a started wake-up writes. One message to the fleet manager, one task, or a
     parent task for the requester and the target's task as its subtask. Returns (task, event, parent task)."""
+    in_transaction("admit_wake")
     route, task = admission["route"], json.loads(t["task"])
     parent, case_id, case_line = None, None, ""
     if t["responsibility"]:         # owner API 1.13: one event of a duty is one case with a key, on either route
@@ -24748,6 +24801,7 @@ def failure_wake(t, r, body, failures):
 
 def failure_wake_rows(t, fail, t0):
     """Inside the run's transaction: the failure wake of failure_wake. Returns (task, event)."""
+    in_transaction("failure_wake_rows")
     route, text = fail["route"], fail["text"]
     if fail["wake"]:
         task, event = join_rows(t, fail["wake"], f"[hub] {text}", t0)
@@ -27111,7 +27165,10 @@ def line_number(value):
 
 MACHINE_STALE = 600                                 # seconds after which a machine reading is stale
 UPDATE_STATES = ("requested", "waiting_idle", "updating", "failed")
-AGENT_NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
+# \Z and not $: `$` also matches before a final newline, so with .match "worker\n" passed every check that uses it.
+AGENT_NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}\Z")
+# Never an agent's name: the owner and the hub sign their own messages, records and log lines with these.
+RESERVED_AGENT_NAMES = ("owner", "hub")
 # The OS user an agent keeps on a Linux server after a rename (team.json "user"): the fleet-<name> of the name it
 # had when it was installed, at most 32 characters, as hubsetup.agent_user makes one.
 AGENT_OS_USER = re.compile(r"fleet-[a-z][a-z0-9-]{1,25}")
@@ -27644,8 +27701,9 @@ def validate_team(team):
                     raise ValueError(f"runtime_facts {name} {fact} {e}") from None
     managers = 0
     for name, a in team["agents"].items():
-        if not AGENT_NAME.match(name) or not isinstance(a, dict):
-            raise ValueError(f"invalid agent name {name!r}")
+        if not AGENT_NAME.match(name) or name in RESERVED_AGENT_NAMES or not isinstance(a, dict):
+            raise ValueError(f"invalid agent name {name!r}" +
+                             (": the owner and the hub keep that name" if name in RESERVED_AGENT_NAMES else ""))
         if a.get("role") not in ("manager", "lead", "worker") or a.get("runtime") not in RUNTIMES:
             known = sorted(RUNTIMES)
             raise ValueError(f"agent {name} needs role manager, lead or worker and runtime "
@@ -29698,13 +29756,19 @@ AGENT_COLUMNS = (
     # history search (AUTONOMY.md P6): whose history a row is, and the other party, which can be an agent. Its index
     # holds the agent's key and not its name (history_key), so a rename leaves the index as it is.
     ("history", "agent"), ("history", "person"),
-    ("model_changes", "agent"), ("model_changes", "by"))       # AUTONOMY.md P8: whose model, and its one changer
+    ("model_changes", "agent"), ("model_changes", "by"),       # AUTONOMY.md P8: whose model, and its one changer
+    ("questions", "answered_by"))           # the agent that answered, or 'owner'
 # The tables with one row for each agent. A row under the new name is what an agent of that name left before it
 # was removed by hand, so it goes first, and the renamed agent's own row takes the name.
 AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent", "machine_updates": "agent"}
-# The hub's own notes about one agent in kv, each kept under a prefix and the agent's name.
+# The hub's own notes about one agent in kv, each kept under a prefix and the agent's name. test_rename reads every
+# kv key the code builds from a value, so a new prefix is placed here or named there with what it holds.
 AGENT_KV = ("tools:", "offline_told:", "runtime_since:", "switched:", "switching:", "history_agent:", "default_vault:",
-            "default_desktop:")
+            "default_desktop:", "checks_brief:", "chat_team:", "duty_review:", "presence:", "turn_ended:")
+# The same, with more after the name: `<prefix><agent>:<window, task or item>`.
+AGENT_KV_SCOPED = ("listed:", "untaken:", "chased:")
+# Columns that hold a JSON list of agents' names: the agents that passed a question up (question_passers).
+AGENT_LISTS = (("questions", "passed"),)
 KEY_FEATURE = "rename_key"      # a server service whose rename job moves the agent's key file (server.py `carry_key`)
 
 
@@ -29767,6 +29831,21 @@ def rename_rows(old, new, t0, key_moves=False):
     for prefix in AGENT_KV:
         DB.execute("DELETE FROM kv WHERE k=?", (prefix + new,))
         DB.execute("UPDATE kv SET k=? WHERE k=?", (prefix + new, prefix + old))
+    # A name holds no ":", so `<prefix><old>:` is the old agent's own and never the start of another agent's key.
+    for prefix in AGENT_KV_SCOPED:
+        was, now_ = f"{prefix}{old}:", f"{prefix}{new}:"
+        DB.execute("DELETE FROM kv WHERE substr(k, 1, ?)=?", (len(now_), now_))
+        DB.execute("UPDATE kv SET k=? || substr(k, ?) WHERE substr(k, 1, ?)=?", (now_, len(was) + 1, len(was), was))
+    for table, column in AGENT_LISTS:
+        for row in DB.execute(f"SELECT rowid AS row_id, {column} AS names FROM {table} WHERE {column} LIKE ?",
+                              (f'%"{old}"%',)).fetchall():
+            try:
+                names = json.loads(row["names"])
+            except ValueError:
+                continue                        # not a list the hub wrote: question_passers reads it as none
+            if isinstance(names, list):
+                DB.execute(f"UPDATE {table} SET {column}=? WHERE rowid=?",
+                           (json.dumps([new if n == old else n for n in names]), row["row_id"]))
 
 
 def rename_agent(agent, body):
@@ -34689,7 +34768,8 @@ class Handler(BaseHTTPRequestHandler):
             if kind not in SERVER_KINDS:
                 raise ValueError("kind must be linux or mac")
             if agent is not None and (kind != "mac" or not isinstance(agent, str) or not AGENT_NAME.match(agent)
-                                      or agent == "owner" or agent in agents() or runtime not in SWITCH_RUNTIMES):
+                                      or agent in RESERVED_AGENT_NAMES or agent in agents()
+                                      or runtime not in SWITCH_RUNTIMES):
                 raise ValueError("agent is a new first agent of a Mac, on a runtime of a sitting")
             if chatgpt is not None and (agent is None or not isinstance(chatgpt, bool)
                                         or ("browser" not in RUNTIME_CAN[runtime] and not chatgpt)):
@@ -34709,7 +34789,7 @@ class Handler(BaseHTTPRequestHandler):
                                                                         "reports_to"))
             if not (isinstance(base, str) and re.fullmatch(r"[0-9a-f]{64}", base)):
                 raise ValueError("base_sha256 must be the SHA-256 of team.json")
-            if not (isinstance(agent, str) and AGENT_NAME.match(agent)) or agent == "owner":
+            if not (isinstance(agent, str) and AGENT_NAME.match(agent)) or agent in RESERVED_AGENT_NAMES:
                 raise ValueError("agent must be 2 to 31 characters a-z 0-9 -, starting with a letter, and not owner")
             if runtime not in SWITCH_RUNTIMES:
                 raise ValueError("runtime must be codex or claude")
@@ -34725,7 +34805,7 @@ class Handler(BaseHTTPRequestHandler):
         """POST /ui/servers/<server>/prepare: the other runtime of an agent on this server, before its switch."""
         def read(data):
             agent, runtime = data.get("agent"), data.get("runtime")
-            if not (isinstance(agent, str) and AGENT_NAME.match(agent)) or agent == "owner":
+            if not (isinstance(agent, str) and AGENT_NAME.match(agent)) or agent in RESERVED_AGENT_NAMES:
                 raise ValueError("agent must be the name of an agent on this server")
             if runtime not in SWITCH_RUNTIMES:
                 raise ValueError("runtime must be codex or claude")
@@ -39359,7 +39439,7 @@ class Handler(BaseHTTPRequestHandler):
             base, name = data.get("base_sha256"), data.get("name")
             if not (isinstance(base, str) and re.fullmatch(r"[0-9a-f]{64}", base)):
                 raise ValueError("base_sha256 must be the SHA-256 of team.json")
-            if not (isinstance(name, str) and AGENT_NAME.fullmatch(name)) or name in ("owner", "hub"):
+            if not (isinstance(name, str) and AGENT_NAME.fullmatch(name)) or name in RESERVED_AGENT_NAMES:
                 raise ValueError("name must be 2 to 31 characters a-z 0-9 -, starting with a letter, and not owner "
                                  "or hub")
             return {"agent": agent, "base_sha256": base, "name": name}
@@ -40457,6 +40537,7 @@ def main():
     settle_stopped_calls()
     settle_pings()
     settle_releases()
+    settle_task_numbers()
     # The heartbeat starts here and not at the first complete pass (tick_heartbeat), so that a hub whose very first
     # pass raises -- a bad row is there before the timers are -- is visible on the owner's screen after TICK_WARN
     # instead of for ever reading as a hub that has not ticked yet. A process with no timers thread (every test)
