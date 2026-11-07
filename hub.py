@@ -31242,7 +31242,8 @@ def door_github_tokens(agent, repos):
 # form shows while that item is open: GET /ui/team github.renew), and "delete" waits for GitHub to refuse the old key.
 # Nothing starts before the first task session's tokens through the door worked (kv door_first_token).
 DOOR_RENEW_EVERY = 300          # seconds between two looks, each one call to the door and one to GitHub
-DOOR_RENEW = {"at": 0.0}
+DOOR_RENEW_FORM = 900           # seconds since the Mac app that shows the form last read GET /ui/door with renew=form
+DOOR_RENEW = {"at": 0.0, "form": 0.0}
 GITHUB_KEY_PRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}=")
 GITHUB_APP_PAGE = re.compile(r"https://github\.com/(?:organizations/[A-Za-z0-9][A-Za-z0-9-]{0,38}/)?settings/apps/"
                              r"[a-z0-9][a-z0-9-]{0,99}")
@@ -31275,8 +31276,8 @@ def door_renew(t0=None):
     state = door_renewal() or {}
     if conf is None or app_id is None or state.get("step") == "done" or t0 - DOOR_RENEW["at"] < DOOR_RENEW_EVERY:
         return None
-    if not state and not kv_get("door_first_token"):
-        return None
+    if not state and (not kv_get("door_first_token") or t0 - DOOR_RENEW["form"] > DOOR_RENEW_FORM):
+        return None             # the first item waits for a token through the door and for an app that shows the form
     DOOR_RENEW["at"] = t0
     asked = {"app_id": app_id, **({"ref": state["old"]} if state.get("step") == "delete" else {})}
     status, key = door_call(conf, "POST", "/github/key", conf["token"], asked)
@@ -35596,6 +35597,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if query.get("db") != kv_get("db_id"):
             return self.json(409, {"error": "hub generation changed; refresh state"})
+        if query.get("renew") == "form":     # plan 13, item 4: this Mac app's GitHub App rows take the App's new key
+            DOOR_RENEW["form"] = now()
         with LOCK:
             view = door_view()
         return self.json(200, dict(view, db=kv_get("db_id")), {"Cache-Control": "no-store"})
