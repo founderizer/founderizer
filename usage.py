@@ -392,8 +392,9 @@ def holds(stream, f):
 
 def read_on(scan, f, stream, size, kit, deadline):
     """Read the complete lines of `stream` after f.offset, up to the size that the file had when it was listed. A line
-    that can hold a token record is parsed whole, and one longer than MAX_ROW is passed over. A scan past its bounds
-    stops between two lines (ScanPending), and a line that a writer is still finishing is read at a later scan."""
+    that can hold a token record is parsed whole, and one longer than MAX_ROW, or a whole one that is not JSON or not
+    of a record's shape, is passed over. A scan past its bounds stops between two lines (ScanPending), and a line that a writer is still
+    finishing is read at a later scan."""
     while f.offset < size:
         if scan.read and (scan.read >= MAX_BYTES or time.monotonic() > deadline):
             raise ScanPending("scan limit")
@@ -414,9 +415,12 @@ def read_on(scan, f, stream, size, kit, deadline):
             try:
                 row = json.loads(line)
             except ValueError:
-                raise ValueError("invalid transcript") from None
+                row = None                          # its offset moves past it, so no later scan stops at it again
             if isinstance(row, dict):
-                f.records.take(f.index, row, kit)
+                try:
+                    f.records.take(f.index, row, kit)
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    pass                            # a row of another shape is passed over in the same way
         f.offset, f.tail, f.index = f.offset + length, tail, f.index + 1
     f.done = True
 

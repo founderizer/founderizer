@@ -1,7 +1,11 @@
 #!/bin/sh
-# Founderizer target host setup (owner feature target_servers). The hub serves it at GET /place with its own address
-# in HUB. The owner runs it as root on the host that holds a target, with the one line from Founderizer (Targets, Add
-# server); FLEET_PLACE holds the one-time code.
+# Founderizer target host setup (owner feature target_servers). The hub served it at GET /place with its own address
+# in HUB, and the owner ran it as root on the host that holds a target, with the one line from Founderizer (Targets,
+# Add server); FLEET_PLACE held the one-time code.
+#
+# Unused since Targets left the hub on 24 October 2026: no hub serves this script or answers its calls any more
+# (POST /place/plan, GET /place/helper, POST /place/done), so it stops at the end of this file, before it calls one or
+# changes this host. main stays, with place.py, for the central vault that comes next (publish.py).
 #
 # A key in a machine's vault reaches the place where an application reads it through one helper on this host,
 # place.py, which the vault may run as the forced command of one SSH key and in no other way. This puts that helper
@@ -212,4 +216,5 @@ Founderizer (Targets, Add server) and run it again; nothing here is done twice."
 }
 
 # The whole script is read before main runs: a command that reads standard input cannot take the rest of the script.
-main
+# main does not run while no hub answers its calls (see the top).
+stop "Founderizer did not give this host its setup."

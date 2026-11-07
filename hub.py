@@ -30790,10 +30790,20 @@ def record_status(agent, data):
         if same_code(rev, target) or same_code(rev, desired) or contains_revision(rev, target):
             q("UPDATE machine_updates SET state='current', detail=NULL, finished=? WHERE agent=?", (now(), agent))
             log(agent, f"runs the requested revision {target[:12]}")
-        elif up["state"] != "failed" and state in ("waiting_idle", "updating", "failed"):
+        elif state in ("waiting_idle", "updating") or state == "failed" and up["state"] != "failed":
+            # A helper takes an update only from a request, so a step that it reports is the request that stands,
+            # also after a failure: a report of the earlier failure can come between a new request and the helper's
+            # update event, and the row must not stay at that failure while the helper updates.
             q("UPDATE machine_updates SET state=?, detail=?, started=CASE WHEN ?='updating' AND started IS NULL "
               "THEN ? ELSE started END, finished=CASE WHEN ?='failed' THEN ? ELSE finished END WHERE agent=?",
               (state, data["update"]["detail"], state, now(), state, now(), agent))
+        elif state is None and up["state"] in ("waiting_idle", "updating") and isinstance(rev, str) and \
+                REVISION.match(rev) and git_kit("cat-file", "-e", f"{rev}^{{commit}}")[0] == 0:
+            # The helper that took the request is gone (a restart or a reboot before its checkout moved), and the
+            # process that reports now has none in hand: the request stands again, and this answer asks it again.
+            # A commit that the hub does not have yet can hold the update (contains_revision fetches it): it waits.
+            q("UPDATE machine_updates SET state='requested', detail=NULL, started=NULL WHERE agent=?", (agent,))
+            log(agent, f"its helper started again before its update ended; it is asked again for {target[:12]}")
     up = q1("SELECT * FROM machine_updates WHERE agent=?", (agent,))
     # The manager's helper too: its kit update is a worker's (request_update), so a release, a change of its own
     # settings and the owner's own button all reach it the same way.
@@ -33326,6 +33336,15 @@ def release_work(applying, automatic=False, fetch=None):
             q("UPDATE releases SET state=?, step=?, says=?, finished=? WHERE state='updating'",
               (releases.FAILED, "merge", "the update ended with an error in the hub; read the hub's own log",
                now()))
+
+
+def settle_releases():
+    """At the start of the hub: an update run lives in the process that started it (release_work), and its row says
+    what came of it before the hub restarts onto the release. A row that still says updating was a run that a stop
+    of the hub cut off, so it ends as a run that ended with an error, and the next run of that release finds out
+    where the checkout is."""
+    q("UPDATE releases SET state=?, step=?, says=?, finished=? WHERE state='updating'",
+      (releases.FAILED, "merge", "the hub stopped before this update ended; the next update takes it again", now()))
 
 
 def finish_release(rid, state, step, says, automatic, result=None):
@@ -36581,6 +36600,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             return self.json(400, {"db": kv_get("db_id"), "error": str(e)})
         if m["account"] not in chat_apps():
+            # the bridge reads this text: an event of an account that is gone leaves its journal (channels.py)
             return self.json(409, {"db": kv_get("db_id"), "error": "unknown chat app account"})
         result = chat_inbound(m)
         return self.json(200, {"db": kv_get("db_id"), "result": result})
@@ -39979,6 +39999,7 @@ def main():
     ensure_bridge_key()
     settle_stopped_calls()
     settle_pings()
+    settle_releases()
     # The heartbeat starts here and not at the first complete pass (tick_heartbeat), so that a hub whose very first
     # pass raises -- a bad row is there before the timers are -- is visible on the owner's screen after TICK_WARN
     # instead of for ever reading as a hub that has not ticked yet. A process with no timers thread (every test)

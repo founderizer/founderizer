@@ -1173,7 +1173,8 @@ class Bridge:
                 if code == 200:
                     self.journal.remove(path)
                     log(f"inbound {where}: {answer.get('result')}")
-                elif code in (400, 413):
+                elif code in (400, 413) or (code == 409 and answer.get("error") == "unknown chat app account"):
+                    # a bad event, or one of an account that the hub does not have (any more): it never gets in
                     self.journal.remove(path)
                     log(f"inbound {where}: the hub refused the event ({code}); removed")
                 elif code == 409:

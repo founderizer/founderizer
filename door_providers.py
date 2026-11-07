@@ -130,8 +130,8 @@ def backblaze(access, agent, account, op, args, content, lookups):
         return Decision("rule" if mine else "judged", "a key that the door minted" if mine else
                         "revoking a key that the door did not mint", target=f"backblaze:{account}",
                         plan={"provider": "backblaze", "account": account,
-                              "steps": [step("POST", "b2_delete_key", {"applicationKeyId": args[0]},
-                                             keep="revoked")]})
+                              "steps": [dict(step("POST", "b2_delete_key", {"applicationKeyId": args[0]},
+                                                  keep="revoked"), key_id=args[0])]})
     if op == "key-place":
         return key_place(access, agent, "backblaze", account, args, lookups)
     if op == "change":                            # D25: a write of the key's own rights, judged
@@ -681,7 +681,7 @@ def tailscale(access, agent, tailnet, op, args, content, lookups):
             re.fullmatch(r"tag:[a-z0-9-]{1,50}|[A-Za-z0-9]{6,40}", args[1]):
         steps = [step("POST", "/tailnet/-/keys", {"keyType": "client", "scopes": ["devices:core"],
                                                    "tags": [args[1]]}, keep="minted")] if args[0] == "make" else \
-            [step("DELETE", f"/tailnet/-/keys/{args[1]}")]
+            [dict(step("DELETE", f"/tailnet/-/keys/{args[1]}", keep="revoked"), key_id=args[1])]
         return Decision("judged", f"{args[0]} an OAuth client for one tag", target=f"tailscale:{tailnet}",
                         plan={"provider": "tailscale", "account": tailnet, "steps": steps})
     if op in ("tags", "acl", "policy"):
@@ -842,7 +842,8 @@ def delete_refusal(key):
 # ---------------------------------------------------------------- execute a plan
 #
 # ctx gives what a plan needs: http(method, url, headers, body) -> (status, answer), the secret of this account
-# (credentials), keep(kind, value) for what the door keeps (a minted key's secret), minted_secret(key_id), and
+# (credentials), keep(kind, value) for what the door keeps (a minted key's secret) and forgets (the id of a key that
+# it revoked), minted_secret(key_id), and
 # host(host, op, args, stdin) for a call through a host's ops-root. Tests give a stub ctx.
 
 BASES = {"cloudflare": "https://api.cloudflare.com/client/v4", "github": "https://api.github.com",
@@ -890,6 +891,8 @@ def execute(plan, ctx):
             said.append(f"minted {answer.get('applicationKeyId') or answer.get('id')}: the door keeps its secret" +
                         (", and the new key works" if provider == "backblaze" else ""))
             continue
+        if s.get("keep") == "revoked":          # a key that the provider ended leaves the door's list and secrets
+            ctx["keep"]("revoked", s["key_id"])
         if s.get("keep") == "server_id":
             kept["server_id"] = answer["servers"][0]["id"]
             continue
@@ -1147,13 +1150,17 @@ def repo_new(plan, ctx):
     token of its own for this call. The door's record keeps the call pending before it is sent and, once GitHub
     answers, the repository by its id with the agent and the app (ctx["repos"]). A retry finds a repository of that
     name: it completes the record only when the App reads it, its one commit is the App's and GitHub made it within a
-    minute of the pending record, and refuses otherwise."""
+    minute of the pending record, and refuses otherwise. A repository that the record shows made for this agent, by
+    its id, gets the App's reach check again: a retry after that check failed finishes there."""
     conf, want = ctx["credentials"], plan["repo_new"]
     full, agent, record = want["name"], want["agent"], ctx["repos"]
     owner, app = full.split("/", 1)
     inst, token = one_call(conf, ctx, plan["repo"], REPO_NEW)
     status, there = gh(ctx, token, "GET", f"/repos/{full}")
     if status == 200:
+        known = record("made", full)
+        if isinstance(there, dict) and known and known.get("agent") == agent and known.get("id") == there.get("id"):
+            return app_reaches(conf, ctx, plan["repo"], full)
         pending = record("pending", full)
         made = isinstance(there, dict) and pending and pending.get("agent") == agent and \
             created_within(there.get("created_at"), pending.get("at"), 60) and app_commit_only(ctx, token, full, inst)
@@ -1171,7 +1178,12 @@ def repo_new(plan, ctx):
     if status != 201 or not isinstance(answer, dict) or answer.get("full_name", "").lower() != full.lower():
         raise Stop(f"GitHub made no repository {full} ({status}): {short(answer, 300)}")
     record("made", full, id=answer.get("id"), agent=agent, app=app)
-    status, _ = gh(ctx, one_call(conf, ctx, plan["repo"], {"metadata": "read"})[1], "GET", f"/repos/{full}")
+    return app_reaches(conf, ctx, plan["repo"], full)
+
+
+def app_reaches(conf, ctx, via, full):
+    """The App's installation reaches a repository that the door made, or the call stops with GitHub's answer."""
+    status, _ = gh(ctx, one_call(conf, ctx, via, {"metadata": "read"})[1], "GET", f"/repos/{full}")
     if status != 200:
         raise Stop(f"GitHub made {full}, and the App's installation does not reach it ({status}): the new-projects plan "
                    f"stops here and goes back to the owner with this answer")

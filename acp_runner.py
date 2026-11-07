@@ -48,6 +48,7 @@ class Records:
         self.post = post
         self.seq, self.pending, self.lock = 0, [], threading.Lock()
         self.kind, self.parts = None, []        # message chunks of one kind become one record
+        self.dead = False                       # the hub refused this session's records for good (409)
 
     def add(self, record):
         with self.lock:
@@ -72,9 +73,12 @@ class Records:
         self.kind, self.parts = None, []
 
     def send(self):
+        """The rule of threads.Tailer.deliver: a batch that the hub did not take goes again at the next send; a 409
+        (an old generation or attempt) ends the sending, and a batch of another 4xx, which the hub will never take,
+        is passed over, so that it holds back no later record."""
         with self.lock:
             self._flush_text()
-            while self.pending:
+            while self.pending and not self.dead:
                 batch, size = [], 0
                 for record in self.pending[:100]:
                     size += len(json.dumps(record))
@@ -85,9 +89,13 @@ class Records:
                     code, _ = self.post(batch)
                 except Exception:
                     return False
-                if code != 200:
+                if code == 409:
+                    self.dead = True
+                elif code != 200 and not 400 <= code < 500:
                     return False
                 del self.pending[:len(batch)]
+            if self.dead:
+                self.pending.clear()            # these records have no place any more
             return True
 
     def update(self, update):

@@ -117,6 +117,9 @@ type Link struct {
 	outMu sync.Mutex
 	out   *json.Encoder
 
+	stateMu sync.Mutex
+	state   stateEvent // the last state sent: a pair on a linked database repeats it
+
 	mu      sync.Mutex
 	pending map[types.MessageID]chan struct{}
 	pairing bool
@@ -193,6 +196,9 @@ func (l *Link) emitState(state string, jid types.JID, errText string) {
 		s := clip(errText)
 		ev.Error = &s
 	}
+	l.stateMu.Lock()
+	defer l.stateMu.Unlock()
+	l.state = ev
 	l.emit(ev)
 }
 
@@ -452,8 +458,12 @@ func (l *Link) typing(c command) error {
 
 func (l *Link) pair() {
 	if l.cli.HasDevice() {
+		// The state again, and not "linked": the bridge sends while the state
+		// is linked, so only a connection that is up may say it.
 		l.log.Infof("Pair: this database already has a linked device")
-		l.emitState("linked", l.cli.OwnJID(), "")
+		l.stateMu.Lock()
+		defer l.stateMu.Unlock()
+		l.emit(l.state)
 		return
 	}
 	l.mu.Lock()
@@ -568,8 +578,10 @@ func (l *Link) onMessage(e *events.Message) bool {
 	case <-wait:
 		return true
 	case <-timer.C:
-		l.log.Warnf("No ack for message %s in %s, confirming it to WhatsApp anyway", id, l.ackWait)
-		return true
+		// The bridge did not journal it. WhatsApp keeps a message that is not
+		// confirmed and delivers it again after the next connection.
+		l.log.Warnf("No ack for message %s in %s, so it is not confirmed; WhatsApp delivers it again after the next connection", id, l.ackWait)
+		return false
 	case <-l.ctx.Done():
 		l.log.Infof("Stopping before the ack of message %s; WhatsApp delivers it again", id)
 		return false

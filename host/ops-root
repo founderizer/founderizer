@@ -16,7 +16,7 @@ the request's SHA-256; there is no TTY and the environment is empty. A root-owne
 then judged forms and file installs are refused here. A judged command runs in a transient service that hides the
 host's app trees, the Docker and containerd sockets and its secret paths; a package install and a file install run
 outside it. A write holds the host's one lock, so a second write waits. A new version of this file comes only from a
-release that the release key signed (`self-update`), and never an older one.
+release that the release key signed (`self-update`), never a held one, and never one before the release it came from.
 
 Exit status: 0 done, 3 refused (the one line says why), 1 failed.
 """
@@ -51,7 +51,7 @@ KIT_FILE = ETC + "/fleet-kit"               # a Fleet machine's checkout, whose 
 POOL_FILE = ETC + "/pool"                   # a CI host's pool volume (an LVM path) for grow-pool
 BUILD_FILE = ETC + "/build-file"            # a CI host's build file (sparse ext4 on a loop device) for grow-file
 RUNNER_USER_FILE = ETC + "/runner-user"     # a CI host's rootless Docker user: each of its containers is a runner
-RELEASE_FILE = ETC + "/release"             # the release revision this file came from
+RELEASE_FILE = ETC + "/release"             # the release revision this file came from: self-update's floor
 STATE = "/var/lib/ops-root"
 LOCK_FILE = "/run/ops-root.lock"
 SELF = "/usr/local/sbin/ops-root"
@@ -796,12 +796,19 @@ def do_self_update(req, data):
     except ValueError:
         raise Refused("self-update needs the release bundle on stdin") from None
     files = verify_bundle(bundle)
+    m = bundle["manifest"]
+    if m.get("hold"):                       # as the door's own take (door.take), and the floor below as there
+        raise Refused(f"release {m['version']} is held")
     new = files["ops-root"]
     found = re.search(rb"^VERSION = ([0-9]{1,6})\b", new, re.M)
     if not found:
         raise Refused("the new ops-root names no VERSION")
     if int(found.group(1)) < VERSION:
         raise Refused(f"ops-root {int(found.group(1))} is older than {VERSION}: never an older one")
+    floor = read(RELEASE_FILE).strip()
+    if floor and not descends(bundle, floor):
+        raise Refused(f"release {m['version']} does not descend from {floor}, the release this ops-root came from: "
+                      f"never an older one")
     for name, target, mode_bits in (("ops-root", SELF, 0o755), ("ops-read", READER, 0o755),
                                     ("inventory", INVENTORY, 0o755), ("app-release", RELEASE_HELPER, 0o755)):
         if name in files:
@@ -1831,6 +1838,31 @@ def verify_bundle(bundle):
     if "ops-root" not in files:
         raise Refused("the bundle carries no ops-root")
     return files
+
+
+def descends(bundle, floor):
+    """True when the signed revision is the floor or comes after it, the door's own rule (git merge-base
+    --is-ancestor) without a repository: the bundle's `history` carries raw commits below the revision, each taken
+    by its own hash, so the way down goes only through the parents that those commits name."""
+    revision, history = bundle["manifest"]["revision"], bundle.get("history") or []
+    try:
+        if not isinstance(history, list):
+            raise ValueError
+        known = {git_object("commit", body): body for body in (base64.b64decode(one) for one in history)}
+    except (TypeError, ValueError):
+        raise Refused("the release bundle is not well formed") from None
+    known[revision] = base64.b64decode(bundle["commit"])
+    todo, seen = [revision], set()
+    while todo:
+        sha = todo.pop()
+        if sha == floor:
+            return True
+        if sha in seen or sha not in known:
+            continue
+        seen.add(sha)
+        head = known[sha].split(b"\n\n", 1)[0]
+        todo += [p.decode() for p in re.findall(rb"^parent ([0-9a-f]{40})$", head, re.M)]
+    return False
 
 
 # Ed25519 (RFC 8032), verify only: the same code as releases.py, here so that this file stands alone.

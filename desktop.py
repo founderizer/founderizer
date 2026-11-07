@@ -72,6 +72,7 @@ class Publisher:
         self.process = None
         self.reader = None
         self.buffer = b""
+        self.ended = None       # the hub's 403, 404 or 409 that ended it: a new publisher would get the same
 
     def start(self):
         self.thread = threading.Thread(target=self.run, daemon=True, name="desktop-preview")
@@ -139,6 +140,7 @@ class Publisher:
                             if code != 200:
                                 self.close_capture()
                     if code in (403, 404, 409):
+                        self.ended = code
                         return
                 except (OSError, ValueError, subprocess.SubprocessError):
                     self.close_capture()

@@ -573,6 +573,15 @@ class Door:
         with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
             f.write(f"{key_id}:{value}")
 
+    def forget_minted(self, key_id):
+        """A key that the door revoked: its id leaves the minted list, and its secret leaves the door's secrets."""
+        with self.lock:
+            minted = read_json(MINTED_FILE, {})
+            if minted.pop(key_id, None) is not None:
+                write_json(MINTED_FILE, minted)
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(os.path.join(P(SECRETS_DIR), "minted-" + hashlib.sha256(key_id.encode()).hexdigest()))
+
     def minted_secret(self, key_id):
         path = os.path.join(P(SECRETS_DIR), "minted-" + hashlib.sha256(key_id.encode()).hexdigest())
         try:
@@ -750,7 +759,8 @@ class Door:
 
     def provider_ctx(self, access, target):
         return {"credentials": dict(self.credential(access, target), owner=target.partition(":")[2]),
-                "http": self.http, "secret": self.secret, "keep": lambda kind, answer: self.keep_minted(answer),
+                "http": self.http, "secret": self.secret,
+                "keep": lambda kind, value: self.forget_minted(value) if kind == "revoked" else self.keep_minted(value),
                 "made": lambda key: self.keep_made(target, key),
                 "repos": self.repo_record,
                 "account": lambda account_id: self.keep_account(access, target, account_id),

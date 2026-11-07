@@ -70,6 +70,14 @@ fi
 if [ "$branch" = "$CONFIG_BRANCH" ]; then
     act merge -q --ff-only "origin/$CONFIG_BRANCH"
 elif git rev-parse --verify --quiet "refs/heads/$CONFIG_BRANCH" >/dev/null; then
+    # This checkout's own branch of that name moves to origin's before the checkout, so the checkout lands on the
+    # commit that the check above passed, and never on an older or an unchecked one on the way. A branch with commits
+    # that origin lacks is not taken.
+    if git rev-parse --verify --quiet "refs/remotes/origin/$CONFIG_BRANCH" >/dev/null; then
+        git merge-base --is-ancestor "refs/heads/$CONFIG_BRANCH" "origin/$CONFIG_BRANCH" ||
+            stop "this checkout's own $CONFIG_BRANCH branch has commits that origin/$CONFIG_BRANCH lacks; push them to it first"
+        act branch -q -f "$CONFIG_BRANCH" "origin/$CONFIG_BRANCH"
+    fi
     act checkout -q "$CONFIG_BRANCH"
     act merge -q --ff-only "origin/$CONFIG_BRANCH"
 else

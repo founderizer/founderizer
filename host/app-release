@@ -23,9 +23,9 @@ reaches, so root never reads a file that the deploy user could change meanwhile.
 0555, files 0444, or 0555 for a file that was executable. It writes .release.env with APP_RELEASE_SHA, the name of
 both procedures, points `previous` at the release that ran and `current` at the new one, each in one rename, restarts
 only the app's unit, and waits for the health path on the app's loopback port to answer 200 with the sha in its body.
-When that fails, `current` goes back, the unit restarts, and that release must answer too. After a healthy release,
-the oldest releases and artifacts go, five of each stay, and a pruning error is a warning that never undoes a good
-release.
+When that fails, `current` and `previous` go back, the unit restarts, and that release must answer too. After a
+healthy release, the oldest releases and artifacts go, five of each stay, and a pruning error is a warning that never
+undoes a good release.
 
 Standard library only. Exit status: 0 done, 3 refused (the one line says why), 1 failed.
 """
@@ -294,7 +294,7 @@ def deploy(app, artifact, checksum, sha):
                 raise
         for name in (f"{sha}.tar", f"{sha}.sha256"):
             os.replace(P(f"{incoming}/{name}"), P(f"{tree}/artifacts/{name}"))
-        old = where(f"{tree}/current")
+        old, before = where(f"{tree}/current"), where(f"{tree}/previous")
         if old != release:
             if old:
                 point(f"{tree}/previous", old)
@@ -303,7 +303,11 @@ def deploy(app, artifact, checksum, sha):
             prune(tree)
             return f"{app} runs {sha}"
         if old and old != release:
-            point(f"{tree}/current", old)
+            point(f"{tree}/current", old)       # both links as they were: a rollback then leaves the release that runs
+            if before:
+                point(f"{tree}/previous", before)
+            else:
+                os.remove(P(f"{tree}/previous"))
             if restart(app) and healthy(port, health, os.path.basename(old)):
                 raise Failed(f"{sha} did not answer its health check: {os.path.basename(old)} runs again")
         raise Failed(f"{sha} did not answer its health check, and no earlier release answers either")

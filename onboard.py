@@ -1735,6 +1735,7 @@ class Onboarding:
     # ---- run
     def run(self):
         steps = self.state.setdefault("steps", {})
+        self.state.pop("finished", None)        # an earlier run's: only this run's good end says it again
         plan, prefix = ((PREPARE_STEPS, "p_") if self.preparing else (EXISTING_STEPS, "x_") if self.existing
                         else (STEPS, None))
         try:
@@ -1743,10 +1744,12 @@ class Onboarding:
                 try:
                     step = getattr(self, prefix + sid, None) if prefix else None
                     status, detail = (step or getattr(self, "s_" + sid))()
-                except StepFailed as e:
+                except (StepFailed, NeedsOwner, Abort) as e:      # a run that ends in a step ends that step too
                     steps[sid] = {"status": "failed", "detail": str(e), "at": self.sys.now()}
                     self.save()
                     self.ch.step(sid, "failed", title, str(e))
+                    if not isinstance(e, StepFailed):
+                        raise
                     self.ch.emit("result", status="failed", summary=str(e), **self.outcome())
                     return 1
                 steps[sid] = {"status": status, "detail": detail, "at": self.sys.now()}

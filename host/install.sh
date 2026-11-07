@@ -199,7 +199,8 @@ if [ "$LEVEL" = fix ]; then
     visudo -c -q -f "$SUDOERS.new" >/dev/null
     mv -f "$SUDOERS.new" "$SUDOERS"
 else
-    rm -f "$SUDOERS" "$SBIN" "$ETC/mode"           # from Fix down to Read: the root path leaves
+    # from Fix down to Read: the root path leaves, and so do the files that only ops-root reads
+    rm -f "$SUDOERS" "$SBIN" "$ETC/mode" "$ETC/fleet-kit" "$ETC/pool" "$ETC/build-file" "$ETC/runner-user"
 fi
 systemctl is-active --quiet ops-sshd.service || die "the second sshd did not start: journalctl -u ops-sshd"
 echo "installed: level $LEVEL${MODE:+, mode $MODE}, the second sshd on $ADDRESS:$PORT"

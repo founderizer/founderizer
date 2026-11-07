@@ -518,10 +518,12 @@ def vault_program_script(repo, branch=lifecycle.CONFIG_BRANCH):
             "fi\n"
             'git -C %(source)s cat-file blob "$revision:vault.py" > "$new" 2>/dev/null || :\n'
             'test -s "$new" || { echo "fleet-vault-program: the signed release carries no vault.py" >&2; exit 4; }\n'
-            "printf '%%s\\n' \"$revision\" > %(floor)s\n"
             'want=$(sha256sum "$new" | cut -d\' \' -f1)\n'
             "have=$(sha256sum %(program)s | cut -d' ' -f1)\n"
+            # The floor moves only to a release whose vault.py the broker runs: a broker that does not come up on
+            # the new one gets the old one back, and keeps its floor.
             'if [ "$want" = "$have" ]; then\n'
+            "    printf '%%s\\n' \"$revision\" > %(floor)s\n"
             '    echo "fleet-vault-program: the broker already runs this vault.py ($want)"\n'
             "    exit 0\n"
             "fi\n"
@@ -537,6 +539,7 @@ def vault_program_script(repo, branch=lifecycle.CONFIG_BRANCH):
             "crashes=$(systemctl show -p NRestarts --value fleet-vault 2>/dev/null || true)\n"
             'if [ "$active" = active ] && { [ -z "$crashes" ] || [ "$crashes" = 0 ] ||'
             ' [ "$crashes" = unknown ]; }; then\n'
+            "    printf '%%s\\n' \"$revision\" > %(floor)s\n"
             '    echo "fleet-vault-program: the broker runs the vault.py of the configuration ref ($want)"\n'
             "    exit 0\n"
             "fi\n"
@@ -1572,17 +1575,19 @@ def repository(tree, bare, kit):
     because the hub writes the owner's changes to that ref and no other (hub.CONFIG_BRANCH). Both refs start at the
     commit the installer's copy is at, so the code the hub serves is the code it runs.
 
-    Safe to run again: a bare repository or a checkout that is there is left as it is, and the checkout's branch is
-    checked either way."""
+    Safe to run again: a bare repository that holds both refs, or a checkout that is there, is left as it is, and
+    the checkout's branch is checked either way. A bare repository without them, as a failed first push leaves it,
+    is filled, by one push that writes both refs or none."""
     code, commit, err = git("rev-parse", "HEAD", folder=tree)
     if code != 0:
         raise Stop(f"{tree} is not a git checkout with a commit, so the hub's repository cannot be made from it: {err}")
-    if os.path.isdir(bare):
+    if all(git(f"--git-dir={bare}", "rev-parse", "--verify", "--quiet", f"refs/heads/{ref}")[0] == 0
+           for ref in (hub.CODE_BRANCH, hub.CONFIG_BRANCH)):
         say(f"the bare repository is in {bare}")
     else:
         if git("init", "-q", "--bare", bare)[0] != 0:
             raise Stop(f"could not make the bare repository {bare}.")
-        code, _, err = git("push", "-q", bare, f"{commit}:refs/heads/{hub.CODE_BRANCH}",
+        code, _, err = git("push", "-q", "--atomic", bare, f"{commit}:refs/heads/{hub.CODE_BRANCH}",
                            f"{commit}:refs/heads/{hub.CONFIG_BRANCH}", folder=tree)
         if code != 0:
             raise Stop(f"could not put the Founderizer code in {bare}: {err}")

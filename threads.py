@@ -282,7 +282,7 @@ class Translator:
         self.shells = {}            # Claude: background command, monitor or workflow call -> its task id, until its
                                     # end notice
         self.shell_calls = {}       # Claude: BACKGROUND_TOOLS calls of this session -> the tool's name
-        self.turn = False           # Claude: a turn of the main session runs
+        self.turn = False           # Claude and Codex: a turn of the main session runs
         self.ends = 0               # Claude: the turn ends of the main session so far (Helper.interrupt reads it)
         self.delivered = False      # Claude: the session called deliver_result
         self.after = False          # Claude: and called a tool other than Fleet's after it (Helper.closing)
@@ -652,7 +652,9 @@ class Translator:
         if ptype == "task_started":
             self.turns.add(payload.get("turn_id"))
             self.limit = False      # a limit in a later turn is that turn's own: it gives its own record
+            self.turn = self.prefix is None     # a turn of the main session runs until its end (Helper.turn_runs)
         elif ptype == "task_complete":
+            self.turn = False
             # Newer rollouts give the error that ended a turn, such as its usage limit, only in its end. A usage limit
             # that a token_count already gave is not given a second time.
             error = payload.get("error") if isinstance(payload.get("error"), dict) else None
@@ -662,6 +664,7 @@ class Translator:
                 out.append(record)
             out.append({"type": "result", "stop_reason": "error" if error else "end_turn"})
         elif ptype == "turn_aborted":
+            self.turn = False
             out.append({"type": "result", "stop_reason": "cancelled"})
         elif ptype == "error":
             out.append(self.codex_error(payload))

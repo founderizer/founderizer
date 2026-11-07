@@ -3237,6 +3237,7 @@ class Helper:
         self.idle_at = {}         # {window: the last screen reading that agreed on its idle input line}
         self.wanted = {}          # {window: ids of this poll's events that want a signal} (handle_events)
         self.typed_at = {}        # {window: when its last signal was typed}, a model call of its session (restart_fresh)
+        self.closed_due = False   # the manager's session closed at a question, and the hub has not heard it (tell_closed)
         # plan P0 (feature update_between_turns): (the task windows whose turn runs, by the hub's reading at the latest
         # poll, when that answer came), or None while there is none: an older hub, or a poll that failed
         self.hub_turns = None
@@ -3349,6 +3350,8 @@ class Helper:
         is told as "limit", which the hold covers. The manager's session and an owner chat or a conversation window
         that stand still at a question close once instead (stuck_manager, close_stuck), and a window of the same name
         that replaces a closed one starts with a watch of its own."""
+        if getattr(self, "closed_due", False):
+            self.tell_closed()
         r = tmux("list-windows", "-t", f"={self.session}:", "-F", "#{window_name}\t#{window_id}\t#{@fleet_attempt}")
         live = {name: (wid, attempt) for name, wid, attempt in
                 ((line.split("\t") + ["", ""])[:3] for line in (r.stdout.split("\n") if r.returncode == 0 else []))
@@ -3428,9 +3431,8 @@ class Helper:
                     seen["closing"] = (records,)        # one try while nothing moves
                     if self.stuck_manager():
                         if not menu:        # its question reached nobody, which the hub tells its next session
-                            with contextlib.suppress(urllib.error.URLError, OSError, ValueError):
-                                http("POST", f"/helper/dialog/{self.agent}/manager", screen_report("closed"),
-                                     timeout=10)
+                            self.closed_due = True
+                            self.tell_closed()
                         continue
             told = "shown still" if kind == "shown" and quiet else kind
             if seen["told"] == told:
@@ -3529,6 +3531,16 @@ class Helper:
         its first call, is closed one time and then left, for the manager's flag."""
         closed = self.stuck_closed.get(window)
         return closed is None or (self.last_call(window) or 0) > closed
+
+    def tell_closed(self):
+        """The hub hears that the manager's session closed at a question that reached nobody, at each round until it
+        answers: a word lost while the hub restarts would leave the next session untold, as the frozen word is kept."""
+        try:
+            code, _ = http("POST", f"/helper/dialog/{self.agent}/manager", screen_report("closed"), timeout=10)
+        except (urllib.error.URLError, OSError, ValueError):
+            code = None
+        if code is not None and code < 500:
+            self.closed_due = False
 
     def stuck_manager(self):
         """Runtime gaps C1 for the standing manager session, whose screen stood still at a question since it showed:
@@ -3899,6 +3911,7 @@ class Helper:
         lease, and the hub refuses it for a held or finished task. A task in the runner (app_server_task) keeps the
         runner's own publisher."""
         publishers = self.__dict__.setdefault("publishers", {})
+        started = self.__dict__.setdefault("publishers_started", {})
         if not (self.worker and {"browser", "screen"} & set(self.conf.get("can", [])) and sys.platform == "darwin"):
             return
         r = tmux("list-windows", "-t", f"={self.session}:", "-F", "#{window_name}\t#{@fleet_attempt}\t#{@fleet_needs}")
@@ -3911,11 +3924,21 @@ class Helper:
                 live.add((name, generation, int(number)))
         for key in [k for k in publishers if k not in live]:
             publishers.pop(key).close()
+            started.pop(key, None)
         for key in live:
-            if key not in publishers or not publishers[key].thread.is_alive():
-                name, generation, number = key
-                publishers[key] = Publisher(self.agent, name, {"attempt": number, "generation": generation}, http)
-                publishers[key].start()
+            if key in publishers and publishers[key].thread.is_alive():
+                continue
+            # A publisher that the hub's 403, 404 or 409 ended (desktop.Publisher.ended) would get the same again: a
+            # task that is held or over, or an attempt that is not the task's any more. It starts again once a line
+            # went into its window since its last start, as the message that resumes a held task does; a new attempt
+            # is a new key, and one that ended for another reason starts again at once.
+            if key in publishers and getattr(publishers[key], "ended", None) and \
+                    self.typed_at.get(key[0], float("-inf")) <= started.get(key, float("inf")):
+                continue
+            name, generation, number = key
+            publishers[key] = Publisher(self.agent, name, {"attempt": number, "generation": generation}, http)
+            started[key] = time.monotonic()
+            publishers[key].start()
 
     def first_line_due(self, window):
         """True when a window that this helper started can take its first line (plan C5). A Claude session's screen
@@ -3984,15 +4007,22 @@ class Helper:
             if not line["reported"]:
                 # owner-contact plan B3: the manager's session starts fresh for it first, and the report says so; a
                 # session that moves now is not closed, and a later poll reports its line, unless it takes it first
-                fresh = self.fresh_untaken(target, line["ids"]) if window == "manager" else False
-                if fresh is None:
-                    return
-                line["reported"] = True
+                if "fresh" not in line:
+                    fresh = self.fresh_untaken(target, line["ids"]) if window == "manager" else False
+                    if fresh is None:
+                        return
+                    line["fresh"] = fresh       # a report that goes again says what this one said
+                fresh = line["fresh"]
                 try:
-                    http("POST", f"/helper/dialog/{self.agent}/{window}",
-                         {"kind": "untaken", "fresh": True} if fresh else {"kind": "untaken"}, timeout=10)
+                    code, _ = http("POST", f"/helper/dialog/{self.agent}/{window}",
+                                   {"kind": "untaken", "fresh": True} if fresh else {"kind": "untaken"}, timeout=10)
                 except (urllib.error.URLError, OSError, ValueError):
-                    pass
+                    code = None
+                if code is None or code >= 500:
+                    # the hub did not answer: the line stays unreported, and a later poll sends its report again
+                    self.say(f"{window}: the hub did not take the report of its untaken line; a later poll sends it")
+                    return
+                line["reported"] = True         # a refusal too: the same report would be refused again
                 self.say(f"{window}: its line was told twice and not taken; the hub knows" +
                          ("; it starts again on a new conversation with the hub's brief" if fresh else ""))
             return
@@ -4585,7 +4615,11 @@ class Helper:
                 if time.monotonic() >= deadline:
                     break
                 if not wants:           # Codex waits here for the owner on its page: a restarted hub needs its link
-                    self.login_look(lid, link, deadline)
+                    status, data = self.login_look(lid, link, deadline)
+                    if status is not None and (status != 200 or data.get("stop")):
+                        self.say(f"sign-in L-{lid}: the hub ended it ({data.get('why', status)})")
+                        self.send_status()  # whatever the owner did on the provider's page is the machine's to say
+                        return
                 time.sleep(2)
             self.send_status()
             # A runtime that takes no code back (Codex) waited all this time for the owner on the provider's page; one
@@ -4684,7 +4718,9 @@ class Helper:
             self.fresh_at, self.manager_due, self.manager_fresh = time.monotonic(), True, True
             self.say(f"manager: {why}, so its session starts again on a new conversation with the hub's brief")
         else:
-            self.chat_fresh = True          # its next start begins a new conversation, with the hub's recap
+            # its next start begins a new conversation, with the hub's recap, and its count of starts that ended
+            # before their conversation began starts again with it (start_chat)
+            self.chat_fresh, self.chat_started = True, None
             self.say(f"{window}: {why}, so it starts again on a new conversation with the hub's recap")
         return True
 
