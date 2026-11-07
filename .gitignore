@@ -2,3 +2,4 @@ pilot.db
 pilot.db-journal
 *.log
 __pycache__/
+pilot.db.lock

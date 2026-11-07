@@ -22,6 +22,7 @@ import argparse
 import base64
 import collections
 import contextlib
+import fcntl
 import functools
 import hashlib
 import hmac
@@ -454,17 +455,25 @@ def read_row(sql, args=()):
 @contextlib.contextmanager
 def transaction():
     """Plain DB.execute statements that commit together or not at all. q, q1, ins, emit and kv_get each commit at
-    once, so none of them may run inside; read_rows is the read that may."""
+    once, so none of them may run inside; read_rows is the read that may. commit() refuses them (no_commit_inside).
+
+    It does not nest. The one connection has one transaction, so an inner block's commit was the outer block's
+    commit too: it landed the outer block's half-written rows, and the outer rollback could undo only what came
+    after it. An inner block is refused instead, before it writes anything."""
     with LOCK:
-        TX.open = getattr(TX, "open", 0) + 1
+        if getattr(TX, "open", 0):
+            raise RuntimeError("transaction() does not nest: an inner block's commit commits the outer block's "
+                               "half-written rows. Inside one, call the *_rows form of the write, which joins it.")
+        TX.open = 1
         try:
             yield
+            TX.open = 0         # the one commit that no_commit_inside lets through: this block's own
             commit()
         except BaseException:
             rollback()
             raise
         finally:
-            TX.open -= 1
+            TX.open = 0
 
 
 # ---------------------------------------------------------------- the apps' change signal (owner feature live_changes)
@@ -514,8 +523,21 @@ def counted():
         changed(name)
 
 
+def no_commit_inside():
+    """Refuse a commit while this thread has a transaction() open: it would land that transaction's half-written rows,
+    and the rollback after a later error could not take them back. Four reads that committed (a q() for a flag, a
+    count or a capability probe) were found on transaction paths in one day, each one looking innocent, so the rule
+    is held here and not by each caller."""
+    if getattr(TX, "open", 0):
+        raise RuntimeError("This commits at once, inside an open transaction(), and would land its half-written rows. "
+                           "Inside one, a read is read_rows or read_row, a write is DB.execute and a message is "
+                           "event_rows.")
+
+
 def commit():
-    """DB.commit(), counted: every write commits through here, transaction() or committed()."""
+    """DB.commit(), counted: every write commits through here, transaction() or committed(). Never inside an open
+    transaction() (no_commit_inside)."""
+    no_commit_inside()
     DB.commit()
     counted()
 
@@ -528,13 +550,18 @@ def rollback():
 
 @contextlib.contextmanager
 def committed():
-    """`with DB:`, counted: one commit, or a rollback on an error."""
+    """`with DB:`, counted: one commit, or a rollback on an error. For the guards it is a transaction() too: a
+    *_rows writer may run inside it (in_transaction), and nothing inside it may commit (no_commit_inside)."""
+    no_commit_inside()
+    TX.open = 1
     try:
         with DB:
             yield
     except BaseException:
         CHANGE["base"] = getattr(DB, "total_changes", None)
         raise
+    finally:
+        TX.open = 0
     counted()
 
 
@@ -561,14 +588,11 @@ def in_transaction(what):
     either way. The comment that says "inside the caller's transaction" does not hold that, so this does: the next
     caller written outside one reads this exception instead of getting a row that is sometimes there.
 
-    Guarded: keep_command, event_rows, waiting_say_rows, dispatch_check, resource_record, log_row, duty_new_case,
-    memory_from_work, memory_close_rows, and the row writers of the six crash windows — record_outcome_rows,
-    stop_request_rows, request_unknown_rows, duty_history_row, duty_watch_rows, duty_review_rows, trigger_create_rows,
-    trigger_edit_rows and trigger_state_rows. Each of those has a committing twin for the callers that have no
-    transaction of their own, so the guard never stands between a caller and the write it meant to make.
-
-    Not guarded yet, in the same shape and each one line from it: attempt_rows, pause_trigger, record_trigger,
-    end_open_runs, once_done, memory_contradicted and memory_indexed."""
+    Every function whose docstring says that it writes inside the caller's transaction calls this as its first
+    statement, before its first write: a guard after the first writes would leave those writes uncommitted for the
+    next unrelated commit. Each of those has a committing twin, or a caller with a transaction of its own, so the
+    guard never stands between a caller and the write it meant to make. Its other half is no_commit_inside: nothing
+    inside an open transaction commits."""
     if not getattr(TX, "open", 0):
         raise RuntimeError(f"{what} writes inside the caller's transaction, and none is open. Put the call in a "
                            f"`with transaction():` block.")
@@ -869,6 +893,7 @@ def key_matches(name, token):
 
 def revoke_sessions(name, t0):
     """Inside a transaction: every session credential of the agent stops at once (its key changed or was removed)."""
+    in_transaction("revoke_sessions")
     DB.execute("UPDATE session_credentials SET revoked=? WHERE agent=? AND revoked IS NULL", (t0, name))
 
 
@@ -3155,6 +3180,7 @@ def attempt_rows(t, reason, event, t0, counted=False):
     """Inside a transaction: the next attempt of task row `t` and its start event. A new attempt number without its
     start event would leave a task that no helper starts. Every new attempt of a task is made here (a restart, a
     fresh start, a reminder, a usage-limit reset, a resume), so the owner's unread steers move to it here too."""
+    in_transaction("attempt_rows")
     DB.execute("UPDATE tasks SET attempt=attempt+1, restarts=restarts+?, missing_since=?, started=?, nudge_level=0 "
                "WHERE id=?", (1 if counted else 0, t0 if counted else None, t0, t["id"]))
     # plan C10: a new attempt moves the task again, so what its stuck notice said is over (tasks_stuck), and a new
@@ -3537,6 +3563,7 @@ def resume_plan(task_id, mode, by, via=None, note=""):
 def resume_rows(plan, t0):
     """Inside a transaction: the hold is released, and the session gets its message or the task its next attempt.
     A released hold without the one or the other would leave a task that nothing continues."""
+    in_transaction("resume_rows")
     DB.execute("UPDATE holds SET state='released', released=?, released_by=?, resume_mode=? WHERE id=?",
                (t0, plan["by"], plan["mode"], plan["hold"]["id"]))
     if plan["attempt"]:
@@ -5432,6 +5459,7 @@ def split_step(agent, value, goal_id, parent):
 def admit_task(requester, f, trigger_id=None, trigger_run=None):
     """A new task, its first attempt and its start event, as plain statements inside the caller's transaction().
     Returns the task ID."""
+    in_transaction("admit_task")
     generation = DB.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()
     t0 = now()
     tid = DB.execute("INSERT INTO tasks(title,details,done_when,needs,goal,goal_id,parent,step,owner,requester,state,"
@@ -5574,6 +5602,7 @@ NEED_CLOSED_BY = "Fleet"        # needs.answered_by of an item that the hub clos
 def question_needs_close(where, args, why, t0):
     """Inside the caller's transaction: the open Needs-you items raised for the questions that `where` selects
     (raise_needs_you question_id) close, as an item that the hub ends: it leaves Needs you, and no ping goes for it."""
+    in_transaction("question_needs_close")
     DB.execute(f"UPDATE needs SET answer=?, answered=?, answered_by=? WHERE answer IS NULL AND question IN "
                f"(SELECT id FROM questions WHERE {where})", (why, t0, NEED_CLOSED_BY, *args))
 
@@ -9315,11 +9344,12 @@ def t_start_task(agent, a):
         text = (f"Opened {tref(tid)} ({title}) for you, with {requester} as its requester. It starts in its own task "
                 f"session; tell the owner with tell_owner that it started, and do the work there, not here. Its "
                 f"result comes back into this chat by itself when it ends: then tell the owner with message_owner.")
+        # with the receipt: a repeat of this call answers from the receipt alone, so a notice after it could be lost
+        event_rows([(requester, "say", filed_under(requester, "say", tid),
+                     f"[hub] The owner asked {agent} for work in its own chat, and {agent} opened {tref(tid)} "
+                     f"({title}). You are its requester: check its result when it comes. The result also goes back "
+                     f"into {agent}'s chat by itself, so do not pass it on to the owner.", QUIET_SAY)], t0)
         keep_command(command, {"task": tid, "text": text}, t0)
-    emit(requester, "say", f"[hub] The owner asked {agent} for work in its own chat, and {agent} opened {tref(tid)} "
-                           f"({title}). You are its requester: check its result when it comes. The result also goes "
-                           f"back into {agent}'s chat by itself, so do not pass it on to the owner.", task=tid,
-         extra=QUIET_SAY)
     log(agent, f"opened {tref(tid)} from the owner's message {source['request_id']}")
     return text
 
@@ -9469,9 +9499,10 @@ def chat_day(ts):
 
 def chat_count(account, what, t0, add=0):
     """Today's counter of one account ("*": all accounts) after adding `add`: inbound, ignored or parts. DB.execute only,
-    so it can run inside a transaction; the caller holds the lock."""
+    so it can run inside a transaction; the caller holds the lock. A count with `add` writes, so it must be inside one."""
     day = chat_day(t0)
     if add:
+        in_transaction("chat_count")
         DB.execute("INSERT INTO chat_counts(day,account,what,n) VALUES(?,?,?,?) ON CONFLICT(day,account,what) "
                    "DO UPDATE SET n=n+excluded.n", (day, account, what, add))
     row = DB.execute("SELECT n FROM chat_counts WHERE day=? AND account=? AND what=?", (day, account, what)).fetchone()
@@ -9481,6 +9512,7 @@ def chat_count(account, what, t0, add=0):
 def chat_queue(kind, account, t0, **fields):
     """Inside a transaction: one outbound item for the bridge (message, typing, read, link or unlink). A new message item
     on a WhatsApp account that sent its daily parts is failed at once."""
+    in_transaction("chat_queue")
     app = (chat_apps().get(account) or {}).get("app")
     state, error = "queued", None
     if kind == "message" and app == "whatsapp" and chat_count(account, "parts", t0) >= WHATSAPP_PARTS_DAY:
@@ -9531,6 +9563,7 @@ def owner_message_replace(previous, value, request_id, t0):
     ui_requests row and its event keep their id and their time, which is why the bubble changes where it stands;
     their text becomes the new words with nothing appended, and the words they replace go into the log, so the
     record still holds what he first said. The files it carries stay with it: an edit brings none."""
+    in_transaction("owner_message_replace")
     files = DB.execute("SELECT * FROM attachments WHERE message=? ORDER BY id", (previous["request_id"],)).fetchall()
     origin = json.loads(previous["origin"]) if previous["origin"] else None
     text = owner_message_text(previous["request_id"], value, previous["recipient"], origin, None, files)
@@ -9551,6 +9584,7 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     Returns the event ID. task: the task whose session the answer of a secret request goes to (answer_secret), and
     quiet: its event wakes nobody and comes with that session's next read; note: hub words for that event only, never
     in his stored answer."""
+    in_transaction("owner_message_rows")
     worker_chat = need is None and agents()[recipient].get("role") in ("worker", "lead")
     # owner feature secret_requests: a worker or a lead asks in its owner chat, so his answer goes back there, read
     # once as an agent's message is: it is no message of his that waits for a reply. A request that tasks wait on
@@ -9678,6 +9712,7 @@ def chat_command(m, person=None):
 def chat_link_attempt(account, acc, m, code, t0):
     """Inside a transaction: a link message (15.7). The right code binds the sender (and sender_alt as its alias) to
     the owner. After 5 wrong codes from one sender in one hour, the hub ignores that sender's codes."""
+    in_transaction("chat_link_attempt")
     app, sender = acc["app"], m["sender"]
     DB.execute("DELETE FROM link_failures WHERE ts<=?", (t0 - 3600,))
     if DB.execute("SELECT COUNT(*) n FROM link_failures WHERE app=? AND sender=?", (app, sender)).fetchone()["n"] \
@@ -9702,6 +9737,7 @@ def chat_link_attempt(account, acc, m, code, t0):
 
 def chat_route(account, acc, m, t0, hit, preview):
     """Inside a transaction: the rules of 15.5 after the duplicate check, in order. Returns (result, request ID)."""
+    in_transaction("chat_route")
     paused = DB.execute("SELECT v FROM kv WHERE k='chat_apps_paused'").fetchone()
     if (paused and paused["v"] == "1") or not chat_enabled(acc) or m["group"] or m["bot"] or m["from_me"]:
         return "ignored", None
@@ -10083,6 +10119,7 @@ def agent_delivery(m, parent, t0, linked=None):
     the start and said it to nobody, so a peer with two tasks open could not tell which one was being asked about.
     A message from a chat window belongs to no task and names none. It is the sender's task and never the reader's
     authority: the header says who is asking about what, and nothing more."""
+    in_transaction("agent_delivery")
     on = f" on {tref(m['sender_task'])}" if m["sender_task"] else ""
     waits = ", waits for your answer" if m["waits"] else ""         # plan C8
     text = f"[message from {m['sender']}{on} id=AM-{m['id']}{waits}] {m['text']}"
@@ -10676,6 +10713,7 @@ def conversation_of(person, agent, m, account, t0):
     """Inside a transaction: (the conversation of this person and this agent, is it new). One conversation for each
     pair, so the whole history of a person with an agent is one record for the owner. The chat and the sender are
     always the newest ones: a person can write from another account of the same agent."""
+    in_transaction("conversation_of")
     row = DB.execute("SELECT * FROM conversations WHERE person=? AND agent=?", (person["id"], agent)).fetchone()
     if row:
         DB.execute("UPDATE conversations SET account=?, chat=?, sender=?, last=? WHERE id=?",
@@ -10699,6 +10737,7 @@ def fixed_once(account, chat, text, t0):
 def conversation_signal(agent, cid, t0):
     """Inside a transaction: the event that starts or wakes the window C-<id> (CHAT-APPS.md 9.4). It never carries the
     person's words. The helper types nothing of a person into a window; the session reads the message itself."""
+    in_transaction("conversation_signal")
     generation = DB.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()
     return DB.execute(EVENT, (agent, "conversation", None, f"New message in conversation C-{cid}.", t0,
                               json.dumps({"conversation": cid,
@@ -14347,6 +14386,7 @@ def agent_notes_text(agent):
 def notes_save(agent, text, why, by, t0, task=None, duty_case=None):
     """One new version of an agent's notes, inside the caller's transaction. The old one is kept: the owner can
     read every version, and a review that makes them worse can be undone by writing the old words again."""
+    in_transaction("notes_save")
     old = notes_row(agent)
     return DB.execute("INSERT INTO agent_notes(agent,text,revision,created,by,task,duty_case,why) "
                       "VALUES(?,?,?,?,?,?,?,?)",
@@ -15723,11 +15763,11 @@ def t_close_case(agent, a):
             DB.execute("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,?,'learned',?)",
                        (r["id"], t0, agent, f"{mref(dead)} from {cref(c)}, a dead end: {tried}"))
             text += f" {mref(dead)} keeps what did not work, so that nobody need pay for it again."
+        if outcome == "failed":         # with the receipt: a repeat of this call answers from the receipt alone
+            event_rows([(manager_name(), "say", None,
+                         f"[duty {rref(r['id'])}] {agent} closed {cref(c)} as failed: {note}. The watch opens no new "
+                         f"case for this key until it is quiet again. Decide what happens with it.", None)], t0)
         keep_command(command, {"case": c["id"], "text": text}, t0)
-    if outcome == "failed":
-        emit(manager_name(), "say", f"[duty {rref(r['id'])}] {agent} closed {cref(c)} as failed: {note}. The watch "
-                                    f"opens no new case for this key until it is quiet again. Decide what happens "
-                                    f"with it.")
     if covers:
         report_notices(t0)
     return text
@@ -15997,13 +16037,15 @@ def t_join_report(agent, a):
         text = f"{dref(rep['id'])} (ticket {rep['ticket']}) is joined to {cref(c)}." + (
             " That was all of this task: the hub ended it as completed. Stop now and end your turn." if ends else
             " When you close the case, name in covers the tickets that its fix covers, with cause and next_step.")
+        if ends:        # with the receipt that says so: a repeat of this call answers from the receipt alone
+            DB.execute("UPDATE tasks SET state='completed', outcome='completed', what=?, where_=?, how=?, delivered=?, "
+                       "waiting_on=NULL, accepted=1, checked_at=?, check_note=? WHERE id=?",
+                       (f"completed: joined {dref(rep['id'])} to {cref(c)}", "the records of the case", "join_report",
+                        t0, t0, "taken by the hub: a report joined to a case of its duty", own["id"]))
+            DB.execute("UPDATE attempts SET ended=? WHERE task=? AND attempt=? AND ended IS NULL",
+                       (t0, own["id"], own["attempt"]))
         keep_command(command, {"report": rep["id"], "case": c["id"], "text": text}, t0)
     if ends:
-        q("UPDATE tasks SET state='completed', outcome='completed', what=?, where_=?, how=?, delivered=?, "
-          "waiting_on=NULL, accepted=1, checked_at=?, check_note=? WHERE id=?",
-          (f"completed: joined {dref(rep['id'])} to {cref(c)}", "the records of the case", "join_report", t0, t0,
-           "taken by the hub: a report joined to a case of its duty", own["id"]))
-        q("UPDATE attempts SET ended=? WHERE task=? AND attempt=? AND ended IS NULL", (t0, own["id"], own["attempt"]))
         unfile_notices(own["id"])
         end_waits(own["id"])
         end_holds(own["id"])
@@ -16310,6 +16352,7 @@ def memory_search_ready():
 
 def memory_indexed(mid):
     """Inside the caller's transaction: one lesson added to the search index, as written."""
+    in_transaction("memory_indexed")
     if MEMORY_FTS[0]:
         try:
             DB.execute("INSERT INTO memory_fts(rowid, text, prevents, about) "
@@ -16551,6 +16594,7 @@ def memory_page(agent, where, args, page, order="id DESC"):
 def memory_drop(m, by, reason, t0):
     """Inside a transaction: one lesson is removed. It leaves every start and every search of memory, its row stays
     (phase 1 of AUTONOMY.md P7), and the history's "forgotten" stream records it with the reason."""
+    in_transaction("memory_drop")
     DB.execute("UPDATE memories SET dropped=?, dropped_by=?, drop_reason=? WHERE id=? AND dropped IS NULL",
                (t0, by, reason, m["id"]))
 
@@ -16824,6 +16868,7 @@ def memory_contradicted(duty_id, key, t0):
 
     Every lesson, whoever wrote it: the agent that did a case's work need not hold the duty (create_task case_id, a
     duty that moved), and its lesson was promised this judgement and then never judged."""
+    in_transaction("memory_contradicted")
     marked = [mref(m["id"]) for m in
               read_rows("SELECT id FROM memories WHERE responsibility=? AND prevents_key=? AND dropped IS NULL",
                         (duty_id, key))]
@@ -17573,6 +17618,7 @@ def history_insert(src, src_id, recs, keys, keep=False):
     """Inside the caller's transaction: the records of one source row into history and its index. The words are
     masked on the way in and kept in the row, except a tool record's on a machine with the index: those are read
     back from their session record. `keys` caches the agents' index keys for the caller's step."""
+    in_transaction("history_insert")
     for r in recs:
         text = history_masked(r["text"])
         hid = DB.execute("INSERT INTO history(agent,kind,ref,person,task,at,owner_chat,src,src_id,text) "
@@ -23794,12 +23840,14 @@ def error_tail(text):
 
 def end_open_runs(trigger_id, why, t0):
     """Inside a transaction: the open runs of a trigger end, so a late result for them is refused."""
+    in_transaction("end_open_runs")
     DB.execute("UPDATE trigger_runs SET state='obsolete', reason=?, retry_at=NULL, finished=? "
                "WHERE trigger_id=? AND state IN ('waiting','sent')", (why, t0, trigger_id))
 
 
 def pause_trigger(trigger_id, by, why, t0):
     """Inside a transaction: the owner, an agent or the hub pauses a trigger, and its open runs end."""
+    in_transaction("pause_trigger")
     before = DB.execute("SELECT state FROM triggers WHERE id=?", (trigger_id,)).fetchone()[0]
     end_open_runs(trigger_id, "The trigger was paused.", t0)
     DB.execute("UPDATE triggers SET state='paused', paused_by=?, paused_reason=?, next_due=NULL, revision=revision+1, "
@@ -23810,6 +23858,7 @@ def pause_trigger(trigger_id, by, why, t0):
 def record_trigger(trigger_id, by, action, detail, t0, saved_in=None):
     """Inside a transaction: one trigger_history row at the trigger's current revision (WAKEUPS-INTERFACE.md), with
     the task whose session saved it and how much outside text that session had read (plan P4), when known."""
+    in_transaction("record_trigger")
     revision = DB.execute("SELECT revision FROM triggers WHERE id=?", (trigger_id,)).fetchone()[0]
     task, reads = saved_in or (None, None)
     DB.execute("INSERT INTO trigger_history(trigger_id,revision,ts,by,action,detail,saved_by_task,outside_reads) "
@@ -23829,6 +23878,7 @@ def keep_command(command, receipt, t0):
 def once_done(t):
     """Inside a transaction: a one-off trigger is done when its occurrence ends. A Run task now before its time
     (owner API 1.83) leaves it its time: its next_due is still there."""
+    in_transaction("once_done")
     if json.loads(t["schedule"])["kind"] == "once":
         DB.execute("UPDATE triggers SET state='done', next_due=NULL WHERE id=? AND state='active' AND next_due IS NULL",
                    (t["id"],))
@@ -25632,71 +25682,81 @@ def tick_changes(t0):
     TICK_SEEN["last"] = (offline, stale)
 
 
+def stop_finished_sessions(t0):
+    """The stop for each session of a finished task (a step of tick)."""
+    for t in q("SELECT * FROM tasks WHERE state IN ('completed','failed','rejected','canceled') AND stop_sent=0"):
+        # plan C5: a helper that closes the window at the end of its turn (turn_close) gets the stop at once;
+        # an older one still after stop_after, because it closes at the stop
+        if t0 - (t["delivered"] or t0) > CFG["stop_after"] or "turn_close" in helper_features(t["owner"]):
+            q("UPDATE tasks SET stop_sent=1 WHERE id=?", (t["id"],))
+            kv_set(f"listed:{t['owner']}:{tref(t['id'])}", None)      # its window's listings end with it
+            emit(t["owner"], "stop", f"close the session of {tref(t['id'])}", task=t["id"],
+                 extra={"generation": kv_get("db_id"), "needs": t["needs"]})
+
+
 def tick():
+    """One pass of the timers. Each step runs on its own: a step that raises is printed to the journal and the pass
+    goes on, so one bad row stops only the step that reads it. Before, the first eight steps had no guard, and one
+    raising row ended the whole pass every five seconds: nothing after it was nudged, restarted or swept. The order
+    still matters, and it stays: what brings work back runs before the clocks that would call that work silent."""
     t0 = now()
     mgr = manager_name()
-    with LOCK:
-        end_limits(t0)
-        # Before the clocks, and for the same reason end_limits is: both bring work back, and a task whose park has
-        # just ended is not a silent task. Run after the silence loop it was nudged at the very tick it came back.
-        reminder_sweep(t0)      # what an agent asked to come back to, at the time it named
-        wait_sweep(t0)          # plan C8: a waited message to an agent that is no longer active
-        secret_wakes(t0)        # owner feature secret_requests: a saved secret that can reach its waiting task now
-        chat_sweep(t0)          # owner feature chat_apps: a message item without a report for 120 seconds
-        # plan C9: no clock nudges a task. Each stored turn end decides once, at intake and here after a restart.
-        turn_end_sweep(t0)
-        liveness(t0)
-        restart_sweep(t0)
+    held = []           # the steps that restart work and raised in this pass: they hold the heartbeat (tick_ok)
+
+    def step(fn, *args, restarts=False):
         try:
-            goal_sweep(t0)
-            duty_sweep(t0)              # owner API 1.13: the duties that are not in order
-            circle_sweep(t0)            # what looks like running in circles
-            lead_unread_sweep(t0)       # what a lead left unread, to the manager before the owner's screen
-            allowance_sweep(t0)         # the manager's own allowance, while it can still act on it
-            integrity_check(t0)
-            expire_handovers(t0)
-            expire_deposits(t0)             # owner feature central_vault: a copy no vault may take any more
-            expire_withdrawals(t0)          # owner feature central_vault: a withdrawal no vault can take any more
-            settle_checks(t0)
-            attachment_sweep(t0)            # owner feature attachments: the files that the hub may let go
-            release_sweep(t0)               # owner feature releases: the automatic poll, when the owner opted in
-            names_sweep(t0)                 # devops task 1.1: the Tailscale names, when the start found none
-            history_sweep(t0)               # AUTONOMY.md P6: what was written since the last pass, into the history
-            default_access_sweep(t0)        # the owner, 28 October 2026: every agent's vault, and a Mac's desktop
-            machine_names_sweep(t0)         # the owner, 30 October 2026: a machine's name is its name in Tailscale
-            mac_setup_sweep(t0)             # the owner, 31 October 2026: one sitting at a new Mac
-            server_watch_sweep(t0)          # the owner, 3 November 2026: each server against its own baseline
-            mac_desktop_sweep()             # what only hands at a Mac can put right
-            first_message_sweep(t0)         # the owner, 4 November 2026: a new fleet's manager writes first, once
-        except Exception:
-            traceback.print_exc()           # a goal or database check must not stop the timers below
-        # close sessions of finished tasks
-        for t in q("SELECT * FROM tasks WHERE state IN ('completed','failed','rejected','canceled') AND stop_sent=0"):
-            # plan C5: a helper that closes the window at the end of its turn (turn_close) gets the stop at once;
-            # an older one still after stop_after, because it closes at the stop
-            if t0 - (t["delivered"] or t0) > CFG["stop_after"] or "turn_close" in helper_features(t["owner"]):
-                q("UPDATE tasks SET stop_sent=1 WHERE id=?", (t["id"],))
-                kv_set(f"listed:{t['owner']}:{tref(t['id'])}", None)      # its window's listings end with it
-                emit(t["owner"], "stop", f"close the session of {tref(t['id'])}", task=t["id"],
-                     extra={"generation": kv_get("db_id"), "needs": t["needs"]})
-        offline_sweep(t0)
-        try:
-            trigger_sweep(t0)
-        except Exception:
-            traceback.print_exc()           # a broken trigger must not stop the reminders and manager checks below
-        try:
-            report_notices(t0)              # support plan F4: the covered tickets that waited for a place
+            fn(*args)
         except Exception:
             traceback.print_exc()
-        manager_flag_update(t0)
-        tick_changes(t0)
-        # The last line of the pass, and the only thing that says the pass reached it (tick_heartbeat). The first
-        # half of this function is deliberately unguarded -- reminder_sweep must run before the clocks, and a tick
-        # that half-runs and says nothing is the thing being fixed, not a reason to wrap each section in a try. So
-        # one raising callee still ends the whole pass, and now the record of it is not only the journal: this key
-        # stops moving, and health_view says so. t0 and not now(), because what the owner needs is when the last
-        # complete pass began: a pass that takes longer than TICK_WARN to finish is also a pass to look at.
-        kv_set("tick_ok", t0)
+            if restarts:
+                held.append(fn)
+
+    with LOCK:
+        step(end_limits, t0)
+        # Before the clocks, and for the same reason end_limits is: both bring work back, and a task whose park has
+        # just ended is not a silent task. Run after the silence loop it was nudged at the very tick it came back.
+        step(reminder_sweep, t0)        # what an agent asked to come back to, at the time it named
+        step(wait_sweep, t0)            # plan C8: a waited message to an agent that is no longer active
+        step(secret_wakes, t0)          # owner feature secret_requests: a saved secret that can reach its waiting task now
+        step(chat_sweep, t0)            # owner feature chat_apps: a message item without a report for 120 seconds
+        # plan C9: no clock nudges a task. Each stored turn end decides once, at intake and here after a restart.
+        step(turn_end_sweep, t0)
+        step(liveness, t0, restarts=True)
+        step(restart_sweep, t0, restarts=True)
+        step(goal_sweep, t0)
+        step(duty_sweep, t0)                # owner API 1.13: the duties that are not in order
+        step(circle_sweep, t0)              # what looks like running in circles
+        step(lead_unread_sweep, t0)         # what a lead left unread, to the manager before the owner's screen
+        step(allowance_sweep, t0)           # the manager's own allowance, while it can still act on it
+        step(integrity_check, t0)
+        step(expire_handovers, t0)
+        step(expire_deposits, t0)           # owner feature central_vault: a copy no vault may take any more
+        step(expire_withdrawals, t0)        # owner feature central_vault: a withdrawal no vault can take any more
+        step(settle_checks, t0)
+        step(attachment_sweep, t0)          # owner feature attachments: the files that the hub may let go
+        step(release_sweep, t0)             # owner feature releases: the automatic poll, when the owner opted in
+        step(names_sweep, t0)               # devops task 1.1: the Tailscale names, when the start found none
+        step(history_sweep, t0)             # AUTONOMY.md P6: what was written since the last pass, into the history
+        step(default_access_sweep, t0)      # the owner, 28 October 2026: every agent's vault, and a Mac's desktop
+        step(machine_names_sweep, t0)       # the owner, 30 October 2026: a machine's name is its name in Tailscale
+        step(mac_setup_sweep, t0)           # the owner, 31 October 2026: one sitting at a new Mac
+        step(server_watch_sweep, t0)        # the owner, 3 November 2026: each server against its own baseline
+        step(mac_desktop_sweep)             # what only hands at a Mac can put right
+        step(first_message_sweep, t0)       # the owner, 4 November 2026: a new fleet's manager writes first, once
+        step(stop_finished_sessions, t0)
+        step(offline_sweep, t0)
+        step(trigger_sweep, t0)
+        step(report_notices, t0)            # support plan F4: the covered tickets that waited for a place
+        step(manager_flag_update, t0)
+        step(tick_changes, t0)
+        # The last line of the pass, and the only thing that says the pass reached it (tick_heartbeat). It moves
+        # unless a step that restarts work raised: the warning it holds up says "no stuck task or session is
+        # restarted", which is then true, and a hub whose sweep of one row breaks no longer stops restarting the
+        # rest. A step that raises elsewhere is in the journal, as the guarded half's were before. t0 and not now(),
+        # because what the owner needs is when the last complete pass began: a pass that takes longer than TICK_WARN
+        # to finish is also a pass to look at.
+        if not held:
+            kv_set("tick_ok", t0)
 
 
 # ---------------------------------------------------------------- practice site
@@ -31640,6 +31700,7 @@ BACKUP_MANIFEST = "fleet.json"
 BACKUP_CONFIG = "config/"           # the owner's own files, under the paths CONFIG_FILES allows
 RESTORE_SUFFIX = ".restore"         # a copy waiting beside the database for the next start to take it
 REPLACED_SUFFIX = ".replaced"       # the records a deliberate replacement put aside, which the owner asked for
+SQLITE_SIDE = ("-journal", "-wal", "-shm")      # what SQLite keeps beside a database file, under that file's name
 WORK_TABLES = ("tasks", "goals", "needs", "owner_reports", "conversations", "responsibilities", "triggers")
 
 
@@ -32172,8 +32233,26 @@ def take_restore(db_path):
         return False, (f"a copy of fleet {asked.get('fleet_id') or 'unknown'} was waiting beside these records "
                        f"and was not taken, because it does not pass SQLite's own check: {'; '.join(bad[:3])}. "
                        f"It is still at {os.path.basename(staged)}; this hub kept its own records.")
+    # A stop in the middle of a commit (the restore's own restart can be one) leaves the old records' rollback journal
+    # beside them, and SQLite plays a journal back into whatever file has its name when it is next opened: the copy
+    # moved in under that name took the old pages and was a malformed database. So the old records take their own
+    # journal back first, and what is still beside them goes where they go.
+    keep = bool(asked.get("keep_replaced")) and os.path.exists(db_path)
     if os.path.exists(db_path):
-        if asked.get("keep_replaced"):
+        with contextlib.suppress(sqlite3.Error):
+            with contextlib.closing(sqlite3.connect(db_path)) as old:
+                old.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    for side in SQLITE_SIDE:
+        if keep:            # a journal of the file an earlier replacement put aside would pair with this one
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(db_path + REPLACED_SUFFIX + side)
+        if os.path.exists(db_path + side):
+            if keep:
+                os.replace(db_path + side, db_path + REPLACED_SUFFIX + side)
+            else:
+                os.remove(db_path + side)
+    if os.path.exists(db_path):
+        if keep:
             os.replace(db_path, db_path + REPLACED_SUFFIX)
         else:
             os.remove(db_path)
@@ -39922,6 +40001,29 @@ def settle_stopped_calls():
       (now(),))
 
 
+HUB_LOCK = []           # the open lock file of this process's records (hub_lock), held until the process ends
+
+
+def hub_lock(db_path):
+    """One hub process for each database, as there is one helper for each agent: an exclusive lock on
+    `<database>.lock`, held until the process ends, so the kernel lets it go however the process stops.
+
+    Everything that main() does after this takes the records as its own: a staged restore replaces their file, the
+    start settles the calls and pings of a hub that has stopped, and the timers start. A second process on the same
+    records (a start by hand beside the service, or one with another --port) did all of that to a hub that still ran,
+    before its own port bind failed. It waits for the lock instead of ending: a start that ended would leave the
+    service to restart into the same lock until systemd gave up, and the hub must start (build_schema). Returns the
+    file descriptor that holds it."""
+    fd = os.open(db_path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(f"Another hub process holds {db_path}. This one waits until it stops, and then starts.", flush=True)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    HUB_LOCK.append(fd)
+    return fd
+
+
 def main():
     global DB
     # Before the parser, because an update run calls this on the *released* code and must get the same two words
@@ -39968,6 +40070,7 @@ def main():
         os.makedirs(os.path.dirname(db_path), mode=0o700, exist_ok=True)
     if args.restore:
         return restore_by_hand(args.restore, db_path)
+    hub_lock(db_path)           # before anything that takes the records as this process's own
     restored, restore_says = take_restore(db_path)      # the one moment a hub's records can be replaced
     DB = sqlite3.connect(db_path, check_same_thread=False)
     DB.row_factory = sqlite3.Row
