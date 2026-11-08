@@ -14557,6 +14557,7 @@ DUTY_WATCH_MAX = 8              # watches of one duty
 DUTY_REPEAT_DAYS = 30           # a key that comes back inside this time is a repeat: the preventive action did not work
 DUTY_WATCH_MINUTES = 30         # the cadence of a watch that brings no times of its own
 DUTY_LOOK_BACK = 10             # duties or cases named when an agent looks back, newest first, with a count of more
+DUTY_OPEN_SHOWN = 5             # open cases of a duty that the list of duties shows whole, newest first; it counts more
 DUTY_HISTORY_SHOWN = 30         # history rows of one duty: how it was managed, newest kept, oldest of those first
 DUTY_NAME_MAX = 80              # how much of the duty's own words stands for it where a short name is needed
 
@@ -15928,8 +15929,9 @@ def duty_sweep(t0):
              "owner alone can do.", extra=LATER_SAY)
 
 
-def duty_case_text(c, r):
-    """One case, for an agent's eyes."""
+def duty_case_text(c, each=False):
+    """One case, for an agent's eyes. each: its records one line each, with who wrote each and when, and how it
+    closed (see_responsibilities case=...); else all its records in one line."""
     tasks = ", ".join(f"{tref(t['id'])} {t['state']}" for t in duty_case_tasks(c["id"])) or "none"
     steps = duty_steps_of(c["id"])
     joins = ", ".join(f"{rref(j['id'])} of {j['agent']}" for j in case_joins(c["id"]))
@@ -15938,8 +15940,51 @@ def duty_case_text(c, r):
            + (f" {joins} works in it too." if joins else ""),
            f"    Opened {goal_time(c['opened'])}; first step "
            + (goal_time(c["first_step"]) if c["first_step"] else "none yet") + f". Tasks: {tasks}."]
-    if steps:
+    if each:
+        out += ([f"    {s['key']} — {s['by']}, {goal_time(s['ts'])}: {s['text']}" for s in steps]
+                or ["    No record yet."])
+        if c["state"] != "open":                # an old row can lack its time or its closer
+            out.append("    Closed" + (f" {goal_time(c['closed'])}" if c["closed"] else "")
+                       + (f" by {c['closed_by']}" if c["closed_by"] else "") + (f": {c['note']}" if c["note"] else "."))
+    elif steps:
         out.append("    Records: " + "; ".join(f"{s['key']}: {s['text']}" for s in steps))
+    return out
+
+
+def duty_case_brief(c):
+    """One case in one line, without its records, for a read that names every open case (duty_case_lines)."""
+    s = q1("SELECT COUNT(*) n, MAX(ts) last FROM duty_steps WHERE duty_case=?", (c["id"],))
+    working = [f"{tref(t['id'])} {t['state']}" for t in duty_case_tasks(c["id"]) if t["state"] not in TERMINAL]
+    joins = [f"{rref(j['id'])} of {j['agent']}" for j in case_joins(c["id"])]
+    return (f"  {cref(c)} [{c['state']}] {c['title']} — opened {goal_time(c['opened'])}; "
+            + (f"{s['n']} record{'' if s['n'] == 1 else 's'}, the last {goal_time(s['last'])}" if s["n"]
+               else "no record yet")
+            + ("; it came back inside 30 days" if c["repeated"] else "")
+            + (f"; tasks {', '.join(working)}" if working else "")
+            + (f"; {', '.join(joins)} works in it too" if joins else "") + ".")
+
+
+def duty_case_lines(cases, every_case, read):
+    """Cases newest first, as a read of duties shows them: the newest whole, records and all (DUTY_LOOK_BACK of any
+    state when one duty is read in full, DUTY_OPEN_SHOWN open ones in the list of duties), then the other open ones:
+    one line each in the one duty, and in the list a count that says how to reach them. So no open case is out of
+    reach, and the list stays short (8 November 2026: one duty's 118 open cases, each with its records, made the
+    manager's list 130,000 characters, and the cases that its holder worked were its oldest). `read`: the id of the
+    duty whose full read names them all."""
+    whole = DUTY_LOOK_BACK if every_case else DUTY_OPEN_SHOWN
+    out = [line for c in cases[:whole] for line in duty_case_text(c)]
+    rest = cases[whole:]
+    still = [c for c in rest if c["state"] == "open"]
+    if still and every_case:
+        out.append(f"  Older open cases ({len(still)}), newest first, one line each; case=\"{cref(still[0])}\" "
+                   f"gives one whole:")
+        out += [duty_case_brief(c) for c in still]
+    elif still:
+        out.append(f"    and {len(still)} older open cases, the oldest {cref(still[-1])}, opened "
+                   f"{goal_time(still[-1]['opened'])}: see_responsibilities with responsibility=\"{rref(read)}\" "
+                   f"shows every open case, and case=\"{cref(still[-1])}\" gives one whole.")
+    if len(rest) > len(still):
+        out.append(f"    and {len(rest) - len(still)} older closed cases.")
     return out
 
 
@@ -15991,20 +16036,13 @@ def duty_text(r, t0, every_case=False):
     if old and r["state"] != "retired":
         out.append("  Its words name " + ", ".join(f"{was}, which is {new} now" for was, new in old)
                    + ": write them again with set_duty, with the names the agents have now.")
-    if every_case:
-        rows = q("SELECT * FROM duty_cases WHERE responsibility=? ORDER BY id DESC", (r["id"],))
-        for c in rows[:DUTY_LOOK_BACK]:
-            out += duty_case_text(c, r)
-        if len(rows) > DUTY_LOOK_BACK:
-            out.append(f"    and {len(rows) - DUTY_LOOK_BACK} older cases.")
-    else:
-        for c in q("SELECT * FROM duty_cases WHERE responsibility=? AND state='open' ORDER BY id", (r["id"],)):
-            out += duty_case_text(c, r)
-    joined = duty_joined_open(r["id"])
+    out += duty_case_lines(q("SELECT * FROM duty_cases WHERE responsibility=?"
+                             + ("" if every_case else " AND state='open'") + " ORDER BY id DESC", (r["id"],)),
+                           every_case, r["id"])
+    joined = duty_joined_open(r["id"]) if r["state"] != "retired" else []      # a retired duty works in none
     if joined:
         out.append(f"  Open cases of other duties that it works in ({len(joined)}), one event each:")
-        for c in joined:
-            out += duty_case_text(c, duty_row(c["responsibility"]))
+        out += duty_case_lines(joined[::-1], every_case, r["id"])
     out.append("  Duty: " + r["text"])
     return out
 
@@ -16048,6 +16086,16 @@ def t_see_responsibilities(agent, a):
     tail = ("Act inside your duty without asking. record_step keeps one line for each real step of a case, "
             "close_case ends it, and open_case opens one that you found yourself. Ask your requester only when "
             "the duty does not cover a step, the step needs a decision that is not yours, or you are blocked.")
+
+    # One case whole, whatever its state, for whoever may work in it (record_step's rule): each record, and how it
+    # closed. The lists show most open cases in one line, and this is the way to the rest of one.
+    if a.get("case") not in (None, ""):
+        c = case_ref(a["case"])
+        r = duty_row(c["responsibility"])
+        if not case_reader(agent, c, r) and not case_worker(agent, c):
+            raise ToolError(f"{cref(c)} is not a case of your duties.")
+        return "\n".join([f"{rref(r['id'])} [{r['state']}] {duty_name(r['text'])} — {r['agent']}"]
+                         + duty_case_text(c, each=True))
 
     # One duty in full, whatever its state: its cases, and how it was managed.
     if a.get("responsibility") not in (None, ""):
@@ -22388,13 +22436,16 @@ TOOLS = [
     # owner API 1.13: the standing duties of an agent (RESPONSIBILITIES.md)
     ("all", "see_responsibilities", t_see_responsibilities,
      "See the duties that you hold: their watches, their open cases and what is not in order. A duty stays; it "
-     "has no 'done'. Four shapes, and the first one that you give wins: responsibility=\"R-1\" gives that one duty "
-     "in full — every case, newest first, and how it was managed from the day it was written; search=\"<words>\" "
-     "finds a duty by its own words, retired ones included; retired=true names the retired ones, newest first; and "
-     "with none of them you get the duties that run now, with one line saying how many retired ones there are. So "
-     "the whole history stays out of your session until you ask for a piece of it. The manager sees every agent's "
-     "duty; pass agent for one agent.",
+     "has no 'done'. Five shapes, and the first one that you give wins: case=\"R-1/C-3\" gives that one case whole, "
+     "any state, each record with who wrote it and when; responsibility=\"R-1\" gives that one duty in full — its "
+     "newest cases whole, each other open case in one line, and how it was managed from the day it was written; "
+     "search=\"<words>\" finds a duty by its own words, retired ones included; retired=true names the retired ones, "
+     "newest first; and with none of them you get the duties that run now, each with its newest open cases whole "
+     "and a count of the others, and one line saying how many retired ones there are. So the whole history stays "
+     "out of your session until you ask for a piece of it. The manager sees every agent's duty; pass agent for one "
+     "agent.",
      S({"agent": {"type": "string", "description": "Only this agent's duties. The manager sees every agent."},
+        "case": {"type": "string", "description": "One case whole, for example R-1/C-3. Any state."},
         "responsibility": {"type": "string", "description": "One duty in full, for example R-1. Any state."},
         "search": {"type": "string", "description": "Words to look for in the words of a duty, any state"},
         "retired": {"type": "boolean", "description": "True to look back at the retired duties"},
