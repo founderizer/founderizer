@@ -10074,7 +10074,8 @@ def vault_request(agent, rid):
 def agent_write(agent, tool, a, fields):
     """(command, stored answer or None) of an agent's write with a request_id (request_ref): an exact repeat (the same
     agent, request_id, tool and fields) gets its first answer again and changes nothing; other fields with the same
-    request_id are refused. keep_command stores the answer with the write."""
+    request_id are refused. keep_command stores the answer with the write, and keep_refusal a refusal that changed what
+    the session has read, whose exact repeat is refused again."""
     rid = request_ref(a)
     digest = hashlib.sha256(json.dumps([tool, fields], sort_keys=True, separators=(",", ":"),
                                        ensure_ascii=False).encode()).hexdigest()
@@ -10082,8 +10083,20 @@ def agent_write(agent, tool, a, fields):
     if old:
         if (old["tool"], old["digest"]) != (tool, digest):
             raise ToolError("This request_id was already used for another call. Use a new request_id.")
-        return None, json.loads(old["receipt"])
+        kept = json.loads(old["receipt"])
+        if isinstance(kept, dict) and kept.get("refused"):
+            raise ToolError(kept["text"])
+        return None, kept
     return (agent, rid, tool, digest), None
+
+
+def keep_refusal(command, text, t0):
+    """Inside the caller's transaction, with the record of what the refusal showed: a refusal of a write over a version
+    that the session never read, kept under its request_id. The refusal shows the newest version, so the session has
+    read it from then on, and only a new request_id is a new call: the repeat of an answer that was lost (RULES.md
+    asks for the same request_id) found the newest version read, and wrote the stale words that the refusal had said
+    were not written."""
+    keep_command(command, {"refused": True, "text": text}, t0)
 
 
 def owner_target(app):
@@ -14566,13 +14579,18 @@ def seen_task(agent, a):
     """(the session's key, when it started) of a call in one of the agent's own task sessions or in the manager's
     standing session, else (None, None): only a session's own reads say what it has read."""
     context = getattr(CALL, "context", None)
-    if context is None and agent == manager_name() and a.get("task_id") in (None, ""):
+    if context is None and agent == manager_name():
+        # The manager's standing session, whose calls carry no context: a task_id that one names is another session's
+        # task (a worker's, or one of the manager's own task sessions), never this session.
         row = read_row("SELECT rowid AS id, created FROM session_credentials WHERE agent=? AND kind='standing' AND "
                        "revoked IS NULL ORDER BY created DESC LIMIT 1", (agent,))
         return (f"standing-{row['id']}", row["created"]) if row else (None, None)
-    given = a.get("task_id")
-    if given in (None, "") and context and len(context) == 3 and re.fullmatch(r"T-[1-9][0-9]{0,17}", str(context[1])):
-        given = context[1]          # a session whose calls carry no task_id (the manager's task sessions)
+    if context is not None:
+        # The session's own task, whatever task_id the call names: a lead names a subtask's in its team tools, which
+        # call_tool leaves as they are, and a chat window or a conversation without tools is no task's session.
+        given = context[1] if len(context) == 3 and re.fullmatch(r"T-[1-9][0-9]{0,17}", str(context[1])) else None
+    else:
+        given = a.get("task_id")
     try:
         tid = parse_task(given) if given not in (None, "") else None
     except ToolError:
@@ -14660,11 +14678,11 @@ def seen_check(key, path, need_read=False):
     return check
 
 
-def notes_moved(agent, a):
+def notes_moved(agent, a, command):
     """The refusal of a write_notes over a version of the notes that this session never read, or None. A version that
     this task wrote itself is one it has read. The refusal shows the notes as they stand, so the session has read them
-    from then on, and its next write goes through. A session with no record of its start (a task that started before
-    this release) is held to the time its attempt started."""
+    from then on, and its next write with a new request_id goes through (keep_refusal). A session with no record of
+    its start (a task that started before this release) is held to the time its attempt started."""
     key, start = seen_task(agent, a)
     cur = notes_row(agent)
     if not key or not cur or (cur["task"] is not None and cur["task"] == key):
@@ -14672,12 +14690,15 @@ def notes_moved(agent, a):
     seen = seen_get(key, "notes")
     if (seen == str(cur["revision"])) if seen is not None else cur["created"] <= start:
         return None
-    seen_set(key, "notes", cur["revision"])
     where = f" in {tref(cur['task'])}" if cur["task"] else ""
-    return (f"Your notes changed after this session read them: revision {cur['revision']} was written "
+    text = (f"Your notes changed after this session read them: revision {cur['revision']} was written "
             f"{goal_time(cur['created'])}{where}: {cur['why']}. Nothing was written, so that no words of it are lost. "
             f"Here are your notes as they stand now: put what you meant to add into them, and call write_notes again "
             f"with a new request_id.\n\n{cur['text']}")
+    with area("quiet"), transaction():
+        seen_row(key, "notes", cur["revision"])
+        keep_refusal(command, text, now())
+    return text
 
 
 def notes_row(agent):
@@ -15046,13 +15067,15 @@ def duty_watch_rows(r, want, by, t0):
 
 def duty_kept_watches(duty_id):
     """An edit without `watch` keeps the rules of the duty: each one as it is, with its details rebuilt from the new
-    words of the duty."""
+    words of the duty. Every read of the duty shows this list too (duty_text), so a rule of an older release that
+    lacks a field of its task reads as that field left out, and never breaks the read."""
     want = []
     for row in duty_watches(duty_id, managed=True):
         task = json.loads(row["task"])
-        want.append({"kind": row["watch"] or "clock", "trigger": row["id"], "needs": task["needs"],
+        want.append({"kind": row["watch"] or "clock", "trigger": row["id"], "needs": task.get("needs") or "none",
                      "check": json.loads(row["check_spec"]) if row["check_spec"] else None,
-                     "schedule": json.loads(row["schedule"]), "title": task["title"], "done_when": task["done_when"]})
+                     "schedule": json.loads(row["schedule"]), "title": task.get("title"),
+                     "done_when": task.get("done_when")})
     return want
 
 
@@ -15920,6 +15943,14 @@ def duty_case_text(c, r):
     return out
 
 
+def duty_schedule_words(s):
+    """", every 10 minutes" for a watch line: the schedule that a watch list of set_duty gives or keeps."""
+    try:
+        return ", " + wakeups.schedule_text(s)
+    except (KeyError, TypeError, AttributeError):
+        return ""
+
+
 def duty_text(r, t0, every_case=False):
     """One duty for an agent's eyes: its heading, its watches, its counters, its marker, its cases and its words.
     The list gives the open cases only; one duty on its own gives the closed ones too, newest first."""
@@ -15931,11 +15962,26 @@ def duty_text(r, t0, every_case=False):
         out.append(f"  Watch {w['trigger']} ({w['kind']}) [{w['state']}"
                    + (f" by {w['paused_by']}" + (f": {w['paused_reason']}" if w["paused_reason"] else "")
                       if w["paused_by"] else "") + "]"
+                   + duty_schedule_words(w["schedule"])
+                   + (f", needs the {w['needs']}" if w["needs"] not in (None, "none") else "")
                    + (f", next {goal_time(w['next_due'])}" if w["next_due"] else "")
                    + (f", check {w['check']['path'] or 'saved code ' + (w['check']['sha256'] or '')[:12]}"
                       + (f" {check_condition_words(w['check']['condition'])}"
                          if check_condition_words(w["check"]["condition"])
                          else ": each new line that it prints wakes the agent") if w["check"] else ""))
+    # What else a change with set_duty replaces, so that a session that reads the duty can put its change into it.
+    sessions = [f"tools {', '.join(duty_tools(r['tools'])) or 'none'}" if duty_tools(r["tools"]) is not None else "",
+                f"MCP servers {', '.join(duty_tools(r['servers'])) or 'none'}"
+                if duty_tools(r["servers"]) is not None else "",
+                f"lists {r['lists']}" if r["lists"] else "",
+                "defect reports to " + ", ".join(rref(i) for i in duty_ids(r["report_to"]))
+                if duty_ids(r["report_to"]) else ""]
+    if any(sessions):
+        out.append("  The sessions of its cases: " + "; ".join(s for s in sessions if s) + ".")
+    kept = duty_kept_watches(r["id"])           # a watch list gives each rule whole: its check, title and done_when
+    if kept:
+        out.append("  Its watch list as set_duty takes it, which keeps each watch as it is: "
+                   + json.dumps(kept, ensure_ascii=False, separators=(", ", ": ")))
     out.append(f"  Cases: {v['open_cases']} open, {v['cases_30d']} in 30 days, {v['repeats_30d']} of them a repeat"
                + (f"; the 30 days before that, {v['repeats_prev_30d']} of {v['cases_prev_30d']}."
                   if v["cases_prev_30d"] else "."))
@@ -16008,6 +16054,7 @@ def t_see_responsibilities(agent, a):
         r = duty_ref(a["responsibility"])
         if not duty_read_allowed(agent, r):
             raise ToolError(f"{rref(r['id'])} is not your duty.")
+        duty_seen_set(seen_task(agent, a)[0], {r["id"]: duty_read_mark(r)})    # the base of a change (duty_moved)
         return "\n".join(duty_text(r, t0, every_case=True) + duty_managed_text(r["id"]) + [tail])
 
     # Looking back, so that the whole history needs no room in the session: the words, or the retired ones.
@@ -16044,6 +16091,7 @@ def t_see_responsibilities(agent, a):
     out = []
     for r in rows:
         out += duty_text(r, t0)
+    duty_seen_set(seen_task(agent, a)[0], {r["id"]: duty_read_mark(r) for r in rows})     # their words: read
     if gone:
         out.append(f"{len(gone)} retired, not listed here: see_responsibilities with retired=true names them, and "
                    f"change_duty reopen brings one back.")
@@ -16093,7 +16141,7 @@ def t_write_notes(agent, a):
     command, stored = agent_write(agent, "write_notes", a, fields)
     if stored:
         return stored["text"]
-    moved = notes_moved(agent, a)       # after agent_write, so a repeat of a write that went through gets its answer
+    moved = notes_moved(agent, a, command)  # after agent_write: a repeat of a write that went through gets its answer
     if moved:
         raise ToolError(moved)
     t0 = now()
@@ -16739,6 +16787,109 @@ def t_attach_watch(agent, a):
     return text
 
 
+# What a session has read of each duty (SEEN_KEY<session>:duties, {duty id: [revision, rules]}): a change with set_duty
+# replaces each field that it gives -- the words, the holder, the watches -- so a change over a revision that the
+# session never read would lose what a parallel session wrote, as a whole write of the notes would (notes_moved).
+# `rules` names the revision of each wake-up rule that the duty's watch list keeps (duty_read_mark): another route
+# changes those (save_trigger, the owner's trigger controls) with no new revision of the duty, and a watch list gives
+# each rule whole. One row for each session, whatever the number of duties that it reads.
+DUTY_REVISION_KINDS = ("created", "edited", "pause", "resume", "retire", "reopen")     # the history rows of a revision
+DUTY_CHANGES_SHOWN = 5          # the changes since a session's read that its refusal names
+
+
+def duty_read_mark(r):
+    """[revision, rules] of what a read of duty r shows now: rules is "id:revision" of each rule that its watch list
+    keeps, oldest first. A read that commits nothing, so it is safe inside a transaction."""
+    return [r["revision"], ",".join(f"{t['id']}:{t['revision']}" for t in duty_watches_read(r["id"], managed=True))]
+
+
+def duty_seen(key):
+    """{duty id: [revision, rules]} that this session read last, or {} for a call that is no session's."""
+    try:
+        return {int(k): [int(v[0]), str(v[1])] for k, v in json.loads(seen_get(key, "duties") or "{}").items()}
+    except (ValueError, TypeError, AttributeError, IndexError, KeyError):
+        return {}
+
+
+def duty_seen_row(key, marks):
+    """Inside the caller's transaction: this session has read these duties now, {id: [revision, rules]}, where None
+    changes nothing: a see_responsibilities that showed their words, a refusal that showed them, or its own change
+    (duty_mark_after)."""
+    in_transaction("duty_seen_row")
+    marks = {i: m for i, m in marks.items() if m is not None}
+    if key and marks:
+        seen = duty_seen(key)
+        seen.update(marks)
+        seen_row(key, "duties", json.dumps({str(k): v for k, v in sorted(seen.items())}, separators=(",", ":")))
+
+
+def duty_seen_set(key, marks):
+    """duty_seen_row in a transaction of its own, which changes nothing that the owner sees."""
+    if key and any(m is not None for m in marks.values()):
+        with area("quiet"), transaction():
+            duty_seen_row(key, marks)
+
+
+def duty_mark_after(seen, before, after):
+    """What a session has read of a duty after its own change of it: `before` and `after` are the duty's marks around
+    the change, `seen` the session's before it. Its own change is read, and a part that it had not read before the
+    change stays unread -- another session's revision, a rule that another route changed -- so the next change that
+    gives that part is refused once. A new duty is read whole, and a duty that it never read stays unread."""
+    if before is None:
+        return after
+    if seen is None:
+        return None
+    return [after[0] if seen[0] == before[0] else seen[0], after[1] if seen[1] == before[1] else seen[1]]
+
+
+def duty_changes_since(r, revision):
+    """The changes of duty r after `revision`, in words, or "": each revision is one row of its history
+    (DUTY_REVISION_KINDS), and the newest DUTY_CHANGES_SHOWN are named, oldest first, each with its time, its author
+    and what it changed."""
+    count = r["revision"] - revision
+    if count <= 0:
+        return ""
+    rows = q(f"SELECT * FROM duty_history WHERE responsibility=? AND kind IN "
+             f"({','.join('?' * len(DUTY_REVISION_KINDS))}) ORDER BY id DESC LIMIT ?",
+             (r["id"], *DUTY_REVISION_KINDS, min(count, DUTY_CHANGES_SHOWN)))
+    said = []
+    for h in reversed(rows):
+        detail = " ".join(str(h["detail"] or "").split())[:120]
+        said.append(f"{goal_time(h['ts'])} {h['by']}: {h['kind']}"
+                    + (f" ({detail})" if detail and detail != "no field" else ""))
+    more = count - len(rows)
+    return "; ".join(said) + (f"; and {more} before them" if more > 0 else "")
+
+
+def duty_moved(key, r, command, watch, seen, mark):
+    """The refusal of a set_duty change of duty r over what this session has not read, or None: another revision of
+    the duty, or, for a change that gives a watch list, another revision of a rule that the list keeps. `seen` is the
+    session's mark of r and `mark` r's own now (duty_read_mark). The refusal shows the duty as it stands, so the
+    session has read it from then on, and it is kept under its request_id (keep_refusal), so only a new request_id is
+    a new call. A call that is no session's is not held, nor a retired duty, which duty_save refuses anyway."""
+    if not key or r["state"] == "retired":
+        return None
+    if seen is not None and seen[0] == mark[0] and (not watch or seen[1] == mark[1]):
+        return None
+    if seen is None:
+        head = f"This session has not read {rref(r['id'])} in full yet"
+    elif seen[0] != mark[0]:
+        changes = duty_changes_since(r, seen[0])
+        head = (f"{rref(r['id'])} changed after this session read revision {seen[0]} of it: it is revision {mark[0]} "
+                f"now" + (f", after these changes: {changes}" if changes else ""))
+    else:
+        was, held = (dict(p.split(":", 1) for p in m.split(",") if p) for m in (seen[1], mark[1]))
+        rules = sorted(int(i) for i in set(was) | set(held) if was.get(i) != held.get(i))
+        head = (f"A wake-up rule that the watch list of {rref(r['id'])} keeps changed after this session read it "
+                f"(rule {', '.join(map(str, rules))}), and a watch list gives each rule whole")
+    text = (f"{head}. Nothing was written, so that no change of it is lost. Here it is as it stands now: put your "
+            f"change into it, and call set_duty again with a new request_id.\n\n" + "\n".join(duty_text(r, now())))
+    with area("quiet"), transaction():
+        duty_seen_row(key, {r["id"]: mark})
+        keep_refusal(command, text, now())
+    return text
+
+
 def t_set_duty(agent, a):
     """A new duty, or a change of one that exists: the manager for any agent, a lead for its own team."""
     duty_id = None
@@ -16762,11 +16913,19 @@ def t_set_duty(agent, a):
     command, stored = agent_write(agent, "set_duty", a, fields)
     if stored:
         return stored["text"]
+    key = seen_task(agent, a)[0]
+    old = duty_row(duty_id) if duty_id is not None else None
+    seen, before = (duty_seen(key).get(duty_id), duty_read_mark(old)) if old else (None, None)
+    if old:     # after agent_write: a repeat of a change that went through gets the answer kept for it
+        moved = duty_moved(key, old, command, "watch" in body, seen, before)
+        if moved:
+            raise ToolError(moved)
     try:
         r = duty_save(dict(body, request_id=command[1]), agent, now(),
                       duty_id=duty_id, command=command)
     except Refusal as e:
         raise ToolError(str(e)) from None
+    duty_seen_set(key, {r["id"]: duty_mark_after(seen, before, duty_read_mark(r))})     # its own write: read
     rules = ", ".join(str(t["id"]) for t in duty_watches(r["id"])) or "none"
     return (f"Saved {rref(r['id'])} ({duty_name(r['text'])}) for {r['agent']}, revision {r['revision']}. Wake-up "
             f"rules of its watches: {rules}. see_responsibilities shows its cases and markers.")
@@ -16788,10 +16947,13 @@ def t_change_duty(agent, a):
     if stored:
         return stored["text"]
     text = f"{rref(r['id'])} is {DUTY_STATE[action]}."
+    key = seen_task(agent, a)[0]
+    seen, before = duty_seen(key).get(r["id"]), duty_read_mark(r)
     try:
         duty_state_change(r, action, agent, note, command, {"responsibility": r["id"], "text": text})
     except Refusal as e:
         raise ToolError(str(e)) from None
+    duty_seen_set(key, {r["id"]: duty_mark_after(seen, before, duty_read_mark(duty_row(r["id"])))})
     return text
 
 
@@ -18921,10 +19083,13 @@ def t_write_knowledge(agent, a):
         commit = commit_kit_file(path, content, message, author=agent, allow=KNOWLEDGE_WRITE,
                                  check=seen_check(key, path, need_read=True))
     except KitMoved as e:
-        if e.held is None:      # nothing to read back: the session has seen that it is gone
-            seen_set(key, path, None)
-            raise ToolError(f"{path} was removed after this session read it ({e.commit}). Nothing was written. Write "
-                            f"it again only if it is still needed, with a new request_id.") from None
+        if e.held is None:      # nothing to read back: the session has seen that it is gone (keep_refusal)
+            said = (f"{path} was removed after this session read it ({e.commit}). Nothing was written. Write it again "
+                    f"only if it is still needed, with a new request_id.")
+            with area("quiet"), transaction():
+                seen_row(key, path, None)
+                keep_refusal(command, said, now())
+            raise ToolError(said) from None
         if not e.read:
             raise ToolError(f"{path} is there already, and this session has not read it with read_knowledge, so a "
                             f"whole write could undo a change that you never saw (your checkout can hold an older "
@@ -19154,9 +19319,12 @@ def t_write_skill(agent, a):
                                  check=seen_check(key, whole))
     except KitMoved as e:
         # A session reads a skill from its checkout, which stays as it was when the session started: so the refusal
-        # shows what changed as it stands now, and the session has read it from then on.
-        seen_set(key, whole, e.held)
-        raise ToolError(skill_moved_text(agent, name, e)) from None
+        # shows what changed as it stands now, and the session has read it from then on (keep_refusal).
+        said = skill_moved_text(agent, name, e)
+        with area("quiet"), transaction():      # seen_check holds only a session's write, so key is set
+            seen_row(key, whole, e.held)
+            keep_refusal(command, said, now())
+        raise ToolError(said) from None
     except Refusal as e:
         raise ToolError(f"The skill {name} was not written: {e}. Nothing changed, so call write_skill again with the "
                         f"same request_id.") from None
@@ -22449,9 +22617,13 @@ TOOLS = [
     ("manager", "set_duty", t_set_duty,
      "Write a duty of an agent: a new one, or a change of one that exists (give responsibility). Give the same "
      "responsibility with another agent to move the duty to that agent, or with other words to change what it "
-     "says. Whose duties you may write: the manager writes the duty of any agent of the fleet, because it is the "
-     "authority over them all; a lead writes the duties of its own team; a worker or a lead writes its own duties, "
-     "and the manager is told of each one and can change, move, pause or retire it. Ask the manager for a duty of "
+     "says. A change builds on the duty as this session last read it in full with see_responsibilities, or changed "
+     "it itself: if this session has not read it in full, or it changed since then, nothing is written, and the "
+     "answer shows the duty as it stands, so that another session's change is not lost; call again with a new "
+     "request_id. Whose duties you may write: the manager writes the duty of any agent of the "
+     "fleet, because it is the authority over them all; a lead writes the duties of its own team; a worker or a "
+     "lead writes its own duties, and the manager is told of each one and can change, move, pause or retire it. "
+     "Ask the manager for a duty of "
      "anybody else. You write duties that the owner asks for, and the ones you work out for yourself: work that "
      "keeps coming back, a goal that needs looking after and not one task, something you keep doing by hand. "
      "Choose the holder by suitability first (see_capacity). The manager can hold a duty itself when no agent "
