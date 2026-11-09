@@ -951,9 +951,10 @@ class Door:
             self.SELECTED[inst["id"]] = (now(), repos)
         return repos
 
-    def installation_repos(self, jwt, iid, login):
+    def installation_repos(self, jwt, iid, login, active=False):
         """Every repository of one installation, in lower case, read with a token of metadata only; None when it has
-        more than the door reads."""
+        more than the door reads. active (github_repos): archived repositories are left out, and a page that GitHub
+        does not give is an error instead of the end of the list."""
         status, got = self.http("POST", f"{GitHub.API}/app/installations/{iid}/access_tokens",
                                 {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json",
                                  "Content-Type": "application/json"},
@@ -965,12 +966,45 @@ class Door:
         for page in range(1, GITHUB_REACH_PAGES + 1):
             status, got = self.http("GET", f"{GitHub.API}/installation/repositories?per_page=100&page={page}",
                                     {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json"}, None)
-            names = [r.get("full_name") for r in (got.get("repositories") if status == 200 and
-                                                  isinstance(got, dict) else None) or [] if isinstance(r, dict)]
-            repos.update(n.lower() for n in names if isinstance(n, str))
-            if len(names) < 100:
+            rows = got.get("repositories") if status == 200 and isinstance(got, dict) else None
+            if active and not isinstance(rows, list):
+                raise door_providers.Stop(f"GitHub gave no list of {login}'s repositories ({status})")
+            rows = [r for r in rows or [] if isinstance(r, dict)]
+            repos.update(r["full_name"].lower() for r in rows
+                         if isinstance(r.get("full_name"), str) and not (active and r.get("archived")))
+            if len(rows) < 100:
                 return repos
         return None
+
+    def github_repos(self):
+        """Every repository that the door's GitHub Apps reach, for the app's list that gives an agent its repositories
+        (9 November 2026, the owner's yes to that list): {"accounts": {account: {"name": the account as GitHub writes
+        it, "repos": [owner/name, ...]}}}, account and repository names in lower case. Unlike github_reach it lists an
+        installation that has all its account's repositories too. Archived repositories and suspended installations
+        are left out; an installation with more than the door reads is an error."""
+        apps = sorted({(str(c["app_id"]), c["secret"]) for k, c in (self.access().get("credentials") or {}).items()
+                       if k.lower().startswith("github:") and isinstance(c, dict) and c.get("app_id") and c.get("secret")})
+        accounts = {}
+        for app_id, ref in apps:
+            jwt = door_providers.app_jwt(app_id, self.secret(ref))
+            status, installs = self.http("GET", f"{GitHub.API}/app/installations?per_page=100",
+                                         {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json"},
+                                         None)
+            if status != 200 or not isinstance(installs, list):
+                raise door_providers.Stop(f"GitHub gave no list of the App's installations ({status})")
+            for one in installs:
+                account = (one.get("account") if isinstance(one, dict) else None) or {}
+                iid, login = one.get("id") if isinstance(one, dict) else None, account.get("login")
+                if isinstance(iid, bool) or not isinstance(iid, int) or not isinstance(login, str) or \
+                        not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login) or one.get("suspended_at"):
+                    continue
+                listed = self.installation_repos(jwt, iid, login, active=True)
+                if listed is None:
+                    raise door_providers.Stop(f"{login} has more repositories than the door reads")
+                entry = accounts.setdefault(login.lower(), {"name": login, "repos": set()})
+                entry["repos"] |= {r for r in listed if door_targets.REPO.fullmatch(r) and
+                                   r.split("/")[0] == login.lower()}
+        return {"accounts": {a: {"name": e["name"], "repos": sorted(e["repos"])} for a, e in sorted(accounts.items())}}
 
     def github_key(self, app_id, ref=None):
         """One key of an App of the door's file, for the hub's renewal of the key that it held (plan 13, item 4, the
@@ -1294,6 +1328,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.answer(403, {"error": "what the App reaches is the hub's to read, with its token secret"})
             try:
                 return self.answer(200, self.door.github_reach())
+            except (Refused, door_providers.Stop) as e:
+                return self.answer(502, {"error": str(e)})
+        if path == "/github/repos":
+            if not self.door.hub_allowed(self.source(), self.bearer(), "token_sha256"):
+                return self.answer(403, {"error": "the repositories that the Apps reach are the hub's to read, with "
+                                                  "its token secret"})
+            try:
+                return self.answer(200, self.door.github_repos())
             except (Refused, door_providers.Stop) as e:
                 return self.answer(502, {"error": str(e)})
         self.answer(404, {"error": "no such route"})

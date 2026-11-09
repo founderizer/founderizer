@@ -951,7 +951,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "knowledge_edit",    # the owner, 5 November 2026: the pencil of a knowledge file, whose edit says
                                     # "changed" and stops a page's daily read (knowledge_replace)
                "door_setup",        # the owner, 6 November 2026 (DevOps D24): the app keeps the door, no hand step
-               "agent_remove"]      # the owner, 7 November 2026: "an option to Delete an agent (after confirmation)"
+               "agent_remove",      # the owner, 7 November 2026: "an option to Delete an agent (after confirmation)"
+               "repo_picker"]       # the owner, 9 November 2026: "ok yes" to the list that gives an agent repositories
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -31440,6 +31441,87 @@ def door_reach_read():
             "owners": {o.lower() for o in answer.get("owners") or [] if isinstance(o, str) and GITHUB_LOGIN.fullmatch(o)}}
 
 
+# Every repository that the fleet's GitHub Apps reach, for the app's list that gives an agent its repositories (owner
+# feature repo_picker; the owner, 9 November 2026: "ok yes" to that list). Unlike the reading above, it names the
+# repositories of an installation that has all its account's repositories too. Only in the hub's memory.
+GITHUB_REPOS = {"at": 0.0, "list": None}
+GITHUB_REPOS_LOCK = threading.Lock()
+
+
+def github_repos_read():
+    """({account: {"name": the account as GitHub writes it, "repos": [owner/name in lower case]}}, problems): the
+    repositories of every installation of the hub's own App and of the door's Apps, archived ones and suspended
+    installations left out. A source that cannot be read is a problem, and the other still counts."""
+    found, problems = {}, []
+
+    def keep(login, name, repos):
+        entry = found.setdefault(login.lower(), {"name": name, "repos": set()})
+        entry["repos"] |= {r for r in repos if REPO_NAME.fullmatch(r) and r.split("/")[0] == login.lower()}
+    app = github_app()
+    if app is not None:
+        try:
+            jwt = github_jwt(*app)
+            installs = github_call("GET", "/app/installations?per_page=100", jwt)
+            if not isinstance(installs, list):
+                raise GitHubError("GitHub gave no list of the App's installations")
+            for one in installs:
+                account = one.get("account") or {}
+                iid, login = one.get("id"), account.get("login")
+                if isinstance(iid, bool) or not isinstance(iid, int) or not isinstance(login, str) or \
+                        not GITHUB_LOGIN.fullmatch(login) or one.get("suspended_at"):
+                    continue
+                token = github_call("POST", f"/app/installations/{iid}/access_tokens", jwt,
+                                    {"permissions": {"metadata": "read"}}).get("token")
+                if not isinstance(token, str) or not GITHUB_TOKEN.fullmatch(token):
+                    raise GitHubError("GitHub gave no valid token")
+                repos = set()
+                for page in range(1, GITHUB_REACH_PAGES + 1):
+                    rows = [r for r in github_call("GET", f"/installation/repositories?per_page=100&page={page}",
+                                                   token).get("repositories") or [] if isinstance(r, dict)]
+                    repos |= {r["full_name"].lower() for r in rows
+                              if isinstance(r.get("full_name"), str) and not r.get("archived")}
+                    if len(rows) < 100:
+                        break
+                else:
+                    raise GitHubError(f"{login} has more repositories than the hub reads")
+                keep(login, login, repos)
+        except GitHubError as e:
+            problems.append(str(e))
+    conf = door_conf()
+    if conf is not None:
+        status, answer = door_call(conf, "GET", "/github/repos", conf["token"])
+        if status == 200 and isinstance(answer, dict) and isinstance(answer.get("accounts"), dict):
+            for login, entry in answer["accounts"].items():
+                if isinstance(login, str) and GITHUB_LOGIN.fullmatch(login) and isinstance(entry, dict):
+                    name = entry.get("name")
+                    keep(login, name if isinstance(name, str) and name.lower() == login.lower() else login,
+                         {r.lower() for r in entry.get("repos") or [] if isinstance(r, str)})
+        else:
+            problems.append("the door's code does not list repositories yet" if status == 404 else
+                            "the door gave no list of repositories" + (f": {answer['error']}" if isinstance(answer, dict)
+                                                                      and isinstance(answer.get("error"), str) else ""))
+    return {a: {"name": e["name"], "repos": sorted(e["repos"])} for a, e in sorted(found.items())}, problems
+
+
+def github_repo_list():
+    """(the newest github_repos_read, its problem in words or None): a reading counts GITHUB_REACH_FRESH seconds, so
+    the list opens at once the second time. Never under LOCK: it calls GitHub and the door."""
+    with GITHUB_REPOS_LOCK:
+        if GITHUB_REPOS["list"] is not None and now() - GITHUB_REPOS["at"] < GITHUB_REACH_FRESH:
+            return GITHUB_REPOS["list"], None
+    try:
+        found, problems = github_repos_read()
+    except (OSError, ValueError, GitHubError) as e:
+        return {}, str(e)[:300] or "GitHub did not answer"
+    if problems:
+        return found, "; ".join(problems)[:300]
+    if not found and github_app() is None and door_conf() is None:
+        return {}, "Founderizer holds no GitHub App yet."
+    with GITHUB_REPOS_LOCK:
+        GITHUB_REPOS.update(at=now(), list=found)
+    return found, None
+
+
 def github_app_asks(reach):
     """DevOps plan 13, item 4 (plan 2.20): an account where agents hold repositories, which no App of the door reaches
     and which owns none of them, needs a GitHub App of its own, because a private App reaches only the account that
@@ -31518,7 +31600,7 @@ def save_repo_reached(body, _waited):
     reach. The route waited for a reading first, outside LOCK."""
     result = save_repo(body)
     many = isinstance(body["repo"], list)
-    pages = github_unreached(body["repo"] if many else [body["repo"]]) if body["access"] else {}
+    pages = github_unreached(body["repo"] if many else [body["repo"]]) if body.get("access") or body.get("level") else {}
     page = pages if many else pages.get(body["repo"])
     return dict(result, unreached=page) if page else result
 
@@ -31946,7 +32028,11 @@ def known_agents(team, names):
 
 def save_repo(body):
     """Who may use one GitHub repository, and how: {agent: read | write | deploy}. An agent that is not named loses
-    it; {} removes the repository from every agent. repo may be a list: each of them gets this access, in one change."""
+    it; {} removes the repository from every agent. repo may be a list: each of them gets this access, in one change.
+    With agent and level instead of access (owner feature repo_picker), only that agent's access to each repository
+    changes, and level null takes them away from it: the other agents keep theirs."""
+    if "agent" in body:
+        return save_agent_repos(body)
     repo, access = body["repo"], body["access"]
     names = repo if isinstance(repo, list) else [repo]
 
@@ -31976,6 +32062,39 @@ def save_repo(body):
              (f"[hub] The owner changed who may use {len(names)} GitHub repositories ({named_few(names)}): {words}. "
               f"An agent gets them in its next task session."))
     return dict(result, repo=repo, access=access)
+
+
+def save_agent_repos(body):
+    """save_repo for one agent: it gets level on each repository, or loses each one with level null, in one change and
+    one message to the manager; every other agent keeps what it holds."""
+    repo, agent, level = body["repo"], body["agent"], body["level"]
+    names = repo if isinstance(repo, list) else [repo]
+
+    def change(team):
+        known_agents(team, {agent: level or "read"})
+        a = team["agents"][agent]
+        repos = dict(a.get("repos") or {})
+        before = dict(repos)
+        for one in names:
+            repos.pop(one, None)
+            if level:
+                repos[one] = level
+        if repos == before:
+            return False
+        if repos:
+            a["repos"] = dict(sorted(repos.items()))
+        else:
+            a.pop("repos", None)
+        return True
+    what = f"{len(names)} repositories" if isinstance(repo, list) else repo
+    result = save_integration(body["base_sha256"], change, f"Owner changed {agent}'s access to {what}")
+    if result["changed"]:
+        held = f"GitHub repositories ({named_few(names)})" if isinstance(repo, list) else f"the GitHub repository {repo}"
+        count = f"{len(names)} " if isinstance(repo, list) else ""
+        emit(manager_name(), "say", "[hub] The owner " + (f"gave {agent} {level} access to {count}{held}" if level else
+                                                           f"took {count}{held} away from {agent}") +
+             ". An agent gets the change in its next task session.")
+    return dict(result, repo=repo, agent=agent, level=level)
 
 
 def save_tool(body):
@@ -36367,7 +36486,8 @@ class Handler(BaseHTTPRequestHandler):
         may also be a list of repositories that all get this access, in one change and one message to the manager
         (9 November 2026: an agent may hold up to REPOS_MOST, and one grant for each would be as many of both)."""
         def read(data):
-            base, repo, access = self.integration_base(data, ("repo", "access")), data.get("repo"), data.get("access")
+            base = self.integration_base(data, ("repo", "access", "agent", "level"))
+            repo, access = data.get("repo"), data.get("access")
             names = repo if isinstance(repo, list) else [repo]
             if not names or len(names) > REPOS_MOST or not all(
                     isinstance(r, str) and REPO_NAME.fullmatch(r.strip().lower()) for r in names) or \
@@ -36375,6 +36495,17 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError(f"repo must be a GitHub repository as owner/name, or a list of up to {REPOS_MOST} "
                                  f"different ones")
             repo = [r.strip().lower() for r in names] if isinstance(repo, list) else repo
+            if "agent" in data or "level" in data:      # owner feature repo_picker: one agent, the others stay
+                agent, level = data.get("agent"), data.get("level")
+                if "access" in data or not ("agent" in data and "level" in data):
+                    raise ValueError("give access, or agent and level, not both")
+                if not isinstance(agent, str) or not AGENT_NAME.match(agent) or (level is not None and
+                                                                                 level not in REPO_ACCESS):
+                    named = ", ".join(f'"{x}"' for x in REPO_ACCESS)
+                    raise ValueError(f"agent must be an agent name, and level one of {named}, or null, which takes "
+                                     f"the repositories away from it")
+                return {"base_sha256": base, "repo": repo if isinstance(repo, list) else repo.strip().lower(),
+                        "agent": agent, "level": level}
             if not isinstance(access, dict) or not all(isinstance(n, str) and AGENT_NAME.match(n) and v in REPO_ACCESS
                                                        for n, v in access.items()):
                 named = ", ".join(f'"{x}"' for x in REPO_ACCESS[:-1]) + f' or "{REPO_ACCESS[-1]}"'
@@ -36382,7 +36513,8 @@ class Handler(BaseHTTPRequestHandler):
             return {"base_sha256": base, "repo": repo if isinstance(repo, list) else repo.strip().lower(),
                     "access": dict(sorted(access.items()))}
         return self.ui_command("team/repos", read, save_repo_reached,
-                               outside=lambda body: github_reach(GITHUB_REACH_WAIT if body["access"] else 0))
+                               outside=lambda body: github_reach(GITHUB_REACH_WAIT if body.get("access") or
+                                                                 body.get("level") else 0))
 
     def ui_team_tool(self):
         """POST /ui/team/tools (owner feature integrations): the agents that get one tool of the catalog."""
@@ -37164,6 +37296,19 @@ class Handler(BaseHTTPRequestHandler):
             rev = kit_revision(fresh=True)
             profiles = [profile_view(name, rev) for name in agents()]
         return self.json(200, scrub(dict(db=generation, revision=rev, profiles=profiles)), {"Cache-Control": "no-store"})
+
+    def ui_github_repos(self, query):
+        """GET /ui/github/repos (owner feature repo_picker): every repository that the fleet's GitHub Apps reach, by
+        account, for the app's list that gives an agent its repositories. problem says what could not be read."""
+        if not self.ui_allowed():
+            return
+        generation = kv_get("db_id")
+        if query.get("db") != generation:
+            return self.json(409, {"error": "hub generation changed; refresh state"})
+        found, problem = github_repo_list()
+        return self.json(200, {"db": generation, "problem": problem,
+                               "accounts": [{"account": e["name"], "repos": e["repos"]} for e in found.values()]},
+                         {"Cache-Control": "no-store"})
 
     def ui_resources(self, query):
         """GET /ui/resources (owner feature resource_grants): what a duty can need, as the owner already holds it. Each
@@ -38937,6 +39082,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_goal(int(parts[2]), query)
         if parts == ["ui", "resources"]:
             return self.ui_resources(query)
+        if parts == ["ui", "github", "repos"]:      # owner feature repo_picker
+            return self.ui_github_repos(query)
         if len(parts) == 3 and parts[:2] == ["ui", "notes"] and AGENT_NAME.match(parts[2]):
             return self.ui_notes(parts[2], query)
         if len(parts) == 3 and parts[:2] == ["ui", "memory"] and AGENT_NAME.match(parts[2]):
