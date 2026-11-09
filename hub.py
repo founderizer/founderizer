@@ -957,7 +957,9 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "door_setup",        # the owner, 6 November 2026 (DevOps D24): the app keeps the door, no hand step
                "agent_remove",      # the owner, 7 November 2026: "an option to Delete an agent (after confirmation)"
                "repo_picker",       # the owner, 9 November 2026: "ok yes" to the list that gives an agent repositories
-               "need_talk"]         # the owner, 9 November 2026: short Needs-you cards, Details, Discuss, ticked options
+               "need_talk",         # the owner, 9 November 2026: short Needs-you cards, Details, Discuss, ticked options
+               "default_models"]    # the owner, 9 November 2026: "a default for each [AI provider] somewhere under
+                                    # settings, and then each agent can be changed individually"
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -22349,7 +22351,8 @@ TOOLS = [
      "Change the model and the effort of an agent you give work to (a lead's own team; the fleet manager's agents "
      "with no lead), inside its own runtime and account: only a model and an effort that its runtime offers on its "
      "machine now. Its next sessions start with them. Change one thing at a time, say why, and keep or undo it by "
-     "the next period's costs. \"default\" is the runtime's own. A new account, provider or money is the owner's.",
+     "the next period's costs. \"default\" is the owner's default for its runtime, else the runtime's own. A new "
+     "account, provider or money is the owner's.",
      S({"agent": {"type": "string", "description": "The agent whose model and effort change"},
         "model": {"type": "string", "description": "A model its runtime offers, or \"default\""},
         "effort": {"type": "string", "description": "An effort of that model, or \"default\""},
@@ -25897,9 +25900,16 @@ def offered(agent, model, effort, reading="models"):
     if model is not None and model not in options and not full_name:
         raise Refusal(409, f"{model} is not offered on {agent}{when}.")
     if effort is not None:
-        efforts = (options[model]["efforts"] if model in options else
-                   next((o["efforts"] for o in r["options"] if o["default"]), []) if model is None else
-                   sorted({e for o in r["options"] for e in o["efforts"]}))
+        # owner feature default_models: the owner's default model where this list offers it and the agent's helper
+        # gives it (an older one runs the list's default until it updates)
+        if model is None and "default_models" in helper_features(agent):
+            wanted = (facts_now(TEAM, APP_SERVER_RUNTIME if screen else runtime).get("default_model") or {}).get("model")
+            if isinstance(wanted, str) and (wanted in options or not screen and r.get("other_names") and
+                                            re.fullmatch(r"claude-[a-z0-9.-]+", wanted)):
+                model = wanted
+        listed = next((o["efforts"] for o in r["options"] if o["default"]), None) if model is None else None
+        efforts = (options[model]["efforts"] if model in options else listed if listed is not None else
+                   sorted({e for o in r["options"] for e in o["efforts"]}))     # Claude's list marks no default model
         if effort not in efforts:
             raise Refusal(409, f"{effort} is not an effort of {model or 'the default model'} on {agent}{when}.")
 
@@ -28330,6 +28340,79 @@ def runtime_facts_view():
     return out
 
 
+def default_models(team):
+    """{runtime: {"model", "effort"}} of the owner's defaults (owner feature default_models, team.json runtime_facts
+    <runtime>.default_model): what an agent of that runtime runs when it has no model or no effort of its own, where its
+    machine's list offers it (fleet.run_settings). The app names it in each agent's first option ("Default (Opus)")."""
+    return {name: chosen for name in RUNTIMES if (chosen := facts_now(team, name).get("default_model"))}
+
+
+def model_readings():
+    """[(runtime, reading)] of every good model reading that the agents' machines sent at most MODELS_MAX_AGE ago, of a
+    runtime with model flags: an agent's reading of the runtime it runs, and the screen readings of the app-server
+    runtime, whose desktop tasks take its default too (owner feature default_models)."""
+    out = []
+    for row in q("SELECT agent, data FROM machine_status ORDER BY agent"):
+        try:
+            data = json.loads(row["data"])
+        except ValueError:
+            continue
+        runtime = (agents().get(row["agent"]) or {}).get("runtime")
+        for key in ("models", "screen_models"):
+            reading = data.get(key) if isinstance(data, dict) else None
+            if isinstance(reading, dict) and reading.get("ok") is True and \
+                    runtime_fact(reading.get("runtime"), "model_flags") and \
+                    reading["runtime"] == (runtime if key == "models" else APP_SERVER_RUNTIME) and \
+                    finite(reading.get("read_at")) and now() - reading["read_at"] <= MODELS_MAX_AGE:     # as offered()
+                out.append((reading["runtime"], reading))
+    return out
+
+
+def model_choices(readings=None):
+    """{runtime: [option]} for the owner's Default models (owner feature default_models): the options of the model
+    readings (model_readings), merged by model in their own order. A model's efforts are those of every reading that
+    lists it."""
+    out = {}
+    for runtime, reading in model_readings() if readings is None else readings:
+        merged = out.setdefault(runtime, {})
+        for o in reading.get("options") or []:
+            if not isinstance(o, dict) or not isinstance(o.get("model"), str):
+                continue
+            entry = merged.setdefault(o["model"], {"model": o["model"], "display_name": o.get("display_name")
+                                                   or o["model"], "default": False, "efforts": [],
+                                                   "default_effort": o.get("default_effort")})
+            entry["default"] = entry["default"] or o.get("default") is True
+            entry["efforts"] += [e for e in o.get("efforts") or [] if e not in entry["efforts"]]
+    return {name: list(merged.values()) for name, merged in out.items()}
+
+
+def default_model_check(runtime, chosen):
+    """409 unless the owner's default for this runtime (owner feature default_models) is one that its machines can
+    give: a runtime with model flags, a model that one of their model readings lists, or a full claude-* name where a
+    reading takes other names (Claude), and an effort of that model; with no model, an effort of the list's default
+    model, or of any model where the list marks none (Claude)."""
+    label = runtime_label(runtime)
+    if not runtime_fact(runtime, "model_flags"):
+        raise Refusal(409, f"{label} takes no model or effort from Founderizer.")
+    readings = [(name, r) for name, r in model_readings() if name == runtime]
+    options = model_choices(readings).get(runtime) or []
+    if not options:
+        raise Refusal(409, f"No server reports the models of {label} yet. Check a server that runs it first.")
+    named = {o["model"]: o for o in options}
+    model, effort = chosen.get("model"), chosen.get("effort")
+    other = any(r.get("other_names") is True for _, r in readings) and re.fullmatch(r"claude-[a-z0-9.-]+", model or "")
+    if model is not None and model not in named and not other:
+        raise Refusal(409, f"{model} is not a model of {label} on any server. Its servers offer "
+                           f"{', '.join(named)}.")
+    if effort is None:
+        return
+    entry = named.get(model) if model is not None else next((o for o in options if o["default"]), None)
+    efforts = entry["efforts"] if entry else sorted({e for o in options for e in o["efforts"]})
+    if effort not in efforts:
+        raise Refusal(409, f"{effort} is not an effort of {model or 'the default model of ' + label}. It takes "
+                           f"{', '.join(efforts) or 'none'}.")
+
+
 def runtime_facts_changes(facts):
     """POST /ui/settings "runtime_facts": {runtime: {fact: value, or None for the table's}}, each value checked by
     its fact's own check. Returns it with the checked values, or raises ValueError with the one that is wrong."""
@@ -28355,6 +28438,9 @@ def save_settings(changes, facts=None):
     """POST /ui/settings: the owner's values of some settings, None for the default, and of some runtime facts, None
     for the table's, in one commit of team.json that is applied at once. It needs no base: it moves only the keys it
     names, and keeps every other one."""
+    for name, facts_of in (facts or {}).items():
+        if facts_of.get("default_model") is not None:
+            default_model_check(name, facts_of["default_model"])
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     before = team.get("settings") if isinstance(team.get("settings"), dict) else {}
@@ -36494,6 +36580,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.json(200, dict(db=generation, revision=rev, sha256=digest, lines=lines, open_tasks=busy,
                                    accounts=team.get("accounts") or {},
                                    logins=catalog, created_logins=made, machines=machines,
+                                   default_models=default_models(team),         # owner feature default_models
                                    **integrations_view(team, lines)), {"Cache-Control": "no-store"})
 
     def ui_team_lines(self):
@@ -38929,7 +39016,8 @@ class Handler(BaseHTTPRequestHandler):
         generation = kv_get("db_id")
         if query.get("db") != generation:
             return self.json(409, {"error": "hub generation changed; refresh state"})
-        return self.json(200, {"db": generation, "settings": settings_view(), "runtime_facts": runtime_facts_view()},
+        return self.json(200, {"db": generation, "settings": settings_view(), "runtime_facts": runtime_facts_view(),
+                               "models": model_choices()},          # owner feature default_models
                          {"Cache-Control": "no-store"})
 
     def ui_settings_save(self):

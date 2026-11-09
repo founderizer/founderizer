@@ -1000,8 +1000,10 @@ def tools():
              {"agent": S["text"], **rid}, ("agent",),
              with_base("/ui/team/agents/{agent}/remove", (), "the deletion of this agent")),
         tool("agent_settings", "One agent's model, effort, capabilities, title, expertise, account or screen model. "
-                               "Each of vault, runtime and vault_create is a command of its own, and has a tool of "
-                               "its own here: vault_access, switch_runtime and login_creation.",
+                               "A null model or effort follows the fleet's default_model of its runtime "
+                               "(save_settings), else the runtime's own. Each of vault, runtime and vault_create is a "
+                               "command of its own, and has a tool of its own here: vault_access, switch_runtime and "
+                               "login_creation.",
              {"agent": S["text"], "model": {"type": ["string", "null"]}, "effort": {"type": ["string", "null"]},
               "can": {"type": "array", "items": {"type": "string",
                                                  "enum": list(FROM_THE_HUB["hub.CAPABILITIES"])}},
@@ -1009,7 +1011,8 @@ def tools():
               "expertise": {"type": "array", "items": {"type": "string"}},
               "account": {"type": ["string", "null"]},
               "screen": {"type": "object", "description": "The model of this agent's screen work: both keys, and "
-                                                           "null in either for the screen runtime's own default.",
+                                                           "null in either for the fleet's Codex default_model, else "
+                                                           "the screen runtime's own default.",
                          "properties": {"model": {"type": ["string", "null"]},
                                         "effort": {"type": ["string", "null"]}},
                          "required": ["model", "effort"], "additionalProperties": False},
@@ -1182,8 +1185,10 @@ def tools():
                               "its new value, or to null for its default. runtime_facts maps a runtime to the facts "
                               "of it to change -- cache_seconds, compact_tokens, token_weights (its list prices "
                               "in dollars per million tokens as {model: {input, cache_read, cache_write, output}} "
-                              "with \"default\" for any other model) and routine (the {model, effort} of routine "
-                              "work) -- or to null for the table's value, for when a provider changes its prices, "
+                              "with \"default\" for any other model), routine (the {model, effort} of routine "
+                              "work) and default_model (the {model, effort} that an agent of that runtime runs "
+                              "when it has none of its own, null for the runtime's own; a model that its servers "
+                              "list) -- or to null for the table's value, for when a provider changes its prices, "
                               "its cache or its models. fleet_read(page=\"settings\") gives every "
                               "setting and fact with its value and its default. One commit of team.json, applied "
                               "at once.",

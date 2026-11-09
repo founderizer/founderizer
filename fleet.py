@@ -64,9 +64,9 @@ from http.client import HTTPException       # only the name: `http` is this modu
 from threads import MARKER, THREAD_ID, CodexFiles, Tailer, Translator, complete_rows, manager_transcript, text_of
 from usage import Collector, local_model, timestamp
 import lifecycle
-from lifecycle import (CHECK_FILE, CHECK_STORE, FLOOR_FILE, GITHUB_TOKEN, MCP_PROGRAM, REPO_ACCESS, REPO_NAME,
-                       RUNTIMES, TOOL_CATALOG, Lifecycle, Updating, app_server_task, check_stores, exe, facts_now,
-                       follow_config_ref, key_env, mcp_variable, no_sign_in, reuse_settings, runtime_fact,
+from lifecycle import (APP_SERVER_RUNTIME, CHECK_FILE, CHECK_STORE, FLOOR_FILE, GITHUB_TOKEN, MCP_PROGRAM, REPO_ACCESS,
+                       REPO_NAME, RUNTIMES, TOOL_CATALOG, Lifecycle, Updating, app_server_task, check_stores, exe,
+                       facts_now, follow_config_ref, key_env, mcp_variable, no_sign_in, reuse_settings, runtime_fact,
                        runtimes_with, screen_program, session_reuse, skills_text, start_form, tool_catalog, tool_needs)
 from desktop import Publisher
 from onboard import CLAUDE_UPDATES_OFF
@@ -114,6 +114,13 @@ def checkout_team():
             return json.load(f)
     except (OSError, ValueError):
         return {}
+
+
+def owner_default(runtime):
+    """The owner's default model and effort for this runtime, {"model", "effort"} or None, from this checkout's
+    team.json as it is now (runtime_facts <runtime>.default_model, lifecycle.facts_now; owner feature
+    default_models). The task-start sync brings the checkout onto the configuration ref first (sync_checkout)."""
+    return facts_now(checkout_team(), runtime).get("default_model") if runtime else None
 
 
 def hub_url(team):
@@ -1833,25 +1840,48 @@ def screen_settings(conf):
     return {"model": screen.get("model"), "effort": screen.get("effort")}
 
 
-def run_settings(conf, models=None):
-    """{"model", "effort"} that a new session of the agent starts with: its own, else the one default of its runtime's
-    own model list (models, a Lifecycle.read_models reading), and with no effort of its own that model's default
-    effort in the list, as a screen task gets them (screen_runner.default_model). Without them the runtime takes its
-    own configuration's, which can name a model or an effort that the account offers no more: a Mac's Codex config
-    named a model that its ChatGPT sign-in did not offer, and every turn of a Codex agent there failed with
-    model_not_found (28 October 2026). A reading of another runtime, a failed one and a list without exactly one
-    default give no model; Claude's list marks no default and no default effort."""
+CLAUDE_FULL_NAME = re.compile(r"claude-[a-z0-9.-]+")      # a full model name that Claude takes unlisted (hub.offered)
+
+
+def run_settings(conf, models=None, default=None, listed=True):
+    """{"model", "effort"} that a new session of the agent starts with: its own; else the owner's default for its
+    runtime (default: team.json runtime_facts <runtime>.default_model, read with facts_now; owner feature default_models)
+    where this machine's reading offers it, a model of the list or a full claude-* name where the list takes other
+    names, and an effort of the model that the session gets; else the one default of its runtime's own model list
+    (models, a Lifecycle.read_models reading), and with no effort yet that model's default effort in the list, as a
+    screen task gets them (screen_runner.default_model). Without them the runtime takes its own configuration's, which
+    can name a model or an effort that the account offers no more: a Mac's Codex config named a model that its ChatGPT
+    sign-in did not offer, and every turn of a Codex agent there failed with model_not_found (28 October 2026). So
+    nothing comes of the owner's default either without a good reading of the same runtime that offers it. A reading of
+    another runtime, a failed one and a list without exactly one default give no model; Claude's list marks no default
+    and no default effort. listed False leaves the list's default model and its effort to an app-server runner, which
+    reads the account's list itself at its start (screen_runner.default_model)."""
     model, effort = conf.get("model") or None, conf.get("effort") or None
-    if isinstance(models, dict) and models.get("ok") and models.get("runtime") == conf.get("runtime"):
-        options = [o for o in models.get("options") or [] if isinstance(o, dict) and isinstance(o.get("model"), str)]
-        if model is None:
-            defaults = [o for o in options if o.get("default") is True]
-            entry = defaults[0] if len(defaults) == 1 else None
-            model = entry["model"] if entry else None
-        else:
-            entry = next((o for o in options if o["model"] == model), None)
-        if entry and effort is None:
-            effort = entry.get("default_effort") or None
+    if not (isinstance(models, dict) and models.get("ok") and models.get("runtime") == conf.get("runtime")):
+        return {"model": model, "effort": effort}
+    options = [o for o in models.get("options") or [] if isinstance(o, dict) and isinstance(o.get("model"), str)]
+    default = default if isinstance(default, dict) else {}
+    wanted, chosen = default.get("model"), False
+    if model is None and isinstance(wanted, str) and (any(o["model"] == wanted for o in options) or (
+            models.get("other_names") is True and CLAUDE_FULL_NAME.fullmatch(wanted))):
+        model, chosen = wanted, True
+    if model is None:
+        defaults = [o for o in options if o.get("default") is True]
+        entry = defaults[0] if len(defaults) == 1 else None
+        model = entry["model"] if entry and listed else None
+    else:
+        entry = next((o for o in options if o["model"] == model), None)
+    # the efforts of the model that the session gets; of every model when that one is not in the list (Claude's own
+    # default, or a full name), whose efforts Claude's list gives once for all of them
+    efforts = (entry.get("efforts") or []) if entry else sorted({e for o in options for e in o.get("efforts") or []})
+    if conf.get("model") is None and effort is not None and entry and effort not in efforts:
+        # its own effort was checked against the model of that day (hub.offered): the owner's default since changed or
+        # cleared, or the list's default moved, and a model never gets an effort that it does not offer
+        effort = None
+    if effort is None and isinstance(default.get("effort"), str) and default["effort"] in efforts:
+        effort = default["effort"]
+    if entry and effort is None and model is not None and (listed or chosen):
+        effort = entry.get("default_effort") or None     # a runner given a model takes no effort from its list
     return {"model": model, "effort": effort}
 
 
@@ -3379,13 +3409,14 @@ class Helper:
         # the hub's end of the manager's usage limit, from its answer to the limit's report (report_limit)
         self.stuck_closed, self.manager_limit_until = {}, None
         if self.worker:
+            # what the helper passes to a session when it starts, the owner's default included (requested_now)
             self.tailer = Tailer(conf.get("runtime", ""), self.task_windows,
                                  lambda batch: http("POST", f"/helper/events/{agent}", batch, timeout=15), kit=KIT,
-                                 requested={"model": conf.get("model"), "effort": conf.get("effort")},
-                                 screen_requested=screen_settings(conf))
+                                 requested=self.requested_now, screen_requested=lambda: self.requested_now(screen=True),
+                                 runner_requested=lambda: self.requested_now(runner=True))
         else:
             self.tailer = Tailer(conf.get("runtime", ""), self.manager_windows, self.report_limit,
-                                 requested={"model": conf.get("model"), "effort": conf.get("effort")})
+                                 requested=self.requested_now)
 
     def moved_away(self):
         """The owner moved this agent to another server (hub.move_agent): its sessions here end, and so does this
@@ -4426,7 +4457,7 @@ class Helper:
                     env = session_env(self.agent, self.conf, "task",
                                       task_place(self.agent, extra.get("generation"), task),
                                       closed=isinstance(extra.get("shell_off"), dict))
-                    return session_command(self.agent, self.conf if runner else self.run_conf(), ev["text"],
+                    return session_command(self.agent, self.runner_conf(needs) if runner else self.run_conf(), ev["text"],
                         task=task, needs=needs, attempt=extra.get("attempt",1), generation=extra.get("generation",""),
                         session=session, token=token, env=env, opening=extra.get("opening"), rules=extra.get("rules"),
                         closed=extra.get("shell_off"),    # support plan F1: the hub's closed start
@@ -4782,10 +4813,8 @@ class Helper:
                 # A signal that this helper typed less than one cache lifetime ago counts as a model call.
                 typed = time.time() - (time.monotonic() - self.typed_at.get(window, float("-inf")))
                 seen = seen[:2] + (max(seen[2], typed),) + seen[3:]
-            reuse, why = session_reuse(runtime, seen,
-                                       dict(started_runs(start, runtime), account=account or None)
-                                       if start.strip() else None,
-                                       dict(self.runs(), runtime=runtime, account=account_now(self.agent, runtime)),
+            started = dict(started_runs(start, runtime), account=account or None) if start.strip() else None
+            reuse, why = session_reuse(runtime, seen, started, self.reuse_runs(started, runtime),
                                        reuse_settings(team), facts=facts_now(team, runtime))
             if reuse:
                 return False
@@ -4819,11 +4848,59 @@ class Helper:
                                  name="model-list").start()
         if isinstance(models, dict) and models.get("ok"):
             self.model_list = models
-        return run_settings(self.conf, getattr(self, "model_list", None))
+        return run_settings(self.conf, getattr(self, "model_list", None), owner_default(self.conf.get("runtime")))
 
     def run_conf(self):
         """The agent's settings as its new sessions start with them (runs)."""
         return dict(self.conf, **self.runs())
+
+    def reuse_runs(self, started, runtime):
+        """What the session reuse rule (lifecycle.session_reuse) compares with a running session's start (started, from
+        started_runs): its runtime, account, model and effort now. Owner feature default_models: a session that started
+        on what the agent would run now without the owner's default keeps running when a default appears, so setting
+        one restarts no session (the owner's fleet of 11 agents, all on Claude's own model, 9 November 2026); the
+        default reaches new sessions, and a running one when it starts again by itself (cold, grown, at compaction).
+        A change of the agent's own model or effort, a later change of the default, a model that its list no longer
+        offers, and a Codex session on its configuration's model where the list gives one (28 October 2026) still
+        start it again. With no good list, a session keeps what it started with."""
+        now = dict(self.runs(), runtime=runtime, account=account_now(self.agent, runtime))
+        if not started:
+            return now
+        models = getattr(self, "model_list", None)
+        if not (isinstance(models, dict) and models.get("ok") and models.get("runtime") == self.conf.get("runtime")):
+            return dict(now, **{k: started.get(k) for k in ("model", "effort") if self.conf.get(k) is None})
+        plain = run_settings(self.conf, models, None)
+        free = [key for key in ("model", "effort") if self.conf.get(key) is None]
+        if all(started.get(key) == plain[key] for key in free):    # it started on no default at all
+            now.update({key: started.get(key) for key in free})
+        return now
+
+    def requested_now(self, screen=False, runner=False):
+        """{"model", "effort"} that this helper passes to a session that starts now, for its records (threads.Tailer):
+        what runs() gives, without reading a list. screen: the screen runtime's (owner API 1.11), {} for an agent
+        without one; runner: an app-server task of the primary runtime, which gets only its own or the default
+        (runner_conf)."""
+        if screen:
+            return (self.runner_conf("screen").get("screen") or {}) if screen_settings(self.conf) is not None else {}
+        return run_settings(self.conf, getattr(self, "model_list", None), owner_default(self.conf.get("runtime")),
+                            listed=not runner)
+
+    def runner_conf(self, needs):
+        """The agent's settings for an app-server task (lifecycle.app_server_task), whose runner reads the account's
+        list itself at its start and takes its default from it (screen_runner.default_model): the agent's own model and
+        effort, else the owner's default where this helper's latest reading offers it (run_settings, listed False). A
+        screen task gets the screen runtime's: its own screen settings (owner API 1.11), else the owner's default for
+        that runtime by the screen reading, never the primary runtime's."""
+        life = getattr(self, "lifecycle", None)
+        if needs == "screen":
+            screen = screen_settings(self.conf)
+            if screen is None:
+                return self.conf
+            chosen = run_settings(dict(screen, runtime=APP_SERVER_RUNTIME), getattr(life, "screen_models", None),
+                                  owner_default(APP_SERVER_RUNTIME), listed=False)
+            return dict(self.conf, screen=chosen)
+        models = getattr(self, "model_list", None) or getattr(life, "models", None)
+        return dict(self.conf, **run_settings(self.conf, models, owner_default(self.conf.get("runtime")), listed=False))
 
     def window_reuse(self, target, window):
         """The session reuse rule (plan P9.10) for a task window or a tools-on conversation window of this agent's
@@ -4856,11 +4933,9 @@ class Helper:
         if re.fullmatch(r"T-\d+", window):
             # The owner, 4 November 2026: a task's session grows with its work, and a fresh one did that work again.
             settings = dict(settings, growth=None)
-        reuse, why = session_reuse(runtime, seen,
-                                   dict(started_runs(start, runtime), account=account or None)
-                                   if start.strip() else None,
-                                   dict(self.runs(), runtime=runtime, account=account_now(self.agent, runtime)),
-                                   settings, facts=facts_now(team, runtime))
+        started = dict(started_runs(start, runtime), account=account or None) if start.strip() else None
+        reuse, why = session_reuse(runtime, seen, started, self.reuse_runs(started, runtime), settings,
+                                   facts=facts_now(team, runtime))
         return reuse, why, int(attempt)
 
     def fresh_task(self, target, window):

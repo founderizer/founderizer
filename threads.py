@@ -1218,10 +1218,12 @@ class Feed:
 class Tailer:
     """Read every task session's records and send them to the hub. A failed send is retried next scan."""
 
-    def __init__(self, runtime, windows, post, home=None, interval=2, kit=None, requested=None, screen_requested=None):
+    def __init__(self, runtime, windows, post, home=None, interval=2, kit=None, requested=None, screen_requested=None,
+                 runner_requested=None):
         self.runtime, self.windows, self.post, self.interval = runtime, windows, post, interval
         self.requested = requested      # the model and effort that this helper passes to new sessions
         self.screen_requested = screen_requested or {}      # the same for screen tasks (owner API 1.11)
+        self.runner_requested = runner_requested            # and for an app-server task of the primary runtime
         self.home = home or os.path.expanduser("~")
         self.codex = CodexFiles(self.home, kit)
         self.kit = kit
@@ -1244,10 +1246,15 @@ class Tailer:
         its one source of records, with the primary runtime's requested settings, and the runner's file gives only
         how the session ended (runner_end). Every other session reads its runtime's own file."""
         runtime = runtime or (window[4] if len(window) > 4 else None) or self.runtime
+        # a function gives them as they are when the session starts: the owner's default can change meanwhile
+        requested = self.requested() if callable(self.requested) else self.requested
         if runtime == "codex_app" and (window[5] if len(window) > 5 else "screen") != "screen":
-            return Feed(window, "codex", self.kit, requested=self.requested, runner=True)
+            asked = self.runner_requested if self.runner_requested is not None else requested
+            return Feed(window, "codex", self.kit, requested=asked() if callable(asked) else asked, runner=True)
         screen = runtime == "codex_app"
-        return Feed(window, runtime, self.kit, requested=self.screen_requested if screen else self.requested)
+        if screen:
+            requested = self.screen_requested() if callable(self.screen_requested) else self.screen_requested
+        return Feed(window, runtime, self.kit, requested=requested)
 
     def scan(self):
         """A window is (name, generation, attempt, session) and, optionally, its own runtime ("codex_app" for a

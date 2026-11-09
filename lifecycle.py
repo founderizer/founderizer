@@ -162,7 +162,8 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "signin_relink",    # its sign-in waits out a hub that is away and sends its link again (send_link)
             # owner-contact plan B3: the manager's helper says when its start of the standing session failed twice in a
             # row, and starts a session that left its line untaken fresh once (hub.MANAGER_START_FAILS)
-            "manager_start_fails"]
+            "manager_start_fails",
+            "default_models"]   # its new sessions take the owner's default model and effort (fleet.run_settings)
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and
@@ -309,6 +310,7 @@ RUNTIMES = {
         "cache_seconds": 300,
         "compact_tokens": 200000,
         "routine": {"model": None, "effort": "low"},
+        "default_model": None,          # the owner's default model and effort for this runtime (Settings › General)
         "task_denied": None,            # Codex has none of the tools that the owner took away
         "task_allowed": None,
         # Its ask tools go with a start option in every session instead (fleet.CODEX_UNATTENDED, decision 41)
@@ -372,6 +374,7 @@ RUNTIMES = {
         "cache_seconds": 3600,          # an hour; its own records say when it is five minutes (fleet.claude_context)
         "compact_tokens": 200000,       # fleet.STANDING_COMPACT, the window that Fleet starts its standing sessions with
         "routine": {"model": "sonnet", "effort": "low"},
+        "default_model": None,
         # The owner, 27 October 2026: "Yes, remove Artifact, Workflow, AskUserQuestion, ReportFindings, Skill and
         # ListAgents from agent task sessions." On Claude Code 2.1.301, 2.1.304, 2.1.308, 2.1.311 and 2.1.312
         # (recorded against stand-ins), Claude Code then offers ArtifactComments and ArtifactData no more either, as
@@ -429,6 +432,7 @@ RUNTIMES = {
         "cache_seconds": None,
         "compact_tokens": None,
         "routine": None,
+        "default_model": None,
         "task_denied": None,
         "task_allowed": None,
         "conversation_denied": None,
@@ -448,8 +452,8 @@ RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manage
                  "owner_chat", "agent_messages", "conversation", "conversation_why", "closed_versions", "mcp_servers",
                  "app_server", "switch", "session_settings", "token_in_env", "model_flags", "local_model", "sign_in",
                  "sign_out", "no_sign_in", "sandbox", "screen_counter", "browser_tabs", "cache_seconds",
-                 "compact_tokens", "routine", "task_denied", "task_allowed", "conversation_denied", "manager_denied",
-                 "task_opening", "token_weights", "memory_off")
+                 "compact_tokens", "routine", "default_model", "task_denied", "task_allowed", "conversation_denied",
+                 "manager_denied", "task_opening", "token_weights", "memory_off")
 
 
 # The session reuse rule (AUTONOMY.md P9.10) and its setting (section 4), one object in team.json "settings":
@@ -598,7 +602,11 @@ def routine_check(value):
 
 EDITABLE_FACTS = {"cache_seconds": whole_or_none(0, 86400), "compact_tokens": whole_or_none(1000, 100000000),
                   "token_weights": weights_check,
-                  "routine": routine_check}             # plan P9.7: what an agent's one changer reaches for first
+                  "routine": routine_check,             # plan P9.7: what an agent's one changer reaches for first
+                  # The owner, 9 November 2026: "a default for each [AI provider] somewhere under settings, and then each
+                  # agent can be changed individually". What an agent of this runtime runs when it has no model or no
+                  # effort of its own, where its machine's model list offers it (fleet.run_settings).
+                  "default_model": routine_check}
 
 
 def facts_now(team, runtime):
@@ -1206,7 +1214,8 @@ def claude_model_list(help_text):
     efforts = [x.strip() for x in levels.group(1).split(",") if EFFORT_NAME.fullmatch(x.strip())] if levels else []
     if not aliases:
         return None, "claude --help names no model aliases"
-    return [{"model": a, "display_name": a, "default": False, "efforts": efforts, "default_effort": None}
+    return [{"model": a, "display_name": a[:1].upper() + a[1:], "default": False, "efforts": efforts,
+             "default_effort": None}
             for a in aliases[:64]], None
 
 
@@ -2214,6 +2223,16 @@ class Lifecycle:
         add(*self.admin_item())
         return items
 
+    def owner_default(self):
+        """The owner's default model and effort of this agent's runtime (owner feature default_models), from this
+        checkout's team.json; None without one."""
+        try:
+            with open(os.path.join(self.kit, "team.json"), encoding="utf-8") as f:
+                team = json.load(f)
+        except (OSError, ValueError):
+            return None
+        return facts_now(team, self.conf.get("runtime")).get("default_model") if isinstance(team, dict) else None
+
     def model_item(self, reading):
         model, effort = self.conf.get("model"), self.conf.get("effort")
         ref = model or "default"
@@ -2226,7 +2245,12 @@ class Lifecycle:
                 return ("model", ref, "not_verified", "Claude takes full model names that it does not list; the first "
                                                       "session shows the model that it uses.")
             return ("model", ref, "failed", f"{model} is not offered here.")
-        o = options.get(model) if model else next((x for x in reading["options"] if x["default"]), None)
+        gets = model     # with no model of its own, the owner's default where this list offers it (fleet.run_settings)
+        wanted = None if model else (self.owner_default() or {}).get("model")
+        if isinstance(wanted, str) and (wanted in options or reading.get("other_names") and
+                                        re.fullmatch(r"claude-[a-z0-9.-]+", wanted)):
+            gets = wanted
+        o = options.get(gets) if gets else next((x for x in reading["options"] if x["default"]), None)
         efforts = o["efforts"] if o else sorted({e for x in reading["options"] for e in x["efforts"]})
         if effort and effort not in efforts:
             return ("model", ref, "failed", f"{effort} is not an effort of {model or 'the default model'} here.")
