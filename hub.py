@@ -8127,7 +8127,6 @@ SECRET_ASKS_PER_MESSAGE = 5     # a worker's or a lead's requests in reply to on
 SECRET_ASKS_PER_TASK = 5        # a task's requests in all, answered ones too
 SECRET_HOST_MAX = 80            # "Enter the API key " + 60 + " for " + 80 is under PUSH_TEXT: no push cuts it
 SECRET_SITE_MAX = 200
-SECRET_WHY_MAX = 1000
 SECRET_GIVE_MAX = 12
 SECRET_DECLINE_MAX = 300
 SECRET_SITE = re.compile(r"https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:[/?#][^\s]*)?")
@@ -8331,9 +8330,12 @@ def t_request_secret(agent, a):
         raise ToolError("Fleet keeps no login of a model provider: " + ", ".join(PROVIDER_SITES) + ". The owner "
                         "signs in to their own account in their own session, through the provider's own flow.")
     why = str(a.get("why") or "").strip()
-    if not why or len(why) > SECRET_WHY_MAX:
-        raise ToolError(f"why is what the work needs it for, in 1 to {SECRET_WHY_MAX} characters: the owner reads "
-                        f"it before they type the value.")
+    details = str(a.get("details") or "").strip()      # owner feature need_talk: the short card of 9 November 2026
+    if not why:
+        raise ToolError("why is what the work needs it for: the owner reads it before they type the value.")
+    wrong = need_words("", why, details=details)
+    if wrong:
+        raise ToolError(wrong)
     give = {"door": "use"} if door else {agent: "use"} if worker else a.get("give_to") or {}
     if not isinstance(give, dict) or len(give) > SECRET_GIVE_MAX:
         raise ToolError(f'give_to maps up to {SECRET_GIVE_MAX} agents to "use" or "read", for example '
@@ -8449,13 +8451,14 @@ def t_request_secret(agent, a):
                   "j.value=?", (tid,))["n"] >= SECRET_ASKS_PER_TASK:
         raise ToolError(f"This task has asked the owner for {SECRET_ASKS_PER_TASK} secrets already: deliver what you "
                         f"can, and say in the result what else it needs.")
-    guard(agent, why, site)
+    guard(agent, why, details, site)
     host = secret_site_host(site) if site else ""
     title = (f"Enter the API key {env}" + (f" for {host}" if host else "")) if kind == "api_key" else \
         f"Enter a login for {host}"
     with LOCK:                  # lane L2: an id that no removed item had (unused_id)
-        nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,kind,secret) VALUES(?,?,?,?,?,?,?,?)",
-                  (unused_id("needs"), title, why, SECRET_TODO, now(), agent, "secret", json.dumps(spec)))
+        nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,kind,secret,details) VALUES(?,?,?,?,?,?,?,?,?)",
+                  (unused_id("needs"), title, why, SECRET_TODO, now(), agent, "secret", json.dumps(spec),
+                   details or None))
     if tid:
         secret_parked(tid, nid)
     emit("owner", "notify", f"Needs you: {title}")
@@ -22548,8 +22551,11 @@ TOOLS = [
                                                  "none: the hub names it DOOR_<its door name>_KEY in the vault"},
         "site": {"type": "string", "description": "The address where it is used, with https://: a login's sign-in "
                                                   "page (required for a login), or the API an agent calls with it"},
-        "why": {"type": "string", "description": "What the work needs it for, in a sentence or two: the owner "
-                                                 "reads it before they type the value"},
+        "why": {"type": "string", "description": f"What the work needs it for, in a sentence or two, at most "
+                                                 f"{NEED_WHY_CHARS} characters: the owner reads it before they type "
+                                                 f"the value"},
+        "details": {"type": "string", "description": f"The longer part, behind Details on his card: how to make the "
+                    f"key (its page, its permissions, its scope), at most {NEED_DETAILS_CHARS} characters, plain words"},
         "give_to": {"type": "object", "additionalProperties": {"type": "string", "enum": ["use", "read"]},
                     "description": "The agents you propose should get it: use (its vault uses it, and the agent "
                                    "never sees it) or, for an API key, read (the key is in its sessions as env). "
@@ -22579,8 +22585,11 @@ TOOLS = [
                                                  "vault"},
         "site": {"type": "string", "description": "The address where it is used, with https://: a login's sign-in "
                                                   "page, or the API that your vault sends the key to (required)"},
-        "why": {"type": "string", "description": "What the work needs it for, in a sentence or two: the owner "
-                                                 "reads it before they type the value"},
+        "why": {"type": "string", "description": f"What the work needs it for, in a sentence or two, at most "
+                                                 f"{NEED_WHY_CHARS} characters: the owner reads it before they type "
+                                                 f"the value"},
+        "details": {"type": "string", "description": f"The longer part, behind Details on his card: how to make the "
+                    f"key (its page, its permissions, its scope), at most {NEED_DETAILS_CHARS} characters, plain words"},
         "in_reply_to": {"type": "string", "description": "In your owner chat: the request_id of the owner's newest "
                                                          "message to you"},
         "door": {"type": "string", "description": "Only for a key that the DevOps door uses for you: its name in "
