@@ -908,6 +908,7 @@ def integration_env(agent, conf, keys=None, place=None, closed=False):
         values["FLEET_WORK"] = place
     for repo, problem in prepare_repos(held_repos(repos, place), values, place).items():
         notes.append(f"{repo} was not fetched: {problem}.")
+    refresh_shared(repos, values)
     # The access token of each oauth MCP server that the hub gave for this session (owner feature mcp): it goes into
     # the session's mode-600 env file, as GH_TOKEN does, and it stops when the server's token life ends.
     values.update({k: v for k, v in (data.get("mcp") or {}).items()
@@ -974,6 +975,29 @@ def held_repos(repos, place):
     it needs them??". Without a place, none: the session asks for each one it works in."""
     return {r: v for r, v in repos.items()
             if place and os.path.isdir(os.path.join(place, *r.split("/"), ".git"))}
+
+
+def refresh_shared(repos, values):
+    """The shared clones in WORK that are there already, fetched in a thread of its own at each task session's start,
+    so that what reads them outside a session, such as a duty's check that scans their lockfiles, stays as fresh as
+    when every start fetched them all, and no start waits for it. It clones nothing: a repository comes to this
+    machine when a session asks for it (cmd_repo). The session's own credentials, which last an hour. The thread, or
+    None when no shared clone is there."""
+    there = [r for r in sorted(repos) if os.path.isdir(os.path.join(WORK, *r.split("/"), ".git"))]
+    if not there:
+        return None
+    env = {**os.environ, **values, "GIT_TERMINAL_PROMPT": "0"}
+    stalled = ["-c", "http.lowSpeedLimit=1", "-c", f"http.lowSpeedTime={GIT_STALLED}"]
+
+    def fetch():
+        for repo in there:
+            folder = os.path.join(WORK, *repo.split("/"))
+            with contextlib.suppress(OSError), repo_lock(repo):
+                if os.path.isdir(os.path.join(folder, ".git")):         # only a fetch, never a first clone
+                    shared_clone(repo, folder, stalled, env)
+    thread = threading.Thread(target=fetch, name="shared-clones", daemon=True)
+    thread.start()
+    return thread
 
 
 def prepare_repos(repos, values, place=None):
