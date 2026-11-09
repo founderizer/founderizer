@@ -439,7 +439,7 @@ def write_message(args):
 
 
 def answer_need(args):
-    body = {k: args[k] for k in ("answer", "choice") if args.get(k) is not None}
+    body = {k: args[k] for k in ("answer", "choice", "choices") if args.get(k) is not None}
     return command(f"/ui/needs/{int(args.get('need') or 0)}", body, "the answer", args.get("request_id"))
 
 
@@ -1261,8 +1261,15 @@ def tools():
                              "A duty is the same — say the standing work and the manager writes it.",
              {"text": S["text"], "recipient": S["text"], **rid}, ("text",), write_message),
         tool("answer_needs_you", "Answer one Needs-you item: the words, or choice, the index of one option the item "
-                                 "offers.",
-             {"need": S["int"], "answer": S["text"], "choice": S["int"], **rid}, ("need",), answer_need),
+                                 "offers, or choices, the indexes of the options it lets the owner tick together "
+                                 "(its multi).",
+             {"need": S["int"], "answer": S["text"], "choice": S["int"],
+              "choices": {"type": "array", "items": {"type": "integer"}}, **rid}, ("need",), answer_need),
+        tool("discuss_need", "Say something about one open Needs-you item before deciding it: a question, a point to "
+                             "clarify. It goes to the manager, whose reply shows under the item; the item stays open "
+                             "until it is answered.",
+             {"need": S["int"], "text": S["text"], **rid}, ("need", "text"),
+             plain("/ui/needs/{need}/talk", ("text",), "the message about this item")),
         tool("decline_secret_request", "Decline one Needs-you item that asks for a secret, a key or a login: the "
                                        "request ends, and the agent that asked reads that it is not given, with "
                                        "the reason if there is one. A decline carries no value. A value goes in "

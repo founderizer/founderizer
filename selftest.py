@@ -88,7 +88,7 @@ EVERY_AGENT = ["read_messages", "search_knowledge", "read_knowledge", "write_kno
                "join_report"]
 MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "answer", "check_result",
                                "decide_permission", "see_team", "see_capacity", "see_goals",
-                               "update_goal", "record_spend", "raise_needs_you", "withdraw_need", "request_secret",
+                               "update_goal", "record_spend", "raise_needs_you", "withdraw_need", "discuss_need", "request_secret",
                                # new-projects plan N8 (b): the door's parts on the servers after the first one
                                "door_rollout", "door_hold",
                                "tell_owner",
@@ -722,7 +722,8 @@ check("...and a refused item pages nobody", not any(e["kind"] == "notify" and "N
 text, err = tool("manager", "raise_needs_you", title="Pick the codename", why="Naming is the owner's choice",
                  what_to_do="Type a name. Nothing else is needed from you.")
 check("raise_needs_you, also when it says nothing else is needed", "N-1" in text, text)
-check("the owner gets a notification event", any(e["kind"] == "notify" and "N-1" in e["text"] for e in events("owner")))
+check("the owner gets a notification event", any(e["kind"] == "notify" and e["text"] == "Needs you: Pick the codename"
+                                                 for e in events("owner")))
 before = events("manager")[-1]["id"]
 code, headers, _ = raw("POST", "/needs/1", form={"answer": "Tide"})
 check("answering on the board redirects back", code == 303)

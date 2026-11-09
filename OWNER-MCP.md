@@ -163,7 +163,8 @@ would read as an empty fleet instead of as a mistake.
 | `owner_device` / `device_code` | `/ui/owner/devices[/<d>/code]` | The owner's phones, and one enrollment code. Its key is the phone's. |
 | `reload_team` | `/ui/team/reload` | Apply `team.json` from a pushed revision without restarting the hub. |
 | `send_message` | `/ui/messages` | Say something to an agent. **This is how a goal or a duty is set.** |
-| `answer_needs_you` | `/ui/needs/<id>` | Answer a Needs-you item, in words or by choosing an option. A secret request takes neither: the app's secure form answers it. |
+| `answer_needs_you` | `/ui/needs/<id>` | Answer a Needs-you item, in words, by choosing an option, or by ticking the options of an item that lets them combine (`choices`). A secret request takes neither: the app's secure form answers it. |
+| `discuss_need` | `/ui/needs/<id>/talk` | Ask about an open Needs-you item before deciding it. The manager replies under the item; the item stays open. |
 | `decline_secret_request` | `/ui/needs/<id>/secret` | Decline a secret request, with a reason or none. A decline carries no value, so this server sends it; an answer with a value stays the app's secure form. |
 | `control_task` / `steer_task` | `/ui/tasks/<id>/control`, `/steer` | Pause, stop, resume; steer an open task. |
 | `goal_state` / `duty_state` / `trigger_state` | `/ui/goals/<id>/state` and the two beside it | Pause, resume, finish, drop. |

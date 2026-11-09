@@ -122,6 +122,10 @@ CREATE TABLE IF NOT EXISTS prompts(id INTEGER PRIMARY KEY, task INTEGER, agent T
 CREATE TABLE IF NOT EXISTS rules(id INTEGER PRIMARY KEY, agent TEXT, tool TEXT, key TEXT, input TEXT, decision TEXT);
 CREATE TABLE IF NOT EXISTS needs(id INTEGER PRIMARY KEY, title TEXT, why TEXT, todo TEXT, raised REAL,
   by TEXT, answer TEXT, answered REAL);
+-- owner feature need_talk: the owner's questions on one Needs-you item and the manager's replies, before he decides.
+-- request_id is the owner's, so a resent question is one row.
+CREATE TABLE IF NOT EXISTS need_talk(id INTEGER PRIMARY KEY, need INTEGER NOT NULL, ts REAL NOT NULL,
+  who TEXT NOT NULL, text TEXT NOT NULL, request_id TEXT UNIQUE);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, agent TEXT, kind TEXT, task INTEGER, text TEXT,
   created REAL, extra TEXT, read_at REAL, helper_ack REAL, handed REAL);
 -- "Come back to this at this time", for any agent. agent is who set it and who the hub brings it back to;
@@ -952,7 +956,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # "changed" and stops a page's daily read (knowledge_replace)
                "door_setup",        # the owner, 6 November 2026 (DevOps D24): the app keeps the door, no hand step
                "agent_remove",      # the owner, 7 November 2026: "an option to Delete an agent (after confirmation)"
-               "repo_picker"]       # the owner, 9 November 2026: "ok yes" to the list that gives an agent repositories
+               "repo_picker",       # the owner, 9 November 2026: "ok yes" to the list that gives an agent repositories
+               "need_talk"]         # the owner, 9 November 2026: short Needs-you cards, Details, Discuss, ticked options
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -1385,6 +1390,41 @@ def send_ping():
 
 NEED_OPTIONS_MAX = 6            # the app draws one full-width row for each: six still read as a list, more do not
 NEED_OPTION_CHARS = 120         # a short sentence on one row, not a paragraph
+# Owner feature need_talk (the owner, 9 November 2026: "Needs You items should be formatted MUCH better so they are
+# shorter and much easier to read"): a card is a short title and one or two plain sentences; the agent's reasoning, its
+# quotes and the facts go behind Details. The hub refuses longer words, and codes, which people do not read.
+NEED_TITLE_CHARS = 70
+NEED_WHY_CHARS = 240
+NEED_DETAILS_CHARS = 4000
+NEED_TALK_CHARS = 2000          # one message of the owner's discussion of an item, or of the manager's reply
+NEED_CODES = re.compile(r"(?<![A-Za-z0-9-])(?:AM|UP|OR|[CGIMNPQRT])-[0-9]+(?![0-9])")
+
+
+def need_words(title, why, todo="", options=(), details=""):
+    """What is wrong with the words of a Needs-you item that the owner reads, or None: a title and a why that a
+    glance takes in, and no code anywhere (T-61, R-3, Q-59): he reads names and plain words."""
+    if len(title) > NEED_TITLE_CHARS:
+        return (f"The title is at most {NEED_TITLE_CHARS} characters: name what he decides, in a few words. This one has "
+                f"{len(title)}.")
+    if len(why) > NEED_WHY_CHARS:
+        return (f"why is at most {NEED_WHY_CHARS} characters, one or two plain sentences: what he decides and why it "
+                f"matters now. Put the reasoning, the quotes and the facts in details, which his card shows behind "
+                f"Details. This one has {len(why)}.")
+    if len(details) > NEED_DETAILS_CHARS:
+        return f"details is at most {NEED_DETAILS_CHARS} characters. This one has {len(details)}."
+    for part in (title, why, todo, *options, details):
+        code = NEED_CODES.search(part)
+        if code:
+            return (f"Say {code.group(0)} in plain words: the owner reads names and what a thing is about, never a "
+                    f"code. Name the task, the question or the agent instead.")
+    return None
+
+
+def need_talk(nid):
+    """The owner's discussion of one item and the replies to it, oldest first: [{who, text, ts}]. who is owner or the
+    agent that replied."""
+    return [{"who": r["who"], "text": r["text"], "ts": r["ts"]}
+            for r in q("SELECT who, text, ts FROM need_talk WHERE need=? ORDER BY id", (nid,))]
 
 
 def need_options(row):
@@ -1416,6 +1456,15 @@ def need_view(row):
     call that his yes lets through once, which the app signs (door_call_statement); his signed yes stays out."""
     view = dict(row, options=need_options(row), secret=need_secret(row))
     view.pop("approval", None)
+    # owner feature need_talk: the long part behind Details, whether the options combine, the indexes he ticked, and
+    # his discussion of the item with the manager
+    keys = row.keys() if hasattr(row, "keys") else ()
+    view["multi"] = bool(row["multi"]) if "multi" in keys else False
+    try:
+        view["chose"] = json.loads(row["chose"]) if "chose" in keys and row["chose"] else None
+    except (ValueError, TypeError):
+        view["chose"] = None
+    view["talk"] = need_talk(row["id"])
     view["door_fleet"] = kv_get("fleet_id") if view.get("door_call") else None   # what a phone's statement names
     return view
 
@@ -2032,7 +2081,10 @@ def migrate():
                   "door_call": "TEXT", "approval": "TEXT",
                   "github_app": "TEXT",       # plan 13, item 4: the account that the item's first option makes an App in
                   "add_device": "INTEGER",    # plan V12 and 8.3: the item's first option opens the Add device picture
-                  "github_key": "TEXT"},      # plan 13, item 4: the App owner whose key the item renews (door_renew)
+                  "github_key": "TEXT",       # plan 13, item 4: the App owner whose key the item renews (door_renew)
+                  # owner feature need_talk (9 November 2026): the long part behind Details, options that combine,
+                  # and the indexes that the owner ticked when they do
+                  "details": "TEXT", "multi": "INTEGER", "chose": "TEXT"},
         "owner_reports": {"agent": "TEXT NOT NULL DEFAULT 'manager'", "in_reply_to": "TEXT",
                           "pushed": "INTEGER NOT NULL DEFAULT 0"},     # chat apps round 2: message_owner
         "chat_out": {"recipient": "TEXT"},          # chat apps round 2: a Discord user ID when chat is null
@@ -7825,6 +7877,19 @@ def t_raise_needs_you(agent, a):
                         "can do or decide now. If there is no such thing, it is not a Needs-you item; tell_owner "
                         "posts it with no notification.")
     options = check_need_options(a.get("options"))
+    # owner feature need_talk: a short card, its long part behind Details, options that combine, and the item that
+    # this one takes the place of after the owner's discussion of it
+    details = str(a.get("details") or "").strip()
+    multi = a.get("multi")
+    if multi is not None and not isinstance(multi, bool):
+        raise ToolError("multi is true when the owner may tick several of the options, and false or left out when he "
+                        "presses one.")
+    if multi and not options:
+        raise ToolError("multi needs options: the owner ticks any of them and sends the ones he ticked.")
+    wrong = need_words(title, why, todo, json.loads(options) if options else (), details)
+    if wrong:
+        raise ToolError(wrong)
+    replaces = None if a.get("replaces") in (None, "") else parse_id(a.get("replaces"), "Needs-you item")
     door_call = a.get("door_call")
     if door_call is not None and not (isinstance(door_call, str) and re.fullmatch(r"[0-9a-f]{64}", door_call)):
         raise ToolError("door_call is the call hash that the door gave with its refusal: 64 hex characters.")
@@ -7869,16 +7934,22 @@ def t_raise_needs_you(agent, a):
     mine = need_is_yours(agent, title, why, todo)
     if mine:
         raise ToolError(mine)
-    guard(agent, title, why, todo, *(json.loads(options) if options else ()))
+    guard(agent, title, why, todo, details, *(json.loads(options) if options else ()))
     with LOCK:                  # lane L2: an id that no removed item had (unused_id)
-        qu = need_question(agent, a.get("question_id"))
-        if qu:                  # the asker's own words, which the owner answers
-            why += f" Quoting {qu['asker']} (Q-{qu['id']} on {tref(qu['task'])}): \"{clip(qu['text'], 1000)}\""
+        old = need_replaced(agent, replaces) if replaces else None
+        qu = need_question(agent, a.get("question_id"), ignore=old["id"] if old else None)
+        if qu:                  # the asker's own words, which the owner answers: behind Details, with no code
+            details = (details + "\n\n" if details else "") + \
+                f"{shown_name(qu['asker'])}'s question, in its own words: \"{clip(qu['text'], 1000)}\""
         nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,github_app,add_device,"
-                  "github_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                  "github_key,details,multi) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (unused_id("needs"), title, why, todo, now(), agent, options, qu["id"] if qu else None, door_call,
-                   github_app, 1 if add_device else None, github_key))
-    emit("owner", "notify", f"Needs you N-{nid}: {title}")
+                   github_app, 1 if add_device else None, github_key, details or None, 1 if multi else None))
+        if old:                 # the discussion goes on under the new item, and the old one leaves Needs you
+            q("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
+              (f"Replaced by {agent} with a new item after the owner's discussion: {title}", now(), agent, old["id"]))
+            q("UPDATE need_talk SET need=? WHERE need=?", (nid, old["id"]))
+    emit("owner", "notify", f"Needs you: {title}")
     ping_need(nid)                                      # owner feature push: the phone rings, also when it is closed
     picks = (" The owner sees your options and presses one: " + ", ".join(json.loads(options)) +
              ". The owner's answer is the words of the one they press, or anything else they write "
@@ -7905,7 +7976,25 @@ def t_raise_needs_you(agent, a):
     return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{linked}{later}{door}{picks}"
 
 
-def need_question(agent, ref):
+def need_replaced(agent, nid):
+    """The open item that raise_needs_you takes the place of (owner feature need_talk: after his discussion of it the
+    manager offers new options or new words), checked: one of this agent's that he has not answered, of a kind whose
+    answer comes back to this agent. A key request, a door call, an App, a phone or a renewal has its own route."""
+    need = q1("SELECT * FROM needs WHERE id=?", (nid,))
+    if not need:
+        raise ToolError(f"There is no Needs-you item N-{nid}.")
+    if need["by"] != agent:
+        raise ToolError(f"N-{nid} is {need['by']}'s: you replace only an item that you raised.")
+    if need["answer"] is not None:
+        raise ToolError(f"N-{nid} is closed already: {clip(need['answer'], 200)}")
+    if need["conversation"] or need["kind"] == "secret" or need["door_call"] or need["github_app"] or \
+            need["add_device"] or need["github_key"]:
+        raise ToolError(f"N-{nid} closes by its own route (a conversation, a key, a door call, an App, a phone or a "
+                        f"key renewal), so it is not replaced: withdraw it with withdraw_need if it is not needed.")
+    return need
+
+
+def need_question(agent, ref, ignore=None):
     """The question that a Needs-you item takes to the owner (raise_needs_you question_id), checked, or None without
     one. The manager's last step for a question that came up its line (the owner, 28 October 2026: "Agent -> Lead ->
     Manager -> Me"): only one that it holds, or holds for a lead that cannot act on it, that blocks its asker, whose
@@ -7926,7 +8015,7 @@ def need_question(agent, ref):
                         f"needed for it. Answer it only if that reading is wrong.")
     if not t or t["state"] in TERMINAL:
         raise ToolError(f"{tref(qu['task'])} has ended, so nothing waits for Q-{qid} any more.")
-    other = q1("SELECT id FROM needs WHERE question=? AND answer IS NULL", (qid,))
+    other = q1("SELECT id FROM needs WHERE question=? AND answer IS NULL AND id IS NOT ?", (qid, ignore))
     if other:
         raise ToolError(f"N-{other['id']} already takes Q-{qid} to the owner: their answer goes to {qu['asker']} by "
                         f"itself.")
@@ -7975,6 +8064,52 @@ def t_withdraw_need(agent, a):
                    (t0, agent, f"withdrew N-{nid} {clip(need['title'] or '', 80)}: {clip(why, 240)}"))
     return (f"Withdrew N-{nid}. It left the owner's Needs you with no notification, and its record keeps your reason. "
             f"Raise a new item only when the owner must do or decide something now.")
+
+
+def need_talk_said(body):
+    """POST /ui/needs/<id>/talk, under LOCK: the owner's message in the discussion of one open item goes to the manager,
+    which answers it under the item (discuss_need). An item of a conversation is that person's question, so it has none."""
+    need = q1("SELECT * FROM needs WHERE id=?", (body["need"],))
+    if not need:
+        raise Refusal(404, "owner request does not exist")
+    if need["answer"] is not None:
+        raise Refusal(409, "owner request is already answered")
+    if need["conversation"]:
+        raise Refusal(409, "an item of a conversation is that person's question: answer it, or ask the manager in its chat")
+    ins("INSERT INTO need_talk(need, ts, who, text) VALUES(?,?,?,?)", (need["id"], now(), "owner", body["text"]))
+    raised = "" if need["by"] == manager_name() else f", which {shown_name(need['by'])} raised"
+    emit(manager_name(), "say",
+         f"[owner] About the Needs-you item N-{need['id']} ({need['title']}){raised}, before he decides: {body['text']}\n"
+         f"Answer him under the item with discuss_need(need=\"N-{need['id']}\", text=...), in plain words. If the talk "
+         f"changes its options or its words, raise it again with raise_needs_you(replaces=\"N-{need['id']}\"). His "
+         f"answer to the item still comes as its own message.")
+    return {"need": need["id"], "talk": need_talk(need["id"])}
+
+
+def t_discuss_need(agent, a):
+    """discuss_need (the manager; owner feature need_talk): one reply in the owner's discussion of an open Needs-you
+    item, which his card shows under the item while he has not decided. His messages there come to the manager."""
+    nid = parse_id(a.get("need"), "Needs-you item")
+    text = str(a.get("text") or "").strip()
+    if not text or len(text) > NEED_TALK_CHARS:
+        raise ToolError(f"text is your reply, 1 to {NEED_TALK_CHARS} characters.")
+    code = NEED_CODES.search(text)
+    if code:
+        raise ToolError(f"Say {code.group(0)} in plain words: the owner reads names and what a thing is about, never "
+                        f"a code.")
+    guard(agent, text)
+    with LOCK:
+        need = q1("SELECT * FROM needs WHERE id=?", (nid,))
+        if not need:
+            raise ToolError(f"There is no Needs-you item N-{nid}.")
+        if need["answer"] is not None:
+            raise ToolError(f"N-{nid} is answered already: {clip(need['answer'], 200)}")
+        if need["conversation"]:
+            raise ToolError(f"N-{nid} is a question of a conversation, which its person answers.")
+        ins("INSERT INTO need_talk(need, ts, who, text) VALUES(?,?,?,?)", (nid, now(), agent, text))
+    emit("owner", "notify", f"{shown_name(agent)} replied about: {need['title']}")
+    return (f"Your reply is under N-{nid} on his card. His next message there comes to you; his answer to the item "
+            f"comes as its own message. When the talk changes the options or the words, raise it again with replaces.")
 
 
 # ---------------------------------------------------------------- secret requests (owner feature secret_requests)
@@ -8323,7 +8458,7 @@ def t_request_secret(agent, a):
                   (unused_id("needs"), title, why, SECRET_TODO, now(), agent, "secret", json.dumps(spec)))
     if tid:
         secret_parked(tid, nid)
-    emit("owner", "notify", f"Needs you N-{nid}: {title}")
+    emit("owner", "notify", f"Needs you: {title}")
     ping_need(nid)
     if tid:
         return f"Asked the owner for {secret_asked(spec)} as N-{nid}. {waits} Never ask the owner for it in words."
@@ -11202,7 +11337,7 @@ def conversation_need(agent, conv, person, kind, title, text, todo, t0):
                    (unused_id("conversation_messages"), conv["id"], "action",
                     f"{'Asked the owner' if kind == 'question' else 'Asked for work'}: {text}", t0, nid))
     if not decides:
-        emit("owner", "notify", f"Needs you N-{nid}: {title}")
+        emit("owner", "notify", f"Needs you: {title}")
         ping_need(nid)                                  # owner feature push
     return nid, False
 
@@ -22313,8 +22448,23 @@ TOOLS = [
      "options are plain words with no codes (T-61, R-3). Read before you raise: an item about a server, a version or "
      "a deploy rests on a reading that is newer than the last change to it, made by you, by an agent that can read "
      "it, or by the next run of its watch, and why says how old that reading is. Raise it only when that reading still "
-     "shows the problem. When an item of yours is not needed any more, withdraw_need closes it.",
-     S({"title": STR, "why": STR,
+     "shows the problem. When an item of yours is not needed any more, withdraw_need closes it. Keep the card short: a "
+     f"title of at most {NEED_TITLE_CHARS} characters that names what he decides, and in why one or two plain sentences "
+     f"(at most {NEED_WHY_CHARS} characters) on what he decides and why it matters now; the reasoning, an agent's words "
+     "and the facts go in details, which his card shows behind Details. When he may pick several of the options, set "
+     "multi: he ticks any of them and sends them together, so never write combined options such as \"Yes to A and C\". "
+     "He can discuss an item before he decides: his messages come to you, and you answer each with discuss_need; when "
+     "the talk changes the options or the words, raise the item again with replaces.",
+     S({"title": {"type": "string", "description": f"What he decides, in at most {NEED_TITLE_CHARS} characters."},
+        "why": {"type": "string", "description": f"One or two plain sentences, at most {NEED_WHY_CHARS} characters: "
+                                                "what he decides and why it matters now."},
+        "details": {"type": "string", "description": f"The longer part, behind Details on his card: the reasoning, "
+                    f"an agent's words, the facts, at most {NEED_DETAILS_CHARS} characters, in plain words."},
+        "multi": {"type": "boolean", "description": "True when he may tick several of the options: he sends the ones "
+                  "he ticked, and their words, joined, are the answer."},
+        "replaces": {"type": "string", "description": "An open item of yours that this one takes the place of, for "
+                     "example N-12, after his discussion of it changed the options or the words: that item leaves "
+                     "Needs you, and the discussion goes on under this one. Give question_id again if it had one."},
         "what_to_do": {"type": "string", "description": "The one thing that only the owner can do or decide now. "
                                                         "If there is none, do not raise the item."},
         "options": {"type": "array", "items": {"type": "string"},
@@ -22342,6 +22492,14 @@ TOOLS = [
                        "key the door got from the hub, for the item that makes its new key or the one that deletes "
                        "the old key. No options: the hub closes it by itself, and the hub's message gives its words."}},
        ["title", "why", "what_to_do"])),
+    ("manager", "discuss_need", t_discuss_need,
+     "Reply to the owner in his discussion of one of your open Needs-you items: his questions about it come to you as "
+     "messages before he decides, and your reply shows under the item on his card. Plain words and no codes; answer "
+     "what he asked, with the facts he needs to decide. When the talk changes the options or the words, raise the item "
+     "again with raise_needs_you replaces.",
+     S({"need": {"type": "string", "description": "The item, for example N-12."},
+        "text": {"type": "string", "description": f"Your reply, at most {NEED_TALK_CHARS} characters."}},
+       ["need", "text"])),
     ("manager", "withdraw_need", t_withdraw_need,
      "Close an open Needs-you item that you raised and that nothing needs any more: a plan change replaced it, the "
      "fix is live, or the work found another route. It leaves the owner's Needs you with no notification, and why "
@@ -30392,7 +30550,7 @@ def remove_server(server, body):
 AGENT_COLUMNS = (
     ("mac_setups", "agent"), ("tasks", "owner"), ("tasks", "requester"), ("notes", "agent"), ("questions", "asker"), ("questions", "requester"),
     ("reports", "from_agent"), ("reports", "to_agent"), ("reports", "decided_by"), ("prompts", "agent"),
-    ("prompts", "by"), ("rules", "agent"), ("rules", "by"), ("needs", "by"), ("events", "agent"), ("reminders", "agent"),
+    ("prompts", "by"), ("rules", "agent"), ("rules", "by"), ("needs", "by"), ("need_talk", "who"), ("events", "agent"), ("reminders", "agent"),
     ("sealed", "sender"), ("sealed", "recipient"), ("jobs", "agent"), ("log", "agent"), ("agents", "name"),
     ("agent_usage", "name"), ("calls", "agent"), ("ui_requests", "recipient"), ("owner_reports", "agent"),
     ("holds", "by"), ("holds", "released_by"), ("outcomes", "by"), ("agent_limits", "agent"),
@@ -37068,6 +37226,21 @@ class Handler(BaseHTTPRequestHandler):
                     "fingerprints": [{k: x[k] for k in ("kind", "hash", "len")} for x in prints]}
         return self.ui_command("secrets/add", read, save_secret)
 
+    def ui_need_talk(self, need_id):
+        """POST /ui/needs/<id>/talk (owner feature need_talk): the owner's message in the discussion of one open item,
+        apart from his answer. The owner, 9 November 2026: "apart from Your Answer, do you think there should be a way to
+        clarify some points and have a conversation with the agent?" It goes to the manager, which replies under the
+        item (discuss_need), and the item stays open until he answers it."""
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "text"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            text = data.get("text")
+            if not isinstance(text, str) or not text.strip() or len(text.strip()) > NEED_TALK_CHARS:
+                raise ValueError(f"text is his message, 1 to {NEED_TALK_CHARS} characters")
+            return {"need": need_id, "text": text.strip()}
+        return self.ui_command(f"needs/{need_id}/talk", read, need_talk_said)
+
     def ui_need_secret(self, need_id):
         """POST /ui/needs/<id>/secret (owner feature secret_requests): the answer of one request_secret, from the app's
         secure form once the value is in the vault and registered: login, the reference of the secret that answers
@@ -37924,6 +38097,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(400, {"error": "statement and signature are the owner's signed yes to the door call "
                                             "of a Needs-you item"})
         choice = data.get("choice")         # owner feature need_options: the owner pressed one of the agent's buttons
+        ticked = data.get("choices")        # owner feature need_talk: the options he ticked, where they combine
+        if ticked is not None:
+            if need_id is None or choice is not None or data.get("answer") is not None:
+                return self.json(400, {"error": "choices answers a Needs-you item whose options combine, with no "
+                                                "choice and no answer text: the words of the options are the answer"})
+            if (not isinstance(ticked, list) or not ticked or len(ticked) > NEED_OPTIONS_MAX or
+                    any(isinstance(c, bool) or not isinstance(c, int) or c < 0 for c in ticked) or
+                    len(set(ticked)) != len(ticked)):
+                return self.json(400, {"error": "choices is the list of the indexes of the options he ticked, each "
+                                                "once"})
+            ticked = sorted(ticked)
         if choice is not None:
             if need_id is None:
                 return self.json(400, {"error": "choice answers a Needs-you item"})
@@ -37932,7 +38116,7 @@ class Handler(BaseHTTPRequestHandler):
             if data.get("answer") is not None:
                 return self.json(400, {"error": "an answer by choice carries no answer text: the words of the option "
                                                 "are the answer"})
-        else:
+        elif ticked is None:
             if value is None and files:
                 value = ""                  # the files are the message
             if not isinstance(value, str) or len(value) > 16000 or (not value.strip() and not files):
@@ -37989,6 +38173,17 @@ class Handler(BaseHTTPRequestHandler):
                     if choice >= len(picks):
                         return self.json(400, {"error": f"choice is 0 to {len(picks) - 1} for this owner request"})
                     value = picks[choice]
+                    if need["multi"]:       # an app that presses one row of combining options: he chose that one
+                        ticked = [choice]
+                    if secret_hit(value):
+                        return self.json(422, {"error": "a registered login cannot be sent as text"})
+                if ticked is not None and choice is None:     # the options he ticked, their words joined
+                    picks = need_options(need)
+                    if not need["multi"]:
+                        return self.json(400, {"error": "this owner request takes one choice"})
+                    if ticked[-1] >= len(picks):
+                        return self.json(400, {"error": f"choices are 0 to {len(picks) - 1} for this owner request"})
+                    value = "; ".join(picks[c] for c in ticked)
                     if secret_hit(value):
                         return self.json(422, {"error": "a registered login cannot be sent as text"})
             old = DB.execute("SELECT * FROM ui_requests WHERE request_id=?", (request_id,)).fetchone()
@@ -38046,7 +38241,9 @@ class Handler(BaseHTTPRequestHandler):
                     event_id, created = previous["event_id"], previous["created"]
                 else:
                     event_id = owner_message_rows(request_id, kind, need, value, client, recipient, replaces, created,
-                                                  files=rows, chosen=choice)
+                                                  files=rows, chosen=None if ticked is not None else choice)
+                    if ticked is not None and need is not None:
+                        DB.execute("UPDATE needs SET chose=? WHERE id=?", (json.dumps(ticked), need["id"]))
                     if yes is not None:
                         DB.execute("UPDATE needs SET approval=? WHERE id=?",
                                    (json.dumps({"statement": yes, "signature": signed}), need["id"]))
@@ -39716,6 +39913,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_submit(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["ui", "needs"] and parts[3] == "secret" and re.fullmatch(r"[1-9][0-9]{0,17}", parts[2]):
             return self.ui_need_secret(int(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["ui", "needs"] and parts[3] == "talk" and re.fullmatch(r"[1-9][0-9]{0,17}", parts[2]):
+            return self.ui_need_talk(int(parts[2]))          # owner feature need_talk
         if len(parts) == 4 and parts[:2] == ["ui", "tasks"] and parts[3] == "control" and re.fullmatch(r"[1-9][0-9]*", parts[2]):
             return self.ui_control(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["ui", "tasks"] and parts[3] == "steer" and re.fullmatch(r"[1-9][0-9]*", parts[2]):
