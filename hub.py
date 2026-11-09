@@ -28418,10 +28418,10 @@ def validate_team(team):
                                                                and EFFORT_NAME.fullmatch(screen["effort"]))):
                 raise ValueError(f"agent {name}: screen must be {{model, effort}} with a model name and an effort name")
         repos, tools = a.get("repos", {}), a.get("tools", [])      # owner feature integrations
-        if not isinstance(repos, dict) or len(repos) > 64 or not all(
+        if not isinstance(repos, dict) or len(repos) > REPOS_MOST or not all(
                 isinstance(r, str) and REPO_NAME.fullmatch(r) and v in REPO_ACCESS for r, v in repos.items()):
-            raise ValueError(f"agent {name}: repos must map up to 64 GitHub repositories (owner/name in lower case) "
-                             f"to {', '.join(REPO_ACCESS)}")
+            raise ValueError(f"agent {name}: repos must map up to {REPOS_MOST} GitHub repositories (owner/name in "
+                             f"lower case) to {', '.join(REPO_ACCESS)}")
         if not isinstance(tools, list) or not all(isinstance(t, str) and t in catalog for t in tools) or \
                 len(set(tools)) != len(tools):
             raise ValueError(f"agent {name}: tools must be different names of the catalog and of the owner's MCP "
@@ -31155,6 +31155,10 @@ def save_account(body):
 # ---------------------------------------------------------------- GitHub repositories and tools (owner feature integrations)
 
 GITHUB_API = "https://api.github.com"
+# The most repositories that one agent holds (validate_team): GitHub makes one App installation token for at most 500,
+# and a session gets one token for each owner and level. It was 32, then 64 (2 November 2026), while each task start
+# fetched every repository; since 9 November 2026 a start fetches only what the task has used (fleet.held_repos).
+REPOS_MOST = 500
 # The hub's GitHub App, on the hub machine only: a mode-600 file of the hub user with the line app_id=<App ID> and
 # then the App's private key as GitHub gave it (openssl reads the key and skips the line before it). Never in git.
 GITHUB_APP = os.path.expanduser("~/.fleet/github-app.pem")
@@ -31510,9 +31514,12 @@ def github_unreached(repos):
 
 def save_repo_reached(body, _waited):
     """POST /ui/team/repos: save_repo, and in its receipt `unreached`, the page where the owner adds the repository,
-    when the hub's GitHub App does not reach it. The route waited for a reading first, outside LOCK."""
+    when the hub's GitHub App does not reach it; for a list of repositories, {owner/name: page} of those it does not
+    reach. The route waited for a reading first, outside LOCK."""
     result = save_repo(body)
-    page = github_unreached([body["repo"]]).get(body["repo"]) if body["access"] else None
+    many = isinstance(body["repo"], list)
+    pages = github_unreached(body["repo"] if many else [body["repo"]]) if body["access"] else {}
+    page = pages if many else pages.get(body["repo"])
     return dict(result, unreached=page) if page else result
 
 
@@ -31939,30 +31946,35 @@ def known_agents(team, names):
 
 def save_repo(body):
     """Who may use one GitHub repository, and how: {agent: read | write | deploy}. An agent that is not named loses
-    it; {} removes the repository from every agent."""
+    it; {} removes the repository from every agent. repo may be a list: each of them gets this access, in one change."""
     repo, access = body["repo"], body["access"]
+    names = repo if isinstance(repo, list) else [repo]
 
     def change(team):
         known_agents(team, access)
         changed = False
         for name, a in team["agents"].items():
             repos = dict(a.get("repos") or {})
-            before = repos.get(repo)
-            repos.pop(repo, None)
-            if name in access:
-                repos[repo] = access[name]
-            if repos.get(repo) != before:
+            before = dict(repos)
+            for one in names:
+                repos.pop(one, None)
+                if name in access:
+                    repos[one] = access[name]
+            if repos != before:
                 changed = True
                 if repos:
                     a["repos"] = dict(sorted(repos.items()))
                 else:
                     a.pop("repos", None)
         return changed
-    result = save_integration(body["base_sha256"], change, f"Owner changed the access to {repo}")
+    what = f"{len(names)} repositories" if isinstance(repo, list) else repo
+    result = save_integration(body["base_sha256"], change, f"Owner changed the access to {what}")
     if result["changed"]:
         words = ", ".join(f"{n} {v}" for n, v in sorted(access.items())) or "no agent"
-        emit(manager_name(), "say", f"[hub] The owner changed who may use the GitHub repository {repo}: {words}. An "
-             f"agent gets it in its next task session.")
+        emit(manager_name(), "say", (f"[hub] The owner changed who may use the GitHub repository {repo}: {words}. An "
+                                     f"agent gets it in its next task session.") if not isinstance(repo, list) else
+             (f"[hub] The owner changed who may use {len(names)} GitHub repositories ({named_few(names)}): {words}. "
+              f"An agent gets them in its next task session."))
     return dict(result, repo=repo, access=access)
 
 
@@ -36351,16 +36363,24 @@ class Handler(BaseHTTPRequestHandler):
         return base
 
     def ui_team_repo(self):
-        """POST /ui/team/repos (owner feature integrations): who may use one GitHub repository, and at which level."""
+        """POST /ui/team/repos (owner feature integrations): who may use one GitHub repository, and at which level. repo
+        may also be a list of repositories that all get this access, in one change and one message to the manager
+        (9 November 2026: an agent may hold up to REPOS_MOST, and one grant for each would be as many of both)."""
         def read(data):
             base, repo, access = self.integration_base(data, ("repo", "access")), data.get("repo"), data.get("access")
-            if not isinstance(repo, str) or not REPO_NAME.fullmatch(repo.strip().lower()):
-                raise ValueError("repo must be a GitHub repository as owner/name")
+            names = repo if isinstance(repo, list) else [repo]
+            if not names or len(names) > REPOS_MOST or not all(
+                    isinstance(r, str) and REPO_NAME.fullmatch(r.strip().lower()) for r in names) or \
+                    len({r.strip().lower() for r in names}) != len(names):
+                raise ValueError(f"repo must be a GitHub repository as owner/name, or a list of up to {REPOS_MOST} "
+                                 f"different ones")
+            repo = [r.strip().lower() for r in names] if isinstance(repo, list) else repo
             if not isinstance(access, dict) or not all(isinstance(n, str) and AGENT_NAME.match(n) and v in REPO_ACCESS
                                                        for n, v in access.items()):
                 named = ", ".join(f'"{x}"' for x in REPO_ACCESS[:-1]) + f' or "{REPO_ACCESS[-1]}"'
                 raise ValueError(f"access must map agent names to {named}; {{}} removes the repository")
-            return {"base_sha256": base, "repo": repo.strip().lower(), "access": dict(sorted(access.items()))}
+            return {"base_sha256": base, "repo": repo if isinstance(repo, list) else repo.strip().lower(),
+                    "access": dict(sorted(access.items()))}
         return self.ui_command("team/repos", read, save_repo_reached,
                                outside=lambda body: github_reach(GITHUB_REACH_WAIT if body["access"] else 0))
 

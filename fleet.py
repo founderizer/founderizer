@@ -866,12 +866,13 @@ def team_catalog():
 def integration_env(agent, conf, keys=None, place=None, closed=False):
     """A task session's GitHub repositories and tools, as the hub gives them at its start (owner feature integrations):
     FLEET_REPOS, GH_TOKEN and git's credentials for them (FLEET_GIT_TOKENS, GIT_CONFIG_*), FLEET_TOOLS with the
-    tools' own variables, and FLEET_GITHUB_NOTE for what the session lacks. First the helper fetches each repository
-    into WORK, or clones it there, and with a place (task_place) makes the task's own clone of it there, which
-    FLEET_WORK names. The helper asks the hub only when team.json gives the agent repos or tools; {} for an agent
-    without them, and from a hub without the route. keys: the API keys of this session (read_env), which a tool of the
-    owner may need; they are already in the session's environment, so they are not given again. closed: a session of
-    an agent whose Shell box is off (support plan F1), which gets its MCP servers and no repository or GitHub token."""
+    tools' own variables, and FLEET_GITHUB_NOTE for what the session lacks. With a place (task_place), which FLEET_WORK
+    names, the helper fetches only the task's own clones that are there already (held_repos): the session brings each
+    other repository when it needs it (cmd_repo). The helper asks the hub only when team.json gives the agent repos or
+    tools; {} for an agent without them, and from a hub without the route. keys: the API keys of this session
+    (read_env), which a tool of the owner may need; they are already in the session's environment, so they are not
+    given again. closed: a session of an agent whose Shell box is off (support plan F1), which gets its MCP servers and
+    no repository or GitHub token."""
     mine = checkout_conf(agent)
     if conf.get("role") not in ("worker", "lead") or not (mine.get("tools") or (mine.get("repos") and not closed)):
         return {}
@@ -891,7 +892,7 @@ def integration_env(agent, conf, keys=None, place=None, closed=False):
               and GITHUB_TOKEN.fullmatch(t["token"]) and isinstance(t.get("repos"), list)]
     groups = [g for g in groups if g["repos"]]      # the first is GH_TOKEN's: the hub sends the highest access first
     tokens = {r: g["token"] for g in groups for r in g["repos"]}
-    values, notes = {}, [f"No GitHub token for {', '.join(map(str, e.get('repos') or []))}: {e.get('error')}."
+    values, notes = {}, [f"No GitHub token for {few(map(str, e.get('repos') or []))}: {e.get('error')}."
                          for e in data.get("errors") or [] if isinstance(e, dict)]
     if repos:       # also without a token: then git for github.com has no credentials, never the machine's own
         values.update(FLEET_REPOS=" ".join(f"{r}:{v}" for r, v in sorted(repos.items())), GIT_TERMINAL_PROMPT="0",
@@ -900,12 +901,13 @@ def integration_env(agent, conf, keys=None, place=None, closed=False):
         values["GH_TOKEN"] = groups[0]["token"]
         others = sorted(set(tokens) - set(groups[0]["repos"]))
         if others:
-            notes.append(f"GH_TOKEN (gh and the GitHub tool) works for {', '.join(groups[0]['repos'])}; for "
-                         f"{', '.join(others)} use git only.")
+            notes.append(f"GH_TOKEN (gh and the GitHub tool) works for {few(groups[0]['repos'])}; for " +
+                         (f"{', '.join(others)} use git only." if len(others) <= FEW else
+                          f"your other {len(others)} repositories use git only."))
     if repos and place:
         values["FLEET_WORK"] = place
-    for repo, problem in prepare_repos(repos, values, place).items():
-        notes.append(f"{repo} was not fetched or cloned: {problem}.")
+    for repo, problem in prepare_repos(held_repos(repos, place), values, place).items():
+        notes.append(f"{repo} was not fetched: {problem}.")
     # The access token of each oauth MCP server that the hub gave for this session (owner feature mcp): it goes into
     # the session's mode-600 env file, as GH_TOKEN does, and it stops when the server's token life ends.
     values.update({k: v for k, v in (data.get("mcp") or {}).items()
@@ -955,14 +957,32 @@ def git_credentials():
 
 
 GIT_STALLED = 600       # seconds a git transfer may move no data before git ends it (prepare_repos)
+FEW = 4                 # repositories that a note names before the rest become a count (few)
+
+
+def few(names):
+    """Names for a note, the first FEW of them and then a count: an agent may hold hundreds of repositories."""
+    names = list(names)
+    return ", ".join(names[:FEW]) + (f" and {len(names) - FEW} more" if len(names) > FEW else "")
+
+
+def held_repos(repos, place):
+    """The repositories of a task session that its start fetches: those whose own clone the task has already, in its
+    place. Each other one waits until the session asks for it (cmd_repo). Before 9 November 2026 every start fetched,
+    or cloned, every repository the agent holds, and the first start of each task made a working tree of each one;
+    the owner, that day: "it should know which repos it has, like knowledge, right? or be able to fetch on demand when
+    it needs them??". Without a place, none: the session asks for each one it works in."""
+    return {r: v for r, v in repos.items()
+            if place and os.path.isdir(os.path.join(place, *r.split("/"), ".git"))}
 
 
 def prepare_repos(repos, values, place=None):
     """Fetch each repository in WORK/<owner>/<name>, or clone a missing one there, with the session's own
     credentials and never a prompt. {repo: problem} of the failures. With a place (task_place), the session works in
-    the task's own clone, <place>/<owner>/<name>: the task's first session makes it from the shared clone (own_clone),
-    and each later one only fetches it, so every attempt finds what the one before it left. The shared clone is then
-    only fetched, never worked in."""
+    the task's own clone, <place>/<owner>/<name>: the first time the task asks for it makes it from the shared clone
+    (own_clone), and each later time, or start, only fetches it, so every attempt finds what the one before it left.
+    The shared clone is then only fetched, never worked in. A task session's start gives this only the repositories
+    that the task has already (held_repos); cmd_repo gives it the one that the session asks for."""
     problems, env = {}, {**os.environ, **values, "GIT_TERMINAL_PROMPT": "0"}     # values has it too
     # plan C6: no wall clock, because a large first clone is healthy work. git's own rule ends only a transfer that
     # moves less than a byte a second for GIT_STALLED seconds: a dead one.
@@ -1007,14 +1027,24 @@ def git_out(args, env=None):
 
 def shared_clone(repo, folder, stalled, env):
     """The fetch of a repository's shared clone in WORK, or its first clone: under repo_lock. gc runs in the
-    foreground, so that no repack of it runs while a task's clone takes its packs."""
+    foreground, so that no repack of it runs while a task's clone takes its packs. A first clone is made beside its
+    folder and renamed into it, so a clone that stopped half way (a session's command that ran out of time, since
+    9 November 2026 the usual way a first clone starts: cmd_repo) leaves nothing that the next one cannot replace."""
     nodetach = ["-c", "gc.autoDetach=false"]
     if os.path.isdir(os.path.join(folder, ".git")):
         return git_problem(["git", *stalled, *nodetach, "-C", folder, "fetch", "--quiet", "--prune", "origin"], env)
     if os.path.lexists(folder):
         return f"{folder} is there, but it is not a git clone"
     os.makedirs(os.path.dirname(folder), exist_ok=True)
-    return git_problem(["git", *stalled, *nodetach, "clone", "--quiet", f"https://github.com/{repo}.git", folder], env)
+    new = os.path.join(task_work(), ".cloning", *repo.split("/"))     # in WORK/.tasks: no owner's name starts so
+    shutil.rmtree(new, ignore_errors=True)
+    os.makedirs(os.path.dirname(new), exist_ok=True)
+    problem = git_problem(["git", *stalled, *nodetach, "clone", "--quiet", f"https://github.com/{repo}.git", new], env)
+    if problem:
+        shutil.rmtree(new, ignore_errors=True)
+        return problem
+    os.rename(new, folder)
+    return None
 
 
 def default_branch(clone, env):
@@ -1122,19 +1152,25 @@ def github_text(values, tools):
     """The part of a task's start text for its GitHub repositories and tools (owner feature integrations)."""
     repos = [r.rsplit(":", 1) for r in values.get("FLEET_REPOS", "").split()]
     text = ""
+    if repos:
+        # A list, as the knowledge index is, and each repository comes when the session asks for it (held_repos,
+        # cmd_repo). The same words for every task of the agent ($FLEET_WORK and not its path, the helper's own
+        # command), so the start's cached part stays the same from one task to the next (AUTONOMY.md P9.2).
+        command = shlex.join([sys.executable, os.path.join(KIT, "fleet.py"), "repo"]) + " <owner/name>"
+        text += (f"Your GitHub repositories ({len(repos)}), by access: " + "; ".join(
+            f"{access}: " + ", ".join(r for r, a in repos if a == access)
+            for access in reversed(REPO_ACCESS) if any(a == access for _, a in repos)) + ". ")
     if repos and values.get("FLEET_WORK"):
-        # The same words for every task of the agent ($FLEET_WORK and not its path), so the start's cached part
-        # stays the same from one task to the next (AUTONOMY.md P9.2).
-        text += ("Your GitHub repositories are this task's own clones, in $FLEET_WORK: " +
-                 ", ".join(f"{r} ({access}) in $FLEET_WORK/{r}" for r, access in repos) +
-                 ". Your helper made each from origin's default branch and fetches it before each session, without "
-                 "installed dependencies or build output; every attempt of this task finds what the last one left, "
-                 "until the task ends. Work, install and build only there, and clone a missing one there with git; "
+        text += ("None of them is on this machine for this task until you ask for it. Before you work in one, run "
+                 f"`{command}`: it clones the repository, or fetches it, into $FLEET_WORK/<owner>/<name> from "
+                 "origin's default branch, without installed dependencies or build output, and prints that folder. "
+                 "The first clone of a big repository can take minutes, so give the command time. A repository that "
+                 "this task used already is there and fetched for this session: every attempt of this task finds "
+                 "what the last one left, until the task ends. Work, install and build only in $FLEET_WORK, and "
                  "never change the shared clones in ~/fleet-work. ")
     elif repos:
-        text += ("Your GitHub repositories are clones on this machine: " +
-                 ", ".join(f"{r} ({access}) in ~/fleet-work/{r}" for r, access in repos) +
-                 ". Your helper fetched them just before this session; clone a missing one there with git. ")
+        text += (f"Before you work in one, run `{command}`: it clones the repository, or fetches it, into "
+                 "~/fleet-work/<owner>/<name> and prints that folder. ")
     if repos:
         text += ("In each repository, work on the default branch of origin: git pull --rebase, commit your change, and "
                  "push it to that branch. Do not make a branch, and do not open a pull request. Give your commit in "
@@ -7572,6 +7608,36 @@ def cmd_leakcheck(args):
     sys.exit(1 if hits or hub_hits else 0)
 
 
+def cmd_repo(args):
+    """fleet.py repo <owner/name>...: a task session brings one of its GitHub repositories to this machine when it
+    needs it (owner feature integrations; held_repos says why a start no longer fetches them all). With FLEET_WORK,
+    the task's own clone, made from the shared clone in WORK, or fetched when the task has it already; without it, the
+    shared clone. The session's own credentials, and only a repository of its FLEET_REPOS. Prints each folder, one a
+    line, and on stderr what failed, with exit status 1."""
+    granted = dict(pair.rsplit(":", 1) for pair in os.environ.get("FLEET_REPOS", "").split() if ":" in pair)
+    place = os.environ.get("FLEET_WORK") or None
+    tasks = os.path.realpath(task_work()) + os.sep
+    if place and not os.path.realpath(place).startswith(tasks):
+        die(f"FLEET_WORK is not a task's folder in {tasks}")
+    failed = False
+    for name in args.repos:
+        repo = re.sub(r"^(https://github\.com/|git@github\.com:)", "", name.strip().lower()).strip("/")
+        repo = repo[:-4] if repo.endswith(".git") else repo
+        if not REPO_NAME.fullmatch(repo) or repo not in granted:
+            print(f"{name}: not one of your repositories. They are in FLEET_REPOS; for another one, ask your "
+                  f"requester with needs_access=\"repo:{repo}\".", file=sys.stderr)
+            failed = True
+            continue
+        problem = prepare_repos({repo: granted[repo]}, {}, place).get(repo)
+        if problem:
+            print(f"{repo}: {problem}", file=sys.stderr)
+            failed = True
+            continue
+        print(os.path.join(place or WORK, *repo.split("/")), flush=True)
+    if failed:
+        sys.exit(1)
+
+
 def cmd_git_credential(args):
     """git's credential helper in a task session (owner feature integrations; git_credentials): the session's token
     for the github.com repository that git names, from FLEET_GIT_TOKENS. Only get answers; git stores nothing here."""
@@ -7623,6 +7689,7 @@ def main():
     p.add_argument("--task"); p.add_argument("--agent"); p.set_defaults(fn=cmd_handover)
     p = sub.add_parser("leakcheck"); p.add_argument("login"); p.add_argument("--agent"); p.set_defaults(fn=cmd_leakcheck)
     p = sub.add_parser("git-credential"); p.add_argument("action"); p.set_defaults(fn=cmd_git_credential)
+    p = sub.add_parser("repo"); p.add_argument("repos", nargs="+", metavar="owner/name"); p.set_defaults(fn=cmd_repo)
     args = ap.parse_args()
     global AGENT
     AGENT = getattr(args, "agent", None) or os.environ.get("FLEET_AGENT") or None      # whose key http() sends
