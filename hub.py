@@ -46,6 +46,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from usage import IDENTITY_CHANGED, IDENTITY_ERRORS, SIGN_IN_REQUIRED, local_model, validate_usage
@@ -35562,6 +35563,34 @@ class HubServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
+# The owner API's large answers go compressed to a client that asks (Handler.json). GZIP_MIN: the bytes of JSON above
+# which an answer is compressed; a smaller one goes in the first flight of packets of a connection, so it would arrive
+# no sooner. GZIP_LEVEL: zlib's fastest. On the first fleet's state of 1.4 MB it gave 29% of the size in 8 ms on an M4;
+# level 6 gave 24% in 27 ms, which is more work at each read for a small part of the gain.
+GZIP_MIN, GZIP_LEVEL = 8192, 1
+GZIP_NAMED = re.compile(r"[ \t]*gzip[ \t]*(?:;[ \t]*q=(0(?:\.[0-9]{0,3})?|1(?:\.0{0,3})?)[ \t]*)?", re.I)
+
+
+def accepts_gzip(lines):
+    """True when the Accept-Encoding lines of a request name gzip with a quality above zero, in the grammar of RFC
+    9110, 12.5.3. When a request names gzip more than once, the first mention decides: that rule is this function's
+    own. Everything else is a no: no line at all, `identity`, `gzip;q=0`, `*` without the name, and a quality that
+    the grammar does not allow. A no is always safe, because every client reads an answer that is not compressed."""
+    for part in ",".join(lines or ()).split(","):
+        named = GZIP_NAMED.fullmatch(part)
+        if named:
+            return named.group(1) is None or float(named.group(1)) > 0
+    return False
+
+
+def gzip_body(body):
+    """These bytes in the gzip format. zlib writes the gzip header and trailer itself (wbits 31), with no time in the
+    header, so the same bytes always give the same answer. zlib releases the interpreter lock while it works, so the
+    hub's other threads go on (measured: a thread beside it ran at its full speed)."""
+    packer = zlib.compressobj(GZIP_LEVEL, zlib.DEFLATED, 31)
+    return packer.compress(body) + packer.flush()
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "FleetPilotHub/0.1"
@@ -35582,7 +35611,30 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def json(self, code, obj, headers=None):
-        self.send(code, json.dumps(obj), headers=headers)
+        """A JSON answer. A 200 of the owner API (/ui/...) with more than GZIP_MIN bytes goes gzip-compressed to a
+        client whose Accept-Encoding names gzip: `Content-Encoding: gzip`, the length of the compressed bytes, and
+        `Vary: Accept-Encoding`. The apps read the whole state every 3 seconds. On the first fleet that answer was
+        1.4 MB with no compression: its transfer was half of each read, and it stalled for seconds when the owner's
+        Mac was busy (10 November 2026). URLSession asks for gzip and decodes it by itself, so no app changes.
+
+        Every other answer stays as it was, byte for byte:
+        - an answer to a client that does not ask. urllib and http.client send `Accept-Encoding: identity` by
+          themselves, so the helpers and owner_mcp.py read what they always read;
+        - a small answer, an answer that is not 200, and a HEAD, which sends no body;
+        - an answer that a route writes while it holds LOCK, because the work would hold every other caller of the
+          hub. The one large answer of that kind is the frame of a task's screen: a JPEG in base64, which gzip
+          makes only 23% smaller;
+        - every route outside the owner API. The Mac's vault helper reads /helper/vault with URLSession, which asks
+          for gzip, and an agent's session calls /mcp with the HTTP client of its runtime (measured on 10 November
+          2026: Claude Code 2.1.312 asks for `identity`, Codex 0.163 sends no Accept-Encoding). What those read
+          must not change because the apps' reads did."""
+        body = json.dumps(obj).encode()
+        if code == 200 and self.command != "HEAD" and len(body) > GZIP_MIN and self.path.startswith("/ui/") \
+                and not LOCK._is_owned() and accepts_gzip(self.headers.get_all("Accept-Encoding")):
+            packed = gzip_body(body)
+            if len(packed) < len(body):
+                body, headers = packed, dict(headers or {}, **{"Content-Encoding": "gzip", "Vary": "Accept-Encoding"})
+        self.send(code, body, headers=headers)
 
     def bearer(self):
         """The credential in the Authorization header (owner API 1.12): None without the header; "" for a header that
