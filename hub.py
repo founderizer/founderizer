@@ -35702,9 +35702,32 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         for k, v in (headers or {}).items():
             self.send_header(k, v)
-        self.end_headers()
-        if body and self.command != "HEAD":
-            self.wfile.write(body)
+        self.head_and_body_out(body if self.command != "HEAD" else b"")
+
+    def head_and_body_out(self, body):
+        """The end of the head and the body, to the socket in ONE write. Before, end_headers() wrote the head and then
+        a second write sent the body. The head left alone in a small packet, and the kernel then held the last packet
+        of the body that was not full until the client had acknowledged that small packet (Nagle's rule with
+        Minshall's change, tcp_nagle_check in Linux: the hub sets no TCP_NODELAY). So each answer on a kept connection
+        took one round trip more: the whole body of a small answer, and the last packet of a large one. From the
+        owner's Mac, at a round trip of 56 ms, the body of a 409 of 50 bytes came 0.056 s after its head
+        (10 November 2026).
+
+        The bytes are the same as before. send_response() and send_header() put the head in the buffer of http.server,
+        as always, and this adds the same blank line that end_headers() adds: none for a request of HTTP/0.9, which
+        gets no head. sendmsg gives the kernel the head and the body as one write, with no copy of the body (a backup
+        is up to 256 MiB). When the kernel takes only a part, the next call sends the rest. TCP_NODELAY also stops the
+        wait, but then each head leaves alone in a packet of its own."""
+        if self.request_version != "HTTP/0.9":
+            self._headers_buffer.append(b"\r\n")
+        parts = [memoryview(part) for part in (b"".join(getattr(self, "_headers_buffer", ())), body) if part]
+        self._headers_buffer = []
+        while parts:
+            sent = self.connection.sendmsg(parts)
+            while parts and sent >= parts[0].nbytes:
+                sent -= parts.pop(0).nbytes
+            if parts:
+                parts[0] = parts[0][sent:]
 
     def json(self, code, obj, headers=None):
         """A JSON answer. A 200 of the owner API (/ui/...) with more than GZIP_MIN bytes goes gzip-compressed to a
