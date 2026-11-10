@@ -85,7 +85,7 @@ Other options: `--port N` (default 8765), `--timezone Z` (default the server's o
 (default 1800) and `--reclaim`, for a hub that has an owner ("The owner's Mac is lost, or it has a new
 address", below).
 
-### What the fifteen steps do
+### What the sixteen steps do
 
 1. **This server and this copy of Founderizer.** Root, the system, systemd, and that the
    copy is a Founderizer checkout with a commit.
@@ -138,7 +138,14 @@ address", below).
     once and never again.
 14. **Security updates:** unattended security updates on, and the pending ones once.
     It never restarts the server; it says when a restart is needed.
-15. **`verify`**, below: the last step says whether this machine is healthy, and the
+15. **A kept connection keeps its speed** (`hubsetup.py tcp`). The Mac app reads the hub's
+    state every 3 seconds on one kept connection, and after a pause Linux starts each answer
+    from a window of 10 packets again: a state of 474 KB took 6 round trips (0.29 s at a round
+    trip of 56 ms). `/etc/sysctl.d/60-fleet-hub-tcp.conf` sets
+    `net.ipv4.tcp_slow_start_after_idle = 0`, and the step sets that value at once too, so an
+    answer takes one round trip (0.06 s). A file of the server's own that sets the value keeps
+    it, and the step then writes nothing. It never stops the install.
+16. **`verify`**, below: the last step says whether this machine is healthy, and the
     line ends in failure when a check failed.
 
 ### One OS user for each agent
@@ -337,6 +344,18 @@ already names an owner makes no new code and is not touched, and the services ar
 written again and restarted. Nothing is destroyed. A second run also makes the user,
 the checkout and the service of an agent that was added since.
 
+- **A hub installed before step 15 existed** (10 November 2026) gets it as root, from root's
+  own clone of the release (below, "The central vault"), never from the hub user's checkout:
+
+  ```sh
+  sudo python3 /usr/local/lib/founderizer-kit/hubsetup.py kit-clone
+  sudo python3 /usr/local/lib/founderizer-kit/hubsetup.py tcp
+  ```
+
+  The first takes the hub's signed release into that clone, and `tcp --check` says what the
+  second would do. A release runs no root code, so no release does it. To undo it: delete
+  `/etc/sysctl.d/60-fleet-hub-tcp.conf`, then `sysctl -w net.ipv4.tcp_slow_start_after_idle=1`.
+  Both act on the next answer of a connection that is open; nothing restarts.
 - **The owner's Mac is lost, or it has a new address.** Run the line with `--reclaim`: it
   makes a new code, waits for the new Mac, and changes only `addresses.owner`. The hub is
   away for the time of the claim; the part below says what happens.
@@ -546,7 +565,7 @@ that runs stops the hub for its time and starts it again in every case (on the n
 when no Mac claimed, and when the claim was ended from outside) and stops nothing that it
 must not, the hub's own repository
 is made for real in a temporary folder with both refs at the right commit, `hub.sh
---check` names its fifteen steps in order and changes nothing, this fleet's id is made
+--check` names its sixteen steps in order and changes nothing, this fleet's id is made
 once and never twice and the installers claim no entitlement, the per-agent user is
 made for the agents of the right machine and for no other and a second run changes
 nothing, both installers end in `verify` and end in failure when a check failed,

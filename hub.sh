@@ -15,7 +15,8 @@
 # repository and the hub's checkout on the configuration ref, the first team.json with the owner's own Mac proved by
 # a one-time code, the root helper that makes an agent's OS user, one OS user for each agent of this machine,
 # the fleet-hub and fleet-git user services, each agent of this machine under its own OS user (its checkout,
-# its runtime and its service), the end checks, this fleet's own id, security updates, and verify.
+# its runtime and its service), the end checks, this fleet's own id, security updates, the TCP window of a kept
+# connection, and verify.
 #
 # With FLEET_MANAGER_SERVER=later, which Founderizer 0.1.112 and later set when they start it, it makes the fleet
 # and no agent: no agent runs on the hub's server, because an agent has a shell and the central vault on this server
@@ -493,6 +494,22 @@ tries again"
 no work"
 }
 
+tcp_window() {  # the apps read this hub every few seconds on one kept connection, and each answer keeps the TCP window
+                # of the one before: Linux would start it again after a pause (hubsetup.py tcp). The hub works without
+                # it, so it stops nothing. As root, it runs the copy this script runs from, as the firewall does, and
+                # never the hub user's checkout.
+    heading "the network: a kept connection keeps its speed"
+    if [ "$check" = yes ]; then
+        plan "run: python3 $tree/hubsetup.py tcp"
+        plan "write /etc/sysctl.d/60-fleet-hub-tcp.conf, which sets net.ipv4.tcp_slow_start_after_idle to 0, and set \
+that value now: an answer to the apps after a pause then needs one round trip and not six; a file of this server's \
+own that sets the value keeps it"
+        return 0
+    fi
+    python3 "$tree/hubsetup.py" tcp </dev/null \
+        || say "  the TCP setting of this hub did not finish: the line above says why"
+}
+
 agent_helper() { # the two root commands of this machine, and the sudoers file that says who may run them
     heading "the root helpers that make an agent's OS user and update this machine's vault broker"
     if [ "$check" = yes ]; then
@@ -601,6 +618,7 @@ main() {
     checks
     fleet_identity
     updates
+    tcp_window
     verify_step
     done_text
     [ "$check" = no ] || say "check only: nothing on this machine changed."

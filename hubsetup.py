@@ -67,6 +67,7 @@ says that the manager holds no credential of ours.
 import argparse
 import base64
 import errno
+import fnmatch
 import glob
 import hashlib
 import http.server
@@ -968,6 +969,123 @@ def harden(service_user="fleet", check=False, run=None, root="", account=None):
     for line in said:
         say(line)
     return said
+# ---------------------------------------------------------------- the hub's TCP window (hub.sh)
+
+SYSCTL_DIR = "/etc/sysctl.d"
+HUB_TCP = SYSCTL_DIR + "/60-fleet-hub-tcp.conf"
+HUB_TCP_KEY = "net.ipv4.tcp_slow_start_after_idle"
+HUB_TCP_LIVE = "/proc/sys/net/ipv4/tcp_slow_start_after_idle"     # the value that the kernel uses now
+# Where a file of the system itself can set the value: each folder that systemd-sysctl and `sysctl --system` read at a
+# start, in their order (a file name in an earlier folder hides the same name in a later one, and a link to /dev/null
+# there switches the later file off), and the one old file.
+SYSCTL_SOURCES = ("/etc/sysctl.d", "/run/sysctl.d", "/usr/local/lib/sysctl.d", "/usr/lib/sysctl.d", "/lib/sysctl.d")
+SYSCTL_CONF = "/etc/sysctl.conf"
+HUB_TCP_TEXT = (
+    "# Founderizer's hub installer writes this file (hubsetup.py tcp): a kept connection keeps its TCP window\n"
+    "# over an idle time. The Mac app reads this hub's state every 3 seconds on one kept connection, and with the\n"
+    "# default (1) each answer starts again from a window of 10 packets: an answer of 474 KB took 6 round trips,\n"
+    "# and with 0 it takes 1 (0.29 s against 0.06 s at a round trip of 56 ms, measured on 10 November 2026).\n"
+    "# To undo it: delete this file, then run  sysctl -w net.ipv4.tcp_slow_start_after_idle=1\n"
+    "net.ipv4.tcp_slow_start_after_idle = 0\n")
+
+
+def sysctl_value(path):
+    """The value in one file of /proc/sys, as its text, or None when it cannot be read."""
+    try:
+        with open(path, encoding="ascii") as f:
+            return f.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def sets_tcp_key(text):
+    """Whether the text of a sysctl file sets net.ipv4.tcp_slow_start_after_idle: a line `key = value` whose key, read
+    as systemd-sysctl reads one ("/" as ".", a "-" before it, a glob such as net.ipv4.tcp_*), names it. A "*" here
+    also crosses a ".", which systemd's does not: such a key counts too, and the step then writes nothing, the safe
+    side."""
+    for line in text.lstrip("\ufeff").splitlines():
+        line = line.strip()
+        if not line or line[0] in "#;" or "=" not in line:
+            continue
+        key = line.split("=", 1)[0].strip().lstrip("-").strip().replace("/", ".")
+        if key and fnmatch.fnmatchcase(HUB_TCP_KEY, key):
+            return True
+    return False
+
+
+def system_tcp_setting(root=""):
+    """The file of the system itself that sets net.ipv4.tcp_slow_start_after_idle (its path, without `root`), or None.
+    It is a setting of the owner's own, or of the system's vendor, and it decides at every start: hub_tcp leaves it.
+    Only the files that a start reads count: of each file name, the one in the first folder of SYSCTL_SOURCES."""
+    first = {}
+    for folder in SYSCTL_SOURCES:
+        for path in sorted(glob.glob(glob.escape(root + folder) + "/*.conf")):
+            first.setdefault(os.path.basename(path), path)
+    for path in [first[name] for name in sorted(first)] + [root + SYSCTL_CONF]:
+        if path == root + HUB_TCP:
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                if sets_tcp_key(f.read()):
+                    return path[len(root):]
+        except OSError:
+            continue
+    return None
+
+
+def hub_tcp_step(check, root):
+    own = system_tcp_setting(root)
+    if own and os.path.lexists(root + HUB_TCP):         # a file of the system's own that came after an earlier run
+        return (f"TCP keeps this server's own setting: {own} sets {HUB_TCP_KEY}, and so does {HUB_TCP} of an earlier "
+                "run; of the two, the file that a start reads last decides")
+    if own:
+        return f"TCP keeps this server's own setting: {own} sets {HUB_TCP_KEY}"
+    path, live = root + HUB_TCP, root + HUB_TCP_LIVE
+    try:
+        with open(path, encoding="utf-8") as f:
+            before = f.read()
+    except OSError:
+        before = None
+    if before == HUB_TCP_TEXT and sysctl_value(live) == "0":
+        return "a kept connection keeps its TCP window over an idle time already"
+    if check:
+        return f"would keep the TCP window of a kept connection over an idle time ({HUB_TCP_KEY} = 0 in {HUB_TCP})"
+    if before != HUB_TCP_TEXT:
+        try:
+            os.makedirs(root + SYSCTL_DIR, mode=0o755, exist_ok=True)
+            put_file(path, HUB_TCP_TEXT, 0o644, *((0, 0) if not root else ()))
+        except OSError as e:
+            return f"TCP keeps its setting: {HUB_TCP} could not be written ({e.strerror or e})"
+    try:
+        with open(live, "w", encoding="ascii") as f:
+            f.write("0\n")
+    except OSError as e:
+        return (f"this server did not take {HUB_TCP_KEY} = 0 now ({e.strerror or e}): {HUB_TCP} sets it at a start "
+                "where /proc/sys can be written")
+    now = sysctl_value(live)
+    if now != "0":
+        return (f"this server still reads {HUB_TCP_KEY} = {now or 'nothing'} after the write: {HUB_TCP} sets 0 at a "
+                "start where /proc/sys can be written")
+    return f"a kept connection keeps its TCP window over an idle time ({HUB_TCP_KEY} = 0)"
+
+
+def hub_tcp(check=False, root=""):
+    """A kept connection to the hub keeps its TCP window over an idle time (the owner, 10 November 2026: "Yes, every
+    hub"). The Mac app reads the whole state every 3 seconds on one kept connection. Linux starts an answer that comes
+    after an idle time longer than the connection's retransmission time-out (about 0.26 s at a round trip of 56 ms)
+    from a window of 10 packets again (net.ipv4.tcp_slow_start_after_idle, RFC 5681 4.1): the state of 474 KB took 6
+    round trips, 0.29 s of each read, and with the value 0 it takes one, 0.06 s. A connection that is open takes the
+    value at its next answer, so nothing restarts.
+
+    One file in /etc/sysctl.d holds the value for every start, and the kernel takes it at once as well. A file of the
+    system itself that sets the value stays the one that decides, and this step then writes nothing. A server that does
+    not take the value now (a container whose /proc/sys is read-only) keeps the file, which a start reads only where
+    /proc/sys can be written. Like the join's hardening, it stops no install. It runs as root from the copy of
+    Founderizer that the installer runs from, or from root's own clone (kit_clone), never from a folder that the hub's
+    user can change. Returns the words of what it did, which it also says."""
+    line = hub_tcp_step(check, root)
+    say(line)
+    return line
 # ---------------------------------------------------------------- the machine's vault broker (PRODUCT.md P5)
 
 def vault_reading(user=VAULT_USER, group=AGENT_GROUP):
@@ -2265,6 +2383,10 @@ def cmd_harden(args):
     harden(service_user=args.user, check=args.check)
 
 
+def cmd_tcp(args):
+    hub_tcp(check=args.check)
+
+
 def cmd_agent_list(args):
     """One line for each agent of this machine: its name, its runtime and its OS user. The installers read it, so
     it prints nothing else."""
@@ -2356,6 +2478,9 @@ def main(argv=None):
     hd.add_argument("--user", default="fleet", help="the user that runs this machine's Founderizer services")
     hd.add_argument("--check", action="store_true", help="say what it would do, change nothing")
     hd.set_defaults(fn=cmd_harden)
+    tc = sub.add_parser("tcp")
+    tc.add_argument("--check", action="store_true", help="say what it would do, change nothing")
+    tc.set_defaults(fn=cmd_tcp)
     ah = sub.add_parser("agent-helper")
     ah.add_argument("--user", default="fleet", help="the user that runs this machine's Founderizer services")
     ah.add_argument("--repo", help="the address of the fleet's configuration ref, which the vault helper fetches "
