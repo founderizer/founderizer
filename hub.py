@@ -33778,7 +33778,7 @@ def backups_enabled():
 
     Off by default was wrong for a product whose data has one copy on one disk. The hub finds its own corruption
     every six hours (integrity_check) and the owner could do nothing about it; the records hold every task, every
-    duty case, every conversation, the grants record and the `fleet_id` that the subscription is tied to. So the
+    duty case, every conversation, the grants record and the fleet's own id, `fleet_id`. So the
     routes are on, the health answer says when there is no recent copy, and an owner who does not want them says
     so once in team.json."""
     conf = TEAM.get("backup")
@@ -34098,7 +34098,7 @@ fleet {manifest['fleet_id']}, at revision {(manifest['revision'] or 'unknown')[:
 ## What is in it
 
 - `{BACKUP_DB}`: every record the hub holds — tasks and their results, goals, duties and their cases, every
-  conversation, the grants record, the log, and the `fleet_id` your subscription is tied to.
+  conversation, the grants record, the log, and this fleet's own id, `fleet_id`.
 - `{BACKUP_CONFIG}`: your own configuration — `team.json`, each agent's profile and skills, and your own
   knowledge. These live only in the hub machine's checkout, so they go with that disk.
 - `{BACKUP_MANIFEST}`: what is in this copy, with the SHA-256 of each file.
@@ -34141,7 +34141,7 @@ here: the day somebody reads it is the day nothing else is left.
    tells you what is in it before it sends anything.
 4. The hub checks the copy, writes your configuration back onto its configuration ref, puts the records in place
    and restarts itself. It keeps the new machine's own addresses, so the app stays connected, and it takes back
-   the fleet id your subscription is tied to, so your plan is the same fleet and you buy nothing again.
+   this fleet's own id, so it is the same fleet as before.
 5. Each agent machine joins again as it did the first time, and each vault store is made again.
 {reconnect}
 Without the app, on the new hub machine: `python3 hub.py --restore <this file>`, then restart the hub service.

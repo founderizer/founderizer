@@ -26,9 +26,10 @@ already run. A Mac or a second server joining a fleet: `WORKER-INSTALL.md`.
 **What is not here.** Our own development repository holds the product documents, the test suite, the owner's own
 fleet and the live records of it. None of that is needed to run a fleet, and none of it is published.
 
-**License.** The Functional Source License, Version 1.1, ALv2 Future License (FSL-1.1-ALv2), in `LICENSE.md`. You
-may use, change and share this code for any purpose except a Competing Use, which `LICENSE.md` defines. Two years
-after we make a version available, that version is also under the Apache License, Version 2.0.
+**License.** The Apache License, Version 2.0. Its text is in `LICENSE`. `NOTICE` holds the copyright notice and the
+credit, and section 4 of the license says how a copy that you share keeps them. Every version published in this
+repository is under this license, including the versions that we published earlier under the Functional Source
+License (FSL-1.1-ALv2) or with no license file.
 
 **Changes from outside.** We do not take pull requests. This repository is a copy that we publish from our own
 repository, so a pull request cannot be merged here. To report a problem or to ask for a change, open an issue.
