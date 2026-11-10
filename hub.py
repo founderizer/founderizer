@@ -71,12 +71,67 @@ DESKTOP = Frames()
 
 SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
 TERMINAL = ("completed", "failed", "rejected", "canceled")
-LOCK = threading.RLock()
+
+
+class Left(Exception):
+    """The agent that a request works for is no longer in the fleet: the owner deleted or renamed it while the request
+    ran. The request ends as every call of a name that no agent has, with 404 (Handler.gone)."""
+
+
+class TeamLock:
+    """LOCK: the reentrant lock of the hub's records, with one rule of its own. A request that works for one agent
+    (Handler.works_for) takes it only while that agent is in the fleet; else the take raises Left.
+
+    A delete and a rename hold the lock for their whole commit, and a call of that agent that was under way waits for
+    it. After the wait, the call went on for a name that was gone: it read `agents()[name]`, a KeyError that the route
+    answered as an error of the hub's own, and where no such read stood in its way it wrote. On 10 November 2026 a
+    tool list brought back the count of its window, a search of the history its mark, and a helper's limit report a
+    usage-limit hold, each one after the delete had taken that agent's rows, for an agent added again under the name
+    to inherit. What the call wrote before the command stays as the command left it: a delete took it, and a rename
+    moved it to the new name. So a route whose answer must follow its write has no take of the lock between the two
+    (helper_key). Every write needs the lock, and a delete and a rename hold it from their first step to the new team,
+    so the rule is held here and not by each route: the name is looked up each time the thread takes the lock from
+    outside, and neither command can take it away while the thread holds the lock. A take from inside, by a thread
+    that holds the lock, is not asked again."""
+    def __init__(self):
+        self.lock = threading.RLock()
+
+    def acquire(self, blocking=True, timeout=-1):
+        agent = CALL.agent
+        if agent is None or self.lock._is_owned():      # no request of one agent, or a take from inside
+            return self.lock.acquire(blocking, timeout)
+        if not self.lock.acquire(blocking, timeout):
+            return False
+        if agent not in agents():
+            self.lock.release()
+            raise Left(agent)
+        return True
+
+    def release(self):
+        self.lock.release()
+
+    __enter__ = acquire
+
+    def __exit__(self, *exc):
+        self.lock.release()
+
+    def _is_owned(self):
+        return self.lock._is_owned()
+
+
+class Call(threading.local):
+    """What a thread knows of the request that it serves now: the session of a tool call (context), and the agent
+    that the request works for (agent, see TeamLock). None for a thread that serves no such request."""
+    context = None
+    agent = None
+
+
+CALL = Call()
+LOCK = TeamLock()
 TX = threading.local()          # transactions this thread has open, for in_transaction's guard
 DB = None
 TEAM = {}
 CFG = {}
-CALL = threading.local()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY, title TEXT, details TEXT, done_when TEXT,
@@ -2149,7 +2204,10 @@ def migrate():
                   # and the indexes that the owner ticked when they do
                   "details": "TEXT", "multi": "INTEGER", "chose": "TEXT"},
         "owner_reports": {"agent": "TEXT NOT NULL DEFAULT 'manager'", "in_reply_to": "TEXT",
-                          "pushed": "INTEGER NOT NULL DEFAULT 0"},     # chat apps round 2: message_owner
+                          "pushed": "INTEGER NOT NULL DEFAULT 0",      # chat apps round 2: message_owner
+                          # 10 November 2026: the request id of the owner's message from the app whose turn this
+                          # report of the manager took, with no link to it (t_tell_owner)
+                          "turn": "TEXT"},
         "chat_out": {"recipient": "TEXT"},          # chat apps round 2: a Discord user ID when chat is null
         "owner_device_push": {"seal": "TEXT"},      # sealed_push: the phone's own key for what a ping says, base64
         # plan V12: the phone's own key that the recovery code is sealed to, and its HMAC of the QR's one-time value
@@ -2227,6 +2285,7 @@ def migrate():
         sql_step("UPDATE session_credentials SET ready=created WHERE kind='chat' AND revoked IS NULL", problems)
     for statement in [
         "CREATE UNIQUE INDEX IF NOT EXISTS owner_reply_identity ON owner_reports(agent,in_reply_to) WHERE in_reply_to IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS owner_report_turn ON owner_reports(turn) WHERE turn IS NOT NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS task_trigger_run ON tasks(trigger_run) WHERE trigger_run IS NOT NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS sealed_job ON sealed(job) WHERE job IS NOT NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS jobs_request ON jobs(agent, request_id) WHERE request_id IS NOT NULL",
@@ -9636,12 +9695,23 @@ def central_backup():
 
 
 def unanswered_owner_message(agent):
-    """The oldest chat message of the owner's to this agent that it has read and nothing has answered, or None."""
-    row = q1("SELECT u.request_id FROM ui_requests u JOIN events e ON e.id=u.event_id "
-             "WHERE u.recipient=? AND u.kind='message' AND u.need_id IS NULL AND e.read_at IS NOT NULL "
-             "AND NOT EXISTS (SELECT 1 FROM owner_reports r WHERE r.agent=u.recipient AND r.in_reply_to=u.request_id) "
-             "ORDER BY u.created LIMIT 1", (agent,))
-    return row["request_id"] if row else None
+    """The chat message of the owner's to this agent whose turn it is, or None: the oldest one that the agent has
+    read, that no report is linked to, and whose turn no report has taken (owner_reports.turn). Its request id, and
+    its origin, which is null for a message that the owner wrote in the app."""
+    return q1("SELECT u.request_id, u.origin FROM ui_requests u JOIN events e ON e.id=u.event_id "
+              "WHERE u.recipient=? AND u.kind='message' AND u.need_id IS NULL AND e.read_at IS NOT NULL "
+              "AND NOT EXISTS (SELECT 1 FROM owner_reports r WHERE r.agent=u.recipient AND r.in_reply_to=u.request_id) "
+              "AND NOT EXISTS (SELECT 1 FROM owner_reports r WHERE r.agent=u.recipient AND r.turn=u.request_id) "
+              "ORDER BY u.created, u.event_id LIMIT 1", (agent,))
+
+
+def owner_wrote(agent, event_id):
+    """True when the message that read_messages gave this agent the name M-<event_id> holds the owner's own words: a
+    chat message, read or not and answered or not, a message from the board, the owner's answer to a Needs-you item,
+    from the app or from the board, or the owner's word in the discussion of one. The hub starts each of them with
+    "[owner", and nothing else that an agent reads. A notice of the hub that carries words of the owner's (a goal's
+    note, a steer) starts as the hub's own, and is one."""
+    return bool(q1("SELECT 1 FROM events WHERE id=? AND agent=? AND text LIKE '[owner%'", (event_id, agent)))
 
 
 def owner_chat_message(agent, event_id):
@@ -9735,30 +9805,36 @@ def t_tell_owner(agent, a):
             # what message_owner is for. Nothing else an agent reads named it.
             raise ToolError("Reply with in_reply_to set to the owner request UUID from read_messages. To write to "
                             "the owner first, with no message of theirs to answer, use message_owner: short and rare.")
-    # **A manager's answer is linked to the message it answers.** Its own owner messages carry no request id — a
-    # worker's do, and that is what a worker names — so the manager cannot name one however it tries, and every
-    # reply of its own landed beside the owner's message instead of under it. The hub reads the chat the way the
-    # owner does: a report posted while a message of his stands read and unanswered is the answer to it. The app
-    # could otherwise only say "a later report has no link to your message", about a conversation he was reading,
-    # answered, in front of him (21 October 2026). A report with nothing of his waiting answers nothing, which is
-    # what a routine post of the manager's is.
-    # **The message that the manager names comes first** (10 November 2026). read_messages gives every message the
-    # name M-<id>, which is the only name a manager has for a message of the owner's, and `about` is where this tool
-    # asks for "the message you are answering (M-<id>)". The oldest message that waits was the only rule: on the first
-    # fleet it put 18 of 66 reports that named a message under another message of the owner's in 14 days, and each
-    # went to that other message's chat app too (chat_source); and the M-<id> that the manager gave in in_reply_to
-    # was refused 18 times in ten days for a request UUID that it never gets, after which it sent its whole report
-    # again. Now:
+    # **A manager's report is linked to the message that it names, and to no other.** read_messages gives every
+    # message the name M-<id>, which is the only name a manager has for a message of the owner's (its messages carry
+    # no request id, as a worker's do), and `about` is where this tool asks for "the message you are answering
+    # (M-<id>)".
     # - in_reply_to names one message, M-<id>: a report is linked to that one or to none. A message that has its
     #   answer, and a name that is no chat message of the owner's, give no link and no refusal: the report is a later
-    #   word, and it still goes to that message's chat app.
-    # - with no in_reply_to, the first message that `about` names and that still waits gets the report. When none of
-    #   them waits, the oldest message that waits gets it, as before: a replay of those 14 days gave the same links
-    #   as that rule for every report but the 13 that it had put under another message than the one they named.
+    #   word, and it still goes to that message's chat app. The M-<id> was refused 18 times in ten days for a request
+    #   UUID that the manager never gets, after which it sent its whole report again.
+    # - with no in_reply_to, the first message that `about` names and that still waits gets the report.
+    # - a report that names the owner's own words to the manager, none of which waits for its link (owner_wrote: a
+    #   chat message that has its answer or is not read, a message from the board, the owner's answer to a Needs-you
+    #   item, the owner's word in the discussion of one), is about those words: it is linked to none and takes no
+    #   turn (below). It goes to a chat app only by the name of a chat message that the manager has read
+    #   (chat_source). A notice of the hub that carries words of the owner's is a word of the hub's. The hub took the
+    #   manager's word on a Needs-you answer as the answer to the oldest chat message that waited: on the first
+    #   fleet, the word on a GitHub permission under a release test of the day before.
+    # - **a report that names no word of the owner's takes the turn of the oldest message that waits** (read, with
+    #   no report linked to it, and with no turn taken). From 21 October 2026 the hub linked such a report to that
+    #   message: a manager could name none then. For a message that the owner sent from a chat app, that stays as it
+    #   was: the link is also what carries the report to WhatsApp or Discord (chat_source). **For a message that the
+    #   owner wrote in the app, the turn leaves no link** (10 November 2026), only its mark on the report
+    #   (owner_reports.turn), so the order of the turns, and with it what reaches each chat app, is the same as
+    #   before. On the first fleet the link of a turn was wrong each time: 14 of the manager's 190 reports stood under
+    #   a message that the manager had carried out with its tools and no words, and none was the answer to it (a word
+    #   about a standing item under a test instruction of days before). A message from the app whose turn was
+    #   taken still gets the report that names it.
     # - the manager's newest report again, with the same words and `about` and no message of the owner's read since
     #   it, is the same call again: it is told as saved, and nothing is saved or sent twice. With a message read since,
-    #   the same words are a report of their own, for that message.
-    note, also = "", None
+    #   the same words are a report of their own.
+    note, also, turn = "", None, None
     if role == "manager":
         if isinstance(reply, str) and not reply.strip():
             reply = None        # an empty field is no name
@@ -9780,12 +9856,16 @@ def t_tell_owner(agent, a):
             note = (f" {named.group(0)} has its answer already, so this report has no link." if old else
                     f" {named.group(0)} is no chat message of the owner's to you, so this report has no link.")
     elif reply is None and role == "manager":
-        for found in ABOUT_EVENT.finditer(about):
-            m = owner_chat_message(agent, int(found.group(1)))
+        names = [int(n) for n in ABOUT_EVENT.findall(about)]
+        for event_id in names:
+            m = owner_chat_message(agent, event_id)
             if m and m["read_at"] is not None and not owner_report(agent, m["request_id"]):
                 reply = m["request_id"]
                 break
-        reply = reply or unanswered_owner_message(agent)
+        waits = None if reply or any(owner_wrote(agent, n) for n in names) else unanswered_owner_message(agent)
+        if waits:
+            # from a chat app: linked, and so sent there, as before; from the app: its turn alone, with no link
+            reply, turn = (waits["request_id"], None) if waits["origin"] else (None, waits["request_id"])
     if reply is not None:
         try:
             reply = str(uuid.UUID(reply))
@@ -9804,8 +9884,8 @@ def t_tell_owner(agent, a):
     chat = chat_source(agent, reply or also, about)  # owner feature chat_apps: the reply goes back to that chat
     t0 = now()
     with transaction():
-        rid = DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to) VALUES(?,?,?,?,?)",
-                         (text, about, t0, agent, reply)).lastrowid
+        rid = DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to,turn) VALUES(?,?,?,?,?,?)",
+                         (text, about, t0, agent, reply, turn)).lastrowid
         if chat:
             chat_answer(agent, chat, rid, text, t0)
     if chat:
@@ -10058,14 +10138,15 @@ def need_question_rows(need, value, t0):
 
 def chat_source(agent, reply, about):
     """15.8: the owner message from a chat app that a tell_owner report answers, or None: by in_reply_to; for the
-    manager without in_reply_to, by the first M-<event id> in about whose request has an origin. The result has the
-    origin, the request and the account's label."""
+    manager without in_reply_to, by the first M-<event id> in about whose request has an origin and that the manager
+    has read. The result has the origin, the request and the account's label."""
     row = None
     if reply:
         row = q1("SELECT * FROM ui_requests WHERE request_id=? AND origin IS NOT NULL", (reply,))
     elif agents()[agent].get("role") == "manager":
-        for m in ABOUT_EVENT.finditer(about):
-            row = q1("SELECT * FROM ui_requests WHERE event_id=? AND recipient=? AND kind='message' AND origin IS NOT NULL",
+        for m in ABOUT_EVENT.finditer(about):       # one that the agent has read: no report answers an unread message
+            row = q1("SELECT u.* FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE u.event_id=? AND "
+                     "u.recipient=? AND u.kind='message' AND u.origin IS NOT NULL AND e.read_at IS NOT NULL",
                      (int(m.group(1)), agent))
             if row:
                 break
@@ -10225,12 +10306,20 @@ def inbound_message(data):
 
 def chat_inbound(m):
     """POST /bridge/inbound (15.5): one checked inbound message, in one transaction. Returns stored, duplicate or
-    ignored. The secret check and the preview of an ignored message are read before the transaction."""
+    ignored, or None for an account that the fleet no longer has. The secret check and the preview of an ignored
+    message are read before the transaction.
+
+    The account is read inside the transaction, under the lock that writes the message. Read before it, a message
+    that waited for a rename of its agent went on with the name that the agent had before, which no agent had any
+    more: the owner got the reply that this agent cannot chat now and the bridge read "stored", a person's message
+    was put aside and the bridge read "ignored", and after either answer the bridge lets the message go."""
     t0, account, text = now(), m["account"], m["text"]
-    acc = chat_apps()[account]
     hit = len(text) <= CHAT_TEXT_MAX and secret_hit(text)
     preview = mask_secrets(text[:1000])[:200]
     with transaction():
+        acc = chat_apps().get(account)
+        if acc is None:
+            return None
         if DB.execute("SELECT 1 FROM chat_in WHERE account=? AND msg_id=?", (account, m["id"])).fetchone():
             return "duplicate"
         result, request_id = chat_route(account, acc, m, t0, hit, preview)
@@ -31291,7 +31380,8 @@ def move_agent(agent, body):
 # team.json entry, the chat app accounts that are its own, its profile and its skills. One transaction takes what is its
 # own on the hub (REMOVED_OWN), deletes its wake-up rules, ends its open sign-in and its server's open job for it, and
 # gives that server's service the job that takes its service, its files and, on Linux, its own OS user with its home
-# (server.py `remove`). Its duties are retired. Nothing of another agent changes, on the hub or on that server.
+# (server.py `remove`). Its duties are retired, and its open Needs-you items close. Nothing of another agent changes,
+# on the hub or on that server.
 #
 # The work it did with the fleet stays as the fleet's history: its tasks, its messages with other agents, its reports
 # and the log. While such history is there, the name stays with it (its row in `agents`), and Add agent and a rename
@@ -31344,6 +31434,11 @@ def remove_rows(agent, t0):
             trigger_state_rows(t["id"], t["revision"], "delete", "owner", t0)
     DB.execute("UPDATE server_jobs SET state='canceled', prompt=NULL, updated=?, detail=? WHERE agent=? AND kind!='remove' "
                "AND state IN ('queued','running','needs_owner')", (t0, f"{shown_role(agent)} was deleted.", agent))
+    # Its open Needs-you items close, as an item that the hub ends (question_needs_close): nobody is left to read the
+    # owner's answer. An answer that the owner sent at the moment of the delete wrote an event and a receipt for a name
+    # that no agent had, for the next agent of that name to read.
+    DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE by=? AND answer IS NULL",
+               (f"Closed: {shown_role(agent)} was deleted.", t0, NEED_CLOSED_BY, agent))
 
 
 def free_name(agent):
@@ -35601,6 +35696,7 @@ class Handler(BaseHTTPRequestHandler):
     def send(self, code, body=b"", ctype="application/json", headers=None):
         if isinstance(body, str):
             body = body.encode()
+        self.answered = True            # this request has its answer (gone)
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -35705,7 +35801,10 @@ class Handler(BaseHTTPRequestHandler):
                                      f"See \"addresses\" in team.json.",
                             **({"auth": "moved"} if want and moved_away(who, src) else {})})   # agent_move
             return False
-        if who == "owner" or who not in agents():
+        if who == "owner":
+            return True
+        self.works_for(who)             # before the next line: a name that left since its route looked it up is held
+        if who not in agents():         # by the lock too, at the route's next take of it
             return True
         token, keyed, shared = self.bearer(), agent_key(who) is not None, shared_machine(who)
         # A rename holds the lock for its whole commit, so this call may have waited in agent_key while its name left.
@@ -35722,6 +35821,27 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return self.refuse(who, "key_required", f"{who} shares its machine with other agents: send its agent key"
                            if shared else f"{who} has an agent key: send it")
+
+    def works_for(self, agent):
+        """From here on this request works for one agent of the fleet: its own helper or one of its sessions calls.
+        If the owner deletes or renames that agent while the request runs, the request takes the hub's lock no more
+        (TeamLock), so it writes nothing for a name that is gone, and it ends with 404 (gone). Only inside a request
+        (do_GET, do_POST), which ends it: a thread serves the next request of its connection too."""
+        if getattr(self, "serving", False):
+            CALL.agent = agent
+
+    def gone(self):
+        """True, with the answer 404 sent, when the agent that this request works for left the fleet while it ran:
+        whatever stopped the request then, the lock's refusal or a read of the team that found no such name, is no
+        error of the hub's. It is the answer that every call of a name that no agent has gets."""
+        agent, CALL.agent = getattr(CALL, "agent", None), None
+        if agent is None or agent in agents():
+            return False
+        if getattr(self, "answered", False):
+            self.close_connection = True    # its answer went out before the agent left: no second one follows it
+        else:
+            self.json(404, {"error": "unknown agent"})
+        return True
 
     def session_allowed(self, agent, context):
         """An MCP call (owner API 1.12): from the agent's machine, with a session credential whose binding matches this
@@ -36191,7 +36311,8 @@ class Handler(BaseHTTPRequestHandler):
                                       "error": r["error"], "outbound": r["id"]}
                         for r in q("SELECT * FROM chat_out WHERE id IN (SELECT MAX(id) FROM chat_out WHERE kind='message' "
                                    "AND report IS NOT NULL GROUP BY report)")}
-            result["reports"] = [dict(r, pushed=bool(r["pushed"]), delivery=delivery.get(r["id"]))
+            result["reports"] = [dict({k: r[k] for k in r.keys() if k != "turn"}, pushed=bool(r["pushed"]),
+                                      delivery=delivery.get(r["id"]))        # turn: the hub's own (t_tell_owner)
                                  for r in q("SELECT * FROM owner_reports ORDER BY id")]
             result["chat_apps"] = {"paused": chat_paused(), "problems": chat_problems()}
             result["goals"] = [goal_view(g) for g in q("SELECT * FROM goals ORDER BY id")]
@@ -36637,13 +36758,15 @@ class Handler(BaseHTTPRequestHandler):
               (update["state"], update["step"], update["detail"],
                json.dumps(update["prompt"]) if update["prompt"] else None, 1 if update["timed_out"] else None,
                now(), job))
-        if update["state"] in ("done", "failed"):
-            log("hub", f"server {name}: job {job} ({row['kind']} {row['agent']}) {update['state']}")
-            if row["kind"] in ("install", "prepare"):
-                status_now(row["agent"])
-            if row["kind"] == "remove" and update["state"] == "done":
-                with transaction():
-                    free_name(row["agent"])     # agent_remove: nothing of it is left on its server
+            # Under the same lock as the job's new state: after it, a delete or a rename of the job's agent could
+            # come first, and the ask for its status went to a name that no agent had.
+            if update["state"] in ("done", "failed"):
+                log("hub", f"server {name}: job {job} ({row['kind']} {row['agent']}) {update['state']}")
+                if row["kind"] in ("install", "prepare"):
+                    status_now(row["agent"])
+                if row["kind"] == "remove" and update["state"] == "done":
+                    with transaction():
+                        free_name(row["agent"])     # agent_remove: nothing of it is left on its server
         return self.json(200, {"ok": True, "state": update["state"]})
 
     def ui_team_reload(self):
@@ -38643,6 +38766,8 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             if data.get("db") != kv_get("db_id"):
                 return self.json(409, {"error": "hub generation changed; refresh state before sending"})
+            if recipient not in agents():       # a delete or a rename took the name while this message waited for it
+                return self.json(400, {"error": "recipient must name a configured agent"})
             need = None
             if need_id is not None:
                 need = DB.execute("SELECT * FROM needs WHERE id=?", (need_id,)).fetchone()
@@ -38799,7 +38924,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def bridge_inbound(self):
         """POST /bridge/inbound: 200 with the result only after the commit; 400 for a bad body; 409 for an unknown
-        account, which the bridge keeps and sends again."""
+        account, whose message the bridge then lets go (channels.py)."""
         if not self.bridge_allowed():
             return
         data = self.bridge_body()
@@ -38809,10 +38934,10 @@ class Handler(BaseHTTPRequestHandler):
             m = inbound_message(data)
         except ValueError as e:
             return self.json(400, {"db": kv_get("db_id"), "error": str(e)})
-        if m["account"] not in chat_apps():
+        result = chat_inbound(m) if m["account"] in chat_apps() else None
+        if result is None:
             # the bridge reads this text: an event of an account that is gone leaves its journal (channels.py)
             return self.json(409, {"db": kv_get("db_id"), "error": "unknown chat app account"})
-        result = chat_inbound(m)
         return self.json(200, {"db": kv_get("db_id"), "result": result})
 
     def bridge_out(self, query):
@@ -39246,6 +39371,13 @@ class Handler(BaseHTTPRequestHandler):
             t0 = now()
             if body.get("delete"):
                 return person_remove(body["id"], t0)
+            try:
+                # Again, under the lock that writes them: `read` looked the names up before this command waited for
+                # the lock, and a delete or a rename can have come first. The person got an agent of a name that
+                # nobody had, for the next agent of that name.
+                person_agent_names(body.get("agents", []))
+            except ValueError as e:
+                raise Refusal(400, str(e)) from None
             if "id" not in body:
                 if q1("SELECT COUNT(*) n FROM people")["n"] >= PEOPLE_MAX:
                     raise Refusal(409, f"this fleet already has {PEOPLE_MAX} people")
@@ -39643,17 +39775,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
+            self.serving, self.answered = True, False
             if not self.host_allowed() or (get_writes(self.route()[0]) and not self.site_allowed()):
                 return
             self.get()
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception:
-            traceback.print_exc()
-            self.json(500, {"error": "hub error"})
+            if not self.gone():
+                traceback.print_exc()
+                self.json(500, {"error": "hub error"})
+        finally:
+            self.serving, CALL.agent = False, None
 
     def do_POST(self):
         try:
+            self.serving, self.answered = True, False
             # read the whole request first: a refusal must not leave half a request on a kept-alive connection
             n = int(self.headers.get("Content-Length") or 0)
             if self.path.startswith("/helper/desktop/") and not 0 <= n <= 1500000:
@@ -39680,8 +39817,11 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception:
-            traceback.print_exc()
-            self.json(500, {"error": "hub error"})
+            if not self.gone():
+                traceback.print_exc()
+                self.json(500, {"error": "hub error"})
+        finally:
+            self.serving, CALL.agent = False, None
 
     # ---- GET
     def get(self):
@@ -40488,7 +40628,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.helper_vault_read(parts[2])
         if parts[:2] == ["helper", "ack"] and len(parts) == 3:
             agent = parts[2]
-            if agent not in agents() or not self.allowed(agent):
+            if agent not in agents():       # it sent no answer at all, and the helper of a deleted agent waited it out
+                return self.json(404, {"error": "unknown agent"})
+            if not self.allowed(agent):
                 return
             # A message's or a chat's delivery ends only with its session's read. A task's ack says that its helper
             # started that attempt once (plan C6, attempt_started), and its delivery still waits for the read.
@@ -40532,34 +40674,40 @@ class Handler(BaseHTTPRequestHandler):
             nid = int(re.sub(r"\D", "", parts[1]) or 0)
             form = self.form()
             answer = (form.get("answer") or "").strip()
-            row = q1("SELECT * FROM needs WHERE id=?", (nid,))
-            chosen = None
-            if row and (form.get("choice") or "").strip().isdigit():     # the owner pressed one of the agent's buttons
-                picks = need_options(row)
-                index = int(form["choice"])
-                if index < len(picks):
-                    chosen, answer = index, picks[index]
-            if answer and secret_hit(answer):
-                log("owner", "BLOCKED an answer that contained a login")
-            elif row and answer and row["answer"] is None and row["kind"] == "secret":
-                log("owner", f"REFUSED an answer in words to the secret request N-{nid}")      # never the words
-            elif row and answer and row["answer"] is None and row["conversation"] and \
-                    q1("SELECT 1 FROM conversations WHERE id=?", (row["conversation"],)):
-                # A question of a person's conversation: the answer goes back there, as owner_message_rows sends it.
-                # As a message to the agent it went to no window, because it belongs to no task.
-                with transaction():
-                    DB.execute("UPDATE needs SET answer=?, answered=?, chosen=? WHERE id=?", (answer, now(), chosen, nid))
-                    conversation_answer(row, answer, now())
-                log("owner", f"answered N-{nid} in C-{row['conversation']}")
-            elif row and answer and row["answer"] is None:
-                t0 = now()
-                with transaction():         # and a question that the item took to him gets his words (A2)
-                    DB.execute("UPDATE needs SET answer=?, answered=?, chosen=? WHERE id=?", (answer, t0, chosen, nid))
-                    asker = need_question_rows(row, answer, t0)
-                    event_rows([(row["by"], "say", None, f"[owner] Answer to Needs-you N-{nid} ({row['title']}): "
-                                 f"{answer}" + (f" The hub gave it to {asker} as the answer to Q-{row['question']}: do "
-                                                f"not pass it on again." if asker else ""), None)], t0)
-                log("owner", f"answered N-{nid}")
+            # The item is read under the lock that writes its answer: read before it, an answer that waited for the
+            # delete of the item's agent took the place of the hub's own close, and went to a name that no agent had.
+            with LOCK:
+                row = q1("SELECT * FROM needs WHERE id=?", (nid,))
+                chosen = None
+                if row and (form.get("choice") or "").strip().isdigit():     # the owner pressed one of its buttons
+                    picks = need_options(row)
+                    index = int(form["choice"])
+                    if index < len(picks):
+                        chosen, answer = index, picks[index]
+                if answer and secret_hit(answer):
+                    log("owner", "BLOCKED an answer that contained a login")
+                elif row and answer and row["answer"] is None and row["kind"] == "secret":
+                    log("owner", f"REFUSED an answer in words to the secret request N-{nid}")      # never the words
+                elif row and answer and row["answer"] is None and row["conversation"] and \
+                        q1("SELECT 1 FROM conversations WHERE id=?", (row["conversation"],)):
+                    # A question of a person's conversation: the answer goes back there, as owner_message_rows sends it.
+                    # As a message to the agent it went to no window, because it belongs to no task.
+                    with transaction():
+                        DB.execute("UPDATE needs SET answer=?, answered=?, chosen=? WHERE id=?",
+                                   (answer, now(), chosen, nid))
+                        conversation_answer(row, answer, now())
+                    log("owner", f"answered N-{nid} in C-{row['conversation']}")
+                elif row and answer and row["answer"] is None:
+                    t0 = now()
+                    with transaction():         # and a question that the item took to the owner gets the answer (A2)
+                        DB.execute("UPDATE needs SET answer=?, answered=?, chosen=? WHERE id=?",
+                                   (answer, t0, chosen, nid))
+                        asker = need_question_rows(row, answer, t0)
+                        passed = f" The hub gave it to {asker} as the answer to Q-{row['question']}: do not pass it " \
+                                 f"on again." if asker else ""
+                        event_rows([(row["by"], "say", None, f"[owner] Answer to Needs-you N-{nid} ({row['title']}): "
+                                     f"{answer}{passed}", None)], t0)
+                    log("owner", f"answered N-{nid}")
             return self.back()
         if parts == ["outbox"]:
             f = self.form()
@@ -40617,6 +40765,8 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(jid, bool) or not isinstance(jid, int):
                 return self.json(400, {"error": "job is required: the handover job that made this copy"})
             with LOCK:
+                if f["recipient"] not in agents():      # a delete or a rename took the name while this call waited
+                    return self.json(404, {"error": "unknown agent"})
                 job = q1("SELECT * FROM jobs WHERE id=?", (jid,))
                 if not job or job["agent"] != f["sender"] or job["kind"] != "handover" or job["target"] != f["recipient"]:
                     return self.json(404, {"error": f"no handover job {jid} of {f['sender']} for {f['recipient']}"})
@@ -40885,6 +41035,7 @@ class Handler(BaseHTTPRequestHandler):
         shared machine only the owner registers keys."""
         if agent not in agents():
             return self.json(404, {"error": "unknown agent"})
+        self.works_for(agent)           # no allowed() here: a key of a name that left would wait for its next agent
         want, src = address_of(agent), self.client_address[0]
         if not want or src != want:
             log("hub", f"REFUSED key enrollment for {agent} from {src}")
@@ -40904,7 +41055,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(409, {"error": f"{agent} already has another key; only the owner replaces it"})
             t0 = now()
             ins("INSERT INTO agent_keys(agent,sha256,created,source) VALUES(?,?,?,'enrolled')", (agent, digest, t0))
-        log(agent, "registered its agent key")
+            # In this hold of the lock, so that the 200 follows the key with no other take of it: a rename that came
+            # in between took the key to the new name, and the helper, which keeps its key file only on 200, read 404.
+            log(agent, "registered its agent key")
         return self.json(200, {"ok": True, "agent": agent, "since": t0})
 
     def helper_session(self, agent):
@@ -42007,6 +42160,7 @@ class Handler(BaseHTTPRequestHandler):
     def mcp(self, agent, context=None):
         if agent not in agents():
             return self.json(404, {"error": f"unknown agent '{agent}'"})
+        self.works_for(agent)
         if not self.session_allowed(agent, context):
             return
         try:
@@ -42114,6 +42268,8 @@ def rpc(agent, m, headers, context=None, credential=None):
         else:
             return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"Method not found: {method}"}}
     except Exception as e:
+        if agent not in agents():       # it left the fleet while its call ran: no error of the hub's (Handler.gone)
+            raise
         traceback.print_exc()
         return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": f"Hub error: {e}"}}
     return {"jsonrpc": "2.0", "id": mid, "result": result}

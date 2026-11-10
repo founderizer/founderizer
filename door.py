@@ -43,6 +43,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1301,6 +1302,10 @@ def run_program(argv, stdin, env, timeout=600):
 
 # ---------------------------------------------------------------- HTTP
 
+class CallerGone(Exception):
+    """The caller ended its connection while the door read its request or wrote its answer: no error of the door's."""
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "fleet-door"
     door = None                 # the Door, set by serve()
@@ -1313,11 +1318,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def answer(self, status, data):
         raw = json.dumps(data).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            raise CallerGone() from None
 
     def bearer(self):
         value = self.headers.get("Authorization") or ""
@@ -1328,7 +1336,11 @@ class Handler(BaseHTTPRequestHandler):
         if n > BODY_MAX:
             raise Refused("the body is over 512 KiB")
         try:
-            data = json.loads(self.rfile.read(n) or b"{}")
+            raw = self.rfile.read(n)
+        except (BrokenPipeError, ConnectionResetError):
+            raise CallerGone() from None
+        try:
+            data = json.loads(raw or b"{}")
         except ValueError:
             raise Refused("the body is not JSON") from None
         if not isinstance(data, dict):
@@ -1398,11 +1410,27 @@ class Handler(BaseHTTPRequestHandler):
         self.answer(404, {"error": "no such route"})
 
 
+class DoorServer(ThreadingHTTPServer):
+    """The door's HTTP server. A caller that ended its connection is no error of the door's: the hub or an agent's
+    machine that gave up before the answer (Handler.answer), in the middle of its request (Handler.body), or before it
+    sent one, which is a reset while the server reads the request line. socketserver printed a traceback for each one,
+    as the hub's server did 630 times in 30 days (hub.HubServer), and such lines hide the errors that are the door's
+    own. Every other error prints as before, also a connection that a provider reset in the door's own work: that one
+    passes through a route (do_GET, do_POST)."""
+    def handle_error(self, request, client_address):
+        _, error, where = sys.exc_info()
+        if isinstance(error, CallerGone):
+            return
+        if isinstance(error, (BrokenPipeError, ConnectionResetError)) and not any(
+                frame.f_code.co_name in ("do_GET", "do_POST") for frame, _ in traceback.walk_tb(where)):
+            return
+        super().handle_error(request, client_address)
+
+
 def serve(door=None, address=None, port=None):
     door = door or Door()
     Handler.door = door
-    httpd = ThreadingHTTPServer((address or door.conf.get("address"), port or door.conf.get("port", DOOR_PORT)),
-                                Handler)
+    httpd = DoorServer((address or door.conf.get("address"), port or door.conf.get("port", DOOR_PORT)), Handler)
     threading.Thread(target=vault_sweep, args=(door,), daemon=True).start()
     httpd.serve_forever()
 
