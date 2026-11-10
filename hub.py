@@ -23083,9 +23083,10 @@ TOOLS = [
     *[("all", name, {"see_triggers": t_see_triggers, "save_trigger": t_save_trigger,
                      "change_trigger": t_change_trigger}[name], desc, schema) for name, desc, schema in wakeups.TOOL_SPECS],
     ("all", "tell_owner", t_tell_owner,
-     "Send a concise reply to this agent's owner chat. Worker chat replies require in_reply_to from read_messages. "
-     "Task workers still report through their task tools; managers may also post checked results. No notification. "
-     "Plain words: name a task or a duty by what it is about, never by its code (T-61, R-3); a code goes in about.",
+     "Send a reply to this agent's owner chat: the answer first, and a longer reply laid out in Markdown (RULES.md, "
+     "\"What the owner reads has a shape\"). Worker chat replies require in_reply_to from read_messages. Task workers "
+     "still report through their task tools; managers may also post checked results. No notification. Name a task "
+     "or a duty by what it is about, never by its code (T-61, R-3); a code goes in about.",
      S({"text": STR,
         "about": {"type": "string", "description": "What this reply is about, for the owner's own record: the "
                                                    "message you are answering (M-<id>), the goal (G-<id>) and the "
@@ -23096,12 +23097,14 @@ TOOLS = [
        ["text"])),
     ("all", "message_owner", t_message_owner,
      "Write to the owner first, for example the result of work they asked you for, or a question about their own "
-     "request. Keep it short and rare. It goes to the chat app where the owner last wrote to you, else to your own "
+     "request. Keep it rare, with the answer first and a longer message laid out in Markdown (RULES.md, \"What the "
+     "owner reads has a shape\"). It goes to the chat app where the owner last wrote to you, else to your own "
      "WhatsApp number or Discord bot; without one it stays in the app. Answer an owner message with tell_owner "
      "instead. One request_id is one message: the same request_id again sends nothing more. Never put a login in the "
      "text. Name a task or a duty by what it is about, never by its code (T-61, R-3).",
      S({"request_id": REQUEST_ID,
-        "text": {"type": "string", "description": "The message, 1 to 4,000 characters"}}, ["request_id", "text"])),
+        "text": {"type": "string", "description": "The message in Markdown, 1 to 4,000 characters"}},
+       ["request_id", "text"])),
     ("worker", "start_task", t_start_task,
      "Only in your owner chat, and only when the owner asks you in their own words to do work: open it as a task of "
      "your own. It runs in its own task session, with your line as its requester (the manager, or your lead), which "
