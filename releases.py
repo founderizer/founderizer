@@ -35,8 +35,9 @@ restart, after the ref has moved. `Update.schema_check` says the rest.
 **The `hold` flag is the stop button.** The manifest can say that no fleet should take this release, whatever a
 fleet's own settings say. It is signed with everything else, so it cannot be stripped on the way.
 
-**The entitlement is carried, never enforced.** The hub sends it as a bearer to the channel and keeps what comes
-back. Nothing here refuses work when it expires; only our side refuses (PRODUCT.md 4.2).
+**The entitlement is carried, never enforced.** A hub that holds one sends it as a bearer to the channel and keeps
+what comes back. Nothing here refuses work when it expires. A hub with none asks with no Authorization header, and
+the channel answers every fleet (the website's docs/CONTRACTS.md, "A call with no token").
 
 No dependency: a hub is a bare Ubuntu server with python3, git and curl (hub.sh PACKAGES), so the Ed25519
 verification below is the reference implementation of RFC 8032 and nothing else.
@@ -403,7 +404,8 @@ def sign_entitlement(secret, claims):
 
 def _fetch(url, token=None, timeout=CHANNEL_TIMEOUT):
     """(status, body, headers). status 0 and the reason in the body when the channel did not answer. The
-    entitlement goes as a bearer and nothing else of this fleet goes with it."""
+    entitlement goes as a bearer when this fleet holds one, and nothing else of this fleet goes with it; a fleet with
+    none sends no Authorization header."""
     headers = {"Accept": "application/json", "User-Agent": "founderizer-hub"}
     if token:
         headers["Authorization"] = "Bearer " + token
@@ -434,9 +436,9 @@ def latest(channel, keys, token=None, *, fetch=_fetch, timeout=CHANNEL_TIMEOUT, 
     status, body, _headers = fetch(url, token, timeout)
     if status == 0:
         return {"status": 0, "manifest": None, "entitlement": None, "says": "the release channel did not answer: " + body}
-    if status in (401, 403):
+    if status in (401, 403):        # the channel asks for no account: only an older channel or a filter answers so
         return {"status": status, "manifest": None, "entitlement": None,
-                "says": "the release channel refused this fleet's entitlement"}
+                "says": f"the release channel refused this fleet ({status})"}
     if status != 200:
         return {"status": status, "manifest": None, "entitlement": None,
                 "says": f"the release channel answered {status}"}

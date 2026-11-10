@@ -1384,7 +1384,10 @@ def recovery_held(device):
 
 PUSH_ENVIRONMENTS = push.ENVIRONMENTS   # the app's own build: production from TestFlight, development from Xcode
 PUSH_TEXT = 178         # characters of an item's title in a ping: about four lines of a notification
-PUSH_BANNER = "Needs you"   # all that a ping says to a phone that cannot open its sealed part
+# All that a ping says to a phone that cannot open its sealed part, and a rule of the wire: our side's push route takes
+# a ping only when its `aps.alert` is exactly {"title": PUSH_BANNER} (the website's BANNER in src/lib/push.ts, and
+# docs/CONTRACTS.md). A new banner needs that change on the website first.
+PUSH_BANNER = "Needs you"
 # Characters that an answer button shows whole; an item with a longer option opens the app. iOS 27 draws a button
 # title on three lines at most and cuts the rest: on an iPhone 18 Pro, about 70 characters at the default text size
 # and about 60 at extra-extra-large (measured in the simulator, 20 October 2026).
@@ -1392,6 +1395,7 @@ PUSH_BUTTON = 50
 PUSH_KEEP = 86400       # seconds that Apple keeps a ping for a phone that is switched off
 PING_EVERY = 30         # seconds between two looks at the queue when nothing woke the sender
 PING_WAKE = threading.Event()
+_ping_hold = {"until": 0.0}     # no ping goes before this time: our side held one back because a count is full (429)
 
 
 def save_push_token(device, token, environment, seal=None):
@@ -1456,22 +1460,39 @@ def settle_pings():
 
 
 def ping_sender():
-    """The one thread that sends pings: in order, and each one once."""
+    """The one thread that sends pings: in order, and each one once. While our side holds the queue back (send_ping)
+    it looks again when that time ends; a ping that is queued meanwhile wakes it, and it sends nothing before then."""
     while True:
         try:
             while send_ping():
                 pass
         except Exception:
             traceback.print_exc()
-        PING_WAKE.wait(PING_EVERY)
+        PING_WAKE.wait(ping_wait())
         PING_WAKE.clear()
 
 
+def ping_wait():
+    """The seconds until the sender looks at the queue again: PING_EVERY, or less when our side's hold ends sooner."""
+    held = _ping_hold["until"] - now()
+    return min(PING_EVERY, held) if held > 0 else PING_EVERY
+
+
 def send_ping():
-    """Sends the oldest queued ping, through our side with this fleet's entitlement (push.py). False when none
-    waits. Apple's answer decides its state, and a token that Apple calls gone is dropped, so that phone gets no ping
-    until the app gives a new one at its next start. A fleet with no entitlement, or one that our side refuses, sends
-    nothing: the ping fails with the one line that says why."""
+    """Sends the oldest queued ping, through our side (push.py): with this fleet's entitlement as the bearer when it
+    holds one, and with no Authorization header when it does not, because our side's route asks for no account. False
+    when none waits. Apple's answer decides its state, and a token that Apple calls gone is dropped, so that phone gets
+    no ping until the app gives a new one at its next start. A ping that our side refuses fails with the one line that
+    says why.
+
+    A ping that our side held back because a count of its is full (429) is queued again, first of the queue, and no
+    ping goes before the time that our side named (push.PushError.retry_after): our side sent nothing to Apple, so
+    the ping still reaches Apple once at most. It goes again as it was, except that Apple keeps it until PUSH_KEEP
+    after the ping was made, and a ping that would be older than that by then fails with our side's line, at the 429
+    or, after a hub that was down, before it goes. The time is kept in memory only: after a restart the queue asks
+    once more."""
+    if now() < _ping_hold["until"]:
+        return False
     with LOCK:
         row = q1("SELECT * FROM pings WHERE state='queued' ORDER BY id LIMIT 1")
         if not row:
@@ -1480,26 +1501,39 @@ def send_ping():
         need = q1("SELECT * FROM needs WHERE id=?", (row["item"],))
         device = q1("SELECT * FROM owner_device_push WHERE device=?", (row["device"],))
         generation, channel, entitlement = kv_get("db_id"), release_channel(), entitlement_token()
-    state, status, error = "skipped", None, None
+    state, status, error, hold = "skipped", None, None, None
     if not device or row["device"] not in owner_devices():
         error = "the device has no push token now"
     elif not need or row["db"] != generation:
         error = "the item is not in these records"
     elif need["answer"] is not None:
         error = "the item was answered before the ping went"
+    elif row["error"] and now() >= row["created"] + PUSH_KEEP:
+        state, error = "failed", row["error"]       # our side held it back, and its day ended (a hub that was down)
     else:
+        # A ping that our side held back has its line in `error` while it is queued again, and keeps the day from its
+        # making; a first try gets a day from now, as always.
+        expires = (row["created"] if row["error"] else now()) + PUSH_KEEP
         try:
             status, reason = push.send(channel, entitlement, device["token"],
                                        ping_payload(need, generation, device["seal"]), device["environment"],
-                                       collapse=f"need-{need['id']}", expires=now() + PUSH_KEEP)
+                                       collapse=f"need-{need['id']}", expires=expires)
             state, error = ("sent" if status == 200 else "unknown" if status == 0 else "failed"), reason or None
         except push.PushError as e:
-            state, error = "failed", str(e)
+            state, error, hold = "failed", str(e), e.retry_after
+            if hold and now() + hold - row["created"] < PUSH_KEEP:
+                state = "queued"
     with LOCK:
         q("UPDATE pings SET state=?, sent=?, status=?, error=? WHERE id=?", (state, now(), status, error, row["id"]))
         if status == 410 or (status == 400 and error in ("BadDeviceToken", "DeviceTokenNotForTopic")):
             q("DELETE FROM owner_device_push WHERE device=? AND token=?", (row["device"], device["token"]))
-    log("hub", f"ping {row['id']} to {row['device']} for N-{row['item']}: {state}" + (f" ({error})" if error else ""))
+    if hold:
+        # The next ping too. A full count of this caller or of all pings would hold it back as well. A full count of one
+        # phone holds the pings of the other phones back for that time too, push.RETRY_MOST at most: the answer does
+        # not say which count is full, and the hub keeps the pings of every phone in one queue.
+        _ping_hold["until"] = now() + hold
+    log("hub", f"ping {row['id']} to {row['device']} for N-{row['item']}: {state}" + (f" ({error})" if error else "")
+        + (f"; it goes again in {hold} seconds" if state == "queued" else ""))
     return True
 
 
@@ -35176,12 +35210,14 @@ def machine_rows():
 #   - a manifest that does not verify against the key shipped in this checkout is not acted on at all;
 #   - a `hold` in the signed manifest stops every fleet, whatever a fleet's own settings say.
 #
-# The entitlement is carried, never enforced: it goes to the channel as a bearer and whatever comes back is kept.
-# Nothing in this file refuses work when it expires — only our side refuses (4.2).
+# The entitlement is carried, never enforced: when the fleet holds one, it goes to the channel as a bearer and
+# whatever comes back is kept. Nothing in this file refuses work when it expires. A fleet with none asks with no
+# Authorization header, because the channel answers every fleet (the website's docs/CONTRACTS.md, "A call with no
+# token").
 #
 # A fleet takes each release by itself (the owner, 22 October 2026: "do they get the latest updates, improvements
-# and bug fixes automatically? it must be like that!"). An owner who turned that off reaches the channel only when
-# he presses Check or Update, and a fleet with no entitlement does not ask at all, because our side would refuse it.
+# and bug fixes automatically? it must be like that!"), with an entitlement and without one (release_sweep). An owner
+# who turned that off reaches the channel only when they press Check or Update.
 
 RELEASE_POLL = 900              # seconds between automatic polls of the channel
 RELEASE_ROWS = 10               # releases the app reads at once, newest first
@@ -35755,9 +35791,36 @@ def restart_hub_soon(pinned, reached, always=False):
     return argv
 
 
+TEAM_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "team.json")      # main()'s --team
+DB_DEFAULT = os.path.join("~", ".fleet", "pilot.db")                                       # main()'s --db
+
+
+def installed_hub():
+    """True when this process is a hub as hub.sh installs one: its service runs <checkout>/hub.py with no argument,
+    so main() read the team.json of the code's own folder and keeps its records at the default place. Only such a hub
+    takes a release by itself when it holds no entitlement (release_sweep): an update merges into that checkout and
+    restarts the hub onto it. A test's or a scratch hub is not so: selftest.py, each test that starts a hub, a hub
+    that somebody starts by hand with records of its own and the app's fixtures give it a --team or a --db of their
+    own, and a test that imports the hub sets its own or none (kit_dir then gives the code's folder; this does not)."""
+    team, db = CFG.get("team_path"), CFG.get("db_path")
+    if not (team and db):
+        return False
+    return os.path.realpath(os.path.dirname(os.path.abspath(team))) == \
+        os.path.realpath(os.path.dirname(TEAM_DEFAULT)) and \
+        os.path.realpath(os.path.expanduser(db)) == os.path.realpath(os.path.expanduser(DB_DEFAULT))
+
+
 def release_sweep(t0):
-    """The automatic poll, unless the owner turned it off. A fleet with no entitlement is not polled either: our
-    side refuses a fleet that carries none, so asking would only reach the network to be told no.
+    """The automatic poll, unless the owner turned it off. A fleet asks with its entitlement and without one: the
+    channel answers every fleet (the website's docs/CONTRACTS.md, "A call with no token"), and a fleet that holds an
+    entitlement still sends it as the bearer, as before.
+
+    **A fleet with no entitlement asks only when it can take a release by itself**: its hub runs as hub.sh installs
+    it (installed_hub), and its checkout is on the configuration ref, which an update merges into. Until the release
+    that brought this (the owner, 10 November 2026: Founderizer is free, with no account), a fleet with no
+    entitlement did not ask at all, and that also kept each test's and scratch hub with no entitlement off the
+    network: without this condition its first tick would ask founderizer.com. A fleet that holds an entitlement asks
+    as before, whatever its checkout and its records (a fixture that holds one asks too).
 
     **The gate is the sweep's own key, and that is the whole point of `releases_swept`.** This sweep is the only
     thing that ever applies a release by itself, and it reaches `start_release_work` only past the gate. While the
@@ -35771,10 +35834,11 @@ def release_sweep(t0):
 
     Plan P0: the sweep polls also while turns run. A release that no run has tried yet then waits (release_wait),
     and every tick looks for the first moment no turn runs, past the gate, to take it."""
-    if not releases_automatic() or not entitlement_token():
+    token = entitlement_token()
+    if not releases_automatic() or not (token or installed_hub()):
         if release_waiting():
-            kv_set("release_waits", None)       # plan P0: nothing waits while the owner turned it off
-        return
+            kv_set("release_waits", None)       # plan P0: nothing waits while the owner turned it off, or on a hub
+        return                                  # that takes no release by itself (a test's or a scratch hub)
     if release_waiting() and not release_running() and fleet_idle()[0]:
         try:
             start_release_work(True, automatic=True)        # plan P0: the first moment no turn runs takes it
@@ -35784,6 +35848,8 @@ def release_sweep(t0):
     if t0 - float(kv_get("releases_swept") or 0) < RELEASE_POLL:
         return
     kv_set("releases_swept", t0)         # a channel that hangs is not polled again at every tick
+    if not token and config_branch() != CONFIG_BRANCH:
+        return          # no release can be merged into this checkout; the next look is one RELEASE_POLL later
     try:
         start_release_work(True, automatic=True)
     except Refusal:
@@ -42558,8 +42624,8 @@ def main():
     ap = argparse.ArgumentParser(description="Founderizer hub")
     ap.add_argument("--host", help="address to listen on; default: the hub machine's address in team.json")
     ap.add_argument("--port", type=int, help="default: the port in team.json")
-    ap.add_argument("--db", default=os.path.join("~", ".fleet", "pilot.db"), help="where the hub keeps its records")
-    ap.add_argument("--team", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "team.json"))
+    ap.add_argument("--db", default=DB_DEFAULT, help="where the hub keeps its records")
+    ap.add_argument("--team", default=TEAM_DEFAULT)
     ap.add_argument("--silence", type=float, default=180, help="seconds of no activity before the first nudge")
     ap.add_argument("--question-wait", type=float, default=120, help="seconds before a waiting question is chased")
     ap.add_argument("--manager-silence", type=float, default=120, help="not read since plan C10: the manager's flag "
