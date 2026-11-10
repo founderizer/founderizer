@@ -8272,6 +8272,64 @@ def t_door_hold(agent, a):
     return text
 
 
+def t_door_gitops(agent, a):
+    """door_gitops (the manager, DevOps plan X3): team.json door.gitops[repo] = {sync, agents}. The app writes each of
+    these Operators' GitOps target in the door's file, {kind: gitops, sync}: the door reads the repository at HEAD
+    through its filter, commits the listed forms, rolls back, and syncs an app through the caller workflow `sync`, all
+    with its own App. No GitHub grant comes with it, so no token of the agent reads the repository and its committed
+    secrets. agents [] ends it."""
+    import door_targets
+    repo = str(a.get("repo") or "").strip()
+    sync = str(a.get("sync") or "").strip()
+    names = a.get("agents")
+    if not door_targets.REPO.fullmatch(repo):
+        raise ToolError("repo is the GitOps repository as owner/name, for example acme/gitops.")
+    if not door_targets.WORKFLOW_FILE.fullmatch(sync):
+        raise ToolError("sync is the file name of the repository's caller workflow in .github/workflows, for example "
+                        "argocd-sync.yml: the door dispatches it with one input, app.")
+    if not isinstance(names, list) or not all(isinstance(n, str) and n for n in names) or \
+            len(set(names)) != len(names):
+        raise ToolError("agents lists the Operators that get this repository through the door, each once; [] ends it.")
+    unknown = [n for n in names if n not in agents()]
+    if unknown:
+        raise ToolError(f"{', '.join(unknown)}: no agent of this fleet has that name.")
+    why = str(a.get("why") or "").strip()
+    if not why or len(why) > GRANT_WHY_MAX:
+        raise ToolError(f"why is the plan step or the reason, in 1 to {GRANT_WHY_MAX} characters: the record keeps it.")
+    guard(agent, why)
+    command, stored = agent_write(agent, "door_gitops", a, {"repo": repo, "sync": sync, "agents": names, "why": why})
+    if stored:
+        return stored["text"]
+    if not isinstance(TEAM.get("door"), dict) or not TEAM["door"].get("address"):
+        raise ToolError("This fleet has no door, so there is no GitOps target to give.")
+
+    def change(team):
+        door = team.get("door") or {}
+        old = dict(door.get("gitops") or {})
+        new = {k: v for k, v in old.items() if k.lower() != repo.lower()}
+        if names:
+            new[repo] = {"sync": sync, "agents": sorted(names)}
+        if new == old:
+            return False
+        if new:
+            door["gitops"] = dict(sorted(new.items()))
+        else:
+            door.pop("gitops", None)
+        return True
+    who = ", ".join(sorted(names))
+    try:
+        result = save_integration(None, change, f"the door's GitOps target {repo}: {who or 'nobody'} ({why})", by=agent)
+    except Refusal as e:
+        raise ToolError(f"The hub refused it: {e}") from None
+    text = (f"{who} {'gets' if len(names) == 1 else 'get'} {repo} through the door: reads through its filter, commits "
+            f"of the listed forms, rollbacks, and syncs through {sync}." if names else
+            f"Nobody gets {repo} through the door now.") + ("" if result["changed"] else " It was so already.") + \
+        " This Mac's app writes the door's file at its next round."
+    with transaction():
+        keep_command(command, {"text": text}, now())
+    return text
+
+
 def secret_site_host(site):
     """The host of a request's address, for its title: "dashboard.stripe.com" of "https://dashboard.stripe.com/login".
     It keeps the subdomain, because that is the page the owner will recognise."""
@@ -22645,6 +22703,21 @@ TOOLS = [
                  "description": "parts, judged, or none to end the hold"},
         "why": {"type": "string", "description": "The plan step that it waits for, or the reason, in a line"}},
        ["request_id", "host", "hold", "why"])),
+    ("manager", "door_gitops", t_door_gitops,
+     "Give Operators a business's GitOps repository through the door, or end it. The door then reads it at HEAD "
+     "through its filter (never a Secret, _config/ or a path of the exposure register), commits a checked image tag or "
+     "digest, a replica count or a restart annotation as rule calls, rolls back to the last good digest, and syncs an "
+     "app through the repository's caller workflow, which it dispatches with its own App. No GitHub grant comes with "
+     "it, so no token of the agent reads the repository: give a GitOps repository this way, never with grant_access. "
+     "Call it again with the whole list of agents to change it; agents [] ends it.",
+     S({"request_id": REQUEST_ID,
+        "repo": {"type": "string", "description": "The GitOps repository, owner/name"},
+        "sync": {"type": "string", "description": "The file name of its caller workflow in .github/workflows, which "
+                                                  "takes one input, app"},
+        "agents": {"type": "array", "items": {"type": "string"},
+                   "description": "Every Operator that gets the repository through the door; [] ends it"},
+        "why": {"type": "string", "description": "The plan step, or the reason, in a line"}},
+       ["request_id", "repo", "sync", "agents", "why"])),
     ("manager", "request_secret", t_request_secret,
      "Ask the owner for a secret that the fleet does not hold: an API key or a login. It is a Needs-you item that they "
      "answer in a secure form in Founderizer on their Mac, so the value goes straight into the vault and never "
@@ -30865,6 +30938,11 @@ def renamed_team(team, old, new):
     for account in (out.get("chat_apps") or {}).values():
         if isinstance(account, dict) and isinstance(account.get("agents"), list):
             account["agents"] = [new if name == old else name for name in account["agents"]]
+    # the door's lists of agents, which validate_door checks against the agents: a key's users and a GitOps target's
+    door = out.get("door") if isinstance(out.get("door"), dict) else {}
+    for entry in list((door.get("credentials") or {}).values()) + list((door.get("gitops") or {}).values()):
+        if isinstance(entry, dict) and isinstance(entry.get("agents"), list):
+            entry["agents"] = [new if name == old else name for name in entry["agents"]]
     return out
 
 
@@ -32704,14 +32782,24 @@ def validate_door(team):
     if door is None:
         return
     if not isinstance(door, dict) or \
-            set(door) - {"address", "port", "secrets", "credentials", "github_apps", "rollout", "holds"}:
-        raise ValueError("door must be {address, port, secrets, credentials, github_apps, rollout, holds}")
+            set(door) - {"address", "port", "secrets", "credentials", "github_apps", "rollout", "holds", "gitops"}:
+        raise ValueError("door must be {address, port, secrets, credentials, github_apps, rollout, holds, gitops}")
     if not isinstance(door.get("rollout", False), bool):
         raise ValueError("door.rollout is true or false: the manager's door_rollout sets it")
     holds = door.get("holds", {})
     if not isinstance(holds, dict) or not all(isinstance(k, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", k) and
                                               v in DOOR_HOLDS for k, v in holds.items()):
         raise ValueError(f"door.holds maps a server's name to {' or '.join(DOOR_HOLDS)}: the manager's door_hold sets it")
+    import door_targets
+    gitops = door.get("gitops", {})
+    if not isinstance(gitops, dict) or not all(
+            isinstance(k, str) and door_targets.REPO.fullmatch(k) and isinstance(v, dict) and
+            set(v) == {"sync", "agents"} and isinstance(v["sync"], str) and
+            door_targets.WORKFLOW_FILE.fullmatch(v["sync"]) and isinstance(v["agents"], list) and v["agents"] and
+            len(set(v["agents"])) == len(v["agents"]) and all(u in (team.get("agents") or {}) for u in v["agents"])
+            for k, v in gitops.items()):
+        raise ValueError("door.gitops maps a GitOps repository to its caller workflow (sync) and the agents that get "
+                         "it: the manager's door_gitops sets it")
     apps = door.get("github_apps", {})
     if not isinstance(apps, dict) or not all(
             isinstance(k, str) and GITHUB_LOGIN.fullmatch(k) and k == k.lower() and isinstance(v, str) and
@@ -32858,7 +32946,11 @@ def door_view():
             "rollout": door.get("rollout") is True,
             # N8 (b): the servers that a plan step holds, from the manager's door_hold: parts (none, and no grant) or
             # judged (the door's file holds them as rule-only, so the door runs no judged call there)
-            "holds": dict(sorted((door.get("holds") or {}).items()))}
+            "holds": dict(sorted((door.get("holds") or {}).items())),
+            # DevOps plan X3: the GitOps repositories, from the manager's door_gitops: {sync, agents}, which the app
+            # writes as each agent's target {kind: gitops, sync}
+            "gitops": {repo: {"sync": g["sync"], "agents": list(g["agents"])}
+                       for repo, g in sorted((door.get("gitops") or {}).items())}}
 
 
 DOOR_PENDING = {}   # {request_id: (token, record)} of one POST /ui/door/secrets: in memory only, never in a record

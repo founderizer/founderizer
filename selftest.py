@@ -91,6 +91,8 @@ MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "an
                                "update_goal", "record_spend", "raise_needs_you", "withdraw_need", "discuss_need", "request_secret",
                                # new-projects plan N8 (b): the door's parts on the servers after the first one
                                "door_rollout", "door_hold",
+                               # DevOps plan X3: a GitOps repository through the door
+                               "door_gitops",
                                "tell_owner",
                                "message_owner", "grant_access",
                                "set_duty", "change_duty", "see_history", "decide_report",

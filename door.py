@@ -268,6 +268,11 @@ def validate_access(data):
             if not door_targets.REPO.fullmatch(repo) or not isinstance(entry, dict) or \
                     entry.get("kind") not in ("devops", "app", "gitops"):
                 raise ValueError(f"agent {name}: repos[{repo!r}] needs a kind, devops, app or gitops")
+            # the sync caller goes into a dispatch's path, so it is one file name of a GitOps target, nothing else
+            if "sync" in entry and (entry["kind"] != "gitops" or not isinstance(entry["sync"], str) or
+                                    not door_targets.WORKFLOW_FILE.fullmatch(entry["sync"])):
+                raise ValueError(f"agent {name}: repos[{repo!r}].sync is the file name of a GitOps target's caller "
+                                 f"workflow")
         for repo, level in (a.get("github") or {}).items():
             if not door_targets.REPO.fullmatch(repo) or level not in GITHUB_ACCESS:
                 raise ValueError(f"agent {name}: github[{repo!r}] is read, write or deploy")

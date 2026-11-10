@@ -218,6 +218,8 @@ def decide_host(access, agent, me, host, op, args, never, content=None, lookups=
 # pull_request_target or workflow_run. With these checks, such a commit is a rule call.
 
 WORKFLOW = re.compile(r"\.github/workflows/[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.ya?ml")
+# The file name alone, as a dispatch names it: a GitOps target's caller workflow (`sync`, DevOps plan X3)
+WORKFLOW_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.ya?ml")
 DEPLOY_PATH = ".github/workflows/deploy.yml"
 ARTIFACT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 GITHUB_RUNNERS = ("ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04")
