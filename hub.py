@@ -35718,8 +35718,8 @@ class Handler(BaseHTTPRequestHandler):
           themselves, so the helpers and owner_mcp.py read what they always read;
         - a small answer, an answer that is not 200, and a HEAD, which sends no body;
         - an answer that a route writes while it holds LOCK, because the work would hold every other caller of the
-          hub. The one large answer of that kind is the frame of a task's screen: a JPEG in base64, which gzip
-          makes only 23% smaller;
+          hub. In the owner API those are refusals and short receipts. The frame of a task's screen was the one
+          large answer of that kind; its route sends it after the lock now (ui_desktop), so it goes compressed;
         - every route outside the owner API. The Mac's vault helper reads /helper/vault with URLSession, which asks
           for gzip, and an agent's session calls /mcp with the HTTP client of its runtime (measured on 10 November
           2026: Claude Code 2.1.312 asks for `identity`, Codex 0.163 sends no Accept-Encoding). What those read
@@ -39715,18 +39715,35 @@ class Handler(BaseHTTPRequestHandler):
         return task, key
 
     def ui_desktop(self, task_id, query):
+        """GET /ui/tasks/<id>/desktop: the frame of a task's screen, which the owner's app reads each second while the
+        owner watches. The answer is made under the lock and sent after it.
+
+        A frame is a JPEG of up to 1 MiB in base64, and the write of an answer ends only when the kernel has room for
+        all of its bytes, which it gets at the pace of the reader. Until 10 November 2026 that write was inside the
+        lock, so every other caller of the hub (the helpers, the agents' tools, the tick) waited for one reader's
+        transfer. Measured that day on Linux with a round trip of 60 ms, as the owner's Mac has: a caller that came
+        during a read waited up to 0.18 s for a frame of 100 KB, and up to 0.34 s for one of 1 MiB. The hub sets no
+        time-out on its sockets, so a reader that stopped reading held the lock until its connection ended. The frame
+        that the answer carries is the one that the hub held when it checked the task, in the same hold of the lock:
+        a text that nothing changes, so a newer frame of the worker does not touch it.
+
+        Outside the lock the answer also goes compressed to a client that asks (json). 11 screenshots from task
+        outputs, encoded again at the worker's settings (JPEG quality 0.6, at most 1,280 pixels wide: 23 to 126 KB),
+        became 58% of their size together, in less than 3 ms each on an M4 Max. On that path a read of one took
+        0.18 s where it took 0.24 s, at the mean: one or two round trips less for 9 of the 11."""
         if not self.ui_allowed():
             return
         try:
             with LOCK:
                 task, key = self.desktop_task("T-" + task_id, query.get("db"), query.get("attempt"))
-                frame = DESKTOP.view(key, now())
-                return self.json(200, dict(db=key[0], task=task["id"], attempt=task["attempt"], **frame),
-                                 {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+                answer = dict(db=key[0], task=task["id"], attempt=task["attempt"], **DESKTOP.view(key, now()))
         except ToolError as e:
             return self.json(409, {"error": str(e)})
+        return self.json(200, answer, {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
     def helper_desktop(self, agent, task_id, data, write=False):
+        """GET and POST /helper/desktop/<agent>/T-<id>: the worker asks if somebody watches its task, and sends a
+        frame. The answer goes out after the lock, as the owner's does (ui_desktop)."""
         if agent not in agents() or not address_of(agent):
             return self.json(403, {"error": "worker address is not configured"})
         if not self.allowed(agent):
@@ -39736,11 +39753,12 @@ class Handler(BaseHTTPRequestHandler):
                 task, key = self.desktop_task(task_id, data.get("generation"), data.get("attempt"), agent)
                 if write:
                     DESKTOP.put(key, data.get("frame", {}), now())
-                return self.json(200, {"watching": DESKTOP.watching(key, now())}, {"Cache-Control": "no-store"})
+                watching = DESKTOP.watching(key, now())
         except ToolError as e:
             return self.json(409, {"error": str(e)})
         except (ValueError, TypeError, KeyError):
             return self.json(400, {"error": "invalid desktop frame"})
+        return self.json(200, {"watching": watching}, {"Cache-Control": "no-store"})
 
     def body(self):
         return self._raw
