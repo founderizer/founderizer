@@ -39884,16 +39884,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def helper_conversation_start(self, agent, cid):
         """POST /helper/conversations/<agent>/<id>/start: the helper asks for everything that the locked window C-<id>
-        needs (CHAT-APPS.md 9.4). It answers with a credential that works for this one conversation."""
+        needs (CHAT-APPS.md 9.4). It answers with a credential that works for this one conversation. The answer is
+        made under the lock and sent after it, as the frame of a task's screen is (ui_desktop).
+
+        The prompt of a closed window carries the last messages of its conversation, up to CONVERSATION_PROMPT_MAX
+        characters, and json.dumps writes each character that is not ASCII as 6 bytes or more: a full recap in Russian
+        made an answer of 72 KB, and one in Chinese 83 KB. The write of an answer ends only when the kernel has room
+        for all of its bytes, and it gets that room at the pace of the reader. Measured on 10 November 2026 on Linux
+        with a round trip of 60 ms, as the owner's Mac has: a new connection took an answer of 36 KB at once, and an
+        answer of 46 KB waited one round trip. While the write was inside the lock, a start held the lock 0.07 s
+        (72 KB) and 0.13 s (83 KB), and 3.2 to 3.4 s with a reader that took no bytes for 2 s. The hub sets no time-out
+        on its sockets, so a reader that stopped reading held the lock until its connection ended. The answer holds
+        nothing that another thread changes: strings, and lists and dicts that conversation_start makes new."""
         if agent not in agents():
             return self.json(404, {"error": "unknown agent"})
         if not self.allowed(agent):
             return
-        with LOCK:
-            try:
-                return self.json(200, conversation_start(agent, cid), {"Cache-Control": "no-store"})
-            except Refusal as e:
-                return self.json(e.status, {"error": str(e)})
+        try:
+            with LOCK:
+                answer = conversation_start(agent, cid)
+        except Refusal as e:
+            return self.json(e.status, {"error": str(e)})
+        return self.json(200, answer, {"Cache-Control": "no-store"})
 
     def ui_people_handle(self):
         """POST /ui/people/handles: remove one owner handle."""
