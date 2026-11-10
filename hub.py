@@ -1515,7 +1515,7 @@ def mobile_agent(name, config):
             "open_tasks": q1("SELECT COUNT(*) n FROM tasks WHERE owner=? AND state NOT IN "
                              "('completed','failed','rejected','canceled')", (name,))["n"],
             "limit": dict(since=lim["since"], until=lim["until"], reset_known=bool(lim["reset_known"])) if lim else None,
-            "usage": windows,
+            "usage": windows, "turn_ended_after": turn_ended_after(name),
             "last": {"ts": last["created"], "side": last["side"], "preview": (last["text"] or "")[:MOBILE_PREVIEW]}
             if last else None}
 
@@ -2983,6 +2983,23 @@ def turn_ended(agent):
     helper_turn), or 0 before the first. A read that commits nothing."""
     row = read_row("SELECT v FROM kv WHERE k=?", (f"turn_ended:{agent}",))
     return float(row["v"]) if row else 0.0
+
+
+def turn_ended_after(agent, ended=None):
+    """When the owner sent the newest chat message that this agent had read at the last turn end of its standing
+    session, or None: its helper reported no turn end (only the manager's reports them, helper_turn), or it had read no
+    chat message of the owner's by then. The turn that took a message sent at or before this time is over, so the apps
+    stop saying that the agent works on that message: a message that asked the manager for no answer stood under
+    "Thinking" for more than an hour after its turn of 20 seconds (10 November 2026). A later turn can still answer
+    it; nothing says that one runs. None too while a usage limit holds the agent: a turn that the limit cut ends as
+    every turn does, with its work not done, so its end says nothing, and the apps go on saying "Usage limit" under
+    the message. `ended` asks the same of a turn end that is not kept yet. A read that commits nothing."""
+    ended = turn_ended(agent) if ended is None else ended
+    if not ended or read_row("SELECT 1 FROM agent_limits WHERE agent=? AND ended IS NULL LIMIT 1", (agent,)):
+        return None
+    row = read_row("SELECT MAX(u.created) AS created FROM ui_requests u JOIN events e ON e.id=u.event_id "
+                   "WHERE u.recipient=? AND u.kind='message' AND e.read_at<=?", (agent, ended))
+    return row["created"] if row else None
 
 
 def not_acting(receiver, event_id):
@@ -35928,6 +35945,9 @@ class Handler(BaseHTTPRequestHandler):
                     # Owner feature manager_server: false while it has no server of its own, so the app's setup of
                     # a new fleet's manager starts with its server.
                     placed=not unplaced(name),
+                    # When the owner sent the newest chat message that it had read at its last turn end: its turn that
+                    # took a message up to then is over, so the chat stops saying that it works on it (turn_ended_after).
+                    turn_ended_after=turn_ended_after(name),
                     limit=dict(since=lim["since"], until=lim["until"], reset_known=bool(lim["reset_known"]),
                                task=lim["task"]) if lim else None, **(dict(row) if row else
                     dict(last_seen=None, alive=None, alive_ts=None, client=None, client_seen=None))))
@@ -41520,7 +41540,10 @@ class Handler(BaseHTTPRequestHandler):
     def helper_turn(self, agent):
         """The turn starts and ends of the manager's own session, with no content (plan C1): the newest of each in one
         batch of its records. The hub keeps the newest of each, never one later than its own clock, so a helper that
-        reads the whole transcript again after a restart moves nothing back. No screen shows them."""
+        reads the whole transcript again after a restart moves nothing back. No screen shows them, but one reads a
+        turn end: the first one after the manager read a chat message of the owner's is where the apps stop saying
+        that it works on that message (turn_ended_after), so that one counts as a change the owner sees. Every other
+        mark stays quiet."""
         if agent not in agents():
             return self.json(404, {"error": "unknown agent"})
         if not self.allowed(agent):
@@ -41531,9 +41554,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(400, {"error": "started or ended must be a time in seconds"})
         t0 = now()
         with LOCK, area("quiet"):
+            end = None if marks["ended"] is None else min(marks["ended"], t0)
+            news = end is not None and end > turn_ended(agent) and \
+                turn_ended_after(agent, end) != turn_ended_after(agent)
             for k, v in marks.items():
                 if v is not None and min(v, t0) > float(kv_get(f"turn_{k}:{agent}") or 0):
-                    kv_set(f"turn_{k}:{agent}", min(v, t0))
+                    with area("state" if news and k == "ended" else "quiet"):
+                        kv_set(f"turn_{k}:{agent}", min(v, t0))
         return self.json(200, {"ok": True})
 
     def helper_presence(self, agent):
