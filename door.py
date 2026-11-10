@@ -114,6 +114,8 @@ REBOOT_BACK = 900           # seconds a reboot-class call holds its business whi
 BODY_MAX = 512 * 1024
 RECORD_PAGE = 500
 GITHUB_REACH_PAGES = 30     # pages of 100 repositories that the door reads of one installation, at most
+# The permissions of an agent's token at each grant level. A read or write token also gets actions: read where the
+# installation holds Actions (token_permissions).
 GITHUB_ACCESS = {"read": {"contents": "read", "pull_requests": "read", "metadata": "read"},
                  "write": {"contents": "write", "pull_requests": "write", "metadata": "read"},
                  "deploy": {"contents": "write", "pull_requests": "write", "metadata": "read",
@@ -897,7 +899,9 @@ class Door:
         errors += [{"repos": [r], "error": "the door made this repository: it makes no deploy token on it, and no write "
                                           "token for an Operator, whose workflow files there go through the door"}
                    for r in kept]
-        for (owner, level), names in sorted(groups.items()):
+        # the highest level first, as the hub's own path sends them: the session's GH_TOKEN is the first token
+        # (fleet.py integration_env), so gh and the GitHub tool get the token that does the most
+        for (owner, level), names in sorted(groups.items(), key=lambda g: (-levels.index(g[0][1]), g[0][0])):
             conf = github_app(access, owner) or sole_app(access) or {}
             try:
                 ctx = {"credentials": dict(conf, owner=owner), "http": self.http, "secret": self.secret}
@@ -918,7 +922,8 @@ class Door:
                                         {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json",
                                          "Content-Type": "application/json"},
                                         json.dumps({"repositories": [n.split("/", 1)[1] for n in names],
-                                                    "permissions": GITHUB_ACCESS[level]}).encode())
+                                                    "permissions": token_permissions(
+                                                        level, inst.get("permissions"))}).encode())
                 if status != 201 or not isinstance(got.get("token"), str):
                     raise door_providers.Stop(f"GitHub gave no token ({status})")
                 tokens.append({"token": got["token"], "expires_at": got.get("expires_at"), "access": level,
@@ -1249,6 +1254,19 @@ def sole_app(access):
     apps = {(str(c.get("app_id")), c.get("secret")): c for k, c in (access.get("credentials") or {}).items()
             if k.lower().startswith("github:") and isinstance(c, dict) and c.get("app_id")}
     return next(iter(apps.values())) if len(apps) == 1 else None
+
+
+def token_permissions(level, held):
+    """The permissions of an agent's token at this level, from an installation that holds `held` (its own
+    permissions, as GitHub gives them with the installation): GITHUB_ACCESS of the level, and for read and write also
+    actions: read where the installation holds Actions, so that the agent can read the runs of GitHub Actions and
+    show that CI passed (10 November 2026: a write token got 404 on a repository's runs). GitHub refuses the whole
+    token (422) when it asks for a permission that the installation does not hold, and an older App can lack Actions,
+    so where the installation does not name Actions the token is exactly GITHUB_ACCESS of the level."""
+    asked = dict(GITHUB_ACCESS[level])
+    if level in ("read", "write") and isinstance(held, dict) and held.get("actions") in ("read", "write"):
+        asked["actions"] = "read"
+    return asked
 
 
 def judge_text(d, content):
