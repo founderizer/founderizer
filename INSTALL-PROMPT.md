@@ -64,7 +64,8 @@ about to do, and why you did not.
 - **Touch no fleet that is already running.** Do not restart, reload, deploy or update a hub or a
   server that is not the one you are installing now.
 - **`--reclaim` only when the owner asks for it in this conversation.** It opens a new owner claim
-  on a hub that already has an owner.
+  on a hub that already has an owner, and that hub is away for the time of the claim: the
+  installer stops its service and starts it again by itself.
 - **Claim no subscription.** The install makes this fleet's own id and stops there. The app is the
   one caller of the claim, and a claim key works once, so a claim of yours would leave the owner
   with a key that has to be re-issued. Never call our website, and never send the fleet id

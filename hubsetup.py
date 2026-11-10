@@ -10,7 +10,9 @@ Standard library only, and it reads no credential of a model provider.
     python3 hubsetup.py claim --address IP --out PATH [--port N] [--timezone Z] [--wait S] [--reclaim] [--commit]
                               [--manager-later]
                                                     the owner claim, then write team.json, and commit it on the ref;
-                                                    --manager-later: the app gives the manager a server of its own
+                                                    --manager-later: the app gives the manager a server of its own;
+                                                    --reclaim: a new owner for a hub that has one; a hub that runs
+                                                    is stopped for the time of the claim and started again
     python3 hubsetup.py runtime --runtime claude|codex
                                                     install the runtime of an agent of this machine, so that the owner
                                                     can sign in to their own account from the app (it signs in to
@@ -53,12 +55,18 @@ before the hub exists. It keeps only the code's SHA-256, never writes the code a
 stops as soon as it has the address. The script it serves at GET /claim then waits for the hub itself on the same
 port and prints the address to paste in Founderizer, so the final check is made from the owner's own machine.
 
+A second claim (`--reclaim`: the owner's Mac is lost, or it has a new address) finds a hub that runs, and that hub
+holds the address and port. So the claim stops the hub's own service for its time and starts it again in every case
+(HubPause). The hub reads team.json at that start: from then on it serves the owner's pages to the new address and
+refuses the one from before.
+
 This program never signs in to Claude, Codex or Grok, never reads or writes a provider credential, and never makes
 a vault entry. The customer signs in to their own account in their own session; `"vault": "none"` in the template
 says that the manager holds no credential of ours.
 """
 import argparse
 import base64
+import errno
 import glob
 import hashlib
 import http.server
@@ -71,11 +79,14 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
+import socket
 import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -90,6 +101,10 @@ KIT = os.path.dirname(os.path.abspath(__file__))
 CODE_LENGTH = 12                # hub.LINK_ALPHABET: 12 characters, 60 bits, as a join code
 CLAIM_TRIES = hub.JOIN_TRIES    # wrong codes from one address; then the claim refuses that address
 CLAIM_LIFE = hub.JOIN_LIFE      # seconds the claim waits for the owner's Mac
+HUB_SERVICE = "fleet-hub.service"   # the hub, as `fleet.py service hub` installs it: a user service of the hub's user
+PORT_TRIES = 20                 # readings of the hub's port, a second apart, after a claim stopped the hub's service
+BACK_TRIES = 60                 # readings of GET /health, a second apart, after a claim started that service again
+CLAIM_ENDS = ("SIGHUP", "SIGTERM")  # what ends a claim from outside: a terminal that closed, and a kill
 # The manager's start policy, as team.json has it on the pilot hub, and a worker's or a lead's for the first one of a
 # fleet, where the hub has no other worker to copy from (hub.py `server_agent_entry`). Both are that runtime's own
 # entry of the runtime table (lifecycle.RUNTIMES "manager_access" and "first_worker"), so the installer writes the
@@ -98,6 +113,7 @@ CLAIM_LIFE = hub.JOIN_LIFE      # seconds the claim waits for the owner's Mac
 STARTS = {name: e["manager_access"]["start"] for name, e in lifecycle.RUNTIMES.items() if e["manager_access"]}
 WORKER_STARTS = {name: e["first_worker"] for name, e in lifecycle.RUNTIMES.items() if e["first_worker"]}
 FIRST_COMMIT = "The first team.json of this hub: one manager, and the owner's own Mac"
+OWNER_COMMIT = "The owner of this hub is another Mac: a second owner claim, made on the hub's own server"
 # One OS user for each agent (PRODUCT.md P2), in this one place: both installers call the command that uses it, so
 # no second copy of the name can drift from it. The agent's name comes from the hub's own pattern.
 AGENT_USER = "fleet-%s"
@@ -1713,10 +1729,17 @@ class ClaimServer(http.server.HTTPServer):
     """One request at a time, on purpose: the claim takes one code once, and handle_request must have written the
     answer before the listener closes, because the owner's script waits for it."""
 
-    def __init__(self, where, hub_ip, port, digest):
-        self.hub_ip, self.hub_port, self.digest = hub_ip, port, digest
+    def __init__(self, where, hub_ip, port, digest, away=False):
+        self.hub_ip, self.hub_port, self.digest, self.away = hub_ip, port, digest, away
         self.owner, self.wrong = None, {}
         super().__init__(where, ClaimHandler)
+
+    def handle_error(self, request, client_address):
+        """A caller that went away, or that the listener cut off (ClaimHandler.cut), is no error of the claim's. Any
+        other error prints as before."""
+        if isinstance(sys.exc_info()[1], OSError):
+            return
+        super().handle_error(request, client_address)
 
 
 class ClaimHandler(http.server.BaseHTTPRequestHandler):
@@ -1724,7 +1747,30 @@ class ClaimHandler(http.server.BaseHTTPRequestHandler):
     and the code is never written to the output."""
     server_version = "fleet-hubsetup/1"
     protocol_version = "HTTP/1.0"
-    timeout = 20                # a connection that says nothing cannot hold the claim
+    timeout = 20                # a connection cannot hold the claim for longer, whatever it sends or does not send
+
+    def setup(self):
+        """One connection gets `timeout` seconds in all, and not only for each read. The listener takes one request at
+        a time, so a caller that sent one byte now and then held it for as long as it liked: past the time of the
+        claim, which is read between two requests, and with it a hub that the claim stopped (HubPause). Each machine
+        of the private network can open that connection, a lost Mac too."""
+        super().setup()
+        self.limit = threading.Timer(self.timeout, self.cut)
+        self.limit.daemon = True
+        self.limit.start()
+
+    def cut(self):
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)      # a read that waits ends at once, and the request with it
+        except OSError:
+            pass
+
+    def finish(self):
+        self.limit.cancel()
+        try:
+            super().finish()
+        except OSError:
+            pass                # the caller is gone, or cut off: there is nobody to answer
 
     def log_message(self, *_args):
         return          # a request line can hold a code: this listener writes none
@@ -1737,15 +1783,28 @@ class ClaimHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def elsewhere(self):
+        """A request that is not the claim. On a new hub nothing else comes, and it gets 404. A second claim stands
+        on the port of a hub that has a fleet (`away`), and every machine and agent of that fleet calls it meanwhile.
+        They read 404 as a hub that does not have this route yet, or as a thing that is gone: a session then starts
+        without its credential or its tokens and says nothing, a server's job is given up, a record is dropped
+        (fleet.py `session_credential` and `session_env`, server.py `Gone`). 503 is to them a hub that does not
+        answer: a helper tries again, a session does not start or says what it did not get, and a server's job that
+        needs the hub fails with its reason after three tries."""
+        if self.server.away:
+            return self.text(503, "Founderizer: the hub is away for an owner claim on its own server. It answers "
+                                  "again when the claim ends.\n")
+        self.text(404, "Founderizer: this is the hub installer, and it serves only the claim.\n")
+
     def do_GET(self):
         if self.path.split("?")[0] != "/claim":
-            return self.text(404, "Founderizer: this is the hub installer, and it serves only the claim.\n")
+            return self.elsewhere()
         self.text(200, claim_script(self.server.hub_ip, self.server.hub_port))
 
     def do_POST(self):
         src = self.client_address[0]
         if self.path.split("?")[0] != "/claim":
-            return self.text(404, "Founderizer: this is the hub installer, and it serves only the claim.\n")
+            return self.elsewhere()
         if self.server.owner is not None:
             return self.text(410, "Founderizer: this claim code was used. The hub has its owner.\n")
         if src == self.server.hub_ip:
@@ -1765,15 +1824,18 @@ class ClaimHandler(http.server.BaseHTTPRequestHandler):
                        f"http://{self.server.hub_ip}:{self.server.hub_port}\n")
 
 
-def claim(hub_ip, port, wait=CLAIM_LIFE, where=None):
+def claim(hub_ip, port, wait=CLAIM_LIFE, where=None, away=False):
     """Make a one-time code, print the line for the owner's Mac, and serve the claim until that Mac sends the code
-    back. Returns the address of the call that sent it. The code is kept only as its SHA-256."""
+    back. Returns the address of the call that sent it. The code is kept only as its SHA-256. away: this is a second
+    claim, on the port of a hub that has a fleet, and that fleet's calls get 503 meanwhile (ClaimHandler.elsewhere)."""
     raw, code = new_code()
-    server = ClaimServer(where or (hub_ip, int(port)), hub_ip, int(port), hashlib.sha256(raw.encode()).hexdigest())
+    server = ClaimServer(where or (hub_ip, int(port)), hub_ip, int(port), hashlib.sha256(raw.encode()).hexdigest(),
+                         away)
     del raw
-    bound = server.hub_port = server.server_address[1]      # in a test the listener takes a free port
-    say(f"the owner claim is open on http://{hub_ip}:{bound} for {int(wait / 60)} minutes.")
-    print(f"""
+    try:
+        bound = server.hub_port = server.server_address[1]      # in a test the listener takes a free port
+        say(f"the owner claim is open on http://{hub_ip}:{bound} for {int(wait / 60)} minutes.")
+        print(f"""
     Paste this line in Terminal on the Mac that will own this fleet:
 
         FLEET_CLAIM={code} sh -c "$(curl -fsS http://{hub_ip}:{bound}/claim)"
@@ -1781,12 +1843,15 @@ def claim(hub_ip, port, wait=CLAIM_LIFE, where=None):
     That Mac must be on this fleet's private network (Tailscale). The line proves its address, so the hub serves the
     owner's pages to it and to nothing else. Waiting.
 """, flush=True)
-    server.timeout = 1
-    deadline = time.monotonic() + wait
-    while server.owner is None and time.monotonic() < deadline:
-        server.handle_request()
+        server.timeout = 1
+        deadline = time.monotonic() + wait
+        while server.owner is None and time.monotonic() < deadline:
+            server.handle_request()
+    finally:
+        # However the claim ends, also when it is ended from outside: a hub that this claim stopped (HubPause) starts
+        # on this address and port next, and a listener that is still open here would refuse it its port.
+        server.server_close()
     owner = server.owner
-    server.server_close()
     if owner is None:
         raise Stop(f"no Mac claimed this hub in {int(wait / 60)} minutes, so nothing was written. Run the installer "
                    f"again; it makes a new code.")
@@ -1795,6 +1860,307 @@ def claim(hub_ip, port, wait=CLAIM_LIFE, where=None):
             f"owner, but check that the app reaches the hub over the private network.")
     say(f"the owner of this hub is the Mac at {owner}.")
     return owner
+
+
+def own_user():
+    """The name of the user that runs this program, or its number when the system has no name for it."""
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        return str(os.getuid())
+
+
+def service_call(word):
+    """The command `systemctl --user <word> fleet-hub.service` and its environment, for the user that runs this
+    program. The hub is a user service of the hub's own user (fleet.py `service hub`), and XDG_RUNTIME_DIR is how
+    systemctl finds that user's service manager. It is this user's own folder in every case, as hub.sh's as_user
+    gives it: `runuser -u fleet --` from a root login keeps root's value, /run/user/0, which this user cannot open,
+    and the hub's service then reads as not active."""
+    return ["systemctl", "--user", word, HUB_SERVICE], dict(os.environ, XDG_RUNTIME_DIR=f"/run/user/{os.getuid()}")
+
+
+def hub_service(word, wait=60):
+    """`systemctl --user <word> fleet-hub.service` (service_call): (exit code, what it said)."""
+    argv, env = service_call(word)
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=wait, env=env)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+    return done.returncode, " ".join(((done.stdout or "") + " " + (done.stderr or "")).split())
+
+
+def port_taken(hub_ip, port):
+    """True when a listener holds this address and port, so that the claim's own listener cannot open there."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)     # as the claim's own listener binds
+        probe.bind((hub_ip, int(port)))
+    except OSError as e:
+        return e.errno == errno.EADDRINUSE
+    finally:
+        probe.close()
+    return False
+
+
+def ref_tip(kit):
+    """The commit at the tip of the configuration ref in the hub's own repository, read there and not from the
+    checkout's copy of it; "" when it cannot be read."""
+    code, out, _err = git("ls-remote", "origin", f"refs/heads/{hub.CONFIG_BRANCH}", folder=kit)
+    return out.split()[0] if code == 0 and out.split() else ""
+
+
+def ref_ahead(kit):
+    """True when the configuration ref of the hub's own repository holds a commit that the hub's checkout `kit` does
+    not have. The hub pushes each write of its own, and each release, to that ref before it moves its checkout, so
+    this is a hub in the middle of one. A commit of team.json on such a checkout cannot be pushed, and the hub then
+    refuses every write (hub.commit_kit_file: "lacks commits that the hub has"). False when the ref cannot be read:
+    a folder that is no checkout says so at its commit."""
+    tip = ref_tip(kit)
+    return bool(tip) and git("merge-base", "--is-ancestor", tip, "HEAD", folder=kit)[0] != 0
+
+
+def team_fault(path):
+    """Why the team.json at `path` is not one the hub can run, for the line that says so; "" when it is one."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            hub.validate_team(json.load(f))
+    except (OSError, ValueError) as e:
+        return str(e)
+    return ""
+
+
+def take_back(kit, head):
+    """A second claim that failed between its write of team.json and its push leaves the hub's checkout as it found
+    it, at the commit `head`: a commit that it made and could not push comes off the branch, and team.json is the
+    file of `head` again. The hub then starts on what it ran before, and it can write. With team.json changed and not
+    committed, or with a commit that its ref does not have, it refuses every write from then on (hub.commit_kit_file).
+    Nothing but team.json is touched. A commit that did reach the ref stays: that write is whole, and what failed
+    came after it."""
+    now, fault = git("rev-parse", "HEAD", folder=kit)[1], ""
+    if now != head:
+        if ref_tip(kit) == now:
+            return
+        code, _out, err = git("reset", "-q", "--soft", head, folder=kit)
+        if code != 0:
+            fault = (f"the commit that the claim made and could not push is still on the branch of {kit} "
+                     f"({err[-200:]}), and the hub refuses its writes until it is gone: git -C {kit} reset --soft "
+                     f"{head[:12]}")
+    code, _out, err = git("checkout", "-q", head, "--", "team.json", folder=kit)
+    if code != 0:
+        fault = fault or f"team.json could not be put back as it was before the claim: {err[-200:]}"
+    try:
+        say(fault or "team.json is as it was before the claim.")
+    except OSError:
+        pass
+
+
+# The program of a claim's guard (HubPause.watch), which runs in a session of its own. It waits for one byte on its
+# standard input. The claim writes that byte when it has started the hub's service again itself. An end of the input
+# with no byte means that the claim's program is gone while the hub was stopped for it: a SIGKILL, the kernel's
+# out-of-memory kill, a signal in the one moment that the claim cannot catch. The guard then starts the service. It
+# ignores what ends a claim, and it gives back the signals that the claim held while it started the guard.
+GUARD = ("import signal, subprocess, sys\n"
+         "for one in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):\n"
+         "    signal.signal(one, signal.SIG_IGN)\n"
+         "signal.pthread_sigmask(signal.SIG_SETMASK, set())\n"
+         "if not sys.stdin.buffer.read(1):\n"
+         "    subprocess.run(sys.argv[1:], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n"
+         "                   stderr=subprocess.DEVNULL)\n")
+
+
+class HubPause:
+    """The hub's own service, stopped for the time of a claim that needs the address and port it holds, and started
+    again in every case.
+
+    The claim listens on the hub's own address and port (the top of this file). On a hub that runs, the hub listens
+    there, and the claim's listener could not open: `OSError: [Errno 98] Address already in use` (10 November 2026).
+    That is every second claim, `--reclaim` on a hub whose owner's Mac is lost or has a new address, so the one
+    documented way to give a hub a new owner did not work on a hub that runs. Another port is no way out: the fleet's
+    Tailscale access rules can name the hub's port alone, and the claim proves exactly that port.
+
+    So the claim stops `fleet-hub`, the service of this user, serves the claim, and starts the service when the claim
+    has ended: after team.json is written and committed, so that the hub reads the new owner at its start and refuses
+    the address from before; and as well when no Mac claimed in time, when a step failed, and when the claim was ended
+    from outside (Ctrl-C, a terminal that closed, a kill). When the claim's own program is gone before it could do
+    that (a SIGKILL), its guard starts the service (GUARD). The hub is away for the time of the claim only. The start
+    is a restart, so that a hub which something else started meanwhile reads team.json again too.
+
+    It stops nothing when the address and port are free: a first claim, and a claim on a hub that somebody stopped
+    before it, run as they always did, and it starts no hub that it did not stop. And it stops nothing that it should
+    not: not when this user's `fleet-hub` does not run, so that another program holds the port; not when team.json is
+    not this hub's own, because the claim would then write a new first team.json over the team of a fleet that runs;
+    not without `--commit`, because the hub refuses every write while its checkout has a change that is not
+    committed; and not in the middle of a write or a release of the hub's own (ref_ahead), read again after the stop.
+
+    before: the owner's address that team.json has before the claim, or None for a first claim."""
+
+    def __init__(self, hub_ip, port, out, commit, before=None):
+        self.hub_ip, self.port, self.out, self.commit, self.before = hub_ip, int(port), out, commit, before
+        self.kit, self.where = os.path.dirname(os.path.abspath(out)), f"{hub_ip}:{int(port)}"
+        self.stopped, self.handlers, self.guard = False, {}, None
+
+    def __enter__(self):
+        return self
+
+    def claim(self, wait):
+        """The owner claim. When a hub that runs holds its address and port: with that hub's service stopped. A hub
+        that has an owner has a fleet, whose calls to this port get 503 while the claim holds it, and no 404."""
+        try:
+            return claim(self.hub_ip, self.port, wait, away=bool(self.before))
+        except OSError as e:
+            if e.errno != errno.EADDRINUSE:
+                raise
+        self.stop()
+        try:
+            owner = claim(self.hub_ip, self.port, wait, away=True)
+        except OSError as e:
+            if e.errno != errno.EADDRINUSE:
+                raise
+            raise Stop(f"the hub's service {HUB_SERVICE} stopped, and another program took {self.where} before the "
+                       f"claim could: the claim has no port. Nothing was written.") from None
+        self.hold()             # the owner is known: what is left takes seconds, and nothing ends it half done
+        return owner
+
+    def stop(self):
+        """Stop the hub's own service, or say why this claim cannot have the port. Every refusal before the stop
+        leaves the machine as it was."""
+        code, said = hub_service("is-active")
+        if code != 0:
+            raise Stop(f"{self.where} is in use, so the owner claim cannot listen there, and the service fleet-hub of "
+                       f"the user {own_user()} does not run, so it is another program that holds it (systemctl --user "
+                       f"is-active {HUB_SERVICE}: {said[-200:] or 'no answer'}). Run this as the user that runs the "
+                       f"hub, or stop the program that listens on that port. Nothing changed.")
+        if own_team(self.out, self.hub_ip, self.port) is None:
+            raise Stop(f"a hub runs at {self.where}, and {self.out} is not a team.json of that hub that the hub can "
+                       f"run ({team_fault(self.out) or 'it names another hub address or port'}). The claim would "
+                       f"write a new first team.json over it, so nothing was stopped and nothing changed.")
+        if not self.commit:
+            raise Stop(f"a hub runs at {self.where}, and a hub refuses every write while its checkout has a change "
+                       f"that is not committed. Run the claim with --commit. Nothing was stopped and nothing changed.")
+        if ref_ahead(self.kit):
+            raise Stop(f"the hub at {self.where} is in the middle of a write or an update of its own: its "
+                       f"configuration ref holds a commit that its checkout does not have yet. Nothing was stopped "
+                       f"and nothing changed. Run this again in a few minutes.")
+        # A signal in the middle of the guard's start would leave a guard that nobody can tell to end, and it would
+        # restart a hub that was never stopped. So the signals wait for these two lines.
+        ends = {getattr(signal, name) for name in (*CLAIM_ENDS, "SIGINT")}
+        held = signal.pthread_sigmask(signal.SIG_BLOCK, ends)
+        try:
+            self.watch()
+            self.catch()
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, held)
+        self.stopped = True
+        code, said = hub_service("stop")
+        if code != 0:
+            raise Stop(f"the hub's service {HUB_SERVICE} did not stop for the claim ({said[-200:] or 'no answer'}), "
+                       f"so the claim has no port. Nothing was written.")
+        tries = 0
+        while port_taken(self.hub_ip, self.port):
+            tries += 1
+            if tries >= PORT_TRIES:
+                raise Stop(f"the hub's service {HUB_SERVICE} stopped, and {self.where} is still in use: another "
+                           f"program listens there, so the claim has no port. Nothing was written.")
+            time.sleep(1)
+        if ref_ahead(self.kit):
+            raise Stop(f"the hub at {self.where} was stopped in the middle of a write or an update of its own: its "
+                       f"configuration ref holds a commit that its checkout does not have. Nothing was written. The "
+                       f"hub runs again now, and it takes that commit back or in by itself: a write of team.json or "
+                       f"of a profile at its start, another one at its next write. Run this again after that.")
+        say(f"the hub's service {HUB_SERVICE} is stopped for the time of the claim, because the claim listens on the "
+            f"hub's own address and port. It starts again when the claim ends, also when no Mac claims.")
+
+    def catch(self):
+        """From here on, what would end this program from outside ends the claim instead, so that __exit__ runs and
+        the hub starts again. A thread that is not the main one sets nothing: no signal reaches Python code there."""
+        def ended(number, _frame):
+            self.hold()         # one end is enough: a second signal must not end the start of the hub
+            sys.exit(f"Founderizer install stopped: the owner claim was ended from outside "
+                     f"({signal.Signals(number).name}), so nothing was written.")
+        for name in CLAIM_ENDS:
+            try:
+                self.handlers[name] = signal.signal(getattr(signal, name), ended)
+            except ValueError:
+                return
+
+    def watch(self):
+        """Start the guard of this claim (GUARD). A claim that cannot have one stops nothing. -I: the guard takes
+        no module from the folder that the claim was started in."""
+        argv, env = service_call("restart")
+        try:
+            self.guard = subprocess.Popen([sys.executable, "-I", "-c", GUARD, *argv], stdin=subprocess.PIPE,
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+                                          start_new_session=True)
+        except OSError as e:
+            raise Stop(f"the claim could not start its guard, which starts the hub's service again when the claim's "
+                       f"own program is killed ({e}). Nothing was stopped and nothing changed.") from None
+
+    def release(self):
+        """Tell the guard that the hub's service is started again, or was never stopped: it ends and starts nothing."""
+        guard, self.guard = self.guard, None
+        if guard is None:
+            return
+        try:
+            guard.stdin.write(b"k")
+            guard.stdin.close()
+            guard.wait(10)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+
+    def hold(self):
+        """Nothing ends this program from here to the hub's start: a commit of team.json that stops half done, or a
+        hub that stays stopped, costs more than the seconds that are left."""
+        for name in (*CLAIM_ENDS, "SIGINT"):
+            try:
+                before = signal.signal(getattr(signal, name), signal.SIG_IGN)
+            except ValueError:
+                return
+            self.handlers.setdefault(name, before)     # the first one read is the one to give back
+
+    def give_back(self):
+        for name, before in self.handlers.items():
+            if before is not None:
+                signal.signal(getattr(signal, name), before)
+        self.handlers = {}
+
+    def __exit__(self, kind, _error, _trace):
+        if not self.stopped:
+            self.release()
+            self.give_back()
+            return False
+        self.hold()
+        code, said = hub_service("restart")     # first, and before any word: the terminal can be gone
+        self.release()
+        self.give_back()
+        ended, fault = kind is not None and not issubclass(kind, Exception), ""
+        if code != 0:
+            fault = (f"the hub's service {HUB_SERVICE} did not start again ({said[-200:] or 'no answer'}). Start it "
+                     f"as the user {own_user()}: systemctl --user start {HUB_SERVICE}")
+        elif not ended:         # a claim that was ended from outside does not wait for the hub's answer
+            for _ in range(BACK_TRIES):
+                if health(self.hub_ip, self.port, timeout=3)[0]:
+                    break
+                time.sleep(1)
+            else:
+                fault = (f"the hub's service {HUB_SERVICE} was started again, and the hub does not answer at "
+                         f"http://{self.where}/health yet. Look at: systemctl --user status {HUB_SERVICE}")
+        if fault and kind is None:
+            raise Stop(fault)
+        try:
+            if fault:
+                print("Founderizer: " + fault, file=sys.stderr, flush=True)
+            elif ended:
+                say(f"the hub's service {HUB_SERVICE} is started again.")
+            elif kind is None:
+                owner = claimed_by(self.out, self.hub_ip, self.port)
+                say(f"the hub's service {HUB_SERVICE} runs again and answers at http://{self.where}. It read "
+                    f"team.json at its start: the owner is the Mac at {owner}"
+                    + (", as before." if owner == self.before else ", and the address from before is refused."))
+            else:
+                say(f"the hub's service {HUB_SERVICE} runs again and answers at http://{self.where}.")
+        except (OSError, ValueError):
+            pass                # a terminal that is gone takes no word, and the hub runs all the same
+        return False
 
 
 def selftest(kit=KIT):
@@ -1833,16 +2199,40 @@ def cmd_claim(args):
         if args.commit:
             commit_team(os.path.dirname(os.path.abspath(args.out)), FIRST_COMMIT)
         return
-    owner = claim(here, args.port, args.wait)
-    team = own_team(args.out, here, args.port) or template(args.address, args.port,
-                                                           args.timezone or machine_timezone(),
-                                                           runtime=args.runtime, ssh_user=args.ssh_user,
-                                                           ssh_port=args.ssh_port, placed=not args.manager_later)
-    team.setdefault("addresses", {})["owner"] = owner
-    write_team(args.out, team)
-    say(f"{args.out} names {owner} as the owner.")
-    if args.commit:
-        commit_team(os.path.dirname(os.path.abspath(args.out)), FIRST_COMMIT)
+    if args.reclaim and not already:
+        # --reclaim is the word for a hub that has an owner. Without this, a claim on a port that is free took the
+        # file for no team of this hub and wrote the first team.json over it: the team of a fleet, when the port or
+        # the address that was given is not the hub's own (`hub.sh --reclaim` without the --port of the install).
+        raise Stop(f"--reclaim gives a new owner to a hub that has one, and {args.out} is not the team.json of a hub "
+                   f"at {here}:{args.port} that has an owner "
+                   f"({team_fault(args.out) or 'it names another hub address or port'}). A claim would write a new "
+                   f"first team.json over it, so no code was made and nothing changed. Give the hub's own address "
+                   f"and port, as its team.json has them.")
+    # A hub that runs holds the claim's address and port: its service makes way for the time of the claim, and it
+    # starts again when this block ends, whatever ended it (HubPause). On a port that is free, nothing is stopped.
+    with HubPause(here, args.port, args.out, args.commit, before=already) as pause:
+        owner = pause.claim(args.wait)
+        team = own_team(args.out, here, args.port) or template(args.address, args.port,
+                                                               args.timezone or machine_timezone(),
+                                                               runtime=args.runtime, ssh_user=args.ssh_user,
+                                                               ssh_port=args.ssh_port, placed=not args.manager_later)
+        team.setdefault("addresses", {})["owner"] = owner
+        kit = os.path.dirname(os.path.abspath(args.out))
+        # A second claim changes the team.json of a fleet. When its write, its commit or its push fails, the checkout
+        # goes back to this commit (take_back), and the hub starts on what it ran before.
+        head = git("rev-parse", "HEAD", folder=kit)[1] if already and args.commit else ""
+        try:
+            write_team(args.out, team)
+            try:
+                say(f"{args.out} names {owner} as the owner.")
+            except OSError:
+                pass            # a terminal that is gone does not undo a claim that the Mac made
+            if args.commit:     # the record says which of the two it was: a second claim is not the first team.json
+                commit_team(kit, OWNER_COMMIT if already else FIRST_COMMIT)
+        except BaseException:
+            if head:
+                take_back(kit, head)
+            raise
 
 
 def cmd_runtime(args):
@@ -2018,7 +2408,9 @@ def main(argv=None):
         else:
             p.add_argument("--out", required=True, help="where team.json goes")
             p.add_argument("--wait", type=float, default=CLAIM_LIFE)
-            p.add_argument("--reclaim", action="store_true", help="a new claim although this hub has an owner")
+            p.add_argument("--reclaim", action="store_true",
+                           help="a new claim although this hub has an owner; a hub that runs is stopped for the "
+                                "time of the claim and started again (with --commit, as the hub's own user)")
             p.add_argument("--commit", action="store_true", help="commit team.json on the configuration ref too")
     args = ap.parse_args(argv)
     try:

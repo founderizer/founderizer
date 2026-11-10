@@ -82,7 +82,8 @@ sh /root/fleet-kit/hub.sh --check
 Other options: `--port N` (default 8765), `--timezone Z` (default the server's own),
 `--runtime claude|codex` for the manager's first AI provider, which its setup page may change, `--hostname NAME` for the Tailscale name
 (default: the name its provider gave the machine, which becomes its name in Fleet), `--claim-wait SECONDS`
-(default 1800) and `--reclaim`.
+(default 1800) and `--reclaim`, for a hub that has an owner ("The owner's Mac is lost, or it has a new
+address", below).
 
 ### What the fifteen steps do
 
@@ -226,12 +227,17 @@ for the hub itself on the same port, and prints the address to paste into the ap
 
 The code is made on the server, kept there only as its SHA-256, and never written to a
 log, a file or a URL. It works once. Five wrong codes from one address and that address
-waits. The hub's own address cannot claim it. If nothing claims it in time, nothing is
+waits. The hub's own address cannot claim it. One connection gets 20 seconds in all, so a
+machine that sends nothing, or a byte now and then, cannot hold the claim open. If nothing claims it in time, nothing is
 written and the line can be run again for a new code.
 
 Because the claim listens on the hub's own address and port, it also proves the fleet's
 Tailscale access rules for port 8765 before the hub exists. A claim that never arrives
 is nearly always those rules.
+
+A second claim finds a hub that runs, and that hub holds the address and port. The claim
+then stops the hub's service for its own time and starts it again in every case: "The
+owner's Mac is lost, or it has a new address", below.
 
 ### The checks at the end
 
@@ -331,8 +337,9 @@ already names an owner makes no new code and is not touched, and the services ar
 written again and restarted. Nothing is destroyed. A second run also makes the user,
 the checkout and the service of an agent that was added since.
 
-- **The owner's Mac changed address.** Run the line with `--reclaim`: it makes a new
-  code, waits for the new Mac, and changes only `addresses.owner`.
+- **The owner's Mac is lost, or it has a new address.** Run the line with `--reclaim`: it
+  makes a new code, waits for the new Mac, and changes only `addresses.owner`. The hub is
+  away for the time of the claim; the part below says what happens.
 - **New code for the fleet.** This is a deployment, not an install: fetch, merge `main`
   into `config`, check `import hub`, push `config`, restart `fleet-hub` (COORDINATION.md,
   "The configuration ref"). The hub serves the new code to every machine from its own
@@ -356,6 +363,94 @@ the checkout and the service of an agent that was added since.
 
   This keeps the repository, the records (`~fleet/.fleet/pilot.db`), the outputs, each
   agent's own checkout and its runtime sign-in.
+
+### The owner's Mac is lost, or it has a new address
+
+The hub serves the owner's pages to one address, `addresses.owner`. A new Mac, or the same
+Mac with a new address, gets `403` from each of them, and only root on the hub's server
+changes that address: with a second claim.
+
+**A lost Mac comes off the fleet's Tailscale network first**, in the network's admin console.
+Until the claim, that Mac is the owner for the hub, and like every machine of the network it
+reaches the hub's port.
+
+Then run the line with `--reclaim`, as root, and with the `--port` of the install when the
+hub does not listen on 8765:
+
+```sh
+sh /root/fleet-kit/hub.sh --reclaim
+```
+
+It prints a claim line, as the first install did. Run that line in Terminal on the Mac that
+owns the fleet from now on. The address of that call becomes `addresses.owner`, nothing else
+in `team.json` changes, and the change is one commit on `config`, "The owner of this hub is
+another Mac".
+
+**The hub is away for the time of the claim**, so have the new Mac ready before you run the
+line. The claim listens on the hub's own address and port, and the hub that runs holds them.
+So the claim stops the service `fleet-hub`, waits for the Mac, writes and commits
+`team.json`, and starts `fleet-hub` again. The hub reads `team.json` at its start: from then
+on it serves the owner's pages to the new address and refuses the address from before. While
+the hub is away, every other call to its port gets `503` from the claim, as from a hub that
+does not answer: each server's helper tries again by itself, and work that needs the hub in
+that time waits or fails with its reason. The records stay. Until 10 November 2026 a second
+claim on a hub that runs ended with "Address already in use" before it printed its line.
+
+**The hub starts again in every case:** when the Mac claimed it; when no Mac claimed it in
+time, and then nothing is written, the address from before keeps the hub, and the line can be
+run again for a new code; when a step failed; when the claim was ended from outside (Ctrl-C,
+a terminal that closed, a kill); and when the claim's own program was killed with no warning,
+because a small guard of the claim then starts the hub. The claim says so when the hub
+answers again. Should `fleet-hub` ever stay stopped all the same, start it:
+
+```sh
+runuser -u fleet -- env XDG_RUNTIME_DIR=/run/user/$(id -u fleet) systemctl --user start fleet-hub
+```
+
+A hub that somebody stopped before the claim is not started by it: the claim then finds the
+port free, as a first claim does, and whoever stopped the hub starts it.
+
+**What the claim refuses.** In each of these cases it prints no claim line, stops nothing
+and changes nothing:
+
+- `team.json` is not the file of a hub at this address and port that has an owner: it names
+  another port or address, or the hub cannot run it. A claim would write a new first
+  `team.json` over the team of a fleet. Give the `--port` of the install;
+- the port is in use and the `fleet-hub` of the hub's own user does not run, so another
+  program holds the port;
+- the hub is in the middle of a write or a release of its own, so its configuration ref holds
+  a commit that its checkout does not have yet. Run the line again in a few minutes.
+
+A claim that cannot commit or push its change takes it back: `team.json` is as it was, and
+the hub starts on what it ran before.
+
+**It changes the owner's address and nothing else.** An enrolled phone keeps its access,
+because it has an address and a key of its own. The central vault keeps the owner key of the
+Mac from before until a `central-vault` run from the new Mac replaces it ("The central
+vault", below).
+
+**The claim always runs from the hub's own checkout** (`~fleet/fleet-pilot/hubsetup.py`),
+which follows the fleet's releases, so an old copy in `/root/fleet-kit` gets all of the above
+too. The other steps of the line run from that copy, as in every second run, so bring it up
+to date first when it is old.
+
+**The claim alone**, with no other step of the installer, as root:
+
+```sh
+cd /home/fleet && runuser -u fleet -- env HOME=/home/fleet python3 fleet-pilot/hubsetup.py claim \
+    --reclaim --commit --address "$(tailscale ip -4 | head -n 1)" --out /home/fleet/fleet-pilot/team.json
+```
+
+It needs nothing afterwards, and no restart of `fleet-hub`: the claim starts the hub itself,
+after its commit. Three things it does need:
+
+- **the hub's own user**, as `runuser` gives it here: `fleet-hub` is a service of that user,
+  and the checkout is that user's. As root without `runuser`, the claim finds a port that is
+  in use and no service of root's that holds it, and says so;
+- **`--commit`**: a hub refuses every write while its checkout has a change that is not
+  committed, so on a hub that runs the claim refuses to go on without it;
+- **the hub's own address and port** (`--port N` when it is not 8765), as `team.json` has
+  them: they are how the claim knows that the file is this hub's own.
 
 ## The central vault
 
@@ -446,7 +541,10 @@ that the owner gives, and it takes no value under a removed name again (UI-API.m
 `python3 -m unittest test_hub_install.py test_join_install.py` proves both installers
 — with `test_agent_users.py` for the per-agent user, the root helper and the agent-add
 path — without touching a machine: the first `team.json` is one the hub can run and holds no
-credential, the claim takes one code once and refuses the rest, the hub's own repository
+credential, the claim takes one code once and refuses the rest, a second claim on a hub
+that runs stops the hub for its time and starts it again in every case (on the new owner,
+when no Mac claimed, and when the claim was ended from outside) and stops nothing that it
+must not, the hub's own repository
 is made for real in a temporary folder with both refs at the right commit, `hub.sh
 --check` names its fifteen steps in order and changes nothing, this fleet's id is made
 once and never twice and the installers claim no entitlement, the per-agent user is
@@ -475,3 +573,18 @@ sudo-rs, chrony), each claimed from another machine of the network, and a Debian
 joined the Debian 13 hub with the hub's own line, ended READY, and then installed the
 manager as its own user, up to the owner's sign-in. The network was Tailscale with a test
 control server, not the owner's tailnet.
+
+On 10 November 2026 the second claim was run in a Linux container without a network (Debian
+12, Python 3.11, git 2.39), from a copy of the tree. That container has no systemd, so a
+stand-in ran `fleet-hub` from the unit file that `fleet.py service hub` wrote, with the
+unit's own stop rule. Everything else was the installer's own: the steps `preflight`,
+`hub_user`, `repository`, `first_team` and `services` of `hub.sh` as root, the hub as
+`fleet`, `runuser`, and git. One address claimed the new hub. Then `first_team` and
+`services` ran again with `--reclaim` while the hub ran, and a second address claimed it:
+before, `GET /ui/state` answered 200 to the first address and 403 to the second; after the
+`services` step, 403 to the first and 200 to the second, with one commit on `config`. The
+claim alone gave the same with no restart after it. A claim that no Mac answered, a kill of
+the claim and of its `runuser`, a `kill -9` of the claim, Ctrl-C, and a terminal that closed
+each left the hub running for the owner from before, with nothing written. On the code from
+before, the same container showed the fault: `OSError: [Errno 98] Address already in use`.
+What that run did not reach: systemd itself (`systemctl --user` of a real user manager), Tailscale, and a real Mac.

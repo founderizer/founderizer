@@ -8,6 +8,8 @@
 #       sh hub.sh                           the install
 #       sh hub.sh --source <git url>        clone the Founderizer repository first, then install from that clone
 #       sh hub.sh --check                   say what it would do, change nothing
+#       sh hub.sh --reclaim                 a hub that has an owner gets a new one: the owner's Mac is lost, or it
+#                                           has a new address (HUB-INSTALL.md, "Run it again, update, remove")
 #
 # Its steps: base packages, the user fleet with lingering, the private network (Tailscale), the firewall, the bare
 # repository and the hub's checkout on the configuration ref, the first team.json with the owner's own Mac proved by
@@ -348,6 +350,9 @@ false), runtime $runtime until its setup in the app chooses one, \"vault\": \"no
         fi
         plan "make a one-time claim code, print the line for the owner's Mac, and serve it on $address:$port until \
 that Mac sends the code back; its address becomes addresses.owner"
+        [ "$reclaim" = no ] || plan "stop the service fleet-hub of a hub that runs for the time of that claim, because \
+the claim listens on the hub's own address and port, and start it again when the claim ends, also when no Mac claims \
+in time; the hub then serves the owner's pages to the new address and refuses the one from before"
         plan "commit team.json on config and push it to $bare"
         return 0
     fi
@@ -358,11 +363,15 @@ that Mac sends the code back; its address becomes addresses.owner"
     more=""
     [ "$reclaim" = no ] || more="--reclaim"
     [ "$manager_later" = no ] || more="$more --manager-later"
+    # The claim listens on this hub's own address and port. On a hub that runs (--reclaim: the owner's Mac is lost, or
+    # it has a new address) the claim itself stops fleet-hub for its time and starts it again in every case, so no
+    # service is stopped here (hubsetup.py HubPause). It is the hub's own copy of hubsetup.py that runs, so an older
+    # copy of this script gets that too.
     # shellcheck disable=SC2086
     as_user python3 "$kit/hubsetup.py" claim --address "$address" --port "$port" --out "$kit/team.json" \
         --runtime "$runtime" --ssh-user "$HUB_USER" --ssh-port "$(printf '%s' "$ports" | head -n 1)" \
         --wait "$claim_wait" --commit $zone $more \
-        || stop "the owner claim did not finish, so team.json was not written."
+        || stop "the owner claim did not finish: the line above says why."
 }
 
 services() {
