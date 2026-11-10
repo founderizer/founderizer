@@ -9697,12 +9697,24 @@ def central_backup():
 def unanswered_owner_message(agent):
     """The chat message of the owner's to this agent whose turn it is, or None: the oldest one that the agent has
     read, that no report is linked to, and whose turn no report has taken (owner_reports.turn). Its request id, and
-    its origin, which is null for a message that the owner wrote in the app."""
-    return q1("SELECT u.request_id, u.origin FROM ui_requests u JOIN events e ON e.id=u.event_id "
-              "WHERE u.recipient=? AND u.kind='message' AND u.need_id IS NULL AND e.read_at IS NOT NULL "
-              "AND NOT EXISTS (SELECT 1 FROM owner_reports r WHERE r.agent=u.recipient AND r.in_reply_to=u.request_id) "
-              "AND NOT EXISTS (SELECT 1 FROM owner_reports r WHERE r.agent=u.recipient AND r.turn=u.request_id) "
-              "ORDER BY u.created, u.event_id LIMIT 1", (agent,))
+    its origin, which is null for a message that the owner wrote in the app.
+
+    A message from a chat app has a turn only while its chat can take the report (chat_takes) and the owner handle
+    that its sender has now was linked before the message came (owner_since). So none has a turn whose account is
+    gone or whose handle the owner removed, nor, after the owner links that handle again, one from before that link.
+    A report that names no message is then for the next one that waits, which can be the owner's first message from
+    a new number. With the turn kept, that report was the answer to an old message, and the owner's newest one got
+    its answer one report late."""
+    for row in q("SELECT u.request_id, u.origin, u.created FROM ui_requests u JOIN events e ON e.id=u.event_id "
+                 "WHERE u.recipient=? AND u.kind='message' AND u.need_id IS NULL AND e.read_at IS NOT NULL "
+                 "AND NOT EXISTS (SELECT 1 FROM owner_reports r WHERE r.agent=u.recipient AND r.in_reply_to=u.request_id) "
+                 "AND NOT EXISTS (SELECT 1 FROM owner_reports r WHERE r.agent=u.recipient AND r.turn=u.request_id) "
+                 "ORDER BY u.created, u.event_id", (agent,)):
+        o = json.loads(row["origin"]) if row["origin"] else None
+        since = owner_since(o) if o else None
+        if o is None or (o.get("account") in chat_apps() and since is not None and since <= row["created"]):
+            return row
+    return None
 
 
 def owner_wrote(agent, event_id):
@@ -9718,7 +9730,7 @@ def owner_chat_message(agent, event_id):
     """The chat message of the owner's to `agent` that read_messages gave the name M-<event_id>: its request id and
     when it was read. None for any other message: the owner's answer to a Needs-you item, a word of the hub or of an
     agent, and a message to another agent."""
-    return q1("SELECT u.request_id, e.read_at FROM ui_requests u JOIN events e ON e.id=u.event_id "
+    return q1("SELECT u.request_id, u.origin, e.read_at FROM ui_requests u JOIN events e ON e.id=u.event_id "
               "WHERE u.event_id=? AND u.recipient=? AND u.kind='message' AND u.need_id IS NULL", (event_id, agent))
 
 
@@ -9813,7 +9825,10 @@ def t_tell_owner(agent, a):
     #   answer, and a name that is no chat message of the owner's, give no link and no refusal: the report is a later
     #   word, and it still goes to that message's chat app. The M-<id> was refused 18 times in ten days for a request
     #   UUID that the manager never gets, after which it sent its whole report again.
-    # - with no in_reply_to, the first message that `about` names and that still waits gets the report.
+    # - with no in_reply_to, the first message that `about` names and that still waits gets the report: the first
+    #   one that the owner wrote in the app or whose chat can take it (chat_takes), and the first one that waits
+    #   only when none of them can. A chat cannot when the owner removed that handle or deleted the account, and the
+    #   report would then reach no chat while the owner's message from the chat that they use now waits for it.
     # - a report that names the owner's own words to the manager, none of which waits for its link (owner_wrote: a
     #   chat message that has its answer or is not read, a message from the board, the owner's answer to a Needs-you
     #   item, the owner's word in the discussion of one), is about those words: it is linked to none and takes no
@@ -9857,11 +9872,15 @@ def t_tell_owner(agent, a):
                     f" {named.group(0)} is no chat message of the owner's to you, so this report has no link.")
     elif reply is None and role == "manager":
         names = [int(n) for n in ABOUT_EVENT.findall(about)]
+        first = None
         for event_id in names:
             m = owner_chat_message(agent, event_id)
             if m and m["read_at"] is not None and not owner_report(agent, m["request_id"]):
-                reply = m["request_id"]
-                break
+                if not m["origin"] or chat_takes(json.loads(m["origin"])):
+                    first = m       # the first one that waits and whose chat can take the report
+                    break
+                first = first or m  # when none can: the first one that waits, as before
+        reply = first["request_id"] if first else None
         waits = None if reply or any(owner_wrote(agent, n) for n in names) else unanswered_owner_message(agent)
         if waits:
             # from a chat app: linked, and so sent there, as before; from the app: its turn alone, with no link
@@ -10136,25 +10155,54 @@ def need_question_rows(need, value, t0):
     return qu["asker"] if answer_rows(qu, t, value, "owner", t0) else None
 
 
+def owner_since(o):
+    """Since when the sender of the chat app message with this origin is the owner's, by the handles as they are now:
+    the earliest `linked` of the owner handles of its app whose ID or alias is the ID that the message came under or
+    its second one (`sender_alt`, which an origin keeps since 10 November 2026). It is the check of the message's
+    arrival (chat_route, owner_handle), asked again. None when no handle has either ID: the owner removed that
+    handle, or the record has one ID, from before that day, and the hub had taken the message by the other. An origin
+    without its app or its sender is nobody's."""
+    ids = [i for i in (o.get("sender"), o.get("sender_alt")) if i]
+    if not o.get("app") or not ids:
+        return None
+    marks = ",".join("?" * len(ids))
+    with LOCK:
+        return DB.execute(f"SELECT MIN(linked) t FROM owner_handles WHERE app=? AND (id IN ({marks}) OR alias IN "
+                          f"({marks}))", (o["app"], *ids, *ids)).fetchone()["t"]
+
+
+def origin_owned(o):
+    """True while the chat app message with this origin still comes from the owner (owner_since). The owner removes a
+    handle on the People page when the number is no longer theirs or Founderizer must not write there: from then on
+    nothing that answers a message of that handle goes to its chat. Before, a report still went there, as the answer
+    to the old message."""
+    return owner_since(o) is not None
+
+
+def chat_takes(o):
+    """True when the chat of the chat app message with this origin can take a report now: its account is in the fleet,
+    and its sender is still an owner handle (origin_owned)."""
+    return o.get("account") in chat_apps() and origin_owned(o)
+
+
 def chat_source(agent, reply, about):
     """15.8: the owner message from a chat app that a tell_owner report answers, or None: by in_reply_to; for the
-    manager without in_reply_to, by the first M-<event id> in about whose request has an origin and that the manager
-    has read. The result has the origin, the request and the account's label."""
-    row = None
+    manager without in_reply_to, by the first M-<event id> in about that the manager has read and whose chat can
+    take the report (chat_takes). The result has the origin, the request and the account's label."""
+    def source(row):
+        origin = json.loads(row["origin"]) if row else None
+        return {"origin": origin, "request_id": row["request_id"],
+                "label": chat_apps()[origin["account"]]["label"]} if origin and chat_takes(origin) else None
     if reply:
-        row = q1("SELECT * FROM ui_requests WHERE request_id=? AND origin IS NOT NULL", (reply,))
-    elif agents()[agent].get("role") == "manager":
+        return source(q1("SELECT * FROM ui_requests WHERE request_id=? AND origin IS NOT NULL", (reply,)))
+    if agents()[agent].get("role") == "manager":
         for m in ABOUT_EVENT.finditer(about):       # one that the agent has read: no report answers an unread message
-            row = q1("SELECT u.* FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE u.event_id=? AND "
-                     "u.recipient=? AND u.kind='message' AND u.origin IS NOT NULL AND e.read_at IS NOT NULL",
-                     (int(m.group(1)), agent))
-            if row:
-                break
-    origin = json.loads(row["origin"]) if row else None
-    acc = chat_apps().get(origin["account"]) if origin else None
-    if not acc:
-        return None
-    return {"origin": origin, "request_id": row["request_id"], "label": acc["label"]}
+            found = source(q1("SELECT u.* FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE u.event_id=? AND "
+                              "u.recipient=? AND u.kind='message' AND u.origin IS NOT NULL AND e.read_at IS NOT NULL",
+                              (int(m.group(1)), agent)))
+            if found:                               # the first one whose chat can take the report
+                return found
+    return None
 
 
 def chat_answer(agent, source, report_id, text, t0):
@@ -10165,17 +10213,19 @@ def chat_answer(agent, source, report_id, text, t0):
 
 
 def chat_read_signals(event_ids, t0):
-    """15.8: read_messages first set read_at on these events. For each owner message from a chat app: one typing item,
-    and on WhatsApp also one read item."""
+    """15.8: read_messages first set read_at on these events. For each owner message from a chat app whose chat can
+    take it (chat_takes): one typing item, and on WhatsApp also one read item. Each item names the message's request,
+    so that the bridge is not given it after the owner removed that handle (chat_give)."""
     for eid in event_ids:
-        row = q1("SELECT origin FROM ui_requests WHERE event_id=? AND origin IS NOT NULL", (eid,))
+        row = q1("SELECT request_id, origin FROM ui_requests WHERE event_id=? AND origin IS NOT NULL", (eid,))
         o = json.loads(row["origin"]) if row else None
-        if not o or o["account"] not in chat_apps():
+        if not o or not chat_takes(o):
             continue
         with transaction():
-            chat_queue("typing", o["account"], t0, chat=o["chat"], seconds=CHAT_TYPING)
+            chat_queue("typing", o["account"], t0, chat=o["chat"], seconds=CHAT_TYPING, request_id=row["request_id"])
             if o["app"] == "whatsapp":
-                chat_queue("read", o["account"], t0, chat=o["chat"], sender=o["sender"], ids=json.dumps([o["id"]]))
+                chat_queue("read", o["account"], t0, chat=o["chat"], sender=o["sender"], ids=json.dumps([o["id"]]),
+                           request_id=row["request_id"])
 
 
 def owner_handle(app, *ids):
@@ -10267,7 +10317,8 @@ def chat_route(account, acc, m, t0, hit, preview):
         chat_reply(account, m["chat"], "That message held a saved secret. It was not stored.", t0)
         return "stored", None
     request_id = str(uuid.uuid4())
-    origin = {"app": acc["app"], "account": account, "chat": m["chat"], "id": m["id"], "sender": m["sender"]}
+    origin = {"app": acc["app"], "account": account, "chat": m["chat"], "id": m["id"], "sender": m["sender"],
+              "sender_alt": m["sender_alt"]}        # the two IDs of its sender, as this check had them (origin_owned)
     owner_message_rows(request_id, "message", None, m["text"].strip(), f"fleet-channels/1/{account}", agent, None, t0,
                        origin)
     return "stored", request_id
@@ -10350,9 +10401,41 @@ def chat_item(r):
     return item
 
 
+GONE_HANDLE = "this chat is no longer known as the owner's"     # chat_out.error of a message that so stays in the app
+
+
+def item_owned(r):
+    """False for a queued item for the owner at a chat that is not the owner's now. An item waits here for the end of
+    Pause all or for the bridge, and the owner can remove a handle in that time; Send again queues one after it.
+    Inside chat_give's transaction, so it only reads, and nothing that it calls commits (read_row, owner_since,
+    owner_handle).
+
+    - An item that names a request (`request_id`) goes to the chat of that message of the owner's: a report that
+      answers it (chat_answer), the signals of its read (chat_read_signals), and an agent's first word that takes the
+      route of the owner's newest message (owner_route). It is the owner's while that message's sender is a handle
+      (origin_owned). An item whose request the hub no longer has, because the owner deleted its agent, is given as
+      before.
+    - A first word with no request (its `report` names the report) went to the owner's newest handle itself: on
+      Discord its recipient is that handle's ID, and on WhatsApp its chat is that ID or its alias (owner_target). It
+      is the owner's while a handle has that ID as its ID or its alias. A first word that was queued before 10
+      November 2026 by rule 1 has no request either: on WhatsApp its chat is checked in the same way, and on
+      Discord, where it has no recipient, it is given as before.
+    - Every other item is given as before: an item of a person's conversation, a fixed reply of the hub (one of its
+      own sentences, in answer to the message that asked), and a link or unlink item."""
+    if r["request_id"]:
+        asked = read_row("SELECT origin FROM ui_requests WHERE request_id=? AND origin IS NOT NULL", (r["request_id"],))
+        return not asked or origin_owned(json.loads(asked["origin"]))
+    target = r["recipient"] or (r["chat"] if r["app"] == "whatsapp" else None)
+    if r["kind"] == "message" and r["report"] is not None and target:
+        return owner_handle(r["app"], target)
+    return True
+
+
 def chat_give(t0, limit=50):
     """The queued items for the bridge, oldest first; none while Pause all is on. A message item is sending from now;
-    the other kinds are done when given out. A typing item older than its seconds expires instead."""
+    the other kinds are done when given out. A typing item older than its seconds expires instead. An item for the
+    owner at a chat that is not the owner's now is not given (item_owned): a message fails, so that the app shows it
+    as not sent, with the reason, and a signal of a read expires."""
     if chat_paused():
         return []
     rows = q("SELECT * FROM chat_out WHERE state='queued' ORDER BY id LIMIT ?", (limit,))
@@ -10361,6 +10444,10 @@ def chat_give(t0, limit=50):
         for r in rows:
             if r["kind"] == "typing" and t0 - r["created"] > (r["seconds"] or 0):
                 DB.execute("UPDATE chat_out SET state='expired', updated=? WHERE id=?", (t0, r["id"]))
+                continue
+            if not item_owned(r):
+                gone = ("failed", GONE_HANDLE) if r["kind"] == "message" else ("expired", None)
+                DB.execute("UPDATE chat_out SET state=?, error=?, updated=? WHERE id=?", (*gone, t0, r["id"]))
                 continue
             DB.execute("UPDATE chat_out SET state=?, given=?, updated=? WHERE id=?",
                        ("sending" if r["kind"] == "message" else "done", t0, t0, r["id"]))
@@ -10563,28 +10650,29 @@ def owner_target(app):
 
 
 def owner_route(agent):
-    """16.1 and 17.5: where a message that the agent writes first goes, {app, account, chat, recipient}, or None (the
-    app only). Every account has one agent, so: (1) the account and chat of the owner's newest chat app message to this
-    agent, while that account is enabled and still the agent's, and its sender is still an owner handle; (2) an enabled
-    account of this agent, WhatsApp before Discord, where the owner has a handle for that app."""
+    """16.1 and 17.5: where a message that the agent writes first goes, {app, account, chat, recipient, request}, or
+    None (the app only). Every account has one agent, so: (1) the account and chat of the owner's newest chat app
+    message to this agent, while that account is enabled and still the agent's, and its sender is still an owner
+    handle (origin_owned); `request` is that message's request, which the queued item keeps (chat_give); (2) an
+    enabled account of this agent, WhatsApp before Discord, where the owner has a handle for that app: the chat or
+    the recipient is that handle's ID, or on WhatsApp its alias when that is the phone-number form (owner_target), and
+    `request` is None."""
     conf = chat_apps()
 
     def serves(aid):
         acc = conf.get(aid)
         return bool(acc and chat_enabled(acc) and acc["agents"] == [agent])
-    row = q1("SELECT origin FROM ui_requests WHERE recipient=? AND kind='message' AND origin IS NOT NULL "
+    row = q1("SELECT request_id, origin FROM ui_requests WHERE recipient=? AND kind='message' AND origin IS NOT NULL "
              "ORDER BY created DESC, rowid DESC LIMIT 1", (agent,))
     o = json.loads(row["origin"]) if row else None
-    if o and serves(o["account"]) and conf[o["account"]]["app"] == o["app"]:
-        with LOCK:
-            known = owner_handle(o["app"], o["sender"])
-        if known:
-            return {"app": o["app"], "account": o["account"], "chat": o["chat"], "recipient": None}
+    if o and serves(o["account"]) and conf[o["account"]]["app"] == o["app"] and origin_owned(o):
+        return {"app": o["app"], "account": o["account"], "chat": o["chat"], "recipient": None,
+                "request": row["request_id"]}
     for app in ("whatsapp", "discord"):
         target = owner_target(app)
         aid = next((aid for aid in sorted(conf) if conf[aid]["app"] == app and serves(aid)), None)
         if target and aid:
-            return {"app": app, "account": aid, "chat": target[0], "recipient": target[1]}
+            return {"app": app, "account": aid, "chat": target[0], "recipient": target[1], "request": None}
     return None
 
 
@@ -10608,7 +10696,7 @@ def t_message_owner(agent, a):
                          "VALUES(?,'',?,?,NULL,1)", (text, t0, agent)).lastrowid
         if route:
             chat_queue("message", route["account"], t0, chat=route["chat"], recipient=route["recipient"], text=text,
-                       reply_to=None, report=rid)
+                       reply_to=None, report=rid, request_id=route["request"])
         answer = {"ok": True, "report": rid,
                   "via": {"app": route["app"], "account": route["account"]} if route else None}
         keep_command(command, answer, t0)
