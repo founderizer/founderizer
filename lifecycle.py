@@ -683,7 +683,8 @@ LOGIN_REASONS = ("ok", "not_found", "no_access", "bad_format", "no_token", "time
 APP_SERVER = "app-server"       # the start policy of a worker or lead of APP_SERVER_RUNTIME: screen_runner.py
 # GitHub repositories (owner feature integrations): owner/name in lower case, and the access that the owner gives,
 # from the lowest to the highest. deploy is write and the repository's own deployment: its workflow files, which a
-# token without the App's workflows permission may not push at all, and its GitHub Actions runs.
+# token without the App's workflows permission may not push at all, and the start of its GitHub Actions runs. read and
+# write read the runs where the App's installation holds Actions (hub.github_permissions, door.token_permissions).
 REPO_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,38}/(?!\.\.?$)[a-z0-9._-]{1,100}")
 REPO_ACCESS = ("read", "write", "deploy")
 # What the owner alone can do for deploy, in one sentence: GitHub refuses the token until the App carries those two

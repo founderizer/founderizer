@@ -39,6 +39,7 @@ import glob
 import plistlib
 import hashlib
 import hmac
+import io
 import ipaddress
 import json
 import os
@@ -52,6 +53,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -59,6 +61,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from http.client import HTTPException       # only the name: `http` is this module's own call to the hub
 
 from threads import MARKER, THREAD_ID, CodexFiles, Tailer, Translator, complete_rows, manager_transcript, text_of
@@ -903,7 +906,9 @@ def integration_env(agent, conf, keys=None, place=None, closed=False):
                          for e in data.get("errors") or [] if isinstance(e, dict)]
     if repos:       # also without a token: then git for github.com has no credentials, never the machine's own
         values.update(FLEET_REPOS=" ".join(f"{r}:{v}" for r, v in sorted(repos.items())), GIT_TERMINAL_PROMPT="0",
-                      FLEET_GIT_TOKENS=json.dumps(tokens, sort_keys=True), **git_credentials())
+                      FLEET_GIT_TOKENS=json.dumps(tokens, sort_keys=True), **git_credentials(),
+                      # what a session does with gh goes to no third party, and the fleet's pin chooses gh's version
+                      **GH_QUIET)
     if groups:
         values["GH_TOKEN"] = groups[0]["token"]
         others = sorted(set(tokens) - set(groups[0]["repos"]))
@@ -1205,10 +1210,17 @@ def github_text(values, tools):
     if repos:
         text += ("In each repository, work on the default branch of origin: git pull --rebase, commit your change, and "
                  "push it to that branch. Do not make a branch, and do not open a pull request. Give your commit in "
-                 "where_output_is. A task that asks for something else wins. ")
+                 "where_output_is. A task that asks for something else wins. "
+                 # what the tokens hold (hub.github_permissions, door.token_permissions): Actions is read at read and
+                 # write where the App's installation holds it, and checks and statuses are in no token
+                 "Where the hub's GitHub App has the Actions permission, read, write and deploy can all read the "
+                 "GitHub Actions runs of a repository, with their jobs and logs (gh run list, gh run view). No token "
+                 "reads check runs or commit statuses, so gh pr checks does not work. Read the runs of the commit "
+                 "instead (gh run list --commit <sha>). ")
     if any(access == "deploy" for _, access in repos):
         text += ("deploy is write and the repository's own deployment: its .github/workflows files, which a write "
-                 "token may not push at all, and its GitHub Actions runs (gh workflow, gh run). ")
+                 "token may not push at all, and the start of its GitHub Actions runs (gh workflow run, "
+                 "gh run rerun). ")
     if "GH_TOKEN" in values:
         text += ("GH_TOKEN and git's credentials for these repositories stop working one hour after this start. Never "
                  "show them or put them in a note, a file, a command or a commit. ")
@@ -6332,6 +6344,232 @@ def ensure_ops():
     return True
 
 
+# The GitHub CLI of the task sessions (gh), as GitHub builds it. A session's GH_TOKEN is for gh and the GitHub tool, but
+# on 10 November 2026 the fleet's Linux servers had no gh (task sessions answered "gh: command not found"), and the
+# agents used curl in its place. The helper puts gh in ~/.local/bin of its own OS user, as it puts the door's ops there:
+# that needs no root, no package source and no root file, which only a join run as root can put on a server, so gh
+# reaches a running server with the release that carries this pin, and a new server with its first agent. A gh on the
+# PATH at the pinned version or newer stays as it is, and the sessions use it (Homebrew's on a Mac); an older one, such
+# as a distribution's package, stays for the machine's other users, and the agent's sessions get the pin first. The
+# pin is a version at least seven days old (the owner's rule for npm packages), and each file is held to its SHA-256:
+# the archive to the one that GitHub publishes with the release (gh_<version>_checksums.txt, which the release's build
+# attestation signs too), and its bin/gh to the one read out of that archive.
+GH_VERSION = "2.103.3"          # GitHub's release of 26 October 2026
+GH_PIN = tuple(int(n) for n in GH_VERSION.split("."))
+GH_RELEASES = "https://github.com/cli/cli/releases/download"
+GH_SYSTEMS = {"Linux": "linux", "Darwin": "macOS"}
+GH_ARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
+GH_BUILDS = {   # gh's name for a system: (its archive, the archive's SHA-256, the SHA-256 of the bin/gh in it)
+    "linux_amd64": ("tar.gz", "4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d",
+                    "b768184570b12536be4ac1528893f6340d1c6a7b40b56ad45bca9cd0e87ad34d"),
+    "linux_arm64": ("tar.gz", "ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306ce63",
+                    "a82a52e1bbe05bcd485f8cbbd5aa67e11a76fce6bdad394a2d179e1c24cfe367"),
+    "macOS_amd64": ("zip", "a2f86418f4350ae6e9ec60d5000bdf7665728436946a97fc27fe50e6ae752682",
+                    "547afd9491efe0730c7f42791b53529dccecda647837155cbd18ddedf92f799f"),
+    "macOS_arm64": ("zip", "d700207eae9ae98fe2b89535c2c087c07823d4628c56364695a5a07ef311c062",
+                    "5f8d7527e2bdf584249b030cdd1550c91d75e8afb40aa3c11573d416817a1260"),
+}
+GH_MOST = 64 << 20              # bytes of the archive, and of its program: they are about 15 and 40 MB
+GH_ROOM = 3 * GH_MOST           # bytes free on the disk of ~/.local/bin before a try, so that a try fills no disk
+GH_TRIES = 4                    # tries at one start of the helper, GH_WAIT seconds apart, while the network fails
+GH_WAIT = 20
+GH_SAYS = re.compile(r"gh version (\d+)\.(\d+)\.(\d+)")      # the first line of `gh --version`
+# gh sends telemetry to GitHub unless it is told not to, and it looks for a newer gh once a day: integration_env gives
+# these two to a session with repositories, and the helper's own calls of gh run with them
+GH_QUIET = {"GH_TELEMETRY": "0", "GH_NO_UPDATE_NOTIFIER": "1"}
+
+
+def file_sha256(path):
+    """The SHA-256 of a file, or None when it cannot be read."""
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                digest.update(block)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def gh_platform(run=subprocess.run):
+    """gh's name for this system and processor (linux_amd64, macOS_arm64), or None where GitHub builds no gh. A Python
+    that runs under Rosetta on an Apple silicon Mac takes the arm64 build, as claude_platform does."""
+    system, machine = GH_SYSTEMS.get(os.uname().sysname), GH_ARCH.get(os.uname().machine)
+    if system == "macOS" and machine == "amd64":
+        try:
+            if run(["sysctl", "-n", "sysctl.proc_translated"], capture_output=True, text=True,
+                   timeout=10).stdout.strip() == "1":
+                machine = "arm64"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    name = f"{system}_{machine}"
+    return name if name in GH_BUILDS else None
+
+
+def gh_version_of(program, run=subprocess.run):
+    """The version of a gh program, (2, 103, 3) for example, from its own `gh --version`; None when it gives none."""
+    try:
+        done = run([program, "--version"], capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL,
+                   env=dict(os.environ, **GH_QUIET))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    said = GH_SAYS.search(done.stdout or "") if done.returncode == 0 else None
+    return tuple(int(n) for n in said.groups()) if said else None
+
+
+@contextlib.contextmanager
+def gh_program(archive, kind, member):
+    """The program in gh's archive (a file object), as a file to read: the member at that path, and only a regular
+    file. Nothing else of the archive is read or written."""
+    try:
+        opened = zipfile.ZipFile(archive) if kind == "zip" else tarfile.open(fileobj=archive, mode="r:gz")
+    except (tarfile.TarError, zipfile.BadZipFile) as e:
+        raise Refused(f"the archive of gh {GH_VERSION} cannot be read ({type(e).__name__})") from None
+    with opened:
+        try:
+            info = opened.getinfo(member) if kind == "zip" else opened.getmember(member)
+        except KeyError:
+            raise Refused(f"the archive of gh {GH_VERSION} has no {member}") from None
+        regular = (not info.is_dir() and not stat.S_ISLNK(info.external_attr >> 16) and info.file_size <= GH_MOST
+                   if kind == "zip" else info.isfile() and info.size <= GH_MOST)
+        if not regular:
+            raise Refused(f"{member} in the archive of gh {GH_VERSION} is not a program of at most {GH_MOST} bytes")
+        with (opened.open(info) if kind == "zip" else opened.extractfile(info)) as f:
+            yield f
+
+
+def gh_copy(source, sink, digest):
+    """source into the file object sink, read in blocks into digest: at most GH_MOST bytes."""
+    size = 0
+    for block in iter(lambda: source.read(1 << 20), b""):
+        size += len(block)
+        if size > GH_MOST:
+            raise Refused(f"the files of gh {GH_VERSION} are larger than {GH_MOST} bytes")
+        digest.update(block)
+        sink.write(block)
+
+
+def ensure_gh(fetch=None, run=subprocess.run):
+    """The pinned gh in ~/.local/bin of this OS user, which the helper's PATH and so every session's carries first.
+    What it did: "there" (that gh is in place), "kept" (the first gh on the PATH is the pinned version or newer),
+    "installed", or "none" (GitHub builds no gh for this system). Where helpers still run as one OS user, they share
+    its ~/.local/bin, so one of them installs it while the others wait, and then they find it in place. The archive stays in memory, and the program appears whole or not at all. Raises
+    Refused when the pinned files cannot be had here (the disk is nearly full, or the archive or its program is not
+    the pinned one), and the error of the download when that fails. fetch: urlopen."""
+    platform = gh_platform(run)
+    if platform is None:
+        return "none"
+    kind, archive_sum, program_sum = GH_BUILDS[platform]
+    folder = os.path.join(os.path.expanduser("~"), ".local", "bin")
+    target = os.path.join(folder, "gh")
+    if file_sha256(target) == program_sum:
+        return "there"
+    found = shutil.which("gh")
+    if found and (gh_version_of(found, run) or ()) >= GH_PIN:
+        return "kept"                           # an older pin of the helper's own, or any older gh, is not
+    os.makedirs(folder, exist_ok=True)
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    with open(os.path.join(HOME, "gh.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)        # the lock ends with the file
+        if file_sha256(target) == program_sum:
+            return "there"                      # another helper of this user installed it a moment ago
+        if shutil.disk_usage(folder).free < GH_ROOM:
+            raise Refused(f"the disk of {folder} has less than {GH_ROOM >> 20} MB free")
+        for left in glob.glob(os.path.join(folder, ".gh.*.new")):
+            pid = left.rsplit(".", 2)[-2]
+            if pid.isdigit() and int(pid) != os.getpid() and process_gone(int(pid)):
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(left)             # what a helper that ended in the middle left behind
+        name = f"gh_{GH_VERSION}_{platform}"
+        new = os.path.join(folder, f".gh.{os.getpid()}.new")
+        try:
+            archive, got = io.BytesIO(), hashlib.sha256()
+            with (fetch or urllib.request.urlopen)(urllib.request.Request(
+                    f"{GH_RELEASES}/v{GH_VERSION}/{name}.{kind}", headers={"User-Agent": OUTSIDE_AGENT}),
+                    timeout=60) as r:
+                gh_copy(r, archive, got)
+            if got.hexdigest() != archive_sum:
+                raise Refused(f"the download of gh {GH_VERSION} does not match the SHA-256 that GitHub publishes")
+            archive.seek(0)
+            got = hashlib.sha256()
+            with gh_program(archive, kind, f"{name}/bin/gh") as program, \
+                    open(os.open(new, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o755), "wb") as f:
+                gh_copy(program, f, got)
+            if got.hexdigest() != program_sum:
+                raise Refused(f"the program in the archive of gh {GH_VERSION} is not the pinned one")
+            os.chmod(new, 0o755)
+            os.replace(new, target)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(new)
+    return "installed"
+
+
+def gh_quiet(program, run=subprocess.run):
+    """gh's own setting telemetry: disabled for this OS user, so that no use of gh by this agent sends telemetry, also
+    in a session without repositories, which gets no GH_TELEMETRY. On Linux only, where the agent's OS user is the
+    fleet's own; on a Mac the user is the desktop account, and the helper leaves its gh settings as they are. True when
+    it set it now."""
+    if os.uname().sysname != "Linux":
+        return False
+    env = dict(os.environ, **GH_QUIET)
+    got = run([program, "config", "get", "telemetry"], capture_output=True, text=True, timeout=20,
+              stdin=subprocess.DEVNULL, env=env)
+    if got.returncode == 0 and got.stdout.strip() == "disabled":
+        return False
+    done = run([program, "config", "set", "telemetry", "disabled"], capture_output=True, text=True, timeout=20,
+               stdin=subprocess.DEVNULL, env=env)
+    if done.returncode != 0:
+        raise Refused(f"gh did not take the setting: {(done.stderr or done.stdout or '').strip()[-200:]}")
+    return True
+
+
+def gh_say(text):
+    print(time.strftime("%H:%M:%S"), text, flush=True)
+
+
+def gh_thread(tries=GH_TRIES, wait=GH_WAIT, sleep=time.sleep, say=gh_say):
+    """ensure_gh at the start of a worker's or a lead's helper, in a thread of its own: the download takes seconds,
+    and the helper's loop does not wait for it. A try that fails on the network is made again `wait` seconds later,
+    `tries` times in all, and a refusal is not tried again; after that, the helper's next start tries again. Each
+    outcome that changes or blocks something is one line of the helper's log, and nothing reaches the hub or the
+    owner's apps."""
+    for again in range(1, tries + 1):
+        try:
+            done = ensure_gh()
+        except Refused as e:
+            say(f"the GitHub CLI gh {GH_VERSION} is not installed: {e}")
+            return None
+        except Exception as e:
+            say(f"the GitHub CLI gh {GH_VERSION} is not installed (try {again} of {tries}): {type(e).__name__}: "
+                f"{str(e)[:200]}")
+            if again < tries:
+                sleep(wait)
+            continue
+        if done == "installed":
+            say(f"the GitHub CLI gh {GH_VERSION} is installed in ~/.local/bin for this agent's sessions")
+        elif done == "none":
+            say(f"GitHub builds no gh for {os.uname().sysname} on {os.uname().machine}, so this agent's sessions "
+                f"have none")
+        program = shutil.which("gh") if done != "none" else None
+        try:
+            if program and gh_quiet(program):
+                say("gh sends no telemetry for this agent's user now (gh config: telemetry disabled)")
+        except Exception as e:
+            say(f"gh's telemetry setting is not changed: {type(e).__name__}: {str(e)[:200]}")
+        return done
+    return None
+
+
+def start_gh(conf):
+    """gh_thread at the start of the helper of a worker or a lead: the roles whose task sessions get GitHub repositories
+    (integration_env). True when the thread started; the helper's loop does not wait for it."""
+    if conf.get("role") not in ("worker", "lead"):
+        return False
+    threading.Thread(target=gh_thread, name="github-cli", daemon=True).start()
+    return True
+
+
 def cmd_run(args):
     agent, conf = args.agent, agent_conf(args.agent)
     if not shutil.which("tmux"):
@@ -6351,6 +6589,7 @@ def cmd_run(args):
     ready_runtime_config()          # before the first session: nobody is there to answer the runtime's first screen
     ready_codex_trust(conf.get("runtime"))      # and Codex's own; a switch to Codex starts a new helper too
     ensure_ops()                    # DevOps plan C1: the door's command on this box
+    start_gh(conf)                  # and the GitHub CLI of its task sessions
     h.manager_due = conf.get("role") == "manager" and h.manager_first()
     print(f"helper for {agent} is running; persistent inbox delivery; sessions in {h.session}", flush=True)
     collector = Collector(KIT, agent, conf["runtime"],

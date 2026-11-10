@@ -22563,7 +22563,7 @@ TOOLS = [
                          "repo:acme/web, secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com or tool:<MCP server>"},
         "needs_level": {"type": "string", "description": "The level of that thing that the task needs, when you "
                         "already hold it at a lower one: a GitHub repository runs read, write, deploy, so an agent "
-                        "with write that must change a workflow file or run GitHub Actions asks for the same "
+                        "with write that must change a workflow file or start a GitHub Actions run asks for the same "
                         "repository at deploy. Leave it out when any level of it does."}},
        ["task_id", "question"])),
     ("worker", "deliver_result", t_deliver_result,
@@ -23405,7 +23405,8 @@ TOOLS = [
         "resource": {"type": "string", "description": "The resource, <kind>:<what>: repo:acme/web, "
                      "secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com or tool:<MCP server>"},
         "level": {"type": "string", "description": "repo: read, write, or deploy for write and the repository's own "
-                  "deployment (its workflow files and its GitHub Actions runs). secret: use, or read for an API key. "
+                  "deployment (its workflow files and the start of its GitHub Actions runs; every level reads the "
+                  "runs where the App has the Actions permission). secret: use, or read for an API key. "
                   "drive: read, write or write_shared. gmail: read or write. tool: use."},
         "why": {"type": "string", "description": "The one line the owner reads about this grant: what the work needs "
                 "it for"},
@@ -32017,7 +32018,8 @@ GITHUB_APP = os.path.expanduser("~/.fleet/github-app.pem")
 # The App permissions of each level (REPO_ACCESS). deploy is write and the two that a deployment needs: workflows,
 # without which GitHub refuses any push that touches .github/workflows (actions: write does not cover it), and
 # actions, to start a run and read it. The owner's App must carry both and the installation must have accepted them,
-# which is what DEPLOY_APP_NOTE says wherever a deploy token is refused.
+# which is what DEPLOY_APP_NOTE says wherever a deploy token is refused. A read or write token also reads the runs
+# where the installation holds Actions (github_permissions).
 GITHUB_ACCESS = {"read": {"contents": "read", "pull_requests": "read", "metadata": "read"},
                  "write": {"contents": "write", "pull_requests": "write", "metadata": "read"},
                  "deploy": {"contents": "write", "pull_requests": "write", "metadata": "read",
@@ -32163,6 +32165,18 @@ def github_hint(access, step, status, names):
     return f"; the GitHub App must be installed on {', '.join(names)}"
 
 
+def github_permissions(access, held):
+    """The permissions of one token at this access, from an installation that holds `held` (its own permissions, as
+    GitHub gives them with the installation): GITHUB_ACCESS of the access, and for read and write also actions: read
+    where the installation holds Actions, so that a session reads the runs of GitHub Actions, as the door's tokens do
+    (door.token_permissions, 10 November 2026). GitHub refuses the whole token (422) when it asks for a permission that
+    the installation does not hold, so elsewhere the token is exactly GITHUB_ACCESS of the access."""
+    asked = dict(GITHUB_ACCESS[access])
+    if access in ("read", "write") and isinstance(held, dict) and held.get("actions") in ("read", "write"):
+        asked["actions"] = "read"
+    return asked
+
+
 def github_tokens(repos, agent=None):
     """([{token, expires_at, access, repos}], [{repos, error}]) for an agent's {owner/name: read | write | deploy}: one
     installation token for each account and access, limited to those repositories and that access. A token lasts
@@ -32183,12 +32197,14 @@ def github_tokens(repos, agent=None):
         step = "install"
         try:
             if account not in installs:     # one installation for each account that the owner installed the App on
-                installs[account] = github_call("GET", f"/repos/{names[0]}/installation", jwt).get("id")
-            if isinstance(installs[account], bool) or not isinstance(installs[account], int):
+                installs[account] = github_call("GET", f"/repos/{names[0]}/installation", jwt)
+            install = installs[account] if isinstance(installs[account], dict) else {}
+            if isinstance(install.get("id"), bool) or not isinstance(install.get("id"), int):
                 raise GitHubError(f"GitHub gave no installation for {names[0]}")
             step = "token"
-            got = github_call("POST", f"/app/installations/{installs[account]}/access_tokens", jwt,
-                              {"repositories": [n.split("/", 1)[1] for n in names], "permissions": GITHUB_ACCESS[access]})
+            got = github_call("POST", f"/app/installations/{install['id']}/access_tokens", jwt,
+                              {"repositories": [n.split("/", 1)[1] for n in names],
+                               "permissions": github_permissions(access, install.get("permissions"))})
             if not isinstance(got.get("token"), str) or not GITHUB_TOKEN.fullmatch(got["token"]):
                 raise GitHubError("GitHub gave no valid token")
             tokens.append({"token": got["token"], "expires_at": got.get("expires_at"), "access": access, "repos": names})
