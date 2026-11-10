@@ -1936,12 +1936,20 @@ def json_plain(text):
     return plain.encode("utf-16", "surrogatepass").decode("utf-16", "replace")      # a pair becomes its one character
 
 
+SCRUB = threading.local()       # the registered logins that this thread's scrub() read once for its whole value
+
+
 def secret_key():
     """The registered logins as a hashable key: (salt, hash, length) per row. The hub keeps only salted hashes.
 
     read_rows and not q: guard and mask_secrets reach here, and both now run on the start-text path, which
     admit_task calls inside the transaction that writes a task, its first attempt and its start event together or
-    not at all. q commits at once, so a q here committed the half-written task. A read needs no commit."""
+    not at all. q commits at once, so a q here committed the half-written task. A read needs no commit.
+
+    While this thread runs scrub(), it gives the logins that scrub read once for its whole value (SCRUB)."""
+    held = getattr(SCRUB, "key", None)
+    if held is not None:
+        return held
     return tuple((r["salt"], r["hash"], r["len"])
                  for r in read_rows("SELECT salt, hash, len FROM secrets ORDER BY id"))
 
@@ -2035,11 +2043,28 @@ def mask_secrets(text):
 
 
 def scrub(value):
-    """Mask old text too: a login can be registered after the text was stored."""
+    """Mask old text too: a login can be registered after the text was stored.
+
+    The registered logins are read once for the whole value, and not once for each text in it. Each text still goes
+    through secret_hit, and secret_key gives it the logins that this scrub read (SCRUB). Only this thread sees them, and
+    only until this scrub ends. The state that the Mac app reads every 3 seconds holds some 9,000 texts. In a copy of
+    the first fleet's database (its row counts and text sizes, with made-up words), their 9,000 reads of the logins
+    were 60% of the time of one read of the state, and 9,000 takes of the hub's lock (10 November 2026)."""
+    if getattr(SCRUB, "key", None) is not None:         # a scrub of this thread is under way: the value is part of it
+        return scrubbed(value)
+    try:
+        SCRUB.key = secret_key()
+        return scrubbed(value)
+    finally:
+        SCRUB.key = None
+
+
+def scrubbed(value):
+    """scrub() of one value, inside the scrub that read the logins."""
     if isinstance(value, dict):
-        return {key: scrub(item) for key, item in value.items()}
+        return {key: scrubbed(item) for key, item in value.items()}
     if isinstance(value, list):
-        return [scrub(item) for item in value]
+        return [scrubbed(item) for item in value]
     if isinstance(value, str) and secret_hit(value):
         return MASK
     return value
@@ -13115,9 +13140,10 @@ def limits_text(limits):
 
 def goal_view(g):
     read = q1("SELECT read_at FROM events WHERE id=?", (g["event_id"],)) if g["event_id"] else None
+    tokens, measured_at = goal_tokens(g["id"])      # one read for both: it joins the goal's tasks to their sessions
     return {"id": g["id"], "title": g["title"], "text": g["text"], "state": g["state"], "paused_by": g["paused_by"],
             "revision": g["revision"], "limits": json.loads(g["limits"]), "spent": spent_cents(g["id"]) / 100,
-            "tokens_used": goal_tokens(g["id"])[0], "tokens_measured_at": goal_tokens(g["id"])[1],
+            "tokens_used": tokens, "tokens_measured_at": measured_at,
             "next_step": live_next_step(g), "plan": [step_view(s) for s in plan_steps(g["id"])],
             "wake_at": g["wake_at"], "result": g["result"],
             "created": g["created"], "updated": g["updated"], "read_at": read["read_at"] if read else None,
@@ -16209,22 +16235,53 @@ def duty_one_line(value, what, limit=200):
         raise ToolError(f"{e}.") from None
 
 
+# The steps and the tasks of cases, oldest first: one text of each read, for one case and for many, so that a case shows
+# the same steps and tasks wherever it is shown.
+DUTY_STEPS_READ = "SELECT * FROM duty_steps WHERE duty_case IN ({}) ORDER BY id"
+DUTY_TASKS_READ = "SELECT id, state, owner, duty_case FROM tasks WHERE duty_case IN ({}) ORDER BY id"
+DUTY_PARTS_CHUNK = 500          # case ids in one read of duty_case_parts, far below SQLite's limit of host parameters
+
+
 def duty_steps_of(case_id):
-    return q("SELECT * FROM duty_steps WHERE duty_case=? ORDER BY id", (case_id,))
+    return q(DUTY_STEPS_READ.format("?"), (case_id,))
 
 
 def duty_case_tasks(case_id):
-    return q("SELECT id, state, owner FROM tasks WHERE duty_case=? ORDER BY id", (case_id,))
+    return q(DUTY_TASKS_READ.format("?"), (case_id,))
 
 
-def duty_case_view(c):
+def duty_case_parts(cases):
+    """The steps and the tasks of these cases, for duty_case_view: ({case: steps}, {case: tasks}, the ids of the cases
+    read), each list oldest first, as duty_steps_of and duty_case_tasks give them. Two reads for all the cases, where
+    those two are two reads for each case: the Mac app reads every duty with its open cases every 3 seconds
+    (GET /ui/state), and on the first fleet one duty had 118 open cases. That was at least 236 reads for each read of
+    the state, all under the hub's lock (10 November 2026)."""
+    ids = sorted({c["id"] for c in cases})
+    steps, tasks = {}, {}
+    for at in range(0, len(ids), DUTY_PARTS_CHUNK):
+        part = ids[at:at + DUTY_PARTS_CHUNK]
+        marks = ",".join("?" * len(part))
+        for s in q(DUTY_STEPS_READ.format(marks), part):
+            steps.setdefault(s["duty_case"], []).append(s)
+        for t in q(DUTY_TASKS_READ.format(marks), part):
+            tasks.setdefault(t["duty_case"], []).append(t)
+    return steps, tasks, frozenset(ids)
+
+
+def duty_case_view(c, parts=None):
+    """One case as the owner's apps and the duty tools show it. parts: duty_case_parts of a set of cases, so that a view
+    of many cases reads their steps and tasks once. A case that they did not read reads its own."""
+    if parts and c["id"] in parts[2]:
+        steps, tasks = parts[0].get(c["id"], []), parts[1].get(c["id"], [])
+    else:
+        steps, tasks = duty_steps_of(c["id"]), duty_case_tasks(c["id"])
     return {"id": c["id"], "ref": cref(c), "responsibility": c["responsibility"], "key": c["key"],
             "title": c["title"], "source": c["source"], "state": c["state"], "opened": c["opened"],
             "opened_by": c["by"], "first_step": c["first_step"], "closed": c["closed"], "closed_by": c["closed_by"],
             "outcome": c["outcome"], "note": c["note"], "repeated": bool(c["repeated"]),
             "steps": [{"key": s["key"], "text": s["text"], "task": s["task"],
-                       "by": s["by"], "at": s["ts"]} for s in duty_steps_of(c["id"])],
-            "tasks": [{"id": t["id"], "state": t["state"]} for t in duty_case_tasks(c["id"])]}
+                       "by": s["by"], "at": s["ts"]} for s in steps],
+            "tasks": [{"id": t["id"], "state": t["state"]} for t in tasks]}
 
 
 def check_condition_words(condition):
@@ -16257,18 +16314,21 @@ def duty_view(r, t0=None):
     # The window before it, so that "fewer repeats" can be read without counting anything new: a repeat is the
     # measure of a preventive action that did not work, and the rate matters, not the count alone.
     before = [c for c in cases if t0 - 2 * window < c["opened"] <= t0 - window]
+    watch = [duty_watch_view(t, t0) for t in duty_watches(r["id"], live=False)]
+    joined = duty_joined_open(r["id"])
+    parts = duty_case_parts(cases[-1:] + live + joined)
     return {"id": r["id"], "agent": r["agent"], "title": duty_name(r["text"]), "text": r["text"],
             "state": r["state"],
             "revision": r["revision"], "created": r["created"], "updated": r["updated"], "created_by": r["created_by"],
             "request_id": r["request_id"] or None,
-            "watch": [duty_watch_view(t, t0) for t in duty_watches(r["id"], live=False)],
+            "watch": watch,
             "open_cases": len(live), "cases_30d": len(recent),
             "repeats_30d": len([c for c in recent if c["repeated"]]),
             "cases_prev_30d": len(before),
             "repeats_prev_30d": len([c for c in before if c["repeated"]]),
-            "last_case": duty_case_view(cases[-1]) if cases else None,
-            "cases": [duty_case_view(c) for c in live],
-            "joined": [duty_case_view(c) for c in duty_joined_open(r["id"])],
+            "last_case": duty_case_view(cases[-1], parts) if cases else None,
+            "cases": [duty_case_view(c, parts) for c in live],
+            "joined": [duty_case_view(c, parts) for c in joined],
             "marker": {"kind": r["marker_kind"], "since": r["marker_since"], "detail": r["marker_detail"]}
             if r["marker_kind"] else None}
 
@@ -36366,6 +36426,7 @@ class Handler(BaseHTTPRequestHandler):
     def ui_state(self):
         if not self.ui_allowed():
             return
+        plain_rows = {}
         with LOCK:
             # Read under the same LOCK as the snapshot, which no write can join while it is built (live_changes).
             result = {"schema_version": 1, "db": kv_get("db_id"), "time": now(), "token": change_token(),
@@ -36374,7 +36435,8 @@ class Handler(BaseHTTPRequestHandler):
                       "ui_features": ui_features()}
             for table, key in (("tasks", "tasks"), ("notes", "notes"),
                                ("prompts", "permissions"), ("holds", "holds"), ("outcomes", "outcomes")):
-                result[key] = [dict(r) for r in q(f"SELECT * FROM {table} ORDER BY id")]
+                plain_rows[key] = q(f"SELECT * FROM {table} ORDER BY id")
+                result[key] = None          # its place in the answer: its rows become dicts after the lock
             result["needs"] = [need_view(r) for r in q("SELECT * FROM needs ORDER BY id")]
             result["agents"] = []
             for name, config in agents().items():
@@ -36431,6 +36493,11 @@ class Handler(BaseHTTPRequestHandler):
             result["steers"] = [steer_view(r) for r in q("SELECT s.*, e.read_at FROM steers s JOIN events e "
                                                           "ON e.id=s.event_id ORDER BY s.id")]
             result["secrets"] = [dict(r) for r in q("SELECT id,COALESCE(label,'Registered login') AS label FROM secrets ORDER BY id")]
+        # A row holds its own values, so this needs no lock. On the first fleet the tasks were 977 KB of the state's
+        # 1.70 MB, and in a copy of its database making their rows into dicts took 2.1 ms of each read's hold of the
+        # lock (10 November 2026).
+        for key, got in plain_rows.items():
+            result[key] = [dict(r) for r in got]
         result["knowledge"] = [knowledge_public(k) for k in knowledge_entries()]
         # Keys, ciphertext, helper jobs, raw worker queues and runtime configuration are excluded.
         # Also mask old text if a login was registered after that text was stored.
