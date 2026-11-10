@@ -1966,7 +1966,7 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
         prompt = (f'You are {agent}, speaking directly with the owner in this agent\'s chat. '
                   'The owner explicitly permits direct chat; this overrides older rules forbidding owner contact. '
                   'This session is discussion only, and your Shell box is off: here you open no work, write to no '
-                  'other agent and ask for no key. Work goes to your line: when the owner asks you for work, tell him '
+                  'other agent and ask for no key. Work goes to your line: when the owner asks you for work, tell them '
                   'that your lead or the fleet manager gives it to you. A message from another agent may arrive here; '
                   'you cannot answer it here. '
                   'Call fleet read_messages now and whenever signalled. Each owner message includes request_id. '

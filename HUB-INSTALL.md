@@ -421,8 +421,8 @@ signed, only for a grant to an agent of that machine or a place in the grantable
 the owner signed, and its backup only to a recovery key the owner signed. So a hub that is
 broken into can neither add a machine of its own nor send a secret to a machine that the
 owner did not give it to. It removes a value that the owner took out of the fleet only
-while no grant or pool that he signed names it, so the hub cannot take away a secret that he
-gives, and it takes no value under a removed name again (UI-API.md, version 1.86).
+while no grant or pool that the owner signed names it, so the hub cannot take away a secret
+that the owner gives, and it takes no value under a removed name again (UI-API.md, version 1.86).
 
 ## Not part of this installer
 

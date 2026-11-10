@@ -122,7 +122,7 @@ CREATE TABLE IF NOT EXISTS prompts(id INTEGER PRIMARY KEY, task INTEGER, agent T
 CREATE TABLE IF NOT EXISTS rules(id INTEGER PRIMARY KEY, agent TEXT, tool TEXT, key TEXT, input TEXT, decision TEXT);
 CREATE TABLE IF NOT EXISTS needs(id INTEGER PRIMARY KEY, title TEXT, why TEXT, todo TEXT, raised REAL,
   by TEXT, answer TEXT, answered REAL);
--- owner feature need_talk: the owner's questions on one Needs-you item and the manager's replies, before he decides.
+-- owner feature need_talk: the owner's questions on one Needs-you item and the manager's replies, before the answer.
 -- request_id is the owner's, so a resent question is one row.
 CREATE TABLE IF NOT EXISTS need_talk(id INTEGER PRIMARY KEY, need INTEGER NOT NULL, ts REAL NOT NULL,
   who TEXT NOT NULL, text TEXT NOT NULL, request_id TEXT UNIQUE);
@@ -1406,12 +1406,12 @@ def need_words(title, why, todo="", options=(), details=""):
     """What is wrong with the words of a Needs-you item that the owner reads, or None: a title and a why that a
     glance takes in, and no code anywhere (T-61, R-3, Q-59): he reads names and plain words."""
     if len(title) > NEED_TITLE_CHARS:
-        return (f"The title is at most {NEED_TITLE_CHARS} characters: name what he decides, in a few words. This one has "
-                f"{len(title)}.")
+        return (f"The title is at most {NEED_TITLE_CHARS} characters: name what the owner decides, in a few words. "
+                f"This one has {len(title)}.")
     if len(why) > NEED_WHY_CHARS:
-        return (f"why is at most {NEED_WHY_CHARS} characters, one or two plain sentences: what he decides and why it "
-                f"matters now. Put the reasoning, the quotes and the facts in details, which his card shows behind "
-                f"Details. This one has {len(why)}.")
+        return (f"why is at most {NEED_WHY_CHARS} characters, one or two plain sentences: what the owner decides and "
+                f"why it matters now. Put the reasoning, the quotes and the facts in details, which the owner's card "
+                f"shows behind Details. This one has {len(why)}.")
     if len(details) > NEED_DETAILS_CHARS:
         return f"details is at most {NEED_DETAILS_CHARS} characters. This one has {len(details)}."
     for part in (title, why, todo, *options, details):
@@ -2774,7 +2774,13 @@ def task_start_text(agent, task_id, resume=False, note="", row=None, opening=Non
             f'session; do not pull at the start. Call read_messages with task_id \"{tref(task_id)}\" now and whenever '
             f'signalled. ')
     closed = shell_off(agent)           # support plan F1: its own tools, and no way up but its typed result
-    said += (f'You are RESUMING task {tref(task_id)} after your earlier session stopped. '
+    # A message started this attempt for a task that waits for its reminder (liveness): its work now is the message,
+    # so this start does not say "continue and finish", which the note after it would then have to take back.
+    said += (f'You are in task {tref(task_id)} again, in a new session, and only for a message: the task itself still '
+             f'waits. Call the fleet tool list_my_tasks with task_id "{tref(task_id)}" for the task. Do not go on '
+             f'with its own work now, and do not deliver it for the message alone.'
+             if resume == PARK_MESSAGE and not closed else
+             f'You are RESUMING task {tref(task_id)} after your earlier session stopped. '
              + (f'First check what was already done, with your own MCP servers (rule 9: check before repeating), '
                 if closed else f'Call the fleet tool list_my_tasks with task_id "{tref(task_id)}". First check what '
                                f'was already done (rule 9: check before repeating), ') +
@@ -3252,10 +3258,12 @@ def session_alive(agent, task_id):
                 tref(task_id) in (row["alive"] or "").split(","))
 
 
-def attempt_event(t, note=""):
-    """emit's row for the start of the next attempt of task row `t` (see event_rows)."""
+def attempt_event(t, note="", resume=True):
+    """emit's row for the start of the next attempt of task row `t` (see event_rows). resume: True, or PARK_MESSAGE
+    for the attempt that a message starts for a parked task, whose start does not say to go on with the task."""
     opening = stable_opening(t["owner"], t["needs"])
-    return (t["owner"], "task", t["id"], start_text(t["owner"], t["id"], resume=True, note=note, row=t, opening=opening),
+    return (t["owner"], "task", t["id"],
+            start_text(t["owner"], t["id"], resume=resume, note=note, row=t, opening=opening),
             dict({"needs": t["needs"], "resume": True, "attempt": t["attempt"] + 1, "generation": kv_get("db_id")},
                  **stable_extra(t["owner"], opening), **closed_extra(t["owner"], t["responsibility"])))
 
@@ -3310,7 +3318,7 @@ PROMPT_POLLS = "prompt_polls"       # the helper feature: its hooks and runners 
 def new_attempt(t, reason, note="", counted=False):
     """Start the task again in a new fenced session. Earlier attempts can no longer report. The attempt and its start
     event are written together, or not at all."""
-    event = attempt_event(t, note)
+    event = attempt_event(t, note, PARK_MESSAGE if reason == PARK_MESSAGE else True)
     with transaction():
         attempt_rows(t, reason, event, now(), counted)
 
@@ -5331,7 +5339,7 @@ def cancel_subtasks(task_id, reason):
         unfile_notices(sub["id"])
         end_waits(sub["id"])
         emit(sub["owner"], "say", f"[hub] {tref(sub['id'])} was canceled because its parent {tref(task_id)} was canceled: "
-             f"{reason}. Stop working on it now.", task=sub["id"])
+             f"{full_stop(reason)} Stop working on it now.", task=sub["id"])
         cancel_subtasks(sub["id"], reason)
 
 
@@ -5631,7 +5639,8 @@ def t_cancel_task(agent, a):
       (f"Canceled: {reason}", now(), tid))
     unfile_notices(tid)
     end_waits(tid)
-    emit(t["owner"], "say", f"[hub] {tref(tid)} was canceled by your requester: {reason}. Stop working on it now.", task=tid)
+    emit(t["owner"], "say", f"[hub] {tref(tid)} was canceled by your requester: {full_stop(reason)} Stop working on it "
+                            f"now.", task=tid)
     cancel_subtasks(tid, reason)
     left = case_left_open(case_id=t["duty_case"]) if t["duty_case"] else None
     return f"{tref(tid)} is canceled." + (" " + case_left_open_text(left) if left else "")
@@ -6059,7 +6068,8 @@ def t_set_reminder(agent, a):
     return (f"Reminder R-{rid}: the hub brings you back to {tref(tid)} at {goal_time(due)}. Until then {tref(tid)} "
             f"waits: nothing nudges it and no session is started for it, and it is marked as waiting until then for "
             f"{t['requester']}.{desk} Stop working on it now; the hub puts your note in front of you in this "
-            f"session if it still runs, and in a new one if it does not.")
+            f"session if it still runs, and in a new one if it does not. A message for {tref(tid)} still reaches you "
+            f"meanwhile, the same way.")
 
 
 def t_see_team(agent, a):
@@ -7884,10 +7894,10 @@ def t_raise_needs_you(agent, a):
     details = str(a.get("details") or "").strip()
     multi = a.get("multi")
     if multi is not None and not isinstance(multi, bool):
-        raise ToolError("multi is true when the owner may tick several of the options, and false or left out when he "
-                        "presses one.")
+        raise ToolError("multi is true when the owner may tick several of the options, and false or left out when "
+                        "they press one.")
     if multi and not options:
-        raise ToolError("multi needs options: the owner ticks any of them and sends the ones he ticked.")
+        raise ToolError("multi needs options: the owner ticks any of them and sends the ones they ticked.")
     wrong = need_words(title, why, todo, json.loads(options) if options else (), details)
     if wrong:
         raise ToolError(wrong)
@@ -7896,8 +7906,8 @@ def t_raise_needs_you(agent, a):
     if door_call is not None and not (isinstance(door_call, str) and re.fullmatch(r"[0-9a-f]{64}", door_call)):
         raise ToolError("door_call is the call hash that the door gave with its refusal: 64 hex characters.")
     if door_call is not None and not options:
-        raise ToolError("An item with a door_call needs options, and the first one is the yes: his app signs only "
-                        "that one, for example [\"Yes, run it once\", \"No\"].")
+        raise ToolError("An item with a door_call needs options, and the first one is the yes: the owner's app "
+                        "signs only that one, for example [\"Yes, run it once\", \"No\"].")
     github_app = a.get("github_app")
     if github_app is not None:
         if not (isinstance(github_app, str) and GITHUB_LOGIN.fullmatch(github_app)):
@@ -7914,8 +7924,9 @@ def t_raise_needs_you(agent, a):
     if add_device is not None:
         if add_device is not True or door_call is not None or github_app is not None or not options:
             raise ToolError("add_device is true, with options whose first one is the yes, and no door_call or "
-                            "github_app: his first option, pressed in Founderizer on his Mac, opens the Add device "
-                            "picture, which his phone scans, for example [\"Show the picture\", \"Not now\"].")
+                            "github_app: the first option, which the owner presses in Founderizer on their Mac, opens "
+                            "the Add device picture, which their phone scans, for example [\"Show the picture\", "
+                            "\"Not now\"].")
     github_key = a.get("github_key")
     if github_key is not None:      # plan 13, item 4: the two steps of the App key that the hub held (door_renew)
         renew = door_renewal() or {}
@@ -7925,7 +7936,7 @@ def t_raise_needs_you(agent, a):
                             "while it waits for that: the hub's message names it.")
         if options or door_call is not None or github_app is not None or add_device is not None:
             raise ToolError("An item with a github_key has no options, door_call, github_app or add_device: it asks "
-                            "him nothing back, and the hub closes it by itself.")
+                            "the owner nothing back, and the hub closes it by itself.")
         github_key = renew["owner"]
     notice = need_is_notice(title, why, todo, *(json.loads(options) if options else ()))
     if notice:
@@ -7959,20 +7970,21 @@ def t_raise_needs_you(agent, a):
     linked = (f" It is for Q-{qu['id']}: the owner's answer goes to {qu['asker']} as the answer of Q-{qu['id']} by "
               f"itself, and if Q-{qu['id']} is answered another way or {tref(qu['task'])} ends first, N-{nid} "
               f"closes by itself." if qu else "")
-    door = (" When the owner answers yes, his app signs that yes to the door call, and the door lets that exact call "
-            "through once: the agent sends the same call again." if door_call else "")
+    door = (" When the owner answers yes, their app signs that yes to the door call, and the door lets that exact "
+            "call through once: the agent sends the same call again." if door_call else "")
     if github_app:
-        door = (f" When the owner presses the first option in Founderizer on his Mac, it opens GitHub's own page that "
-                f"makes a private App in {github_app} with its permissions filled in. GitHub gives the App's key to his app, which gives it "
-                f"to the door, and then GitHub asks him to install the App on that account's repositories. The App's "
-                f"ID reaches the hub (GET /ui/door github_apps), and the door reads what it reaches.")
+        door = (f" When the owner presses the first option in Founderizer on their Mac, it opens GitHub's own page "
+                f"that makes a private App in {github_app} with its permissions filled in. GitHub gives the App's key "
+                f"to the owner's app, which gives it to the door, and then GitHub asks the owner to install the App on "
+                f"that account's repositories. The App's ID reaches the hub (GET /ui/door github_apps), and the door "
+                f"reads what it reaches.")
     if add_device:
-        door = (" When the owner presses the first option in Founderizer on his Mac, it opens the Add device picture, "
-                "and his phone enrolls when it scans it: it then gets the phone's signed yes of door calls and a copy "
-                "of the recovery code (GET /ui/owner/devices: certified and recovery).")
+        door = (" When the owner presses the first option in Founderizer on their Mac, it opens the Add device "
+                "picture, and their phone enrolls when it scans it: it then gets the phone's signed yes of door calls "
+                "and a copy of the recovery code (GET /ui/owner/devices: certified and recovery).")
     if github_key:
         door = (f" The hub closes N-{nid} by itself when its step is done (the door makes tokens with the new key, or "
-                f"GitHub refuses the old one), so do not withdraw it, and nobody asks him to report back.")
+                f"GitHub refuses the old one), so do not withdraw it, and nobody asks the owner to report back.")
     later = "" if qu or github_key else (" If nothing needs it any more before the owner answers, close it at once "
                                          "with withdraw_need.")
     return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{linked}{later}{door}{picks}"
@@ -8081,11 +8093,23 @@ def need_talk_said(body):
     ins("INSERT INTO need_talk(need, ts, who, text) VALUES(?,?,?,?)", (need["id"], now(), "owner", body["text"]))
     raised = "" if need["by"] == manager_name() else f", which {shown_name(need['by'])} raised"
     emit(manager_name(), "say",
-         f"[owner] About the Needs-you item N-{need['id']} ({need['title']}){raised}, before he decides: {body['text']}\n"
-         f"Answer him under the item with discuss_need(need=\"N-{need['id']}\", text=...), in plain words. If the talk "
-         f"changes its options or its words, raise it again with raise_needs_you(replaces=\"N-{need['id']}\"). His "
-         f"answer to the item still comes as its own message.")
+         f"[owner] About the Needs-you item N-{need['id']} ({need['title']}){raised}, before the owner decides: "
+         f"{body['text']}\nAnswer the owner under the item with discuss_need(need=\"N-{need['id']}\", text=...), in "
+         f"plain words.{need_again(manager_name(), need)} The owner's answer to the item still comes as its own "
+         f"message.")
     return {"need": need["id"], "talk": need_talk(need["id"])}
+
+
+def need_again(agent, need):
+    """The sentence that says how a discussion changes an open item: this agent raises it again with replaces. "" for
+    an item that raise_needs_you does not take the place of (need_replaced: another agent's, a key request, a door
+    call, an App, a phone or a key renewal), so the hub never names a call that it then refuses."""
+    try:
+        need_replaced(agent, need["id"])
+    except ToolError:
+        return ""
+    return (f" If the talk changes its options or its words, raise it again with "
+            f"raise_needs_you(replaces=\"N-{need['id']}\").")
 
 
 def t_discuss_need(agent, a):
@@ -8109,9 +8133,10 @@ def t_discuss_need(agent, a):
         if need["conversation"]:
             raise ToolError(f"N-{nid} is a question of a conversation, which its person answers.")
         ins("INSERT INTO need_talk(need, ts, who, text) VALUES(?,?,?,?)", (nid, now(), agent, text))
+        again = need_again(agent, need)
     emit("owner", "notify", f"{shown_name(agent)} replied about: {need['title']}")
-    return (f"Your reply is under N-{nid} on his card. His next message there comes to you; his answer to the item "
-            f"comes as its own message. When the talk changes the options or the words, raise it again with replaces.")
+    return (f"Your reply is under N-{nid} on the owner's card. Their next message there comes to you; their answer to "
+            f"the item comes as its own message.{again}")
 
 
 # ---------------------------------------------------------------- secret requests (owner feature secret_requests)
@@ -9482,6 +9507,19 @@ def unanswered_owner_message(agent):
     return row["request_id"] if row else None
 
 
+def owner_chat_message(agent, event_id):
+    """The chat message of the owner's to `agent` that read_messages gave the name M-<event_id>: its request id and
+    when it was read. None for any other message: the owner's answer to a Needs-you item, a word of the hub or of an
+    agent, and a message to another agent."""
+    return q1("SELECT u.request_id, e.read_at FROM ui_requests u JOIN events e ON e.id=u.event_id "
+              "WHERE u.event_id=? AND u.recipient=? AND u.kind='message' AND u.need_id IS NULL", (event_id, agent))
+
+
+def owner_report(agent, request_id):
+    """The report of `agent` that is linked to this message of the owner's, or None."""
+    return q1("SELECT * FROM owner_reports WHERE agent=? AND in_reply_to=?", (agent, request_id))
+
+
 def owner_message(agent, reply):
     """The owner's own message to this agent, read in its chat, that the request UUID `reply` names: its ui_requests
     row, or a ToolError. Nothing else starts work from a chat: a message of another agent is in agent_messages, and a
@@ -9552,8 +9590,8 @@ def t_tell_owner(agent, a):
     if not text or len(text) > 16000 or len(about) > 500:
         raise ToolError("A report needs 1 to 16000 characters; about is at most 500 characters.")
     guard(agent, text, about)
-    reply = a.get("in_reply_to")
-    if agents()[agent].get("role") in ("worker", "lead"):
+    reply, role = a.get("in_reply_to"), agents()[agent].get("role")
+    if role in ("worker", "lead"):
         chat_fence(agent)
         if not reply:
             # The one moment an agent is already reaching for the owner with nothing of his to answer, which is
@@ -9567,13 +9605,57 @@ def t_tell_owner(agent, a):
     # could otherwise only say "a later report has no link to your message", about a conversation he was reading,
     # answered, in front of him (21 October 2026). A report with nothing of his waiting answers nothing, which is
     # what a routine post of the manager's is.
-    if reply is None and agents()[agent].get("role") == "manager":
-        reply = unanswered_owner_message(agent)
+    # **The message that the manager names comes first** (10 November 2026). read_messages gives every message the
+    # name M-<id>, which is the only name a manager has for a message of the owner's, and `about` is where this tool
+    # asks for "the message you are answering (M-<id>)". The oldest message that waits was the only rule: on the first
+    # fleet it put 18 of 66 reports that named a message under another message of the owner's in 14 days, and each
+    # went to that other message's chat app too (chat_source); and the M-<id> that the manager gave in in_reply_to
+    # was refused 18 times in ten days for a request UUID that it never gets, after which it sent its whole report
+    # again. Now:
+    # - in_reply_to names one message, M-<id>: a report is linked to that one or to none. A message that has its
+    #   answer, and a name that is no chat message of the owner's, give no link and no refusal: the report is a later
+    #   word, and it still goes to that message's chat app.
+    # - with no in_reply_to, the first message that `about` names and that still waits gets the report. When none of
+    #   them waits, the oldest message that waits gets it, as before: a replay of those 14 days gave the same links
+    #   as that rule for every report but the 13 that it had put under another message than the one they named.
+    # - the manager's newest report again, with the same words and `about` and no message of the owner's read since
+    #   it, is the same call again: it is told as saved, and nothing is saved or sent twice. With a message read since,
+    #   the same words are a report of their own, for that message.
+    note, also = "", None
+    if role == "manager":
+        if isinstance(reply, str) and not reply.strip():
+            reply = None        # an empty field is no name
+        last = q1("SELECT * FROM owner_reports WHERE agent=? ORDER BY id DESC LIMIT 1", (agent,))
+        if last and (last["text"], last["about"]) == (text, about) and not q1(
+                "SELECT 1 FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE u.recipient=? AND u.kind='message' "
+                "AND u.need_id IS NULL AND e.read_at>? LIMIT 1", (agent, last["created"])):
+            return f"Report R-{last['id']} already saved. No duplicate was sent."
+    named = OWNER_MESSAGE.fullmatch(reply.strip()) if role == "manager" and isinstance(reply, str) else None
+    if named:
+        m = owner_chat_message(agent, int(named.group(1)))
+        if m and m["read_at"] is None:
+            raise ToolError(f"Read {named.group(0)} before you answer it: call read_messages.")
+        old = owner_report(agent, m["request_id"]) if m else None
+        if old and (old["text"], old["about"]) == (text, about):
+            return f"Report R-{old['id']} already saved. No duplicate was sent."
+        reply, also = (None, m["request_id"]) if old else (m["request_id"] if m else None, None)
+        if reply is None:
+            note = (f" {named.group(0)} has its answer already, so this report has no link." if old else
+                    f" {named.group(0)} is no chat message of the owner's to you, so this report has no link.")
+    elif reply is None and role == "manager":
+        for found in ABOUT_EVENT.finditer(about):
+            m = owner_chat_message(agent, int(found.group(1)))
+            if m and m["read_at"] is not None and not owner_report(agent, m["request_id"]):
+                reply = m["request_id"]
+                break
+        reply = reply or unanswered_owner_message(agent)
     if reply is not None:
         try:
             reply = str(uuid.UUID(reply))
         except (ValueError, AttributeError, TypeError):
-            raise ToolError("in_reply_to must be an owner request UUID.") from None
+            raise ToolError("in_reply_to names the owner's message as read_messages gives it, for example M-12. Leave "
+                            "it out for a report that answers none." if role == "manager" else
+                            "in_reply_to must be an owner request UUID.") from None
         source = q1("SELECT u.*,e.read_at FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE u.request_id=?", (reply,))
         if not source or source["recipient"] != agent or source["kind"] != "message" or source["read_at"] is None:
             raise ToolError("Read this agent's owner message before replying; another agent's message cannot be answered.")
@@ -9582,7 +9664,7 @@ def t_tell_owner(agent, a):
             if (old["text"], old["about"]) != (text, about):
                 raise ToolError("This owner message already has a different reply. Do not replace it.")
             return f"Report R-{old['id']} already saved. No duplicate was sent."
-    chat = chat_source(agent, reply, about)          # owner feature chat_apps: the reply goes back to that chat
+    chat = chat_source(agent, reply or also, about)  # owner feature chat_apps: the reply goes back to that chat
     t0 = now()
     with transaction():
         rid = DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to) VALUES(?,?,?,?,?)",
@@ -9590,8 +9672,8 @@ def t_tell_owner(agent, a):
         if chat:
             chat_answer(agent, chat, rid, text, t0)
     if chat:
-        return f"Report R-{rid} added to the owner's {agent} chat and queued for {chat['label']}."
-    return f"Report R-{rid} added to the owner's {agent} chat. No notification was sent."
+        return f"Report R-{rid} added to the owner's {agent} chat and queued for {chat['label']}.{note}"
+    return f"Report R-{rid} added to the owner's {agent} chat. No notification was sent.{note}"
 
 
 # The owner chat of a worker or lead lives in two halves, and only one of them travels: the hub keeps every message
@@ -9654,7 +9736,8 @@ LINK_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 LINK_LIFE = 600                 # seconds a link code works
 LINK_TRIES = 5                  # wrong codes from one sender in one hour
 LINK_TEXT = re.compile(r"(?i)^\s*link\s+([A-Z0-9]{4}-?[A-Z0-9]{4})\s*$")
-ABOUT_EVENT = re.compile(r"\bM-(\d+)\b")
+ABOUT_EVENT = re.compile(r"\bM-(\d{1,18})\b")       # at most 18 digits: a longer number is no row id of SQLite
+OWNER_MESSAGE = re.compile(r"M-([1-9][0-9]{0,17})")     # in_reply_to of a manager's report: one message, whole
 
 
 def chat_apps():
@@ -11660,7 +11743,7 @@ def removed_conversation_tasks_end(linked, reason):
         unfile_notices(t["id"])
         end_waits(t["id"])
         if not is_conversation_task(t):         # a conversation task runs in the conversation's session, now gone
-            emit(t["owner"], "say", f"[hub] {tref(t['id'])} was canceled: {reason}. Stop working on it now.",
+            emit(t["owner"], "say", f"[hub] {tref(t['id'])} was canceled: {full_stop(reason)} Stop working on it now.",
                  task=t["id"])
         cancel_subtasks(t["id"], reason)
         ended.append(t["id"])
@@ -16545,8 +16628,9 @@ def t_close_case(agent, a):
             text += f" {mref(dead)} keeps what did not work, so that nobody need pay for it again."
         if outcome == "failed":         # with the receipt: a repeat of this call answers from the receipt alone
             event_rows([(manager_name(), "say", None,
-                         f"[duty {rref(r['id'])}] {agent} closed {cref(c)} as failed: {note}. The watch opens no new "
-                         f"case for this key until it is quiet again. Decide what happens with it.", None)], t0)
+                         f"[duty {rref(r['id'])}] {agent} closed {cref(c)} as failed: {full_stop(note)} The watch "
+                         f"opens no new case for this key until it is quiet again. Decide what happens with it.",
+                         None)], t0)
         keep_command(command, {"case": c["id"], "text": text}, t0)
     if covers:
         report_notices(t0)
@@ -20291,8 +20375,9 @@ def standing_start_text(agent):
 
 
 def full_stop(text):
-    """text as the end of a sentence in the owner's lines: its own ".", "!" or "?" when it has one, else a full stop.
-    Words that end with their own gave ".." or "!." (28 October 2026)."""
+    """text as the end of a sentence in the hub's lines: its own ".", "!" or "?" when it has one, else a full stop.
+    Words that end with their own gave ".." or "!." in the owner's lines (28 October 2026), and in the lines that an
+    agent reads about a canceled task, a failed case and a new, changed or ended standing item (10 November 2026)."""
     text = text.rstrip()
     return text if text.endswith((".", "!", "?")) else text + "."
 
@@ -20317,21 +20402,21 @@ def standing_said(r, actor=None, asked_by=None, why=None):
 
 def standing_new_say(r, reader, t0):
     """What a running session that item `r` steers reads about it when it is new."""
-    return (f"[hub] New standing item: {standing_line(r, reader, t0)}. It steers your work from now on, inside your "
-            f"access.")
+    return (f"[hub] New standing item: {full_stop(standing_line(r, reader, t0))} It steers your work from now on, "
+            f"inside your access.")
 
 
 def standing_change_say(r, reader, t0):
     """... when what target `r` says changed (target_update)."""
-    return f"[hub] Standing item changed: {standing_line(r, reader, t0)}. Follow it as it reads now."
+    return f"[hub] Standing item changed: {full_stop(standing_line(r, reader, t0))} Follow it as it reads now."
 
 
 def standing_end_say(r, why, ended=True):
     """... when it ended, or, not ended, when it no longer steers this reader: its reporting line changed."""
     if not ended:
-        return f"[hub] Standing item {iref(r['id'])} no longer steers you: {r['words']}. Stop following it."
-    return f"[hub] Standing item {iref(r['id'])} ended" + (f" ({why})" if why else "") + f": {r['words']}. " \
-           f"Stop following it."
+        return f"[hub] Standing item {iref(r['id'])} no longer steers you: {full_stop(r['words'])} Stop following it."
+    return f"[hub] Standing item {iref(r['id'])} ended" + (f" ({why})" if why else "") + \
+        f": {full_stop(r['words'])} Stop following it."
 
 
 def standing_news_rows(r, said, by_agent, by_task, t0):
@@ -20349,8 +20434,8 @@ def standing_news_rows(r, said, by_agent, by_task, t0):
             continue
         for t in DB.execute(f"SELECT id FROM tasks WHERE owner=? AND {OPEN_TASK} AND source_message IS NULL",
                             (name,)).fetchall():
-            if t["id"] != by_task:
-                DB.execute(EVENT, (name, "say", t["id"], said(name), t0, "{}"))
+            if t["id"] != by_task:      # marked: it starts no session for a parked task (message_waits)
+                DB.execute(EVENT, (name, "say", t["id"], said(name), t0, json.dumps({"standing": r["id"]})))
 
 
 def standing_new_rows(agent, fields, by_task, t0):
@@ -22455,22 +22540,25 @@ TOOLS = [
      "a deploy rests on a reading that is newer than the last change to it, made by you, by an agent that can read "
      "it, or by the next run of its watch, and why says how old that reading is. Raise it only when that reading still "
      "shows the problem. When an item of yours is not needed any more, withdraw_need closes it. Keep the card short: a "
-     f"title of at most {NEED_TITLE_CHARS} characters that names what he decides, and in why one or two plain sentences "
-     f"(at most {NEED_WHY_CHARS} characters) on what he decides and why it matters now; the reasoning, an agent's words "
-     "and the facts go in details, which his card shows behind Details. When he may pick several of the options, set "
-     "multi: he ticks any of them and sends them together, so never write combined options such as \"Yes to A and C\". "
-     "He can discuss an item before he decides: his messages come to you, and you answer each with discuss_need; when "
-     "the talk changes the options or the words, raise the item again with replaces.",
-     S({"title": {"type": "string", "description": f"What he decides, in at most {NEED_TITLE_CHARS} characters."},
+     f"title of at most {NEED_TITLE_CHARS} characters that names what the owner decides, and in why one or two plain "
+     f"sentences (at most {NEED_WHY_CHARS} characters) on what they decide and why it matters now; the reasoning, an "
+     "agent's words and the facts go in details, which the card shows behind Details. When the owner may pick several "
+     "of the options, set multi: they tick any of them and send them together, so never write combined options such as "
+     "\"Yes to A and C\". The owner can discuss an item before they decide: their messages come to you, and you answer "
+     "each with discuss_need; when the talk changes the options or the words, raise the item again with replaces.",
+     S({"title": {"type": "string",
+                  "description": f"What the owner decides, in at most {NEED_TITLE_CHARS} characters."},
         "why": {"type": "string", "description": f"One or two plain sentences, at most {NEED_WHY_CHARS} characters: "
-                                                "what he decides and why it matters now."},
-        "details": {"type": "string", "description": f"The longer part, behind Details on his card: the reasoning, "
-                    f"an agent's words, the facts, at most {NEED_DETAILS_CHARS} characters, in plain words."},
-        "multi": {"type": "boolean", "description": "True when he may tick several of the options: he sends the ones "
-                  "he ticked, and their words, joined, are the answer."},
+                                                "what the owner decides and why it matters now."},
+        "details": {"type": "string", "description": f"The longer part, behind Details on the owner's card: the "
+                    f"reasoning, an agent's words, the facts, at most {NEED_DETAILS_CHARS} characters, in plain "
+                    f"words."},
+        "multi": {"type": "boolean", "description": "True when the owner may tick several of the options: they send "
+                  "the ones they ticked, and the words of those options, joined, are the answer."},
         "replaces": {"type": "string", "description": "An open item of yours that this one takes the place of, for "
-                     "example N-12, after his discussion of it changed the options or the words: that item leaves "
-                     "Needs you, and the discussion goes on under this one. Give question_id again if it had one."},
+                     "example N-12, after the owner's discussion of it changed the options or the words: that item "
+                     "leaves Needs you, and the discussion goes on under this one. Give question_id again if it had "
+                     "one."},
         "what_to_do": {"type": "string", "description": "The one thing that only the owner can do or decide now. "
                                                         "If there is none, do not raise the item."},
         "options": {"type": "array", "items": {"type": "string"},
@@ -22486,23 +22574,25 @@ TOOLS = [
                       "through the door once. Put the exact command in what_to_do, and give options whose first "
                       "one is the yes."},
         "github_app": {"type": "string", "description": "The GitHub account, an organization or a user, that needs "
-                       "a GitHub App of its own, because no App of the door reaches it (the hub tells you when): his "
-                       "first option, pressed in Founderizer on his Mac, then makes it with GitHub's own two pages, its "
-                       "key goes to the door, and he installs it on that account's repositories. Give options whose "
-                       "first one is the yes, and say in what_to_do that he presses it on his Mac."},
-        "add_device": {"type": "boolean", "description": "True when his phone must enroll again from the Add device "
-                       "picture: for its signed yes of door calls, or for its copy of the recovery code (the devices "
-                       "list says which phone lacks one). His first option, pressed in Founderizer on his Mac, opens "
-                       "that picture, and his phone scans it. Give options whose first one is the yes."},
+                       "a GitHub App of its own, because no App of the door reaches it (the hub tells you when): the "
+                       "first option, which the owner presses in Founderizer on their Mac, then makes it with GitHub's "
+                       "own two pages, its key goes to the door, and the owner installs it on that account's "
+                       "repositories. Give options whose first one is the yes, and say in what_to_do that the owner "
+                       "presses it on their Mac."},
+        "add_device": {"type": "boolean", "description": "True when the owner's phone must enroll again from the Add "
+                       "device picture: for its signed yes of door calls, or for its copy of the recovery code (the "
+                       "devices list says which phone lacks one). The first option, which the owner presses in "
+                       "Founderizer on their Mac, opens that picture, and their phone scans it. Give options whose "
+                       "first one is the yes."},
         "github_key": {"type": "string", "description": "Only when the hub asks for it: the GitHub account whose App "
                        "key the door got from the hub, for the item that makes its new key or the one that deletes "
                        "the old key. No options: the hub closes it by itself, and the hub's message gives its words."}},
        ["title", "why", "what_to_do"])),
     ("manager", "discuss_need", t_discuss_need,
-     "Reply to the owner in his discussion of one of your open Needs-you items: his questions about it come to you as "
-     "messages before he decides, and your reply shows under the item on his card. Plain words and no codes; answer "
-     "what he asked, with the facts he needs to decide. When the talk changes the options or the words, raise the item "
-     "again with raise_needs_you replaces.",
+     "Reply to the owner in their discussion of one of your open Needs-you items: their questions about it come to you "
+     "as messages before they decide, and your reply shows under the item on their card. Plain words and no codes; "
+     "answer what the owner asked, with the facts they need to decide. When the talk changes the options or the words, "
+     "raise the item again with raise_needs_you replaces.",
      S({"need": {"type": "string", "description": "The item, for example N-12."},
         "text": {"type": "string", "description": f"Your reply, at most {NEED_TALK_CHARS} characters."}},
        ["need", "text"])),
@@ -22557,8 +22647,9 @@ TOOLS = [
         "why": {"type": "string", "description": f"What the work needs it for, in a sentence or two, at most "
                                                  f"{NEED_WHY_CHARS} characters: the owner reads it before they type "
                                                  f"the value"},
-        "details": {"type": "string", "description": f"The longer part, behind Details on his card: how to make the "
-                    f"key (its page, its permissions, its scope), at most {NEED_DETAILS_CHARS} characters, plain words"},
+        "details": {"type": "string", "description": f"The longer part, behind Details on the owner's card: how to "
+                    f"make the key (its page, its permissions, its scope), at most {NEED_DETAILS_CHARS} characters, "
+                    f"plain words"},
         "give_to": {"type": "object", "additionalProperties": {"type": "string", "enum": ["use", "read"]},
                     "description": "The agents you propose should get it: use (its vault uses it, and the agent "
                                    "never sees it) or, for an API key, read (the key is in its sessions as env). "
@@ -22591,8 +22682,9 @@ TOOLS = [
         "why": {"type": "string", "description": f"What the work needs it for, in a sentence or two, at most "
                                                  f"{NEED_WHY_CHARS} characters: the owner reads it before they type "
                                                  f"the value"},
-        "details": {"type": "string", "description": f"The longer part, behind Details on his card: how to make the "
-                    f"key (its page, its permissions, its scope), at most {NEED_DETAILS_CHARS} characters, plain words"},
+        "details": {"type": "string", "description": f"The longer part, behind Details on the owner's card: how to "
+                    f"make the key (its page, its permissions, its scope), at most {NEED_DETAILS_CHARS} characters, "
+                    f"plain words"},
         "in_reply_to": {"type": "string", "description": "In your owner chat: the request_id of the owner's newest "
                                                          "message to you"},
         "door": {"type": "string", "description": "Only for a key that the DevOps door uses for you: its name in "
@@ -22959,7 +23051,8 @@ TOOLS = [
     ("all", "set_reminder", t_set_reminder,
      "Come back to this at a time you name. In a task session it parks that task: nothing nudges it and no session "
      "is started for it until then, and at the time you named the hub puts your note in front of you in this "
-     "session if it still runs, or in a new one if it does not. So a wait of hours -- a build, a deploy, somebody "
+     "session if it still runs, or in a new one if it does not. A message for the task still reaches you while it "
+     "waits. So a wait of hours -- a build, a deploy, somebody "
      "else's answer, nine tomorrow -- costs no open tool call and no turn. Give either minutes or at. Calling it "
      "again for the same task moves the time instead of making a second reminder. For work that repeats, or a check "
      "that must cost no turn at all, use save_trigger instead: that is a rule, this is one time.",
@@ -22980,7 +23073,10 @@ TOOLS = [
         "about": {"type": "string", "description": "What this reply is about, for the owner's own record: the "
                                                    "message you are answering (M-<id>), the goal (G-<id>) and the "
                                                    "tasks it came from"},
-        "in_reply_to": STR}, ["text"])),
+        "in_reply_to": {"type": "string", "description": "The message of the owner's that this answers: its "
+                                                         "request_id in a worker's or a lead's chat, and for the "
+                                                         "manager the M-<id> that read_messages gives it"}},
+       ["text"])),
     ("all", "message_owner", t_message_owner,
      "Write to the owner first, for example the result of work they asked you for, or a question about their own "
      "request. Keep it short and rare. It goes to the chat app where the owner last wrote to you, else to your own "
@@ -26467,6 +26563,21 @@ def liveness(t0):
         # owner feature secret_requests: so is the owner's secret, until it reaches the task (secret_wakes): a session
         # lost meanwhile gets its new attempt after that, which then holds the secret
         secret = secret_wait(tid)
+        # **A message brings a parked task back when its session is gone.** A task that waits for its reminder reads
+        # a message in its own session, which stands open meanwhile, and a turn there ends the park (parked). A
+        # session that was lost meanwhile, when its machine started again, reads nothing, and nothing started one
+        # before the reminder's own time: on the first fleet a lead's task that was parked for 34 hours got a question
+        # of its team and a message of its requester, and both waited two hours for the reminder (5 November 2026),
+        # while its helper tried the window that was gone at every poll. So the park is a live path only while the
+        # session is there or has nothing to read: with a message that the delivery tells and no window of its
+        # started attempt, the task is judged as one that is not parked. What makes any lost session wait makes this
+        # one wait too (its own open question, the owner's secret, a release, a sign-in, new settings); with none of
+        # them it starts in a new session now, as the reminder would and as no restart. The new attempt ends the park,
+        # and the reminder still comes at its time. A parked task with nothing to read is left alone, as before, and
+        # so is one whose reminder comes within PARK_SOON: that start reads the message too, and two starts in one
+        # minute would be one too many.
+        woken = bool(park and once and launched and has_list and not alive and not starting and
+                     park["due"] - t0 >= PARK_SOON and message_waits(t, t0))
         if hold:
             path = held_word(hold)
         elif lim:
@@ -26474,7 +26585,7 @@ def liveness(t0):
             path = (f"waiting for the usage limit of the account {owner} shares with {source} to reset at "
                     f"{clock(lim['until'])}" if source else
                     f"waiting for {owner}'s usage limit to reset at {clock(lim['until'])}")
-        elif park:
+        elif park and not woken:
             path = f"waiting until {clock(park['due'])}, as {owner} asked (R-{park['id']})"
         elif t["state"] == "submitted" and not launched:
             path = ((f"waiting for {owner} to load its new settings" if settings_pending(owner) else
@@ -26504,6 +26615,22 @@ def liveness(t0):
               (path, tid, path))
             if alive and t["missing_since"]:
                 q("UPDATE tasks SET missing_since=NULL WHERE id=?", (tid,))
+            continue
+        if woken:           # nothing else holds it: its message brings it back
+            # The new session knows nothing of the wait, and a new attempt ends the park. So its start says what the
+            # task waits for, in the whole words of the reminder's own note, and that only the message is its work
+            # now: a step that its agent held back until a time must not run early because a message came. It gives
+            # the reminder's time in the form that set_reminder takes, so that "the same time" can be given back.
+            at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(park["due"]))
+            new_attempt(t, PARK_MESSAGE, note=(
+                f"This session starts for a message, and not because the wait is over. {tref(tid)} waits for its "
+                f"reminder R-{park['id']}, which comes {until_clock(park['due'], t0)}; your note for it was: "
+                f"\"{park['note']}\". Its session was not running any more when the message came. Read the message "
+                f"with read_messages and do what it asks. Leave what waits for the reminder alone, unless the message "
+                f"changes it. Then call set_reminder again, with at=\"{at}\" unless the message changes the time, so "
+                f"that the task waits quietly until then."))
+            log("hub", f"a message brought {owner} back to {tref(tid)} in a new session; R-{park['id']} still comes "
+                       f"{until_clock(park['due'], t0)}")
             continue
         reason = "its session is not running" if online else silent_words(owner, row["last_seen"] if row else None, t0)
         q("UPDATE tasks SET live_path=NULL, stalled_since=COALESCE(stalled_since,?), stalled_reason=? WHERE id=? AND "
@@ -26546,6 +26673,27 @@ def liveness(t0):
                                      f"live path: {reason}. It is still {t['state']}. Decide what to do: wait, cancel "
                                      f"it and give it to another worker, or raise a Needs-you item.", task=tid))
             log("hub", f"{tref(tid)} has no live path: {reason}")
+
+
+PARK_MESSAGE = "message"        # the reason of an attempt that a message started for a parked task (liveness)
+PARK_SOON = 120                 # seconds: a reminder this near brings the task back by itself, and the message with it
+
+
+def message_waits(t, t0):
+    """True when a message waits unread for the session of task row `t` that is worth a new session: one that the
+    delivery tells its helper (the events route), and that somebody is behind. Not a quiet one, which comes with the
+    session's next read (quiet_waits); not a steer of an earlier attempt, which a new attempt carries over by itself
+    (carry_steers); and not the hub's own news that a new session reads at its start anyway or that is over by then:
+    a standing item (standing_news_rows; standing_start_text) and a usage limit (LIMIT_SAY: after its reset a parked
+    task comes back at its own time, resume_held)."""
+    for e in q("SELECT created, extra FROM events WHERE agent=? AND task=? AND kind='say' AND read_at IS NULL",
+               (t["owner"], t["id"])):
+        extra = json.loads(e["extra"] or "{}")
+        if quiet_waits(e["created"], extra, t0) or extra.get("limit") or extra.get("standing") or \
+                (extra.get("steer") and extra.get("attempt", 1) != t["attempt"]):
+            continue
+        return True
+    return False
 
 
 # Plan C6: losses decided by facts. A helper that names START_ONCE acks a task event when it has started its window,
@@ -31800,8 +31948,9 @@ def github_app_asks(reach):
         emit(manager_name(), "say", f"[hub] No GitHub App of the door reaches {owner}, where agents hold "
                                     f"{len(repos)} repositories, so they get no token for them. A private App reaches "
                                     f"only the account that made it. Raise one Needs-you item with github_app "
-                                    f"\"{owner}\": its first option, pressed in Founderizer on his Mac, makes the App "
-                                    f"in {owner} with GitHub's own pages, and its key goes to the door.")
+                                    f"\"{owner}\": its first option, which the owner presses in Founderizer on their "
+                                    f"Mac, makes the App in {owner} with GitHub's own pages, and its key goes to the "
+                                    f"door.")
         told.append(owner)
     return told
 
@@ -32972,10 +33121,10 @@ def door_renew(t0=None):
                              f"that key gets a successor and then goes (DevOps plan 13, item 4). Raise one Needs-you "
                              f"item now with raise_needs_you, github_key \"{state['owner']}\" and no options. Its "
                              f"what_to_do: on {state['page']}, click \"Generate a private key\"; then in Founderizer on "
-                             f"his Mac, on the Apps page under GitHub, choose the file that GitHub downloaded next to "
-                             f"Private key, and click Save. The form shows there while the item is open, with the "
-                             f"App's ID in it. The hub closes the item by itself when the door makes tokens with the "
-                             f"new key, and then it tells you the second item, which deletes the old key.")
+                             f"the owner's Mac, on the Apps page under GitHub, choose the file that GitHub downloaded "
+                             f"next to Private key, and click Save. The form shows there while the item is open, with "
+                             f"the App's ID in it. The hub closes the item by itself when the door makes tokens with "
+                             f"the new key, and then it tells you the second item, which deletes the old key.")
         log("hub", f"the App key that the hub held gets a successor: App {app_id} of {state['owner']}, "
                    f"{state['fingerprint']}")
         return state
@@ -34512,7 +34661,7 @@ def login_for_machine(agent, lid):
         # him again, and he sends the code again.
         state = "needs_owner"
         q("UPDATE signin_jobs SET state=?, detail=NULL, updated=? WHERE id=?", (state, now(), lid))
-        log("hub", f"{agent}: sign-in L-{lid} waits for the owner's code again: his code did not reach the machine")
+        log("hub", f"{agent}: sign-in L-{lid} waits for the owner's code again: the code did not reach the machine")
     # send_link: a restart of this hub took the link of a sign-in that waits for the owner, and the machine that
     # still has its window open sends it again (helper feature signin_relink).
     return {"stop": False, "state": state, "runtime": row["runtime"], "code": code,
@@ -35216,6 +35365,15 @@ class HubServer(ThreadingHTTPServer):
     dozen routes or more at once, and a connection that finds the backlog full is refused: the app reads that as a
     failed read and shows its reading as old ("Last reading") while the hub is well (29 October 2026)."""
     request_queue_size = 64
+
+    def handle_error(self, request, client_address):
+        """A client that ended its connection is no error of the hub's. do_GET and do_POST say so for an answer that
+        nobody reads any more; this is the same for the read of the next request on a kept connection, which is
+        outside both. socketserver printed a traceback for each one: 630 in 30 days on the first fleet, which was
+        most of the hub's own output and hid the errors that were its own. Every other error prints as before."""
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -37333,7 +37491,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError(f"unknown field {extra[0]}")
             text = data.get("text")
             if not isinstance(text, str) or not text.strip() or len(text.strip()) > NEED_TALK_CHARS:
-                raise ValueError(f"text is his message, 1 to {NEED_TALK_CHARS} characters")
+                raise ValueError(f"text is the owner's message, 1 to {NEED_TALK_CHARS} characters")
             return {"need": need_id, "text": text.strip()}
         return self.ui_command(f"needs/{need_id}/talk", read, need_talk_said)
 
@@ -37978,6 +38136,11 @@ class Handler(BaseHTTPRequestHandler):
         if secret_hit(json.dumps(data)):
             return self.json(422, {"error": "registered login refused"})
         with LOCK:
+            # A delete or a rename holds this lock for its whole commit, so the name can leave while this report
+            # waits for it. A report of a name that is gone writes nothing: its machine_status row would come back
+            # after forget_removed_agents took it, for an agent added again under that name to inherit.
+            if agent not in agents():
+                return self.json(404, {"error": "unknown agent"})
             answer = record_status(agent, data)
         return self.json(200, dict(answer, ok=True))
 
@@ -38201,8 +38364,8 @@ class Handler(BaseHTTPRequestHandler):
             if (not isinstance(ticked, list) or not ticked or len(ticked) > NEED_OPTIONS_MAX or
                     any(isinstance(c, bool) or not isinstance(c, int) or c < 0 for c in ticked) or
                     len(set(ticked)) != len(ticked)):
-                return self.json(400, {"error": "choices is the list of the indexes of the options he ticked, each "
-                                                "once"})
+                return self.json(400, {"error": "choices is the list of the indexes of the options that the owner "
+                                                "ticked, each once"})
             ticked = sorted(ticked)
         if choice is not None:
             if need_id is None:
@@ -39587,9 +39750,22 @@ class Handler(BaseHTTPRequestHandler):
             deadline, told = now() + wait, None
             # The tool list that a new owner chat of this agent gets now: its helper starts a chat that started with
             # another one again, between two turns, on the same conversation (Helper.restart_chat_for_tools).
-            chat_contract = tool_contract(agent, (kv_get("db_id"), "owner-chat", "1")) \
-                if role_of(agent) in ("worker", "lead") else None
+            try:
+                chat_contract = tool_contract(agent, (kv_get("db_id"), "owner-chat", "1")) \
+                    if role_of(agent) in ("worker", "lead") else None
+            except KeyError:
+                if agent in agents():
+                    raise               # an error of the hub's own
+                return self.json(404, {"error": "unknown agent"})       # it left while its tool list was read
             while True:
+                # The owner can delete or rename this agent while its helper's call waits here, or waits for the lock
+                # that the change holds: its name is unknown then, as at the start of a call. It was a KeyError and a
+                # 500 with a traceback (the first fleet, 11 times in 30 days, at each agent that left). The name is
+                # looked up at the start of each round, and once more after the last one: a change can land inside a
+                # round's own reads, which wait for that lock.
+                conf = agents().get(agent)
+                if conf is None:
+                    return self.json(404, {"error": "unknown agent"})
                 rows = q("SELECT * FROM events WHERE agent=? AND "
                          "((kind IN ('task','say') AND read_at IS NULL) OR (kind='chat') OR "
                          "(kind='conversation' AND (read_at IS NULL OR helper_ack IS NULL)) OR "
@@ -39599,7 +39775,7 @@ class Handler(BaseHTTPRequestHandler):
                 # waits for that read (conversation_reads); an older one takes it at its ack, as before
                 reads = "conversation_reads" in helper_features(agent)
                 keep = []
-                worker = agents()[agent].get("role") in ("worker", "lead")       # a lead works like a worker
+                worker = conf.get("role") in ("worker", "lead")       # a lead works like a worker
                 limited = active_limit(agent)          # the manager's own limit holds its signals too
                 held = manager_held(agent)             # owner feature runtime_switch: until its new session runs
                 pending = worker and settings_pending(agent)        # owner API 1.9: wait for the new settings
@@ -39685,6 +39861,8 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 told = chat
                 time.sleep(0.5)
+            if agent not in agents():       # it left inside the last round: nothing is handed to a name that is gone
+                return self.json(404, {"error": "unknown agent"})
             # plan P0: this answer hands out these conversation signals, so a turn of their task may begin now
             # (conversation_signalled). The helper sends no ack of one: it types it, or starts the window, at once.
             handed = [r["id"] for r in rows if r["kind"] == "conversation" and r["handed"] is None]
