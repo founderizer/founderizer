@@ -123,7 +123,7 @@ would read as an empty fleet instead of as a mistake.
 | `install_hub` | SSH, `hub.sh` (INSTALL-PROMPT.md A1–A5) | Install a hub on a server the owner names. |
 | `install_log` | SSH, `tail` | The install's own log, with the claim code read out of it. |
 | `claim_hub` | `POST /claim` | Prove this Mac's address. This is what grants the authority. |
-| `add_machine` | `/ui/servers/join` | The one-time join line, and with `host` it runs it over SSH. |
+| `add_machine` | `/ui/servers/join` | The one-time join line, and with `host` it runs it over SSH: as root on Linux, as the Mac user on a Mac. |
 | `add_agent` | `/ui/servers/<s>/agents` | An agent on an available server, with its install job. |
 | `remove_machine` | `/ui/servers/<s>/remove` | A server with no agent leaves. |
 | `activate_agent` / `agent_settings` | `/ui/team/agents/<a>` | Turn an agent on or off; its model, effort, capabilities. |
@@ -269,7 +269,17 @@ and a tool was taken out of this file's own table, and every check failed naming
   `sudo -n -i -- /bin/sh -c '…'`, and `/bin/sh` (and dash) gets each program unchanged. A program
   that `sudo -i` would change goes as `eval` of a `printf` (`through_sudo`, the idea of the app's
   `InstallPlan.throughSudo`). Until 11 November 2026 root's login shell expanded take_line's "$t"
-  to nothing, so on a server that had the code already the code did not move.
+  to nothing, so on a server that had the code already the code did not move. The same server
+  says no, too: a `sudo` that does not let the user in stops `install_hub` at its first root step
+  with sudo's own words and nothing changed (`become_root`; `add_machine` stops the same way for a
+  Linux server before the hub makes a code, and `install_log` instead of a read for ever), a step
+  of the code that fails (git that apt-get cannot install, a fetch that git cannot make, a move
+  that `may-take` refuses) stops it with that step's words before the install starts, and a Mac's
+  join line runs whole as the Mac user that SSH reaches, never through sudo. Root on a Mac, and a
+  kind that is not the machine's (`uname -s`), are refused before a code is made, and the answer
+  says when a join did not run (a line that printed nothing) or ended with a failure. Until that
+  day the agent read a sudo refusal as a missing repository credential, the install started with
+  the old code after a refused move, and join.sh stopped each Mac line that this server ran as root.
 - **`Refusals`** — a Mac that is not the owner's, a generation that moved, a `team.json` that
   moved under a command, the same `request_id` twice, and a field the hub refuses.
 - **`NoSecret`** — no tool takes a secret, the credential-carrying routes are not tools here, a

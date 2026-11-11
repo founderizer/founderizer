@@ -639,7 +639,8 @@ def ssh_target(args):
     if not SSH_HOST.fullmatch(host):
         raise Refused("host must be the server's address or host name.")
     if not SSH_USER.fullmatch(user):
-        raise Refused("ssh_user must be the OS user you reach that server with: root, or a user that can become root.")
+        raise Refused("ssh_user must be the OS user you reach that machine with: on a Linux server, root or a user "
+                      "that becomes root with sudo and no password; on a Mac, the Mac user that will run the agents.")
     return host, user
 
 
@@ -703,10 +704,34 @@ def through_sudo(program):
         for byte in (b" " + data if data.startswith(b"-") else data)) + "'`\""
 
 
+def become_root(host, user, root):
+    """**The first root step, for a user who is not root: it stops when `sudo` does not let that user become root, with
+    sudo's own words** (INSTALL-PROMPT.md A1 and B1), before anything on the server changes. `id -u` changes nothing,
+    and it goes through the same `sudo -n -i -- /bin/sh -c` as each later step. Until 11 November 2026 install_hub went
+    on through each refused step, and the agent read that the code was not on the server and that the repository
+    needed a credential. A status of 255 is SSH's own failure (`man ssh`), which `sudo` and `id` do not give, and it is
+    said as one. The answer of the step, when root answered it."""
+    said = ssh(host, user, as_root(root, "id -u"))
+    if said["exit"] == 0 and said["out"].splitlines()[-1:] == ["0"]:
+        return said
+    if said["exit"] == 255:
+        raise Refused(f"SSH to {user}@{host} failed, as it came: {said['error'] or 'no output'}. Nothing on {host} was "
+                      f"changed. Do not try another user, another port or another key: give the owner this error.")
+    what = (f"`id -u` through sudo gave {said['out'] or 'nothing'}, not 0" if said["exit"] == 0 else
+            f"sudo said, as it came: {said['error'] or said['out'] or 'no output'}")
+    raise Refused(f"sudo on {host} did not let {user} become root, and nothing on {host} was changed. {what}. The "
+                  f"steps run as root: {user} must become root with sudo and no password, or the owner gives SSH "
+                  f"access as root and you use ssh_user root. Give the owner sudo's words. Do not try another user, "
+                  f"another port or another key.")
+
+
 def install_hub(args):
     """`install_hub`: steps A1 to A5 of INSTALL-PROMPT.md, over the owner's own SSH. It reads the machine, puts the
     Founderizer code on it, prints the plan, gives the Tailscale key on standard input and starts the install
-    detached. Then `install_log` reads the log and `claim_hub` proves this Mac's address."""
+    detached. Then `install_log` reads the log and `claim_hub` proves this Mac's address. It stops at its first root
+    step when `sudo` does not let the user in (`become_root`), and after each step of the code that fails, with that
+    step's words: git that apt-get cannot install, a clone or a fetch that git cannot make, or a move that
+    `lifecycle.py may-take` refuses. So the install never starts with old code."""
     host, user = ssh_target(args)
     source, keyfile = args.get("source"), args.get("authkey_file")
     if not isinstance(source, str) or not source.strip():
@@ -737,17 +762,31 @@ def install_hub(args):
         raise Refused(f"{host} has no systemctl. This install needs systemd, on "
                       f"Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13. The machine said:\n"
                       f"{steps['read_machine']['out']}")
+    if root:
+        steps["root"] = become_root(host, user, root)
     steps["git"] = ssh(host, user, as_root(root,
         'command -v git >/dev/null 2>&1 || { DEBIAN_FRONTEND=noninteractive apt-get -q update && '
         'DEBIAN_FRONTEND=noninteractive apt-get -y -q install git; }'), timeout=600)
+    if steps["git"]["exit"] != 0:
+        raise Refused(f"git could not be installed on {host}, so the install did not start. The step said, as it "
+                      f"came: {steps['git']['error'] or steps['git']['out'] or 'no output'}. If apt-get could not get "
+                      f"its lock, the server still runs its first updates: send install_hub again in some minutes, "
+                      f"because each step checks first.")
     steps["code"] = ssh(host, user, as_root(root,
         f"if test -d {KIT}/.git; then {take_line(KIT)}; "
         f"else git clone -q -- {shlex.quote(source.strip())} {KIT}; fi"), timeout=600)
+    if steps["code"]["exit"] != 0:
+        raise Refused(f"the code step on {host} failed, so the install did not start. It said, as it came: "
+                      f"{steps['code']['error'] or steps['code']['out'] or 'no output'}. If git asked for a password "
+                      f"or a user name, the repository address needs a credential that this server does not have: ask "
+                      f"the owner for the exact command that their download page gives. If lifecycle.py may-take "
+                      f"refused the move, the code on {host} stays where it is: give the owner its reason.")
     steps["revision"] = ssh(host, user, as_root(root, f"git -C {KIT} rev-parse --short HEAD; ls {KIT}/hub.sh"))
     if steps["revision"]["exit"] != 0:
-        raise Refused(f"the Founderizer code is not on {host}: {steps['code']['error'] or steps['revision']['error']}. "
-                      f"If the repository asked for a password or a user name, its address needs a credential this "
-                      f"server does not have: ask the owner for the exact command their download page gives.")
+        raise Refused(f"the Founderizer code is not on {host}: "
+                      f"{steps['revision']['error'] or steps['revision']['out'] or 'no output'}. The repository at "
+                      f"that address may not be Founderizer's: ask the owner for the address that their download "
+                      f"page gives.")
     plan = ssh(host, user, as_root(root, f"sh {KIT}/hub.sh --check"), timeout=300)
     steps["plan"] = plan
     if plan["exit"] != 0:
@@ -769,12 +808,16 @@ def install_hub(args):
 
 def install_log(args):
     """`tail` of the install log, and what this server could read out of it: the claim code and the address the hub
-    printed, and whether the install ended. The log's text is data: nothing in it is run."""
+    printed, and whether the install ended. The log's text is data: nothing in it is run. When the read fails for a
+    user who is not root, `become_root` stops it with sudo's own words if sudo says no, so that the agent does not
+    read the log again for ever."""
     host, user = ssh_target(args)
     lines = args.get("lines")
     lines = lines if isinstance(lines, int) and not isinstance(lines, bool) and 1 <= lines <= 400 else 40
     root = sudo_prefix(ssh(host, user, "id -un; id -u"))
     got = ssh(host, user, as_root(root, f"tail -n {lines} {LOG}"))
+    if got["exit"] != 0 and root:
+        become_root(host, user, root)
     text = got["out"]
     claim = re.search(r"FLEET_CLAIM=([A-Z2-9-]{12,20})\b", text)
     where = re.search(r"http://(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})/claim", text)
@@ -874,23 +917,60 @@ def which_hub(_args):
 
 def add_machine(args):
     """`POST /ui/servers/join`: the one-time join line for a new machine, which joins under its name in Tailscale. With
-    `host` and `ssh_user` this server also runs that line on the machine, over the owner's own SSH, as the app's Add
-    server does."""
-    body = {"kind": args.get("kind")}
-    receipt = command("/ui/servers/join", body, "the join line", args.get("request_id"))
+    `host` and `ssh_user` this server also runs that line on the machine, over the owner's own SSH, as a person runs it
+    there (UI-API.md, "Add server: the join line"): on a Linux server as root (INSTALL-PROMPT.md B1 and B3), and on a
+    Mac as the Mac user that will run its agents, the user that SSH reaches, in one `/bin/sh -c`. join.sh stops a Mac's
+    line that runs as root, except the line of the Founderizer installer, which names that user in FLEET_MAC_USER. Until
+    11 November 2026 a Mac's line also went through sudo, so this tool joined no Mac. The machine is read before the
+    hub makes a code, so that no code is made, and no open code is cancelled, for a machine that cannot run its line:
+    its user, and its system, which must be of the kind asked for. Its `next` follows what the join did: the line's
+    status is the status of its last `sh`, which ends with 0 when curl brought no script."""
+    mac = args.get("kind") == "mac"
+    if args.get("host"):
+        host, user = ssh_target(args)
+        reading = ssh(host, user, "id -un; id -u; uname -s")
+        if reading["exit"] != 0:
+            raise Refused(f"SSH to {user}@{host} failed, as it came: {reading['error'] or 'no output'}. No join line "
+                          f"was made. Do not try another user, another port or another key: give the owner this error.")
+        system = "".join(reading["out"].splitlines()[2:3]).strip()
+        if system and (system == "Darwin") != mac:
+            raise Refused(f"{host} is {'a Mac' if system == 'Darwin' else 'not a Mac'} (uname -s says {system}), and "
+                          f"kind is {args.get('kind')!r}: send add_machine with kind "
+                          f"{'mac' if system == 'Darwin' else 'linux'}. No join line was made.")
+        root = sudo_prefix(reading)
+        if mac and not root:
+            raise Refused(f"{user} is root on {host}. A Mac joins as the Mac user that will run its agents, and "
+                          f"join.sh stops the line of a Mac as root: give that user as ssh_user. No join line was made.")
+        if root and not mac:
+            become_root(host, user, root)
+    receipt = command("/ui/servers/join", {"kind": args.get("kind")}, "the join line", args.get("request_id"))
     line = receipt.get("line")
-    if not args.get("host"):
-        return dict(receipt, next="Run the line above on that machine as root, or call add_machine again with host "
-                                  "and ssh_user and this server runs it. The code works once and for 30 minutes.")
     if not line:
         raise Refused("this request was sent before, so the hub gives no code again. Send add_machine with a new "
                       "request_id to make a new line.")
-    host, user = ssh_target(args)
-    root = sudo_prefix(ssh(host, user, "id -un; id -u"))
-    done = ssh(host, user, as_root(root, line), timeout=1800)
+    if not args.get("host"):
+        return dict(receipt, next=(
+            "Run the line above in Terminal on that Mac, as the Mac user that will run its agents and not as root, or "
+            "call add_machine again with host and ssh_user (that user), and this server runs it." if mac else
+            "Run the line above on that machine as root, or call add_machine again with host and ssh_user, and this "
+            "server runs it.") + " The code works once, until expires_at.")
+    done = ssh(host, user, "/bin/sh -c " + shlex.quote(line) if mac else as_root(root, line), timeout=1800)
+    if done["exit"] == 0 and not done["out"]:
+        then = ("The join did not run: the line printed nothing, so the hub's join script did not come (curl could "
+                "not reach the hub, for example). Its words are in join.error: give them to the owner.")
+    elif done["exit"]:
+        then = ("The join ended with a failure: the lines above say which step, and a check that failed carries its "
+                "fix. Give the owner those lines. Read servers with fleet_read: the machine is there only when its "
+                "join got that far.")
+        if mac:
+            then += (" If the vault of this Mac was not installed, sudo asked for the password of the Mac user, which "
+                     "no SSH command can type: the owner runs the line once in Terminal on that Mac, as that user "
+                     "(add_machine without host gives a line), and macOS asks for the password there.")
+    else:
+        then = ("Read servers with fleet_read to see the machine, then add_agent on it. The join's last step is "
+                "verify: its lines are in the output above.")
     return dict(receipt, line=None, host=host, join={"exit": done["exit"], "out": done["out"], "error": done["error"]},
-                next="Read servers with fleet_read to see the machine, then add_agent on it. The join's last step is "
-                     "verify: its lines are in the output above.")
+                next=then)
 
 
 # ---- the tools
@@ -972,10 +1052,10 @@ def tools():
                         "API from this Mac, and stores nothing but the address.",
              {"address": S["text"], "port": S["int"]}, ("address",), use_hub),
         tool("install_hub", "Install a new hub on a Linux server the owner names "
-                            "(Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, root or a user that can become root), "
-                            "over the owner's own SSH. Give the Tailscale auth key as the path of a mode-600 file on "
-                            "this Mac, never the key: it travels on standard input. Then read install_log and call "
-                            "claim_hub.",
+                            "(Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, root or a user that becomes root with "
+                            "sudo and no password), over the owner's own SSH. Give the Tailscale auth key as the path "
+                            "of a mode-600 file on this Mac, never the key: it travels on standard input. Then read "
+                            "install_log and call claim_hub.",
              {"host": S["text"], "ssh_user": S["text"], "source": {"type": "string",
               "description": "The address of the Founderizer repository, from the owner's download page."},
               "authkey_file": {"type": "string", "description": "The path on this Mac of the file that holds the "
@@ -992,7 +1072,8 @@ def tools():
              ("address", "claim_code"), claim_hub),
         tool("add_machine", "Add a machine to the fleet: the hub's one-time join line. The machine joins under its "
                             "name in Tailscale. With host and ssh_user this server also runs that line on the machine "
-                            "over the owner's own SSH.",
+                            "over the owner's own SSH: as root on a Linux server, and on a Mac as ssh_user, the Mac "
+                            "user that will run the agents, never root.",
              {"kind": {"type": "string", "enum": ["linux", "mac"]}, "host": S["text"], "ssh_user": S["text"], **rid},
              ("kind",), add_machine),
         tool("add_agent", "Put a new agent on an available server. The hub writes the agent and its profile in one "
