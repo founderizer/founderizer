@@ -2207,9 +2207,24 @@ def secret_key():
                  for r in read_rows("SELECT salt, hash, len FROM secrets ORDER BY id"))
 
 
+# No login that the hub finds is shorter: fingerprint_items and POST /secrets take a length of 8 or more, a row
+# without a length matches letter-and-digit tokens of 8 or more, and a JSON escape only makes a login longer.
+LOGIN_LEAST = 8
+# A name that the hub makes of someone's words drops their final dots: the end of a duty's first sentence (duty_name)
+# and of a profile's "Responsible for" line (looks_after_text). A login that ends in dots there is shown and kept
+# without them, in the name and in every copy of it, and a search for the whole login never finds that. So the search
+# also finds a login whose last DROPPED_DOTS dots or fewer are gone, where the rest has LOGIN_LEAST characters or more
+# and lies in a run that a name can make, of DOTS_RUN_MOST characters at most (find_secret_spans); and a name drops the
+# dots of a run of LOGIN_LEAST or more characters only when the run ends in DROPPED_DOTS or fewer (final_dots_off).
+# A shorter rest is not looked for: it is an ordinary word as often as a login (a login "admin..." would have masked
+# every "admin," in the state), and a cut keeps only a run of LOGIN_LEAST or more whole (cut_whole). So a login of 8 to
+# 10 characters whose rest without its final dots is shorter than 8 is not found where a name dropped those dots.
+DROPPED_DOTS = 3
+DOTS_RUN_MOST = 256             # a name is at most LOOKS_AFTER_MAX characters, and a line glues a few to it
+DOTS_TAIL = 8                   # and those few close it: a ")", a ":", a "," or a "." before a space (rest_ends)
 # The search finds nothing in a text shorter than SECRET_TEXT_LEAST, as it always did, and json_plain makes no text
 # longer, so secret_hit does not look such a text up.
-SECRET_TEXT_LEAST = 8
+SECRET_TEXT_LEAST = LOGIN_LEAST
 # Two caches of the search:
 # - the general one, as it always was: 8,192 texts of any length. The guard of each tool call, the masks of each tool
 #   result, an attachment and a knowledge file use it, and so does a text of the state that is too long for the other;
@@ -2228,29 +2243,85 @@ SCRUB_SPANS_KEPT = 65536
 SCRUB_TEXT_MOST = 4096
 
 
+JSON_BREAK = re.compile(r"\\[nrt]")    # a line break or a tab, as a JSON string writes it: in the run, not between
+
+
+def rest_ends(run):
+    """Where in a run the rest of a login can end that a name dropped its final dots from: at the run's end, or before
+    the last characters of the run when none of them is a letter or a digit, DOTS_TAIL of them at most. Every place
+    that sets a name in a line puts at most a ")", a ":", a "," or a "." after it, and then a space, a line break or
+    nothing; a rest that a letter or a digit follows in its run is part of another word. A JSON text writes a line
+    break or a tab as two characters of the run (JSON_BREAK), which json_plain leaves as they are: each of them ends
+    a line there, as the run's end does."""
+    ends = {}
+    for stop in [m.start() for m in JSON_BREAK.finditer(run)] + [len(run)]:
+        end = stop
+        ends[end] = None
+        while end > 0 and stop - end < DOTS_TAIL and not run[end - 1].isalnum():
+            end -= 1
+            ends[end] = None
+    return list(ends)
+
+
+@functools.lru_cache(maxsize=64)
+def long_runs(least):
+    """The runs of `least` or more characters, found whole in one search of the text (SECRET_RUN)."""
+    return re.compile(r"(?<!\S)\S{%d,}" % least)
+
+
+def run_least(n):
+    """The shortest run that the search reads for a row: one that can hold its login of n characters, or the rest of
+    it without its final dots (LOGIN_LEAST or more). A row without a length matches tokens of LOGIN_LEAST or more."""
+    return min(n, max(n - DROPPED_DOTS, LOGIN_LEAST)) if n else LOGIN_LEAST
+
+
 def find_secret_spans(text, key):
     """Every (start, end) of a registered login in text. A login may contain punctuation and may be glued
     to other characters; it cannot contain whitespace. Rows without a length match whole letter-and-digit
-    tokens, as before."""
-    spans = []
-    if len(text) < SECRET_TEXT_LEAST:
+    tokens, as before.
+
+    A login whose last DROPPED_DOTS dots or fewer were dropped (a name made of the words that held it: duty_name,
+    looks_after_text) is found too, where the rest of it has LOGIN_LEAST characters or more, lies in a run of
+    DOTS_RUN_MOST characters at most, and ends where a name's end can be in its run (rest_ends). Its span is that
+    rest. So a text full of punctuation, paths or links costs at most a few more hashes for each run of it.
+
+    Only the runs that can hold a login are read (run_least), which one search of the text finds. In a copy of the
+    first fleet's state, 2,922 of 178,399 runs were long enough for logins of 30 characters or more, the shortest of
+    the live fleet (11 November 2026). A window is hashed with "surrogatepass": a lone surrogate, which a JSON field
+    can bring, is in no login, and the search used to stop with an exception on it."""
+    if len(text) < SECRET_TEXT_LEAST or not key:
         return ()
-    runs = [(m.start(), m.group(0)) for m in SECRET_RUN.finditer(text)]
+    runs = [(m.start(), m.group(0)) for m in long_runs(max(1, min(run_least(n) for _, _, n in key))).finditer(text)]
+    spans, ends = [], {}
     for salt, digest, n in key:
         base = hashlib.sha256(salt.encode())
         for start, run in runs:
-            if n:
-                for i in range(len(run) - n + 1):
-                    h = base.copy()
-                    h.update(run[i:i + n].encode())
-                    if h.hexdigest() == digest:
-                        spans.append((start + i, start + i + n))
-            else:
+            if not n:
                 for m in re.finditer(r"[A-Za-z0-9]{8,}", run):
                     h = base.copy()
                     h.update(m.group(0).encode())
                     if h.hexdigest() == digest:
                         spans.append((start + m.start(), start + m.end()))
+                continue
+            for i in range(len(run) - n + 1):
+                h = base.copy()
+                h.update(run[i:i + n].encode("utf-8", "surrogatepass"))
+                if h.hexdigest() == digest:
+                    spans.append((start + i, start + i + n))
+            if n <= LOGIN_LEAST or not max(n - DROPPED_DOTS, LOGIN_LEAST) <= len(run) <= DOTS_RUN_MOST:
+                continue                    # no rest that the search looks for, or no run that a name can make
+            if start not in ends:           # where the rest of a login can end: each row reads the same places
+                ends[start] = rest_ends(run)
+            for end in ends[start]:
+                for dots in range(1, DROPPED_DOTS + 1):
+                    size = n - dots
+                    if not LOGIN_LEAST <= size <= end or run.startswith("." * dots, end):
+                        continue            # no rest that long there, or the whole login is: the loop above reads it
+                    h = base.copy()
+                    h.update(run[end - size:end].encode("utf-8", "surrogatepass"))
+                    h.update(b"." * dots)
+                    if h.hexdigest() == digest:
+                        spans.append((start + end - size, start + end))
     return tuple(sorted(spans))
 
 
@@ -2272,8 +2343,9 @@ def secret_spans(text, key=None):
 
 
 def secret_hit(*texts):
-    """True when any text holds a registered login, also inside JSON-escaped text. A text shorter than
-    SECRET_TEXT_LEAST is not looked up: 3,093 of the 9,144 texts of the first fleet's state were that short."""
+    """True when any text holds a registered login, also inside JSON-escaped text, and also one whose last dots a
+    name dropped (find_secret_spans). A text shorter than SECRET_TEXT_LEAST is not looked up: of the 9,144 texts of
+    the first fleet's state, 3,093 had fewer than 8 characters."""
     key = secret_key()
     if not key:
         return False
@@ -2296,6 +2368,9 @@ def guard(agent, *texts):
 
 
 MASK = "[Registered login removed]"
+# What a mask takes around a login (mask_secrets): no whitespace, and no double quote that a backslash does not
+# escape; a backslash and the character after it are one, as a JSON string has them.
+MASK_PIECE = re.compile(r'(?:[^\s"\\]|\\\S?)+')
 
 
 def mask_secrets(text):
@@ -2309,10 +2384,33 @@ def mask_secrets(text):
     Finding the escaped span and mapping it back is not the fix: json_plain changes the length of the text, so the
     offsets do not line up. So where the hub cannot say *where* the login is but still sees that one is there, it
     says the whole text is gone, exactly as scrub does. That also makes this the self-checking gate: anything a
-    later secret_spans cannot place is masked whole rather than let out."""
+    later secret_spans cannot place is masked whole rather than let out.
+
+    A mask takes the characters around a login out to the whitespace or the unescaped double quote before and after
+    it (MASK_PIECE). The masked text is often kept, and a login that is registered later and overlaps the masked one
+    lies in the same run, because a login holds no whitespace (SECRET_RUN): with only the first login's characters
+    masked, the rest of the later one stayed in the kept text for good, and a later search finds a login only whole.
+    So the characters glued to a login go with it: "TOKEN=" before it, a "." after it, all of a database address that
+    holds a password. An unescaped double quote stops the mask because it ends a JSON string, which a later login
+    cannot go on past: a JSON text keeps its quotes and stays JSON, and an API's answer in JSON with a login in one of
+    its values is not held back whole (call_api). An escaped one (a backslash and a quote) is in the string, so the
+    mask goes on past it and takes the pair whole: a login that holds a quote is in the text only in that escaped form,
+    and a mask that stopped at its quote left half of it. A later login that holds a quote itself, in a text that is
+    not JSON, can keep its part across that quote."""
     text = str(text or "")
-    merged = []
-    for start, end in secret_spans(text):
+    merged, spans = [], secret_spans(text)
+    pieces = [m.span() for m in MASK_PIECE.finditer(text)] if spans else []
+    at = 0
+    for start, end in spans:
+        while at < len(pieces) and pieces[at][1] < start:      # out from the login's first character: to the start
+            at += 1                                             # of the piece that holds the character before it
+        if at < len(pieces) and pieces[at][0] < start:
+            start = pieces[at][0]
+        after = at                                              # and out from its last: to the end of the piece that
+        while after < len(pieces) and pieces[after][1] <= end:  # holds the character after it
+            after += 1
+        if after < len(pieces) and pieces[after][0] <= end:
+            end = pieces[after][1]
         if merged and start <= merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], end)
         else:
@@ -2359,11 +2457,6 @@ def scrubbed(value):
     return value
 
 
-# No login that the hub finds is shorter: fingerprint_items and POST /secrets take a length of 8 or more, a row
-# without a length matches letter-and-digit tokens of 8 or more, and a JSON escape only makes a login longer.
-LOGIN_LEAST = 8
-
-
 def cut_whole(text, most):
     """The first `most` characters of a text that is kept or shown before a later scrub reads it, with no login cut in
     two. scrub finds a login only whole, and a login can be registered after its text was cut: a part of one in a
@@ -2380,6 +2473,27 @@ def cut_whole(text, most):
     if before is None or before.end() + after.end() - most < LOGIN_LEAST:
         return text[:most]
     return text[:most - before.end()].rstrip()
+
+
+FINAL_RUN = re.compile(r"\S*\Z")
+
+
+def final_dots_off(words):
+    """Words without their final dots, as a name that the hub makes of them ends (duty_name, looks_after_text), the
+    same as words.rstrip(".") except where a login can end in those dots that the search would not find without them.
+    The search finds a login whose last DROPPED_DOTS dots or fewer are gone, so a run of LOGIN_LEAST or more
+    characters that ends in more dots than that keeps them all, and a login that ends there stays whole. A run of
+    dots alone loses them: nothing of it is left to show."""
+    bare = words.rstrip(".")
+    dots, run = len(words) - len(bare), len(FINAL_RUN.search(words).group(0))
+    return words if dots > DROPPED_DOTS and run >= LOGIN_LEAST and run > dots else bare
+
+
+def cut_name(name, most, dots=""):
+    """cut_whole of a name that dropped the final `dots` of its words (duty_name_dots): a name that fits stays whole,
+    and the cut of a longer one reads its last run with those dots, so that it does not cut a login that ends in them
+    in two."""
+    return name if len(name) <= most else cut_whole(name + dots, most)
 
 
 # ---------------------------------------------------------------- tools
@@ -7006,16 +7120,13 @@ def looks_after_text(agent, rev, duties):
     """looks_after with the duties already read: no read of the database, so it is safe inside a transaction. A long
     line is cut before its last word, or, with no space in its first LOOKS_AFTER_MAX characters, where no login can
     be cut in two (cut_whole): the start texts that carry it are kept, and a login registered after one was made is
-    masked there only whole."""
+    masked there only whole. The line ends without its final dots (final_dots_off), and so a cut one shows no "..."
+    either: until 11 November 2026 one was added and then taken off with those dots."""
     said = responsible_line(agent, rev)
     if len(said) > LOOKS_AFTER_MAX:
         head = said[:LOOKS_AFTER_MAX]
-        if " " in head:
-            said = head.rsplit(" ", 1)[0] + "..."
-        else:
-            said = cut_whole(said, LOOKS_AFTER_MAX)
-            said = said + "..." if said else ""
-    said = (said or (agents().get(agent) or {}).get("title") or "nothing that its profile says yet").rstrip(".")
+        said = head.rsplit(" ", 1)[0] if " " in head else cut_whole(said, LOOKS_AFTER_MAX)
+    said = final_dots_off(said or (agents().get(agent) or {}).get("title") or "nothing that its profile says yet")
     return said + (". Duties: " + ", ".join(duties) if duties else "")
 
 
@@ -16374,14 +16485,23 @@ def duty_name(text):
     """The short name of a duty, for a page heading, a task title or a line that lists duties. It is the first
     sentence of the duty's own words, because a duty is its words and nobody fills in a title. A longer sentence is
     cut where no login can be cut in two (cut_whole): the name is kept in task titles, messages, start texts and
-    lessons, and a login registered after it was made is masked there only whole."""
+    lessons, and a login registered after it was made is masked there only whole. The sentence's final dots are not
+    in the name (final_dots_off), and the cut counts them: "abcdefg." is a run of 8, as a login can be."""
+    return duty_name_dots(text)[0]
+
+
+def duty_name_dots(text):
+    """duty_name, and the final dots that it dropped from its last run: a further cut of the name, as a lesson's tag
+    makes, counts them too (cut_name)."""
     first = str(text or "").strip().split("\n")[0].strip()
     stop = first.find(". ")
     if stop > 0:
-        first = first[:stop]
-    first = first.rstrip(".").strip() or "A duty"
-    return first if len(first) <= DUTY_NAME_MAX else \
-        (cut_whole(first, DUTY_NAME_MAX - 1).rstrip() or "A duty") + "…"
+        first = first[:stop + 1]
+    name = final_dots_off(first).strip() or "A duty"
+    if len(name) > DUTY_NAME_MAX:
+        return (cut_whole(first, DUTY_NAME_MAX - 1).rstrip() or "A duty") + "…", ""
+    dots = first[len(name):] if first.startswith(name) else ""
+    return name, dots if dots.startswith(".") else ""
 
 
 def cref(c):
@@ -18065,7 +18185,8 @@ def t_close_case(agent, a):
         fields.update({k: a.get(k) for k in ("covers", "cause", "next_step")})
     if topic:                                                                       # and so does one without it
         fields["about"] = topic
-    tag = topic or cut_whole(duty_name(r["text"]), MEMORY_ABOUT) or "work"     # kept unmasked with the lesson
+    name, dots = duty_name_dots(r["text"])
+    tag = topic or cut_name(name, MEMORY_ABOUT, dots) or "work"     # kept unmasked with the lesson
     command, stored = agent_write(agent, "close_case", a, fields)
     if stored:
         return stored["text"]
@@ -19338,7 +19459,8 @@ def memory_work_tag(t):
         case = read_row("SELECT responsibility FROM duty_cases WHERE id=?", (t["duty_case"],))
         resp = case["responsibility"] if case else None
     r = read_row("SELECT text FROM responsibilities WHERE id=?", (resp,)) if resp else None
-    return cut_whole(" ".join((duty_name(r["text"]) if r else (t["title"] or "work")).split()), MEMORY_ABOUT) or "work"
+    name, dots = duty_name_dots(r["text"]) if r else (t["title"] or "work", "")
+    return cut_name(" ".join(name.split()), MEMORY_ABOUT, dots) or "work"
 
 
 def memory_from_work(agent, text, prevents, about, t0, task=None, responsibility=None, prevents_key=None, beside=()):
