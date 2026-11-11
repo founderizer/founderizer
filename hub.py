@@ -1249,6 +1249,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "mac_setup",         # the owner, 31 October 2026: one sitting at a new Mac
                "agent_move",        # DevOps plan C7, 2 November 2026: an agent moves to an empty server
                "server_access",     # DevOps plan C4: Read or Fix on a server, through the door
+               "servers_for_apps",  # the owner, 11 November 2026: a server for apps, the door on the hub's server,
+                                    # the manager as a holder, /ui/servers "apps" (UI-API.md 1.122)
                "sealed_push",       # the owner, 3 November 2026: a ping says nothing to founderizer.com or Apple
                "device_by_code",    # the owner, 3 November 2026: Add device shows the QR at once, with no fields
                "door_calls",        # DevOps plan 5.4: the owner's signed yes lets one door call through, once
