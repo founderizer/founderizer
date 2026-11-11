@@ -1,12 +1,12 @@
 """The door's provider targets (DevOps plan, section 2 and step C6), in the plan's order: Backblaze, Cloudflare,
 GitHub, Hetzner, then AWS, Azure and Tailscale. Standard library only.
 
-Each provider has its listed reads (no path on the list returns a token), its rule calls, which code passes, and its
-judged calls; anything else is refused. decide() turns one call into a plan of steps, and execute() runs a plan with
-the token that the door holds for that account. A token never leaves the door: no answer carries one, and a key that
-the door mints stays on the door until it places it on a host itself, through that host's ops-root (`place`), where
-the old value is, found by its hash. An AWS account holds no key at all: the door assumes that account's role with
-its own bot's web identity token.
+Each provider has its listed reads (no path on the list returns a token), its rule calls, which code passes, and the
+agent's own calls, which run on the agent's grant and for which the agent answers; anything else is refused. decide()
+turns one call into a plan of steps, and execute() runs a plan with the token that the door holds for that account. A
+token never leaves the door: no answer carries one, and a key that the door mints stays on the door until it places it
+on a host itself, through that host's ops-root (`place`), where the old value is, found by its hash. An AWS account
+holds no key at all: the door assumes that account's role with its own bot's web identity token.
 
     ops backblaze:<account> buckets | keys | files <bucket-id> [prefix]
     ops backblaze:<account> key-mint <host> <bucket-id>            rule: a key for one host, its name as the prefix,
@@ -14,36 +14,36 @@ its own bot's web identity token.
     ops backblaze:<account> key-place <host> <file> <key-id> <NAME>=id:<sha256> <NAME>=key:<sha256>
     ops backblaze:<account> key-revoke <key-id>                    rule for a key that the door minted, else the
                                                                    owner's (a delete of what no agent made)
-    ops backblaze:<account> change <b2 call>                       judged (D25), its body as content
+    ops backblaze:<account> change <b2 call>                       own call (D25), its body as content
     ops cloudflare:<account> zones | records <zone> | tunnels | rulesets <zone>
     ops cloudflare:<account> cname <zone> <name> <tunnel-id>       rule: a new CNAME to a tunnel of that account
     ops cloudflare:<account> tunnel-route <tunnel-id> <hostname> <port>   rule: a new hostname, the host's own origin
     ops cloudflare:<account> purge <zone> <host or url> ...        rule
-    ops cloudflare:<account> change <METHOD> <path>                judged (D25), its body as content
+    ops cloudflare:<account> change <METHOD> <path>                own call (D25), its body as content
     ops github:<owner> runs|failed|alerts|code-alerts|secret-alerts|runners <repo>
-    ops github:<owner> workflow <repo> <workflow> [name=value ...] rule for a health workflow, judged for bootstrap
+    ops github:<owner> workflow <repo> <workflow> [name=value ...] rule for a health workflow, own call for bootstrap
     ops github:<owner> secret <repo> <NAME> <key-id> id|key        rule: a value that the door rotated
     ops github:<owner> pull-request <repo> <head> <base> <title>   rule
     ops hetzner:<project> servers | server <name> | firewalls | volumes | ips
     ops hetzner:<project> power-cycle <server>                     rule, for a server that the agent holds
-    ops hetzner:<project> change <METHOD> <path> <server>          judged: a held server's firewall, protection, name
-    ops hetzner:<project> change <METHOD> <path>                   judged (D25)
+    ops hetzner:<project> change <METHOD> <path> <server>          own call: a held server's firewall, protection, name
+    ops hetzner:<project> change <METHOD> <path>                   own call (D25)
     ops aws:<account> instances | groups | stacks | identity
     ops aws:<account> start|stop|reboot <instance-id>              rule, for a tagged instance
-    ops aws:<account> ingress|change-set|key-off ...               judged
-    ops aws:<account> eks-allowlist <cluster> <ipv4-range> ...     judged: the EKS public endpoint's new list
-    ops aws:<account> call <service> <Action> [<region>]           judged: any other call inside the role's rights,
+    ops aws:<account> ingress|change-set|key-off ...               own call
+    ops aws:<account> eks-allowlist <cluster> <ipv4-range> ...     own call: the EKS public endpoint's new list
+    ops aws:<account> call <service> <Action> [<region>]           own call: any other call inside the role's rights,
                                                                    its parameters as JSON content
-    ops aws:<account> call eks <METHOD> <path> [<region>]          judged, the same for a REST API
+    ops aws:<account> call eks <METHOD> <path> [<region>]          own call, the same for a REST API
     ops azure:<subscription> get <path>                            listed reads and metrics
-    ops azure:<subscription> sql-firewall|app-setting ...          judged
-    ops azure:<subscription> change <METHOD> <path> <api-version>  judged (D25)
+    ops azure:<subscription> sql-firewall|app-setting ...          own call
+    ops azure:<subscription> change <METHOD> <path> <api-version>  own call (D25)
     ops tailscale:<tailnet> devices | device <id>
     ops tailscale:<tailnet> key-expiry-off <id> | rename <id> <name>   rule, for a device of the fleet
-    ops tailscale:<tailnet> delete <id> | oauth-client <tag>       judged
-    ops tailscale:<tailnet> change <METHOD> <path>                 judged (D25)
+    ops tailscale:<tailnet> delete <id> | oauth-client <tag>       own call
+    ops tailscale:<tailnet> change <METHOD> <path>                 own call (D25)
 
-A judged delete passes to the judge only when the door's own record shows that an agent made its target through the
+A delete in an agent's own call runs only when the door's own record shows that an agent made its target through the
 door (made_keys, deletes); any other delete, and every AWS delete, goes to the owner as a Needs-you item with the exact
 call.
 """
@@ -127,14 +127,14 @@ def backblaze(access, agent, account, op, args, content, lookups):
         if len(args) != 1 or not ID.fullmatch(args[0]):
             return refused("key-revoke takes the key's id")
         mine = (lookups.get("minted") or (lambda k: False))(args[0])
-        return Decision("rule" if mine else "judged", "a key that the door minted" if mine else
+        return Decision("rule" if mine else "own", "a key that the door minted" if mine else
                         "revoking a key that the door did not mint", target=f"backblaze:{account}",
                         plan={"provider": "backblaze", "account": account,
                               "steps": [dict(step("POST", "b2_delete_key", {"applicationKeyId": args[0]},
                                                   keep="revoked"), key_id=args[0])]})
     if op == "key-place":
         return key_place(access, agent, "backblaze", account, args, lookups)
-    if op == "change":                            # D25: a write of the key's own rights, judged
+    if op == "change":                            # D25: a write of the key's own rights, the agent's own call
         name = args[0] if len(args) == 1 else ""
         if not re.fullmatch(r"b2_[a-z_]{3,40}", name):
             return refused("change takes one call of the B2 API, such as b2_update_bucket, with its body as content")
@@ -145,7 +145,7 @@ def backblaze(access, agent, account, op, args, content, lookups):
         body = json_body(content) if content else {}
         if body is False or not isinstance(body, dict):
             return refused("the body is one JSON object of at most 64 KiB")
-        return Decision("judged", f"a call of {name} inside the key's rights", target=f"backblaze:{account}",
+        return Decision("own", f"a call of {name} inside the key's rights", target=f"backblaze:{account}",
                         plan={"provider": "backblaze", "account": account, "steps": [step("POST", name, body)]})
     return refused(f"{op} is not listed for Backblaze")
 
@@ -191,8 +191,8 @@ def cloudflare(access, agent, account, op, args, content, lookups):
         if len(args) != 3 or not re.fullmatch(r"[0-9a-f]{32}", zone) or not HOSTNAME.fullmatch(args[1]) or \
                 not re.fullmatch(r"[0-9a-f-]{36}", args[2]):
             return refused("cname takes the zone's id, the full name and the tunnel's id")
-        if args[2] in (account_of(access, "cloudflare", account).get("judged_tunnels") or []):
-            return refused("that tunnel's names are judged: use change")
+        if args[2] in (account_of(access, "cloudflare", account).get("change_tunnels") or []):
+            return refused("that tunnel's names go through change")
         return Decision("rule", "a new CNAME to a tunnel of this account", target=f"cloudflare:{account}",
                         plan={"provider": "cloudflare", "account": account, "steps": [
                             step("GET", "/accounts/{account_id}/cfd_tunnel/" + args[2], keep="tunnel"),
@@ -204,8 +204,8 @@ def cloudflare(access, agent, account, op, args, content, lookups):
         if len(args) != 3 or not re.fullmatch(r"[0-9a-f-]{36}", args[0]) or not HOSTNAME.fullmatch(args[1]) or \
                 not re.fullmatch(r"[1-9][0-9]{0,4}", args[2]):
             return refused("tunnel-route takes the tunnel's id, the full name and the host's own port")
-        if args[0] in (account_of(access, "cloudflare", account).get("judged_tunnels") or []):
-            return refused("that tunnel is judged: use change")
+        if args[0] in (account_of(access, "cloudflare", account).get("change_tunnels") or []):
+            return refused("that tunnel's names go through change")
         return Decision("rule", "a new tunnel hostname with the host's own origin", target=f"cloudflare:{account}",
                         plan={"provider": "cloudflare", "account": account, "tunnel": args[0], "steps": [
                             step("GET", f"/accounts/{{account_id}}/cfd_tunnel/{args[0]}/configurations",
@@ -226,19 +226,20 @@ def cloudflare(access, agent, account, op, args, content, lookups):
                                  {"files": urls} if urls and not hosts else {"hosts": hosts} if hosts and not urls
                                  else {"files": urls, "hosts": hosts})]})
     if op == "change":
-        return judged_write("cloudflare", account, args, content, CF_PATH, CF_NEVER,
-                            lambda method, path: f"a change of {path.split('/')[3] if path.count('/') > 2 else path}",
-                            check=lambda body: "a tunnel to ssh://, tcp://, rdp://, smb:// or a socket is never the door's"
-                            if re.search(r'"service"\s*:\s*"(ssh|tcp|rdp|smb|unix|unix\+tls)://', json.dumps(body or {}))
-                            else None)
+        return own_write("cloudflare", account, args, content, CF_PATH, CF_NEVER,
+                         lambda method, path: f"a change of {path.split('/')[3] if path.count('/') > 2 else path}",
+                         check=lambda body: "a tunnel to ssh://, tcp://, rdp://, smb:// or a socket is never the door's"
+                         if re.search(r'"service"\s*:\s*"(ssh|tcp|rdp|smb|unix|unix\+tls)://', json.dumps(body or {}))
+                         else None)
     return refused(f"{op} is not listed for Cloudflare")
 
 
 # The owner, 6 November 2026 (DevOps D25: "Yes, as for AWS"): for every provider account, a write that is not listed
-# goes to the judge inside the key's own rights, as AWS's `call` does; the judge refuses what spends money, deletes what
-# no agent made, gives a person access or weakens a control, and such a call comes to the owner as a Needs-you item
-# with the exact call, which his signed yes lets through once. An unlisted read stays refused, so that no read returns
-# a key, and a write whose answer is a secret is never sent: the door gives the agent the provider's answer.
+# is one write inside the key's own rights, as AWS's `call` is. Since the owner's word of 11 November 2026 ("it needs
+# to be the agent itself") it runs as the agent's own call, for which the agent answers; a delete of what no agent made
+# through the door comes to the owner as a Needs-you item with the exact call, which his signed yes lets through once
+# (deletes). An unlisted read stays refused, so that no read returns a key, and a write whose answer is a secret is
+# never sent: the door gives the agent the provider's answer.
 WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 CF_PATH = re.compile(r"/(zones|accounts)/([0-9a-f]{32}|\{account_id\})(/[A-Za-z0-9._~:@-]+){1,10}")
 CF_NEVER = ((r"/tokens(/|$)", "an API token's answer is its secret: never the door's"),
@@ -249,9 +250,10 @@ CF_NEVER = ((r"/tokens(/|$)", "an API token's answer is its secret: never the do
             (r"/service_tokens", "a service token's answer is its secret: never the door's"))
 
 
-def judged_write(provider, account, args, content, path, never, why, host=None, first=(), methods=WRITE_METHODS,
-                 query=None, check=None):
-    """D25's form `change <METHOD> <path>`, with the body as content: one write of the key's own rights, judged. A read
+def own_write(provider, account, args, content, path, never, why, host=None, first=(), methods=WRITE_METHODS,
+              query=None, check=None):
+    """D25's form `change <METHOD> <path>`, with the body as content: one write of the key's own rights, as the agent's
+    own call. A read
     is not one, so an unlisted read stays refused. check(body): the words of a refusal of this provider's own, or
     None, on the body as the door parsed it."""
     if len(args) < 2 or args[0] not in methods:
@@ -272,7 +274,7 @@ def judged_write(provider, account, args, content, path, never, why, host=None, 
     if words:
         return refused(words)
     last = step(method, where, body, **({"query": query} if query else {}))
-    return Decision("judged", why(method, where), target=f"{provider}:{account}", host=host,
+    return Decision("own", why(method, where), target=f"{provider}:{account}", host=host,
                     plan={"provider": provider, "account": account, "steps": [*first, last]})
 
 
@@ -321,7 +323,7 @@ def github(access, agent, owner, op, args, content, lookups):
                 return refused(f"{pair!r} is not an input that code can check")
             inputs[key] = value
         kind = "rule" if args[1] in (lists.get("health") or []) else \
-            "judged" if args[1] in (lists.get("bootstrap") or []) else None
+            "own" if args[1] in (lists.get("bootstrap") or []) else None
         if kind is None:
             return refused(f"{args[1]} is not a listed workflow of {full}")
         ref = lists.get("ref") or (lookups.get("default_branch") or (lambda name: None))(full)
@@ -367,7 +369,7 @@ def github(access, agent, owner, op, args, content, lookups):
         if not made or made.get("agent") != agent:
             return refused(f"{full} is no repository that the door made for this agent: deleting another one is the "
                            f"owner's, through a Needs-you item")
-        return Decision("judged", "deleting a repository that the door made, which has no runner",
+        return Decision("own", "deleting a repository that the door made, which has no runner",
                         target=f"github:{owner}", plan={"provider": "github", "account": owner, "repo": full,
                                                          "repo_delete": {"name": full, "id": made.get("id")}})
     return refused(f"{op} is not listed for GitHub")
@@ -410,7 +412,7 @@ def holds(access, agent, repo):
 
 # ---------------------------------------------------------------- Hetzner Cloud
 
-HZ_JUDGED = (r"/firewalls/[0-9]{1,12}/actions/(set_rules|apply_to_resources|remove_from_resources)",
+HZ_HELD = (r"/firewalls/[0-9]{1,12}/actions/(set_rules|apply_to_resources|remove_from_resources)",
              r"/servers/[0-9]{1,12}/actions/change_protection", r"/servers/[0-9]{1,12}")
 
 
@@ -433,21 +435,21 @@ def hetzner(access, agent, project, op, args, content, lookups):
             return refused("change takes the method, the path and the server it is for, which this agent holds")
         if "rescue" in args[1]:
             return refused("Rescue is never booted")
-        if not any(re.fullmatch(p, args[1]) for p in HZ_JUDGED):
+        if not any(re.fullmatch(p, args[1]) for p in HZ_HELD):
             return refused(f"{args[1]} is not a firewall, protection or name change")
         body = json_body(content)
         if body is False:
             return refused("the body is JSON of at most 64 KiB")
-        return Decision("judged", "a firewall, protection or name of a held server", target=f"hetzner:{project}",
+        return Decision("own", "a firewall, protection or name of a held server", target=f"hetzner:{project}",
                         host=args[2], plan={"provider": "hetzner", "account": project, "steps": [
                             step("GET", "/servers", query={"name": args[2]}, keep="server_id", need="one_server"),
                             step(args[0], args[1], body, need="server_path")]})
-    if op == "change" and len(args) == 2:         # D25: a write of the project's own rights, judged
+    if op == "change" and len(args) == 2:         # D25: a write of the project's own rights, the agent's own call
         server_made = args[0] == "POST" and args[1] == "/servers"
-        return judged_write("hetzner", project, args, content, HZ_PATH, HZ_NEVER,
-                            lambda method, path: f"a change of {path.split('/')[1]}", methods=("POST", "PUT", "DELETE"),
-                            check=lambda body: "a server with no SSH key gives its root password in the answer: name an "
-                            "SSH key" if server_made and not (body or {}).get("ssh_keys") else None)
+        return own_write("hetzner", project, args, content, HZ_PATH, HZ_NEVER,
+                         lambda method, path: f"a change of {path.split('/')[1]}", methods=("POST", "PUT", "DELETE"),
+                         check=lambda body: "a server with no SSH key gives its root password in the answer: name an "
+                         "SSH key" if server_made and not (body or {}).get("ssh_keys") else None)
     return refused(f"{op} is not listed for Hetzner")
 
 
@@ -477,7 +479,7 @@ AWS_SERVICES = {
     "logs": ("json", "logs.{region}.amazonaws.com", "Logs_20140328"),
     "eks": ("rest", "eks.{region}.amazonaws.com", None),
 }
-# Never, judged or not (plan section 2, "Always refused"): an answer that is a secret or a credential, a shell or code
+# Never, whoever asks (plan section 2, "Always refused"): an answer that is a secret or a credential, a shell or code
 # on a host, a person's or a program's access, IAM beyond the listed key form, and the account itself.
 AWS_NEVER = re.compile(
     r"(sts|iam|organizations|account|secretsmanager|kms|lambda|ec2-instance-connect):.*"
@@ -491,7 +493,6 @@ AWS_NEVER_PATH = re.compile(r"/(access-entries|access-policies|pod-identity-asso
                             r"(/|$)")
 REGION = re.compile(r"[a-z]{2}(-[a-z]+)+-[0-9]")
 CIDR4 = re.compile(r"(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})(\.(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})){3}/([0-9]|[12][0-9]|3[0-2])")
-AWS_COST = ". A call that adds cost goes to the owner through your line, as a Needs-you item with the exact command (D11)."
 
 
 def aws(access, agent, account, op, args, content, lookups):
@@ -516,7 +517,7 @@ def aws(access, agent, account, op, args, content, lookups):
                 not re.fullmatch(r"[0-9.]{7,15}/[0-9]{1,2}", args[4]):
             return refused("ingress takes add or remove, the group, tcp or udp, the port and an IPv4 range")
         action = "AuthorizeSecurityGroupIngress" if args[0] == "add" else "RevokeSecurityGroupIngress"
-        return Decision("judged", "a security group of a tagged instance", target=f"aws:{account}",
+        return Decision("own", "a security group of a tagged instance", target=f"aws:{account}",
                         plan={"provider": "aws", "account": account, "steps": [
                             {"aws": ("ec2", "DescribeInstances"), "params": {
                                 "Filter.1.Name": "instance.group-id", "Filter.1.Value.1": args[1],
@@ -528,7 +529,7 @@ def aws(access, agent, account, op, args, content, lookups):
     if op == "change-set":
         if len(args) != 2 or not NAME.fullmatch(args[0]) or not NAME.fullmatch(args[1]) or not content:
             return refused("change-set takes the stack, the change set's name and the template as content")
-        return Decision("judged", "a CloudFormation change set", target=f"aws:{account}",
+        return Decision("own", "a CloudFormation change set", target=f"aws:{account}",
                         plan={"provider": "aws", "account": account, "steps": [
                             {"aws": ("cloudformation", "CreateChangeSet"), "params": {
                                 "StackName": args[0], "ChangeSetName": args[1],
@@ -536,7 +537,7 @@ def aws(access, agent, account, op, args, content, lookups):
     if op == "key-off":
         if len(args) != 2 or not NAME.fullmatch(args[0]) or not re.fullmatch(r"AKIA[0-9A-Z]{16}", args[1]):
             return refused("key-off takes the user and the access key id")
-        return Decision("judged", "deactivating an IAM key that shows no use", target=f"aws:{account}",
+        return Decision("own", "deactivating an IAM key that shows no use", target=f"aws:{account}",
                         plan={"provider": "aws", "account": account, "steps": [
                             {"aws": ("iam", "GetAccessKeyLastUsed"), "params": {"AccessKeyId": args[1]},
                              "need": "unused"},
@@ -547,7 +548,7 @@ def aws(access, agent, account, op, args, content, lookups):
             return refused("eks-allowlist takes the cluster and its new list: one to 40 IPv4 ranges")
         if any(a.endswith("/0") for a in args[1:]):
             return refused("an EKS endpoint open to every address is never the door's to set")
-        return Decision("judged", "a change of the EKS public endpoint allowlist", target=f"aws:{account}",
+        return Decision("own", "a change of the EKS public endpoint allowlist", target=f"aws:{account}",
                         plan={"provider": "aws", "account": account, "steps": [
                             {"aws": ("eks", "DescribeCluster"), "method": "GET", "path": f"/clusters/{args[0]}"},
                             {"aws": ("eks", "UpdateClusterConfig"), "method": "POST",
@@ -559,9 +560,10 @@ def aws(access, agent, account, op, args, content, lookups):
 
 
 def aws_any(account, args, content):
-    """Any other call inside the role's rights, judged (the plan's AWS row): `call <service> <Action> [<region>]` with
-    its parameters as one JSON object of content (flat for a query service), or `call eks <METHOD> <path> [<region>]`
-    with an optional JSON body. The role's own deny list and the judge hold the rest."""
+    """Any other call inside the role's rights, as the agent's own call (the plan's AWS row): `call <service> <Action>
+    [<region>]` with its parameters as one JSON object of content (flat for a query service), or `call eks <METHOD>
+    <path> [<region>]` with an optional JSON body. AWS_NEVER and the role's own deny list hold the rest, and every AWS
+    delete is the owner's (deletes)."""
     service = args[0] if args else ""
     protocol = (AWS_SERVICES.get(service) or ("",))[0]
     rest = protocol == "rest"
@@ -600,7 +602,7 @@ def aws_any(account, args, content):
              else params or {}}
     if region:
         s["region"] = region
-    return Decision("judged", f"a call of {service} inside the role's rights", target=f"aws:{account}",
+    return Decision("own", f"a call of {service} inside the role's rights", target=f"aws:{account}",
                     plan={"provider": "aws", "account": account, "steps": [s], "call": True})
 
 
@@ -624,7 +626,7 @@ def azure(access, agent, account, op, args, content, lookups):
         if len(args) != 4 or args[0] not in (conf.get("sql_servers") or []) or not NAME.fullmatch(args[1]) or \
                 not all(re.fullmatch(r"[0-9.]{7,15}", ip) for ip in args[2:]):
             return refused("sql-firewall takes a listed SQL server, the rule's name and the first and last address")
-        return Decision("judged", "a firewall rule on a listed SQL server", target=f"azure:{account}",
+        return Decision("own", "a firewall rule on a listed SQL server", target=f"azure:{account}",
                         plan={"provider": "azure", "account": account, "steps": [step(
                             "PUT", f"{args[0]}/firewallRules/{args[1]}",
                             {"properties": {"startIpAddress": args[2], "endIpAddress": args[3]}})]})
@@ -632,17 +634,17 @@ def azure(access, agent, account, op, args, content, lookups):
         if len(args) != 3 or args[0] not in (conf.get("sites") or []) or \
                 not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,99}", args[1]) or len(args[2]) > 2000:
             return refused("app-setting takes a listed site, the setting's name and its value")
-        return Decision("judged", "an App Service setting", target=f"azure:{account}",
+        return Decision("own", "an App Service setting", target=f"azure:{account}",
                         plan={"provider": "azure", "account": account, "app_setting": {
                             "site": args[0], "name": args[1], "value": args[2]}})
-    if op == "change":                            # D25: a write of the service principal's own rights, judged
+    if op == "change":                            # D25: a write of the service principal's own rights, an own call
         if len(args) != 3 or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}(-preview)?", args[2]):
             return refused("change takes the method, the path and the API version of its resource provider, with the "
                            "body as content")
-        return judged_write("azure", account, args[:2], content, AZ_PATH, AZ_NEVER,
-                            lambda method, path: "a change of " + (path.split("/providers/")[-1].split("/")[0]
-                                                                   if "/providers/" in path else "a resource group"),
-                            query={"api-version": args[2]})
+        return own_write("azure", account, args[:2], content, AZ_PATH, AZ_NEVER,
+                         lambda method, path: "a change of " + (path.split("/providers/")[-1].split("/")[0]
+                                                                if "/providers/" in path else "a resource group"),
+                         query={"api-version": args[2]})
     return refused(f"{op} is not listed for Azure")
 
 
@@ -674,7 +676,7 @@ def tailscale(access, agent, tailnet, op, args, content, lookups):
                             step("GET", f"/device/{args[0]}", need="fleet_device"), last],
                               "fleet_tags": fleet_tags})
     if op == "delete" and len(args) == 1 and ID.fullmatch(args[0]):
-        return Decision("judged", "deleting a device", target=f"tailscale:{tailnet}",
+        return Decision("own", "deleting a device", target=f"tailscale:{tailnet}",
                         plan={"provider": "tailscale", "account": tailnet,
                               "steps": [step("DELETE", f"/device/{args[0]}")]})
     if op == "oauth-client" and len(args) == 2 and args[0] in ("make", "revoke") and \
@@ -682,13 +684,13 @@ def tailscale(access, agent, tailnet, op, args, content, lookups):
         steps = [step("POST", "/tailnet/-/keys", {"keyType": "client", "scopes": ["devices:core"],
                                                    "tags": [args[1]]}, keep="minted")] if args[0] == "make" else \
             [dict(step("DELETE", f"/tailnet/-/keys/{args[1]}", keep="revoked"), key_id=args[1])]
-        return Decision("judged", f"{args[0]} an OAuth client for one tag", target=f"tailscale:{tailnet}",
+        return Decision("own", f"{args[0]} an OAuth client for one tag", target=f"tailscale:{tailnet}",
                         plan={"provider": "tailscale", "account": tailnet, "steps": steps})
     if op in ("tags", "acl", "policy"):
         return refused("a device's tags and the policy file are never the door's")
-    if op == "change":                            # D25: a write of the client's own rights, judged
-        return judged_write("tailscale", tailnet, args, content, TS_PATH, TS_NEVER,
-                            lambda method, path: f"a change of {path.split('/')[-1]}")
+    if op == "change":                            # D25: a write of the client's own rights, an own call
+        return own_write("tailscale", tailnet, args, content, TS_PATH, TS_NEVER,
+                         lambda method, path: f"a change of {path.split('/')[-1]}")
     return refused(f"{op} is not listed for Tailscale")
 
 
@@ -714,10 +716,10 @@ def decide(access, agent, kind, name, op, args, content, lookups):
 
 # ---------------------------------------------------------------- what an agent made, and what a delete removes
 #
-# The coordinator's change to D25 (6 November 2026): "a delete of what no agent made" is a code check, and not only a
-# rule of the judge, because the judge can miss a crafted call. The door keeps the names of what writes through it
-# made (made_keys, from the provider's answer); a judged call that deletes anything else (deletes) goes to the owner as
-# a Needs-you item with the exact call, as a refusal of the judge does, and his signed yes lets it through once.
+# The coordinator's change to D25 (6 November 2026): "a delete of what no agent made" is a code check. The door keeps
+# the names of what writes through it made (made_keys, from the provider's answer); an agent's own call that deletes
+# anything else (deletes) goes to the owner as a Needs-you item with the exact call, and his signed yes lets it through
+# once.
 
 HZ_ONE = {"servers": "server", "firewalls": "firewall", "volumes": "volume", "primary_ips": "primary_ip",
           "floating_ips": "floating_ip", "networks": "network", "load_balancers": "load_balancer",
@@ -732,8 +734,8 @@ AZ_DELETE_ACTION = re.compile(r"(?i)(delete|purge|remove|reimage|wipe|clear|trun
 # too, so a record would take them for made). Delete, Terminate, Remove, Deregister, Revoke and Purge, as he named them,
 # and the ones of the listed services that remove something under another name: BatchDelete (ECR's images), Release (an
 # Elastic IP or a dedicated host), Cancel (a spot fleet's cancel can end its instances), and three that delete by a
-# rule. The listed form `ingress remove` stays with the judge, as before D25: it closes access and deletes nothing, and
-# the exposure duty needs it fast to close an open port.
+# rule. The listed form `ingress remove` stays the agent's own call, as before D25: it closes access and deletes
+# nothing, and the exposure duty needs it fast to close an open port.
 AWS_DELETE = re.compile(r"(Delete|BatchDelete|Terminate|Remove|Deregister|Revoke|Purge|Release|Cancel)[A-Z][A-Za-z0-9]*")
 AWS_DELETE_OTHER = ("logs:PutRetentionPolicy",          # a shorter retention deletes the older logs
                     "ecr:PutLifecyclePolicy",           # its rules delete images
@@ -833,7 +835,7 @@ def named(key):
 
 
 def delete_refusal(key):
-    """The door's words for a judged delete that is the owner's, for the first name that deletes() gave."""
+    """The door's words for a delete that is the owner's, for the first name that deletes() gave."""
     if key.startswith("aws:"):
         return f"this call is an AWS delete ({key[4:]}), and every AWS delete is the owner's."
     return f"this call deletes {named(key)}, which no agent made through the door, and such a delete is the owner's."
@@ -905,7 +907,7 @@ def execute(plan, ctx):
 
 def check_need(need, answer, plan, kept):
     if need == "none" and (answer.get("result") or []):
-        raise Stop("a record of that name exists: a change of it is judged")
+        raise Stop("a record of that name exists: a change of it goes through change")
     if need == "one_server" and len(answer.get("servers") or []) != 1:
         raise Stop("no one server has that name in this project")
     if need == "tagged" and not any(r.get("instancesSet") for r in answer.get("reservations", [{}])) and \
@@ -1001,7 +1003,7 @@ def send(provider, s, path, session, ctx, kept, plan):
         ingress = ((kept.get("ingress") or {}).get("result") or {}).get("config", {}).get("ingress") or []
         add = body["add"]
         if any(rule.get("hostname") == add["hostname"] for rule in ingress):
-            raise Stop("that hostname is in the tunnel already: a change of it is judged")
+            raise Stop("that hostname is in the tunnel already: a change of it goes through change")
         body = {"config": dict(((kept.get("ingress") or {}).get("result") or {}).get("config") or {},
                                ingress=[r for r in ingress if r.get("hostname")] + [add] +
                                [r for r in ingress if not r.get("hostname")] or [add, {"service": "http_status:404"}])}
@@ -1208,7 +1210,7 @@ def app_commit_only(ctx, token, full, inst):
 
 def repo_delete(plan, ctx):
     """New-projects plan N3: delete a repository that the door made, which has no runner, with a token of its own for
-    that one repository (plan N2). The judge read the call first."""
+    that one repository (plan N2)."""
     conf, want = ctx["credentials"], plan["repo_delete"]
     full = want["name"]
     _, token = one_call(conf, ctx, full, REPO_DELETE, repositories=[full.split("/", 1)[1]])

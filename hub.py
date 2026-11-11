@@ -8645,16 +8645,17 @@ def t_door_rollout(agent, a):
 
 def t_door_hold(agent, a):
     """door_hold (the manager, new-projects plan N8 (b)): team.json door.holds[host]. parts: the app puts no door parts
-    on the server, and nobody gets it through the door. judged: it gets its parts and its Operator, and the door's file
-    holds it as rule-only, so the door runs no judged call there. none ends the hold. The coordinator's word of
-    6 November 2026: hel1-1 waits for plan 2.23, and the judged calls of five servers for 2.14 to 2.17."""
+    on the server, and nobody gets it through the door. rule-only: it gets its parts and its Operator, and the door's
+    file holds it as rule-only, so only rule calls run there, none of an agent's own calls. none ends the hold. The
+    coordinator's word of 6 November 2026: hel1-1 waits for plan 2.23, and five servers stay rule-only for 2.14 to
+    2.17. judged is the old name of rule-only (DOOR_HOLD_NAMES)."""
     host = str(a.get("host") or "").strip().lower()
-    hold = a.get("hold")
+    hold = DOOR_HOLD_NAMES.get(a.get("hold"), a.get("hold"))
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", host):
         raise ToolError("host is the server's name, as Tailscale gives it, for example hel1-1.")
     if hold not in DOOR_HOLDS + ("none",):
-        raise ToolError("hold is parts (no door parts and no grant), judged (its parts, and no judged call there) or "
-                        "none (the hold ends).")
+        raise ToolError("hold is parts (no door parts and no grant), rule-only (its parts, and only rule calls there) "
+                        "or none (the hold ends).")
     why = str(a.get("why") or "").strip()
     if not why or len(why) > GRANT_WHY_MAX:
         raise ToolError(f"why is the plan step or the reason, in 1 to {GRANT_WHY_MAX} characters: the record keeps it.")
@@ -8668,12 +8669,12 @@ def t_door_hold(agent, a):
     def change(team):
         door = team.get("door") or {}
         holds = dict(door.get("holds") or {})
-        if holds.get(host) == (None if hold == "none" else hold):
+        if DOOR_HOLD_NAMES.get(holds.get(host), holds.get(host)) == (None if hold == "none" else hold):
             return False
         if hold == "none":
             holds.pop(host, None)
         else:
-            holds[host] = hold
+            holds[host] = DOOR_HOLD_STORED.get(hold, hold)
         if holds:
             door["holds"] = dict(sorted(holds.items()))
         else:
@@ -8684,8 +8685,8 @@ def t_door_hold(agent, a):
     except Refusal as e:
         raise ToolError(f"The hub refused it: {e}") from None
     text = {"parts": f"{host} gets no door parts, and nobody gets it through the door, until you end the hold.",
-            "judged": f"{host} gets its parts and its Operator, and the door runs no judged call there until you end "
-                      f"the hold.",
+            "rule-only": f"{host} gets its parts and its Operator, and only rule calls run there through the door "
+                         f"until you end the hold.",
             "none": f"{host} has no hold now."}[hold] + ("" if result["changed"] else " It was so already.") + \
         " This Mac's app writes the door's file at its next round."
     with transaction():
@@ -8821,9 +8822,9 @@ def t_request_secret(agent, a):
             raise ToolError("This fleet has no door, so there is no key to ask for it. Leave door out.")
         if kind != "api_key" or not DOOR_CREDENTIAL.fullmatch(door):
             raise ToolError(f"door is the key's name in the door's rules: <provider>:<account> of "
-                            f"{', '.join(DOOR_PROVIDERS)} (for example cloudflare:acme), model, or app:<app>:<NAME> "
-                            f"for one setting of an app on a host (for example app:shop:STRIPE_SECRET_KEY), and it "
-                            f"is an API key. AWS needs no key, and a GitHub App key comes through the app.")
+                            f"{', '.join(DOOR_PROVIDERS)} (for example cloudflare:acme), or app:<app>:<NAME> for "
+                            f"one setting of an app on a host (for example app:shop:STRIPE_SECRET_KEY), and it is "
+                            f"an API key. AWS needs no key, and a GitHub App key comes through the app.")
     env = str(a.get("env") or "").strip() or (door_env(door) if door else "")
     if kind == "api_key" and not env_name(env):
         if door:
@@ -23301,8 +23302,7 @@ def resume_lines(t0):
     waits = door_waits_after()
     if waits:
         out.append(f"The door's parts wait after {waits}, whose door check passed: once its Operator's normal work "
-                   f"there through the door with rule calls passed (test 6), call door_rollout with go true. A judged "
-                   f"call refused for want of a judge key does not hold it back.")
+                   f"there through the door with rule calls passed (test 6), call door_rollout with go true.")
     tasks = q(f"SELECT * FROM tasks WHERE {OPEN_TASK} ORDER BY id")
     if tasks:
         out.append("Open tasks:")
@@ -23899,9 +23899,9 @@ TOOLS = [
                         "for example Q-4: the item quotes its asker, the owner's answer goes back to it as the answer, "
                         "and the item closes by itself when the question is answered another way or its task ends"},
         "door_call": {"type": "string", "description": "The call hash that the door gave with its refusal of a "
-                      "judged call (for example a call that adds cost): the owner's yes then lets that exact call "
-                      "through the door once. Put the exact command in what_to_do, and give options whose first "
-                      "one is the yes."},
+                      "call that is the owner's (a delete of what no agent made through the door, or an AWS "
+                      "delete): the owner's yes then lets that exact call through the door once. Put the exact "
+                      "command in what_to_do, and give options whose first one is the yes."},
         "github_app": {"type": "string", "description": "The GitHub account, an organization or a user, that needs "
                        "a GitHub App of its own, because no App of the door reaches it (the hub tells you when): the "
                        "first option, which the owner presses in Founderizer on their Mac, then makes it with GitHub's "
@@ -23939,9 +23939,8 @@ TOOLS = [
      "one server first, checks that server's second sshd itself (test 1), and the hub tells you when that passed. Then "
      "give the server's Operator normal work there through the door with rule calls (test 6: updates, a service "
      "restart and a reboot on a CI runner, and on an app host also a deploy, a backup run, an nginx edit and a "
-     "restore). A judged call that the door refuses for want of a judge key does not hold it back. When that work "
-     "passed, call this with go true: the app puts the parts on the other servers, one each round, and checks each "
-     "one the same way. go false stops it after the server that it is on.",
+     "restore). When that work passed, call this with go true: the app puts the parts on the other servers, one each "
+     "round, and checks each one the same way. go false stops it after the server that it is on.",
      S({"request_id": REQUEST_ID,
         "go": {"type": "boolean", "description": "true: the other servers get the door's parts too; false: no "
                                                  "further server gets them"},
@@ -23949,12 +23948,12 @@ TOOLS = [
        ["request_id", "go", "why"])),
     ("manager", "door_hold", t_door_hold,
      "Keep the door from one server while a plan step waits. parts: the app puts no door parts on it, and nobody gets "
-     "it through the door. judged: it gets its parts and its Operator, and the door runs no judged call there, only "
-     "rule calls. none ends the hold, once the step's check passed.",
+     "it through the door. rule-only: it gets its parts and its Operator, and only rule calls run there through the "
+     "door, none of an agent's own calls. none ends the hold, once the step's check passed.",
      S({"request_id": REQUEST_ID,
         "host": {"type": "string", "description": "The server's name, as Tailscale gives it"},
-        "hold": {"type": "string", "enum": ["parts", "judged", "none"],
-                 "description": "parts, judged, or none to end the hold"},
+        "hold": {"type": "string", "enum": ["parts", "rule-only", "none"],
+                 "description": "parts, rule-only, or none to end the hold"},
         "why": {"type": "string", "description": "The plan step that it waits for, or the reason, in a line"}},
        ["request_id", "host", "hold", "why"])),
     ("manager", "door_gitops", t_door_gitops,
@@ -24000,7 +23999,7 @@ TOOLS = [
                                    "The owner can change this before they save."},
         "door": {"type": "string", "description": "Only for a key that the DevOps door uses: its name in the door's "
                                                   "rules, <provider>:<account> (cloudflare, hetzner, backblaze, "
-                                                  "azure or tailscale), model for the door's own judge, or "
+                                                  "azure or tailscale), or "
                                                   "app:<app>:<NAME> for one setting of an app on a host. The card "
                                                   "gives it to the door alone, and give_to is not used."}},
        ["why"])),
@@ -34049,12 +34048,13 @@ def record_status(agent, data):
 DOOR_SECRETS_FILE = os.path.expanduser("~/.fleet/door.json")   # {"token", "record"}, written as root (plan step X2)
 DOOR_PORT = 8766
 # A key that the owner saves for the door from a key card is one credential of the door's rules (DevOps plan 13, item
-# 3): <provider>:<account>, or the door judge's own model key. AWS has no key (the door's own bot), and a GitHub App
-# key comes through the app's GitHub App rows, so neither is asked for with a card. app:<app>:<NAME> is a key for one
+# 3): <provider>:<account>. AWS has no key (the door's own bot), and a GitHub App key comes through the app's GitHub
+# App rows, so neither is asked for with a card. The door calls no model, so it needs no model key (the owner,
+# 11 November 2026: "no, I dont want any api key! it needs to be the agent itself"). app:<app>:<NAME> is a key for one
 # setting of one app on a host (new-projects plan N4), which the door's env-new puts in that app's settings file.
 DOOR_PROVIDERS = ("backblaze", "cloudflare", "hetzner", "azure", "tailscale")
 DOOR_APP_KEY = r"app:[a-z][a-z0-9-]{0,23}:[A-Z][A-Z0-9_]{0,63}"
-DOOR_CREDENTIAL = re.compile(r"(?:" + "|".join(DOOR_PROVIDERS) + r"):[a-z0-9][a-z0-9-]{0,39}|model|" + DOOR_APP_KEY)
+DOOR_CREDENTIAL = re.compile(r"(?:" + "|".join(DOOR_PROVIDERS) + r"):[a-z0-9][a-z0-9-]{0,39}|" + DOOR_APP_KEY)
 DOOR_WAIT = 30                  # seconds one call to the door may take
 DOOR_READ_EVERY = 60            # seconds between two reads of the door's record
 DOOR_PAGE = 500
@@ -34091,7 +34091,7 @@ def validate_door(team):
         raise ValueError("door.rollout is true or false: the manager's door_rollout sets it")
     holds = door.get("holds", {})
     if not isinstance(holds, dict) or not all(isinstance(k, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", k) and
-                                              v in DOOR_HOLDS for k, v in holds.items()):
+                                              v in DOOR_HOLDS + tuple(DOOR_HOLD_NAMES) for k, v in holds.items()):
         raise ValueError(f"door.holds maps a server's name to {' or '.join(DOOR_HOLDS)}: the manager's door_hold sets it")
     import door_targets
     gitops = door.get("gitops", {})
@@ -34127,7 +34127,7 @@ def validate_door(team):
     for name, c in credentials.items():
         if not isinstance(name, str) or not DOOR_CREDENTIAL.fullmatch(name):
             raise ValueError(f"door.credentials: {name!r} is not <provider>:<account> of "
-                             f"{', '.join(DOOR_PROVIDERS)}, model, or app:<app>:<NAME>")
+                             f"{', '.join(DOOR_PROVIDERS)}, or app:<app>:<NAME>")
         users = c.get("agents", []) if isinstance(c, dict) else None
         if not isinstance(c, dict) or set(c) - {"secret", "agents"} or c.get("secret") not in held or \
                 not isinstance(users, list) or len(set(users)) != len(users) or \
@@ -34248,7 +34248,8 @@ def door_view():
             # servers after the first one
             "rollout": door.get("rollout") is True,
             # N8 (b): the servers that a plan step holds, from the manager's door_hold: parts (none, and no grant) or
-            # judged (the door's file holds them as rule-only, so the door runs no judged call there)
+            # judged, the stored name of rule-only (the door's file holds them as rule-only, so only rule calls run
+            # there; DOOR_HOLD_STORED)
             "holds": dict(sorted((door.get("holds") or {}).items())),
             # DevOps plan X3: the GitOps repositories, from the manager's door_gitops: {sync, agents}, which the app
             # writes as each agent's target {kind: gitops, sync}
@@ -34339,7 +34340,11 @@ def save_door_entry(body):
 
 
 DOOR_HOST_STATES = ("installed", "passed", "failed")
-DOOR_HOLDS = ("parts", "judged")       # N8 (b): what the manager's door_hold keeps from one server
+DOOR_HOLDS = ("parts", "rule-only")    # N8 (b): what the manager's door_hold keeps from one server
+# rule-only had the name judged until 11 November 2026. team.json and the app's view keep that name, because an app
+# from before that day reads only it; an app from that day on reads both (DoorAccess.HubDoor.ruleOnlyHolds)
+DOOR_HOLD_NAMES = {"judged": "rule-only"}
+DOOR_HOLD_STORED = {"rule-only": "judged"}
 
 
 def door_waits_after():
@@ -34377,13 +34382,11 @@ def door_host_report(body):
                 f"passed (test 1): no shell, no TTY, no scp, no forward and no form outside the list, and a read and a "
                 f"rule form through sudo ops-root work. Give its Operator normal work there through the door with "
                 f"rule calls (test 6): on a CI runner, updates, a service restart and one reboot when no build runs; "
-                f"on an app host also a deploy, a restic run, an nginx edit and reload, and a restore. A judged call "
-                f"that the door refuses because it has no judge key yet is test 4's expected result: it does not "
-                f"count against test 6 and does not hold back door_rollout, and judged work waits for the judge's "
-                f"key card. When that work passed, call door_rollout with go true: the app then puts the parts on the "
-                f"other servers, one each round, and checks each one the same way. Before that, give door_hold to "
-                f"each server that a plan step keeps from the door: parts (it gets none, and no grant) or judged (it "
-                f"gets its parts, and the door runs no judged call there).")
+                f"on an app host also a deploy, a restic run, an nginx edit and reload, and a restore. When that "
+                f"work passed, call door_rollout with go true: the app then puts the parts on the other servers, "
+                f"one each round, and checks each one the same way. Before that, give door_hold to each server that "
+                f"a plan step keeps from the door: parts (it gets none, and no grant) or rule-only (it gets its "
+                f"parts, and only rule calls run there through the door).")
     elif state == "failed":
         told = (f"[hub] The door's parts did not go on {host}, or the door's check of it failed: {said} The app puts "
                 f"the parts on no other server until a new release of the app or the door.")
@@ -34412,8 +34415,8 @@ def door_key_name(text):
 def door_env(door):
     """The vault's name for a door key whose request gave no env (the coordinator, 7 November 2026: both first
     requests were refused for want of one): no agent reads it, so the hub names it after the key's door name, DOOR_
-    and that name with a key ending. model gives DOOR_MODEL_KEY, cloudflare:acme DOOR_CLOUDFLARE_ACME_KEY and
-    app:shop:STRIPE_SECRET_KEY DOOR_APP_SHOP_STRIPE_SECRET_KEY. A name longer than a variable name may be is not
+    and that name with a key ending. cloudflare:acme gives DOOR_CLOUDFLARE_ACME_KEY and app:shop:STRIPE_SECRET_KEY
+    DOOR_APP_SHOP_STRIPE_SECRET_KEY. A name longer than a variable name may be is not
     one, and the request then needs its own env."""
     name = "DOOR_" + re.sub(r"[^A-Z0-9]+", "_", door.upper()).strip("_")
     return name if name.endswith(KEY_SUFFIXES) else name + "_KEY"
@@ -34422,8 +34425,8 @@ def door_env(door):
 def save_door_credential(name, ref, asker):
     """A key that the owner saved from a key card for the door (DevOps plan 13, item 3): the door's rules name it
     `name`, for the agent that asked. The app writes both into the door's access file at its next round. A key that
-    the manager asked for names no agent: the door uses it itself (the judge's model key), or for the agent whose own
-    card names it later. A key saved again under the same name replaces the old one."""
+    the manager asked for names no agent: the door uses it for the agent whose own card names it later. A key saved
+    again under the same name replaces the old one."""
     users = [asker] if role_of(asker) in ("worker", "lead") else []
 
     def change(team):
@@ -34656,7 +34659,7 @@ def door_timer():
 
 def history_door(a, days, start, before):
     """see_history what="door": the door's record over the window, as the manager reads it for the owner's weekly
-    message: calls by kind and outcome, what the judge passed, and the refusals."""
+    message: calls by kind and outcome, the agents' own calls that ran, and the refusals."""
     rows = q("SELECT * FROM door_record WHERE ts>=? ORDER BY n", (start,))
     if not rows:
         return [f"The door's record holds no call in the last {days} days." if door_conf() else
@@ -34665,8 +34668,10 @@ def history_door(a, days, start, before):
     for r in rows:
         counts[(r["kind"], r["outcome"])] = counts.get((r["kind"], r["outcome"]), 0) + 1
     lines = [f"The door, last {days} days: " + ", ".join(f"{n} {k} {o}" for (k, o), n in sorted(counts.items()))]
-    lines += [f"judged and allowed: {r['caller']} {r['target']} {r['action']}" for r in rows
-              if r["kind"] == "judged" and r["outcome"] == "done"][-20:]
+    said = "{}'s own call, which it answers for: "       # the door's own words before the reason (door.py, call)
+    lines += [f"{r['caller']}'s own call: {r['target']} {r['action']} "
+              f"({r['why'].removeprefix(said.format(r['caller']))})"
+              for r in rows if r["kind"] == "own" and r["outcome"] == "done"][-20:]
     lines += [f"refused: {r['caller']} {r['target']} {r['action']}: {r['why']}" for r in rows
               if r["kind"] == "refused"][-20:]
     return lines

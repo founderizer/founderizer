@@ -8,15 +8,16 @@ itself and passes every other form here, through one sudoers line:
 
     sudo -n /usr/local/sbin/ops-root <base64 of {"v": 1, "op": <form>, "args": [<text>, ...], "sha256": <hex>}>
 
-Standard library only, the same file on every host, and its own check of each form: the door classifies a call with
-this very table (door_targets.py loads this file), and this file refuses on its own what the door should never have
-sent, so a door bug passes nothing that the table refuses. Stdin is closed except for a file's bytes, which must have
-the request's SHA-256; there is no TTY and the environment is empty. A root-owned mode file, written at install, says
-`fix` or `rule-only`: on the hub, a Fleet machine and a CI host that two businesses share it says `rule-only`, and
-then judged forms and file installs are refused here. A judged command runs in a transient service that hides the
-host's app trees, the Docker and containerd sockets and its secret paths; a package install and a file install run
-outside it. A write holds the host's one lock, so a second write waits. A new version of this file comes only from a
-release that the release key signed (`self-update`), never a held one, and never one before the release it came from.
+Standard library only, the same file on every host, and its own check of each form: the door classifies a call with this
+very table (door_targets.py loads this file), and this file refuses on its own what the door should never have sent, so
+a door bug passes nothing that the table refuses. Stdin is closed except for a file's bytes, which must have the
+request's SHA-256; there is no TTY and the environment is empty. A root-owned mode file, written at install, says `fix`
+or `rule-only`: on the hub, a Fleet machine and a CI host that two businesses share it says `rule-only`, and then only
+rule forms run here: the agent's own forms, the file install among them, are refused. An `exec` command runs in a
+transient service that hides the host's app trees, the Docker and containerd sockets and its secret paths; a package
+install and a file install run outside it. A write holds the host's one lock, so a second write waits. A new version of
+this file comes only from a release that the release key signed (`self-update`), never a held one, and never one before
+the release it came from.
 
 Exit status: 0 done, 3 refused (the one line says why), 1 failed.
 """
@@ -83,7 +84,7 @@ KEEP_PACKAGES = ("openssh-server", "openssh-sftp-server", "sudo", "python3", "py
                  "libc6", "libc-bin", "coreutils", "util-linux", "login", "passwd", "ufw", "nftables", "iptables",
                  "netplan.io", "unattended-upgrades", "ca-certificates", "openssl", "libssl*")
 
-# What a judged command may never run: shells, interpreters and every program that runs another one, reads a raw
+# What an exec command may never run: shells, interpreters and every program that runs another one, reads a raw
 # disk, changes namespaces or credentials, or talks to the container runtimes (DevOps plan, "Always refused").
 REFUSED_PROGRAMS = {
     "sh", "bash", "dash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "busybox", "toybox", "rbash", "screen", "tmux",
@@ -100,7 +101,7 @@ REFUSED_PROGRAMS = {
     "snap", "pip", "pip3", "npm", "npx", "yarn", "pnpm", "cargo", "go", "java", "dotnet", "mono", "R", "Rscript",
     "julia", "swipl", "visudo", "ops-root", "tailscale"}
 REFUSED_ARGS = {"-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls", "--exec"}
-# Paths that no file install writes and that a judged command sees read-only: this file and its own, ops-agent's
+# Paths that no file install writes and that an exec command sees read-only: this file and its own, ops-agent's
 # files, the second sshd, the login files and the preload list (DevOps plan, "The host login").
 PROTECTED = ("/usr/local/sbin/ops-root", LIB + "/", ETC + "/", STATE + "/", "/var/lib/ops-agent/",
              "/etc/sudoers.d/ops-agent", "/etc/passwd", "/etc/shadow", "/etc/group", "/etc/gshadow", "/etc/sudoers",
@@ -172,10 +173,10 @@ def mode():
 
 # ---------------------------------------------------------------- the forms
 #
-# Each form: its kind (rule: code passes it; judged: the door's model passed it; refused never comes here), whether
-# it writes, its window class (the door refuses a write of that class inside a window, DevOps plan section 4) and
-# whether it is reboot-class (one at a time in each business). check() turns the arguments into the form's own,
-# or raises Refused; run() does it.
+# Each form: its kind (rule: code passes it; own: the agent's own call, which runs only on a host in fix mode; refused
+# never comes here), whether it writes, its window class (the door refuses a write of that class inside a window, DevOps
+# plan section 4) and whether it is reboot-class (one at a time in each business). check() turns the arguments into the
+# form's own, or raises Refused; run() does it.
 
 FORMS = {}
 
@@ -288,7 +289,7 @@ def check_timer(args):
 
 
 def check_exec(args):
-    """A judged command: an argv with no shell. Never a shell, an interpreter or a program that runs another one,
+    """An exec command: an argv with no shell. Never a shell, an interpreter or a program that runs another one,
     never an option that runs one, and never a write to a protected path."""
     if not args:
         raise Refused("exec needs a command")
@@ -311,7 +312,7 @@ def check_exec(args):
         if path.startswith("/") and protected(path):
             raise Refused(f"{path} is protected on this host")
         if path.startswith("/") and any(path == h or path.startswith(h.rstrip("/") + "/") for h in hidden_paths()):
-            raise Refused(f"{path} is an app tree or a secret path, which no judged command reads")
+            raise Refused(f"{path} is an app tree or a secret path, which no exec command reads")
     return list(args)
 
 
@@ -341,7 +342,7 @@ def check_file(args):
 
 
 def protected(path):
-    """True when the path, or where it really leads, is one that no install and no judged command writes."""
+    """True when the path, or where it really leads, is one that no install and no exec command writes."""
     names = {os.path.normpath(path)}
     with contextlib.suppress(OSError):
         names.add(os.path.realpath(P(path))[len(ROOT):] if ROOT else os.path.realpath(path))
@@ -701,9 +702,9 @@ def do_inventory(req, data):
     return checked((status, out), out)
 
 
-# ---- judged forms
+# ---- the agent's own forms: a host in fix mode only
 
-@form("exec", kind="judged", window="restart", help="one command, no shell, in a service that hides the app trees")
+@form("exec", kind="own", window="restart", help="one command, no shell, in a service that hides the app trees")
 def do_exec(req, data):
     args = req["args"]
     said = ""
@@ -721,14 +722,14 @@ def do_exec(req, data):
     return said + checked((status, out), out or "done")
 
 
-@form("install", kind="judged", help="apt-get install of packages by name, which goes on if the session ends")
+@form("install", kind="own", help="apt-get install of packages by name, which goes on if the session ends")
 def do_install(req, data):
     return detached("install", ["apt-get", "install", "-y", "--no-install-recommends", "-o", "DPkg::Lock::Timeout=600",
                                 "-o", "Dpkg::Options::=--force-confold", *req["args"]])
 
 
-@form("purge", kind="judged", help="apt-get purge of packages by name, when apt's own dry run removes no package of "
-                                   "the door's way in")
+@form("purge", kind="own", help="apt-get purge of packages by name, when apt's own dry run removes no package of "
+                                "the door's way in")
 def do_purge(req, data):
     status, out = run(["apt-get", "--simulate", "purge", *req["args"]], timeout=300)
     if status != 0:
@@ -744,7 +745,7 @@ def do_purge(req, data):
     return detached("purge", ["apt-get", "purge", "-y", "-o", "DPkg::Lock::Timeout=600", *req["args"]])
 
 
-@form("passwd-lock", kind="judged", help="passwd -l of one user, never root's or ops-agent's")
+@form("passwd-lock", kind="own", help="passwd -l of one user, never root's or ops-agent's")
 def do_passwd_lock(req, data):
     user = req["args"][0]
     try:
@@ -756,7 +757,7 @@ def do_passwd_lock(req, data):
     return checked(run(["passwd", "-l", user]), f"the password of {user} is locked")
 
 
-@form("file", kind="judged", help="install a file: its bytes on stdin, with their sha256")
+@form("file", kind="own", help="install a file: its bytes on stdin, with their sha256")
 def do_file(req, data):
     path, mode_text, owner = req["args"]
     if data is None or len(data) > FILE_MAX:
@@ -996,8 +997,9 @@ def do_app_check(req, data):
 # read another app's. Its ExecStart runs the release under current, and no command has a prefix that runs it with
 # privileges. It pulls in no unit beyond the network, a database and the app's own, a bind mount stays inside the
 # app's own folders (a bind skips the modes of the folders above a file), and no folder that systemd makes for it
-# changes the owner of anything that is not the app's. Then the judge reads it. env-new and env-add add one setting to
-# that file, with the value that the door sends on stdin, which no answer shows: never a name that the unit sets.
+# changes the owner of anything that is not the app's. Then it is the agent's own call. env-new and env-add add one
+# setting to that file, with the value that the door sends on stdin, which no answer shows: never a name that the
+# unit sets.
 
 UNIT_MAX = 16 * 1024
 SYSTEM_DIRS = ("/etc", "/var/lib", "/var/cache", "/var/log", "/run", "/opt", "/srv", "/usr/lib", "/usr/share")
@@ -1162,8 +1164,8 @@ def unit_folders(app, text):
     return out
 
 
-@form("unit-new", kind="judged", help="an app's systemd unit, /etc/systemd/system/<app>.service, installed and "
-                                      "enabled: <app>, the unit on stdin with its sha256, on a fix host only")
+@form("unit-new", kind="own", help="an app's systemd unit, /etc/systemd/system/<app>.service, installed and "
+                                   "enabled: <app>, the unit on stdin with its sha256, on a fix host only")
 def do_unit_new(req, data):
     app = req["args"][0]
     n = app_names(app)
@@ -1240,12 +1242,12 @@ def add_setting(req, data):
                       "the value on stdin (the door's), on a fix host only")
 def do_env_new(req, data):
     if os.path.lexists(P(f"{WWW}/{req['args'][0]}/current")):
-        raise Refused(f"{req['args'][0]} has a release: env-add adds a setting now, and the judge reads it")
+        raise Refused(f"{req['args'][0]} has a release: env-add adds a setting now, as the agent's own call")
     return add_setting(req, data)
 
 
-@form("env-add", kind="judged", help="a new setting in an app's settings file, after its first release: <app> <NAME> "
-                                     "random|key, the value on stdin (the door's), on a fix host only")
+@form("env-add", kind="own", help="a new setting in an app's settings file, after its first release: <app> <NAME> "
+                                  "random|key, the value on stdin (the door's), on a fix host only")
 def do_env_add(req, data):
     return add_setting(req, data)
 
@@ -1390,14 +1392,14 @@ def do_runner_new(req, data):
 
 # ---- the app's vhost (new-projects plan N7)
 #
-# vhost-new <app> installs /etc/nginx/sites-available/<app> and its link in sites-enabled, judged, once code has read
-# it. It holds server blocks only. It listens only on 127.0.0.1 and [::1], at one port of its own that is not 80, 443
-# or the app's own port, and that no listener and no other app has. No other vhost serves its server_name. It sends
-# requests only to the app's own port on loopback, serves files only from the app's own tree, includes only nginx's
-# own snippets, and writes logs only to /var/log/nginx, because nginx opens those files as root. Then the judge reads
-# it. nginx -t must pass with no warning that was not there before, and nginx reloads. The two folders' immutable bit
-# goes back as it was in a finally block, and a step that fails takes the vhost back, so nginx stays as it was. The
-# tunnel then sends the app's hostname to that port (cloudflare tunnel-route).
+# vhost-new <app> installs /etc/nginx/sites-available/<app> and its link in sites-enabled, as the agent's own call, once
+# code has read it. It holds server blocks only. It listens only on 127.0.0.1 and [::1], at one port of its own that is
+# not 80, 443 or the app's own port, and that no listener and no other app has. No other vhost serves its server_name.
+# It sends requests only to the app's own port on loopback, serves files only from the app's own tree, includes only
+# nginx's own snippets, and writes logs only to /var/log/nginx, because nginx opens those files as root. nginx -t must
+# pass with no warning that was not there before, and nginx reloads. The two folders' immutable bit goes back as it was
+# in a finally block, and a step that fails takes the vhost back, so nginx stays as it was. The tunnel then sends the
+# app's hostname to that port (cloudflare tunnel-route).
 
 NGINX = "/etc/nginx"
 VHOST_MAX = 64 * 1024
@@ -1510,8 +1512,8 @@ def nginx_warnings():
     return status, out, {line.strip() for line in out.splitlines() if "[warn]" in line or "[emerg]" in line}
 
 
-@form("vhost-new", kind="judged", window="restart", help="an app's nginx vhost on a loopback port of its own: <app>, "
-                                                         "the vhost on stdin with its sha256, on a fix host only")
+@form("vhost-new", kind="own", window="restart", help="an app's nginx vhost on a loopback port of its own: <app>, "
+                                                      "the vhost on stdin with its sha256, on a fix host only")
 def do_vhost_new(req, data):
     app = req["args"][0]
     n = app_names(app)
@@ -2156,8 +2158,8 @@ def call(req, data=None):
     op = req["op"]
     req["args"] = check_args(op, req["args"])
     f = FORMS[op]
-    if f["kind"] == "judged" and mode() != "fix":
-        raise Refused("this host is rule-only: no judged form and no file install")
+    if f["kind"] == "own" and mode() != "fix":
+        raise Refused("this host is rule-only: only rule forms run here, and no file install")
     if op in PLAN_WRITES and mode() != "fix":        # new-projects plan N4: a new app lives on a fix host only
         raise Refused("this host is rule-only: no form of a new app writes here")
     if data is not None and op not in ("file", "self-update", "pro-attach", "runner-register", "place", "unit-new",

@@ -1,11 +1,12 @@
 """What the door may do: one table for each kind of target (DevOps plan, section 2, "The door"). Standard library only.
 
-Every call is one of three kinds: a rule call, which code passes at once with no model, so that it works when the model
-is down; a judged call, which one model call allows or refuses; or a refusal. A call that no table lists is refused,
-reads too. decide() gives the kind of one call and the reason, and never acts: door.py acts on what it gives.
+Every call is one of three kinds: a rule call, which code passes at once; the agent's own call, which code does not list
+as a rule but which the agent's grant covers, so that it runs and the agent answers for it (the owner, 11 November 2026:
+"it needs to be the agent itself"); or a refusal. A call that no table lists is refused, reads too. decide() gives the
+kind of one call and the reason, and never acts: door.py acts on what it gives.
 
     host                a managed host, through its second sshd: the fixed reads of host/ops-read, the rule forms
-                        of host/ops-root, and its judged forms on a host whose mode is fix
+                        of host/ops-root, and its own forms (the agent's own calls) on a host whose mode is fix
     <provider>:<name>   one provider account of the access file (door_providers.py)
     commit:<owner/repo> a commit that the door makes on a repository the access file gives the agent
     deploy:<owner/repo> that repository's documented deploy
@@ -42,13 +43,13 @@ OPS_READ = load("ops_read", os.path.join(HERE, "host", "ops-read"))
 VENDOR_REPOS = ("miguelpieras/founderizer-fleet", "miguelpieras/founderizer-web", "miguelpieras/agents")
 # Host forms that only the door sends, with a value of its own on stdin: never an agent's call.
 DOOR_ONLY = {"self-update", "place", "pro-attach", "runner-register"}
-# Host forms whose content goes to the host on stdin, with its sha256 (the judge reads it first), and the forms whose
-# value the door itself sends there (new-projects plan N4): never the caller's.
+# Host forms whose content goes to the host on stdin, with its sha256, and the forms whose value the door itself sends
+# there (new-projects plan N4): never the caller's.
 HOST_CONTENT = ("file", "unit-new", "vhost-new")
 DOOR_VALUE = ("env-new", "env-add")
 TARGET = re.compile(r"[a-z0-9][a-z0-9.-]{0,62}|[a-z]+:[A-Za-z0-9][A-Za-z0-9._/-]{0,99}")
 REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
-CONTENT_MAX = 256 * 1024     # bytes of content in one call; the judge's own cap is the door's (door.JUDGE_MAX)
+CONTENT_MAX = 256 * 1024     # bytes of content in one call
 
 # The commit rules (DevOps plan section 2): these paths, at any depth, never pass in any commit.
 NEVER_PATHS = (".claude/**", ".codex/**", ".mcp.json", "AGENTS.md", "CLAUDE.md", ".github/**", ".husky/**",
@@ -70,8 +71,8 @@ NPM_AGE = 7 * 86400          # min-release-age=7, which npm ci does not check on
 
 
 class Decision:
-    """kind: read | rule | judged | refused. why: one line for the agent and the record. form, args: what the door
-    runs. host, window, reboot: what the door's order needs."""
+    """kind: read | rule | own (the agent's own call) | refused. why: one line for the agent and the record. form, args:
+    what the door runs. host, window, reboot: what the door's order needs."""
 
     def __init__(self, kind, why, **more):
         self.kind, self.why = kind, why
@@ -79,7 +80,7 @@ class Decision:
         self.form, self.args = more.get("form"), more.get("args") or []
         self.host, self.window, self.reboot = more.get("host"), more.get("window"), more.get("reboot", False)
         self.business = more.get("business")
-        self.write = more.get("write", kind in ("rule", "judged"))
+        self.write = more.get("write", kind in ("rule", "own"))
         self.plan = more.get("plan")            # what the door runs: a provider's requests, a commit, a deploy
         # what the door sends on the host's stdin: (random, None) or (key, app:<app>:<NAME>) for a setting (N4), and
         # (runner, <owner>/<repo>, <runner name>) for a runner (N6)
@@ -200,10 +201,10 @@ def decide_host(access, agent, me, host, op, args, never, content=None, lookups=
         return refused(f"{op} takes its bytes as the call's content", **common)
     f = OPS_ROOT.FORMS[op]
     more = dict(common, form=op, args=checked, window=f["window"], reboot=f["reboot"], write=f["write"], value=value)
-    if f["kind"] == "judged":
+    if f["kind"] == "own":
         if h.get("mode") != "fix":
-            return refused(f"{host} is rule-only: no judged form and no file install", **more)
-        return Decision("judged", f"{op} is judged", **more)
+            return refused(f"{host} is rule-only: only rule forms run there, and no file install", **more)
+        return Decision("own", f"the host form {op}", **more)
     return Decision("rule" if f["write"] else "read", f"{op} is a rule call", **more)
 
 
@@ -399,9 +400,9 @@ def commit_files(content):
 
 def decide_commit(access, agent, me, repo, op, args, content, lookups):
     """A commit that the door makes. devops: any file outside the commit rules and scripts/ is a rule call, and
-    scripts/ is judged. app: a checked lockfile fix, a checked image, a replica count or a dated scan exception is a
-    rule call, and other paths are judged. gitops goes through gitops:<repo>. The workflow files of a repository that
-    the door made go only through decide_workflows, for the agent that made it (N5)."""
+    scripts/ is the agent's own call. app: a checked lockfile fix, a checked image, a replica count or a dated scan
+    exception is a rule call, and other paths are the agent's own call. gitops goes through gitops:<repo>. The workflow
+    files of a repository that the door made go only through decide_workflows, for the agent that made it (N5)."""
     made = (lookups.get("made_repo") or (lambda name: None))(repo)
     mine = isinstance(made, dict) and made.get("agent") == agent
     if op == "deploy-template":
@@ -433,7 +434,7 @@ def decide_commit(access, agent, me, repo, op, args, content, lookups):
     plan = {"repo": repo, "files": files, "message": message, "branch": entry.get("branch")}
     if entry["kind"] == "devops":
         if any(p == "scripts" or p.startswith("scripts/") for p, _, _ in files):
-            return Decision("judged", "a commit under scripts/ is judged", target=f"commit:{repo}", plan=plan)
+            return Decision("own", "a commit under scripts/", target=f"commit:{repo}", plan=plan)
         return Decision("rule", "a commit outside the commit rules and scripts/", target=f"commit:{repo}", plan=plan)
     reasons = []
     for path, data, _mode in files:
@@ -444,12 +445,12 @@ def decide_commit(access, agent, me, repo, op, args, content, lookups):
             return refused(why[len("refused:"):].strip(), target=f"commit:{repo}")
         reasons.append(why or f"{path} is not a form of the rule calls")
     if reasons:
-        return Decision("judged", reasons[0], target=f"commit:{repo}", plan=plan)
+        return Decision("own", reasons[0], target=f"commit:{repo}", plan=plan)
     return Decision("rule", "a checked change of the listed forms", target=f"commit:{repo}", plan=plan)
 
 
 def app_path_rule(path, data, lookups, repo):
-    """True for a rule form, "refused: ..." for a refusal, else the reason the judge reads it."""
+    """True for a rule form, "refused: ..." for a refusal, else the reason that it is the agent's own call."""
     base = os.path.basename(path)
     if data is None:
         return f"{path} is deleted"
@@ -515,7 +516,8 @@ def exception_rule(data):
 def lockfile_rule(path, data, lookups):
     """A checked lockfile fix (DevOps plan section 2). For each changed entry: `resolved` is on the registry,
     `integrity` equals the registry's, the version is 7 days old, the name exists already or the registry names it
-    as a dependency, and no new install script appears. Too young is refused; any other failure goes to the judge."""
+    as a dependency, and no new install script appears. Too young is refused; any other failure makes the commit the
+    agent's own call."""
     registry = lookups.get("npm") or (lambda name: None)
     old_text = (lookups.get("base_file") or (lambda p: None))(path)
     try:
@@ -575,8 +577,8 @@ def manifest_refusal(old_text, new_text):
 
 
 def plan_channels(text):
-    """The channel lines of k3s upgrade Plans. A Plan names one version, so each k3s upgrade is one judged commit
-    (DevOps plan 5.5), and a channel, which upgrades with no commit, is never the door's."""
+    """The channel lines of k3s upgrade Plans. A Plan names one version, so each k3s upgrade is one commit, the agent's
+    own call (DevOps plan 5.5), and a channel, which upgrades with no commit, is never the door's."""
     return sum(len(re.findall(r"^\s*channel\s*:\s*\S", doc, re.M)) for doc in re.split(r"^---\s*$", text, flags=re.M)
                if re.search(r"^apiVersion\s*:\s*upgrade\.cattle\.io/", doc, re.M))
 
@@ -613,7 +615,7 @@ def gitops_path_refused(path, access):
 def decide_gitops(access, me, repo, op, args, content, lookups):
     """read <path> at HEAD through the filter; commit an image tag or digest, a replica count or a restart
     annotation as rule calls; rollback to the last good digest after a schema check; sync through the listed caller
-    workflow. Other manifests are judged."""
+    workflow. Other manifests are the agent's own call."""
     entry = repo_entry(me, repo, ("gitops",))
     if entry is None:
         return refused(f"the door gives this agent nothing on {repo}")
@@ -638,7 +640,7 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
     if files is None:
         return refused(message, target=target)
     plan = {"repo": repo, "files": files, "message": message, "branch": entry.get("branch")}
-    judged = None
+    own = None
     for path, data, mode in files:
         if mode in ("120000", "160000") or never_path(path):
             return refused(f"{path} is under the commit rules", target=target)
@@ -646,7 +648,7 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
         if why:
             return refused(why, target=target)
         if data is None:
-            judged = judged or f"{path} is deleted"
+            own = own or f"{path} is deleted"
             continue
         text = data.decode("utf-8", "replace")
         old = (lookups.get("base_file") or (lambda p: None))(path)
@@ -658,11 +660,11 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
         if hit:
             return refused(f"{path}: {hit}, which no commit passes", target=target)
         if old is None:
-            judged = judged or f"{path} is a new manifest"
+            own = own or f"{path} is a new manifest"
             continue
         changed = changed_lines(old, data)
         if changed is None:
-            judged = judged or f"{path} changes more than its values"
+            own = own or f"{path} changes more than its values"
         elif all(re.fullmatch(r"\s*-?\s*replicas\s*:\s*\d{1,2}\s*", line) for line in changed):
             continue
         elif all(re.fullmatch(r"\s*[\w./-]*restartedAt['\"]?\s*:\s*['\"]?[0-9T:.Z+-]{10,40}['\"]?\s*", line)
@@ -671,13 +673,13 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
         elif all(re.fullmatch(r"\s*-?\s*(image|tag|digest|newTag|newName)\s*:\s*\S+\s*", line) for line in changed):
             ok = image_rule(old, data, lookups)
             if ok is not True:
-                judged = judged or ok
+                own = own or ok
             elif op == "rollback" and not (lookups.get("schema_ok") or (lambda p, d: False))(path, data):
                 return refused(f"the schema check of {path} failed: no rollback", target=target)
         else:
-            judged = judged or f"{path}: other manifest lines"
-    if judged:
-        return Decision("judged", judged, target=target, plan=plan, window="deploy")
+            own = own or f"{path}: other manifest lines"
+    if own:
+        return Decision("own", own, target=target, plan=plan, window="deploy")
     return Decision("rule", "a listed GitOps change", target=target, plan=plan, window="deploy")
 
 
