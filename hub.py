@@ -6543,7 +6543,7 @@ def t_check_result(agent, a):
         raise ToolError(f"{tref(tid)} is still {t['state']}; there is no result to check yet.")
     q("UPDATE tasks SET accepted=?, check_note=?, checked_at=? WHERE id=?", (1 if accepted else 0, note, now(), tid))
     if accepted:
-        return f"{tref(tid)} accepted."
+        return f"{tref(tid)} accepted." + open_items_line(agent, t)
     return (f"{tref(tid)} not accepted. A finished task is never reopened: create a follow-up with "
             f"create_task(..., follows=\"{tref(tid)}\") that says what to fix.")
 
@@ -8613,7 +8613,8 @@ def t_raise_needs_you(agent, a):
              "instead.") if options else ""
     linked = (f" It is for Q-{qu['id']}: the owner's answer goes to {qu['asker']} as the answer of Q-{qu['id']} by "
               f"itself, and if Q-{qu['id']} is answered another way or {tref(qu['task'])} ends first, N-{nid} "
-              f"closes by itself." if qu else "")
+              f"closes by itself. If an agent does the work first, answer Q-{qu['id']} yourself with what was done, "
+              f"so that the owner does not do it again." if qu else "")
     door = (" When the owner answers yes, their app signs that yes to the door call, and the door lets that exact "
             "call through once: the agent sends the same call again." if door_call else "")
     if github_app:
@@ -8722,6 +8723,31 @@ def t_withdraw_need(agent, a):
                    (t0, agent, f"withdrew N-{nid} {clip(need['title'] or '', 80)}: {clip(why, 240)}"))
     return (f"Withdrew N-{nid}. It left the owner's Needs you with no notification, and its record keeps your reason. "
             f"Raise a new item only when the owner must do or decide something now.")
+
+
+ITEMS_NAMED = 5                 # open items that one accept names; the rest are a count
+
+
+def open_items_line(agent, t):
+    """check_result's words after an accept: the open Needs-you items that this agent raised for a question about the
+    goal of task row `t`, and how one closes. The owner, 11 November 2026, to a card that asked him to install two
+    scripts as root on a server: "why can't devops agent do that? that is the point of having it!" The business's DevOps
+    agent had installed them through the door four hours before, and the manager had accepted that result, but it
+    never answered the question that the card took to him: the card stayed on his screen, and the task that asked
+    waited for him. An item with no question names no goal, so only the manager's rules close it (withdraw_need)."""
+    if not t["goal_id"]:
+        return ""
+    rows = q("SELECT n.id, n.title, n.question FROM needs n JOIN questions qu ON qu.id=n.question "
+             "JOIN tasks k ON k.id=qu.task WHERE n.by=? AND n.answer IS NULL AND qu.answer IS NULL AND k.goal_id=? "
+             "ORDER BY n.id", (agent, t["goal_id"]))
+    if not rows:
+        return ""
+    named = "; ".join(f"N-{r['id']} \"{clip(r['title'] or '', 80)}\", which takes Q-{r['question']} to the owner"
+                      for r in rows[:ITEMS_NAMED])
+    more = f"; and {len(rows) - ITEMS_NAMED} more" if len(rows) > ITEMS_NAMED else ""
+    return (f" Your Needs-you items about {gref(t['goal_id'])} are still open: {named}{more}. If this result did what "
+            f"one of them asks, answer its question now with what was done: the item then closes by itself, and the "
+            f"owner does not do the same work again.")
 
 
 def need_talk_said(body):
