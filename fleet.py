@@ -6348,14 +6348,14 @@ def ensure_ops():
 # on 10 November 2026 the fleet's Linux servers had no gh (task sessions answered "gh: command not found"), and the
 # agents used curl in its place. The helper puts gh in ~/.local/bin of its own OS user, as it puts the door's ops there:
 # that needs no root, no package source and no root file, which only a join run as root can put on a server, so gh
-# reaches a running server with the release that carries this pin, and a new server with its first agent. A gh on the
-# PATH at the pinned version or newer stays as it is, and the sessions use it (Homebrew's on a Mac); an older one, such
-# as a distribution's package, stays for the machine's other users, and the agent's sessions get the pin first. The
-# pin is a version at least seven days old (the owner's rule for npm packages), and each file is held to its SHA-256:
-# the archive to the one that GitHub publishes with the release (gh_<version>_checksums.txt, which the release's build
-# attestation signs too), and its bin/gh to the one read out of that archive.
+# reaches a running server with the release that carries this pin, and a new server with its first agent. On every
+# machine, Linux or Mac, the pinned copy is first on the PATH, so every session runs the same gh (the owner, 11 November
+# 2026: a Mac of the fleet uses it too, for consistency); a gh that the machine has elsewhere (a distribution's package,
+# Homebrew's) stays as it is for its other uses. The pin is a version at least seven days old (the owner's rule for
+# npm packages), and each file is held to its SHA-256: the archive to the one that GitHub publishes with the release
+# (gh_<version>_checksums.txt, which the release's build attestation signs too), and its bin/gh to the one read out
+# of that archive.
 GH_VERSION = "2.103.3"          # GitHub's release of 26 October 2026
-GH_PIN = tuple(int(n) for n in GH_VERSION.split("."))
 GH_RELEASES = "https://github.com/cli/cli/releases/download"
 GH_SYSTEMS = {"Linux": "linux", "Darwin": "macOS"}
 GH_ARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
@@ -6373,7 +6373,6 @@ GH_MOST = 64 << 20              # bytes of the archive, and of its program: they
 GH_ROOM = 3 * GH_MOST           # bytes free on the disk of ~/.local/bin before a try, so that a try fills no disk
 GH_TRIES = 4                    # tries at one start of the helper, GH_WAIT seconds apart, while the network fails
 GH_WAIT = 20
-GH_SAYS = re.compile(r"gh version (\d+)\.(\d+)\.(\d+)")      # the first line of `gh --version`
 # gh sends telemetry to GitHub unless it is told not to, and it looks for a newer gh once a day: integration_env gives
 # these two to a session with repositories, and the helper's own calls of gh run with them
 GH_QUIET = {"GH_TELEMETRY": "0", "GH_NO_UPDATE_NOTIFIER": "1"}
@@ -6404,17 +6403,6 @@ def gh_platform(run=subprocess.run):
             pass
     name = f"{system}_{machine}"
     return name if name in GH_BUILDS else None
-
-
-def gh_version_of(program, run=subprocess.run):
-    """The version of a gh program, (2, 103, 3) for example, from its own `gh --version`; None when it gives none."""
-    try:
-        done = run([program, "--version"], capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL,
-                   env=dict(os.environ, **GH_QUIET))
-    except (OSError, subprocess.SubprocessError):
-        return None
-    said = GH_SAYS.search(done.stdout or "") if done.returncode == 0 else None
-    return tuple(int(n) for n in said.groups()) if said else None
 
 
 @contextlib.contextmanager
@@ -6451,11 +6439,12 @@ def gh_copy(source, sink, digest):
 
 def ensure_gh(fetch=None, run=subprocess.run):
     """The pinned gh in ~/.local/bin of this OS user, which the helper's PATH and so every session's carries first.
-    What it did: "there" (that gh is in place), "kept" (the first gh on the PATH is the pinned version or newer),
-    "installed", or "none" (GitHub builds no gh for this system). Where helpers still run as one OS user, they share
-    its ~/.local/bin, so one of them installs it while the others wait, and then they find it in place. The archive stays in memory, and the program appears whole or not at all. Raises
-    Refused when the pinned files cannot be had here (the disk is nearly full, or the archive or its program is not
-    the pinned one), and the error of the download when that fails. fetch: urlopen."""
+    What it did: "there" (that gh is in place), "installed" (in place of no gh there, or of any other, older or newer),
+    or "none" (GitHub builds no gh for this system). Where helpers still run as one OS user, they share its
+    ~/.local/bin, so one of them installs it while the others wait, and then they find it in place. The archive stays
+    in memory, and the program appears whole or not at all. Raises Refused when the pinned files cannot be had here
+    (the disk is nearly full, or the archive or its program is not the pinned one), and the error of the download
+    when that fails. fetch: urlopen."""
     platform = gh_platform(run)
     if platform is None:
         return "none"
@@ -6464,9 +6453,6 @@ def ensure_gh(fetch=None, run=subprocess.run):
     target = os.path.join(folder, "gh")
     if file_sha256(target) == program_sum:
         return "there"
-    found = shutil.which("gh")
-    if found and (gh_version_of(found, run) or ()) >= GH_PIN:
-        return "kept"                           # an older pin of the helper's own, or any older gh, is not
     os.makedirs(folder, exist_ok=True)
     os.makedirs(HOME, mode=0o700, exist_ok=True)
     with open(os.path.join(HOME, "gh.lock"), "a") as lock:
@@ -6507,11 +6493,8 @@ def ensure_gh(fetch=None, run=subprocess.run):
 
 def gh_quiet(program, run=subprocess.run):
     """gh's own setting telemetry: disabled for this OS user, so that no use of gh by this agent sends telemetry, also
-    in a session without repositories, which gets no GH_TELEMETRY. On Linux only, where the agent's OS user is the
-    fleet's own; on a Mac the user is the desktop account, and the helper leaves its gh settings as they are. True when
-    it set it now."""
-    if os.uname().sysname != "Linux":
-        return False
+    in a session without repositories, which gets no GH_TELEMETRY. On every machine: on a Mac the user is the desktop
+    account, which is the agent's (the owner, 10 and 11 November 2026). True when it set it now."""
     env = dict(os.environ, **GH_QUIET)
     got = run([program, "config", "get", "telemetry"], capture_output=True, text=True, timeout=20,
               stdin=subprocess.DEVNULL, env=env)
@@ -6551,9 +6534,9 @@ def gh_thread(tries=GH_TRIES, wait=GH_WAIT, sleep=time.sleep, say=gh_say):
         elif done == "none":
             say(f"GitHub builds no gh for {os.uname().sysname} on {os.uname().machine}, so this agent's sessions "
                 f"have none")
-        program = shutil.which("gh") if done != "none" else None
+        program = os.path.join(os.path.expanduser("~"), ".local", "bin", "gh")      # the pinned copy, which is used
         try:
-            if program and gh_quiet(program):
+            if done != "none" and gh_quiet(program):
                 say("gh sends no telemetry for this agent's user now (gh config: telemetry disabled)")
         except Exception as e:
             say(f"gh's telemetry setting is not changed: {type(e).__name__}: {str(e)[:200]}")
