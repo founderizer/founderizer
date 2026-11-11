@@ -96,7 +96,9 @@ address", below).
    its own user (step 9). Nothing of Founderizer runs as root.
 4. **The private network.** Tailscale from its own installer when the server has none
    (`curl -fsSL https://tailscale.com/install.sh | sh`, the vendor's own script, which is what
-   `join.sh` uses for a server too),
+   the hub's join line uses for a server too). That script does not wait for apt's lock, which
+   the first updates of a new server hold, so the step waits up to 20 minutes for the lock before
+   each try of the script, and tries three times at most;
    then `tailscale up --auth-key=file:<a root-only file> --accept-dns=false` (with
    `--hostname NAME` only when it is given). This hub's address is what `tailscale ip -4` then gives.
 5. **The firewall** (`ufw`, `hubsetup.py firewall`): incoming traffic on `tailscale0` only,

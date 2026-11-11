@@ -131,13 +131,22 @@ port or another key.
 
 ### A2. Put the server on the fleet's private network
 
-    ssh "$SSHUSER@$HOST" '/bin/sh -c "command -v tailscale >/dev/null 2>&1 || curl -fsSL https://tailscale.com/install.sh | sh"'
+    ssh "$SSHUSER@$HOST" '/bin/sh -c "command -v tailscale >/dev/null 2>&1 || for try in 1 2 3; do DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=1200 -q install </dev/null >/dev/null 2>&1; curl -fsSL https://tailscale.com/install.sh | sh && command -v tailscale >/dev/null && break; sleep 20; done; tailscale version"'
     ssh "$SSHUSER@$HOST" '/bin/sh -c "umask 077; cat > /root/fleet-authkey"' < "$KEYFILE"
     ssh "$SSHUSER@$HOST" '/bin/sh -c "tailscale status >/dev/null 2>&1 || tailscale up --auth-key=file:/root/fleet-authkey --accept-dns=false; rm -f /root/fleet-authkey; tailscale ip -4"'
 
-Check: the last command prints an address that starts with `100.`. If `tailscale up` refuses the
-key, stop and give the owner the error as it came; a key is used once unless they made it
-reusable, and an advertised tag must exist in their own Tailscale policy.
+On a new server the first line can take some minutes: the server installs its first updates, and
+they hold apt's lock. Tailscale's installer does not wait for that lock, so the line waits up to 20
+minutes for it before each try of the installer, and it tries three times at most. Usually it ends
+in about 10 minutes; in the worst case it takes more than one hour. Give the line that time: if
+your shell stops a command sooner, run the line in the background, and when it ends, read its
+output and its exit status.
+
+Check: the first line ends with Tailscale's version and an exit status of 0, and the last command
+prints an address that starts with `100.`. If the first line ends without the version, or with an
+exit status that is not 0, stop and give the owner the last lines that it printed, as they came.
+If `tailscale up` refuses the key, stop and give the owner the error as it came; a key is used once
+unless they made it reusable, and an advertised tag must exist in their own Tailscale policy.
 
 Then set `HOST` to that address, and reach the server there for every step after this one:
 
@@ -234,13 +243,17 @@ The command of A1, with the same checks and the same stops. If `id -u` is not `0
 
 ### B2. Put the server on the fleet's private network
 
-    ssh "$SSHUSER@$HOST" '/bin/sh -c "command -v tailscale >/dev/null 2>&1 || curl -fsSL https://tailscale.com/install.sh | sh"'
+    ssh "$SSHUSER@$HOST" '/bin/sh -c "command -v tailscale >/dev/null 2>&1 || for try in 1 2 3; do DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=1200 -q install </dev/null >/dev/null 2>&1; curl -fsSL https://tailscale.com/install.sh | sh && command -v tailscale >/dev/null && break; sleep 20; done; tailscale version"'
     ssh "$SSHUSER@$HOST" '/bin/sh -c "umask 077; cat > /root/fleet-authkey"' < "$KEYFILE"
     ssh "$SSHUSER@$HOST" '/bin/sh -c "tailscale status >/dev/null 2>&1 || tailscale up --auth-key=file:/root/fleet-authkey --accept-dns=false; rm -f /root/fleet-authkey; tailscale ip -4"'
 
-Check: the last command prints an address that starts with `100.`. If `tailscale up` refuses the
-key, stop and give the owner the error as it came; a key is used once unless they made it
-reusable, and an advertised tag must exist in their own Tailscale policy.
+On a new server the first line can take some minutes, as in A2: give it that time in the same way.
+
+Check: the first line ends with Tailscale's version and an exit status of 0, and the last command
+prints an address that starts with `100.`. If the first line ends without the version, or with an
+exit status that is not 0, stop and give the owner the last lines that it printed, as they came.
+If `tailscale up` refuses the key, stop and give the owner the error as it came; a key is used once
+unless they made it reusable, and an advertised tag must exist in their own Tailscale policy.
 
 Then set `HOST` to that address, and reach the server there from now on, as in A2:
 
@@ -296,5 +309,6 @@ writing, every command it gives the model is one the installers really take, no 
 a model provider or reads a provider credential, the auth key never stands in an argument, and the
 last step of both jobs is `verify`. Its `PromptThroughSudo` runs each later step through a stand-in
 for `sudo -i`, for root and for a user who is not root, and fails when a part of a step does not run
-as root. It also runs the first line of A3 on a stand-in server whose first updates hold apt's lock,
-and fails when the line does not wait for it.
+as root. It also runs the first lines of A2, A3 and B2 on a stand-in server whose first updates
+hold apt's lock, and fails when a line does not wait for it. The first line of A2 and of B2 must
+also try Tailscale's installer again when the server's own updates got in its way.

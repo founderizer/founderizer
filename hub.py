@@ -31917,19 +31917,30 @@ def join_tags():
     return TAILNET_NAMES.get("tags") or []
 
 
+# Tailscale's own installer, on a server that can be new. The installer runs apt-get with no wait for apt's lock, and a
+# new server's first updates hold that lock for about 9 minutes after its first start. So each try waits up to 1200
+# seconds for the lock first (hubsetup.py APT_LOCK_WAIT), with an `apt-get install` that installs nothing, as the Mac
+# app's InstallPlan.tailscaleInstall does. A try counts only when `tailscale` is there after it, because `sh` ends
+# with 0 when curl gives it no script. A try that fails (the updates got in its way, or curl got nothing) is made again
+# after 20 seconds, three times at most. INSTALL-PROMPT.md A2 and B2 use these words too. They have no ", ', $ or new
+# line, which a join line may not have, and which `sudo -i` would change.
+TAILSCALE_INSTALL = ("for try in 1 2 3; do DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=1200 -q "
+                     "install </dev/null >/dev/null 2>&1; curl -fsSL https://tailscale.com/install.sh | sh && "
+                     "command -v tailscale >/dev/null && break; sleep 20; done")
+
+
 def join_line(code, kind, tags=None):
     """The one line that the owner pastes on the new server. A Mac has Tailscale already. A VPS gets it from Tailscale's
-    own installer and joins the private network with the tags of hub_tags, and with no --advertise-tags when it gives
-    none (one sign-in link, or none with a key that the app makes), under the name its provider gave it, which becomes
-    its name in Fleet. Then the line runs this hub's join script, with the code in that script's environment: never in
-    a URL."""
+    own installer (TAILSCALE_INSTALL) and joins the private network with the tags of hub_tags, and with no
+    --advertise-tags when it gives none (one sign-in link, or none with a key that the app makes), under the name its
+    provider gave it, which becomes its name in Fleet. Then the line runs this hub's join script, with the code in that
+    script's environment: never in a URL."""
     ip, port = hub_address()
     join = f"curl -fsS http://{ip}:{port}/join | FLEET_JOIN={code} sh"
     if kind == "mac":
         return join
     up = "tailscale up" + (f" --advertise-tags={','.join(tags)}" if tags else "") + " --accept-dns=false"
-    return ("command -v tailscale >/dev/null || curl -fsSL https://tailscale.com/install.sh | sh; tailscale status "
-            f">/dev/null 2>&1 || {up}; " + join)
+    return f"command -v tailscale >/dev/null || {TAILSCALE_INSTALL}; tailscale status >/dev/null 2>&1 || {up}; " + join
 
 
 def new_join_code(kind, label="", agent=None, runtime=None, tags=None, chatgpt=None):

@@ -280,7 +280,19 @@ tailscale up --auth-key=file:<that file>${hostname:+ --hostname=$hostname} --acc
     fi
     if ! command -v tailscale >/dev/null 2>&1; then
         say "  installing Tailscale"
-        curl -fsSL https://tailscale.com/install.sh | sh >/dev/null || stop "Could not install Tailscale."
+        # Tailscale's installer runs apt-get with no wait for apt's lock, which the first updates of a new server hold:
+        # each try waits for the lock first. A try counts only when `tailscale` is there after it, because `sh` ends
+        # with 0 when curl gives it no script. A try that fails (the updates got in its way, or curl got nothing) is
+        # made again, three times at most (hub.py TAILSCALE_INSTALL, and the Mac app's InstallPlan.tailscaleInstall).
+        export DEBIAN_FRONTEND=noninteractive
+        try=1
+        while :; do
+            apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" -q install </dev/null >/dev/null 2>&1 || true
+            curl -fsSL https://tailscale.com/install.sh | sh >/dev/null && command -v tailscale >/dev/null 2>&1 && break
+            [ "$try" -lt 3 ] || stop "Could not install Tailscale."
+            try=$((try + 1))
+            sleep 20
+        done
     fi
     if tailscale status >/dev/null 2>&1; then
         say "  this machine is on the private network already"
