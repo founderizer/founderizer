@@ -108,8 +108,11 @@ Say in each part's `why` why that agent suits that part.
   `ops` prints it: the agent that holds the grant; the owner's window, after which the same call runs; none, which
   changes the plan; or the owner's yes, for a call that the door refused with its call hash (a delete of what no agent
   made, an AWS delete, or a host's `run`, a root script with no box). For that last one, raise one Needs-you item with
-  `door_call` set to that hash and the exact command in `what_to_do`; his yes lets that exact call through once. No
-  item asks the owner to do a server step by hand: the holder does it, through the door.
+  `door_call` set to that hash and the exact command in `what_to_do`; his yes lets that exact call through once. For a
+  `run`, give `door_host`, its server, too: the item is then the door's card, "Run one root script on <server>?", with
+  the script in `details`, and the hub gives it the three answers Run it once, Full access on <server>, and No. Full
+  access lets every later root script on that server through, so no later run there needs an item. No item asks the
+  owner to do a server step by hand: the holder does it, through the door.
 - **Each grant is written where the owner reads it.** `grant_access` takes a `why` and writes one record into the
   owner's chat with the manager, with no notification: who now holds what, at what level, the manager's own reason,
   and that the owner ends it on the Resources page in one step. The manager answers for giving access, so giving it

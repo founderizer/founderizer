@@ -66,6 +66,12 @@ def route_line(answer, target):
     route, call = answer.get("route"), answer.get("call")
     if route is None and call:
         route = "yes"
+    if route == "yes" and call and answer.get("full_access"):
+        host = answer["full_access"]
+        return (f"route: the owner's yes. Ask your requester with ask_my_requester and this call hash, {call}: the "
+                f"manager raises a Needs-you item with door_call {call} and door_host {host}. After the owner's Run it "
+                f"once, this same call runs once; after Full access on {host}, it and every later root script there "
+                f"run. Then send this same call again.")
     if route == "yes" and call:
         return (f"route: the owner's yes. Ask your requester with ask_my_requester and this call hash, {call}: the "
                 f"manager raises a Needs-you item with door_call {call}, and after the owner's yes you send this same "

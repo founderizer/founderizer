@@ -22,7 +22,9 @@ What it does. A call is a rule call (code passes it at once), the agent's own ca
 but the agent's grant covers it: it runs, and the agent answers for it), a call that the next mode allows (a host's
 `run`, a root script with no box), or a refusal (door_targets.py). The door calls no model. A delete of what no agent
 made through the door, every AWS delete, and a call that the next mode allows are the owner's: his signed yes lets that
-exact call through once, and the refusal gives the call's hash for it. Every refusal names its route (ROUTES). Writes on
+exact call through once, and the refusal gives the call's hash for it. His signed Full access on a host (a mode
+statement, which the hub carries as it carries his yeses) lets every such call on that host through, and Auto is the
+default. Every refusal names its route (ROUTES). Writes on
 one host wait for each other, one reboot-class call runs at a time in each business, and inside a window of the access
 file a deploy, a restart, a script or a reboot is refused. A script or a run arms the host's rollback timer first, and
 the door ends the countdown when the host answers it after the call.
@@ -80,6 +82,8 @@ APPROVALS_FILE = STATE + "/approvals.json"  # the owner's signed yeses for exact
 APPROVED_FILE = STATE + "/approved.json"    # the yeses that were used: each lets its one call through once
 APPROVAL_DAYS = 7                           # a signed yes older than this lets nothing through
 DEVICES_FILE = STATE + "/devices.json"      # the owner's phones whose signing key his owner key certified
+MODES_FILE = STATE + "/modes.json"          # the owner's signed mode of each host: the newest statement of each
+MODES = ("auto", "full")                    # door-modes proposal, step 4: Auto, the default, and Full access
 UPSTREAM = "https://github.com/miguelpieras/founderizer-fleet.git"
 SYSTEMD = "/etc/systemd/system"
 FOLLOW_UNIT = "fleet-door-follow"           # the root timer by which the door takes each signed release (plan 13.2)
@@ -125,6 +129,8 @@ HOST_KEY = re.compile(r"ssh-ed25519 [A-Za-z0-9+/=]{60,100}")
 WINDOW_CLASSES = ("upgrade", "restart", "reboot", "deploy", "tailscale")
 APPROVAL_NOTE = (" Its call hash is {sha}: a Needs-you item that names it (raise_needs_you door_call) lets this exact "
                  "call through once, when the owner answers yes.")
+FULL_NOTE = (" Its second answer, Full access on {host} (raise_needs_you door_host), lets it and every later root script "
+             "on {host} through.")
 # The route of a refusal, in the door's answer (door-modes proposal, step 1: "a door refusal names its route"); ops
 # prints it. yes: the owner's signed yes to the call hash that the answer gives lets that exact call through once.
 # holder: the agent lacks the grant, and the agent that holds it does that part (needs names it as ask_my_requester's
@@ -336,6 +342,32 @@ def approval(access, statement, signature, devices=None):
             not (devices and vault.owner_signed({"owner_keys": sorted(devices.values())}, statement, signature)):
         return None
     return said["call"], said["need"]
+
+
+def mode_statement(access, statement, signature):
+    """(host, mode, at) of the owner's signed mode of one server, or None (door-modes proposal, step 4: the card's
+    second answer, Full access on <host>). The statement is {v: 1, kind: "door-mode", fleet, host, mode, at} in its
+    canonical form: of this fleet, a host of the access file, a mode of MODES, not from the future, and signed by one of
+    the owner keys of the access file, his Mac, with the central vault's own check. A phone's key signs no mode: the
+    owner's decision 3, whether the phone sets one, is open. A mode has no age limit, as a yes has: it stands until a
+    newer statement of the same host."""
+    keys, fleet = access.get("owner_keys"), access.get("fleet")
+    if not keys or not fleet or not isinstance(statement, str) or not isinstance(signature, str):
+        return None
+    try:
+        said = json.loads(statement)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(said, dict) or set(said) != {"v", "kind", "fleet", "host", "mode", "at"} or \
+            vault.canonical(said) != statement:
+        return None
+    if type(said["v"]) is not int or said["v"] != 1 or said["kind"] != "door-mode" or said["fleet"] != fleet or \
+            not isinstance(said["host"], str) or said["host"] not in (access.get("hosts") or {}) or \
+            said["mode"] not in MODES or type(said["at"]) is not int or said["at"] > now() + 300:
+        return None
+    if not vault.owner_signed({"owner_keys": keys}, statement, signature):
+        return None
+    return said["host"], said["mode"], said["at"]
 
 
 def in_window(spans, t):
@@ -552,6 +584,21 @@ class Door:
             write_json(APPROVED_FILE, used)
         return entry
 
+    def full_access(self, access, host, agent):
+        """True when the owner's signed mode of this host is Full access and the door honours it here: the access file
+        holds the host at fix, the host is on no never list, and the caller holds it at Fix in the host's own business
+        (door-modes proposal, section 2). The door checks it all at each call, the statement's signature too, because
+        the file's owner keys can change: a host at rule-only, or on the never list, ignores any statement."""
+        h = (access.get("hosts") or {}).get(host)
+        me = (access.get("agents") or {}).get(agent) or {}
+        if not h or h.get("mode") != "fix" or host in ((access.get("never") or {}).get("hosts") or []) or \
+                me.get("business") != h.get("business") or (me.get("servers") or {}).get(host) != "fix":
+            return False
+        entry = read_json(MODES_FILE, {}).get(host)
+        if not isinstance(entry, dict) or entry.get("mode") != "full":
+            return False
+        return mode_statement(access, entry.get("statement"), entry.get("signature")) == (host, "full", entry.get("at"))
+
     def keep_minted(self, answer):
         """A key that the door minted: its id goes in the minted list, and its secret into the door's own secrets,
         where only the door reads it, until the door places it."""
@@ -605,11 +652,17 @@ class Door:
                 d = door_targets.refused(why, target=d.target, route="window")
         sha = hashlib.sha256(json.dumps([target, op, args], sort_keys=True).encode() + (content or b"")).hexdigest()
         hashed = d.kind in ("own", "full")      # a refusal of these two kinds is the owner's to lift: it gives the hash
-        yes = self.approved(access, sha) if hashed else None
-        if yes:                 # the owner said yes to this exact call: it runs once
+        full_host = d.host if d.kind == "full" else None
+        full = full_host is not None and self.full_access(access, full_host, agent)
+        yes = self.approved(access, sha) if hashed and not full else None
+        if full:                # door-modes proposal, step 4: the owner set this server to Full access
+            d.kind, d.why = "own", f"{agent}'s own call, which it answers for: a root script with no box on " \
+                                   f"{full_host}, which the owner set to Full access"
+        elif yes:               # the owner said yes to this exact call: it runs once
             d.kind, d.why = "approved", f"the owner's signed yes (N-{yes['need']}) to this exact call, used once"
         elif d.kind == "full":  # door-modes proposal, step 3: what the next mode allows runs only with his yes
-            d = door_targets.refused(d.why + "." + APPROVAL_NOTE.format(sha=sha), target=d.target)
+            d = door_targets.refused(d.why + "." + APPROVAL_NOTE.format(sha=sha) + FULL_NOTE.format(host=full_host),
+                                     target=d.target)
         elif d.kind == "own":
             # D25: a delete of what no agent made through the door, and every AWS delete, is the owner's, by code
             unmade = [key for key in door_providers.deletes(d.plan, self.credential(access, d.target))
@@ -626,6 +679,8 @@ class Door:
                       d.route if d.route in ROUTES else "none"}
             if hashed:
                 answer["call"] = sha
+            if full_host:       # the server whose Full access lets this call, and each later one, through
+                answer["full_access"] = full_host
             if d.needs:
                 answer.update(needs=d.needs, **({"level": d.level} if d.level else {}))
             return answer
@@ -1446,6 +1501,20 @@ def fetch_approvals(door):
     with door.lock:
         write_json(DEVICES_FILE, devices)
         write_json(APPROVALS_FILE, kept)
+        # The owner's signed modes (step 4): the door keeps the newest statement of each host, so an older one cannot
+        # come back, and a mode that the hub stops serving stays as it was. Only a newer statement changes it.
+        modes = read_json(MODES_FILE, {})
+        given = answer.get("modes") if isinstance(answer.get("modes"), list) else []
+        changed = False
+        for item in given[:200]:
+            found = mode_statement(access, item.get("statement"), item.get("signature")) \
+                if isinstance(item, dict) else None
+            if found and found[2] > ((modes.get(found[0]) or {}).get("at") or -1):
+                modes[found[0]] = {"mode": found[1], "at": found[2], "statement": item["statement"],
+                                   "signature": item["signature"]}
+                changed = True
+        if changed:
+            write_json(MODES_FILE, modes)
     return len(kept)
 
 

@@ -1252,6 +1252,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "sealed_push",       # the owner, 3 November 2026: a ping says nothing to founderizer.com or Apple
                "device_by_code",    # the owner, 3 November 2026: Add device shows the QR at once, with no fields
                "door_calls",        # DevOps plan 5.4: the owner's signed yes lets one door call through, once
+               "door_modes",        # the owner, 11 November 2026 ("Yes, as shown"): the door card's Full access on
+                                    # <server>, his signed mode of that server, which the Mac signs
                "recovery_copy",     # DevOps plan V12: a phone keeps a copy of the recovery code, sealed to its key
                "server_ai_choice",  # the owner, 1 November 2026: "why are we asking for chatgpt AND claude login"
                "manager_server",    # the owner, 4 November 2026: a new fleet's manager gets its server in its setup
@@ -2651,6 +2653,9 @@ def migrate():
                   # DevOps plan 5.4 (D11, D22): the door call that the owner's yes lets through once, and his signed
                   # yes to it, which only the door reads (GET /door/approvals)
                   "door_call": "TEXT", "approval": "TEXT",
+                  # door-modes proposal, step 4 (the owner's "Yes, as shown", 11 November 2026): the server whose mode
+                  # the item's second answer, Full access on <server>, sets with his signed mode statement
+                  "door_host": "TEXT",
                   "github_app": "TEXT",       # plan 13, item 4: the account that the item's first option makes an App in
                   "add_device": "INTEGER",    # plan V12 and 8.3: the item's first option opens the Add device picture
                   "github_key": "TEXT",       # plan 13, item 4: the App owner whose key the item renews (door_renew)
@@ -8661,6 +8666,19 @@ def t_raise_needs_you(agent, a):
     door_call = a.get("door_call")
     if door_call is not None and not (isinstance(door_call, str) and re.fullmatch(r"[0-9a-f]{64}", door_call)):
         raise ToolError("door_call is the call hash that the door gave with its refusal: 64 hex characters.")
+    door_host = a.get("door_host")
+    if door_host is not None:       # door-modes proposal, step 4: the card's three answers are fixed, as he approved them
+        if not (isinstance(door_host, str) and SERVER_HOST.fullmatch(door_host)) or door_call is None:
+            raise ToolError("door_host is the server of a run that the door refused with its call hash: give it with "
+                            "that door_call, and the card offers Run it once, Full access on that server, and No.")
+        if not any((x.get("servers") or {}).get(door_host) == "fix" for x in agents().values()):
+            raise ToolError(f"No agent holds {door_host} at Fix through the door: door_host is the server of the "
+                            f"door's refusal, which the agent that asked holds.")
+        fixed = ["Run it once", f"Full access on {door_host}", "No"]
+        if (options is not None and json.loads(options) != fixed) or a.get("multi"):
+            raise ToolError(f"An item with a door_host has the three answers of the door's card, in this order: "
+                            f"{', '.join(fixed)}. Leave options and multi out.")
+        options = check_need_options(fixed)
     if door_call is not None and not options:
         raise ToolError("An item with a door_call needs options, and the first one is the yes: the owner's app "
                         "signs only that one, for example [\"Yes, run it once\", \"No\"].")
@@ -8710,10 +8728,11 @@ def t_raise_needs_you(agent, a):
         if qu:                  # the asker's own words, which the owner answers: behind Details, with no code
             details = (details + "\n\n" if details else "") + \
                 f"{shown_role(qu['asker'])}'s question, in its own words: \"{clip(qu['text'], 1000)}\""
-        nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,github_app,add_device,"
-                  "github_key,details,multi) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,door_host,github_app,"
+                  "add_device,github_key,details,multi) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (unused_id("needs"), title, why, todo, now(), agent, options, qu["id"] if qu else None, door_call,
-                   github_app, 1 if add_device else None, github_key, details or None, 1 if multi else None))
+                   door_host, github_app, 1 if add_device else None, github_key, details or None,
+                   1 if multi else None))
         if old:                 # the discussion goes on under the new item, and the old one leaves Needs you
             q("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
               (f"Replaced by {agent} with a new item after the owner's discussion: {title}", now(), agent, old["id"]))
@@ -8729,6 +8748,11 @@ def t_raise_needs_you(agent, a):
               f"so that the owner does not do it again." if qu else "")
     door = (" When the owner answers yes, their app signs that yes to the door call, and the door lets that exact "
             "call through once: the agent sends the same call again." if door_call else "")
+    if door_host:
+        door = (f" When the owner presses Run it once, their Mac signs that yes, and the door lets that exact call "
+                f"through once. When they press Full access on {door_host}, their Mac signs that server's mode, and "
+                f"the door lets that call and every later root script on {door_host} through. Either way, the agent "
+                f"sends the same call again.")
     if github_app:
         door = (f" When the owner presses the first option in Founderizer on their Mac, it opens GitHub's own page "
                 f"that makes a private App in {github_app} with its permissions filled in. GitHub gives the App's key "
@@ -24317,6 +24341,11 @@ TOOLS = [
                       "a host's run: a root script with no box): the owner's yes then lets that exact call through "
                       "the door once. Put the exact command in what_to_do, and give options whose first one is the "
                       "yes."},
+        "door_host": {"type": "string", "description": "For a host's run that the door refused (its answer names "
+                      "full_access): that server, with the run's door_call. The card is then the door's card, which "
+                      "the owner approved: the title \"Run one root script on <server>?\", one or two sentences, the "
+                      "script in details, and the three answers Run it once, Full access on <server>, and No, which "
+                      "the hub writes itself. Leave options out."},
         "github_app": {"type": "string", "description": "The GitHub account, an organization or a user, that needs "
                        "a GitHub App of its own, because no App of the door reaches it (the hub tells you when): the "
                        "first option, which the owner presses in Founderizer on their Mac, then makes it with GitHub's "
@@ -35182,19 +35211,60 @@ def door_call_statement(need, statement):
     return None
 
 
+def door_mode_statement(need, statement):
+    """Why the owner's signed Full access does not fit this Needs-you item, or None (door-modes proposal, step 4): it
+    is {v: 1, kind: "door-mode", fleet, host, mode: "full", at} in its canonical form, for the item's door_host. The
+    door checks the signature against the owner keys of its own access file, so the hub can hold it back and forge
+    none."""
+    host = need["door_host"] if "door_host" in need.keys() else None
+    if not host:
+        return "this Needs-you item names no server whose mode it sets"
+    try:
+        said = json.loads(statement)
+    except (ValueError, RecursionError):
+        said = None
+    if not isinstance(said, dict) or set(said) != {"v", "kind", "fleet", "host", "mode", "at"} or \
+            json.dumps(said, sort_keys=True, separators=(",", ":"), ensure_ascii=False) != statement:
+        return "the statement is not a door-mode statement in its canonical form"
+    if said["v"] != 1 or said["kind"] != "door-mode" or said["host"] != host or said["mode"] != "full" or \
+            type(said["at"]) is not int:
+        return "the statement is not Full access on this item's server"
+    return None
+
+
+def statement_kind(approval):
+    """The kind of the owner's signed statement that a Needs-you item keeps (door-call or door-mode), or None."""
+    try:
+        said = json.loads(json.loads(approval)["statement"])
+    except (ValueError, TypeError, KeyError, RecursionError):
+        return None
+    return said.get("kind") if isinstance(said, dict) else None
+
+
 def door_approvals(src):
-    """GET /door/approvals: the owner's signed yeses to door calls of the last DOOR_APPROVAL_DAYS, answered only to
-    the door's own address. Each lets its one call through once, which the door keeps count of."""
+    """GET /door/approvals: the owner's signed yeses to door calls of the last DOOR_APPROVAL_DAYS, and his signed mode
+    of each server (door-modes proposal, step 4: the newest of each, of any age, because a mode stands), answered only
+    to the door's own address. Each yes lets its one call through once, which the door keeps count of; the door keeps
+    the newest mode of each server, and checks every signature itself."""
     door = TEAM.get("door") or {}
     if not door.get("address") or src != door["address"]:
         raise Refusal(403, "this is the door's route")
     rows = q("SELECT id, approval FROM needs WHERE approval IS NOT NULL AND answered > ? ORDER BY id",
              (now() - DOOR_APPROVAL_DAYS * 86400,))
+    modes = {}
+    for r in q("SELECT id, approval FROM needs WHERE approval IS NOT NULL AND door_host IS NOT NULL ORDER BY id"):
+        if statement_kind(r["approval"]) == "door-mode":
+            item = json.loads(r["approval"])
+            said = json.loads(item["statement"])
+            if said["at"] >= modes.get(said["host"], ({}, -1))[1]:
+                modes[said["host"]] = ({"statement": item["statement"], "signature": item["signature"]}, said["at"])
     phones, devices = q("SELECT device, statement, signature FROM owner_device_signing WHERE statement IS NOT NULL "
                         "ORDER BY device"), owner_devices()
-    return {"approvals": [dict(json.loads(r["approval"]), need=r["id"]) for r in rows],
+    return {"approvals": [dict(json.loads(r["approval"]), need=r["id"]) for r in rows
+                          if statement_kind(r["approval"]) != "door-mode"],
             "devices": [{"device": r["device"], "statement": r["statement"], "signature": r["signature"]}
-                        for r in phones if r["device"] in devices]}
+                        for r in phones if r["device"] in devices],
+            "modes": [item for _, (item, _) in sorted(modes.items())]}
 
 
 def door_release(src):
@@ -40500,10 +40570,15 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json(409, {"error": SECRET_NO_WORDS.format(id=need_id)})
                 if need["conversation"] and files:      # a conversation window can open no file
                     return self.json(409, {"error": "an answer that goes into a conversation carries no file"})
+                host = need["door_host"] if "door_host" in need.keys() else None
                 if yes is not None:
-                    wrong = door_call_statement(need, yes) or (None if choice == 0 else
-                                                               "only the first option, the yes, carries a signed "
-                                                               "statement")
+                    if choice == 1 and host:        # door-modes step 4: Full access on <host>, his signed mode of it
+                        wrong = door_mode_statement(need, yes)
+                    else:
+                        wrong = door_call_statement(need, yes) or (None if choice == 0 else
+                                                                   "only the first option, the yes, carries a signed "
+                                                                   "statement" + (f", and Full access on {host} its "
+                                                                                  f"signed mode" if host else ""))
                     if wrong:
                         return self.json(400, {"error": wrong})
                 phone = owner_device_at(self.client_address[0]) if yes is not None else None
@@ -40513,6 +40588,12 @@ class Handler(BaseHTTPRequestHandler):
                     # key that the Mac certified (phone_signed): otherwise it is not recorded, and the item stays open
                     return self.json(409, {"error": "This yes lets a door call through, so it needs the signature of "
                                                     "the owner key on the Mac. Answer it in Founderizer on the Mac."})
+                if choice == 1 and host and (yes is None or phone is not None):
+                    # Full access counts only with the owner key's own signature, on the Mac: whether a phone sets a
+                    # server's mode is his decision 3, which is open, so no phone's key signs one
+                    return self.json(409, {"error": f"Full access on {host} sets that server's mode, so it needs the "
+                                                    f"signature of the owner key on the Mac. Answer it in the newest "
+                                                    f"Founderizer on the Mac."})
                 if choice is not None:      # the owner pressed a button: its own words become the answer
                     picks = need_options(need)
                     if not picks:
