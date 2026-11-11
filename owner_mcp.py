@@ -1161,13 +1161,18 @@ def tools():
         tool("save_person", "The people who may write to an agent from Discord or WhatsApp: add one, change one, or "
                             "remove one with delete true and its id. role is one of the roles that "
                             "fleet_read(page=\"people\") lists; agents are the agents they may reach; daily is their "
-                            "own message limit, or null for the role's own. This route is the only writer of the "
+                            "own message limit, or null for the role's own. scopes, for a person who is there "
+                            "already, maps an agent of their list to null (All: whatever that agent holds) or to a "
+                            "list {\"repo:<owner/name>\": \"read\" or \"write\", \"secret:bws://<uuid>\": \"use\" or "
+                            "\"read\"} of what that agent holds: their conversation with it then runs locked, and "
+                            "the hub makes each repository call for it. This route is the only writer of the "
                             "people tables, so nothing a person says can widen their own access.",
              {"id": S["int"], "name": S["text"], "role": S["text"], "agents": {"type": "array", "items": S["text"]},
               "note": {"type": ["string", "null"]}, "daily": {"type": ["integer", "null"]}, "blocked": S["bool"],
-              "handles": {"type": "array", "items": {"type": "object"}}, "delete": S["bool"], **rid}, (),
-             plain("/ui/people", ("id", "name", "role", "agents", "note", "daily", "blocked", "handles", "delete"),
-                   "this person")),
+              "handles": {"type": "array", "items": {"type": "object"}}, "delete": S["bool"],
+              "scopes": {"type": "object", "additionalProperties": {"type": ["object", "null"]}}, **rid}, (),
+             plain("/ui/people", ("id", "name", "role", "agents", "note", "daily", "blocked", "handles", "delete",
+                                  "scopes"), "this person")),
         tool("save_role", "One role of the people who may write to an agent: add one, change one, rename one with "
                           "rename (its people keep it), or delete one with delete true. A name that is not there yet "
                           "is a new role, which needs prompt and tools; a change writes only the fields it gives. To "

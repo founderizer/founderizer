@@ -2045,6 +2045,15 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
 # The Fleet tools that a closed conversation session may call, MCP context conversation (CHAT-APPS 9.4): the hub offers
 # the ones of the person's role. ask_team is a closed session's way out with contacts.v2 (AUTONOMY.md P2).
 CONVERSATION_TOOLS = ("read_messages", "reply", "ask_owner", "request_work", "ask_team")
+# The person access plan, version 5: the allow list of a narrowed conversation's locked window, which the hub starts
+# with mode "narrowed": hub.SCOPE_TOOLS, the same names (test_person_scope asserts it, because dontAsk refuses a tool
+# that this list does not name, in silence). The hub offers each one only where the person's list allows it.
+NARROWED_TOOLS = ("read_messages", "reply", "search_history", "read_history", "call_api", "resolve_outcome",
+                  "repo_files", "repo_read", "repo_search", "repo_change", "repo_pull_request", "repo_checks")
+def narrowed_mode(mode):
+    """True for a narrowed conversation's mode: "narrowed", or "narrowed:<the list's time>", which changes with each
+    new list, so that a window of the old list ends (the person access plan, section 7)."""
+    return isinstance(mode, str) and (mode == "narrowed" or mode.startswith("narrowed:"))
 CONVERSATION_WINDOW = re.compile(r"C-[1-9][0-9]{0,11}")     # the tmux window of a conversation: C-<id>
 CONVERSATION_IDLE = 1200        # seconds a conversation window stays open after its last signal (CHAT-APPS.md 7.2)
 CONVERSATION_WINDOWS = 2        # conversation windows of one agent at the same time; the others wait in the hub
@@ -2192,7 +2201,8 @@ def conversation_folder(conversation):
     return folder
 
 
-def conversation_command(agent, conf, generation, conversation, url, token, prompt, runtime=None, version=None):
+def conversation_command(agent, conf, generation, conversation, url, token, prompt, runtime=None, version=None,
+                         mode=None):
     """The start of a locked conversation session with another person than the owner (CHAT-APPS.md 7.2): only the Fleet
     tools of url, the conversation's MCP address, with token, its credential of kind conversation. The hub decides
     which of CONVERSATION_TOOLS the person's level gets. prompt: the hub's whole prompt for this person, from a mode-600
@@ -2223,8 +2233,10 @@ def conversation_command(agent, conf, generation, conversation, url, token, prom
     # what it keeps of the user's settings (kept_user_settings); a pinned version keeps its updater off whatever their
     # env says, because --settings env would win over CLOSED_NO_UPDATES
     kept = {key: value for key, value in kept_user_settings().items() if runtime is None or key != "env"}
+    # mode "narrowed" (the person access plan): the same lock, with the narrowed tools as the allow list
+    allowed = NARROWED_TOOLS if narrowed_mode(mode) else CONVERSATION_TOOLS
     settings = dict({**CLAUDE_NO_MEMORY, **NO_SUGGESTION,
-                     "permissions": {"allow": [f"mcp__fleet__{t}" for t in CONVERSATION_TOOLS], "deny": DENY}}, **kept)
+                     "permissions": {"allow": [f"mcp__fleet__{t}" for t in allowed], "deny": DENY}}, **kept)
     # --setting-sources "": no user, project or local settings, so no CLAUDE.md, hook or plugin of this machine, and
     # --settings still applies. --safe-mode would also drop the --mcp-config server, so the session had no tools.
     own = runtime is None or runtime == conf.get("runtime")
@@ -4474,11 +4486,17 @@ class Helper:
                         closed=data.get("shell_off")),     # support plan F1
                         cid, extra["generation"], session, needs="none")
                 else:
+                    if data.get("mode") is not None and data.get("mode") != "closed" and \
+                            not narrowed_mode(data.get("mode")):
+                        # never a window with tools for a start that this helper does not know (person access plan)
+                        raise Refused(f"the hub's start of {window} names a mode that this helper does not know: "
+                                      f"{data.get('mode')}")
                     try:
                         command = conversation_command(self.agent, self.run_conf(), extra["generation"], cid,
                                                        data.get("url") or HUB + str(data.get("path") or ""),
                                                        data.get("token"), data.get("prompt"),
-                                                       runtime=data.get("runtime"), version=data.get("version"))
+                                                       runtime=data.get("runtime"), version=data.get("version"),
+                                                       mode=data.get("mode"))
                     except Installing:      # no window started, so the start guard counts no start
                         last, count = self.conversation_starts[window]
                         self.conversation_starts[window] = (last, count - 1)
@@ -5954,7 +5972,13 @@ class Helper:
         for window in [w for w in self.conversation_seen if w not in open_windows]:
             self.conversation_seen.pop(window, None)
         for window in open_windows:
-            if self.conversation_switched(window) and not self.working(f"={self.session}:={window}"):
+            modes = getattr(self, "conversation_modes", None)
+            narrowed = isinstance(modes, dict) and narrowed_mode(modes.get(window[2:]))
+            if narrowed and self.conversation_switched(window):
+                # the person access plan, section 7: the person's access was narrowed, so a window of another mode
+                # ends at once, in the middle of a turn too: its shell and its tokens must not outlive the list
+                why = "its person's access was narrowed"
+            elif self.conversation_switched(window) and not self.working(f"={self.session}:={window}"):
                 why = "its conversation runs another way now"
             elif self.conversations is not None:
                 if int(window[2:]) in self.conversations:
