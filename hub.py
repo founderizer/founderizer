@@ -1853,7 +1853,8 @@ def check_need_options(given):
 
 def mobile_agent(name, config):
     """One agent for the phone: what its row, its chat header and its page show, without the whole usage record.
-    `machine` is the server it runs on (its team.json `machine`), which its page names under Runs on."""
+    `machine` is the server it runs on (its team.json `machine`), which its page names under Runs on. The preview of
+    its newest message is the whole text here: Handler.ui_mobile cuts it after scrub (mobile_cut)."""
     row = q1("SELECT last_seen,alive,alive_ts FROM agents WHERE name=?", (name,))
     usage = q1("SELECT data FROM agent_usage WHERE name=?", (name,))
     lim = active_limit(name)
@@ -1871,8 +1872,7 @@ def mobile_agent(name, config):
                              "('completed','failed','rejected','canceled')", (name,))["n"],
             "limit": dict(since=lim["since"], until=lim["until"], reset_known=bool(lim["reset_known"])) if lim else None,
             "usage": windows, "turn_ended_after": turn_ended_after(name),
-            "last": {"ts": last["created"], "side": last["side"], "preview": (last["text"] or "")[:MOBILE_PREVIEW]}
-            if last else None}
+            "last": {"ts": last["created"], "side": last["side"], "preview": last["text"] or ""} if last else None}
 
 
 def mobile_state(generation, at=None):
@@ -1900,6 +1900,18 @@ def mobile_state(generation, at=None):
             "counts": {"tasks_open": len(tasks), "needs_open": len(needs),
                        "messages": q1("SELECT COUNT(*) n FROM ui_requests")["n"],
                        "reports": q1("SELECT COUNT(*) n FROM owner_reports")["n"]}}
+
+
+def mobile_cut(answer):
+    """The answer of GET /ui/mobile after scrub, with the preview of each agent's newest message cut to MOBILE_PREVIEW
+    characters. scrub masks a text that holds a registered login as a whole, and it finds no login in a part of one.
+    So until 11 November 2026, when the cut came first, a login that lay across the cut and was registered after its
+    text was stored reached the phone in part. Now a message that holds a login is the mask in the phone's list, as it
+    is in the phone's chat; a message with none is cut as before."""
+    for agent in answer["agents"]:
+        if agent["last"]:
+            agent["last"]["preview"] = agent["last"]["preview"][:MOBILE_PREVIEW]
+    return answer
 
 
 def mobile_tagged(answer):
@@ -37537,7 +37549,8 @@ class Handler(BaseHTTPRequestHandler):
             result = dict(mobile_state(generation, at), token=token)
         # scrub masks a login in old text too, because a login can be registered after the text was stored. As in
         # GET /ui/state, it reads the logins after the moment, so it also masks a login registered during the build.
-        result = scrub(result)
+        # The previews are cut after it (mobile_cut).
+        result = mobile_cut(scrub(result))
         tag = '"' + hashlib.sha256(json.dumps(mobile_tagged(result), sort_keys=True).encode()).hexdigest()[:32] + '"'
         headers = {"ETag": tag, "Cache-Control": "no-store"}
         if self.headers.get("If-None-Match") == tag:
