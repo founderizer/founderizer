@@ -36,6 +36,17 @@ release adds reaches the agent only when the folder holds that release and a new
 
 Nothing else is needed. There is no token to issue, no key to copy and nothing to rotate.
 
+`install_hub` and `add_machine` can run for a long time: the first updates of a new server hold
+apt's lock for about 9 minutes, and a join can wait for that lock more than once. While a command
+over SSH runs, the server sends a progress notification for the call every 30 seconds, when the
+request of the call gave a `progressToken`. Claude Code gives one with each tool call. It ends a
+call to a local server that sends no answer and no progress for 30 minutes
+(`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`), and then the agent gets Claude Code's error, not the words
+of this server. A client that gives no token gets no progress. Such a client ends a call at its own
+time limit for a call, if it has one, and the steps still run on the server. So give it a limit for
+this server that is longer than the longest call, which is about 6300 seconds for a join: in Codex,
+`tool_timeout_sec = 7200` in the `[mcp_servers.founderizer]` table of its configuration.
+
 ## How it authenticates to the hub, and why that is the whole of it
 
 **It does not.** The hub knows the owner by the address the call comes from.
@@ -263,7 +274,15 @@ and a tool was taken out of this file's own table, and every check failed naming
   stand-in `ssh` that answers from a table, because no test provisions a server: the auth key on
   standard input exactly once and in no argument, a key file other users can read refused before
   any command, a host or user that would not be one argument refused, the claim code read out of
-  the log, and an install that stopped given to the owner instead of worked around.
+  the log, and an install that stopped given to the owner instead of worked around. While a command
+  runs, a client that gave a `progressToken` gets a progress notification for the call at regular
+  times, all before the answer; a client that gave none gets none. Each SSH asks the server for a
+  sign of life every 30 seconds (`ServerAliveInterval`), as the Mac app's install SSH does.
+- **`Progress`** — the same in this process: only a string or an integer token asks for progress,
+  and only while its call runs; the progress increases through all the commands of one call; and
+  the notifications stop when a command ends, also when it does not finish or the client closed
+  its end. And `install_hub` and `add_machine` tell the agent that this server answers no other
+  call until theirs ends.
 - **`RootThroughSudo`** — `install_hub` (twice), `install_log` and `add_machine` run on the stand-in
   server of `test_hub_install.py`, as root and as a user who is not root: each root step is one
   `sudo -n -i -- /bin/sh -c '…'`, and `/bin/sh` (and dash) gets each program unchanged. A program
@@ -283,7 +302,11 @@ and a tool was taken out of this file's own table, and every check failed naming
   On a new server whose first updates hold apt's lock, the git step waits for the lock, as A3,
   `hub.sh` and `join.sh` do: the stand-in's `apt-get` holds the lock of dpkg as apt does. Its SSH
   time-out is longer than that wait, and shorter than the 30 minutes after which Claude Code ends a
-  call to a stdio MCP server that gave no answer. A key step or a start step that fails stops the
+  call to a stdio MCP server that gave no answer and no progress. A Linux join line has the time of
+  each wait of the join for apt's lock, one after the other, and of its work: join.sh's apt-gets
+  that install, and the age install of the vault broker. A Mac's join line has 3600 seconds. A step
+  that can change the server and that SSH loses (status 255) is said as a command that did not
+  finish, not in the step's own words for a failure. A key step or a start step that fails stops the
   install with its own words. A command that does not finish in its time says what to do in the
   words of its tool: a join line, which writes no install log, does not send the agent to
   `install_log`.

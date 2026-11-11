@@ -32,6 +32,7 @@ Standard library only, as `mcp.py` and `hubsetup.py` are. Tests: `test_owner_mcp
 """
 
 import argparse
+import contextlib
 import hashlib
 import json
 import mimetypes
@@ -42,6 +43,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -86,8 +88,32 @@ GIT_STEP = ("command -v git >/dev/null 2>&1 || { "
             f"DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout={APT_LOCK_WAIT} -y -q install git; }}")
 # The time of the git step: the wait of `apt-get install` for the lock of dpkg (one total for its locks, apt's
 # debsystem.cc), and 500 seconds for the work. It ends before Claude Code ends a call to a stdio MCP server that gave no
-# answer and no progress for 30 minutes (CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT), so that the agent gets this server's words.
+# answer and no progress for 30 minutes (CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT), so that the agent gets this server's words
+# also from a client that asks for no progress (keep_call_open).
 GIT_STEP_TIME = APT_LOCK_WAIT + 500
+# The time of a join line (add_machine): each wait for apt's lock that a join can make, one after the other, and the
+# work. join.sh's apt-get of the packages that the server does not have and its apt-get of the pending security
+# updates can each wait APT_LOCK_WAIT. Its `apt-get update` does not wait: it takes the lock of the package lists with
+# one try (apt's pkgAcquire::GetLock). The age install of the vault broker (`hubsetup.py vault`) has hubsetup.py's own
+# time, AGE_INSTALL_TIME: 2 * APT_LOCK_WAIT + 300. The other work of a usual join gets 900 seconds, as hubsetup.py
+# gives each other step of the vault broker; join.sh's apt_daily waits for apt's daily services with no limit of its
+# own, so this time is not a bound of all the work. Until 11 November 2026 a join had 1800 seconds in all, less than
+# these waits. This time is longer than 30 minutes, so a client that asks for no progress and ends a call after 30
+# minutes ends the call first. Then the agent gets that client's error, and the join still runs on the server.
+JOIN_TIME = 2 * APT_LOCK_WAIT + (2 * APT_LOCK_WAIT + 300) + 900
+# The time of a Mac's join line, which has no wait for apt's lock: Homebrew, the join and the vault. As long as the
+# Mac app gives a join (MachineInstaller.swift).
+MAC_JOIN_TIME = 3600
+# The seconds between two progress notifications of a tool call while a command over SSH runs (keep_call_open).
+# Claude Code ends a call to a stdio MCP server that sends no answer and no progress for 30 minutes
+# (CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT), and it examines each call every 30 seconds. Then the agent gets the client's
+# error and not this server's words, and the steps still run on the server. Until 11 November 2026 this server sent no
+# progress, so the client could end a long install_hub or a long join.
+PROGRESS_EVERY = 30
+# The progress of the tool call that runs now: the progressToken of its request or None, the last progress value that
+# the call sent, and the function that writes one message to the client. `rpc` sets the token for each tools/call, and
+# `serve` sets the function. One call runs at a time, because `serve` reads one message at a time.
+PROGRESS = {"token": None, "sent": 0, "write": None}
 # What the agent does when a command does not finish in its time (`ssh`'s `late`): a step of install_hub before the
 # start, the start, a join line, whose code works once, and a read of the install log.
 STEP_LATE = ("The install did not start. Wait some minutes, then send install_hub again: each step checks first. If "
@@ -96,6 +122,11 @@ START_LATE = "The install can have started: read the install log with install_lo
 JOIN_LATE = ("Do not run the join line again: its code works once. Read servers with fleet_read: the machine is there "
              "when its join got that far. Give the owner what you read.")
 LOG_LATE = "A read of the log changes nothing on the server: send install_log again."
+# The words of a tool whose call can run for many minutes. `serve` reads one message at a time, so a call that the
+# agent sends while such a call runs waits in the pipe with no progress, and its client can end it while the server
+# still has it to run.
+ONE_CALL = (" A call that runs a command over SSH can run for many minutes, and this server answers no other call "
+            "until it ends: wait for its answer before you call a tool of this server again.")
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # Every owner command route of hub.py that is deliberately NOT a tool here, with the reason (OWNER-MCP-BOUNDARY.md
@@ -666,24 +697,75 @@ def ssh_target(args):
     return host, user
 
 
-def ssh(host, user, remote, stdin=None, timeout=120, late=""):
+@contextlib.contextmanager
+def keep_call_open():
+    """**While the block runs, a progress notification for the tool call that runs now, every PROGRESS_EVERY
+    seconds**, when the request of that call gave a progressToken (MCP "Progress"). So Claude Code does not end the call
+    while a command over SSH still runs. Each notification has the token of the request, and a progress that increases
+    by one in each call. It has no `message`: the client shows its own words for it. A request without a token gets no
+    notification, as the specification says. The block ends only after the last notification, so that no notification
+    comes after the answer: the client takes such a notification as an error."""
+    token, write = PROGRESS["token"], PROGRESS["write"]
+    if token is None or write is None:
+        yield
+        return
+    stop = threading.Event()
+
+    def tell():
+        while not stop.wait(PROGRESS_EVERY):
+            PROGRESS["sent"] += 1
+            try:
+                write({"jsonrpc": "2.0", "method": "notifications/progress",
+                       "params": {"progressToken": token, "progress": PROGRESS["sent"]}})
+            except (OSError, ValueError):         # the client closed its end; the answer finds that out too
+                return
+
+    teller = threading.Thread(target=tell, name="progress", daemon=True)
+    teller.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        teller.join()
+
+
+def ssh(host, user, remote, stdin=None, timeout=120, late="", lost=False):
     """One command on the server, over the owner's own SSH. The key is `ssh`'s, never this server's: it reads the
     owner's own configuration and agent, exactly as the Mac app's Add server does. `stdin`: an open file whose bytes
     go to the command's standard input, which is how the Tailscale auth key travels and the only way it travels.
     `late`: what the agent does when the command does not finish in `timeout` seconds. The caller gives these words,
     because only the caller knows what the command does and what the agent can read after it. Until 11 November 2026
-    each time-out sent the agent to the install log, also for a join, which has no such log."""
-    line = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", f"{user}@{host}", remote]
+    each time-out sent the agent to the install log, also for a join, which has no such log.
+
+    `lost`: a status of 255, SSH's own failure (`man ssh`), is said as a time-out is, with `late`. SSH can end the
+    connection while the command runs (a server that gives no sign of life, a network that changed), and then the
+    command can still run there, or it stopped part way. The caller sets it for a step that can change the server and
+    whose own words for a failure would give another cause. The machine's read and the check of sudo read 255
+    themselves, as SSH that cannot connect; the key step and the start say what stays on the server.
+
+    While the command runs, the client gets progress for the call (`keep_call_open`), and SSH asks the server for a sign
+    of life every 30 seconds, as the Mac app's install SSH does (`ServerAliveInterval`). So a command that waits and
+    prints nothing keeps its connection through a NAT, and a connection to a server that does not answer any more ends
+    after about two minutes (three questions with no answer), not at the time of the command. Until 11 November 2026
+    neither was there."""
+    line = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30", f"{user}@{host}",
+            remote]
     try:
-        done = subprocess.run(line, stdin=stdin or subprocess.DEVNULL, capture_output=True, text=True,
-                              timeout=timeout)
+        with keep_call_open():
+            done = subprocess.run(line, stdin=stdin or subprocess.DEVNULL, capture_output=True, text=True,
+                                  timeout=timeout)
     except subprocess.TimeoutExpired:
         raise Refused(f"the command on {host} did not finish in {timeout} seconds, and it can still run there. "
                       f"Nothing was repeated. {late}".rstrip()) from None
     except OSError as e:
         raise Refused(f"ssh could not run on this Mac: {e}") from None
-    return {"exit": done.returncode, "out": (done.stdout or "").strip()[-4000:],
+    said = {"exit": done.returncode, "out": (done.stdout or "").strip()[-4000:],
             "error": (done.stderr or "").strip()[-2000:]}
+    if lost and said["exit"] == 255:
+        raise Refused(f"SSH to {host} stopped with its own failure (status 255) before the command ended. SSH said, as "
+                      f"it came: {said['error'] or 'no output'}. The command can still run there, or it stopped part "
+                      f"way. Nothing was repeated. {late}".rstrip())
+    return said
 
 
 def sudo_prefix(reading):
@@ -791,7 +873,7 @@ def install_hub(args):
                       f"{steps['read_machine']['out']}")
     if root:
         steps["root"] = become_root(host, user, root, late=STEP_LATE)
-    steps["git"] = ssh(host, user, as_root(root, GIT_STEP), timeout=GIT_STEP_TIME, late=STEP_LATE)
+    steps["git"] = ssh(host, user, as_root(root, GIT_STEP), timeout=GIT_STEP_TIME, late=STEP_LATE, lost=True)
     if steps["git"]["exit"] != 0:
         raise Refused(f"git could not be installed on {host}, so the install did not start. The step said, as it "
                       f"came: {steps['git']['error'] or steps['git']['out'] or 'no output'}. If apt-get could not get "
@@ -799,7 +881,7 @@ def install_hub(args):
                       f"because each step checks first.")
     steps["code"] = ssh(host, user, as_root(root,
         f"if test -d {KIT}/.git; then {take_line(KIT)}; "
-        f"else git clone -q -- {shlex.quote(source.strip())} {KIT}; fi"), timeout=600, late=STEP_LATE)
+        f"else git clone -q -- {shlex.quote(source.strip())} {KIT}; fi"), timeout=600, late=STEP_LATE, lost=True)
     if steps["code"]["exit"] != 0:
         raise Refused(f"the code step on {host} failed, so the install did not start. It said, as it came: "
                       f"{steps['code']['error'] or steps['code']['out'] or 'no output'}. If git asked for a password "
@@ -807,13 +889,13 @@ def install_hub(args):
                       f"the owner for the exact command that their download page gives. If lifecycle.py may-take "
                       f"refused the move, the code on {host} stays where it is: give the owner its reason.")
     steps["revision"] = ssh(host, user, as_root(root, f"git -C {KIT} rev-parse --short HEAD; ls {KIT}/hub.sh"),
-                            late=STEP_LATE)
+                            late=STEP_LATE, lost=True)
     if steps["revision"]["exit"] != 0:
         raise Refused(f"the Founderizer code is not on {host}: "
                       f"{steps['revision']['error'] or steps['revision']['out'] or 'no output'}. The repository at "
                       f"that address may not be Founderizer's: ask the owner for the address that their download "
                       f"page gives.")
-    plan = ssh(host, user, as_root(root, f"sh {KIT}/hub.sh --check"), timeout=300, late=STEP_LATE)
+    plan = ssh(host, user, as_root(root, f"sh {KIT}/hub.sh --check"), timeout=300, late=STEP_LATE, lost=True)
     steps["plan"] = plan
     if plan["exit"] != 0:
         raise Refused(f"the installer refused this machine before it changed anything:\n{plan['out']}\n{plan['error']}")
@@ -826,7 +908,7 @@ def install_hub(args):
                       f"install_hub again when the cause is gone: each step checks first. If the install is not sent "
                       f"again, the owner removes that file.")
     steps["authkey_mode"] = ssh(host, user, as_root(root, f"test -s {AUTHKEY} && stat -c %a {AUTHKEY}"),
-                                late=STEP_LATE)
+                                late=STEP_LATE, lost=True)
     if steps["authkey_mode"]["out"].strip() != "600":
         raise Refused(f"the auth key did not reach {host} as a file only root can read "
                       f"({steps['authkey_mode']['out'] or steps['authkey_mode']['error']}). Nothing was started.")
@@ -964,7 +1046,9 @@ def add_machine(args):
     11 November 2026 a Mac's line also went through sudo, so this tool joined no Mac. The machine is read before the
     hub makes a code, so that no code is made, and no open code is cancelled, for a machine that cannot run its line:
     its user, and its system, which must be of the kind asked for. Its `next` follows what the join did: the line's
-    status is the status of its last `sh`, which ends with 0 when curl brought no script."""
+    status is the status of its last `sh`, which ends with 0 when curl brought no script. A Linux line has JOIN_TIME
+    seconds: each wait of the join for apt's lock, one after the other, and its work; a Mac's has MAC_JOIN_TIME. A
+    connection that SSH loses while the line runs is said as a line that did not finish (`ssh`'s `lost`)."""
     mac = args.get("kind") == "mac"
     if args.get("host"):
         host, user = ssh_target(args)
@@ -994,8 +1078,8 @@ def add_machine(args):
             "call add_machine again with host and ssh_user (that user), and this server runs it." if mac else
             "Run the line above on that machine as root, or call add_machine again with host and ssh_user, and this "
             "server runs it.") + " The code works once, until expires_at.")
-    done = ssh(host, user, "/bin/sh -c " + shlex.quote(line) if mac else as_root(root, line), timeout=1800,
-               late=JOIN_LATE)
+    done = ssh(host, user, "/bin/sh -c " + shlex.quote(line) if mac else as_root(root, line),
+               timeout=MAC_JOIN_TIME if mac else JOIN_TIME, late=JOIN_LATE, lost=True)
     if done["exit"] == 0 and not done["out"]:
         then = ("The join did not run: the line printed nothing, so the hub's join script did not come (curl could "
                 "not reach the hub, for example). Its words are in join.error: give them to the owner.")
@@ -1096,7 +1180,7 @@ def tools():
                             "(Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, root or a user that becomes root with "
                             "sudo and no password), over the owner's own SSH. Give the Tailscale auth key as the path "
                             "of a mode-600 file on this Mac, never the key: it travels on standard input. Then read "
-                            "install_log and call claim_hub.",
+                            "install_log and call claim_hub." + ONE_CALL,
              {"host": S["text"], "ssh_user": S["text"], "source": {"type": "string",
               "description": "The address of the Founderizer repository, from the owner's download page."},
               "authkey_file": {"type": "string", "description": "The path on this Mac of the file that holds the "
@@ -1114,7 +1198,7 @@ def tools():
         tool("add_machine", "Add a machine to the fleet: the hub's one-time join line. The machine joins under its "
                             "name in Tailscale. With host and ssh_user this server also runs that line on the machine "
                             "over the owner's own SSH: as root on a Linux server, and on a Mac as ssh_user, the Mac "
-                            "user that will run the agents, never root.",
+                            "user that will run the agents, never root." + ONE_CALL,
              {"kind": {"type": "string", "enum": ["linux", "mac"]}, "host": S["text"], "ssh_user": S["text"], **rid},
              ("kind",), add_machine),
         tool("add_agent", "Put a new agent on an available server. The hub writes the agent and its profile in one "
@@ -1533,7 +1617,14 @@ def rpc(message):
         elif method == "tools/list":
             result = {"tools": [{k: v for k, v in t.items() if k != "run"} for t in TOOLS.values()]}
         elif method == "tools/call":
-            text, is_error = call_tool(params.get("name"), params.get("arguments"))
+            meta = params.get("_meta")
+            token = meta.get("progressToken") if isinstance(meta, dict) else None
+            PROGRESS.update(token=token if isinstance(token, (str, int)) and not isinstance(token, bool) else None,
+                            sent=0)
+            try:
+                text, is_error = call_tool(params.get("name"), params.get("arguments"))
+            finally:
+                PROGRESS["token"] = None
             result = {"content": [{"type": "text", "text": text}], "isError": is_error}
         elif method in EMPTY:
             result = {EMPTY[method]: []}
@@ -1550,7 +1641,16 @@ def rpc(message):
 
 def serve(source=sys.stdin, sink=sys.stdout):
     """One MCP server over standard input and output: one JSON message a line, as a local MCP server speaks. A
-    notification (no id) is read and answered with nothing."""
+    notification (no id) is read and answered with nothing. The answers and the progress notifications of a call
+    (`keep_call_open`) go through one `write`, so that two messages never mix on one line."""
+    lock = threading.Lock()
+
+    def write(out):
+        with lock:
+            sink.write(json.dumps(out) + "\n")
+            sink.flush()
+
+    PROGRESS["write"] = write
     for line in source:
         if not line.strip():
             continue
@@ -1565,8 +1665,7 @@ def serve(source=sys.stdin, sink=sys.stdout):
             if not answers:
                 continue
             out = answers if isinstance(message, list) else answers[0]
-        sink.write(json.dumps(out) + "\n")
-        sink.flush()
+        write(out)
 
 
 def main():
