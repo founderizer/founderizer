@@ -3212,6 +3212,22 @@ def parked(task_id):
     return r
 
 
+PARKED_PATH = "waiting until "  # how the live path of a parked task begins (liveness); the owner's state reads it
+
+
+def parked_until():
+    """Owner API 1.117: by task, the time of the reminder that its agent parked it with (asking_and_waiting), for each
+    open task whose live path says that it waits for that time. The live path is liveness' own judgement at the last
+    tick, so a task that a hold or a usage limit holds, or whose lost session a message woke, is not here, and neither
+    is one whose park ended (parked). read_rows and read_row: it is read inside the state's own hold of the lock."""
+    out = {}
+    for t in read_rows(f"SELECT id FROM tasks WHERE {OPEN_TASK} AND live_path LIKE ?", (PARKED_PATH + "%",)):
+        park = parked(t["id"])
+        if park:
+            out[t["id"]] = park["due"]
+    return out
+
+
 PRESENCE_SAME = 10              # seconds two pings may disagree about a step's start and still be the same step
 TURN_CALLS = 64                 # open calls that one attempt's turn state keeps: the newest
 TURN_SAID = 500                 # characters of the attempt's last agent message that its turn state keeps
@@ -27291,7 +27307,7 @@ def liveness(t0):
                     f"{clock(lim['until'])}" if source else
                     f"waiting for {owner}'s usage limit to reset at {clock(lim['until'])}")
         elif park and not woken:
-            path = f"waiting until {clock(park['due'])}, as {owner} asked (R-{park['id']})"
+            path = f"{PARKED_PATH}{clock(park['due'])}, as {owner} asked (R-{park['id']})"
         elif t["state"] == "submitted" and not launched:
             path = ((f"waiting for {owner} to load its new settings" if settings_pending(owner) else
                      "waiting for its session to start") if online else None)
@@ -36913,11 +36929,15 @@ class Handler(BaseHTTPRequestHandler):
             result["steers"] = [steer_view(r) for r in q("SELECT s.*, e.read_at FROM steers s JOIN events e "
                                                           "ON e.id=s.event_id ORDER BY s.id")]
             result["secrets"] = [dict(r) for r in q("SELECT id,COALESCE(label,'Registered login') AS label FROM secrets ORDER BY id")]
+            parks = parked_until()
         # A row holds its own values, so this needs no lock. On the first fleet the tasks were 977 KB of the state's
         # 1.70 MB, and in a copy of its database making their rows into dicts took 2.1 ms of each read's hold of the
         # lock (10 November 2026).
         for key, got in plain_rows.items():
             result[key] = [dict(r) for r in got]
+        for task in result["tasks"]:            # owner API 1.117: until when its agent parked it, on that task only
+            if task["id"] in parks:
+                task["parked_until"] = parks[task["id"]]
         result["knowledge"] = [knowledge_public(k) for k in knowledge_entries()]
         # Keys, ciphertext, helper jobs, raw worker queues and runtime configuration are excluded.
         # Also mask old text if a login was registered after that text was stored. scrub makes each dict and list of
