@@ -6536,8 +6536,15 @@ def gh_thread(tries=GH_TRIES, wait=GH_WAIT, sleep=time.sleep, say=gh_say):
                 f"have none")
         program = os.path.join(os.path.expanduser("~"), ".local", "bin", "gh")      # the pinned copy, which is used
         try:
-            if done != "none" and gh_quiet(program):
-                say("gh sends no telemetry for this agent's user now (gh config: telemetry disabled)")
+            if done != "none":
+                # gh writes its whole config file again, so a helper of the same user that read it in the middle of
+                # that write would save a config without the user's other settings: one helper at a time
+                os.makedirs(HOME, mode=0o700, exist_ok=True)
+                with open(os.path.join(HOME, "gh.lock"), "a") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    quiet = gh_quiet(program)
+                if quiet:
+                    say("gh sends no telemetry for this agent's user now (gh config: telemetry disabled)")
         except Exception as e:
             say(f"gh's telemetry setting is not changed: {type(e).__name__}: {str(e)[:200]}")
         return done
