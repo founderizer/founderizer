@@ -21489,7 +21489,8 @@ def resource_entry(rid, entry, team):
                          f"resource {rid!r}: {what!r} is no {RESOURCE_WORDS[kind]} that this team has")
     if kind == "server":
         raise ValueError(f"resource {rid!r}: a server is the owner's alone to give: his app gives each server to the "
-                         f"DevOps agent of the business whose Tailscale tag it carries, and no pool holds it")
+                         f"DevOps agent of the business whose Tailscale tag it carries, or to the manager while the "
+                         f"business has none, and no pool holds it")
     if not isinstance(entry, dict) or not entry or set(entry) - {"max", "to"}:
         raise ValueError(f"resource {rid!r} needs max, with an optional to")
     levels = RESOURCE_LEVELS[kind]
@@ -21681,7 +21682,8 @@ def take_resource(body):
         raise Refusal(404, f"the fleet does not hold {rid}")
     if kind == "server":        # DevOps plan C4 and "Yes, by business": the app gives a server and takes it back
         raise Refusal(409, "A server goes with its business: the owner's app gives each server to the DevOps agent of "
-                           "the business whose Tailscale tag it carries, and takes it back when the tag goes.")
+                           "the business whose Tailscale tag it carries, or to the manager while the business has "
+                           "none, and takes it back when the tag goes.")
     phrase = resource_phrase(kind, what)
     held = next((h["level"] for h in resource_holders(kind, what) if h["agent"] == agent), None)
     result = grant_resource("owner", rid, agent, None, phrase)
@@ -32131,7 +32133,8 @@ def servers_view():
         why = (["hub_machine"] if name == hub_machine else []) + \
             (["has_agent"] if here and INSTALL_KEY not in server_features(name) else
              ["agent_not_ready"] if [n for n in not_shareable(team, here) if not installing(job, n)] else []) + \
-            (["fix_holder"] if fix_holders(team, name) else [])
+            (["fix_holder"] if fix_holders(team, name) else []) + \
+            (["door_caller"] if door_callers_at(team, name) else [])
         if name not in keys:
             why.append("no_service")
         elif reading is None or reading["source"] != "server":
@@ -32144,8 +32147,29 @@ def servers_view():
                     "address": team["addresses"][name], "user": entry.get("user") or (reading or {}).get("user"),
                     "hub": name == hub_machine, "joined": name in keys, "agents": here, "reading": reading,
                     "load": load, "available": not why, "why": why, "job": job_view(job)})
-    return {"desired_revision": desired, "servers": out,
+    return {"desired_revision": desired, "servers": out, "apps": app_servers_view(team),
             "join": join_view(q1("SELECT * FROM join_codes ORDER BY id DESC LIMIT 1"), t0)}
+
+
+def app_servers_view(team):
+    """GET /ui/servers "apps" (version 1.122): each server for apps, which no agent runs on and agents reach through the
+    door: a host that an agent holds and that is no machine of the fleet, or one that the owner added for apps and
+    whose door parts the app reported. Its holders with their levels, and the app's last word about its door parts. In
+    the list of machines it would leave the order in which the app puts the door's parts on servers
+    (DoorHosts.order)."""
+    machines = set(team.get("addresses") or {})
+    held = {}
+    for name, a in sorted((team.get("agents") or {}).items()):
+        for host, level in sorted((a.get("servers") or {}).items()):
+            if host not in machines:
+                held.setdefault(host, []).append({"agent": name, "level": level})
+    words = {}
+    for row in q("SELECT k, v FROM kv WHERE k LIKE 'door_host:%'"):
+        with contextlib.suppress(ValueError, TypeError, AttributeError):
+            word = json.loads(row["v"])
+            words[row["k"][len("door_host:"):]] = {k: word[k] for k in ("state", "said", "at", "added") if k in word}
+    names = sorted(set(held) | {h for h, w in words.items() if w.get("added") is True and h not in machines})
+    return [{"name": h, "holders": held.get(h, []), "door": words.get(h)} for h in names]
 
 
 def hub_tags(status):
@@ -32509,6 +32533,10 @@ def add_server_agent(server, body):
         if fix_holders(team, server):       # DevOps plan C4: root there through the door would reach the new agent
             raise Refusal(409, f"{', '.join(fix_holders(team, server))} holds Fix on {server}: a new agent goes to a "
                                f"server where no other agent has root.")
+        if door_callers_at(team, server):   # the door would no longer tell that agent apart by its address
+            raise Refusal(409, f"{', '.join(shown_role(n) for n in door_callers_at(team, server))} holds servers "
+                               f"through the door and runs alone on {server}, by which the door knows it: a new agent "
+                               f"goes to another server.")
         if not_shareable(team, here):       # its helper or its vault would stop answering beside a second agent
             raise Refusal(409, f"{', '.join(shown_role(n) for n in not_shareable(team, here))} on {server} cannot share "
                                f"it yet: an agent beside another needs its own agent key and a vault that serves both.")
@@ -34522,15 +34550,19 @@ DOOR = {"read_at": 0.0, "error": None}      # what the record timer last saw, in
 DOOR_APPROVAL_DAYS = 7          # the days a signed yes is served to the door (door.APPROVAL_DAYS refuses older ones)
 
 
+SERVER_ROLES = ("worker", "lead", "manager")     # the manager holds a business's servers while it has no DevOps agent
+
+
 def server_holds(name, a):
-    """team.json agents.<name>.servers: up to 32 hosts, each at read or fix, for a worker or a lead, and never its own
-    machine, where it has free root with no door. ValueError with the reason."""
+    """team.json agents.<name>.servers: up to 32 hosts, each at read or fix, for a worker, a lead or the manager, and
+    never its own machine, where it has free root with no door. The manager holds a business's servers until the
+    business has a DevOps agent (the owner's answer of 11 November 2026, "The manager"). ValueError with the reason."""
     held = a.get("servers", {})
     if not isinstance(held, dict) or len(held) > 32 or not all(
             isinstance(h, str) and SERVER_HOST.fullmatch(h) and v in SERVER_LEVELS for h, v in held.items()):
         raise ValueError(f"agent {name}: servers must map up to 32 hosts to read or fix")
-    if held and a.get("role") not in ("worker", "lead"):
-        raise ValueError(f"agent {name}: a server through the door is for a worker or a lead")
+    if held and a.get("role") not in SERVER_ROLES:
+        raise ValueError(f"agent {name}: a server through the door is for a worker, a lead or the manager")
     if a.get("machine") in held:
         raise ValueError(f"agent {name} has free root on its own server, {a['machine']}: no door grant there")
 
@@ -34571,8 +34603,14 @@ def validate_door(team):
         ipaddress.ip_address(door.get("address"))
     except (ValueError, TypeError):
         raise ValueError("door.address is the door's address on the private network") from None
-    if door["address"] in (team.get("addresses") or {}).values():
-        raise ValueError("the door runs on a server of its own, which is no machine of the fleet")
+    # The door runs on a server of its own, or on the hub's server, where no agent with a shell runs beside it and the
+    # central vault already holds every key (the owner's yes of 11 November 2026 to the layouts of 1, 2 and 3 servers):
+    # never on a machine of the agents, whose shells would sit beside its keys.
+    addresses = team.get("addresses") or {}
+    if door["address"] in addresses.values() and \
+            door["address"] != addresses.get((team.get("hub") or {}).get("machine")):
+        raise ValueError("the door runs on a server of its own or on the hub's server, and on no other machine of the "
+                         "fleet")
     port = door.get("port", DOOR_PORT)
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError("door.port is a port number")
@@ -34599,6 +34637,12 @@ def fix_holders(team, server):
     return [n for n, a in (team.get("agents") or {}).items() if (a.get("servers") or {}).get(server) == "fix"]
 
 
+def door_callers_at(team, server):
+    """The agents that run on this server and hold servers through the door. The door knows a caller by its address,
+    and refuses an address that two agents share, so a server of such an agent takes no second agent."""
+    return [n for n, a in (team.get("agents") or {}).items() if a.get("machine") == server and a.get("servers")]
+
+
 def server_mode(team, server):
     """rule-only on a machine of the fleet (the hub's server among them), fix elsewhere: code decides it, so it needs
     no control. A CI host that two businesses share is rule-only too, which the app's access file says."""
@@ -34613,9 +34657,9 @@ def grant_server(body):
     a = agents().get(agent)
     if a is None:
         raise Refusal(404, "no such agent")
-    if a.get("role") not in ("worker", "lead"):
-        raise Refusal(409, f"{shown_role(agent)} is the {a.get('role')}: a server through the door is for a worker or "
-                           f"a lead.")
+    if a.get("role") not in SERVER_ROLES:
+        raise Refusal(409, f"{shown_role(agent)} is the {a.get('role')}: a server through the door is for a worker, a "
+                           f"lead or the manager.")
     if a.get("machine") == server:
         raise Refusal(409, f"{server} is {shown_role(agent)}'s own server, where it has free root with no door.")
     rid = f"server:{server}"
@@ -34798,7 +34842,8 @@ def save_door_entry(body):
     return save_integration(None, change, f"the door is at {address}:{port}")
 
 
-DOOR_HOST_STATES = ("installed", "passed", "failed")
+# removed (version 1.122): the owner's Remove server took the door's parts off a server for apps, which leaves the list
+DOOR_HOST_STATES = ("installed", "passed", "failed", "removed")
 DOOR_HOLDS = ("parts", "rule-only")    # N8 (b): what the manager's door_hold keeps from one server
 # rule-only had the name judged until 11 November 2026. team.json and the app's view keep that name, because an app
 # from before that day reads only it; an app from that day on reads both (DoorAccess.HubDoor.ruleOnlyHolds)
@@ -34813,13 +34858,15 @@ def door_waits_after():
     not named again."""
     if (TEAM.get("door") or {}).get("rollout") is True:
         return None
-    rows = q("SELECT k, v FROM kv WHERE k LIKE 'door_host:%'")
+    rows = []
+    for row in q("SELECT k, v FROM kv WHERE k LIKE 'door_host:%'"):
+        with contextlib.suppress(ValueError, TypeError, AttributeError):
+            word = json.loads(row["v"])
+            if word.get("added") is not True:      # a server that the owner added for apps is no canary (1.122)
+                rows.append((row["k"][len("door_host:"):], word))
     if len(rows) != 1:
         return None
-    with contextlib.suppress(ValueError, TypeError, AttributeError):
-        if json.loads(rows[0]["v"]).get("state") == "passed":
-            return rows[0]["k"][len("door_host:"):]
-    return None
+    return rows[0][0] if rows[0][1].get("state") == "passed" else None
 
 
 def door_host_report(body):
@@ -34830,13 +34877,30 @@ def door_host_report(body):
     (test 6) and door_rollout, and of each failure, after which the app puts the parts on no other server until a new
     release of the app or the door. Called with LOCK held."""
     host, state, said = body["host"], body["state"], body["said"]
+    # A server that the owner added for apps in the app (version 1.122) is no canary: his add is the go-ahead, the app
+    # puts its parts on at once, and a failure stops that server only. door_rollout stays for the servers that the app
+    # finds by their tags.
+    added = body.get("added") is True
     key = f"door_host:{host}"
+    if state == "removed":
+        with transaction():
+            gone = DB.execute("DELETE FROM kv WHERE k=?", (key,)).rowcount > 0
+        if gone:
+            log("owner", f"the door's parts are off {host}, which leaves the servers for apps")
+        return {"host": host, "state": state, "changed": gone}
     old = json.loads(kv_get(key) or "null") or {}
-    if (old.get("state"), old.get("said")) == (state, said):
+    if (old.get("state"), old.get("said"), old.get("added") is True) == (state, said, added):
         return {"host": host, "state": state, "changed": False}
     rollout = (TEAM.get("door") or {}).get("rollout") is True
     told = None
-    if state == "passed" and not rollout:
+    holders = [shown_role(n) for n in fix_holders(TEAM, host)]
+    if added and state == "passed":
+        told = (f"[hub] The owner added {host} for apps, and the door's own check of it passed. "
+                + (f"{' and '.join(holders)} holds it through the door: `ops {host} help` lists its forms."
+                   if holders else "No agent holds it yet."))
+    elif added and state == "failed":
+        told = f"[hub] The door's parts did not go on {host}, which the owner added for apps: {said}"
+    elif state == "passed" and not rollout:
         told = (f"[hub] The door's parts are on {host}, the first server, and the door's own check of its second sshd "
                 f"passed (test 1): no shell, no TTY, no scp, no forward and no form outside the list, and a read and a "
                 f"rule form through sudo ops-root work. Give its Operator normal work there through the door with "
@@ -34853,7 +34917,8 @@ def door_host_report(body):
     task = filed_under(manager, "say", None)
     with transaction():     # the server's word and the manager's message, together or not at all
         DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-                   (key, json.dumps({"state": state, "said": said, "at": round(t0)})))
+                   (key, json.dumps({"state": state, "said": said, "at": round(t0),
+                                     **({"added": True} if added else {})})))
         if told:
             event_rows([(manager, "say", task, told, None)], t0)
     log("owner", f"the door's parts on {host}: {state}" + (f": {said}" if said else ""))
@@ -39743,7 +39808,7 @@ class Handler(BaseHTTPRequestHandler):
         """POST /ui/door/host (owner feature door_setup, new-projects plan N8 (b)): the app's word about one business
         server: installed, passed or failed, with its words."""
         def read(data):
-            extra = sorted(set(data) - {"request_id", "db", "host", "state", "said"})
+            extra = sorted(set(data) - {"request_id", "db", "host", "state", "said", "added"})
             if extra:
                 raise ValueError(f"unknown field {extra[0]}")
             host, state, said = data.get("host"), data.get("state"), data.get("said", "")
@@ -39753,7 +39818,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError(f"state is one of {', '.join(DOOR_HOST_STATES)}")
             if not isinstance(said, str) or len(said) > 600 or "\n" in said:
                 raise ValueError("said is one line of at most 600 characters")
-            return {"host": host, "state": state, "said": said}
+            if not isinstance(data.get("added", False), bool):
+                raise ValueError("added is true for a server that the owner added for apps in the app")
+            return {"host": host, "state": state, "said": said, "added": data.get("added") is True}
         return self.ui_command("door/host", read, door_host_report)
 
     def ui_door_github_app(self):

@@ -156,8 +156,9 @@ NOT_TOOLS = {
     "/ui/vault/intake": "a value sealed to the central vault, which only the owner's own vault makes",
     "/ui/vault/pin": "a statement signed with the owner's own key, which only their app on their Mac holds",
     "/ui/servers/grant": "a server goes with its business: the owner's app gives each server that carries a "
-                         "business's Tailscale tag to that business's DevOps agent, puts the host's parts in place and "
-                         "writes the door's access file over the owner's own SSH (DevOps plan C4)",
+                         "business's Tailscale tag to that business's DevOps agent (or the manager while it has "
+                         "none), puts the host's parts in place and writes the door's access file over the owner's "
+                         "own SSH (DevOps plan C4)",
     "/ui/vault/recovery": "a statement signed with the owner's own key, which only their app on their Mac holds",
     "/ui/vault/grant": "a statement signed with the owner's own key, which only their app on their Mac holds",
     "/ui/owner/devices/{}/certify": "a statement signed with the owner's own key, which only their app on their Mac "
@@ -634,8 +635,8 @@ def grant_access(args):
     kind, _, what = str(rid or "").partition(":")
     if kind == "server":            # DevOps plan C4 and "Yes, by business": the app gives it, and sets up the host
         raise Refused("A server goes with its business: the owner's app gives each server that carries a business's "
-                      "Tailscale tag to that business's DevOps agent, puts the host's parts in place and writes the "
-                      "door's access file. Nothing here gives it.")
+                      "Tailscale tag to that business's DevOps agent (or the manager while it has none), puts the "
+                      "host's parts in place and writes the door's access file. Nothing here gives it.")
     if kind not in GRANTS or not what:
         raise Refused("resource must be <kind>:<what>, with a kind of " + ", ".join(sorted(GRANTS)) +
                       " — for example repo:acme/web, secret:bws://<uuid>, gmail:a@b.com or tool:github.")
@@ -1327,8 +1328,8 @@ def tools():
                              "who gave what to whom. A repository that the hub's GitHub App does not reach comes back "
                              "with unreached: the GitHub page where the owner adds it to the App. A server "
                              "(server:<name> read|fix) is not given here: the owner's app gives each server that "
-                             "carries a business's Tailscale tag to that business's DevOps agent, because it also puts "
-                             "the host's parts in place.",
+                             "carries a business's Tailscale tag to that business's DevOps agent (or the manager "
+                             "while it has none), because it also puts the host's parts in place.",
              {"resource": S["text"], "agent": S["text"], "level": S["level"], **rid},
              ("resource", "agent", "level"), grant_access),
         tool("share_resource", "The owner's standing for one resource in the grantable pool: the manager may hand it "
