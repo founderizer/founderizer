@@ -553,7 +553,10 @@ that the owner gives, and it takes no value under a removed name again (UI-API.m
 - **The apps.** The Mac app and the iPhone app are installed on the owner's own
   machines, not here.
 - **Backups.** The records are `~fleet/.fleet/pilot.db` and the repository is
-  `~fleet/fleet-pilot.git`; the owner decides how they are kept.
+  `~fleet/fleet-pilot.git`; the owner decides how they are kept. The hub puts the
+  records in WAL mode when it starts: the newest commits can be in `pilot.db-wal`
+  beside them, so a copy of `pilot.db` alone can lack them. The app's copy of the
+  fleet has them all, and so does `sqlite3 ~fleet/.fleet/pilot.db ".backup <file>"`.
 
 ## The test
 

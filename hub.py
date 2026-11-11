@@ -493,6 +493,8 @@ UUID_TEXT = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 # ---------------------------------------------------------------- database
 
 def q(sql, args=()):
+    if SNAP.conn is not None:           # a read of the state, from its own moment of the records (state_moment)
+        return SNAP.conn.execute(sql, args).fetchall()
     with LOCK:
         rows = DB.execute(sql, args).fetchall()
         commit()
@@ -519,6 +521,8 @@ def read_rows(sql, args=()):
     that path would commit the half-written task. test_runtime and test_triggers measure exactly that. The lock is
     the same reentrant one that q() and transaction() take, so a read from a request thread that holds none is safe
     too: see_earlier_work reads from there."""
+    if SNAP.conn is not None:           # a read of the state, from its own moment of the records (state_moment)
+        return SNAP.conn.execute(sql, args).fetchall()
     with LOCK:
         return DB.execute(sql, args).fetchall()
 
@@ -550,6 +554,155 @@ def transaction():
             raise
         finally:
             TX.open = 0
+
+
+# ---------------------------------------------------------------- a read of the state from one moment, without LOCK
+#
+# GET /ui/state reads the whole state for each open Mac app every 3 seconds, and it read it under LOCK: every other
+# caller of the hub waited until it was done. On the first fleet's hub that block still took about 15 ms after the
+# changes of 10 and 11 November 2026, for its statements and the fetching of their rows. The records are in WAL mode
+# (wal_on, main), so a second connection can read them as they were at one moment while the writers go on. A read of the
+# state takes LOCK for that moment only (state_moment), and reads the rest from its own read-only connection with no
+# lock held.
+
+class Snapshot(threading.local):
+    """What one thread reads while it builds the state from its own moment (state_moment): the read connection, whose
+    transaction holds the records as they were at that moment, the team as it was then, and (the change token, the
+    time) of that moment. q, q1, read_rows and read_row read through conn, and team_read gives team. All are None in
+    every other thread, and in this one before and after."""
+    conn = None
+    team = None
+    moment = None
+
+
+SNAP = Snapshot()
+READERS = {"db": None, "path": None, "turn": 0, "idle": [], "told": None}   # readers_for: read connections of DB
+READERS_LOCK = threading.Lock()         # held only while READERS changes, never with LOCK
+READERS_KEPT = 4                        # idle read connections kept open: more than the reads of the state at one time
+# The most bytes that the WAL file keeps after SQLite starts it again from its beginning. While reads of the state
+# follow each other with no gap, a writer cannot start it again, and it grows; it does not get smaller by itself after.
+WAL_MOST = 64 * 1024 * 1024
+
+
+def wal_on():
+    """The records of DB in WAL mode, which their file keeps from then on: (True, None), or (False, why not). In WAL
+    mode a reader holds no lock that a writer waits for, so a read connection can read them while the hub writes
+    (state_moment). In the journal mode that they had before, a reader's shared lock stopped every commit, and with it
+    the writer that held LOCK. Records that SQLite does not switch stay as they are, for example when another process
+    holds them open or when they are in memory. Then the hub reads the state under LOCK, as before, and its log says
+    why."""
+    try:
+        mode = str(DB.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()
+        if mode == "wal":       # a setting of this connection, not of the file: it is set again at each start
+            DB.execute(f"PRAGMA journal_size_limit={WAL_MOST}").fetchone()
+    except sqlite3.Error as e:
+        return False, str(e)
+    return (True, None) if mode == "wal" else (False, f"SQLite kept the journal mode {mode}")
+
+
+def readers_for(path):
+    """Read connections of the records at `path`, for DB as it is now, or none at all with None. main() calls it once
+    the records are in WAL mode (wal_on): a reader of records in another journal mode would hold back every writer. A
+    connection open from before is closed, and a busy one is closed when it comes back (reader_back)."""
+    with READERS_LOCK:
+        idle = READERS["idle"]
+        READERS.update(db=DB if path else None, path=path, turn=READERS["turn"] + 1, idle=[], told=None)
+    for conn in idle:
+        conn.close()
+
+
+def reader():
+    """(a read connection of DB's records, the turn of readers_for that it is for), an idle one when there is one, or
+    None when DB has none: readers_for was not called for this DB (records not in WAL mode, a test's own database)."""
+    with READERS_LOCK:
+        if READERS["path"] is None or READERS["db"] is not DB:
+            return None
+        turn = READERS["turn"]
+        if READERS["idle"]:
+            return READERS["idle"].pop(), turn
+        path = READERS["path"]
+    conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")    # a write through it fails, and so it can never join the writers' work
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()     # its schema now, not in the moment
+    except BaseException:
+        conn.close()
+        raise
+    return conn, turn
+
+
+def reader_back(conn, turn):
+    """A read connection whose read has ended: kept for the next read when it is of the turn of now (reader gives none
+    while DB is another), else closed."""
+    with READERS_LOCK:
+        if turn == READERS["turn"] and len(READERS["idle"]) < READERS_KEPT:
+            READERS["idle"].append(conn)
+            return
+    conn.close()
+
+
+def team_read():
+    """TEAM, or in a read of the state the copy of it that its moment took (SNAP), so that the team goes with the rows.
+    Every reader of TEAM that a read of the state reaches reads it through here: agents, chat_apps, setting and
+    unplaced."""
+    return TEAM if SNAP.team is None else SNAP.team
+
+
+@contextlib.contextmanager
+def state_moment():
+    """The records, the change token, the clock and the team as they were at one moment, for a read of the state.
+    Yields (the change token, the time) of that moment.
+
+    With a read connection (reader), LOCK is held for that moment only. Every writer commits under LOCK, and the change
+    token counts each commit after it (counted), so the read transaction that starts then holds every row that the
+    token counts, and none that it does not. The team is copied in the same moment: apply_team replaces the values of
+    TEAM and changes none of them in place, and the owner's commands, the agents' tools, the tick and POST /join call it
+    under LOCK, so the copy is the team that went with those rows. The block before this read TEAM again at each use.
+    Then this thread reads from that transaction, with no lock held (SNAP), and the writers go on: what
+    they commit from then on is in the next read, and moves the token past the one of this read, so an app that waits
+    with it reads again. Without a read connection, or when its read cannot start, the whole read holds LOCK, as every
+    read of the state did before 11 November 2026. Inside a moment of its own thread it is that moment."""
+    if SNAP.conn is not None:
+        yield SNAP.moment
+        return
+    got = None
+    try:
+        got = reader()
+        if got is not None:
+            try:
+                with LOCK:
+                    got[0].execute("BEGIN")
+                    got[0].execute("SELECT count(*) FROM sqlite_master").fetchone()     # the read begins: the moment
+                    token, at, team = change_token(), now(), dict(TEAM)
+            except BaseException:
+                got[0].close()
+                raise
+    except sqlite3.Error as e:
+        got = None
+        if READERS.get("told") != str(e):       # once for each new reason, not at each read
+            READERS["told"] = str(e)
+            said = f"a read of the state could not start its own read of the records, so it held the hub's lock for " \
+                   f"all of it: {e}"
+            print("WARNING: " + said, flush=True)
+            with contextlib.suppress(sqlite3.Error):    # records that refuse a read can refuse this write too
+                log("hub", said)
+    if got is None:
+        with LOCK:
+            yield change_token(), now()
+        return
+    conn, turn = got
+    SNAP.conn, SNAP.team, SNAP.moment = conn, team, (token, at)
+    try:
+        yield token, at
+    finally:
+        SNAP.conn = SNAP.team = SNAP.moment = None
+        try:
+            conn.execute("ROLLBACK")            # it read only: this ends its read transaction
+        except sqlite3.Error:
+            conn.close()
+        else:
+            reader_back(conn, turn)
 
 
 # ---------------------------------------------------------------- the apps' change signal (owner feature live_changes)
@@ -752,7 +905,7 @@ def log(agent, what):
 
 
 def agents():
-    return TEAM.get("agents", {})
+    return team_read().get("agents", {})
 
 
 def manager_name():
@@ -833,7 +986,7 @@ def unplaced(name, team=None):
     the manager's own setup page gives it its server (the owner, 4 November 2026). Until then its `machine` names the
     hub's machine only so that every reader of `machine` still finds one with an address: the hub lists it on no server,
     reads no machine of it, answers no caller as it, and no installer installs it anywhere."""
-    return ((team or TEAM).get("agents") or {}).get(name, {}).get("placed") is False
+    return ((team or team_read()).get("agents") or {}).get(name, {}).get("placed") is False
 
 
 def runtime_label(runtime):
@@ -10280,7 +10433,7 @@ OWNER_MESSAGE = re.compile(r"M-([1-9][0-9]{0,17})")     # in_reply_to of a manag
 def chat_apps():
     """team.json "chat_apps" (owner feature chat_apps): {account: {"app", "label", "agents", "unknown", "enabled"}}.
     agents has exactly one agent: the account's agent."""
-    return TEAM.get("chat_apps") or {}
+    return team_read().get("chat_apps") or {}
 
 
 def chat_enabled(acc):
@@ -29824,7 +29977,7 @@ def setting(key):
     """One setting's value now: the owner's own from team.json, else its default. A stored value that its check
     refuses (a file written by hand, which team_problem names) reads as the default."""
     default, check, _ = SETTINGS[key]
-    stored = TEAM.get("settings")
+    stored = team_read().get("settings")
     if not isinstance(stored, dict) or key not in stored:
         return default
     try:
@@ -35208,6 +35361,19 @@ A copy nobody has ever put back is not a copy. Try it once on a spare machine be
 """
 
 
+def rollback_header(records):
+    """An image of a database, with the header of rollback mode where it has the one of WAL mode: bytes 18 and 19 (the
+    file format's write and read versions) are 1 and 1 where WAL mode writes 2 and 2. The hub's records are in WAL mode
+    since 11 November 2026 (wal_on), and DB.serialize() copies that header. SQLite opens no image in WAL mode from
+    memory ("unable to open database file"), so read_bundle refused every such copy, and so does the restore of a hub
+    from before this change. SQLite's documentation of sqlite3_deserialize
+    (https://www.sqlite.org/c3ref/deserialize.html) says to set bytes 18 and 19 to 1 for it. The pages are the whole
+    records either way, and a hub that takes the copy puts them in WAL mode again at its start."""
+    if records[18:20] == b"\x02\x02":
+        records = b"".join((records[:18], b"\x01\x01", records[20:]))
+    return records
+
+
 def backup_bundle(central=None):
     """One copy of this fleet for the owner's own machine, as a zip: the database, the owner's configuration, a
     manifest and RESTORE.md, and the central vault's sealed store when it gave one. Call it under LOCK; nothing is
@@ -35219,7 +35385,7 @@ def backup_bundle(central=None):
                                                                           "copy"})
     member = json.dumps(export, indent=2, sort_keys=True).encode() if export else None
     fleet = fleet_id()          # before the records are read: it is made on first use, and the copy needs it in
-    records = DB.serialize()    # the records themselves — a restore reads it from there and not from the manifest
+    records = rollback_header(DB.serialize())   # the records themselves: a restore reads them, not the manifest
     config = owner_files()
     manifest = {"format": BACKUP_FORMAT, "made_at": now(), "fleet_id": fleet, "db_id": kv_get("db_id"),
                 "revision": kit_revision(), "hub": TEAM.get("hub"), "agents": sorted(agents()),
@@ -35286,7 +35452,7 @@ def read_bundle(data):
     records, central = read.pop(BACKUP_DB), read.pop(CENTRAL_MEMBER, None)
     check = sqlite3.connect(":memory:")
     try:
-        check.deserialize(records)
+        check.deserialize(rollback_header(records))
         bad = [str(r[0]) for r in check.execute("PRAGMA quick_check")]
         if bad != ["ok"]:
             raise Refusal(422, "the records in this copy do not pass SQLite's own check: " + "; ".join(bad[:3]))
@@ -37525,9 +37691,10 @@ class Handler(BaseHTTPRequestHandler):
         if not self.ui_allowed():
             return
         plain_rows = {}
-        with LOCK:
-            # Read under the same LOCK as the snapshot, which no write can join while it is built (live_changes).
-            result = {"schema_version": 1, "db": kv_get("db_id"), "time": now(), "token": change_token(),
+        with state_moment() as (token, at):
+            # The rows, the token and the team of one moment (state_moment): LOCK is held for that moment only. A write
+            # after it is not in this answer, and it moves the token past this answer's (live_changes).
+            result = {"schema_version": 1, "db": kv_get("db_id"), "time": at, "token": token,
                       "manager_flag": kv_get("mgr_flag"),
                       "manager_warning": manager_warning(),
                       "ui_features": ui_features()}
@@ -43756,6 +43923,9 @@ def main():
     DB = sqlite3.connect(db_path, check_same_thread=False)
     DB.row_factory = sqlite3.Row
     schema_problems = build_schema()        # it raises nothing: a hub that cannot start cannot be reached
+    walled, unwalled = wal_on()             # a read of the state reads its own moment, without LOCK (state_moment)
+    if walled:
+        readers_for(os.path.abspath(db_path))
     kv_set("schema_problems", json.dumps(schema_problems) if schema_problems else None)
     if restored:
         # A new generation, because these records came from somewhere else: no helper, session or app state from
@@ -43775,6 +43945,8 @@ def main():
         log("hub", CFG["team_problem"])
     for says in schema_problems:        # the records are the hub's own, so the log holds them before anything else
         log("hub", "this database refused a schema step: " + says)
+    if unwalled:
+        log("hub", f"the records are not in WAL mode, so each read of the state holds the hub's lock: {unwalled}")
     if restore_says:
         log("hub", restore_says)
     # owner feature chat_apps: the bridge's key, next to the records (~/.fleet/chat-apps with the default --db), so a
@@ -43812,6 +43984,9 @@ def main():
     if schema_problems:
         print(f"WARNING: this database refused {len(schema_problems)} schema step(s), and the hub runs without "
               f"them. /ui/health says so (warning: schema). " + " | ".join(schema_problems), flush=True)
+    if unwalled:
+        print(f"WARNING: the records are not in WAL mode, so each read of the state holds the hub's lock: {unwalled}",
+              flush=True)
     if restored:
         print(f"Restored: {restore_says}. Its generation is new, so every app and helper reads the state again.",
               flush=True)
