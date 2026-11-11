@@ -1240,7 +1240,8 @@ def tools():
              plain("/ui/machines/{agent}/manager", (), "the manager start")),
         tool("agent_key", "Register, replace or remove one agent's key, which an agent on a shared machine needs. "
                           "It takes the SHA-256 of the key and never a key: the value is the machine's own. Each "
-                          "change revokes every session credential of that agent at once.",
+                          "change revokes every session credential of that agent at once. A key that a server "
+                          "service registered is replaced, never removed.",
              {"agent": S["text"], "sha256": S["text"], "delete": S["bool"], **rid}, ("agent",),
              plain("/ui/team/agents/{agent}/key", ("sha256", "delete"), "this agent's key")),
         tool("owner_device", "One of the owner's own phones: its name, its label and its address on the private "

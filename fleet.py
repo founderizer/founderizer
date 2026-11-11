@@ -2455,7 +2455,8 @@ def make_key(agent, rotate=False):
 
 def cmd_key(args):
     """Print only the SHA-256 of this agent's key, made here if it has none (or a new one with --rotate). The owner
-    registers it with POST /ui/team/agents/<agent>/key; an agent alone on its address registers its own."""
+    registers it with POST /ui/team/agents/<agent>/key; a server service registers the key of an agent that it
+    installs; an agent alone on a machine without such a service registers its own."""
     if not re.fullmatch(r"[a-z][a-z0-9-]{1,30}", args.agent):
         die("an agent name has 2 to 31 lowercase letters, digits and -")
     print(make_key(args.agent, rotate=args.rotate))
@@ -2463,9 +2464,11 @@ def cmd_key(args):
 
 def enroll_key(agent):
     """Owner API 1.12: the first time, make this agent's key and register its SHA-256 with the hub. The hub takes it
-    only while the agent is alone on its address; on a shared machine the owner registers the key. The key file
-    appears only after the hub has the key, so no request carries a key that the hub does not know. True when the
-    agent has its key."""
+    only while the agent is alone on its address and its machine has no server service that registers its agents'
+    keys; on a shared machine the owner registers the key. The key file appears only after the hub has the key, so no
+    request carries a key that the hub does not know. True when the agent has its key; None when the hub takes no key
+    from this helper, because the server service of this machine registers it (at the install) or the owner does;
+    False otherwise."""
     if load_agent_key(agent):
         return True
     os.makedirs(HOME, mode=0o700, exist_ok=True)
@@ -2481,6 +2484,11 @@ def enroll_key(agent):
         key = secrets.token_urlsafe(32)
         write_private(pending, key + "\n")
     code, data = http("POST", f"/helper/key/{agent}", {"sha256": hashlib.sha256(key.encode()).hexdigest()}, timeout=15)
+    if code == 409 and data.get("by") == "server":
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(pending)          # never registered: the key file comes from the server service or the owner
+        print(f"agent key not registered: {str(data.get('error') or '')[:160]}", flush=True)
+        return None
     if code != 200:
         print(f"agent key not registered ({code}): {str(data.get('error') or '')[:160]}", flush=True)
         return False
@@ -3370,6 +3378,7 @@ class Helper:
         self.typed_at = {}        # {window: when its last signal was typed}, a model call of its session (restart_fresh)
         self.closed_due = False   # the manager's session closed at a question, and the hub has not heard it (tell_closed)
         self.keyed, self.enrolled_at = False, None      # owner API 1.12: it has its agent key; its last try to get one (enroll)
+        self.key_by_server = False      # the hub takes no key from this helper: its server service registers it
         # plan P0 (feature update_between_turns): (the task windows whose turn runs, by the hub's reading at the latest
         # poll, when that answer came), or None while there is none: an older hub, or a poll that failed
         self.hub_turns = None
@@ -3843,53 +3852,82 @@ class Helper:
         session's start (manage), which then starts with its credential: the hub refuses an MCP call without one from
         an agent that has a key, also while it is alone on its address. The key file is the key. Without it, the
         helper registers a key while no task window runs, so that no hook of a running task can call the hub between
-        the hub's registration and the key file's arrival, and tries again every minute, also after a lost answer.
-        The first round that this helper has the key, it closes the windows that cannot use it (close_keyless). A
-        window list that tmux did not give is unknown, never empty (look_known): no registration then. True once the
-        agent has its key."""
+        the hub's registration and the key file's arrival, and tries again every minute, also after a lost answer. On a
+        server whose own service registers its agents' keys the hub takes none from a helper (enroll_key gives None):
+        it then asks no more, until the hub next answers no_key (key_removed), and waits for the key file, which that
+        service or the owner makes. A window list that tmux did not give is unknown, never empty (look_known): no
+        registration then. The first round that this helper has the key, it closes the windows that cannot use it
+        (close_keyless). A window whose credential the hub revoked later, because the owner replaced or removed the
+        key, is the hub's to name (close_revoked). True once the agent has its key."""
         if self.keyed:
             return True
         new = not load_agent_key(self.agent)
         if new:
             names = self.look_known()
-            if (self.enrolled_at is not None and time.monotonic() - self.enrolled_at <= 60) or names is None or \
-                    any(re.fullmatch(r"T-\d+", w) for w in names):
+            if self.key_by_server or (self.enrolled_at is not None and time.monotonic() - self.enrolled_at <= 60) or \
+                    names is None or any(re.fullmatch(r"T-\d+", w) for w in names):
                 return False
             self.enrolled_at = time.monotonic()     # before the call: a lost answer, which raises, waits the minute too
-            if not enroll_key(self.agent):
+            got = enroll_key(self.agent)
+            if got is None:
+                self.key_by_server = True
+                self.say("the hub takes this agent's key only from its server service or the owner; this helper waits "
+                         "for the key file")
+            if not got:
                 return False
         self.keyed = True
         self.close_keyless(new)
         return True
 
     def key_removed(self):
-        """The hub has no key for this agent any more (the owner removed it): its key file goes, and the next round
-        registers a key again, as for a helper that never had one (enroll)."""
+        """The hub has no key for this agent any more (the owner removed it, which revoked every credential): its key
+        file goes, and the next round registers a key again, as for a helper that never had one (enroll), also where
+        the hub refused one before (key_by_server): that answer then comes once more."""
         os.remove(key_file(self.agent))
-        self.keyed, self.enrolled_at = False, None
+        self.keyed, self.enrolled_at, self.key_by_server = False, None, False
 
-    def close_keyless(self, new):
+    def close_keyless(self, revoked):
         """The standing session and the owner chat of this agent that cannot use its key close and start again with a
         credential: the standing session in this round (manage), the owner chat when the hub next wants it
         (keep_chat). Once for each start of this helper, at its first round with the agent's key (enroll). The hub
         refuses each MCP call that a keyed agent makes without a credential, so a window that started without one can
         do nothing, and nothing else would start it again: a Mac's first standing session started before its helper
         had a key, and an owner chat can start while a task window keeps the key from being registered. They are the
-        ones that legacy_windows names. new: this helper registered the key just now, so a credential that a window
-        holds was for a key that is gone (the owner removed it, which revoked every credential): both windows close,
-        whatever they hold. A window that has its credential stays otherwise, and so does a task window or a
-        conversation's window: a task's credential comes from the hub at its start, and a conversation's is the hub's
-        own. Returns the windows that closed."""
-        legacy = [] if new else (self.legacy_windows() or [])
-        closed = [w for w in ("manager", "owner-chat")
-                  if (new or w in legacy) and tmux("kill-window", "-t", f"={self.session}:={w}").returncode == 0]
+        ones that legacy_windows names. revoked: a credential that a window holds was for a key that is gone (this
+        helper registered a key just now, or the owner removed or replaced the key, which revoked every credential):
+        both windows close, whatever they hold. A window that has its credential stays otherwise, and so does a task
+        window or a conversation's window: a task's credential comes from the hub at its start, and a conversation's
+        is the hub's own. Returns the windows that closed."""
+        legacy = [] if revoked else (self.legacy_windows() or [])
+        return self.close_windows([w for w in ("manager", "owner-chat") if revoked or w in legacy],
+                                  "no session credential of this agent's key, which the hub needs from an agent "
+                                  "with a key")
+
+    def close_revoked(self, windows, alive):
+        """The hub's word in its poll answer (revoked, owner API 1.12): the standing session and the owner chat whose
+        newest credential it revoked, because the owner replaced or removed this agent's key. Such a window can make
+        no MCP call, and nothing else would start it again, so it closes and starts again with a new credential, also
+        when this helper started after the change. alive: the windows that tmux listed in this round, or None when it
+        listed none (then each named window is tried). A task window and a conversation's window stay, as in
+        close_keyless."""
+        if not isinstance(windows, list):
+            return []
+        return self.close_windows([w for w in ("manager", "owner-chat")
+                                   if w in windows and (alive is None or w in alive)],
+                                  "the hub revoked its session credential, because this agent's key changed")
+
+    def close_windows(self, windows, why):
+        """Close these of the standing session and the owner chat, so that each starts again with a credential: the
+        standing session in the next round (manage), the owner chat when the hub next wants it (keep_chat). Returns
+        the windows that closed."""
+        closed = [w for w in windows if tmux("kill-window", "-t", f"={self.session}:={w}").returncode == 0]
         if "manager" in closed:
             self.manager_due = True
         if "owner-chat" in closed:
             self.chat_started = None        # a chat closed here is not a start that ended (start_chat)
         if closed:
-            self.say(f"{' and '.join(closed)}: no session credential of this agent's key, which the hub needs from an "
-                     f"agent with a key; {'it starts' if len(closed) == 1 else 'they start'} again with one")
+            self.say(f"{' and '.join(closed)}: {why}; {'it starts' if len(closed) == 1 else 'they start'} again with "
+                     f"one")
         return closed
 
     def sweep_sessions(self):
@@ -6706,7 +6744,8 @@ def cmd_run(args):
                 return
             if code == 403 and data.get("auth") == "no_key" and load_agent_key(agent):
                 h.key_removed()         # the owner removed this agent's key: legacy again until it enrolls
-                h.say("the hub has no key for this agent any more; it enrolls again when it can")
+                h.say("the hub has no key for this agent any more; it enrolls again when it can, or waits for the "
+                      "key that its server service or the owner registers")
             if code != 200:
                 raise Refused(f"hub answered {code}")
             h.doing("chat")
@@ -6717,6 +6756,7 @@ def cmd_run(args):
             h.conversations = data.get("conversations") if isinstance(data.get("conversations"), list) else None
             h.conversation_modes = data.get("conversation_modes") \
                 if isinstance(data.get("conversation_modes"), dict) else None
+            h.close_revoked(data.get("revoked"), names)    # owner API 1.12: a key change revoked their credential
             h.keep_chat(data.get("chat"), data.get("db"))
             h.open_tasks = data.get("open_tasks") if isinstance(data.get("open_tasks"), list) else None
             h.poll_db = data.get("db")

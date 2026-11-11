@@ -1050,6 +1050,25 @@ def revoke_sessions(name, t0):
     DB.execute("UPDATE session_credentials SET revoked=? WHERE agent=? AND revoked IS NULL", (t0, name))
 
 
+def revoked_windows(name):
+    """The windows of the standing session and the owner chat of this agent whose newest session credential is
+    revoked: revoke_sessions stopped it (the owner replaced or removed the key), and no newer one replaced it. Such a
+    window can make no MCP call. The helper's poll answer names them (revoked), so that its helper closes them and
+    each starts again with a new credential (fleet.Helper.close_revoked), also a helper that started after the change.
+    A new credential for the same session revokes the older one, so the newest one is the one its window holds. An
+    agent without a key gets none: alone on its address, its helper starts these windows without a credential, so a
+    revoked row would close them in every round, and the first round with a key closes them (close_keyless)."""
+    if agent_key(name) is None:
+        return []
+    # One read for both: with MAX(), SQLite takes `revoked` from the newest row of each kind (as chat_session_ready,
+    # this generation's rows only; a session of another one starts again for its generation).
+    newest = {r["kind"]: r["revoked"] for r in q(
+        "SELECT kind, revoked, MAX(created) FROM session_credentials WHERE agent=? AND generation=? AND "
+        "kind IN ('standing', 'chat') GROUP BY kind", (name, kv_get("db_id")))}
+    return [window for kind, window in (("standing", "manager"), ("chat", "owner-chat"))
+            if newest.get(kind) is not None]
+
+
 UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "limit_holds",
                "liveness", "live_desktop", "machines", "goals", "profiles", "goal_tokens",
                "task_steering", "health", "reporting_lines", "leads", "browser_desktop",
@@ -32336,7 +32355,7 @@ def move_agent(agent, body):
     with transaction():
         if old != server:
             revoke_sessions(agent, t0)
-            DB.execute("DELETE FROM agent_keys WHERE agent=?", (agent,))   # its helper there enrolls its own key
+            DB.execute("DELETE FROM agent_keys WHERE agent=?", (agent,))   # the install there registers its new key
             for table in ("machine_status", "machine_updates"):
                 DB.execute(f"DELETE FROM {table} WHERE agent=?", (agent,))
             DB.execute("DELETE FROM kv WHERE k=?", (f"default_vault:{agent}",))
@@ -41453,6 +41472,9 @@ class Handler(BaseHTTPRequestHandler):
                       (now(), *handed))
             return self.json(200, {"db": kv_get("db_id"), "last": newest, "chat": chat,
                 "listed": listed_windows(agent, query.get("alive")),
+                # owner API 1.12: the standing session and the owner chat whose credential a key change revoked; the
+                # helper closes them, and each starts again with a new credential (fleet.Helper.close_revoked)
+                "revoked": revoked_windows(agent),
                 # plan P0: the task windows of this helper whose turn runs now, by the rule that a release waits for:
                 # a helper with UPDATE_BETWEEN_TURNS takes its own update when none does (fleet.Helper.update_busy).
                 # A conversation task's window is its conversation's, C-<id> (AUTONOMY.md P2).
@@ -42232,7 +42254,10 @@ class Handler(BaseHTTPRequestHandler):
     def helper_key(self, agent):
         """Enrollment (owner API 1.12): the helper of an agent alone on its address registers the SHA-256 of the key
         that it made, once; the same SHA-256 again changes nothing. Address only, so it takes no credential. On a
-        shared machine only the owner registers keys."""
+        shared machine only the owner registers keys. On a server whose own service registers its agents' keys
+        (INSTALL_KEY: the install job's key step) only that service and the owner do: any user of that machine can
+        call from its address, and its first key would be that user's (the access review of 10 and 11 November
+        2026). The answer then says so ("by": "server"), and the helper asks no more."""
         if agent not in agents():
             return self.json(404, {"error": "unknown agent"})
         self.works_for(agent)           # no allowed() here: a key of a name that left would wait for its next agent
@@ -42253,6 +42278,12 @@ class Handler(BaseHTTPRequestHandler):
                 if hmac.compare_digest(known["sha256"], digest):
                     return self.json(200, {"ok": True, "agent": agent, "since": known["created"]})
                 return self.json(409, {"error": f"{agent} already has another key; only the owner replaces it"})
+            machine = (agents().get(agent) or {}).get("machine")
+            if machine and INSTALL_KEY in server_features(machine):
+                log("hub", f"REFUSED key enrollment for {agent} from {src}: the server service of {machine} registers "
+                           f"its key")
+                return self.json(409, {"error": f"the server service of {machine} registers {agent}'s key, at its "
+                                                f"install; after that only the owner registers one", "by": "server"})
             t0 = now()
             ins("INSERT INTO agent_keys(agent,sha256,created,source) VALUES(?,?,?,'enrolled')", (agent, digest, t0))
             # In this hold of the lock, so that the 200 follows the key with no other take of it: a rename that came
@@ -42475,7 +42506,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def ui_agent_key(self, agent):
         """The owner registers, replaces or removes an agent's key (owner API 1.12), also for an agent that team.json
-        does not list yet. Each change revokes every session credential of the agent at once."""
+        does not list yet. Each change revokes every session credential of the agent at once. The key of an agent on
+        a server whose own service registers its agents' keys (INSTALL_KEY) is replaced, never removed: without a key
+        the address of that machine would name the agent again, and its helper cannot register one there
+        (helper_key)."""
         def read(data):
             extra = sorted(set(data) - {"request_id", "db", "sha256", "delete"})
             if extra:
@@ -42483,6 +42517,11 @@ class Handler(BaseHTTPRequestHandler):
             if "delete" in data:
                 if data["delete"] is not True or "sha256" in data:
                     raise ValueError("delete must be true, without sha256")
+                machine = (agents().get(agent) or {}).get("machine")
+                if machine and INSTALL_KEY in server_features(machine):
+                    raise ValueError(f"the server service of {machine} registers {agent}'s key, so it is replaced and "
+                                     f"never removed: run fleet.py key {agent} --rotate there as {agent}'s own user, "
+                                     f"and register the SHA-256 that it prints")
                 return {"agent": agent, "delete": True}
             if not isinstance(data.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", data["sha256"]):
                 raise ValueError("give sha256 (64 lowercase hex characters) or delete: true")
