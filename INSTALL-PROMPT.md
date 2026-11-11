@@ -149,9 +149,15 @@ reach the server's port 22, because after the install SSH comes in over the priv
 
 ### A3. Put the Founderizer code on the server
 
-    ssh "$SSHUSER@$HOST" '/bin/sh -c "command -v git >/dev/null 2>&1 || { DEBIAN_FRONTEND=noninteractive apt-get -q update && DEBIAN_FRONTEND=noninteractive apt-get -y -q install git; }"'
+    ssh "$SSHUSER@$HOST" '/bin/sh -c "command -v git >/dev/null 2>&1 || { DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=1200 -q update && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=1200 -y -q install git; }"'
     ssh "$SSHUSER@$HOST" "/bin/sh -c \"if test -d /root/fleet-kit/.git; then git -C /root/fleet-kit pull -q --ff-only; else git clone -q -- '$SOURCE' /root/fleet-kit; fi\""
     ssh "$SSHUSER@$HOST" '/bin/sh -c "git -C /root/fleet-kit rev-parse --short HEAD; ls /root/fleet-kit/hub.sh"'
+
+On a new server the first line can take some minutes: the server installs its first updates, they
+hold apt's lock, and apt-get waits up to 20 minutes for it. Give the line that time: if your shell
+stops a command sooner, run the line in the background and read its output until it ends. If
+apt-get still says that it could not get the lock, wait one minute and run the same line again, two
+times at most.
 
 In the second line, your own shell puts the address in place of `$SOURCE` before `ssh` sends the
 line, so the server gets no `$`.
@@ -290,4 +296,5 @@ writing, every command it gives the model is one the installers really take, no 
 a model provider or reads a provider credential, the auth key never stands in an argument, and the
 last step of both jobs is `verify`. Its `PromptThroughSudo` runs each later step through a stand-in
 for `sudo -i`, for root and for a user who is not root, and fails when a part of a step does not run
-as root.
+as root. It also runs the first line of A3 on a stand-in server whose first updates hold apt's lock,
+and fails when the line does not wait for it.

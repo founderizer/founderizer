@@ -74,6 +74,28 @@ def take_line(kit):
             f"python3 {kit}/lifecycle.py may-take {kit} \"$t\" && git -C {kit} merge -q --ff-only \"$t\"")
 LOG = "/root/fleet-install.log"         # INSTALL-PROMPT.md A5
 AUTHKEY = "/root/fleet-authkey"         # INSTALL-PROMPT.md A4: the key on the server, mode 600, removed at the end
+APT_LOCK_WAIT = 1200                    # hubsetup.py APT_LOCK_WAIT: the seconds that an apt-get waits for apt's lock
+# INSTALL-PROMPT.md A3, line 1: git, which the code step needs and which Debian's images do not have. Each apt-get
+# waits for apt's lock as in hub.sh and join.sh: a new server installs its first updates for about 9 minutes after its
+# first start, and they hold the lock. Until 11 November 2026 this step did not wait, so on such a server apt-get
+# stopped at once. The wait is for the lock of dpkg, which `apt-get install` takes. `apt-get update` takes the lock of
+# the package lists, with one try only (apt's pkgAcquire::GetLock), so it can still stop at once in the seconds while
+# the updates of the server read their lists.
+GIT_STEP = ("command -v git >/dev/null 2>&1 || { "
+            f"DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout={APT_LOCK_WAIT} -q update && "
+            f"DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout={APT_LOCK_WAIT} -y -q install git; }}")
+# The time of the git step: the wait of `apt-get install` for the lock of dpkg (one total for its locks, apt's
+# debsystem.cc), and 500 seconds for the work. It ends before Claude Code ends a call to a stdio MCP server that gave no
+# answer and no progress for 30 minutes (CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT), so that the agent gets this server's words.
+GIT_STEP_TIME = APT_LOCK_WAIT + 500
+# What the agent does when a command does not finish in its time (`ssh`'s `late`): a step of install_hub before the
+# start, the start, a join line, whose code works once, and a read of the install log.
+STEP_LATE = ("The install did not start. Wait some minutes, then send install_hub again: each step checks first. If "
+             "this step does not finish again, give the owner this error.")
+START_LATE = "The install can have started: read the install log with install_log before you send install_hub again."
+JOIN_LATE = ("Do not run the join line again: its code works once. Read servers with fleet_read: the machine is there "
+             "when its join got that far. Give the owner what you read.")
+LOG_LATE = "A read of the log changes nothing on the server: send install_log again."
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # Every owner command route of hub.py that is deliberately NOT a tool here, with the reason (OWNER-MCP-BOUNDARY.md
@@ -644,17 +666,20 @@ def ssh_target(args):
     return host, user
 
 
-def ssh(host, user, remote, stdin=None, timeout=120):
+def ssh(host, user, remote, stdin=None, timeout=120, late=""):
     """One command on the server, over the owner's own SSH. The key is `ssh`'s, never this server's: it reads the
     owner's own configuration and agent, exactly as the Mac app's Add server does. `stdin`: an open file whose bytes
-    go to the command's standard input, which is how the Tailscale auth key travels and the only way it travels."""
+    go to the command's standard input, which is how the Tailscale auth key travels and the only way it travels.
+    `late`: what the agent does when the command does not finish in `timeout` seconds. The caller gives these words,
+    because only the caller knows what the command does and what the agent can read after it. Until 11 November 2026
+    each time-out sent the agent to the install log, also for a join, which has no such log."""
     line = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", f"{user}@{host}", remote]
     try:
         done = subprocess.run(line, stdin=stdin or subprocess.DEVNULL, capture_output=True, text=True,
                               timeout=timeout)
     except subprocess.TimeoutExpired:
-        raise Refused(f"the command on {host} did not finish in {timeout} seconds. Nothing was repeated: read the "
-                      f"install log with install_log before you send it again.") from None
+        raise Refused(f"the command on {host} did not finish in {timeout} seconds, and it can still run there. "
+                      f"Nothing was repeated. {late}".rstrip()) from None
     except OSError as e:
         raise Refused(f"ssh could not run on this Mac: {e}") from None
     return {"exit": done.returncode, "out": (done.stdout or "").strip()[-4000:],
@@ -704,14 +729,14 @@ def through_sudo(program):
         for byte in (b" " + data if data.startswith(b"-") else data)) + "'`\""
 
 
-def become_root(host, user, root):
+def become_root(host, user, root, late=""):
     """**The first root step, for a user who is not root: it stops when `sudo` does not let that user become root, with
     sudo's own words** (INSTALL-PROMPT.md A1 and B1), before anything on the server changes. `id -u` changes nothing,
     and it goes through the same `sudo -n -i -- /bin/sh -c` as each later step. Until 11 November 2026 install_hub went
     on through each refused step, and the agent read that the code was not on the server and that the repository
     needed a credential. A status of 255 is SSH's own failure (`man ssh`), which `sudo` and `id` do not give, and it is
-    said as one. The answer of the step, when root answered it."""
-    said = ssh(host, user, as_root(root, "id -u"))
+    said as one. `late`: the caller's words for a time-out (`ssh`). The answer of the step, when root answered it."""
+    said = ssh(host, user, as_root(root, "id -u"), late=late)
     if said["exit"] == 0 and said["out"].splitlines()[-1:] == ["0"]:
         return said
     if said["exit"] == 255:
@@ -731,7 +756,8 @@ def install_hub(args):
     detached. Then `install_log` reads the log and `claim_hub` proves this Mac's address. It stops at its first root
     step when `sudo` does not let the user in (`become_root`), and after each step of the code that fails, with that
     step's words: git that apt-get cannot install, a clone or a fetch that git cannot make, or a move that
-    `lifecycle.py may-take` refuses. So the install never starts with old code."""
+    `lifecycle.py may-take` refuses. So the install never starts with old code. The git step waits for apt's lock
+    (GIT_STEP), and a key step or a start step that fails stops it with its own words too."""
     host, user = ssh_target(args)
     source, keyfile = args.get("source"), args.get("authkey_file")
     if not isinstance(source, str) or not source.strip():
@@ -752,7 +778,8 @@ def install_hub(args):
         raise Refused(f"{key_path} is mode {mode:03o}: other users of this Mac can read the fleet's auth key. Ask the "
                       f"owner for chmod 600 on it first.")
     steps = {}
-    steps["read_machine"] = ssh(host, user, 'id -un; id -u; sed -n "1,2p" /etc/os-release; command -v systemctl')
+    steps["read_machine"] = ssh(host, user, 'id -un; id -u; sed -n "1,2p" /etc/os-release; command -v systemctl',
+                                late=STEP_LATE)
     if steps["read_machine"]["exit"] != 0:
         raise Refused(f"SSH to {user}@{host} failed, as it came: {steps['read_machine']['error'] or 'no output'}. "
                       f"Nothing was changed. Do not try another user, another port or another key: give the owner "
@@ -763,43 +790,56 @@ def install_hub(args):
                       f"Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13. The machine said:\n"
                       f"{steps['read_machine']['out']}")
     if root:
-        steps["root"] = become_root(host, user, root)
-    steps["git"] = ssh(host, user, as_root(root,
-        'command -v git >/dev/null 2>&1 || { DEBIAN_FRONTEND=noninteractive apt-get -q update && '
-        'DEBIAN_FRONTEND=noninteractive apt-get -y -q install git; }'), timeout=600)
+        steps["root"] = become_root(host, user, root, late=STEP_LATE)
+    steps["git"] = ssh(host, user, as_root(root, GIT_STEP), timeout=GIT_STEP_TIME, late=STEP_LATE)
     if steps["git"]["exit"] != 0:
         raise Refused(f"git could not be installed on {host}, so the install did not start. The step said, as it "
                       f"came: {steps['git']['error'] or steps['git']['out'] or 'no output'}. If apt-get could not get "
-                      f"its lock, the server still runs its first updates: send install_hub again in some minutes, "
+                      f"its lock, the server still installs its own updates: send install_hub again in some minutes, "
                       f"because each step checks first.")
     steps["code"] = ssh(host, user, as_root(root,
         f"if test -d {KIT}/.git; then {take_line(KIT)}; "
-        f"else git clone -q -- {shlex.quote(source.strip())} {KIT}; fi"), timeout=600)
+        f"else git clone -q -- {shlex.quote(source.strip())} {KIT}; fi"), timeout=600, late=STEP_LATE)
     if steps["code"]["exit"] != 0:
         raise Refused(f"the code step on {host} failed, so the install did not start. It said, as it came: "
                       f"{steps['code']['error'] or steps['code']['out'] or 'no output'}. If git asked for a password "
                       f"or a user name, the repository address needs a credential that this server does not have: ask "
                       f"the owner for the exact command that their download page gives. If lifecycle.py may-take "
                       f"refused the move, the code on {host} stays where it is: give the owner its reason.")
-    steps["revision"] = ssh(host, user, as_root(root, f"git -C {KIT} rev-parse --short HEAD; ls {KIT}/hub.sh"))
+    steps["revision"] = ssh(host, user, as_root(root, f"git -C {KIT} rev-parse --short HEAD; ls {KIT}/hub.sh"),
+                            late=STEP_LATE)
     if steps["revision"]["exit"] != 0:
         raise Refused(f"the Founderizer code is not on {host}: "
                       f"{steps['revision']['error'] or steps['revision']['out'] or 'no output'}. The repository at "
                       f"that address may not be Founderizer's: ask the owner for the address that their download "
                       f"page gives.")
-    plan = ssh(host, user, as_root(root, f"sh {KIT}/hub.sh --check"), timeout=300)
+    plan = ssh(host, user, as_root(root, f"sh {KIT}/hub.sh --check"), timeout=300, late=STEP_LATE)
     steps["plan"] = plan
     if plan["exit"] != 0:
         raise Refused(f"the installer refused this machine before it changed anything:\n{plan['out']}\n{plan['error']}")
     with open(key_path, "rb") as key:               # the key on standard input, never in an argument or a URL
-        steps["authkey"] = ssh(host, user, as_root(root, f"umask 077; cat > {AUTHKEY}"), stdin=key)
-    steps["authkey_mode"] = ssh(host, user, as_root(root, f"test -s {AUTHKEY} && stat -c %a {AUTHKEY}"))
+        steps["authkey"] = ssh(host, user, as_root(root, f"umask 077; cat > {AUTHKEY}"), stdin=key, late=STEP_LATE)
+    if steps["authkey"]["exit"] != 0:
+        raise Refused(f"the auth key did not reach {host}, so the install did not start. The step said, as it came: "
+                      f"{steps['authkey']['error'] or steps['authkey']['out'] or 'no output'}. A part of the key can "
+                      f"stay in {AUTHKEY} on {host}, which only root can read. Give the owner these words, and send "
+                      f"install_hub again when the cause is gone: each step checks first. If the install is not sent "
+                      f"again, the owner removes that file.")
+    steps["authkey_mode"] = ssh(host, user, as_root(root, f"test -s {AUTHKEY} && stat -c %a {AUTHKEY}"),
+                                late=STEP_LATE)
     if steps["authkey_mode"]["out"].strip() != "600":
         raise Refused(f"the auth key did not reach {host} as a file only root can read "
                       f"({steps['authkey_mode']['out'] or steps['authkey_mode']['error']}). Nothing was started.")
     extra = f" --port {int(args['port'])}" if args.get("port") else ""
     steps["started"] = ssh(host, user, as_root(root,
-        f'setsid sh -c "sh {KIT}/hub.sh{extra} < {AUTHKEY} > {LOG} 2>&1; rm -f {AUTHKEY}" > /dev/null 2>&1 &'))
+        f'setsid sh -c "sh {KIT}/hub.sh{extra} < {AUTHKEY} > {LOG} 2>&1; rm -f {AUTHKEY}" > /dev/null 2>&1 &'),
+        late=START_LATE)
+    if steps["started"]["exit"] != 0:
+        raise Refused(f"the step that starts the install on {host} ended with exit {steps['started']['exit']}. It "
+                      f"said, as it came: {steps['started']['error'] or steps['started']['out'] or 'no output'}. Read "
+                      f"install_log: when it shows no new install, give the owner these words, and send install_hub "
+                      f"again when the cause is gone: each step checks first. Until an install reads it, the auth key "
+                      f"stays in {AUTHKEY} on {host}, which only root can read.")
     return {"host": host, "root_prefix": root or "none", "plan": plan["out"], "steps": steps,
             "next": "The install runs on its own and waits up to 30 minutes for this Mac to claim the hub. Read "
                     "install_log every 20 seconds until it gives a claim code, then call claim_hub with that code "
@@ -814,10 +854,10 @@ def install_log(args):
     host, user = ssh_target(args)
     lines = args.get("lines")
     lines = lines if isinstance(lines, int) and not isinstance(lines, bool) and 1 <= lines <= 400 else 40
-    root = sudo_prefix(ssh(host, user, "id -un; id -u"))
-    got = ssh(host, user, as_root(root, f"tail -n {lines} {LOG}"))
+    root = sudo_prefix(ssh(host, user, "id -un; id -u", late=LOG_LATE))
+    got = ssh(host, user, as_root(root, f"tail -n {lines} {LOG}"), late=LOG_LATE)
     if got["exit"] != 0 and root:
-        become_root(host, user, root)
+        become_root(host, user, root, late=LOG_LATE)
     text = got["out"]
     claim = re.search(r"FLEET_CLAIM=([A-Z2-9-]{12,20})\b", text)
     where = re.search(r"http://(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})/claim", text)
@@ -928,7 +968,7 @@ def add_machine(args):
     mac = args.get("kind") == "mac"
     if args.get("host"):
         host, user = ssh_target(args)
-        reading = ssh(host, user, "id -un; id -u; uname -s")
+        reading = ssh(host, user, "id -un; id -u; uname -s", late="No join line was made.")
         if reading["exit"] != 0:
             raise Refused(f"SSH to {user}@{host} failed, as it came: {reading['error'] or 'no output'}. No join line "
                           f"was made. Do not try another user, another port or another key: give the owner this error.")
@@ -942,7 +982,7 @@ def add_machine(args):
             raise Refused(f"{user} is root on {host}. A Mac joins as the Mac user that will run its agents, and "
                           f"join.sh stops the line of a Mac as root: give that user as ssh_user. No join line was made.")
         if root and not mac:
-            become_root(host, user, root)
+            become_root(host, user, root, late="No join line was made.")
     receipt = command("/ui/servers/join", {"kind": args.get("kind")}, "the join line", args.get("request_id"))
     line = receipt.get("line")
     if not line:
@@ -954,7 +994,8 @@ def add_machine(args):
             "call add_machine again with host and ssh_user (that user), and this server runs it." if mac else
             "Run the line above on that machine as root, or call add_machine again with host and ssh_user, and this "
             "server runs it.") + " The code works once, until expires_at.")
-    done = ssh(host, user, "/bin/sh -c " + shlex.quote(line) if mac else as_root(root, line), timeout=1800)
+    done = ssh(host, user, "/bin/sh -c " + shlex.quote(line) if mac else as_root(root, line), timeout=1800,
+               late=JOIN_LATE)
     if done["exit"] == 0 and not done["out"]:
         then = ("The join did not run: the line printed nothing, so the hub's join script did not come (curl could "
                 "not reach the hub, for example). Its words are in join.error: give them to the owner.")

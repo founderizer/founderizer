@@ -280,6 +280,13 @@ and a tool was taken out of this file's own table, and every check failed naming
   says when a join did not run (a line that printed nothing) or ended with a failure. Until that
   day the agent read a sudo refusal as a missing repository credential, the install started with
   the old code after a refused move, and join.sh stopped each Mac line that this server ran as root.
+  On a new server whose first updates hold apt's lock, the git step waits for the lock, as A3,
+  `hub.sh` and `join.sh` do: the stand-in's `apt-get` holds the lock of dpkg as apt does. Its SSH
+  time-out is longer than that wait, and shorter than the 30 minutes after which Claude Code ends a
+  call to a stdio MCP server that gave no answer. A key step or a start step that fails stops the
+  install with its own words. A command that does not finish in its time says what to do in the
+  words of its tool: a join line, which writes no install log, does not send the agent to
+  `install_log`.
 - **`Refusals`** — a Mac that is not the owner's, a generation that moved, a `team.json` that
   moved under a command, the same `request_id` twice, and a field the hub refuses.
 - **`NoSecret`** — no tool takes a secret, the credential-carrying routes are not tools here, a
