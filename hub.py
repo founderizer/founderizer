@@ -2567,16 +2567,22 @@ def chat_wanted(agent, held):
             and signed_in_now(agent, a.get("runtime")) is not False)
 
 
-def chat_ready_now(agent, alive):
+def chat_ready_now(agent, alive, reads=None):
     """What the app reads as `chat_ready`: True when the agent's owner chat window runs (alive: its helper's window
     list) and its session has its tools, False while its helper starts it, and None when its helper does not start
     one by itself, the agent has no owner chat of its own, or it has no key: a session without a credential lists its
-    tools as no one, so its chat could never be called ready."""
+    tools as no one, so its chat could never be called ready. reads: agent_reads(); without it, the agent reads its
+    own rows."""
     a = agents().get(agent) or {}
-    if a.get("role") not in ("worker", "lead") or not owner_chat(a) or not agent_active(agent) or \
-            "chat_warm" not in helper_features(agent) or not agent_key(agent):
+    if a.get("role") not in ("worker", "lead") or not owner_chat(a) or not agent_active(agent):
         return None
-    return "owner-chat" in (alive or "").split(",") and chat_session_ready(agent)
+    if reads is None:
+        if "chat_warm" not in helper_features(agent) or not agent_key(agent):
+            return None
+        return "owner-chat" in (alive or "").split(",") and chat_session_ready(agent)
+    if "chat_warm" not in reads.features(agent) or agent not in reads.keys:
+        return None
+    return "owner-chat" in (alive or "").split(",") and reads.chat_ready(agent)
 
 
 def fence(agent, tid, context=None):
@@ -3293,7 +3299,7 @@ def turn_ended(agent):
     return float(row["v"]) if row else 0.0
 
 
-def turn_ended_after(agent, ended=None):
+def turn_ended_after(agent, ended=None, reads=None):
     """When the owner sent the newest chat message that this agent had read at the last turn end of its standing
     session, or None: its helper reported no turn end (only the manager's reports them, helper_turn), or it had read no
     chat message of the owner's by then. The turn that took a message sent at or before this time is over, so the apps
@@ -3301,13 +3307,116 @@ def turn_ended_after(agent, ended=None):
     "Thinking" for more than an hour after its turn of 20 seconds (10 November 2026). A later turn can still answer
     it; nothing says that one runs. None too while a usage limit holds the agent: a turn that the limit cut ends as
     every turn does, with its work not done, so its end says nothing, and the apps go on saying "Usage limit" under
-    the message. `ended` asks the same of a turn end that is not kept yet. A read that commits nothing."""
-    ended = turn_ended(agent) if ended is None else ended
-    if not ended or read_row("SELECT 1 FROM agent_limits WHERE agent=? AND ended IS NULL LIMIT 1", (agent,)):
+    the message. `ended` asks the same of a turn end that is not kept yet. A read that commits nothing. reads:
+    agent_reads(), for the turn end and the open limits of every agent; without it, the agent reads its own."""
+    if ended is None:
+        ended = turn_ended(agent) if reads is None else reads.turn_ended(agent)
+    if not ended or (read_row("SELECT 1 FROM agent_limits WHERE agent=? AND ended IS NULL LIMIT 1", (agent,))
+                     if reads is None else agent in reads.limits):
         return None
     row = read_row("SELECT MAX(u.created) AS created FROM ui_requests u JOIN events e ON e.id=u.event_id "
                    "WHERE u.recipient=? AND u.kind='message' AND e.read_at<=?", (agent, ended))
     return row["created"] if row else None
+
+
+AGENT_SEEN = ("last_seen", "alive", "alive_ts", "client", "client_seen")     # what the state shows of an agents row
+
+
+class AgentReads:
+    """What the state reads for each agent, read once for all of them: one read of each table where agent_view reads
+    the rows of one agent. In a copy of the first fleet's database (10 November 2026) its 11 agents made 119 reads in
+    each read of the state, all under the hub's lock, and 10 of them read all of session_credentials, a table that
+    gets a row for each session.
+    rows: {agent: its AGENT_SEEN values}.
+    usage: {agent: its stored usage}.
+    limits: {agent: its newest open limit}.
+    status: {agent: its machine_status row}. data(agent) is that row's data, read from JSON once.
+    jobs and logins: {(agent, runtime): the time of its newest done sign-in}, as finished_sign_in reads them.
+    keys: the agents with a key.
+    chats: {agent: `ready` of its newest live chat credential of this hub generation}, as chat_session_ready reads it,
+    read at the first chat_ready().
+    turns: {agent: its stored turn end}."""
+    def __init__(self):
+        self.rows = {r["name"]: {k: r[k] for k in AGENT_SEEN}
+                     for r in q(f"SELECT name,{','.join(AGENT_SEEN)} FROM agents")}
+        self.usage = {r["name"]: r["data"] for r in q("SELECT name, data FROM agent_usage")}
+        self.limits, self.chats, self.parsed = {}, None, {}
+        for r in q("SELECT * FROM agent_limits WHERE ended IS NULL ORDER BY id DESC"):
+            self.limits.setdefault(r["agent"], r)
+        self.status = {r["agent"]: r for r in q("SELECT agent, data, reported FROM machine_status")}
+        self.jobs = {(r["agent"], r["runtime"]): r["t"] for r in q(
+            "SELECT agent, runtime, MAX(updated) t FROM server_jobs WHERE state='done' AND step='sign_in' AND "
+            "kind IN ('install','prepare') AND agent IS NOT NULL AND runtime IS NOT NULL GROUP BY agent, runtime")}
+        self.logins = {(r["agent"], r["runtime"]): r["t"] for r in q(
+            "SELECT agent, runtime, MAX(updated) t FROM signin_jobs WHERE state='done' GROUP BY agent, runtime")}
+        self.keys = {r["agent"] for r in q("SELECT agent FROM agent_keys")}
+        self.turns = {r["k"][len("turn_ended:"):]: r["v"]
+                      for r in q("SELECT k, v FROM kv WHERE k >= 'turn_ended:' AND k < 'turn_ended;'")}
+
+    def data(self, agent):
+        if agent not in self.parsed:
+            self.parsed[agent] = json.loads(self.status[agent]["data"])
+        return self.parsed[agent]
+
+    def features(self, agent):
+        """helper_features(agent)."""
+        return (self.data(agent).get("features") or []) if agent in self.status else []
+
+    def chat_ready(self, agent):
+        """chat_session_ready(agent). The chat credentials are read at the first call, as chat_session_ready reads them
+        only for an agent whose chat can be ready: session_credentials gets a row for each session."""
+        if self.chats is None:
+            # The order is chat_session_ready's own. The credential route revokes an agent's live chat credentials in
+            # the same transaction in which it writes a new one (helper_session), so an agent has one live chat
+            # credential at most, and this read has nothing to choose between.
+            self.chats = {}
+            for r in q("SELECT agent, ready FROM session_credentials WHERE kind='chat' AND generation=? AND "
+                       "revoked IS NULL ORDER BY created DESC", (kv_get("db_id"),)):
+                self.chats.setdefault(r["agent"], r["ready"])
+        return bool(agent in self.chats and self.chats[agent] is not None)
+
+    def turn_ended(self, agent):
+        """turn_ended(agent)."""
+        return float(self.turns[agent]) if agent in self.turns else 0.0
+
+
+def agent_reads():
+    return AgentReads()
+
+
+def agent_view(name, config, reads=None):
+    """One agent as the state shows it (GET /ui/state). reads: agent_reads(), so that a view of every agent reads each
+    table once; without it, the agent reads its own rows."""
+    if reads is None:
+        row = q1(f"SELECT {','.join(AGENT_SEEN)} FROM agents WHERE name=?", (name,))
+        usage = q1("SELECT data FROM agent_usage WHERE name=?", (name,))
+        seen, used, lim = (dict(row) if row else None), (json.loads(usage["data"]) if usage else None), active_limit(name)
+    else:
+        seen = reads.rows.get(name)
+        used = json.loads(reads.usage[name]) if name in reads.usage else None
+        lim = reads.limits.get(name)
+    return dict(name=name, role=config["role"], runtime=config["runtime"],
+                title=config.get("title"), active=agent_active(name),
+                can=config.get("can", []), usage=used,
+                reports_to=None if config["role"] == "manager" else
+                (config["reports_to"] if config.get("reports_to") in agents() else manager_name()),
+                direct_chat=owner_chat(config),
+                local_model=local_model(config),
+                # What its machine last said about its own provider, so the app shows a signed-out agent its sign-in in
+                # place of its chat: null when the reading is old or a local model needs none.
+                signed_in=None if local_model(config) else signed_in_now(name, config["runtime"], reads),
+                # Owner feature chat_warm: whether its owner chat can answer now, so the app shows "Setting up" in place
+                # of a chat that cannot yet (chat_ready_now).
+                chat_ready=chat_ready_now(name, seen["alive"] if seen else None, reads),
+                # Owner feature manager_server: false while it has no server of its own, so the app's setup of a new
+                # fleet's manager starts with its server.
+                placed=not unplaced(name),
+                # When the owner sent the newest chat message that it had read at its last turn end: its turn that took
+                # a message up to then is over, so the chat stops saying that it works on it (turn_ended_after).
+                turn_ended_after=turn_ended_after(name, reads=reads),
+                limit=dict(since=lim["since"], until=lim["until"], reset_known=bool(lim["reset_known"]),
+                           task=lim["task"]) if lim else None,
+                **(seen or dict.fromkeys(AGENT_SEEN)))
 
 
 def not_acting(receiver, event_id):
@@ -35676,7 +35785,7 @@ def last_login(agent):
     return q1("SELECT * FROM signin_jobs WHERE agent=? ORDER BY id DESC LIMIT 1", (agent,))
 
 
-def signed_in_now(agent, runtime):
+def signed_in_now(agent, runtime, reads=None):
     """Whether that runtime is signed in on the agent's machine: True, False or None when nothing recent says.
 
     **The newest source decides, dated by when it was taken** (live_changes): the machine's reading, at the time it was
@@ -35692,17 +35801,20 @@ def signed_in_now(agent, runtime):
     "Claude Code is signed in on this machine. Its own sign-out comes first.", which is a dead end with the wrong
     reason on it. Unknown is the honest answer, and then the route refuses for the reason that is true or starts
     the sign-in."""
-    said, read_at = machine_said(agent, runtime)
-    done = finished_sign_in(agent, runtime)
+    said, read_at = machine_said(agent, runtime, reads)
+    done = finished_sign_in(agent, runtime, reads=reads)
     if done and done > (read_at or 0) and now() - done <= MACHINE_STALE:
         return True
     return said
 
 
-def finished_sign_in(agent, runtime, installed=False):
+def finished_sign_in(agent, runtime, installed=False, reads=None):
     """When the newest sign-in of that runtime on the agent's machine ended done, or None: a sign-in job, or an
     install or a preparation that ended done at its sign-in step, which the server service reaches only once the
     runtime is installed and signed in (server.py sign_in_step). installed: only those, which also installed it."""
+    if reads is not None and not installed:            # agent_reads(): every agent's, read once
+        job, login = reads.jobs.get((agent, runtime)), reads.logins.get((agent, runtime))
+        return max([t for t in (job, login) if t], default=None)
     job = q1("SELECT MAX(updated) t FROM server_jobs WHERE agent=? AND runtime=? AND state='done' AND step='sign_in' "
              "AND kind IN ('install','prepare')", (agent, runtime))["t"]
     if installed:
@@ -35739,7 +35851,7 @@ def said(reading):
     return untimed({k: v for k, v in reading.items() if k not in ("load", "use")})
 
 
-def machine_said(agent, runtime):
+def machine_said(agent, runtime, reads=None):
     """The machine's own reading with the time it was taken: (True/False/None, read_at or None). read_at is the
     report's arrival less the age its helper gave the reading (`reading_age`), so a reading that was taken before a
     sign-in but arrived after it is older than that sign-in, as it is (live_changes).
@@ -35748,10 +35860,11 @@ def machine_said(agent, runtime):
     wants another account of the same provider — must not be closed by a reading taken before its sign-out, which
     still says "signed in" about the account he is leaving. So `end_signed_in_waits` asks when the machine said it,
     and a reading older than the job's own last step decides nothing."""
-    row = q1("SELECT data, reported FROM machine_status WHERE agent=?", (agent,))
+    row = q1("SELECT data, reported FROM machine_status WHERE agent=?", (agent,)) if reads is None \
+        else reads.status.get(agent)                    # agent_reads(): every agent's, read once
     if not row or now() - row["reported"] > MACHINE_STALE:
         return None, None
-    data = json.loads(row["data"])
+    data = json.loads(row["data"]) if reads is None else reads.data(agent)
     read_at = row["reported"] - reading_age_of(data.get("reading_age"))
     for where in (data.get("runtimes") or {}, {(data.get("runtime") or {}).get("name"): data.get("runtime") or {}}):
         if runtime in where and isinstance(where[runtime], dict):
@@ -37418,33 +37531,8 @@ class Handler(BaseHTTPRequestHandler):
             needs = q("SELECT * FROM needs ORDER BY id")
             needs_read = need_reads() if needs else None    # with no item it reads nothing more, as before
             result["needs"] = None          # its place: a view of rows read here, made after the lock
-            result["agents"] = []
-            for name, config in agents().items():
-                row = q1("SELECT last_seen,alive,alive_ts,client,client_seen FROM agents WHERE name=?", (name,))
-                usage = q1("SELECT data FROM agent_usage WHERE name=?", (name,))
-                lim = active_limit(name)
-                result["agents"].append(dict(name=name, role=config["role"], runtime=config["runtime"],
-                    title=config.get("title"), active=agent_active(name),
-                    can=config.get("can", []), usage=json.loads(usage["data"]) if usage else None,
-                    reports_to=None if config["role"] == "manager" else
-                    (config["reports_to"] if config.get("reports_to") in agents() else manager_name()),
-                    direct_chat=owner_chat(config),
-                    local_model=local_model(config),
-                    # What its machine last said about its own provider, so the app shows a signed-out agent its
-                    # sign-in in place of its chat: null when the reading is old or a local model needs none.
-                    signed_in=None if local_model(config) else signed_in_now(name, config["runtime"]),
-                    # Owner feature chat_warm: whether its owner chat can answer now, so the app shows "Setting up"
-                    # in place of a chat that cannot yet (chat_ready_now).
-                    chat_ready=chat_ready_now(name, row["alive"] if row else None),
-                    # Owner feature manager_server: false while it has no server of its own, so the app's setup of
-                    # a new fleet's manager starts with its server.
-                    placed=not unplaced(name),
-                    # When the owner sent the newest chat message that it had read at its last turn end: its turn that
-                    # took a message up to then is over, so the chat stops saying that it works on it (turn_ended_after).
-                    turn_ended_after=turn_ended_after(name),
-                    limit=dict(since=lim["since"], until=lim["until"], reset_known=bool(lim["reset_known"]),
-                               task=lim["task"]) if lim else None, **(dict(row) if row else
-                    dict(last_seen=None, alive=None, alive_ts=None, client=None, client_seen=None))))
+            agents_read = agent_reads()     # each table once for all the agents
+            result["agents"] = [agent_view(name, config, agents_read) for name, config in agents().items()]
             conf = chat_apps()
             messages = q("SELECT u.*,e.read_at FROM ui_requests u JOIN events e ON e.id=u.event_id "
                          "ORDER BY u.created,u.request_id")
