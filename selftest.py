@@ -8,12 +8,67 @@ Needs nothing but Python. The sealed-handover checks are skipped when `age` is n
 Takes about a minute because it waits for the hub's timers. It tests hub.py only: fleet.py needs
 tmux and real sessions, which is what the pilot itself is for.
 """
-import ast, base64, hashlib, json, os, re, shlex, shutil, socket, subprocess, sys, tempfile, threading, time, uuid
+import ast, atexit, base64, hashlib, json, os, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading
+import time, uuid
 import urllib.error, urllib.parse, urllib.request
+
+
+def guard(folder, fd):
+    """The guard of one run (see GONE below): it waits until every process of that run has ended, which the end of
+    `fd` says, and then removes the run's folder."""
+    while os.read(fd, 4096):
+        pass
+    shutil.rmtree(folder, ignore_errors=True)
+
+
+if sys.argv[1:2] == ["--guard"]:
+    guard(sys.argv[2], int(sys.argv[3]))
+    sys.exit(0)
 
 VERBOSE = "-v" in sys.argv
 KIT = os.path.dirname(os.path.abspath(__file__))
 TMP = tempfile.mkdtemp(prefix="fleet-selftest-")
+
+# No hub of this run and no file of it outlives the run, however it ends (AGENTS.md: a test stops the servers and
+# removes the folders that it made). On 11 November 2026 ten hubs of ended runs still served on this Mac, the oldest
+# for eight days: a run that ended early ("the hub did not start", an exception, a signal) stopped none of its hubs,
+# and a caller that gives up on a run kills it with SIGKILL at its time-out (autopublish.py, releases.py, verify.py,
+# test_publish.py), which no cleanup inside the run survives. So, besides finish() below:
+# - every hub reads LIFE, whose write end only this process holds, and stops itself when that read ends, because
+#   this process is gone (hub.py --parent-pipe);
+# - a guard process reads GONE, whose write ends this process and every hub hold, so that read ends when all of
+#   them have ended, and then it removes TMP. A session of its own keeps a Ctrl-C or a kill of this process group
+#   from reaching it.
+LIFE, LIFE_W = os.pipe()
+GONE, GONE_W = os.pipe()
+subprocess.Popen([sys.executable, os.path.abspath(__file__), "--guard", TMP, str(GONE)], pass_fds=(GONE,),
+                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                 start_new_session=True)
+os.close(GONE)
+HUBS = []           # every hub this run started
+
+
+def finish():
+    """Every hub of this run stopped and ended, and its folder removed: at its last line, and at every early end --
+    "the hub did not start", an exception, a Ctrl-C, a SIGTERM or a SIGHUP. A hub that SIGTERM has not ended in ten
+    seconds gets SIGKILL. A second signal does not cut it short."""
+    for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(number, signal.SIG_IGN)
+    for proc in HUBS:
+        if proc.poll() is None:
+            proc.terminate()
+    for proc in HUBS:
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    shutil.rmtree(TMP, ignore_errors=True)
+
+
+atexit.register(finish)
+for number in (signal.SIGTERM, signal.SIGHUP):          # the default action of both ends the process with no atexit
+    signal.signal(number, lambda got, frame: sys.exit(128 + got))
 
 
 def free_port():
@@ -50,11 +105,13 @@ def start_hub(name, addresses, *flags, agents=None, extra=None):
     path = os.path.join(TMP, f"{name}.json")
     json.dump(team, open(path, "w"))
     proc = subprocess.Popen([sys.executable, os.path.join(KIT, "hub.py"), "--host", "127.0.0.1", "--port", str(port),
-                             "--db", os.path.join(TMP, f"{name}.db"), "--team", path, *flags],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             "--db", os.path.join(TMP, f"{name}.db"), "--team", path, "--parent-pipe", str(LIFE),
+                             *flags],
+                            pass_fds=(LIFE, GONE_W), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             # a home of this run's own: ~/.fleet holds the owner's Google, MCP and GitHub App files,
                             # which are the machine's and not these checks'
                             env=dict(os.environ, HOME=TMP))
+    HUBS.append(proc)
     base = f"http://127.0.0.1:{port}"
     for _ in range(80):
         try:
@@ -1088,6 +1145,6 @@ check("the board counts the calls the machine rule refused, and nothing else",
       b3[-900:])
 proc3.terminate()
 
-shutil.rmtree(TMP, ignore_errors=True)
+finish()
 print(f"{count[0] - len(fails)} of {count[0]} checks passed." + ("" if not fails else f" FAILED: {fails}"))
 sys.exit(1 if fails else 0)

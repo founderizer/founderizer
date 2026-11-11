@@ -34,6 +34,7 @@ import platform
 import re
 import secrets
 import shlex
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -42981,6 +42982,19 @@ def hub_lock(db_path):
     return fd
 
 
+def stop_with_parent(fd):
+    """A hub that a test started (--parent-pipe) stops when that test is gone, however the test ended. A test that its
+    caller kills with SIGKILL at a time-out runs no cleanup of its own, and on 11 November 2026 ten hubs of such runs
+    still served, the oldest for eight days. `fd` is the read end of a pipe whose write end only the test holds, so
+    the read ends when the test has ended, and only then."""
+    try:
+        while os.read(fd, 4096):
+            pass
+    except OSError:
+        pass
+    os.kill(os.getpid(), signal.SIGTERM)        # the same stop as the test's own
+
+
 def main():
     global DB
     # Before the parser, because an update run calls this on the *released* code and must get the same two words
@@ -43007,7 +43021,11 @@ def main():
     ap.add_argument("--chat-apps", help="the chat apps folder with the bridge's key; default: chat-apps next to --db")
     ap.add_argument("--restore", metavar="COPY", help="put a copy of a fleet back on this machine and stop; the "
                                                       "hub service takes it at its next start")
+    ap.add_argument("--parent-pipe", type=int, metavar="FD", help="for a test: the read end of a pipe from the test "
+                                                                  "that started this hub; the hub stops when it closes")
     args = ap.parse_args()
+    if args.parent_pipe is not None:        # first, before this hub takes its records
+        threading.Thread(target=stop_with_parent, args=(args.parent_pipe,), name="parent-pipe", daemon=True).start()
     CFG.update(silence=args.silence, question_wait=args.question_wait, manager_silence=args.manager_silence,
                hook_wait=args.hook_wait, job_wait=args.job_wait,
                request_wait=args.request_wait,
