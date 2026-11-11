@@ -300,7 +300,9 @@ and a tool was taken out of this file's own table, and every check failed naming
   day the agent read a sudo refusal as a missing repository credential, the install started with
   the old code after a refused move, and join.sh stopped each Mac line that this server ran as root.
   On a new server whose first updates hold apt's lock, the git step waits for the lock, as A3,
-  `hub.sh` and `join.sh` do: the stand-in's `apt-get` holds the lock of dpkg as apt does. Its SSH
+  `hub.sh` and `join.sh` do: the stand-in's `apt-get` holds the lock of dpkg as apt does. The git
+  step's `apt-get update`, which tries the lock of the package lists once, gets up to 10 tries, 15
+  seconds apart (since 11 November 2026). The step's SSH
   time-out is longer than that wait, and shorter than the 30 minutes after which Claude Code ends a
   call to a stdio MCP server that gave no answer and no progress. A Linux join line has the time of
   each wait of the join for apt's lock, one after the other, and of its work: join.sh's apt-gets

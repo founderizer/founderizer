@@ -84,6 +84,19 @@ act() {                 # one changing command: in check mode it is only named
     fi
 }
 plan() { [ "$check" = yes ] && printf 'Founderizer:   would %s\n' "$*" || true; }
+# `apt-get update` tries the lock of the package lists once: apt reads DPkg::Lock::Timeout only for the lock of dpkg.
+# The first updates of a new server hold the lock of the lists while they read the lists, so `update` gets up to 10
+# tries, 15 seconds apart. The first 9 say nothing; the words and the exit status of the 10th are the function's.
+# join.sh has the same function.
+apt_update() {
+    update_try=1
+    while [ "$update_try" -lt 10 ]; do
+        if apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" update -q </dev/null >/dev/null 2>&1; then return 0; fi
+        update_try=$((update_try + 1))
+        sleep 15
+    done
+    apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" update -q </dev/null >/dev/null
+}
 
 usage() {
     printf '%s\n' "Usage: sh hub.sh [--check] [--source <git url or path>] [--port N] [--timezone Z]" \
@@ -189,7 +202,7 @@ or 13."
         else
             say "  installing git"
             export DEBIAN_FRONTEND=noninteractive
-            apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" update -q </dev/null >/dev/null
+            apt_update
             apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" install -y -q --no-install-recommends git </dev/null >/dev/null
         fi
     fi
@@ -240,7 +253,7 @@ packages() {
     fi
     say "  installing$missing"
     export DEBIAN_FRONTEND=noninteractive
-    apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" update -q </dev/null >/dev/null
+    apt_update
     # shellcheck disable=SC2086
     apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" install -y -q --no-install-recommends $missing </dev/null >/dev/null
 }

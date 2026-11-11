@@ -1120,11 +1120,19 @@ def vault_user_script(user=VAULT_USER, group=AGENT_GROUP):
 # about 9 minutes after its first boot, and they hold the lock: in the proof run of 5 November 2026 a wait of 5 minutes
 # stopped the vault step of a join, and the same step passed 10 minutes later. hub.sh and join.sh wait as long.
 APT_LOCK_WAIT = 1200
+# `apt-get update` tries the lock of the package lists once: apt reads DPkg::Lock::Timeout only for the lock of dpkg.
+# The first updates of a new server hold the lock of the lists while they read the lists, so `update` gets up to 10
+# tries, 15 seconds apart, as hub.sh's and join.sh's apt_update does: the 10th try comes after the loop, so that its
+# words and its exit status are the step's.
+_UPDATE_ONCE = f"apt-get -o DPkg::Lock::Timeout={APT_LOCK_WAIT} update -q </dev/null >/dev/null"
+APT_UPDATE = f"for try in 1 2 3 4 5 6 7 8 9; do {_UPDATE_ONCE} && break; sleep 15; false; done || {_UPDATE_ONCE}"
 AGE_INSTALL = ("export DEBIAN_FRONTEND=noninteractive\n"
-               f"apt-get -o DPkg::Lock::Timeout={APT_LOCK_WAIT} update -q </dev/null >/dev/null\n"
+               f"{APT_UPDATE}\n"
                f"apt-get -o DPkg::Lock::Timeout={APT_LOCK_WAIT} install -y -q --no-install-recommends age "
                "</dev/null >/dev/null\n")
-AGE_INSTALL_TIME = 2 * APT_LOCK_WAIT + 300     # both of its apt-gets can wait for the lock, then do their work
+# The time of AGE_INSTALL: the wait of its `apt-get install` for the lock of dpkg, the 9 pauses of APT_UPDATE, and the
+# work, with room to spare.
+AGE_INSTALL_TIME = 2 * APT_LOCK_WAIT + 300
 
 
 def vault_key_script(user=VAULT_USER):

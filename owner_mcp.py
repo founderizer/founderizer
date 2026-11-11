@@ -81,15 +81,18 @@ APT_LOCK_WAIT = 1200                    # hubsetup.py APT_LOCK_WAIT: the seconds
 # waits for apt's lock as in hub.sh and join.sh: a new server installs its first updates for about 9 minutes after its
 # first start, and they hold the lock. Until 11 November 2026 this step did not wait, so on such a server apt-get
 # stopped at once. The wait is for the lock of dpkg, which `apt-get install` takes. `apt-get update` takes the lock of
-# the package lists, with one try only (apt's pkgAcquire::GetLock), so it can still stop at once in the seconds while
-# the updates of the server read their lists.
-GIT_STEP = ("command -v git >/dev/null 2>&1 || { "
-            f"DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout={APT_LOCK_WAIT} -q update && "
-            f"DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout={APT_LOCK_WAIT} -y -q install git; }}")
+# the package lists, with one try only (apt's pkgAcquire::GetLock), and the updates of the server hold it while they
+# read their lists: so `update` gets up to 10 tries, 15 seconds apart, as hub.sh's apt_update does. The 10th try comes
+# after the loop, and git is installed only after an update that worked, as before.
+_UPDATE_ONCE = f"DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout={APT_LOCK_WAIT} -q update"
+GIT_STEP = (f"command -v git >/dev/null 2>&1 || {{ {{ for try in 1 2 3 4 5 6 7 8 9; do {_UPDATE_ONCE} && break; "
+            f"sleep 15; false; done || {_UPDATE_ONCE}; }} && DEBIAN_FRONTEND=noninteractive apt-get -o "
+            f"DPkg::Lock::Timeout={APT_LOCK_WAIT} -y -q install git; }}")
 # The time of the git step: the wait of `apt-get install` for the lock of dpkg (one total for its locks, apt's
-# debsystem.cc), and 500 seconds for the work. It ends before Claude Code ends a call to a stdio MCP server that gave no
-# answer and no progress for 30 minutes (CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT), so that the agent gets this server's words
-# also from a client that asks for no progress (keep_call_open).
+# debsystem.cc), and 500 seconds for the work, which holds the 9 pauses of 15 seconds between the tries of `apt-get
+# update` (a try that meets the lock of the lists ends at once). It ends before Claude Code ends a call to a stdio MCP
+# server that gave no answer and no progress for 30 minutes (CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT), so that the agent gets
+# this server's words also from a client that asks for no progress (keep_call_open).
 GIT_STEP_TIME = APT_LOCK_WAIT + 500
 # The time of a join line (add_machine): each wait for apt's lock that a join can make, one after the other, and the
 # work. join.sh's apt-get of the packages that the server does not have and its apt-get of the pending security

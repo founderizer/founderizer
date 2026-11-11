@@ -44,6 +44,19 @@ APT_LOCK_WAIT=1200
 
 say() { printf 'Founderizer: %s\n' "$*"; }
 stop() { printf 'Founderizer join stopped: %s\n' "$*" >&2; exit 1; }
+# `apt-get update` tries the lock of the package lists once: apt reads DPkg::Lock::Timeout only for the lock of dpkg.
+# The first updates of a new server hold the lock of the lists while they read the lists, so `update` gets up to 10
+# tries, 15 seconds apart. The first 9 say nothing; the words and the exit status of the 10th are the function's.
+# hub.sh has the same function.
+apt_update() {
+    update_try=1
+    while [ "$update_try" -lt 10 ]; do
+        if apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" update -q </dev/null >/dev/null 2>&1; then return 0; fi
+        update_try=$((update_try + 1))
+        sleep 15
+    done
+    apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" update -q </dev/null >/dev/null
+}
 
 linux() {
     [ "$(id -u)" = 0 ] || stop "Run the line as root (for example after sudo -i)."
@@ -68,7 +81,7 @@ linux() {
     if [ -n "$missing" ]; then
         say "installing$missing"
         export DEBIAN_FRONTEND=noninteractive
-        apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" update -q </dev/null >/dev/null
+        apt_update
         # shellcheck disable=SC2086
         apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" install -y -q --no-install-recommends $missing </dev/null >/dev/null
     fi

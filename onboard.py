@@ -878,9 +878,9 @@ class Onboarding:
 
         if not missing():
             return "skipped", "All base packages are installed."
-        self.must("export DEBIAN_FRONTEND=noninteractive\napt-get -o DPkg::Lock::Timeout=%d update -q\n"
+        self.must("export DEBIAN_FRONTEND=noninteractive\n%s\n"
                   "apt-get -o DPkg::Lock::Timeout=%d install -y -q --no-install-recommends %s"
-                  % (APT_LOCK_WAIT, APT_LOCK_WAIT, PACKAGES),
+                  % (APT_UPDATE, APT_LOCK_WAIT, PACKAGES),
                   "Package installation", timeout=2 * APT_LOCK_WAIT + 600)
         left = missing()
         if left:
@@ -905,7 +905,7 @@ class Onboarding:
                       "Security update setup")
             if kv(self.root(check)[1]).get("enabled") != "yes":
                 raise StepFailed("Unattended security updates are still off.")
-        self.must("apt-get -o DPkg::Lock::Timeout=%d update -q" % APT_LOCK_WAIT, "Package list update",
+        self.must(APT_UPDATE, "Package list update",
                   timeout=APT_LOCK_WAIT + 300)
         pending, reboot, auto_reboot = self.security_status()
         found, installed = pending, False
@@ -1842,16 +1842,22 @@ echo key=present"""
 # A new server runs its first security updates for about nine minutes after its first start, and they hold apt's lock
 # (the proof run of 5 November 2026): every apt-get here waits that out, as hub.sh, join.sh and hubsetup.py do.
 APT_LOCK_WAIT = 1200
+# `apt-get update` tries the lock of the package lists once: apt reads DPkg::Lock::Timeout only for the lock of dpkg.
+# The first updates of a new server hold the lock of the lists while they read the lists, so `update` gets up to 10
+# tries, 15 seconds apart, as hub.sh's and join.sh's apt_update does: the 10th try comes after the loop, so that its
+# words and its exit status are the step's.
+_UPDATE_ONCE = "apt-get -o DPkg::Lock::Timeout=%d update -q" % APT_LOCK_WAIT
+APT_UPDATE = "for try in 1 2 3 4 5 6 7 8 9; do %s && break; sleep 15; false; done || %s" % (_UPDATE_ONCE, _UPDATE_ONCE)
 
 TAILSCALE_INSTALL = """export DEBIAN_FRONTEND=noninteractive
 if ! command -v tailscale >/dev/null; then
   . /etc/os-release
   curl -fsSL "https://pkgs.tailscale.com/stable/${ID}/${VERSION_CODENAME}.noarmor.gpg" -o /usr/share/keyrings/tailscale-archive-keyring.gpg
   curl -fsSL "https://pkgs.tailscale.com/stable/${ID}/${VERSION_CODENAME}.tailscale-keyring.list" -o /etc/apt/sources.list.d/tailscale.list
-  apt-get -o DPkg::Lock::Timeout=%d update -q
+  %s
   apt-get -o DPkg::Lock::Timeout=%d install -y -q tailscale
 fi
-systemctl enable --now tailscaled""" % (APT_LOCK_WAIT, APT_LOCK_WAIT)
+systemctl enable --now tailscaled""" % (APT_UPDATE, APT_LOCK_WAIT)
 
 # SSH comes in over tailscale0 alone, which the third line allows; the public SSH rule of an earlier executor goes,
 # found by its comment, from the highest number down (hubsetup.firewall_script does the same).

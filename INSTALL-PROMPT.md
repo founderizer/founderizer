@@ -158,15 +158,17 @@ reach the server's port 22, because after the install SSH comes in over the priv
 
 ### A3. Put the Founderizer code on the server
 
-    ssh "$SSHUSER@$HOST" '/bin/sh -c "command -v git >/dev/null 2>&1 || { DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=1200 -q update && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=1200 -y -q install git; }"'
+    ssh "$SSHUSER@$HOST" '/bin/sh -c "command -v git >/dev/null 2>&1 || { { for try in 1 2 3 4 5 6 7 8 9; do DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=1200 -q update && break; sleep 15; false; done || DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=1200 -q update; } && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=1200 -y -q install git; }"'
     ssh "$SSHUSER@$HOST" "/bin/sh -c \"if test -d /root/fleet-kit/.git; then git -C /root/fleet-kit pull -q --ff-only; else git clone -q -- '$SOURCE' /root/fleet-kit; fi\""
     ssh "$SSHUSER@$HOST" '/bin/sh -c "git -C /root/fleet-kit rev-parse --short HEAD; ls /root/fleet-kit/hub.sh"'
 
 On a new server the first line can take some minutes: the server installs its first updates, they
-hold apt's lock, and apt-get waits up to 20 minutes for it. Give the line that time: if your shell
-stops a command sooner, run the line in the background and read its output until it ends. If
-apt-get still says that it could not get the lock, wait one minute and run the same line again, two
-times at most.
+hold apt's lock, and apt-get waits up to 20 minutes for it. `apt-get update` does not wait for the
+lock of the package lists, so the line gives `apt-get update` up to 10 tries, 15 seconds apart, and
+installs git only after an update that worked. Give the line that time: if your shell stops a
+command sooner, run the line in the background and read its output until it ends. If apt-get
+still says that it could not get the lock, wait one minute and run the same line again, two times
+at most.
 
 In the second line, your own shell puts the address in place of `$SOURCE` before `ssh` sends the
 line, so the server gets no `$`.
