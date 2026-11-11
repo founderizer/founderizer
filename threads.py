@@ -226,6 +226,20 @@ def notice_tag(notice, name):
     return found.group(1) if found else None
 
 
+# The words of a command's result that say that it runs on in the background, with its task id, and that a notice
+# of its end will come (Claude Code 2.1.311's own program text, and a subagent's file of 2.1.321, 11 November 2026).
+# A subagent's own file gives such a row no `toolUseResult`, so there the id comes from these words, and only for a
+# call that asked for the background. The result of a command that Claude Code ends with the subagent's answer says
+# that in other words ("it is terminated when you give your final response and no notification can follow that"):
+# no notice of its end comes, so it is no background call here, and it shows as a finished call, as before.
+BACKGROUND_ID = re.compile(r"Command running in background with ID: ([A-Za-z0-9_-]{1,64})")
+BACKGROUND_NOTICE = "You will be notified when it completes"
+# The Claude Code tools with which a session stops a background task of its own, by the task's id (task_id; shell_id in
+# the older ones). Claude Code gives no end notice for a task that the session stopped itself (2.1.321, 11 November
+# 2026), so the result of the stop is that task's end.
+STOP_TOOLS = ("TaskStop", "KillShell", "KillBash")
+
+
 # A fork's own file starts with what its parent had in front of it (Claude Code 2.1.311's own program text, and a
 # fork's files of 2.1.321, 11 November 2026): a `fork-context-ref` row, then a copy of the parent's message that
 # started the fork, with every tool call of that message under its own id, and one user row with a stand-in result
@@ -316,6 +330,11 @@ class Translator:
         self.shells = {}            # Claude: background command, monitor or workflow call -> its task id, until its
                                     # end notice
         self.shell_calls = {}       # Claude: BACKGROUND_TOOLS calls of this session -> the tool's name
+        self.asked = set()          # Claude: Bash calls of this session that asked to run in the background
+        self.stops = {}             # Claude: STOP_TOOLS call of this session -> the id of the task that it stops
+        self.blocks = {}            # Claude: subagent call -> its translator ("child"), how many rows of its file
+                                    # are shown ("shown"), its agent id as its launch gave it ("agent") and as its
+                                    # notices name it ("named"), and the status of its newest end ("status")
         self.turn = False           # Claude and Codex: a turn of the main session runs
         self.ends = 0               # Claude: the turn ends of the main session so far (Helper.interrupt reads it)
         self.delivered = False      # Claude: the session called deliver_result
@@ -371,7 +390,7 @@ class Translator:
     def remaining(self):
         out = self.turn_end("end_turn") if self.ending else []
         for call, agent in sorted(self.pending.items()):
-            out.extend(self.subagent_block(call, agent))
+            out.extend(self.subagent_block(call, agent))        # as far as it got: no end of it was seen
         self.pending.clear()
         # The session is over, and Claude Code stops its background commands when it exits: one with no end notice
         # did not finish. A Codex session's background commands end with it the same way.
@@ -392,12 +411,16 @@ class Translator:
         return out
 
     def made(self, row):
-        made = (self.claude(row) if self.runtime == "claude" else
-                self.codex_app(row) if self.runtime == "codex_app" else self.codex(row))
+        return self.mine(self.claude(row) if self.runtime == "claude" else
+                         self.codex_app(row) if self.runtime == "codex_app" else self.codex(row))
+
+    def mine(self, made):
+        """Records as this translator gives them: a subagent's own carry its starting call as their parent, and
+        their call ids start with it; deeper ones already carry their parent."""
         if not self.prefix:
             return made
         out = []
-        for record in made:     # a subagent's own records; deeper ones already carry their parent
+        for record in made:
             if "parent" not in record:
                 if record["type"] == "session":
                     continue
@@ -407,27 +430,75 @@ class Translator:
             out.append(record)
         return out
 
-    def subagent_block(self, call, agent):
-        """One subagent's records, translated in its own state, placed at the point where its end is recorded.
-        A fixed place keeps the sequence numbers the same when the helper reads the files again.
+    def left_open(self, call):
+        """The end of a background call that got no end of its own in this translator's file: closed as failed, the
+        record that a session's end gives its own (remaining)."""
+        self.open.discard(call)
+        return self.mine([{"type": "tool_call_update", "tool_call_id": call, "status": "failed", "interrupted": False}])
+
+    def stop(self, task):
+        """The end of the background call with this task id, in this translator or in a subagent below it: a session
+        can stop a command that a subagent of it left running."""
+        out = []
+        for call in sorted(c for c, known in self.shells.items() if known == task):
+            del self.shells[call]
+            out.extend(self.left_open(call))
+        for _, block in sorted(self.blocks.items()):
+            out.extend(block["child"].stop(task))
+        return out
+
+    def inside(self):
+        """True while a subagent of this session has background work of its own open in its records: a command that
+        runs on after the subagent's call ended. It is background work of the session (fleet.Helper.background_open)."""
+        return any(b["child"].pending or b["child"].shells or b["child"].inside() for b in self.blocks.values())
+
+    def subagent_block(self, call, agent, until=None, over=False):
+        """The records of a subagent's rows that are not shown yet, translated in the subagent's own state. They are
+        placed where a row of its parent reports the subagent: the result of its call, a notice of it, or the
+        session's end. until: the time of that row. Only the subagent's rows up to that time show there, so the same
+        files give the same records in the same places whenever the helper reads them. A subagent's file can grow
+        after a row that reports it: Claude Code runs a subagent again when background work of its own ends or when
+        a message reaches it (2.1.311's own program text, and runs on 2.1.321, 11 November 2026), and each later
+        notice of the subagent then shows the rows since (notices). A row without a time shows at once, as before.
 
         A subagent is never read inside itself: a call that started this translator's own subagent, or one above it,
         starts none below it. A fork's file has a copy of its starting call (own_rows), and its meta file names that
         call, so the reader found the fork's own file for it and read it inside itself without an end. That error
         took the fork's end with it: the hub held the call for one that ran on, refused the task's first delivery and
-        told the requester that a subagent still ran (two tasks of 9 November 2026)."""
+        told the requester that a subagent still ran (two tasks of 9 November 2026).
+
+        over: the subagent is over for good, because its agent waited for its result or a notice says that it
+        failed or was stopped. Claude Code then stops what the subagent left running (2.1.311: "killing orphaned
+        shell task"), and no row of its file ends those calls, so each closes here as failed (left_open): an async
+        subagent of its own, after that one's rows, and a background command, a monitor or a workflow. Without that
+        end the hub held the call for work that still ran until the session's end: no turn end of the task was then
+        an empty one (plan C9 asked nobody), and a subagent's call cost one refused delivery. A subagent in the
+        background that stopped with the status "completed" is not over in that way: its own background work runs
+        on, Claude Code keeps the subagent for it, and the subagent's file shows the end of that work later."""
         if call in (self.prefix or "").split("/"):
             return []
-        rows = self.children(agent, call) if self.children else None
-        if not rows:
-            return []
-        child = Translator(self.runtime, self.root, self.children, prefix=f"{self.prefix}/{call}" if self.prefix else call)
-        out = []
-        for row in own_rows(rows):
+        rows = (self.children(agent, call) if self.children else None) or []
+        block = self.blocks.get(call)
+        if block is None:
+            if not rows:
+                return []
+            child = Translator(self.runtime, self.root, self.children, prefix=f"{self.prefix}/{call}" if self.prefix else call)
+            block = self.blocks[call] = {"child": child, "shown": 0, "agent": agent, "named": agent, "status": None}
+        child, out = block["child"], []
+        for row in own_rows(rows)[block["shown"]:]:
             ts = when(row.get("timestamp")) if isinstance(row, dict) else None
+            if until is not None and ts is not None and ts > until:
+                break
+            block["shown"] += 1
             out.extend(dict(r, ts=r.get("ts", ts)) for r in child.made(row))
         for sub_call, sub_agent in sorted(child.pending.items()):
-            out.extend(child.subagent_block(sub_call, sub_agent))
+            out.extend(child.subagent_block(sub_call, sub_agent, until, over))
+            out.extend(child.left_open(sub_call) if over else [])
+        for sub_call in sorted(child.shells) if over else []:
+            out.extend(child.left_open(sub_call))
+        if over:
+            child.pending.clear()
+            child.shells.clear()
         return out
 
     def place(self, path):
@@ -441,18 +512,24 @@ class Translator:
 
     # ---- Claude Code transcript lines
     def claude(self, row):
+        kind, out, at = row.get("type"), [], when(row.get("timestamp"))
+        message = row.get("message") if isinstance(row.get("message"), dict) else {}
+        origin = row.get("origin") if isinstance(row.get("origin"), dict) else {}
+        if self.prefix and row.get("isMeta") and kind == "user" and origin.get("kind") == "task-notification":
+            # In a subagent's own file, the notice of the end of its own background work is a row of this form, with
+            # a frame of Claude Code's text before the notice (2.1.321, 11 November 2026). It ends that work in the
+            # subagent's records, and it is nobody's words.
+            return self.notices(text_of(message.get("content")), at)
         if (row.get("isSidechain") and not self.prefix) or row.get("isMeta") or row.get("isCompactSummary") \
                 or row.get("isVisibleInTranscriptOnly"):
             return []
-        kind, out = row.get("type"), []
-        message = row.get("message") if isinstance(row.get("message"), dict) else {}
         if self.ending and not (kind == "assistant" and message.get("id") == self.ending):
             out += self.turn_end("end_turn")        # the first row after the message that ended the turn
         if kind == "queue-operation" and row.get("operation") == "enqueue":
-            return out + self.notices(row.get("content"))
+            return out + self.notices(row.get("content"), at)
         if kind == "attachment":
             attachment = row.get("attachment") if isinstance(row.get("attachment"), dict) else {}
-            return out + (self.notices(attachment.get("prompt")) if attachment.get("type") == "queued_command" else [])
+            return out + (self.notices(attachment.get("prompt"), at) if attachment.get("type") == "queued_command" else [])
         if kind not in ("user", "assistant", "system"):
             return out
         if not self.started and row.get("sessionId"):
@@ -495,7 +572,7 @@ class Translator:
             elif kind == "user" and btype == "text":
                 text = str(block.get("text") or "").strip()
                 if text.startswith("<task-notification>"):     # a background task's end, not the user's words
-                    out.extend(self.notices(text))
+                    out.extend(self.notices(text, at))
                     self.turn = self.turn or self.prefix is None    # an idle session's notice starts a turn
                 elif text.startswith("[Request interrupted by user"):
                     if self.prefix is not None:
@@ -520,11 +597,16 @@ class Translator:
                         out.append({"type": "tool_call_update", "tool_call_id": call, "status": "in_progress",
                                     "background": True, "interrupted": False})
                         continue
-                    out.extend(self.subagent_block(call, agent))
+                    out.extend(self.subagent_block(call, agent, at, over=True))     # its agent waited for it
                 body = text_of(block.get("content")).strip()
                 tool = self.shell_calls.pop(call, None)
                 running = result.get("backgroundTaskId") if tool == "Bash" else result.get("taskId") if tool == "Monitor" \
                     or (tool == "Workflow" and result.get("status") == "async_launched") else None
+                if call in self.asked and not result and tool == "Bash":
+                    # a subagent's file: the id is in the result's own words, when a notice of the end will come
+                    found = BACKGROUND_ID.match(body) if BACKGROUND_NOTICE in body else None
+                    running = found.group(1) if found else None
+                self.asked.discard(call)
                 if isinstance(running, str) and running.strip() and not block.get("is_error"):
                     # A command that runs on in the background, a monitor or a workflow: open until its own end notice,
                     # so that nothing takes its session for one that waits on nothing.
@@ -532,6 +614,13 @@ class Translator:
                     out.append({"type": "tool_call_update", "tool_call_id": call, "status": "in_progress",
                                 "background": True, "interrupted": False, "output": clip(body, OUTPUT)})
                     continue
+                stopped = self.stops.pop(call, None)
+                if stopped and not block.get("is_error"):
+                    # The session stopped a background command, a monitor or a workflow of its own: no notice of that
+                    # end comes, so the call stayed open, and the hub counted a stopped command as work at every turn
+                    # end until the session's end (four commands of three tasks in the fleet's records, 2 to 10
+                    # November 2026). It did not finish: the record that a notice of a stopped task gives.
+                    out.extend(self.stop(stopped))
                 self.open.discard(call)
                 out.append({"type": "tool_call_update", "tool_call_id": call,
                             "status": "failed" if block.get("is_error") else "completed",
@@ -543,21 +632,38 @@ class Translator:
                 out += self.turn_end("end_turn")
         return out
 
-    def notices(self, text):
+    def notices(self, text, ts=None):
         """Async subagents and background commands that ended, by Claude Code's task notices (the first copy of a
-        notice counts). A notice without one of SHELL_ENDS is a monitor's event: its call stays open."""
+        notice counts). A notice without one of SHELL_ENDS is a monitor's event: its call stays open.
+
+        ts: the time of the row that carries the notice. The first notice of a subagent in the background ends its
+        call, after the subagent's rows up to that time. A subagent whose call has ended can run again
+        (subagent_block): a later notice of it gives the rows that it wrote since and its status once more, and
+        nothing when no row came and the status is the same, as for a copy of a notice. Such a notice names the
+        subagent's task, and the call only the first time (2.1.321)."""
         out = []
-        if not (self.pending or self.shells) or "<task-notification>" not in str(text or ""):
+        if not (self.pending or self.shells or self.blocks) or "<task-notification>" not in str(text or ""):
             return out
         for notice in NOTICE.findall(str(text)):
             named = clip(notice_tag(notice, "tool-use-id") or "", 100)
             agents = set(re.findall(r"<task-id>\s*([^<]*?)\s*</task-id>", notice))    # older notices name only agents
-            calls = [named] if named in self.pending else [c for c, a in sorted(self.pending.items()) if a and a in agents]
+            first = [named] if named in self.pending else [c for c, a in sorted(self.pending.items()) if a and a in agents]
+            later = [c for c, b in sorted(self.blocks.items())
+                     if c not in self.pending and (c == named or (b["named"] and b["named"] in agents))]
             state = notice_tag(notice, "status")
             status = "completed" if state == "completed" else "failed"
-            for call in calls:
-                out.extend(self.subagent_block(call, self.pending.pop(call)))
+            for call in first + later:
+                block = self.blocks.get(call)
+                agent = self.pending.pop(call) if call in first else block["agent"]
+                more = self.subagent_block(call, agent, ts, over=status != "completed")
+                if call in later and not more and block["status"] == status:
+                    continue
+                block = self.blocks.get(call)
+                if block:       # a launch that named no agent: its notice does, and the later ones name nothing else
+                    block["named"] = block["named"] or (min(agents) if len(agents) == 1 else None)
+                    block["status"] = status
                 self.open.discard(call)
+                out.extend(more)
                 out.append({"type": "tool_call_update", "tool_call_id": call, "interrupted": False, "status": status})
             if state in SHELL_ENDS:
                 shells = [named] if named in self.shells else [c for c, t in sorted(self.shells.items()) if t in agents]
@@ -587,6 +693,10 @@ class Translator:
         self.open.add(call)
         if name in BACKGROUND_TOOLS:
             self.shell_calls[call] = name           # a result with a task id makes it a background call
+        if name == "Bash" and args.get("run_in_background") is True:
+            self.asked.add(call)
+        if name in STOP_TOOLS:
+            self.stops[call] = str(args.get("task_id") or args.get("shell_id") or "").strip()
         if name == "Workflow":                      # its saved name, else its script's own description
             found = WORKFLOW_DESCRIPTION.search(str(args.get("script") or ""))
             detail = first_line(args.get("name") or (found.group(2) if found else "") or

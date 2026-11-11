@@ -3650,7 +3650,8 @@ class Helper:
 
     def background_open(self, window):
         """True while a session of this window has background work open by its own records: an async subagent or
-        workflow, a background command or a monitor (threads.Translator pending, shells and background). Their records
+        workflow, a background command or a monitor (threads.Translator pending, shells and background), or a command
+        that a subagent of it left running after the subagent's own call ended (inside). Their records
         are their own, and the session's main record file stands still meanwhile, so a screen that reads as a question
         then is no stuck session (the review of 29 October 2026). A window that no feed reads counts as having none:
         the owner chat, and a closed conversation, whose tools are Fleet's only."""
@@ -3660,7 +3661,7 @@ class Helper:
         with tailer.lock:
             translators = [f.translator for f in tailer.feeds.values() if f.name == window]
         # A Codex subagent is a spawn call with its thread that is still open (threads.Translator.codex_activity)
-        return any(t.pending or t.shells or t.background or
+        return any(t.pending or t.shells or t.background or t.inside() or
                    any(thread and call in t.open for call, thread in t.agents.items()) for t in translators)
 
     def stuck_allowed(self, window):
