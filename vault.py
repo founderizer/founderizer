@@ -2,22 +2,17 @@
 """Fleet vault broker for a Linux worker: the store's key and the handover key belong to the vault, not to agents.
 
 The broker runs as its own user (for example fleet-vault). Only that user can read the key of the fleet's own store
-(or the Bitwarden access token) and the age key that opens sealed handovers. Agents run as the worker's user, so they can read neither, and no operation of
-the broker gives them a login: it answers with an outcome, or with a handover that only the receiving machine's
-broker can open. The helper sends only a job number; the broker takes the login, the receiving agent and that
-agent's pinned handover key from the hub's confirmation of the job, never from the request.
+and the age key that opens sealed handovers. Agents run as the worker's user, so they can read neither, and no
+operation of the broker gives them a login: it answers with an outcome, or with a handover that only the receiving
+machine's broker can open. The helper sends only a job number; the broker takes the login, the receiving agent and
+that agent's pinned handover key from the hub's confirmation of the job, never from the request.
 
-A broker opens its logins from one of two stores, which its configuration chooses:
-
-  - **the fleet's own store** (store, store_key): one age-encrypted file on this machine. No Bitwarden account, no
-    organization and no network. A value reaches it only from the central vault, sealed to this broker's pinned key
-    (deposit); its names are listed with  store-list , and  store-init  makes the key and the empty store. The key is
-    an age identity in the broker's state folder, mode 600, which only the vault user can read; an agent never reads
-    the store, the key or a value.
-  - **a Bitwarden Secrets Manager project** (region, token_file, bws, bws_config): what the pilot used. Since the
-    DevOps plan's track B (2 November 2026) no server keeps a Bitwarden token: load_config refuses such a
-    configuration, so an installed program that has one keeps running the old program (fleet-vault-program), and the
-    central vault is the one way a value reaches a server.
+A broker opens its logins from **the fleet's own store** (store, store_key): one age-encrypted file on this machine.
+No account, no organization and no network. A value reaches it only from the central vault, sealed to this broker's
+pinned key (deposit); its names are listed with  store-list , and  store-init  makes the key and the empty store. The
+key is an age identity in the broker's state folder, mode 600, which only the vault user can read; an agent never
+reads the store, the key or a value. It is the only store: Founderizer has no Bitwarden backend any more (11 November
+2026), and load_config refuses a configuration that names a Bitwarden key, so the broker does not start on one.
 
 A broker belongs to a machine and not to one agent: `worker_group` is the group of that machine's agent users, so an
 agent the owner adds later, or one whose OS user changed, reaches it with no change to its configuration. Such a
@@ -28,10 +23,7 @@ that ran one agent, and it still works.
 A Linux broker does handovers. Signing in needs a browser, so it is the Mac vault helper's work (same protocol).
 
 A Linux broker also makes a new login for a confirmed job (create_login): it makes the password, keeps a record
-before its one create call, and answers with the login's name. With the fleet's own store it needs nothing more,
-because that store writes itself. With a Bitwarden project it needs the write setup, which uses the pinned Bitwarden
-SDK library in the broker's own process, because the Bitwarden program takes a new value as a command argument;
-without that setup such a broker only reads, as before.
+before its one save, and answers with the login's name. It needs nothing more, because the store writes itself.
 
 With a curl program in its configuration, a Linux broker also sends one HTTP request for a confirmed job (call_api):
 to the origin of the saved login and with its key, which stays in the broker. It keeps the identity of each request
@@ -41,15 +33,14 @@ Without that key the broker sends no request.
 A Linux broker also gives a session start the API keys that the owner lets the calling agent read (read): the hub
 names them, and the broker reads each value and registers its fingerprints before it gives it to the worker's user.
 
-With the fleet's own store, a Linux broker also takes a key or a login that the owner typed into Founderizer on his
-Mac (deposit): the central vault seals the value to this broker's pinned key, for a grant that the owner signed, the
-hub carries the sealed copy, and the broker opens it, has the hub compare the value's fingerprints with the owner's,
-and saves it under the same reference.
+A Linux broker also takes a key or a login that the owner typed into Founderizer on his Mac (deposit): the central
+vault seals the value to this broker's pinned key, for a grant that the owner signed, the hub carries the sealed copy,
+and the broker opens it, has the hub compare the value's fingerprints with the owner's, and saves it under the same
+reference.
 
-With the fleet's own store, a Linux broker also gives such a delivered secret back (withdraw) when no agent of its
-machine holds it any more: the hub names the reference for one confirmed job, and the broker removes the item only when
-its store says that the owner's vault delivered it, never a login that the owner saved there himself or that this
-vault made.
+A Linux broker also gives such a delivered secret back (withdraw) when no agent of its machine holds it any more: the
+hub names the reference for one confirmed job, and the broker removes the item only when its store says that the
+owner's vault delivered it, never a login that the owner saved there himself or that this vault made.
 
 A broker writes no key into another host: place, which wrote one into an application's .env file or a Kubernetes
 Secret over SSH, left the broker (DevOps plan 0.3). It hands a login over to another machine (handover) only when the
@@ -66,13 +57,13 @@ that the owner took out of the fleet (remove) only while no grant or pool that h
 user (CENTRAL_UNIT), and only root installs or updates it (`hubsetup.py central-vault`): no release reaches it.
 
 Run a copy that the worker's user cannot change (root-owned, outside the worker's checkout), with a root-owned
-configuration, Bitwarden settings and programs, because an agent can change every file in its own checkout:
+configuration and programs, because an agent can change every file in its own checkout:
     python3 /usr/local/lib/fleet-vault/vault.py serve --config /etc/fleet-vault/vault.json
     python3 vault.py unit --config /etc/fleet-vault/vault.json --user fleet-vault --group <worker group>
     python3 /usr/local/lib/fleet-vault/vault.py store-init --config /etc/fleet-vault/vault.json \\
         --user fleet-vault                                       (as root; the fleet's own store, safe to run again)
-    python3 /usr/local/lib/fleet-vault/vault.py sdk-install --config /etc/fleet-vault/vault.json \\
-        --manifest <folder>/vault-sdk.json --project <Bitwarden project UUID>   (as root; Bitwarden's write setup)
+    python3 /usr/local/lib/fleet-vault/vault.py store-list --config /etc/fleet-vault/vault.json
+                                                                 (as the vault user; names only, never a value)
     python3 vault.py unit --central --config /etc/fleet-vault-central/vault.json --group <the hub user's group>
 Protocol 2: one JSON line in, one JSON line out, on a Unix socket. See UI-API.md, "Vault isolation (V3)", and for the
 central vault "the central vault (central_vault)".
@@ -99,7 +90,6 @@ import hashlib
 import json
 import grp
 import os
-import platform
 import pwd
 import re
 import secrets
@@ -120,7 +110,7 @@ import uuid
 
 PROTOCOL = 2
 PROVENANCE = 1          # a locked copy says which handover job and source login made it
-KEYS = {"hub", "age_key", "socket", "age"}                                   # every broker, whatever its store
+KEYS = {"hub", "age_key", "socket", "age"}                                   # every broker
 # agent is the one agent whose vault this is, the form of a machine that ran one agent, and it is optional: a broker
 # that serves the agents of its machine has no agent of its own, and every request of such a broker names its caller
 # (caller()). It can therefore be installed before the machine has its first agent, which is when a Linux machine is
@@ -135,10 +125,16 @@ CALLER_KEYS = {"worker_uid", "worker_group"}
 # machine writes them (hubsetup.py vault --owner-key ... --fleet ...), and nothing the hub sends changes them.
 OWNER_PIN_KEYS = {"owner_keys", "fleet"}
 GROUP_NAME = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
-# The store, all of one group or all of the other: the fleet's own encrypted file on this machine, or a Bitwarden
-# Secrets Manager project. A configuration with both is refused, because then no answer says which one holds a login.
+# The store, both keys: the fleet's own encrypted file on this machine, and the key that opens it. It is the one store
+# that a configuration names.
 STORE_KEYS = {"store", "store_key"}
-BITWARDEN_KEYS = {"region", "token_file", "bws", "bws_config"}
+# The keys of the Bitwarden backend, which is gone (11 November 2026): a Secrets Manager project (region, token_file,
+# bws, bws_config) and its write setup (sdk, sdk_sha256, write_project). A configuration with one of them is refused,
+# so a broker never opens a Bitwarden token, and its store is the fleet's own.
+BITWARDEN_KEYS = {"region", "token_file", "bws", "bws_config", "sdk", "sdk_sha256", "write_project"}
+NO_BITWARDEN = ("Founderizer has no Bitwarden backend any more, so this vault broker does not start: its "
+                "configuration names {keys}. Give it the fleet's own store: store and store_key, made by store-init, "
+                "and no Bitwarden key. Its values come from the central vault.")
 AGENT_NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 CALLER_KEY = re.compile(r"[A-Za-z0-9_-]{43}")          # an agent key (owner API 1.12): 256 bits, base64url
 # The central vault's own operations, beside status: a central vault serves only these, and a machine's broker none.
@@ -148,40 +144,24 @@ OPERATIONS = ("status", "signin", "handover", "probe", "create", "request", "can
               "withdraw") + CENTRAL_OPERATIONS
 ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,59}")         # read: the variable name of an API key, as the hub checks it
 READS = 32                  # read: the most values that one session gets
-# The write setup (create_login): all three keys or none. sdk: the installed library; sdk_sha256: its checksum;
-# write_project: the Bitwarden project of new items (an ID, no secret).
-WRITE_KEYS = {"sdk", "sdk_sha256", "write_project"}
 STORE = 1                           # the format of the fleet's own store
-LOCAL = "local"                     # where an item of that store is: it holds one place and names no project
 REQUEST_KEY = "curl"                # optional (call_api): the curl program that sends a request; without it, none is sent
 PLACE_KEY = "ssh"                   # optional and not used: place left the broker (DevOps plan 0.3); an older
                                     # installer wrote it, so a configuration that has it still loads
-# What ssh says when it failed before the server ran any command: only these prove that nothing was written.
-# What the manifest of an installed library must say: the pinned recipe (vault_sdk_build.py), nothing else.
-SDK_PIN = {"v": 1, "sdk": "2.1.0", "rev": "0520690b9710af7a8b1e47aad776f002f369688f", "crate": "bitwarden-c",
-           "addition_sha256": "43d0eb44d44fd18bdeba6ea9631a25a03bdc07ff2359430c19843aff0b8ace2f",
-           "library": "libbitwarden_c.so", "system": "Linux", "self_test": "passed",
-           "symbols": ["init", "run_command", "free_mem", "fleet_free_string"]}
-JOURNAL = "creates.json"            # beside the token, in the broker's private state folder
-# The fixed sentences of a save, as the Mac vault helper says them. No text repeats a value.
+JOURNAL = "creates.json"            # in the broker's private state folder, beside the store
+# The fixed sentences of a save, as the Mac vault helper says them for its own store. No text repeats a value.
 NOT_SET_UP = "This machine's vault is not set up to save logins."
-SAVE_REFUSED = "Bitwarden refused this save and made nothing."
-SAVE_UNKNOWN = "The vault could not confirm that Bitwarden saved the login. It is not sent again."
+SAVE_REFUSED = "The vault store refused this save and made nothing."
+SAVE_UNKNOWN = "The vault could not confirm that its store saved the login. It is not sent again."
 SAVE_UNREGISTERED = "The login is saved, but the hub did not register it."
 SAVE_CHANGED = "This save was made with other values. It is not made again."
 NO_RECORD = "The vault could not keep its record of this save, so it made nothing."
-NO_WRITE_ACCESS = "Bitwarden refused the write token or its project. Nothing was made."
 NOT_MADE_HERE = "This vault did not make this login for that request, so it does not use it."
-# The same outcomes in the words of the fleet's own store, which names no Bitwarden (says()).
-STORE_REFUSED = "The vault store refused this save and made nothing."
-STORE_UNKNOWN = "The vault could not confirm that its store saved the login. It is not sent again."
-NO_STORE_WRITE = "The vault store could not be opened for a save. Nothing was made."
-STORE_SAVED_ONLY = "A request needs a login that is saved in this fleet's vault, not a handed-over copy. Nothing was sent."
-REQUESTS = "requests.json"          # the requests that this broker started, beside the token too
+REQUESTS = "requests.json"          # the requests that this broker started, in the same folder
 # The fixed sentences of a request (call_api). "Nothing was sent" is said only when the broker knows it. The first
 # five are this broker's own; the Mac vault helper says the other eight in the same words.
 NO_REQUESTS = "This machine's vault is not set up to send requests."
-SAVED_ONLY = "A request needs a login that is saved in Bitwarden, not a handed-over copy. Nothing was sent."
+SAVED_ONLY = "A request needs a login that is saved in this fleet's vault, not a handed-over copy. Nothing was sent."
 BAD_ADDRESS = "This login's address is not one that the vault can send to. Nothing was sent."
 NO_REQUEST_RECORD = "The vault could not keep its record of this request. Nothing was sent."
 NOT_STARTED = "The vault could not start this request. Nothing was sent."
@@ -294,29 +274,22 @@ def load_config(path):
     if isinstance(conf, dict) and "central" in conf:        # the central vault's own form; every other one as before
         return central_config(conf)
     given = set(conf) if isinstance(conf, dict) else set()
-    if given & (BITWARDEN_KEYS | WRITE_KEYS):
-        raise SystemExit("A server keeps no Bitwarden token: this broker's configuration names a Bitwarden project ("
-                         + ", ".join(sorted(given & (BITWARDEN_KEYS | WRITE_KEYS))) + "). Give it the fleet's own "
-                         "store (store, store_key, made by store-init); its values come from the central vault.")
-    stores = [group for group in (STORE_KEYS, BITWARDEN_KEYS) if given & group]
-    if not isinstance(conf, dict) or given - KEYS - CALLER_KEYS - STORE_KEYS - BITWARDEN_KEYS - WRITE_KEYS \
-            - {REQUEST_KEY, PLACE_KEY, "agent"} - OWNER_PIN_KEYS or \
-            (given & OWNER_PIN_KEYS) not in (set(), OWNER_PIN_KEYS) or \
-            not KEYS <= given or not given & CALLER_KEYS or len(stores) != 1 or not stores[0] <= given or \
-            (given & WRITE_KEYS) not in (set(), WRITE_KEYS) or (given & WRITE_KEYS and stores[0] is STORE_KEYS):
+    if given & BITWARDEN_KEYS:          # the one clear refusal of an old configuration: the broker does not start
+        raise SystemExit(NO_BITWARDEN.format(keys=", ".join(sorted(given & BITWARDEN_KEYS))))
+    if not isinstance(conf, dict) or given - KEYS - CALLER_KEYS - STORE_KEYS - {REQUEST_KEY, PLACE_KEY, "agent"} \
+            - OWNER_PIN_KEYS or (given & OWNER_PIN_KEYS) not in (set(), OWNER_PIN_KEYS) or \
+            not KEYS <= given or not given & CALLER_KEYS or not STORE_KEYS <= given:
         raise SystemExit("The vault configuration needs exactly: " + ", ".join(sorted(KEYS)) + "; optionally agent, "
                          "the one agent whose vault it is; who may ask it: " +
-                         " or ".join(sorted(CALLER_KEYS)) + ", or both; and one store: all of " +
-                         ", ".join(sorted(STORE_KEYS)) + " (the fleet's own) or all of " +
-                         ", ".join(sorted(BITWARDEN_KEYS)) + " (a Bitwarden project), never both; for new logins in "
-                         "Bitwarden also all of: " + ", ".join(sorted(WRITE_KEYS)) + "; and for API requests also: "
-                         + REQUEST_KEY + "; and " + PLACE_KEY + " (read and not used), as older installers wrote it")
+                         " or ".join(sorted(CALLER_KEYS)) + ", or both; its one store: " +
+                         " and ".join(sorted(STORE_KEYS)) + " (the fleet's own, made by store-init); optionally the "
+                         "owner's keys: " + " and ".join(sorted(OWNER_PIN_KEYS)) + ", both or neither; for API "
+                         "requests also: " + REQUEST_KEY + "; and " + PLACE_KEY + " (read and not used), as older "
+                         "installers wrote it")
     if "agent" in conf and (not isinstance(conf["agent"], str) or not AGENT_NAME.match(conf["agent"])):
         raise SystemExit("agent must be the Fleet name of the one agent whose vault this is, or be left out")
     if OWNER_PIN_KEYS <= given:
         owner_pin_config(conf)
-    if "region" in conf and conf["region"] not in ("eu", "us"):
-        raise SystemExit("region must be eu or us")
     if not re.fullmatch(r"https?://[^/\s]+", str(conf["hub"])):
         raise SystemExit("hub must be the hub's address, for example http://100.80.1.2:8765")
     uid = conf.get("worker_uid")
@@ -336,43 +309,23 @@ def load_config(path):
         me = pwd.getpwuid(os.getuid())
         if me.pw_name in members.gr_mem or members.gr_gid == me.pw_gid:
             raise SystemExit("worker_group must be the group of the agents' users, never one the vault user is in")
-    for key in ["age_key", "socket", "age"] + sorted((STORE_KEYS | BITWARDEN_KEYS - {"region"}) & given):
+    for key in ("age_key", "socket", "age", "store", "store_key"):
         if not isinstance(conf[key], str) or not os.path.isabs(conf[key]):
             raise SystemExit(f"{key} must be an absolute path")
-    if BITWARDEN_KEYS <= given:
-        unchangeable(conf["bws"], "The Bitwarden CLI")               # the agent cannot swap a program
-        unchangeable(conf["bws_config"], "The Bitwarden settings")   # or point the token at another server
-    unchangeable(conf["age"], "The age program")
+    unchangeable(conf["age"], "The age program")                     # the agent cannot swap a program
     if REQUEST_KEY in conf:             # call_api: the program that gets the key of a request, checked as the other two
         if not isinstance(conf[REQUEST_KEY], str) or not os.path.isabs(conf[REQUEST_KEY]):
             raise SystemExit("curl must be an absolute path")
         unchangeable(conf[REQUEST_KEY], "The curl program")
     if PLACE_KEY in conf and (not isinstance(conf[PLACE_KEY], str) or not os.path.isabs(conf[PLACE_KEY])):
         raise SystemExit("ssh must be an absolute path")        # the program itself is checked when the broker starts
-    if WRITE_KEYS <= set(conf):         # the write setup: its form here; the library itself is checked at the start
-        if not isinstance(conf["sdk"], str) or not os.path.isabs(conf["sdk"]):
-            raise SystemExit("sdk must be an absolute path")
-        if not isinstance(conf["sdk_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", conf["sdk_sha256"]):
-            raise SystemExit("sdk_sha256 must be the SHA-256 of the library: 64 lowercase hex characters")
-        if not isinstance(conf["write_project"], str) or canonical_id(conf["write_project"]) != conf["write_project"]:
-            raise SystemExit("write_project must be the Bitwarden project's UUID, in lower case")
     return conf
 
 
-def backend(conf):
-    """Which store this broker opens: "store", the fleet's own encrypted file on this machine, or "bitwarden"."""
-    return "store" if STORE_KEYS <= set(conf) else "bitwarden"
-
-
-def says(conf, bitwarden, store):
-    """One fixed outcome in the words of the store that this broker uses."""
-    return store if backend(conf) == "store" else bitwarden
-
-
 def state_folder(conf):
-    """The broker's private folder: of its store, or of its Bitwarden token. Its journal and its record of started
-    requests lie there, and only the vault user can read it."""
-    return os.path.dirname(os.path.abspath(conf["store" if backend(conf) == "store" else "token_file"]))
+    """The broker's private folder, which holds its store. Its journal and its record of started requests lie there,
+    and only the vault user can read it."""
+    return os.path.dirname(os.path.abspath(conf["store"]))
 
 
 def canonical_id(value):
@@ -653,27 +606,9 @@ def provenance(text, data, sid):
     return made["source"]
 
 
-def bws_item(conf, sid, token):
-    """One Bitwarden item, inside the broker only: {id, key (its name), value}."""
-    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": pwd.getpwuid(os.getuid()).pw_dir, "BWS_ACCESS_TOKEN": token}
-    r = run([conf["bws"], "--config-file", conf["bws_config"], "--profile", conf["region"], "--output", "json",
-             "secret", "get", sid], None, env)
-    if r is None or r.returncode != 0:
-        # CLI errors can contain its response or the token. Never return either stream.
-        raise Refused("Bitwarden refused this login; check the vault token, project access, region and secret ID")
-    try:
-        item = json.loads(r.stdout)
-        if str(item["id"]).lower() != sid.lower() or not isinstance(item["key"], str) or not item["key"] or \
-                not isinstance(item["value"], str):
-            raise ValueError()
-    except (ValueError, KeyError, TypeError):
-        raise Refused("Bitwarden gave no valid item for this login") from None
-    return item
-
-
 def open_login(conf, ref, task, store):
-    """(the login, its name, its source login), inside the broker only. store: what opens a saved login here (the
-    fleet's own store, or Bitwarden)."""
+    """(the login, its name, its source login), inside the broker only. store: this machine's own store, which opens
+    a saved login (LocalStore)."""
     m = SECRET_REF.fullmatch(ref)
     if m:
         item = store.item(m.group(1))
@@ -694,7 +629,7 @@ def open_login(conf, ref, task, store):
 
 def handover(conf, job):
     """Lock one login for the receiving agent's broker. The answer holds only the locked copy."""
-    store = opened_store(conf)          # a broken vault must not use up the job
+    store = LocalStore(conf)            # a broken vault must not use up the job
     read_private(conf["age_key"], "handover key")
     confirmed = confirm_job(conf, job, "handover")
     owner_pinned(conf, confirmed)       # DevOps plan 0.3: a recipient that the owner signed, and no other
@@ -718,7 +653,7 @@ def read(conf, purpose=None):
     before it gives it, so that the hub masks it in texts. The worker's user may read exactly these values. A value
     that the broker cannot read or protect is left out, and its name is in missing. purpose: "check" or "session", which
     the hub is told: it gives no key to a session of an agent whose Shell box is off (support plan F1)."""
-    store = opened_store(conf)
+    store = LocalStore(conf)
     code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}/read",
                      {"for": purpose} if purpose in ("check", "session") else {})
     found = data.get("secrets") if isinstance(data, dict) else None
@@ -748,7 +683,7 @@ def probe(conf, job):
     """Which logins of the agent's profile this vault can open (owner API 1.9): the hub names them for one probe job.
     The answer has fixed codes only: no part of a login leaves the broker."""
     try:
-        store = opened_store(conf)
+        store = LocalStore(conf)
     except Refused:
         store = None                    # a vault without its key or its store opens nothing, and says so per login
     code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}", {"job": job, "kind": "probe"})
@@ -783,8 +718,6 @@ def deposit(conf, number):
     key, and the hub compares the value's fingerprints with the ones that the owner's vault registered under that
     reference before anything is saved. It is saved under the same reference, so `bws://<id>` names one value in every
     vault of the fleet, and the answer holds no part of it."""
-    if backend(conf) != "store":
-        raise Refused("this machine's vault opens a Bitwarden project, so it takes no delivered secret")
     store = LocalStore(conf)            # a store that does not open refuses before the hub gives the copy
     read_private(conf["age_key"], "handover key")
     code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}", {"job": number, "kind": "deposit"})
@@ -819,8 +752,6 @@ def withdraw(conf, number):
     names the reference. Only an item that a deposit saved is removed: a login that the owner saved here himself, or
     that this vault made, is refused, because the hub's catalog is not where it came from. "absent" when the store
     has no such item, so a withdrawal that is asked again ends the same way."""
-    if backend(conf) != "store":
-        raise Refused("this machine's vault opens a Bitwarden project, so it holds no delivered secret")
     store = LocalStore(conf)            # a store that does not open refuses before the hub's job is used
     code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}", {"job": number, "kind": "withdraw"})
     if code != 200 or not isinstance(data, dict) or data.get("ok") is not True or data.get("job") != number \
@@ -836,53 +767,7 @@ def withdraw(conf, number):
     return {"ok": True, "v": PROTOCOL, "withdrawal": number, "login": ref.lower(), "removed": removed}
 
 
-def probe_one(conf, ref, token):
-    def result(state, reason):
-        return {"login": ref, "state": state, "reason": reason}
-    if not token:
-        return result("not_readable", "no_token")
-    m = SECRET_REF.fullmatch(ref)
-    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": pwd.getpwuid(os.getuid()).pw_dir, "BWS_ACCESS_TOKEN": token}
-    try:
-        r = subprocess.run([conf["bws"], "--config-file", conf["bws_config"], "--profile", conf["region"], "--output",
-                            "json", "secret", "get", m.group(1)], capture_output=True, text=True, timeout=30, env=env)
-    except subprocess.TimeoutExpired:
-        return result("not_readable", "timeout")
-    except (OSError, subprocess.SubprocessError, UnicodeError):
-        return result("not_readable", "error")
-    if r.returncode != 0:               # the CLI's text is only searched, never kept or shown
-        text = (r.stdout + r.stderr).lower()
-        return result("not_readable", "not_found" if "404" in text or "not found" in text else
-                      "no_access" if any(w in text for w in ("401", "403", "unauthorized", "forbidden")) else "error")
-    try:
-        item = json.loads(r.stdout)
-        value = json.loads(item["value"])
-        good = str(item["id"]).lower() == m.group(1).lower() and isinstance(value, dict) and \
-            isinstance(value.get("username", ""), str) and isinstance(value.get("password"), str) and value["password"]
-    except (ValueError, KeyError, TypeError):
-        good = False
-    return result("readable", "ok") if good else result("not_readable", "bad_format")
-
-
-# ---------------------------------------------------------------- the two stores
-
-class BitwardenStore:
-    """A Bitwarden Secrets Manager project, read with the CLI and this broker's own access token. The token is read
-    for one request and stays in this process and its children."""
-
-    def __init__(self, conf):
-        self.conf = conf
-        self.token = read_private(conf["token_file"], "token").strip()
-
-    def item(self, sid):
-        return bws_item(self.conf, sid, self.token)
-
-    def probe(self, ref):
-        return probe_one(self.conf, ref, self.token)
-
-    def writer(self, refusal):
-        return reach(self.conf, self.token, refusal)
-
+# ---------------------------------------------------------------- the fleet's own store
 
 def plain_values(value):
     """The secret values inside one stored item, for the check that the locked store holds none of them: the password
@@ -898,7 +783,7 @@ def plain_values(value):
 
 class LocalStore:
     """The fleet's own store: the owner's logins and keys in one file on this machine, which the agents' user can
-    neither read nor open. No Bitwarden account, no organization and no network.
+    neither read nor open. No account, no organization and no network.
 
     The file holds {"v": 1, "items": {id: {key, value, note, made_at}}} — an item of the shape that the rest of the
     broker already reads — encrypted with the configured age program (X25519 and ChaCha20-Poly1305) to the public
@@ -1049,7 +934,7 @@ class LocalStore:
         return dict(found, id=str(sid).lower())
 
     def probe(self, ref):
-        """Can this vault open this login? The fixed codes of a probe, as Bitwarden's: no part of a login leaves."""
+        """Can this vault open this login? The fixed codes of a probe: no part of a login leaves."""
         def result(state, reason):
             return {"login": ref, "state": state, "reason": reason}
         try:
@@ -1064,11 +949,8 @@ class LocalStore:
             good = False
         return result("readable", "ok") if good else result("not_readable", "bad_format")
 
-    # What create() asks of a store that writes. This store is one place, so it takes a project and names none.
-    def writer(self, refusal):
-        return self, LOCAL
-
-    def named(self, name, project, organization):
+    # What create() asks of the store for a new login: one save, and a look-up by its name and its mark.
+    def named(self, name):
         """The ids of the items with exactly this name."""
         return sorted(i for i, x in self.opened().items() if x["key"] == name)
 
@@ -1076,10 +958,10 @@ class LocalStore:
         items = self.opened()
         return {i: items[i]["note"] for i in ids if i in items}
 
-    def create(self, name, value, note, project, organization):
+    def create(self, name, value, note):
         """Exactly one save: ("created", id), or ("refused", None) when nothing was made. The store is one file on
         this machine, which is made complete beside the old one and then takes its place, so a save that fails leaves
-        the store as it was and no outcome is unknown."""
+        the store as it was."""
         try:
             return "created", self.add(name, value, note)
         except Refused:
@@ -1089,21 +971,8 @@ class LocalStore:
         """The broker's own new item, read again: its values are fingerprinted from the store, not from memory."""
         return check_login(self.item(item)["value"])
 
-    def close(self):
-        """Nothing is held open: every read and every save opens the file itself."""
-
-
-def opened_store(conf):
-    """What opens this broker's logins, read for one request: the fleet's own store, or the Bitwarden project of this
-    broker's token. A store that does not open refuses here, before the hub's job is used up."""
-    return LocalStore(conf) if backend(conf) == "store" else BitwardenStore(conf)
-
 
 # ---------------------------------------------------------------- new logins (create_login)
-
-class Provider(Exception):
-    """Bitwarden, or its library, gave no good answer. The text of an answer is never kept or passed on."""
-
 
 def sync_folder(path):
     """Make a new name in this folder safe against a loss of power: the file's own sync does not keep its name."""
@@ -1114,150 +983,12 @@ def sync_folder(path):
         os.close(fd)
 
 
-def sha256_file(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def library_problem(conf):
-    """None when the configured library is the installed one: on a path that the worker cannot change, and with the
-    checksum that the configuration names. Else the reason in one sentence."""
-    try:
-        unchangeable(conf["sdk"], "The Bitwarden library")
-        if sha256_file(conf["sdk"]) != conf["sdk_sha256"]:
-            return "the Bitwarden library is not the one that the configuration names"
-    except SystemExit as e:
-        return str(e)
-    except OSError:
-        return "the Bitwarden library cannot be read"
-    return None
-
-
-class Sdk:
-    """The Bitwarden SDK in this process: the pinned library from its protected path. The token and a new value go to
-    it in memory only; no program argument, no environment variable and no file has them. `library`: a stand-in with
-    the same four functions, for tests."""
-    def __init__(self, path, region, library=None):
-        import ctypes
-        self.ctypes, self.client = ctypes, None
-        lib = library
-        if lib is None:
-            lib = ctypes.CDLL(path)
-            lib.init.restype, lib.init.argtypes = ctypes.c_void_p, [ctypes.c_char_p]
-            lib.run_command.restype, lib.run_command.argtypes = ctypes.c_void_p, [ctypes.c_char_p, ctypes.c_void_p]
-            lib.free_mem.restype, lib.free_mem.argtypes = None, [ctypes.c_void_p]
-            lib.fleet_free_string.restype, lib.fleet_free_string.argtypes = None, [ctypes.c_void_p]
-        self.lib = lib
-        domain = "bitwarden.eu" if region == "eu" else "bitwarden.com"
-        self.client = lib.init(json.dumps({"apiUrl": f"https://api.{domain}", "identityUrl": f"https://identity.{domain}",
-                                           "userAgent": "Fleet Vault", "deviceType": "SDK"}).encode())
-        if not self.client:
-            raise Provider()
-
-    def answer(self, command):
-        """The SDK's answer to one command as an object, or None: no answer, or one that cannot be read. The
-        answer's memory is cleared and freed by the library's own function."""
-        raw = self.lib.run_command(json.dumps(command).encode(), self.client)
-        if not raw:
-            return None
-        try:
-            data = self.ctypes.string_at(raw)
-            reply = json.loads(data.decode()) if len(data) <= 1 << 20 else None
-        except (ValueError, UnicodeError):
-            reply = None
-        finally:
-            self.lib.fleet_free_string(raw)
-        return reply if isinstance(reply, dict) else None
-
-    def close(self):
-        if self.client:
-            self.lib.free_mem(self.client)
-            self.client = None
-
-
-class Items:
-    """The Bitwarden calls of a new login, after sign-in with this broker's token (the calls of the Mac vault)."""
-    def __init__(self, sdk, token):
-        self.sdk = sdk
-        try:
-            self.command({"loginAccessToken": {"accessToken": token}})
-        except Provider:
-            sdk.close()
-            raise
-
-    def command(self, command):
-        reply = self.sdk.answer(command)
-        if not reply or reply.get("success") is not True or not isinstance(reply.get("data"), dict):
-            raise Provider()
-        return reply["data"]
-
-    def organization(self, project):
-        """The organization of the project, which also proves that the token reaches the project."""
-        data = self.command({"projects": {"get": {"id": project}}})
-        if canonical_id(str(data.get("id")).lower()) != project or not canonical_id(str(data.get("organizationId")).lower()):
-            raise Provider()
-        return str(data["organizationId"]).lower()
-
-    def named(self, name, project, organization):
-        """The IDs of the project's items with exactly this name."""
-        rows = self.command({"secrets": {"list": {"organizationId": organization}}}).get("data")
-        if not isinstance(rows, list):
-            raise Provider()
-        found = []
-        for row in rows:
-            if not isinstance(row, dict) or not canonical_id(str(row.get("id")).lower()) or \
-                    not isinstance(row.get("key"), str) or not isinstance(row.get("projectIds"), list):
-                raise Provider()
-            if row["key"] == name and project in [str(x).lower() for x in row["projectIds"]]:
-                found.append(str(row["id"]).lower())
-        return found
-
-    def notes(self, ids):
-        rows = self.command({"secrets": {"getByIds": {"ids": ids}}}).get("data")
-        if not isinstance(rows, list) or not all(isinstance(r, dict) and isinstance(r.get("id"), str)
-                                                 and isinstance(r.get("note"), str) for r in rows):
-            raise Provider()
-        return {r["id"].lower(): r["note"] for r in rows}
-
-    def create(self, name, value, note, project, organization):
-        """Exactly one create call: ("created", id), ("refused", None) or ("unknown", None). Only an answer of the
-        server with a 4xx status proves that nothing was made; no answer, an answer that cannot be read and every
-        other error leave the outcome unknown. The error text is never passed on."""
-        reply = self.sdk.answer({"secrets": {"create": {"organizationId": organization, "key": name, "value": value,
-                                                        "note": note, "projectIds": [project]}}})
-        if not reply:
-            return "unknown", None
-        if reply.get("success") is True:
-            made = canonical_id(str((reply.get("data") or {}).get("id")).lower()) if isinstance(reply.get("data"), dict) else None
-            return ("created", made) if made else ("unknown", None)
-        refused = re.match(r"Received error message from server: \[4[0-9]{2}[ \]]", str(reply.get("errorMessage") or ""))
-        return ("refused", None) if refused else ("unknown", None)
-
-    def login(self, item):
-        """The broker's own new item, read again: its values are fingerprinted from Bitwarden, not from memory."""
-        data = self.command({"secrets": {"get": {"id": item}}})
-        if str(data.get("id")).lower() != item or not isinstance(data.get("value"), str):
-            raise Provider()
-        return check_login(data["value"])
-
-    def close(self):
-        self.sdk.close()
-
-
-def open_items(conf, token):
-    """Sign in with the broker's token through the pinned library. Raises Provider when that fails."""
-    return Items(Sdk(conf["sdk"], conf["region"]), token)
-
-
 class Journal:
-    """This broker's record of every new login that it was asked to make, in its private state folder. Bitwarden has
-    no create that is safe to repeat, and a look-up that finds nothing does not prove that an earlier create failed.
-    So the journal decides: a request_id gets a create call only while it has no record, the record is kept before
-    the call, and a save with an unknown outcome is only looked for by its mark. No record is ever dropped. One
-    exclusive lock, held for the life of the broker, gives the journal to one process."""
+    """This broker's record of every new login that it was asked to make, in its private state folder. A broker can
+    end between its one save and the record of what came of it, and a look-up that finds nothing does not prove that
+    an earlier save failed. So the journal decides: a request_id gets a create call only while it has no record, the
+    record is kept before the call, and a save with an unknown outcome is only looked for by its mark. No record is
+    ever dropped. One exclusive lock, held for the life of the broker, gives the journal to one process."""
     LIMIT, RESERVE = 4 * 1024 * 1024, 256
     STATES = ("creating", "created", "registered", "unknown", "failed", "discarded")
     FIELDS = {"request_id", "title", "hub", "db", "state", "login", "started_at", "updated_at", "binding", "mark"}
@@ -1406,91 +1137,66 @@ def new_password(length=24):
     raise Refused("the vault could not make a password")
 
 
-def reach(conf, token, refusal):
-    """(the Bitwarden calls, the project's organization): sign-in with the token, and the project that it must
-    reach. Nothing is made here."""
-    try:
-        items = open_items(conf, token)
-    except (Provider, OSError, AttributeError):
-        raise Refused(refusal) from None
-    try:
-        return items, items.organization(conf["write_project"])
-    except Provider:
-        items.close()
-        raise Refused(refusal) from None
-
-
 def create(conf, job):
-    """create_login: one new login for a confirmed job of the calling agent, with a password that this broker makes.
-    The answer is the login's name, or one fixed sentence. `unknown` says that the item can exist: the same request
-    again only looks for it by its mark, or finishes the hub's steps, and never sends a second create call."""
+    """create_login: one new login for a confirmed job of the calling agent, with a password that this broker makes,
+    saved in this machine's own store. The answer is the login's name, or one fixed sentence. `unknown` says that the
+    item can exist: the same request again only looks for it by its mark, or finishes the hub's steps, and never makes
+    a second save."""
     def unknown(text):
         return {"ok": False, "v": PROTOCOL, "unknown": True, "error": text}
     journal = conf.get("_journal")
     if journal is None:                 # the machine's own setup comes first: without it, nothing is asked
         raise Refused(NOT_SET_UP)
-    store = opened_store(conf)
+    store = LocalStore(conf)            # a store that does not open refuses here: no job is used and nothing is made
     made = confirm_create(conf, job)
-    project = conf.get("write_project", LOCAL)
-    record, items = journal.get(made["request_id"]), None
-    try:
-        if record is not None and record["binding"] != made["binding"]:
-            raise Refused(SAVE_CHANGED)
-        if record is None:
-            # Sign-in and the project come before the password and the record: a failure here made nothing.
-            items, organization = store.writer(says(conf, NO_WRITE_ACCESS, NO_STORE_WRITE))
-            value = json.dumps({"username": made["username"], "password": new_password(), "url": made["url"]},
-                               sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-            now = journal.clock()
-            record = {"request_id": made["request_id"], "title": made["label"], "hub": conf["hub"], "db": made["db"],
-                      "state": "creating", "login": None, "started_at": now, "updated_at": now,
-                      "binding": made["binding"], "mark": made["mark"]}
-            journal.begin(record)       # kept before the call
-            try:
-                outcome, item = items.create(made["label"], value, made["mark"], project, organization)
-            except Exception:           # the call can have gone out: an error here proves nothing
-                outcome, item = "unknown", None
-            del value
-            # A record that stays `creating` in the file becomes `unknown` at the next start.
-            journal.change(record, state={"created": "created", "refused": "failed"}.get(outcome, "unknown"),
-                           login=f"bws://{item}" if outcome == "created" else None)
-        elif record["state"] == "unknown":
-            # Only looked for by its mark. An item that is not found leaves the record: the first call can still arrive.
-            try:
-                items, organization = store.writer(says(conf, SAVE_UNKNOWN, STORE_UNKNOWN))
-                ids = items.named(record["title"], project, organization)
-                notes = items.notes(ids) if ids else {}
-            except (Refused, Provider):
-                return unknown(says(conf, SAVE_UNKNOWN, STORE_UNKNOWN))
-            found = next((i for i in sorted(ids) if notes.get(i) == record["mark"]), None)
-            if found:
-                journal.change(record, state="created", login=f"bws://{found}")
-        if record["state"] in ("failed", "discarded"):
-            raise Refused(says(conf, SAVE_REFUSED, STORE_REFUSED))
-        if record["state"] not in ("created", "registered") or not record["login"]:
-            return unknown(says(conf, SAVE_UNKNOWN, STORE_UNKNOWN))
-        if record["state"] == "created":
-            # The hub learns the name and gets the fingerprints before the helper gets the answer. The item exists
-            # now, so every failure here stays unknown: the same request again finishes these steps.
-            try:
-                if items is None:
-                    items, _ = store.writer(SAVE_UNREGISTERED)
-                code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}/created", {"job": job, "login": record["login"]})
-                salts = data.get("fingerprint_salts") if isinstance(data, dict) else None
-                if code != 200 or data.get("ok") is not True or data.get("job") != job or data.get("login") != record["login"] \
-                        or not isinstance(salts, dict) or set(salts) != {"password", "totp"} \
-                        or not all(re.fullmatch(r"[0-9a-f]{32}", str(v)) for v in salts.values()):
-                    return unknown(SAVE_UNREGISTERED)
-                protect(conf, {"job": job, "fingerprint_salts": salts}, items.login(record["login"][6:]))
-                journal.change(record, must=True, state="registered")
-            except Refused as e:
-                return unknown(str(e) if "agent's key" in str(e) else SAVE_UNREGISTERED)
-            except Provider:
+    record = journal.get(made["request_id"])
+    if record is not None and record["binding"] != made["binding"]:
+        raise Refused(SAVE_CHANGED)
+    if record is None:
+        value = json.dumps({"username": made["username"], "password": new_password(), "url": made["url"]},
+                           sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        now = journal.clock()
+        record = {"request_id": made["request_id"], "title": made["label"], "hub": conf["hub"], "db": made["db"],
+                  "state": "creating", "login": None, "started_at": now, "updated_at": now,
+                  "binding": made["binding"], "mark": made["mark"]}
+        journal.begin(record)           # kept before the call
+        try:
+            outcome, item = store.create(made["label"], value, made["mark"])
+        except Exception:               # the save can have been made: an error here proves nothing
+            outcome, item = "unknown", None
+        del value
+        # A record that stays `creating` in the file becomes `unknown` at the next start.
+        journal.change(record, state={"created": "created", "refused": "failed"}.get(outcome, "unknown"),
+                       login=f"bws://{item}" if outcome == "created" else None)
+    elif record["state"] == "unknown":
+        # Only looked for by its mark. An item that is not found leaves the record, and the request gets no second save.
+        try:
+            ids = store.named(record["title"])
+            notes = store.notes(ids) if ids else {}
+        except Refused:
+            return unknown(SAVE_UNKNOWN)
+        found = next((i for i in sorted(ids) if notes.get(i) == record["mark"]), None)
+        if found:
+            journal.change(record, state="created", login=f"bws://{found}")
+    if record["state"] in ("failed", "discarded"):
+        raise Refused(SAVE_REFUSED)
+    if record["state"] not in ("created", "registered") or not record["login"]:
+        return unknown(SAVE_UNKNOWN)
+    if record["state"] == "created":
+        # The hub learns the name and gets the fingerprints before the helper gets the answer. The item exists
+        # now, so every failure here stays unknown: the same request again finishes these steps.
+        try:
+            code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}/created", {"job": job, "login": record["login"]})
+            salts = data.get("fingerprint_salts") if isinstance(data, dict) else None
+            if code != 200 or data.get("ok") is not True or data.get("job") != job or data.get("login") != record["login"] \
+                    or not isinstance(salts, dict) or set(salts) != {"password", "totp"} \
+                    or not all(re.fullmatch(r"[0-9a-f]{32}", str(v)) for v in salts.values()):
                 return unknown(SAVE_UNREGISTERED)
-        return {"ok": True, "v": PROTOCOL, "job": job, "login": record["login"]}
-    finally:
-        if items is not None:
-            items.close()
+            protect(conf, {"job": job, "fingerprint_salts": salts}, store.login(record["login"][6:]))
+            journal.change(record, must=True, state="registered")
+        except Refused as e:
+            return unknown(str(e) if "agent's key" in str(e) else SAVE_UNREGISTERED)
+    return {"ok": True, "v": PROTOCOL, "job": job, "login": record["login"]}
 
 
 # ---------------------------------------------------------------- API requests (call_api)
@@ -1784,11 +1490,11 @@ def send(conf, job):
     calls = conf.get("_requests")
     if calls is None:                   # the machine's own setup comes first: without it, nothing is asked
         raise Refused(NO_REQUESTS)
-    store = opened_store(conf)          # a broken vault must not use up the job
+    store = LocalStore(conf)            # a broken vault must not use up the job
     confirmed = confirm_job(conf, job, "request")
     call = request_of(confirmed)
     if not SECRET_REF.fullmatch(confirmed["login"]):
-        raise Refused(says(conf, SAVED_ONLY, STORE_SAVED_ONLY))
+        raise Refused(SAVED_ONLY)
     # What a cancel names: the key that came with the request (its checksum only), the agent, and the hub's
     # generation, task and attempt.
     scope = (hashlib.sha256(conf["agent_key"].encode()).hexdigest(), conf["agent"], call["db"], call["task"], call["attempt"])
@@ -2367,16 +2073,16 @@ def handle(conf, line, uid):
     if op in CENTRAL_OPERATIONS:        # and a machine's broker none of the central vault's
         raise Refused("unknown operation")
     if op == "status":
-        status = {"ok": True, "v": PROTOCOL, "agent": conf.get("agent"), "store": "user", "backend": backend(conf),
+        # backend: the store that this broker opens, which is always the fleet's own now. fleet.py's doctor and the
+        # Mac app read the field, so it stays. The fleet's own store takes a secret that the owner delivers (deposits),
+        # and gives it back when no agent of the machine holds it (withdrawals).
+        status = {"ok": True, "v": PROTOCOL, "agent": conf.get("agent"), "store": "user", "backend": "store",
                   "user": pwd.getpwuid(os.getuid()).pw_name, "recipient": recipient(conf), "callers": True,
-                  "source": conf.get("_source")}
-        if conf.get("_journal") is not None:        # this broker can make a login: its own store, or the write setup
+                  "source": conf.get("_source"), "deposits": True, "withdrawals": True}
+        if conf.get("_journal") is not None:        # this broker can make a login: its record of saves is open
             status["creates"] = True
         if conf.get("_requests") is not None:       # only with a curl program: this broker can send a request
             status["requests"] = True
-        if backend(conf) == "store":                # the fleet's own store takes a secret the owner delivers,
-            status["deposits"] = True
-            status["withdrawals"] = True            # and gives it back when no agent of the machine holds it
         return status
     who = caller(req)
     if who:                             # this request acts for its caller; the store does not change
@@ -2450,20 +2156,14 @@ def read_line(conn, limit=8192):
 
 
 def with_writes(conf):
-    """The configuration with the broker's journal (`_journal`), which it needs to make a login: with the fleet's own
-    store always, because the store writes itself; with Bitwarden only when the write setup is there and good. Else
-    the configuration as it is, and the reason in the log: that broker reads and makes no login."""
-    reason = None
-    if backend(conf) == "store" or WRITE_KEYS <= set(conf):
-        reason = None if backend(conf) == "store" else library_problem(conf)
-        if reason is None:
-            try:
-                return dict(conf, _journal=Journal(os.path.join(state_folder(conf), JOURNAL)))
-            except Refused as e:
-                reason = str(e)
-    if reason is not None:
-        log(f"no new logins: {reason}")
-    return conf
+    """The configuration with the broker's journal (`_journal`), which it needs to make a login; the store writes
+    itself, so nothing more is needed. Else, when the journal cannot be opened (another process has it, or it cannot
+    be read), the configuration as it is, and the reason in the log: that broker reads and makes no login."""
+    try:
+        return dict(conf, _journal=Journal(os.path.join(state_folder(conf), JOURNAL)))
+    except Refused as e:
+        log(f"no new logins: {e}")
+        return conf
 
 
 def with_source(conf):
@@ -2580,137 +2280,7 @@ class Broker:
             self.conf = {k: v for k, v in self.conf.items() if k != "_requests"}
 
 
-# ---------------------------------------------------------------- the write setup: one operation (sdk-install)
-
-SELF_TEST = {"fleetSelfTest": {}}       # a command that the SDK does not have: it answers an error by itself
-
-
-def sdk_test(library):
-    """Load the library and ask it one command that it refuses by itself: the four functions are there, an answer
-    comes back, and the library frees it. No token, no secret and no network. Never as root."""
-    if os.geteuid() == 0:
-        raise SystemExit("The load test runs as the vault user, never as root.")
-    sdk = Sdk(library, "eu")
-    try:
-        reply = sdk.answer(SELF_TEST)
-    finally:
-        sdk.close()
-    if not reply or reply.get("success") is not False or not isinstance(reply.get("errorMessage"), str):
-        raise SystemExit("The library did not pass its load test.")
-    return True
-
-
-def run_sdk_test(library, uid, gid):
-    """sdk_test in a process of its own, as the vault user. True when it passed."""
-    if uid == 0:
-        return False
-    change = {} if (uid, gid) == (os.geteuid(), os.getegid()) else {"user": uid, "group": gid, "extra_groups": []}
-    try:
-        done = subprocess.run([sys.executable, "-B", os.path.abspath(__file__), "sdk-test", "--library", library],
-                              capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
-                              env={"PATH": "/usr/local/bin:/usr/bin:/bin"}, **change)
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return False
-    return done.returncode == 0 and done.stdout.strip() == "ok"
-
-
-def glibc(text):
-    """(2, 31) from "glibc 2.31"; None for another C library."""
-    m = re.fullmatch(r"glibc (\d+)\.(\d+)(?:\.\d+)?", str(text or ""))
-    return (int(m.group(1)), int(m.group(2))) if m else None
-
-
-def sdk_install(config, manifest, project, library=None, system=None, machine=None, libc=None, test=run_sdk_test,
-                folder=None):
-    """The write setup of a broker, in one operation: check the built library against its manifest and the pinned
-    recipe, check that this machine can run it, put a copy that the worker cannot change beside this program, test
-    that the vault user can load it (no token), and name it with the project in the broker's configuration. It
-    reads no token and changes none. The broker uses the setup after its next start. Returns the new keys.
-    system, machine, libc, test and folder have other values only in tests."""
-    system, machine = system or platform.system(), machine or platform.machine()
-    libc = libc if libc is not None else (os.confstr("CS_GNU_LIBC_VERSION") if "CS_GNU_LIBC_VERSION" in os.confstr_names else "")
-    conf = load_config(config)
-    if backend(conf) != "bitwarden":
-        raise SystemExit("This broker opens the fleet's own store, which makes a login by itself. The Bitwarden "
-                         "library belongs to a broker with a Bitwarden project.")
-    project = canonical_id(project)
-    if not project:
-        raise SystemExit("--project must be the UUID of the Bitwarden project for new logins.")
-    try:
-        with open(manifest, encoding="utf-8") as f:
-            said = json.load(f)
-    except (OSError, ValueError):
-        raise SystemExit("The manifest cannot be read.") from None
-    if not isinstance(said, dict) or any(said.get(k) != v for k, v in SDK_PIN.items()):
-        raise SystemExit("The manifest is not of the pinned recipe: another source, another addition, another system "
-                         "or no passed self-test.")
-    if system != "Linux" or said.get("machine") != machine:
-        raise SystemExit(f"The library is for Linux on {said.get('machine')}; this machine is {system} on {machine}.")
-    need, have = glibc(said.get("libc")), glibc(libc)
-    if not need or not have or have < need:
-        raise SystemExit(f"The library was built with {said.get('libc')}; this machine has {libc or 'no glibc'}.")
-    source = library or os.path.join(os.path.dirname(os.path.abspath(manifest)), SDK_PIN["library"])
-    digest = said.get("library_sha256")
-    if os.path.islink(source) or not os.path.isfile(source) or not isinstance(digest, str) \
-            or not re.fullmatch(r"[0-9a-f]{64}", digest) or os.path.getsize(source) != said.get("library_bytes") \
-            or sha256_file(source) != digest:
-        raise SystemExit("The library is not the one of the manifest.")
-    folder = folder or os.path.dirname(os.path.realpath(__file__))     # beside the broker program, on no other path
-    dest, staged = os.path.join(folder, SDK_PIN["library"]), os.path.join(folder, "." + SDK_PIN["library"] + ".new")
-    new, next_config = {"sdk": dest, "sdk_sha256": digest, "write_project": project}, config + ".new"
-    try:
-        owner = os.stat(os.path.dirname(os.path.abspath(conf["token_file"])))   # the vault user owns the state folder
-    except OSError:
-        raise SystemExit("The vault's state folder (the folder of token_file) is not there.") from None
-    try:
-        # The new copy and the new configuration are made complete beside the installed ones, and the copy is tested
-        # there. Only then do they take the places. A setup that fails leaves the old library and configuration.
-        try:
-            with open(source, "rb") as src, \
-                    os.fdopen(os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644), "wb") as out:
-                for block in iter(lambda: src.read(1 << 20), b""):
-                    out.write(block)
-                out.flush()
-                os.fsync(out.fileno())
-            os.chmod(staged, 0o644)
-        except OSError:
-            raise SystemExit(f"The library could not be put in {folder}.") from None
-        unchangeable(staged, "The Bitwarden library")
-        if sha256_file(staged) != digest:
-            raise SystemExit("The copy of the library is not the one of the manifest.")
-        if owner.st_uid == 0 or not test(staged, owner.st_uid, owner.st_gid):
-            raise SystemExit("The vault user could not load the library, so it is not set up. The load test never runs "
-                             "as root.")
-        try:
-            with open(config, encoding="utf-8") as f:
-                current = json.load(f)
-            with os.fdopen(os.open(next_config, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644), "w",
-                           encoding="utf-8") as f:
-                json.dump(dict(current, **new), f, indent=2)
-                f.write("\n")
-                f.flush()
-                os.fsync(f.fileno())
-            os.chmod(next_config, stat.S_IMODE(os.stat(config).st_mode))
-        except (OSError, ValueError):
-            raise SystemExit("The new configuration could not be written.") from None
-        load_config(next_config)        # the form that the broker reads at its next start
-        try:
-            os.replace(staged, dest)
-            os.replace(next_config, config)
-            sync_folder(folder)
-            sync_folder(os.path.dirname(os.path.abspath(config)))
-        except OSError:
-            raise SystemExit("The setup could not be put in place. Run it again.") from None
-    finally:
-        for left in (staged, next_config):
-            try:
-                os.unlink(left)
-            except OSError:
-                pass
-    return new
-
-
-# ---------------------------------------------------------------- the fleet's own store: three operations
+# ---------------------------------------------------------------- the fleet's own store: its operations
 
 def owned_by(path, info, mode):
     """A file of the store that belongs to the vault user and that no one else can read."""
@@ -2728,10 +2298,7 @@ def store_init(config, user=None, keygen="age-keygen"):
     For a central vault it also makes the vault's own key (age_key), to which the owner seals a new value, and keeps
     that one too when it is there. With no user named, the user is the one that the service runs as: fleet-vault, or
     founderizer-vault (CENTRAL_USER) for a central vault."""
-    conf = load_config(config)
-    if backend(conf) != "store":
-        raise SystemExit("This broker's configuration names a Bitwarden project. Name store and store_key instead, "
-                         "and no Bitwarden key, to use the fleet's own store.")
+    conf = load_config(config)          # it names the store: load_config refuses one that does not
     user = user or (CENTRAL_USER if conf.get("central") is True else "fleet-vault")
     try:
         info = pwd.getpwnam(user)
@@ -2794,8 +2361,6 @@ def store_list(config):
     """The names in the fleet's own store: its items' references, titles and when they were saved. Never a value.
     Run it as the vault user."""
     conf = load_config(config)
-    if backend(conf) != "store":
-        raise SystemExit("This broker opens a Bitwarden project, so its items are listed there.")
     try:
         items = LocalStore(conf).opened()
     except Refused as e:
@@ -2880,19 +2445,7 @@ def main(argv=None):
     p = sub.add_parser("store-list", help="The references and titles in the fleet's own store, as the vault user. "
                                           "Never a value")
     p.add_argument("--config", required=True)
-    p = sub.add_parser("sdk-install", help="The write setup, as root: install the pinned Bitwarden library and name it "
-                                           "and the project for new logins in the configuration")
-    p.add_argument("--config", required=True)
-    p.add_argument("--manifest", required=True, help="vault-sdk.json of a build of vault_sdk_build.py")
-    p.add_argument("--project", required=True, help="the UUID of the Bitwarden project for new logins (no secret)")
-    p.add_argument("--library", help="the built library; default: beside the manifest")
-    p = sub.add_parser("sdk-test", help="Load a library and ask it one command without a token; never as root")
-    p.add_argument("--library", required=True)
     args = parser.parse_args(argv)
-    if args.cmd == "sdk-test":
-        sdk_test(args.library)
-        print("ok")
-        return 0
     if args.cmd in ("store-init", "store-list"):
         unchangeable(os.path.realpath(__file__), "The vault broker program")     # the installed copy, not a checkout
         if args.cmd == "store-init":
@@ -2901,13 +2454,6 @@ def main(argv=None):
             print(json.dumps(dict(store_init(args.config, args.user, args.keygen), ok=True)))
         else:
             print(json.dumps(store_list(args.config), indent=2))
-        return 0
-    if args.cmd == "sdk-install":
-        if os.geteuid() != 0:
-            raise SystemExit("Run sdk-install as root: the library and the configuration must belong to root.")
-        unchangeable(os.path.realpath(__file__), "The vault broker program")     # the installed copy, not a checkout
-        print(json.dumps(dict(sdk_install(args.config, args.manifest, args.project, args.library), ok=True,
-                              next="restart the broker service to use the setup")))
         return 0
     if args.cmd == "unit":
         with open(args.config, encoding="utf-8") as f:

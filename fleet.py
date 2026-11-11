@@ -19,16 +19,14 @@ On your own machine
   fleet.py say "text"          send the manager a message
   fleet.py board               print the board as text
   fleet.py hub                 print the hub's address
-  fleet.py register bws://<secret-id> [--site]
-                               give the hub the fingerprint of a login, never the login
-                               (--site: also let it sign in to the practice site)
 
 Logins, by hand (agents never run these: they ask the helper with the team tools sign_in and hand_over)
   fleet.py signin <login> --agent <agent>
   fleet.py handover --login <login> --to <agent> --agent <agent>
   fleet.py leakcheck <login> [--agent <agent>]    look for that login where it must never be
 
-A login is named  bws://<secret-id>  (kept in Bitwarden Secrets Manager) or  sealed:<number>  (a handover).
+A login is named  bws://<secret-id>  (its UUID in the fleet's own vault) or  sealed:<number>  (a handover). Only a
+machine's vault broker opens one.
 This is a throwaway test kit, not the product.
 """
 import argparse
@@ -318,12 +316,11 @@ def shell_off(conf):
 
 
 def read_env(agent, conf, kind):
-    """The API keys that the owner lets this agent read (Secrets: read), for session_env: the
-    machine's vault gives the values, the broker in broker mode and this helper's own token in file mode, and the hub
-    has their fingerprints before a value comes here, so it masks each one in texts. The agent may read them and never
-    prints or stores them. The helper asks only when this checkout's team.json gives the agent a read grant, and the
-    hub decides what it gets. A session starts without a value that the vault cannot give now; the helper's log says
-    which."""
+    """The API keys that the owner lets this agent read (Secrets: read), for session_env: the machine's vault broker
+    gives the values, and the hub has their fingerprints before a value comes here, so it masks each one in texts.
+    The agent may read them and never prints or stores them. The helper asks only when this checkout's team.json
+    gives the agent a read grant, and the hub decides what it gets. A session starts without a value that the vault
+    cannot give now; the helper's log says which."""
     try:
         with open(os.path.join(KIT, "team.json"), encoding="utf-8") as f:
             grants = (json.load(f)["agents"].get(agent) or {}).get("secrets") or {}
@@ -334,8 +331,7 @@ def read_env(agent, conf, kind):
     # what the keys are for: the hub gives none for a session of an agent whose Shell box is off (support plan F1)
     purpose = "check" if kind == "check" else "session"
     try:
-        done = broker_job_request(agent, {"op": "read", "for": purpose}, timeout=60) if vault_mode(agent) == "broker" \
-            else read_values(agent, purpose)
+        done = broker_job_request(agent, {"op": "read", "for": purpose}, timeout=60)
     except Exception as e:          # the session starts in every case
         print(time.strftime("%H:%M:%S"), f"{kind}: the session starts without its read variables: "
               f"{e if isinstance(e, Refused) else type(e).__name__}", flush=True)
@@ -692,7 +688,7 @@ DENY = ["Read(~/.fleet/**)", "Edit(~/.fleet/**)", "Bash(*.fleet/*)"] + UNSEEN_TO
 CHROME_TOOLS = "mcp__claude-in-chrome__*"      # the tools that Claude Code's --chrome adds to a browser task
 # The files of this checkout that no worker session edits: Fleet's code, the rules, the owner's files, and the agents'
 # skills, which an agent changes with write_skill only (design v4 D1).
-PROTECTED = ("fleet.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.py", "screen_runner.py", "desktop.py", "FleetWorker.swift", "worker_install.py", "install-worker.sh", "Install Fleet Worker.command", "hub.py", "wakeups.py", "usage.py", "threads.py", "selftest.py", "test_logins.py", "verify.py", "verify_case.py", "pilot.py", "publish.py", "publish/**", "team.json", "bws.toml", "RULES.md", "rules/**", "CLAUDE.md", "AGENTS.md", "profiles/**", "skills/**")
+PROTECTED = ("fleet.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.py", "screen_runner.py", "desktop.py", "FleetWorker.swift", "worker_install.py", "install-worker.sh", "Install Fleet Worker.command", "hub.py", "wakeups.py", "usage.py", "threads.py", "selftest.py", "test_logins.py", "verify.py", "verify_case.py", "pilot.py", "publish.py", "publish/**", "team.json", "RULES.md", "rules/**", "CLAUDE.md", "AGENTS.md", "profiles/**", "skills/**")
 # No Claude session that a helper starts loads a setting source of its machine (--setting-sources ''). A Mac keeps one
 # desktop user for its agents (PRODUCT.md P2), so that person's own CLAUDE.md, rules, skills, agents, plugins and hooks
 # would steer every agent there unseen, and an agent could write them to steer its own later sessions; and the
@@ -7045,29 +7041,24 @@ def cmd_check(args):
             line(True if f'url = "{url}"' in text else None,
                  "Codex in a terminal here reaches the team tools", hand)
     print("For the login tests:")
-    token = os.path.join(HOME, "bws-token")
-    if vault_mode(agent) == "file":
-        # Only this user's own vault files use them. A broker keeps its store, its region and its programs in its own
-        # root-owned configuration, and one that opens the fleet's own store has no Bitwarden account at all; an
-        # agent with no credential access has nothing to open either way. In both of those this failed a machine
-        # that is exactly as it should be, for something that is not its business.
-        line(True if shutil.which("bws") else None, "Bitwarden Secrets Manager CLI (bws) installed", "not installed")
-        line(TEAM.get("bitwarden_region") in ("eu", "us"), "Bitwarden region is eu or us",
-             "set bitwarden_region in team.json")
+    if (conf or {}).get("vault") == "file":
+        # File mode read a Bitwarden token of this user. Founderizer has no Bitwarden backend any more, so such an
+        # entry reads as no credential access (vault_mode), and this one line says why.
+        line(False, "vault file is gone: this agent's vault must be broker",
+             "file mode read a Bitwarden token, and Founderizer has no Bitwarden backend any more")
     if vault_mode(agent) == "none":
         line(None, "no credential access, so this agent has no login to test",
              "the owner gives an agent its machine's vault in Founderizer")
     elif vault_mode(agent) == "broker":
         readable = vault_readable()
-        line(not readable, "vault token and handover key are not readable by this user (vault broker)",
-             "move ~/.fleet/" + " and ~/.fleet/".join(readable) + " to the vault")
+        line(not readable, "no old vault file is readable by this user (vault broker)",
+             "take ~/.fleet/" + " and ~/.fleet/".join(readable) + " off this machine")
         try:
             status = vault_call({"op": "status"}, timeout=5)
             line(True, f"vault broker answers (kept by {status.get('user') or 'the signed helper'})")
-            store = status.get("backend")           # P5: the fleet's own store, or a Bitwarden project
-            line(store in ("store", "bitwarden") or None,
-                 "vault broker opens " + ("the fleet's own store" if store == "store" else
-                                          "a Bitwarden project" if store == "bitwarden" else "a store it does not name"),
+            store = status.get("backend")           # P5: the fleet's own store, the one store a broker opens
+            line(store == "store" or None,
+                 "vault broker opens " + ("the fleet's own store" if store == "store" else "a store it does not name"),
                  "this broker is older than the fleet's own store")
             line(status.get("recipient") == conf.get("vault_recipient"), "vault broker key is the one pinned in team.json",
                  "set vault_recipient for this agent to the broker's public key")
@@ -7100,14 +7091,6 @@ def cmd_check(args):
                  "this broker says nothing about its program" if not status.get("source") else catch_up)
         except Refused as e:
             line(False, "vault broker", str(e))
-    elif os.path.exists(token):
-        try:
-            bws_token()
-            line(True, "Bitwarden token file is private and nonempty")
-        except Refused as e:
-            line(False, "Bitwarden token file", str(e))
-    else:
-        line(None, "Bitwarden token in ~/.fleet/bws-token", "not there; login tests are not ready")
     line(True if shutil.which("age") else None, "age installed", "not installed")
     if sys.platform == "darwin" and conf and "browser" in conf.get("can", []):
         if os.path.exists("/Applications/Google Chrome.app"):
@@ -7190,21 +7173,6 @@ def cmd_hub(args):
 
 # ---------------------------------------------------------------- logins
 
-def bws_token():
-    """Read only this helper's token. Never use an inherited account or print a token."""
-    try:
-        with open(os.path.join(HOME, "bws-token"), encoding="utf-8") as f:
-            info = os.fstat(f.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-                raise Refused("the Bitwarden token must belong to this user and have mode 600: ~/.fleet/bws-token")
-            token = f.read().strip()
-    except (OSError, UnicodeError):
-        raise Refused("this machine has no readable Bitwarden token in ~/.fleet/bws-token") from None
-    if not token:
-        raise Refused("this machine's Bitwarden token file is empty")
-    return token
-
-
 def vault_socket():
     """Where this machine's vault broker listens: a broker user's service on Linux, the signed Fleet helper on a Mac."""
     if sys.platform == "darwin":
@@ -7214,18 +7182,15 @@ def vault_socket():
 
 def vault_mode(agent):
     """What opens this agent's logins, from team.json: "broker", its machine's vault broker, which holds the fleet's
-    own store or a Bitwarden token; "file", the Bitwarden token of this user, which the pilot started with; or
-    "none", no credential access at all (owner API 1.12).
+    own store; or "none", no credential access at all (owner API 1.12).
 
-    **A team.json that says nothing about an agent means "none"** (PRODUCT.md P5): a fresh fleet has no Bitwarden
-    account and no token file, so a default of "file" pointed every new agent at a file that is not there. An agent
-    gets credential access when the owner gives it, which is also what hub.sh already writes for the first manager.
-    A command that names no agent is the owner's own on his own machine (fleet.py register), and it still reads the
-    token file of this user, which he put there himself."""
-    if not agent:
-        return "file"
-    mode = (TEAM.get("agents", {}).get(agent) or {}).get("vault")
-    return mode if mode in ("broker", "file") else "none"
+    **A team.json that says nothing about an agent means "none"** (PRODUCT.md P5), and so does an entry that still
+    says "file": file mode read a Bitwarden token of this user, which the pilot started with, and Founderizer has no
+    Bitwarden backend any more (11 November 2026). The doctor says so (cmd_check). An agent gets credential access
+    when the owner gives it, which is also what hub.sh already writes for the first manager. A command that names no
+    agent is the owner's own on his own machine, and it opens no login either."""
+    mode = (TEAM.get("agents", {}).get(agent) or {}).get("vault") if agent else None
+    return "broker" if mode == "broker" else "none"
 
 
 NO_CREDENTIALS = "this agent has no credential access; only the owner changes that"
@@ -7309,57 +7274,19 @@ LOGIN_REF = re.compile(r"bws://([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]
 
 def probe_logins(agent, job):
     """The owner's login probe (owner API 1.9): which logins of the profile this machine's vault can open. The answer
-    has fixed codes only, and no part of a login leaves the vault. In broker mode the broker does it."""
+    has fixed codes only, and no part of a login leaves the vault. In broker mode the broker does it; an agent with
+    no credential access confirms the job and opens nothing."""
     if vault_mode(agent) == "broker":
         return broker_job_request(agent, {"op": "probe", "job": job}, timeout=60)
     code, data = http("POST", f"/helper/vault/{agent}", {"job": job, "kind": "probe"}, timeout=15)
     if code != 200 or not isinstance(data, dict) or data.get("ok") is not True or data.get("job") != job:
         raise Refused("the hub did not confirm the probe job")
-    logins = [x for x in data.get("logins") or [] if isinstance(x, str) and LOGIN_REF.fullmatch(x)][:32]
-    if vault_mode(agent) == "none":
-        return {"ok": True, "results": []}     # no vault file is read
-    try:
-        token = bws_token()
-    except Refused:
-        token = None
-    return {"ok": True, "results": [probe_one(ref, token) for ref in logins]}
-
-
-def probe_one(ref, token):
-    """One login of the profile: can this vault open it? Fixed codes only."""
-    def result(state, reason):
-        return {"login": ref, "state": state, "reason": reason}
-    region = TEAM.get("bitwarden_region")
-    if not token:
-        return result("not_readable", "no_token")
-    if not shutil.which("bws") or region not in ("eu", "us"):
-        return result("not_readable", "error")
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("BWS_", "RUST_"))}
-    env["BWS_ACCESS_TOKEN"] = token
-    secret_id = LOGIN_REF.fullmatch(ref).group(1)
-    try:
-        r = subprocess.run(["bws", "--config-file", os.path.join(KIT, "bws.toml"), "--profile", region, "--output",
-                            "json", "secret", "get", secret_id], capture_output=True, text=True, env=env, timeout=30)
-    except subprocess.TimeoutExpired:
-        return result("not_readable", "timeout")
-    except (OSError, subprocess.SubprocessError, UnicodeError):
-        return result("not_readable", "error")
-    if r.returncode != 0:               # the CLI's text is only searched, never kept or shown
-        text = (r.stdout + r.stderr).lower()
-        return result("not_readable", "not_found" if "404" in text or "not found" in text else
-                      "no_access" if any(w in text for w in ("401", "403", "unauthorized", "forbidden")) else "error")
-    try:
-        item = json.loads(r.stdout)
-        value = json.loads(item["value"])
-        good = str(item["id"]).lower() == secret_id.lower() and isinstance(value, dict) and \
-            isinstance(value.get("username", ""), str) and isinstance(value.get("password"), str) and value["password"]
-    except (ValueError, KeyError, TypeError):
-        good = False
-    return result("readable", "ok") if good else result("not_readable", "bad_format")
+    return {"ok": True, "results": []}     # no vault file is read
 
 
 def vault_readable():
-    """The vault files that this user (and so its agents) can read: the token and the handover key."""
+    """The old vault files of file mode that this user (and so its agents) can read: a Bitwarden token and a handover
+    key in ~/.fleet. A machine with the vault broker must have neither where its agents can read it."""
     return [name for name in ("bws-token", "age.key") if os.access(os.path.join(HOME, name), os.R_OK)]
 
 
@@ -7387,13 +7314,9 @@ def vault_status(agent):
               "broker_recipient": recipient if isinstance(recipient, str) else None,
               "broker_source": source if isinstance(source, str) and re.fullmatch(r"[0-9a-f]{64}", source) else None,
               "broker_read_at": time.time() if status else None}
-    mode = vault_mode(agent)
-    if mode == "none":
+    if vault_mode(agent) == "none":
         return dict(broker, mode="none", isolated=None)
-    readable = bool(vault_readable())
-    if mode == "broker":
-        return dict(broker, mode="broker", isolated=status is not None and not readable)
-    return dict(broker, **({"mode": "file", "isolated": False} if readable else {"mode": None, "isolated": None}))
+    return dict(broker, mode="broker", isolated=status is not None and not vault_readable())
 
 
 def broker_job(agent, job):
@@ -7401,83 +7324,14 @@ def broker_job(agent, job):
     readable = vault_readable()
     if readable:
         raise Refused("this machine uses the vault broker, but ~/.fleet/" + " and ~/.fleet/".join(readable) +
-                      " can still be read by the agents' user; the owner must move them to the vault")
+                      " can still be read by the agents' user; the owner must take them off this machine")
     if not isinstance(job, int) or isinstance(job, bool) or job < 1:
         raise Refused("with the vault broker, a login is used only for a sign-in or handover job from the hub")
     return job
 
 
-def bws_get(secret_id):
-    """Fetch one secret (file mode). Token and plaintext stay in this helper and its CLI child."""
-    return login_from_item(bws_item(secret_id), secret_id)
-
-
-def read_values(agent, purpose=None):
-    """read in file mode (owner feature secrets): the hub names the API keys that this agent reads in its sessions;
-    this helper reads each with its own token, as for a sign-in, and registers the value's fingerprint at the hub
-    before a session gets it. {"env": {NAME: value}, "missing": [NAME]}. purpose: "check" or "session", which the hub
-    is told as the broker tells it (read_env)."""
-    code, data = http("POST", f"/helper/vault/{agent}/read", {"for": purpose} if purpose in ("check", "session") else {},
-                      timeout=15)
-    found = data.get("secrets") if isinstance(data, dict) else None
-    if code != 200 or not isinstance(found, list) or data.get("ok") is not True:
-        reason = data.get("error") if isinstance(data, dict) else None
-        raise Refused("the hub did not name the secrets to read" + (f": {reason}" if isinstance(reason, str) else ""))
-    env, missing = {}, []
-    for x in found[:32]:
-        name, ref, salts = (x.get("env"), x.get("login"), x.get("fingerprint_salts")) if isinstance(x, dict) else (None,) * 3
-        salt = salts.get("password") if isinstance(salts, dict) else None
-        if not (isinstance(name, str) and ENV_NAME.fullmatch(name) and isinstance(ref, str) and LOGIN_REF.fullmatch(ref)
-                and isinstance(salt, str) and re.fullmatch(r"[0-9a-f]{32}", salt)):
-            raise Refused("the hub named no valid secrets to read")
-        try:
-            sid = LOGIN_REF.fullmatch(ref).group(1)
-            item = bws_item(sid)
-            value = json.loads(item["value"]).get("password") if item.get("id", "").lower() == sid.lower() else None
-            if not isinstance(value, str) or not value:
-                raise Refused("the item has no value")
-            if len(value) >= 8 and not re.search(r"\s", value):     # what the hub's filter can find in a text
-                prints = [{"kind": "password", "hash": hashlib.sha256((salt + value).encode()).hexdigest(), "len": len(value)}]
-                code, done = http("POST", f"/helper/vault/{agent}/fingerprints", {"login": ref.lower(), "fingerprints": prints},
-                                  timeout=15)
-                if code != 200 or not isinstance(done, dict) or done.get("ok") is not True or \
-                        (done.get("stored") or 0) + (done.get("known") or 0) != 1:
-                    raise Refused("the value could not be protected in messages")
-        except (Refused, ValueError, KeyError, TypeError, AttributeError):
-            missing.append(name)
-            continue
-        env[name] = value
-    return {"env": env, "missing": missing}
-
-
-def bws_item(secret_id):
-    """One Bitwarden item as the CLI gives it (file mode): {id, key (its name), value}. Token and plaintext stay in
-    this helper and its CLI child."""
-    if not shutil.which("bws"):
-        raise Refused("the Bitwarden Secrets Manager CLI (bws) is not installed on this machine")
-    region = TEAM.get("bitwarden_region")
-    if region not in ("eu", "us"):
-        raise Refused("set bitwarden_region to eu or us in team.json before using Bitwarden")
-    # Do not let an inherited CLI profile, server URL or debug setting override the pilot.
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("BWS_", "RUST_"))}
-    env["BWS_ACCESS_TOKEN"] = bws_token()
-    try:
-        result = subprocess.run(["bws", "--config-file", os.path.join(KIT, "bws.toml"),
-                                 "--profile", region, "--output", "json", "secret", "get", secret_id],
-                                capture_output=True, text=True, env=env, timeout=30)
-    except (OSError, subprocess.TimeoutExpired, UnicodeError):
-        raise Refused("Bitwarden could not be reached by the helper; ask your requester") from None
-    if result.returncode != 0:
-        # CLI errors can contain its response or token. Never return either stream.
-        raise Refused("Bitwarden refused this login; check this machine's token, project access, region and secret ID")
-    try:
-        return json.loads(result.stdout)
-    except ValueError:
-        return None
-
-
 def login_from_item(item, secret_id):
-    """A Bitwarden item, from the CLI or the vault broker, as {username, password, url, label[, totp]}. An API key
+    """A saved item of a vault, {id, key (its name), value}, as {username, password, url, label[, totp]}. An API key
     (owner feature secrets) is such an item with an empty user name."""
     try:
         if not isinstance(item, dict) or item.get("id", "").lower() != secret_id.lower():
@@ -7499,7 +7353,7 @@ def login_from_item(item, secret_id):
             extra["totp"] = value["totp"]
         return {k: value[k] for k in ("username", "password", "url")} | extra | {"label": item["key"]}
     except (ValueError, KeyError, TypeError, AttributeError):
-        raise Refused("Bitwarden login is invalid: its value must be JSON with username, password and an http(s) url, "
+        raise Refused("the saved login is invalid: its value must be JSON with username, password and an http(s) url, "
                       "and an optional authenticator seed in totp") from None
 
 
@@ -7526,14 +7380,15 @@ def totp_code(seed, at=None):
 def split_ref(ref):
     m = re.fullmatch(r"bws://([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})", ref.strip())
     if not m:
-        raise Refused("a Bitwarden login is named bws://<secret-id>, where secret-id is its UUID")
+        raise Refused("a saved login is named bws://<secret-id>, where secret-id is its UUID in the fleet's vault")
     return m.group(1)
 
 
 def read_login(ref, agent=None, task=""):
     """Return {"username", "password", "url", "label"}. Nothing here is ever printed. A handover opened for a task
     belongs to that task from then on, and the hub throws it away when the task ends. Never in broker mode: there
-    only the vault broker opens logins."""
+    only the vault broker opens logins. This helper opens no saved login (bws://) at all: file mode, which read one
+    with a Bitwarden token of this user, is gone, and vault_mode answers broker or none."""
     if vault_mode(agent) == "none":
         raise Refused(NO_CREDENTIALS)
     if vault_mode(agent) == "broker":
@@ -7553,7 +7408,8 @@ def read_login(ref, agent=None, task=""):
         login = json.loads(r.stdout)
         login["label"] = data.get("label") or ref
         return login
-    return bws_get(split_ref(ref))
+    split_ref(ref)                      # a name that is not a saved login's is refused as such
+    raise Refused("only this machine's vault broker opens a saved login")
 
 
 def apple_string(s):
@@ -7995,25 +7851,6 @@ def cmd_handover(args):
         die(str(e))
 
 
-def cmd_register(args):
-    try:
-        login = read_login(args.login)
-    except Refused as e:
-        die(str(e))
-    pw = login["password"]
-    if len(pw) < 8 or any(c.isspace() for c in pw):
-        die("not registered: Fleet finds a login in text only when it has 8 or more characters and no spaces")
-    salt = secrets.token_hex(8)
-    data = {"label": login["label"], "salt": salt, "len": len(pw),
-            "hash": hashlib.sha256((salt + pw).encode()).hexdigest(),
-            "username": login["username"] if args.site else ""}
-    code, resp = http("POST", "/secrets", data)
-    if code == 200:
-        print(f"registered \"{login['label']}\": the hub now knows this login's fingerprint, not the login")
-    else:
-        die(f"not registered: {resp.get('error', code)}")
-
-
 def cmd_leakcheck(args):
     try:
         login = read_login(args.login, me(args) if args.login.strip().startswith("sealed:") else None)
@@ -8132,8 +7969,6 @@ def main():
     p = sub.add_parser("say"); p.add_argument("text"); p.set_defaults(fn=cmd_say)
     p = sub.add_parser("board"); p.set_defaults(fn=cmd_board)
     p = sub.add_parser("hub"); p.set_defaults(fn=cmd_hub)
-    p = sub.add_parser("register"); p.add_argument("login"); p.add_argument("--site", action="store_true")
-    p.set_defaults(fn=cmd_register)
     p = sub.add_parser("signin"); p.add_argument("login"); p.add_argument("--agent"); p.set_defaults(fn=cmd_signin)
     p = sub.add_parser("handover"); p.add_argument("--to", required=True); p.add_argument("--login", required=True)
     p.add_argument("--task"); p.add_argument("--agent"); p.set_defaults(fn=cmd_handover)

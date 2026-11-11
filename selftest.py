@@ -859,8 +859,8 @@ code, _, text = owner_ui("/ui/needs/2/secret", {"decline": "Use the test account
 said = json.loads(raw("GET", "/events/manager?after=0&wait=0", base=hubS)[2])["events"][-1]["text"]
 check("a declined secret request reaches the manager in the owner's words",
       code == 200 and "Not given: Use the test account first" in said, text + said)
-text, err = tool("manager", "raise_needs_you", base=hubS, title="Vault token", why="Fleet Vault has none",
-                 what_to_do="Paste the Bitwarden access token into Fleet Vault on your Mac.")
+text, err = tool("manager", "raise_needs_you", base=hubS, title="Shop key", why="Fleet Vault has none",
+                 what_to_do="Paste the shop's API key into Fleet Vault on your Mac.")
 check("a Needs-you item that sends the owner to their own app passes", not err and "N-3" in text, text)
 code, _, text = owner_ui("/ui/needs/3/secret", {"decline": ""}, base=hubS)
 check("an item that asks for no secret takes no secure answer", code == 409, text)
@@ -942,7 +942,7 @@ check("leak check finds a login that slipped into the hub", json.loads(raw("GET"
 # 9 logins: the agent asks, its helper does the work
 for ref in ("op://fleet-pilot/pilot-site-a", "bws://name", "bws://--help", "bws://11111111-1111-4111-8111-111111111111/path"):
     text, err = tool("studio", "sign_in", task_id="T-2", login=ref)
-    check("invalid or old login reference is refused: " + ref, err and "Bitwarden UUID" in text, text)
+    check("invalid or old login reference is refused: " + ref, err and "its UUID in the fleet's vault" in text, text)
 picked = []
 def helper_answers(agent, ok, text, delay=0.6):
     """Stand in for the helper: pick up the job and report what came of it (text None: pick it up and stay silent)."""

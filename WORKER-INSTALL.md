@@ -185,14 +185,17 @@ to its configuration. That is the one thing to get right, because a broker that
 admits one user ID was left unreachable by the move to one OS user for each agent --
 running, current, and serving nobody.
 
-**A machine's broker opens the fleet's own store**: one `age` file on that machine
-(`store`, `store_key`), made by `vault.py store-init`, with no Bitwarden account, no
+**A machine's broker opens the fleet's own store, and no other**: one `age` file on that
+machine (`store`, `store_key`), made by `vault.py store-init`, with no account, no
 organization and no token. So installing a machine needs nothing of the owner's, and the
-one thing that cannot be automatic does not arise. Since the DevOps plan's track B (2
-November 2026) **no server keeps a Bitwarden token**: a broker refuses a configuration that
-names a Bitwarden project, so a broker installed with one keeps running its old program
-until its configuration names the fleet's own store, and `python3 fleet.py check <agent>`
-shows `backend` in its status.
+one thing that cannot be automatic does not arise. **Founderizer has no Bitwarden backend
+any more** (11 November 2026; since 2 November 2026 no server kept a Bitwarden token): a
+broker does not start on a configuration that names a Bitwarden key (`region`,
+`token_file`, `bws`, `bws_config`, `sdk`, `sdk_sha256` or `write_project`), and the first
+line of its log says to give it the fleet's own store. So a broker installed with one keeps
+running its old program, and the hub says that its vault is behind, until its
+configuration names the fleet's own store. `python3 fleet.py check <agent>` shows the store
+that the broker opens (`backend` in its status).
 
 **The owner's keys reach that store from the central vault only** (HUB-INSTALL.md, "The
 central vault"). It seals a value to a machine's pinned vault key, only for a grant of it to
@@ -239,13 +242,11 @@ see the next section.
 
 ## Vault broker (macOS)
 
-The Mac helper opens **one of two stores**, which its configuration chooses, exactly
-as a Linux broker does: the fleet's own store on that Mac, or a Bitwarden project.
-A fleet of Macs therefore needs no Bitwarden account either. The configuration at
-`/Library/Application Support/Fleet Vault/config.json`, root with mode 644, names
-one and never both — `"store": "fleet"` or `"region": "eu"|"us"` — and `status`
-answers that word, so `python3 fleet.py check <agent>` prints "vault broker opens
-the fleet's own store".
+The Mac helper opens **the fleet's own store** on that Mac, as a Linux broker does, so
+a fleet of Macs needs no account of a vault vendor either. The configuration at
+`/Library/Application Support/Fleet Vault/config.json`, root with mode 644, names it
+(`"store": "fleet"`), and `status` answers that word, so `python3 fleet.py check
+<agent>` prints "vault broker opens the fleet's own store".
 
 The store is `~/Library/Application Support/Fleet Vault/store.age`, mode 600, with
 the same format as a Linux store (`{"v": 1, "items": {...}}`, one item for each
@@ -292,9 +293,10 @@ that flag and refuses it.
 
 Nothing else is needed: the helper makes the store key, the handover key and an empty
 store at its first request, and `create_login` works on that store with no project and
-no setup. `--switch-store` changes a Mac that opens the other store, and **moves no
-value**: a broker opens one store or the other, so the items of the first one are then
-unreachable and the owner adds each secret again.
+no setup. A configuration that still names a `region` is of the Bitwarden backend, which
+the vault does not open any more: the install stops on it and changes nothing. The owner
+removes that configuration as root and installs again, which **moves no value**: they add
+each secret again.
 
 The owner saves one item into a Mac's store with the helper's own commands, the Mac
 equivalents of `store-put` and `store-list`. The value is on standard input, so it
@@ -397,41 +399,16 @@ next status report (within ten minutes). A broker that says nothing about its
 program — one older than this, or a Mac's signed helper, which the app updates
 itself — raises no warning, because unknown is not behind.
 
-### New logins on a Linux broker (`create_login`): the write setup
+### New logins on a Linux broker (`create_login`)
 
-A broker only reads until it has this setup. With it, the broker makes a new login
-in its own process with the pinned Bitwarden library, so that no value is a program
-argument (UI-API.md, "`create_login` on a Linux worker"). It needs root and the
-owner's approval. It reads and changes no token: the token in
-`/var/lib/fleet-vault/bws-token` must already have write access to the project, which
-the owner gives in Bitwarden. Linux on x86_64 with glibc 2.31 or later.
-
-Build the library with the pinned recipe, or take a build that main gave you with its
-manifest (`python3 -B vault_sdk_build.py build --out <folder>`, as an ordinary user).
-Then, with absolute paths:
-
-```bash
-# As an ordinary user: the build is the pinned one, and it loads.
-python3 -B vault_sdk_build.py verify --manifest <folder>/vault-sdk.json --self-test
-# As root: put the current broker program in place, then do the one setup operation.
-install -o root -g root -m 644 ~<worker>/fleet-pilot/vault.py /usr/local/lib/fleet-vault/vault.py
-python3 /usr/local/lib/fleet-vault/vault.py sdk-install --config /etc/fleet-vault/vault.json \
-    --manifest <folder>/vault-sdk.json --project <UUID of the Bitwarden project for new logins>
-systemctl restart fleet-vault
-```
-
-`sdk-install` checks the library against its manifest and the pinned recipe, checks
-the processor and the C library, makes a root-owned copy
-`/usr/local/lib/fleet-vault/libbitwarden_c.so`, tests as the `fleet-vault` user
-(never as root, and with no token) that the copy loads, and only then puts the copy
-in place and adds `sdk`, `sdk_sha256` and `write_project` to the configuration. A
-setup that fails leaves the installed library and the configuration as they were.
-
-Check: after the restart, `journalctl -u fleet-vault` has no line "no new logins",
-and the machine row shows `security.vault.creates: true`. The owner then allows the
-agent in Founderizer (`vault_create`), and a project with its own permission. To undo:
-remove the three keys from `/etc/fleet-vault/vault.json` and restart the broker; it
-reads as before. Its record of saves, `/var/lib/fleet-vault/creates.json`, stays.
+A broker makes a new login in its own store, with no setup: the store writes itself, and
+the broker's record of its saves, `/var/lib/fleet-vault/creates.json`, decides that one
+request gets one save (UI-API.md, "`create_login` on a Linux worker"). The machine row
+shows `security.vault.creates: true` while that record is open; when it cannot be opened,
+`journalctl -u fleet-vault` has a line "no new logins", and the broker still reads. The
+owner then allows the agent in Founderizer (`vault_create`), and a project with its own
+permission. The write setup of a Bitwarden project (`vault.py sdk-install`, the pinned
+library and `vault_sdk_build.py`) is gone with the Bitwarden backend.
 
 
 ### API requests on a Linux broker (`call_api`): the curl program

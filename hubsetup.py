@@ -1141,8 +1141,9 @@ def vault_config(hub_address, group=AGENT_GROUP, before=None, owner_keys=None, f
 
     A machine that has no broker yet gets **the fleet's own store** (`store`, `store_key`): one age file on this
     machine, made by `vault.py store-init`, with no account, no organization and no token, so that installing a
-    machine needs nothing of the owner. A broker that is already there keeps the store it has, whatever it is: the
-    token of a Bitwarden project is the owner's and this installer neither reads nor replaces it.
+    machine needs nothing of the owner. A broker that is already there keeps its store, its keys and its values.
+    This installer writes no Bitwarden key: Founderizer has no Bitwarden backend any more, and a broker refuses a
+    configuration that names one (vault.py, load_config).
 
     `worker_group` is the one field this always brings up to date: the group of every agent user of this machine
     (AGENT_GROUP), so an agent added later, or one whose OS user changed, reaches the broker with no change here.
@@ -1211,7 +1212,9 @@ def vault_install(kit=None, hub_address=None, user=VAULT_USER, group=AGENT_GROUP
     except (OSError, ValueError):
         current = None
     conf = vault_config(hub_address, group, current, owner_keys, fleet)
-    store = "the fleet's own store" if "store" in conf else "a Bitwarden project"
+    # A configuration of the old Bitwarden backend names no store: the broker refuses it, and the install stops
+    # below with the broker's own words in its journal.
+    store = "the fleet's own store" if "store" in conf else "no store that this vault opens"
     try:
         program = hashlib.sha256(pathlib.Path(os.path.join(kit, "vault.py")).read_bytes()).hexdigest()
     except OSError:

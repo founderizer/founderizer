@@ -8340,7 +8340,8 @@ def helper_job(agent, tid, kind, login, target=""):
     login = str(login or "").strip()
     guard(agent, login)
     if not LOGIN_NAME.fullmatch(login):
-        raise ToolError("A login is named bws://<secret-id> (a Bitwarden UUID), or sealed:<number> for one handed over to you.")
+        raise ToolError("A login is named bws://<secret-id> (its UUID in the fleet's vault), or sealed:<number> for one "
+                        "handed over to you.")
     if kind == "handover" and agents()[agent].get("vault") == "broker" and agents().get(target, {}).get("vault") != "broker":
         raise ToolError(f"{target} keeps its handover key where its agents can read it. A machine with the vault broker "
                         f"hands logins only to another machine with the vault broker.")
@@ -9463,8 +9464,8 @@ def latest_deposits(ref):
 def delivery_words(ref, holders, told=True):
     """What the hub knows of this secret in the vaults of these agents' machines, in sentences: its deliveries there,
     and a machine that could take one and got none. A machine that takes no delivery is left out, because what its
-    vault holds is not the hub's to say: one that reads the owner's Bitwarden project can have it already. told: the
-    reader gets the delivery notice (finish_deposit tells the manager only)."""
+    vault holds is not the hub's to say: an older vault can hold a value that came another way. told: the reader gets
+    the delivery notice (finish_deposit tells the manager only)."""
     machines, done, by = deposit_machines(), latest_deposits(ref), {}
     for m in sorted({agents()[a]["machine"] for a in holders if a in agents()}):
         state = deposit_view(done[m])["state"] if m in done else "none" if machines.get(m, {}).get("carrier") else None
@@ -14697,7 +14698,7 @@ def profile_view(agent, rev):
 
 
 _code_diffs = {}
-FLEET_FILES = re.compile(r"(?:^|/)[^/]+\.py$|^team\.json$|^bws\.toml$|^profiles/|^rules/|^(?:RULES|CLAUDE|AGENTS)\.md$")
+FLEET_FILES = re.compile(r"(?:^|/)[^/]+\.py$|^team\.json$|^profiles/|^rules/|^(?:RULES|CLAUDE|AGENTS)\.md$")
 # Never run by helpers: lifecycle.OWNER_ONLY, which a helper reads, names the same files.
 OWNER_ONLY = re.compile(r"(?:^|/)(?:test_[^/]*|ui_fixture|selftest|verify|pilot|vault|place)\.py$")
 
@@ -23618,12 +23619,12 @@ TOOLS = [
     ("worker", "sign_in", t_sign_in,
      "Have this machine's helper sign in to a site in Chrome with a login you name. Open the site's sign-in page "
      "first. You never see the password.",
-     S({"task_id": TASK_ID, "login": {"type": "string", "description": "bws://<secret-id> (Bitwarden UUID), or sealed:<number>"}},
+     S({"task_id": TASK_ID, "login": {"type": "string", "description": "bws://<secret-id> (its UUID in the fleet's vault), or sealed:<number>"}},
        ["task_id", "login"])),
     ("worker", "hand_over", t_hand_over,
      "Have this machine's helper lock a copy of a login so that only one other agent's machine can open it. "
      "Returns a sealed:<number> name to pass on. Use it only when a task asks you to.",
-     S({"task_id": TASK_ID, "login": {"type": "string", "description": "bws://<secret-id> (Bitwarden UUID), or sealed:<number>"},
+     S({"task_id": TASK_ID, "login": {"type": "string", "description": "bws://<secret-id> (its UUID in the fleet's vault), or sealed:<number>"},
         "to": {"type": "string", "description": "The agent that needs the login"}},
        ["task_id", "login", "to"])),
     ("worker", "create_login", t_create_login,
@@ -30279,16 +30280,17 @@ def validate_team(team):
                              f"hub's machine until it has one, or absent")
         # An entry that says nothing about an agent means "none", no credential access (PRODUCT.md P5), which is
         # the word fleet.vault_mode answers on the agent's own machine. A default of "file" pointed a new agent at
-        # a Bitwarden token file that a fresh fleet has not got, and made the hub refuse it broker access.
+        # a token file of file mode that a fresh fleet has not got, and made the hub refuse it broker access.
         if a.get("vault", "none") not in ("file", "broker", "none"):
             raise ValueError(f"agent {name}: vault must be file, broker or none")
-        # DevOps plan V3: no server keeps a Bitwarden token, so no agent gets the vault files of its server (file,
-        # which read one) that it does not have in the team.json that the hub runs now; one that has them keeps them.
-        # Outside a running hub (fleet.py verify, an installer) there is no "now", and the rule says nothing.
+        # File mode read a Bitwarden token on the agent's server, and Founderizer has no Bitwarden backend any more
+        # (11 November 2026): an agent's helper reads "file" as no credential access. So no agent gets it that does
+        # not have it in the team.json that the hub runs now; one that has it keeps the word. Outside a running hub
+        # (fleet.py verify, an installer) there is no "now", and the rule says nothing.
         running = TEAM.get("agents") or {}
         if a.get("vault") == "file" and running and (running.get(name) or {}).get("vault") != "file":
-            raise ValueError(f"agent {name}: vault file reads a Bitwarden token on its server, and no server keeps one "
-                             f"any more: its vault is broker or none")
+            raise ValueError(f"agent {name}: vault file is gone, because Founderizer has no Bitwarden backend any "
+                             f"more: its vault is broker or none")
         if "vault_create" in a and (a["vault_create"] is not True or a["role"] not in ("worker", "lead")):
             raise ValueError(f"agent {name}: vault_create is true for a worker or a lead, or absent")
         if not isinstance(a.get("active", True), bool) or (a["role"] == "manager" and a.get("active") is False):
