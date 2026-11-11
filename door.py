@@ -27,7 +27,8 @@ statement, which the hub carries as it carries his yeses) lets every such call o
 default. Every refusal names its route (ROUTES). Writes on
 one host wait for each other, one reboot-class call runs at a time in each business, and inside a window of the access
 file a deploy, a restart, a script or a reboot is refused. A script or a run arms the host's rollback timer first, and
-the door ends the countdown when the host answers it after the call.
+the door ends the countdown when the host answers it after the call. Each host takes the host parts of the release that
+the door runs (update_hosts, by ops-root's self-update), within a minute of the door's start on that release.
 Every call leaves one numbered line in the record, which the hub reads each minute; if the hub is down, the door
 still works. No value reaches an agent: the door's tokens and keys are secrets of the central vault with the door as
 their holder, sealed to the door's own key, and only this OS user opens them.
@@ -69,6 +70,10 @@ HUB_FILE = ETC + "/hub.json"                # the SHA-256 of the hub's two secre
 KEY_FILE = ETC + "/release-key.pub"         # the release keys, pinned at install
 EARLY_FILE = ETC + "/early-key.pub"         # and the early ones (releases.every_key), when the install had them
 FLOOR_FILE = ETC + "/floor"                 # the revision the door runs; update never moves below it
+RELEASE_JSON = ETC + "/release.json"        # the signed manifest of that release, which root keeps for the hosts
+HOSTS_FILE = STATE + "/hosts.json"          # each host's self-update: the release that it was sent, and how it ended
+HOST_FILES = ("ops-root", "ops-read", "inventory", "app-release")     # what self-update takes (host/ops-root)
+HOST_RETRY = 3600                           # seconds before a host that did not answer is asked again for a release
 RECORD_FILE = STATE + "/record.jsonl"
 MINTED_FILE = STATE + "/minted.json"        # ids of the keys this door minted (never their values)
 MADE_FILE = STATE + "/made.json"            # names of what writes through the door made, by provider account (D25)
@@ -584,6 +589,30 @@ class Door:
             write_json(APPROVED_FILE, used)
         return entry
 
+    def update_host(self, host, name, manifest, code):
+        """(outcome, words) of one host's update to the host parts of the release that the door runs: current, done,
+        refused, failed or unreachable. Its help says its version and its release (an ops-root of version 1 names no
+        release, and one that no self-update gave says none): a host of another release gets the bundle, with the
+        commits down to its own release, which self-update checks the way down by."""
+        status, out = self.ssh(host, {"v": 1, "op": "help", "args": []}, None)
+        if status == 255:
+            return "unreachable", f"{name} did not answer the door: {out.strip()[-200:]}"
+        found = re.match(r"ops-root [0-9]{1,6}, mode [a-z-]+(?:, release ([0-9a-f]{40}|none))?", out.strip()) \
+            if status == 0 else None
+        if not found:
+            return "failed", f"{name}'s ops-root gave no version ({status}): {out.strip()[-200:]}"
+        if found.group(1) == manifest["revision"]:
+            return "current", f"{name} runs the host parts of release {manifest['version']}"
+        try:
+            bundle = host_bundle(code, manifest, found.group(1) if found.group(1) not in (None, "none") else "")
+        except (OSError, ValueError, subprocess.SubprocessError) as e:
+            return "failed", f"the door could not make the bundle for {name}: {e}"
+        status, out = self.ssh(host, {"v": 1, "op": "self-update", "args": []}, json.dumps(bundle).encode())
+        if status == 0:
+            return "done", out.strip() or f"{name} takes release {manifest['version']}"
+        return ("refused" if status == 3 else "unreachable" if status == 255 else "failed"), \
+            out.strip().removeprefix("refused: ")[-300:]
+
     def full_access(self, access, host, agent):
         """True when the owner's signed mode of this host is Full access and the door honours it here: the access file
         holds the host at fix, the host is on no never list, and the caller holds it at Fix in the host's own business
@@ -745,9 +774,10 @@ class Door:
             status, out = self.ssh(access["hosts"][d.host], req, stdin)
             if status == 3:             # ops-root refused it before it ran, and before a script armed the timer
                 said = out.strip().removeprefix("refused: ")
-                if said.startswith(f"{op!r} is no form of a host"):    # a host keeps the ops-root of its install
-                    said = (f"{d.host} runs an ops-root older than the door's, which has no form {op}: the host gets "
-                            f"it with a new install of the door's parts")
+                if said.startswith(f"{op!r} is no form of a host"):    # the door has not updated the host yet
+                    said = (f"{d.host} runs an ops-root older than the door's, which has no form {op}: the door "
+                            f"brings each host the ops-root of its release (update_hosts), so send the same call "
+                            f"again in a few minutes")
                 raise Refused(said)
             if op in door_targets.TIMED_FORMS:
                 out = out.rstrip("\n") + "\n" + self.timer_off(access["hosts"][d.host], d.host) + "\n"
@@ -1417,7 +1447,85 @@ def serve(door=None, address=None, port=None):
     Handler.door = door
     httpd = DoorServer((address or door.conf.get("address"), port or door.conf.get("port", DOOR_PORT)), Handler)
     threading.Thread(target=vault_sweep, args=(door,), daemon=True).start()
+    threading.Thread(target=host_sweep, args=(door,), daemon=True).start()
     httpd.serve_forever()
+
+
+def git_raw(code, *args):
+    """The bytes that git gives of the door's code folder, which root owns and the door's user reads: safe.directory
+    lets the door's user read it, and nothing here writes it."""
+    r = subprocess.run(["git", "-c", "safe.directory=*", "-C", code, *args], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+                       env={"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8",
+                            "HOME": os.environ.get("HOME", "/")})
+    if r.returncode != 0:
+        raise ValueError(f"git {args[0]} gave {r.returncode}: {r.stderr.decode('utf-8', 'replace').strip()[-200:]}")
+    return r.stdout
+
+
+def host_bundle(code, manifest, floor):
+    """What self-update reads (host/ops-root, verify_bundle and descends): the signed manifest of the release that the
+    door runs, its commit, its root tree and its host/ tree as raw git objects, the host files, and the commits on the
+    way down to the host's own release, when it has one. The published history is one commit for each release, so
+    the way down is short for a host that took the releases before."""
+    revision = manifest["revision"]
+
+    def raw(kind, name):
+        return base64.b64encode(git_raw(code, "cat-file", kind, name)).decode()
+    listed = git_raw(code, "ls-tree", "--name-only", f"{revision}:host").decode().split()
+    history = []
+    if floor:
+        history = [raw("commit", sha) for sha in
+                   git_raw(code, "rev-list", "--ancestry-path", f"{floor}..{revision}").decode().split()
+                   if sha != revision]
+    return {"manifest": manifest, "commit": raw("commit", revision), "root": raw("tree", f"{revision}^{{tree}}"),
+            "host": raw("tree", f"{revision}:host"), "history": history,
+            "files": {name: raw("blob", f"{revision}:host/{name}") for name in HOST_FILES if name in listed}}
+
+
+def update_hosts(door):
+    """Each host of the access file takes the host parts of the release that the door runs: ops-root, ops-read,
+    inventory and app-release, by self-update, the one form by which ops-root takes a new version of itself, and only
+    from a release that a release key signed and that descends from the release that it came from. Before, a host
+    kept the copy of its install for good. The door asks each host for its release and sends the update only to a host
+    of another release: once for each host and release, and again after HOST_RETRY for a host that did not answer.
+    Each update that the door sends leaves a line in its record. A host on the never list is no target of the door."""
+    revision, manifest = running_revision(), read_json(RELEASE_JSON, None)
+    code = os.path.join(P(CODE), revision) if revision else ""
+    if not revision or not isinstance(manifest, dict) or manifest.get("revision") != revision or \
+            not os.path.isdir(os.path.join(code, "host")):
+        return []
+    access = door.access()
+    never = set((access.get("never") or {}).get("hosts") or [])
+    with door.lock:
+        state = read_json(HOSTS_FILE, {})
+    done = []
+    for name, host in sorted((access.get("hosts") or {}).items()):
+        last = state.get(name) or {}
+        if name in never or (last.get("revision") == revision and (last.get("outcome") != "unreachable" or
+                                                                   now() - (last.get("at") or 0) < HOST_RETRY)):
+            continue
+        with door.held(door.host_locks, name):
+            outcome, said = door.update_host(host, name, manifest, code)
+        if outcome != "current":
+            door.record.add(caller="door", target=name, action="self-update", kind="rule",
+                            outcome="done" if outcome == "done" else "refused" if outcome == "refused" else "failed",
+                            why=said[:300])
+        done.append((name, outcome))
+        with door.lock:
+            write_json(HOSTS_FILE, dict(read_json(HOSTS_FILE, {}), **{name: {
+                "revision": revision, "outcome": outcome, "at": round(now())}}))
+    return done
+
+
+def host_sweep(door, once=False):
+    """update_hosts each minute, in a thread of its own: a host that does not answer holds no yes of the owner."""
+    while True:
+        with contextlib.suppress(Exception):
+            update_hosts(door)
+        if once:
+            return
+        time.sleep(60)
 
 
 def item_secret(text):
@@ -1616,6 +1724,7 @@ def take(raw):
         os.rename(repo, target)
     if running == revision:
         ensure_follow_units()
+        keep_release(manifest)
         return f"the door runs release {manifest['version']} ({revision[:12]}) already"
     link = os.path.join(P(CODE), "current")
     with contextlib.suppress(FileNotFoundError):
@@ -1629,7 +1738,16 @@ def take(raw):
         if re.fullmatch(r"[0-9a-f]{40}", name) and name not in (revision, running):
             shutil.rmtree(os.path.join(P(CODE), name), ignore_errors=True)
     ensure_follow_units()
+    keep_release(manifest)
     return f"the door runs release {manifest['version']} ({revision[:12]})"
+
+
+def keep_release(manifest):
+    """The signed manifest of the release that the door runs, which its pinned keys checked, kept for its hosts'
+    self-update (update_hosts) where root writes and the door's user reads. A held release is never kept, as take()
+    never runs one."""
+    if isinstance(manifest, dict) and not manifest.get("hold") and read_json(RELEASE_JSON, None) != manifest:
+        write_json(RELEASE_JSON, manifest, mode=0o644)
 
 
 def cmd_update(args):
@@ -1660,6 +1778,11 @@ def cmd_follow(args):
     if status != 200 or not isinstance(answer, dict):
         sys.exit(f"the hub gave no release ({status})")
     if answer.get("revision") == running_revision():
+        # A door that took this release with the code before it has no copy of its manifest: its hosts get theirs now
+        import releases
+        with contextlib.suppress(ValueError, releases.Untrusted):
+            keep_release(releases.check(answer, releases.read_keys(P(ETC), "release-key.pub")
+                                        + releases.read_keys(P(ETC), "early-key.pub")))
         return
     print(take(answer))
 

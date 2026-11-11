@@ -133,6 +133,7 @@ APP = re.compile(r"[a-z0-9][a-z0-9-]{0,40}")
 PACKAGE = re.compile(r"[a-z0-9][a-z0-9+.-]{0,99}(=[A-Za-z0-9.+~:-]{1,100})?")
 RUNNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
+SHA1 = re.compile(r"[0-9a-f]{40}")
 
 
 class Refused(Exception):
@@ -396,10 +397,14 @@ CHECKS = {
 
 # ---- rule forms
 
-@form("help", write=False, help="the forms of this host")
+@form("help", write=False, help="the forms of this host, and the release that this file came from")
 def do_help(req, data):
+    """The forms; its first line is the door's reading of this file (door.py, update_hosts): its version, the host's
+    mode, and the release that self-update gave it, or none for the copy of an install."""
     lines = [f"{f['name']:<17} {f['kind']:<6} {f['help']}" for f in FORMS.values()]
-    return f"ops-root {VERSION}, mode {mode()}\n" + "\n".join(lines)
+    release = read(RELEASE_FILE).strip()
+    return f"ops-root {VERSION}, mode {mode()}, release {release if SHA1.fullmatch(release) else 'none'}\n" + \
+        "\n".join(lines)
 
 
 @form("upgrade", window="upgrade", help="security upgrades (unattended-upgrade), which go on if the session ends")
