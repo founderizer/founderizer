@@ -3171,6 +3171,9 @@ def colleague_facts(name):
             out.append(f"{GOOGLE_NAMES[service]} at the level {google[service]['level']}")
     if a.get("tools"):
         out.append("MCP servers " + named_few(sorted(a["tools"]), TEAM_ITEMS))
+    if a.get("servers"):        # who to give server work to: the door takes a server's calls from its holder only
+        out.append("servers through the door " +
+                   named_few((f"{h} ({v})" for h, v in sorted(a["servers"].items())), TEAM_ITEMS))
     return out
 
 
@@ -9137,6 +9140,11 @@ def t_door_gitops(agent, a):
     unknown = [n for n in names if n not in agents()]
     if unknown:
         raise ToolError(f"{', '.join(unknown)}: no agent of this fleet has that name.")
+    apart = [n for n in names if n not in door_holders()]
+    if apart:           # the door's file names an agent with a target only with its business (door_holders)
+        raise ToolError(f"{', '.join(apart)} hold{'s' if len(apart) == 1 else ''} no server through the door, so the "
+                        f"door does not know {'it' if len(apart) == 1 else 'them'}: a GitOps target is for an agent "
+                        f"that holds the servers of its business.")
     why = str(a.get("why") or "").strip()
     if not why or len(why) > GRANT_WHY_MAX:
         raise ToolError(f"why is the plan step or the reason, in 1 to {GRANT_WHY_MAX} characters: the record keeps it.")
@@ -9247,6 +9255,54 @@ def t_request_secret(agent, a):
                             f"{', '.join(DOOR_PROVIDERS)} (for example cloudflare:acme), or app:<app>:<NAME> for "
                             f"one setting of an app on a host (for example app:shop:STRIPE_SECRET_KEY), and it is "
                             f"an API key. AWS needs no key, and a GitHub App key comes through the app.")
+        # Only an agent that holds servers through the door can use a key of the door (door_holders). A request of
+        # any other worker would put its name in the door's file with no business, and the door refuses that file.
+        holders = door_holders()
+        if worker and agent not in holders:
+            raise ToolError(
+                f"The door uses a key only for an agent that holds servers through it, and you hold none, so "
+                f"`ops` would refuse you with {door}. " +
+                (f"{', '.join(holders)} hold{'s' if len(holders) == 1 else ''} the servers: ask your requester with "
+                 f"ask_my_requester to give that part of the work to "
+                 f"{'it' if len(holders) == 1 else 'the one whose servers it is for'}." if holders else
+                 "No agent holds a server through the door yet: ask your requester with ask_my_requester."))
+        # Which holder the door uses the key for: the asker when it holds servers, else the one that the manager
+        # names in give_to, else the one holder of the fleet. With several holders the manager names it, so that no
+        # agent of one business takes a key of another by asking for it.
+        named = [n for n in a["give_to"] if n != "door"] if not worker and isinstance(a.get("give_to"), dict) else []
+        if len(named) > 1 or (named and named[0] not in holders):
+            raise ToolError(f"For a key of the door, give_to names one agent that holds servers through the door, "
+                            f"which the door then uses the key for" +
+                            (f": {', '.join(holders)}." if holders else ", and no agent holds one yet."))
+        door_user = named[0] if named else agent if agent in holders else holders[0] if len(holders) == 1 else None
+        if not door_user and holders:
+            raise ToolError(f"Several agents hold servers through the door ({', '.join(holders)}): name in give_to "
+                            f"the one whose servers this key is for, for example {{\"{holders[0]}\": \"use\"}}. "
+                            f"The door uses the key for that agent alone.")
+        held = (TEAM["door"].get("credentials") or {}).get(door)
+        if held:        # the door has this key already: nothing to type, and at most one name more in its rules
+            users = held.get("agents") or []
+            if door_user in users:
+                raise ToolError(f"The door already holds {door} for {'you' if door_user == agent else door_user}, so "
+                                f"there is nothing to type: `ops` takes it.")
+            if users:
+                raise ToolError(f"The door already holds {door}, for {', '.join(users)}: "
+                                f"{'ask your requester to give' if worker else 'give'} that part of the work to "
+                                f"{users[0] if len(users) == 1 else 'one of them'}, which does it through the door.")
+            if worker:
+                raise ToolError(f"The door already holds {door}, for no agent yet: ask your requester with "
+                                f"ask_my_requester. The manager gives it to you with request_secret, this door name "
+                                f"and your name in give_to, and nobody types anything.")
+            if not door_user:
+                raise ToolError(f"The door already holds {door}, and no agent holds a server through the door yet, "
+                                f"so no agent can use it.")
+            try:
+                save_door_credential(door, held["secret"], door_user, named=True)
+            except Refusal as e:
+                raise ToolError(f"The hub refused it: {e}") from None
+            return (f"The door already held {door}, for no agent: it now uses it for "
+                    f"{'you' if door_user == agent else door_user}, with nothing to type. The door's rules take it "
+                    f"when the app next writes them, within a few minutes; then `ops` takes it.")
     env = str(a.get("env") or "").strip() or (door_env(door) if door else "")
     if kind == "api_key" and not env_name(env):
         if door:
@@ -9297,6 +9353,7 @@ def t_request_secret(agent, a):
                             f'it, or for an API key "read", which puts the key into its sessions as the variable.')
     spec = {"kind": kind, **({"env": env} if env else {}), **({"site": site} if site else {}),
             **({"give": dict(sorted(give.items()))} if give else {}), **({"door": door} if door else {}),
+            **({"door_user": door_user} if door and door_user else {}),     # the holder that the door uses it for
             **({"reply": reply["request_id"]} if chat else {}),         # the owner message it answers
             **({"tasks": [tid]} if tid else {})}                        # the task that waits on it
     if kind == "api_key":
@@ -9478,12 +9535,20 @@ def answer_secret(body, request_id, client):
                                   task=bool(spec.get("tasks")))
         gave = any(h["agent"] == need["by"] for h in resource_holders("secret", ref))
         if spec.get("door"):    # DevOps plan 13, item 3: the door holds it, and its rules name it for the asker
-            save_door_credential(spec["door"], ref, need["by"])
+            save_door_credential(spec["door"], ref, spec.get("door_user") or need["by"],
+                                 named=bool(spec.get("door_user")))
             app_key = spec["door"].split(":") if spec["door"].startswith("app:") else None
-            text = (f"Saved for the door as {spec['door']} ({ref}): the door holds the key, and no agent holds it. "
-                    f"The door's rules take it when the app next writes them, within a few minutes; then " +
-                    (f"`ops <host> env-new {app_key[1]} {app_key[2]} key` puts it in the app's settings."
-                     if app_key else f"`ops {spec['door']} <form>` works."))
+            users = ((TEAM.get("door") or {}).get("credentials") or {}).get(spec["door"], {}).get("agents") or []
+            text = (f"Saved for the door as {spec['door']} ({ref}): the door holds the key, and no agent holds it. " +
+                    (f"The door uses it for {', '.join(users)}. The door's rules take it when the app next writes "
+                     f"them, within a few minutes; then " +
+                     (f"`ops <host> env-new {app_key[1]} {app_key[2]} key` puts it in the app's settings."
+                      if app_key else f"`ops {spec['door']} <form>` works.") if users else
+                     f"No agent uses it yet, because " +
+                     ("several agents hold servers through the door" if door_holders() else
+                      "no agent holds a server through the door") +
+                     f": once one does, request_secret with door {spec['door']} and that agent's name in give_to "
+                     f"gives it to that agent, with nothing to type."))
     else:
         text = "Not given" + (f": {body['decline']}" if body["decline"] else ".") + \
             " Do not ask for it in words instead."
@@ -24605,7 +24670,11 @@ TOOLS = [
                                                   "rules, <provider>:<account> (cloudflare, hetzner, backblaze, "
                                                   "azure or tailscale), or "
                                                   "app:<app>:<NAME> for one setting of an app on a host. The card "
-                                                  "gives it to the door alone, and give_to is not used."}},
+                                                  "gives it to the door alone. The door uses it for one agent "
+                                                  "that holds servers through it: you when you hold them, else the "
+                                                  "one agent that does; with several such agents, name the one in "
+                                                  "give_to. A key that the door holds for no agent goes to the "
+                                                  "agent that you name the same way, with nothing typed."}},
        ["why"])),
     # A worker's and a lead's own entry: in its owner chat, in reply to the owner's message, and in a task session
     # that no contact drives (tools_for), where the task waits for his answer
@@ -24641,7 +24710,8 @@ TOOLS = [
                                                   "of an app on a host, for example app:shop:STRIPE_SECRET_KEY, "
                                                   "which `ops <host> env-new <app> <NAME> key` puts in the app's "
                                                   "settings. The card gives it to the door, not to you, and you "
-                                                  "never hold it."}},
+                                                  "never hold it. Only an agent that holds servers through the "
+                                                  "door asks for one: the door knows no other agent."}},
        ["why", "site"])),
     # owner API 1.13: the standing duties of an agent (RESPONSIBILITIES.md)
     ("all", "see_responsibilities", t_see_responsibilities,
@@ -33183,6 +33253,22 @@ def removed_team(team, agent):
             del apps[aid]
         if not apps:
             del out["chat_apps"]
+    # the door's lists of agents, which validate_door checks against the agents (as renamed_team names them anew): a
+    # key that only this agent used stays with the door for nobody, and a GitOps target that only it had ends
+    door = out.get("door") if isinstance(out.get("door"), dict) else {}
+    for c in (door.get("credentials") or {}).values():
+        if isinstance(c, dict) and isinstance(c.get("agents"), list) and agent in c["agents"]:
+            c["agents"] = [name for name in c["agents"] if name != agent]
+            if not c["agents"]:
+                del c["agents"]
+    gitops = door.get("gitops")
+    if isinstance(gitops, dict):
+        for repo in [r for r, g in gitops.items() if isinstance(g, dict) and agent in (g.get("agents") or [])]:
+            gitops[repo]["agents"] = [name for name in gitops[repo]["agents"] if name != agent]
+            if not gitops[repo]["agents"]:
+                del gitops[repo]
+        if not gitops:
+            del door["gitops"]
     return out
 
 
@@ -34828,6 +34914,13 @@ def grant_server(body):
                            f"lead or the manager.")
     if a.get("machine") == server:
         raise Refusal(409, f"{server} is {shown_role(agent)}'s own server, where it has free root with no door.")
+    # The reverse of door_callers_at: the door knows a caller by its server's address alone, so an agent beside the
+    # holder on one server would be the holder to the door. The app's own check of the box says the same.
+    mates = sorted(n for n in machine_agents(agent) if n != agent)
+    if level and mates:
+        raise Refusal(409, f"{shown_role(agent)} shares {a['machine']} with "
+                           f"{', '.join(shown_role(n) for n in mates)}: the door knows a caller by its server's "
+                           f"address, so an agent that holds servers through the door runs alone on its server.")
     rid = f"server:{server}"
     phrase = resource_phrase("server", server)
     result = grant_resource("owner", rid, agent, level, phrase)
@@ -34890,7 +34983,7 @@ def door_view():
     agent's machine address and OS user, as its own helper reports it. The app names a door agent as the hub does only
     when its operator box itself shows that one OS user at that address, so the box still decides who operates and the
     hub only gives the name. Called with LOCK held."""
-    door, addresses = TEAM.get("door") or {}, TEAM.get("addresses") or {}
+    door, addresses, holders = TEAM.get("door") or {}, TEAM.get("addresses") or {}, set(door_holders())
     users = {r["agent"]: ((json.loads(r["data"]) or {}).get("access") or {}).get("user")
              for r in q("SELECT agent, data FROM machine_status")}
     app = None
@@ -34899,7 +34992,9 @@ def door_view():
     with CENTRAL_LOCK:      # LOCK, then CENTRAL_LOCK, as vault_view takes them
         status = CENTRAL["status"]
     return {"door": {"address": door["address"], "port": door.get("port", DOOR_PORT)} if door.get("address") else None,
-            "credentials": {name: {"secret": c["secret"], "agents": list(c.get("agents") or [])}
+            # Only for an agent that holds servers now (door_holders): one that lost its last server keeps its name
+            # in team.json, so that it has its keys again when the app gives it a server again, but not at the door.
+            "credentials": {name: {"secret": c["secret"], "agents": [u for u in c.get("agents") or [] if u in holders]}
                             for name, c in sorted((door.get("credentials") or {}).items())},
             "agents": {name: {"address": addresses[a["machine"]], "user": users.get(name),
                               "repos": dict(sorted((a.get("repos") or {}).items()))}
@@ -34922,8 +35017,9 @@ def door_view():
             "holds": dict(sorted((door.get("holds") or {}).items())),
             # DevOps plan X3: the GitOps repositories, from the manager's door_gitops: {sync, agents}, which the app
             # writes as each agent's target {kind: gitops, sync}
-            "gitops": {repo: {"sync": g["sync"], "agents": list(g["agents"])}
-                       for repo, g in sorted((door.get("gitops") or {}).items())}}
+            "gitops": {repo: {"sync": g["sync"], "agents": [u for u in g["agents"] if u in holders]}
+                       for repo, g in sorted((door.get("gitops") or {}).items())
+                       if any(u in holders for u in g["agents"])}}
 
 
 DOOR_PENDING = {}   # {request_id: (token, record)} of one POST /ui/door/secrets: in memory only, never in a record
@@ -35112,12 +35208,27 @@ def door_env(door):
     return name if name.endswith(KEY_SUFFIXES) else name + "_KEY"
 
 
-def save_door_credential(name, ref, asker):
+def door_holders(team=None):
+    """The agents that hold a server through the door, in the order of team.json. The door's file names only these by
+    their address and their business, so only these can use a key or a GitOps target of the door: an entry of any
+    other agent with one of them is a file that the door refuses whole (door.validate_access, "needs its business")."""
+    return [name for name, a in ((team or TEAM).get("agents") or {}).items() if a.get("servers")]
+
+
+def save_door_credential(name, ref, asker, named=False):
     """A key that the owner saved from a key card for the door (DevOps plan 13, item 3): the door's rules name it
     `name`, for the agent that asked. The app writes both into the door's access file at its next round. A key that
     the manager asked for names no agent: the door uses it for the agent whose own card names it later. A key saved
-    again under the same name replaces the old one."""
-    users = [asker] if role_of(asker) in ("worker", "lead") else []
+    again under the same name replaces the old one.
+
+    The door knows a caller by its address, and its file names only the agents that hold servers through it. So the
+    key is for the asker when it holds a server, the manager too (API 1.122), and else for the one agent that holds
+    the servers when the fleet has exactly one. With several holders the manager's request names the one
+    (t_request_secret, give_to), and that name comes here as the asker; no agent takes a key by asking for it."""
+    holders = door_holders()
+    # named: the card or the manager named this agent. When it holds no server any more (it lost its last one, or it
+    # left the fleet, between the ask and the owner's Save), the key stays with nobody, and never goes to another.
+    users = [asker] if asker in holders else holders if len(holders) == 1 and not named else []
 
     def change(team):
         door = team.get("door")

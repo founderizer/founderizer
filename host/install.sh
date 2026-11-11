@@ -7,6 +7,9 @@
 #   install.sh --level fix --mode fix|rule-only --door-key "..."           Fix: Read, ops-root and its sudoers line
 #   install.sh --remove                                                     No access: every part of the door leaves
 #
+# A remove leaves the apps that ops-root's app-new made, which are the owner's: while one is there, the release helper
+# and the apps' settings stay, because each /usr/local/sbin/<app>-deploy is a link to that helper.
+#
 # Options of a Fix host: --hidden <path> (an app tree or a secret path more, again for each), --fleet-kit <path> (a
 # Fleet machine's checkout), --pool <lvm path> (a CI host's pool volume), --build-file <path> (a CI host's sparse ext4
 # file on a loop device, which holds its runners' builds) and --runner-user <user> (a CI host's rootless Docker user,
@@ -15,7 +18,8 @@
 # (ci_layout). --port <n> is the second sshd's port, and --address <ip> the address it listens
 # on, this host's Tailscale address unless a test host names 127.0.0.1.
 #
-# It refuses a distribution release that the tests did not cover. A second run is safe: it writes the same files
+# An install refuses a distribution release that the tests did not cover; a remove runs on every release, so that a
+# host that was upgraded past them can still lose the door's parts. A second run is safe: it writes the same files
 # again and keeps the host key. Its last line is the host key of the second sshd, which the door's access file needs.
 set -euo pipefail
 umask 022
@@ -49,11 +53,6 @@ while [ $# -gt 0 ]; do
 done
 
 [ "$(id -u)" = 0 ] || die "run it as root"
-. /etc/os-release
-case " $COVERED " in
-    *" ${ID:-?}:${VERSION_ID:-?} "*) ;;
-    *) die "${PRETTY_NAME:-this system} is not a release that the door's tests covered ($COVERED)" ;;
-esac
 [[ "$PORT" =~ ^[1-9][0-9]{2,4}$ ]] || die "--port is a port number"
 
 remove() {
@@ -72,7 +71,21 @@ remove() {
     if [ -f "$ETC/installed-openssh" ]; then      # this script installed sshd for itself: it leaves with it
         apt-get purge -y -o DPkg::Lock::Timeout=600 openssh-server >/dev/null
     fi
-    rm -rf "$ETC" "$LIB" "$STATE" "$SBIN" /var/lib/ops-agent
+    rm -rf /var/lib/ops-agent
+    # An app of app-new deploys through /usr/local/sbin/<app>-deploy, a link to the release helper, which reads the
+    # app's settings: both stay while an app is there, and every other file of the door goes.
+    apps=""
+    for f in "$ETC"/apps/*.json; do
+        if [ -f "$f" ]; then apps="$apps $(basename "$f" .json)"; fi
+    done
+    if [ -n "$apps" ]; then
+        find "$ETC" -mindepth 1 -maxdepth 1 ! -name apps -exec rm -rf {} +
+        [ ! -d "$LIB" ] || find "$LIB" -mindepth 1 -maxdepth 1 ! -name app-release -exec rm -rf {} +
+        rm -rf "$STATE" "$SBIN"
+        echo "kept: the release helper and the settings of$apps, whose deploys go on"
+    else
+        rm -rf "$ETC" "$LIB" "$STATE" "$SBIN"
+    fi
     echo "removed: ops-agent, ops-read, ops-root and the second sshd"
 }
 
@@ -80,6 +93,12 @@ if [ "$REMOVE" = 1 ]; then
     remove
     exit 0
 fi
+
+. /etc/os-release
+case " $COVERED " in
+    *" ${ID:-?}:${VERSION_ID:-?} "*) ;;
+    *) die "${PRETTY_NAME:-this system} is not a release that the door's tests covered ($COVERED)" ;;
+esac
 
 case "$LEVEL" in
     read) [ -z "$MODE" ] || die "--mode goes with --level fix" ;;
@@ -107,6 +126,11 @@ if ! dpkg-query -W -f='${Status}' openssh-server 2>/dev/null | grep -q 'install 
     touch "$ETC/installed-openssh"
 fi
 
+# $ETC/release names the release whose parts ops-root's self-update put here, and ops-root's help gives it to the
+# door, which sends no update to a host that names the door's own release. Parts from this folder that are not those
+# bytes are a copy of no release that the host knows: the file goes, the help says none, and the door sends its own.
+for f in ops-read inventory app-release; do cmp -s "$HERE/$f" "$LIB/$f" || rm -f "$ETC/release"; done
+[ "$LEVEL" = read ] || cmp -s "$HERE/ops-root" "$SBIN" || rm -f "$ETC/release"
 install -d -m 0755 -o root -g root "$ETC" "$LIB"
 install -d -m 0700 -o root -g root "$STATE"
 install -m 0755 -o root -g root "$HERE/ops-read" "$LIB/ops-read"

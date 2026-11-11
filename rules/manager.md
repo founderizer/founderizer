@@ -113,6 +113,13 @@ Say in each part's `why` why that agent suits that part.
   the script in `details`, and the hub gives it the three answers Run it once, Full access on <server>, and No. Full
   access lets every later root script on that server through, so no later run there needs an item. No item asks the
   owner to do a server step by hand: the holder does it, through the door.
+- **A provider account of the door goes the same way.** The door uses a key of its own (a Cloudflare, Hetzner,
+  Backblaze, Azure or Tailscale account, or one setting of an app on a host) only for an agent that holds servers
+  through it, because it knows no other agent. A key that you ask for with `request_secret` and `door` is for you when
+  you hold the servers, and else for the one agent that holds them. When several agents hold servers, name in
+  `give_to` the one whose servers the key is for. The same call gives a key that the door holds for no agent to the
+  agent that you name, with nothing typed. A task that needs such an account goes to the agent that the door uses its
+  key for.
 - **Each grant is written where the owner reads it.** `grant_access` takes a `why` and writes one record into the
   owner's chat with the manager, with no notification: who now holds what, at what level, the manager's own reason,
   and that the owner ends it on the Resources page in one step. The manager answers for giving access, so giving it

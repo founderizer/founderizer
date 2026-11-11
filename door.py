@@ -89,6 +89,7 @@ APPROVAL_DAYS = 7                           # a signed yes older than this lets 
 DEVICES_FILE = STATE + "/devices.json"      # the owner's phones whose signing key his owner key certified
 MODES_FILE = STATE + "/modes.json"          # the owner's signed mode of each host: the newest statement of each
 MODES = ("auto", "full")                    # door-modes proposal, step 4: Auto, the default, and Full access
+MODE_SKEW = 300                             # seconds that the clock of the owner's Mac may be behind the door's
 UPSTREAM = "https://github.com/founderizer/founderizer.git"
 SYSTEMD = "/etc/systemd/system"
 FOLLOW_UNIT = "fleet-door-follow"           # the root timer by which the door takes each signed release (plan 13.2)
@@ -117,6 +118,11 @@ WantedBy=timers.target
 REBOOT_BACK = 900           # seconds a reboot-class call holds its business while the host comes back
 BODY_MAX = 512 * 1024
 RECORD_PAGE = 500
+RECORD_TEXT = 300           # characters of one field of a record line: a caller's own words are cut to it
+# Bytes that the door reads of one host's answer. ops-read cuts its own at 256 KiB of text and ops-root at 64 KiB, so
+# no form needs more, and a host that writes more is stopped.
+HOST_OUT_MAX = 2 * 1024 * 1024
+HELP_WAIT = 60              # seconds for a host's help, which the host sweep asks of each host in turn
 GITHUB_REACH_PAGES = 30     # pages of 100 repositories that the door reads of one installation, at most
 # The permissions of an agent's token at each grant level. A read or write token also gets actions: read where the
 # installation holds Actions (token_permissions).
@@ -167,13 +173,18 @@ def read_json(path, default):
         return default
 
 
-def write_json(path, data, mode=0o600):
+def write_json(path, data, mode=0o600, group=None):
+    """The file, replaced whole. group: root's file for that group, set before the replace, so that no reader of the
+    group finds a file that it cannot read yet."""
     folder = os.path.dirname(P(path))
     os.makedirs(folder, mode=0o700, exist_ok=True)
     fd, temp = tempfile.mkstemp(dir=folder, prefix=".door-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, sort_keys=True)
+            if group is not None:
+                with contextlib.suppress(OSError):
+                    os.fchown(f.fileno(), 0, group)
         os.chmod(temp, mode)
         os.replace(temp, P(path))
     finally:
@@ -190,6 +201,27 @@ def tailnet_address(text):
     except ValueError:
         return False
     return a in ipaddress.ip_network("100.64.0.0/10") or a in ipaddress.ip_network("fd7a:115c:a1e0::/48")
+
+
+def own_servers(data):
+    """{address: "hub" or "door"}: the hub's server and the door's own, by address, however an IPv6 address is
+    written. The door reads its own address from the file that door.sh wrote; a test has none, and then only the hub's
+    counts. On such a server an agent's own call, a file install or a script, would reach the central vault or the
+    door's keys, so a host at one of these addresses is rule-only (own_server)."""
+    out, hub = {}, data.get("hub") if isinstance(data.get("hub"), dict) else {}
+    for who, text in (("door", read_json(CONF_FILE, {}).get("address")), ("hub", hub.get("address"))):
+        with contextlib.suppress(ValueError):
+            if isinstance(text, str):
+                out[ipaddress.ip_address(text)] = who
+    return out
+
+
+def own_server(own, host):
+    """"hub" or "door" for a host at one of the addresses of own_servers, or None."""
+    try:
+        return own.get(ipaddress.ip_address(host.get("address"))) if isinstance(host.get("address"), str) else None
+    except ValueError:
+        return None
 
 
 def validate_access(data):
@@ -214,7 +246,7 @@ def validate_access(data):
             raise ValueError("each of owner_keys is the base64 of an uncompressed P-256 public key") from None
     if "fleet" in data and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", str(data["fleet"])):
         raise ValueError("fleet is the fleet's id, which the owner's signed statements name")
-    hosts = data.get("hosts") or {}
+    hosts, own = data.get("hosts") or {}, own_servers(data)
     for name, h in hosts.items():
         if not HOST.fullmatch(name) or not isinstance(h, dict):
             raise ValueError(f"host {name!r} is not a host name")
@@ -222,6 +254,8 @@ def validate_access(data):
             raise ValueError(f"host {name} needs its address on the private network and its second sshd's host key")
         if h.get("mode") not in ("fix", "rule-only") or not NAME.fullmatch(h.get("business", "")):
             raise ValueError(f"host {name} needs a mode, fix or rule-only, and a business")
+        if h["mode"] == "fix" and own_server(own, h):
+            raise ValueError(f"host {name} is the {own_server(own, h)}'s own server: its mode is rule-only, never fix")
         if not isinstance(h.get("port", SSHD_PORT), int):
             raise ValueError(f"host {name}: the port is a number")
     credentials = data.get("credentials") or {}
@@ -355,7 +389,8 @@ def mode_statement(access, statement, signature):
     canonical form: of this fleet, a host of the access file, a mode of MODES, not from the future, and signed by one of
     the owner keys of the access file, his Mac, with the central vault's own check. A phone's key signs no mode: the
     owner's decision 3, whether the phone sets one, is open. A mode has no age limit, as a yes has: it stands until a
-    newer statement of the same host."""
+    newer statement of the same host, or until the host of that name is another server, and the door takes none from
+    before it first saw the server (settle_modes)."""
     keys, fleet = access.get("owner_keys"), access.get("fleet")
     if not keys or not fleet or not isinstance(statement, str) or not isinstance(signature, str):
         return None
@@ -373,6 +408,64 @@ def mode_statement(access, statement, signature):
     if not vault.owner_signed({"owner_keys": keys}, statement, signature):
         return None
     return said["host"], said["mode"], said["at"]
+
+
+def mode_time(entry, field="at"):
+    value = entry.get(field)
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def mode_signed(entry):
+    """{"after": time} of the last statement that the door took for a name, as its entry says it, or {}: the time of
+    the statement that the entry holds, or the `after` that it carries. An ended entry of an older release has no
+    `after`, and its time is that of the statement that it ended."""
+    older = entry.get("mode") == "ended" and "after" not in entry
+    signed = mode_time(entry) if "statement" in entry or older else mode_time(entry, "after")
+    return {} if signed is None else {"after": signed}
+
+
+def settle_modes(access, modes):
+    """The kept modes against the access file of now; True when one changed. A statement names its host by name only
+    and has no age limit, so the door keeps, for every host of the access file, the host key that the name stands for
+    and when it first saw the name with that key: a host with no entry gets Auto with the time of now, and so does a
+    name that stands for a server with another key, or that left the file and came back. A statement from before
+    that time is never taken (mode_floor), so no old Full access reaches a new server: not one that the door has
+    kept, and not one that the hub held back, or serves to a door that is new or lost its file. `after` is the time
+    of the last statement that the door took for the name, which the same statement and every older one never pass.
+    A name that left the file keeps only its times ("ended"), and what is no entry is dropped, so the file holds one
+    entry for each name that the access file ever had. An entry that the code before this wrote has no key: the door
+    cannot know which server it was signed for, and binds it to the key that the host has now, with its time."""
+    hosts, changed, t = access.get("hosts") or {}, False, round(now())
+    for name, entry in list(modes.items()):
+        if not isinstance(entry, dict):
+            del modes[name]
+        elif name not in hosts and entry.get("mode") != "ended":
+            modes[name] = dict({"mode": "ended", "at": mode_time(entry)}, **mode_signed(entry))
+        else:
+            continue
+        changed = True
+    for name, host in hosts.items():
+        key, entry = host.get("host_key"), modes.get(name)
+        if entry is None:
+            modes[name] = {"mode": "auto", "at": t, "host_key": key}
+        elif entry.get("mode") == "ended" or entry.get("host_key", key) != key:
+            modes[name] = dict({"mode": "auto", "at": t, "host_key": key}, **mode_signed(entry))
+        elif "host_key" not in entry:
+            modes[name] = dict(entry, host_key=key)
+        else:
+            continue
+        changed = True
+    return changed
+
+
+def mode_floor(entry):
+    """The time that a statement is newer than, to take the place of this entry: the time of the statement that the
+    entry holds, so that only a newer one changes it; or, for an entry that the door made when it first saw the server,
+    that time less MODE_SKEW, by which the clock of the owner's Mac may be behind the door's; and never the time of
+    the last statement that the door took for the name before (settle_modes)."""
+    at, after = mode_time(entry), mode_time(entry, "after")
+    floor = -1 if at is None else at if "statement" in entry else at - MODE_SKEW
+    return floor if after is None else max(floor, after)
 
 
 def in_window(spans, t):
@@ -415,6 +508,9 @@ class Record:
                         self.last = max(self.last, json.loads(line)["n"])
 
     def add(self, **entry):
+        # A field can hold a caller's own words (the target and the action of a call that the door refuses), as long
+        # as a request's body: each field is one short text or a number
+        entry = {k: v if v is None or isinstance(v, (int, float)) else str(v)[:RECORD_TEXT] for k, v in entry.items()}
         with self.lock:
             self.last += 1
             entry = dict(entry, n=self.last, ts=round(now(), 3))
@@ -458,15 +554,42 @@ class Door:
     # ---- the files
     def access(self):
         try:
-            mtime = os.stat(P(ACCESS_FILE)).st_mtime_ns
+            st = os.stat(P(ACCESS_FILE))
         except OSError:
             return {"v": 1, "agents": {}, "hosts": {}}
-        if self.access_cache[0] != mtime:
+        # A new owner or a new mode of the file moves no mtime, and a read that failed before it must not stay: the
+        # door reads the file again when any of these four changes.
+        mark = (st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino)
+        if self.access_cache[0] != mark:
             try:
-                self.access_cache = (mtime, validate_access(read_json(ACCESS_FILE, None)))
+                with open(P(ACCESS_FILE), encoding="utf-8") as f:
+                    data = json.load(f)
+            except OSError:         # not kept: the next call reads the file again
+                return {"v": 1, "agents": {}, "hosts": {}}
             except ValueError:
-                self.access_cache = (mtime, {"v": 1, "agents": {}, "hosts": {}})    # a broken file names nobody
+                data = None
+            # A file from before the rule of own_servers can hold the hub's server or the door's own at fix. The door
+            # reads such a host as rule-only, so that a new release leaves no door that names nobody, and `door.py
+            # access` refuses the next file that says fix there.
+            hosts = data.get("hosts") if isinstance(data, dict) else None
+            own = own_servers(data) if isinstance(hosts, dict) else {}
+            for h in hosts.values() if own else []:
+                if isinstance(h, dict) and h.get("mode") == "fix" and own_server(own, h):
+                    h["mode"] = "rule-only"
+            try:
+                self.access_cache = (mark, validate_access(data))
+            except ValueError:
+                self.access_cache = (mark, {"v": 1, "agents": {}, "hosts": {}})     # a broken file names nobody
+            else:
+                self.keep_modes(data)       # the first read of a new file: a mode of a host that left it ends
         return self.access_cache[1]
+
+    def keep_modes(self, access):
+        """settle_modes on the door's file of modes, at the first read of an access file that changed."""
+        with contextlib.suppress(OSError), self.lock:
+            modes = read_json(MODES_FILE, {})
+            if isinstance(modes, dict) and settle_modes(access, modes):
+                write_json(MODES_FILE, modes)
 
     def caller(self, address):
         """The agent at this address, or None: Tailscale proves the address, and the access file names it."""
@@ -595,7 +718,7 @@ class Door:
         release, and one that no self-update gave says none): a host of another release gets the bundle, with the
         commits down to its own release, which self-update checks the way down by."""
         status, out = self.ssh(host, {"v": 1, "op": "help", "args": []}, None)
-        if status == 255:
+        if status in (255, 124):        # no session, or no answer within HELP_WAIT: the door asks again later
             return "unreachable", f"{name} did not answer the door: {out.strip()[-200:]}"
         found = re.match(r"ops-root [0-9]{1,6}, mode [a-z-]+(?:, release ([0-9a-f]{40}|none))?", out.strip()) \
             if status == 0 else None
@@ -617,14 +740,16 @@ class Door:
         """True when the owner's signed mode of this host is Full access and the door honours it here: the access file
         holds the host at fix, the host is on no never list, and the caller holds it at Fix in the host's own business
         (door-modes proposal, section 2). The door checks it all at each call, the statement's signature too, because
-        the file's owner keys can change: a host at rule-only, or on the never list, ignores any statement."""
+        the file's owner keys can change: a host at rule-only, or on the never list, ignores any statement. So does a
+        host whose host key is not the one that the statement was accepted for (settle_modes): a new server that got
+        the name of an old one is at Auto until the owner signs a new statement."""
         h = (access.get("hosts") or {}).get(host)
         me = (access.get("agents") or {}).get(agent) or {}
         if not h or h.get("mode") != "fix" or host in ((access.get("never") or {}).get("hosts") or []) or \
                 me.get("business") != h.get("business") or (me.get("servers") or {}).get(host) != "fix":
             return False
         entry = read_json(MODES_FILE, {}).get(host)
-        if not isinstance(entry, dict) or entry.get("mode") != "full":
+        if not isinstance(entry, dict) or entry.get("mode") != "full" or entry.get("host_key") != h.get("host_key"):
             return False
         return mode_statement(access, entry.get("statement"), entry.get("signature")) == (host, "full", entry.get("at"))
 
@@ -884,7 +1009,9 @@ class Door:
                 "run": lambda argv, stdin, env: run_program(argv, stdin, env)}
 
     def ssh_call(self, host, req, stdin):
-        """One request through a host's second sshd, as ops-agent with the door's key, pinned to its host key."""
+        """One request through a host's second sshd, as ops-agent with the door's key, pinned to its host key. The
+        door reads HOST_OUT_MAX of the answer at most, and a host's help, which answers at once, gets HELP_WAIT: the
+        host sweep asks it of each host in turn, and one host that hangs must not hold the others for an hour."""
         known = os.path.join(P(STATE), f"known_hosts-{host['address']}-{host.get('port', SSHD_PORT)}")
         line = f"[{host['address']}]:{host.get('port', SSHD_PORT)} {host['host_key']}\n"
         os.makedirs(os.path.dirname(known), mode=0o700, exist_ok=True)
@@ -894,7 +1021,7 @@ class Door:
                 "-o", "BatchMode=yes", "-o", f"UserKnownHostsFile={known}", "-o", "StrictHostKeyChecking=yes",
                 "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30", f"ops-agent@{host['address']}",
                 base64.b64encode(json.dumps(req).encode()).decode()]
-        return run_program(argv, stdin, {}, timeout=3600)
+        return run_program(argv, stdin, {}, timeout=HELP_WAIT if req.get("op") == "help" else 3600, limit=HOST_OUT_MAX)
 
     # ---- the hub's two rights
     def hub_allowed(self, address, token, which):
@@ -1188,10 +1315,22 @@ class GitHub:
         data = self.file_at_head(path)
         if data is None:
             raise Refused(f"{path} is not a file at HEAD")
-        text = data.decode("utf-8", "replace")
-        if re.search(r"^kind\s*:\s*Secret\s*$", text, re.M) or "-----BEGIN" in text:
+        # The file as the patterns read it. One that is not block style is no refusal here, as it is in a commit: the
+        # repository's own people wrote it, and the door is the agent's only way to read it. So it comes back, unless
+        # a loose reading of its text says that it may hold a Secret (door_targets.loose_secret).
+        text, why = door_targets.manifest_text(path, data)
+        if why:
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                raise Refused(f"{path} is not UTF-8 text, so it may hold a Secret that the filter cannot see: the "
+                              f"filter keeps it back") from None
+        elif door_targets.secret_object(text) or "-----BEGIN" in text:
             raise Refused(f"{path} holds a Secret, which the filter keeps back")
-        return text
+        # the loose reading too for a file with another name than .yaml, .yml or .json, which no reader reads by lines
+        if (why or not door_targets.manifest_name(path)) and (door_targets.loose_secret(text) or "-----BEGIN" in text):
+            raise Refused(f"{path} may hold a Secret, which the filter keeps back")
+        return text if why else data.decode("utf-8", "replace")
 
     def commit(self, plan):
         """One commit on the branch's head, made through the API: the blobs, one tree on the head's tree, the commit,
@@ -1303,16 +1442,72 @@ def token_permissions(level, held):
     return asked
 
 
-def run_program(argv, stdin, env, timeout=600):
+def run_program(argv, stdin, env, timeout=600, limit=None):
+    """(status, output) of one program. limit: the most bytes of its output that the door reads; a program that
+    writes more is stopped, with status 1 and one line in place of its output."""
+    env = dict({"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}, **env)
+    if limit is not None:
+        return run_capped(argv, stdin, env, timeout, limit)
     try:
         r = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
-                           env=dict({"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}, **env),
-                           stdin=None if stdin is not None else subprocess.DEVNULL)
+                           env=env, stdin=None if stdin is not None else subprocess.DEVNULL)
     except FileNotFoundError:
         return 127, f"{argv[0]} is not on the door"
     except subprocess.TimeoutExpired:
         return 124, f"{os.path.basename(argv[0])} took longer than {timeout} seconds"
     return r.returncode, r.stdout.decode("utf-8", "replace")
+
+
+def run_capped(argv, stdin, env, timeout, limit):
+    """run_program with a cap on the output: one thread reads it and stops the program at the first byte over the cap,
+    and one writes the input, so that neither pipe fills while the other waits."""
+    try:
+        p = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+    except FileNotFoundError:
+        return 127, f"{argv[0]} is not on the door"
+    got, over = [], []
+
+    def read():
+        size = 0
+        with contextlib.suppress(OSError, ValueError):
+            while True:
+                chunk = p.stdout.read1(65536)
+                if not chunk:
+                    return
+                size += len(chunk)
+                if size > limit:
+                    over.append(size)
+                    p.kill()
+                    return
+                got.append(chunk)
+
+    def write():
+        with contextlib.suppress(OSError, ValueError):
+            p.stdin.write(stdin)
+        with contextlib.suppress(OSError, ValueError):
+            p.stdin.close()
+    threads = [threading.Thread(target=fn, daemon=True) for fn in ([read, write] if stdin is not None else [read])]
+    for t in threads:
+        t.start()
+    late = False
+    try:
+        p.wait(timeout)
+    except subprocess.TimeoutExpired:
+        late = True
+        p.kill()
+        p.wait()
+    for t in threads:
+        t.join(5)
+    if not threads[0].is_alive():       # a reader that still waits holds the pipe: closing it here would wait too
+        with contextlib.suppress(OSError, ValueError):
+            p.stdout.close()
+    name = os.path.basename(argv[0])
+    if late:
+        return 124, f"{name} took longer than {timeout} seconds"
+    if over:
+        return 1, f"{name} wrote more than {limit // 1024} KiB, which the door does not read"
+    return p.returncode, b"".join(got).decode("utf-8", "replace")
 
 
 # ---------------------------------------------------------------- HTTP
@@ -1347,7 +1542,12 @@ class Handler(BaseHTTPRequestHandler):
         return value[7:].strip() if value.lower().startswith("bearer ") else None
 
     def body(self):
-        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if n < 0:           # a read of a negative length would go on to the end of the stream, with no cap
+            raise Refused("the Content-Length is a number, 0 or more")
         if n > BODY_MAX:
             raise Refused("the body is over 512 KiB")
         try:
@@ -1554,11 +1754,17 @@ def vault_sweep(door, once=False):
         time.sleep(60)
 
 
+def hub_url(hub):
+    """http://<address>:<port> of the hub of the access file, with an IPv6 address in brackets."""
+    host = hub["address"] if ":" not in hub["address"] else f"[{hub['address']}]"
+    return f"http://{host}:{hub.get('port', 8765)}"
+
+
 def fetch_sealed(door):
     hub = door.access().get("hub") or {}
     if not hub.get("address"):
         return 0
-    base = f"http://{hub['address']}:{hub.get('port', 8765)}"
+    base = hub_url(hub)
     status, answer = door.http("GET", f"{base}/door/sealed", {"X-Fleet-Client": "door"}, None)
     if status != 200 or not isinstance(answer, dict):
         return 0
@@ -1595,8 +1801,7 @@ def fetch_approvals(door):
     hub = access.get("hub") or {}
     if not hub.get("address") or not access.get("owner_keys"):
         return 0
-    status, answer = door.http("GET", f"http://{hub['address']}:{hub.get('port', 8765)}/door/approvals",
-                               {"X-Fleet-Client": "door"}, None)
+    status, answer = door.http("GET", hub_url(hub) + "/door/approvals", {"X-Fleet-Client": "door"}, None)
     if status != 200 or not isinstance(answer, dict) or not isinstance(answer.get("approvals"), list):
         return 0
     devices = device_keys(access, answer.get("devices") if isinstance(answer.get("devices"), list) else [])
@@ -1610,16 +1815,20 @@ def fetch_approvals(door):
         write_json(DEVICES_FILE, devices)
         write_json(APPROVALS_FILE, kept)
         # The owner's signed modes (step 4): the door keeps the newest statement of each host, so an older one cannot
-        # come back, and a mode that the hub stops serving stays as it was. Only a newer statement changes it.
+        # come back, and a mode that the hub stops serving stays as it was. Only a newer statement changes it, and
+        # the end of the server that it was accepted for (settle_modes): each one goes with its host's key of now,
+        # and none is taken that is from before the door first saw that server under its name (mode_floor).
         modes = read_json(MODES_FILE, {})
+        modes = modes if isinstance(modes, dict) else {}
         given = answer.get("modes") if isinstance(answer.get("modes"), list) else []
-        changed = False
+        changed = settle_modes(access, modes)
         for item in given[:200]:
             found = mode_statement(access, item.get("statement"), item.get("signature")) \
                 if isinstance(item, dict) else None
-            if found and found[2] > ((modes.get(found[0]) or {}).get("at") or -1):
+            if found and isinstance(modes.get(found[0]), dict) and found[2] > mode_floor(modes[found[0]]):
                 modes[found[0]] = {"mode": found[1], "at": found[2], "statement": item["statement"],
-                                   "signature": item["signature"]}
+                                   "signature": item["signature"],
+                                   "host_key": access["hosts"][found[0]]["host_key"]}
                 changed = True
         if changed:
             write_json(MODES_FILE, modes)
@@ -1639,10 +1848,13 @@ def cmd_access(args):
         data = validate_access(json.loads(raw))
     except ValueError as e:
         sys.exit(f"refused: {e}")
-    write_json(ACCESS_FILE, data, mode=0o640)
-    with contextlib.suppress(KeyError, OSError):
+    group = None
+    with contextlib.suppress(KeyError):
         import grp
-        os.chown(P(ACCESS_FILE), 0, grp.getgrnam("door").gr_gid)
+        group = grp.getgrnam("door").gr_gid
+    # The door's group and the mode go on the file before it takes the place of the old one: a door that read it
+    # between the two steps could not open it, and named nobody.
+    write_json(ACCESS_FILE, data, mode=0o640, group=group)
     print(f"access file saved: {len(data.get('agents') or {})} agents, {len(data.get('hosts') or {})} hosts")
 
 
@@ -1772,9 +1984,7 @@ def cmd_follow(args):
     if not hub.get("address"):
         print("the access file names no hub yet")
         return
-    host = hub["address"] if ":" not in hub["address"] else f"[{hub['address']}]"
-    status, answer = door_providers.http("GET", f"http://{host}:{hub.get('port', 8765)}/door/release",
-                                         {"X-Fleet-Client": "door"}, None)
+    status, answer = door_providers.http("GET", hub_url(hub) + "/door/release", {"X-Fleet-Client": "door"}, None)
     if status != 200 or not isinstance(answer, dict):
         sys.exit(f"the hub gave no release ({status})")
     if answer.get("revision") == running_revision():

@@ -26,8 +26,9 @@ holds no key at all: the door assumes that account's role with its own bot's web
     ops github:<owner> pull-request <repo> <head> <base> <title>   rule
     ops hetzner:<project> servers | server <name> | firewalls | volumes | ips
     ops hetzner:<project> power-cycle <server>                     rule, for a server that the agent holds
-    ops hetzner:<project> change <METHOD> <path> <server>          own call: a held server's firewall, protection, name
-    ops hetzner:<project> change <METHOD> <path>                   own call (D25)
+    ops hetzner:<project> change <METHOD> <path> <server>          own call: a held server's firewall, protection, label
+    ops hetzner:<project> change <METHOD> <path>                   own call (D25); a write that names a server only
+                                                                   for a server that the agent holds at Fix
     ops aws:<account> instances | groups | stacks | identity
     ops aws:<account> start|stop|reboot <instance-id>              rule, for a tagged instance
     ops aws:<account> ingress|change-set|key-off ...               own call
@@ -41,7 +42,7 @@ holds no key at all: the door assumes that account's role with its own bot's web
     ops tailscale:<tailnet> devices | device <id>
     ops tailscale:<tailnet> key-expiry-off <id> | rename <id> <name>   rule, for a device of the fleet
     ops tailscale:<tailnet> delete <id> | oauth-client <tag>       own call
-    ops tailscale:<tailnet> change <METHOD> <path>                 own call (D25)
+    ops tailscale:<tailnet> change <METHOD> <path>                 own call (D25): a device's name, key expiry, delete
 
 A delete in an agent's own call runs only when the door's own record shows that an agent made its target through the
 door (made_keys, deletes); any other delete, and every AWS delete, goes to the owner as a Needs-you item with the exact
@@ -145,6 +146,11 @@ def backblaze(access, agent, account, op, args, content, lookups):
         body = json_body(content) if content else {}
         if body is False or not isinstance(body, dict):
             return refused("the body is one JSON object of at most 64 KiB")
+        copies = body.get("replicationConfiguration")
+        if body.get("bucketType") not in (None, "allPrivate") or \
+                (copies.get("asReplicationSource") if isinstance(copies, dict) else copies):
+            return refused("a public bucket gives each file in it to anybody, and a bucket that copies itself gives "
+                           "them to another account; no read of the door gives a file, so this is never the door's")
         return Decision("own", f"a call of {name} inside the key's rights", target=f"backblaze:{account}",
                         plan={"provider": "backblaze", "account": account, "steps": [step("POST", name, body)]})
     return refused(f"{op} is not listed for Backblaze")
@@ -416,6 +422,16 @@ HZ_HELD = (r"/firewalls/[0-9]{1,12}/actions/(set_rules|apply_to_resources|remove
              r"/servers/[0-9]{1,12}/actions/change_protection", r"/servers/[0-9]{1,12}")
 
 
+def hz_held(access, agent):
+    """The servers that this agent holds at Fix through the door, by name: the one set for every Hetzner write that
+    names a server. Never a server on the never list, and never a rule-only host: the hub's server, the door's own
+    and each machine of the agents hold the keys of the whole fleet, and a copy of such a disk is every one of them."""
+    never, hosts = (access.get("never") or {}).get("hosts") or [], access.get("hosts") or {}
+    mine = ((access.get("agents") or {}).get(agent) or {}).get("servers") or {}
+    return sorted(name for name, level in mine.items() if level == "fix" and name not in never and
+                  (hosts.get(name) or {}).get("mode") == "fix")
+
+
 def hetzner(access, agent, project, op, args, content, lookups):
     reads = {"servers": "/servers", "firewalls": "/firewalls", "volumes": "/volumes", "ips": "/primary_ips"}
     if op in reads and not args:
@@ -423,33 +439,40 @@ def hetzner(access, agent, project, op, args, content, lookups):
     if op == "server" and len(args) == 1 and NAME.fullmatch(args[0]):
         return read_plan("hetzner", project, [step("GET", "/servers", query={"name": args[0]})], "a listed read")
     if op == "power-cycle":
-        if len(args) != 1 or args[0] not in held_servers(access, agent):
-            return refused("power-cycle takes a server that this agent holds")
+        if len(args) != 1 or args[0] not in hz_held(access, agent):
+            return refused("power-cycle takes a server that this agent holds at Fix")
         return Decision("rule", "a power cycle of a server that the agent holds", target=f"hetzner:{project}",
                         host=args[0], reboot=True, window="reboot",
                         plan={"provider": "hetzner", "account": project, "steps": [
                             step("GET", "/servers", query={"name": args[0]}, keep="server_id", need="one_server"),
                             step("POST", "/servers/{server_id}/actions/reset")]})
     if op == "change" and len(args) == 3:
-        if args[0] not in ("POST", "PUT") or args[2] not in held_servers(access, agent):
-            return refused("change takes the method, the path and the server it is for, which this agent holds")
+        if args[0] not in ("POST", "PUT") or args[2] not in hz_held(access, agent):
+            return refused("change takes the method, the path and the server it is for, which this agent holds at Fix")
         if "rescue" in args[1]:
             return refused("Rescue is never booted")
         if not any(re.fullmatch(p, args[1]) for p in HZ_HELD):
-            return refused(f"{args[1]} is not a firewall, protection or name change")
+            return refused(f"{args[1]} is not a firewall, protection or label change")
         body = json_body(content)
         if body is False:
             return refused("the body is JSON of at most 64 KiB")
-        return Decision("own", "a firewall, protection or name of a held server", target=f"hetzner:{project}",
-                        host=args[2], plan={"provider": "hetzner", "account": project, "steps": [
+        words, first = hz_reads(args[1], body)
+        if words:
+            return refused(words)
+        # the named server binds a path of a server (server_path); a firewall has the reads of the two-argument form
+        return Decision("own", "a firewall, protection or labels of a held server", target=f"hetzner:{project}",
+                        host=args[2], plan={"provider": "hetzner", "account": project,
+                                            "held": hz_held(access, agent), "steps": [
                             step("GET", "/servers", query={"name": args[2]}, keep="server_id", need="one_server"),
+                            *(first if args[1].startswith("/firewalls/") else []),
                             step(args[0], args[1], body, need="server_path")]})
     if op == "change" and len(args) == 2:         # D25: a write of the project's own rights, the agent's own call
         server_made = args[0] == "POST" and args[1] == "/servers"
-        return own_write("hetzner", project, args, content, HZ_PATH, HZ_NEVER,
-                         lambda method, path: f"a change of {path.split('/')[1]}", methods=("POST", "PUT", "DELETE"),
-                         check=lambda body: "a server with no SSH key gives its root password in the answer: name an "
-                         "SSH key" if server_made and not (body or {}).get("ssh_keys") else None)
+        d = own_write("hetzner", project, args, content, HZ_PATH, HZ_NEVER,
+                      lambda method, path: f"a change of {path.split('/')[1]}", methods=("POST", "PUT", "DELETE"),
+                      check=lambda body: "a server with no SSH key gives its root password in the answer: name an "
+                      "SSH key" if server_made and not (body or {}).get("ssh_keys") else None)
+        return hz_disks(access, agent, d) if d.kind == "own" else d
     return refused(f"{op} is not listed for Hetzner")
 
 
@@ -458,6 +481,114 @@ HZ_PATH = re.compile(r"/(servers|firewalls|volumes|primary_ips|floating_ips|netw
 HZ_NEVER = ((r"rescue", "Rescue is never booted"),
             (r"/actions/(reset_password|request_console|rebuild)$",
              "its answer is a password or a console: never the door's"))
+HZ_KEYS = {"name", "image", "volumes", "networks", "public_net", "ipv4", "ipv6", "server", "assignee", "assignee_id",
+           "apply_to", "remove_from", "targets", "type", "id"}      # the body keys that hz_reads looks at
+HZ_SYSTEM = re.compile(r"[a-z][a-z0-9._-]{0,62}")      # a system image has a name; a snapshot or a backup has none
+# What sits on one server at a time: its name in an answer, the action that puts it on a server, the action that
+# takes it off, and the field that names the server, in its own answer and in a body.
+HZ_ON = {"volumes": ("volume", "attach", "detach", "server"),
+         "floating_ips": ("floating_ip", "assign", "unassign", "server"),
+         "primary_ips": ("primary_ip", "assign", "unassign", "assignee_id")}
+
+
+def hz_disks(access, agent, d):
+    """The two-argument change that own_write let through. A server's disk holds its keys, and whoever starts a copy
+    of it with an SSH key of their own is root there. So a write that names a server by its id passes only for a
+    server of hz_held: the door reads what hz_reads says first, and sends the write when each need holds. A delete
+    keeps its own rule (deletes)."""
+    if deletes(d.plan, {}):
+        return d
+    last = d.plan["steps"][-1]
+    words, first = hz_reads(last["path"], last["body"])
+    if words:
+        return refused(words)
+    if first:
+        d.plan["held"] = hz_held(access, agent)
+        if not d.plan["held"]:
+            return refused("a write on a server, its disk, its volume, its address or its firewall takes a server "
+                           "that this agent holds at Fix, and it holds none")
+        d.plan["steps"][:0] = first
+    return d
+
+
+def hz_reads(path, body):
+    """(the words of a refusal or None, the reads that the door sends first) for one Hetzner write that is no delete.
+    A write on a server reads that server's name (held_server), and so no write changes a server's name. A new server
+    starts from a system image, with no volume, network or address of the project: the agent's own SSH key is root on
+    it, and no agent holds it yet. A snapshot or a backup is a copy of a disk, so no write changes one. A volume or
+    an address leaves a held server, and joins a held server when it is on none. A firewall goes on and off held
+    servers, and its rules change when each server that it is on is held."""
+    kind, one, action = re.fullmatch(r"/([a-z_]+)(?:/([0-9]+))?(?:/actions/([a-z_]+))?", path).groups()
+    body = body if isinstance(body, dict) else {}
+    # The checks below read a key as the provider's documents spell it. A key in another case, at any depth, and a
+    # key with a letter outside ASCII are refused, so that no check depends on how the provider reads one.
+    todo = [body]
+    while todo:
+        part = todo.pop()
+        for k, v in part.items() if isinstance(part, dict) else ():
+            if not isinstance(k, str) or not k.isascii():
+                return "each key of the body is plain ASCII text", []
+            if k != k.lower() and k.lower() in HZ_KEYS:
+                return f"the body's key {k} is written {k.lower()}", []
+            if k != "labels":       # a label's name is the owner's own word, in any case: no check reads one
+                todo.append(v)
+        todo.extend(part if isinstance(part, list) else ())
+
+    def held(server):
+        return step("GET", f"/servers/{server}", keep="check", need="held_server")
+    if kind == "servers" and one:
+        if "name" in body:
+            return "a server's name at the provider is how the door knows which server it is: no write of the door " \
+                   "changes it", []
+        return None, [held(one)]
+    if kind == "servers":
+        image, net = body.get("image"), body.get("public_net")
+        if image is not None and not (isinstance(image, str) and HZ_SYSTEM.fullmatch(image)):
+            return "a new server starts from a system image by its name, such as ubuntu-24.04: a snapshot or a " \
+                   "backup is a copy of a server's disk, and is never the door's", []
+        if body.get("volumes"):
+            return "a new server takes no volume: a volume joins a server through its own attach action, for a " \
+                   "server that this agent holds", []
+        if body.get("networks"):
+            return "a new server joins no private network of the project: the agent's own SSH key is root on it, and " \
+                   "attach_to_network takes a server that this agent holds", []
+        if isinstance(net, dict) and (net.get("ipv4") is not None or net.get("ipv6") is not None):
+            return "a new server takes no address of the project: an address joins a server through its own assign " \
+                   "action, for a server that this agent holds", []
+    if kind == "images" and one:
+        return "an image is a copy of a server's disk: a change of one is never the door's", []
+    if kind in HZ_ON:
+        thing, join, leave, field = HZ_ON[kind]
+        if action == leave:
+            return None, [step("GET", f"/{kind}/{one}", keep="check", need=f"on:{thing}"), held("{server_id}")]
+        if action == join or (not one and body.get(field) is not None):
+            if type(body.get(field)) is not int:
+                return f"the body names the server by its id, a number, as {field}", []
+            return None, ([step("GET", f"/{kind}/{one}", keep="check", need=f"free:{thing}")] if one else []) + \
+                [held(body[field])]
+    if kind == "load_balancers":        # a target is a server whose ports the load balancer shows to the internet
+        if not one and body.get("targets"):
+            return "a new load balancer has no target: add_target adds each one, a server that this agent holds", []
+        if action in ("add_target", "remove_target"):
+            server = body.get("server")
+            if body.get("type") != "server" or not isinstance(server, dict) or type(server.get("id")) is not int:
+                return "a load balancer's target is a server that the body names by its id, never a label or an " \
+                       "address", []
+            return None, [held(server["id"])]
+    if kind == "firewalls" and action == "set_rules":
+        return None, [step("GET", "/servers", query={"per_page": "50"}, keep="check", need="server_names"),
+                      step("GET", f"/firewalls/{one}", keep="check", need="held_firewall")]
+    if kind == "firewalls":
+        named = body.get({"apply_to_resources": "apply_to", "remove_from_resources": "remove_from"}.get(
+            action, "apply_to" if not one else ""))
+        if named:
+            if not isinstance(named, list) or len(named) > 10 or any(
+                    not isinstance(r, dict) or r.get("type") != "server" or not isinstance(r.get("server"), dict) or
+                    type(r["server"].get("id")) is not int for r in named):
+                return "a firewall goes on and off the servers that the body names by their ids, 10 at most, and " \
+                       "never by a label", []
+            return None, [held(r["server"]["id"]) for r in named]
+    return None, []
 
 
 # ---------------------------------------------------------------- AWS
@@ -480,14 +611,17 @@ AWS_SERVICES = {
     "eks": ("rest", "eks.{region}.amazonaws.com", None),
 }
 # Never, whoever asks (plan section 2, "Always refused"): an answer that is a secret or a credential, a shell or code
-# on a host, a person's or a program's access, IAM beyond the listed key form, and the account itself.
+# on a host, a person's or a program's access, IAM beyond the listed key form, and the account itself. A disk's copy
+# that goes to another account or to a bucket is access too: a shared image or snapshot, and an export.
 AWS_NEVER = re.compile(
     r"(sts|iam|organizations|account|secretsmanager|kms|lambda|ec2-instance-connect):.*"
     r"|ssm:(Get|Send|Start|Resume).*|ecr:(GetAuthorizationToken|GetDownloadUrlForLayer|InitiateLayerUpload"
     r"|UploadLayerPart|CompleteLayerUpload)"
     r"|ec2:(GetPasswordData|DescribeInstanceAttribute|ModifyInstanceAttribute|GetLaunchTemplateData"
     r"|DescribeLaunchTemplateVersions|CreateLaunchTemplate.*|GetConsoleOutput|GetConsoleScreenshot"
-    r"|CreateKeyPair|ImportKeyPair)", re.I)
+    r"|CreateKeyPair|ImportKeyPair|ModifyImageAttribute|ModifySnapshotAttribute|ExportImage"
+    r"|CreateInstanceExportTask|CreateStoreImageTask)"
+    r"|rds:(ModifyDBSnapshotAttribute|ModifyDBClusterSnapshotAttribute|StartExportTask)", re.I)
 CALL_SERVICES = [name for name in AWS_SERVICES if not AWS_NEVER.fullmatch(f"{name}:Any")]
 AWS_NEVER_PATH = re.compile(r"/(access-entries|access-policies|pod-identity-associations|identity-provider-configs)"
                             r"(/|$)")
@@ -559,11 +693,27 @@ def aws(access, agent, account, op, args, content, lookups):
     return refused(f"{op} is not listed for AWS")
 
 
+def aws_held(service, action, params):
+    """The words of a refusal for a call that is right only for a server that the agent holds, or None. The door has
+    no record of which instance of an AWS account an agent holds, so it sends none of them: a copy of a disk, a disk
+    on another instance, code that runs at start-up, and a new master password."""
+    names = {name.lower() for name in params}
+    if service == "ec2" and re.fullmatch(r"(?i)CreateImage|CreateSnapshots?", action):
+        return "it makes a copy of an instance's disk, and the door does not know which instances an agent holds"
+    if service == "ec2" and re.fullmatch(r"(?i)AttachVolume|CreateReplaceRootVolumeTask", action):
+        return "it puts a disk on another instance, and the door does not know which instances an agent holds"
+    if service == "ec2" and any(name.endswith("userdata") for name in names):
+        return "UserData is code that runs as root when an instance starts"
+    if service == "rds" and action.lower().startswith("modify") and "masteruserpassword" in names:
+        return "a new master password is a login to a database that is there"
+    return None
+
+
 def aws_any(account, args, content):
     """Any other call inside the role's rights, as the agent's own call (the plan's AWS row): `call <service> <Action>
     [<region>]` with its parameters as one JSON object of content (flat for a query service), or `call eks <METHOD>
-    <path> [<region>]` with an optional JSON body. AWS_NEVER and the role's own deny list hold the rest, and every AWS
-    delete is the owner's (deletes)."""
+    <path> [<region>]` with an optional JSON body. AWS_NEVER, aws_held and the role's own deny list hold the rest, and
+    every AWS delete is the owner's (deletes)."""
     service = args[0] if args else ""
     protocol = (AWS_SERVICES.get(service) or ("",))[0]
     rest = protocol == "rest"
@@ -585,6 +735,10 @@ def aws_any(account, args, content):
             return refused("the call takes GET, POST, PUT or DELETE and a path")
         if AWS_NEVER_PATH.search(path.partition("?")[0]):
             return refused("a person's or a program's access to a cluster is never the door's")
+        if re.fullmatch(r"/clusters/[^/]+/update-config", path.partition("?")[0]) and \
+                "resourcesvpcconfig" in keys_in(params):
+            return refused("the cluster's endpoint and the addresses that reach it change through eks-allowlist, "
+                           "which never opens it to every address")
         s = {"aws": (service, f"{method} {path.partition('?')[0]}"), "method": method, "path": path, "params": params}
     else:
         action = args[1]
@@ -593,6 +747,9 @@ def aws_any(account, args, content):
         if AWS_NEVER.fullmatch(f"{service}:{action}"):
             return refused(f"{service}:{action} is never the door's: its answer is a secret, it opens a shell or "
                            f"code on a host, or it gives access")
+        why = aws_held(service, action, params or {})
+        if why:
+            return refused(f"{service}:{action} is never the door's here: {why}")
         if protocol == "query" and params and (len(params) > 200 or any(
                 not re.fullmatch(r"[A-Za-z0-9.]{1,100}", k) or not isinstance(v, (str, int, bool))
                 for k, v in params.items())):
@@ -644,7 +801,10 @@ def azure(access, agent, account, op, args, content, lookups):
         return own_write("azure", account, args[:2], content, AZ_PATH, AZ_NEVER,
                          lambda method, path: "a change of " + (path.split("/providers/")[-1].split("/")[0]
                                                                 if "/providers/" in path else "a resource group"),
-                         query={"api-version": args[2]})
+                         query={"api-version": args[2]},
+                         check=lambda body: "a machine's osProfile, customData, userData and extensionProfile set its "
+                         "login or run code on it at start-up: never the door's"
+                         if re.search(r"(?i)/Microsoft\.Compute/", args[1]) and AZ_LOGIN & set(keys_in(body)) else None)
     return refused(f"{op} is not listed for Azure")
 
 
@@ -654,7 +814,26 @@ AZ_NEVER = ((r"(?i)^POST \S*/(list[a-z]*|regenerate[a-z]*|generate[a-z]*|get[a-z
              "its answer can be a key, a password, a token, a connection string or a setting, which ARM gives only "
              "to an action like this one: never the door's"),
             (r"(?i)/(keys|functionkeys|hostkeys|systemkeys|secrets)(/[^/]+)?$",
-             "a key or a secret of a resource is never the door's"))
+             "a key or a secret of a resource is never the door's"),
+            (r"(?i)/runcommands?(/|$)", "a command on a machine or in a cluster is a shell there: never the door's"),
+            (r"(?i)/Microsoft\.(Compute|HybridCompute)/\S+/extensions(/|$)",
+             "an extension runs code as root on a machine, and one of them sets its login: never the door's"),
+            (r"(?i)/Microsoft\.Resources/(deployments|deploymentScripts|deploymentStacks)(/|$)",
+             "a deployment makes whatever its template says, and a deployment script runs code, with all of the "
+             "door's rights: never the door's. change takes one resource at a time"),
+            (r"(?i)/Microsoft\.Authorization(/|$)", "a person's or a program's access is never the door's"))
+AZ_LOGIN = {"osprofile", "customdata", "userdata", "extensionprofile"}      # ARM reads a name in any case
+
+
+def keys_in(value):
+    """Each name in a JSON value, at any depth, in lower case."""
+    if isinstance(value, dict):
+        for name, inner in value.items():
+            yield name.lower()
+            yield from keys_in(inner)
+    elif isinstance(value, list):
+        for inner in value:
+            yield from keys_in(inner)
 
 
 # ---------------------------------------------------------------- Tailscale
@@ -695,10 +874,20 @@ def tailscale(access, agent, tailnet, op, args, content, lookups):
 
 
 TS_PATH = re.compile(r"/(tailnet/-|device/[0-9A-Za-z]{6,40})(/[A-Za-z0-9._-]+){0,4}")
+# The door knows a caller by its Tailscale address and by nothing else, so whoever moves a device's address, routes
+# or approval, or the tailnet's own settings, can become another agent to the door. `change` passes the three writes
+# of TS_OWN, which the listed forms make too, and no other write of a device or of the tailnet.
+TS_OWN = r"POST /device/[^/]+/(name|key)|DELETE /device/[^/]+"
 TS_NEVER = ((r"/keys(/|$)", "a key's answer is its secret: the door's oauth-client makes one and keeps it"),
             (r"/(acl|tags)(/|$)", "a device's tags and the policy file are never the door's"),
             (r"/webhooks(/|$)", "a webhook's answer is its secret: never the door's"),
-            (r"-invites(/|$)", "an invite's answer is a link that lets anybody in: never the door's"))
+            (r"-invites(/|$)", "an invite's answer is a link that lets anybody in: never the door's"),
+            (rf"^(?!({TS_OWN})$)\S+ /device/",
+             "a device's address, routes, approval and attributes decide who a caller is on the private network: "
+             "never the door's. change takes a device's name, its key expiry and its delete"),
+            (r"^\S+ /tailnet/",
+             "the tailnet's settings, its DNS, its posture rules and its users decide who reaches what and who is who "
+             "on the private network: never the door's"))
 
 
 PROVIDERS = {"backblaze": backblaze, "cloudflare": cloudflare, "github": github, "hetzner": hetzner, "aws": aws,
@@ -898,7 +1087,7 @@ def execute(plan, ctx):
         if s.get("keep") == "server_id":
             kept["server_id"] = answer["servers"][0]["id"]
             continue
-        if s.get("keep") in ("tunnel", "ingress"):
+        if s.get("keep") in ("tunnel", "ingress", "check"):     # check: a read that only a need looks at
             kept[s["keep"]] = answer
             continue
         said.append(short(answer, 4000))
@@ -910,6 +1099,30 @@ def check_need(need, answer, plan, kept):
         raise Stop("a record of that name exists: a change of it goes through change")
     if need == "one_server" and len(answer.get("servers") or []) != 1:
         raise Stop("no one server has that name in this project")
+    if need == "held_server" and (answer.get("server") or {}).get("name") not in (plan.get("held") or []):
+        raise Stop("that server is none that this agent holds at Fix: a write on a server, its disk or its volume "
+                   "passes only for one that it holds")
+    how, _, thing = need.partition(":")
+    if how in ("free", "on"):       # Hetzner: the server that a volume or an address is on, before it moves (HZ_ON)
+        one, name = answer.get(thing), thing.replace("_", " ")
+        on = one.get("assignee_id" if thing == "primary_ip" else "server") if isinstance(one, dict) else False
+        if how == "free" and on is not None:
+            raise Stop(f"that {name} is on a server, or the project did not say: take it off first, from a server "
+                       f"that this agent holds")
+        if how == "on" and type(on) is not int:
+            raise Stop(f"that {name} is on no server")
+        kept["server_id"] = on                      # the next step reads that server's name (held_server)
+    if need == "server_names":      # Hetzner: the project's servers, for the firewall that the next step reads
+        kept["names"] = {one.get("id"): one.get("name") for one in answer.get("servers") or []
+                         if isinstance(one, dict)}
+    if need == "held_firewall":
+        firewall = answer.get("firewall")
+        on = firewall.get("applied_to") if isinstance(firewall, dict) else None
+        if not isinstance(on, list) or any(
+                not isinstance(r, dict) or r.get("type") != "server" or not isinstance(r.get("server"), dict) or
+                kept["names"].get(r["server"].get("id")) not in (plan.get("held") or []) for r in on):
+            raise Stop("that firewall is on a server that this agent does not hold at Fix, or on servers by a label, "
+                       "or on one beyond the project's first 50: its rules are not this agent's to set")
     if need == "tagged" and not any(r.get("instancesSet") for r in answer.get("reservations", [{}])) and \
             not answer.get("tagged"):
         raise Stop("that instance or group has no instance with the door's tag")
@@ -1007,7 +1220,7 @@ def send(provider, s, path, session, ctx, kept, plan):
         body = {"config": dict(((kept.get("ingress") or {}).get("result") or {}).get("config") or {},
                                ingress=[r for r in ingress if r.get("hostname")] + [add] +
                                [r for r in ingress if not r.get("hostname")] or [add, {"service": "http_status:404"}])}
-    if s.get("need") == "server_path" and not path.startswith(f"/servers/{kept.get('server_id')}") and \
+    if s.get("need") == "server_path" and not re.match(rf"/servers/{kept.get('server_id')}(/|$)", path) and \
             not path.startswith("/firewalls/"):
         raise Stop("that path is not the named server's")
     if query:

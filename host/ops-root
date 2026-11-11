@@ -108,17 +108,26 @@ REFUSED_PROGRAMS = {
     "julia", "swipl", "visudo", "ops-root", "tailscale"}
 REFUSED_ARGS = {"-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls", "--exec"}
 # Paths that no file install writes and that an exec command sees read-only: this file and its own, ops-agent's
-# files, the second sshd, the login files and the preload list (DevOps plan, "The host login").
+# files, the second sshd, the login files and the preload list (DevOps plan, "The host login"). And the door's own
+# settings, state and code, where a door runs on a host that it manages (door.sh).
 PROTECTED = ("/usr/local/sbin/ops-root", LIB + "/", ETC + "/", STATE + "/", "/var/lib/ops-agent/",
              "/etc/sudoers.d/ops-agent", "/etc/passwd", "/etc/shadow", "/etc/group", "/etc/gshadow", "/etc/sudoers",
              "/etc/ld.so.preload", "/etc/pam.d/", "/etc/ssh/", "/etc/security/",
              "/etc/systemd/system/" + SSHD_UNIT, "/etc/systemd/system/" + SSHD_UNIT + ".d/",
-             "/etc/systemd/system/" + BOOT_UNIT, "/etc/systemd/system/" + BOOT_UNIT + ".d/")
-# The app trees and secret paths of every host, beside the host's own list (HIDDEN_FILE).
+             "/etc/systemd/system/" + BOOT_UNIT, "/etc/systemd/system/" + BOOT_UNIT + ".d/",
+             "/etc/fleet-door/", "/var/lib/fleet-door/", "/opt/fleet-door/")
+# The app trees and secret paths of every host, beside the host's own list (HIDDEN_FILE). The door's keys and state
+# are in it (its code is under /opt), and the keys and the store of the central vault on a hub's server.
 HIDDEN = ("/var/www", "/srv", "/opt", "/home", "/root", "/etc/letsencrypt", "/etc/ssl/private", "/etc/credstore",
           "/etc/founderizer", "/var/lib/docker", "/var/lib/containerd", "/var/lib/postgresql", "/var/lib/mysql",
           "/var/lib/redis", "/run/docker.sock", "/var/run/docker.sock", "/run/containerd", "/run/podman",
-          "/var/lib/fleet-vault", "/var/lib/tailscale", "/etc/tailscale", "/var/backups")
+          "/var/lib/fleet-vault", "/var/lib/fleet-vault-central", "/var/lib/tailscale", "/etc/tailscale",
+          "/var/backups", "/etc/fleet-door", "/var/lib/fleet-door")
+# Units that no form starts: systemd's own ways to power a host off, restart it, put it to sleep or open a root
+# console. The reboot form restarts a host, and the door keeps its rules.
+POWER_UNITS = ("systemd-poweroff", "systemd-halt", "systemd-reboot", "systemd-kexec", "systemd-soft-reboot",
+               "systemd-suspend", "systemd-hibernate", "systemd-hybrid-sleep", "systemd-suspend-then-hibernate",
+               "systemd-exit", "emergency", "rescue", "debug-shell")
 # Changes that can cut the door off: each arms the rollback timer first.
 TIMED_PATHS = ("/etc/ufw/", "/etc/default/ufw", "/etc/nftables.conf", "/etc/nftables.d/", "/etc/default/tailscaled",
                "/etc/iptables/", "/etc/systemd/system/tailscaled.service.d/", "/etc/netplan/")
@@ -243,6 +252,12 @@ def check_unit(args, kinds=("service",), name="this form"):
         raise Refused("the door's own sshd is not a unit of this form")
     if unit == BOOT_UNIT:           # its start waits for the host's lock, which this form holds
         raise Refused("the rollback's boot unit is ops-root's own, not a unit of this form")
+    base = unit.rsplit(".", 1)[0]
+    if base in POWER_UNITS:
+        raise Refused(f"{unit} powers the host off, restarts it or opens a root console: only the reboot form "
+                      f"restarts a host")
+    if base.startswith("ops-root-"):        # the rollback timer, the reboot and the transient unit of each form
+        raise Refused(f"{unit} is ops-root's own, not a unit of this form")
     return [unit]
 
 
@@ -284,9 +299,15 @@ def check_purge(args):
 
 
 def check_paths(args, name, n):
+    """The paths of same, covers and drop: never a protected or a hidden one, and never one path two times."""
     if len(args) != n or any(not a.startswith("/") or "\0" in a for a in args):
         raise Refused(f"{name} takes {n} absolute paths")
-    return [os.path.normpath(a) for a in args]
+    paths = [os.path.normpath(a) for a in args]
+    for path in paths:
+        guarded(path, name)
+    if n == 2 and paths[0] == paths[1]:
+        raise Refused(f"{paths[0]} and {paths[1]} are one file: {name} takes two")
+    return paths
 
 
 def check_timer(args):
@@ -364,6 +385,65 @@ def protected(path):
             if name == p.rstrip("/") or (p.endswith("/") and name.startswith(p)):
                 return True
     return False
+
+
+def real(path):
+    "Where the path really leads on this host, with each link followed."
+    try:
+        return os.path.realpath(P(path))[len(ROOT):] if ROOT else os.path.realpath(path)
+    except OSError:
+        return os.path.normpath(path)
+
+
+def hidden(path):
+    "True when the path, or where it really leads, is an app tree or a secret path of this host."
+    return any(name == h or name.startswith(h.rstrip("/") + "/")
+               for name in (os.path.normpath(path), real(path)) for h in hidden_paths())
+
+
+def guarded(path, name):
+    """Refused for a protected or a hidden path. same, covers and drop run as root with no box, on a rule-only host
+    too: without this, a yes said what a secret file holds, and a drop deleted the door's state or an app's
+    settings."""
+    if protected(path):
+        raise Refused(f"{path} is protected on this host")
+    if hidden(path):
+        raise Refused(f"{path} is an app tree or a secret path, which {name} never reads and never deletes")
+
+
+def plain(path):
+    "True for a file that is there and is no link, no folder and no device."
+    try:
+        return stat.S_ISREG(os.lstat(P(path)).st_mode)
+    except OSError:
+        return False
+
+
+def apart(path, other, name):
+    """Refused unless the first path is a plain file and the other one is another file. A link, a folder and a device
+    hold no bytes of their own that another file keeps, and one file under two names is no second copy. A file that
+    is not there passes: it gets no yes."""
+    for p, look in ((path, os.lstat), (other, os.stat)):
+        with contextlib.suppress(OSError):
+            if not stat.S_ISREG(look(P(p)).st_mode):
+                raise Refused(f"{p} is no plain file: {name} compares the bytes of two files, and the first one is "
+                              f"never a link")
+    with contextlib.suppress(OSError):
+        if real(path) == real(other) or os.path.samestat(os.stat(P(path)), os.stat(P(other))):
+            raise Refused(f"{path} and {other} are one file: {name} takes two")
+
+
+def covered(old, new):
+    """True when every line of the old file is in the new one, and the old file has a line that says something: a
+    file with no such line is covered by any file, which proves nothing."""
+    try:
+        with open(P(old), "rb") as f:
+            old_lines = set(f.read().splitlines())
+        with open(P(new), "rb") as f:
+            new_lines = set(f.read().splitlines())
+    except OSError:
+        return False
+    return any(line.strip() for line in old_lines) and old_lines <= new_lines
 
 
 CHECKS = {
@@ -617,38 +697,46 @@ def do_grow_file(req, data):
 
 @form("same", write=False, help="yes when two files hold the same bytes")
 def do_same(req, data):
-    a, b = (file_digest(p) for p in req["args"])
+    path, other = req["args"]
+    apart(path, other, "same")
+    a, b = file_digest(path), file_digest(other)
     said = "yes" if a is not None and a == b else "no"
     if said == "yes":
-        remember_yes(req["args"][0], a)
+        remember_yes(path, a, other, "same")
     return said
 
 
 @form("covers", write=False, help="yes when every line of the old file is in the new one")
 def do_covers(req, data):
     old, new = req["args"]
-    try:
-        with open(P(old), "rb") as f:
-            old_lines = set(f.read().splitlines())
-        with open(P(new), "rb") as f:
-            new_lines = set(f.read().splitlines())
-    except OSError:
-        return "no"
-    said = "yes" if old_lines <= new_lines else "no"
+    apart(old, new, "covers")
+    said = "yes" if covered(old, new) else "no"
     if said == "yes":
-        remember_yes(old, file_digest(old))
+        remember_yes(old, file_digest(old), new, "covers")
     return said
 
 
-@form("drop", help="delete a file that same or covers said yes for, while it is unchanged")
+@form("drop", help="delete a file that same or covers said yes for, while it is unchanged and the other file still "
+                   "holds it")
 def do_drop(req, data):
+    """The delete checks again what the yes said, against the other file as it is now: a yes is old by the time of
+    the drop, and a delete must never take the last copy of anything."""
     path = req["args"][0]
     yes = json.loads(read(STATE + "/yes.json", "{}") or "{}")
-    digest = file_digest(path)
-    if digest is None or yes.get(path) != digest:
+    entry = yes.get(path)
+    digest = file_digest(path) if entry and plain(path) else None      # only a plain file with a yes is read
+    if isinstance(entry, str) and entry == digest:      # an older ops-root kept the digest alone
+        raise Refused(f"{path} has its yes from an older ops-root, which kept no name of the other file: ask same or "
+                      f"covers again")
+    other, said = (entry.get("other"), entry.get("form")) if isinstance(entry, dict) else (None, None)
+    if digest is None or not isinstance(other, str) or said not in ("same", "covers") or \
+            entry.get("digest") != digest:
         raise Refused(f"{path} had no yes from same or covers in its present form")
-    if protected(path):
-        raise Refused(f"{path} is protected on this host")
+    for p in (path, other):
+        guarded(p, "drop")
+    apart(path, other, "drop")
+    if not (file_digest(other) == digest if said == "same" else covered(path, other)):
+        raise Refused(f"{other} no longer holds what {path} holds: nothing was deleted, ask {said} again")
     os.remove(P(path))
     yes.pop(path, None)
     write_state("yes.json", json.dumps(yes))
@@ -1698,9 +1786,11 @@ def file_digest(path):
         return None
 
 
-def remember_yes(path, digest):
+def remember_yes(path, digest, other, said):
+    """A yes of same or covers, for drop: the file's digest, the other file, which holds what it holds, and the form
+    that said so. drop checks all three again."""
     yes = json.loads(read(STATE + "/yes.json", "{}") or "{}")
-    yes[path] = digest
+    yes[path] = {"digest": digest, "other": other, "form": said}
     if len(yes) > 1000:
         yes = dict(list(yes.items())[-1000:])
     write_state("yes.json", json.dumps(yes))

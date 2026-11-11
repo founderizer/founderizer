@@ -63,20 +63,69 @@ CONTENT_MAX = 256 * 1024     # bytes of content in one call
 
 # The commit rules (DevOps plan section 2): these paths, at any depth, never pass in any commit.
 NEVER_PATHS = (".claude/**", ".codex/**", ".mcp.json", "AGENTS.md", "CLAUDE.md", ".github/**", ".husky/**",
-               ".vscode/**", "policy.hujson", "scripts/security/check-tailnet-policy.mjs")
-# Manifest forms that code refuses in rendered output: a new one of these is never committed.
+               ".vscode/**", "policy.hujson", "scripts/security/check-tailnet-policy.mjs",
+               # the other files that an agent's runtime reads as its instructions or its settings: Claude Code's and
+               # Codex's local ones, and those of the other runtimes that a person of the repository may run in it
+               "CLAUDE.local.md", "AGENTS.override.md", ".agents/**", "GEMINI.md", ".gemini/**", ".cursorrules",
+               ".cursor/**", ".windsurfrules", ".windsurf/**", ".clinerules", ".clinerules/**", ".roo/**",
+               ".roorules", ".continue/**", ".aider.conf.yml", ".opencode/**", "opencode.json", ".kiro/**",
+               ".junie/**")
+# Manifest forms that code refuses in rendered output: a new one of these is never committed. Each pattern reads one
+# line of block style, which is all that a YAML file of the GitOps repository may hold (unread): a key at any depth,
+# after the dashes of a list too, its value quoted or not and in any case, with a comment after it.
+ITEM = r"^[ \t]*(?:-[ \t]+)*"                 # the start of a line: its indentation and the dashes of its lists
+END = r"[\"']?[ \t\r]*(?:#.*)?$"              # the end of a value: its closing quote, a comment, and the CR of a CRLF
+TRUE = r"\s*[\"']?(?i:true|yes|on|y)\b"       # the words that YAML 1.1 reads as true, which a cluster's readers take
+
+
+def kind_line(names):
+    return ITEM + r"(?i:kind)[ \t]*:\s*[\"']?(?i:" + names + ")" + END
+
+
 MANIFEST_REFUSED = {
     "a new secretKeyRef": r"\bsecretKeyRef\s*:", "a new secretRef": r"\bsecretRef\s*:",
-    "a new secret volume": r"^\s*secret\s*:\s*$|\bsecretName\s*:", "a hostPath": r"\bhostPath\s*:",
-    "privileged": r"\bprivileged\s*:\s*true", "a host namespace": r"\bhost(Network|PID|IPC)\s*:\s*true",
-    "an Application": r"^kind\s*:\s*(Application|ApplicationSet|AppProject)\s*$",
-    "an external-secrets kind": r"^apiVersion\s*:\s*external-secrets\.io/",
-    "a CRD": r"^kind\s*:\s*CustomResourceDefinition\s*$",
-    "a webhook": r"^kind\s*:\s*(Mutating|Validating)WebhookConfiguration\s*$",
-    "a new LoadBalancer": r"\btype\s*:\s*LoadBalancer\b", "a Secret object": r"^kind\s*:\s*Secret\s*$",
-    "RBAC": r"^kind\s*:\s*(Role|ClusterRole|RoleBinding|ClusterRoleBinding)\s*$",
-    "a Tailscale operator setting": r"tailscale\.com/tags\s*:|^kind\s*:\s*ProxyClass\s*$",
+    "a new secret volume": ITEM + r"secret[ \t]*:[ \t\r]*(?:#.*)?$|\bsecretName\s*:", "a hostPath": r"\bhostPath\s*:",
+    "privileged": r"\bprivileged\s*:" + TRUE, "a host namespace": r"\bhost(Network|PID|IPC)\s*:" + TRUE,
+    "an Application": kind_line("Application|ApplicationSet|AppProject"),
+    "an external-secrets kind": ITEM + r"apiVersion[ \t]*:\s*[\"']?(?i:external-secrets\.io)/",
+    "a CRD": kind_line("CustomResourceDefinition"),
+    "a webhook": kind_line("(?:Mutating|Validating)WebhookConfiguration"),
+    "a new LoadBalancer": r"\btype\s*:\s*[\"']?LoadBalancer\b", "a Secret object": kind_line("Secret"),
+    "RBAC": kind_line("Role|ClusterRole|RoleBinding|ClusterRoleBinding"),
+    "a Tailscale operator setting": r"tailscale\.com/tags\s*:|" + kind_line("ProxyClass"),
 }
+SECRET_KIND = re.compile(MANIFEST_REFUSED["a Secret object"], re.M)
+SECRET_TOP = re.compile(r"^(?i:kind)[ \t]*:\s*[\"']?(?i:Secret)" + END, re.M)
+SECRET_DATA = re.compile(ITEM + r"(?i:data|stringData)[ \t]*:", re.M)
+LIST_TOP = re.compile(kind_line(r"\w*List"), re.M)        # a List of objects, at any depth of a JSON array of them
+KEY_AT = re.compile(r"^([ \t]*(?:-[ \t]+)*)(?i:(kind)[ \t]*:\s*[\"']?(?i:Secret)" + END +
+                    r"|(apiVersion)[ \t]*:)", re.M)
+
+
+def secret_object(text):
+    """True when a block-style text holds a Secret object: the kind at the top level of a document; or the kind at
+    any depth with an apiVersion key at its own depth, which makes it an object (an extra object of a chart), or in
+    a List, or in a text that has a data or a stringData key. A text that only names the kind, as an Application's
+    ignoreDifferences and a patch's target do, holds none."""
+    if SECRET_TOP.search(text):
+        return True
+    if not SECRET_KIND.search(text):
+        return False
+    if SECRET_DATA.search(text) or LIST_TOP.search(text):
+        return True
+    found = [(len(m.group(1)), bool(m.group(2))) for m in KEY_AT.finditer(text)]
+    kinds, versions = {d for d, kind in found if kind}, {d for d, kind in found if not kind}
+    return bool(kinds & versions)
+
+
+# The keys whose value a pattern reads: it stands on the key's own line, with no escape and as no block scalar.
+READ_VALUES = ("kind", "apiVersion", "type", "channel", "serviceAccountName", "storage")
+DQ, SQ = r'"(?:[^"\\]|\\.)*"', r"'(?:[^']|'')*'"
+PLAIN = (r"(?:[\w./~+=$^(]|-(?=[\w.$-]))"       # a plain value of a flow sequence: no `: `, no comma, bracket or brace
+         r"(?:[^\s,\[\]{}#:]|:(?=[^\s,\[\]{}])|[ \t]+(?=[^\s,\[\]{}#:]))*")
+NOT_PLAIN = "\"'{[|>&*!%@`"                    # what a plain key or a plain value never starts with
+FLOW_ONE = f"(?:{DQ}|{SQ}|{PLAIN})"
+FLOW_LIST = re.compile(rf"\[[ \t]*(?:{FLOW_ONE}[ \t]*(?:,[ \t]*{FLOW_ONE}[ \t]*)*,?[ \t]*)?\]")
 NPM_AGE = 7 * 86400          # min-release-age=7, which npm ci does not check on a lockfile: the door does
 
 
@@ -122,7 +171,10 @@ def glob_match(path, pattern):
 
 
 def never_path(path):
-    return next((p for p in NEVER_PATHS if glob_match(path, p)), None)
+    """The commit rule that covers this path, in whatever case its name comes: a checkout on a disk that does not
+    tell the cases apart, as a Mac's, reads claude.md as CLAUDE.md."""
+    low = path.casefold()
+    return next((p for p in NEVER_PATHS if glob_match(low, p.casefold())), None)
 
 
 # ---------------------------------------------------------------- one call
@@ -222,6 +274,10 @@ def decide_host(access, agent, me, host, op, args, never, content=None, lookups=
         if f["kind"] == "full":             # door-modes proposal, step 3: the owner's yes runs that exact call once
             return Decision("full", f"{op} is a root script with no box, which no grant on {host} covers", **more)
         return Decision("own", f"the host form {op}", **more)
+    # N4: a new app lives on a fix host only. ops-root refuses it there too, but the door refuses it first, before it
+    # makes a value or a runner's tokens for a call that the host will not run.
+    if op in OPS_ROOT.PLAN_WRITES and h.get("mode") != "fix":
+        return refused(f"{host} is rule-only: no form of a new app writes there", **more)
     return Decision("rule" if f["write"] else "read", f"{op} is a rule call", **more)
 
 
@@ -496,6 +552,25 @@ def changed_lines(old, new):
     return [y for x, y in zip(a, b) if x != y]
 
 
+def same_keys(old, new):
+    """True when each line that a change of equal line count changes keeps its key, with its indentation and its
+    dash: only its value changes. Without it, a line of another key (privileged: false) could become a listed one
+    (replicas: 2), which takes the first one out."""
+    def key(line):
+        found = re.match(r"\s*(?:-\s*)?[^:#\s]+\s*:", line)
+        return found.group(0) if found else None
+    a, b = old.decode("utf-8", "replace").splitlines(), new.decode("utf-8", "replace").splitlines()
+    return len(a) == len(b) and all(key(x) is not None and key(x) == key(y) for x, y in zip(a, b) if x != y)
+
+
+def listed_before(old, new):
+    """True when each line that a change changes was a listed line at HEAD too. In a file that is not block style a
+    line can hold more than its first key (a flow mapping over several lines, an include of a template), and a new
+    listed line in its place takes the rest of it out."""
+    a, b = old.decode("utf-8", "replace").splitlines(), new.decode("utf-8", "replace").splitlines()
+    return len(a) == len(b) and all(LISTED_LINE.fullmatch(x) for x, y in zip(a, b) if x != y)
+
+
 def image_rule(old, new, lookups):
     """A checked image: the same repository name, and a green release run of that repository made this tag or
     digest."""
@@ -579,9 +654,262 @@ def lockfile_rule(path, data, lookups):
     return True
 
 
+# ---------------------------------------------------------------- reading a manifest
+#
+# Code reads a manifest with patterns, line by line, and the standard library has no YAML parser. YAML can write the
+# same manifest in forms that no line pattern reads: as JSON or in flow style ({"kind": "Pod", "spec": {"hostPID":
+# true}}), with a quoted key ("privileged": true), through an anchor, an alias, a merge key or a tag, with its value on
+# the next line, or in a text with an escape. So the door does not try to parse YAML: it refuses a YAML file that is
+# not block style, where each line outside a block scalar is one plain key with its value, one item of a list, a
+# document mark or a comment. A JSON file is parsed, and read as the block style lines that say the same.
+
+def after_value(tail):
+    "True when nothing but a comment follows a value on its line."
+    return not tail.strip(" \t") or re.match(r"[ \t]+#", tail) is not None
+
+
+def value_problem(value, key):
+    """(why code cannot read the value of one line, whether it opens a block scalar). key is its key, or None for an
+    item of a list. An empty flow mapping or sequence ({} and []) and a flow sequence of plain or quoted values on
+    one line (args: ["a", "b"]) are read; a flow mapping is not, and neither is an expression of a template ({{ }})."""
+    first = value[0]
+    if first in "\"'":
+        quoted = re.match(DQ if first == '"' else SQ, value)
+        if not quoted or not after_value(value[quoted.end():]):
+            return "a quoted text that does not end on its line", False
+        if key in READ_VALUES and "\\" in quoted.group():
+            return f"an escape in the value of {key}", False
+    elif first in "{[":
+        flow = re.match(r"\{\}" if first == "{" else FLOW_LIST, value)
+        if not flow or not after_value(value[flow.end():]):
+            return ("a flow mapping ({...}) or an expression of a template" if first == "{" else
+                    "a flow sequence ([...]) that is not one line of plain values"), False
+    elif first in "|>":
+        head = re.match(r"[|>](?:[+-][1-9]?|[1-9][+-]?)?", value)
+        if not after_value(value[head.end():]):
+            return "text on the line that opens a block scalar", False
+        if key in READ_VALUES:
+            return f"a block scalar as the value of {key}", False
+        return None, True
+    elif first in NOT_PLAIN:
+        return {"&": "an anchor", "*": "an alias", "!": "a tag"}.get(first, f"a value that starts with {first}"), False
+    return None, False
+
+
+def unread(text):
+    """Why code cannot read this YAML text line by line, or None: the first form in it that is not block style. The
+    lines of a block scalar (key: | and key: >) are text, and code reads only that they stand to the right of their
+    key, as YAML asks; the patterns still read them, so a text that looks like a refused form is refused too."""
+    if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x85\u2028\u2029\ufeff]|\r(?!\n)", text):
+        return "a character that ends a line or hides one, other than a line feed"
+    # inside a block scalar, and after a plain text that can go on: the column that the next lines stand to the right of
+    under = more = None
+    for line in text.replace("\r\n", "\n").split("\n"):
+        rest = line.lstrip(" ")
+        indent = len(line) - len(rest)
+        if not rest.strip(" \t"):
+            continue
+        if under is not None:
+            if indent > under:
+                continue
+            under = None
+        on, more = more, None
+        if rest[0] == "\t":
+            return "a tab in the indentation"
+        if rest[0] == "#":
+            continue
+        if indent == 0 and re.match(r"(?:---|\.\.\.)(?=[ \t]|$)", rest):
+            if not re.fullmatch(r"(?:---|\.\.\.)[ \t]*(?:#.*)?", rest):
+                return "content on the line of a document mark"
+            continue
+        if indent == 0 and rest[0] == "%":
+            return "a directive"
+        dashes = re.match(r"(?:-(?:[ \t]+|$))*", rest)
+        item, key = rest[dashes.end():].rstrip(" \t"), None
+        if not item or item[0] == "#":          # dashes alone: the item is in the lines below
+            continue
+        if item[0] in "\"'":
+            quoted = re.match(DQ if item[0] == '"' else SQ, item)
+            if quoted and re.match(r"[ \t]*:", item[quoted.end():]):
+                return "a quoted key"
+        elif item[0] in "?:" and item[1:2] in ("", " ", "\t"):
+            return "a key or a value with a mark of its own (? or :)"
+        elif item[0] not in NOT_PLAIN:
+            colon, comment = re.search(r":(?=[ \t]|$)", item), re.search(r"[ \t]#", item)
+            if colon and not (comment and comment.start() < colon.start()):
+                key, item = item[:colon.start()].rstrip(" \t"), item[colon.end():].strip(" \t")
+                if key == "<<":
+                    return "a merge key"
+        why, opens = value_problem(item, key) if item and item[0] != "#" else (None, False)
+        if why:
+            return why
+        plain = bool(item) and item[0] not in NOT_PLAIN + "#"
+        if key is None and not dashes.end():
+            # A line with no key and no dash. To the right of the key of a plain text, YAML reads it as the next line
+            # of that text, as a tool writes a long one. Anywhere else it is the value of the key above, which code
+            # would not read with its key.
+            if on is None or indent <= on or not plain:
+                return "a value on a line of its own, with no key and no dash"
+            more = None if re.search(r"[ \t]#", item) else on
+            continue
+        column = indent + (dashes.end() if key is not None else rest.rindex("-", 0, dashes.end()))
+        if opens:
+            under = column
+        elif plain and not re.search(r"[ \t]#", item):
+            more = column
+    return None
+
+
+def as_block(value, depth=0):
+    """A JSON value as the block style lines that say the same, for the patterns: one key or one item on each line."""
+    def flat(v):
+        return re.sub(r"\s+", " ", v) if isinstance(v, str) else json.dumps(v)
+    pad, out = "  " * depth, []
+    for key, v in value.items() if isinstance(value, dict) else [(None, v) for v in value]:
+        out.append(pad + ("-" if key is None else flat(key) + ":"))
+        out.append("\n" + as_block(v, depth + 1) if isinstance(v, (dict, list)) else " " + flat(v) + "\n")
+    return "".join(out)
+
+
+def no_key_twice(pairs):
+    if len({k for k, _ in pairs}) != len(pairs):
+        raise ValueError("a key is there twice")
+    return dict(pairs)
+
+
+def manifest_text(path, data):
+    """(the text of one file of the GitOps repository as the patterns read it, None), or (None, why code cannot read
+    it). A YAML file is block style (unread); a JSON file, which a cluster's tools apply as they apply YAML, is read
+    as block style lines; a file with another name is read as it is (a commit reads it loosely too: loose_read)."""
+    name = path.lower()
+    if not name.endswith((".yaml", ".yml", ".json")):
+        return data.decode("utf-8", "replace"), None
+    try:
+        text = data.decode("utf-8")
+        if not name.endswith(".json"):
+            why = unread(text)
+            return (None, why) if why else (text, None)
+        value = json.loads(text, object_pairs_hook=no_key_twice)
+        return (as_block(value) if isinstance(value, (dict, list)) else text), None
+    except UnicodeDecodeError:
+        return None, "bytes that are not UTF-8"
+    except (ValueError, RecursionError):
+        return None, "a JSON file that is not JSON with each key once"
+
+
+def manifest_name(path):
+    "True for a name that the block reader or the JSON parser reads: .yaml, .yml or .json, in any case."
+    return path.lower().endswith((".yaml", ".yml", ".json"))
+
+
+# The loose reading, for a text that the block reader does not read: a file of the GitOps repository with another name
+# than .yaml, .yml or .json, which Kustomize takes as a resource and Helm renders as a template all the same, and a
+# YAML file that its own people wrote in another style. It finds a word wherever it stands, and never says what the
+# text means. LOOSE_WORDS are the words of every form that MANIFEST_REFUSED and the checks beside it refuse, and the
+# tag by which YAML reads a key from base64. Role, Application and a secret volume are words of plain speech too, so
+# LOOSE_KEYS takes them with their key, in the text with its quotes, spaces, tabs and braces taken out.
+LOOSE_WORDS = ("secretkeyref", "secretref", "secretname", "hostpath", "privileged", "hostnetwork", "hostpid", "hostipc",
+               "applicationset", "appproject", "external-secrets.io", "customresourcedefinition",
+               "mutatingwebhookconfiguration", "validatingwebhookconfiguration", "loadbalancer", "clusterrole",
+               "rolebinding", "clusterrolebinding", "tailscale.com/tags", "proxyclass", "upgrade.cattle.io",
+               "serviceaccountname", "!!binary", "tag:yaml.org,2002:binary")
+LOOSE_KEYS = {"kind: role": r"kind:\s*role(?![a-z0-9])", "kind: application": r"kind:\s*application(?![a-z0-9])",
+              "secret:": r"(?<![a-z0-9_./-])secret:",
+              # and the two that a text can turn on with no new word, from false to true
+              "privileged: true": r"privileged:\s*(?:true|yes|on|y)(?![a-z0-9])",
+              "a host namespace: true": r"host(?:network|pid|ipc):\s*(?:true|yes|on|y)(?![a-z0-9])"}
+
+
+def loose_text(text):
+    """A text in lower case, with the escapes that YAML and JSON read in a quoted text written out (a backslash with
+    x50 or u0050, and a line that ends in a backslash, which goes on in the next one), so that no word hides in one."""
+    def char(found):
+        try:
+            return chr(int(next(g for g in found.groups() if g), 16))
+        except (ValueError, OverflowError):
+            return ""
+    text = re.sub(r"\\\r?\n[ \t]*", "", text)
+    return re.sub(r"\\(?:x([0-9a-fA-F]{2})|u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8}))", char, text).lower()
+
+
+def loose_counts(text):
+    low = loose_text(text)
+    bare = re.sub(r"[\"'{} \t]", "", low)
+    counts = {w: len(re.findall(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])", low)) for w in LOOSE_WORDS}
+    counts.update({w: len(re.findall(pattern, bare)) for w, pattern in LOOSE_KEYS.items()})
+    return counts, bare
+
+
+def loose_danger(old_text, new_text):
+    """The first refused form that the loose reading finds more of in the new text than in the old, or None: a word of
+    LOOSE_WORDS or a key of LOOSE_KEYS, another service account, or a bigger volume claim. With no old text, one
+    word is enough: a README that says hostPath is refused too, and the refusal names the word."""
+    (old, old_bare), (new, new_bare) = loose_counts(old_text), loose_counts(new_text)
+    word = next((w for w in new if new[w] > old[w]), None)
+    if word:
+        return f"the word {word}"
+    accounts, sizes = (lambda bare: re.findall(r"serviceaccountname:([^,\s\]]*)", bare)), \
+        (lambda bare: [quantity(x) for x in re.findall(r"storage:([0-9.]+[kmgtp]i?)", bare)])
+    if accounts(old_bare) != accounts(new_bare):
+        return "a changed serviceAccountName"
+    a, b = sizes(old_bare), sizes(new_bare)
+    return "a bigger volume claim" if len(b) > len(a) or any(n > o for o, n in zip(a, b)) else None
+
+
+def manifest_keys(text):
+    """How many kind and apiVersion keys a text holds, in the loose reading: what makes a text a manifest."""
+    return len(re.findall(r"(?<![a-z0-9_./-])(?:kind|apiversion):", loose_counts(text)[1]))
+
+
+def loose_secret(text):
+    """True when the loose reading says that a text may hold a Secret object. The text in lower case, with its quotes,
+    spaces, tabs and braces taken out, names the kind Secret or has a stringData key; or the text is JSON and an
+    object in it has that kind, in any case. The filter of a read asks it of a file that the block reader cannot
+    read, where the repository's own people wrote the text, and a commit of a file that gets the loose reading."""
+    bare = re.sub(r"[\"'{} \t]", "", loose_text(text))
+    if re.search(r"kind:\s*secret(?![a-z0-9])", bare) or "stringdata:" in bare:
+        return True
+    try:
+        left = [json.loads(text)]
+    except (ValueError, RecursionError):
+        return False
+    while left:
+        value = left.pop()
+        if isinstance(value, dict):
+            if any(k.lower() == "kind" and isinstance(v, str) and v.lower() == "secret" for k, v in value.items()):
+                return True
+            left.extend(value.values())
+        elif isinstance(value, list):
+            left.extend(value)
+    return False
+
+
+# The lines that a commit changes in a YAML file that code reads only loosely: the values of decide_gitops's rule calls
+LISTED_LINE = re.compile(r"\s*-?\s*replicas\s*:\s*\d{1,2}\s*|"
+                         r"\s*[\w./-]*restartedAt['\"]?\s*:\s*['\"]?[0-9T:.Z+-]{10,40}['\"]?\s*|"
+                         r"\s*-?\s*(?:image|tag|digest|newTag|newName)\s*:\s*[\w./:@-]+\s*")
+
+
+def loose_read(path, data, old):
+    """True when a commit's file gets the loose reading and not the block reader's: a file with another name than
+    .yaml, .yml or .json; and a YAML file that the block reader cannot read and could not read at HEAD either, which
+    the people of the repository wrote that way (a flow list of mappings, an expression of a template, a quoted
+    key). A new YAML file, and one that was block style at HEAD, stay with the block reader, which refuses them."""
+    if not manifest_name(path):
+        return True
+    if path.lower().endswith(".json") or old is None:
+        return False
+    try:
+        return bool(unread(data.decode("utf-8"))) and bool(manifest_text(path, old)[1])
+    except UnicodeDecodeError:
+        return False
+
+
 def manifest_refusal(old_text, new_text):
     """The first refused manifest form that the new rendered output has more of than the old, or None."""
     for what, pattern in MANIFEST_REFUSED.items():
+        if what == "a Secret object" and not secret_object(new_text):
+            continue                    # the kind's name alone, as a reference to it, is no Secret
         if len(re.findall(pattern, new_text, re.M)) > len(re.findall(pattern, old_text, re.M)):
             return what
     if plan_channels(new_text) > plan_channels(old_text):
@@ -596,8 +924,9 @@ def manifest_refusal(old_text, new_text):
 def plan_channels(text):
     """The channel lines of k3s upgrade Plans. A Plan names one version, so each k3s upgrade is one commit, the agent's
     own call (DevOps plan 5.5), and a channel, which upgrades with no commit, is never the door's."""
-    return sum(len(re.findall(r"^\s*channel\s*:\s*\S", doc, re.M)) for doc in re.split(r"^---\s*$", text, flags=re.M)
-               if re.search(r"^apiVersion\s*:\s*upgrade\.cattle\.io/", doc, re.M))
+    return sum(len(re.findall(ITEM + r"channel\s*:\s*\S", doc, re.M))
+               for doc in re.split(r"^---(?:[ \t\r].*)?$", text, flags=re.M)
+               if re.search(ITEM + r"apiVersion[ \t]*:\s*[\"']?(?i:upgrade\.cattle\.io)/", doc, re.M))
 
 
 def sa_changed(old_text, new_text):
@@ -613,10 +942,10 @@ def storage_grew(old_text, new_text):
 
 
 def quantity(text):
-    m = re.fullmatch(r"([0-9.]+)([KMGTP])(i?)", text)
-    if not m:
+    m = re.fullmatch(r"([0-9.]+)([KMGTP])(i?)", text, re.I)        # in lower case too, for the loose reading
+    if not m or not re.fullmatch(r"[0-9]+[.]?[0-9]*|[.][0-9]+", m.group(1)):
         return 0
-    return float(m.group(1)) * (1024 if m.group(3) else 1000) ** ("KMGTP".index(m.group(2)) + 1)
+    return float(m.group(1)) * (1024 if m.group(3) else 1000) ** ("KMGTP".index(m.group(2).upper()) + 1)
 
 
 # ---------------------------------------------------------------- the GitOps repository
@@ -667,12 +996,37 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
         if data is None:
             own = own or f"{path} is deleted"
             continue
-        text = data.decode("utf-8", "replace")
         old = (lookups.get("base_file") or (lambda p: None))(path)
-        if re.search(r"^kind\s*:\s*Secret\s*$", text, re.M):
+        loose_yaml = block = False
+        if loose_read(path, data, old):
+            loose_yaml = manifest_name(path)
+            # Read as it is, and then decided as the code before the block reader decided it, so that a tag or a
+            # replica count in such a file stays a rule call. Such a file holds no more of each of the loose reading's
+            # words than it holds at HEAD, where its own people wrote it: a new file with another name holds none.
+            text, before = data.decode("utf-8", "replace"), (old or b"").decode("utf-8", "replace")
+            hit = loose_danger(before, text)
+            if not hit and loose_secret(text) and not loose_secret(before):
+                hit = "what may be a Secret object"
+            if not hit and not manifest_name(path) and manifest_keys(text) > manifest_keys(before):
+                hit = "a kind or an apiVersion key"     # a text that becomes a manifest with the words it had
+            if hit:
+                return refused(f"{path}: {hit}, more than the file holds at HEAD, which no commit passes in a file "
+                               f"that code reads only loosely: one with another name than .yaml, .yml or .json, or "
+                               f"a YAML file that is not block style at HEAD", target=target)
+        else:
+            text, why = manifest_text(path, data)
+            if why:
+                return refused(f"{path} has {why}. Code reads a manifest line by line, so the door takes it only in "
+                               f"block style: one plain key with its value, or one item of a list, on each line",
+                               target=target)
+            # the file at HEAD as the patterns read it; one that is not block style is counted as it is
+            before = manifest_text(path, old)[0] if old else ""
+            before = (old or b"").decode("utf-8", "replace") if before is None else before
+            block = True
+        if secret_object(text) if block else SECRET_KIND.search(text):
             return refused(f"{path} holds a Secret object", target=target)
         rendered = lookups.get("render") or (lambda p, before, after: (before, after))
-        before, after = rendered(path, (old or b"").decode("utf-8", "replace"), text)
+        before, after = rendered(path, before, text)
         hit = manifest_refusal(before, after)
         if hit:
             return refused(f"{path}: {hit}, which no commit passes", target=target)
@@ -680,7 +1034,16 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
             own = own or f"{path} is a new manifest"
             continue
         changed = changed_lines(old, data)
-        if changed is None:
+        kept = same_keys(old, data)
+        if loose_yaml and (changed is None or not kept or not listed_before(old, data) or
+                           not all(LISTED_LINE.fullmatch(line) for line in changed)):
+            # A count of words cannot say what such a change does: a key that a template builds, a tag before a value
+            # and a word that moves out of a comment add none. So only the listed values change in such a file.
+            return refused(f"{path} is not block style, so code cannot read what this change of it does: only an "
+                           f"image, a tag, a replica count and a restart time change in such a file. Write a "
+                           f"manifest in block style first, as a commit of its own; a template has no such commit",
+                           target=target)
+        if changed is None or not kept:
             own = own or f"{path} changes more than its values"
         elif all(re.fullmatch(r"\s*-?\s*replicas\s*:\s*\d{1,2}\s*", line) for line in changed):
             continue
