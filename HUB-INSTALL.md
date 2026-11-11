@@ -112,7 +112,11 @@ address", below).
    with the comment `fleet kept`. It comes before the claim, because the
    owner's Mac must reach port 8765 while the install still runs. A firewall that is already
    active keeps its own rules, and loses only the public SSH rule (`fleet ssh`) that an
-   installer before 2 November 2026 added.
+   installer before 2 November 2026 added. The step changes nothing on a server that is not
+   on the private network: `tailscale ip -4` must give an address, and `tailscale status` must
+   succeed. A server that waits for an admin to approve it in Tailscale has an address
+   already, but nothing on the private network reaches it. On such a server the step stops,
+   and the server keeps its public SSH.
 6. **The Founderizer repository on this hub.** `~fleet/fleet-pilot.git` is the bare
    repository and the origin of the whole fleet: `fleet-git` serves it read-only over
    `git://`, and every worker and joined server fetches its code from it.

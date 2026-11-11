@@ -792,16 +792,41 @@ def firewall(check=False, run=None):
     step, and a machine that an earlier installer set up takes it as root in its own checkout, once.
 
     It runs only on a machine that is on the private network, because a firewall that lets SSH in over Tailscale
-    alone leaves no way in to a machine that is not on it. A machine whose firewall was off keeps open the ports that
-    answered from the internet before (`public_listeners`): a VPS that a customer already uses keeps its website.
+    alone leaves no way in to a machine that is not on it. Its sign of the private network is an address from
+    `tailscale ip -4` and a `tailscale status` that succeeds, as in the installers' network steps. An address alone is
+    not enough. Tailscale gives one to a machine that waits for an admin of the tailnet to approve it
+    (NeedsMachineAuth), and nothing on the private network reaches that machine until then. Neither read proves that
+    the owner's Mac reaches SSH on that address: onboard.py's firewall step proves that over SSH first.
+    A machine whose firewall was off keeps open the ports that answered from the internet before
+    (`public_listeners`): a VPS that a customer already uses keeps its website.
     Safe to run again. Returns "set" or "would set"."""
     run = run or _shell
+
+    def off_network(why):
+        return Stop(f"this machine is not on the private network ({why}), so its firewall stays as it is: one that "
+                    "lets SSH in over the private network only would leave no way in. Connect Tailscale, then run "
+                    "this again.")
+
     _code, out, _err = run("tailscale ip -4 2>/dev/null | head -n 1")
     ip = (out or "").strip()
     if not PRIVATE.match(ip):
-        raise Stop("this machine is not on the private network (tailscale ip -4 gave none of its addresses), so its "
-                   "firewall stays as it is: one that lets SSH in over the private network only would leave no way "
-                   "in. Connect Tailscale, then run this again.")
+        raise off_network("tailscale ip -4 gave none of its addresses")
+    # Plain `tailscale status` ends with 1 in each state but Running and Starting. `--json` ends with 0 in each state,
+    # and it names the state (Tailscale 1.104.6, cmd/tailscale/cli/status.go).
+    if run("tailscale status >/dev/null 2>&1")[0] != 0:
+        _code, out, _err = run("tailscale status --json 2>/dev/null")
+        try:
+            status = json.loads(out or "{}")
+        except ValueError:
+            status = None
+        backend = status.get("BackendState") if isinstance(status, dict) else None
+        if backend == "NeedsMachineAuth":
+            raise Stop("this machine waits for an admin to approve it in the fleet's Tailscale admin console. Until "
+                       "then, nothing on the private network reaches it. So its firewall stays as it is: one that "
+                       "lets SSH in over the private network only would leave no way in. Approve this machine there, "
+                       "then run this again.")
+        raise off_network("tailscale status failed" + (f"; Tailscale's state is {backend}"
+                                                       if isinstance(backend, str) and backend.isalpha() else ""))
     _code, listening, _err = run("ss -H -ltnup 2>/dev/null")
     _code, ports, _err = run("sshd -T 2>/dev/null | sed -n 's/^port //p'")
     kept = public_listeners(listening, ssh_ports={"22", *(ports or "").split()})
