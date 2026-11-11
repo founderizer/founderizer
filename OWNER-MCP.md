@@ -29,7 +29,21 @@ local server:
 
 `FOUNDERIZER_HUB` can be left out: then the agent calls `use_hub` once with the address, or
 `install_hub` and `claim_hub` when there is no hub yet, and the server writes the address into
-`~/.founderizer/hub`. That file is the whole of its state, and it is no credential.
+`~/.founderizer/hub`. That file is no credential.
+
+The install's firewall lets SSH in over the fleet's private network only. So `install_hub` puts the
+server on that network itself, before the install starts, and keeps the public keys of the server's
+SSH, and the port of its SSH, in `~/.founderizer/known_hosts`, for its address on that network. It
+reads them over the owner's own SSH to the address that the owner gave, which the owner's own
+`known_hosts` knows. The first read of `install_hub` and `install_log` goes to the address that the
+owner gave; when SSH gets no connection there, the read and the later steps go to the private
+address, and SSH checks the server there against those keys only. In BatchMode, SSH refuses a server
+whose key it does not know, and the owner's `known_hosts` does not know the private address. Each
+line has the name `<host>@<address>`, so the keys that one server gave count for the commands of its
+own host. They count for a command whose host is that private address itself only when each host
+that found the address gave the same keys and port, because a server can say that it has the
+address of another server. That file is no credential either, and the owner's own
+`~/.ssh/known_hosts` does not change.
 
 The server runs the code of that folder, as it was when the agent's session started it. So a tool that a later
 release adds reaches the agent only when the folder holds that release and a new session starts.
@@ -44,8 +58,9 @@ call to a local server that sends no answer and no progress for 30 minutes
 (`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`), and then the agent gets Claude Code's error, not the words
 of this server. A client that gives no token gets no progress. Such a client ends a call at its own
 time limit for a call, if it has one, and the steps still run on the server. So give it a limit for
-this server that is longer than the longest call, which is about 6300 seconds for a join: in Codex,
-`tool_timeout_sec = 7200` in the `[mcp_servers.founderizer]` table of its configuration.
+this server that is longer than the longest call. That is about 10800 seconds, for the join of a
+Linux server that must go on the private network first: in Codex, `tool_timeout_sec = 12000` in
+the `[mcp_servers.founderizer]` table of its configuration.
 
 The server runs one tool call at a time, and it reads its input also while a call runs. Claude Code
 moves a call that runs longer than 2 minutes to the background, and then the agent can send another
@@ -106,8 +121,12 @@ because this server would be the thing that carried the value.
 Two kinds of short text do pass, and both are allowed by RULES.md, "Logins":
 
 - **The Tailscale auth key is named, never carried.** `install_hub` takes the *path* of a file on
-  this Mac, refuses it unless only its owner can read it (mode 600), never opens it in Python, and
-  gives it to the server on `ssh`'s standard input, exactly as `INSTALL-PROMPT.md` asks.
+  this Mac, refuses it unless only its owner can read it (mode 600), never reads it in Python, and
+  gives it on `ssh`'s standard input to the step that puts the server on the private network, as
+  `INSTALL-PROMPT.md` A2 does, with a time limit and `--reset` for `tailscale up`, and only for a
+  server that is not on that network yet.
+  `add_machine` does the same with its `authkey_file` (B2). That step removes the server's copy of
+  the key after `tailscale up`, and the install itself reads no key.
 - **A one-time code that dies in minutes** — the install's claim code, a machine's join code, the
   device code a provider shows the owner. "A one-time code that dies within minutes is the only
   thing you may pass on as plain text." The hub keeps each of them only as a SHA-256.
@@ -145,10 +164,10 @@ would read as an empty fleet instead of as a mistake.
 | `search_history` | `/ui/history` | Search what one agent, or every agent, took part in, by words, dates, person, task and kind; with `ref`, one record in full. |
 | `see_costs` | `/ui/costs` | What every agent's work cost, against the period before: list dollars, the four kinds of tokens, results without rework by kind of work, checks, each account's window and the model changes. |
 | `which_hub` / `use_hub` | `/ui/state` | Which hub, on what authority; and point at one. |
-| `install_hub` | SSH, `hub.sh` (INSTALL-PROMPT.md A1–A5) | Install a hub on a server the owner names. |
-| `install_log` | SSH, `tail` | The install's own log, with the claim code read out of it. |
+| `install_hub` | SSH, `hub.sh` (INSTALL-PROMPT.md A1–A5) | Install a hub on a server the owner names. It puts the server on the private network first (A2), with `authkey_file`, and starts the install at the server's address there. It changes nothing on a server where an install runs. |
+| `install_log` | SSH, `tail` | The install's own log, with the claim code read out of it. When SSH gets no connection to the host, because of the install's firewall, it reads the log at the server's address on the private network. |
 | `claim_hub` | `POST /claim` | Prove this Mac's address. This is what grants the authority. |
-| `add_machine` | `/ui/servers/join` | The one-time join line, and with `host` it runs it over SSH: as root on Linux, as the Mac user on a Mac. |
+| `add_machine` | `/ui/servers/join` | The one-time join line, and with `host` it runs it over SSH: as root on Linux, as the Mac user on a Mac. A Linux server that is not on the private network goes on it first, with `authkey_file` (B2); without that file, it stops before the hub makes a code. |
 | `add_agent` | `/ui/servers/<s>/agents` | An agent on an available server, with its install job. |
 | `remove_machine` | `/ui/servers/<s>/remove` | A server with no agent leaves. |
 | `activate_agent` / `agent_settings` | `/ui/team/agents/<a>` | Turn an agent on or off; its model, effort, capabilities. |
@@ -249,6 +268,7 @@ the file are where that repetition lives — `NOT_TOOLS` (the routes left out, e
 | A **new owner route** | The owner asks for it, the agent has no tool, and nobody knows the route exists | Every `ui_command` route of `hub.py` must be a tool here or named in `NOT_TOOLS` |
 | A **new field** on a route that is already a tool | The worst one: `plain` and `with_base` send exactly the fields their own tuple names, so the call still succeeds and the setting is simply **not there** | Every field a route takes must be sendable by one of its tools |
 | A **new value** of an enum | The agent is told the old values and refuses a good one, or sends a stale one | Every entry of `FROM_THE_HUB` must equal the hub's own constant |
+| **New words** of a shell text that both run (`TAILSCALE_INSTALL`, Tailscale's install with its wait for apt's lock) | `add_machine` installs Tailscale in another way than the hub's join line and INSTALL-PROMPT.md B2 | The same check: the text is an entry of `FROM_THE_HUB` |
 | A **tool nobody wrote down** | The owner never learns they have it, and the table below goes stale both ways | Every tool must be named in this file, and every tool the table names must exist |
 
 **All of them run in `selftest.py`**, section 0, from the source alone — no hub, no network, nothing started. That is
@@ -286,7 +306,9 @@ and a tool was taken out of this file's own table, and every check failed naming
   left as it stands, the pool's standing, and a copy of the fleet written to this Mac and checked.
 - **`Install`** — the install's commands in the order `INSTALL-PROMPT.md` gives them, with a
   stand-in `ssh` that answers from a table, because no test provisions a server: the auth key on
-  standard input exactly once and in no argument, a key file other users can read refused before
+  standard input exactly once and in no argument, the network step before the start, the read and
+  the start at the server's private address and the port of its SSH, which the keys that the network
+  step read check, a key file other users can read refused before
   any command, a host or user that would not be one argument refused, the claim code read out of
   the log, and an install that stopped given to the owner instead of worked around. While a call
   runs, a client that gave a `progressToken` gets a progress notification for the call at regular
@@ -330,10 +352,33 @@ and a tool was taken out of this file's own table, and every check failed naming
   each wait of the join for apt's lock, one after the other, and of its work: join.sh's apt-gets
   that install, and the age install of the vault broker. A Mac's join line has 3600 seconds. A step
   that can change the server and that SSH loses (status 255) is said as a command that did not
-  finish, not in the step's own words for a failure. A key step or a start step that fails stops the
-  install with its own words. A command that does not finish in its time says what to do in the
+  finish, not in the step's own words for a failure. A network step or a start step that fails stops
+  the install with its own words. A command that does not finish in its time says what to do in the
   words of its tool: a join line, which writes no install log, does not send the agent to
-  `install_log`.
+  `install_log`. A Linux server that is not on the private network goes on it before the hub makes
+  a code (B2): the owner's key file on the standard input of one root step and in no argument,
+  `tailscale up` with the file that the step writes, the file removed after it, and a wait for
+  apt's lock before each try of Tailscale's installer. The step starts tailscaled when it does not
+  run. Its `tailscale up` has a time limit, and `--reset`: a server that an earlier join line left
+  waiting for a sign-in keeps the settings of that line, which Tailscale does not let a `tailscale
+  up` drop without `--reset`. On a server that is on the network already, the key stays on this
+  Mac. Without a key file, `add_machine` stops in the words of B2, and a key that Tailscale refuses
+  stops it in Tailscale's words; no code is made. Until 11 November 2026 the hub's line ran
+  `tailscale up` with no key on such a server, and it waited for a sign-in that nobody saw.
+  After the firewall step of the install, the stand-in SSH refuses a new session to the public
+  address, and it knows the private address only by the keys that `install_hub` kept: `install_log`
+  and a second `install_hub` still reach the server, at its private address, also when the agent
+  gives the public address, and `hub.sh` reads no key. The first read goes to the private address
+  only when SSH gets no connection to the public one, so a server that the owner replaced, and that
+  still runs at the kept address, gets no install. When this Mac does not reach the private address,
+  `install_hub` starts nothing; when neither address answers, `install_log` gives SSH's words at
+  each. The kept keys are the ones that `sshd -T` names, with its port, and they count for the host
+  that read them: a server cannot write a marker or the name of another host, and it cannot change
+  the lines of another host. A server that says that it has another server's address makes those
+  keys count for that address no more. A server where an install runs gets no second one, but a
+  plan that still runs does not stop the install. Until 11 November 2026
+  `install_hub` gave the key to `hub.sh`, and after its firewall step no `install_log` could
+  connect, so the agent could not read the claim code.
 - **`Refusals`** — a Mac that is not the owner's, a generation that moved, a `team.json` that
   moved under a command, the same `request_id` twice, and a field the hub refuses.
 - **`NoSecret`** — no tool takes a secret, the credential-carrying routes are not tools here, a

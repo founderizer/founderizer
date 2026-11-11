@@ -364,7 +364,7 @@ def board():
 # until it has decided whether the owner's own agent can reach it. Source only: no hub, no network, nothing started.
 
 def constants(path, name):
-    """One tuple, list or dict constant of a module, as the source has it (its keys, for a dict)."""
+    """One tuple, list or dict constant of a module, as the source has it (its keys, for a dict), or one text."""
     for node in ast.parse(open(path).read()).body:
         if isinstance(node, ast.Assign) and any(getattr(x, "id", "") == name for x in node.targets):
             value = node.value
@@ -372,6 +372,8 @@ def constants(path, name):
                 return tuple(k.value for k in value.keys if isinstance(k, ast.Constant))
             if isinstance(value, (ast.Tuple, ast.List)):
                 return tuple(e.value for e in value.elts if isinstance(e, ast.Constant))
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                return value.value
     return None
 
 def owner_api_routes():
@@ -430,7 +432,8 @@ try:
         real = getattr(lifecycle, attribute, None) if module == "lifecycle" else \
             constants(os.path.join(KIT, "hub.py"), attribute)
         if real is None or tuple(real) != tuple(repeated):
-            stale.append(f"{name}: it says {tuple(repeated)}, the hub says {real and tuple(real)}")
+            said = (lambda value: value if isinstance(value, str) else value and tuple(value))
+            stale.append(f"{name}: it says {said(repeated)!r}, the hub says {said(real)!r}")
     check("what the owner's MCP server repeats from the hub is what the hub says", not stale, "; ".join(stale))
 
     # And the document the owner reads: a tool nobody wrote down is a tool he will not know he has.
