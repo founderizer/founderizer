@@ -1585,6 +1585,17 @@ def need_talk(nid):
             for r in q("SELECT who, text, ts FROM need_talk WHERE need=? ORDER BY id", (nid,))]
 
 
+def need_reads():
+    """What need_view reads for each item, read once for all of them: (need_talk of every item as {item: [{who, text,
+    ts}]}, each list oldest first; the fleet's id). The Mac app reads every item with its discussion every 3 seconds
+    (GET /ui/state). need_talk has no index on its item, so each item's own read reads the whole table: on the first
+    fleet, on 10 November 2026, 61 items made 61 such reads in each read of the state, all under the hub's lock."""
+    talks = {}
+    for r in q("SELECT need, who, text, ts FROM need_talk ORDER BY id"):
+        talks.setdefault(r["need"], []).append({"who": r["who"], "text": r["text"], "ts": r["ts"]})
+    return talks, kv_get("fleet_id")
+
+
 def need_options(row):
     """The labels that the agent offered on a Needs-you item, as a list. Empty when it offered none."""
     try:
@@ -1607,11 +1618,13 @@ def need_secret(row):
     return got if isinstance(got, dict) else {}
 
 
-def need_view(row):
+def need_view(row, reads=None):
     """One Needs-you item for the owner: its row, with the agent's options as a list and the option that the owner
     pressed as its index. chosen is null for an answer that the owner typed. secret is what a secret request asks
     for, which the app answers with its secure form, and null on every other item. door_call is the hash of the door
-    call that his yes lets through once, which the app signs (door_call_statement); his signed yes stays out."""
+    call that his yes lets through once, which the app signs (door_call_statement); his signed yes stays out.
+    reads: need_reads(), so that a view of many items reads their discussions once and reads nothing itself; without
+    it, the item reads its own."""
     view = dict(row, options=need_options(row), secret=need_secret(row))
     view.pop("approval", None)
     # owner feature need_talk: the long part behind Details, whether the options combine, the indexes he ticked, and
@@ -1622,8 +1635,11 @@ def need_view(row):
         view["chose"] = json.loads(row["chose"]) if "chose" in keys and row["chose"] else None
     except (ValueError, TypeError):
         view["chose"] = None
-    view["talk"] = need_talk(row["id"])
-    view["door_fleet"] = kv_get("fleet_id") if view.get("door_call") else None   # what a phone's statement names
+    view["talk"] = need_talk(row["id"]) if reads is None else reads[0].get(row["id"], [])
+    if view.get("door_call"):                       # what a phone's statement names
+        view["door_fleet"] = kv_get("fleet_id") if reads is None else reads[1]
+    else:
+        view["door_fleet"] = None
     return view
 
 
@@ -13115,6 +13131,18 @@ def open_step_parts(step_id):
     return q(f"SELECT id, owner FROM tasks WHERE step=? AND {OPEN_TASK} ORDER BY id", (step_id,))
 
 
+def all_step_parts():
+    """step_parts of every step, in one read: {step: [tasks]}, each list in the order of step_parts. Each part also
+    says whether open_step_parts holds it (`is_open`, 1 or a false value). tasks has no index on step, so each read of
+    step_parts reads every task: the Mac app reads every goal's plan every 3 seconds (GET /ui/state), which was one
+    read of the whole table for each step of each plan, all under the hub's lock (11 November 2026)."""
+    parts = {}
+    for p in q(f"SELECT step, id, owner, state, title, {OPEN_TASK} AS is_open FROM tasks WHERE step IS NOT NULL "
+               "ORDER BY id"):
+        parts.setdefault(p["step"], []).append(p)
+    return parts
+
+
 def step_where(step_id):
     """"; part of step 4 of G-3" for a task that is one part of a split piece of work, and "" for every other task."""
     s = q1("SELECT goal, n FROM goal_steps WHERE id=?", (step_id,)) if step_id else None
@@ -13139,8 +13167,10 @@ def step_stands_text(step_id):
                     f"update_goal step_id={s['n']} step_state=done (or failed, or blocked with what it waits for). ")
 
 
-def step_view(s):
-    parts = step_parts(s["id"])
+def step_view(s, parts_of=None):
+    """One step of a plan as the owner's apps show it. parts_of: all_step_parts(), so that a view of many steps reads
+    their parts once; without it, the step reads its own."""
+    parts = step_parts(s["id"]) if parts_of is None else parts_of.get(s["id"], [])
     return {"n": s["n"], "text": s["text"], "task": s["task"], "state": s["state"],
             # manager_as_lead: a step split across several agents. Empty for a step one task carries, which is still
             # read from task above, so nothing that read this object before reads anything new.
@@ -13183,17 +13213,24 @@ def plan_blocked_step(goal_id):
     return next((s for s in rows if s["state"] == "blocked"), None)
 
 
-def live_next_step(g):
+def live_next_step(g, parts_of=None):
     """The goal's next step; a step whose work has ended counts as none, so the goal looks idle and the manager is
     asked for the next one. The work is the one task that carries the step, or, for a step split across several
-    agents, every part of it: one part still open keeps the step alive."""
+    agents, every part of it: one part still open keeps the step alive. parts_of: all_step_parts(), as for
+    step_view."""
     if not g["next_step"]:
         return None
     t = q1("SELECT state FROM tasks WHERE id=?", (g["next_task"],)) if g["next_task"] else None
     if t and t["state"] in TERMINAL:
         return None
-    if g["next_step_id"] and step_parts(g["next_step_id"]) and not open_step_parts(g["next_step_id"]):
-        return None
+    if g["next_step_id"]:
+        if parts_of is None:
+            ended = step_parts(g["next_step_id"]) and not open_step_parts(g["next_step_id"])
+        else:
+            parts = parts_of.get(g["next_step_id"], [])
+            ended = parts and not [p for p in parts if p["is_open"]]
+        if ended:
+            return None
     return {"text": g["next_step"], "task": g["next_task"], "step": g["next_step_id"], "set_at": g["next_set"]}
 
 
@@ -13357,6 +13394,17 @@ def goal_tokens(goal_id):
     return (int(row["total"]), row["at"]) if row and row["total"] is not None else (None, None)
 
 
+def all_goal_tokens():
+    """goal_tokens of every goal, in one read: {goal: (tokens, newest report time)}, and no entry for a goal before
+    any report. Each read of goal_tokens reads every session event of every task (its index), so the Mac app's read of
+    every goal every 3 seconds (GET /ui/state) read them once for each goal, under the hub's lock (11 November 2026)."""
+    rows = q("SELECT s.goal_id goal, SUM(st.total) total, MAX(st.reported) at FROM session_tokens st JOIN "
+             "(SELECT DISTINCT t.goal_id, t.owner, json_extract(te.data, '$.session_id') sid FROM tasks t "
+             "JOIN thread_events te ON te.task=t.id AND te.type='session' WHERE t.goal_id IS NOT NULL) s "
+             "ON st.agent=s.owner AND st.session_id=s.sid GROUP BY s.goal_id")
+    return {r["goal"]: (int(r["total"]), r["at"]) for r in rows if r["total"] is not None}
+
+
 def budget_use(g):
     """The used share of the goal's money limit, or None without one. A money limit of 0 with recorded spending is
     used up. Tokens are measured, but no token limit counts (owner API 1.10), also an old goal's stored one."""
@@ -13415,13 +13463,24 @@ def limits_text(limits):
     return text
 
 
-def goal_view(g):
+def goal_reads():
+    """What goal_view reads for each goal, read once for all of them: (all_goal_tokens(), all_step_parts())."""
+    return all_goal_tokens(), all_step_parts()
+
+
+def goal_view(g, reads=None):
+    """One goal as the owner's apps show it. reads: goal_reads(), so that a view of every goal reads its tokens and the
+    parts of its steps once; without it, the goal reads its own."""
     read = q1("SELECT read_at FROM events WHERE id=?", (g["event_id"],)) if g["event_id"] else None
-    tokens, measured_at = goal_tokens(g["id"])      # one read for both: it joins the goal's tasks to their sessions
+    if reads is None:
+        tokens, measured_at = goal_tokens(g["id"])  # one read for both: it joins the goal's tasks to their sessions
+        parts_of = None
+    else:
+        (tokens, measured_at), parts_of = reads[0].get(g["id"], (None, None)), reads[1]
     return {"id": g["id"], "title": g["title"], "text": g["text"], "state": g["state"], "paused_by": g["paused_by"],
             "revision": g["revision"], "limits": json.loads(g["limits"]), "spent": spent_cents(g["id"]) / 100,
             "tokens_used": tokens, "tokens_measured_at": measured_at,
-            "next_step": live_next_step(g), "plan": [step_view(s) for s in plan_steps(g["id"])],
+            "next_step": live_next_step(g, parts_of), "plan": [step_view(s, parts_of) for s in plan_steps(g["id"])],
             "wake_at": g["wake_at"], "result": g["result"],
             "created": g["created"], "updated": g["updated"], "read_at": read["read_at"] if read else None,
             "reviewed_at": g["reviewed_at"], "request_id": g["request_id"],
@@ -15860,10 +15919,15 @@ def duty_watch_target(body, want, t0):
                 raise Refusal(400, f"watch.trigger {w['trigger']} is not a live watch of this duty")
 
 
+def duty_watch_states(live=True):
+    """The states of the wake-up rules that duty_watches gives: the live ones, or every one that a duty shows."""
+    return ("active", "paused") if live else ("active", "paused", "done", "deleted")
+
+
 def duty_watch_query(duty_id, live=True, managed=False):
     """(the SQL, its arguments) for the wake-up rules of a duty, oldest first. managed: only the kinds that a watch
     list writes (`check` and `clock`), never a rule that the agent attached itself."""
-    states = ("active", "paused") if live else ("active", "paused", "done", "deleted")
+    states = duty_watch_states(live)
     marks = ",".join("?" * len(states))
     kinds = " AND watch IN ('check','clock')" if managed else ""
     return (f"SELECT * FROM triggers WHERE responsibility=? AND state IN ({marks}){kinds} ORDER BY id",
@@ -16570,8 +16634,11 @@ def check_condition_words(condition):
     return None
 
 
-def duty_watch_view(t, t0):
-    last = q1("SELECT * FROM trigger_runs WHERE trigger_id=? ORDER BY id DESC LIMIT 1", (t["id"],))
+def duty_watch_view(t, t0, runs=None):
+    """One wake-up rule of a duty with its last run. runs: DutyReads.runs, the last run of every rule; without it, the
+    rule reads its own."""
+    last = q1("SELECT * FROM trigger_runs WHERE trigger_id=? ORDER BY id DESC LIMIT 1", (t["id"],)) if runs is None \
+        else runs.get(t["id"])
     check = json.loads(t["check_spec"]) if t["check_spec"] else None
     return {"trigger": t["id"], "kind": t["watch"] or "clock", "state": t["state"], "paused_by": t["paused_by"],
             "paused_reason": t["paused_reason"], "schedule": json.loads(t["schedule"]),
@@ -16582,18 +16649,69 @@ def duty_watch_view(t, t0):
                          "task": last["task"], "created": last["created"]} if last else None}
 
 
-def duty_view(r, t0=None):
+class DutyReads:
+    """What duty_view reads for each duty, read once for all the duties: one read of each table where duty_view reads
+    the rows of one duty. The Mac app reads every duty every 3 seconds (GET /ui/state): in a copy of the first fleet's
+    database (10 November 2026) its 11 duties made 68 reads in each read of the state, all under the hub's lock, and
+    they read all columns of every case, although most cases are closed and only counted.
+    cases: {duty: [its cases]}, oldest first, each with only id, responsibility, state, opened and repeated;
+    whole: {case: all columns of its row}, for each open case and the last case of each duty;
+    joined: {duty: [the ids of the open cases that it joined]}, in the order of duty_joined_open;
+    watches: {duty: [its wake-up rules]}, as duty_watches(live=False) gives them;
+    runs: {rule: its last run};
+    parts: duty_case_parts of every case in whole."""
+    def __init__(self):
+        self.cases, self.joined, self.watches = {}, {}, {}
+        for c in q("SELECT id, responsibility, state, opened, repeated FROM duty_cases ORDER BY id"):
+            self.cases.setdefault(c["responsibility"], []).append(c)
+        self.whole = {c["id"]: c for c in q("SELECT * FROM duty_cases WHERE state='open' OR id IN "
+                                            "(SELECT MAX(id) FROM duty_cases GROUP BY responsibility) ORDER BY id")}
+        for j in q("SELECT j.responsibility, c.id FROM duty_joins j JOIN duty_cases c ON c.id=j.duty_case WHERE "
+                   "c.state='open' ORDER BY c.id"):
+            self.joined.setdefault(j["responsibility"], []).append(j["id"])
+        states = duty_watch_states(live=False)
+        rules = f"FROM triggers t WHERE t.responsibility IS NOT NULL AND t.state IN ({','.join('?' * len(states))})"
+        for t in q(f"SELECT * {rules} ORDER BY t.id", states):
+            self.watches.setdefault(t["responsibility"], []).append(t)
+        # The newest run of each of those rules, read as duty_watch_view reads it: back from the table's newest run to
+        # the rule's own, in one statement. No index of trigger_runs can serve this read (both are partial), and the hub
+        # does not prune runs, so a MAX(id) for each rule would read the whole table every time: 7.8 ms with 60,000
+        # runs, where this read took 0.05 ms while each rule had run lately (11 November 2026). A rule that never ran
+        # still reads the whole table, as it did before.
+        self.runs = {run["trigger_id"]: run for run in q(
+            "SELECT * FROM trigger_runs WHERE id IN (SELECT (SELECT r.id FROM trigger_runs r WHERE r.trigger_id=t.id "
+            f"ORDER BY r.id DESC LIMIT 1) {rules})", states)}
+        self.parts = duty_case_parts(list(self.whole.values()))
+
+
+def duty_reads():
+    return DutyReads()
+
+
+def duty_view(r, t0=None, reads=None):
+    """One duty as the owner's apps show it. reads: duty_reads(), so that a view of every duty reads each table once;
+    without it, the duty reads its own rows."""
     t0 = t0 or now()
-    cases = q("SELECT * FROM duty_cases WHERE responsibility=? ORDER BY id", (r["id"],))
-    live = [c for c in cases if c["state"] == "open"]
+    if reads is None:
+        cases = q("SELECT * FROM duty_cases WHERE responsibility=? ORDER BY id", (r["id"],))
+        whole = lambda c: c                         # these rows have all their columns
+    else:
+        cases = reads.cases.get(r["id"], [])        # id, responsibility, state, opened and repeated: enough to count
+        whole = lambda c: reads.whole[c["id"]]
+    live = [whole(c) for c in cases if c["state"] == "open"]
     window = DUTY_REPEAT_DAYS * 86400
     recent = [c for c in cases if c["opened"] > t0 - window]
     # The window before it, so that "fewer repeats" can be read without counting anything new: a repeat is the
     # measure of a preventive action that did not work, and the rate matters, not the count alone.
     before = [c for c in cases if t0 - 2 * window < c["opened"] <= t0 - window]
-    watch = [duty_watch_view(t, t0) for t in duty_watches(r["id"], live=False)]
-    joined = duty_joined_open(r["id"])
-    parts = duty_case_parts(cases[-1:] + live + joined)
+    if reads is None:
+        watch = [duty_watch_view(t, t0) for t in duty_watches(r["id"], live=False)]
+        joined = duty_joined_open(r["id"])
+        parts = duty_case_parts(cases[-1:] + live + joined)
+    else:
+        watch = [duty_watch_view(t, t0, reads.runs) for t in reads.watches.get(r["id"], [])]
+        joined = [reads.whole[case] for case in reads.joined.get(r["id"], [])]
+        parts = reads.parts
     return {"id": r["id"], "agent": r["agent"], "title": duty_name(r["text"]), "text": r["text"],
             "state": r["state"],
             "revision": r["revision"], "created": r["created"], "updated": r["updated"], "created_by": r["created_by"],
@@ -16603,7 +16721,7 @@ def duty_view(r, t0=None):
             "repeats_30d": len([c for c in recent if c["repeated"]]),
             "cases_prev_30d": len(before),
             "repeats_prev_30d": len([c for c in before if c["repeated"]]),
-            "last_case": duty_case_view(cases[-1], parts) if cases else None,
+            "last_case": duty_case_view(whole(cases[-1]), parts) if cases else None,
             "cases": [duty_case_view(c, parts) for c in live],
             "joined": [duty_case_view(c, parts) for c in joined],
             "marker": {"kind": r["marker_kind"], "since": r["marker_since"], "detail": r["marker_detail"]}
@@ -36873,7 +36991,9 @@ class Handler(BaseHTTPRequestHandler):
                                ("prompts", "permissions"), ("holds", "holds"), ("outcomes", "outcomes")):
                 plain_rows[key] = q(f"SELECT * FROM {table} ORDER BY id")
                 result[key] = None          # its place in the answer: its rows become dicts after the lock
-            result["needs"] = [need_view(r) for r in q("SELECT * FROM needs ORDER BY id")]
+            needs = q("SELECT * FROM needs ORDER BY id")
+            needs_read = need_reads() if needs else None    # with no item it reads nothing more, as before
+            result["needs"] = None          # its place: a view of rows read here, made after the lock
             result["agents"] = []
             for name, config in agents().items():
                 row = q1("SELECT last_seen,alive,alive_ts,client,client_seen FROM agents WHERE name=?", (name,))
@@ -36902,30 +37022,20 @@ class Handler(BaseHTTPRequestHandler):
                                task=lim["task"]) if lim else None, **(dict(row) if row else
                     dict(last_seen=None, alive=None, alive_ts=None, client=None, client_seen=None))))
             conf = chat_apps()
-            result["messages"] = [dict(r) for r in q(
-                "SELECT u.*,e.read_at FROM ui_requests u JOIN events e ON e.id=u.event_id ORDER BY u.created,u.request_id")]
-            for m in result["messages"]:        # owner feature chat_apps: the chat app of a message, without its IDs
-                o = json.loads(m["origin"]) if m.get("origin") else None
-                m["origin"] = {"app": o["app"], "account": o["account"],
-                               "label": (conf.get(o["account"]) or {}).get("label", o["account"])} if o else None
-                # edit_in_place: when he last changed its words, and not every text it has had
-                m["edited"] = message_edited(m)
-                m.pop("edits", None)
-            files = {}                          # owner feature attachments: the files of each message
-            for r in q("SELECT * FROM attachments WHERE message IS NOT NULL ORDER BY id"):
-                files.setdefault(r["message"], []).append(attachment_view(r))
-            for m in result["messages"]:
-                m["attachments"] = files.get(m["request_id"], [])
-            delivery = {r["report"]: {"app": r["app"], "account": r["account"], "state": r["state"], "at": r["updated"],
-                                      "error": r["error"], "outbound": r["id"]}
-                        for r in q("SELECT * FROM chat_out WHERE id IN (SELECT MAX(id) FROM chat_out WHERE kind='message' "
-                                   "AND report IS NOT NULL GROUP BY report)")}
-            result["reports"] = [dict({k: r[k] for k in r.keys() if k != "turn"}, pushed=bool(r["pushed"]),
-                                      delivery=delivery.get(r["id"]))        # turn: the hub's own (t_tell_owner)
-                                 for r in q("SELECT * FROM owner_reports ORDER BY id")]
+            messages = q("SELECT u.*,e.read_at FROM ui_requests u JOIN events e ON e.id=u.event_id "
+                         "ORDER BY u.created,u.request_id")
+            files = q("SELECT * FROM attachments WHERE message IS NOT NULL ORDER BY id")
+            outbound = q("SELECT * FROM chat_out WHERE id IN (SELECT MAX(id) FROM chat_out WHERE kind='message' "
+                         "AND report IS NOT NULL GROUP BY report)")
+            reports = q("SELECT * FROM owner_reports ORDER BY id")
+            result["messages"] = result["reports"] = None      # their places: they are made after the lock
             result["chat_apps"] = {"paused": chat_paused(), "problems": chat_problems()}
-            result["goals"] = [goal_view(g) for g in q("SELECT * FROM goals ORDER BY id")]
-            result["responsibilities"] = [duty_view(r) for r in q("SELECT * FROM responsibilities ORDER BY id")]
+            goals = q("SELECT * FROM goals ORDER BY id")
+            goals_read = goal_reads() if goals else None    # each table once for all the goals, and none for no goal
+            result["goals"] = [goal_view(g, goals_read) for g in goals]
+            duties = q("SELECT * FROM responsibilities ORDER BY id")
+            duties_read = duty_reads() if duties else None
+            result["responsibilities"] = None   # its place: views of rows read here, made after the lock
             result["steers"] = [steer_view(r) for r in q("SELECT s.*, e.read_at FROM steers s JOIN events e "
                                                           "ON e.id=s.event_id ORDER BY s.id")]
             result["secrets"] = [dict(r) for r in q("SELECT id,COALESCE(label,'Registered login') AS label FROM secrets ORDER BY id")]
@@ -36938,6 +37048,28 @@ class Handler(BaseHTTPRequestHandler):
         for task in result["tasks"]:            # owner API 1.117: until when its agent parked it, on that task only
             if task["id"] in parks:
                 task["parked_until"] = parks[task["id"]]
+        # The needs, the messages, the reports and the duties from the rows read in the lock, after it too: with the
+        # rows that they were given, these views read nothing themselves (11 November 2026).
+        result["needs"] = [need_view(r, needs_read) for r in needs]
+        result["responsibilities"] = [duty_view(r, reads=duties_read) for r in duties]
+        result["messages"] = [dict(r) for r in messages]
+        for m in result["messages"]:            # owner feature chat_apps: the chat app of a message, without its IDs
+            o = json.loads(m["origin"]) if m.get("origin") else None
+            m["origin"] = {"app": o["app"], "account": o["account"],
+                           "label": (conf.get(o["account"]) or {}).get("label", o["account"])} if o else None
+            # edit_in_place: when he last changed its words, and not every text it has had
+            m["edited"] = message_edited(m)
+            m.pop("edits", None)
+        attached = {}                           # owner feature attachments: the files of each message
+        for r in files:
+            attached.setdefault(r["message"], []).append(attachment_view(r))
+        for m in result["messages"]:
+            m["attachments"] = attached.get(m["request_id"], [])
+        delivery = {r["report"]: {"app": r["app"], "account": r["account"], "state": r["state"], "at": r["updated"],
+                                  "error": r["error"], "outbound": r["id"]} for r in outbound}
+        result["reports"] = [dict({k: r[k] for k in r.keys() if k != "turn"}, pushed=bool(r["pushed"]),
+                                  delivery=delivery.get(r["id"]))            # turn: the hub's own (t_tell_owner)
+                             for r in reports]
         result["knowledge"] = [knowledge_public(k) for k in knowledge_entries()]
         # Keys, ciphertext, helper jobs, raw worker queues and runtime configuration are excluded.
         # Also mask old text if a login was registered after that text was stored. scrub makes each dict and list of
