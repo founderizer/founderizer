@@ -37,8 +37,8 @@ release adds reaches the agent only when the folder holds that release and a new
 Nothing else is needed. There is no token to issue, no key to copy and nothing to rotate.
 
 `install_hub` and `add_machine` can run for a long time: the first updates of a new server hold
-apt's lock for about 9 minutes, and a join can wait for that lock more than once. While a command
-over SSH runs, the server sends a progress notification for the call every 30 seconds, when the
+apt's lock for about 9 minutes, and a join can wait for that lock more than once. While a tool
+call runs, the server sends a progress notification for it every 30 seconds, when the
 request of the call gave a `progressToken`. Claude Code gives one with each tool call. It ends a
 call to a local server that sends no answer and no progress for 30 minutes
 (`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`), and then the agent gets Claude Code's error, not the words
@@ -46,6 +46,20 @@ of this server. A client that gives no token gets no progress. Such a client end
 time limit for a call, if it has one, and the steps still run on the server. So give it a limit for
 this server that is longer than the longest call, which is about 6300 seconds for a join: in Codex,
 `tool_timeout_sec = 7200` in the `[mcp_servers.founderizer]` table of its configuration.
+
+The server runs one tool call at a time, and it reads its input also while a call runs. Claude Code
+moves a call that runs longer than 2 minutes to the background, and then the agent can send another
+call. That call waits in the server, with progress, and runs when the first one ends. A request
+that is not a tool call, such as a ping, gets its answer at once. When the client ends a call (the
+user's Esc, or the client's own time limit), it sends a cancel. A cancelled call that waits never
+runs. A cancelled call that runs gets no more progress and no answer, but its command over SSH goes
+on to its end: a join line works once, and a step that stops part way leaves the server in a state
+that no step expects. Then the call starts no other step, so a cancelled `add_machine` does not go
+on to its join line. A call that waits needs the time of the call before it too: a client that ends
+a call at its own time limit, such as Codex, needs a limit of two times the longest call. So the
+long tools tell the agent to wait for their answer before it calls a tool of this server again.
+Until 11 November 2026 the server read one message at a time. So a call that waited behind a long
+call got no progress, Claude Code ended it after 30 minutes, and the server still ran it later.
 
 ## How it authenticates to the hub, and why that is the whole of it
 
@@ -274,15 +288,23 @@ and a tool was taken out of this file's own table, and every check failed naming
   stand-in `ssh` that answers from a table, because no test provisions a server: the auth key on
   standard input exactly once and in no argument, a key file other users can read refused before
   any command, a host or user that would not be one argument refused, the claim code read out of
-  the log, and an install that stopped given to the owner instead of worked around. While a command
+  the log, and an install that stopped given to the owner instead of worked around. While a call
   runs, a client that gave a `progressToken` gets a progress notification for the call at regular
   times, all before the answer; a client that gave none gets none. Each SSH asks the server for a
-  sign of life every 30 seconds (`ServerAliveInterval`), as the Mac app's install SSH does.
-- **`Progress`** — the same in this process: only a string or an integer token asks for progress,
-  and only while its call runs; the progress increases through all the commands of one call; and
-  the notifications stop when a command ends, also when it does not finish or the client closed
-  its end. And `install_hub` and `add_machine` tell the agent that this server answers no other
-  call until theirs ends.
+  sign of life every 30 seconds (`ServerAliveInterval`), as the Mac app's install SSH does. A call
+  that the agent sends while another runs waits with progress and runs after it, and a ping gets
+  its answer at once. A cancel drops a call that waits, so that it never runs, and it ends the
+  progress and the answer of the call that runs, but not its command: that call starts no other step.
+- **`Progress`** — `Calls` in this process: only a string or an integer token of a tool call asks
+  for progress; a call has progress from its reading to its answer and none after it; the calls
+  run one at a time, in the order of reading, while a ping gets its answer at once; a cancel drops
+  a call that waits and silences the call that runs, which finishes its step and starts no other
+  command over SSH and no call to the hub; a claim that went through keeps the hub address also
+  after a cancel; the type of an id counts; a batch gets one list of
+  answers, and a cancel in a batch can name a request of the same batch; a client that closed its
+  end stops the progress and not the call, and no other call starts; and `serve` returns at the end
+  of its input only after the calls that it read. And `install_hub` and `add_machine` tell the
+  agent that this server runs one call at a time, and to wait for their answer.
 - **`RootThroughSudo`** — `install_hub` (twice), `install_log` and `add_machine` run on the stand-in
   server of `test_hub_install.py`, as root and as a user who is not root: each root step is one
   `sudo -n -i -- /bin/sh -c '…'`, and `/bin/sh` (and dash) gets each program unchanged. A program

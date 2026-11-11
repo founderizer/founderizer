@@ -32,7 +32,7 @@ Standard library only, as `mcp.py` and `hubsetup.py` are. Tests: `test_owner_mcp
 """
 
 import argparse
-import contextlib
+import collections
 import hashlib
 import json
 import mimetypes
@@ -92,7 +92,7 @@ GIT_STEP = (f"command -v git >/dev/null 2>&1 || {{ {{ for try in 1 2 3 4 5 6 7 8
 # debsystem.cc), and 500 seconds for the work, which holds the 9 pauses of 15 seconds between the tries of `apt-get
 # update` (a try that meets the lock of the lists ends at once). It ends before Claude Code ends a call to a stdio MCP
 # server that gave no answer and no progress for 30 minutes (CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT), so that the agent gets
-# this server's words also from a client that asks for no progress (keep_call_open).
+# this server's words also from a client that asks for no progress (`Calls`).
 GIT_STEP_TIME = APT_LOCK_WAIT + 500
 # The time of a join line (add_machine): each wait for apt's lock that a join can make, one after the other, and the
 # work. join.sh's apt-get of the packages that the server does not have and its apt-get of the pending security
@@ -107,16 +107,12 @@ JOIN_TIME = 2 * APT_LOCK_WAIT + (2 * APT_LOCK_WAIT + 300) + 900
 # The time of a Mac's join line, which has no wait for apt's lock: Homebrew, the join and the vault. As long as the
 # Mac app gives a join (MachineInstaller.swift).
 MAC_JOIN_TIME = 3600
-# The seconds between two progress notifications of a tool call while a command over SSH runs (keep_call_open).
+# The seconds between two progress notifications of a tool call, from its reading until its answer (`Calls`).
 # Claude Code ends a call to a stdio MCP server that sends no answer and no progress for 30 minutes
 # (CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT), and it examines each call every 30 seconds. Then the agent gets the client's
 # error and not this server's words, and the steps still run on the server. Until 11 November 2026 this server sent no
 # progress, so the client could end a long install_hub or a long join.
 PROGRESS_EVERY = 30
-# The progress of the tool call that runs now: the progressToken of its request or None, the last progress value that
-# the call sent, and the function that writes one message to the client. `rpc` sets the token for each tools/call, and
-# `serve` sets the function. One call runs at a time, because `serve` reads one message at a time.
-PROGRESS = {"token": None, "sent": 0, "write": None}
 # What the agent does when a command does not finish in its time (`ssh`'s `late`): a step of install_hub before the
 # start, the start, a join line, whose code works once, and a read of the install log.
 STEP_LATE = ("The install did not start. Wait some minutes, then send install_hub again: each step checks first. If "
@@ -125,11 +121,13 @@ START_LATE = "The install can have started: read the install log with install_lo
 JOIN_LATE = ("Do not run the join line again: its code works once. Read servers with fleet_read: the machine is there "
              "when its join got that far. Give the owner what you read.")
 LOG_LATE = "A read of the log changes nothing on the server: send install_log again."
-# The words of a tool whose call can run for many minutes. `serve` reads one message at a time, so a call that the
-# agent sends while such a call runs waits in the pipe with no progress, and its client can end it while the server
-# still has it to run.
-ONE_CALL = (" A call that runs a command over SSH can run for many minutes, and this server answers no other call "
-            "until it ends: wait for its answer before you call a tool of this server again.")
+# The words of a tool whose call can run for many minutes. This server runs one call at a time (`Calls`), so a call
+# that the agent sends while such a call runs waits for it, and then runs. Claude Code keeps that call open, because it
+# gets progress, and a cancel drops it. But a client with its own time limit for each call and no cancel can still end
+# it while it waits, and the server then runs it later. So the words still tell the agent to wait for the answer.
+ONE_CALL = (" A call of this tool can run for many minutes. This server runs one call at a time: another call that you "
+            "send meanwhile waits for this call to end. So wait for its answer before you call a tool of this server "
+            "again.")
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # Every owner command route of hub.py that is deliberately NOT a tool here, with the reason (OWNER-MCP-BOUNDARY.md
@@ -190,6 +188,27 @@ FROM_THE_HUB = {
 
 class Refused(Exception):
     """Something the agent must be told instead of a result. Its text is the whole answer and holds no secret."""
+
+
+class Cancelled(Exception):
+    """The client cancelled the call that runs (`next_step`). No tool catches it, so the tool stops at once, and `rpc`
+    makes it an error that the client never gets: a cancelled call gets no answer."""
+
+
+# The request that the worker of `Calls` runs now. Only that thread has one: a tool that a test or another module
+# calls directly has none.
+RUNNING = threading.local()
+
+
+def next_step(what):
+    """**A cancelled call starts no other step.** Each step of a tool starts here: a command over SSH, a call to the
+    hub, the claim. When the client cancelled the call that runs, the step does not start, and the tool stops. The step
+    that ran at the cancel went on to its end, because a command over SSH that stops part way leaves a server in a
+    state that no step expects. Without this check, a cancelled add_machine would go on to get a join code and run its
+    join line, and the agent could send add_machine again and join the machine two times."""
+    held = getattr(RUNNING, "held", None)
+    if held is not None and held.cancelled:
+        raise Cancelled(f"the client cancelled the call, so {what} did not start")
 
 
 # ---- where the hub is, and the one identity this server has
@@ -259,6 +278,7 @@ def call(method, path, body=None, base=None, timeout=TIMEOUT, limit=READ_MAX, mi
 
     `mime`: the body is those bytes under that media type, instead of JSON — the one route whose body is a file
     (`POST /ui/attachments`). `extra`: that route's own headers, which carry what a JSON body would carry as fields."""
+    next_step(f"the call {method} {path}")
     base = base or hub_base()
     headers = {"Accept": "application/json", "User-Agent": f"{NAME}/{VERSION}"}
     data = None
@@ -700,38 +720,6 @@ def ssh_target(args):
     return host, user
 
 
-@contextlib.contextmanager
-def keep_call_open():
-    """**While the block runs, a progress notification for the tool call that runs now, every PROGRESS_EVERY
-    seconds**, when the request of that call gave a progressToken (MCP "Progress"). So Claude Code does not end the call
-    while a command over SSH still runs. Each notification has the token of the request, and a progress that increases
-    by one in each call. It has no `message`: the client shows its own words for it. A request without a token gets no
-    notification, as the specification says. The block ends only after the last notification, so that no notification
-    comes after the answer: the client takes such a notification as an error."""
-    token, write = PROGRESS["token"], PROGRESS["write"]
-    if token is None or write is None:
-        yield
-        return
-    stop = threading.Event()
-
-    def tell():
-        while not stop.wait(PROGRESS_EVERY):
-            PROGRESS["sent"] += 1
-            try:
-                write({"jsonrpc": "2.0", "method": "notifications/progress",
-                       "params": {"progressToken": token, "progress": PROGRESS["sent"]}})
-            except (OSError, ValueError):         # the client closed its end; the answer finds that out too
-                return
-
-    teller = threading.Thread(target=tell, name="progress", daemon=True)
-    teller.start()
-    try:
-        yield
-    finally:
-        stop.set()
-        teller.join()
-
-
 def ssh(host, user, remote, stdin=None, timeout=120, late="", lost=False):
     """One command on the server, over the owner's own SSH. The key is `ssh`'s, never this server's: it reads the
     owner's own configuration and agent, exactly as the Mac app's Add server does. `stdin`: an open file whose bytes
@@ -746,17 +734,17 @@ def ssh(host, user, remote, stdin=None, timeout=120, late="", lost=False):
     whose own words for a failure would give another cause. The machine's read and the check of sudo read 255
     themselves, as SSH that cannot connect; the key step and the start say what stays on the server.
 
-    While the command runs, the client gets progress for the call (`keep_call_open`), and SSH asks the server for a sign
-    of life every 30 seconds, as the Mac app's install SSH does (`ServerAliveInterval`). So a command that waits and
-    prints nothing keeps its connection through a NAT, and a connection to a server that does not answer any more ends
-    after about two minutes (three questions with no answer), not at the time of the command. Until 11 November 2026
-    neither was there."""
+    While the command runs, the client gets progress for the call (`Calls`), and SSH asks the server for a sign of life
+    every 30 seconds, as the Mac app's install SSH does (`ServerAliveInterval`). So a command that waits and prints
+    nothing keeps its connection through a NAT, and a connection to a server that does not answer any more ends after
+    about two minutes (three questions with no answer), not at the time of the command. Until 11 November 2026 neither
+    was there. A cancel of the call does not stop the command: a join line works once, and a step that stops part way
+    leaves the server in a state that no step expects. But a cancelled call starts no other command (`next_step`)."""
+    next_step(f"the command on {host}")
     line = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30", f"{user}@{host}",
             remote]
     try:
-        with keep_call_open():
-            done = subprocess.run(line, stdin=stdin or subprocess.DEVNULL, capture_output=True, text=True,
-                                  timeout=timeout)
+        done = subprocess.run(line, stdin=stdin or subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise Refused(f"the command on {host} did not finish in {timeout} seconds, and it can still run there. "
                       f"Nothing was repeated. {late}".rstrip()) from None
@@ -975,6 +963,9 @@ def claim_hub(args):
                       f"{answer.raw[:300].decode(errors='replace').strip()}. A code works once and for 30 minutes; "
                       f"read install_log again, and start install_hub again if it expired.")
     base = hub_address(args.get("address"), int(args.get("port") or PORT))
+    # The hub took this Mac as its owner, and the code works once: the address is saved before the wait for the
+    # owner API, so that a cancel of the call during the wait (`next_step`) does not lose it.
+    set_hub(base)
     waited, reads = time.monotonic() + 300, None
     while time.monotonic() < waited:
         try:
@@ -982,13 +973,11 @@ def claim_hub(args):
         except Refused:
             reads = None
         if reads is not None and reads.status == 200:
-            set_hub(base)
             return {"hub": base, "claimed": answer.raw.decode(errors="replace").strip(),
                     "generation": (reads.data or {}).get("db"),
                     "next": "This Mac is the owner of that hub, and this server now reads it. The install's last "
                             "steps are the security updates and verify: read install_log until it says READY."}
         time.sleep(5)
-    set_hub(base)
     return {"hub": base, "claimed": answer.raw.decode(errors="replace").strip(),
             "reads_owner_api": False,
             "next": "The hub took this Mac as its owner, but it does not answer the owner API yet. Read install_log "
@@ -997,6 +986,7 @@ def claim_hub(args):
 
 def _claim_post(listener, code):
     """The claim code to the installer's listener, on the request body, as `hubsetup.py` `claim_script` sends it."""
+    next_step("the claim")
     request = urllib.request.Request(listener + "/claim", data=code.encode(), method="POST",
                                      headers={"Content-Type": "text/plain", "User-Agent": f"{NAME}/{VERSION}"})
     try:
@@ -1620,14 +1610,7 @@ def rpc(message):
         elif method == "tools/list":
             result = {"tools": [{k: v for k, v in t.items() if k != "run"} for t in TOOLS.values()]}
         elif method == "tools/call":
-            meta = params.get("_meta")
-            token = meta.get("progressToken") if isinstance(meta, dict) else None
-            PROGRESS.update(token=token if isinstance(token, (str, int)) and not isinstance(token, bool) else None,
-                            sent=0)
-            try:
-                text, is_error = call_tool(params.get("name"), params.get("arguments"))
-            finally:
-                PROGRESS["token"] = None
+            text, is_error = call_tool(params.get("name"), params.get("arguments"))
             result = {"content": [{"type": "text", "text": text}], "isError": is_error}
         elif method in EMPTY:
             result = {EMPTY[method]: []}
@@ -1642,33 +1625,189 @@ def rpc(message):
     return {"jsonrpc": "2.0", "id": mid, "result": result}
 
 
+def progress_token(message):
+    """The progressToken of a tools/call request (MCP "Progress"): a string or an integer, as the specification says,
+    or None. Claude Code gives the id of the request as the token of each tool call."""
+    params = message.get("params")
+    meta = params.get("_meta") if isinstance(params, dict) else None
+    token = meta.get("progressToken") if isinstance(meta, dict) else None
+    if message.get("method") != "tools/call" or isinstance(token, bool) or not isinstance(token, (str, int)):
+        return None
+    return token
+
+
+class Held:
+    """One request that this server holds, from its reading to its answer (`Calls`)."""
+
+    def __init__(self, message):
+        self.message = message
+        self.key = json.dumps(message["id"])            # a cancel names the request by its id, and its type counts
+        self.token = progress_token(message)
+        self.sent = 0                                   # the progress value of its last notification
+        self.due = time.monotonic() + PROGRESS_EVERY    # when its next notification goes
+        self.cancelled = False
+
+
+class Calls:
+    """**The requests that this server holds, from their reading to their answers.** `serve` reads the input all the
+    time, also while a call runs, and gives each message to `take`.
+
+    - A request that is not a tools/call changes nothing and does not wait, so it gets its answer at once.
+    - Each tools/call, and each batch with one, waits in a queue. One worker runs them one at a time, in the order of
+      reading (`work`), so that two calls never change the fleet at the same time.
+    - A tools/call whose request gave a progressToken gets a progress notification every PROGRESS_EVERY seconds from its
+      reading until its answer, while it waits and while it runs (`tell`). So Claude Code does not end it. Each
+      notification has the token, a progress that increases by one each time, and no `message`: the client shows its
+      own words for it. A request with no token gets no notification, as the specification says. No notification of a
+      request comes after its answer, because the client takes such a notification as an error.
+    - A notifications/cancelled (MCP "Cancellation") ends the progress of the request that it names, and that request
+      gets no answer (`cancel`). A request that waits never runs. A call that runs finishes the step that runs, because
+      a command over SSH must not stop part way: a join line works once. Then it starts no other step (`next_step`).
+    - When the client closed its end of the output, the call that runs goes on to its end, and the calls that wait
+      never start (`say`).
+    - At the end of the input, the work that the server read runs to its end, as before, and then `serve` returns
+      (`finish`).
+
+    Until 11 November 2026 `serve` read one message, answered it and then read the next. So while install_hub or
+    add_machine ran (a join line can take 6000 seconds), a call that the agent sent waited in the pipe with no progress.
+    Claude Code moves a call that runs longer than 2 minutes to the background, and then the agent can send another
+    call. Claude Code ended the call that waited after 30 minutes, and the server still ran it later, so a write tool
+    could run two times when the agent sent it again. And the server read a cancel only after its call had ended."""
+
+    def __init__(self, sink):
+        self.sink = sink
+        self.lock = threading.Condition()       # re-entrant: the state, and one message at a time on the output
+        self.queue = collections.deque()        # the work that waits: its held requests, and whether it is a batch
+        self.held = []                          # each request that waits or runs, in the order of reading
+        self.reading = True                     # False at the end of the input
+        self.gone = False                       # True when the client closed its end of the output
+        self.over = False                       # True when the work ended
+        self.worker = threading.Thread(target=self.work, name="calls", daemon=True)
+        self.teller = threading.Thread(target=self.tell, name="progress", daemon=True)
+        self.worker.start()
+        self.teller.start()
+
+    def say(self, message):
+        """One message on one line of the output, never two on one line. After the client closed its end of the
+        output, nothing more goes."""
+        with self.lock:
+            if self.gone:
+                return
+            try:
+                self.sink.write(json.dumps(message) + "\n")
+                self.sink.flush()
+            except (OSError, ValueError):
+                self.gone = True
+
+    def take(self, message):
+        """One message that `serve` read: a request, a notification or a batch of them."""
+        batch = isinstance(message, list)
+        requests, cancels = [], []
+        for one in message if batch else [message]:
+            if not isinstance(one, dict) or "method" not in one:
+                continue
+            if one.get("id") is not None:
+                requests.append(one)
+            elif one["method"] == "notifications/cancelled":
+                cancels.append(one.get("params"))
+        if not any(one["method"] == "tools/call" for one in requests):
+            for params in cancels:
+                self.cancel(params)
+            answers = [rpc(one) for one in requests]
+            if answers:
+                self.say(answers if batch else answers[0])
+            return
+        with self.lock:
+            held = [Held(one) for one in requests]
+            self.held.extend(held)
+            self.queue.append((held, batch))
+            for params in cancels:              # after the requests: a cancel can name one of the same batch
+                self.cancel(params)
+            self.lock.notify_all()
+
+    def cancel(self, params):
+        """notifications/cancelled: the request that it names gets no more progress and no answer, and it never runs if
+        it waits. A cancel of a request that this server does not hold (one that it does not know, or one with its
+        answer sent) changes nothing, as the specification lets a server do."""
+        if not isinstance(params, dict) or params.get("requestId") is None:
+            return
+        key = json.dumps(params["requestId"])
+        with self.lock:
+            for one in self.held:
+                if one.key == key:
+                    one.cancelled = True
+
+    def work(self):
+        """The worker: the work that waits, one at a time, in the order of reading. It ends at the end of the input,
+        when no work waits."""
+        while True:
+            with self.lock:
+                while not self.queue and self.reading:
+                    self.lock.wait()
+                if not self.queue:
+                    return
+                held, batch = self.queue.popleft()
+            answers = []
+            try:
+                for one in held:
+                    with self.lock:
+                        dropped = one.cancelled or self.gone
+                    if not dropped:
+                        RUNNING.held = one
+                        try:
+                            answers.append((one, rpc(one.message)))
+                        finally:
+                            RUNNING.held = None
+            finally:
+                with self.lock:                 # the progress of these requests ends before their answer goes
+                    self.held = [one for one in self.held if all(one is not done for done in held)]
+                    said = [answer for one, answer in answers if not one.cancelled]
+                    if said:
+                        self.say(said if batch else said[0])
+
+    def tell(self):
+        """The progress: a notification for each held tools/call with a token, PROGRESS_EVERY seconds after its
+        reading and then every PROGRESS_EVERY seconds, until its answer or its cancel."""
+        with self.lock:
+            while not self.over:
+                now = time.monotonic()
+                asking = [] if self.gone else [one for one in self.held if one.token is not None and not one.cancelled]
+                for one in asking:
+                    if one.due <= now:
+                        one.sent += 1
+                        one.due = now + PROGRESS_EVERY
+                        self.say({"jsonrpc": "2.0", "method": "notifications/progress",
+                                  "params": {"progressToken": one.token, "progress": one.sent}})
+                self.lock.wait(max(0.0, min(one.due for one in asking) - time.monotonic()) if asking else None)
+
+    def finish(self):
+        """The end of the input: the work that the server read runs to its end, and then the threads end."""
+        with self.lock:
+            self.reading = False
+            self.lock.notify_all()
+        self.worker.join()
+        with self.lock:
+            self.over = True
+            self.lock.notify_all()
+        self.teller.join()
+
+
 def serve(source=sys.stdin, sink=sys.stdout):
-    """One MCP server over standard input and output: one JSON message a line, as a local MCP server speaks. A
-    notification (no id) is read and answered with nothing. The answers and the progress notifications of a call
-    (`keep_call_open`) go through one `write`, so that two messages never mix on one line."""
-    lock = threading.Lock()
-
-    def write(out):
-        with lock:
-            sink.write(json.dumps(out) + "\n")
-            sink.flush()
-
-    PROGRESS["write"] = write
+    """One MCP server over standard input and output: one JSON message a line, as a local MCP server speaks. It reads
+    the input all the time, also while a call runs, and `Calls` holds what it reads: one call runs at a time, a call
+    with a progressToken gets progress while it waits and while it runs, and a cancel works at once. A notification (no
+    id) gets no answer."""
+    calls = Calls(sink)
     for line in source:
         if not line.strip():
             continue
         try:
             message = json.loads(line)
         except ValueError:
-            out = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
+            calls.say({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
         else:
-            batch = message if isinstance(message, list) else [message]
-            answers = [rpc(m) for m in batch
-                       if isinstance(m, dict) and "method" in m and m.get("id") is not None]
-            if not answers:
-                continue
-            out = answers if isinstance(message, list) else answers[0]
-        write(out)
+            calls.take(message)
+    calls.finish()
 
 
 def main():
