@@ -3357,6 +3357,7 @@ class Helper:
         self.wanted = {}          # {window: ids of this poll's events that want a signal} (handle_events)
         self.typed_at = {}        # {window: when its last signal was typed}, a model call of its session (restart_fresh)
         self.closed_due = False   # the manager's session closed at a question, and the hub has not heard it (tell_closed)
+        self.keyed, self.enrolled_at = False, None      # owner API 1.12: it has its agent key; its last try to get one (enroll)
         # plan P0 (feature update_between_turns): (the task windows whose turn runs, by the hub's reading at the latest
         # poll, when that answer came), or None while there is none: an older hub, or a poll that failed
         self.hub_turns = None
@@ -3818,10 +3819,66 @@ class Helper:
 
     def legacy_windows(self):
         """Owner API 1.12: the windows that started without a session credential (before this agent had a key, or
-        from an older helper). Each gets one at its next normal start. A window with one names its file in
-        ~/.fleet/sessions in its start command."""
+        from an older helper). A window with one names its file in ~/.fleet/sessions in its start command. The hub
+        refuses each MCP call of such a window once its agent has a key, also while it is alone on its address (the
+        access review of 10 November 2026), so this helper closes the standing session and the owner chat among them
+        when it first has the key (close_keyless)."""
         windows = self.started()
         return None if windows is None else sorted(n for n, start in windows.items() if SESSIONS + os.sep not in start)
+
+    def enroll(self):
+        """One round of the helper's loop (owner API 1.12): this agent's key. The loop asks before the standing
+        session's start (manage), which then starts with its credential: the hub refuses an MCP call without one from
+        an agent that has a key, also while it is alone on its address. The key file is the key. Without it, the
+        helper registers a key while no task window runs, so that no hook of a running task can call the hub between
+        the hub's registration and the key file's arrival, and tries again every minute, also after a lost answer.
+        The first round that this helper has the key, it closes the windows that cannot use it (close_keyless). A
+        window list that tmux did not give is unknown, never empty (look_known): no registration then. True once the
+        agent has its key."""
+        if self.keyed:
+            return True
+        new = not load_agent_key(self.agent)
+        if new:
+            names = self.look_known()
+            if (self.enrolled_at is not None and time.monotonic() - self.enrolled_at <= 60) or names is None or \
+                    any(re.fullmatch(r"T-\d+", w) for w in names):
+                return False
+            self.enrolled_at = time.monotonic()     # before the call: a lost answer, which raises, waits the minute too
+            if not enroll_key(self.agent):
+                return False
+        self.keyed = True
+        self.close_keyless(new)
+        return True
+
+    def key_removed(self):
+        """The hub has no key for this agent any more (the owner removed it): its key file goes, and the next round
+        registers a key again, as for a helper that never had one (enroll)."""
+        os.remove(key_file(self.agent))
+        self.keyed, self.enrolled_at = False, None
+
+    def close_keyless(self, new):
+        """The standing session and the owner chat of this agent that cannot use its key close and start again with a
+        credential: the standing session in this round (manage), the owner chat when the hub next wants it
+        (keep_chat). Once for each start of this helper, at its first round with the agent's key (enroll). The hub
+        refuses each MCP call that a keyed agent makes without a credential, so a window that started without one can
+        do nothing, and nothing else would start it again: a Mac's first standing session started before its helper
+        had a key, and an owner chat can start while a task window keeps the key from being registered. They are the
+        ones that legacy_windows names. new: this helper registered the key just now, so a credential that a window
+        holds was for a key that is gone (the owner removed it, which revoked every credential): both windows close,
+        whatever they hold. A window that has its credential stays otherwise, and so does a task window or a
+        conversation's window: a task's credential comes from the hub at its start, and a conversation's is the hub's
+        own. Returns the windows that closed."""
+        legacy = [] if new else (self.legacy_windows() or [])
+        closed = [w for w in ("manager", "owner-chat")
+                  if (new or w in legacy) and tmux("kill-window", "-t", f"={self.session}:={w}").returncode == 0]
+        if "manager" in closed:
+            self.manager_due = True
+        if "owner-chat" in closed:
+            self.chat_started = None        # a chat closed here is not a start that ended (start_chat)
+        if closed:
+            self.say(f"{' and '.join(closed)}: no session credential of this agent's key, which the hub needs from an "
+                     f"agent with a key; {'it starts' if len(closed) == 1 else 'they start'} again with one")
+        return closed
 
     def sweep_sessions(self):
         """Remove this agent's session files that no window names any more, a minute after they were made."""
@@ -6598,19 +6655,15 @@ def cmd_run(args):
     threading.Thread(target=h.lifecycle.run_forever, name="machine-status", daemon=True).start()
     threading.Thread(target=h.tailer.run, name="thread-records", daemon=True).start()
     threading.Thread(target=h.presence, name="presence", daemon=True).start()      # plan C2
-    has_key, keyed, enrolled_at = False, False, 0.0
+    has_key = False
     while True:
         try:
             h.doing("manage")
             h.keep_session()        # the tmux session is not this helper's to assume (keep_session says why)
+            h.enroll()              # owner API 1.12: the agent key first, so that the standing session has its credential
             h.manage()
             h.doing("key")
             has_key = has_key or register_key(agent)
-            # Owner API 1.12: enroll the agent key while no task window runs, so that no hook of a running task can
-            # call the hub between the hub's registration and the key file's arrival.
-            if not keyed and time.monotonic() - enrolled_at > 60 and not any(re.fullmatch(r"T-\d+", w) for w in h.look()):
-                enrolled_at = time.monotonic()
-                keyed = enroll_key(agent)
             h.doing("sweep")
             h.sweep_desktop()
             h.sweep_sessions()
@@ -6628,8 +6681,7 @@ def cmd_run(args):
                 h.moved_away()          # agent_move: the owner moved this agent to another server
                 return
             if code == 403 and data.get("auth") == "no_key" and load_agent_key(agent):
-                os.remove(key_file(agent))      # the owner removed this agent's key: legacy again until it enrolls
-                keyed, enrolled_at = False, 0.0
+                h.key_removed()         # the owner removed this agent's key: legacy again until it enrolls
                 h.say("the hub has no key for this agent any more; it enrolls again when it can")
             if code != 200:
                 raise Refused(f"hub answered {code}")
@@ -6799,6 +6851,10 @@ default_tools_approval_mode = "approve"
 '''
 
 
+CONNECT_LIMIT = ("The hub takes this server's calls only while {agent} has no agent key (owner API 1.12). With a key, "
+                 "it takes only the sessions that the helper of {agent} starts, each with its own credential.")
+
+
 def cmd_connect(args):
     agent, conf = args.agent, agent_conf(args.agent)
     if not HUB:
@@ -6813,6 +6869,7 @@ def cmd_connect(args):
         if r.returncode != 0:
             die(f"claude mcp add failed: {(r.stderr or r.stdout).strip()[:300]}")
         print(f"Claude Code, in this folder only, now has the team tools of {agent}: {url}")
+        print(CONNECT_LIMIT.format(agent=agent))
         print("Undo with: claude mcp remove fleet")
     elif conf.get("runtime") == "codex":
         path = os.path.expanduser("~/.codex/config.toml")
@@ -6829,6 +6886,7 @@ def cmd_connect(args):
             with open(path, "a", encoding="utf-8") as f:
                 f.write(block)
             print(f"Codex now has the team tools of {agent}. Added to {path}:{block}")
+        print(CONNECT_LIMIT.format(agent=agent))
     else:
         die(f"connect knows claude and codex, not '{conf.get('runtime')}'")
 
@@ -6886,9 +6944,8 @@ def cmd_check(args):
         try:
             c, r = http("POST", f"/mcp/{agent}", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, timeout=8)
             names = [t["name"] for t in r.get("result", {}).get("tools", [])]
-            if c == 403 and r.get("auth") == "credential_required":     # owner API 1.12: a shared machine
-                line(None, f"the hub takes this machine as {agent}", "on a shared machine only sessions with their "
-                                                                      "credential reach the team tools")
+            if c == 403 and r.get("auth") == "credential_required":     # owner API 1.12: after the address check
+                line(True, f"the hub takes this machine as {agent} (its sessions send a credential for the team tools)")
             else:
                 line(c == 200 and bool(names), f"the hub takes this machine as {agent} ({len(names)} team tools)",
                      r.get("error") if isinstance(r.get("error"), str) else "")
@@ -6905,8 +6962,9 @@ def cmd_check(args):
         # `-c mcp_servers.fleet.url=...`, and Claude gets `--strict-mcp-config --mcp-config ...`, which uses only
         # that configuration and so ignores the registered server on purpose. So neither line says anything about
         # whether the agent reaches its team tools, and a failure here failed a machine that works.
-        url, hand = f"{HUB}/mcp/{agent}", f"run: python3 fleet.py connect {agent}. An agent's own sessions get the " \
-                                          f"team tools on the command line and need this for nothing"
+        url, hand = f"{HUB}/mcp/{agent}", f"run: python3 fleet.py connect {agent}, which works only for an agent " \
+                                          f"with no agent key. An agent's own sessions get the team tools on the " \
+                                          f"command line and need this for nothing"
         if runtime == "claude" and shutil.which("claude") and HUB:
             try:
                 r = subprocess.run(["claude", "mcp", "list"], cwd=KIT, capture_output=True, text=True, timeout=90)

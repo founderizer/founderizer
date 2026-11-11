@@ -36098,9 +36098,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def session_allowed(self, agent, context):
         """An MCP call (owner API 1.12): from the agent's machine, with a session credential whose binding matches this
-        route. A call without any credential only while the agent is alone on its address: a session that started
-        before its credential. A credential that is sent but does not match is refused, never taken as absent. An
-        agent whose machine has no address is refused on a hub that checks addresses (address_checked)."""
+        route. A call without any credential only while the agent is alone on its address and has no key yet, as
+        allowed() takes a helper route: an agent with a key sends its session's credential on every call, also while
+        it is alone, so that no other user of its machine can act as its owner chat, a conversation, one of its
+        tasks or its standing session (the access review of 10 November 2026). Its helper enrolls the key before it
+        starts the standing session (Helper.enroll). A window that started without a credential, before its agent had
+        a key, is refused from then on, and its helper closes the standing session and the owner chat among them, so
+        that each starts again with one (Helper.close_keyless). A credential that is sent but does not match is
+        refused, never taken as absent. An agent whose machine has no address is refused on a hub that checks
+        addresses (address_checked)."""
         if unplaced(agent):
             return self.no_server(agent)
         want, src = address_of(agent), self.client_address[0]
@@ -36112,9 +36118,13 @@ class Handler(BaseHTTPRequestHandler):
             return False
         token, self.credential = self.bearer(), None
         if token is None:
-            return True if not shared_machine(agent) else self.refuse(
-                agent, "credential_required", f"{agent} shares its machine with other agents: this session needs its "
-                                              f"credential and must start again")
+            shared = shared_machine(agent)
+            if not shared and agent_key(agent) is None:
+                return True             # alone, and its helper has not enrolled its key yet: the address rule
+            return self.refuse(agent, "credential_required",
+                               f"{agent} shares its machine with other agents: this session needs its credential and "
+                               f"must start again" if shared else
+                               f"{agent} has an agent key: this session needs its credential and must start again")
         row = q1("SELECT * FROM session_credentials WHERE sha256=?", (hashlib.sha256(token.encode()).hexdigest(),)) \
             if token else None
         if row and row["revoked"] is None and row["agent"] == agent and binding_matches(row, context):
