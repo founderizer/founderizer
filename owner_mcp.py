@@ -661,14 +661,46 @@ def ssh(host, user, remote, stdin=None, timeout=120):
 
 
 def sudo_prefix(reading):
-    """Root runs the steps as they are; a user that can become root gets `sudo -i -- ` in front of each step. Each step
-    here is one `sh -c` command, so `sudo` runs all of it as root: INSTALL-PROMPT.md A1 gives the agent the same rule,
-    with `sudo -n -i -- `. `sudo -i` gives the command to root's login shell, which expands each "$name" in it before
-    `sh` reads it."""
+    """Root runs the steps as they are; a user that can become root gets `sudo -n -i -- ` in front of each step, as
+    INSTALL-PROMPT.md A1 tells the agent. `-n`: `sudo` never waits for a password, because nobody can type one here,
+    and it never reads the auth key on standard input as a password. Each step is one `/bin/sh -c` command
+    (`as_root`), so `sudo` runs all of it as root."""
     lines = reading["out"].splitlines()
     if len(lines) >= 2 and lines[1].strip() == "0":
         return ""
-    return "sudo -i -- "
+    return "sudo -n -i -- "
+
+
+def as_root(root, program):
+    """The remote command that runs `program` whole as root: one `/bin/sh -c`, with `root` (`sudo_prefix`) in front.
+    Behind `sudo` the program goes in the words of `through_sudo`, so that `/bin/sh` gets it unchanged."""
+    return root + "/bin/sh -c " + shlex.quote(through_sudo(program) if root else program)
+
+
+def through_sudo(program):
+    """**A root program in words that reach `/bin/sh` unchanged through `sudo -i`**, as the Mac app's
+    `InstallPlan.throughSudo` makes them (Founderizer 0.1.176). `sudo -i` joins the command and its arguments with
+    spaces, puts a backslash before each character except letters, digits, "_", "-" and "$" (`man sudo`, `-i`), and
+    gives that text to root's login shell. So that shell expands a "$" before a letter, a digit, "_", "-" or "$" ("$t",
+    "$1", "$$", "$-") before `/bin/sh` reads the program, and it removes each new line with the backslash before it. A
+    "$" before another character stays as it is ("$(", "${", "$?"). Until 11 November 2026 every program went as it
+    is, so take_line's "$t" arrived as "": on a server that has the code already, `may-take` and `merge` got no commit,
+    and the code did not move.
+
+    A program in printable ASCII with no new line and no such "$" goes as it is. Each other program goes as one
+    `printf` whose format writes the program, with a three-digit octal escape for each byte that a shell or `printf`
+    can read in another way: `/bin/sh` runs what it prints with `eval`, in the same shell, with the same standard input
+    and exit status. Only the new lines at the end of the program go, as in each command substitution. These words
+    have no "$", no new line and only printable ASCII, so they arrive unchanged too.
+
+    A program that starts with "-" gets one space in front, which the shell skips. Without it, `printf` reads the "-"
+    as an option and prints nothing, so that `eval ""` ends with 0; and bash's `eval` reads it as an option too."""
+    data = program.encode()
+    if all(0x20 <= byte <= 0x7e for byte in data) and not re.search(rb"\$[A-Za-z0-9_$-]", data):
+        return program
+    return "eval \"`printf '" + "".join(
+        chr(byte) if 0x20 <= byte <= 0x7e and byte not in b"'\\%`\"$" else f"\\{byte:03o}"
+        for byte in (b" " + data if data.startswith(b"-") else data)) + "'`\""
 
 
 def install_hub(args):
@@ -705,30 +737,29 @@ def install_hub(args):
         raise Refused(f"{host} has no systemctl. This install needs systemd, on "
                       f"Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13. The machine said:\n"
                       f"{steps['read_machine']['out']}")
-    steps["git"] = ssh(host, user, root + 'sh -c ' + shlex.quote(
+    steps["git"] = ssh(host, user, as_root(root,
         'command -v git >/dev/null 2>&1 || { DEBIAN_FRONTEND=noninteractive apt-get -q update && '
         'DEBIAN_FRONTEND=noninteractive apt-get -y -q install git; }'), timeout=600)
-    steps["code"] = ssh(host, user, root + "sh -c " + shlex.quote(
+    steps["code"] = ssh(host, user, as_root(root,
         f"if test -d {KIT}/.git; then {take_line(KIT)}; "
         f"else git clone -q -- {shlex.quote(source.strip())} {KIT}; fi"), timeout=600)
-    steps["revision"] = ssh(host, user, root + "sh -c " + shlex.quote(f"git -C {KIT} rev-parse --short HEAD; ls {KIT}/hub.sh"))
+    steps["revision"] = ssh(host, user, as_root(root, f"git -C {KIT} rev-parse --short HEAD; ls {KIT}/hub.sh"))
     if steps["revision"]["exit"] != 0:
         raise Refused(f"the Founderizer code is not on {host}: {steps['code']['error'] or steps['revision']['error']}. "
                       f"If the repository asked for a password or a user name, its address needs a credential this "
                       f"server does not have: ask the owner for the exact command their download page gives.")
-    plan = ssh(host, user, root + f"sh {KIT}/hub.sh --check", timeout=300)
+    plan = ssh(host, user, as_root(root, f"sh {KIT}/hub.sh --check"), timeout=300)
     steps["plan"] = plan
     if plan["exit"] != 0:
         raise Refused(f"the installer refused this machine before it changed anything:\n{plan['out']}\n{plan['error']}")
     with open(key_path, "rb") as key:               # the key on standard input, never in an argument or a URL
-        steps["authkey"] = ssh(host, user, root + "sh -c " + shlex.quote(f"umask 077; cat > {AUTHKEY}"), stdin=key)
-    steps["authkey_mode"] = ssh(host, user, root + "sh -c " + shlex.quote(
-        f"test -s {AUTHKEY} && stat -c %a {AUTHKEY}"))
+        steps["authkey"] = ssh(host, user, as_root(root, f"umask 077; cat > {AUTHKEY}"), stdin=key)
+    steps["authkey_mode"] = ssh(host, user, as_root(root, f"test -s {AUTHKEY} && stat -c %a {AUTHKEY}"))
     if steps["authkey_mode"]["out"].strip() != "600":
         raise Refused(f"the auth key did not reach {host} as a file only root can read "
                       f"({steps['authkey_mode']['out'] or steps['authkey_mode']['error']}). Nothing was started.")
     extra = f" --port {int(args['port'])}" if args.get("port") else ""
-    steps["started"] = ssh(host, user, root + "sh -c " + shlex.quote(
+    steps["started"] = ssh(host, user, as_root(root,
         f'setsid sh -c "sh {KIT}/hub.sh{extra} < {AUTHKEY} > {LOG} 2>&1; rm -f {AUTHKEY}" > /dev/null 2>&1 &'))
     return {"host": host, "root_prefix": root or "none", "plan": plan["out"], "steps": steps,
             "next": "The install runs on its own and waits up to 30 minutes for this Mac to claim the hub. Read "
@@ -743,7 +774,7 @@ def install_log(args):
     lines = args.get("lines")
     lines = lines if isinstance(lines, int) and not isinstance(lines, bool) and 1 <= lines <= 400 else 40
     root = sudo_prefix(ssh(host, user, "id -un; id -u"))
-    got = ssh(host, user, root + "sh -c " + shlex.quote(f"tail -n {lines} {LOG}"))
+    got = ssh(host, user, as_root(root, f"tail -n {lines} {LOG}"))
     text = got["out"]
     claim = re.search(r"FLEET_CLAIM=([A-Z2-9-]{12,20})\b", text)
     where = re.search(r"http://(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})/claim", text)
@@ -856,7 +887,7 @@ def add_machine(args):
                       "request_id to make a new line.")
     host, user = ssh_target(args)
     root = sudo_prefix(ssh(host, user, "id -un; id -u"))
-    done = ssh(host, user, root + "sh -c " + shlex.quote(line), timeout=1800)
+    done = ssh(host, user, as_root(root, line), timeout=1800)
     return dict(receipt, line=None, host=host, join={"exit": done["exit"], "out": done["out"], "error": done["error"]},
                 next="Read servers with fleet_read to see the machine, then add_agent on it. The join's last step is "
                      "verify: its lines are in the output above.")

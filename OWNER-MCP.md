@@ -264,6 +264,12 @@ and a tool was taken out of this file's own table, and every check failed naming
   standard input exactly once and in no argument, a key file other users can read refused before
   any command, a host or user that would not be one argument refused, the claim code read out of
   the log, and an install that stopped given to the owner instead of worked around.
+- **`RootThroughSudo`** — `install_hub` (twice), `install_log` and `add_machine` run on the stand-in
+  server of `test_hub_install.py`, as root and as a user who is not root: each root step is one
+  `sudo -n -i -- /bin/sh -c '…'`, and `/bin/sh` (and dash) gets each program unchanged. A program
+  that `sudo -i` would change goes as `eval` of a `printf` (`through_sudo`, the idea of the app's
+  `InstallPlan.throughSudo`). Until 11 November 2026 root's login shell expanded take_line's "$t"
+  to nothing, so on a server that had the code already the code did not move.
 - **`Refusals`** — a Mac that is not the owner's, a generation that moved, a `team.json` that
   moved under a command, the same `request_id` twice, and a field the hub refuses.
 - **`NoSecret`** — no tool takes a secret, the credential-carrying routes are not tools here, a
