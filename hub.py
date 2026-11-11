@@ -593,11 +593,15 @@ def wal_on():
     why."""
     try:
         mode = str(DB.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()
-        if mode == "wal":       # a setting of this connection, not of the file: it is set again at each start
-            DB.execute(f"PRAGMA journal_size_limit={WAL_MOST}").fetchone()
     except sqlite3.Error as e:
         return False, str(e)
-    return (True, None) if mode == "wal" else (False, f"SQLite kept the journal mode {mode}")
+    if mode != "wal":
+        return False, f"SQLite kept the journal mode {mode}"
+    # A setting of this connection, not of the file: it is set again at each start. Only the WAL file's size depends
+    # on it, so the records are in WAL mode whether or not it takes.
+    with contextlib.suppress(sqlite3.Error):
+        DB.execute(f"PRAGMA journal_size_limit={WAL_MOST}").fetchone()
+    return True, None
 
 
 def readers_for(path):
@@ -657,8 +661,10 @@ def state_moment():
     With a read connection (reader), LOCK is held for that moment only. Every writer commits under LOCK, and the change
     token counts each commit after it (counted), so the read transaction that starts then holds every row that the
     token counts, and none that it does not. The team is copied in the same moment: apply_team replaces the values of
-    TEAM and changes none of them in place, and the owner's commands, the agents' tools, the tick and POST /join call it
-    under LOCK, so the copy is the team that went with those rows. The block before this read TEAM again at each use.
+    TEAM and changes none of them in place, and each of its callers that was read on 11 November 2026 runs under LOCK
+    (the owner's commands, the agents' tools through call_tool, the tick and POST /join), so the copy is the team that
+    went with those rows. No test holds this: a caller with no lock would let one read show the team of another moment
+    beside its rows, as the block before this could, which read TEAM again at each use.
     Then this thread reads from that transaction, with no lock held (SNAP), and the writers go on: what
     they commit from then on is in the next read, and moves the token past the one of this read, so an app that waits
     with it reads again. Without a read connection, or when its read cannot start, the whole read holds LOCK, as every
