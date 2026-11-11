@@ -35457,8 +35457,9 @@ def door_mode_statement(need, statement):
     return None
 
 
-def statement_kind(approval):
-    """The kind of the owner's signed statement that a Needs-you item keeps (door-call or door-mode), or None."""
+def approval_kind(approval):
+    """The kind of the owner's signed statement that a Needs-you item keeps (door-call or door-mode), or None. Not
+    statement_kind, the central vault's reader: a second def of that name replaced it (selftest.py 0c)."""
     try:
         said = json.loads(json.loads(approval)["statement"])
     except (ValueError, TypeError, KeyError, RecursionError):
@@ -35478,7 +35479,7 @@ def door_approvals(src):
              (now() - DOOR_APPROVAL_DAYS * 86400,))
     modes = {}
     for r in q("SELECT id, approval FROM needs WHERE approval IS NOT NULL AND door_host IS NOT NULL ORDER BY id"):
-        if statement_kind(r["approval"]) == "door-mode":
+        if approval_kind(r["approval"]) == "door-mode":
             item = json.loads(r["approval"])
             said = json.loads(item["statement"])
             if said["at"] >= modes.get(said["host"], ({}, -1))[1]:
@@ -35486,7 +35487,7 @@ def door_approvals(src):
     phones, devices = q("SELECT device, statement, signature FROM owner_device_signing WHERE statement IS NOT NULL "
                         "ORDER BY device"), owner_devices()
     return {"approvals": [dict(json.loads(r["approval"]), need=r["id"]) for r in rows
-                          if statement_kind(r["approval"]) != "door-mode"],
+                          if approval_kind(r["approval"]) != "door-mode"],
             "devices": [{"device": r["device"], "statement": r["statement"], "signature": r["signature"]}
                         for r in phones if r["device"] in devices],
             "modes": [item for _, (item, _) in sorted(modes.items())]}

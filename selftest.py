@@ -545,6 +545,47 @@ try:
 except Exception as root_rights_problem:     # a changed shape is a failure, never a silent pass
     check("the root rights of a machine can be checked", False, repr(root_rights_problem))
 
+# 0c no name of hub.py is bound twice
+#
+# Python keeps the last of two definitions of one name and says nothing: every caller of the first one calls the
+# second. Many lanes write hub.py at the same time, each at its own place, and no reader sees both. On 11 November
+# 2026 the door's reader of an approval's kind (da272623) was a second `def statement_kind`. It replaced the central
+# vault's reader and read None from each signed statement of the owner, so `POST /ui/vault/pin`, `/recovery` and
+# `/grant` refused all of them with 400, until the door's reader got its own name (`approval_kind`). So no name is
+# bound twice at the top level of hub.py or in the body of one of its classes, by `def`, `class` or `=`. A
+# definition whose decorator reads the one before it (`@rows.setter`) keeps that one, so it is not a repeat. Source
+# only. This block failed on the hub.py of da272623 before it shipped, with the two lines of `statement_kind`.
+
+try:
+    def bound_twice(body, where=""):
+        """Each name that this body binds a second time, with the lines of both."""
+        first, out = {}, []
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if any(isinstance(d, ast.Attribute) and isinstance(d.value, ast.Name) and d.value.id == node.name
+                       for d in node.decorator_list):
+                    continue                    # @rows.setter on def rows: the decorator keeps the one before
+                bound = [node.name]
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)) and getattr(node, "value", None) is not None:
+                bound = [n.id for target in getattr(node, "targets", None) or [node.target]
+                         for n in ast.walk(target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)]
+            else:
+                continue
+            for name in bound:
+                if name in first:
+                    out.append(f"{where}{name} (lines {first[name]} and {node.lineno})")
+                else:
+                    first[name] = node.lineno
+        return out
+
+    HUB_TREE = ast.parse(open(os.path.join(KIT, "hub.py")).read())
+    twice = bound_twice(HUB_TREE.body) + [one for node in ast.walk(HUB_TREE) if isinstance(node, ast.ClassDef)
+                                          for one in bound_twice(node.body, f"{node.name}.")]
+    check("no name is bound twice at the top level of hub.py or in one of its classes", not twice,
+          "the later one replaces the earlier in silence: " + "; ".join(twice))
+except Exception as bound_twice_problem:     # a changed shape is a failure, never a silent pass
+    check("hub.py can be read for names bound twice", False, repr(bound_twice_problem))
+
 # 1 handshake and roles
 code, headers, resp = rpc("manager", "initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "sim-cli", "version": "9.9"}})
 check("initialize answers with the requested version", code == 200 and resp["result"]["protocolVersion"] == "2025-06-18")
