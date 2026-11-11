@@ -99,8 +99,12 @@ address", below).
    the hub's join line uses for a server too). That script does not wait for apt's lock, which
    the first updates of a new server hold, so the step waits up to 20 minutes for the lock before
    each try of the script, and tries three times at most;
-   then `tailscale up --auth-key=file:<a root-only file> --accept-dns=false` (with
-   `--hostname NAME` only when it is given). This hub's address is what `tailscale ip -4` then gives.
+   then `tailscale up --reset --auth-key=file:<a root-only file> --accept-dns=false --timeout=300s`
+   (with `--hostname NAME` only when it is given). `--reset` removes the settings that an earlier
+   `tailscale up` left, for example a join line that waited for a sign-in: Tailscale refuses each
+   new try that does not name them again. With no `--timeout`, `tailscale up` waits for ever on a
+   tailnet that approves each new machine by hand. This hub's address is what `tailscale ip -4`
+   then gives.
 5. **The firewall** (`ufw`, `hubsetup.py firewall`): incoming traffic on `tailscale0` only,
    SSH included, outgoing allowed. SSH is open to the internet no more, so after this step SSH
    reaches the server at its Tailscale address only. A firewall that was off keeps open each

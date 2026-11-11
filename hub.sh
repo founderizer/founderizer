@@ -60,6 +60,10 @@ NEEDED="hub.py fleet.py hubsetup.py selftest.py config-ref.sh team.json RULES.md
 # Seconds that each apt-get waits for the package lock: a new server runs its first updates for about 9 minutes after
 # its first boot, and they hold it (hubsetup.py's APT_LOCK_WAIT).
 APT_LOCK_WAIT=1200
+# Seconds that `tailscale up` waits for the private network with the owner's key. With no limit it waits for ever on a
+# tailnet that approves each new machine by hand, and the install waits with it (as onboard.py's TAILSCALE_UP_WAIT
+# and the Mac app's InstallPlan.tailscaleUpWait).
+TAILSCALE_UP_WAIT=300
 
 check=no
 source=""
@@ -285,7 +289,8 @@ network() {
     if [ "$check" = yes ]; then
         command -v tailscale >/dev/null 2>&1 || plan "install Tailscale from https://tailscale.com/install.sh"
         plan "read the Tailscale auth key on standard input into a file that only root can read, then run: \
-tailscale up --auth-key=file:<that file>${hostname:+ --hostname=$hostname} --accept-dns=false"
+tailscale up --reset --auth-key=file:<that file>${hostname:+ --hostname=$hostname} --accept-dns=false \
+--timeout=${TAILSCALE_UP_WAIT}s"
         plan "take this machine's address from: tailscale ip -4"
         address="100.64.0.1"
         say "  check only: the plan below uses $address as this machine's address"
@@ -323,9 +328,15 @@ terminal on this server and paste the key."; }
         ( umask 077; printf '%s\n' "$key" > "$keydir/authkey" )
         key=""
         unset key
-        tailscale up --auth-key="file:$keydir/authkey" ${hostname:+--hostname="$hostname"} --accept-dns=false \
-            || { rm -rf "$keydir"; stop "Tailscale did not join with that auth key. Make a new key in the fleet's \
-Tailscale admin console, then run the line again."; }
+        # --reset: a `tailscale up` before this one (a join line that waited for a sign-in, or this line with another
+        # --hostname) left its settings, and Tailscale refuses a `tailscale up` that does not name each of them again.
+        # This line runs only when `tailscale status` fails: Tailscale has no login, it waits for a sign-in or for an
+        # admin, or somebody stopped it. --reset then also removes the settings of a stopped Tailscale, which a hub does
+        # not need: hubsetup.py's harden step sets auto-update after this step.
+        tailscale up --reset --auth-key="file:$keydir/authkey" ${hostname:+--hostname="$hostname"} --accept-dns=false \
+            --timeout="${TAILSCALE_UP_WAIT}s" \
+            || { rm -rf "$keydir"; stop "Tailscale did not join with that auth key. If Tailscale asked you to approve \
+this machine, approve it in the fleet's Tailscale admin console. Else make a new key there. Then run the line again."; }
         rm -rf "$keydir"
         trap - EXIT INT TERM
         say "  this machine joined the private network${hostname:+ as $hostname}"

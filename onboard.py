@@ -964,10 +964,17 @@ class Onboarding:
         tags = " --advertise-tags=%s" % shlex.quote(tag) if tag else ""
         up = "tailscale up%s --accept-dns=false --ssh=false" % tags        # its own name
         if self.auth.get("tailscale") == "auth_key":
+            # --reset: an earlier `tailscale up` on this server (a join line, a sign-in or a run with another tag) left
+            # its settings, and Tailscale refuses a `tailscale up` that does not name each of them again. This line runs
+            # only when Tailscale does not run (ts_status above): it has no login, it waits for a sign-in or for an
+            # admin, or somebody stopped it. --reset then also removes the settings of a stopped Tailscale, which a
+            # worker does not need.
             key = self.ch.secret("tailscale_auth_key")
             self.must("printf '%%s\\n' \"$FLEET_INPUT\" | install -m 600 /dev/stdin /run/fleet-ts-authkey\n"
-                      "%s --auth-key=file:/run/fleet-ts-authkey || { rm -f /run/fleet-ts-authkey; exit 1; }\n"
-                      "rm -f /run/fleet-ts-authkey" % up, "Tailscale join", input=key, timeout=180)
+                      "%s --reset --auth-key=file:/run/fleet-ts-authkey --timeout=%ds "
+                      "|| { rm -f /run/fleet-ts-authkey; exit 1; }\n"
+                      "rm -f /run/fleet-ts-authkey" % (up, TAILSCALE_UP_WAIT), "Tailscale join", input=key,
+                      timeout=TAILSCALE_UP_WAIT + 60)
         else:
             self.root("%s --timeout=10s >/dev/null 2>&1 || true" % up, timeout=120)
             data, ip = self.ts_status()
@@ -1858,6 +1865,10 @@ if ! command -v tailscale >/dev/null; then
   apt-get -o DPkg::Lock::Timeout=%d install -y -q tailscale
 fi
 systemctl enable --now tailscaled""" % (APT_UPDATE, APT_LOCK_WAIT)
+# Seconds that `tailscale up` waits for the private network with the owner's key. With no limit it waits for ever on a
+# tailnet that approves each new machine by hand: then the SSH call ends first, and the key file stays on the server.
+# The line ends by itself before its SSH call does, and removes the key file (hub.sh's TAILSCALE_UP_WAIT).
+TAILSCALE_UP_WAIT = 300
 
 # SSH comes in over tailscale0 alone, which the third line allows; the public SSH rule of an earlier executor goes,
 # found by its comment, from the highest number down (hubsetup.firewall_script does the same).

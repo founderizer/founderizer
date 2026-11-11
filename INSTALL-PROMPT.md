@@ -133,7 +133,7 @@ port or another key.
 
     ssh "$SSHUSER@$HOST" '/bin/sh -c "command -v tailscale >/dev/null 2>&1 || for try in 1 2 3; do DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=1200 -q install </dev/null >/dev/null 2>&1; curl -fsSL https://tailscale.com/install.sh | sh && command -v tailscale >/dev/null && break; sleep 20; done; tailscale version"'
     ssh "$SSHUSER@$HOST" '/bin/sh -c "umask 077; cat > /root/fleet-authkey"' < "$KEYFILE"
-    ssh "$SSHUSER@$HOST" '/bin/sh -c "tailscale status >/dev/null 2>&1 || tailscale up --auth-key=file:/root/fleet-authkey --accept-dns=false; rm -f /root/fleet-authkey; tailscale ip -4"'
+    ssh "$SSHUSER@$HOST" '/bin/sh -c "tailscale status >/dev/null 2>&1 || tailscale up --reset --auth-key=file:/root/fleet-authkey --accept-dns=false --timeout=300s; rm -f /root/fleet-authkey; tailscale status >/dev/null 2>&1 && tailscale ip -4"'
 
 On a new server the first line can take some minutes: the server installs its first updates, and
 they hold apt's lock. Tailscale's installer does not wait for that lock, so the line waits up to 20
@@ -142,11 +142,21 @@ in about 10 minutes; in the worst case it takes more than one hour. Give the lin
 your shell stops a command sooner, run the line in the background, and when it ends, read its
 output and its exit status.
 
+The last line can wait up to 5 minutes for Tailscale to come up: give it that time in the same way.
+Its `--reset` removes the settings that an earlier `tailscale up` left on the server, for example
+the tags of a join line that waited for a sign-in: without it, Tailscale refuses each new try. The
+line prints the address only when Tailscale runs.
+
 Check: the first line ends with Tailscale's version and an exit status of 0, and the last command
 prints an address that starts with `100.`. If the first line ends without the version, or with an
 exit status that is not 0, stop and give the owner the last lines that it printed, as they came.
 If `tailscale up` refuses the key, stop and give the owner the error as it came; a key is used once
 unless they made it reusable, and an advertised tag must exist in their own Tailscale policy.
+If `tailscale up` ends with `timeout waiting for Tailscale service to enter a Running state`,
+stop and give the owner that error as it came. Usually their network holds each new machine until
+an admin approves it: tell them to approve this server in their Tailscale admin console. (A key with
+the option "Pre-approved" removes this step for the next servers.) When they say that they
+approved it, run the last line again. If it again prints no address, stop and tell the owner.
 
 Then set `HOST` to that address, and reach the server there for every step after this one:
 
@@ -247,15 +257,22 @@ The command of A1, with the same checks and the same stops. If `id -u` is not `0
 
     ssh "$SSHUSER@$HOST" '/bin/sh -c "command -v tailscale >/dev/null 2>&1 || for try in 1 2 3; do DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=1200 -q install </dev/null >/dev/null 2>&1; curl -fsSL https://tailscale.com/install.sh | sh && command -v tailscale >/dev/null && break; sleep 20; done; tailscale version"'
     ssh "$SSHUSER@$HOST" '/bin/sh -c "umask 077; cat > /root/fleet-authkey"' < "$KEYFILE"
-    ssh "$SSHUSER@$HOST" '/bin/sh -c "tailscale status >/dev/null 2>&1 || tailscale up --auth-key=file:/root/fleet-authkey --accept-dns=false; rm -f /root/fleet-authkey; tailscale ip -4"'
+    ssh "$SSHUSER@$HOST" '/bin/sh -c "tailscale status >/dev/null 2>&1 || tailscale up --reset --auth-key=file:/root/fleet-authkey --accept-dns=false --timeout=300s; rm -f /root/fleet-authkey; tailscale status >/dev/null 2>&1 && tailscale ip -4"'
 
 On a new server the first line can take some minutes, as in A2: give it that time in the same way.
+The last line can wait up to 5 minutes: give it that time too. Its `--reset` removes the settings
+of an earlier `tailscale up`, as in A2.
 
 Check: the first line ends with Tailscale's version and an exit status of 0, and the last command
 prints an address that starts with `100.`. If the first line ends without the version, or with an
 exit status that is not 0, stop and give the owner the last lines that it printed, as they came.
 If `tailscale up` refuses the key, stop and give the owner the error as it came; a key is used once
 unless they made it reusable, and an advertised tag must exist in their own Tailscale policy.
+If `tailscale up` ends with `timeout waiting for Tailscale service to enter a Running state`,
+stop and give the owner that error as it came. Usually their network holds each new machine until
+an admin approves it: tell them to approve this server in their Tailscale admin console. (A key with
+the option "Pre-approved" removes this step for the next servers.) When they say that they
+approved it, run the last line again. If it again prints no address, stop and tell the owner.
 
 Then set `HOST` to that address, and reach the server there from now on, as in A2:
 
