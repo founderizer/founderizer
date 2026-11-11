@@ -43,8 +43,11 @@ def load(name, path):
 OPS_ROOT = load("ops_root", os.path.join(HERE, "host", "ops-root"))
 OPS_READ = load("ops_read", os.path.join(HERE, "host", "ops-read"))
 
-# The product's own repositories: no customer's door ever touches them (DevOps plan, "Always refused").
-VENDOR_REPOS = ("miguelpieras/founderizer-fleet", "miguelpieras/founderizer-web", "miguelpieras/agents")
+# The product's own repositories: no customer's door ever touches them (DevOps plan, "Always refused"). GitHub sends
+# the old name of a moved repository to its new one, so an old name stays here: the hub's public repository moved from
+# miguelpieras/founderizer-fleet to founderizer/founderizer on 11 November 2026.
+VENDOR_REPOS = ("founderizer/founderizer", "founderizer/founderizer-apps", "miguelpieras/founderizer-fleet",
+                "miguelpieras/founderizer-web", "miguelpieras/agents")
 # Host forms that only the door sends, with a value of its own on stdin: never an agent's call.
 DOOR_ONLY = {"self-update", "place", "pro-attach", "runner-register"}
 # Host forms whose content goes to the host on stdin, with its sha256, and the forms whose value the door itself sends

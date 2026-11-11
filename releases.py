@@ -65,7 +65,7 @@ import urllib.request
 # its own configuration (hub.releases region), because P7 settles the host of the channel and the address of the
 # published repository.
 DEFAULT_CHANNEL = "https://founderizer.com"
-DEFAULT_UPSTREAM = "https://github.com/miguelpieras/founderizer-fleet.git"
+DEFAULT_UPSTREAM = "https://github.com/founderizer/founderizer.git"
 REMOTE = "upstream"                 # PRODUCT.md 4.3: "every hub carries [it] as the git remote `upstream`"
 MOVED = "refs/founderizer/moved"    # where the clone keeps the ref's own tip when a push lost to it
 KEY_FILE = "release-key.pub"        # the release public keys, shipped in the repository beside this file

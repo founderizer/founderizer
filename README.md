@@ -4,6 +4,8 @@ The code a Founderizer fleet runs: the hub, the helper of each machine, the inst
 reads. This repository is what a customer's hub carries as the git remote `upstream` and fetches a release from, so
 everything here is public and everything here is in the clone of every machine of every fleet.
 
+The apps for Mac and iPhone have their own repository: <https://github.com/founderizer/founderizer-apps>.
+
 | File | What it is |
 | --- | --- |
 | `hub.py` | The hub: the team tools of each agent, the tasks, the duties, the timers and the owner's own API. Runs on the always-on machine. |
@@ -31,5 +33,12 @@ credit, and section 4 of the license says how a copy that you share keeps them. 
 repository is under this license, including the versions that we published earlier under the Functional Source
 License (FSL-1.1-ALv2) or with no license file.
 
-**Changes from outside.** We do not take pull requests. This repository is a copy that we publish from our own
-repository, so a pull request cannot be merged here. To report a problem or to ask for a change, open an issue.
+**The name.** The name Founderizer and its logo belong to Amura Ventures SL, and the license gives no right to use
+them (section 6). You can say that your work is based on Founderizer. A changed copy that you share uses a different
+name and a different logo.
+
+**Changes from outside.** Issues and pull requests are welcome. This repository is a copy that we publish from our
+own repository, so we do not merge a pull request here. We apply its change to our repository, run our whole test
+suite on it, and the next release carries it. Then we close the pull request with a link to that release. The release
+commit names you as co-author, so GitHub lists you as a contributor. Under section 5 of the license, what you send is
+under the Apache License 2.0. Before you send a change, run `python3 selftest.py`.

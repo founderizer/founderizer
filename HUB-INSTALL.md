@@ -62,7 +62,7 @@ With `--source` it clones the repository into `/root/fleet-kit` first, which rep
 step 3 above when the server can reach that address:
 
 ```sh
-sh hub.sh --source https://github.com/miguelpieras/founderizer-fleet.git
+sh hub.sh --source https://github.com/founderizer/founderizer.git
 ```
 
 The installer asks for the Tailscale auth key and does not show what you type. To give it
@@ -501,7 +501,7 @@ at the revision of the release that the hub runs: the hub's `release.json` is th
 signed manifest, and one of the release keys of the clone itself must have signed it. A
 release that does not descend from the clone's own revision is refused, so no older release
 comes back, and a second run with nothing new changes nothing. `--source` names another
-copy of the published repository (default: `https://github.com/miguelpieras/founderizer-fleet.git`);
+copy of the published repository (default: `https://github.com/founderizer/founderizer.git`);
 the signature names the commit, so it is the same commit from any copy. The first clone is
 made once, as root, from the hub's own checkout (`sudo python3 ~fleet/fleet-pilot/hubsetup.py
 kit-clone`), on the day the hub is trusted with its first signed release; every later run is
