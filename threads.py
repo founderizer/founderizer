@@ -226,6 +226,40 @@ def notice_tag(notice, name):
     return found.group(1) if found else None
 
 
+# A fork's own file starts with what its parent had in front of it (Claude Code 2.1.311's own program text, and a
+# fork's files of 2.1.321, 11 November 2026): a `fork-context-ref` row, then a copy of the parent's message that
+# started the fork, with every tool call of that message under its own id, and one user row with a stand-in result
+# for each of those calls ("Fork started — that fork is you.") and the fork's instructions, which open with this block
+# of Claude Code's own. Those calls are the parent's, and the copied starting call has the id that the fork's meta
+# file names: read as the fork's own, it was a subagent call inside the fork whose subagent is the fork itself.
+FORK_START, FORK_START_END = "<fork-boilerplate>", "</fork-boilerplate>"
+
+
+def own_rows(rows):
+    """The rows of a subagent's file that are its own work. A fork's rows are its own from the user row with its
+    instructions, and of that row only the instructions after Claude Code's own block (FORK_START). A file that
+    starts as a fork's (`fork-context-ref`) and has no such block is its own after its first user row, the one with
+    the stand-in results, and has no row of its own before that row is written: the copied calls are never the
+    fork's steps. Every other subagent's file is its own from its first row."""
+    fork = bool(rows) and isinstance(rows[0], dict) and rows[0].get("type") == "fork-context-ref"
+    first = None
+    for at, row in enumerate(rows):
+        message = row.get("message") if isinstance(row, dict) and isinstance(row.get("message"), dict) else None
+        if not message or row.get("type") != "user":
+            continue
+        first = at if first is None else first
+        content = message.get("content")
+        for block in [{"type": "text", "text": content}] if isinstance(content, str) else \
+                content if isinstance(content, list) else []:
+            text = block.get("text") if isinstance(block, dict) and block.get("type") == "text" else None
+            if isinstance(text, str) and text.lstrip().startswith(FORK_START):
+                said = text.split(FORK_START_END, 1)[1].strip() if FORK_START_END in text else ""
+                return [dict(row, message=dict(message, content=said))] + rows[at + 1:]
+    if fork:
+        return rows[first + 1:] if first is not None else []
+    return rows
+
+
 def complete_rows(data):
     """The JSON objects of a file's complete lines (a writer can still be finishing the last one)."""
     out = []
@@ -375,13 +409,21 @@ class Translator:
 
     def subagent_block(self, call, agent):
         """One subagent's records, translated in its own state, placed at the point where its end is recorded.
-        A fixed place keeps the sequence numbers the same when the helper reads the files again."""
+        A fixed place keeps the sequence numbers the same when the helper reads the files again.
+
+        A subagent is never read inside itself: a call that started this translator's own subagent, or one above it,
+        starts none below it. A fork's file has a copy of its starting call (own_rows), and its meta file names that
+        call, so the reader found the fork's own file for it and read it inside itself without an end. That error
+        took the fork's end with it: the hub held the call for one that ran on, refused the task's first delivery and
+        told the requester that a subagent still ran (two tasks of 9 November 2026)."""
+        if call in (self.prefix or "").split("/"):
+            return []
         rows = self.children(agent, call) if self.children else None
         if not rows:
             return []
         child = Translator(self.runtime, self.root, self.children, prefix=f"{self.prefix}/{call}" if self.prefix else call)
         out = []
-        for row in rows:
+        for row in own_rows(rows):
             ts = when(row.get("timestamp")) if isinstance(row, dict) else None
             out.extend(dict(r, ts=r.get("ts", ts)) for r in child.made(row))
         for sub_call, sub_agent in sorted(child.pending.items()):

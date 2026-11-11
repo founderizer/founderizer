@@ -17419,11 +17419,13 @@ def duty_case_text(c, each=False):
 
 
 def duty_case_brief(c):
-    """One case in one line, without its records, for a read that names every open case (duty_case_lines)."""
+    """One case in one line, without its records, for a read that names every open case (duty_case_lines). The line
+    has the case's key: a watch's check and its holder's own lists name an event by its key, and a holder that needed
+    the keys of its open cases read each of about 100 cases whole for that one word, in two tasks (9 November 2026)."""
     s = q1("SELECT COUNT(*) n, MAX(ts) last FROM duty_steps WHERE duty_case=?", (c["id"],))
     working = [f"{tref(t['id'])} {t['state']}" for t in duty_case_tasks(c["id"]) if t["state"] not in TERMINAL]
     joins = [f"{rref(j['id'])} of {j['agent']}" for j in case_joins(c["id"])]
-    return (f"  {cref(c)} [{c['state']}] {c['title']} — opened {goal_time(c['opened'])}; "
+    return (f"  {cref(c)} [{c['state']}] {c['title']} — key {c['key']}; opened {goal_time(c['opened'])}; "
             + (f"{s['n']} record{'' if s['n'] == 1 else 's'}, the last {goal_time(s['last'])}" if s["n"]
                else "no record yet")
             + ("; it came back inside 30 days" if c["repeated"] else "")
@@ -24043,12 +24045,12 @@ TOOLS = [
      "See the duties that you hold: their watches, their open cases and what is not in order. A duty stays; it "
      "has no 'done'. Five shapes, and the first one that you give wins: case=\"R-1/C-3\" gives that one case whole, "
      "any state, each record with who wrote it and when; responsibility=\"R-1\" gives that one duty in full — its "
-     "newest cases whole, each other open case in one line, and how it was managed from the day it was written; "
-     "search=\"<words>\" finds a duty by its own words, retired ones included; retired=true names the retired ones, "
-     "newest first; and with none of them you get the duties that run now, each with its newest open cases whole "
-     "and a count of the others, and one line saying how many retired ones there are. So the whole history stays "
-     "out of your session until you ask for a piece of it. The manager sees every agent's duty; pass agent for one "
-     "agent.",
+     "newest cases whole, each other open case in one line with its key, and how it was managed from the day it was "
+     "written; search=\"<words>\" finds a duty by its own words, retired ones included; retired=true names the "
+     "retired ones, newest first; and with none of them you get the duties that run now, each with its newest open "
+     "cases whole and a count of the others, and one line saying how many retired ones there are. So the whole "
+     "history stays out of your session until you ask for a piece of it. The manager sees every agent's duty; pass "
+     "agent for one agent.",
      S({"agent": {"type": "string", "description": "Only this agent's duties. The manager sees every agent."},
         "case": {"type": "string", "description": "One case whole, for example R-1/C-3. Any state."},
         "responsibility": {"type": "string", "description": "One duty in full, for example R-1. Any state."},
