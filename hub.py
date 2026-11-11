@@ -1994,13 +1994,33 @@ def secret_key():
                  for r in read_rows("SELECT salt, hash, len FROM secrets ORDER BY id"))
 
 
-@functools.lru_cache(maxsize=8192)
-def _secret_spans(text, key):
+# The search finds nothing in a text shorter than SECRET_TEXT_LEAST, as it always did, and json_plain makes no text
+# longer, so secret_hit does not look such a text up.
+SECRET_TEXT_LEAST = 8
+# Two caches of the search:
+# - the general one, as it always was: 8,192 texts of any length. The guard of each tool call, the masks of each tool
+#   result, an attachment and a knowledge file use it, and so does a text of the state that is too long for the other;
+# - scrub()'s own, for the texts of up to SCRUB_TEXT_MOST characters that it asks for (spans_of). It asks for all the
+#   texts of the state that the Mac app reads every 3 seconds, in the same order at each read, so its cache must hold
+#   all of them: a cache that holds fewer keeps none that the next read asks for, and each read searches every text
+#   again. With 8,192, a copy of the first fleet's database with 2.3 times its rows (some 10,400 different texts) took
+#   454 to 705 ms for each read in place of 73 to 76 ms, and calls that came in during a read waited up to 177 ms
+#   (11 November 2026). The live state had 3,751 different texts, and it grows each day. An entry keeps its text: an
+#   ASCII text of 340 characters, the mean of the state's, makes an entry of 529 bytes, so a full cache of such texts
+#   is about 35 MB. An ASCII text of 4,000 characters made an entry of 4.2 KB, and one with an emoji in it 16 KB, so
+#   a cache full of the longest texts would be about 275 MB, or about 1 GB: for that, the answers that scrub masks
+#   would have to hold 65,536 different texts of 4,096 characters, where the live state had 3,751 texts in all.
+SECRET_SPANS_KEPT = 8192
+SCRUB_SPANS_KEPT = 65536
+SCRUB_TEXT_MOST = 4096
+
+
+def find_secret_spans(text, key):
     """Every (start, end) of a registered login in text. A login may contain punctuation and may be glued
     to other characters; it cannot contain whitespace. Rows without a length match whole letter-and-digit
     tokens, as before."""
     spans = []
-    if len(text) < 8:
+    if len(text) < SECRET_TEXT_LEAST:
         return ()
     runs = [(m.start(), m.group(0)) for m in SECRET_RUN.finditer(text)]
     for salt, digest, n in key:
@@ -2021,21 +2041,36 @@ def _secret_spans(text, key):
     return tuple(sorted(spans))
 
 
+_secret_spans = functools.lru_cache(maxsize=SECRET_SPANS_KEPT)(find_secret_spans)
+_scrub_spans = functools.lru_cache(maxsize=SCRUB_SPANS_KEPT)(find_secret_spans)
+
+
+def spans_of(text, key):
+    """find_secret_spans of one text: through scrub()'s own cache for a text of up to SCRUB_TEXT_MOST characters while
+    this thread runs a scrub, and through the general cache for every other text, as every text went before."""
+    if len(text) <= SCRUB_TEXT_MOST and getattr(SCRUB, "key", None) is not None:
+        return _scrub_spans(text, key)
+    return _secret_spans(text, key)
+
+
 def secret_spans(text, key=None):
     key = secret_key() if key is None else key
-    return list(_secret_spans(str(text or ""), key)) if key else []
+    return list(spans_of(str(text or ""), key)) if key else []
 
 
 def secret_hit(*texts):
-    """True when any text holds a registered login, also inside JSON-escaped text."""
+    """True when any text holds a registered login, also inside JSON-escaped text. A text shorter than
+    SECRET_TEXT_LEAST is not looked up: 3,093 of the 9,144 texts of the first fleet's state were that short."""
     key = secret_key()
     if not key:
         return False
     for text in texts:
         text = str(text or "")
-        if _secret_spans(text, key):
+        if len(text) < SECRET_TEXT_LEAST:
+            continue
+        if spans_of(text, key):
             return True
-        if "\\" in text and _secret_spans(json_plain(text), key):
+        if "\\" in text and spans_of(json_plain(text), key):
             return True
     return False
 
@@ -2100,13 +2135,14 @@ def scrub(value):
 
 
 def scrubbed(value):
-    """scrub() of one value, inside the scrub that read the logins."""
+    """scrub() of one value, inside the scrub that read the logins. A text first: a text is never a dict or a list,
+    and the state holds more texts than dicts and lists together."""
+    if isinstance(value, str):
+        return MASK if secret_hit(value) else value
     if isinstance(value, dict):
         return {key: scrubbed(item) for key, item in value.items()}
     if isinstance(value, list):
         return [scrubbed(item) for item in value]
-    if isinstance(value, str) and secret_hit(value):
-        return MASK
     return value
 
 
@@ -36141,6 +36177,62 @@ def accepts_gzip(lines):
     return False
 
 
+# Python's interpreter lock: a thread that waits for it while another runs Python code gets it after at most this many
+# seconds (sys.setswitchinterval; Python's own default is 0.005). The hub serves each request in a thread of its own,
+# and while one read of the state builds and writes its answer (scrub, json_text), a call that came in waited up to
+# 5 ms for each of its turns: on the first fleet a call that came 40 ms after a read of the state took 15 to 18 ms more
+# (three runs, 11 November 2026). Measured with the hub alone in a Linux container on two cores and a copy of that
+# fleet's database with 2.3 times its rows, so that the work takes about as long as on that hub, and 16 calls 10 ms
+# apart after each of 25 reads: the calls that came 30 to 50 ms after the request took 25 to 31 ms more in all with
+# 0.005 (three runs), and 10 to 13 ms with 0.001 (five runs). The read itself took about as long. 0.0005 gave 6 to
+# 12 ms in three runs: not clearly better, for twice as many switches.
+SWITCH_INTERVAL = 0.001
+JSON_SLICE = 32         # items of a list that json_text writes with one json.dumps
+JSON_KEYS_MOST = 64     # keys of a dict that json_text writes one at a time; a dict with more goes whole
+
+
+class InParts(dict):
+    """An answer that Handler.json writes in parts (json_text). Each dict and list in it is its route's own, made for
+    this answer, so that no other thread changes one while it is written: json.dumps writes in one piece, and nothing
+    else runs while it does. ui_state's answer is scrub()'s copy of the state."""
+
+
+def json_text(obj):
+    """json.dumps(obj), the same text, written in parts: a dict of str keys one key at a time, and each list in it that
+    has more than JSON_SLICE items that many items at a time.
+
+    json.dumps keeps Python's interpreter lock until its whole text is made, and no other thread of the hub runs in that
+    time: 4.4 ms for the state of 1.7 MB on the owner's Mac (10 November 2026), and the first fleet's hub did the same
+    work about twice as slowly (with the code before release 2026.11.298: 0.27 s of its own work for one read there, and
+    139 ms for one read in one process on the Mac with a copy of its database). Between two parts another thread can
+    take the interpreter lock (SWITCH_INTERVAL). The text is the same: json.dumps writes a dict as `{"key": value, ...}`
+    and a list as `[item, item, ...]`, with `", "` between two items and `": "` after a key, and each part here is a
+    json.dumps of its own. A dict with a key that is not a str goes whole, because json.dumps writes such a key in a way
+    of its own; so does a dict with more than JSON_KEYS_MOST keys, because a json.dumps for each of 5,000 small keys
+    took 4.0 ms where one json.dumps took 0.35 ms.
+
+    The dict's items are read once, before the first part, and each long list once, before its first slice, so that
+    the parts of a list are of one moment: no other thread changes the dicts and lists of an InParts answer anyway.
+    On an error the whole value goes to json.dumps once more, so that the error is that of json.dumps, with its notes
+    (Python 3.14 adds notes that name the item, and a part knows only its own items)."""
+    if not (isinstance(obj, dict) and len(obj) <= JSON_KEYS_MOST and all(isinstance(key, str) for key in obj)):
+        return json.dumps(obj)
+    try:
+        parts = []
+        for key, value in list(obj.items()):
+            if isinstance(value, list) and len(value) > JSON_SLICE:
+                value = list(value)
+                value_text = "[" + ", ".join(json.dumps(value[at:at + JSON_SLICE])[1:-1]
+                                             for at in range(0, len(value), JSON_SLICE)) + "]"
+            else:
+                value_text = json.dumps(value)
+            parts.append(json.dumps(key) + ": " + value_text)
+        return "{" + ", ".join(parts) + "}"
+    except Exception:
+        pass                # outside this block, so that json.dumps raises its error with no other one chained to it
+    return json.dumps(obj)
+
+
 def gzip_body(body):
     """These bytes in the gzip format. zlib writes the gzip header and trailer itself (wbits 31), with no time in the
     header, so the same bytes always give the same answer. zlib releases the interpreter lock while it works, so the
@@ -36209,8 +36301,10 @@ class Handler(BaseHTTPRequestHandler):
         - every route outside the owner API. The Mac's vault helper reads /helper/vault with URLSession, which asks
           for gzip, and an agent's session calls /mcp with the HTTP client of its runtime (measured on 10 November
           2026: Claude Code 2.1.312 asks for `identity`, Codex 0.163 sends no Accept-Encoding). What those read
-          must not change because the apps' reads did."""
-        body = json.dumps(obj).encode()
+          must not change because the apps' reads did.
+        An InParts answer (the state) is written in parts (json_text), the same text, so that other threads run while
+        it is made."""
+        body = (json_text(obj) if isinstance(obj, InParts) else json.dumps(obj)).encode()
         if code == 200 and self.command != "HEAD" and len(body) > GZIP_MIN and self.path.startswith("/ui/") \
                 and not LOCK._is_owned() and accepts_gzip(self.headers.get_all("Accept-Encoding")):
             packed = gzip_body(body)
@@ -36825,8 +36919,9 @@ class Handler(BaseHTTPRequestHandler):
             result[key] = [dict(r) for r in got]
         result["knowledge"] = [knowledge_public(k) for k in knowledge_entries()]
         # Keys, ciphertext, helper jobs, raw worker queues and runtime configuration are excluded.
-        # Also mask old text if a login was registered after that text was stored.
-        return self.json(200, scrub(result))
+        # Also mask old text if a login was registered after that text was stored. scrub makes each dict and list of
+        # the answer new, so it can be written in parts (InParts).
+        return self.json(200, InParts(scrub(result)))
 
     def ui_machines(self, query):
         """Machine status, Fleet revision and update state for every agent (owner API 1.2)."""
@@ -42892,6 +42987,7 @@ def main():
     # from every version that has it, whatever options that version's parser has gained or lost.
     if len(sys.argv) == 3 and sys.argv[1] == "--check-schema":
         return check_schema(sys.argv[2])
+    sys.setswitchinterval(SWITCH_INTERVAL)      # for every thread of the hub
     ap = argparse.ArgumentParser(description="Founderizer hub")
     ap.add_argument("--host", help="address to listen on; default: the hub machine's address in team.json")
     ap.add_argument("--port", type=int, help="default: the port in team.json")
