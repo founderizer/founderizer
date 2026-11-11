@@ -5540,7 +5540,8 @@ def access_needed(value, level=None):
         return None, None
     if len(rid) > 200 or not resource_parts(rid)[0]:
         raise ToolError(f"needs_access must be <kind>:<what>, with a kind of {', '.join(sorted(RESOURCE_LEVELS))}: "
-                        f"repo:acme/web, secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com or tool:<MCP server>. "
+                        f"repo:acme/web, secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com, tool:<MCP server> or "
+                        f"server:<name>. "
                         f"Leave it out for a question that is not about access. A key or a login that the fleet does "
                         f"not hold at all has no reference yet: ask the owner for it yourself with request_secret; if "
                         f"this session has no request_secret, leave needs_access out and say in the question which one "
@@ -21463,7 +21464,8 @@ def resource_entry(rid, entry, team):
         raise ValueError(f"resource {rid!r}: {what!r} is no email address" if kind in ("drive", "gmail") else
                          f"resource {rid!r}: {what!r} is no {RESOURCE_WORDS[kind]} that this team has")
     if kind == "server":
-        raise ValueError(f"resource {rid!r}: a server is the owner's alone to give, in the Servers group")
+        raise ValueError(f"resource {rid!r}: a server is the owner's alone to give: his app gives each server to the "
+                         f"DevOps agent of the business whose Tailscale tag it carries, and no pool holds it")
     if not isinstance(entry, dict) or not entry or set(entry) - {"max", "to"}:
         raise ValueError(f"resource {rid!r} needs max, with an optional to")
     levels = RESOURCE_LEVELS[kind]
@@ -21606,7 +21608,7 @@ def resources_view(team):
     accounts = {a["email"]: bool(a["connected"]) for a in google_view(team)["accounts"]}
     return {"kinds": [{"kind": kind, "title": RESOURCE_TITLES[kind], "word": RESOURCE_WORDS[kind],
                        "levels": list(levels), "needs": RESOURCE_NEEDS[kind]}
-                      for kind, levels in RESOURCE_LEVELS.items() if kind != "server"],     # the Servers group's
+                      for kind, levels in RESOURCE_LEVELS.items() if kind != "server"],     # the app gives these
             "audience": RESOURCE_AUDIENCE, "limit": RESOURCE_LIMIT,
             "resources": [resource_view(rid, team, accounts) for rid in resource_ids(team, accounts)]}
 
@@ -21653,9 +21655,9 @@ def take_resource(body):
         raise Refusal(404, "no such agent")
     if not resource_known(kind, what, TEAM):
         raise Refusal(404, f"the fleet does not hold {rid}")
-    if kind == "server":        # DevOps plan C4: No access in the Servers group, which takes the host's parts too
-        raise Refusal(409, "A server is taken back with No access in the Servers group, which removes its parts from "
-                           "the host too.")
+    if kind == "server":        # DevOps plan C4 and "Yes, by business": the app gives a server and takes it back
+        raise Refusal(409, "A server goes with its business: the owner's app gives each server to the DevOps agent of "
+                           "the business whose Tailscale tag it carries, and takes it back when the tag goes.")
     phrase = resource_phrase(kind, what)
     held = next((h["level"] for h in resource_holders(kind, what) if h["agent"] == agent), None)
     result = grant_resource("owner", rid, agent, None, phrase)
@@ -21706,9 +21708,11 @@ def grant_check(agent, rid, level):
     if a.get("role") not in ("worker", "lead"):
         raise ToolError(f"{agent} is the {a.get('role')}: a repository, a tool, a Google service and a secret reach "
                         f"task sessions, so only a worker or a lead gets one. You never grant to yourself.")
-    if kind == "server":        # DevOps plan C4: given only by the owner
-        return (f"A server is the owner's alone to give, in the Servers group of the app. Ask the owner with "
-                f"raise_needs_you for {what} at the level the work needs.")
+    if kind == "server":        # DevOps plan C4 and "Yes, by business": the owner's app gives it, by its tag
+        return (f"A server is the owner's alone to give: his app gives each server that carries a business's Tailscale "
+                f"tag to that business's DevOps agent, by itself. Give the work on {what} to the agent that holds it, "
+                f"which does it through the door, and raise no Needs-you item that asks the owner to do the step by "
+                f"hand.")
     entry = resource_pool().get(rid) or {}
     if not entry.get("max") and kind == "repo" and door_made(what):
         # new-projects plan N3: a repository that the door made is the manager's to give, up to write, to an agent that
@@ -23844,7 +23848,8 @@ TOOLS = [
                     "does not pause. Leave it out when you are blocked, and never give one for access, money or "
                     "anything that leaves the building."},
         "needs_access": {"type": "string", "description": "The access that the task needs, as <kind>:<what>: "
-                         "repo:acme/web, secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com or tool:<MCP server>"},
+                         "repo:acme/web, secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com, tool:<MCP server> or "
+                         "server:<name>, a server through the door, whose holder the hub names"},
         "needs_level": {"type": "string", "description": "The level of that thing that the task needs, when you "
                         "already hold it at a lower one: a GitHub repository runs read, write, deploy, so an agent "
                         "with write that must change a workflow file or start a GitHub Actions run asks for the same "
@@ -24308,9 +24313,10 @@ TOOLS = [
                         "for example Q-4: the item quotes its asker, the owner's answer goes back to it as the answer, "
                         "and the item closes by itself when the question is answered another way or its task ends"},
         "door_call": {"type": "string", "description": "The call hash that the door gave with its refusal of a "
-                      "call that is the owner's (a delete of what no agent made through the door, or an AWS "
-                      "delete): the owner's yes then lets that exact call through the door once. Put the exact "
-                      "command in what_to_do, and give options whose first one is the yes."},
+                      "call that is the owner's (a delete of what no agent made through the door, an AWS delete, or "
+                      "a host's run: a root script with no box): the owner's yes then lets that exact call through "
+                      "the door once. Put the exact command in what_to_do, and give options whose first one is the "
+                      "yes."},
         "github_app": {"type": "string", "description": "The GitHub account, an organization or a user, that needs "
                        "a GitHub App of its own, because no App of the door reaches it (the hub tells you when): the "
                        "first option, which the owner presses in Founderizer on their Mac, then makes it with GitHub's "
@@ -34456,7 +34462,8 @@ def record_status(agent, data):
 # ---------------------------------------------------------------- the door and server access (DevOps plan C4)
 #
 # A server is one more thing that an agent can use, as a repository is: server:<name>, at Read or Fix, and only the
-# owner gives it, in the Servers group of his app. Read is the host's fixed reads through the door; Fix adds ops-root,
+# owner's app gives it, by business: each server with a business's Tailscale tag goes to that business's DevOps agent
+# (the owner's "Yes, by business", 2 November 2026). Read is the host's fixed reads through the door; Fix adds ops-root,
 # whose mode file limits a Fleet machine (the hub's server among them) to the rule calls, so agents patch and reboot
 # those and cannot open other agents. Fix on the agent's own server is its free root, with no door, so it is no grant.
 # The hub only records a grant (team.json agents.<name>.servers): the app puts the host's parts on the host over the

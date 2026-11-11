@@ -6,10 +6,10 @@
 
 A target is a host (`ops web-1 restart nginx`, `ops web-1 journal unit=nginx lines=200`, `ops web-1 help`), a provider
 account (`ops cloudflare:main purge <zone> app.example.com`), a repository (`ops commit:acme/ops push --content
-change.json`, `ops deploy:acme/shop run`) or the GitOps repository (`ops gitops:acme/cluster read apps/shop.yaml`). The
-door answers what ran, or why it refused: a refusal is the end of that call, and a case that needs it goes to the
-owner with the exact command. The door knows this box by its address on the private network, so this command sends
-no credential.
+change.json`, `ops deploy:acme/shop run`) or the GitOps repository (`ops gitops:acme/cluster read apps/shop.yaml`). A
+host takes a bash script in its box too (`ops web-1 script --content fix.sh`). The door answers what ran, or why it
+refused and the route that is left: the owner's yes to the call's hash, the agent that holds the grant, the owner's
+window, or none. The door knows this box by its address on the private network, so this command sends no credential.
 
 The door's address comes from team.json's "door" ({address, port}) in this checkout, or FLEET_DOOR=<address>:<port>.
 Exit status: 0 done, 3 refused, 1 failed, 2 the door does not answer (one line, which a check can print as it is).
@@ -60,6 +60,34 @@ def ask(method, path, body=None, timeout=TIMEOUT):
         return None, {"why": f"the door does not answer at {host}:{port}"}
 
 
+def route_line(answer, target):
+    """The route that a refusal leaves, as the door names it (door.py ROUTES), in one line: what this agent does next.
+    None when the door names none, as a door of an older release does: it gives only a call hash, which is the yes."""
+    route, call = answer.get("route"), answer.get("call")
+    if route is None and call:
+        route = "yes"
+    if route == "yes" and call:
+        return (f"route: the owner's yes. Ask your requester with ask_my_requester and this call hash, {call}: the "
+                f"manager raises a Needs-you item with door_call {call}, and after the owner's yes you send this same "
+                f"call again, which then runs once.")
+    if route == "holder":
+        needs, level = answer.get("needs"), answer.get("level")
+        if needs:
+            return (f"route: the agent that holds it. Ask your requester with ask_my_requester and needs_access "
+                    f"{needs}" + (f" and needs_level {level}" if level else "") + ": the hub names the agent that "
+                    f"holds it, and the manager gives this part of the work to that agent.")
+        return (f"route: the agent that holds it. Ask your requester with ask_my_requester: the manager gives this part "
+                f"of the work to the agent that holds {target}.")
+    if route == "window":
+        return "route: the owner's window. Send the same call again when the window allows it."
+    if route == "again":
+        return "route: the same call again later. The door could not check it now."
+    if route == "none":
+        return ("route: none. No grant and no yes of the owner lets this call through: change the call, or plan "
+                "another way.")
+    return None
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ["status"]:
@@ -99,7 +127,12 @@ def main(argv=None):
         print(out if out.endswith("\n") else out + "\n", end="")
         return 0
     print(("refused: " if answer.get("kind") == "refused" else "failed: ") + str(answer.get("why") or status))
-    return 3 if answer.get("kind") == "refused" else 1
+    if answer.get("kind") == "refused":
+        line = route_line(answer, target)
+        if line:
+            print(line)
+        return 3
+    return 1
 
 
 if __name__ == "__main__":

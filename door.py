@@ -19,10 +19,13 @@ reading of what the door's App reaches (GET /github/reach) and the state of one 
 fingerprint and whether GitHub takes it, never the key) for the same secret, and read the record (GET /record).
 
 What it does. A call is a rule call (code passes it at once), the agent's own call (code does not list it as a rule,
-but the agent's grant covers it: it runs, and the agent answers for it), or a refusal (door_targets.py). The door calls
-no model. A delete of what no agent made through the door, and every AWS delete, is the owner's: his signed yes lets
-that exact call through once. Writes on one host wait for each other, one reboot-class call runs at a time in each
-business, and inside a window of the access file a deploy, a restart or a reboot is refused.
+but the agent's grant covers it: it runs, and the agent answers for it), a call that the next mode allows (a host's
+`run`, a root script with no box), or a refusal (door_targets.py). The door calls no model. A delete of what no agent
+made through the door, every AWS delete, and a call that the next mode allows are the owner's: his signed yes lets that
+exact call through once, and the refusal gives the call's hash for it. Every refusal names its route (ROUTES). Writes on
+one host wait for each other, one reboot-class call runs at a time in each business, and inside a window of the access
+file a deploy, a restart, a script or a reboot is refused. A script or a run arms the host's rollback timer first, and
+the door ends the countdown when the host answers it after the call.
 Every call leaves one numbered line in the record, which the hub reads each minute; if the hub is down, the door
 still works. No value reaches an agent: the door's tokens and keys are secrets of the central vault with the door as
 their holder, sealed to the door's own key, and only this OS user opens them.
@@ -122,6 +125,15 @@ HOST_KEY = re.compile(r"ssh-ed25519 [A-Za-z0-9+/=]{60,100}")
 WINDOW_CLASSES = ("upgrade", "restart", "reboot", "deploy", "tailscale")
 APPROVAL_NOTE = (" Its call hash is {sha}: a Needs-you item that names it (raise_needs_you door_call) lets this exact "
                  "call through once, when the owner answers yes.")
+# The route of a refusal, in the door's answer (door-modes proposal, step 1: "a door refusal names its route"); ops
+# prints it. yes: the owner's signed yes to the call hash that the answer gives lets that exact call through once.
+# holder: the agent lacks the grant, and the agent that holds it does that part (needs names it as ask_my_requester's
+# needs_access takes it, with its level). window: the owner's window refuses it now, and it runs outside the window.
+# again: the door could not check it now. none: no grant and no yes lets this call through: the call or the plan
+# changes.
+ROUTES = ("yes", "holder", "window", "again", "none")
+TIMER_TRIES = 6             # times that the door asks a host to end its rollback countdown after a script or a run
+TIMER_PAUSE = 10            # seconds between them, while the host does not answer
 
 
 class Refused(Exception):
@@ -580,35 +592,43 @@ class Door:
         if agent is None:
             n = self.record.add(caller=address, target=target, action=op, kind="refused", outcome="refused",
                                 why="not in the access file")
-            return {"ok": False, "kind": "refused", "why": "this caller is not in the door's access file", "n": n}
+            return {"ok": False, "kind": "refused", "why": "this caller is not in the door's access file", "n": n,
+                    "route": "holder"}
         access = self.access()
         try:
             d = door_targets.decide(access, agent, target, op, args, content, self.lookups(access, target, agent))
         except (Refused, door_providers.Stop) as e:
-            d = door_targets.refused(f"the door could not check this call: {e}", target=target)
+            d = door_targets.refused(f"the door could not check this call: {e}", target=target, route="again")
         if d.kind != "refused" and d.write:
             why = window_refusal(access, d.host or target, d.window, self.clock())
             if why:
-                d = door_targets.refused(why, target=d.target)
+                d = door_targets.refused(why, target=d.target, route="window")
         sha = hashlib.sha256(json.dumps([target, op, args], sort_keys=True).encode() + (content or b"")).hexdigest()
-        own = d.kind == "own"
-        if own:
-            yes = self.approved(access, sha)
-            if yes:             # the owner said yes to this exact call: it runs once
-                d.kind, d.why = "approved", f"the owner's signed yes (N-{yes['need']}) to this exact call, used once"
-            else:
-                # D25: a delete of what no agent made through the door, and every AWS delete, is the owner's, by code
-                unmade = [key for key in door_providers.deletes(d.plan, self.credential(access, d.target))
-                          if not self.made(d.target, key)]
-                if unmade:
-                    d = door_targets.refused(door_providers.delete_refusal(unmade[0]) + APPROVAL_NOTE.format(sha=sha),
-                                             target=d.target)
-                else:           # the owner, 11 November 2026: no model decides, "it needs to be the agent itself"
-                    d.why = f"{agent}'s own call, which it answers for: {d.why}"
+        hashed = d.kind in ("own", "full")      # a refusal of these two kinds is the owner's to lift: it gives the hash
+        yes = self.approved(access, sha) if hashed else None
+        if yes:                 # the owner said yes to this exact call: it runs once
+            d.kind, d.why = "approved", f"the owner's signed yes (N-{yes['need']}) to this exact call, used once"
+        elif d.kind == "full":  # door-modes proposal, step 3: what the next mode allows runs only with his yes
+            d = door_targets.refused(d.why + "." + APPROVAL_NOTE.format(sha=sha), target=d.target)
+        elif d.kind == "own":
+            # D25: a delete of what no agent made through the door, and every AWS delete, is the owner's, by code
+            unmade = [key for key in door_providers.deletes(d.plan, self.credential(access, d.target))
+                      if not self.made(d.target, key)]
+            if unmade:
+                d = door_targets.refused(door_providers.delete_refusal(unmade[0]) + APPROVAL_NOTE.format(sha=sha),
+                                         target=d.target)
+            else:               # the owner, 11 November 2026: no model decides, "it needs to be the agent itself"
+                d.why = f"{agent}'s own call, which it answers for: {d.why}"
         if d.kind == "refused":
             n = self.record.add(caller=agent, target=target, action=op, kind="refused", outcome="refused",
                                 why=d.why[:300], sha256=sha)
-            return dict({"ok": False, "kind": "refused", "why": d.why, "n": n}, **({"call": sha} if own else {}))
+            answer = {"ok": False, "kind": "refused", "why": d.why, "n": n, "route": "yes" if hashed else
+                      d.route if d.route in ROUTES else "none"}
+            if hashed:
+                answer["call"] = sha
+            if d.needs:
+                answer.update(needs=d.needs, **({"level": d.level} if d.level else {}))
+            return answer
         try:
             out = self.run(agent, access, d, op, args, content)
             ok, outcome = True, "done"
@@ -668,8 +688,14 @@ class Door:
             if d.value:
                 stdin = self.runner_input(access, d.value) if d.value[0] == "runner" else self.setting(access, d.value)
             status, out = self.ssh(access["hosts"][d.host], req, stdin)
-            if status == 3:
-                raise Refused(out.strip().removeprefix("refused: "))
+            if status == 3:             # ops-root refused it before it ran, and before a script armed the timer
+                said = out.strip().removeprefix("refused: ")
+                if said.startswith(f"{op!r} is no form of a host"):    # a host keeps the ops-root of its install
+                    said = (f"{d.host} runs an ops-root older than the door's, which has no form {op}: the host gets "
+                            f"it with a new install of the door's parts")
+                raise Refused(said)
+            if op in door_targets.TIMED_FORMS:
+                out = out.rstrip("\n") + "\n" + self.timer_off(access["hosts"][d.host], d.host) + "\n"
             if status != 0:
                 raise door_providers.Stop(out.strip()[-4000:] or f"the host answered {status}")
             return out
@@ -686,6 +712,22 @@ class Door:
         if "workflow" in plan:
             return hub.dispatch(plan["workflow"], plan["inputs"])
         raise Refused("the door cannot run this")
+
+    def timer_off(self, host, name):
+        """After a script or a run, which armed the host's rollback timer first: a host that answers the door now did not
+        lock the door out, so the door ends the countdown, and the change stays. A host that does not answer keeps the
+        countdown, and the timer puts its firewall, its network, sshd and Tailscale back. One line for the answer."""
+        for attempt in range(TIMER_TRIES):
+            if attempt:
+                time.sleep(TIMER_PAUSE)
+            status, out = self.ssh(host, {"v": 1, "op": "timer", "args": ["cancel"]}, None)
+            if status == 0:
+                return out.strip() or "the rollback timer is off"
+            if status == 3:
+                return f"{name} refused to end the rollback countdown: {out.strip().removeprefix('refused: ')}"
+        return (f"{name} did not answer the door after the script: if the script armed the rollback timer, it puts the "
+                f"firewall, the network, sshd and Tailscale back in 600 seconds, unless `ops {name} timer cancel` comes "
+                f"first")
 
     def lookups(self, access, target, agent=None):
         """The facts that the code checks of a commit or a deploy read from outside, each asked only when a check

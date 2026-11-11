@@ -70,7 +70,9 @@ like a refund tool that checks the amount itself — and never for a wider key.
 
 - **A blocked task names what it needs.** A worker or a lead that cannot go on for want of access calls
   `ask_my_requester` with the thing itself in `needs_access`: `repo:acme/web`, `secret:bws://<uuid>`, `gmail:a@b.com`,
-  `drive:a@b.com` or `tool:<MCP server>`, the same name that `grant_access` takes. A thing you hold at
+  `drive:a@b.com`, `tool:<MCP server>` or `server:<name>`, the same name that `grant_access` takes. A server goes
+  only with its business, so for a server the answer is the agent that holds it, which does that part through the
+  door; `ops` prints that name with the door's refusal, as it prints every refusal's route. A thing you hold at
   a **lower level** than the work needs is access you do not have, so name that level in `needs_level`: a repository at
   `write` when the work must change a workflow file is an ask for the same repository at `deploy`. The hub reads the
   pool and the holders at that moment and tells your requester which of the three routes it is, in the words of its own

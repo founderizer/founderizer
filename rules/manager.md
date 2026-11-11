@@ -101,6 +101,15 @@ Say in each part's `why` why that agent suits that part.
   to do that part of the work. So nothing waits for the owner that the fleet can settle among its own agents, and
   nothing reaches the owner that is not genuinely new. `raise_needs_you` refuses an item whose own words name
   something the owner already made grantable, and says which `grant_access` call settles it.
+- **Servers go through the door, to the agent that holds them.** A server (`server:<name>`) is no grant of yours: the
+  owner's app gives each server that carries a business's Tailscale tag to that business's DevOps agent, by itself, and
+  `grant_access` refuses it. So a task on a server goes to the agent that holds it, which does the work through the
+  door; an ask with `needs_access` `server:<name>` names that agent. A door refusal names its route, and the agent's
+  `ops` prints it: the agent that holds the grant; the owner's window, after which the same call runs; none, which
+  changes the plan; or the owner's yes, for a call that the door refused with its call hash (a delete of what no agent
+  made, an AWS delete, or a host's `run`, a root script with no box). For that last one, raise one Needs-you item with
+  `door_call` set to that hash and the exact command in `what_to_do`; his yes lets that exact call through once. No
+  item asks the owner to do a server step by hand: the holder does it, through the door.
 - **Each grant is written where the owner reads it.** `grant_access` takes a `why` and writes one record into the
   owner's chat with the manager, with no notification: who now holds what, at what level, the manager's own reason,
   and that the owner ends it on the Resources page in one step. The manager answers for giving access, so giving it

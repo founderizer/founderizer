@@ -13,11 +13,13 @@ very table (door_targets.py loads this file), and this file refuses on its own w
 a door bug passes nothing that the table refuses. Stdin is closed except for a file's bytes, which must have the
 request's SHA-256; there is no TTY and the environment is empty. A root-owned mode file, written at install, says `fix`
 or `rule-only`: on the hub, a Fleet machine and a CI host that two businesses share it says `rule-only`, and then only
-rule forms run here: the agent's own forms, the file install among them, are refused. An `exec` command runs in a
-transient service that hides the host's app trees, the Docker and containerd sockets and its secret paths; a package
-install and a file install run outside it. A write holds the host's one lock, so a second write waits. A new version of
-this file comes only from a release that the release key signed (`self-update`), never a held one, and never one before
-the release it came from.
+rule forms run here: the agent's own forms, the file install among them, are refused. An `exec` command and a `script`
+run in the box: a transient service that hides the host's app trees, the Docker and containerd sockets and its secret
+paths, and in which the agent's own copies go to one folder (BACKUPS); a package install and a file install run outside
+it. A `run` is a root script with no box, under the rollback timer: the door sends it only with the owner's signed yes
+to that exact call, and this file refuses it on a `rule-only` host. A write holds the host's one lock, so a second write
+waits. A new version of this file comes only from a release that the release key signed (`self-update`), never a held
+one, and never one before the release it came from.
 
 Exit status: 0 done, 3 refused (the one line says why), 1 failed.
 """
@@ -42,7 +44,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = 1                 # the floor: self-update takes only a file whose VERSION is not lower
+VERSION = 2                 # the floor: self-update takes only a file whose VERSION is not lower
 ROOT = ""                   # a prefix for every path below, which only the tests set
 ETC = "/etc/ops-root"
 MODE_FILE = ETC + "/mode"                   # fix | rule-only
@@ -55,6 +57,7 @@ BUILD_FILE = ETC + "/build-file"            # a CI host's build file (sparse ext
 RUNNER_USER_FILE = ETC + "/runner-user"     # a CI host's rootless Docker user: each of its containers is a runner
 RELEASE_FILE = ETC + "/release"             # the release revision this file came from: self-update's floor
 STATE = "/var/lib/ops-root"
+BACKUPS = "/var/lib/ops-backups"            # the one folder for the agent's own copies that the box writes, root's only
 LOCK_FILE = "/run/ops-root.lock"
 SELF = "/usr/local/sbin/ops-root"
 LIB = "/usr/local/lib/ops-root"
@@ -69,6 +72,8 @@ PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ENV = {"PATH": PATH, "LANG": "C.UTF-8", "SYSTEMD_PAGER": "", "PAGER": "cat", "DEBIAN_FRONTEND": "noninteractive"}
 OUT_MAX = 64 * 1024          # bytes of output that go back to the door
 FILE_MAX = 1024 * 1024       # bytes of one file install
+SCRIPT_MAX = 256 * 1024      # bytes of one script or run, the door's own cap of a call's content
+SCRIPT_WAIT = 3000           # seconds that a script or a run may take: the door's session waits 3600
 ARGS_MAX = 64
 ARG_MAX = 4096
 VACUUM = "500M"              # journalctl --vacuum-size, fixed
@@ -173,10 +178,11 @@ def mode():
 
 # ---------------------------------------------------------------- the forms
 #
-# Each form: its kind (rule: code passes it; own: the agent's own call, which runs only on a host in fix mode; refused
-# never comes here), whether it writes, its window class (the door refuses a write of that class inside a window, DevOps
-# plan section 4) and whether it is reboot-class (one at a time in each business). check() turns the arguments into the
-# form's own, or raises Refused; run() does it.
+# Each form: its kind (rule: code passes it; own: the agent's own call, which runs only on a host in fix mode; full: what
+# the next mode allows, a root script with no box, which the door sends only with the owner's signed yes to that exact
+# call and which runs only on a host in fix mode; refused never comes here), whether it writes, its window class (the
+# door refuses a write of that class inside a window, DevOps plan section 4) and whether it is reboot-class (one at a
+# time in each business). check() turns the arguments into the form's own, or raises Refused; run() does it.
 
 FORMS = {}
 
@@ -295,7 +301,8 @@ def check_exec(args):
         raise Refused("exec needs a command")
     program = os.path.basename(args[0])
     if program in REFUSED_PROGRAMS or re.fullmatch(r"(python|perl|ruby|php|lua|pypy|node)[0-9.]*", program):
-        raise Refused(f"{program} is a shell, an interpreter or a program that runs others: never through the door")
+        raise Refused(f"{program} is a shell, an interpreter or a program that runs others, which exec never runs: the "
+                      f"script form runs a bash script in the same box")
     if any(a in REFUSED_ARGS or a.startswith("--exec") for a in args[1:]):
         raise Refused("an option that runs a command is never passed")
     if program == "dpkg" and (len(args) < 2 or args[1] not in ("--configure", "--audit", "-l", "-L", "-s", "-S")):
@@ -312,7 +319,8 @@ def check_exec(args):
         if path.startswith("/") and protected(path):
             raise Refused(f"{path} is protected on this host")
         if path.startswith("/") and any(path == h or path.startswith(h.rstrip("/") + "/") for h in hidden_paths()):
-            raise Refused(f"{path} is an app tree or a secret path, which no exec command reads")
+            raise Refused(f"{path} is an app tree or a secret path, which nothing in the box reads: copies go to "
+                          f"{BACKUPS}, and a root script that needs the path is the run form")
     return list(args)
 
 
@@ -704,22 +712,84 @@ def do_inventory(req, data):
 
 # ---- the agent's own forms: a host in fix mode only
 
-@form("exec", kind="own", window="restart", help="one command, no shell, in a service that hides the app trees")
+def box(unit):
+    """systemd-run's argv for one transient service in the box of exec and script: the host's app trees and secret
+    paths hidden, the protected paths read-only, and the kernel rights dropped that would open them again (DevOps
+    plan, "The host login"). The agent's own copies go to BACKUPS, which the box writes and only root reads: systemd
+    makes it for the service, as its state folder, and names it in $STATE_DIRECTORY."""
+    props = ["PrivateDevices=yes", "NoNewPrivileges=yes", "ProtectKernelModules=yes", "ProtectKernelTunables=yes",
+             "ProtectControlGroups=yes", "RestrictSUIDSGID=yes", "LockPersonality=yes",
+             "CapabilityBoundingSet=~" + " ".join(CAPS_DROPPED),
+             "StateDirectory=" + BACKUPS.removeprefix("/var/lib/"), "StateDirectoryMode=0700"]
+    props += [f"InaccessiblePaths=-{p}" for p in hidden_paths()]
+    props += [f"ReadOnlyPaths=-{p.rstrip('/')}" for p in PROTECTED]
+    argv = ["systemd-run", "--pipe", "--wait", "--collect", "--quiet", "--unit", unit]
+    for p in props:
+        argv += ["--property", p]
+    return argv
+
+
+@form("exec", kind="own", window="restart", help=f"one command, no shell, in the box: a service that hides the app "
+                                                 f"trees, where copies go to {BACKUPS}")
 def do_exec(req, data):
     args = req["args"]
     said = ""
     if os.path.basename(args[0]) in TIMED_PROGRAMS:
         said = arm_timer() + "\n"
-    props = ["PrivateDevices=yes", "NoNewPrivileges=yes", "ProtectKernelModules=yes", "ProtectKernelTunables=yes",
-             "ProtectControlGroups=yes", "RestrictSUIDSGID=yes", "LockPersonality=yes",
-             "CapabilityBoundingSet=~" + " ".join(CAPS_DROPPED)]
-    props += [f"InaccessiblePaths=-{p}" for p in hidden_paths()]
-    props += [f"ReadOnlyPaths=-{p.rstrip('/')}" for p in PROTECTED]
-    argv = ["systemd-run", "--pipe", "--wait", "--collect", "--quiet", "--unit", f"ops-root-exec-{os.getpid()}"]
-    for p in props:
-        argv += ["--property", p]
-    status, out = run(argv + ["--", *args])
+    status, out = run(box(f"ops-root-exec-{os.getpid()}") + ["--", *args])
     return said + checked((status, out), out or "done")
+
+
+def script_bytes(req, data, name):
+    """A script's bytes from stdin, which have the request's sha256: text for bash, with no NUL byte."""
+    if not data or len(data) > SCRIPT_MAX:
+        raise Refused(f"{name} takes the script on stdin, at most {SCRIPT_MAX // 1024} KiB")
+    if not SHA256.fullmatch(str(req.get("sha256") or "")) or hashlib.sha256(data).hexdigest() != req["sha256"]:
+        raise Refused("the bytes do not have the request's sha256")
+    if b"\0" in data:
+        raise Refused(f"the script of {name} is text for bash, with no NUL byte")
+    return data
+
+
+def run_script(name, req, data, boxed):
+    """A bash script from stdin, in a transient service of its own: in the box for script, as root with no box for
+    run. The rollback timer is armed first, whatever the script does, because no code reads in a script whether it
+    changes the firewall, the network or sshd; the door ends the countdown when the host answers it after the script,
+    and a host that does not answer gets them back. The script's file is in this file's own folder, which the box reads
+    and never writes, and it goes when the script ends."""
+    data = script_bytes(req, data, name)
+    said = arm_timer() + "\n"
+    path, unit = f"{STATE}/{name}-{os.getpid()}.sh", f"ops-root-{name}-{os.getpid()}"
+    os.makedirs(os.path.dirname(P(path)), mode=0o700, exist_ok=True)
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(P(path))
+    try:
+        with open(os.open(P(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700), "wb") as f:
+            f.write(data)
+        argv = box(unit) if boxed else ["systemd-run", "--pipe", "--wait", "--collect", "--quiet", "--unit", unit]
+        status, out = run(argv + [f"--setenv={k}={v}" for k, v in ENV.items()] + ["--", "/bin/bash", path],
+                          timeout=SCRIPT_WAIT)
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(P(path))
+    if status != 0:
+        raise Failed(said + (out.strip() or f"the script ended with status {status}"))
+    return said + (out or "done")
+
+
+@form("script", kind="own", window="restart", help="a bash script in the box of exec, under the rollback timer: the "
+                                                   "script on stdin with its sha256; pipes, loops and flock work")
+def do_script(req, data):
+    return run_script("script", req, data, boxed=True)
+
+
+# ---- what the next mode allows: the door sends it only with the owner's signed yes to that exact call
+
+@form("run", kind="full", window="restart", help="a bash script as root with no box, under the rollback timer: the "
+                                                 "script on stdin with its sha256; the door sends it only with the "
+                                                 "owner's yes to that exact call, on a fix host only")
+def do_run(req, data):
+    return run_script("run", req, data, boxed=False)
 
 
 @form("install", kind="own", help="apt-get install of packages by name, which goes on if the session ends")
@@ -2158,12 +2228,12 @@ def call(req, data=None):
     op = req["op"]
     req["args"] = check_args(op, req["args"])
     f = FORMS[op]
-    if f["kind"] == "own" and mode() != "fix":
+    if f["kind"] in ("own", "full") and mode() != "fix":
         raise Refused("this host is rule-only: only rule forms run here, and no file install")
     if op in PLAN_WRITES and mode() != "fix":        # new-projects plan N4: a new app lives on a fix host only
         raise Refused("this host is rule-only: no form of a new app writes here")
     if data is not None and op not in ("file", "self-update", "pro-attach", "runner-register", "place", "unit-new",
-                                       "env-new", "env-add", "runner-new", "vhost-new"):
+                                       "env-new", "env-add", "runner-new", "vhost-new", "script", "run"):
         raise Refused(f"{op} takes nothing on stdin")
     if not f["write"]:
         return f["run"](req, data)

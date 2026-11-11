@@ -1,12 +1,16 @@
 """What the door may do: one table for each kind of target (DevOps plan, section 2, "The door"). Standard library only.
 
-Every call is one of three kinds: a rule call, which code passes at once; the agent's own call, which code does not list
+Every call is one of four kinds: a rule call, which code passes at once; the agent's own call, which code does not list
 as a rule but which the agent's grant covers, so that it runs and the agent answers for it (the owner, 11 November 2026:
-"it needs to be the agent itself"); or a refusal. A call that no table lists is refused, reads too. decide() gives the
-kind of one call and the reason, and never acts: door.py acts on what it gives.
+"it needs to be the agent itself"); a call that the next mode allows, which runs only with the owner's signed yes to
+that exact call (door-modes proposal, step 3: a host's `run`, a root script with no box); or a refusal. A call that no
+table lists is refused, reads too. A refusal names its route: the agent that holds the grant, the owner's window, or a
+check that failed now. decide() gives the kind of one call and the reason, and never acts: door.py acts on what it
+gives.
 
     host                a managed host, through its second sshd: the fixed reads of host/ops-read, the rule forms
-                        of host/ops-root, and its own forms (the agent's own calls) on a host whose mode is fix
+                        of host/ops-root, its own forms (the agent's own calls) on a host whose mode is fix, and its
+                        run there with the owner's yes
     <provider>:<name>   one provider account of the access file (door_providers.py)
     commit:<owner/repo> a commit that the door makes on a repository the access file gives the agent
     deploy:<owner/repo> that repository's documented deploy
@@ -45,8 +49,11 @@ VENDOR_REPOS = ("miguelpieras/founderizer-fleet", "miguelpieras/founderizer-web"
 DOOR_ONLY = {"self-update", "place", "pro-attach", "runner-register"}
 # Host forms whose content goes to the host on stdin, with its sha256, and the forms whose value the door itself sends
 # there (new-projects plan N4): never the caller's.
-HOST_CONTENT = ("file", "unit-new", "vhost-new")
+HOST_CONTENT = ("file", "unit-new", "vhost-new", "script", "run")
 DOOR_VALUE = ("env-new", "env-add")
+# Host forms that arm the rollback timer before they run, whatever they do: a host that answers the door after one of
+# them did not lock the door out, so the door ends the countdown then (door.py, Door.timer_off).
+TIMED_FORMS = ("script", "run")
 TARGET = re.compile(r"[a-z0-9][a-z0-9.-]{0,62}|[a-z]+:[A-Za-z0-9][A-Za-z0-9._/-]{0,99}")
 REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
 CONTENT_MAX = 256 * 1024     # bytes of content in one call
@@ -71,8 +78,10 @@ NPM_AGE = 7 * 86400          # min-release-age=7, which npm ci does not check on
 
 
 class Decision:
-    """kind: read | rule | own (the agent's own call) | refused. why: one line for the agent and the record. form, args:
-    what the door runs. host, window, reboot: what the door's order needs."""
+    """kind: read | rule | own (the agent's own call) | full (what the next mode allows: it runs only with the owner's
+    signed yes to that exact call) | refused. why: one line for the agent and the record. form, args: what the door
+    runs. host, window, reboot: what the door's order needs. route: what the caller of a refusal can do next, when it is
+    not "none" (door.py ROUTES): holder, with needs (the needs_access name of what it lacks, server:<host>) and level."""
 
     def __init__(self, kind, why, **more):
         self.kind, self.why = kind, why
@@ -80,7 +89,8 @@ class Decision:
         self.form, self.args = more.get("form"), more.get("args") or []
         self.host, self.window, self.reboot = more.get("host"), more.get("window"), more.get("reboot", False)
         self.business = more.get("business")
-        self.write = more.get("write", kind in ("rule", "own"))
+        self.write = more.get("write", kind in ("rule", "own", "full"))
+        self.route, self.needs, self.level = more.get("route"), more.get("needs"), more.get("level")
         self.plan = more.get("plan")            # what the door runs: a provider's requests, a commit, a deploy
         # what the door sends on the host's stdin: (random, None) or (key, app:<app>:<NAME>) for a setting (N4), and
         # (runner, <owner>/<repo>, <runner name>) for a runner (N6)
@@ -147,7 +157,7 @@ def decide(access, agent, target, op, args, content=None, lookups=None):
     if f"{kind}:{name}" in (never.get("accounts") or []):
         return refused(f"{target} is never a target of the door")
     if target not in (me.get("providers") or []):
-        return refused(f"{agent} holds no grant on {target}")
+        return refused(f"{agent} holds no grant on {target}", route="holder")
     return door_providers.decide(access, agent, kind, name, op, args, content, lookups or {})
 
 
@@ -158,8 +168,10 @@ def decide_host(access, agent, me, host, op, args, never, content=None, lookups=
     if h is None or host in (never.get("hosts") or []):
         return refused(f"{host} is no host of the door" if h is None else f"{host} is never a target of the door")
     level = (me.get("servers") or {}).get(host)
+    # what the agent lacks, by the name that ask_my_requester's needs_access takes: the hub names the agent that holds it
+    lacks = {"route": "holder", "needs": f"server:{host}", "level": "read" if op in OPS_READ.READS else "fix"}
     if level not in ("read", "fix"):
-        return refused(f"{agent} holds no grant on {host}")
+        return refused(f"{agent} holds no grant on {host}", **lacks)
     common = {"target": host, "host": host, "business": h.get("business")}
     if op in OPS_READ.READS:
         try:
@@ -172,7 +184,7 @@ def decide_host(access, agent, me, host, op, args, never, content=None, lookups=
     if op not in OPS_ROOT.FORMS:
         return refused(f"{op} is not listed for a host: `help` lists the forms", **common)
     if level != "fix":
-        return refused(f"{agent} holds Read on {host}: no write", **common)
+        return refused(f"{agent} holds Read on {host}: no write", **dict(common, **lacks))
     try:
         checked = OPS_ROOT.check_args(op, list(args))
     except OPS_ROOT.Refused as e:
@@ -201,9 +213,11 @@ def decide_host(access, agent, me, host, op, args, never, content=None, lookups=
         return refused(f"{op} takes its bytes as the call's content", **common)
     f = OPS_ROOT.FORMS[op]
     more = dict(common, form=op, args=checked, window=f["window"], reboot=f["reboot"], write=f["write"], value=value)
-    if f["kind"] == "own":
-        if h.get("mode") != "fix":
+    if f["kind"] in ("own", "full"):
+        if h.get("mode") != "fix":          # Patch only is code's: no yes of the owner lifts it, so no hash asks for it
             return refused(f"{host} is rule-only: only rule forms run there, and no file install", **more)
+        if f["kind"] == "full":             # door-modes proposal, step 3: the owner's yes runs that exact call once
+            return Decision("full", f"{op} is a root script with no box, which no grant on {host} covers", **more)
         return Decision("own", f"the host form {op}", **more)
     return Decision("rule" if f["write"] else "read", f"{op} is a rule call", **more)
 
@@ -419,7 +433,7 @@ def decide_commit(access, agent, me, repo, op, args, content, lookups):
             return decide_workflows(repo, made, files, message)
     entry = repo_entry(me, repo, ("devops", "app"))
     if entry is None:
-        return refused(f"the door commits nothing on {repo} for this agent")
+        return refused(f"the door commits nothing on {repo} for this agent", route="holder")
     files, message = commit_files(content)
     if files is None:
         return refused(message)
@@ -618,7 +632,7 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
     workflow. Other manifests are the agent's own call."""
     entry = repo_entry(me, repo, ("gitops",))
     if entry is None:
-        return refused(f"the door gives this agent nothing on {repo}")
+        return refused(f"the door gives this agent nothing on {repo}", route="holder")
     target = f"gitops:{repo}"
     if op == "read":
         if len(args) != 1 or not args[0] or args[0].startswith("/") or ".." in args[0].split("/"):
@@ -690,7 +704,7 @@ def decide_deploy(access, me, repo, op, args, lookups):
     commit (one the door made), with green CI and audit, and no hold line."""
     entry = repo_entry(me, repo, ("app",))
     if entry is None or not entry.get("deploy"):
-        return refused(f"{repo} has no deploy that the door runs for this agent")
+        return refused(f"{repo} has no deploy that the door runs for this agent", route="holder")
     if op != "run" or args:
         return refused("a deploy target takes run, with no arguments")
     facts = (lookups.get("deploy_facts") or (lambda r: None))(repo)
