@@ -563,7 +563,7 @@ def transaction():
 # changes of 10 and 11 November 2026, for its statements and the fetching of their rows. The records are in WAL mode
 # (wal_on, main), so a second connection can read them as they were at one moment while the writers go on. A read of the
 # state takes LOCK for that moment only (state_moment), and reads the rest from its own read-only connection with no
-# lock held.
+# lock held. The phone's read, GET /ui/mobile, reads its rows the same way (Handler.ui_mobile).
 
 class Snapshot(threading.local):
     """What one thread reads while it builds the state from its own moment (state_moment): the read connection, whose
@@ -578,7 +578,8 @@ class Snapshot(threading.local):
 SNAP = Snapshot()
 READERS = {"db": None, "path": None, "turn": 0, "idle": [], "told": None}   # readers_for: read connections of DB
 READERS_LOCK = threading.Lock()         # held only while READERS changes, never with LOCK
-READERS_KEPT = 4                        # idle read connections kept open: more than the reads of the state at one time
+READERS_KEPT = 4                        # idle read connections kept open: more than the reads of the state and of the
+                                        # phone's page (Handler.ui_mobile) at one time; a read beyond them opens its own
 # The most bytes that the WAL file keeps after SQLite starts it again from its beginning. While reads of the state
 # follow each other with no gap, a writer cannot start it again, and it grows; it does not get smaller by itself after.
 WAL_MOST = 64 * 1024 * 1024
@@ -1874,9 +1875,11 @@ def mobile_agent(name, config):
             if last else None}
 
 
-def mobile_state(generation):
+def mobile_state(generation, at=None):
     """GET /ui/mobile: the heads that the phone's pages need at once. A task's details, a conversation and a task's
-    notes come one at a time from the two routes below, because together they are too much for a phone."""
+    notes come one at a time from the two routes below, because together they are too much for a phone. `at` is the
+    time of the answer: Handler.ui_mobile gives the time of the moment that the rows are of (state_moment), and
+    without it the answer has the time of now."""
     ended = "('completed','failed','rejected','canceled')"
     tasks = [{k: r[k] for k in MOBILE_HEAD} for r in q(f"SELECT * FROM tasks WHERE state NOT IN {ended} ORDER BY id")]
     recent = [{k: r[k] for k in MOBILE_HEAD} for r in q(f"SELECT * FROM tasks WHERE state IN {ended} "
@@ -1886,8 +1889,8 @@ def mobile_state(generation):
     # answered items too, oldest first. `needs` stays the open ones, which every phone already reads.
     answered = [need_view(r) for r in q("SELECT * FROM needs WHERE answer IS NOT NULL ORDER BY id DESC LIMIT ?",
                                         (MOBILE_ANSWERED,))]
-    return {"schema_version": 1, "db": generation, "time": now(), "manager_flag": kv_get("mgr_flag"),
-            "manager_warning": manager_warning(), "ui_features": ui_features(),
+    return {"schema_version": 1, "db": generation, "time": now() if at is None else at,
+            "manager_flag": kv_get("mgr_flag"), "manager_warning": manager_warning(), "ui_features": ui_features(),
             "agents": [mobile_agent(name, config) for name, config in agents().items()],
             "needs": needs, "answered_needs": list(reversed(answered)), "tasks": tasks,
             "recent": list(reversed(recent)),
@@ -37520,14 +37523,21 @@ class Handler(BaseHTTPRequestHandler):
     def ui_mobile(self, query):
         """GET /ui/mobile (owner feature mobile): the phone's own read, with an ETag, so that an unchanged fleet
         costs one empty answer. The whole snapshot of /ui/state is too much for a phone. It carries the change token
-        (live_changes), read under the same lock, for the phone's GET /ui/wait; the tag leaves it out."""
+        (live_changes) of the moment that its rows are of, for the phone's GET /ui/wait; the tag leaves it out."""
         if not self.ui_allowed():
             return
         generation = kv_get("db_id")
         if query.get("db") not in (None, generation):
             return self.json(409, {"error": "hub generation changed; refresh state"})
-        with LOCK:
-            result = scrub(dict(mobile_state(generation), token=change_token()))
+        with state_moment() as (token, at):
+            # The rows, the token, the time and the team of one moment, as GET /ui/state reads them (state_moment):
+            # LOCK is held for that moment only. A write after it is not in this answer, and it moves the token past
+            # this answer's (live_changes). Until 11 November 2026 the build held LOCK for all its statements: 138 on a
+            # copy of the first fleet's records, and 148 on one with 2.3 times its rows.
+            result = dict(mobile_state(generation, at), token=token)
+        # scrub masks a login in old text too, because a login can be registered after the text was stored. As in
+        # GET /ui/state, it reads the logins after the moment, so it also masks a login registered during the build.
+        result = scrub(result)
         tag = '"' + hashlib.sha256(json.dumps(mobile_tagged(result), sort_keys=True).encode()).hexdigest()[:32] + '"'
         headers = {"ETag": tag, "Cache-Control": "no-store"}
         if self.headers.get("If-None-Match") == tag:
