@@ -2359,6 +2359,29 @@ def scrubbed(value):
     return value
 
 
+# No login that the hub finds is shorter: fingerprint_items and POST /secrets take a length of 8 or more, a row
+# without a length matches letter-and-digit tokens of 8 or more, and a JSON escape only makes a login longer.
+LOGIN_LEAST = 8
+
+
+def cut_whole(text, most):
+    """The first `most` characters of a text that is kept or shown before a later scrub reads it, with no login cut in
+    two. scrub finds a login only whole, and a login can be registered after its text was cut: a part of one in a
+    name, a title or a stored row stays there. A login holds no whitespace (SECRET_RUN) and has at least LOGIN_LEAST
+    characters, so a cut that falls in a run of characters that long goes back to where the run starts, and drops the
+    whitespace before it. A cut between two runs, or in a shorter run, stays where it was: a text with no such run
+    across the cut is cut exactly as before."""
+    if len(text) <= most:
+        return text
+    if most <= 0:
+        return ""
+    after = SECRET_RUN.match(text, most, most + LOGIN_LEAST)        # the run from the cut on, as far as it counts
+    before = SECRET_RUN.match(text[most - 1::-1]) if after else None    # and the run back from the cut
+    if before is None or before.end() + after.end() - most < LOGIN_LEAST:
+        return text[:most]
+    return text[:most - before.end()].rstrip()
+
+
 # ---------------------------------------------------------------- tools
 
 def sql_steps(script):
@@ -6980,10 +7003,18 @@ def looks_after(agent, rev, duties=None):
 
 
 def looks_after_text(agent, rev, duties):
-    """looks_after with the duties already read: no read of the database, so it is safe inside a transaction."""
+    """looks_after with the duties already read: no read of the database, so it is safe inside a transaction. A long
+    line is cut before its last word, or, with no space in its first LOOKS_AFTER_MAX characters, where no login can
+    be cut in two (cut_whole): the start texts that carry it are kept, and a login registered after one was made is
+    masked there only whole."""
     said = responsible_line(agent, rev)
     if len(said) > LOOKS_AFTER_MAX:
-        said = said[:LOOKS_AFTER_MAX].rsplit(" ", 1)[0] + "..."
+        head = said[:LOOKS_AFTER_MAX]
+        if " " in head:
+            said = head.rsplit(" ", 1)[0] + "..."
+        else:
+            said = cut_whole(said, LOOKS_AFTER_MAX)
+            said = said + "..." if said else ""
     said = (said or (agents().get(agent) or {}).get("title") or "nothing that its profile says yet").rstrip(".")
     return said + (". Duties: " + ", ".join(duties) if duties else "")
 
@@ -16315,13 +16346,16 @@ def rref(duty_id):
 
 def duty_name(text):
     """The short name of a duty, for a page heading, a task title or a line that lists duties. It is the first
-    sentence of the duty's own words, because a duty is its words and nobody fills in a title."""
+    sentence of the duty's own words, because a duty is its words and nobody fills in a title. A longer sentence is
+    cut where no login can be cut in two (cut_whole): the name is kept in task titles, messages, start texts and
+    lessons, and a login registered after it was made is masked there only whole."""
     first = str(text or "").strip().split("\n")[0].strip()
     stop = first.find(". ")
     if stop > 0:
         first = first[:stop]
     first = first.rstrip(".").strip() or "A duty"
-    return first if len(first) <= DUTY_NAME_MAX else first[:DUTY_NAME_MAX - 1].rstrip() + "…"
+    return first if len(first) <= DUTY_NAME_MAX else \
+        (cut_whole(first, DUTY_NAME_MAX - 1).rstrip() or "A duty") + "…"
 
 
 def cref(c):
@@ -18005,7 +18039,7 @@ def t_close_case(agent, a):
         fields.update({k: a.get(k) for k in ("covers", "cause", "next_step")})
     if topic:                                                                       # and so does one without it
         fields["about"] = topic
-    tag = topic or duty_name(r["text"])[:MEMORY_ABOUT]
+    tag = topic or cut_whole(duty_name(r["text"]), MEMORY_ABOUT) or "work"     # kept unmasked with the lesson
     command, stored = agent_write(agent, "close_case", a, fields)
     if stored:
         return stored["text"]
@@ -19271,13 +19305,14 @@ def memory_work_tag(t):
     """The tag of a lesson that a delivery writes with no `about` of its own: the name of the duty that the task
     works for, which the next task of that duty names again, else the task's title. A title is rarely said again: of
     132 starts replayed on 7 November 2026, a tag matched in 35, and each one was a duty's name or a title that
-    recurs. Reads only."""
+    recurs. Reads only. The tag is kept with the lesson and shown with it, so it is cut where no login can be cut in
+    two (cut_whole): a login registered after the lesson was written is masked there only whole."""
     resp = t["responsibility"]
     if not resp and t["duty_case"]:
         case = read_row("SELECT responsibility FROM duty_cases WHERE id=?", (t["duty_case"],))
         resp = case["responsibility"] if case else None
     r = read_row("SELECT text FROM responsibilities WHERE id=?", (resp,)) if resp else None
-    return " ".join((duty_name(r["text"]) if r else (t["title"] or "work")).split())[:MEMORY_ABOUT]
+    return cut_whole(" ".join((duty_name(r["text"]) if r else (t["title"] or "work")).split()), MEMORY_ABOUT) or "work"
 
 
 def memory_from_work(agent, text, prevents, about, t0, task=None, responsibility=None, prevents_key=None, beside=()):
@@ -20148,18 +20183,24 @@ HISTORY_BY_NAME = {s.name: s for s in HISTORY_STREAMS}
 
 def history_masked(text):
     """A record's words as the history keeps them: the first HISTORY_TEXT characters, with every registered login
-    masked. A login holds no whitespace (SECRET_RUN), so no login may be cut in two: the run of characters that the
-    cut falls in is kept whole when it ends within HISTORY_RUN characters of the cut, and is left out from where it
-    starts when it goes on further. So masking reads at most HISTORY_TEXT + HISTORY_RUN characters, however long the
-    record and its logins, and a step masks its rows inside the hub's lock."""
+    masked. A login holds no whitespace (SECRET_RUN) and has at least LOGIN_LEAST characters, so no login may be cut
+    in two: a run of characters that long that the cut falls in is kept whole when it ends within HISTORY_RUN
+    characters of the cut, and is left out from where it starts when it goes on further. So masking reads at most
+    HISTORY_TEXT + HISTORY_RUN characters, however long the record and its logins, and a step masks its rows inside
+    the hub's lock.
+
+    The masked words are not cut again. Until 11 November 2026 they were, at HISTORY_TEXT: a login registered after
+    its record was indexed, in the run across the cut or pushed across it by a mask longer than a login before it,
+    stayed in the row and in the index in part, and a later scrub finds no login in a part of one. So a row can be
+    longer than HISTORY_TEXT, by the run across the cut and by what each mask adds to the login it replaces. A row
+    that the older cut made reads differently now, so history_heal indexes it again when a search or a read finds it,
+    except the row of a moment's event, which stays as it happened."""
     text, end = str(text or ""), HISTORY_TEXT
-    run = SECRET_RUN.match(text, end, end + HISTORY_RUN + 1)
-    if run and run.end() <= end + HISTORY_RUN:
-        end = run.end()
-    elif run:
-        start = SECRET_RUN.match(text[end - 1::-1])            # the run read backwards from the cut
-        end -= start.end() if start else 0
-    return mask_secrets(text[:end])[:HISTORY_TEXT]
+    run = SECRET_RUN.match(text, end, end + HISTORY_RUN + 1)        # the run from the cut on
+    back = SECRET_RUN.match(text[end - 1::-1]) if run else None     # and the run back from the cut, read backwards
+    if back and back.end() + run.end() - end >= LOGIN_LEAST:
+        end = run.end() if run.end() <= end + HISTORY_RUN else end - back.end()
+    return mask_secrets(text[:end])
 
 
 def history_insert(src, src_id, recs, keys, keep=False):
@@ -20272,6 +20313,7 @@ def history_indexer():
         try:
             if first:
                 history_orphans()
+                history_recut()
                 first = False
             done = history_catch_up(HISTORY_STEP)
             HISTORY_FAILED[0] = None
@@ -20400,6 +20442,42 @@ def history_orphans():
             if r["person"][2:].isdigit() and not DB.execute("SELECT 1 FROM people WHERE id=?",
                                                             (int(r["person"][2:]),)).fetchone():
                 history_forget_person(int(r["person"][2:]))
+
+
+def history_recut():
+    """At the start: a release before 11 November 2026 cut a row made of a longer record at HISTORY_TEXT characters
+    after its mask, so such a row can end in part of a login registered later, which no scrub finds. history_heal
+    indexes a row again from its record when a read finds it, but never the row of a moment's event or of
+    history_note, which stays as it happened: so the run that such a row of exactly HISTORY_TEXT characters ends in
+    leaves the row, and the index with it. That also takes the last word of such a row that was no cut, of an older
+    release or of this one (a cut at a space, or in a run too short to be a login): that word holds no login. A tool
+    record keeps no words in its row: a search reads them again from its record, masked.
+
+    Each pass goes on from the id that the last one finished (kv history_recut), so a row that an older release wrote
+    after a rollback goes at the next start, and a row is taken once: then it is shorter. An id that SQLite gives
+    again after the newest row was deleted can be at or below the mark, and that row is not read; it would also take
+    a rollback to hold an older cut. In steps of HISTORY_SPAN ids, so the hub answers between two. SQLite's length()
+    stops at a NUL, so the rows are found by their bytes."""
+    kept_as_said = tuple(s.name for s in HISTORY_STREAMS if s.at) + ("note",)
+    last, top = int(kv_get("history_recut") or 0), read_rows("SELECT MAX(id) m FROM history")[0]["m"] or 0
+    while last < top:
+        upper = min(top, last + HISTORY_SPAN)
+        with area("quiet"), transaction():
+            for h in DB.execute(f"SELECT id, agent, text FROM history WHERE id>? AND id<=? AND src IN "
+                                f"({','.join('?' * len(kept_as_said))}) AND length(CAST(text AS BLOB))>=?",
+                                (last, upper, *kept_as_said, HISTORY_TEXT)).fetchall():
+                run = SECRET_RUN.match(h["text"][::-1]) if len(h["text"]) == HISTORY_TEXT else None
+                if not run:                                             # the run it ends in, read backwards
+                    continue
+                kept, key = h["text"][:len(h["text"]) - run.end()].rstrip(), history_key(h["agent"])
+                if HISTORY_FTS[0] and key:
+                    DB.execute("INSERT INTO history_fts(history_fts,rowid,text,agent) VALUES('delete',?,?,?)",
+                               (h["id"], h["text"], key))
+                    DB.execute("INSERT INTO history_fts(rowid,text,agent) VALUES(?,?,?)", (h["id"], kept, key))
+                DB.execute("UPDATE history SET text=? WHERE id=?", (kept, h["id"]))
+            DB.execute("INSERT INTO kv(k,v) VALUES('history_recut',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                       (str(upper),))
+        last = upper
 
 
 def contact_session(agent, context=None):
@@ -29048,10 +29126,12 @@ def knowledge_scope(path):
 
 
 def knowledge_heading(text):
-    """(title, source) of a knowledge file: its first "# " line and the "Source: " line under it, or None."""
+    """(title, source) of a knowledge file: its first "# " line and the "Source: " line under it, or None. Each is cut
+    where no login can be cut in two (cut_whole): the catalog keeps them for as long as the file has this text
+    (KNOWLEDGE_BLOBS), and a login registered after that is masked in them only whole."""
     lines = text.splitlines()
-    title = next((line[2:].strip()[:200] for line in lines if line.startswith("# ")), None)
-    source = next((line[8:].strip()[:300] for line in lines[:6] if line.startswith("Source: ")), None)
+    title = next((cut_whole(line[2:].strip(), 200) for line in lines if line.startswith("# ")), None)
+    source = next((cut_whole(line[8:].strip(), 300) for line in lines[:6] if line.startswith("Source: ")), None)
     return title, source
 
 
