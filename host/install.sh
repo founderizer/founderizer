@@ -10,7 +10,9 @@
 # Options of a Fix host: --hidden <path> (an app tree or a secret path more, again for each), --fleet-kit <path> (a
 # Fleet machine's checkout), --pool <lvm path> (a CI host's pool volume), --build-file <path> (a CI host's sparse ext4
 # file on a loop device, which holds its runners' builds) and --runner-user <user> (a CI host's rootless Docker user,
-# whose containers are its runners). --port <n> is the second sshd's port, and --address <ip> the address it listens
+# whose containers are its runners). The app names neither: when an install named neither, ops-root finds both on the
+# host itself, the one user other than root whose rootless Docker keeps its data on such a file, and that file
+# (ci_layout). --port <n> is the second sshd's port, and --address <ip> the address it listens
 # on, this host's Tailscale address unless a test host names 127.0.0.1.
 #
 # It refuses a distribution release that the tests did not cover. A second run is safe: it writes the same files

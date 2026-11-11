@@ -55,6 +55,7 @@ KIT_FILE = ETC + "/fleet-kit"               # a Fleet machine's checkout, whose 
 POOL_FILE = ETC + "/pool"                   # a CI host's pool volume (an LVM path) for grow-pool
 BUILD_FILE = ETC + "/build-file"            # a CI host's build file (sparse ext4 on a loop device) for grow-file
 RUNNER_USER_FILE = ETC + "/runner-user"     # a CI host's rootless Docker user: each of its containers is a runner
+LAYOUT = {}                                 # ci_layout's answer, found once in each call
 RELEASE_FILE = ETC + "/release"             # the release revision this file came from: self-update's floor
 STATE = "/var/lib/ops-root"
 BACKUPS = "/var/lib/ops-backups"            # the one folder for the agent's own copies that the box writes, root's only
@@ -586,7 +587,7 @@ def do_grow_file(req, data):
     """truncate, losetup --set-capacity and resize2fs, as the owner grew it by hand. The file is sparse, so the file
     system that holds it must keep GROW_KEEP GiB free beyond all that the file may still take: a full build file
     stops the runners, and a full file system under it stops the host."""
-    path = read(BUILD_FILE).strip()
+    path = ci_layout()[1]
     if not path.startswith("/") or os.path.normpath(path) != path or protected(path):
         raise Refused("this host names no build file")
     try:
@@ -1741,9 +1742,64 @@ def runners():
     return found
 
 
-def rootless(*words, timeout=300):
-    """(status, output) of docker in the runner user's rootless daemon, as that user."""
-    user = read(RUNNER_USER_FILE).strip()
+def ci_layout():
+    """(runner user, build file) of a CI host whose runners are containers of a rootless Docker on a sparse ext4 file
+    (E50): what install.sh's --runner-user and --build-file named, and on a host whose install named neither, what the
+    host itself shows. That is the one user other than root whose rootless Docker runs and keeps its data on the
+    mounted ext4 file system of a loop device, and that device's file. The app's install names neither, and a host
+    keeps the settings of its install, so before this no host of that layout grew its build file or restarted a runner
+    container by a rule call. ("", "") on every other host: Docker on the host's own disk, no rootless Docker, or more
+    than one such user."""
+    if "found" not in LAYOUT:
+        LAYOUT["found"] = find_layout()
+    return LAYOUT["found"]
+
+
+def find_layout():
+    named = (read(RUNNER_USER_FILE).strip(), read(BUILD_FILE).strip())
+    if any(named):
+        return named
+    status, out = run(["findmnt", "--list", "--noheadings", "--types", "ext4", "--output", "SOURCE"])
+    loops = {word for word in out.split() if re.fullmatch(r"/dev/loop[0-9]{1,4}", word)} if status == 0 else set()
+    found = []
+    for user in rootless_users() if loops else []:
+        status, out = rootless_as(user, "info", "--format", "{{.DockerRootDir}}", timeout=30)
+        roots = [line.strip() for line in out.splitlines() if line.strip().startswith("/")]   # a warning is no path
+        root = roots[0] if len(roots) == 1 else ""
+        if status != 0 or not root or os.path.normpath(root) != root:
+            continue
+        status, out = run(["findmnt", "--noheadings", "--output", "SOURCE", "--target", root])
+        if status != 0 or out.strip() not in loops:
+            continue
+        status, out = run(["losetup", "--noheadings", "--output", "BACK-FILE", out.strip()])
+        path = out.strip()
+        if status == 0 and path.startswith("/") and os.path.normpath(path) == path:
+            found.append((user, path))
+    return found[0] if len(found) == 1 else ("", "")
+
+
+def rootless_users():
+    """The users other than root whose rootless Docker runs: each one's socket /run/user/<uid>/docker.sock, its own."""
+    users = []
+    try:
+        entries = sorted(os.listdir(P("/run/user")))
+    except OSError:
+        return users
+    for entry in entries:
+        if not re.fullmatch(r"[1-9][0-9]{0,9}", entry):
+            continue
+        try:
+            st = os.stat(P(f"/run/user/{entry}/docker.sock"))
+            name = pwd.getpwuid(int(entry)).pw_name
+        except (OSError, KeyError):
+            continue
+        if stat.S_ISSOCK(st.st_mode) and st.st_uid == int(entry) and re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", name):
+            users.append(name)
+    return users
+
+
+def rootless_as(user, *words, timeout=300):
+    """(status, output) of docker in one user's rootless daemon, as that user."""
     try:
         pw = pwd.getpwnam(user) if re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user) else None
     except KeyError:
@@ -1755,10 +1811,15 @@ def rootless(*words, timeout=300):
                 f"DOCKER_HOST=unix://{runtime}/docker.sock", "docker", *words], timeout=timeout)
 
 
+def rootless(*words, timeout=300):
+    """(status, output) of docker in the runner user's rootless daemon, as that user."""
+    return rootless_as(ci_layout()[0], *words, timeout=timeout)
+
+
 def container_runners():
     """[(name, state, busy)] of the runner containers: every container of the runner user's rootless daemon. A host
-    that names no runner user has none."""
-    if not read(RUNNER_USER_FILE).strip():
+    that has no runner user has none."""
+    if not ci_layout()[0]:
         return []
     status, out = rootless("ps", "--all", "--format", "{{.Names}}\t{{.State}}")
     if status != 0:
@@ -2230,6 +2291,7 @@ def decode(text):
 
 def call(req, data=None):
     """The answer to one request, as text; Refused or Failed otherwise."""
+    LAYOUT.clear()
     op = req["op"]
     req["args"] = check_args(op, req["args"])
     f = FORMS[op]
