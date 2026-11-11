@@ -661,7 +661,10 @@ def ssh(host, user, remote, stdin=None, timeout=120):
 
 
 def sudo_prefix(reading):
-    """INSTALL-PROMPT.md A1: root runs the steps as they are; a user that can become root gets `sudo -i -- `."""
+    """Root runs the steps as they are; a user that can become root gets `sudo -i -- ` in front of each step. Each step
+    here is one `sh -c` command, so `sudo` runs all of it as root: INSTALL-PROMPT.md A1 gives the agent the same rule,
+    with `sudo -n -i -- `. `sudo -i` gives the command to root's login shell, which expands each "$name" in it before
+    `sh` reads it."""
     lines = reading["out"].splitlines()
     if len(lines) >= 2 and lines[1].strip() == "0":
         return ""

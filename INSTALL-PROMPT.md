@@ -79,8 +79,8 @@ Ask the owner for all of it in one message, and wait for the answer. Do not gues
 
 1. **Which job**: install a new hub, or join a server to a hub that runs already.
 2. **The server**: the address or host name you reach it at, and the user you reach it with. That
-   user must be `root` or must be able to become root. Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or
-   13, and a machine that stays on — never a laptop.
+   user must be `root`, or must be able to become root with `sudo` and no password. Ubuntu 22.04,
+   24.04 or 26.04, or Debian 12 or 13, and a machine that stays on — never a laptop.
 3. **The Tailscale auth key of their fleet**, from their own Tailscale admin console, **written by
    them into a file on this machine** with `chmod 600`, for example `~/.founderizer-authkey`. Ask
    for the path of that file, not for the key. If they paste the key into this conversation
@@ -101,7 +101,9 @@ Keep these in shell variables of your own session, so that no secret is in a com
     KEYFILE=<the path of the auth key file on this machine>
 
 Every command below runs over SSH from this machine. If you are already running on the server
-itself, leave out the `ssh "$SSHUSER@$HOST"` part and run the rest as root.
+itself, put `sh -c` in place of `ssh`, its options and `"$SSHUSER@$HOST"`, change nothing else, and
+run each command as yourself: A1 tells you whether to put `sudo -n -i -- ` in front of the remote
+command of each later step.
 
 **The server lets SSH in over the private network only once it is installed.** So the first thing
 both jobs do is put it on that network, and from then on every command goes to the address it gets
@@ -113,19 +115,25 @@ there: `HOST` changes once, and only at the step that says so.
 
     ssh -o BatchMode=yes "$SSHUSER@$HOST" 'id -un; id -u; sed -n "1,2p" /etc/os-release; command -v systemctl'
 
-Check: `id -u` is `0`, the system is Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, and `systemctl`
-has a path. If `id -u` is not `0` but the user can become root, put `sudo -i -- ` in front of the remote
-command of every later step. If the system is another one, or there is no `systemctl`, stop: this
-install needs one of those systems. Tell the owner, and ask nothing else.
+Check: the system is Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, and `systemctl` has a path.
+If the system is another one, or there is no `systemctl`, stop: this install needs one of those
+systems. Tell the owner, and ask nothing else.
+
+If `id -u` is not `0`, put `sudo -n -i -- ` in front of the remote command of every later step,
+inside its quotes: `ssh "$SSHUSER@$HOST" 'sudo -n -i -- /bin/sh -c "…"'`. Each remote command is one
+command, so `sudo` runs all of it as root. Put `sudo` nowhere else, and add no `$` and no new line to
+a remote command: `sudo -i` gives the command to root's login shell, which reads it again and can
+change them. If `sudo` says that it needs a password, or refuses, stop and give the owner its words
+as they came.
 
 If SSH itself fails, stop and give the owner the error as it came. Do not try another user, another
 port or another key.
 
 ### A2. Put the server on the fleet's private network
 
-    ssh "$SSHUSER@$HOST" 'command -v tailscale >/dev/null 2>&1 || curl -fsSL https://tailscale.com/install.sh | sh'
-    ssh "$SSHUSER@$HOST" 'umask 077; cat > /root/fleet-authkey' < "$KEYFILE"
-    ssh "$SSHUSER@$HOST" 'tailscale status >/dev/null 2>&1 || tailscale up --auth-key=file:/root/fleet-authkey --accept-dns=false; rm -f /root/fleet-authkey; tailscale ip -4'
+    ssh "$SSHUSER@$HOST" '/bin/sh -c "command -v tailscale >/dev/null 2>&1 || curl -fsSL https://tailscale.com/install.sh | sh"'
+    ssh "$SSHUSER@$HOST" '/bin/sh -c "umask 077; cat > /root/fleet-authkey"' < "$KEYFILE"
+    ssh "$SSHUSER@$HOST" '/bin/sh -c "tailscale status >/dev/null 2>&1 || tailscale up --auth-key=file:/root/fleet-authkey --accept-dns=false; rm -f /root/fleet-authkey; tailscale ip -4"'
 
 Check: the last command prints an address that starts with `100.`. If `tailscale up` refuses the
 key, stop and give the owner the error as it came; a key is used once unless they made it
@@ -141,9 +149,12 @@ reach the server's port 22, because after the install SSH comes in over the priv
 
 ### A3. Put the Founderizer code on the server
 
-    ssh "$SSHUSER@$HOST" 'command -v git >/dev/null 2>&1 || { DEBIAN_FRONTEND=noninteractive apt-get -q update && DEBIAN_FRONTEND=noninteractive apt-get -y -q install git; }'
-    ssh "$SSHUSER@$HOST" "if test -d /root/fleet-kit/.git; then git -C /root/fleet-kit pull -q --ff-only; else git clone -q -- '$SOURCE' /root/fleet-kit; fi"
-    ssh "$SSHUSER@$HOST" 'git -C /root/fleet-kit rev-parse --short HEAD; ls /root/fleet-kit/hub.sh'
+    ssh "$SSHUSER@$HOST" '/bin/sh -c "command -v git >/dev/null 2>&1 || { DEBIAN_FRONTEND=noninteractive apt-get -q update && DEBIAN_FRONTEND=noninteractive apt-get -y -q install git; }"'
+    ssh "$SSHUSER@$HOST" "/bin/sh -c \"if test -d /root/fleet-kit/.git; then git -C /root/fleet-kit pull -q --ff-only; else git clone -q -- '$SOURCE' /root/fleet-kit; fi\""
+    ssh "$SSHUSER@$HOST" '/bin/sh -c "git -C /root/fleet-kit rev-parse --short HEAD; ls /root/fleet-kit/hub.sh"'
+
+In the second line, your own shell puts the address in place of `$SOURCE` before `ssh` sends the
+line, so the server gets no `$`.
 
 Check: the last command prints a commit and the path of `hub.sh`. If the clone asks for a password
 or a user name, stop: the repository address needs a credential you do not have. Ask the owner for
@@ -163,7 +174,7 @@ The install waits up to 30 minutes for the owner's Mac to claim the hub, so it r
 writes to a log you read. The server is on the private network already (A2), so the installer asks
 for no key:
 
-    ssh "$SSHUSER@$HOST" 'setsid sh -c "sh /root/fleet-kit/hub.sh < /dev/null > /root/fleet-install.log 2>&1" > /dev/null 2>&1 &'
+    ssh "$SSHUSER@$HOST" '/bin/sh -c "setsid sh /root/fleet-kit/hub.sh < /dev/null > /root/fleet-install.log 2>&1 &"'
 
 Then read the log every 20 seconds, until it holds the line that starts with `FLEET_CLAIM=`:
 
@@ -212,13 +223,14 @@ prompt; otherwise give it to the owner and stop.
 
 ### B1. Read the server
 
-The command of A1, with the same checks and the same stops.
+The command of A1, with the same checks and the same stops. If `id -u` is not `0`, put
+`sudo -n -i -- ` in front of the remote command of every later step, as A1 says.
 
 ### B2. Put the server on the fleet's private network
 
-    ssh "$SSHUSER@$HOST" 'command -v tailscale >/dev/null 2>&1 || curl -fsSL https://tailscale.com/install.sh | sh'
-    ssh "$SSHUSER@$HOST" 'umask 077; cat > /root/fleet-authkey' < "$KEYFILE"
-    ssh "$SSHUSER@$HOST" 'tailscale status >/dev/null 2>&1 || tailscale up --auth-key=file:/root/fleet-authkey --accept-dns=false; rm -f /root/fleet-authkey; tailscale ip -4'
+    ssh "$SSHUSER@$HOST" '/bin/sh -c "command -v tailscale >/dev/null 2>&1 || curl -fsSL https://tailscale.com/install.sh | sh"'
+    ssh "$SSHUSER@$HOST" '/bin/sh -c "umask 077; cat > /root/fleet-authkey"' < "$KEYFILE"
+    ssh "$SSHUSER@$HOST" '/bin/sh -c "tailscale status >/dev/null 2>&1 || tailscale up --auth-key=file:/root/fleet-authkey --accept-dns=false; rm -f /root/fleet-authkey; tailscale ip -4"'
 
 Check: the last command prints an address that starts with `100.`. If `tailscale up` refuses the
 key, stop and give the owner the error as it came; a key is used once unless they made it
@@ -234,9 +246,13 @@ reach the server's port 22, because the join lets SSH in over the private networ
 
 ### B3. Run the join line of the app
 
-Run the line the owner gave you, unchanged, on the server:
+Run the line the owner gave you, unchanged, on the server. Put it in place of
+`<the whole join line from the app>`, inside the double quotes:
 
-    ssh "$SSHUSER@$HOST" '<the whole join line from the app>'
+    ssh "$SSHUSER@$HOST" '/bin/sh -c "<the whole join line from the app>"'
+
+The join line has no `"`, no `'`, no `$` and no new line. If the line you were given has one of
+them, stop and ask the owner for a new line from the app.
 
 It fetches the join script from their own hub and joins the server: base packages, the service
 user, the checkout, the join itself with the one-time code on standard input, security updates,
@@ -272,4 +288,6 @@ you stopped, say exactly where and why.
 `test_hub_install.py` reads this file and holds it to the shape above: the refusal list is there in
 writing, every command it gives the model is one the installers really take, no command signs in to
 a model provider or reads a provider credential, the auth key never stands in an argument, and the
-last step of both jobs is `verify`.
+last step of both jobs is `verify`. Its `PromptThroughSudo` runs each later step through a stand-in
+for `sudo -i`, for root and for a user who is not root, and fails when a part of a step does not run
+as root.
