@@ -41536,6 +41536,11 @@ class ConnectHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass                        # a Unix socket has no address to print, and the hub logs its own lines
 
+    def version_string(self):
+        """The Server header of each answer: the name alone. These answers reach the Internet, and the base class
+        adds the version of Python (seen through the gate with a real client, 13 November 2026)."""
+        return self.server_version
+
     def capp_send(self, code, body=b"", headers=None):
         if isinstance(body, str):
             body = body.encode()

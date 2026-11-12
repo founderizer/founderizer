@@ -628,7 +628,9 @@ class Separate(unittest.TestCase):
         own = {k: v for k, v in vars(hub.ConnectHandler).items() if callable(v)}
         for key, value in own.items():
             self.assertIsNot(value, vars(hub.Handler).get(key), key)
-            self.assertTrue(key.startswith("capp_") or key in ("do_GET", "do_POST", "do_DELETE", "log_message"), key)
+            # the base class's own hooks, by name: the routes, the log line and the Server header
+            self.assertTrue(key.startswith("capp_") or key in ("do_GET", "do_POST", "do_DELETE", "log_message",
+                                                               "version_string"), key)
 
     def test_the_connected_apps_code_never_calls_an_owner_gate_or_handler(self):
         tree = ast.parse(Path(hub.__file__).read_text())
@@ -669,6 +671,13 @@ class Endpoints(Socket):
     def setUp(self):
         super().setUp()
         self.opened()
+
+    def test_an_answer_names_the_hub_and_no_version_of_python(self):
+        # these answers reach the Internet: a good one, a refused one and a page
+        for method, path in (("GET", "/.well-known/oauth-authorization-server"), ("POST", "/mcp"),
+                             ("GET", "/authorize")):
+            _, head, _ = self.http(method, path, body={} if method == "POST" else None)
+            self.assertEqual(head["Server"], "Founderizer", (method, path))
 
     def test_the_two_metadata_documents(self):
         for path in ("/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"):

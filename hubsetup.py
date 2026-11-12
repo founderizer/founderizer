@@ -2091,7 +2091,10 @@ def connect_on(hub_user="fleet", kit=None, run=None, read=None, account=None):
         say(f"the gate runs as {CONNECT_USER} on {CONNECT_TARGET}")
     else:
         # A restart and not `enable --now` alone: a running gate reads a new program only when it starts again.
-        step("systemctl enable %(s)s >/dev/null 2>&1\nsystemctl reset-failed %(s)s >/dev/null 2>&1 || true\n"
+        # The reload first: a run that wrote the unit and then failed at its reload leaves the unit in place, and
+        # the next run writes nothing, so it would start the gate from a unit that systemd never read.
+        step("systemctl daemon-reload\nsystemctl enable %(s)s >/dev/null 2>&1\n"
+             "systemctl reset-failed %(s)s >/dev/null 2>&1 || true\n"
              "systemctl restart %(s)s\nsleep %(t)d\n" % {"s": CONNECT_SERVICE, "t": CONNECT_SETTLE},
              f"the service {CONNECT_SERVICE}", timeout=120)
         after = kv(run(connect_reading())[1])

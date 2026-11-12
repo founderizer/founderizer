@@ -488,10 +488,21 @@ class ConnectStep(unittest.TestCase):
         self.assertIn("install -o root -g root -m 644 " + shlex.quote(str(HERE / "gate.py")) +
                       " /usr/local/lib/founderizer-connect/gate.py", changes[2])
         self.assertIn("systemctl daemon-reload", changes[3])
+        self.assertTrue(changes[4].startswith("systemctl daemon-reload\n"), changes[4])
         self.assertIn("systemctl restart founderizer-connect", changes[4])
         self.assertEqual(changes[5], "tailscale funnel --bg --yes --https=443 http://127.0.0.1:8767")
         self.assertEqual(box.ran[-1], "tailscale funnel status --json")
         self.assertEqual(box.files[hubsetup.CONNECT_UNIT], hubsetup.connect_unit_text(N))
+
+    def test_a_unit_that_an_earlier_run_wrote_is_read_again_before_the_start(self):
+        # an earlier run wrote the unit and stopped before systemd read it: this run writes nothing, and reloads
+        box = Box()
+        box.files[hubsetup.CONNECT_UNIT] = hubsetup.connect_unit_text(N)
+        self.assertEqual(self.on(box)["state"], "made")
+        start = [s for s in box.changes() if "systemctl restart founderizer-connect" in s]
+        self.assertEqual(len(start), 1, box.changes())
+        self.assertTrue(start[0].startswith("systemctl daemon-reload\n"), start[0])
+        self.assertFalse([s for s in box.changes() if hubsetup.CONNECT_UNIT in s], box.changes())
 
     def test_a_second_run_changes_nothing(self):
         box = Box()
