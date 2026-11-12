@@ -403,6 +403,35 @@ class Messages(Base):
         self.assertEqual(rows[f"OM-{mine}"]["snippet"], "Please renew the domain before the end of the month")
         self.assertEqual(rows[f"OR-{report}"]["snippet"], "The domain renews on the 30th")   # no "studio to the owner"
 
+    def test_a_message_of_a_connected_app_says_so_and_its_snippet_drops_the_head(self):
+        connection = hub.ins("INSERT INTO capp_connections(client,name,redirect_host,level,resource,created) "
+                             "VALUES('c','Claude','claude.ai','act','https://hub-1.tail0000.ts.net/mcp',?)",
+                             (self.clock,))
+        with hub.LOCK, hub.transaction():
+            hub.owner_message_rows(str(uuid.uuid4()), "message", None, "Renew the domain today", f"connected:{connection}",
+                                   "studio", None, self.clock, connection={"id": connection, "name": "Claude"})
+        mine = hub.q1("SELECT rowid FROM ui_requests ORDER BY rowid DESC LIMIT 1")["rowid"]
+        need = hub.ins("INSERT INTO needs(title,why,todo,raised,by) VALUES('Which name','w','t',?,'studio')",
+                       (self.clock,))
+        with hub.LOCK, hub.transaction():
+            hub.owner_message_rows(str(uuid.uuid4()), "answer", hub.read_row("SELECT * FROM needs WHERE id=?", (need,)),
+                                   "The domain of the shop", f"connected:{connection}", "studio", None, self.clock,
+                                   connection={"id": connection, "name": "Claude"})
+        hub.history_catch_up()
+        code, one = self.owner(agent="studio", ref=f"OM-{mine}")
+        self.assertEqual((code, [r["text"] for r in one["records"]]),
+                         (200, ["The owner (through the app Claude): Renew the domain today"]))
+        code, answer = self.owner(agent="studio", ref=f"N-{need}")
+        self.assertIn("The owner (through the app Claude) answered N-%d (Which name): The domain of the shop" % need,
+                      [r["text"] for r in answer["records"]])
+        rows = {r["ref"]: r for r in self.messages("domain")["results"]}
+        self.assertEqual(rows[f"OM-{mine}"]["snippet"], "Renew the domain today")
+        self.assertEqual(rows[f"N-{need}"]["snippet"], "The domain of the shop")
+        later = self.owner_says("Renew the domain tomorrow", agent="studio")     # the owner's Mac: no app named
+        hub.history_catch_up()
+        code, plain = self.owner(agent="studio", ref=f"OM-{later}")
+        self.assertEqual([r["text"] for r in plain["records"]], ["The owner: Renew the domain tomorrow"])
+
     def test_no_tool_record_lesson_standing_item_or_conversation(self):
         tid = self.task(title="Session")
         self.records(tid, [{"seq": 1, "type": "agent_message", "text": "The parrot backup ran"}])

@@ -854,7 +854,10 @@ class MobileMoment(unittest.TestCase):
 
         def names(node):
             return {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
-        block = next(n for n in ast.walk(functions["Handler.ui_mobile"]) if isinstance(n, ast.With)
+        # The route's body is hub.phone_mobile since the connected apps call it too (the build specification of the
+        # MCP address, section 4), and the route calls it after ui_allowed.
+        self.assertIn("phone_mobile", names(functions["Handler.ui_mobile"]))
+        block = next(n for n in ast.walk(functions["phone_mobile"]) if isinstance(n, ast.With)
                      and ast.unparse(n.items[0].context_expr) == "state_moment()")
         selfs = [ast.unparse(n) for stmt in block.body for n in ast.walk(stmt)      # the scan cannot follow these
                  if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "self"]

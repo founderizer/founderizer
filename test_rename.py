@@ -405,6 +405,10 @@ class Columns(unittest.TestCase):
         ("door_record", "target"): "a host or a provider account of the door (DevOps plan C4)",
         ("door_record", "caller"): "the door's own record of who called it, kept as the door keeps it (plan C4)",
         ("needs", "answered_by"): "the owner (null), a deputy 'P-<id> <name>' or Fleet",
+        ("capp_clients", "name"): "a connected app's own name", ("capp_connections", "name"): "a connected app",
+        ("capp_grants", "name"): "the connected app of an authorization code",
+        ("capp_connections", "ended_by"): "what ended a connected app: owner, reuse, code_reuse, off, client or "
+                                          "restore",
     }
     WORDS = {"agent", "owner", "requester", "asker", "from_agent", "to_agent", "decided_by", "by", "sender", "recipient",
              "released_by", "paused_by", "created_by", "closed_by", "dropped_by", "name", "who", "machine", "target",

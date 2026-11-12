@@ -45,6 +45,10 @@ Standard library only, and it reads no credential of a model provider.
                                                     vault, its own user and service, which the hub's user can ask and
                                                     neither read nor replace; kit-clone and a second run of it are how
                                                     it is updated
+    python3 /usr/local/lib/founderizer-kit/hubsetup.py connect on|off [--hub-user fleet]
+                                                    as root on the hub's Linux machine, from that clone only: the gate
+                                                    of the remote MCP address, its own user and service, and Tailscale
+                                                    Funnel on port 443 to it; off undoes the Funnel and the service
 
 Why the claim exists. The owner is a Tailscale address and no token (hub.py `allowed("owner")`), so a hub with the
 wrong `addresses.owner` serves the owner's pages to the wrong machine, and one with none serves them to nobody. The
@@ -172,6 +176,17 @@ FLEET_ID = re.compile(r"[0-9a-f]{16}")              # hub.fleet_id(): sixteen lo
 # hub's user can change, or a path that the hub names (DevOps plan V2).
 ROOT_KIT = "/usr/local/lib/founderizer-kit"
 RELEASE_FILE = "release.json"                       # the signed manifest of the release a checkout runs (plan 0.1)
+# The gate of the remote MCP address (connected apps, `connect on|off`): its own user, which cannot read the hub's or
+# the vault's folders, its root-owned program, the folder of the hub's socket, and its service. Not a fleet-* name,
+# for the reason of CENTRAL_USER.
+CONNECT_USER = "founderizer-connect"
+CONNECT_SERVICE = "founderizer-connect"
+CONNECT_LIB = "/usr/local/lib/founderizer-connect"  # gate.py, root-owned 644, outside every checkout
+CONNECT_STATE = "/var/lib/founderizer-connect"      # hub.sock: the hub's user, group founderizer-connect, 2750
+CONNECT_UNIT = "/etc/systemd/system/founderizer-connect.service"
+CONNECT_TARGET = "http://127.0.0.1:8767"            # gate.LISTEN and gate.PORT: the one target that Funnel publishes
+CONNECT_HTTPS = 443                                 # the public port of the address
+CONNECT_SETTLE = 2                                  # seconds before the gate's service is read after its start
 PRIVATE = re.compile(r"100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.(?:[0-9]{1,3})\.(?:[0-9]{1,3})$")
 
 
@@ -1703,6 +1718,311 @@ def central_install(owner_key, hub_user="fleet", fleet=None, kit=None, run=None,
     return dict(done, state="made")
 
 
+# ---------------------------------------------------------------- the gate of the remote MCP address (connected apps)
+#
+# The owner's app runs `connect on` as root over the owner's SSH, from root's own clone (ROOT_KIT), as for the central
+# vault: the gate's user and group, the folder of the hub's socket, gate.py as a root-owned program, its service, and
+# then Tailscale Funnel on port 443 to the gate. Each part reads first and says one line, so a second run changes
+# nothing. `connect off` undoes the Funnel and the service, and keeps the user, the folder and the program. Nothing
+# runs this step by itself: the hub opens its socket only when team.json says hub.connect, and until the last commit
+# of the feature validate_team refuses that key.
+
+def tailscale_argv(what, target=CONNECT_TARGET):
+    """The Tailscale commands of this step, with their exact arguments. what: status, serve-status, funnel-on,
+    funnel-off or funnel-status. The funnel forms are those of the CLI since Tailscale 1.52; on the hub's own version
+    they are not confirmed (the build specification, section 7), so each is marked where it is."""
+    return {
+        "status": ["tailscale", "status", "--json"],
+        "serve-status": ["tailscale", "serve", "status", "--json"],
+        # Not confirmed on the hub's Tailscale version: --bg, --yes and --https=<port> (the CLI changed in 1.52).
+        "funnel-on": ["tailscale", "funnel", "--bg", "--yes", f"--https={CONNECT_HTTPS}", target],
+        # Not confirmed on the hub's Tailscale version: `off` after the flags of the port, with no target.
+        "funnel-off": ["tailscale", "funnel", f"--https={CONNECT_HTTPS}", "off"],
+        # Not confirmed on the hub's Tailscale version: --json of `funnel status`, and that it is the serve config.
+        "funnel-status": ["tailscale", "funnel", "status", "--json"],
+    }[what]
+
+
+def connect_unit_text(name):
+    """The gate's service: its own user, no state directory (the folder of the hub's socket belongs to the hub's
+    user), and the network of a listener on 127.0.0.1 only. name: the hub's DNS name, which the gate holds every
+    request's Host to."""
+    if not isinstance(name, str) or not hub.HOST_NAME.fullmatch(name) or "." not in name:
+        raise Stop(f"the hub's DNS name {name!r} is not a full name of the private network.")
+    return f"""[Unit]
+Description=Founderizer connect gate (forwards the hub's public MCP address to the hub's own socket)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+User={CONNECT_USER}
+Group={CONNECT_USER}
+ExecStart=/usr/bin/python3 -I {CONNECT_LIB}/gate.py --name {name}
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+LimitCORE=0
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=127.0.0.1/32
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def connect_reading():
+    """The shell that reads the gate's parts, so that a second run changes nothing. user= is the user's primary group,
+    or empty when there is no such user; folder= is owner:group:mode."""
+    return ("echo user=$(id -u %(u)s >/dev/null 2>&1 && id -gn %(u)s)\n"
+            "echo folder=$(stat -c '%%U:%%G:%%a' %(state)s 2>/dev/null)\n"
+            "echo program=$(sha256sum %(lib)s/gate.py 2>/dev/null | cut -d' ' -f1)\n"
+            "echo active=$(systemctl is-active %(svc)s 2>/dev/null || true)\n"
+            "echo enabled=$(systemctl is-enabled %(svc)s 2>/dev/null || true)\n"
+            "echo restarts=$(systemctl show -p NRestarts --value %(svc)s 2>/dev/null || echo unknown)\n") % {
+                "u": CONNECT_USER, "state": CONNECT_STATE, "lib": CONNECT_LIB, "svc": CONNECT_SERVICE}
+
+
+def connect_user_script():
+    """The gate's group and user: a system user with no login, no shell and no home, each line safe to run again."""
+    return ("getent group %(u)s >/dev/null 2>&1 || groupadd --system %(u)s\n"
+            "id -u %(u)s >/dev/null 2>&1 || useradd --system --gid %(u)s --no-create-home --home-dir /nonexistent "
+            "--shell /usr/sbin/nologin %(u)s\n") % {"u": CONNECT_USER}
+
+
+def connect_folder_script(hub_user):
+    """The folder of the hub's socket: the hub's user makes hub.sock in it, and the gate's group may only reach it.
+    The setgid bit gives the socket that group."""
+    return ("install -d -o %(h)s -g %(u)s -m 2750 %(state)s\n"
+            "chown %(h)s:%(u)s %(state)s\n"
+            "chmod 2750 %(state)s\n") % {"h": shlex.quote(hub_user), "u": CONNECT_USER, "state": CONNECT_STATE}
+
+
+def _json_of(run, what, empty=None):
+    """The JSON object that one Tailscale command prints. Stop when it fails or prints no object."""
+    argv = tailscale_argv(what)
+    code, out, err = run(shlex.join(argv), timeout=60)
+    if code != 0:
+        raise Stop(f"`{shlex.join(argv)}` failed: {(err or out or 'no output').strip()[-300:]}")
+    if not out.strip() and empty is not None:
+        return empty
+    try:
+        value = json.loads(out)
+    except ValueError:
+        value = None
+    if not isinstance(value, dict):
+        raise Stop(f"`{shlex.join(argv)}` printed no JSON object.")
+    return value
+
+
+def tailnet_name(run):
+    """This machine's full name on the private network (Self.DNSName of `tailscale status --json`): the name of the
+    public address."""
+    name = str((_json_of(run, "status").get("Self") or {}).get("DNSName") or "").rstrip(".").lower()
+    if not hub.HOST_NAME.fullmatch(name) or "." not in name:
+        raise Stop("Tailscale gives this machine no full DNS name: turn on MagicDNS for the private network.")
+    return name
+
+
+def serve_configs(conf):
+    """A Tailscale serve config and every config inside it (Foreground, Services), each as a dict."""
+    if not isinstance(conf, dict):
+        return
+    yield conf
+    for key in ("Foreground", "Services"):
+        inner = conf.get(key)
+        if isinstance(inner, dict):
+            for one in inner.values():
+                yield from serve_configs(one)
+
+
+def serve_targets(conf):
+    """Every target of a serve config (`tailscale serve status --json`): [{"port", "where", "target", "funnel"}].
+    target: a proxy address, or tcp://<address> for a TCP forward, or what else the handler serves (text, a path, a
+    redirect). funnel: True when Funnel publishes that host and port."""
+    out = []
+    for one in serve_configs(conf):
+        allow = one.get("AllowFunnel") if isinstance(one.get("AllowFunnel"), dict) else {}
+        funnel = {str(k) for k, v in allow.items() if v is True}
+        tcp = one.get("TCP") if isinstance(one.get("TCP"), dict) else {}
+        for port, handler in tcp.items():
+            if isinstance(handler, dict) and handler.get("TCPForward"):
+                out.append({"port": str(port), "where": f"TCP {port}", "target": f"tcp://{handler['TCPForward']}",
+                            "funnel": any(k.rpartition(":")[2] == str(port) for k in funnel)})
+        web = one.get("Web") if isinstance(one.get("Web"), dict) else {}
+        for hostport, server in web.items():
+            handlers = server.get("Handlers") if isinstance(server, dict) else None
+            for mount, h in (handlers.items() if isinstance(handlers, dict) else ()):
+                h = h if isinstance(h, dict) else {}
+                target = h.get("Proxy") or (h.get("Path") and "path " + str(h["Path"])) or \
+                    (h.get("Text") and "text") or (h.get("Redirect") and "redirect " + str(h["Redirect"])) or "unknown"
+                out.append({"port": str(hostport).rpartition(":")[2], "where": f"{hostport}{mount}",
+                            "target": str(target), "funnel": str(hostport) in funnel})
+        for hostport in funnel:                 # Funnel on with no handler of its own
+            if not any(t["where"].startswith(hostport) for t in out):
+                out.append({"port": hostport.rpartition(":")[2], "where": hostport, "target": "none", "funnel": True})
+    return out
+
+
+def connect_conflicts(conf):
+    """What stops `connect on`: every target on port 443 other than the gate at the root path, and every other
+    target that Funnel publishes (the hub keeps its socket closed while Funnel publishes anything but the gate)."""
+    found = []
+    for t in serve_targets(conf):
+        ours = t["target"] == CONNECT_TARGET and t["where"].endswith(":443/")
+        if t["port"] == str(CONNECT_HTTPS) and not ours:
+            found.append(f"{t['where']} to {t['target']}")
+        elif t["funnel"] and t["target"] != CONNECT_TARGET:
+            found.append(f"Funnel {t['where']} to {t['target']}")
+    return found
+
+
+def connect_in_place(conf, name):
+    """True when Funnel publishes https://<name>:443/ to the gate and to nothing else."""
+    if not isinstance(conf, dict) or connect_conflicts(conf):
+        return False
+    tcp = (conf.get("TCP") or {}).get(str(CONNECT_HTTPS)) if isinstance(conf.get("TCP"), dict) else None
+    web = (conf.get("Web") or {}).get(f"{name}:{CONNECT_HTTPS}") if isinstance(conf.get("Web"), dict) else None
+    allow = conf.get("AllowFunnel") if isinstance(conf.get("AllowFunnel"), dict) else {}
+    return isinstance(tcp, dict) and tcp.get("HTTPS") is True and isinstance(web, dict) and \
+        web.get("Handlers") == {"/": {"Proxy": CONNECT_TARGET}} and allow.get(f"{name}:{CONNECT_HTTPS}") is True
+
+
+def connect_on(hub_user="fleet", kit=None, run=None, read=None, account=None):
+    """`connect on`, as root on the hub's Linux machine (the build specification of the remote MCP address, section
+    7, step 2). First the checks that change nothing: the machine's name, and port 443, which may hold no other
+    Funnel or Serve target. Then each part, read first: the user and group founderizer-connect, the folder of the
+    hub's socket, gate.py in /usr/local/lib/founderizer-connect/, the unit and its service, and Funnel. Returns
+    {"name", "address", "state": "made"|"there"}."""
+    run = run or _shell
+    read = read or (lambda path: pathlib.Path(path).read_text(encoding="utf-8"))
+    kit = kit or KIT
+    (account or hub_account)(hub_user)
+    name = tailnet_name(run)
+    conf = _json_of(run, "serve-status", empty={})
+    other = connect_conflicts(conf)
+    if other:
+        raise Stop(f"this machine's Tailscale already publishes {other[0]}, so the connect gate is not put in place. "
+                   f"Nothing was changed.")
+    try:
+        program = hashlib.sha256(pathlib.Path(kit, "gate.py").read_bytes()).hexdigest()
+    except OSError:
+        raise Stop(f"{os.path.join(kit, 'gate.py')} is not readable, so the connect gate cannot be installed.") from None
+    unit = connect_unit_text(name)
+    before = kv(run(connect_reading())[1])
+    made = False
+
+    def step(script, what, timeout=120):
+        code, out, err = run(script, timeout=timeout)
+        if code != 0:
+            raise Stop(f"{what} could not be put in place: {(err or out or 'no output').strip()[-300:]}")
+
+    if before.get("user") == CONNECT_USER:
+        say(f"the user {CONNECT_USER} is there")
+    elif before.get("user"):
+        raise Stop(f"the user {CONNECT_USER} is there with another group ({before['user']}). Nothing more was changed.")
+    else:
+        step(connect_user_script(), f"the user {CONNECT_USER}")
+        made = True
+        say(f"made the system user {CONNECT_USER}, with no login and no home")
+    want = f"{hub_user}:{CONNECT_USER}:2750"
+    if before.get("folder") == want:
+        say(f"the folder {CONNECT_STATE} is there ({want})")
+    else:
+        step(connect_folder_script(hub_user), f"the folder {CONNECT_STATE}")
+        made = True
+        say(f"made the folder {CONNECT_STATE}: {hub_user} makes the hub's socket in it, {CONNECT_USER} may only reach it")
+    changed = False
+    if before.get("program") == program:
+        say(f"the gate's program in {CONNECT_LIB} is this kit's")
+    else:
+        step("install -d -o root -g root -m 755 %s\ninstall -o root -g root -m 644 %s %s/gate.py\n"
+             % (CONNECT_LIB, shlex.quote(os.path.join(kit, "gate.py")), CONNECT_LIB), "the gate's program")
+        changed = True
+        say(f"installed the gate's program in {CONNECT_LIB}, owned by root")
+    try:
+        unit_now = read(CONNECT_UNIT)
+    except OSError:
+        unit_now = None
+    if unit_now == unit:
+        say(f"the service {CONNECT_SERVICE} is written as it should be")
+    else:
+        folder = tempfile.mkdtemp(prefix="founderizer-connect-")
+        try:
+            one = os.path.join(folder, CONNECT_SERVICE + ".service")
+            with open(one, "w", encoding="utf-8") as f:
+                f.write(unit)
+            step(f"install -o root -g root -m 644 {shlex.quote(one)} {CONNECT_UNIT}\nsystemctl daemon-reload\n",
+                 f"the service {CONNECT_SERVICE}")
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+        changed = True
+        say(f"wrote the service {CONNECT_SERVICE}")
+    if not changed and before.get("active") == "active" and before.get("enabled") == "enabled":
+        say(f"the gate runs as {CONNECT_USER} on {CONNECT_TARGET}")
+    else:
+        # A restart and not `enable --now` alone: a running gate reads a new program only when it starts again.
+        step("systemctl enable %(s)s >/dev/null 2>&1\nsystemctl reset-failed %(s)s >/dev/null 2>&1 || true\n"
+             "systemctl restart %(s)s\nsleep %(t)d\n" % {"s": CONNECT_SERVICE, "t": CONNECT_SETTLE},
+             f"the service {CONNECT_SERVICE}", timeout=120)
+        after = kv(run(connect_reading())[1])
+        if after.get("active") != "active" or after.get("restarts") not in ("0", "unknown"):
+            raise Stop(f"the gate is {after.get('active') or 'not running'} {CONNECT_SETTLE} seconds after its start. "
+                       f"Read `journalctl -u {CONNECT_SERVICE} -n 30` on this machine.")
+        made = True
+        say(f"started the gate as {CONNECT_USER} on {CONNECT_TARGET}")
+    if connect_in_place(conf, name):
+        say(f"Funnel publishes https://{name} to the gate already")
+    else:
+        step(shlex.join(tailscale_argv("funnel-on")), "Tailscale Funnel on port 443", timeout=60)
+        made = True
+        say(f"Funnel publishes https://{name} to the gate")
+    if not connect_in_place(_json_of(run, "funnel-status", empty={}), name):
+        raise Stop(f"`{shlex.join(tailscale_argv('funnel-status'))}` does not show https://{name} published to "
+                   f"{CONNECT_TARGET} alone. The Tailscale policy may not give this machine the funnel attribute.")
+    say(f"the remote MCP address is https://{name}/mcp")
+    return {"name": name, "address": f"https://{name}/mcp", "state": "made" if made or changed else "there"}
+
+
+def connect_off(run=None):
+    """`connect off`, as root on the hub's machine: Funnel off on port 443 when it publishes the gate, then the
+    gate's service stopped and disabled. A port 443 that holds another target is left as it is. The user, the folder
+    and the program stay, so that a later `connect on` is quick. Returns {"state": "off"}."""
+    run = run or _shell
+    targets = serve_targets(_json_of(run, "serve-status", empty={}))
+    on_443 = [t for t in targets if t["port"] == str(CONNECT_HTTPS)]
+    ours = [t for t in on_443 if t["target"] == CONNECT_TARGET]
+    if ours and len(ours) == len(on_443):
+        argv = tailscale_argv("funnel-off")
+        code, out, err = run(shlex.join(argv), timeout=60)
+        if code != 0:
+            raise Stop(f"`{shlex.join(argv)}` failed: {(err or out or 'no output').strip()[-300:]}")
+        say("Funnel publishes nothing on port 443 now")
+    elif ours:
+        say("port 443 holds the gate beside another target, so Funnel is left as it is: the gate stops, and that "
+            "path answers no more")
+    elif on_443:
+        say("port 443 holds another target, which is left as it is")
+    else:
+        say("Funnel publishes nothing on port 443")
+    before = kv(run(connect_reading())[1])
+    if before.get("active") in ("active", "activating") or before.get("enabled") == "enabled":
+        code, out, err = run(f"systemctl disable --now {CONNECT_SERVICE}", timeout=120)
+        if code != 0:
+            raise Stop(f"the service {CONNECT_SERVICE} could not be stopped: {(err or out or 'no output').strip()[-300:]}")
+        say(f"stopped and disabled the service {CONNECT_SERVICE}")
+    else:
+        say(f"the service {CONNECT_SERVICE} does not run")
+    return {"state": "off"}
+
+
 def write_team(path, team):
     """Write team.json, after hub.validate_team has taken it. Atomic: a run that stops leaves the old file."""
     try:
@@ -2467,6 +2787,31 @@ def cmd_central_vault(args):
                       "fleet": done["fleet"]}), flush=True)
 
 
+def cmd_connect(args):
+    """connect on|off, as root on the hub's Linux machine, from root's own clone. The owner's app reads its last line
+    on standard output, which is always one JSON object: {"ok": true, "state", ...}, or {"ok": false, "error": "<one
+    sentence>"} with a non-zero exit. Every line before it is progress."""
+    try:
+        if platform.system() == "Darwin":
+            raise Stop("a hub on a Mac keeps the remote MCP address off in this build: Funnel on macOS needs another "
+                       "Tailscale client.")
+        if platform.system() != "Linux":
+            raise Stop("the remote MCP address runs on the hub's Linux server, and this machine is not one.")
+        if os.geteuid() != 0:
+            raise Stop(f"run it as root on the hub's machine: sudo python3 {ROOT_KIT}/hubsetup.py connect {args.turn}")
+        if os.path.realpath(KIT) != ROOT_KIT or not root_owned(ROOT_KIT):
+            raise Stop(f"the connect gate is installed only from root's own clone, {ROOT_KIT}, which kit-clone makes: "
+                       f"never from a folder that the hub's user can change")
+        done = connect_on(hub_user=args.hub_user) if args.turn == "on" else connect_off()
+    except Stop as e:
+        print(json.dumps({"ok": False, "error": str(e)}), flush=True)
+        raise
+    except Exception as e:          # never a trace on the last line: the app reads it as the answer
+        print(json.dumps({"ok": False, "error": f"connect {args.turn} stopped ({type(e).__name__})."}), flush=True)
+        raise Stop(f"connect {args.turn} stopped ({type(e).__name__}).") from None
+    print(json.dumps(dict({"ok": True}, **done)), flush=True)
+
+
 def cmd_kit_clone(args):
     """kit-clone, as root on the hub's machine (kit_clone)."""
     if platform.system() != "Linux":
@@ -2548,6 +2893,11 @@ def main(argv=None):
     cv.add_argument("--keep-owner", action="store_true", help="leave a central vault that another owner key holds as "
                                                                "it is: the app's own install, which takes nothing over")
     cv.set_defaults(fn=cmd_central_vault)
+    cn = sub.add_parser("connect")
+    cn.add_argument("turn", choices=("on", "off"), help="on: the gate, its service and Funnel; off: Funnel and the "
+                                                        "service")
+    cn.add_argument("--hub-user", default="fleet", help="the user the hub runs as: it makes the hub's socket")
+    cn.set_defaults(fn=cmd_connect)
     one = sub.add_parser("repository")
     for what, why in (("tree", "the copy of Founderizer that this installer runs from"),
                       ("bare", "the bare repository that every machine of this fleet fetches from"),

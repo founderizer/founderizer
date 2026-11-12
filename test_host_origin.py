@@ -127,6 +127,25 @@ class HostAndOrigin(LocalHub):
         self.assertEqual(big[:2], (421, ""))
         self.assertEqual(self.said(), [])
 
+    def test_a_request_that_tailscale_funnel_brought_is_refused_on_every_route(self):
+        """Guard 6(a) of the connected apps (the build specification of the MCP address): the header of a Funnel request
+        on the hub's own port, from any address and with the hub's own Host, gets 403 auth funnel before any route
+        runs. That tailscaled adds the header is not confirmed; guard 6(b) keeps Funnel off this port."""
+        host = f"127.0.0.1:{self.port}"
+        for method, path in (("GET", "/board.txt"), ("GET", "/ui/state"), ("GET", "/ui/mobile"), ("GET", "/health"),
+                             ("HEAD", "/board"), ("DELETE", "/mcp")):
+            with self.subTest(method=method, path=path):
+                status, body, _ = self.ask(method, path, {"Tailscale-Funnel-Request": "?1"}, host=host)
+                self.assertEqual(status, 403)
+                if method != "HEAD":
+                    self.assertEqual(json.loads(body), {"error": "this port does not take requests from the Internet",
+                                                        "auth": "funnel"})
+        status, body, headers = self.post("/say", "text=I+am+the+owner", **{"Tailscale-Funnel-Request": "?1"})
+        self.assertEqual((status, json.loads(body)["auth"], headers.get("Connection")), (403, "funnel", "close"))
+        self.assertEqual(self.said(), [])
+        self.assertEqual(self.get("/board.txt")[0], 200)                # without the header, as before
+        self.assertEqual(len([r for r in self.refused_lines() if "Tailscale Funnel" in r]), 7)    # once for each path
+
     def test_the_tailscale_names_of_the_hub_are_answered_with_the_bound_port(self):
         hub.TAILNET_NAMES["names"] = ("hub-box.tail0000.ts.net", "hub-box")
         for host in (f"hub-box.tail0000.ts.net:{self.port}", f"HUB-BOX:{self.port}"):

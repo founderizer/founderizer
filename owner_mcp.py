@@ -221,6 +221,10 @@ NOT_TOOLS = {
     "/ui/owner/enroll": "the phone's own call, before it has a key",
     "/ui/owner/devices/code": "a code for a new phone, which its camera reads from the Mac app's screen; the owner's "
                               "agent adds a phone with owner_device and device_code",
+    "/ui/connect/code": "a one-time code for a connected app, which the hub makes at the owner's Mac, where they read "
+                        "it; connected apps are not in this release",
+    "/ui/connect/{}/revoke": "the end of a connected app's connection; connected apps are not in this release",
+    "/ui/connect/settings": "connected apps on or off; connected apps are not in this release",
 }
 
 # What this file repeats from the hub because it cannot import it: this server runs on the owner's Mac with the

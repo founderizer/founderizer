@@ -88,7 +88,9 @@ call got no progress, Claude Code ended it after 30 minutes, and the server stil
 browser `Origin`. The Mac app is authorized by exactly that and by nothing else — "The native app
 uses the existing owner machine identity." So an MCP server that runs on the owner's Mac inherits
 that identity as it stands. It holds no credential of its own, and there is no second credential
-path to secure, leak or revoke.
+path to secure, leak or revoke. (The hub's remote MCP address for the owner's Claude or ChatGPT app,
+when a later release turns it on, is another server with its own OAuth tokens at the phone's level
+or less; those tokens never reach an owner route: OWNER-MCP-BOUNDARY.md, section 7a.)
 
 That address is proved once, by the install's **claim** (`hubsetup.py`, "Why the claim exists"):
 the installer on the new hub makes a one-time code, the owner's Mac sends it back, and the address

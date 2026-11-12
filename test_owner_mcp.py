@@ -34,7 +34,7 @@ import hub
 import hubsetup
 import owner_mcp
 from test_hub_install import StandInServer
-from test_servers import NEW, OWNER, Servers
+from test_servers import NEW, OWNER, STUDIO, Servers
 
 HERE = pathlib.Path(__file__).resolve().parent
 SHELLS = [sh for sh in ("/bin/sh", "/bin/dash") if os.access(sh, os.X_OK)]     # this machine's, Debian's and Ubuntu's
@@ -2854,6 +2854,53 @@ class Boundary(WithServer):
             with self.assertRaises(ValueError) as caught:
                 hub.validate_team(team)
             self.assertIn("has the address of a machine", str(caught.exception), machine)
+
+    def test_no_agent_gets_the_hubs_own_public_address_as_a_server(self):
+        """The connected apps (the build specification of the MCP address): the hub's own MCP address is the owner's,
+        at the level of the owner's code. An agent that held it as a server could connect itself."""
+        names = dict(hub.TAILNET_NAMES)
+        self.addCleanup(lambda: (hub.TAILNET_NAMES.clear(), hub.TAILNET_NAMES.update(names)))
+        hub.TAILNET_NAMES["names"] = ("hub-1.tail0000.ts.net", "hub-1")
+        for url in ("https://hub-1.tail0000.ts.net/mcp", "https://HUB-1.tail0000.ts.net./mcp",
+                    "https://hub-1.tail0000.ts.net/other", "https://hub-1.tail0000.ts.net:443/mcp",
+                    "HTTPS://hub-1.tail0000.ts.net/mcp?x=1"):
+            with self.subTest(url=url):
+                team = self.live()
+                team["mcp"] = {"x": {"title": "X", "url": url}}
+                with self.assertRaisesRegex(ValueError, "this hub's own public MCP address"):
+                    hub.validate_team(team)
+        # The owner's own MCP server on the hub machine is no connected app: another port, the short name, or http on
+        # the hub's own loopback (lifecycle.mcp_address takes http only there)
+        for url in ("https://mcp.example.com/mcp", "https://hub-1:9000/mcp", "https://hub-1/mcp",
+                    "https://hub-1.tail0000.ts.net:9000/mcp", "https://hub-1.tail0000.ts.net:8443/mcp",
+                    "http://127.0.0.1:9000/mcp"):
+            with self.subTest(url=url):
+                team = self.live()
+                team["mcp"] = {"x": {"title": "X", "url": url}}
+                hub.validate_team(team)
+
+    def test_a_connected_apps_token_is_no_credential_of_the_hubs_own_port(self):
+        """A connection's access token, replayed on the hub's own port: the owner's Mac takes no bearer token, a phone
+        takes only its own key, any other address is no owner, and an agent's MCP route takes only a session
+        credential. So the token never reaches an owner route."""
+        token, sha = "example-connected-app-token-0123456789", None
+        connection = hub.ins("INSERT INTO capp_connections(client,name,redirect_host,level,resource,created) "
+                             "VALUES('c','Claude','claude.ai','act','https://hub-1.tail0000.ts.net/mcp',?)", (hub.now(),))
+        hub.ins("INSERT INTO capp_tokens(sha256,connection,kind,created,expires) VALUES(?,?,'access',?,?)",
+                (hashlib.sha256(token.encode()).hexdigest(), connection, hub.now(), hub.now() + 3600))
+        bearer = {"Content-Type": "application/json", "X-Fleet-Client": "test", "Authorization": "Bearer " + token}
+        code, answer = self.request("/ui/mobile", headers=bearer, source=OWNER)
+        self.assertEqual((code, answer.get("auth")), (403, "key_not_expected"))
+        hub.TEAM["owner_devices"] = {"iphone": {"label": "iPhone", "address": "127.0.0.6"}}
+        made = hub.new_device_code("iphone")
+        hub.enroll_device("iphone", made["code"])
+        code, answer = self.request("/ui/mobile", headers=bearer, source="127.0.0.6")
+        self.assertEqual((code, answer.get("auth")), (403, "device_key_mismatch"))
+        code, answer = self.request("/ui/mobile", headers=bearer, source="127.0.0.10")
+        self.assertEqual(code, 403)
+        code, answer = self.request("/mcp/studio", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                                    headers=bearer, source=STUDIO)
+        self.assertEqual((code, answer.get("auth")), (403, "credential_invalid"))
 
     def test_the_owners_own_computer_cannot_join_the_fleet_as_a_machine(self):
         """The other half of it: the owner's Mac never becomes a machine that an agent could be placed on."""
