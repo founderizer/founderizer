@@ -1214,7 +1214,12 @@ def github_text(values, tools):
                  "Where the hub's GitHub App has the Actions permission, read, write and deploy can all read the "
                  "GitHub Actions runs of a repository, with their jobs and logs (gh run list, gh run view). No token "
                  "reads check runs or commit statuses, so gh pr checks does not work. Read the runs of the commit "
-                 "instead (gh run list --commit <sha>). ")
+                 "instead (gh run list --commit <sha>). "
+                 # and Issues: read at read, write at write and deploy, where the installation holds it at that level
+                 "Where the hub's GitHub App has the Issues permission, read, write and deploy can all read the "
+                 "issues of a repository and their comments (gh issue list, gh issue view); where it has Issues at "
+                 "write, write and deploy can also open an issue and comment on one (gh issue create, "
+                 "gh issue comment). ")
     if any(access == "deploy" for _, access in repos):
         text += ("deploy is write and the repository's own deployment: its .github/workflows files, which a write "
                  "token may not push at all, and the start of its GitHub Actions runs (gh workflow run, "

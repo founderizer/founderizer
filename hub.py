@@ -34750,7 +34750,8 @@ GITHUB_APP = os.path.expanduser("~/.fleet/github-app.pem")
 # without which GitHub refuses any push that touches .github/workflows (actions: write does not cover it), and
 # actions, to start a run and read it. The owner's App must carry both and the installation must have accepted them,
 # which is what DEPLOY_APP_NOTE says wherever a deploy token is refused. A read or write token also reads the runs
-# where the installation holds Actions (github_permissions).
+# where the installation holds Actions, and a token of each level gets issues where the installation holds Issues:
+# read at read, write at write and deploy (github_permissions).
 GITHUB_ACCESS = {"read": {"contents": "read", "pull_requests": "read", "metadata": "read"},
                  "write": {"contents": "write", "pull_requests": "write", "metadata": "read"},
                  "deploy": {"contents": "write", "pull_requests": "write", "metadata": "read",
@@ -34899,12 +34900,18 @@ def github_hint(access, step, status, names):
 def github_permissions(access, held):
     """The permissions of one token at this access, from an installation that holds `held` (its own permissions, as
     GitHub gives them with the installation): GITHUB_ACCESS of the access, and for read and write also actions: read
-    where the installation holds Actions, so that a session reads the runs of GitHub Actions, as the door's tokens do
-    (door.token_permissions, 10 November 2026). GitHub refuses the whole token (422) when it asks for a permission that
-    the installation does not hold, so elsewhere the token is exactly GITHUB_ACCESS of the access."""
+    where the installation holds Actions, so that a session reads the runs of GitHub Actions (10 November 2026), and
+    issues where the installation holds Issues: read at read, write at write and deploy, so that a session reads the
+    issues of its repositories and, from write, opens them and comments on them (12 November 2026), but never more
+    than the installation holds; as the door's tokens do (door.token_permissions). GitHub refuses the whole token (422)
+    when it asks for a permission that the installation does not hold, so elsewhere the token is exactly
+    GITHUB_ACCESS of the access."""
     asked = dict(GITHUB_ACCESS[access])
-    if access in ("read", "write") and isinstance(held, dict) and held.get("actions") in ("read", "write"):
+    held = held if isinstance(held, dict) else {}
+    if access in ("read", "write") and held.get("actions") in ("read", "write"):
         asked["actions"] = "read"
+    if held.get("issues") in ("read", "write"):
+        asked["issues"] = "write" if access != "read" and held["issues"] == "write" else "read"
     return asked
 
 

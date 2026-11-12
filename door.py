@@ -213,7 +213,8 @@ HOST_OUT_MAX = 2 * 1024 * 1024
 HELP_WAIT = 60              # seconds for a host's help, which the host sweep asks of each host in turn
 GITHUB_REACH_PAGES = 30     # pages of 100 repositories that the door reads of one installation, at most
 # The permissions of an agent's token at each grant level. A read or write token also gets actions: read where the
-# installation holds Actions (token_permissions).
+# installation holds Actions, and a token of each level gets issues where the installation holds Issues: read at read,
+# write at write and deploy (token_permissions).
 GITHUB_ACCESS = {"read": {"contents": "read", "pull_requests": "read", "metadata": "read"},
                  "write": {"contents": "write", "pull_requests": "write", "metadata": "read"},
                  "deploy": {"contents": "write", "pull_requests": "write", "metadata": "read",
@@ -1620,14 +1621,21 @@ def sole_app(access):
 
 def token_permissions(level, held):
     """The permissions of an agent's token at this level, from an installation that holds `held` (its own
-    permissions, as GitHub gives them with the installation): GITHUB_ACCESS of the level, and for read and write also
-    actions: read where the installation holds Actions, so that the agent can read the runs of GitHub Actions and
-    show that CI passed (10 November 2026: a write token got 404 on a repository's runs). GitHub refuses the whole
-    token (422) when it asks for a permission that the installation does not hold, and an older App can lack Actions,
-    so where the installation does not name Actions the token is exactly GITHUB_ACCESS of the level."""
+    permissions, as GitHub gives them with the installation): GITHUB_ACCESS of the level, and two that an App can
+    lack. For read and write also actions: read where the installation holds Actions, so that the agent can read the
+    runs of GitHub Actions and show that CI passed (10 November 2026: a write token got 404 on a repository's runs).
+    And issues where the installation holds Issues: read at read, so that the agent reads the issues of its
+    repositories, and write at write and deploy, so that it also opens them and comments on them (12 November 2026: a
+    write token got 403 on a comment to the developer that the team's policy lets it talk to in GitHub issues), but
+    never more than the installation holds. GitHub refuses the whole token (422) when it asks for a permission that
+    the installation does not hold, and an older App can lack both, so where the installation names neither the
+    token is exactly GITHUB_ACCESS of the level."""
     asked = dict(GITHUB_ACCESS[level])
-    if level in ("read", "write") and isinstance(held, dict) and held.get("actions") in ("read", "write"):
+    held = held if isinstance(held, dict) else {}
+    if level in ("read", "write") and held.get("actions") in ("read", "write"):
         asked["actions"] = "read"
+    if held.get("issues") in ("read", "write"):
+        asked["issues"] = "write" if level != "read" and held["issues"] == "write" else "read"
     return asked
 
 

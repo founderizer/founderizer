@@ -435,6 +435,40 @@ class HubSide(OwnerAPI):
                 self.assertEqual(hub.github_permissions("deploy", held), hub.GITHUB_ACCESS["deploy"])
         self.assertIsNot(hub.github_permissions("read", None), hub.GITHUB_ACCESS["read"])     # never the table itself
 
+    def test_a_token_reads_the_issues_and_from_write_comments_on_them_only_where_the_installation_holds_issues(self):
+        """As the door's tokens do since 12 November 2026 (door.token_permissions): where GitHub's answer for the
+        installation names Issues, a read token also asks issues: read, and a write or deploy token issues: write, or
+        read where the installation holds Issues only at read, so that a session reads the issues of its repositories
+        and, from write, opens them and comments on them (gh issue list, gh issue comment). An installation that does
+        not name Issues gets exactly the tokens of before, because GitHub refuses a whole token that asks for a
+        permission the installation lacks."""
+        server, calls = fake_github(self.root, str(self.keys / "public.pem"), {"acme": 11},
+                                    holds={"contents": "write", "issues": "write", "metadata": "read",
+                                           "pull_requests": "write"})
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        hub.CFG["github_api"] = f"http://127.0.0.1:{server.server_port}"
+        self.agents(dev={"repos": {"acme/web": "deploy", "acme/api": "write", "acme/lib": "read"}})
+        code, data = self.tokens()
+        self.assertEqual(code, 200, data)
+        self.assertEqual(([(t["access"], t["repos"]) for t in data["tokens"]], data["errors"]),
+                         ([("deploy", ["acme/web"]), ("write", ["acme/api"]), ("read", ["acme/lib"])], []))
+        self.assertEqual([c[4]["permissions"] for c in calls if c[0] == "POST"], [
+            dict(hub.GITHUB_ACCESS["deploy"], issues="write"), dict(hub.GITHUB_ACCESS["write"], issues="write"),
+            dict(hub.GITHUB_ACCESS["read"], issues="read")])
+        for held, read, write in (({"issues": "write"}, "read", "write"), ({"issues": "read"}, "read", "read"),
+                                  ({"issues": "none"}, None, None), ({}, None, None), (None, None, None),
+                                  (["issues"], None, None), ({"issues": ["write"]}, None, None)):
+            with self.subTest(held=held):
+                self.assertEqual(hub.github_permissions("read", held),
+                                 dict(hub.GITHUB_ACCESS["read"], **({"issues": read} if read else {})))
+                for access in ("write", "deploy"):
+                    self.assertEqual(hub.github_permissions(access, held),
+                                     dict(hub.GITHUB_ACCESS[access], **({"issues": write} if write else {})))
+        self.assertEqual(hub.github_permissions("write", {"actions": "write", "issues": "write"}),
+                         dict(hub.GITHUB_ACCESS["write"], actions="read", issues="write"))      # the two together
+        self.assertNotIn("issues", json.dumps(hub.GITHUB_ACCESS))       # the table itself never changes
+
     def test_a_deploy_token_the_app_cannot_mint_says_which_permissions_the_owner_must_accept(self):
         """The one thing the hub cannot do for the owner. GitHub answers 422 and says nothing about which permission
         is missing or who adds it, so the error the agent and its manager read says both, and says that write still
@@ -653,6 +687,22 @@ class HelperSide(unittest.TestCase):
                       "Actions permission", levels["grant_access"]["properties"]["level"]["description"])
         self.assertIn("must change a workflow file or start a GitHub Actions run asks for the same repository at "
                       "deploy", levels["ask_my_requester"]["properties"]["needs_level"]["description"])
+
+    def test_the_start_says_what_each_level_does_with_github_issues(self):
+        """12 November 2026: where the App holds Issues, every level reads the issues of a repository, and write and
+        deploy also open them and comment on them where it holds Issues at write (hub.github_permissions,
+        door.token_permissions). The start of a task and rules/github.md say that, with the commands of gh."""
+        words = ("Where the hub's GitHub App has the Issues permission, read, write and deploy can all read the issues "
+                 "of a repository and their comments (gh issue list, gh issue view); where it has Issues at write, "
+                 "write and deploy can also open an issue and comment on one (gh issue create, gh issue comment).")
+        for repos in ("acme/lib:read", "acme/web:write acme/lib:read", "acme/web:deploy"):
+            with self.subTest(repos=repos):
+                self.assertIn(words, fleet.github_text({"FLEET_REPOS": repos, "GH_TOKEN": WRITE}, []))
+        rules = Path(fleet.KIT, "rules", "github.md").read_text()
+        self.assertIn("Where the hub's GitHub App has the Issues permission, `read`, `write` and `deploy` can all read "
+                      "the issues of a repository and their comments (`gh issue list`, `gh issue view`); where it has "
+                      "Issues at write, `write` and `deploy` can also open an issue and comment on one "
+                      "(`gh issue create`, `gh issue comment`).", rules)
 
     def test_hundreds_of_repositories_make_short_notes(self):
         """An agent may hold up to 500 repositories (hub.REPOS_MOST): a note names a few and counts the rest."""

@@ -1601,6 +1601,49 @@ class HubRights(Served):
         self.assertNotIn("actions", door.GITHUB_ACCESS["read"])
         self.assertNotIn("actions", door.GITHUB_ACCESS["write"])
 
+    def test_a_token_reads_the_issues_and_from_write_comments_on_them_only_where_the_installation_holds_issues(self):
+        """12 November 2026: a write token got 403 on a comment in an issue, so an agent could not talk to the
+        developer that its team's policy lets it talk to in GitHub issues. Where the installation holds Issues, a read
+        token asks for issues: read, and a write or deploy token for issues: write, or for read where the installation
+        holds Issues only at read. Where it does not hold Issues, the token asks for exactly what it asked before,
+        because GitHub refuses the whole token (422) when it asks for more than the installation holds."""
+        stubbed, held = self.door.http, {}
+
+        def http(method, url, headers, body):
+            if url.endswith("/installation"):
+                return 200, {"id": 77, "permissions": dict(held)}
+            return stubbed(method, url, headers, body)
+        self.door.http = http
+
+        def asked(repos):
+            del self.github[:]
+            status, got = self.post("/github/token", {"agent": "ops-one", "repos": repos}, self.secrets["token"])
+            self.assertEqual(status, 200, got)
+            self.assertEqual(sorted(t["access"] for t in got["tokens"]), sorted(repos.values()), got)
+            return {json.loads(d)["repositories"][0]: json.loads(d)["permissions"]
+                    for m, u, d in self.github if u.endswith("/access_tokens")}
+
+        three = {"one-org/ops": "read", "one-org/shop": "write", "one-org/tools": "deploy"}
+        before = {"contents": "write", "metadata": "read", "pull_requests": "write"}
+        held.update(before, actions="write", workflows="write", issues="write")
+        self.assertEqual(asked(three), {"ops": dict(door.GITHUB_ACCESS["read"], actions="read", issues="read"),
+                                        "shop": dict(door.GITHUB_ACCESS["write"], actions="read", issues="write"),
+                                        "tools": dict(door.GITHUB_ACCESS["deploy"], issues="write")})
+        held.clear()
+        held.update(before, issues="read")      # Issues only at read: no token asks for more than that
+        self.assertEqual(asked(three), {"ops": dict(door.GITHUB_ACCESS["read"], issues="read"),
+                                        "shop": dict(door.GITHUB_ACCESS["write"], issues="read"),
+                                        "tools": dict(door.GITHUB_ACCESS["deploy"], issues="read")})
+        for issues in ({}, {"issues": "none"}, {"issues": None}, {"issues": ["write"]}):
+            with self.subTest(issues=issues):   # an App without Issues: the tokens of before, to the letter
+                held.clear()
+                held.update(before, **issues)
+                self.assertEqual(asked(three), {"ops": door.GITHUB_ACCESS["read"], "shop": door.GITHUB_ACCESS["write"],
+                                                "tools": door.GITHUB_ACCESS["deploy"]})
+        self.assertEqual(door.token_permissions("write", ["issues"]), door.GITHUB_ACCESS["write"])
+        self.assertIsNot(door.token_permissions("read", {"issues": "read"}), door.GITHUB_ACCESS["read"])
+        self.assertNotIn("issues", json.dumps(door.GITHUB_ACCESS))      # the table itself never changes
+
     def test_the_highest_level_comes_first_because_the_first_token_is_gh_token(self):
         """The session's GH_TOKEN is the first token that the hub gives (fleet.integration_env), and the hub's own path
         sends the highest level first, so that gh and the GitHub tool get the token that does the most. 10 November
