@@ -148,6 +148,8 @@ class Decision:
         # what the door sends on the host's stdin: (random, None) or (key, app:<app>:<NAME>) for a setting (N4), and
         # (runner, <owner>/<repo>, <runner name>) for a runner (N6)
         self.value = more.get("value")
+        # what a call hash covers besides the call's own content: a prune's list, which the door made (X3)
+        self.hash_content = more.get("hash_content")
 
     def __repr__(self):
         return f"Decision({self.kind}, {self.why!r})"
@@ -997,8 +999,12 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
                         plan={"repo": repo, "read": args[0], "filter": True})
     if op == "sync":
         caller = entry.get("sync")
-        if len(args) != 1 or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", args[0]) or not caller:
-            return refused("sync takes one app name, through the repository's listed caller workflow", target=target)
+        if len(args) not in (1, 2) or not APP_NAME.fullmatch(str(args[0])) or not caller or \
+                args[1:] not in ([], ["prune"]):
+            return refused("sync takes one app name, and prune after it to prune too, through the repository's listed "
+                           "caller workflow", target=target)
+        if args[1:]:
+            return decide_prune(lookups, repo, target, caller, args[0])
         # the call waits for the run and answers with how it ended (door.GitHub.dispatch), so a failed sync fails
         return Decision("rule", "a sync through the listed caller", target=target, window="deploy",
                         plan={"repo": repo, "workflow": caller, "inputs": {"app": args[0]}, "wait": True})
@@ -1025,9 +1031,198 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
                            route="again" if report.get("again") else None)
         report = None
     try:
-        return gitops_files(lookups, op, target, plan, files, report)
+        d = gitops_files(lookups, op, target, plan, files, report)
     except (KeyError, TypeError, AttributeError, ValueError, RecursionError):
         return refused("the door could not read the render of this commit", target=target, route="again")
+    if d.kind != "refused":
+        plan["objects"] = commit_objects(files, report, lookups)     # door.py keeps them once the commit is made
+    return d
+
+
+# ---------------------------------------------------------------- the door's prune (DevOps plan X3)
+#
+# A door sync with prune deletes from the cluster what Argo CD wants to prune in one app, as Argo CD lists it in a
+# listing run of the repository's caller. The owner, 12 November 2026, "The agent (Recommended)": an object that the
+# agent's own commit through the door removed prunes as the agent's own call, like its other changes, also when people
+# made it before the door; Git keeps the object, so a revert brings it back. Data volumes, Secrets, namespaces and
+# load balancers never prune that way: those, and every object that the door cannot tie to its own commit, take the
+# whole list to the owner as the door's card (kind full, his signed yes to the exact list, once). An object that a
+# commit through the door added and then removed is a rule call.
+
+APP_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+PRUNE_KEY = re.compile(r"[a-z0-9.-]{0,253}:[A-Za-z][A-Za-z0-9]{0,62}:(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)?/"
+                       r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?")     # GROUP:KIND:NAMESPACE/NAME, as argocd takes it
+PRUNE_OWNER_KINDS = ("Namespace", "CustomResourceDefinition", "PersistentVolume", "PersistentVolumeClaim", "Secret")
+PRUNE_MOST = 20              # objects in one prune that is no card
+PRUNE_LISTED = 200           # objects that a listing may name
+LISTING_MARK = "DOOR-PRUNE-LIST"
+
+
+def object_key(doc):
+    """GROUP:KIND:NAMESPACE/NAME of one object as a dict, as a prune names it, or None when it is not one."""
+    meta = doc.get("metadata") if isinstance(doc, dict) else None
+    api, kind = (doc.get("apiVersion"), doc.get("kind")) if isinstance(doc, dict) else (None, None)
+    if not isinstance(meta, dict) or not isinstance(api, str) or not isinstance(kind, str) or kind == "List":
+        return None
+    group = api.rpartition("/")[0] if "/" in api else ""
+    key = f"{group}:{kind}:{meta.get('namespace') or ''}/{meta.get('name')}"
+    return key if isinstance(meta.get("name"), str) and PRUNE_KEY.fullmatch(key) else None
+
+
+def plain_value(value):
+    "The value of one block style line as text, with no comment and no quotes, or None when it is not a plain one."
+    value = re.sub(r"[ \t]+#.*$", "", value).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    return value if value and not value.startswith(("{", "[", "|", ">", "&", "*", "!")) else None
+
+
+def object_keys(path, data):
+    """The objects of one file as a prune names them, as a set of keys, or None when code cannot read them all: a
+    manifest that is not block style or JSON (manifest_text), or a document whose kind, name or namespace the door
+    cannot read. A file that is no manifest holds no object for a cluster, and gives the empty set."""
+    if data is None:
+        return set()
+    if not manifest_name(path):
+        return set()
+    text, why = manifest_text(path, data)
+    if why or text is None:
+        return None
+    keys = set()
+    for doc in re.split(r"^---[^\n]*\n?", text.replace("\r\n", "\n"), flags=re.M):
+        top, meta, child = {}, {}, None
+        within = False
+        for line in doc.split("\n"):
+            if not line.strip() or line.lstrip().startswith("#") or line.startswith("..."):
+                continue
+            if not line.startswith((" ", "\t")):
+                within = False
+                found = re.match(r"([A-Za-z]+):(.*)$", line)
+                if found:
+                    top[found.group(1)] = found.group(2)
+                    within = found.group(1) == "metadata" and not found.group(2).strip()
+                continue
+            if within:
+                indent = len(line) - len(line.lstrip(" "))
+                child = indent if child is None else child
+                found = re.match(r" +(name|namespace):(.*)$", line)
+                if indent == child and found:
+                    meta[found.group(1)] = found.group(2)
+        if not top:
+            continue
+        api, kind = plain_value(top.get("apiVersion", "")), plain_value(top.get("kind", ""))
+        name = plain_value(meta.get("name", ""))
+        namespace = plain_value(meta["namespace"]) if "namespace" in meta else ""
+        if not api or not kind or not name or namespace is None:
+            return None
+        key = object_key({"apiVersion": api, "kind": kind,
+                          "metadata": {"name": name, **({"namespace": namespace} if namespace else {})}})
+        if key is None:
+            return None
+        keys.add(key)
+    return keys
+
+
+def commit_objects(files, report, lookups):
+    """{removed, added}: what a GitOps commit takes from the cluster and gives it, as a prune names objects. From the
+    door's render of each chart and Kustomize folder that the commit touches (an object at HEAD and none after is
+    removed), and from the before and after of each other file of the commit that the door reads: a plain YAML or JSON
+    manifest, a deleted one too. A file that the door cannot read, at HEAD or after, gives nothing, so no object of it
+    is the door's own."""
+    removed, added, rendered = set(), set(), set()
+    for unit in (report or {}).get("units", {}).values():
+        if not unit.get("ok") or unit.get("closed"):
+            continue
+        for group in unit.get("changed") or []:
+            before = {k for k in (object_key(o) for o in group.get("before") or []) if k}
+            after = {k for k in (object_key(o) for o in group.get("after") or []) if k}
+            removed |= before - after
+            added |= after - before
+    for path, info in ((report or {}).get("files") or {}).items():
+        if info.get("units"):
+            rendered.add(path)
+    for path, data, _mode in files:
+        if path in rendered:
+            continue
+        if report:
+            head = (report.get("files") or {}).get(path) or {}
+            old = None if head.get("head") is None else base64.b64decode(head["head"])
+        else:
+            old = (lookups.get("base_file") or (lambda p: None))(path)
+        before, after = object_keys(path, old), object_keys(path, data)
+        if before is None or after is None:
+            continue
+        removed |= before - after
+        added |= after - before
+    return {"removed": sorted(removed - added), "added": sorted(added - removed)}
+
+
+def listing(text, app):
+    """The objects that Argo CD wants to prune in one app, from the line LISTING_MARK of a listing run: {prune: [key],
+    lb: [key of a Service of type LoadBalancer]}, or why the line is no listing. The run is on a shared runner, so the
+    line is only a list to check: each key must have the form, the app must be this one, and the door decides with its
+    own record."""
+    found = [line.split(LISTING_MARK + " ", 1)[1].strip() for line in (text or "").splitlines()
+             if LISTING_MARK + " " in line]
+    if len(found) != 1:
+        return f"the listing run printed {len(found)} lines {LISTING_MARK}, not one"
+    try:
+        body = json.loads(base64.b64decode(found[0], validate=True))
+    except (ValueError, TypeError):
+        return f"the line {LISTING_MARK} is not base64 JSON"
+    if not isinstance(body, dict) or body.get("app") != app or not isinstance(body.get("prune"), list) or \
+            not isinstance(body.get("lb"), list):
+        return f"the line {LISTING_MARK} is not the listing of {app}"
+    keys = body["prune"]
+    if len(keys) > PRUNE_LISTED or not all(isinstance(k, str) and PRUNE_KEY.fullmatch(k) for k in keys) or \
+            len(set(keys)) != len(keys) or not all(isinstance(k, str) for k in body["lb"]):
+        return f"the line {LISTING_MARK} names objects that are not GROUP:KIND:NAMESPACE/NAME, or names one twice"
+    return {"prune": sorted(keys), "lb": sorted(set(body["lb"]) & set(keys))}
+
+
+def decide_prune(lookups, repo, target, caller, app):
+    """A sync with prune: the caller syncs the app, then prunes exactly the listed objects, each of which Argo CD must
+    still want to prune in that run (its prune=yes). The list is the listing run's, never the agent's.
+    rule: each object was added and then removed by commits through the door. own: each was removed by the agent's
+    own commit through the door (the owner, 12 November 2026). full: anything else, the whole list to the owner."""
+    found = lookups.get("prune_listing")
+    if not isinstance(found, dict):
+        return refused(f"the door could not read what Argo CD wants to prune in {app}: "
+                       f"{found or 'no listing run'}", target=target, route="again")
+    keys, lbs = found["prune"], set(found["lb"])
+    base = {"repo": repo, "workflow": caller, "wait": True}
+    if not keys:
+        return Decision("rule", f"a sync through the listed caller: Argo CD wants to prune nothing in {app}",
+                        target=target, window="deploy", plan=dict(base, inputs={"app": app}))
+    removed = lookups.get("removed_object") or (lambda key: False)
+    made = lookups.get("made_object") or (lambda key: False)
+    owner = []
+    for key in keys:
+        _group, kind, rest = key.split(":", 2)
+        if kind in PRUNE_OWNER_KINDS:
+            owner.append(f"{key} is a {kind}")
+        elif not rest.split("/", 1)[0]:
+            owner.append(f"{key} has no namespace")
+        elif key in lbs:
+            owner.append(f"{key} is a Service of type LoadBalancer")
+        elif not removed(key):
+            owner.append(f"no commit through the door removed {key}")
+    if len(keys) > PRUNE_MOST:
+        owner.append(f"it prunes {len(keys)} objects, more than {PRUNE_MOST}")
+    listed = "\n".join(keys)
+    plan = dict(base, pruned=keys, inputs={"app": app, "prune": "yes", "prune_objects": listed,
+                                           "prune_owner_yes": "true" if owner else "false"})
+    every = ", ".join(keys)
+    if owner:
+        return Decision("full", f"a prune in {app} that is the owner's: {'; '.join(owner[:5])}. The whole list goes "
+                        f"to him, because a part of it would leave the app OutOfSync: {every}", target=target,
+                        window="deploy", plan=plan, hash_content=listed.encode())
+    if all(made(key) for key in keys):
+        return Decision("rule", f"a prune in {app} of what commits through the door made and then removed: {every}",
+                        target=target, window="deploy", plan=plan, hash_content=listed.encode())
+    return Decision("own", f"a prune in {app} of what its own commits through the door removed (the owner, 12 "
+                    f"November 2026: \"The agent (Recommended)\"): {every}", target=target, window="deploy",
+                    plan=plan, hash_content=listed.encode())
 
 
 def objects_text(docs):

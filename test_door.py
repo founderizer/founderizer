@@ -113,7 +113,7 @@ ACCESS = {
 
 def load_tests(loader, _tests, _pattern):
     return unittest.TestSuite(cls(name) for cls in (Access, Callers, RuleArguments, Refusals, OwnCalls, Order,
-                                                    HubLine, HubRights, GitHubFacts, SyncRuns, Vault, AuditReplay, AWSRole,
+                                                    HubLine, HubRights, GitHubFacts, SyncRuns, PruneParts, Prunes, Vault, AuditReplay, AWSRole,
                                                     OwnerYes, CallHash, ScriptsAndRuns, FullAccess, Routes, MadeDeletes,
                                                     HostPath, AppSettingsPath, ScriptPath, HostUpdates, KeyCardAccount,
                                                     WorkKeys,
@@ -2022,6 +2022,103 @@ class SyncRuns(DoorCase):
                                 {"ref": "master", "inputs": {"app": "shop"}}])
 
 
+OLD_CONFIG = ("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: old-config\n  namespace: shop\n  labels:\n"
+              "    name: not-this-one\ndata:\n  conf: |\n    kind: NotAnObject\n    name: nor-this\n---\n"
+              "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: old-policy\n"
+              "  namespace: \"shop\"  # quoted\nspec: {}\n")
+
+
+def listing_line(prune, lb=(), app="shop"):
+    "A listing run's log line, as the caller workflow prints it."
+    body = json.dumps({"app": app, "prune": list(prune), "lb": list(lb)})
+    return "2026-11-12T17:00:00.0000000Z DOOR-PRUNE-LIST " + base64.b64encode(body.encode()).decode() + "\n"
+
+
+class PruneParts(unittest.TestCase):
+    """The pure parts of the door's prune (DevOps plan X3): the objects of a file and of a commit, the listing line,
+    and the decision, with the owner's answer of 12 November 2026."""
+
+    def test_the_objects_of_a_block_style_file_and_what_cannot_be_read(self):
+        self.assertEqual(door_targets.object_keys("a/old.yaml", OLD_CONFIG.encode()),
+                         {":ConfigMap:shop/old-config", "networking.k8s.io:NetworkPolicy:shop/old-policy"})
+        self.assertEqual(door_targets.object_keys("a/ns.yaml", b"apiVersion: v1\nkind: Namespace\nmetadata:\n"
+                                                                b"  name: shop\n"), {":Namespace:/shop"})
+        self.assertEqual(door_targets.object_keys("a/readme.md", b"kind: Deployment"), set())
+        self.assertEqual(door_targets.object_keys("a/gone.yaml", None), set())
+        for bad in (b'{"kind": "ConfigMap", "metadata": {"name": "x"}}', b"kind: ConfigMap\nmetadata:\n  name: x\n",
+                    b"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Values.name }}\n",
+                    b"apiVersion: v1\nkind: List\nitems: []\nmetadata:\n  name: l\n"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(door_targets.object_keys("a/bad.yaml", bad))
+        self.assertEqual(door_targets.object_keys("a/one.json", json.dumps(
+            {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "web", "namespace": "shop"}}).encode()),
+            {"apps:Deployment:shop/web"})
+
+    def test_what_a_commit_removes_and_adds_from_files_and_from_the_render(self):
+        heads = {"a/old.yaml": OLD_CONFIG.encode(), "a/flow.yaml": b'{"kind": "ConfigMap"}'}
+        files = [("a/old.yaml", OLD_CONFIG.split("---")[0].encode(), "100644"),     # the policy goes
+                 ("a/flow.yaml", None, "100644"),                                   # unreadable at HEAD: nothing
+                 ("a/new.yaml", b"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: n\n  namespace: shop\n",
+                  "100644")]
+        got = door_targets.commit_objects(files, None, {"base_file": heads.get})
+        self.assertEqual(got, {"removed": ["networking.k8s.io:NetworkPolicy:shop/old-policy"],
+                               "added": [":ConfigMap:shop/n"]})
+        cm = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "c", "namespace": "shop"}}
+        report = {"files": {"chart/values.yaml": {"units": ["helm:chart"], "head": None}},
+                  "units": {"helm:chart": {"ok": True, "closed": False, "changed": [
+                      {"object": "an object", "set": "its own values", "before": [cm], "after": []}]},
+                      "helm:shut": {"ok": True, "closed": True, "changed": [
+                          {"object": "an object", "set": "x", "before": [dict(cm, kind="Secret")], "after": []}]}}}
+        got = door_targets.commit_objects([("chart/values.yaml", b"x: 1\n", "100644")], report, {})
+        self.assertEqual(got, {"removed": [":ConfigMap:shop/c"], "added": []})
+
+    def test_a_listing_line_is_only_a_list_to_check(self):
+        good = door_targets.listing(listing_line([":Service:shop/front", ":ConfigMap:shop/a"], [":Service:shop/front",
+                                                                                                 ":Service:x/y"]), "shop")
+        self.assertEqual(good, {"prune": [":ConfigMap:shop/a", ":Service:shop/front"], "lb": [":Service:shop/front"]})
+        for text, why in ((listing_line([":ConfigMap:shop/a"], app="web"), "not the listing of shop"),
+                          (listing_line(["ConfigMap/a"]), "not GROUP:KIND:NAMESPACE/NAME"),
+                          (listing_line([":ConfigMap:shop/a", ":ConfigMap:shop/a"]), "names one twice"),
+                          (listing_line([]) * 2, "2 lines"), ("no line\n", "0 lines"),
+                          ("DOOR-PRUNE-LIST !!!\n", "not base64 JSON")):
+            with self.subTest(why=why):
+                self.assertIn(why, door_targets.listing(text, "shop"))
+
+    def decide(self, keys, lb=(), removed=(), made=()):
+        found = {"prune": sorted(keys), "lb": sorted(lb)}
+        return door_targets.decide_prune({"prune_listing": found, "removed_object": lambda k: k in removed,
+                                          "made_object": lambda k: k in made},
+                                         "one-org/cluster", "gitops:one-org/cluster", "sync-app.yml", "shop")
+
+    def test_the_decision_rule_own_or_the_owner_s_card(self):
+        a, b = ":ConfigMap:shop/a", "apps:Deployment:shop/b"
+        d = self.decide([a, b], removed=[a, b], made=[a, b])
+        self.assertEqual((d.kind, d.plan["inputs"]["prune_owner_yes"]), ("rule", "false"))
+        d = self.decide([a, b], removed=[a, b], made=[a])
+        self.assertEqual(d.kind, "own")
+        self.assertIn('the owner, 12 November 2026: "The agent (Recommended)"', d.why)
+        self.assertEqual(d.plan["inputs"], {"app": "shop", "prune": "yes", "prune_objects": f"{a}\n{b}",
+                                            "prune_owner_yes": "false"})
+        self.assertEqual((d.plan["pruned"], d.hash_content, d.window), ([a, b], f"{a}\n{b}".encode(), "deploy"))
+        for keys, lb, why in (([a, ":Secret:shop/s"], (), ":Secret:shop/s is a Secret"),
+                              (["v1:Namespace:/shop"], (), "is a Namespace"),
+                              ([":Node:/n1"], (), ":Node:/n1 has no namespace"),
+                              ([a, ":Service:shop/front"], [":Service:shop/front"], "is a Service of type LoadBalancer"),
+                              ([a, ":ConfigMap:shop/z"], (), "no commit through the door removed :ConfigMap:shop/z"),
+                              ([f":ConfigMap:shop/c{n}" for n in range(21)], (), "21 objects, more than 20")):
+            with self.subTest(why=why):
+                removed = [k for k in keys if not k.endswith("/z")]
+                d = self.decide(keys, lb, removed=removed)
+                self.assertEqual((d.kind, d.plan["inputs"]["prune_owner_yes"]), ("full", "true"))
+                self.assertIn(why, d.why)
+                self.assertIn("The whole list goes to him", d.why)
+        d = self.decide([])
+        self.assertEqual((d.kind, d.plan["inputs"], "pruned" in d.plan), ("rule", {"app": "shop"}, False))
+        d = door_targets.decide_prune({"prune_listing": "the listing run failed: no"}, "one-org/cluster",
+                                      "gitops:one-org/cluster", "sync-app.yml", "shop")
+        self.assertEqual((d.kind, d.route), ("refused", "again"))
+
+
 class GitHubFacts(DoorCase):
     """What the door reads from GitHub for its checks: each repository's default branch (one has only `master`), and
     the runs of the repository that built an image, never those of the GitOps repository."""
@@ -2428,6 +2525,123 @@ class Signed:
                                 "at": round(time.time())})
         self.answers.append({"need": need, "statement": said, "signature": self.sign(said)})
         return door.fetch_approvals(self.door)
+
+
+class Prunes(Signed, DoorCase):
+    """A door sync with prune, on the whole path of Door.call: the listing run and its log line, the door's record of
+    what its commits removed, the prune run, and the owner's card for a list that is his (DevOps plan X3; the owner,
+    12 November 2026)."""
+    API = "https://api.github.com"
+
+    def setUp(self):
+        super().setUp()
+        self.signed_setup()             # the owner's keys in the door's file
+        github_stubs(self)              # self.answers: GitHub's answers by method and address
+        github, self.yeses = self.door.http, []
+        self.door.http = lambda method, url, headers, body: (200, {"approvals": self.yeses, "devices": []}) \
+            if url.endswith("/door/approvals") else github(method, url, headers, body)
+        patcher = patch.object(door, "RUN_POLL", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.line = listing_line([])
+        self.answers[("GET", f"{self.API}/repos/one-org/cluster/actions/runs/4242/jobs?per_page=50")] = \
+            (200, {"jobs": [{"id": 99, "name": "List what Argo CD wants to prune", "conclusion": "success"}]})
+        for p in (patch.object(door, "http_redirect", lambda method, url, headers, timeout=30:
+                               (302, "https://logs.example/99") if url.endswith("/actions/jobs/99/logs") else (404, "")),
+                  patch.object(door, "http_raw", lambda method, url, headers, limit, timeout=120:
+                               (200, self.line.encode()) if url == "https://logs.example/99" else (599, b""))):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def yes(self, call, need=9):
+        said = vault.canonical({"v": 1, "kind": "door-call", "fleet": "fleet-1", "need": need, "call": call,
+                                "at": round(time.time())})
+        self.yeses.append({"need": need, "statement": said, "signature": self.sign(said)})
+        return door.fetch_approvals(self.door)
+
+    def head(self, path, text):
+        self.answers[("GET", f"{self.API}/repos/one-org/cluster/contents/{path}?ref=master")] = \
+            (200, {"encoding": "base64", "content": base64.b64encode(text.encode()).decode()})
+
+    def dispatched(self):
+        return [d["inputs"] for m, u, d in self.calls if u.endswith("/sync-app.yml/dispatches")]
+
+    def prune(self):
+        return self.call(ONE, "gitops:one-org/cluster", "sync", "shop", "prune")
+
+    def test_a_prune_of_what_the_agent_s_own_commit_removed_runs_as_its_own_call(self):
+        self.head("apps/shop/old.yaml", OLD_CONFIG)
+        got = self.call(ONE, "gitops:one-org/cluster", "push", content=json.dumps(
+            {"message": "retire", "files": [{"path": "apps/shop/old.yaml", "delete": True}]}).encode())
+        self.assertEqual((got["ok"], got["kind"]), (True, "own"), got)
+        removed = json.loads(slurp(self.root + door.REMOVED_FILE, "r"))["one-org/cluster"]
+        self.assertEqual(sorted(removed), [":ConfigMap:shop/old-config",
+                                           "networking.k8s.io:NetworkPolicy:shop/old-policy"])
+        self.assertEqual(removed[":ConfigMap:shop/old-config"]["commit"], "c2")
+        self.line = listing_line([":ConfigMap:shop/old-config", "networking.k8s.io:NetworkPolicy:shop/old-policy"])
+        got = self.prune()
+        self.assertEqual((got["ok"], got["kind"]), (True, "own"), got)
+        self.assertEqual(self.dispatched(), [
+            {"app": "shop", "prune": "list"},
+            {"app": "shop", "prune": "yes", "prune_owner_yes": "false",
+             "prune_objects": ":ConfigMap:shop/old-config\nnetworking.k8s.io:NetworkPolicy:shop/old-policy"}])
+        lines = [(e["action"], e["kind"], e["outcome"]) for e in self.door.record.after(0)]
+        self.assertEqual(lines[-2:], [("prune-list", "read", "done"), ("sync", "own", "done")])
+        self.assertIn("own call, which it answers for: a prune in shop of what its own commits",
+                      self.door.record.after(0)[-1]["why"])
+        self.assertEqual(json.loads(slurp(self.root + door.REMOVED_FILE, "r"))["one-org/cluster"], {})
+
+    def test_a_list_that_is_the_owner_s_goes_to_his_card_whole_and_runs_once_after_his_yes(self):
+        keys = [":ConfigMap:shop/made-by-people", ":Service:shop/front"]
+        self.line = listing_line(keys, [":Service:shop/front"])
+        got = self.prune()
+        self.assertEqual((got["ok"], got["route"]), (False, "yes"), got)
+        sha = door.call_hash("gitops:one-org/cluster", "sync", ["shop", "prune"], "\n".join(keys).encode())
+        self.assertEqual(got["call"], sha)
+        self.assertIn(":Service:shop/front is a Service of type LoadBalancer", got["why"])
+        self.assertIn("no commit through the door removed :ConfigMap:shop/made-by-people", got["why"])
+        self.assertNotIn("Full access", got["why"])
+        self.assertNotIn("full_access", got)
+        self.assertEqual(self.dispatched(), [{"app": "shop", "prune": "list"}])        # no prune was sent
+        self.yes(sha)
+        got = self.prune()
+        self.assertEqual((got["ok"], got["kind"]), (True, "approved"), got)
+        self.assertEqual(self.dispatched()[-1], {"app": "shop", "prune": "yes", "prune_owner_yes": "true",
+                                                 "prune_objects": "\n".join(keys)})
+        got = self.prune()                                  # his yes lets that one call through, once
+        self.assertEqual((got["ok"], got["route"]), (False, "yes"))
+        self.line = listing_line(keys + [":ConfigMap:shop/more"], [":Service:shop/front"])
+        self.assertNotEqual(self.prune()["call"], sha)      # another list is another call
+
+    def test_what_door_commits_made_and_then_removed_prunes_as_a_rule_call(self):
+        new = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: trial\n  namespace: shop\ndata:\n  k: v\n"
+        got = self.call(ONE, "gitops:one-org/cluster", "push", content=change(("apps/shop/trial.yaml", new)))
+        self.assertTrue(got["ok"], got)
+        self.head("apps/shop/trial.yaml", new)
+        got = self.call(ONE, "gitops:one-org/cluster", "push", content=json.dumps(
+            {"message": "end the trial", "files": [{"path": "apps/shop/trial.yaml", "delete": True}]}).encode())
+        self.assertTrue(got["ok"], got)
+        self.line = listing_line([":ConfigMap:shop/trial"])
+        got = self.prune()
+        self.assertEqual((got["ok"], got["kind"]), (True, "rule"), got)
+
+    def test_outside_the_deploy_window_a_prune_starts_no_listing_run(self):
+        data = json.loads(slurp(self.root + door.ACCESS_FILE, "r"))
+        data["windows"] = [{"hosts": ["gitops:one-org/cluster"], "forms": ["deploy"], "deny": [["11:00", "13:00"]]}]
+        self.write_access(data)
+        got = self.prune()
+        self.assertEqual((got["ok"], got["route"]), (False, "window"), got)
+        self.assertEqual(self.dispatched(), [])
+
+    def test_nothing_to_prune_is_a_sync_and_a_failed_listing_is_no_prune(self):
+        got = self.prune()
+        self.assertEqual((got["ok"], got["kind"]), (True, "rule"), got)
+        self.assertEqual(self.dispatched(), [{"app": "shop", "prune": "list"}, {"app": "shop"}])
+        self.line = "the run printed something else\n"
+        got = self.prune()
+        self.assertEqual((got["ok"], got["route"]), (False, "again"))
+        self.assertIn("printed 0 lines DOOR-PRUNE-LIST", got["why"])
+        self.assertEqual(self.door.record.after(0)[-2]["outcome"], "failed")     # the listing's own line
 
 
 class ScriptsAndRuns(Signed, DoorCase):

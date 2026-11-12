@@ -92,6 +92,8 @@ HOST_RETRY = 3600                           # seconds before a host that did not
 RECORD_FILE = STATE + "/record.jsonl"
 MINTED_FILE = STATE + "/minted.json"        # ids of the keys this door minted (never their values)
 MADE_FILE = STATE + "/made.json"            # names of what writes through the door made, by provider account (D25)
+REMOVED_FILE = STATE + "/removed.json"      # objects that GitOps commits through the door removed, for a prune (X3)
+REMOVED_DAYS = 30                           # a removal older than this is no longer the door's own for a prune
 REPOS_FILE = STATE + "/repos.json"          # the repositories that the door made, and a repo-new that is pending (N3)
 ACCOUNTS_FILE = STATE + "/accounts.json"    # the Cloudflare account of a token whose credential names none (plan N1)
 KEYS_FILE = STATE + "/keys.json"            # what each saved Cloudflare key is, and the work keys that the door made
@@ -249,6 +251,7 @@ TIMER_PAUSE = 10            # seconds between them, while the host does not answ
 RUN_WAIT = 50 * 60          # how long a GitOps sync's call waits for its run to end: less than an agent's ops call waits
 RUN_POLL = 15               # seconds between two reads of that run
 RUN_FIND = 60               # seconds in which the run of a dispatch whose answer gave no run id must show up
+LOG_MOST = 1024 * 1024      # bytes of a job's log that the door reads: a listing run prints one line
 
 
 class Refused(Exception):
@@ -950,14 +953,21 @@ class Door:
             return {"ok": False, "kind": "refused", "why": "this caller is not in the door's access file", "n": n,
                     "route": "holder"}
         access = self.access()
+        listing = early = None  # DevOps plan X3: a sync with prune decides on what Argo CD wants to prune now
+        if isinstance(target, str) and target.startswith("gitops:") and op == "sync" and args[1:] == ["prune"]:
+            early = window_refusal(access, target, "deploy", self.clock())     # no listing run outside the window
+            listing = None if early else self.prune_listing(access, agent, target, args[0])
         try:
-            d = door_targets.decide(access, agent, target, op, args, content, self.lookups(access, target, agent))
+            d = door_targets.refused(early, target=target, route="window") if early else door_targets.decide(
+                access, agent, target, op, args, content, self.lookups(access, target, agent, listing))
         except (Refused, door_providers.Stop) as e:
             d = door_targets.refused(f"the door could not check this call: {e}", target=target, route="again")
         if d.kind != "refused" and d.write:
             why = window_refusal(access, d.host or target, d.window, self.clock())
             if why:
                 d = door_targets.refused(why, target=d.target, route="window")
+        if content is None and getattr(d, "hash_content", None) is not None:
+            content = d.hash_content        # a prune's list, which the door made: his yes is to that exact list (X3)
         sha = call_hash(target, op, args, content)
         hashed = d.kind in ("own", "full")      # a refusal of these two kinds is the owner's to lift: it gives the hash
         full_host = d.host if d.kind == "full" else None
@@ -969,8 +979,8 @@ class Door:
         elif yes:               # the owner said yes to this exact call: it runs once
             d.kind, d.why = "approved", f"the owner's signed yes (N-{yes['need']}) to this exact call, used once"
         elif d.kind == "full":  # door-modes proposal, step 3: what the next mode allows runs only with his yes
-            d = door_targets.refused(d.why + "." + APPROVAL_NOTE.format(sha=sha) + FULL_NOTE.format(host=full_host),
-                                     target=d.target)
+            d = door_targets.refused(d.why + "." + APPROVAL_NOTE.format(sha=sha) +
+                                     (FULL_NOTE.format(host=full_host) if full_host else ""), target=d.target)
         elif d.kind == "own":
             # D25: a delete of what no agent made through the door, and every AWS delete, is the owner's, by code
             unmade = [key for key in door_providers.deletes(d.plan, self.credential(access, d.target))
@@ -1070,12 +1080,75 @@ class Door:
             return plan["text"]
         hub = GitHub(self, access, plan["repo"])
         if "files" in plan:
-            return hub.commit(plan)
+            out = hub.commit(plan)
+            self.keep_objects(plan, out)
+            return out
         if "read" in plan:
             return hub.read(plan["read"], access)
         if "workflow" in plan:
-            return hub.dispatch(plan["workflow"], plan["inputs"], wait=bool(plan.get("wait")))
+            out = hub.dispatch(plan["workflow"], plan["inputs"], wait=bool(plan.get("wait")))
+            if plan.get("pruned"):          # the run passed: what it pruned is no longer waiting
+                self.prune_done(plan["repo"], plan["pruned"])
+            return out
         raise Refused("the door cannot run this")
+
+    def keep_objects(self, plan, out):
+        """What a GitOps commit through the door removed and added (door_targets.commit_objects), once it is made. A
+        removed object can then prune as the agent's own call (DevOps plan X3), and an added one is made, so that its
+        later prune is a rule call. An object that a later commit adds again is no longer removed."""
+        objects = plan.get("objects") or {}
+        removed, added = objects.get("removed") or [], objects.get("added") or []
+        if not removed and not added:
+            return
+        target = "gitops:" + plan["repo"]
+        for key in added:
+            self.keep_made(target, "object:" + key)
+        commit = out.rsplit(" ", 1)[-1] if isinstance(out, str) else ""
+        with self.lock:
+            held = read_json(REMOVED_FILE, {})
+            mine = held.setdefault(plan["repo"].lower(), {})
+            for key in added:
+                mine.pop(key, None)
+            for key in removed:
+                mine[key] = {"commit": commit, "at": round(now())}
+            write_json(REMOVED_FILE, held)
+
+    def removed_object(self, repo, key):
+        "True when a commit through the door removed this object within REMOVED_DAYS (keep_objects)."
+        entry = (read_json(REMOVED_FILE, {}).get(repo.lower()) or {}).get(key)
+        return isinstance(entry, dict) and now() - (entry.get("at") or 0) < REMOVED_DAYS * 86400
+
+    def prune_done(self, repo, keys):
+        "The objects of a prune whose run passed: no longer waiting for one."
+        with self.lock:
+            held = read_json(REMOVED_FILE, {})
+            mine = held.get(repo.lower()) or {}
+            for key in keys:
+                mine.pop(key, None)
+            write_json(REMOVED_FILE, held)
+
+    def prune_listing(self, access, agent, target, app):
+        """What Argo CD wants to prune in one app now, for a sync with prune (DevOps plan X3): the door dispatches the
+        repository's caller with prune=list, waits for that run, and reads its line LISTING_MARK from the logs of its
+        jobs (door_targets.listing). None for a call that decide refuses anyway; a str says why there is no listing.
+        That run is on a shared runner, so its listing is only a list to check: the door decides with its own record,
+        and the prune run reads Argo CD again before it deletes anything."""
+        repo = target.split(":", 1)[1]
+        me = (access.get("agents") or {}).get(agent) or {}
+        entry = door_targets.repo_entry(me, repo, ("gitops",)) if door_targets.REPO.fullmatch(repo) else None
+        if not entry or not entry.get("sync") or not door_targets.APP_NAME.fullmatch(str(app)):
+            return None
+        hub = GitHub(self, access, repo)
+        try:
+            hub.dispatch(entry["sync"], {"app": app, "prune": "list"}, wait=True)
+            found = door_targets.listing(hub.run_text(hub.run_id), app)
+        except (Refused, door_providers.Stop) as e:
+            found = f"the listing run failed: {e}"
+        self.record.add(caller=agent, target=target, action="prune-list", kind="read",
+                        outcome="done" if isinstance(found, dict) else "failed",
+                        why=(f"Argo CD wants to prune {len(found['prune'])} objects in {app}" if isinstance(found, dict)
+                             else found)[:300])
+        return found
 
     def timer_off(self, host, name):
         """After a script or a run, which armed the host's rollback timer first: a host that answers the door now did not
@@ -1093,7 +1166,7 @@ class Door:
                 f"firewall, the network, sshd and Tailscale back in 600 seconds, unless `ops {name} timer cancel` comes "
                 f"first")
 
-    def lookups(self, access, target, agent=None):
+    def lookups(self, access, target, agent=None, listing=None):
         """The facts that the code checks of a commit or a deploy read from outside, each asked only when a check
         needs it: a file at the head of the branch that the commit goes to, the npm registry, a release run, the
         state of the default branch, a repository's default branch."""
@@ -1109,6 +1182,9 @@ class Door:
         branch = entry.get("branch") if isinstance(entry, dict) else None
         facts.update(base_file=lambda path: hub.file_at_head(path, branch), image_made=hub.image_made,
                      deploy_facts=hub.deploy_facts, npm=self.npm, schema_ok=lambda path, data: True)
+        if kind == "gitops":    # a sync with prune (DevOps plan X3): the listing, and the door's own record
+            facts.update(prune_listing=listing, removed_object=lambda key: self.removed_object(repo, key),
+                         made_object=lambda key: self.made(target, "object:" + key))
         box = self.box or (box_call if os.path.exists(P(RENDER_SOCKET)) else None)
         # A door with no render box gives no render, and the rules that need none stay. But only for a repository that
         # this door never rendered: where it did, templates changed under the render, and the rules that read lines
@@ -1551,6 +1627,7 @@ class GitHub:
     def __init__(self, door, access, repo):
         self.door, self.access, self.repo = door, access, repo
         self.owner = repo.split("/")[0]
+        self.run_id = None          # the run that this object's last waited dispatch started
 
     def token(self):
         got = self.TOKENS.get(self.owner.lower())
@@ -1667,6 +1744,7 @@ class GitHub:
         run = answer.get("workflow_run_id") if status == 200 and isinstance(answer, dict) else None
         if not isinstance(run, int) or isinstance(run, bool) or run <= 0:
             run = self.find_run(workflow, branch, started)
+        self.run_id = run
         return self.wait_run(workflow, run)
 
     def find_run(self, workflow, branch, started):
@@ -1714,6 +1792,29 @@ class GitHub:
                 raise door_providers.Stop(f"{workflow} of {self.repo}: run {run} did not end within "
                                           f"{RUN_WAIT // 60} minutes, so the door cannot say that it passed ({url})")
             time.sleep(RUN_POLL)
+
+    def run_text(self, run):
+        "The logs of a run's jobs, one after the other: what a listing run printed (Door.prune_listing)."
+        status, got = self.call("GET", f"/repos/{self.repo}/actions/runs/{run}/jobs?per_page=50")
+        jobs = [j for j in ((got or {}).get("jobs") or [] if status == 200 and isinstance(got, dict) else [])
+                if isinstance(j, dict) and isinstance(j.get("id"), int) and not isinstance(j.get("id"), bool)]
+        if not jobs:
+            raise door_providers.Stop(f"GitHub gave no jobs of run {run} ({status})")
+        return "\n".join(self.job_log(job["id"]) for job in jobs)
+
+    def job_log(self, job):
+        """The log of one job, as text, LOG_MOST bytes at most. GitHub answers with a redirect to an address that needs
+        no token, and the door follows it with no token: the App's token never goes to another host."""
+        status, location = http_redirect("GET", f"{self.API}/repos/{self.repo}/actions/jobs/{job}/logs", {
+            "Authorization": "Bearer " + self.token(), "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"})
+        if status not in (301, 302, 303, 307, 308) or not isinstance(location, str) or \
+                not location.startswith("https://"):
+            raise door_providers.Stop(f"GitHub gave no log of job {job} ({status})")
+        status, raw = http_raw("GET", location, {}, LOG_MOST)
+        if status != 200:
+            raise door_providers.Stop(f"the log of job {job} could not be read ({status})")
+        return raw.decode("utf-8", "replace")
 
     def failed_steps(self, run):
         "The jobs and steps of a run that failed, as words for the answer: ', in <job> / <step>' for three at most."
@@ -1800,6 +1901,26 @@ def token_permissions(level, held):
     if held.get("issues") in ("read", "write"):
         asked["issues"] = "write" if level != "read" and held["issues"] == "write" else "read"
     return asked
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    "A redirect comes back as the answer, and is not followed."
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def http_redirect(method, url, headers, timeout=30):
+    """(status, the Location of a redirect, or the answer's text): one call that never follows a redirect, so that its
+    headers, a token among them, reach this host alone."""
+    req = urllib.request.Request(url, method=method, headers=dict(headers, **{"User-Agent": "fleet-door"}))
+    try:
+        with urllib.request.build_opener(NoRedirect).open(req, timeout=timeout) as r:
+            return r.status, r.read(64 * 1024).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers.get("Location") if e.code in (301, 302, 303, 307, 308) else ""
+    except (urllib.error.URLError, OSError) as e:
+        return 599, str(e)
 
 
 def http_raw(method, url, headers, limit, timeout=120):
