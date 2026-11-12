@@ -2686,6 +2686,8 @@ def swap_value(conf, uid, host, port, name, form):
     try:
         value = check_value(LocalStore(conf).item(SECRET_REF.fullmatch(entry["login"]).group(1))["value"])["password"]
     except Refused:
+        # Also when the store has the item no more: at the end of the last grant of a machine the hub takes the value
+        # back (withdraw), and a grant that is given again brings it back (deposit). In between, there is no key.
         return {"ok": False, "code": "refused"}
     if re.search(r"[\x00-\x08\x0a-\x1f\x7f]", value):      # a line end or another control character: no header value
         return {"ok": False, "code": "refused"}

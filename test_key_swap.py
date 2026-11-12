@@ -1477,6 +1477,16 @@ class Helper(unittest.TestCase):
                 self.connects.append(conn.recv(4096).split(b"\r\n")[0].decode())
                 conn.sendall(self.answer)
 
+    def proxy_ends(self):
+        """The stand-in proxy goes away. On Linux a close alone does not end an accept that waits, and the port
+        would still take a connection: a shutdown ends it. On macOS a shutdown of a listener is an error, and the
+        close is enough."""
+        try:
+            self.listener.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.listener.close()
+
     def test_the_variables_name_the_proxy_and_the_ca_files_of_this_agents_sites(self):
         env = fleet.swap_variables({"runtime": "claude"}, self.swap, ["SHOP_API_KEY"])
         bundle, sites = (str(self.dir / "home" / name) for name in fleet.SWAP_CA_FILES)
@@ -1508,7 +1518,9 @@ class Helper(unittest.TestCase):
         self.answer = b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
         with self.assertRaises(fleet.Refused):
             fleet.swap_variables({"runtime": "claude"}, self.swap, held)
-        self.listener.close()
+        self.answer = b"HTTP/1.1 200 Connection established\r\n\r\n"         # a good answer again, and then no proxy
+        self.assertEqual(fleet.swap_variables({"runtime": "claude"}, self.swap, held)["HTTPS_PROXY"], self.swap["proxy"])
+        self.proxy_ends()
         with self.assertRaises(fleet.Refused):
             fleet.swap_variables({"runtime": "claude"}, self.swap, held)
 
@@ -1548,7 +1560,7 @@ class Helper(unittest.TestCase):
         self.assertEqual((env["SHOP_API_KEY"], env["OTHER_KEY"], env["HTTPS_PROXY"]), (PLACE, "sk-example-plain-value", self.swap["proxy"]))
         self.assertIn("openai.com", env["NO_PROXY"])
         self.assertEqual(said, "")
-        self.listener.close()                                               # the proxy does not answer
+        self.proxy_ends()                                                   # the proxy does not answer
         env, said = self.read(done)
         self.assertEqual(env, {"OTHER_KEY": "sk-example-plain-value"})      # no placeholder and no proxy variable
         self.assertIn("the vault's proxy is not ready for SHOP_API_KEY", said)
