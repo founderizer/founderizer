@@ -108,9 +108,9 @@ ACCESS = {
 def load_tests(loader, _tests, _pattern):
     return unittest.TestSuite(cls(name) for cls in (Access, Callers, RuleArguments, Refusals, OwnCalls, Order,
                                                     HubLine, HubRights, GitHubFacts, Vault, AuditReplay, AWSRole,
-                                                    OwnerYes, ScriptsAndRuns, FullAccess, Routes, MadeDeletes, HostPath,
-                                                    AppSettingsPath, ScriptPath, HostUpdates, KeyCardAccount, Workflows,
-                                                    RunnerNew, Probe, CallerGone)
+                                                    OwnerYes, CallHash, ScriptsAndRuns, FullAccess, Routes, MadeDeletes,
+                                                    HostPath, AppSettingsPath, ScriptPath, HostUpdates, KeyCardAccount,
+                                                    Workflows, RunnerNew, Probe, CallerGone)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -2188,6 +2188,55 @@ def call_hash(target, op, content, *args):
     return hashlib.sha256(json.dumps([target, op, list(args)], sort_keys=True).encode() + content).hexdigest()
 
 
+# The examples of a call's hash that both sides are tested with: the door (door.call_hash) and the owner's Mac, which
+# computes the hash of the script that its card shows and signs only when it is the hash that the hub gave
+# (DoorCall.hash in app/Sources/FleetCore/DoorCall.swift). One JSON line for each: [target, action, arguments, content
+# as text, hash]. This is the one definition: app/Tests/FleetCoreTests/DoorCallTests.swift holds a copy of these lines
+# between two marks, and CallHash fails when the copy differs.
+CALL_HASHES = r'''
+["web-1", "run", [], "id\n", "166f72a0e75ff9b58dd452f10cc9d93600ef1d33e15f1c38fe2071cafd688d70"]
+["web-1", "run", [], "id", "6f32c97d1968a553afdbc5788ed7dee1c872feb1a740083e1ef11a1c44a22a23"]
+["web-1", "run", [], "", "812f281547e30beda0ec6ce09ebcf4a10fe6859394d4390f1072b07d66973410"]
+["db-1.example.internal", "run", [], "#!/bin/bash\nset -euo pipefail\nflock /run/lock/app.lock \\\n\tcp -a \"/srv/app/uploads\" /root/uploads-$(date +%F)\n", "195c09ac81728cad73a7a9f54af8c3939a2cb56f5b972300575279311b8c6d87"]
+["web-1", "run", [], "echo 'caf\u00e9 \u00fc\u00f1 \u4e2d\u6587 \ud83d\ude00'\n", "cfd77784479f00274b0ad2154e69062aeaf395cd206386ee95ca593c96282161"]
+["web-1", "restart", ["nginx"], "", "caef4b357ff328666c9390e2b13166e80ad10a97710c1fd8bb5fdcfc8b30b990"]
+["hetzner:one", "server-delete", ["shop \"old\" \\ 1", "caf\u00e9", "\ud83d\ude00 \u007f"], "", "0428db94f078234bf77c8e1b7b416f01560359ff7573ade4db44ae96a2fb7cd8"]
+["web-1", "file", ["/etc/app/a b.conf", "0644"], "key = \"value\"\n", "1ffa5dbd2fa34e5d48087a042d7dc3e5d0d292bf1119d39ecfee0f343e3da241"]
+'''.strip().split("\n")
+
+
+class CallHash(unittest.TestCase):
+    """One definition of a call's hash for the door and for the owner's Mac (review point 5.6 of 11 November 2026:
+    the Mac signs a hash only when it is the hash of what its card shows)."""
+
+    def test_the_door_gives_the_hash_of_each_example(self):
+        self.assertGreaterEqual(len(CALL_HASHES), 8)
+        for line in CALL_HASHES:
+            target, action, args, content, sha = json.loads(line)
+            with self.subTest(line=line):
+                self.assertEqual(door.call_hash(target, action, args, content.encode()), sha)
+        # the first one by hand, with nothing of json.dumps: the JSON of the list, then the script's bytes
+        self.assertEqual(hashlib.sha256(b'["web-1", "run", []]' + b"id\n").hexdigest(), json.loads(CALL_HASHES[0])[4])
+        self.assertEqual(door.call_hash("web-1", "run", []), door.call_hash("web-1", "run", [], b""))
+
+    def test_the_door_s_call_gives_that_hash_with_its_refusal(self):
+        """The refusal of a run names door.call_hash of the call, so the examples are what an agent gets."""
+        import inspect
+        self.assertIn("sha = call_hash(target, op, args, content)", inspect.getsource(door.Door.call))
+
+    def test_the_app_s_tests_hold_the_same_examples(self):
+        """The Swift tests of DoorCall.hash read their examples from a copy of the lines above. A clone with no app
+        folder (the published hub) has no copy to compare."""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app", "Tests", "FleetCoreTests",
+                            "DoorCallTests.swift")
+        if not os.path.isdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "app", "Tests")):
+            self.skipTest("this clone has no app folder")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        copy = text.split("// call-hashes:begin\n")[1].split("// call-hashes:end")[0]
+        self.assertEqual([line.strip() for line in copy.strip().split("\n")], CALL_HASHES)
+
+
 class Signed:
     """The owner's keys in the door's file, and his signed yeses as the hub serves them (OwnerYes)."""
 
@@ -2388,6 +2437,135 @@ class FullAccess(Signed, DoorCase):
         self.mode("web-1", at=t)
         self.assertEqual(self.run_on()["kind"], "own")
 
+    def serve(self, *statements, signature=None):
+        """The hub serves these statements, and the door refreshes one time."""
+        self.modes = [{"statement": said, "signature": signature or self.sign(said)} for said in statements]
+        door.fetch_approvals(self.door)
+
+    def test_a_signed_auto_ends_full_access_at_the_next_refresh_and_no_older_full_comes_back(self):
+        """The row of a server (door-modes proposal, E1; the owner's "Yes, as shown" of 11 November 2026) signs Auto
+        as the card signs Full access. The hub serves the newest statement of each host: the door takes the Auto at
+        its next refresh, and no Full access from before it comes back, whatever the hub serves afterwards and in
+        whatever order: not the one that the Auto ended, not one between the two, and not one of the Auto's own
+        second."""
+        t = round(time.time())
+        full = self.mode("web-1", at=t - 100)
+        self.assertEqual((self.run_on()["kind"], self.door.modes_said()["web-1"]),
+                         ("own", {"mode": "full", "at": t - 100}))
+        auto = self.statement("web-1", "auto", at=t - 50)
+        signature = self.sign(auto)
+        self.modes = [{"statement": auto, "signature": signature}]
+        self.assertEqual(self.run_on()["kind"], "own")                  # the door has not asked the hub yet
+        door.fetch_approvals(self.door)                                 # its next refresh, each minute
+        got = self.run_on()
+        self.assertEqual((got["kind"], got["full_access"], got["route"]), ("refused", "web-1", "yes"), got)
+        kept = self.kept()
+        self.assertEqual(kept, {"mode": "auto", "at": t - 50, "statement": auto, "signature": signature,
+                                "host_key": KEY})
+        self.assertEqual(self.door.modes_said()["web-1"], {"mode": "auto", "at": t - 50})
+        between, same = self.statement("web-1", at=t - 51), self.statement("web-1", at=t - 50)
+        for old in (full, between, same):
+            for served in ((old,), (old, auto), (auto, old), (old, old)):
+                with self.subTest(old=old, served=served):
+                    self.serve(*served)
+                    self.assertEqual((self.run_on()["kind"], self.kept()), ("refused", kept))
+        kept = self.kept()
+        self.serve()                                                    # the hub serves none: the door keeps its own
+        self.assertEqual(self.kept(), kept)
+        fresh = door.Door(conf=self.door.conf, http=self.door.http, ssh=self.door.ssh)       # the door starts again
+        self.serve(full, between, same)
+        self.assertFalse(fresh.full_access(fresh.access(), "web-1", "ops-one"))
+        self.assertEqual(self.kept(), kept)
+        self.mode("web-1", at=t - 49)                                   # only a newer statement of the owner changes it
+        self.assertEqual(self.run_on()["kind"], "own")
+        self.mode("web-1", "auto", at=t - 48)
+        self.assertEqual(self.run_on()["kind"], "refused")
+        self.assertEqual(self.run_on("web-2", TWO)["kind"], "refused")  # no other host got a mode from these
+
+    def test_a_signed_auto_far_down_the_hub_s_list_still_ends_full_access(self):
+        """The door read the first 200 statements of the hub's answer. The hub serves one for each server that an
+        agent holds, in the order of their names, so on a large fleet the signed Auto of a late name was never read
+        and Full access stood. The door reads MODES_READ of them, and what is no statement costs it no signature
+        check."""
+        t = round(time.time())
+        self.mode("web-1", at=t - 100)
+        self.assertEqual(self.run_on()["kind"], "own")
+        other = self.statement("web-2", at=t - 100)
+        filler = [{"statement": other, "signature": "c2ln"}] * 300 + [None, 5, "text", {"statement": 5}] * 25
+        auto = self.statement("web-1", "auto", at=t - 50)
+        self.modes = filler + [{"statement": auto, "signature": self.sign(auto)}]
+        self.assertGreater(len(self.modes), 200)
+        door.fetch_approvals(self.door)
+        self.assertEqual((self.run_on()["kind"], self.kept()["mode"]), ("refused", "auto"))
+        self.assertGreaterEqual(door.MODES_READ, 2000)
+
+    def test_an_auto_that_the_owner_key_did_not_sign_ends_no_full_access(self):
+        """The hub carries a statement and checks no signature. An Auto that the door does not take leaves Full
+        access as it was, and the door's own word (modes_said, which the hub reads with the record) says so."""
+        from test_vault_central import owner_point
+        t = round(time.time())
+        self.mode("web-1", at=t - 100)
+        phone = 0x0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+        cert = vault.canonical({"v": 1, "kind": "owner-device", "fleet": "fleet-1", "device": "iphone",
+                                "key": owner_point(phone), "at": t})
+        self.door.http = lambda method, url, headers, body: \
+            (200, {"approvals": [], "devices": [{"device": "iphone", "statement": cert, "signature": self.sign(cert)}],
+                   "modes": self.modes}) if url.endswith("/door/approvals") else (404, {})
+        auto = self.statement("web-1", "auto", at=t - 50)
+        for said, signature in ((auto, self.sign(auto, phone)), (auto, self.sign(auto.replace("auto", "full"))),
+                                (auto, "c2ln"), (auto + " ", self.sign(auto + " ")),
+                                (self.statement("web-1", "auto", at=t - 50, fleet="fleet-2"), None),
+                                (self.statement("web-1", "auto", at=t + 3600), None),
+                                (self.statement("web-1", "auto", at=t - 100), None),
+                                (self.statement("web-1", "off", at=t - 50), None),
+                                (auto.replace(str(t - 50), f"{t - 50}.0"), None),
+                                (auto.replace(str(t - 50), "true"), None)):
+            with self.subTest(said=said, signature=signature):
+                self.serve(said, signature=signature or self.sign(said))
+                self.assertEqual((self.run_on()["kind"], self.door.modes_said()["web-1"]),
+                                 ("own", {"mode": "full", "at": t - 100}))
+        self.serve(auto)
+        self.assertEqual((self.run_on()["kind"], self.door.modes_said()["web-1"]),
+                         ("refused", {"mode": "auto", "at": t - 50}))
+
+    def test_the_first_seen_rule_holds_for_a_signed_auto_too(self):
+        """mode_floor: the door takes no statement from before it first saw a server under its name, an Auto as
+        little as a Full access. Were an old Auto taken, its time would be the entry's, and a Full access between
+        that time and the door's first sight of the server would be newer than it. And the time of a signed Auto
+        that the door did take stays the floor of the name through a new host key and through the server's leave."""
+        t = round(time.time())
+        self.door.access()
+        first = self.kept()
+        self.assertEqual((first["mode"], "statement" in first, self.door.modes_said()["web-1"]),
+                         ("auto", False, {"mode": "auto", "at": None}))
+        old_auto = self.statement("web-1", "auto", at=t - door.MODE_SKEW - 60)
+        old_full = self.statement("web-1", at=t - door.MODE_SKEW - 30)             # newer than that Auto
+        for served in ((old_auto,), (old_auto, old_full), (old_full, old_auto)):
+            with self.subTest(served=served):
+                self.serve(*served)
+                self.assertEqual((self.run_on()["kind"], self.kept()), ("refused", first))
+        auto = self.statement("web-1", "auto", at=t - 20)       # the Mac's clock a little behind the door's: taken
+        self.serve(old_auto, old_full, auto)
+        self.assertEqual((self.kept()["statement"], self.door.modes_said()["web-1"]),
+                         (auto, {"mode": "auto", "at": t - 20}))
+        self.serve(old_full, self.statement("web-1", at=t - 30), self.statement("web-1", at=t - 20))
+        self.assertEqual((self.run_on()["kind"], self.kept()["statement"]), ("refused", auto))
+        # another server under the name: the signed Auto's time stays the floor, and so through its leave and return
+        self.file_with(lambda d: d["hosts"]["web-1"].update(host_key=KEY2))
+        self.serve(old_full, auto, self.statement("web-1", at=t - 20))
+        kept = self.kept()
+        self.assertEqual((kept["mode"], kept["host_key"], kept["after"], "statement" in kept), ("auto", KEY2, t - 20, False))
+        self.file_with(lambda d: (d["hosts"].pop("web-1"), d["agents"]["ops-one"]["servers"].pop("web-1")))
+        self.serve(self.statement("web-1", at=t - 20))
+        self.assertEqual(self.kept(), {"mode": "ended", "at": kept["at"], "after": t - 20})
+        self.assertNotIn("web-1", self.door.modes_said())
+        self.file_with(lambda d: (d["hosts"].update({"web-1": dict(ACCESS["hosts"]["web-1"], host_key=KEY)}),
+                                  d["agents"]["ops-one"]["servers"].update({"web-1": "fix"})))
+        self.serve(old_full, auto, self.statement("web-1", at=t - 20))
+        self.assertEqual((self.run_on()["kind"], self.kept()["mode"], self.kept()["after"]), ("refused", "auto", t - 20))
+        self.serve(self.statement("web-1", at=t - 19))                              # the owner's newer statement
+        self.assertEqual(self.run_on()["kind"], "own")
+
     def test_only_the_owner_key_signs_a_mode_of_this_fleet_s_host(self):
         from test_vault_central import owner_point
         phone = 0x0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
@@ -2420,9 +2598,19 @@ class FullAccess(Signed, DoorCase):
                 self.assertEqual(got["kind"], "refused")
                 self.assertNotIn("full_access", got)
         self.assertEqual(self.run_on("web-2", TWO)["kind"], "own")     # its own business's agent at Fix
+        # the door's own word says Full access only where full_access says it for an agent, so the two agree
+        said = self.door.modes_said()
+        self.assertEqual({host: said[host] for host in ("ci-1", "fleet-1", "site-1", "logs-1")},
+                         {host: {"mode": "auto", "at": None} for host in ("ci-1", "fleet-1", "site-1", "logs-1")})
+        self.assertEqual(said["web-2"]["mode"], "full")
+        for host, word in said.items():
+            holders = [a for a, me in self.door.access()["agents"].items() if (me.get("servers") or {}).get(host) == "fix"]
+            self.assertEqual(word["mode"] == "full",
+                             any(self.door.full_access(self.door.access(), host, a) for a in holders), host)
         data = json.loads(json.dumps(door.read_json(door.ACCESS_FILE, {})))
         data["hosts"]["web-2"]["mode"] = "rule-only"                    # a mode statement never lifts Patch only
         self.write_access(data)
+        self.assertEqual(self.door.modes_said()["web-2"], {"mode": "auto", "at": None})
         self.assertEqual(self.run_on("web-2", TWO)["why"],
                          "web-2 is rule-only: only rule forms run there, and no file install")
         self.assertFalse(self.door.full_access(self.door.access(), "web-2", "ops-two"))
@@ -2620,9 +2808,11 @@ class Routes(Served):
         call = call_hash("web-1", "run", SCRIPT)
         self.assertEqual(self.route("web-1", "run", "--content", path),
                          f"route: the owner's yes. Ask your requester with ask_my_requester and this call hash, "
-                         f"{call}: the manager raises a Needs-you item with door_call {call} and door_host web-1. After "
-                         f"the owner's Run it once, this same call runs once; after Full access on web-1, it and every "
-                         f"later root script there run. Then send this same call again.")
+                         f"{call}: the manager raises a Needs-you item with door_call {call} and door_host web-1. Put "
+                         f"the whole script in your question, character for character: the manager gives it as "
+                         f"door_script, and the owner's Mac signs Run it once only for the script that its card shows. "
+                         f"After the owner's Run it once, this same call runs once; after Full access on web-1, it and "
+                         f"every later root script there run. Then send this same call again.")
         self.assertEqual(ops.route_line({"route": "yes", "call": call}, "hetzner:one"),        # a delete of D25
                          f"route: the owner's yes. Ask your requester with ask_my_requester and this call hash, "
                          f"{call}: the manager raises a Needs-you item with door_call {call}, and after the owner's "

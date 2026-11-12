@@ -1259,6 +1259,9 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "door_calls",        # DevOps plan 5.4: the owner's signed yes lets one door call through, once
                "door_modes",        # the owner, 11 November 2026 ("Yes, as shown"): the door card's Full access on
                                     # <server>, his signed mode of that server, which the Mac signs
+               "door_mode_set",     # the owner, 11 November 2026 ("Yes, as shown", the row "Managed by <agent>"):
+                                    # his signed mode of a server, Auto or Full access, with no Needs-you item
+                                    # (POST /ui/door/mode), and each server's mode in /ui/servers "apps"
                "recovery_copy",     # DevOps plan V12: a phone keeps a copy of the recovery code, sealed to its key
                "server_ai_choice",  # the owner, 1 November 2026: "why are we asking for chatgpt AND claude login"
                "manager_server",    # the owner, 4 November 2026: a new fleet's manager gets its server in its setup
@@ -1765,6 +1768,158 @@ def need_words(title, why, todo="", options=(), details=""):
             return (f"Say {code.group(0)} in plain words: the owner reads names and what a thing is about, never a "
                     f"code. Name the task, the question or the agent instead.")
     return None
+
+
+DOOR_SCRIPT_CHARS = 4000        # characters of the script of a door card: what the card shows whole, as details
+DOOR_CARD_TITLE = "Run one root script on {host}?"         # the title of the door's card, as the owner approved it
+# The widest run of spaces in a script, and the most blank lines in a row: more of either moves a command away from
+# the words before it (DoorCall.padded).
+DOOR_SCRIPT_GAP = 32
+DOOR_SCRIPT_BLANK = 2
+DOOR_SCRIPT_LINES = 200         # lines of a script that a card shows: more is a file for the agent to install, not a card
+
+
+def door_call_hash(target, action, args, content=b""):
+    """The hash that the door gives with a refusal that the owner's yes lifts (door.call_hash, which the hub does
+    not import: the door is another program on another machine). test_server_access holds both to the examples of
+    test_door.CALL_HASHES."""
+    return hashlib.sha256(json.dumps([target, action, args], sort_keys=True).encode() + content).hexdigest()
+
+
+def door_script_hidden(script):
+    """The first character of a script that the owner's Mac does not sign for, as U+XXXX, or None. A script is
+    printable ASCII and line feeds. Every other character can change what runs without changing what he reads: one
+    that draws nothing (a zero-width mark, a variation selector, a filler), one that draws as a blank or as another
+    letter or quote, one of a right-to-left script, which reorders the line on screen, and a tab, which the card
+    draws to a tab stop: as no gap at all, or as a new row. The reviews of 12 November 2026 found 263 characters
+    that draw nothing outside the control and format categories, so the rule is what is allowed (DoorCall.hidden in
+    the app, which decides)."""
+    for ch in script:
+        if ch != "\n" and not " " <= ch <= "~":
+            return f"U+{ord(ch):04X}"
+    return None
+
+
+def door_script_padded(script):
+    """True when a script is padded: a run of more than DOOR_SCRIPT_GAP spaces, or more than DOOR_SCRIPT_BLANK blank
+    lines in a row. The card wraps a script's long lines, so every character is on screen; padding would still put
+    a command far from the line that it belongs to (DoorCall.padded)."""
+    lines = script.split("\n")
+    if script.endswith("\n"):
+        lines.pop()
+    blank = 0
+    for line in lines:
+        if " " * (DOOR_SCRIPT_GAP + 1) in line:
+            return True
+        blank = blank + 1 if not line.strip(" ") else 0
+        if blank > DOOR_SCRIPT_BLANK:
+            return True
+    return False
+
+
+def door_script_details(script):
+    """The script as the card's details: one code block, which the owner's app draws character for character. The
+    app's own parser of that text must give back exactly this script, which the owner's Mac checks before it signs
+    (DoorCall.shown in the app)."""
+    return "```\n" + script + ("" if script.endswith("\n") else "\n") + "```"
+
+
+def door_script_card(title, host, call, script, words=()):
+    """(script, details) of a door card that carries its script (raise_needs_you door_script, review point 5.6 of 11
+    November 2026), or a ToolError that says what to change. The script is the content of the run that the door
+    refused with this call hash: the hub computes the hash of [host, "run", []] and the script's bytes as the door
+    does, and takes the script with or without its last line feed, whichever is the one of the hash, because an
+    agent's words lose that byte easily. The card then shows the script and nothing else under Script, and its title
+    names the server of the hash, so that what the owner reads is what his Mac hashes and signs. The rules are the
+    ones of the owner's Mac (DoorCall.checked), which decides: a script that the hub takes and the Mac refuses is a
+    card that he cannot answer with Run it once."""
+    if not isinstance(script, str) or not script.strip():
+        raise ToolError("door_script is the script of the run, as text.")
+    try:
+        script.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ToolError("door_script is not text that can be sent: it holds half of a character.") from None
+    found = next((text for text in (script, script + "\n", script.removesuffix("\n"))
+                  if door_call_hash(host, "run", [], text.encode("utf-8")) == call), None)
+    if found is None:
+        raise ToolError(f"door_script is not the script of door_call on {host}: the hash of this text is not the "
+                        f"one that the door gave. Give the script character for character as the agent sent it "
+                        f"(ask the agent for it again, or for the file), and the door_call and door_host of that "
+                        f"same refusal.")
+    if len(found) > DOOR_SCRIPT_CHARS:
+        raise ToolError(f"door_script is at most {DOOR_SCRIPT_CHARS} characters, because the card shows it whole "
+                        f"and the owner reads it before Run it once. This one has {len(found)}: the agent sends a "
+                        f"shorter script, or the owner sets the server to Full access.")
+    hidden = door_script_hidden(found)
+    if hidden:
+        raise ToolError(f"door_script holds a character that is not plain text ({hidden}). The owner's Mac signs Run "
+                        f"it once only for a script of printable ASCII characters and line feeds, because any other "
+                        f"character can change what runs and not what the owner reads; a tab is drawn to a tab stop, "
+                        f"as no gap or as a new row. The agent sends the script without it, with spaces for tabs.")
+    if len(found.removesuffix("\n").split("\n")) > DOOR_SCRIPT_LINES:
+        raise ToolError(f"door_script is at most {DOOR_SCRIPT_LINES} lines, because the owner reads it whole before "
+                        f"Run it once. The agent sends a shorter script, or the owner sets the server to Full "
+                        f"access.")
+    if door_script_padded(found):
+        raise ToolError(f"door_script has a run of more than {DOOR_SCRIPT_GAP} spaces, or more than "
+                        f"{DOOR_SCRIPT_BLANK} blank lines in a row, which can put a command out of the owner's "
+                        f"sight. The agent sends the script without that padding.")
+    if any(line.strip(" ").startswith("```") for line in found.split("\n")):
+        raise ToolError("A line of door_script starts with ```, which ends the card's code block: the card would "
+                        "not show the whole script. The agent sends the script without such a line.")
+    if any("`" in text for text in words):
+        raise ToolError("why and what_to_do of a card with a door_script hold no backtick: code in the card's own "
+                        "words would stand beside the script as a second script. Say it in plain words.")
+    return found, door_script_details(found)
+
+
+def door_call_known(call):
+    """(target, action) of the call with this hash, out of the door's record that the hub reads each minute (the door
+    writes the hash on each line of a refusal, and has since its first release), or None when the hub holds no such
+    line."""
+    row = q1("SELECT target, action FROM door_record WHERE call=? ORDER BY n DESC LIMIT 1", (call,))
+    return (row["target"], row["action"]) if row else None
+
+
+def door_call_run(call):
+    """The server whose root script (a host's run) this call hash is of, by the door's record, or None."""
+    known = door_call_known(call)
+    return known[0] if known and known[1] == "run" and ":" not in known[0] else None
+
+
+def door_card_fits(call, host):
+    """A ToolError when a door card does not fit the call of its hash, by the door's own record (review of 12
+    November 2026). The owner's Mac computes the hash itself only on the door's card of a run, where it has the
+    server and the script; on every other card with a door_call it signs the hash that the hub gives, and so does a
+    phone on every card. So a card with free words must never carry the hash of a run: a steered manager could ask
+    "Delete the old test volume?" with a root script's hash, which it can compute with no refusal at all. The door's
+    record says what each refused call was, and no agent writes it: the hash of a host's run needs door_host, that
+    host; another call's hash takes no door_host; and a hash that the hub's copy of the record does not hold gets no
+    card. That is so for a refusal that the hub has not read yet (it reads the record at once), and for one that it
+    read before it kept hashes (version 1.125): the agent sends the same call again, and the door's new refusal
+    has the same hash. A fleet with no door has no refusal of a door, so no hash gets a card there: a yes that
+    waited would be served to a door that came within its seven days."""
+    if not (TEAM.get("door") or {}).get("address"):
+        raise ToolError("This fleet has no door, so no call was refused by one: door_call is the call hash that the "
+                        "door gave with its refusal. Leave it out.")
+    known = door_call_known(call)
+    if known is None:
+        DOOR["read_at"] = 0.0           # the record timer reads at its next pass, within seconds
+        raise ToolError("The hub's copy of the door's record holds no refusal with this call hash. The hub reads the "
+                        "record now: raise the item again in a few seconds, with the hash exactly as the door gave "
+                        "it. If the hub says this again, it read that refusal before it kept hashes, or it cannot "
+                        "read the door's record: the agent sends the same call to the door again, and the new "
+                        "refusal has the same hash.")
+    target, action = known
+    is_run = action == "run" and ":" not in target
+    if is_run and host != target:
+        raise ToolError(f"This call hash is of a root script on {target} (the door's record): raise it as the door's "
+                        f"card of that run, with door_host {target} and door_script, the script character for "
+                        f"character. The owner signs a root script only on that card, which shows the script.")
+    if not is_run and host is not None:
+        raise ToolError(f"This call hash is of {target} {action} (the door's record), which is no root script of a "
+                        f"server: leave door_host and door_script out, put the exact command in what_to_do, and "
+                        f"give options whose first one is the yes.")
 
 
 def need_talk(nid):
@@ -2699,6 +2854,9 @@ def migrate():
                   # door-modes proposal, step 4 (the owner's "Yes, as shown", 11 November 2026): the server whose mode
                   # the item's second answer, Full access on <server>, sets with his signed mode statement
                   "door_host": "TEXT",
+                  # review point 5.6 of 11 November 2026: the script of the run that a door card asks for, byte for
+                  # byte, which the owner's Mac hashes itself before it signs Run it once (door_script_card)
+                  "door_script": "TEXT",
                   "github_app": "TEXT",       # plan 13, item 4: the account that the item's first option makes an App in
                   "add_device": "INTEGER",    # plan V12 and 8.3: the item's first option opens the Add device picture
                   "github_key": "TEXT",       # plan 13, item 4: the App owner whose key the item renews (door_renew)
@@ -2714,7 +2872,8 @@ def migrate():
         "owner_device_push": {"seal": "TEXT"},      # sealed_push: the phone's own key for what a ping says, base64
         # plan V12: the phone's own key that the recovery code is sealed to, and its HMAC of the QR's one-time value
         "owner_device_signing": {"recovery_key": "TEXT", "recovery_binding": "TEXT"},
-        "door_record": {"made": "TEXT"},     # new-projects plan N3: what the door's call made, a repository by name
+        # call: the hash of a refused call, which the door writes on its line (door_card_fits)
+        "door_record": {"made": "TEXT", "call": "TEXT"},     # new-projects plan N3: what the door's call made, a repository by name
         "triggers": {"failures": "INTEGER NOT NULL DEFAULT 0", "created_by": "TEXT NOT NULL DEFAULT 'owner'",
                      "responsibility": "INTEGER", "watch": "TEXT"},         # owner API 1.13: a duty's watch
         # the task that open_case opened the case in: a task that opened two carries neither (t_open_case)
@@ -8716,7 +8875,9 @@ def t_raise_needs_you(agent, a):
                         "they press one.")
     if multi and not options:
         raise ToolError("multi needs options: the owner ticks any of them and sends the ones they ticked.")
-    wrong = need_words(title, why, todo, json.loads(options) if options else (), details)
+    # the title of the door's card is the hub's own words with the server's name, however long that name is
+    door_title = isinstance(a.get("door_host"), str) and title == DOOR_CARD_TITLE.format(host=a["door_host"])
+    wrong = need_words("" if door_title else title, why, todo, json.loads(options) if options else (), details)
     if wrong:
         raise ToolError(wrong)
     replaces = None if a.get("replaces") in (None, "") else parse_id(a.get("replaces"), "Needs-you item")
@@ -8731,11 +8892,32 @@ def t_raise_needs_you(agent, a):
         if not any((x.get("servers") or {}).get(door_host) == "fix" for x in agents().values()):
             raise ToolError(f"No agent holds {door_host} at Fix through the door: door_host is the server of the "
                             f"door's refusal, which the agent that asked holds.")
+        if not door_title:      # the owner's Mac signs on this card only when its title names the server
+            raise ToolError(f"The title of the door's card is \"{DOOR_CARD_TITLE.format(host=door_host)}\", word "
+                            f"for word, as the owner approved it: their Mac signs Run it once and Full access only "
+                            f"for the server that the card names.")
         fixed = ["Run it once", f"Full access on {door_host}", "No"]
         if (options is not None and json.loads(options) != fixed) or a.get("multi"):
             raise ToolError(f"An item with a door_host has the three answers of the door's card, in this order: "
                             f"{', '.join(fixed)}. Leave options and multi out.")
         options = check_need_options(fixed)
+    if door_call is not None:       # what the door's own record says that this hash is of, before the card's words
+        door_card_fits(door_call, door_host)
+    door_script = a.get("door_script")
+    if door_host is not None and door_script is None:
+        # review point 5.6: the script on the door's card is the script of the hash, and never the manager's words
+        raise ToolError("An item with a door_host needs door_script: the script of that run, character for character "
+                        "as the agent sent it to the door (ask the agent for it, or for its file). The hub checks "
+                        "that it is the script of door_call, and the card shows that script and nothing else under "
+                        "Script, so leave details out.")
+    if door_script is not None:     # the card shows the script that the hub checked and that the owner's Mac hashes
+        if door_host is None:
+            raise ToolError("door_script is the script of a host's run that the door refused: give it with that "
+                            "run's door_call and door_host.")
+        if details:
+            raise ToolError("An item with a door_script has no details: the card shows the script itself there, "
+                            "under Script. Put what the owner must know in why.")
+        door_script, details = door_script_card(title, door_host, door_call, door_script, (why, todo))
     if door_call is not None and not options:
         raise ToolError("An item with a door_call needs options, and the first one is the yes: the owner's app "
                         "signs only that one, for example [\"Yes, run it once\", \"No\"].")
@@ -8782,14 +8964,14 @@ def t_raise_needs_you(agent, a):
     with LOCK:                  # lane L2: an id that no removed item had (unused_id)
         old = need_replaced(agent, replaces) if replaces else None
         qu = need_question(agent, a.get("question_id"), ignore=old["id"] if old else None)
-        if qu:                  # the asker's own words, which the owner answers: behind Details, with no code
+        if qu and door_script is None:  # the asker's own words, which the owner answers: behind Details, with no code
             details = (details + "\n\n" if details else "") + \
                 f"{shown_role(qu['asker'])}'s question, in its own words: \"{clip(qu['text'], 1000)}\""
         nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,door_host,github_app,"
-                  "add_device,github_key,details,multi) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  "add_device,github_key,details,multi,door_script) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (unused_id("needs"), title, why, todo, now(), agent, options, qu["id"] if qu else None, door_call,
                    door_host, github_app, 1 if add_device else None, github_key, details or None,
-                   1 if multi else None))
+                   1 if multi else None, door_script))
         if old:                 # the discussion goes on under the new item, and the old one leaves Needs you
             q("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
               (f"Replaced by {agent} with a new item after the owner's discussion: {title}", now(), agent, old["id"]))
@@ -24617,7 +24799,17 @@ TOOLS = [
                       "full_access): that server, with the run's door_call. The card is then the door's card, which "
                       "the owner approved: the title \"Run one root script on <server>?\", one or two sentences, the "
                       "script in details, and the three answers Run it once, Full access on <server>, and No, which "
-                      "the hub writes itself. Leave options out."},
+                      "the hub writes itself. Leave options out. The door's record says which call a hash is "
+                      "of: the hash of a host's run needs door_host, that host, and no other hash takes one."},
+        "door_script": {"type": "string", "description": f"With door_host, always: the script of that run, character for "
+                        f"character as the agent sent it to the door, at most {DOOR_SCRIPT_CHARS} characters of "
+                        f"printable ASCII and line feeds (spaces for tabs), in at most {DOOR_SCRIPT_LINES} lines, "
+                        f"with no run of more than {DOOR_SCRIPT_GAP} spaces and at most {DOOR_SCRIPT_BLANK} blank "
+                        f"lines in a row. The card "
+                        f"then shows this script under Script, and nothing else there, so leave details out, and "
+                        f"put no backtick in why and what_to_do. The hub checks that it is the script of door_call, "
+                        f"and the owner's Mac computes that hash again from what its card shows before it signs Run "
+                        f"it once: a card with no door_script, or with another script, gets no signed Run it once."},
         "github_app": {"type": "string", "description": "The GitHub account, an organization or a user, that needs "
                        "a GitHub App of its own, because no App of the door reaches it (the hub tells you when): the "
                        "first option, which the owner presses in Founderizer on their Mac, then makes it with GitHub's "
@@ -32452,7 +32644,16 @@ def app_servers_view(team):
             word = json.loads(row["v"])
             words[row["k"][len("door_host:"):]] = {k: word[k] for k in ("state", "said", "at", "added") if k in word}
     names = sorted(set(held) | {h for h, w in words.items() if w.get("added") is True and h not in machines})
-    return [{"name": h, "holders": held.get(h, []), "door": words.get(h)} for h in names]
+    # owner feature door_mode_set: the mode of the owner's newest signed statement of each server that the hub
+    # carries (auto with no statement), when he signed it, and what the door itself says that it keeps
+    modes, said = door_modes_held(), door_modes_word() or {}
+
+    def door_says(h):
+        word = said.get(h)
+        return word.get("mode") if isinstance(word, dict) and word.get("mode") in DOOR_MODES else None
+    return [{"name": h, "holders": held.get(h, []), "door": words.get(h),
+             "mode": modes[h]["mode"] if h in modes else "auto", "mode_at": modes[h]["at"] if h in modes else None,
+             "mode_door": door_says(h)} for h in names]
 
 
 def hub_tags(status):
@@ -35445,6 +35646,7 @@ def door_sweep(t0=None):
     if DOOR["error"] is not None:
         DOOR["error"] = None
         emit(manager_name(), "say", "[hub] The door answers again.")
+    door_modes_said(answer, t0)
     rows = [e for e in answer.get("entries") or [] if isinstance(e, dict) and isinstance(e.get("n"), int)]
     newest, again = answer.get("last"), next((e for e in rows if e["n"] == last), None) if last else None
     other = again is not None and type(again.get("ts")) in (int, float) and abs(again["ts"] - top["ts"]) > 0.001
@@ -35457,11 +35659,16 @@ def door_sweep(t0=None):
         for e in rows[:DOOR_PAGE]:
             made = e.get("made") if isinstance(e.get("made"), str) and GITHUB_FULL_NAME.fullmatch(
                 str(e.get("made")).lower()) else None
-            DB.execute("INSERT OR IGNORE INTO door_record(n,ts,caller,target,action,kind,outcome,why,made) "
-                       "VALUES(?,?,?,?,?,?,?,?,?)", (base + e["n"], float(e.get("ts") or t0), str(e.get("caller"))[:64],
-                                                     str(e.get("target"))[:120], str(e.get("action"))[:40],
-                                                     str(e.get("kind"))[:16], str(e.get("outcome"))[:16],
-                                                     str(e.get("why") or "")[:300], made))
+            call = e.get("sha256") if isinstance(e.get("sha256"), str) and e.get("kind") == "refused" and \
+                re.fullmatch(r"[0-9a-f]{64}", e["sha256"]) else None
+            if call:            # a line that the hub read before it kept hashes, and reads again (its last one)
+                DB.execute("UPDATE door_record SET call=? WHERE n=? AND call IS NULL AND abs(ts-?)<0.001",
+                           (call, base + e["n"], float(e.get("ts") or t0)))
+            DB.execute("INSERT OR IGNORE INTO door_record(n,ts,caller,target,action,kind,outcome,why,made,call) "
+                       "VALUES(?,?,?,?,?,?,?,?,?,?)", (base + e["n"], float(e.get("ts") or t0), str(e.get("caller"))[:64],
+                                                       str(e.get("target"))[:120], str(e.get("action"))[:40],
+                                                       str(e.get("kind"))[:16], str(e.get("outcome"))[:16],
+                                                       str(e.get("why") or "")[:300], made, call))
     return len(rows)
 
 
@@ -35600,24 +35807,52 @@ def door_call_statement(need, statement):
     return None
 
 
+DOOR_MODES = ("auto", "full")           # door.MODES: Auto, the default, and Full access
+DOOR_MODE_AHEAD = 300                   # seconds that a statement's time may be ahead of the hub's clock, as the door's
+
+
+def door_mode_said(statement):
+    """A door-mode statement as a dict, or None: {v: 1, kind: "door-mode", fleet, host, mode, at} in its canonical
+    form (vault.canonical), with a host's name, a mode of DOOR_MODES and a whole number of seconds. This is the form
+    and nothing more: the hub holds no owner key, so it cannot check the owner's signature and does not try (the door
+    does, against the owner keys of its own root-written access file, door.mode_statement)."""
+    try:
+        said = json.loads(statement)
+    except (ValueError, TypeError, RecursionError):
+        return None
+    if not isinstance(said, dict) or set(said) != {"v", "kind", "fleet", "host", "mode", "at"} or \
+            json.dumps(said, sort_keys=True, separators=(",", ":"), ensure_ascii=False) != statement:
+        return None
+    if type(said["v"]) is not int or said["v"] != 1 or said["kind"] != "door-mode" or \
+            not isinstance(said["fleet"], str) or not isinstance(said["host"], str) or \
+            not SERVER_HOST.fullmatch(said["host"]) or said["mode"] not in DOOR_MODES or type(said["at"]) is not int:
+        return None
+    return said
+
+
 def door_mode_statement(need, statement):
     """Why the owner's signed Full access does not fit this Needs-you item, or None (door-modes proposal, step 4): it
-    is {v: 1, kind: "door-mode", fleet, host, mode: "full", at} in its canonical form, for the item's door_host. The
-    door checks the signature against the owner keys of its own access file, so the hub can hold it back and forge
-    none."""
+    is {v: 1, kind: "door-mode", fleet, host, mode: "full", at} in its canonical form, for the item's door_host, of
+    this fleet, not from the future, and newer than the newest mode of that server that the hub carries, as the
+    server's own row requires (door_mode_set): a statement that the door would not take must not take the place of
+    one that it would. The door checks the signature against the owner keys of its own access file, so the hub can
+    hold it back and forge none."""
     host = need["door_host"] if "door_host" in need.keys() else None
     if not host:
         return "this Needs-you item names no server whose mode it sets"
-    try:
-        said = json.loads(statement)
-    except (ValueError, RecursionError):
-        said = None
-    if not isinstance(said, dict) or set(said) != {"v", "kind", "fleet", "host", "mode", "at"} or \
-            json.dumps(said, sort_keys=True, separators=(",", ":"), ensure_ascii=False) != statement:
+    said = door_mode_said(statement)
+    if said is None:
         return "the statement is not a door-mode statement in its canonical form"
-    if said["v"] != 1 or said["kind"] != "door-mode" or said["host"] != host or said["mode"] != "full" or \
-            type(said["at"]) is not int:
+    if said["host"] != host or said["mode"] != "full":
         return "the statement is not Full access on this item's server"
+    if said["fleet"] != fleet_id():
+        return "the statement is not of this fleet"
+    if said["at"] > now() + DOOR_MODE_AHEAD:        # the door takes none from the future, and it would stand later
+        return "the statement's time is in the future by the hub's clock: check this Mac's clock, and answer again"
+    held = door_modes_held().get(host)
+    if held and said["at"] <= held["at"]:
+        return (f"the hub carries a mode of {host} that is as new as this statement or newer, and the door takes only "
+                f"a newer one: answer again")
     return None
 
 
@@ -35631,30 +35866,139 @@ def approval_kind(approval):
     return said.get("kind") if isinstance(said, dict) else None
 
 
+def door_modes_held():
+    """{host: {statement, signature, mode, at, received}}: the owner's newest signed mode of each server that the
+    hub carries, whichever way it came: as the second answer of the door's card (a Needs-you item's approval) or
+    from the server's own row (POST /ui/door/mode, kept as door_mode:<host>). The newest is the one with the latest
+    time in the statement, and of two with the same time the one that the hub got first, because the door takes
+    only a statement that is newer than the one it keeps (door.mode_floor). A statement of any age stands, because
+    a mode stands. The hub checked the form of each and the signature of none."""
+    found = []
+    for r in q("SELECT approval, answered FROM needs WHERE approval IS NOT NULL AND door_host IS NOT NULL ORDER BY id"):
+        with contextlib.suppress(ValueError, TypeError, KeyError, RecursionError):
+            item = json.loads(r["approval"])
+            found.append((item["statement"], item["signature"], r["answered"] or 0))
+    for r in q("SELECT v FROM kv WHERE k LIKE 'door_mode:%' ORDER BY k"):
+        with contextlib.suppress(ValueError, TypeError, KeyError, RecursionError):
+            item = json.loads(r["v"])
+            found.append((item["statement"], item["signature"], item["received"]))
+    held, fleet = {}, kv_get("fleet_id")
+    for statement, signature, received in found:
+        said = door_mode_said(statement)
+        if said is None or not isinstance(signature, str) or type(received) not in (int, float) or \
+                received != received:
+            continue
+        # A statement from the future of its own arrival is none: the door did not take it then, and it would take
+        # it later by itself and stand before every statement that the owner signed in between (a card of a hub
+        # release before version 1.125, which checked no time).
+        if said["at"] > received + DOOR_MODE_AHEAD or said["fleet"] != fleet:
+            continue
+        old = held.get(said["host"])
+        if old is None or (said["at"], -received) > (old["at"], -old["received"]):
+            held[said["host"]] = {"statement": statement, "signature": signature, "mode": said["mode"],
+                                  "at": said["at"], "received": received}
+    return held
+
+
+def held_servers(team):
+    """The servers that an agent holds through the door, at any level."""
+    return {h for a in (team.get("agents") or {}).values() for h in (a.get("servers") or {})}
+
+
+def door_mode_servers(team):
+    """{host: the agents that hold it at Fix} for each server whose mode the owner can set: a server that an agent
+    holds at Fix through the door and that is no machine of the fleet. The door honours Full access nowhere else
+    (door.full_access: a host at fix, for an agent that holds it at Fix), and a machine of the fleet is rule-only by
+    code (server_mode)."""
+    return {host: holders for host in sorted({h for a in (team.get("agents") or {}).values()
+                                              for h in (a.get("servers") or {})})
+            if server_mode(team, host) == "fix" for holders in [fix_holders(team, host)] if holders}
+
+
+def door_mode_set(body):
+    """POST /ui/door/mode (owner feature door_mode_set; the owner's "Yes, as shown" of 11 November 2026 to the row
+    "Managed by <agent>" with Auto and Full access): the owner's signed mode of one server, with no Needs-you item.
+    The hub checks the form (door_mode_said), that the statement is of this fleet and of this server, that its time
+    is not from the future, that an agent holds the server at Fix (for Auto, also a server whose mode the hub
+    carries already, so that Full access can always be ended), and that it is newer than the newest statement of
+    that server that the hub carries, because the door takes no other. Then it keeps the statement, in place of the
+    one before it from this route, and serves the newest of each server to the door (GET /door/approvals). The hub
+    cannot check the owner's signature and does not say that it did: only the door knows whether it takes the
+    statement, and GET /ui/servers gives the door's own word beside the hub's (mode_door). Called with LOCK held."""
+    host, statement, signature = body["host"], body["statement"], body["signature"]
+    said = door_mode_said(statement)        # read() checked the form: this is the same statement
+    if said["fleet"] != fleet_id():
+        raise Refusal(409, "the statement is not of this fleet: sign it with this fleet's id, which the vault's "
+                           "reading gives")
+    if said["at"] > now() + DOOR_MODE_AHEAD:
+        raise Refusal(409, "the statement's time is in the future by the hub's clock, and the door takes none from "
+                           "the future: check this Mac's clock, and sign it again")
+    held = door_modes_held().get(host)
+    if held and (held["statement"], held["signature"]) == (statement, signature):
+        return {"host": host, "mode": said["mode"], "at": said["at"], "changed": False}
+    if host not in door_mode_servers(TEAM) and not (said["mode"] == "auto" and held):
+        raise Refusal(409, f"no agent holds {host} at Fix through the door, so it has no mode to set: Full access is "
+                           f"for a server that an agent manages")
+    if held and said["at"] <= held["at"]:
+        e = Refusal(409, f"the hub carries a mode of {host} that is as new as this statement or newer, and the door "
+                         f"takes only a newer one: sign it again with a later time")
+        e.extra = {"at": held["at"]}
+        raise e
+    kv_set(f"door_mode:{host}", json.dumps({"statement": statement, "signature": signature, "received": now()},
+                                           sort_keys=True))
+    log("owner", f"signed mode of {host} carried to the door: {said['mode']} (the door checks the signature)")
+    return {"host": host, "mode": said["mode"], "at": said["at"], "changed": True}
+
+
+def door_modes_word():
+    """{host: {mode, at}} that the hub keeps of the door's own word, or None when it keeps none that reads."""
+    try:
+        kept = json.loads(kv_get("door_modes_said") or "null")
+    except (ValueError, RecursionError):
+        return None
+    modes = kept.get("modes") if isinstance(kept, dict) else None
+    return modes if isinstance(modes, dict) else None
+
+
+def door_modes_said(answer, t0):
+    """What the door says that it keeps as each host's mode, out of its answer to the record read (door.modes_said):
+    kept as door_modes_said when it changed, {at, modes: {host: {mode, at}}}. It is the door's word for the owner's
+    page and nothing reads it back: a statement that the door did not take shows there as not taken."""
+    given = answer.get("modes")
+    if not isinstance(given, dict):         # a door of an older release says nothing
+        return
+    modes = {host: {"mode": m["mode"], "at": m.get("at") if type(m.get("at")) is int else None}
+             for host, m in sorted(given.items())[:500]
+             if isinstance(host, str) and SERVER_HOST.fullmatch(host) and isinstance(m, dict)
+             and m.get("mode") in DOOR_MODES}
+    old = door_modes_word()
+    if old is None or old != modes:
+        kv_set("door_modes_said", json.dumps({"at": round(t0), "modes": modes}, sort_keys=True))
+
+
 def door_approvals(src):
     """GET /door/approvals: the owner's signed yeses to door calls of the last DOOR_APPROVAL_DAYS, and his signed mode
-    of each server (door-modes proposal, step 4: the newest of each, of any age, because a mode stands), answered only
-    to the door's own address. Each yes lets its one call through once, which the door keeps count of; the door keeps
-    the newest mode of each server, and checks every signature itself."""
+    of each server (door-modes proposal, step 4: the newest of each, of any age, because a mode stands; from the
+    door's card or from the server's row, door_modes_held), answered only to the door's own address. Each yes lets
+    its one call through once, which the door keeps count of; the door keeps the newest mode of each server, and
+    checks every signature itself."""
     door = TEAM.get("door") or {}
     if not door.get("address") or src != door["address"]:
         raise Refusal(403, "this is the door's route")
     rows = q("SELECT id, approval FROM needs WHERE approval IS NOT NULL AND answered > ? ORDER BY id",
              (now() - DOOR_APPROVAL_DAYS * 86400,))
-    modes = {}
-    for r in q("SELECT id, approval FROM needs WHERE approval IS NOT NULL AND door_host IS NOT NULL ORDER BY id"):
-        if approval_kind(r["approval"]) == "door-mode":
-            item = json.loads(r["approval"])
-            said = json.loads(item["statement"])
-            if said["at"] >= modes.get(said["host"], ({}, -1))[1]:
-                modes[said["host"]] = ({"statement": item["statement"], "signature": item["signature"]}, said["at"])
     phones, devices = q("SELECT device, statement, signature FROM owner_device_signing WHERE statement IS NOT NULL "
                         "ORDER BY device"), owner_devices()
     return {"approvals": [dict(json.loads(r["approval"]), need=r["id"]) for r in rows
                           if approval_kind(r["approval"]) != "door-mode"],
             "devices": [{"device": r["device"], "statement": r["statement"], "signature": r["signature"]}
                         for r in phones if r["device"] in devices],
-            "modes": [item for _, (item, _) in sorted(modes.items())]}
+            # of every server, and first of those that an agent holds: the door reads a bounded list, which the
+            # names of servers that left the fleet must not push a held server out of, and an Auto of a server that
+            # no agent holds now must still reach the door before an agent holds it again
+            "modes": [{"statement": item["statement"], "signature": item["signature"]}
+                      for host, item in sorted(door_modes_held().items(),
+                                               key=lambda kv: (kv[0] not in held_servers(TEAM), kv[0]))]}
 
 
 def door_release(src):
@@ -40148,6 +40492,35 @@ class Handler(BaseHTTPRequestHandler):
             return {"host": host, "state": state, "said": said, "added": data.get("added") is True}
         return self.ui_command("door/host", read, door_host_report)
 
+    def ui_door_mode(self):
+        """POST /ui/door/mode (owner feature door_mode_set): the owner's signed mode of one server, Auto or Full
+        access, from the server's own row and with no Needs-you item (door_mode_set). Only the owner key of his Mac
+        signs a mode, so a phone's call is refused here, as its Full access on the door's card is."""
+        phone = owner_device_at(self.client_address[0])
+
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "host", "statement", "signature"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            if phone is not None:
+                raise Refusal(409, "A server's mode needs the signature of the owner key on the Mac. Set it in "
+                                   "Founderizer on the Mac.")
+            host, statement, signature = data.get("host"), data.get("statement"), data.get("signature")
+            if not isinstance(host, str) or not SERVER_HOST.fullmatch(host):
+                raise ValueError("host is the server's name, as the door's access file gives it")
+            if not isinstance(statement, str) or len(statement) > CENTRAL_STATEMENT_MAX or \
+                    not isinstance(signature, str) or not CENTRAL_SIGNATURE.fullmatch(signature):
+                raise ValueError("statement and signature are the owner's signed mode of the server: the statement "
+                                 "as text, and the base64 of its DER signature")
+            said = door_mode_said(statement)
+            if said is None:
+                raise ValueError("the statement is not a door-mode statement in its canonical form: {v: 1, kind: "
+                                 "\"door-mode\", fleet, host, mode: auto or full, at}")
+            if said["host"] != host:
+                raise ValueError("the statement is not of this server")
+            return {"host": host, "statement": statement, "signature": signature}
+        return self.ui_command("door/mode", read, door_mode_set)
+
     def ui_door_github_app(self):
         """POST /ui/door/github-app (owner feature door_setup): the ID of a GitHub App that the app made with GitHub's
         manifest flow, and the account it was made in. The door holds its key."""
@@ -40974,6 +41347,23 @@ class Handler(BaseHTTPRequestHandler):
                     if wrong:
                         return self.json(400, {"error": wrong})
                 phone = owner_device_at(self.client_address[0]) if yes is not None else None
+                if choice == 0 and ("door_call" in need.keys() and need["door_call"]):
+                    # Review of 12 November 2026: his yes to a root script counts only on the door's card of that
+                    # run, which shows the script that the hub checked against the hash (door_script_card). An item
+                    # from before version 1.125 can carry a run's hash under free words, or a door card with the
+                    # manager's words as its script.
+                    run_on = door_call_run(need["door_call"])
+                    script = need["door_script"] if "door_script" in need.keys() else None
+                    if (run_on is not None and run_on != host) or (host and not script):
+                        return self.json(409, {"error": f"This item does not show the script that its yes would "
+                                                        f"run as root on {run_on or host}. Answer No, and ask "
+                                                        f"{shown_role(need['by'])} for a new card."})
+                    if door_call_known(need["door_call"]) is None:
+                        # the door's record says what a hash is of; one that it does not hold can be a root script's
+                        return self.json(409, {"error": f"The door's record does not hold the call of this item, so "
+                                                        f"the hub cannot tell what its yes would let through. "
+                                                        f"Answer No, and ask {shown_role(need['by'])} for a new "
+                                                        f"card."})
                 if choice == 0 and ("door_call" in need.keys() and need["door_call"]) and \
                         (yes is None or phone is not None and not phone_signed(phone, yes, signed)):
                     # a yes that lets a door call through counts only when the owner key signed it, or a phone's own
@@ -42786,6 +43176,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_door_github_app()
         if parts == ["ui", "door", "host"]:          # new-projects plan N8 (b): the door's parts on one server
             return self.ui_door_host()
+        if parts == ["ui", "door", "mode"]:          # owner feature door_mode_set: his signed mode of one server
+            return self.ui_door_mode()
         if len(parts) == 3 and parts[:2] == ["door", "sealed"] and re.fullmatch(r"[1-9][0-9]{0,17}", parts[2]):
             return self.door_route(lambda: door_fetched(self.client_address[0], int(parts[2]),
                                                         self.form().get("sha256")))

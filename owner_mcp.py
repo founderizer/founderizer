@@ -188,6 +188,8 @@ NOT_TOOLS = {
     "/ui/github-app": "the GitHub App's private key",
     "/ui/door": "the door's address, which the app writes by itself when it finds the door by its tag",
     "/ui/door/secrets": "the hub's two secrets for the door, which the app makes on the door by itself",
+    "/ui/door/mode": "a server's mode, Auto or Full access: a statement signed with the owner's own key, which only "
+                     "their app on their Mac holds",
     "/ui/door/github-app": "the ID of a GitHub App that the app made with GitHub's manifest flow, whose key the door "
                            "holds",
     "/ui/door/host": "the app's own word about the door's parts on one server, which its round writes by itself",

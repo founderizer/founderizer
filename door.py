@@ -89,6 +89,9 @@ APPROVAL_DAYS = 7                           # a signed yes older than this lets 
 DEVICES_FILE = STATE + "/devices.json"      # the owner's phones whose signing key his owner key certified
 MODES_FILE = STATE + "/modes.json"          # the owner's signed mode of each host: the newest statement of each
 MODES = ("auto", "full")                    # door-modes proposal, step 4: Auto, the default, and Full access
+MODES_READ = 2000                           # statements that the door reads of one answer of the hub: the hub serves
+                                            # one for each server that an agent holds, and a signed Auto past the cut
+                                            # would leave Full access standing (it was 200)
 MODE_SKEW = 300                             # seconds that the clock of the owner's Mac may be behind the door's
 UPSTREAM = "https://github.com/founderizer/founderizer.git"
 SYSTEMD = "/etc/systemd/system"
@@ -383,16 +386,22 @@ def approval(access, statement, signature, devices=None):
     return said["call"], said["need"]
 
 
-def mode_statement(access, statement, signature):
-    """(host, mode, at) of the owner's signed mode of one server, or None (door-modes proposal, step 4: the card's
-    second answer, Full access on <host>). The statement is {v: 1, kind: "door-mode", fleet, host, mode, at} in its
-    canonical form: of this fleet, a host of the access file, a mode of MODES, not from the future, and signed by one of
-    the owner keys of the access file, his Mac, with the central vault's own check. A phone's key signs no mode: the
-    owner's decision 3, whether the phone sets one, is open. A mode has no age limit, as a yes has: it stands until a
-    newer statement of the same host, or until the host of that name is another server, and the door takes none from
-    before it first saw the server (settle_modes)."""
-    keys, fleet = access.get("owner_keys"), access.get("fleet")
-    if not keys or not fleet or not isinstance(statement, str) or not isinstance(signature, str):
+def call_hash(target, op, args, content=None):
+    """The hash of one call, which the door gives with a refusal that the owner's yes lifts, and which his yes names:
+    SHA-256 of the JSON of [target, action, arguments], as json.dumps writes it (", " between the items, and every
+    character outside the printable ASCII ones as \\uXXXX), then the content's bytes. One changed byte is another
+    hash. The owner's Mac computes the same hash from the server and the script that its card shows, and signs only
+    when the two agree (DoorCall.hash in the app; test_door.CallHash holds the examples that both sides are tested
+    with)."""
+    return hashlib.sha256(json.dumps([target, op, args], sort_keys=True).encode() + (content or b"")).hexdigest()
+
+
+def mode_form(access, statement):
+    """(host, mode, at) of a mode statement by its form alone, or None: the checks of mode_statement without the
+    signature. The refresh reads the form first, so that a statement that is not newer than the kept one costs no
+    signature check."""
+    fleet = access.get("fleet")
+    if not fleet or not isinstance(statement, str):
         return None
     try:
         said = json.loads(statement)
@@ -405,9 +414,25 @@ def mode_statement(access, statement, signature):
             not isinstance(said["host"], str) or said["host"] not in (access.get("hosts") or {}) or \
             said["mode"] not in MODES or type(said["at"]) is not int or said["at"] > now() + 300:
         return None
-    if not vault.owner_signed({"owner_keys": keys}, statement, signature):
-        return None
     return said["host"], said["mode"], said["at"]
+
+
+def mode_statement(access, statement, signature):
+    """(host, mode, at) of the owner's signed mode of one server, or None (door-modes proposal, step 4: the card's
+    second answer, Full access on <host>; and the server's own row, Auto or Full access). The statement is {v: 1,
+    kind: "door-mode", fleet, host, mode, at} in its canonical form: of this fleet, a host of the access file, a mode
+    of MODES, not from the future (mode_form), and signed by one of the owner keys of the access file, his Mac, with
+    the central vault's own check. A phone's key signs no mode: the owner's decision 3, whether the phone sets one,
+    is open. A mode has no age limit, as a yes has: it stands until a newer statement of the same host, or until the
+    host of that name is another server, and the door takes none from before it first saw the server
+    (settle_modes)."""
+    keys = access.get("owner_keys")
+    if not keys or not isinstance(signature, str):
+        return None
+    found = mode_form(access, statement)
+    if found is None or not vault.owner_signed({"owner_keys": keys}, statement, signature):
+        return None
+    return found
 
 
 def mode_time(entry, field="at"):
@@ -590,6 +615,32 @@ class Door:
             modes = read_json(MODES_FILE, {})
             if isinstance(modes, dict) and settle_modes(access, modes):
                 write_json(MODES_FILE, modes)
+
+    def modes_said(self):
+        """{host: {mode, at}}: the mode that the door keeps for each host of its access file now, auto or full, and
+        the time of the owner's statement that set it (null for a host at Auto with no statement). The hub reads it
+        with the record and shows it to the owner beside the statement that it carries, so that a statement that
+        the door did not take (another key signed it, or its time is not newer than the door's own) shows as not
+        taken. Full access is said only while full_access says it for an agent that holds the host at Fix: a host
+        at rule-only, on the never list or with no such agent is at Auto in this word, whatever statement the door
+        keeps for it. It is a reading: nothing of the door's reads it back."""
+        access = self.access()
+        hosts = access.get("hosts") or {}
+        modes = read_json(MODES_FILE, {})
+        out = {}
+        for name in sorted(hosts)[:500]:
+            entry = modes.get(name) if isinstance(modes, dict) else None
+            if not isinstance(entry, dict) or entry.get("mode") not in MODES:
+                continue
+            at = mode_time(entry) if "statement" in entry else None
+            # Full access is said when full_access itself says it for an agent: the same check, so the two agree
+            holders = [a for a, me in (access.get("agents") or {}).items()
+                       if isinstance(me, dict) and (me.get("servers") or {}).get(name) == "fix"]
+            if entry["mode"] == "full" and not any(self.full_access(access, name, a) for a in holders):
+                out[name] = {"mode": "auto", "at": None}
+            else:
+                out[name] = {"mode": entry["mode"], "at": at}
+        return out
 
     def caller(self, address):
         """The agent at this address, or None: Tailscale proves the address, and the access file names it."""
@@ -804,7 +855,7 @@ class Door:
             why = window_refusal(access, d.host or target, d.window, self.clock())
             if why:
                 d = door_targets.refused(why, target=d.target, route="window")
-        sha = hashlib.sha256(json.dumps([target, op, args], sort_keys=True).encode() + (content or b"")).hexdigest()
+        sha = call_hash(target, op, args, content)
         hashed = d.kind in ("own", "full")      # a refusal of these two kinds is the owner's to lift: it gives the hash
         full_host = d.host if d.kind == "full" else None
         full = full_host is not None and self.full_access(access, full_host, agent)
@@ -1572,7 +1623,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.answer(403, {"error": "the record is the hub's to read, with its own secret"})
             after = urllib.parse.parse_qs(query).get("after", ["0"])[0]
             return self.answer(200, {"entries": self.door.record.after(int(after) if after.isdigit() else 0),
-                                     "last": self.door.record.last})
+                                     "last": self.door.record.last, "modes": self.door.modes_said()})
         if path == "/github/reach":
             if not self.door.hub_allowed(self.source(), self.bearer(), "token_sha256"):
                 return self.answer(403, {"error": "what the App reaches is the hub's to read, with its token secret"})
@@ -1811,21 +1862,33 @@ def fetch_approvals(door):
             if isinstance(item, dict) else None
         if found:
             kept[found[0]] = {"need": found[1], "statement": item["statement"], "signature": item["signature"]}
+    # The owner's signed modes (step 4): the door keeps the newest statement of each host, so an older one cannot
+    # come back, and a mode that the hub stops serving stays as it was. Only a newer statement changes it, and
+    # the end of the server that it was accepted for (settle_modes): each one goes with its host's key of now,
+    # and none is taken that is from before the door first saw that server under its name (mode_floor).
+    #
+    # The signatures are checked here, before the lock that each call of an agent takes (approved): a check is some
+    # milliseconds, and a hub that serves many statements must not hold the calls. The form is read first, against
+    # a copy of the kept modes, so that a statement that is not newer than the kept one, which is each one of a
+    # quiet minute, costs no signature check. Under the lock, each checked statement is held to the floor again.
+    given = answer.get("modes") if isinstance(answer.get("modes"), list) else []
+    seen = read_json(MODES_FILE, {})
+    seen = json.loads(json.dumps(seen)) if isinstance(seen, dict) else {}
+    settle_modes(access, seen)
+    signed = []
+    for item in given[:MODES_READ]:
+        form = mode_form(access, item.get("statement")) if isinstance(item, dict) else None
+        if form and isinstance(seen.get(form[0]), dict) and form[2] > mode_floor(seen[form[0]]) and \
+                mode_statement(access, item.get("statement"), item.get("signature")) == form:
+            signed.append((form, item))
     with door.lock:
         write_json(DEVICES_FILE, devices)
         write_json(APPROVALS_FILE, kept)
-        # The owner's signed modes (step 4): the door keeps the newest statement of each host, so an older one cannot
-        # come back, and a mode that the hub stops serving stays as it was. Only a newer statement changes it, and
-        # the end of the server that it was accepted for (settle_modes): each one goes with its host's key of now,
-        # and none is taken that is from before the door first saw that server under its name (mode_floor).
         modes = read_json(MODES_FILE, {})
         modes = modes if isinstance(modes, dict) else {}
-        given = answer.get("modes") if isinstance(answer.get("modes"), list) else []
         changed = settle_modes(access, modes)
-        for item in given[:200]:
-            found = mode_statement(access, item.get("statement"), item.get("signature")) \
-                if isinstance(item, dict) else None
-            if found and isinstance(modes.get(found[0]), dict) and found[2] > mode_floor(modes[found[0]]):
+        for found, item in signed:
+            if isinstance(modes.get(found[0]), dict) and found[2] > mode_floor(modes[found[0]]):
                 modes[found[0]] = {"mode": found[1], "at": found[2], "statement": item["statement"],
                                    "signature": item["signature"],
                                    "host_key": access["hosts"][found[0]]["host_key"]}
