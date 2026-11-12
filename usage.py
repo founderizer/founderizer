@@ -44,6 +44,13 @@ REPORT_MAX = 512 * 1024             # hub.USAGE_REPORT_MAX: a report with the mo
 MODEL = re.compile(r"[A-Za-z0-9._:/\[\]-]{1,120}")      # threads.Translator.model_record takes the same names
 SCOPE = "Retained Fleet workspace sessions"
 SOURCES = {"claude": "Claude Code transcripts", "codex": "Codex session records"}
+# The third source (the AI providers build spec, section 3.7): each runtime of driver acp, whose runner keeps the
+# tokens of a session in a file of its own, ~/.fleet/acp/<fleet session>.json (acp_runner.Usage).
+ACP_SOURCE = "ACP session records"
+SOURCES.update({name: ACP_SOURCE for name, entry in lifecycle.RUNTIMES.items() if entry["driver"] == "acp"})
+ACP_FILES = ".fleet/acp"
+ACP_FILE_MAX = 256 * 1024           # a usage file is numbers and model names: a longer one is no usage file
+ACP_FILES_MAX = 20000               # the files of one scan; more are a fault, and the reading fails as a whole
 LIMIT_SOURCES = {"claude": "Claude Code /usage cache", "codex": "Codex account/rateLimits/read"}
 SCREEN_SOURCE = "Codex screen task events"
 SCREEN_SCOPE = "Recorded Fleet screen tasks"
@@ -453,6 +460,52 @@ def read_files(scan, root, kit, records):
         scan.stale = True
 
 
+def acp_sessions(home, kit, runtime):
+    """{session: what it spent} from the usage files of this runtime's ACP sessions whose `kit` is this checkout, and
+    how many sessions spent any token, as claude_sessions gives them. A file is written whole at each change, so each
+    is read whole; one that is no usage file of this checkout and runtime is passed over."""
+    per, folder = {}, Path(home) / ACP_FILES
+    try:
+        paths = sorted(p for p in folder.iterdir() if p.suffix == ".json")
+    except OSError:
+        return per, 0
+    if len(paths) > ACP_FILES_MAX:
+        raise ValueError("too many usage files")
+    for path in paths:
+        try:
+            if path.is_symlink() or path.stat().st_size > ACP_FILE_MAX:
+                continue
+            data = json.loads(path.read_bytes())
+        except (OSError, ValueError):
+            continue
+        sid = data.get("session_id") if isinstance(data, dict) else None
+        if not isinstance(sid, str) or not SESSION_ID.fullmatch(sid) or data.get("kit") != kit or \
+                data.get("runtime") != runtime or not isinstance(data.get("models"), dict):
+            continue
+        try:
+            models = {}
+            for name, row in data["models"].items():
+                values = [number(v, True) for v in row]
+                if len(values) != len(MODEL_FIELDS):
+                    raise ValueError("invalid row")
+                if not any(values[:4]):
+                    continue            # a row with calls and no token is no row of a report (validate_models)
+                bucket = models.setdefault(model_name(name), [0] * len(MODEL_FIELDS))   # a name of no model: none
+                bucket[:] = [a + b for a, b in zip(bucket, values)]
+            first = data.get("first")
+            first = [number(v, True) for v in first] if isinstance(first, list) and len(first) == 4 else None
+            since, last = (None if data.get(k) is None else number(data[k]) for k in ("since", "last"))
+        except (ValueError, TypeError):
+            continue
+        if not any(any(row[:4]) for row in models.values()):
+            continue
+        # `first` is in the order of MODEL_FIELDS (input, cache_read, cache_write, output); cache_share reads the
+        # order of TOKEN_KEYS (input, output, cache_read, cache_write)
+        per[sid] = {"models": models, "since": since, "last": last, "model": model_name(data.get("model")),
+                    "first": [first[0], first[3], first[1], first[2]] if first else None}
+    return per, len(per)
+
+
 def transcript_tokens(runtime, kit, home=None, scan=None):
     """The tokens of the retained sessions that ran in the checkout `kit`: in total, and each of the newest sessions
     its own, with its sub-agents' and workflow agents' calls and each model apart (helper feature session_models).
@@ -460,6 +513,10 @@ def transcript_tokens(runtime, kit, home=None, scan=None):
     needs more than one scan and has no Scan to go on with fails, as a scan of every file did before."""
     home, kit = Path(home or Path.home()), str(Path(kit).resolve())
     scan = Scan() if scan is None else scan
+    if lifecycle.runtime_fact(runtime, "driver") == "acp":
+        # the runner's own files, each small and written whole: every reading reads them again
+        made = token_reading(runtime, *acp_sessions(home, kit, runtime))
+        return dict(made, collected_at=time.time()) if made else None
     if runtime == "claude":
         # Every level below the project folder: a subagent's transcript is <session>/subagents/agent-<id>.jsonl, and
         # a workflow agent's <session>/subagents/workflows/<run>/agent-<id>.jsonl (AUTONOMY.md decision 41), whose
@@ -761,8 +818,9 @@ def validate_usage(data, runtime, screen=False):
             raise ValueError("invalid error")
         if value["collected_at"] is not None and number(value["collected_at"]) > time.time() + 60:
             raise ValueError("invalid time")
-        source = SCREEN_SOURCE if screen and kind == "tokens" else (SOURCES if kind == "tokens" else LIMIT_SOURCES)[runtime]
-        if value["source"] != source:
+        source = SCREEN_SOURCE if screen and kind == "tokens" else \
+            (SOURCES if kind == "tokens" else LIMIT_SOURCES).get(runtime)
+        if source is None or value["source"] != source:     # a runtime with no such source sends null for it
             raise ValueError("invalid source")
         if kind == "tokens":
             for key in (*TOKEN_KEYS, "total", "sessions"):
@@ -854,9 +912,16 @@ def screen_tokens(kit, agent, home=None):
                 collected_at=time.time(), source=SCREEN_SOURCE, scope=SCREEN_SCOPE, error=None)
 
 
-def local_model(conf):
-    """A worker that runs a model on the machine itself, by the flag its runtime has for that (lifecycle.RUNTIMES
-    "local_model"): its tokens count, but no vendor account limit applies."""
+def local_model(conf, accounts=None):
+    """A worker that runs a model which is the owner's own: its tokens count, but no vendor account limit applies.
+    Two ways say it. Its account is the owner's own model server (accounts: team.json "accounts"; an entry of kind
+    "server", the AI providers build spec, section 3.1). Or its start has the flag that its runtime has for a model
+    on the machine itself (lifecycle.RUNTIMES "local_model"), as before. A caller that gives no accounts asks only
+    the second."""
+    entry = accounts.get(conf.get("account")) if isinstance(accounts, dict) and isinstance(conf.get("account"), str) \
+        else None
+    if isinstance(entry, dict) and entry.get("kind") == "server":
+        return True
     flag = lifecycle.runtime_fact(conf.get("runtime"), "local_model")
     return bool(flag) and bool(re.search(rf"(?:^|\s){re.escape(flag)}(?:\s|$)", str(conf.get("start") or "")))
 
@@ -929,7 +994,7 @@ class Collector:
             except (OSError, ValueError, sqlite3.Error):
                 if self.data["screen"]["tokens"]:
                     self.data["screen"]["tokens"]["error"] = "Token records could not be read."
-        if self.runtime not in SOURCES:         # Grok documents no usage: unknown, never another runtime's numbers
+        if self.runtime not in SOURCES:         # a runtime with no usage source: unknown, never another's numbers
             self.send(self.data)
             return
         if self.previous and time.time() - self.previous_poll >= POLL_SECONDS:
@@ -948,7 +1013,9 @@ class Collector:
         except (OSError, ValueError, KeyError, TypeError):
             if self.data["tokens"]:
                 self.data["tokens"]["error"] = "Token records could not be read."
-        if not self.local and time.time() - self.last_poll >= POLL_SECONDS:
+        # A runtime with no reader of an account's allowance sends none: an agent on a key or on a model server, and
+        # each ACP program until its own reader is built.
+        if not self.local and self.runtime in LIMIT_SOURCES and time.time() - self.last_poll >= POLL_SECONDS:
             self.last_poll = time.time()
             if self.screen_command:
                 try:

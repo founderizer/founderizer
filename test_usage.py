@@ -315,6 +315,52 @@ class TokenRecords(unittest.TestCase):
             collector.collect()
         self.assertEqual(collector.data["tokens"]["total"], 3 * 127)
 
+    def test_the_sessions_of_an_acp_program_are_read_from_the_runners_usage_files(self):
+        """The collector's third source (the AI providers build spec, section 3.7): the usage file that the ACP runner
+        keeps for each session, ~/.fleet/acp/<fleet session>.json. A session's row has the fleet's own session id,
+        its four kinds, its calls and each model apart, and only the files of this checkout and this runtime count."""
+        import acp_runner
+        folder = self.home / ".fleet" / "acp"
+        first, second = "11111111-2222-4333-8444-555555555555", "11111111-2222-4333-8444-666666666666"
+        spent = acp_runner.Usage(str(folder / f"{first}.json"), first, self.kit, "grok")
+        spent.add({"models": {"grok-4.7": [400, 600, 0, 50, 2]}, "context": {"used": 700, "size": 500000}},
+                  "grok-4.7", now=1794420000.0)
+        spent.add({"models": {"grok-4.7": [300, 900, 10, 40, 1], "grok-4.5": [100, 0, 0, 20, 1]}, "context": None},
+                  "grok-4.7", now=1794420300.0)
+        acp_runner.Usage(str(folder / f"{second}.json"), second, self.kit, "grok").add(
+            {"models": {"grok-4.5": [10, 0, 0, 5, 1]}, "context": None}, "grok-4.5", now=1794420100.0)
+        # another checkout's session, another program's, and files that are no usage files
+        acp_runner.Usage(str(folder / "other-kit.json"), "other-kit", "/elsewhere", "grok").add(
+            {"models": {"grok-4.7": [9, 9, 9, 9, 9]}}, "grok-4.7")
+        acp_runner.Usage(str(folder / "other-program.json"), "other-program", self.kit, "opencode").add(
+            {"models": {"own/m": [7, 7, 7, 7, 7]}}, "own/m")
+        (folder / "broken.json").write_text("{\"session_id\": ")
+        (folder / "list.json").write_text("[1, 2, 3]")
+        (folder / "negative.json").write_text(json.dumps({"session_id": "negative", "kit": self.kit, "runtime": "grok",
+                                                          "models": {"m": [-1, 0, 0, 5, 1]}}))
+        (folder / f"{first}.json.part").write_text("{}")
+        reading = usage.transcript_tokens("grok", self.kit, self.home)
+        self.assertEqual({k: reading[k] for k in ("input", "cache_read", "cache_write", "output", "total", "sessions")},
+                         {"input": 810, "cache_read": 1500, "cache_write": 10, "output": 115, "total": 2435,
+                          "sessions": 2})
+        self.assertEqual((reading["source"], reading["since"], reading["last_activity"]),
+                         ("ACP session records", 1794420000.0, 1794420300.0))
+        rows = {row["session_id"]: row for row in reading["by_session"]}
+        self.assertEqual(sorted(rows), [first, second])
+        self.assertEqual(rows[first], {
+            "session_id": first, "total": 2420, "last_activity": 1794420300.0, "input": 800, "output": 110,
+            "cache_read": 1500, "cache_write": 10, "calls": 4, "model": "grok-4.7",
+            "first_cache_share": 0.6,       # of the first turn: 600 of the 1000 tokens that it read came from the cache
+            "models": [["grok-4.7", 700, 1500, 10, 90, 3], ["grok-4.5", 100, 0, 0, 20, 1]]})
+        self.assertEqual(usage.validate_usage({"tokens": reading, "limits": None}, "grok")["tokens"], reading)
+        self.assertEqual(usage.transcript_tokens("opencode", self.kit, self.home)["by_session"][0]["model"], "own/m")
+        self.assertIsNone(usage.transcript_tokens("grok", str(self.home / "another-kit"), self.home))
+        # a runtime with this source sends no limits, and a report of it with limits is refused
+        with self.assertRaises(ValueError):
+            usage.validate_usage({"tokens": reading, "limits": limits("codex")}, "grok")
+        with self.assertRaises(ValueError):
+            usage.validate_usage({"tokens": tokens("codex"), "limits": None}, "grok")
+
     def test_claude_scoped_windows_and_original_cache_time(self):
         cache = dict(oauthAccount=dict(accountUuid="safe-id", userRateLimitTier="default_claude_max_5x"),
                      cachedUsageUtilization=dict(accountUuid="safe-id", fetchedAtMs=3000000, utilization=dict(limits=[

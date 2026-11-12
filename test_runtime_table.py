@@ -25,6 +25,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import acp_programs
 import fleet
 import hub
 import hubsetup
@@ -183,6 +184,11 @@ MECHANICS = {
         "cmd_connect": "registering the Fleet MCP server with each provider's own CLI configuration",
         "cmd_check": "checking that registration with each provider's own command",
     },
+    # What one ACP program does in its own way is code, and acp_programs.py is its one place: an adapter for each
+    # program, which an entry names with `acp_adapter`. The adapters are chosen by that name and compare none, and so
+    # does the runner that calls them: a fifth program is a row of the table, an adapter and a pin.
+    "acp_programs.py": {},
+    "acp_runner.py": {},
 }
 # A fourth provider, to prove an entry is the whole edit. It is a terminal CLI with an owner chat and no sign-in.
 FOURTH = {
@@ -236,6 +242,32 @@ class TheFacts(unittest.TestCase):
                     self.assertTrue(lifecycle.pinned_path(name, "/home/a").startswith("/home/a/.fleet/runtimes/"))
                 else:
                     self.assertIsNone(lifecycle.pinned_path(name, "/home/a"))
+
+    def test_each_acp_runtime_names_an_adapter_that_exists_and_each_adapter_is_named(self):
+        """The code of one ACP program has one home (the AI providers spec, section 3.11 item 12): its adapter in
+        acp_programs.py, which its entry names. An entry with no adapter of its own gets the standard one."""
+        named = {entry["acp_adapter"] for entry in lifecycle.RUNTIMES.values() if entry["acp_adapter"]}
+        self.assertEqual(named, set(acp_programs.ADAPTERS))
+        for name, entry in lifecycle.RUNTIMES.items():
+            with self.subTest(name):
+                if entry["driver"] == "acp":
+                    self.assertIn(entry["acp_adapter"], acp_programs.ADAPTERS)
+                    adapter = acp_programs.adapter(entry["acp_adapter"], "/home/a")
+                    self.assertIsInstance(adapter, acp_programs.Program)
+                    # its sessions have a folder of their own, so that no credential that the program stored
+                    # reaches one, and each variable of that folder is one of the program's own names
+                    folder = adapter.folder("s")
+                    self.assertTrue(folder.startswith("/home/a/.fleet/"), folder)
+                    self.assertTrue(adapter.session_env("s"))
+                    for variable, value in adapter.session_env("s").items():
+                        self.assertTrue(variable.startswith(entry["own_env"]), variable)
+                        self.assertTrue(value.startswith(folder), value)
+                else:
+                    self.assertIsNone(entry["acp_adapter"])
+        self.assertIs(type(acp_programs.adapter(None)), acp_programs.Program)
+        with self.assertRaises(KeyError):
+            acp_programs.adapter("no-such-program")
+        self.assertIn("acp_programs.py", MECHANICS)
 
     def test_the_names_of_a_programs_own_variables_and_of_its_key(self):
         """own_env is what keeps a program's own settings out of its session without a new reserved name (a new one
@@ -491,13 +523,20 @@ class AFourthEntry(unittest.TestCase):
 
     def test_an_acp_provider_needs_no_more_than_its_command(self):
         entry = dict(FOURTH, driver="acp", acp_command="fourth agent stdio", owner_chat=False, manager=False)
+        files = tempfile.mkdtemp(prefix="fleet-fourth-")       # the session's prompt is a file of the window
+        self.addCleanup(shutil.rmtree, files, True)
         with patch.dict(lifecycle.RUNTIMES, {"fourth": entry}):
-            with patch.object(fleet, "team_catalog", dict), patch.object(fleet, "session_env", lambda *a, **k: {}):
+            with patch.object(fleet, "team_catalog", dict), patch.object(fleet, "session_env", lambda *a, **k: {}), \
+                    patch.object(fleet, "SESSIONS", files), patch.object(fleet, "HOME", files):
                 command = fleet.session_command("alpha", {"role": "worker", "runtime": "fourth"}, "do it",
                                                 task="T-1", generation="g1", session="s1")
             self.assertIn("acp_runner.py", command)
+            # with no pin, no adapter and no fact of its own, its command is its entry's, and the runner speaks
+            # standard ACP to it
             self.assertIn("--agent-command 'fourth agent stdio'", command)
             self.assertIn("--runtime fourth", command)
+            self.assertIn("--policy full", command)
+            self.assertEqual([Path(files, name).read_text() for name in os.listdir(files)], ["do it"])
             with self.assertRaises(fleet.Refused) as refused:
                 fleet.chat_command("alpha", {"role": "worker", "runtime": "fourth"}, "g1")
             self.assertIn("a Fourth agent has no direct chat yet", str(refused.exception))

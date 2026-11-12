@@ -705,11 +705,12 @@ class HelperSide(unittest.TestCase):
                       fleet.launch_words(command)[-1])
         self.assertNotIn("mcp__crm__*", command)
 
-    def test_a_codex_runner_and_a_grok_agent_get_no_server(self):
-        for conf in (dict(CODEX_CONF, start="app-server"), dict(CODEX_CONF, runtime="grok", start="grok agent stdio")):
-            command = self.command(conf)
-            self.assertNotIn("mcp_servers.crm", command)
-            self.assertEqual(self.env_file(command)[TOKEN], ACCESS)      # the variable is there; no server uses it
+    def test_a_codex_runner_gets_no_server(self):
+        """An agent of an ACP program got none either, until the AI providers build: its servers now reach the ACP
+        runner in a file of the session (test_acp_runner, Wiring)."""
+        command = self.command(dict(CODEX_CONF, start="app-server"))
+        self.assertNotIn("mcp_servers.crm", command)
+        self.assertEqual(self.env_file(command)[TOKEN], ACCESS)      # the variable is there; no server uses it
 
     def test_the_machine_resolves_a_command_servers_program_and_runs_nothing(self):
         """The helper's answer to the hub's mcp_program event (owner feature mcp_program)."""

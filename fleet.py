@@ -64,6 +64,7 @@ from http.client import HTTPException       # only the name: `http` is this modu
 
 from threads import MARKER, THREAD_ID, CodexFiles, Tailer, Translator, complete_rows, manager_transcript, text_of
 from usage import Collector, local_model, timestamp
+import acp_programs
 import lifecycle
 from lifecycle import (APP_SERVER_RUNTIME, CHECK_FILE, CHECK_STORE, FLOOR_FILE, GITHUB_TOKEN, MCP_PROGRAM, REPO_ACCESS,
                        REPO_NAME, RUNTIMES, TOOL_CATALOG, Lifecycle, Updating, app_server_task, check_stores, exe,
@@ -689,7 +690,7 @@ DENY = ["Read(~/.fleet/**)", "Edit(~/.fleet/**)", "Bash(*.fleet/*)"] + UNSEEN_TO
 CHROME_TOOLS = "mcp__claude-in-chrome__*"      # the tools that Claude Code's --chrome adds to a browser task
 # The files of this checkout that no worker session edits: Fleet's code, the rules, the owner's files, and the agents'
 # skills, which an agent changes with write_skill only (design v4 D1).
-PROTECTED = ("fleet.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.py", "screen_runner.py", "desktop.py", "FleetWorker.swift", "worker_install.py", "install-worker.sh", "Install Fleet Worker.command", "hub.py", "wakeups.py", "usage.py", "threads.py", "selftest.py", "test_logins.py", "verify.py", "verify_case.py", "pilot.py", "publish.py", "publish/**", "team.json", "RULES.md", "rules/**", "CLAUDE.md", "AGENTS.md", "profiles/**", "skills/**")
+PROTECTED = ("fleet.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.py", "acp_programs.py", "prices/**", "screen_runner.py", "desktop.py", "FleetWorker.swift", "worker_install.py", "install-worker.sh", "Install Fleet Worker.command", "hub.py", "wakeups.py", "usage.py", "threads.py", "selftest.py", "test_logins.py", "verify.py", "verify_case.py", "pilot.py", "publish.py", "publish/**", "team.json", "RULES.md", "rules/**", "CLAUDE.md", "AGENTS.md", "profiles/**", "skills/**")
 # No Claude session that a helper starts loads a setting source of its machine (--setting-sources ''). A Mac keeps one
 # desktop user for its agents (PRODUCT.md P2), so that person's own CLAUDE.md, rules, skills, agents, plugins and hooks
 # would steer every agent there unseen, and an agent could write them to steer its own later sessions; and the
@@ -1273,6 +1274,11 @@ STABLE_WHERE = {"read": ("The task is the first answer of read_messages.",
                          "The fleet's rules for you (RULES.md and your parts of rules/) and your profile follow: they"),
                 "prompt": ("The task is at the end of this text.",
                            "RULES.md is the AGENTS.md of this folder, and your parts of rules/ and your profile follow: "
+                           "they"),
+                # An ACP program (the AI providers spec, 3.5.1): the stable text is its session's system text, and
+                # its task is the first prompt. No ACP program reads RULES.md as its folder's AGENTS.md.
+                "system": ("The task is your first message.",
+                           "The fleet's rules for you (RULES.md and your parts of rules/) and your profile follow: "
                            "they")}
 CODEX_RULES_BYTES = 32 * 1024   # Codex's own default project_doc_max_bytes, which a longer AGENTS.md would be cut at
 
@@ -1330,7 +1336,7 @@ def stable_text(agent, opening, parts, head=None, skills=True, knowledge=False):
         core = read("RULES.md")
         if opening == "prompt" and read("AGENTS.md") != core:
             return None
-        texts = ([core] if opening == "read" else []) + \
+        texts = ([core] if opening in ("read", "system") else []) + \
             [read(f"rules/{part}.md") for part in RULES_PARTS if part in parts] + [read(f"profiles/{agent}.md")]
     except OSError:
         return None
@@ -1367,10 +1373,11 @@ def codex_rules_limit():
 def stable_start(conf, needs, opening, rules):
     """True when this task session starts with its stable text first (plan P9.2): the hub said how its task reaches
     it (opening, its runtime's task_opening) and which parts of the rules it reads, and it starts in a terminal of
-    that runtime. Anything else starts as before."""
+    that runtime, or in the ACP runner with the opening "system". Anything else starts as before."""
     runtime = conf.get("runtime")
+    driver = runtime_fact(runtime, "driver")
     return isinstance(rules, list) and opening in STABLE_WHERE and runtime_fact(runtime, "task_opening") == opening \
-        and runtime_fact(runtime, "driver") == "terminal" and not app_server_task(conf, needs)
+        and (driver == "terminal" or (driver == "acp" and opening == "system")) and not app_server_task(conf, needs)
 
 
 def checked_start(conf):
@@ -1384,6 +1391,133 @@ def checked_start(conf):
         raise Refused(f"this agent's start in team.json is not one of Fleet's own forms for "
                       f"{runtime_fact(runtime, 'label', runtime)}, so no session starts with it")
     return start
+
+
+def acp_server(name, catalog, values):
+    """A catalog tool as an MCP server of an ACP session (`mcpServers` of session/new), made as claude_server makes
+    it for Claude Code, with each value in it: the server reaches the runner in a mode-600 file of the session only.
+    A server with a `url` takes its bearer as a header, and one with a `command` its own variables."""
+    tool = catalog[name]
+    if tool.get("url"):
+        bearer = values.get(tool["bearer"]) if tool.get("bearer") else None
+        return {"type": "http", "name": name, "url": tool["url"],
+                "headers": [{"name": "Authorization", "value": "Bearer " + bearer}] if bearer else []}
+    return {"name": name, "command": exe(tool["command"]) or tool["command"], "args": list(tool.get("args") or []),
+            "env": [{"name": var, "value": values[var]} for var in tool.get("env") or {} if values.get(var)]}
+
+
+def account_key(agent, conf):
+    """The key of this agent's model account from the machine's vault, by the road of read_env with the purpose
+    `check`, or None: what the setup check proves, and what a reading of the program's model list starts with."""
+    account = lifecycle.model_account(checkout_team() or TEAM, conf)
+    if not account or not account["secret"] or not account["env"]:
+        return None
+    return read_env(agent, conf, "check").get(account["env"])
+
+
+def acp_command(agent, conf, prompt, task, attempt, generation, session, values, stable, tools, catalog, minted):
+    """The window command of a task session of a runtime of driver acp (the AI providers build spec, section 3.5):
+
+        env FLEET_ATTEMPT=… FLEET_GENERATION=… FLEET_HUB=… FLEET_AGENT=… FLEET_TASK=… <memory_off> <acp_quiet>
+          <python> acp_runner.py --agent-command <start> --runtime <name> --mcp-url <url> --session <uuid>
+          --prompt-file <file> [--system-file <file>] [--model <name>] [--effort <name>] [--auth <method>]
+          [--mcp-file <file>] [--usage-file <file>] --policy full
+
+    Nothing of it is a secret: the session's credential, its read variables and the account's key are in the
+    session's mode-600 env file, the prompt, the system text and the agent's MCP servers in mode-600 files that the
+    runner removes once it read them. What one program does in its own way comes from its adapter (acp_programs), and
+    what it is from its entry of the table: this function compares no name.
+
+    values: the session's variables (session_env, and the credential). stable: its stable text, or None. tools: the
+    catalog tools that it loads. Raises Refused, and Installing while the helper downloads a pinned program."""
+    runtime = conf.get("runtime")
+    label = runtime_fact(runtime, "label", runtime)
+    fact = lambda name: runtime_fact(runtime, name)
+    words = shlex.split(checked_start(conf))
+    if fact("pinned"):
+        words[0] = pinned_program(runtime)      # the file of its pin: no PATH decides which program runs
+    adapter = acp_programs.adapter(fact("acp_adapter"), os.path.dirname(HOME))
+    account = lifecycle.model_account(checkout_team() or TEAM, conf)
+    if account and account["runtime"] != runtime:
+        raise Refused(f"this agent's account is not one that {label} runs")
+    if adapter.needs_account and not account:
+        raise Refused(f"a {label} agent runs on an account with a key or on a model server, and this agent has none")
+    # The env file, in this order: the key by the variable name of the secret's own login; then no read variable of
+    # the program's own names; then the key under the name by which the program takes it.
+    values, key = dict(values), None
+    if account and account["secret"]:
+        key = values.get(account["env"]) if account["env"] else None
+        if not key:
+            raise Refused("the vault gave no key for this agent's account")
+    own = tuple(fact("own_env") or ())
+    dropped = sorted(name for name in values if own and name.startswith(own))
+    for name in dropped:
+        values.pop(name)
+    if dropped:
+        print(time.strftime("%H:%M:%S"), f"{task}: {label} does not get {', '.join(dropped)}: a name of the program's "
+                                         f"own settings is no read variable of its session", flush=True)
+    if key:
+        values[fact("key_env")] = key
+    # The model: the agent's own; else the account's; else, for a model server, the one that its check kept
+    mine = checkout_conf(agent)
+    model, effort = (mine if mine else conf).get("model") if account else conf.get("model"), conf.get("effort")
+    names = []
+    if account:
+        kept = lifecycle.kept_account(os.path.dirname(HOME), agent, account) if account["kind"] == "server" else None
+        model = model or account["model"] or (kept or {}).get("model")
+        names = [m for m in (kept or {}).get("models") or [] if isinstance(m, str)]
+        if account["kind"] == "server" and not model:
+            raise Refused("this agent's model server has no checked model yet")
+    methods = fact("acp_auth") or {}
+    auth = methods.get(account["kind"] if account else "plan")
+    system = stable + github_text(values, tools) if stable is not None else None
+    try:
+        adapter.prepare(session, None if adapter.carries_system() else system,
+                        lifecycle.program_account(account, runtime, model, names))
+    except FileExistsError:
+        raise Refused(f"the folder of the session {session} is there already, and a session never takes an old one")
+    window = task
+    arguments = ["--agent-command", shlex.join(words), "--runtime", runtime,
+                 "--mcp-url", f"{HUB}/mcp/{agent}/{generation}/{task}/{attempt}", "--session", session,
+                 "--prompt-file", session_file(agent, window, "md", prompt)]
+    if system is not None and adapter.carries_system():
+        arguments += ["--system-file", session_file(agent, window, "md", system)]
+    arguments += [x for name, value in (("--model", model), ("--effort", effort), ("--auth", auth)) if value
+                  for x in (name, value)]
+    servers = [acp_server(t, catalog, dict(values, **({catalog[t]["bearer"]: minted[t]} if t in minted else {})))
+               for t in tools]
+    if servers:
+        arguments += ["--mcp-file", session_file(agent, window, "json", json.dumps({"servers": servers}))]
+    arguments += ["--usage-file", os.path.join(HOME, "acp", f"{session}.json"), "--policy", "full"]
+    quiet = [f"{name}={value}" for name, value in
+             {**((fact("memory_off") or {}).get("env") or {}), **(fact("acp_quiet") or {})}.items()]
+    return env_prefix(agent, window, values) + shlex.join([
+        "env", f"FLEET_ATTEMPT={attempt}", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}",
+        f"FLEET_AGENT={agent}", f"FLEET_TASK={task}", *quiet, sys.executable, os.path.join(KIT, "acp_runner.py"),
+        *arguments])
+
+
+def sweep_acp_folders(runtime):
+    """Remove the folders of this runtime's sessions that no window of this user names any more, a minute after they
+    were made: a session's own folder goes with its window (the runner removes it), and this takes what a runner
+    that was killed left. With no answer of tmux, each stays."""
+    adapter = acp_programs.adapter(runtime_fact(runtime, "acp_adapter"), os.path.dirname(HOME))
+    probe = adapter.folder("-")
+    try:
+        names = [n for n in os.listdir(os.path.dirname(probe))] if probe else []
+    except OSError:
+        return
+    old = [n for n in names if re.fullmatch(acp_programs.SESSION, n)]
+    if not old:
+        return
+    r = tmux("list-panes", "-a", "-F", "#{pane_start_command}")
+    if r.returncode != 0 and "no server running" not in (r.stderr or ""):
+        return
+    for name in old:
+        path = adapter.folder(name)
+        with contextlib.suppress(OSError):
+            if name not in r.stdout and time.time() - os.lstat(path).st_mtime > 60:
+                shutil.rmtree(path, ignore_errors=True)
 
 
 def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, generation="", session="", token=None,
@@ -1411,7 +1545,8 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     runtime = conf.get("runtime")
     if runtime == "codex":
         values.update({catalog[t]["bearer"]: v for t, v in minted.items() if t in catalog})
-    prefix = env_prefix(agent, task or "manager", values)
+    acp = runtime_fact(runtime, "driver") == "acp"      # its start writes an env file of its own (acp_command)
+    prefix = "" if acp else env_prefix(agent, task or "manager", values)
     tools = [] if not runtime_fact(runtime, "mcp_servers") or app_server_task(conf, needs) else \
         [t for t in values.get("FLEET_TOOLS", "").split() if t in catalog and (t in minted or not catalog[t].get("mint"))]
     if task:
@@ -1421,20 +1556,12 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         stable = stable_text(agent, opening, rules, head="") if opening else None
     if task and stable is None:
         prompt += github_text(values, tools)
-    if runtime_fact(runtime, "driver") == "acp":
-        # An ACP agent (Grok Build: "grok agent stdio") runs inside acp_runner.py, with the task-bound fleet tools.
-        # Its own command comes from team.json, else from its entry (lifecycle.RUNTIMES "acp_command").
+    if acp:
+        # An ACP agent (Grok Build, OpenCode) runs inside acp_runner.py, with the task-bound fleet tools.
         if not task or not generation or not session:
             raise Refused(f"a {runtime_fact(runtime, 'label', runtime)} agent runs managed task sessions only")
-        start = checked_start(conf)
-        own_memory = [f"{key}={value}" for key, value in
-                      ((runtime_fact(runtime, "memory_off") or {}).get("env") or {}).items()]    # its memory: off
-        return prefix + shlex.join(["env", f"FLEET_ATTEMPT={attempt}", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}",
-                           f"FLEET_AGENT={agent}", f"FLEET_TASK={task}", *own_memory, sys.executable,
-                           os.path.join(KIT, "acp_runner.py"), "--agent-command",
-                           start,
-                           "--runtime", runtime, "--mcp-url", f"{HUB}/mcp/{agent}/{generation}/{task}/{attempt}",
-                           "--session", session, "--prompt", prompt])
+        return acp_command(agent, conf, prompt, task, attempt, generation, session, values, stable, tools, catalog,
+                           minted)
     if app_server_task(conf, needs):
         if not task or not generation or (needs == "screen" and not conf.get("screen_command")):
             raise Refused("screen tasks need a configured runner and a fenced task" if needs == "screen" else
@@ -4094,6 +4221,8 @@ class Helper:
                 with contextlib.suppress(OSError):
                     if time.time() - os.lstat(path).st_mtime > 60:
                         os.remove(path)
+        if runtime_fact(self.conf.get("runtime"), "driver") == "acp":
+            sweep_acp_folders(self.conf.get("runtime"))     # and the own folders of sessions whose windows ended
 
     def chat_resume(self, generation):
         """The conversation to continue when the owner chat of this generation starts again (a Codex thread or a
@@ -6851,7 +6980,7 @@ def cmd_run(args):
     print(f"helper for {agent} is running; persistent inbox delivery; sessions in {h.session}", flush=True)
     collector = Collector(KIT, agent, conf["runtime"],
                           lambda payload: http("POST", f"/helper/usage/{agent}", payload, timeout=5),
-                          screen_command=screen_program(conf), local=local_model(conf),
+                          screen_command=screen_program(conf), local=local_model(conf, TEAM.get("accounts")),
                           previous=next(iter(conf.get("runtime_policies") or {}), None))   # owner feature runtime_switch
     h.collector = collector         # a sign-in on this machine makes it read the account again (account_changed)
     threading.Thread(target=collector.run, name="usage-collector", daemon=True).start()
@@ -6861,7 +6990,8 @@ def cmd_run(args):
                             legacy=h.legacy_windows, switch=h.switch_state,
                             runtimes_busy=h.runtimes_busy, say=h.say,       # it updates this user's runtimes
                             slow_file=os.path.join(HOME, "slow-%s.json" % agent),
-                            floor=os.path.join(HOME, FLOOR_FILE))     # DevOps plan 0.1: every move under may_take
+                            floor=os.path.join(HOME, FLOOR_FILE),     # DevOps plan 0.1: every move under may_take
+                            read_key=lambda: account_key(agent, conf))    # the key of a model account, for its check
     threading.Thread(target=h.lifecycle.run_forever, name="machine-status", daemon=True).start()
     threading.Thread(target=h.tailer.run, name="thread-records", daemon=True).start()
     threading.Thread(target=h.presence, name="presence", daemon=True).start()      # plan C2

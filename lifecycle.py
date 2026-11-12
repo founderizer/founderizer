@@ -12,12 +12,15 @@ works: the vendor's own update, a check of the new version, and the previous ver
 import contextlib
 import fcntl
 import glob
+import http.client
 import json
+import math
 import os
 import plistlib
 import pwd
 import queue
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -26,7 +29,10 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
+import uuid
 
 import onboard      # the vendors' installers, which the runtime updates run (update_runtime)
 
@@ -166,7 +172,14 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             # owner-contact plan B3: the manager's helper says when its start of the standing session failed twice in a
             # row, and starts a session that left its line untaken fresh once (hub.MANAGER_START_FAILS)
             "manager_start_fails",
-            "default_models"]   # its new sessions take the owner's default model and effort (fleet.run_settings)
+            "default_models",   # its new sessions take the owner's default model and effort (fleet.run_settings)
+            # The AI providers build, step 1. acp_tasks: a start of driver acp takes `opening` and `rules`, its
+            # sessions' tokens are in the usage report (usage.acp_sessions), and an ACP program's model list is read
+            # (Lifecycle.acp_model_options). The build's spec names this feature acp_v2, which no hub can take: a
+            # feature's name is of the letters a to z and _ (hub.validate_status), and a report with another name
+            # is refused whole. model_accounts: an agent whose account has a kind starts on that account's key or
+            # model server, and its setup check has the `account` item (Lifecycle.account_item).
+            "acp_tasks", "model_accounts"]
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and
@@ -728,12 +741,41 @@ def facts_now(team, runtime):
 
 def token_price(weights, model):
     """One model's prices from a runtime's token_weights: the entry whose key is the longest part of the model's
-    name, case aside, else "default"; None for a runtime with no prices."""
+    name, case aside, else "default"; None for a runtime with no prices. A key that ends in "/" matches only the start
+    of a model's name, and such a key wins over each other key: it names where a model runs, as "own/" names the
+    owner's own model server, whose models cost nothing whatever their names hold (own/deepseek-r1 is no model of a
+    key "deepseek")."""
     if not weights:
         return None
     name = str(model or "").lower()
-    named = [k for k in weights if k != "default" and k.lower() in name]
+    placed = [k for k in weights if k.endswith("/") and name.startswith(k.lower())]
+    if placed:
+        return weights[max(placed, key=len)]
+    named = [k for k in weights if k != "default" and not k.endswith("/") and k.lower() in name]
     return weights[max(named, key=len)] if named else weights.get("default")
+
+
+# The list prices of the models that an ACP program runs, in one file of this checkout (prices.py makes it from a
+# public list; a person runs that when a pin moves). It is loaded here, relative to this file, as the token_weights of
+# each runtime of driver acp. A file that is missing or wrong gives None and never an error: `lifecycle.py may-take`
+# runs at each move of a checkout, and an import that fails there stops each update.
+PRICE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prices", "models.json")
+
+
+def price_file(path=PRICE_FILE):
+    """The prices of the file as token_weights, or None for a file that is missing, too long or not of that shape."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(256 * 1024 + 1)
+        return weights_check(json.loads(raw)) if len(raw) <= 256 * 1024 else None
+    except (OSError, ValueError, TypeError, RecursionError, AttributeError):
+        return None
+
+
+for _entry in RUNTIMES.values():
+    if _entry["driver"] == "acp":
+        _entry["token_weights"] = price_file()
+del _entry
 
 
 def runtimes_with(fact):
@@ -1792,6 +1834,246 @@ def key_env(name):
         and not ENV_RESERVED.fullmatch(name)
 
 
+# ---------------------------------------------------------------- model accounts (the AI providers build spec, 3.1 to 3.3)
+#
+# An agent gets its model in one of three ways: a plan (a sign-in in the vendor's own program, as before), a key (an
+# API key in the vault) or the owner's own model server (an address). The two last are an entry of team.json
+# "accounts" with a `kind`, which the agent names with `account`. What follows is data: which program runs an account,
+# what a provider is called inside that program, and the one call that says whether a key is good.
+#
+#   label     what the owner reads for the provider
+#   runtime   the program of an account of this provider
+#   program   the provider's name inside that program; None where the program has one provider only
+#   makers    "one": the account may leave its model out, and the program takes its own default; "many": a seller of
+#             several makers' models, whose account names its model
+#   site      the key's site, for the vault's form
+#   check     the call that a good key answers with 200 and a refused one with 400, 401 or 403: {method, url,
+#             header: the header that carries the key, None for a bearer; body: a POST's JSON}. A key never goes
+#             into an address. Not proved before a first owner's key: that each call answers 200 with a good one
+ACCOUNT_KINDS = ("key", "server")
+KEY_PROVIDERS = {
+    "google": {"label": "Gemini", "runtime": "opencode", "program": "google", "makers": "one",
+               "site": "https://generativelanguage.googleapis.com",
+               "check": {"method": "GET", "url": "https://generativelanguage.googleapis.com/v1beta/models",
+                         "header": "x-goog-api-key", "body": None}},
+    "xai": {"label": "Grok", "runtime": "grok", "program": None, "makers": "one", "site": "https://api.x.ai",
+            "check": {"method": "GET", "url": "https://api.x.ai/v1/models", "header": None, "body": None}},
+    "opencode-go": {"label": "OpenCode Go", "runtime": "opencode", "program": "opencode-go", "makers": "many",
+                    "site": "https://opencode.ai",
+                    "check": {"method": "GET", "url": "https://opencode.ai/inference/go/v1/models", "header": None,
+                              "body": None}},
+    "openrouter": {"label": "OpenRouter", "runtime": "opencode", "program": "openrouter", "makers": "many",
+                   "site": "https://openrouter.ai",
+                   "check": {"method": "GET", "url": "https://openrouter.ai/api/v1/key", "header": None, "body": None}},
+    # GET /v1/models there answers 200 to a wrong key, so it cannot check one; POST /api/me refuses it with 401
+    "ollama-cloud": {"label": "Ollama Cloud", "runtime": "opencode", "program": "ollama-cloud", "makers": "many",
+                     "site": "https://ollama.com",
+                     "check": {"method": "POST", "url": "https://ollama.com/api/me", "header": None, "body": {}}},
+}
+# The owner's own model server: the provider "own" of a `server` account. The program's configuration names it `own`
+# too, so each of its models is own/<name>.
+OWN_SERVER = {"provider": "own", "runtime": "opencode", "program": "own", "makers": "many"}
+REQUIRED_CONTEXT = 64000        # the tokens of context that a model server must take: the fleet's rules alone are
+                                # about 17,000 at each start
+ACCOUNT_FILE = "account-%s.json"    # in ~/.fleet: what the check of a model server kept for one agent
+# The words of the setup check's `account` item. Proposed, not approved: no live fleet shows them before the apps
+# offer an account kind, and the owner says yes to each one before a release shows it.
+NO_ANSWER = "This server does not answer."
+OPEN_SERVER = "This server answers with no key, and more than one agent can reach it."
+NO_TOOL_CALL = "No model here passed a tool call."
+SMALL_CONTEXT = f"Its context is smaller than {REQUIRED_CONTEXT:,} tokens."
+NO_KEY = "The vault gave no key for this account."
+KEY_REFUSED = "The provider refused the key."
+CHECK_CLIENT = "Founderizer-Fleet/1 (helper)"       # fleet.OUTSIDE_AGENT: an edge can refuse Python's default name
+CHECK_MODELS = 8                # the models of a server's list that the check tries, in the list's order
+CHECK_BODY = 4 * 1024 * 1024    # the most of an answer that the check reads
+PING = "Call the tool ping with the value 7."
+PING_TOOL = {"type": "function", "function": {
+    "name": "ping", "description": "Answers pong.",
+    "parameters": {"type": "object", "properties": {"value": {"type": "integer"}}, "required": ["value"]}}}
+
+
+def model_account(team, conf):
+    """What team.json says of the model account of one agent, or None for an agent whose account has no kind (a
+    plan's sign-in, as before): {id, kind, provider, runtime, program, makers, title, address, model, secret, env,
+    check}. runtime is None for a provider that this release does not know, and no session starts on such an
+    account. env is the variable name of the secret's own entry of team.json "logins", by which the vault gives its
+    value."""
+    accounts, ident = (team or {}).get("accounts"), (conf or {}).get("account")
+    entry = accounts.get(ident) if isinstance(accounts, dict) and isinstance(ident, str) else None
+    if not isinstance(entry, dict) or entry.get("kind") not in ACCOUNT_KINDS:
+        return None
+    kind, provider = entry["kind"], entry.get("provider")
+    known = (OWN_SERVER if provider == OWN_SERVER["provider"] else None) if kind == "server" else \
+        KEY_PROVIDERS.get(provider) if isinstance(provider, str) else None
+    known = known or {}
+    secret = entry.get("secret") if isinstance(entry.get("secret"), str) and entry["secret"] else None
+    logins = team.get("logins") if isinstance(team.get("logins"), dict) else {}
+    login = logins.get(secret) if secret and isinstance(logins.get(secret), dict) else {}
+    name = login.get("env") if login.get("kind") == "api_key" else None
+    model, address = entry.get("model"), entry.get("address")
+    return {"id": ident, "kind": kind, "provider": provider, "runtime": known.get("runtime"),
+            "program": known.get("program"), "makers": known.get("makers"),
+            "title": entry.get("title") if isinstance(entry.get("title"), str) else None,
+            "address": address.rstrip("/") if kind == "server" and isinstance(address, str) else None,
+            "model": model if isinstance(model, str) and MODEL_NAME.fullmatch(model) else None,
+            "secret": secret, "env": name if isinstance(name, str) and KEY_ENV.fullmatch(name) else None,
+            "check": known.get("check")}
+
+
+def account_path(home, agent):
+    return os.path.join(home or os.path.expanduser("~"), FLEET_DIR, ACCOUNT_FILE % agent)
+
+
+def kept_account(home, agent, account):
+    """What the setup check kept for this agent's model server, {account, address, key, models, model, at}, when it
+    is of this account as team.json has it now: the same id, address and key or no key. Else None. The hub writes
+    no team.json for the model that passed, because a write of an account would make the check of each agent old."""
+    try:
+        with open(account_path(home, agent), "rb") as f:
+            kept = json.loads(f.read(1 << 20))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(kept, dict) or not account or kept.get("account") != account["id"] or \
+            kept.get("address") != account["address"] or kept.get("key") is not bool(account["secret"]) or \
+            not isinstance(kept.get("model"), str) or not MODEL_NAME.fullmatch(kept["model"]) or \
+            not isinstance(kept.get("models"), list):
+        return None
+    return kept
+
+
+def program_account(account, runtime, model=None, models=()):
+    """An account as the adapter of its program takes it for the session's files (acp_programs.Program.files):
+    {provider, the provider's name in the program; model; models, the names of a model server's own models; key_env,
+    the variable that holds the key, None for a server with no key; address, title, context}."""
+    if not account:
+        return None
+    return {"provider": account["program"], "model": model, "models": list(models),
+            "key_env": runtime_fact(runtime, "key_env") if account["secret"] else None,
+            "address": account["address"], "title": account["title"], "context": REQUIRED_CONTEXT}
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """The check follows no redirect: a typed address is called as it is typed, and a key goes nowhere else."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def model_call(method, url, key=None, body=None, timeout=30, header=None):
+    """(status, the answer's JSON or None) of one fixed call of the setup check, or (None, None) for no answer in
+    time. The key goes as a bearer, or in `header`; no proxy of the environment and no redirect is followed."""
+    headers = {"User-Agent": CHECK_CLIENT, "Accept": "application/json"}
+    if key:
+        headers.update({header: key} if header else {"Authorization": f"Bearer {key}"})
+    data = None
+    if body is not None:
+        data, headers["Content-Type"] = json.dumps(body).encode(), "application/json"
+    opener = urllib.request.build_opener(NoRedirect, urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(urllib.request.Request(url, data=data, headers=headers, method=method), timeout=timeout) as r:
+            status, raw = r.status, r.read(CHECK_BODY + 1)
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except (OSError, ValueError, http.client.HTTPException):
+        return None, None
+    try:
+        return status, json.loads(raw) if len(raw) <= CHECK_BODY else None
+    except ValueError:
+        return status, None
+
+
+def server_models(answer):
+    """The model names of a server's list, GET <address>/models in the OpenAI shape, in its order."""
+    rows = answer.get("data") if isinstance(answer, dict) else None
+    names = [row.get("id") for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+    return [name for name in names if isinstance(name, str) and MODEL_NAME.fullmatch("own/" + name)][:64]
+
+
+def pinged(answer):
+    """True when a chat answer has exactly one tool call, of `ping`, whose arguments parse to {"value": 7}."""
+    try:
+        calls = answer["choices"][0]["message"].get("tool_calls") or []
+        if len(calls) != 1 or calls[0]["function"]["name"] != "ping":
+            return False
+        given = calls[0]["function"]["arguments"]
+        return (json.loads(given) if isinstance(given, str) else given) == {"value": 7}
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError):
+        return False
+
+
+def prompt_tokens(answer):
+    value = (answer.get("usage") or {}).get("prompt_tokens") if isinstance(answer, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def check_server(account, key, kept=None, call=model_call, clock=time.time):
+    """The setup check of the owner's own model server, in its order; the first failure ends it. Returns (state,
+    detail, what to keep or None). The helper sends only fixed prompts and reports only the fixed words and a model's
+    name.
+
+      1. GET <address>/models, with the key if the account has one: the server answers with its models.
+      2. With a key: the same call with no key must answer 401 or 403, and the server's own routes at its host and
+         port (Ollama's /api/tags and /api/version) must not answer with their JSON: a proxy that guards /v1 only
+         would leave them open to each agent that can reach the address.
+      3. One tool call for each model of the list, 8 at most, until one passes.
+      4. For that model: its context takes REQUIRED_CONTEXT tokens. A server that cuts a long prompt fails here.
+
+    Steps 3 and 4 run again only when the account, the address, the key or the model list differ from what was kept
+    (kept_account); else the kept result stands."""
+    address = account["address"]
+    status, answer = call("GET", f"{address}/models", key=key, timeout=30)
+    models = server_models(answer) if status == 200 else []
+    if status != 200 or not isinstance(answer, dict):
+        return "failed", NO_ANSWER, None
+    if key:
+        status, _ = call("GET", f"{address}/models", timeout=30)
+        if status not in (401, 403):
+            return "failed", OPEN_SERVER, None
+        parts = urllib.parse.urlsplit(address)
+        for route, field in (("/api/tags", "models"), ("/api/version", "version")):
+            status, said = call("GET", f"{parts.scheme}://{parts.netloc}{route}", timeout=30)
+            if status == 200 and isinstance(said, dict) and field in said:
+                return "failed", OPEN_SERVER, None
+    if kept and kept.get("models") == models:
+        return "ok", kept["model"], None
+    passed = None
+    for name in models[:CHECK_MODELS]:
+        status, answer = call("POST", f"{address}/chat/completions", key=key, timeout=120, body={
+            "model": name, "messages": [{"role": "user", "content": PING}], "tools": [PING_TOOL], "stream": False})
+        if status == 200 and pinged(answer):
+            passed = name
+            break
+    if passed is None:
+        return "failed", NO_TOOL_CALL, None
+    ask = lambda words: call("POST", f"{address}/chat/completions", key=key, timeout=600, body={
+        "model": passed, "messages": [{"role": "user", "content": " ".join(["seven"] * words)}], "max_tokens": 1,
+        "stream": False})
+    status, answer = ask(2000)
+    measured = prompt_tokens(answer) if status == 200 else None
+    if not measured:
+        return "failed", SMALL_CONTEXT, None
+    status, answer = ask(math.ceil(REQUIRED_CONTEXT * 2000 / measured))
+    taken = prompt_tokens(answer) if status == 200 else None
+    if not taken or taken < 0.95 * REQUIRED_CONTEXT:
+        return "failed", SMALL_CONTEXT, None
+    model = "own/" + passed
+    return "ok", model, {"account": account["id"], "address": address, "key": bool(account["secret"]),
+                         "models": models, "model": model, "at": clock()}
+
+
+def check_key(account, key, call=model_call):
+    """The setup check of a key account: the provider's own call answers 200 with the key. No model is called."""
+    check = account.get("check")
+    if not key:
+        return "failed", NO_KEY
+    if not check:
+        return "failed", KEY_REFUSED
+    status, _ = call(check["method"], check["url"], key=key, body=check.get("body"), timeout=30,
+                     header=check.get("header"))
+    return ("ok", "") if status == 200 else ("failed", KEY_REFUSED)
+
+
 # Where a machine keeps the saved checks that its own sessions wrote, by the SHA-256 of their bytes:
 # ~/fleet-checks/<sha256>.py, a folder of the agent's own user that its sessions may write. ~/.fleet holds the agent's
 # key and its sessions' files, and Fleet's deny list keeps every session out of it (fleet.DENY). The hub keeps a saved
@@ -1912,8 +2194,11 @@ class Lifecycle:
     def __init__(self, kit, agent, conf, post, busy, restart=None, run=_run, clock=time.time,
                  platform_name=sys.platform, home=None, vault=None, probe=None, models=codex_model_list, legacy=None,
                  switch=None, which=None, monotonic=time.monotonic, runtimes_busy=None, say=print, slow_file=None,
-                 floor=None):
+                 floor=None, read_key=None):
         self.kit, self.agent, self.conf, self.post, self.busy = kit, agent, conf, post, busy
+        # () -> the key of the agent's model account from this machine's vault, or None (fleet.account_key): the
+        # setup check proves the key with it, and a reading of the program's model list starts the program with it
+        self.read_key = read_key
         self.floor = floor              # this user's release floor (floor_path); None: no floor, as for a reading
         # () -> True while a session of this OS user may be using a runtime: its updates wait for False
         # (update_runtimes). None: this process updates no runtime, as for the server service's readings.
@@ -2287,9 +2572,76 @@ class Lifecycle:
                        "options": options or []}
         return self.models
 
+    def account(self):
+        """The model account of this agent as this checkout's team.json has it now (model_account), or None for an
+        agent whose account has no kind."""
+        try:
+            with open(os.path.join(self.kit, "team.json"), encoding="utf-8") as f:
+                team = json.load(f)
+        except (OSError, ValueError):
+            return None
+        return model_account(team, self.conf) if isinstance(team, dict) else None
+
+    def account_key(self, account):
+        """The key of the agent's model account, from the machine's vault; None with no secret or no value."""
+        if not account or not account["secret"] or not self.read_key:
+            return None
+        try:
+            key = self.read_key()
+        except Exception:
+            return None
+        return key if isinstance(key, str) and key else None
+
+    def acp_model_options(self, name, exe, how):
+        """(options, error, source) of an ACP program, read where its entry's acp_models says: the program is started
+        as a session starts it, in a folder of its own, with the account's key and configuration, and no prompt is
+        sent. 64 options at most; the model that the program would run now is the default."""
+        import acp_programs
+        import acp_runner
+        source = "ACP " + ("initialize" if how == "initialize" else "session/new")
+        label = runtime_fact(name, "label", name)
+        if not exe:
+            return None, f"{label} is not installed", source
+        account = self.account()
+        if account and account["runtime"] != name:
+            account = None
+        adapter = acp_programs.adapter(runtime_fact(name, "acp_adapter"), self.home)
+        kept = kept_account(self.home, self.agent, account) if account and account["kind"] == "server" else None
+        model = self.conf.get("model") or (account or {}).get("model") or (kept or {}).get("model")
+        names = [m for m in (kept or {}).get("models") or [] if isinstance(m, str)]
+        key, session = self.account_key(account), str(uuid.uuid4())
+        environ = dict(os.environ)
+        if key:
+            environ[runtime_fact(name, "key_env")] = key
+        methods = runtime_fact(name, "acp_auth") or {}
+        auth = methods.get(account["kind"] if account else "plan")
+        try:
+            adapter.prepare(session, None, program_account(account, name, model, names))
+            listed, error = acp_runner.read_models(
+                [exe, *shlex.split(runtime_fact(name, "acp_command") or "")[1:]], self.kit,
+                acp_runner.started_env(name, adapter, session, auth, environ), adapter, how, auth=auth)
+        except OSError as e:
+            listed, error = None, f"{label} could not be started for its model list: {type(e).__name__}"
+        finally:
+            adapter.remove(session)
+        options = []
+        for model, efforts, effort, current in listed or []:
+            if isinstance(model, str) and MODEL_NAME.fullmatch(model) and all(o["model"] != model for o in options):
+                options.append({"model": model, "display_name": model, "default": current is True,
+                                "efforts": [e for e in efforts if isinstance(e, str) and EFFORT_NAME.fullmatch(e)][:16],
+                                "default_effort": effort if isinstance(effort, str) and EFFORT_NAME.fullmatch(effort)
+                                else None})
+        if not options:
+            return None, error or f"{label} listed no models", source
+        return options[:64], None, source
+
     def model_options(self, name, exe):
         """(options, error, source): one runtime's own model options, read with its executable exe (None when it is
-        not installed). The reading of read_models, and the check of a runtime update (runtime_check)."""
+        not installed). The reading of read_models, and the check of a runtime update (runtime_check). An ACP
+        program's list is read by its entry's acp_models, whatever the program is."""
+        how = runtime_fact(name, "acp_models")
+        if how:
+            return self.acp_model_options(name, exe, how)
         if name == "codex":
             options, error = self.codex_models(exe) if exe else (None, "codex is not installed")
             return options, error, "codex app-server model/list"
@@ -2309,8 +2661,13 @@ class Lifecycle:
             items.append({"kind": kind, "ref": ref, "state": state, "detail": detail[:300]})
         rt = status.get("runtime") or {}
         name = rt.get("name") or "unknown"
+        account = self.account()
         if not rt.get("version"):
             add("runtime", name, "failed", f"{name} is not installed.")
+        elif account:
+            # an agent on a key or on a model server: its program has no sign-in to read, and the account's own item
+            # says whether the key or the server is good
+            add("runtime", name, "ok", str(rt["version"]))
         elif rt.get("signed_in") is True:
             add("runtime", name, "ok", f"{rt['version']}, signed in")
         elif rt.get("signed_in") is False:
@@ -2318,6 +2675,8 @@ class Lifecycle:
         else:
             add("runtime", name, "not_verified", f"{rt['version']}; the sign-in could not be read")
         add(*self.model_item(status.get("models")))
+        if account:
+            add(*self.account_item(account))
         user = pwd.getpwuid(os.getuid()).pw_name
         add("capability", "shell", "ok", f"Commands run as {user}.")
         add("capability", "web", "not_verified", "Web access is a runtime tool; Fleet cannot check it without a model turn.")
@@ -2337,6 +2696,36 @@ class Lifecycle:
                                      f"checkout.")
         add(*self.admin_item())
         return items
+
+    def account_item(self, account):
+        """The setup check's item of the agent's model account, ("account", its id, state, detail): the key is good at
+        its provider (check_key), or the owner's own model server answers, asks for its key, passes a tool call and
+        takes the context that the fleet needs (check_server). What a check of a server passed is kept for this
+        agent in ~/.fleet (account_path): a session starts with the kept model while neither the agent nor the
+        account names one."""
+        key = self.account_key(account)
+        if account["kind"] == "key" or (account["secret"] and not key):
+            state, detail = check_key(account, key) if account["kind"] == "key" else ("failed", NO_KEY)
+            return ("account", account["id"], state, detail)
+        if not account["address"]:
+            return ("account", account["id"], "failed", NO_ANSWER)
+        state, detail, keep = check_server(account, key, kept_account(self.home, self.agent, account),
+                                           clock=self.clock)
+        if keep:
+            path = account_path(self.home, self.agent)
+            try:
+                os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+                with open(os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+                    json.dump(keep, f)
+                os.replace(path + ".new", path)
+            except OSError:
+                return ("account", account["id"], "failed", NO_ANSWER)     # without the file no session could start
+        elif state != "ok" and detail != NO_ANSWER:
+            # a server that is open, or that no model of passes, keeps no model; one that only does not answer now
+            # keeps what its last check proved, for when it answers again
+            with contextlib.suppress(OSError):
+                os.remove(account_path(self.home, self.agent))
+        return ("account", account["id"], state, detail)
 
     def owner_default(self):
         """The owner's default model and effort of this agent's runtime (owner feature default_models), from this

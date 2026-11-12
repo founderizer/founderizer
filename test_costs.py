@@ -409,7 +409,15 @@ class Weights(Base):
         self.assertAlmostEqual(hub.session_cost(dict(row, model="claude-opus-5-5[1m]"), book), 4.0 + 0.2 + 8.0 + 20.0)
         self.assertAlmostEqual(hub.session_cost(dict(row, model="claude-unknown-9"), book), 32.2)     # the default
         self.assertAlmostEqual(hub.session_cost(dict(row, runtime="codex", model="gpt-6.1-sol"), book), 14.1)
-        self.assertIsNone(hub.session_cost(dict(row, runtime="grok"), book))            # no prices: no cost
+        self.assertIsNone(hub.session_cost(dict(row, runtime="gemini"), book))          # no prices: no cost
+        # The two ACP programs take their prices from the price file of the checkout (lifecycle.price_file): a model
+        # of the owner's own server costs nothing, whatever its name holds, and a priced one its price
+        prices = lifecycle.RUNTIMES["opencode"]["token_weights"]
+        self.assertEqual(book["opencode"], prices)
+        self.assertEqual(book["grok"], prices)
+        self.assertEqual(hub.session_cost(dict(row, runtime="opencode", model="own/deepseek-r1"), book), 0)
+        self.assertAlmostEqual(hub.session_cost(dict(row, runtime="grok", model="grok-4.7"), book),
+                               sum(prices["grok"].values()))
         self.assertIsNone(hub.session_cost(dict(row, input=None), book))                # no kinds: no cost
         self.assertEqual(set(hub.EDITABLE_FACTS), {"cache_seconds", "compact_tokens", "token_weights", "routine",
                                                    "default_model"})
@@ -425,7 +433,7 @@ class Weights(Base):
         self.assertAlmostEqual(hub.session_cost(dict(row, models=None), book), 2 * 4.0 + 0.2 + 20.0)
         self.assertAlmostEqual(hub.session_cost(dict(row, output=2_000_000), book), 2 * 4.0 + 0.2 + 40.0)
         self.assertAlmostEqual(hub.session_cost(dict(row, runtime="codex"), book), 2 * 2.0 + 0.1 + 10.0)
-        self.assertIsNone(hub.session_cost(dict(row, runtime="grok"), book))
+        self.assertIsNone(hub.session_cost(dict(row, runtime="gemini"), book))          # a name with no prices
 
     def test_the_owner_changes_a_price_and_a_cache_fact_and_puts_them_back(self):
         code, page = self.request("/ui/settings?db=test-generation")
