@@ -11,6 +11,7 @@ here is that the provenance is there and says the truth.
 
 An in-process hub with a temporary database and a set clock. No AI call, no live hub, no helper, no network.
 """
+import hashlib
 import json
 import unittest
 import uuid
@@ -194,6 +195,107 @@ class SecretThroughAnEscape(Base):
         self.assertIn("The shop login is", said)
         self.assertNotIn("assw0rd", said)
         self.assertIn(hub.MASK, said)
+
+    def test_one_message_with_a_login_that_the_mask_cannot_place_costs_no_other_message(self):
+        """A read joins its messages, and call_tool masks the joined text once more. A login that the mask finds but
+        cannot place, as JSON writes one with a quote, made that last mask give MASK for the whole read, every
+        message of which was already marked read: one colleague's message held back all the others. Each message is
+        masked on its own now (mask_message)."""
+        answer = json.dumps({"login": self.LOGIN, "shop": "acme"})        # an API's answer, passed on as it came
+        for text in (f"The shop answered:\n{answer}", "Use the staging shop first."):
+            self.ok("vps", "message_agent", request_id=str(uuid.uuid4()), agent="manager", text=text)
+        self.register()
+        said = self.ok("manager", "read_messages")
+        self.assertIn("Use the staging shop first.", said)
+        self.assertIn(f"The shop answered:\n{hub.MASK}", said)
+        self.assertNotIn("assw0rd", said)
+
+    def test_the_team_directory_of_a_chat_read_is_masked_on_its_own(self):
+        """The first read of an owner chat session begins with the team directory (chat_team_once): a login in it
+        that the mask cannot place costs the directory, and not the messages after it."""
+        self.ok("vps", "message_agent", request_id=str(uuid.uuid4()), agent="studio",
+                text="Use the staging shop first.")
+        self.register()
+        team = "\nYOUR TEAM: vps, who looks after " + json.dumps({"shop": self.LOGIN})
+        with patch.object(hub, "chat_context", lambda a, c=None: a == "studio"), \
+             patch.object(hub, "chat_fence", lambda a, c=None: None), \
+             patch.object(hub, "team_start_text", lambda agent: team):
+            text, error = hub.call_tool("studio", "read_messages", {})
+        self.assertFalse(error, text)
+        self.assertTrue(text.startswith(hub.MASK + "\n\nMessage M-"), text[:80])
+        self.assertIn("Use the staging shop first.", text)
+        self.assertNotIn("assw0rd", text)
+
+    def test_a_message_keeps_its_bytes_and_a_quoted_login_costs_that_login_only(self):
+        """mask_message: a text with no login comes back as it was. Where the mask cannot place a login, a line that
+        is one JSON string loses that login only, any other line that holds it goes whole, and the rest of the
+        message stays."""
+        self.register()
+        for text in ("Plain words.", '"A JSON line with \\" and \\\\ and \\u00e9"', '"Not JSON', '"one" "two"', "",
+                     "\n\n", '"A lone \\ud800 surrogate"', "CR\r\nLF and more", hub.json_one_line("a b\x85c\nd")):
+            self.assertEqual(hub.mask_message(text), text, repr(text))
+        quoted = hub.json_one_line(f"Laura's password is {self.LOGIN} now.")
+        passed = (f"[conversation C-3] 2 message(s) of Laura:\n[Fleet C-3] Laura · 11 Nov 22:20 (CM-41)\n{quoted}\n"
+                  f"[Fleet C-3] Laura · 11 Nov 22:21 (CM-42)\n" + hub.json_one_line("Call me\nat noon."))
+        self.assertEqual(hub.mask_secrets(passed), hub.MASK)            # the whole text, as the read's last mask has it
+        said = hub.mask_message(passed).split("\n")
+        self.assertEqual(said[2], hub.json_one_line(f"Laura's password is {hub.MASK} now."))
+        self.assertEqual(said[:2] + said[3:], passed.split("\n")[:2] + passed.split("\n")[3:])
+        twice = hub.json_one_line(json.dumps({"pw": self.LOGIN}))       # words that held the login escaped already
+        self.assertEqual((hub.mask_secrets(twice), hub.secret_hit(twice)), (twice, False))     # no mask finds it there
+        # a JSON text in the words, a line that is not one JSON string, words with a lone surrogate: the line goes
+        for line, gone in ((twice, hub.json_one_line(hub.MASK)),
+                           (json.dumps({"pw": self.LOGIN}), hub.MASK),
+                           ('"A lone \\ud800 and ' + json.dumps(self.LOGIN)[1:], hub.MASK)):
+            said = hub.mask_message(f"Before.\n{line}\nAfter.")
+            self.assertEqual(said.split("\n"), ["Before.", gone, "After."], line)
+            said.encode("utf-8")
+        for text in (passed, quoted, json.dumps({"pw": self.LOGIN}), f"{quoted}\n{quoted}"):
+            self.assertFalse(hub.secret_hit(hub.mask_message(text)), text)
+        # words of several lines lose the line that holds the login, and the words lose what the line would lose: a
+        # login glued to a quote, which the line has escaped, takes its whole run along (mask_words)
+        three = hub.json_one_line("Line one.\nIts config: " + json.dumps({"pw": self.LOGIN}) + "\nCall me at noon.")
+        self.assertEqual(json.loads(hub.mask_message(three)), f"Line one.\n{hub.MASK}\nCall me at noon.")
+        mixed = f"[agent vps] Its config: {json.dumps({'pw': self.LOGIN})}\n" + hub.json_one_line("Call me at noon.")
+        self.assertEqual(hub.mask_message(mixed), f"{hub.MASK}\n" + hub.json_one_line("Call me at noon."))
+        glued, salt = "SYNTHETICGLUEDLOGIN-4410", "cd" * 16
+        hub.q("INSERT INTO secrets(label,salt,hash,len,username) VALUES(?,?,?,?,'')",
+              ("bws://22222222-2222-2222-2222-222222222222 token", salt,
+               hashlib.sha256((salt + glued).encode()).hexdigest(), len(glued)))
+        line = hub.json_one_line(f'Use token="{glued}" now.')
+        self.assertEqual(hub.mask_message(line), hub.mask_secrets(line))
+        self.assertEqual(json.loads(hub.mask_message(line)), f"Use {hub.MASK} now.")
+
+    def test_a_read_reads_the_logins_once_for_all_its_masks(self):
+        """A read masks its messages after the lock that marks them read, with the logins that it read in that lock
+        (logins_held). A mask that read them again would take the lock again, once for each line of a message with a
+        JSON line, and TeamLock raises Left at such a take for an agent that left meanwhile: the messages that the read
+        had marked read would be lost. So a read reads the logins as often for a long message as for a short one."""
+        self.register()
+
+        def reads(lines):
+            self.ok("vps", "message_agent", request_id=str(uuid.uuid4()), agent="manager",
+                    text="\n".join(f"Line {n}." for n in range(lines)) + "\n" + hub.json_one_line("Call me at noon."))
+            seen, real = [], hub.read_rows
+            with patch.object(hub, "read_rows", lambda sql, args=(): seen.append(sql) or real(sql, args)):
+                said = self.ok("manager", "read_messages")
+            self.assertIn(hub.json_one_line("Call me at noon."), said.splitlines())
+            return sum("FROM secrets" in sql for sql in seen)
+        self.assertEqual(reads(5), reads(200))
+
+    def test_the_unread_messages_that_come_with_another_answer_are_masked(self):
+        """A task's unread messages come with the MCP answer of its session's other fleet calls (unread_tail), after
+        call_tool's last mask, and they went out with no mask at all: a login registered after its message was
+        written went out in them."""
+        hub.emit("vps", "say", f"[manager] The shop login is {self.LOGIN}; use it once.", task=self.task)
+        self.register()
+        answer = hub.rpc("vps", {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                 "params": {"name": "report_progress", "arguments": {"note": "Counting now."}}},
+                         {}, ("test-generation", hub.tref(self.task), 1))
+        blocks = [block["text"] for block in answer["result"]["content"]]
+        self.assertEqual(len(blocks), 2, blocks)
+        self.assertIn(f"The shop login is {hub.MASK}", blocks[1])
+        self.assertNotIn("assw0rd", blocks[1])
 
 
 class SecretOutOfTheBuilding(test_chat_apps.ChatApps, Late):

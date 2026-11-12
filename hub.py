@@ -2609,6 +2609,22 @@ def scrub(value):
         SCRUB.key = None
 
 
+@contextlib.contextmanager
+def logins_held(key):
+    """The registered logins that this thread's masks read (secret_key) while the block runs: `key`, which the caller
+    read under LOCK, as scrub() holds its own (SCRUB). A read masks its messages after the lock that marks them read
+    (t_read_messages, conversation_read), and each mask read the logins again, which took the lock again, once for
+    each line of a message with a JSON line: TeamLock raises Left at such a take for an agent that left meanwhile, so
+    a rename or a delete during the masks lost messages that were already marked read. Only this thread sees them,
+    until the block ends; a block inside another gives the outer one's back."""
+    held = getattr(SCRUB, "key", None)
+    SCRUB.key = key
+    try:
+        yield
+    finally:
+        SCRUB.key = held
+
+
 def scrubbed(value):
     """scrub() of one value, inside the scrub that read the logins. A text first: a text is never a dict or a list,
     and the state holds more texts than dicts and lists together."""
@@ -3115,11 +3131,19 @@ def fence(agent, tid, context=None):
 
 
 def t_read_messages(agent, a):
-    """The read is the receipt. A helper wake-up is never a receipt."""
+    """The read is the receipt. A helper wake-up is never a receipt. Each message of a read, and the team directory
+    that an owner chat's first read begins with, is masked on its own (mask_message), so a login that the mask cannot
+    place costs its own message, and not every message that the read marked read. The masks run after the lock: they
+    read each registered login against each run of each message, which takes seconds for long runs, and the lock holds
+    every other call of the hub. So call_tool runs this tool outside its lock, and each branch fences its session. The
+    masks use the logins that the hub reads in the section that marks the messages read (logins_held), so they take
+    no lock."""
+    with LOCK:
+        window = conversation_context(agent)
+    if window:                                  # a locked window with another person: its own messages only
+        return conversation_read(agent)
     reader = None
     with LOCK:
-        if conversation_context(agent):         # a locked window with another person: its own messages only
-            return conversation_read(agent)
         if chat_context(agent):
             chat_fence(agent)
             rows = q("SELECT e.* FROM events e JOIN ui_requests u ON u.event_id=e.id "
@@ -3165,6 +3189,7 @@ def t_read_messages(agent, a):
             kv_set("mgr_screen_shown", None)        # a session that reads has no question in front of it
             kv_set("mgr_screen_frozen", None)       # and is not frozen
         team = chat_team_once(agent) if chat_context(agent) else ""      # plan P9.1
+        said, head = None, ""
         if not rows:
             if chat_context(agent) or agents()[agent].get("role") == "manager":
                 unanswered(agent, now())            # plan C8: a standing session's closing empty read ends its turn
@@ -3172,20 +3197,25 @@ def t_read_messages(agent, a):
                 chase = requester_chase(agent, now())   # plan C9: what it read and left open, once each
                 if chase:
                     chased(agent, chase[1], emit(agent, "say", chase[0]))
+        else:
+            # A task's start event is the text that its session began with, as its first prompt or its appended
+            # system prompt (fleet.session_command), so its first read gave the same thousands of characters a second
+            # time. A Claude session that began with its stable text instead (opening "read", plan P9.2) reads it here.
+            said = [(r["id"], START_READ if r["kind"] == "task" and json.loads(r["extra"] or "{}").get("opening")
+                     != "read" else None, r["text"]) for r in rows]
+            if agents()[agent].get("role") == "manager":
+                # The first line names the messages: after a switch the helper finds them there in the previous
+                # session's conversation file (fleet.read_ids), where no message text can stand in for that line. The
+                # guidance is about the owner's own words, so it comes with them and not with every read.
+                head = ("Unread messages: " + ", ".join(f"M-{r['id']}" for r in rows) + ".\n\n"
+                        + (OWNER_CHAT_GUIDANCE if any(r["text"].startswith("[owner") for r in rows) else ""))
+        key = secret_key()
+    with logins_held(key):
+        team = mask_message(team)
+        if said is None:
             return team + "No unread messages. Wait for the next signal."
-        # A task's start event is the text that its session began with, as its first prompt or its appended system
-        # prompt (fleet.session_command), so its first read gave the same thousands of characters a second time. A
-        # Claude session that began with its stable text instead (opening "read", plan P9.2) reads it here.
-        messages = "\n\n".join(f"Message M-{r['id']}:\n" + (START_READ if r["kind"] == "task" and json.loads(
-            r["extra"] or "{}").get("opening") != "read" else r["text"]) for r in rows)
-        if agents()[agent].get("role") == "manager":
-            # The first line names the messages: after a switch the helper finds them there in the previous session's
-            # conversation file (fleet.read_ids), where no message text can stand in for that line. The guidance is
-            # about the owner's own words, so it comes with them and not with every read.
-            messages = ("Unread messages: " + ", ".join(f"M-{r['id']}" for r in rows) + ".\n\n"
-                        + (OWNER_CHAT_GUIDANCE if any(r["text"].startswith("[owner") for r in rows) else "")
-                        + messages)
-        return team + messages
+        return team + head + "\n\n".join(f"Message M-{n}:\n" + (start or mask_message(text))
+                                          for n, start, text in said)
 
 
 def chat_team_once(agent):
@@ -12846,59 +12876,65 @@ def conversation_header(conv, person, row):
 
 def conversation_read(agent):
     """read_messages inside a conversation window: only the messages of that one conversation, each with the header
-    that the hub writes, and the lines that the hub writes there for the agent (a task's result, header Fleet).
-    Inside the lock. In a conversation with the agent's tools (AUTONOMY.md P2), the first read of a session begins
-    with its brief, the read also gives the messages that the fleet filed under the open conversation task, and it
-    starts that task.
+    that the hub writes, and the lines that the hub writes there for the agent (a task's result, header Fleet). It
+    takes the lock for its reads and writes. In a conversation with the agent's tools (AUTONOMY.md P2), the first read
+    of a session begins with its brief, the read also gives the messages that the fleet filed under the open
+    conversation task, and it starts that task.
 
     Each message's words are one JSON string under its header (json_one_line), as a person's words go on to a task
     session: the line always begins with a quote mark, so a person's text can neither make nor begin a line that reads
     as the hub's own, a "Message CM-" line or a header in the owner's name or Fleet's, and its line breaks stay, as
-    escapes. The words are masked before they are quoted, each message on its own, as the recap of a new window masks
-    them: JSON writes a quote as \\" and a backslash as \\\\, so call_tool's mask after it would find a login that
-    holds one, registered after its message was stored, only as a hit that it cannot place, and hold back the whole
-    read, every message of which is already marked read."""
-    conv, person = conversation_fence(agent)
-    rows = q("SELECT * FROM conversation_messages WHERE conversation=? AND read_at IS NULL AND "
-             "(who IN ('person','owner') OR (who='action' AND event IS NOT NULL)) ORDER BY id", (conv["id"],))
-    works = conversation_works(person, agent)
-    t = conversation_task(conv["id"]) if works else None
-    says = q("SELECT * FROM events WHERE agent=? AND task=? AND kind='say' AND read_at IS NULL ORDER BY id",
-             (agent, t["id"])) if t else []
-    brief = works and kv_get(f"conversation_brief:{conv['id']}")
-    # lane L3: what changed in its standing items since its last read; a brief's per-task block carries them all. A
-    # narrowed pair's session keeps no standing item (person access plan, section 3), so it hears of none.
-    narrowed = person_scope(person["id"], agent) is not None
-    news = standing_pull(agent, conv["id"], (t is not None) if brief else None) if works and not narrowed else []
-    if not rows and not says and not brief and not news:
-        return "No unread messages. Wait for the next signal."
-    t0 = now()
-    for r in rows:
-        q("UPDATE conversation_messages SET read_at=? WHERE id=?", (t0, r["id"]))
-        if r["event"]:
-            q("UPDATE events SET read_at=COALESCE(read_at,?) WHERE id=?", (t0, r["event"]))
-    for e in says:
-        q("UPDATE events SET read_at=COALESCE(read_at,?) WHERE id=?", (t0, e["id"]))
-        q("UPDATE agent_messages SET read_at=COALESCE(read_at,?) WHERE event_id=?", (t0, e["id"]))
-    if t and t["state"] == "submitted":
-        q("UPDATE tasks SET state='working', started=? WHERE id=? AND state='submitted'", (t0, t["id"]))
-    if rows:
-        with transaction():         # the person sees that the agent is reading, as the owner does
-            chat_queue("typing", conv["account"], t0, chat=conv["chat"], seconds=CHAT_TYPING)
-            if (chat_apps().get(conv["account"]) or {}).get("app") == "whatsapp":
-                ids = [r["msg_id"] for r in rows if r["msg_id"]]
-                if ids:
-                    chat_queue("read", conv["account"], t0, chat=conv["chat"], sender=conv["sender"],
-                               ids=json.dumps(ids))
-    text = "\n\n".join([f"Message {cm_ref(r['id'])}:\n{conversation_header(conv, person, r)}\n"
-                         f"{json_one_line(mask_secrets(r['text']))}"
-                        for r in rows] + [e["text"] for e in says] + news +
-                       ([f"These are {tref(t['id'])}, the open conversation task: your task tools work for it, and "
-                         f"your reply ends it."] if t else []))
-    if brief:
-        kv_set(f"conversation_brief:{conv['id']}", None)
-        text = conversation_brief(agent, conv, person, t) + "\n" + (text or "No unread messages yet.")
-    return text
+    escapes. The words are masked before they are quoted, each message on its own (mask_words): JSON writes a quote as
+    \\" and a backslash as \\\\, so call_tool's mask after it would find a login that holds one, registered after its
+    message was stored, only as a hit that it cannot place, and hold back the whole read, every message of which is
+    already marked read. For the same reason each message that the fleet filed under the conversation task, and each
+    piece of news of the standing items, is masked on its own (mask_message). The masks run after the lock, with the
+    logins that it read there, as those of t_read_messages do; the brief is made, and masked, under it
+    (conversation_brief)."""
+    with LOCK:
+        conv, person = conversation_fence(agent)
+        rows = q("SELECT * FROM conversation_messages WHERE conversation=? AND read_at IS NULL AND "
+                 "(who IN ('person','owner') OR (who='action' AND event IS NOT NULL)) ORDER BY id", (conv["id"],))
+        works = conversation_works(person, agent)
+        t = conversation_task(conv["id"]) if works else None
+        says = q("SELECT * FROM events WHERE agent=? AND task=? AND kind='say' AND read_at IS NULL ORDER BY id",
+                 (agent, t["id"])) if t else []
+        brief = works and kv_get(f"conversation_brief:{conv['id']}")
+        # lane L3: what changed in its standing items since its last read; a brief's per-task block carries them all.
+        # A narrowed pair's session keeps no standing item (person access plan, section 3), so it hears of none.
+        narrowed = person_scope(person["id"], agent) is not None
+        news = standing_pull(agent, conv["id"], (t is not None) if brief else None) if works and not narrowed else []
+        if not rows and not says and not brief and not news:
+            return "No unread messages. Wait for the next signal."
+        t0 = now()
+        for r in rows:
+            q("UPDATE conversation_messages SET read_at=? WHERE id=?", (t0, r["id"]))
+            if r["event"]:
+                q("UPDATE events SET read_at=COALESCE(read_at,?) WHERE id=?", (t0, r["event"]))
+        for e in says:
+            q("UPDATE events SET read_at=COALESCE(read_at,?) WHERE id=?", (t0, e["id"]))
+            q("UPDATE agent_messages SET read_at=COALESCE(read_at,?) WHERE event_id=?", (t0, e["id"]))
+        if t and t["state"] == "submitted":
+            q("UPDATE tasks SET state='working', started=? WHERE id=? AND state='submitted'", (t0, t["id"]))
+        if rows:
+            with transaction():         # the person sees that the agent is reading, as the owner does
+                chat_queue("typing", conv["account"], t0, chat=conv["chat"], seconds=CHAT_TYPING)
+                if (chat_apps().get(conv["account"]) or {}).get("app") == "whatsapp":
+                    ids = [r["msg_id"] for r in rows if r["msg_id"]]
+                    if ids:
+                        chat_queue("read", conv["account"], t0, chat=conv["chat"], sender=conv["sender"],
+                                   ids=json.dumps(ids))
+        heads = [f"Message {cm_ref(r['id'])}:\n{conversation_header(conv, person, r)}\n" for r in rows]
+        last = [f"These are {tref(t['id'])}, the open conversation task: your task tools work for it, and your "
+                f"reply ends it."] if t else []
+        if brief:
+            kv_set(f"conversation_brief:{conv['id']}", None)
+            brief = conversation_brief(agent, conv, person, t) + "\n"
+        key = secret_key()
+    with logins_held(key):
+        text = "\n\n".join([head + json_one_line(mask_words(r["text"] or "")) for head, r in zip(heads, rows)]
+                           + [mask_message(e["text"]) for e in says] + [mask_message(n) for n in news] + last)
+    return brief + (text or "No unread messages yet.") if brief else text
 
 
 def conversation_context(agent, context=None):
@@ -13887,6 +13923,69 @@ def json_one_line(text):
     return said
 
 
+def json_words(line):
+    """The words of a line that is one JSON string and nothing else, as json_one_line writes one, or None. Words with a
+    lone surrogate are not taken: json_one_line would write it as it is, and no UTF-8 text can hold one."""
+    if len(line) < 2 or line[0] != '"' or line[-1] != '"':
+        return None
+    try:
+        words = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(words, str) or any("\ud800" <= c <= "\udfff" for c in words):
+        return None
+    return words
+
+
+def mask_words(words):
+    """mask_secrets of the words that a JSON line quotes (json_one_line), before they are quoted. A login takes the
+    whole run of non-whitespace that holds it: in the line each quote of the words is escaped, and the mask of the
+    line takes an escaped quote into the run (MASK_PIECE), so no part of a later login that overlaps this one stays,
+    as none stays in the line. Where a login stays that the mask cannot place, the words go whole, or each line of
+    them that holds one."""
+    words = str(words or "")
+    spans = secret_spans(words)
+    out, last = [], 0
+    if spans:
+        for m in SECRET_RUN.finditer(words):
+            if any(m.start() <= start < m.end() for start, _end in spans):
+                out += [words[last:m.start()], MASK]
+                last = m.end()
+    said = "".join(out) + words[last:]
+    if "\\" not in words or not secret_hit(said):
+        return said
+    lines = words.split("\n")
+    return MASK if len(lines) == 1 else "\n".join(mask_words(line) for line in lines)
+
+
+def mask_message(text):
+    """mask_secrets of one message of a read, before the read joins it with the others and masks the whole once more.
+    A message is masked line by line when a line of it is one JSON string, as json_one_line writes a person's words,
+    or when mask_secrets finds a login in it that it cannot place and so gives MASK for all of it.
+
+    A JSON line is masked in its words (mask_words), and quoted again when the mask took something out. In such a line
+    a login that holds a quote or a backslash is only in its escaped form, which the mask finds but cannot place, and
+    one that the words held escaped already is escaped twice there, which no mask finds. So one such login, registered
+    after its message was stored, held back the whole read, every message of which was already marked read, or went
+    out. Now it costs that login, or at most the line that holds it. Each line that it gives passes mask_secrets too,
+    so the masked message needs no mask after it (unread_tail). A message with no login keeps its bytes."""
+    text = str(text or "")
+    lines = text.split("\n")
+    quoted = [json_words(line) for line in lines]
+    if all(words is None for words in quoted):
+        said = mask_secrets(text)
+        if said != MASK:
+            return said
+    out = []
+    for line, words in zip(lines, quoted):
+        if words is None:
+            out.append(mask_secrets(line))
+            continue
+        masked = mask_words(words)
+        out.append(mask_secrets(line if masked == words else json_one_line(masked)))
+    return "\n".join(out)
+
+
 def conversation_pass_rows(conv, person, tid, rows, t0):
     """Inside the caller's transaction (AUTONOMY.md P2, decision 40): the person's messages `rows` reach the session
     of open work `tid` as one message, each with its header and as one JSON string that no line of theirs can end.
@@ -13932,7 +14031,12 @@ def conversation_brief(agent, conv, person, t):
     """The first read of a conversation's session with the agent's tools: who it talks with, how this session works,
     what the owner says about the person, what was said before, and then the per-task block of every session (the
     agent's holdings and team, its standing items, its notes and lessons, its checks: start_text with this as its
-    first part). Its start command carries only one line, so the brief has no size of a command to fit."""
+    first part). Its start command carries only one line, so the brief has no size of a command to fit.
+
+    The role's words, the owner's note and each message of the recap are masked each on its own, as the prompt of a
+    new window masks them (conversation_prompt): start_text masks the whole block once more, and one login that the
+    mask cannot place there, as JSON writes one with a quote, made the whole brief MASK, and the window ran without its
+    rules, its holdings and its standing items."""
     access = person_access(person)
     narrowed = person_scope(person["id"], agent) is not None
     if narrowed:        # person access plan, section 5: no task, no one else
@@ -13960,7 +14064,7 @@ def conversation_brief(agent, conv, person, t):
             "- message_contact writes to a person on your list whose role has tools on (PEOPLE ON YOUR LIST, below): "
             "first, or later. With waits=true your task waits, and their next message is the answer."]
     lines = [
-        f"CONVERSATION C-{conv['id']} with {person['name']}, who is {person['role']}: {access['prompt']}",
+        f"CONVERSATION C-{conv['id']} with {person['name']}, who is {person['role']}: {mask_secrets(access['prompt'])}",
         "",
         "How this conversation runs:",
         f"- This is one live session for {person['name']}, "
@@ -13979,14 +14083,14 @@ def conversation_brief(agent, conv, person, t):
         f"conversation.",
     ]
     if person["note"]:
-        lines += ["", f"What the owner says about {person['name']}: {person['note']}"]
+        lines += ["", f"What the owner says about {person['name']}: {mask_secrets(person['note'])}"]
     rows = q("SELECT * FROM conversation_messages WHERE conversation=? AND who IN ('person','agent','owner') AND "
              "read_at IS NOT NULL ORDER BY id DESC LIMIT ?", (conv["id"], CONVERSATION_RECAP))
     if rows:
         said = {"person": " ".join(person["name"].split()), "agent": " ".join(agent_display(agent).split()),
                 "owner": "The owner"}           # one line each, as clip makes each message: a name begins no line
         lines += ["", "What was said before, oldest first:"] + \
-                 [f"{said[r['who']]}: {clip(r['text'], 600)}" for r in reversed(rows)]
+                 [f"{said[r['who']]}: {mask_secrets(clip(r['text'], 600))}" for r in reversed(rows)]
     first = "\n".join(lines) + "\n"
     # how this session started (conversation_start), which says whether its stable text lists the agent's skills
     return start_text(agent, t["id"], first=first, opening=stable_opening(agent, "none")) if t else \
@@ -22509,11 +22613,14 @@ def target_detail(r, t0):
 
 def standing_line(r, reader, t0):
     """One active item in one line, for an agent that it steers. Always whole: an item cut short can lose the
-    condition it was given with. Only the owner's lists cut its words, beside his line that carries them whole."""
+    condition it was given with. Only the owner's lists cut its words, beside his line that carries them whole. Its
+    words are masked on their own: start_text masks the whole per-task block once more, and one login that the mask
+    could not place in one item, as JSON writes one with a quote, made every start text of the agent MASK, and the
+    brief of each window."""
     scope = "" if r["scope"] != "team" else " for your team" if r["agent"] == reader else f" for {r['agent']}'s team"
     source = item_source(r)
     return (f"{iref(r['id'])} {r['kind']}{scope}, from {standing_who(r['author'], reader)}"
-            + (f" ({source})" if source else "") + f", {ago(r['created'])} ago: {r['words']}"
+            + (f" ({source})" if source else "") + f", {ago(r['created'])} ago: {mask_secrets(r['words'])}"
             + (f" [{target_detail(r, t0)}]" if r["kind"] == "target" else ""))
 
 
@@ -25900,7 +26007,11 @@ def unread_tail(agent, tid):
     """The messages of a task that its session has not read, read now and added to the MCP answer of another fleet
     call as a block of their own (rpc, plan P9.4), so that the session needs no read_messages for them and its helper
     types no signal. "" when none. A start event alone is not one of them: its read is the session's own, which its
-    start tells it to make. It reads in the call's own context (CALL.context), as read_messages does."""
+    start tells it to make. It reads in the call's own context (CALL.context), as read_messages does. This block comes
+    after the last mask of a tool's answer (call_tool), and it went out with no mask at all, so a login registered
+    after its message was written went out in it. Its masks are the read's own now (mask_message), with the logins
+    that the read took under the lock that marked the messages read: one more mask here would take the lock again
+    after that, where TeamLock raises Left for an agent that left meanwhile, and the messages would be lost."""
     unread = q1("SELECT 1 FROM events WHERE agent=? AND task=? AND kind='say' AND read_at IS NULL LIMIT 1",
                 (agent, tid))
     if not unread:
@@ -25981,9 +26092,10 @@ def call_tool(agent, name, args, context=None):
                 # These wait for an answer, a helper or Google, or read many files (search_knowledge): not under LOCK.
                 # deliver_result waits for the helper to send the task's files (deliver_outputs). The history's two
                 # take the lock for each step of their own, so the hub answers between the steps of a long search.
+                # read_messages takes it for its reads and writes, and masks each message after it (t_read_messages).
                 if name in ("ask_my_requester", "sign_in", "hand_over", "create_login", "save_key", "call_api",
                             "message_agent", "search_knowledge", "read_knowledge", "write_knowledge", "write_skill",
-                            "deliver_result", "search_history", "read_history") or \
+                            "deliver_result", "search_history", "read_history", "read_messages") or \
                         name in GOOGLE_TOOLS or name in REPO_CALLS:     # the door for threads asks GitHub
                     text = fn(agent, args)
                 else:

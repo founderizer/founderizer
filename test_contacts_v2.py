@@ -406,6 +406,129 @@ class Conversations(Base):
         self.assertEqual([json.loads(line) for line in quoted], [words])
         self.assertEqual([line for line in details if line.startswith("[Fleet C-") or line.startswith("Refund")], [])
 
+    def test_a_login_with_a_quote_in_words_passed_on_costs_that_login_only_in_the_tasks_read(self):
+        """open_work passes a person's words on as one JSON string, which writes a quote as \\" and a backslash as
+        \\\\. A login that holds one, registered after the words were passed on, is masked in its own words
+        (mask_message), and the task session's read keeps the rest: call_tool's mask of the joined read found it but
+        could not place it, and gave MASK for the whole read, every message of which was already marked read. Words
+        that held the login escaped already, as a JSON text does, have it escaped twice there, which no mask found."""
+        login = 'Synth"Pass\\w0rd-731-example'
+        cid = self.says(PAT, "Please rebuild the export for all of October.")["conversation"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        self.ok("open_work", self.context(cid), title="Rebuild the October export", details="All of October.")
+        work = hub.q1("SELECT * FROM tasks WHERE title='Rebuild the October export'")
+        self.ok("reply", self.context(cid), text="Started it.", in_reply_to="CM-1")
+        passed = [self.says(PAT, f"The shop's new password is {login} for October."),
+                  self.says(PAT, "Its config: " + json.dumps({"password": login})),
+                  self.says(PAT, "And call me at noon.")]
+        self.ok("read_messages", self.context(cid))
+        self.ok("open_work", self.context(cid), task=hub.tref(work["id"]), messages=[f"CM-{m['id']}" for m in passed])
+        test_people.register(login)
+        text = self.ok("read_messages", ("test-generation", hub.tref(work["id"]), "1"), task_id=hub.tref(work["id"]))
+        lines = text.splitlines()
+        self.assertEqual([lines[n + 1] for n, line in enumerate(lines) if line.startswith(f"[Fleet C-{cid}] ")],
+                         [hub.json_one_line(f"The shop's new password is {hub.MASK} for October."),
+                          hub.json_one_line(hub.MASK), hub.json_one_line("And call me at noon.")])
+        self.assertTrue(any(line.startswith(f"[conversation C-{cid}] The conversation passes on 3 message(s)")
+                            for line in lines), lines)
+        self.assertNotIn("w0rd-731", text)
+
+    def test_a_login_that_the_mask_cannot_place_costs_its_own_line_only_in_a_windows_read(self):
+        """A message that the fleet filed under the conversation task goes into the window's read beside the person's
+        messages. A login in it that the mask cannot place, as JSON writes one with a quote, costs that line
+        (mask_message), and the read keeps the rest of it and the person's message."""
+        login = 'Synth"Pass\\w0rd-731-example'
+        cid = self.says(PAT, "Please rebuild the export for all of October.")["conversation"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        hub.emit("studio", "say", "[agent vps] The shop answered:\n" + json.dumps({"login": login, "shop": "acme"}) +
+                 "\nUse it once.", task=self.conversation_task(cid)["id"])
+        later = self.says(PAT, "And call me at noon.")
+        test_people.register(login)
+        text = self.ok("read_messages", self.context(cid))
+        lines = text.splitlines()
+        self.assertIn(f"Message CM-{later['id']}:", lines)
+        self.assertIn(hub.json_one_line("And call me at noon."), lines)
+        at = lines.index("[agent vps] The shop answered:")
+        self.assertEqual(lines[at:at + 3], ["[agent vps] The shop answered:", hub.MASK, "Use it once."])
+        self.assertNotIn("w0rd-731", text)
+
+    def test_a_message_of_the_recap_with_a_login_that_the_mask_cannot_place_costs_its_line_of_the_brief(self):
+        """The brief of a new window recaps what was said before, and start_text masks the whole brief once more: a
+        login that the mask cannot place in one message, as JSON writes one with a quote, made the whole brief MASK,
+        so the window ran without its rules. Each message of the recap, the role's words and the owner's note are masked
+        each on its own now."""
+        login = 'Synth"Pass\\w0rd-731-example'
+        held = json.dumps({"password": login})
+        hub.q("UPDATE roles SET prompt=prompt || ? WHERE name='peer'", (f" The desk's config: {held}",))
+        self.assertEqual(self.change(self.pat["id"], note=f"His config: {held}")[0], 200)
+        cid = self.says(PAT, f"Its config: {held}")["conversation"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        self.ok("reply", self.context(cid), text="Thanks, noted.", in_reply_to="CM-1")
+        test_people.register(login)
+        hub.conversation_start("studio", cid)                  # a new window, whose first read is its brief
+        text = self.ok("read_messages", self.context(cid))
+        lines = text.splitlines()
+        self.assertEqual(lines[0], f"CONVERSATION C-{cid} with Pat, who is peer: {hub.MASK}")
+        self.assertIn("How this conversation runs:", lines)
+        self.assertIn(f"What the owner says about Pat: {hub.MASK}", lines)
+        self.assertIn(f"Pat: {hub.MASK}", lines)
+        self.assertNotIn("w0rd-731", text)
+
+    def test_a_standing_item_with_a_login_that_the_mask_cannot_place_costs_that_item_only(self):
+        """start_text masks the whole per-task block once more, and a window's brief is that block: one standing item
+        with a login that the mask cannot place, as JSON writes one with a quote, made every start text of the agent
+        and the brief of each window MASK, so a session got neither its task nor its rules. The words of each item
+        are masked on their own now (standing_line)."""
+        login = 'Synth"Pass\\w0rd-731-example'
+        tid, here = self.normal_task()
+        self.ok("keep_instruction", here, words="Sign in to the shop with " + json.dumps({"login": login}),
+                scope="agent")
+        test_people.register(login)
+        start = hub.start_text("studio", tid)
+        self.assertIn("STANDING ITEMS, lasting wishes", start)
+        self.assertIn(f"ago: {hub.MASK}", start)
+        self.assertNotIn("w0rd-731", start)
+        cid = self.says(PAT, "Please rebuild the export for all of October.")["conversation"]
+        hub.conversation_start("studio", cid)
+        text = self.ok("read_messages", self.context(cid))
+        self.assertTrue(text.startswith(f"CONVERSATION C-{cid} with Pat, who is peer: "), text[:80])
+        self.assertIn("How this conversation runs:", text.splitlines())
+        self.assertNotIn("w0rd-731", text)
+
+    def test_a_login_that_the_mask_cannot_place_in_standing_news_costs_that_news_only(self):
+        """The window takes the news of the standing items that steer its agent at its read (standing_pull), beside
+        the person's messages. A login in an item's words that the mask cannot place, as a JSON text has one with a
+        quote, costs those words in the news of a new item (standing_line), and the news of an ended item, which
+        carries its words as they were written, costs that piece of news (mask_message): the read keeps the rest."""
+        login = 'Synth"Pass\\w0rd-731-example'
+        cid = self.says(PAT, "Please rebuild the export for all of October.")["conversation"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        tid, here = self.normal_task()
+        self.ok("keep_instruction", here, words="Sign in to the shop with " + json.dumps({"login": login}),
+                scope="agent")
+        self.says(PAT, "And call me at noon.")
+        test_people.register(login)
+        text = self.ok("read_messages", self.context(cid))
+        lines = text.splitlines()
+        self.assertIn(hub.json_one_line("And call me at noon."), lines)
+        news = [line for line in lines if line.startswith("[hub] New standing item: ")]
+        self.assertEqual(len(news), 1, lines)
+        self.assertTrue(news[0].endswith(f"ago: {hub.MASK}. It steers your work from now on, inside your access."),
+                        news)
+        item = hub.q1("SELECT id FROM standing ORDER BY id DESC LIMIT 1")["id"]
+        self.ok("end_standing", here, id=f"I-{item}", why="the shop has a new login")
+        self.says(PAT, "Thanks.")
+        text = self.ok("read_messages", self.context(cid))
+        lines = text.splitlines()
+        self.assertIn(hub.json_one_line("Thanks."), lines)
+        self.assertEqual(lines.count(hub.MASK), 1, lines)               # the news of the end, and only that
+        self.assertTrue(lines[lines.index(hub.MASK) + 2].startswith("These are T-"), lines)
+        self.assertNotIn("w0rd-731", text)
+
     # ---- a customer: the closed session, and ask_team
     def test_a_closed_windows_prompt_masks_the_role_and_the_note_that_hold_a_later_login(self):
         """The role's prompt and the owner's note about the person go into a closed window's prompt, as its recap
@@ -991,6 +1114,21 @@ class ShellOffRule(Base):
         lines = self.ok("read_messages", here).splitlines()
         self.assertEqual([json.loads(line) for line in lines if line.startswith('"')], [words])
         self.assertEqual([line for line in lines if line.startswith("Refund") or line.startswith("Done")], [])
+
+    def test_an_answer_that_holds_a_json_text_with_a_login_loses_that_login_in_the_read(self):
+        """A JSON text writes a login with a quote escaped, and the one JSON string of the answer escapes it again:
+        no mask found it there, so a login registered after the answer came went out in the read. mask_message masks
+        the words of the string as they were written."""
+        login = 'Synth"Pass\\w0rd-731-example'
+        self.person("Kim", "manager", KIM, app="discord")
+        tid, here = self.normal_task(title="Answer the ticket")
+        self.ok("message_contact", here, person="Kim", text="Which config?", request_id=str(uuid.uuid4()), waits=True)
+        words = "This one: " + json.dumps({"password": login})
+        self.assertEqual(self.inbound(text=words, account="discord-studio", sender=KIM, chat="dm-9")[0], "stored")
+        test_people.register(login)
+        text = self.ok("read_messages", here)
+        self.assertIn(hub.json_one_line(hub.MASK), text.splitlines())
+        self.assertNotIn("w0rd-731", text)
 
     def test_a_shell_off_task_session_writes_to_a_colleague_and_the_answer_comes_back_into_it(self):
         """The owner, 3 November 2026: a ticket session of an agent whose Shell box is off writes first to a person.
