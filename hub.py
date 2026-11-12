@@ -28388,7 +28388,9 @@ def save_agent_settings(agent, body):
                           if c["field"] == "title" else f"its expertise is now {', '.join(c['after']) or 'none'}"
                           if c["field"] == "expertise" else f"its account label is now {c['after'] or 'none'}"
                           for c in changed if c["field"] in told)
-        emit(manager_name(), "say", f"[hub] The owner changed {agent}: {words}.")
+        # agent_first_message_sweep waits for the manager's turn with this word of an activation
+        emit(manager_name(), "say", f"[hub] The owner changed {agent}: {words}.",
+             extra={"activated": agent} if any(c["field"] == "active" and c["after"] for c in changed) else None)
     log("owner", f"changed the settings of {agent} in {commit[:12]}: {', '.join(sorted(fields))}")
     return {"agent": agent, "revision": commit, "sha256": hashlib.sha256(data).hexdigest(), "changed": changed,
             "updates_requested": updates, "settings_pending": settings_pending(agent),
@@ -29351,6 +29353,7 @@ def tick():
         step(server_watch_sweep, t0)        # the owner, 3 November 2026: each server against its own baseline
         step(mac_desktop_sweep)             # what only hands at a Mac can put right
         step(first_message_sweep, t0)       # the owner, 4 November 2026: a new fleet's manager writes first, once
+        step(agent_first_message_sweep, t0)     # the owner, 12 November 2026: and so does each new agent
         step(stop_finished_sessions, t0)
         step(offline_sweep, t0)
         step(trigger_sweep, t0)
@@ -32169,6 +32172,9 @@ def mac_setup_activate(row):
     mac_setup_prove(row)
 
 
+MAC_PROOF_TITLE = "Open the last page of this Mac's setup"      # agent_first_message_sweep knows the proof by it
+
+
 def mac_setup_prove(row):
     """One real task of the agent: it opens a page of this hub in Chrome. The page's script answers the hub, so a task
     that never reached a real browser proves nothing, whatever its result says."""
@@ -32185,7 +32191,7 @@ def mac_setup_prove(row):
         return mac_setup_stop(row, f"{shown_role(row['agent'])} has no browser and no screen on that Mac.", hands=True)
     browser = "browser" in can
     task = check_task(manager_name(), {
-        "owner": row["agent"], "needs": "browser" if browser else "screen", "title": "Open the last page of this Mac's setup",
+        "owner": row["agent"], "needs": "browser" if browser else "screen", "title": MAC_PROOF_TITLE,
         # A screen agent's Codex once tried Chrome's browser access, which needs OpenAI's extension that the sitting
         # skips, and stopped to ask its manager (4 November 2026): its words say how, with the screen alone.
         "details": f"Open {url} in Google Chrome with your browser tools, and wait until the page says Done. Use no "
@@ -33041,6 +33047,7 @@ def add_server_agent(server, body):
                                  more={f"profiles/{agent}.md": profile} if profile else None)
         apply_team(team)
         digest = hashlib.sha256(data).hexdigest()
+        kv_set(AGENT_FIRST_MESSAGE + agent, "wait")     # it writes to the owner first, once (agent_first_message_sweep)
     job = ins("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated,was) VALUES(?,?,?,?,?,?,?,?)",
               (server, kind, agent, runtime, "queued", t0, t0, was))
     log("owner", f"added agent {agent} ({runtime}) on server {server}: job {job}" if kind == "install" else
@@ -33161,7 +33168,8 @@ AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent"
 # The hub's own notes about one agent in kv, each kept under a prefix and the agent's name. test_rename reads every
 # kv key the code builds from a value, so a new prefix is placed here or named there with what it holds.
 AGENT_KV = ("tools:", "offline_told:", "runtime_since:", "switched:", "switching:", "history_agent:", "default_vault:",
-            "default_desktop:", "checks_brief:", "chat_team:", "duty_review:", "presence:", "turn_ended:")
+            "default_desktop:", "checks_brief:", "chat_team:", "duty_review:", "presence:", "turn_ended:",
+            "first_message:")
 # The same, with more after the name: `<prefix><agent>:<window, task or item>`.
 AGENT_KV_SCOPED = ("listed:", "untaken:", "chased:")
 # Columns that hold a JSON list of agents' names: the agents that passed a question up (question_passers).
@@ -33677,6 +33685,94 @@ def first_message_sweep(t0):
         DB.execute("UPDATE kv SET v='told' WHERE k=?", (FIRST_MESSAGE,))
         log_row("hub", f"asked {mgr} for its first message to the owner"
                 + (": its setup check passed" if passed else ": its setup check did not pass, so it does not say so"))
+
+
+# The owner, 12 November 2026, of how a new agent learns what it is for: "or maybe just start a conversation like a
+# human, with some suggestions". So a new agent writes first too, once, in its own chat, as the manager of a new fleet
+# does: no field of Add agent asks for its role. The state begins when the owner adds the agent (add_server_agent), so
+# an agent from before this, every one of a fleet that runs today, is never asked.
+#   wait    the agent was added; it is in setup or not signed in, or the manager still has its turn with the news
+#   told    the agent was asked for the message
+#   none    somebody wrote first, or the agent has work or a duty already, so nothing is asked
+AGENT_FIRST_MESSAGE = "first_message:"      # kv, with the agent's name after it (AGENT_KV)
+# **The ask is read once by every release, also the one before this** (COORDINATION.md, "Rollback reads"): a chat
+# event of the hub's own that a chat reads once is known to the read and to the helper's poll by `task_result` in its
+# extra (chat_result, 29 October 2026), and neither reads its value. An extra of its own would need a read side that
+# the release before has not: after a rollback the event came at every poll for ever and the agent's chat heard no
+# later message of the owner's (the review of this change, 12 November 2026). So the ask carries that field, with a
+# word in place of a task's number, and `first_message` beside it says what it is.
+AGENT_FIRST_EXTRA = {"task_result": "first-message", "first_message": True}
+MAC_SETUP_OPEN = ("add", "waiting", "finished", "checking", "proving")      # a new Mac's sitting that still runs
+AGENT_FIRST_SUGGESTS = ("watch a page or a service", "fix the bugs of a repository", "build the small features of a "
+                        "list", "check refunds and payments")
+
+
+def manager_had_its_turn(agent, t0):
+    """True when the manager has read the hub's word that the owner activated this agent and has ended that turn, or
+    cannot have one now. A manager that settled the agent's job with the owner before (rules/manager.md, "A fleet with
+    no worker") gives the duty in that turn, and a duty or a task cannot be given earlier: an agent in setup takes
+    neither. Without this wait the agent asked the owner what it should look after right after the owner had told the
+    manager (the review of this change, 12 November 2026). An event and never a clock: a manager with no server, at a
+    usage limit, held for a switch, signed out, with its helper away or with a flag on its session (down, frozen, a
+    question on its screen, silent: manager_flag_update) has no turn to wait for, and neither has one whose helper
+    reports no turn end, once it has read the word."""
+    mgr = manager_name()
+    if unplaced(mgr) or active_limit(mgr) or manager_held(mgr) or not helper_online(mgr, t0) or \
+            kv_get("mgr_flag_kind") or signed_in_now(mgr, (agents().get(mgr) or {}).get("runtime")) is False:
+        return True
+    told = q1("SELECT read_at FROM events WHERE agent=? AND kind='say' AND json_extract(extra, '$.activated')=? "
+              "ORDER BY id DESC LIMIT 1", (mgr, agent))
+    if not told:
+        return True
+    if told["read_at"] is None:
+        return False
+    ended = turn_ended(mgr)
+    return not ended or ended > told["read_at"]
+
+
+def agent_first_message_sweep(t0):
+    """One step of each new agent's first message to the owner, from what the hub reads; nothing waits on a clock.
+    The ask is one chat event, so it goes to the agent's own chat window, which its helper starts for it as for an
+    owner's message, and it stays until that session reads it (t_read_messages). It says only what the first message
+    is: what the agent does with the owner's answer is in RULES.md, which a chat session that starts again reads."""
+    for row in q("SELECT k FROM kv WHERE substr(k, 1, ?)=? AND v='wait'",
+                 (len(AGENT_FIRST_MESSAGE), AGENT_FIRST_MESSAGE)):
+        agent = row["k"][len(AGENT_FIRST_MESSAGE):]
+        a = agents().get(agent) or {}
+        # An agent whose Shell box is off opens no work from its chat and writes no duty (SHELL_OFF_CHAT), so the
+        # question would lead the owner to an answer that it cannot act on.
+        if a.get("role") not in ("worker", "lead") or not owner_chat(a) or shell_off(agent) or \
+                q1("SELECT 1 FROM ui_requests WHERE recipient=? LIMIT 1", (agent,)) or \
+                q1("SELECT 1 FROM owner_reports WHERE agent=? LIMIT 1", (agent,)) or \
+                q1("SELECT 1 FROM tasks WHERE owner=? AND NOT (requester=? AND title=?) LIMIT 1",
+                   (agent, manager_name(), MAC_PROOF_TITLE)) or \
+                q1("SELECT 1 FROM responsibilities WHERE agent=? LIMIT 1", (agent,)):
+            kv_set(row["k"], "none")
+            continue
+        # A new Mac's sitting adds its agent this way too (mac_setup_add) and ends with a task of the hub's own, the
+        # proof that its browser works (mac_setup_prove). That task is no work of the owner's, so it does not count
+        # above (by its title, which a second Finish of the sitting does not clear as it clears the row's task), and
+        # the agent writes when the sitting of its own Mac is over. A sitting that stopped holds nothing: the agent's
+        # own setup page in the app still finishes it (mac_setup_stop), and then it is active and signed in as any other.
+        sitting = q1("SELECT state FROM mac_setups WHERE agent=? AND server=?", (agent, a.get("machine")))
+        if not agent_active(agent) or signed_in_now(agent, a.get("runtime")) is not True or \
+                (sitting and sitting["state"] in MAC_SETUP_OPEN) or not manager_had_its_turn(agent, t0):
+            continue
+        text = (f"[hub] You are new in this fleet: you run on {a.get('machine')} with {runtime_label(a.get('runtime'))}"
+                ", and the owner and you have not written to each other yet. First call see_responsibilities. If you "
+                "hold a duty, send the owner ONE short message with message_owner that says what you look after, and "
+                "ask nothing. Otherwise send the owner ONE short message with message_owner, as a new colleague would "
+                "write it: that you are ready, and ask what you should look after. Offer three or four things in a "
+                "line each, the ones that need the least from the owner first, for example: "
+                + ", ".join(AGENT_FIRST_SUGGESTS) + ". Say that the owner can also say it in their own words. Name no "
+                "mailbox, account or repository that the owner did not name, and send nothing else. If the owner has "
+                "written to you meanwhile, answer that message instead. What you do with the owner's answer is in "
+                "RULES.md, \"Who answers to whom\".")
+        extra = dict(AGENT_FIRST_EXTRA, generation=kv_get("db_id"))
+        with transaction():             # the ask and its mark land together, so a restart never asks twice
+            event_rows([(agent, "chat", None, text, extra)], t0)
+            DB.execute("UPDATE kv SET v='told' WHERE k=?", (row["k"],))
+            log_row("hub", f"asked {agent} for its first message to the owner")
 
 
 # ---- a machine's name is its name in Tailscale

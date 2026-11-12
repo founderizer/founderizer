@@ -6,6 +6,7 @@ on every path he answers by; only the manager and the owner chats write to the o
 chat opens comes back into it; start_task opens work under a lead; the manager acts for a lead that cannot. In-process
 hub on a temporary database, with the owner API's harness: no helper, no git, no network and no AI call."""
 import json
+import pathlib
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -483,9 +484,196 @@ class OwnerChats(Chain):
         self.assertEqual((t["owner"], t["requester"], t["parent"]), ("solo", "manager", None))
 
 
+class NewAgentWritesFirst(OwnerChats):
+    """A new agent writes to the owner first, once, in its own chat (the owner, 12 November 2026, of how a new agent
+    learns what it is for: "or maybe just start a conversation like a human, with some suggestions"). The hub asks it
+    when it can answer, as it asks the manager of a new fleet (first_message_sweep)."""
+
+    def setUp(self):
+        super().setUp()
+        hub.kv_set(hub.AGENT_FIRST_MESSAGE + "x", "wait")         # as Add agent leaves it (add_server_agent)
+        self.signed_in = True
+        signed = patch.object(hub, "signed_in_now", lambda agent, runtime, reads=None: self.signed_in)
+        signed.start()
+        self.addCleanup(signed.stop)
+
+    def sweep(self):
+        with hub.LOCK:
+            hub.agent_first_message_sweep(hub.now())
+
+    def asked(self, agent="x"):
+        return [e for e in hub.q("SELECT * FROM events WHERE agent=? AND kind='chat' ORDER BY id", (agent,))
+                if json.loads(e["extra"]).get("first_message")]
+
+    def state(self, agent="x"):
+        return hub.kv_get(hub.AGENT_FIRST_MESSAGE + agent)
+
+    def test_it_is_asked_once_when_it_is_set_up_and_signed_in_and_the_ask_is_read_once(self):
+        hub.TEAM["agents"]["x"]["active"] = False               # in setup: the owner has not activated it yet
+        self.sweep()
+        self.signed_in = None
+        del hub.TEAM["agents"]["x"]["active"]
+        self.sweep()                                            # active, and nothing says that it is signed in
+        self.signed_in = False
+        self.sweep()
+        self.assertEqual((self.state(), self.asked()), ("wait", []))
+        self.signed_in = True
+        self.sweep()
+        self.sweep()
+        asked = self.asked()
+        self.assertEqual((len(asked), self.state()), (1, "told"))
+        # `task_result` is how every release, also the one before this, knows a chat event that is read once
+        self.assertEqual(json.loads(asked[0]["extra"]), {"generation": "test-generation", "first_message": True,
+                                                         "task_result": "first-message"})
+        text = asked[0]["text"]
+        self.assertIn("You are new in this fleet: you run on m-x with Claude", text)
+        self.assertIn("First call see_responsibilities. If you hold a duty, send the owner ONE short message with "
+                      "message_owner that says what you look after, and ask nothing. Otherwise send the owner ONE "
+                      "short message with message_owner, as a new colleague would write it: that you are ready, and "
+                      "ask what you should look after", text)
+        self.assertNotIn("start_task", text)        # what follows the owner's answer is in RULES.md, which a chat
+        self.assertIn("names none that the owner did not name or that it does not hold. The task's session reads only "
+                      "the task's title",
+                      (pathlib.Path(hub.__file__).parent / "RULES.md").read_text())      # that starts again reads
+        for one in hub.AGENT_FIRST_SUGGESTS:
+            self.assertIn(one, text)
+        self.assertIn("Name no mailbox, account or repository that the owner did not name", text)
+        self.assertNotRegex(text, r"\b(he|his|him)\b")          # the hub's words to agents name no owner "he"
+        polled = lambda: [e["id"] for e in self.helper_events("x") if e["kind"] == "chat"]
+        self.assertIn(asked[0]["id"], polled())                 # its helper starts its chat window for it
+        self.assertIn("You are new in this fleet", self.ok("x", "read_messages", {}, context=CHAT))
+        self.assertNotIn("You are new in this fleet", self.ok("x", "read_messages", {}, context=CHAT))  # read once
+        self.assertNotIn(asked[0]["id"], polled())
+        self.ok("x", "message_owner", {"request_id": str(uuid.uuid4()),
+                                       "text": "I am ready. What should I look after?"}, context=CHAT)
+        report = hub.q1("SELECT * FROM owner_reports WHERE agent='x'")
+        self.assertEqual((report["in_reply_to"], report["pushed"]), (None, 1))
+
+    def test_never_after_the_owner_wrote_to_it(self):
+        self.owner_asks("x", "Hello")
+        self.sweep()
+        self.assertEqual((self.state(), self.asked()), ("none", []))
+
+    def test_nor_when_it_wrote_or_has_work_or_a_duty_by_then(self):
+        t0 = hub.now()
+        for agent, sql, args in (
+                ("x", "INSERT INTO owner_reports(text,about,created,agent) VALUES('Hi','',?,?)", (t0, "x")),
+                ("solo", None, None),
+                # lone has no task (Chain.setUp gives w one), so only its duty can decide this
+                ("lone", "INSERT INTO responsibilities(agent,text,state,revision,created,updated,created_by,"
+                         "request_id) VALUES(?,'Keep the page up.','active',1,?,?,'manager','r-1')", ("lone", t0, t0))):
+            hub.kv_set(hub.AGENT_FIRST_MESSAGE + agent, "wait")
+            if sql:
+                hub.q(sql, args)
+            else:
+                self.create("manager", agent)                   # a task of its own
+            self.assertIsNone(hub.q1("SELECT 1 FROM tasks WHERE owner=?", (agent,)) if sql else None, agent)
+            self.sweep()
+            self.assertEqual((agent, self.state(agent), self.asked(agent)), (agent, "none", []))
+
+    def test_a_new_macs_proof_task_is_no_work_and_the_agent_writes_when_its_sitting_is_done(self):
+        """A new Mac's sitting adds its agent as Add agent does and ends with a task of the hub's own, the proof that
+        its browser works. That task is not the owner's work, so the agent still writes first, after the sitting."""
+        t0 = hub.now()
+        hub.kv_set(hub.AGENT_FIRST_MESSAGE + "solo", "wait")
+        proof = self.create("manager", "solo")
+        hub.q("UPDATE tasks SET title=? WHERE id=?", (hub.MAC_PROOF_TITLE, proof))
+        # a second Finish of the sitting clears the row's task, and the first proof is still no work
+        hub.q("INSERT INTO mac_setups(server,agent,runtime,state,task,created,updated) VALUES('m-solo','solo',"
+              "'claude','proving',NULL,?,?)", (t0, t0))
+        self.sweep()
+        self.assertEqual((self.state("solo"), self.asked("solo")), ("wait", []))
+        hub.q("UPDATE mac_setups SET state='done' WHERE server='m-solo'")
+        self.sweep()
+        self.assertEqual((self.state("solo"), len(self.asked("solo"))), ("told", 1))
+        other = self.create("manager", "solo")                  # and a task that is not the proof is work
+        hub.kv_set(hub.AGENT_FIRST_MESSAGE + "solo", "wait")
+        hub.q("DELETE FROM events WHERE agent='solo' AND kind='chat'")
+        self.sweep()
+        self.assertEqual((other > proof, self.state("solo"), self.asked("solo")), (True, "none", []))
+
+    def test_it_waits_for_the_managers_turn_with_the_word_of_its_activation(self):
+        """A manager that settled the agent's job with the owner gives the duty in the turn that reads the hub's word
+        of the activation, and cannot give it earlier. So the agent is not asked before that turn has ended, and not
+        at all when the turn gave it a duty: the owner is not asked a second time what they just said."""
+        t0 = hub.now()
+        hub.q("INSERT OR REPLACE INTO agents(name,last_seen) VALUES('manager',?)", (t0,))      # its helper is there
+        notice = hub.emit("manager", "say", "[hub] The owner changed x: it is active now and can get tasks.",
+                          extra={"activated": "x"})
+        self.sweep()
+        self.assertEqual((self.state(), self.asked()), ("wait", []))            # the manager has not read it
+        hub.q("UPDATE events SET read_at=? WHERE id=?", (t0 + 1, notice))
+        hub.kv_set("turn_ended:manager", t0)                                    # an earlier turn's end
+        self.sweep()
+        self.assertEqual((self.state(), self.asked()), ("wait", []))            # it reads, and its turn runs
+        hub.kv_set("turn_ended:manager", t0 + 2)
+        self.sweep()
+        self.assertEqual((self.state(), len(self.asked())), ("told", 1))
+        # the same, and the manager's turn gave it a duty: nothing is asked
+        hub.kv_set(hub.AGENT_FIRST_MESSAGE + "solo", "wait")
+        notice = hub.emit("manager", "say", "[hub] The owner changed solo: it is active now and can get tasks.",
+                          extra={"activated": "solo"})
+        self.sweep()
+        self.assertEqual(self.state("solo"), "wait")
+        hub.q("INSERT INTO responsibilities(agent,text,state,revision,created,updated,created_by,request_id) "
+              "VALUES('solo','Keep the page up.','active',1,?,?,'manager','r-2')", (t0, t0))
+        hub.q("UPDATE events SET read_at=? WHERE id=?", (t0 + 3, notice))
+        hub.kv_set("turn_ended:manager", t0 + 4)
+        self.sweep()
+        self.assertEqual((self.state("solo"), self.asked("solo")), ("none", []))
+
+    def test_a_manager_that_has_no_turn_now_is_not_waited_for(self):
+        notice = hub.emit("manager", "say", "[hub] The owner changed x: it is active now and can get tasks.",
+                          extra={"activated": "x"})
+        self.assertIsNone(hub.q1("SELECT read_at FROM events WHERE id=?", (notice,))["read_at"])
+        self.sweep()                                    # its helper never reached the hub: nobody reads that word
+        self.assertEqual((self.state(), len(self.asked())), ("told", 1))
+        # and a manager whose helper is there and that is signed out reads nothing either
+        hub.kv_set(hub.AGENT_FIRST_MESSAGE + "solo", "wait")
+        hub.q("INSERT OR REPLACE INTO agents(name,last_seen) VALUES('manager',?)", (hub.now(),))
+        hub.emit("manager", "say", "[hub] The owner changed solo: it is active now and can get tasks.",
+                 extra={"activated": "solo"})
+        self.sweep()
+        self.assertEqual(self.state("solo"), "wait")
+        with patch.object(hub, "signed_in_now", lambda agent, runtime, reads=None: agent != "manager" and True):
+            self.sweep()
+        self.assertEqual((self.state("solo"), len(self.asked("solo"))), ("told", 1))
+
+    def test_an_agent_whose_shell_box_is_off_is_not_asked(self):
+        """Its chat opens no work and its sessions write no duty, so the question would have no use."""
+        hub.TEAM["agents"]["x"]["can"] = ["web"]
+        self.sweep()
+        self.assertEqual((self.state(), self.asked()), ("none", []))
+
+    def test_a_sitting_that_stopped_or_that_is_another_macs_holds_nothing(self):
+        t0 = hub.now()
+        hub.q("INSERT INTO mac_setups(server,agent,runtime,state,created,updated) VALUES('m-x','x','claude','stopped',"
+              "?,?)", (t0, t0))
+        hub.q("INSERT INTO mac_setups(server,agent,runtime,state,created,updated) VALUES('m-other','x','claude',"
+              "'waiting',?,?)", (t0, t0))       # a join code of another Mac that named this agent
+        self.sweep()
+        self.assertEqual((self.state(), len(self.asked())), ("told", 1))
+
+    def test_a_manager_with_a_flag_on_its_session_is_not_waited_for(self):
+        hub.q("INSERT OR REPLACE INTO agents(name,last_seen) VALUES('manager',?)", (hub.now(),))
+        hub.emit("manager", "say", "[hub] The owner changed x: it is active now and can get tasks.",
+                 extra={"activated": "x"})
+        self.sweep()
+        self.assertEqual(self.state(), "wait")
+        hub.kv_set("mgr_flag_kind", "down")
+        self.sweep()
+        self.assertEqual((self.state(), len(self.asked())), ("told", 1))
+
+    def test_an_agent_from_before_is_never_asked_and_the_state_is_one_of_an_agents_own_keys(self):
+        """The state begins at Add agent, so every agent of a fleet that runs today has none."""
+        self.sweep()
+        self.assertEqual([e["agent"] for e in hub.q("SELECT agent FROM events WHERE kind='chat'")], ["x"])
+        self.assertIn(hub.AGENT_FIRST_MESSAGE, hub.AGENT_KV)
+
+
 def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
-    for cls in (PassUp, NotChased, Needs, Access, ManagerActs, OwnerChats):
+    for cls in (PassUp, NotChased, Needs, Access, ManagerActs, OwnerChats, NewAgentWritesFirst):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 

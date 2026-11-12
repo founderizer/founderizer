@@ -774,7 +774,9 @@ class Servers(OwnerAPI):
         self.assertEqual(self.add_agent(runtime="grok")[0], 400)
         status, conflict = self.add_agent(base="0" * 64)
         self.assertEqual((status, conflict["sha256"]), (409, self.team_sha()))
+        self.assertIsNone(hub.kv_get(hub.AGENT_FIRST_MESSAGE + "scout"))    # no refusal above began anything
         self.assertEqual(self.add_agent()[0], 200)
+        self.assertEqual(hub.kv_get(hub.AGENT_FIRST_MESSAGE + "scout"), "wait")     # it writes to the owner first, once
         self.assertEqual(self.add_agent(agent="second")[0], 409)            # busy, and it has an agent
 
     def job_ends(self, job, server="mini"):

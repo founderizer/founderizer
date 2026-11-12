@@ -938,6 +938,14 @@ def later_data(t0=None):
           (f"[hub] T-{made['work']} (Fix the export), which you opened from the owner's message a-1 in this chat, is "
            f"completed: fixed", t0, json.dumps({"generation": "test-generation", "task_result": made["work"]}), t0))
     hub.q("INSERT INTO kv(k,v) VALUES(?,'1') ON CONFLICT(k) DO UPDATE SET v=excluded.v", ("lead_unread:stuck:1:1",))
+    # and, from 12 November 2026, as hub.agent_first_message_sweep writes them: the ask for a new agent's first message
+    # to the owner, which its chat read, and where that agent's first message stands
+    made["first_ask"] = hub.ins(
+        "INSERT INTO events(agent,kind,text,created,extra,read_at) VALUES('vps','chat',?,?,?,?)",
+        ("[hub] You are new in this fleet: you run on vps with Claude", t0,
+         json.dumps(dict(getattr(hub, "AGENT_FIRST_EXTRA", {"task_result": "first-message", "first_message": True}),
+                         generation="test-generation")), t0))
+    hub.q("INSERT INTO kv(k,v) VALUES(?,'told') ON CONFLICT(k) DO UPDATE SET v=excluded.v", ("first_message:vps",))
     # and, from 29 October 2026, as hub.t_request_secret writes them for a task session: a task that waits on its open
     # request, and a task that waits for the secret that the owner saved to reach its machine (a delivery on its way)
     made["asking"] = hub.ins("INSERT INTO tasks(title,details,done_when,needs,owner,requester,state,waiting_on,created,"
@@ -1080,6 +1088,7 @@ class RollbackReads(HubFixture):
         self.peer, self.boss, self.talk, self.task, self.rule = (made[k] for k in ("peer", "boss", "talk", "task",
                                                                                      "rule"))
         self.secret_answer, self.work = made["secret_answer"], made["work"]
+        self.first_ask = made["first_ask"]
         self.asking, self.saved = made["asking"], made["saved"]
         self.joiner = made["joiner"]
 
@@ -1105,6 +1114,16 @@ class RollbackReads(HubFixture):
         code, data = self.request("/events/vps?delivery=1&wait=0", source="127.0.0.3")
         self.assertEqual(code, 200, data)
         self.assertNotIn(self.secret_answer, [e["id"] for e in data["events"]])
+
+    def test_the_ask_for_a_new_agents_first_message_that_its_chat_read_comes_no_more(self):
+        """agent_first_message_sweep: the ask is a chat event of the hub's own, with no message of the owner's and no
+        agent's message behind it. A release that does not know it must still give it only until it is read, or the
+        chat is deaf as above: so it carries the field that every release reads so (task_result)."""
+        context = (hub.kv_get("db_id"), "owner-chat", "1")
+        self.assertNotIn("You are new in this fleet", hub.call_tool("vps", "read_messages", {}, context)[0])
+        code, data = self.request("/events/vps?delivery=1&wait=0", source="127.0.0.3")
+        self.assertEqual(code, 200, data)
+        self.assertNotIn(self.first_ask, [e["id"] for e in data["events"]])
 
     def tick(self):
         """One pass of the hub's timers. A sweep that raises is printed and skipped there, so each one is a failure
