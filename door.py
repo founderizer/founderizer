@@ -42,6 +42,7 @@ with the rights that its rules need, which the provider ends after a day, and th
 """
 import argparse
 import base64
+import calendar
 import contextlib
 import datetime
 import hashlib
@@ -245,6 +246,9 @@ FULL_NOTE = (" Its second answer, Full access on {host} (raise_needs_you door_ho
 ROUTES = ("yes", "holder", "window", "again", "none")
 TIMER_TRIES = 6             # times that the door asks a host to end its rollback countdown after a script or a run
 TIMER_PAUSE = 10            # seconds between them, while the host does not answer
+RUN_WAIT = 50 * 60          # how long a GitOps sync's call waits for its run to end: less than an agent's ops call waits
+RUN_POLL = 15               # seconds between two reads of that run
+RUN_FIND = 60               # seconds in which the run of a dispatch whose answer gave no run id must show up
 
 
 class Refused(Exception):
@@ -475,6 +479,11 @@ def approval(access, statement, signature, devices=None):
             not (devices and vault.owner_signed({"owner_keys": sorted(devices.values())}, statement, signature)):
         return None
     return said["call"], said["need"]
+
+
+def run_word(value):
+    "A name that GitHub gives for a run, a job or a step, as an answer prints it: 80 plain characters at most."
+    return re.sub(r"[^\w .:/()-]", "?", str(value))[:80]
 
 
 def call_hash(target, op, args, content=None):
@@ -1065,7 +1074,7 @@ class Door:
         if "read" in plan:
             return hub.read(plan["read"], access)
         if "workflow" in plan:
-            return hub.dispatch(plan["workflow"], plan["inputs"])
+            return hub.dispatch(plan["workflow"], plan["inputs"], wait=bool(plan.get("wait")))
         raise Refused("the door cannot run this")
 
     def timer_off(self, host, name):
@@ -1640,12 +1649,83 @@ class GitHub:
             raise door_providers.Stop(f"{branch} moved meanwhile, or GitHub refused ({status}): nothing changed")
         return f"{self.repo} {branch} is at {made['sha']}"
 
-    def dispatch(self, workflow, inputs):
-        status, _ = self.call("POST", f"/repos/{self.repo}/actions/workflows/{workflow}/dispatches",
-                              {"ref": self.branch(), "inputs": inputs})
-        if status != 204:
+    def dispatch(self, workflow, inputs, wait=False):
+        """One workflow_dispatch on the default branch. wait (a GitOps sync): the call waits for that run to end and
+        answers with how it ended, so a sync that fails is a failed call, in the door's record and for the agent;
+        before, the door wrote done as soon as GitHub took the dispatch. GitHub gives the run's id when the request
+        asks for it (return_run_details, REST API 2022-11-28; version 2026-03-10 gives it always). A plain 204 with
+        no id: the door finds the run by its workflow, branch and start."""
+        branch, started = self.branch(), now()
+        path = f"/repos/{self.repo}/actions/workflows/{workflow}/dispatches"
+        status, answer = self.call("POST", path, {"ref": branch, "inputs": inputs, "return_run_details": True})
+        if status == 422 and "return_run_details" in json.dumps(answer):     # an API that does not know it
+            status, answer = self.call("POST", path, {"ref": branch, "inputs": inputs})
+        if status not in (200, 204):
             raise door_providers.Stop(f"GitHub answered {status} for {workflow}")
-        return f"{workflow} of {self.repo} started"
+        if not wait:
+            return f"{workflow} of {self.repo} started"
+        run = answer.get("workflow_run_id") if status == 200 and isinstance(answer, dict) else None
+        if not isinstance(run, int) or isinstance(run, bool) or run <= 0:
+            run = self.find_run(workflow, branch, started)
+        return self.wait_run(workflow, run)
+
+    def find_run(self, workflow, branch, started):
+        """The id of the run that a dispatch started, when GitHub's answer named none: the one run of this workflow
+        on this branch, by workflow_dispatch, that began at the dispatch or after it. Two such runs are no answer: the
+        door cannot tell which one is its own."""
+        query = urllib.parse.urlencode({"event": "workflow_dispatch", "branch": branch, "per_page": "20"})
+        deadline = now() + RUN_FIND
+        while True:
+            status, runs = self.call("GET", f"/repos/{self.repo}/actions/workflows/{workflow}/runs?{query}")
+            mine = []
+            for r in ((runs or {}).get("workflow_runs") or []) if status == 200 and isinstance(runs, dict) else []:
+                try:
+                    begun = calendar.timegm(time.strptime(str(r.get("created_at"))[:19], "%Y-%m-%dT%H:%M:%S"))
+                except ValueError:
+                    continue
+                if begun >= int(started) - 2 and isinstance(r.get("id"), int):
+                    mine.append(r["id"])
+            if len(mine) == 1:
+                return mine[0]
+            if len(mine) > 1:
+                raise door_providers.Stop(f"{workflow} of {self.repo} started, and GitHub named no run: {len(mine)} "
+                                          f"runs began since, so the door cannot say which one is this call's")
+            if now() >= deadline:
+                raise door_providers.Stop(f"{workflow} of {self.repo} started, and no run of it showed up within "
+                                          f"{RUN_FIND} seconds")
+            time.sleep(RUN_POLL)
+
+    def wait_run(self, workflow, run):
+        """How one run ended, once GitHub says that it is completed: the answer for success, Stop for every other
+        conclusion (with the jobs and steps that failed) and for a run that has not ended after RUN_WAIT."""
+        url = f"https://github.com/{self.repo}/actions/runs/{run}"
+        deadline = now() + RUN_WAIT
+        while True:
+            status, got = self.call("GET", f"/repos/{self.repo}/actions/runs/{run}")
+            if status == 200 and isinstance(got, dict):
+                url = got.get("html_url") if isinstance(got.get("html_url"), str) else url
+                if got.get("status") == "completed":
+                    ended = got.get("conclusion")
+                    if ended == "success":
+                        return f"{workflow} of {self.repo}: run {run} passed ({url})"
+                    raise door_providers.Stop(f"{workflow} of {self.repo}: run {run} ended "
+                                              f"{run_word(ended)}{self.failed_steps(run)} ({url})")
+            if now() >= deadline:
+                raise door_providers.Stop(f"{workflow} of {self.repo}: run {run} did not end within "
+                                          f"{RUN_WAIT // 60} minutes, so the door cannot say that it passed ({url})")
+            time.sleep(RUN_POLL)
+
+    def failed_steps(self, run):
+        "The jobs and steps of a run that failed, as words for the answer: ', in <job> / <step>' for three at most."
+        status, got = self.call("GET", f"/repos/{self.repo}/actions/runs/{run}/jobs?per_page=50")
+        found = []
+        for job in ((got or {}).get("jobs") or []) if status == 200 and isinstance(got, dict) else []:
+            if not isinstance(job, dict) or job.get("conclusion") in (None, "success", "skipped", "neutral"):
+                continue
+            steps = [s.get("name") for s in job.get("steps") or []
+                     if isinstance(s, dict) and s.get("conclusion") not in (None, "success", "skipped", "neutral")]
+            found.append(" / ".join(run_word(x) for x in [job.get("name")] + steps[:1] if x))
+        return (", in " + "; ".join(found[:3])) if found else ""
 
     def image_made(self, image):
         """True when a green run of the repository that built the image made its tag: the run of that tag's push, or

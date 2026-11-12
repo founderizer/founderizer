@@ -113,7 +113,7 @@ ACCESS = {
 
 def load_tests(loader, _tests, _pattern):
     return unittest.TestSuite(cls(name) for cls in (Access, Callers, RuleArguments, Refusals, OwnCalls, Order,
-                                                    HubLine, HubRights, GitHubFacts, Vault, AuditReplay, AWSRole,
+                                                    HubLine, HubRights, GitHubFacts, SyncRuns, Vault, AuditReplay, AWSRole,
                                                     OwnerYes, CallHash, ScriptsAndRuns, FullAccess, Routes, MadeDeletes,
                                                     HostPath, AppSettingsPath, ScriptPath, HostUpdates, KeyCardAccount,
                                                     WorkKeys,
@@ -1911,7 +1911,12 @@ def github_stubs(self):
         ("POST", f"{api}/repos/one-org/cluster/git/trees"): (201, {"sha": "t2"}),
         ("POST", f"{api}/repos/one-org/cluster/git/commits"): (201, {"sha": "c2"}),
         ("PATCH", f"{api}/repos/one-org/cluster/git/refs/heads/master"): (200, {}),
-        ("POST", f"{api}/repos/one-org/cluster/actions/workflows/sync-app.yml/dispatches"): (204, {}),
+        ("POST", f"{api}/repos/one-org/cluster/actions/workflows/sync-app.yml/dispatches"):
+            (200, {"workflow_run_id": 4242, "run_url": f"{api}/repos/one-org/cluster/actions/runs/4242",
+                   "html_url": "https://github.com/one-org/cluster/actions/runs/4242"}),
+        ("GET", f"{api}/repos/one-org/cluster/actions/runs/4242"):
+            (200, {"status": "completed", "conclusion": "success",
+                   "html_url": "https://github.com/one-org/cluster/actions/runs/4242"}),
         ("GET", f"{api}/repos/one-org/shop/actions/runs?branch=v2.0.1&status=success&per_page=20"):
             (200, {"workflow_runs": [{"head_branch": "v2.0.1"}]}),
         ("GET", f"{api}/repos/one-org/web/actions/runs?status=success&per_page=100"):
@@ -1922,6 +1927,99 @@ def github_stubs(self):
         self.calls.append((method, url, None if data is None else json.loads(data)))
         return self.answers.get((method, url), (404, {"message": "not stubbed"}))
     self.door.http = http
+
+
+class SyncRuns(DoorCase):
+    """A GitOps sync's call waits for its run and answers with how it ended (finding (c) of 12 November 2026): the door
+    wrote done when GitHub took the dispatch, also for a sync that then failed."""
+    API = "https://api.github.com"
+    RUN = f"{API}/repos/one-org/cluster/actions/runs/4242"
+    RUNS = (f"{API}/repos/one-org/cluster/actions/workflows/sync-app.yml/runs?"
+            "event=workflow_dispatch&branch=master&per_page=20")
+
+    def setUp(self):
+        super().setUp()
+        github_stubs(self)
+        for name, value in (("RUN_POLL", 0), ("RUN_FIND", 60)):
+            patcher = patch.object(door, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.runs = []          # the answers that the run gives, one for each read, the last one again
+
+    def sync(self):
+        stub = self.door.http
+
+        def http(method, url, headers, data):
+            if method == "GET" and url == self.RUN and self.runs:
+                self.calls.append((method, url, None))
+                return self.runs.pop(0) if len(self.runs) > 1 else self.runs[0]
+            return stub(method, url, headers, data)
+        self.door.http = http
+        return self.call(ONE, "gitops:one-org/cluster", "sync", "shop")
+
+    def test_a_failed_run_is_a_failed_call_in_the_record_and_for_the_agent(self):
+        self.runs = [(200, {"status": "queued"}), (200, {"status": "in_progress"}),
+                     (200, {"status": "completed", "conclusion": "failure", "html_url": "https://github.com/x/4242"})]
+        self.answers[("GET", self.RUN + "/jobs?per_page=50")] = (200, {"jobs": [
+            {"name": "Verify authorized actor and application name", "conclusion": "success", "steps": []},
+            {"name": "Sync the application / sync-app", "conclusion": "failure", "steps": [
+                {"name": "ArgoCD app sync", "conclusion": "success"},
+                {"name": "Verify app status", "conclusion": "failure"}]}]})
+        got = self.sync()
+        why = ("sync-app.yml of one-org/cluster: run 4242 ended failure, in Sync the application / sync-app / Verify "
+               "app status (https://github.com/x/4242)")
+        self.assertEqual((got["ok"], got["kind"], got["why"]), (False, "rule", why))
+        last = self.door.record.after(0)[-1]
+        self.assertEqual((last["action"], last["outcome"]), ("sync", "failed"))
+        self.assertEqual(len([u for m, u, d in self.calls if u == self.RUN]), 3)
+
+    def test_a_dispatch_whose_answer_names_no_run_finds_its_one_run_and_never_guesses_between_two(self):
+        self.answers[("POST", f"{self.API}/repos/one-org/cluster/actions/workflows/sync-app.yml/dispatches")] = \
+            (204, {})
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(door.now() + 1))
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(door.now() - 600))
+        self.answers[("GET", self.RUNS)] = (200, {"workflow_runs": [{"id": 4242, "created_at": at},
+                                                                   {"id": 4100, "created_at": old}]})
+        self.runs = [(200, {"status": "completed", "conclusion": "success"})]
+        got = self.sync()
+        self.assertEqual((got["ok"], got["out"]), (True, "sync-app.yml of one-org/cluster: run 4242 passed "
+                                                         "(https://github.com/one-org/cluster/actions/runs/4242)"))
+        self.answers[("GET", self.RUNS)] = (200, {"workflow_runs": [{"id": 4242, "created_at": at},
+                                                                   {"id": 4243, "created_at": at}]})
+        got = self.sync()
+        self.assertEqual(got["ok"], False)
+        self.assertIn("2 runs began since, so the door cannot say which one is this call's", got["why"])
+
+    def test_a_run_that_does_not_end_in_time_fails_the_call_and_says_so(self):
+        self.runs = [(200, {"status": "in_progress"})]
+        clock = [door.now()]
+
+        def later():
+            clock[0] += door.RUN_WAIT / 3
+            return clock[0]
+        with patch.object(door, "now", later):
+            got = self.sync()
+        self.assertEqual(got["ok"], False)
+        self.assertIn("run 4242 did not end within 50 minutes, so the door cannot say that it passed", got["why"])
+
+    def test_an_api_that_does_not_know_return_run_details_takes_the_plain_dispatch(self):
+        url = f"{self.API}/repos/one-org/cluster/actions/workflows/sync-app.yml/dispatches"
+        answers = [(422, {"message": "Invalid request. \"return_run_details\" is not a permitted key."}), (204, {})]
+        stub = self.door.http
+
+        def http(method, u, headers, data):
+            if method == "POST" and u == url:
+                self.calls.append((method, u, json.loads(data)))
+                return answers.pop(0)
+            return stub(method, u, headers, data)
+        self.door.http = http
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(door.now() + 1))
+        self.answers[("GET", self.RUNS)] = (200, {"workflow_runs": [{"id": 4242, "created_at": at}]})
+        got = self.call(ONE, "gitops:one-org/cluster", "sync", "shop")
+        self.assertTrue(got["ok"], got)
+        sent = [d for m, u, d in self.calls if u == url]
+        self.assertEqual(sent, [{"ref": "master", "inputs": {"app": "shop"}, "return_run_details": True},
+                                {"ref": "master", "inputs": {"app": "shop"}}])
 
 
 class GitHubFacts(DoorCase):
@@ -2043,9 +2141,10 @@ class GitHubFacts(DoorCase):
             ("apps/shop/deployment.yaml", OLD_DEPLOYMENT.replace("replicas: 2", "replicas: 3"))))
         self.assertEqual((got["ok"], got["kind"], got["out"]), (True, "rule", "one-org/cluster master is at c2"))
         got = self.call(ONE, "gitops:one-org/cluster", "sync", "shop")
-        self.assertTrue(got["ok"], got)
+        self.assertEqual((got["ok"], got["out"]), (True, "sync-app.yml of one-org/cluster: run 4242 passed "
+                                                     "(https://github.com/one-org/cluster/actions/runs/4242)"))
         sync = next(d for m, u, d in self.calls if u.endswith("/sync-app.yml/dispatches"))
-        self.assertEqual(sync, {"ref": "master", "inputs": {"app": "shop"}})
+        self.assertEqual(sync, {"ref": "master", "inputs": {"app": "shop"}, "return_run_details": True})
         self.assertFalse([u for m, u, d in self.calls if "main" in u])
         self.assertEqual(len([u for m, u, d in self.calls if u.endswith("/repos/one-org/cluster")]), 1)   # kept
 

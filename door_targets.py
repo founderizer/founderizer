@@ -999,8 +999,9 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
         caller = entry.get("sync")
         if len(args) != 1 or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", args[0]) or not caller:
             return refused("sync takes one app name, through the repository's listed caller workflow", target=target)
-        return Decision("rule", "a sync through the listed caller", target=target,
-                        plan={"repo": repo, "workflow": caller, "inputs": {"app": args[0]}}, window="deploy")
+        # the call waits for the run and answers with how it ended (door.GitHub.dispatch), so a failed sync fails
+        return Decision("rule", "a sync through the listed caller", target=target, window="deploy",
+                        plan={"repo": repo, "workflow": caller, "inputs": {"app": args[0]}, "wait": True})
     if op not in ("push", "rollback"):
         return refused("the GitOps repository takes read, push, rollback and sync", target=target)
     files, message = commit_files(content)
