@@ -25,8 +25,10 @@ installers say what they need.
 **Where to start.** A hub: `HUB-INSTALL.md`, or the install prompt of `INSTALL-PROMPT.md` pasted into the agent you
 already run. A Mac or a second server joining a fleet: `WORKER-INSTALL.md`.
 
-**What is not here.** Our own development repository holds the product documents, the test suite, the owner's own
-fleet and the live records of it. None of that is needed to run a fleet, and none of it is published.
+**What is not here.** Our own development repository holds the product documents, the owner's own fleet and the live
+records of it, and the few tests that read them or that test how this repository is published. None of that is needed
+to run a fleet, and none of it is published. The other tests are here: the `test_*.py` files, `leftovers.py`, which
+stops what a test started and removes what it made, and `ui_fixture.py`, a hub with made-up data for the apps.
 
 **License.** The Apache License, Version 2.0. Its text is in `LICENSE`. `NOTICE` holds the copyright notice and the
 credit, and section 4 of the license says how a copy that you share keeps them. Every version published in this
@@ -41,4 +43,10 @@ name and a different logo.
 own repository, so we do not merge a pull request here. We apply its change to our repository, run our whole test
 suite on it, and the next release carries it. Then we close the pull request with a link to that release. The release
 commit names you as co-author, so GitHub lists you as a contributor. Under section 5 of the license, what you send is
-under the Apache License 2.0. Before you send a change, run `python3 selftest.py`.
+under the Apache License 2.0.
+
+Before you send a change, run `python3 selftest.py` and the tests of the files that you changed, one file at a time,
+from the folder of this repository: for example `python3 -m unittest test_servers`. The tests of a file are the
+`test_*.py` files that import it. Use `unittest` and not `pytest`: each test file keeps only its own checks. A test
+makes its own hubs, folders and git repositories in a temporary folder and removes them at its end. All of them, one
+file after the other, take about an hour on a Mac: `for f in test_*.py; do python3 -m unittest "${f%.py}"; done`.
