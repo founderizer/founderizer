@@ -252,6 +252,8 @@ RUN_WAIT = 50 * 60          # how long a GitOps sync's call waits for its run to
 RUN_POLL = 15               # seconds between two reads of that run
 RUN_FIND = 60               # seconds in which the run of a dispatch whose answer gave no run id must show up
 LOG_MOST = 1024 * 1024      # bytes of a job's log that the door reads: a listing run prints one line
+CHECKS_FIND = 45            # seconds after a GitOps commit in which its push's runs show up, the late ones too
+CHECKS_WAIT = 20 * 60       # how long the commit's call waits for those runs to end
 
 
 class Refused(Exception):
@@ -482,6 +484,11 @@ def approval(access, statement, signature, devices=None):
             not (devices and vault.owner_signed({"owner_keys": sorted(devices.values())}, statement, signature)):
         return None
     return said["call"], said["need"]
+
+
+class RunFailed(door_providers.Stop):
+    """A run that the door waited for ended badly. Its words are the door's own (run_word, the run's address), so
+    they go in the record too, where a provider's answer never goes."""
 
 
 def run_word(value):
@@ -1002,14 +1009,16 @@ class Door:
             if d.needs:
                 answer.update(needs=d.needs, **({"level": d.level} if d.level else {}))
             return answer
+        ran = None              # a run that the door waited for and that ended badly: the record says how
         try:
             out = self.run(agent, access, d, op, args, content)
             ok, outcome = True, "done"
         except (Refused, door_providers.Stop) as e:
             ok, outcome, out = False, "failed", str(e)
+            ran = str(e) if isinstance(e, RunFailed) else None
         made = ((d.plan or {}).get("repo_new") or {}).get("name") if ok else None     # N3: what the call made
-        n = self.record.add(caller=agent, target=target, action=op, kind=d.kind, outcome=outcome, why=d.why[:300],
-                            sha256=sha, **({"made": made} if made else {}))
+        n = self.record.add(caller=agent, target=target, action=op, kind=d.kind, outcome=outcome,
+                            why=(f"{ran}. {d.why}" if ran else d.why)[:300], sha256=sha, **({"made": made} if made else {}))
         return {"ok": ok, "kind": d.kind, "out" if ok else "why": out, "n": n}
 
     def run(self, agent, access, d, op, args, content):
@@ -1082,6 +1091,11 @@ class Door:
         if "files" in plan:
             out = hub.commit(plan)
             self.keep_objects(plan, out)
+            if plan.get("checks"):          # a GitOps commit: the agent learns how its checks ended, at once
+                passed, words = hub.wait_checks(hub.commit_sha)
+                if not passed:
+                    raise RunFailed(f"{out}, and {words}: fix the commit or revert it")
+                out = f"{out}; {words}"
             return out
         if "read" in plan:
             return hub.read(plan["read"], access)
@@ -1628,6 +1642,7 @@ class GitHub:
         self.door, self.access, self.repo = door, access, repo
         self.owner = repo.split("/")[0]
         self.run_id = None          # the run that this object's last waited dispatch started
+        self.commit_sha = self.commit_branch = None     # the commit that this object made last
 
     def token(self):
         got = self.TOKENS.get(self.owner.lower())
@@ -1724,6 +1739,7 @@ class GitHub:
                                   {"sha": made["sha"], "force": False})
         if status != 200:
             raise door_providers.Stop(f"{branch} moved meanwhile, or GitHub refused ({status}): nothing changed")
+        self.commit_sha, self.commit_branch = made["sha"], branch
         return f"{self.repo} {branch} is at {made['sha']}"
 
     def dispatch(self, workflow, inputs, wait=False):
@@ -1786,12 +1802,44 @@ class GitHub:
                     ended = got.get("conclusion")
                     if ended == "success":
                         return f"{workflow} of {self.repo}: run {run} passed ({url})"
-                    raise door_providers.Stop(f"{workflow} of {self.repo}: run {run} ended "
-                                              f"{run_word(ended)}{self.failed_steps(run)} ({url})")
+                    raise RunFailed(f"{workflow} of {self.repo}: run {run} ended "
+                                    f"{run_word(ended)}{self.failed_steps(run)} ({url})")
             if now() >= deadline:
-                raise door_providers.Stop(f"{workflow} of {self.repo}: run {run} did not end within "
-                                          f"{RUN_WAIT // 60} minutes, so the door cannot say that it passed ({url})")
+                raise RunFailed(f"{workflow} of {self.repo}: run {run} did not end within "
+                                f"{RUN_WAIT // 60} minutes, so the door cannot say that it passed ({url})")
             time.sleep(RUN_POLL)
+
+    def wait_checks(self, sha):
+        """(passed, words): how the workflow runs that the push of this commit started ended, for a GitOps commit
+        through the door. The door waits CHECKS_FIND seconds for them to show up, the late ones too, then until each
+        has ended, CHECKS_WAIT at most. Before, nobody learned that a commit broke the repository's own checks: on 11
+        November 2026 they stayed red for about 31 hours. A run that does not end in time, or runs that GitHub does not
+        give, are no failure of the commit: the words say so."""
+        query = urllib.parse.urlencode({"head_sha": sha, "event": "push", "per_page": "50"})
+        begun = now()
+        while True:
+            status, got = self.call("GET", f"/repos/{self.repo}/actions/runs?{query}")
+            if status != 200 or not isinstance(got, dict):
+                return True, f"the door could not read its checks (GitHub answered {status})"
+            runs = [r for r in got.get("workflow_runs") or [] if isinstance(r, dict) and isinstance(r.get("id"), int)
+                    and not isinstance(r.get("id"), bool) and r.get("head_sha") in (None, sha)]
+            settled = now() - begun >= CHECKS_FIND
+            if settled and not runs:
+                return True, "no check ran for it"
+            if settled and all(r.get("status") == "completed" for r in runs):
+                break
+            if now() - begun >= CHECKS_WAIT:
+                going = [run_word(r.get("name")) for r in runs if r.get("status") != "completed"]
+                return True, (f"{len(going)} of its checks had not ended after {CHECKS_WAIT // 60} minutes: "
+                              f"{', '.join(going[:5])}")
+            time.sleep(RUN_POLL)
+        bad = [r for r in runs if r.get("conclusion") not in ("success", "skipped", "neutral")]
+        if not bad:
+            return True, "its checks passed: " + ", ".join(sorted({run_word(r.get("name")) for r in runs}))
+        words = "; ".join(f"{run_word(r.get('name'))} ended {run_word(r.get('conclusion'))}{self.failed_steps(r['id'])}"
+                          f" ({r.get('html_url') if isinstance(r.get('html_url'), str) else r['id']})"
+                          for r in bad[:3])
+        return False, f"its check {words}" if len(bad) == 1 else f"{len(bad)} of its checks failed: {words}"
 
     def run_text(self, run):
         "The logs of a run's jobs, one after the other: what a listing run printed (Door.prune_listing)."

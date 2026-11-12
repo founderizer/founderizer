@@ -1013,7 +1013,8 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
     files, message = commit_files(content)
     if files is None:
         return refused(message, target=target)
-    plan = {"repo": repo, "files": files, "message": message, "branch": entry.get("branch")}
+    # checks: the call waits for the runs that the commit's push starts, and the agent learns how they ended
+    plan = {"repo": repo, "files": files, "message": message, "branch": entry.get("branch"), "checks": True}
     for path, data, mode in files:
         if mode in ("120000", "160000") or never_path(path):
             return refused(f"{path} is under the commit rules", target=target)

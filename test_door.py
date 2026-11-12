@@ -113,7 +113,7 @@ ACCESS = {
 
 def load_tests(loader, _tests, _pattern):
     return unittest.TestSuite(cls(name) for cls in (Access, Callers, RuleArguments, Refusals, OwnCalls, Order,
-                                                    HubLine, HubRights, GitHubFacts, SyncRuns, PruneParts, Prunes, Vault, AuditReplay, AWSRole,
+                                                    HubLine, HubRights, GitHubFacts, SyncRuns, CommitChecks, PruneParts, Prunes, Vault, AuditReplay, AWSRole,
                                                     OwnerYes, CallHash, ScriptsAndRuns, FullAccess, Routes, MadeDeletes,
                                                     HostPath, AppSettingsPath, ScriptPath, HostUpdates, KeyCardAccount,
                                                     WorkKeys,
@@ -1303,7 +1303,9 @@ class OwnCalls(DoorCase):
             {"path": "apps/shop-test/values.yaml", "delete": True}]}).encode()
         with patch.object(door_providers, "app_jwt", lambda app_id, pem, sign=None: "jwt"):
             got = self.call(ONE, "gitops:one-org/cluster", "push", content=content)
-        self.assertEqual((got["ok"], got["kind"], got.get("out")), (True, "own", "one-org/cluster main is at c2"), got)
+        self.assertEqual((got["ok"], got["kind"], got.get("out")), (True, "own", "one-org/cluster main is at c2; "
+                                                                  "the door could not read its checks (GitHub "
+                                                                  "answered 404)"), got)
         tree = next(body for method, url, body in calls if url.endswith("/git/trees"))
         self.assertEqual([(e["path"], e["sha"]) for e in tree["tree"]],
                          [("apps/shop-canary/deployment.yaml", None), ("apps/shop-test/values.yaml", None)])
@@ -1892,6 +1894,9 @@ def github_stubs(self):
     "GitHub as a test of the door reads it: the answers of its API by method and address, and the calls that came."
     door.GitHub.TOKENS.clear()
     door.GitHub.BRANCHES.clear()
+    checks = patch.object(door, "CHECKS_FIND", 0)        # the runs of a commit's push are all there at once
+    checks.start()
+    self.addCleanup(checks.stop)
     patcher = patch.object(door_providers, "app_jwt", lambda app_id, pem, sign=None: "jwt")
     patcher.start()
     self.addCleanup(patcher.stop)
@@ -1917,6 +1922,9 @@ def github_stubs(self):
         ("GET", f"{api}/repos/one-org/cluster/actions/runs/4242"):
             (200, {"status": "completed", "conclusion": "success",
                    "html_url": "https://github.com/one-org/cluster/actions/runs/4242"}),
+        ("GET", f"{api}/repos/one-org/cluster/actions/runs?head_sha=c2&event=push&per_page=50"):
+            (200, {"workflow_runs": [{"id": 5150, "name": "Validate manifests", "head_sha": "c2", "status": "completed",
+                                      "conclusion": "success"}]}),
         ("GET", f"{api}/repos/one-org/shop/actions/runs?branch=v2.0.1&status=success&per_page=20"):
             (200, {"workflow_runs": [{"head_branch": "v2.0.1"}]}),
         ("GET", f"{api}/repos/one-org/web/actions/runs?status=success&per_page=100"):
@@ -1971,6 +1979,7 @@ class SyncRuns(DoorCase):
         self.assertEqual((got["ok"], got["kind"], got["why"]), (False, "rule", why))
         last = self.door.record.after(0)[-1]
         self.assertEqual((last["action"], last["outcome"]), ("sync", "failed"))
+        self.assertTrue(last["why"].startswith(why[:120]), last["why"])      # the record says how the run ended
         self.assertEqual(len([u for m, u, d in self.calls if u == self.RUN]), 3)
 
     def test_a_dispatch_whose_answer_names_no_run_finds_its_one_run_and_never_guesses_between_two(self):
@@ -2020,6 +2029,76 @@ class SyncRuns(DoorCase):
         sent = [d for m, u, d in self.calls if u == url]
         self.assertEqual(sent, [{"ref": "master", "inputs": {"app": "shop"}, "return_run_details": True},
                                 {"ref": "master", "inputs": {"app": "shop"}}])
+
+
+class CommitChecks(DoorCase):
+    """A GitOps commit through the door waits for the runs that its push starts, and the agent and the record learn
+    how they ended (11 November 2026: a door commit left the repository's checks red for about 31 hours)."""
+    API = "https://api.github.com"
+    CHECKS = f"{API}/repos/one-org/cluster/actions/runs?head_sha=c2&event=push&per_page=50"
+
+    def setUp(self):
+        super().setUp()
+        github_stubs(self)
+        for name, value in (("RUN_POLL", 0), ("CHECKS_FIND", 30)):
+            patcher = patch.object(door, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.reads = []         # the answers that the runs of the commit give, one for each read, the last one again
+        stub = self.door.http
+
+        def http(method, url, headers, data):
+            if method == "GET" and url == self.CHECKS and self.reads:
+                self.calls.append((method, url, None))
+                return self.reads.pop(0) if len(self.reads) > 1 else self.reads[0]
+            return stub(method, url, headers, data)
+        self.door.http = http
+        self.clock = [door.now()]
+        patcher = patch.object(door, "now", lambda: self.clock[0])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(door.time, "sleep", lambda s: self.clock.__setitem__(0, self.clock[0] + 10))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def push(self):
+        return self.call(ONE, "gitops:one-org/cluster", "push", content=change(
+            ("apps/shop/deployment.yaml", OLD_DEPLOYMENT.replace("replicas: 2", "replicas: 3"))))
+
+    @staticmethod
+    def runs(*runs):
+        return (200, {"workflow_runs": [dict(r, head_sha="c2") for r in runs]})
+
+    def test_a_check_that_fails_is_a_failed_call_that_says_that_the_commit_is_made(self):
+        self.reads = [self.runs({"id": 1, "name": "guardrails", "status": "in_progress"}),
+                      self.runs({"id": 1, "name": "guardrails", "status": "completed", "conclusion": "failure",
+                                 "html_url": "https://github.com/x/1"},
+                                {"id": 2, "name": "manifests", "status": "completed", "conclusion": "success"})]
+        self.answers[("GET", f"{self.API}/repos/one-org/cluster/actions/runs/1/jobs?per_page=50")] = (200, {"jobs": [
+            {"name": "guardrails", "conclusion": "failure", "steps": [
+                {"name": "Check exposure policy", "conclusion": "failure"}]}]})
+        got = self.push()
+        why = ("one-org/cluster master is at c2, and its check guardrails ended failure, in guardrails / Check exposure "
+               "policy (https://github.com/x/1): fix the commit or revert it")
+        self.assertEqual((got["ok"], got["kind"], got["why"]), (False, "rule", why))
+        last = self.door.record.after(0)[-1]
+        self.assertEqual((last["action"], last["outcome"]), ("push", "failed"))
+        self.assertTrue(last["why"].startswith("one-org/cluster master is at c2, and its check guardrails"), last)
+
+    def test_a_late_run_is_waited_for_and_no_run_at_all_is_said(self):
+        self.reads = [self.runs(), self.runs({"id": 3, "name": "manifests", "status": "queued"}),
+                      self.runs({"id": 3, "name": "manifests", "status": "completed", "conclusion": "success"})]
+        got = self.push()
+        self.assertEqual((got["ok"], got["out"]), (True, "one-org/cluster master is at c2; its checks passed: manifests"))
+        self.reads = [self.runs()]
+        got = self.push()
+        self.assertEqual((got["ok"], got["out"]), (True, "one-org/cluster master is at c2; no check ran for it"))
+
+    def test_a_check_that_does_not_end_in_time_is_said_and_is_no_failure(self):
+        self.reads = [self.runs({"id": 4, "name": "slow", "status": "in_progress"})]
+        got = self.push()
+        self.assertEqual((got["ok"], got["out"]), (True, "one-org/cluster master is at c2; 1 of its checks had not "
+                                                         "ended after 20 minutes: slow"))
 
 
 OLD_CONFIG = ("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: old-config\n  namespace: shop\n  labels:\n"
@@ -2236,7 +2315,8 @@ class GitHubFacts(DoorCase):
         self.assertEqual((got["ok"], got["out"]), (True, OLD_DEPLOYMENT))
         got = self.call(ONE, "gitops:one-org/cluster", "push", content=change(
             ("apps/shop/deployment.yaml", OLD_DEPLOYMENT.replace("replicas: 2", "replicas: 3"))))
-        self.assertEqual((got["ok"], got["kind"], got["out"]), (True, "rule", "one-org/cluster master is at c2"))
+        self.assertEqual((got["ok"], got["kind"], got["out"]),
+                         (True, "rule", "one-org/cluster master is at c2; its checks passed: Validate manifests"))
         got = self.call(ONE, "gitops:one-org/cluster", "sync", "shop")
         self.assertEqual((got["ok"], got["out"]), (True, "sync-app.yml of one-org/cluster: run 4242 passed "
                                                      "(https://github.com/one-org/cluster/actions/runs/4242)"))
