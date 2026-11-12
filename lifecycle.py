@@ -179,7 +179,41 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             # feature's name is of the letters a to z and _ (hub.validate_status), and a report with another name
             # is refused whole. model_accounts: an agent whose account has a kind starts on that account's key or
             # model server, and its setup check has the `account` item (Lifecycle.account_item).
-            "acp_tasks", "model_accounts"]
+            "acp_tasks", "model_accounts",
+            # the host list: a closed task session takes its agent's host list from the hub's start, and its page
+            # reads open only on those hosts (fleet.closed_task_command)
+            "web_hosts"]
+# ---------------------------------------------------------------- the host list
+#
+# The host list of an agent whose Shell box is off and whose Web box is on (team.json "web_hosts"): the hosts on which
+# the page reads of its sessions open. An address that a session fetches can carry data to the site that it names, so
+# the list is a control and not a convenience. One form of an entry for the hub, which checks the owner's write, and
+# for the helper, which checks what the hub's start names: a host name in lower case, or "*." and a host name for that
+# host and every host below it. A name has two labels or more and at most 80 characters, and its last label begins
+# with a letter: so no entry is "*", "*.com", a name with a port or a path, or an address in numbers, which a
+# browser's reading also takes in forms such as 127.0x1.
+WEB_HOST = re.compile(r"(?:\*\.)?(?=[a-z0-9.-]{4,80}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+                      r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?")
+WEB_HOSTS_MOST = 20     # with 80 characters each, the start of a session stays far below what tmux takes (16 KiB)
+WEB_HOSTS_FORM = (f"a list of 1 to {WEB_HOSTS_MOST} different hosts, each a host name in lower case such as "
+                  f"docs.example.com, or *.example.com for example.com and every host below it")
+# The versions of Claude Code at which a closed session with a host list passed its live test
+# (test_web_hosts.Live, with FLEET_LIVE_LOCKDOWN=1), the default first: on the owner's Mac, 12 November 2026, a page
+# on a listed host opened, and a page on another host, a redirect to another host and Claude Code's own list of
+# documentation hosts did not. A session with a host list runs at the version of closed sessions when it is one of
+# these, else at the first of these (hub.closed_extra), and a helper starts none at another (closed_task_command).
+# A version joins only in a release whose live test passed at it. 2.1.308 was not on that Mac, so it is not here.
+HOST_LIST_VERSIONS = ("2.1.312", "2.1.311")
+
+
+def web_hosts(value):
+    """value as a host list, in its own order, or ValueError with the form (WEB_HOSTS_FORM)."""
+    if not isinstance(value, list) or not 1 <= len(value) <= WEB_HOSTS_MOST or \
+            not all(isinstance(h, str) and WEB_HOST.fullmatch(h) for h in value) or len(set(value)) != len(value):
+        raise ValueError(WEB_HOSTS_FORM)
+    return list(value)
+
+
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and

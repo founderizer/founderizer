@@ -1644,7 +1644,8 @@ def tools():
                              "job end; the same call again gives a failed removal once more.",
              {"agent": S["text"], **rid}, ("agent",),
              with_base("/ui/team/agents/{agent}/remove", (), "the deletion of this agent")),
-        tool("agent_settings", "One agent's model, effort, capabilities, title, expertise, account or screen model. "
+        tool("agent_settings", "One agent's model, effort, capabilities, title, expertise, account, screen model or "
+                               "host list. "
                                "A null model or effort follows the fleet's default_model of its runtime "
                                "(save_settings), else the runtime's own. Each of vault, runtime and vault_create is a "
                                "command of its own, and has a tool of its own here: vault_access, switch_runtime and "
@@ -1661,10 +1662,25 @@ def tools():
                          "properties": {"model": {"type": ["string", "null"]},
                                         "effort": {"type": ["string", "null"]}},
                          "required": ["model", "effort"], "additionalProperties": False},
+              "web_hosts": {"type": "array", "items": {"type": "string"},
+                            "description": "The host list, only for a worker or a lead whose Shell and Browser "
+                                           "boxes are off and "
+                                           "whose Web box is on: the page reads of its sessions then open only on "
+                                           "these hosts, 20 at most. Each is a host name in lower case, such as "
+                                           "docs.example.com, or *.example.com for example.com and every host "
+                                           "below it. A listed host's own www. name also opens when the host "
+                                           "sends a read there, and a listed host is open on every port. Without "
+                                           "a list such a session reads no page at all. [] "
+                                           "removes the list. The list limits page reads and not web search. A "
+                                           "session sends each address that it reads to the host that the "
+                                           "address names, so list only hosts that the owner trusts with what "
+                                           "the agent sees. A running session keeps the list that it started "
+                                           "with; a Shell or a Browser box that goes on, or a Web box that goes "
+                                           "off, removes the list."},
               **rid},
              ("agent",),
              with_base("/ui/team/agents/{agent}",
-                       ("model", "effort", "can", "title", "expertise", "account", "screen"),
+                       ("model", "effort", "can", "title", "expertise", "account", "screen", "web_hosts"),
                        "these agent settings")),
         tool("switch_runtime", "Switch one agent to its other runtime, codex or claude. It is a command of its own: "
                                "send nothing else with it. The agent's own start command for that runtime comes "

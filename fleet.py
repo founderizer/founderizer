@@ -712,7 +712,7 @@ DENY = ["Read(~/.fleet/**)", "Edit(~/.fleet/**)", "Bash(*.fleet/*)"] + UNSEEN_TO
 CHROME_TOOLS = "mcp__claude-in-chrome__*"      # the tools that Claude Code's --chrome adds to a browser task
 # The files of this checkout that no worker session edits: Fleet's code, the rules, the owner's files, and the agents'
 # skills, which an agent changes with write_skill only (design v4 D1).
-PROTECTED = ("fleet.py", "hook_clean.py", "hidden.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.py", "acp_programs.py", "prices/**", "pins.py", "prices.py", "screen_runner.py", "desktop.py", "FleetWorker.swift", "worker_install.py", "install-worker.sh", "Install Fleet Worker.command", "hub.py", "wakeups.py", "usage.py", "threads.py", "selftest.py", "test_logins.py", "verify.py", "verify_case.py", "pilot.py", "publish.py", "publish/**", "team.json", "RULES.md", "rules/**", "CLAUDE.md", "AGENTS.md", "profiles/**", "skills/**")
+PROTECTED = ("fleet.py", "hook_clean.py", "hook_hosts.py", "hidden.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.py", "acp_programs.py", "prices/**", "pins.py", "prices.py", "screen_runner.py", "desktop.py", "FleetWorker.swift", "worker_install.py", "install-worker.sh", "Install Fleet Worker.command", "hub.py", "wakeups.py", "usage.py", "threads.py", "selftest.py", "test_logins.py", "verify.py", "verify_case.py", "pilot.py", "publish.py", "publish/**", "team.json", "RULES.md", "rules/**", "CLAUDE.md", "AGENTS.md", "profiles/**", "skills/**")
 # No Claude session that a helper starts loads a setting source of its machine (--setting-sources ''). A Mac keeps one
 # desktop user for its agents (PRODUCT.md P2), so that person's own CLAUDE.md, rules, skills, agents, plugins and hooks
 # would steer every agent there unseen, and an agent could write them to steer its own later sessions; and the
@@ -1837,10 +1837,39 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
 # Support plan F1: the built-in tools that a closed task session can have, by the Tools box that allows each. Every
 # other built-in tool -- a shell, a file tool, an agent, a plan, a question, a timer -- is outside its --tools. The Web
 # box gives web search and never a page fetch: an address that the model writes can carry data to any site's log
-# (support plan H4), so a closed session reads pages only through a server of its own.
+# (support plan H4), so a closed session reads pages only through a server of its own, or on the hosts of its agent's
+# host list (CLOSED_PAGE_TOOL).
 CLOSED_BUILT_INS = {"web": ("WebSearch",)}
+# The host list (team.json "web_hosts"): the page fetch of a closed task session whose Web box is on, only when the
+# hub's start names the hosts of its agent's list and this tool. Three parts hold it to those hosts, and
+# test_web_hosts.Live proves them in a real session. Its rules, WebFetch(domain:<host>), open the listed hosts, and
+# dontAsk refuses a page on every other host. Claude Code follows no redirect to another host: it gives the model the
+# new address, which is one more call under the same rules (a redirect between a host and its own www. name is the
+# one that it follows). And Claude Code opens a list of documentation hosts of its own in every permission mode, with
+# no rule, so a hook before each call stops every address that is not on a listed host (hook_hosts.py).
+CLOSED_PAGE_TOOL = "WebFetch"
+HOSTS_HOOK_TIMEOUT = 60         # seconds; the program reads one small JSON object and exits
+# Claude Code lets a call go on when its hook ends with another code than 0 or 2, cannot start or runs out of time,
+# unless the hook says this. With it, each of those stops the call (read in 2.1.311 and 2.1.312, and proved live).
+HOSTS_HOOK_FAILURE = "block"
 # What a closed browser task never runs of the tools that --chrome adds (DevOps plan B2): a local file to a page.
 CLOSED_CHROME_DENY = ("mcp__claude-in-chrome__file_upload",)
+
+
+def host_rules(hosts):
+    """Claude Code's allow rules for the page reads of a host list: one for each host, and for "*.<host>" the host and
+    Claude Code's own form for every host below it."""
+    return [f"{CLOSED_PAGE_TOOL}(domain:{name})" for h in hosts for name in ((h[2:], h) if h.startswith("*.") else (h,))]
+
+
+def hosts_hook(hosts):
+    """The PreToolUse entry that stops each page read whose address is not on a listed host (hook_hosts.py), which
+    also closes Claude Code's own list of documentation hosts. `|| exit 2`: a program that cannot start, or that ends
+    in any other way than with 0, stops the call; onFailure: so does one that runs out of time. So a fault of this
+    hook never opens a page."""
+    return {"matcher": CLOSED_PAGE_TOOL, "hooks": [{
+        "type": "command", "timeout": HOSTS_HOOK_TIMEOUT, "onFailure": HOSTS_HOOK_FAILURE,
+        "command": shlex.join([sys.executable, "-S", os.path.join(KIT, "hook_hosts.py"), *hosts]) + " || exit 2"}]}
 
 
 def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, session, token, env, opening, rules,
@@ -1852,7 +1881,9 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
     hub fixes (hub.shell_tools), and the agent's own catalog servers (--strict-mcp-config); no key, no GitHub token and
     nothing of the session's own in its environment, so the values that its servers need are in its mode-600 MCP file
     only; in dontAsk, which refuses whatever its allow list does not name. closed: {runtime, version, built_ins} from
-    the hub's start event (hub.closed_extra); without it, the first tested version and the Web box's tools. Codex and
+    the hub's start event (hub.closed_extra); without it, the first tested version and the Web box's tools. With
+    web_hosts in it, the hosts of the agent's host list, and WebFetch among its built_ins: page reads on those hosts
+    only (CLOSED_PAGE_TOOL), at a version that passed the host list's live test, and at no other. Codex and
     the screen runner are refused: Fleet's own lockdown test shows that Codex cannot be held to a list of tools. task
     "conversation" is a conversation with the agent's own tools (conversation_work_command): its route is the
     conversation's, and attempt is its id."""
@@ -1867,10 +1898,25 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
     if not (token and session and generation):
         raise Refused("a closed task session needs its credential, its session id and its generation")
     closed = closed if isinstance(closed, dict) else {}
-    program = closed_program(closed.get("runtime") or conf.get("runtime"), closed.get("version") or tested[0])
+    version = closed.get("version") or tested[0]
+    hosts = closed.get("web_hosts")
+    if hosts is not None:           # the host list: a start that this helper cannot hold to its hosts starts nothing
+        try:
+            hosts = lifecycle.web_hosts(hosts)
+        except ValueError:
+            raise Refused("the host list of this start is not " + lifecycle.WEB_HOSTS_FORM) from None
+        if version not in lifecycle.HOST_LIST_VERSIONS:
+            raise Refused(f"a session with a host list runs only at a version of Claude Code that passed the host "
+                          f"list's test ({', '.join(lifecycle.HOST_LIST_VERSIONS)}), and this start names {version}")
+        if needs == "browser":      # a task from before the list, when the Browser box was on: Chrome has no list
+            raise Refused("a session with a host list has no browser task: its browser would open every host")
+    program = closed_program(closed.get("runtime") or conf.get("runtime"), version)
     allowed = [name for box, names in CLOSED_BUILT_INS.items() if box in (conf.get("can") or []) for name in names]
     named = closed.get("built_ins")
     built_ins = [name for name in allowed if not isinstance(named, list) or name in named]
+    paged = bool(hosts) and "web" in (conf.get("can") or []) and isinstance(named, list) and CLOSED_PAGE_TOOL in named
+    if paged:
+        built_ins.append(CLOSED_PAGE_TOOL)
     values, minted = dict(env or {}), dict(minted or {})
     catalog = team_catalog()
     values.update({catalog[t]["bearer"]: v for t, v in minted.items() if t in catalog})
@@ -1881,7 +1927,8 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
              (t in minted or not catalog[t].get("mint"))]
     servers = {t: claude_server(t, catalog, values) for t in tools}
     url = f"{HUB}/mcp/{agent}/{generation}/{task}/{attempt}"
-    allow = ["mcp__fleet__*"] + [f"mcp__{t}__*" for t in tools] + built_ins
+    allow = ["mcp__fleet__*"] + [f"mcp__{t}__*" for t in tools] + \
+        [name for name in built_ins if name != CLOSED_PAGE_TOOL] + (host_rules(hosts) if paged else [])
     deny = list(DENY)
     if needs == "browser":
         allow.append(CHROME_TOOLS)
@@ -1895,6 +1942,11 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
                                                clean_hook()],      # and hidden characters out (hook_clean.py)
                                "PostToolUseFailure": [clean_hook()]}},
                     **{k: v for k, v in kept_user_settings().items() if k != "env"})   # the pinned version's updater
+    if paged:
+        # its hook, and no lookup of each host at the vendor before a read: the owner chose these hosts, and the lookup
+        # would give each name to one more site
+        settings["hooks"]["PreToolUse"] = [hosts_hook(hosts)]
+        settings["skipWebFetchPreflight"] = True
     # its rules, its profile and its knowledge files in its start, because it reads no file; no skill list, whose
     # SKILL.md it could not open either. A start without that text would tell it to read files: none is made.
     text = stable_text(agent, opening, rules, skills=False, knowledge=True) \

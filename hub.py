@@ -1316,8 +1316,9 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # card, from GET /ui/history?mode=messages (UI-API.md 1.128)
                "secret_compare",    # the same yes: "Changed in 1Password" on the import page, from
                                     # GET /ui/secrets/same (UI-API.md 1.129)
-               "default_models"]    # the owner, 9 November 2026: "a default for each [AI provider] somewhere under
+               "default_models",    # the owner, 9 November 2026: "a default for each [AI provider] somewhere under
                                     # settings, and then each agent can be changed individually"
+               "web_hosts"]         # the host list of an agent whose Shell box is off (UI-API.md, "the host list")
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -3648,6 +3649,8 @@ def colleague_facts(name):
     reach = sorted(set(a.get("can") or []) - {"shell", "web"})
     if reach:
         out.append("can use " + named_few(reach, TEAM_ITEMS))
+    if a.get("web_hosts"):      # the host list: which pages this agent can read, for whoever gives it page work
+        out.append("reads web pages only on " + named_few(a["web_hosts"], TEAM_ITEMS))
     if a.get("repos"):
         out.append("GitHub " + named_few((f"{r} ({v})" for r, v in sorted(a["repos"].items())), TEAM_ITEMS))
     google = a.get("google") or {}
@@ -3922,7 +3925,8 @@ def task_start_text(agent, task_id, resume=False, note="", row=None, opening=Non
              + (f'\nFirst check what was already done, with your own MCP servers (rule 9: check before repeating), '
                 if closed else f'\nFirst check what was already done (rule 9: check before repeating), ') +
              f'then continue and finish with deliver_result.' if resume else task_itself(task_id, closed)) + \
-        (SHELL_OFF_RULE + lists_start_text(task_id) if closed else RULE_FOUR)      # F4: its lists and its reports
+        (SHELL_OFF_RULE + lists_start_text(task_id) + web_hosts_text(agent, task_id)   # F4, and its host list
+         if closed else RULE_FOUR)
     # owner feature secret_requests: the one thing that it asks the owner for itself, in a task that no contact drives
     said += "" if closed or contact_session(agent, ("", tref(task_id), "1")) else SECRET_SELF
     # manager_as_lead: when this task is one part of a split piece of work, which piece and who holds the other
@@ -26691,7 +26695,8 @@ TOOLS = [
                   "trigger}. The whole list replaces the watches of the duty."},
         "tools": {"type": "array", "items": {"type": "string"}, "description": "Only for a holder whose Shell box "
                   "is off: the optional tools of the sessions of its cases, which replace the Web box's "
-                  "WebSearch: any of WebSearch, remember and write_notes. Leave it out for the defaults."},
+                  "WebSearch: any of WebSearch, remember and write_notes. Leave it out for the defaults. A session "
+                  "with WebSearch also reads pages on the hosts of its agent's host list, when the owner gave one."},
         "servers": {"type": "array", "items": {"type": "string"}, "description": "Only for a holder whose Shell box "
                     "is off: the MCP servers of the sessions of its cases, by name, and no other. Without it they "
                     "get no server whose token is made for a session."},
@@ -26977,7 +26982,8 @@ SHELL_OFF_TOOLS = ("read_messages", "record_step", "close_case", "deliver_result
 # needs them, and no session with a shell reads them, because memory and notes are this agent's own (H8).
 SHELL_OFF_DUTY_TOOLS = ("remember", "write_notes")
 # The built-in tools that a duty may name for its sessions, which the Web box must still allow (fleet.CLOSED_BUILT_INS):
-# web search, and never a page fetch, whose address can carry data out (H4). A duty with no web names none.
+# web search, and never a page fetch, whose address can carry data out (H4). A duty with no web names none. (A page
+# fetch comes only with the agent's host list, and then with web search: closed_extra, "the host list" below.)
 SHELL_OFF_BUILT_INS = ("WebSearch",)
 # The owner chat of such an agent: CHAT_TOOLS without a way to another agent, to new work or to a key.
 SHELL_OFF_CHAT = ("read_messages", "tell_owner", "message_owner", "see_responsibilities", "recall")
@@ -27089,10 +27095,74 @@ def closed_extra(owner, responsibility=None):
         else None
     named = duty_tools(row["tools"]) if row else None
     allowed = SHELL_OFF_BUILT_INS if "web" in (agents()[owner].get("can") or []) else ()
-    return {"shell_off": {"runtime": setting("conversations.closed_runtime"),
-                          "version": setting("conversations.closed_version"),
-                          "built_ins": [n for n in allowed if named is None or n in named],
-                          "servers": duty_tools(row["servers"]) if row else None}}
+    out = {"runtime": setting("conversations.closed_runtime"), "version": setting("conversations.closed_version"),
+           "built_ins": [n for n in allowed if named is None or n in named],
+           "servers": duty_tools(row["servers"]) if row else None}
+    hosts = agents()[owner].get("web_hosts")
+    if hosts and WEB_SEARCH in out["built_ins"]:        # the host list: page reads go with web search, on its hosts
+        out.update(built_ins=out["built_ins"] + [WEB_PAGES], web_hosts=list(hosts), version=host_list_version())
+    return {"shell_off": out}
+
+
+# ---------------------------------------------------------------- the host list (UI-API.md, "the host list")
+#
+# A session of an agent whose Shell box is off holds private data and reads strangers' text, and an address that it
+# fetches can carry that data to the site that the address names. So the Web box of such an agent gives web search
+# and no page read (H4), unless the owner gives the agent a host list (team.json "web_hosts", lifecycle.WEB_HOST):
+# then each session of it that has web search also reads pages, and only on those hosts. Its helper holds the session
+# to them (fleet.closed_task_command), and the hub only names them in the start. The list limits page reads and not
+# web search: a search query goes to the AI provider's search service, never to a site that the model names, and a
+# result on a host that is not listed does not open. An agent whose Shell box is on gets no list, because its shell
+# reaches every host anyway; so does one whose Browser box is on, because a browser task of it opens every host in
+# Chrome; and so does an agent on a runtime that cannot be held to a list of tools.
+WEB_SEARCH, WEB_PAGES = "WebSearch", "WebFetch"
+WEB_HOSTS = "web_hosts"         # the helper feature (lifecycle.FEATURES), the owner feature and the field
+
+
+def host_list_version():
+    """The version of Claude Code that a session with a host list runs at: the version of closed sessions when the
+    host list's live test passed at it, else the first at which it passed (lifecycle.HOST_LIST_VERSIONS)."""
+    pinned = setting("conversations.closed_version")
+    return pinned if pinned in lifecycle.HOST_LIST_VERSIONS else lifecycle.HOST_LIST_VERSIONS[0]
+
+
+def web_hosts_refusal(a):
+    """Why this entry of team.json gets no host list, in words that follow the agent's name, or None when it can have
+    one. One reading for validate_team and for the owner's write (save_agent_settings)."""
+    if a.get("role") not in ("worker", "lead"):
+        return "is the fleet manager, whose session is not closed: only a worker or a lead gets a host list"
+    if not closed_versions(a.get("runtime")):
+        return (f"runs on {runtime_label(a.get('runtime'))}, which cannot be held to a fixed list of tools, so no "
+                f"session of it can be held to a list of hosts")
+    if not isinstance(a.get("can"), list) or "shell" in a["can"]:
+        return "has its Shell box on: its shell reaches every host, so a host list would limit nothing"
+    if "web" not in a["can"]:
+        return "has its Web box off: its sessions have no web tool, so there is nothing for a host list to limit"
+    if "browser" in a["can"]:       # a closed browser task has Chrome's own tools, which no rule holds to a host
+        return "has its Browser box on: a browser task of it opens every host, so a host list would not hold"
+    return None
+
+
+def web_hosts_words(hosts):
+    """A host list in words: each host, and "<host> and every host below it" for an entry that begins with "*."."""
+    return "; ".join(f"{h[2:]} and every host below it" if h.startswith("*.") else h for h in hosts)
+
+
+def web_hosts_text(agent, task_id):
+    """In the start of a closed task session that reads pages: the hosts on which they open, from the fleet's own
+    record, and that web search is not limited by them. "" for every other session. Its task's duty can name the
+    tools of its sessions. (A conversation of such an agent is always closed, with no web tool: conversation_works.)
+    read_row only: start_text runs in admit_task's transaction."""
+    if not shell_off(agent):
+        return ""
+    row = read_row("SELECT responsibility FROM tasks WHERE id=?", (task_id,))
+    hosts = closed_extra(agent, row["responsibility"] if row else None)["shell_off"].get(WEB_HOSTS)
+    if not hosts:
+        return ""
+    return (f" Your page reads ({WEB_PAGES}) open only on the hosts of your host list: {web_hosts_words(hosts)}. A "
+            f"page on another host does not open, also when a web search names it or a listed page sends you to it "
+            f"(only a listed host's own www. name opens that way): do not try another address for it. Web search "
+            f"itself is not limited by the list.")
 
 
 def typed_list(value, what):
@@ -29810,9 +29880,9 @@ def save_agent_settings(agent, body):
         raise Refusal(400, "the manager is always active")
     old = {"active": a.get("active", True) is not False, "model": a.get("model"), "effort": a.get("effort"),
            "can": list(a.get("can") or []), "title": a.get("title"), "expertise": list(a.get("expertise") or []),
-           "account": a.get("account"), "screen": screen_settings(a)}
-    new = {k: body[k] for k in ("active", "model", "effort", "can", "title", "expertise", "account", "screen")
-           if k in body}
+           "account": a.get("account"), "screen": screen_settings(a), WEB_HOSTS: list(a.get(WEB_HOSTS) or [])}
+    new = {k: body[k] for k in ("active", "model", "effort", "can", "title", "expertise", "account", "screen",
+                                WEB_HOSTS) if k in body}
     if new.get("title") and agent_words(new["title"]) != agent_words(old["title"]):
         clash = role_clash(agent, new["title"], team["agents"])       # each role names one agent (agent_called)
         if clash:
@@ -29841,6 +29911,27 @@ def save_agent_settings(agent, body):
         if SHELL_BOX not in helper_features(agent):
             raise Refusal(409, f"{shown_role(agent)} cannot turn its Shell box off yet. Update Founderizer on its "
                                f"server first.")
+    # The host list: only for an agent whose sessions can be held to it, with the boxes as this write leaves them,
+    # and on a helper that holds them. A change of the boxes that leaves nothing for the list to limit removes it in
+    # the same commit, so that no list stays that says more than the fleet does.
+    boxes = dict(a, can=new["can"]) if "can" in new else a
+    if new.get(WEB_HOSTS):
+        if web_hosts_refusal(boxes):
+            raise Refusal(409, f"{shown_role(agent)} {web_hosts_refusal(boxes)}.")
+        if new[WEB_HOSTS] != old[WEB_HOSTS] and WEB_HOSTS not in helper_features(agent):
+            raise Refusal(409, f"{shown_role(agent)} cannot hold a host list yet. Update Founderizer on its server "
+                               f"first.")
+        # a browser task from the time when its Browser box was on would still start with its browser
+        browsing = [r["id"] for r in q(f"SELECT id FROM tasks WHERE owner=? AND needs='browser' AND {OPEN_TASK} "
+                                       f"ORDER BY id", (agent,))] if new[WEB_HOSTS] != old[WEB_HOSTS] else []
+        if browsing:
+            raise Conflict(f"{shown_role(agent)} has an open browser task, whose browser opens every host; finish or "
+                           f"cancel it first.", open_tasks=browsing)
+    elif WEB_HOSTS not in new and old[WEB_HOSTS] and web_hosts_refusal(boxes):
+        new[WEB_HOSTS] = []
+    # That removal is said apart from `changed` (also_changed): an app checks `changed` against the fields that it
+    # sent, and the app of today sends the boxes and knows no host list.
+    also = [WEB_HOSTS] if WEB_HOSTS in new and WEB_HOSTS not in body else []
     if new.get("active") is False and old["active"]:
         busy = [r["id"] for r in q(f"SELECT id FROM tasks WHERE owner=? AND {OPEN_TASK} ORDER BY id", (agent,))]
         if busy:
@@ -29866,7 +29957,7 @@ def save_agent_settings(agent, body):
                 a.pop("active", None)           # absent means active
             else:
                 a["active"] = False
-        elif c["after"] is None or (c["field"] == "expertise" and not c["after"]):
+        elif c["after"] is None or (c["field"] in ("expertise", WEB_HOSTS) and not c["after"]):
             a.pop(c["field"], None)
         else:
             a[c["field"]] = c["after"]
@@ -29886,11 +29977,14 @@ def save_agent_settings(agent, body):
     # holds its runtime switch. Its running standing session keeps the settings that it started with.
     updates = [agent] if fields & {"model", "effort", "can", "screen"} and \
         request_update(agent, commit) == "requested" else []
-    told = {"active", "can", "title", "expertise", "account"}
+    told = {"active", "can", "title", "expertise", "account", WEB_HOSTS}
     if fields & told:
         words = "; ".join(("it is active now and can get tasks" if c["after"] else "it is in setup now and gets no tasks")
                           if c["field"] == "active" else f"it can now: {', '.join(c['after']) or 'nothing'}"
-                          if c["field"] == "can" else f"its title is now {c['after'] or 'none'}"
+                          if c["field"] == "can" else
+                          (f"its page reads now open only on: {web_hosts_words(c['after'])}" if c["after"] else
+                           "its host list is removed")
+                          if c["field"] == WEB_HOSTS else f"its title is now {c['after'] or 'none'}"
                           if c["field"] == "title" else f"its expertise is now {', '.join(c['after']) or 'none'}"
                           if c["field"] == "expertise" else f"its account label is now {c['after'] or 'none'}"
                           for c in changed if c["field"] in told)
@@ -29898,9 +29992,11 @@ def save_agent_settings(agent, body):
         emit(manager_name(), "say", f"[hub] The owner changed {agent}: {words}.",
              extra={"activated": agent} if any(c["field"] == "active" and c["after"] for c in changed) else None)
     log("owner", f"changed the settings of {agent} in {commit[:12]}: {', '.join(sorted(fields))}")
-    return {"agent": agent, "revision": commit, "sha256": hashlib.sha256(data).hexdigest(), "changed": changed,
+    return {"agent": agent, "revision": commit, "sha256": hashlib.sha256(data).hexdigest(),
+            "changed": [c for c in changed if c["field"] not in also],
             "updates_requested": updates, "settings_pending": settings_pending(agent),
-            "activation": {"check": check["id"], "checked_at": check["completed"]} if activating else None}
+            "activation": {"check": check["id"], "checked_at": check["completed"]} if activating else None,
+            **({"also_changed": [c for c in changed if c["field"] in also]} if also else {})}
 
 
 # ---------------------------------------------------------------- runtime switch (owner feature runtime_switch)
@@ -32878,6 +32974,13 @@ def validate_team(team):
             raise ValueError(f"agent {name}: a vault broker needs vault_recipient, its broker's public handover key")
         if "title" in a and not (isinstance(a["title"], str) and 1 <= len(a["title"].strip()) <= 60 and "\n" not in a["title"]):
             raise ValueError(f"agent {name}: title must be one line of 1 to 60 characters")
+        if WEB_HOSTS in a:      # the host list: only where a session can be held to it, and absent for none
+            try:
+                lifecycle.web_hosts(a[WEB_HOSTS])
+            except ValueError as e:
+                raise ValueError(f"agent {name}: web_hosts must be {e}, or absent") from None
+            if web_hosts_refusal(a):
+                raise ValueError(f"agent {name} {web_hosts_refusal(a)}")
         tags = a.get("expertise", [])
         if not isinstance(tags, list) or len(tags) > 8 or len(set(map(str, tags))) != len(tags) or \
                 not all(isinstance(x, str) and TAG.fullmatch(x) for x in tags):
@@ -33516,7 +33619,9 @@ def give_defaults(name, vault, desktop):
         if a["machine"] not in (team.get("vault_stores") or {}):
             team["vault_stores"] = dict(team.get("vault_stores") or {}, **{a["machine"]: key})
         given.append("its machine's vault")
-    added = with_desktop(a, team) if desktop else []
+    # the host list: an agent that has one takes no browser of its Mac by default, because a browser ends the list;
+    # the owner's boxes stand, and its other defaults are given as for every agent
+    added = with_desktop(a, team) if desktop and not a.get(WEB_HOSTS) else []
     if added:
         given.append("the " + " and ".join(added) + " of its Mac")
     if given:
@@ -43088,6 +43193,7 @@ class Handler(BaseHTTPRequestHandler):
                 a = team["agents"].get(line["agent"]) or {}
                 line.update(active=a.get("active", True) is not False, model=a.get("model"), effort=a.get("effort"),
                             can=list(a.get("can") or []), settings_pending=settings_pending(line["agent"]),
+                            web_hosts=list(a.get(WEB_HOSTS) or []),
                             reported_model=reported_model(line["agent"]),
                             screen=screen_settings(a), reported_screen_model=reported_model(line["agent"], screen=True),
                             title=a.get("title"), expertise=list(a.get("expertise") or []), account=a.get("account"),
@@ -43136,7 +43242,8 @@ class Handler(BaseHTTPRequestHandler):
         """One agent's model, effort, capabilities and activation (owner API 1.9), committed like the reporting lines."""
         def read(data):
             extra = sorted(set(data) - {"request_id", "db", "base_sha256", "active", "model", "effort", "can", "title",
-                                        "expertise", "account", "screen", "vault", "runtime", "vault_create"})
+                                        "expertise", "account", "screen", "vault", "runtime", "vault_create",
+                                        "web_hosts"})
             if extra:
                 raise ValueError(f"unknown field {extra[0]}")
             if "vault_create" in data:      # create_login: the agent's permission, in a command of its own
@@ -43196,6 +43303,12 @@ class Handler(BaseHTTPRequestHandler):
                         not (s["effort"] is None or (isinstance(s["effort"], str) and EFFORT_NAME.fullmatch(s["effort"]))):
                     raise ValueError("screen must be {model, effort}: a model name or null, and an effort name or null")
                 body["screen"] = {"model": s["model"], "effort": s["effort"]}
+            if "web_hosts" in data:         # the host list: its hosts, or [] or null for none
+                hosts = data["web_hosts"]
+                try:
+                    body["web_hosts"] = lifecycle.web_hosts(hosts) if hosts not in (None, []) else []
+                except ValueError as e:
+                    raise ValueError(f"web_hosts must be {e}, or [] for none") from None
             if "vault" in data:
                 body["vault"] = data["vault"]
             if "runtime" in data:
@@ -43203,8 +43316,8 @@ class Handler(BaseHTTPRequestHandler):
             if "vault_create" in data:
                 body["vault_create"] = data["vault_create"]
             if len(body) == 2:
-                raise ValueError("give active, model, effort, can, title, expertise, account, screen, vault, runtime or "
-                                 "vault_create")
+                raise ValueError("give active, model, effort, can, title, expertise, account, screen, web_hosts, vault, "
+                                 "runtime or vault_create")
             return body
         return self.ui_command(f"team/agents/{agent}", read, lambda body: save_vault(agent, body) if "vault" in body
                                else save_runtime(agent, body) if "runtime" in body
