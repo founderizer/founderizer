@@ -1216,7 +1216,7 @@ def decide_prune(lookups, repo, target, caller, app):
     every = ", ".join(keys)
     if owner:
         return Decision("full", f"a prune in {app} that is the owner's: {'; '.join(owner[:5])}. The whole list goes "
-                        f"to him, because a part of it would leave the app OutOfSync: {every}", target=target,
+                        f"to the owner, because a part of it would leave the app OutOfSync: {every}", target=target,
                         window="deploy", plan=plan, hash_content=listed.encode())
     if all(made(key) for key in keys):
         return Decision("rule", f"a prune in {app} of what commits through the door made and then removed: {every}",

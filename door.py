@@ -252,6 +252,8 @@ RUN_WAIT = 50 * 60          # how long a GitOps sync's call waits for its run to
 RUN_POLL = 15               # seconds between two reads of that run
 RUN_FIND = 60               # seconds in which the run of a dispatch whose answer gave no run id must show up
 LOG_MOST = 1024 * 1024      # bytes of a job's log that the door reads: a listing run prints one line
+LOG_TRIES = 3               # reads of a job's log that GitHub does not give yet, when its job just ended
+LOG_PAUSE = 5               # seconds between them
 CHECKS_FIND = 45            # seconds after a GitOps commit in which its push's runs show up, the late ones too
 CHECKS_WAIT = 20 * 60       # how long the commit's call waits for those runs to end
 
@@ -1092,7 +1094,7 @@ class Door:
             out = hub.commit(plan)
             self.keep_objects(plan, out)
             if plan.get("checks"):          # a GitOps commit: the agent learns how its checks ended, at once
-                passed, words = hub.wait_checks(hub.commit_sha)
+                passed, words = hub.wait_checks(hub.commit_sha, hub.commit_branch)
                 if not passed:
                     raise RunFailed(f"{out}, and {words}: fix the commit or revert it")
                 out = f"{out}; {words}"
@@ -1809,12 +1811,13 @@ class GitHub:
                                 f"{RUN_WAIT // 60} minutes, so the door cannot say that it passed ({url})")
             time.sleep(RUN_POLL)
 
-    def wait_checks(self, sha):
+    def wait_checks(self, sha, branch=None):
         """(passed, words): how the workflow runs that the push of this commit started ended, for a GitOps commit
         through the door. The door waits CHECKS_FIND seconds for them to show up, the late ones too, then until each
         has ended, CHECKS_WAIT at most. Before, nobody learned that a commit broke the repository's own checks: on 11
         November 2026 they stayed red for about 31 hours. A run that does not end in time, or runs that GitHub does not
-        give, are no failure of the commit: the words say so."""
+        give, are no failure of the commit: the words say so, and so do they of a check that failed on its run before
+        this commit too (failed_before)."""
         query = urllib.parse.urlencode({"head_sha": sha, "event": "push", "per_page": "50"})
         begun = now()
         while True:
@@ -1836,19 +1839,57 @@ class GitHub:
         bad = [r for r in runs if r.get("conclusion") not in ("success", "skipped", "neutral")]
         if not bad:
             return True, "its checks passed: " + ", ".join(sorted({run_word(r.get("name")) for r in runs}))
-        words = "; ".join(f"{run_word(r.get('name'))} ended {run_word(r.get('conclusion'))}{self.failed_steps(r['id'])}"
-                          f" ({r.get('html_url') if isinstance(r.get('html_url'), str) else r['id']})"
-                          for r in bad[:3])
-        return False, f"its check {words}" if len(bad) == 1 else f"{len(bad)} of its checks failed: {words}"
+
+        def said(some):
+            return "; ".join(f"{run_word(r.get('name'))} ended {run_word(r.get('conclusion'))}"
+                             f"{self.failed_steps(r['id'])} ({r.get('html_url') if isinstance(r.get('html_url'), str) else r['id']})"
+                             for r in some[:3])
+        # A check that failed on its run before this commit too is not this commit's doing (12 November 2026: one that a
+        # commit of the day before left red made each later door commit a failed call, which says "revert it").
+        old = [r for r in bad if self.failed_before(r, branch)] if branch else []
+        new = [r for r in bad if r not in old]
+        if not new:
+            return True, (f"its checks passed, except {len(old)} that failed on the run before this commit too, so not "
+                          f"by this commit: {said(old)}")
+        also = f"; and {len(old)} more that failed on the run before this commit too" if old else ""
+        return False, (f"its check {said(new)}" if len(new) == 1 else f"{len(new)} of its checks failed: {said(new)}") + also
+
+    def failed_before(self, run, branch):
+        """True when the newest run of the same workflow on the branch before this run that passed or failed (and was
+        not cancelled), failed."""
+        wid, number = run.get("workflow_id"), run.get("run_number")
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in (wid, number)):
+            return False
+        query = urllib.parse.urlencode({"branch": branch, "event": "push", "status": "completed", "per_page": "20"})
+        status, got = self.call("GET", f"/repos/{self.repo}/actions/workflows/{wid}/runs?{query}")
+        if status != 200 or not isinstance(got, dict):
+            return False
+        earlier = [r for r in got.get("workflow_runs") or [] if isinstance(r, dict) and r.get("workflow_id") in (None, wid)
+                   and isinstance(r.get("run_number"), int) and not isinstance(r.get("run_number"), bool)
+                   and r["run_number"] < number and r.get("conclusion") in ("success", "failure")]
+        return bool(earlier) and max(earlier, key=lambda r: r["run_number"]).get("conclusion") == "failure"
 
     def run_text(self, run):
-        "The logs of a run's jobs, one after the other: what a listing run printed (Door.prune_listing)."
+        """The logs of a run's jobs that ran, one after the other: what a listing run printed (Door.prune_listing). A
+        skipped job has no log (12 November 2026: GitHub answers 404 for it, and the first live listing failed so),
+        and the log of a job that just ended can come a few seconds late."""
         status, got = self.call("GET", f"/repos/{self.repo}/actions/runs/{run}/jobs?per_page=50")
         jobs = [j for j in ((got or {}).get("jobs") or [] if status == 200 and isinstance(got, dict) else [])
-                if isinstance(j, dict) and isinstance(j.get("id"), int) and not isinstance(j.get("id"), bool)]
+                if isinstance(j, dict) and isinstance(j.get("id"), int) and not isinstance(j.get("id"), bool)
+                and j.get("conclusion") != "skipped"]
         if not jobs:
-            raise door_providers.Stop(f"GitHub gave no jobs of run {run} ({status})")
-        return "\n".join(self.job_log(job["id"]) for job in jobs)
+            raise door_providers.Stop(f"GitHub gave no jobs of run {run} that ran ({status})")
+        texts = []
+        for job in jobs:
+            for attempt in range(LOG_TRIES):
+                try:
+                    texts.append(self.job_log(job["id"]))
+                    break
+                except door_providers.Stop:
+                    if attempt == LOG_TRIES - 1:
+                        raise
+                    time.sleep(LOG_PAUSE)
+        return "\n".join(texts)
 
     def job_log(self, job):
         """The log of one job, as text, LOG_MOST bytes at most. GitHub answers with a redirect to an address that needs

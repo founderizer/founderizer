@@ -416,6 +416,7 @@ class Columns(unittest.TestCase):
     NOT_AGENT_KV = {
         "check_fails:": "a wake-up rule", "check_lost:": "a run of a check", "conversation_brief:": "a conversation",
         "deliver_running:": "a task", "desktop_click:": "a Mac", "desktop_seen:": "a Mac", "desktop_told:": "a Mac",
+        "door_mode:": "a server of the door",
         "history:": "a stream of the history", "knowledge_asked:": "a knowledge file", "lead_unread:": "an unread item",
         "lost:": "a task", "name_told:": "a machine", "owner_pin:": "a machine", "park_ended:": "a reminder",
         "row_floor:": "a table", "screen_frozen:": "a task", "screen_limit:": "a task", "screen_question:": "a task",

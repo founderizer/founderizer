@@ -2085,6 +2085,35 @@ class CommitChecks(DoorCase):
         self.assertEqual((last["action"], last["outcome"]), ("push", "failed"))
         self.assertTrue(last["why"].startswith("one-org/cluster master is at c2, and its check guardrails"), last)
 
+    def test_a_check_that_failed_before_the_commit_too_is_not_its_doing(self):
+        """12 November 2026: a check that a commit of the day before had left red made each later door commit a failed
+        call that said "revert it". A failed run whose workflow failed on its run before too leaves the call done."""
+        bad = {"id": 1, "name": "images", "status": "completed", "conclusion": "failure", "workflow_id": 77,
+               "run_number": 12, "html_url": "https://github.com/x/1"}
+        self.reads = [self.runs(bad, {"id": 2, "name": "manifests", "status": "completed", "conclusion": "success"})]
+        self.answers[("GET", f"{self.API}/repos/one-org/cluster/actions/runs/1/jobs?per_page=50")] = (200, {"jobs": [
+            {"name": "images", "conclusion": "failure", "steps": [{"name": "Report", "conclusion": "failure"}]}]})
+        history = (f"{self.API}/repos/one-org/cluster/actions/workflows/77/runs?branch=master&event=push"
+                   f"&status=completed&per_page=20")
+        self.answers[("GET", history)] = (200, {"workflow_runs": [
+            {"run_number": 12, "conclusion": "failure"}, {"run_number": 11, "conclusion": "cancelled"},
+            {"run_number": 10, "conclusion": "failure"}, {"run_number": 9, "conclusion": "success"}]})
+        got = self.push()
+        self.assertEqual((got["ok"], got["kind"]), (True, "rule"), got)
+        self.assertEqual(got["out"], "one-org/cluster master is at c2; its checks passed, except 1 that failed on the run "
+                                     "before this commit too, so not by this commit: images ended failure, in images / "
+                                     "Report (https://github.com/x/1)")
+        self.assertEqual(self.door.record.after(0)[-1]["outcome"], "done")
+        # the run before it that ended passed: this commit made the check fail
+        self.answers[("GET", history)] = (200, {"workflow_runs": [
+            {"run_number": 11, "conclusion": "cancelled"}, {"run_number": 10, "conclusion": "success"}]})
+        got = self.push()
+        self.assertEqual((got["ok"], got["kind"]), (False, "rule"), got)
+        self.assertIn("its check images ended failure, in images / Report", got["why"])
+        # no run before it that GitHub gives, or a run with no workflow: the commit's failure, as before
+        del self.answers[("GET", history)]
+        self.assertFalse(self.push()["ok"])
+
     def test_a_late_run_is_waited_for_and_no_run_at_all_is_said(self):
         self.reads = [self.runs(), self.runs({"id": 3, "name": "manifests", "status": "queued"}),
                       self.runs({"id": 3, "name": "manifests", "status": "completed", "conclusion": "success"})]
@@ -2190,7 +2219,7 @@ class PruneParts(unittest.TestCase):
                 d = self.decide(keys, lb, removed=removed)
                 self.assertEqual((d.kind, d.plan["inputs"]["prune_owner_yes"]), ("full", "true"))
                 self.assertIn(why, d.why)
-                self.assertIn("The whole list goes to him", d.why)
+                self.assertIn("The whole list goes to the owner", d.why)
         d = self.decide([])
         self.assertEqual((d.kind, d.plan["inputs"], "pruned" in d.plan), ("rule", {"app": "shop"}, False))
         d = door_targets.decide_prune({"prune_listing": "the listing run failed: no"}, "one-org/cluster",
@@ -2624,12 +2653,24 @@ class Prunes(Signed, DoorCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.line = listing_line([])
+        # the jobs of a listing run as GitHub gives them: the sync job is skipped and has no log (GitHub answers 404)
         self.answers[("GET", f"{self.API}/repos/one-org/cluster/actions/runs/4242/jobs?per_page=50")] = \
-            (200, {"jobs": [{"id": 99, "name": "List what Argo CD wants to prune", "conclusion": "success"}]})
+            (200, {"jobs": [{"id": 97, "name": "Verify the caller", "conclusion": "success"},
+                            {"id": 99, "name": "List what Argo CD wants to prune", "conclusion": "success"},
+                            {"id": 98, "name": "Sync the application", "conclusion": "skipped"}]})
+        self.late = []          # log addresses that GitHub does not give yet, one read each
+        logs = {"https://logs.example/97": lambda: b"the caller may run this workflow\n",
+                "https://logs.example/99": lambda: self.line.encode()}
+
+        def log(method, url, headers, limit, timeout=120):
+            if url in self.late:
+                self.late.remove(url)
+                return 404, b""
+            return (200, logs[url]()) if url in logs else (599, b"")
         for p in (patch.object(door, "http_redirect", lambda method, url, headers, timeout=30:
-                               (302, "https://logs.example/99") if url.endswith("/actions/jobs/99/logs") else (404, "")),
-                  patch.object(door, "http_raw", lambda method, url, headers, limit, timeout=120:
-                               (200, self.line.encode()) if url == "https://logs.example/99" else (599, b""))):
+                               (302, "https://logs.example/" + url.split("/")[-2]) if url.endswith(
+                                   ("/actions/jobs/97/logs", "/actions/jobs/99/logs")) else (404, "")),
+                  patch.object(door, "http_raw", log), patch.object(door, "LOG_PAUSE", 0)):
             p.start()
             self.addCleanup(p.stop)
 
@@ -2670,6 +2711,20 @@ class Prunes(Signed, DoorCase):
         self.assertIn("own call, which it answers for: a prune in shop of what its own commits",
                       self.door.record.after(0)[-1]["why"])
         self.assertEqual(json.loads(slurp(self.root + door.REMOVED_FILE, "r"))["one-org/cluster"], {})
+
+    def test_a_skipped_job_is_not_read_and_a_log_that_comes_late_is_read_again(self):
+        "12 November 2026, the first live listing: the skipped sync job has no log, and GitHub answered 404 for it."
+        self.line = listing_line([])
+        self.late = ["https://logs.example/99"]
+        got = self.prune()
+        self.assertEqual((got["ok"], got["kind"]), (True, "rule"), got)
+        self.assertEqual(self.late, [])
+        self.assertIn("Argo CD wants to prune nothing in shop", self.door.record.after(0)[-1]["why"])
+        # a log that never comes: the listing failed, and the door says which job
+        self.late = ["https://logs.example/99"] * door.LOG_TRIES
+        got = self.prune()
+        self.assertEqual((got["ok"], got["route"]), (False, "again"), got)
+        self.assertIn("the log of job 99 could not be read (404)", got["why"])
 
     def test_a_list_that_is_the_owner_s_goes_to_his_card_whole_and_runs_once_after_his_yes(self):
         keys = [":ConfigMap:shop/made-by-people", ":Service:shop/front"]
