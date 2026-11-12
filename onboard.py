@@ -72,9 +72,11 @@ RUNTIME_PINS = {"codex": "0.160.0", "claude": "2.1.287"}
 # SHA-512 of that file as it is downloaded; and `member`, the program's path in a .tgz, or None for a file that is the
 # program. `python3 pins.py <name> <version>` makes an entry. It takes only a version that npm published at least
 # lifecycle.NPM_DAYS days before, it holds each file of npm to npm's own digest, and it holds Grok Build's files, which
-# come from the vendor's own store, to the copy that npm holds of them. These two are of 12 November 2026. At OpenCode
-# 2.2.5 the program of linux-x64-baseline is byte for byte the program of linux-x64. No code reads this before step 1
-# of that spec.
+# come from the vendor's own store, to the copy that npm holds of them: `packed` names npm's file of that platform,
+# npm's own SHA-512 of it, and the member that opens with Brotli to the same bytes as the store's file. That copy is
+# what proves the age of a store's file, so the tool makes no such entry without it. These two are of 12 November
+# 2026. At OpenCode 2.2.5 the program of linux-x64-baseline is byte for byte the program of linux-x64. No code reads
+# this before step 1 of that spec.
 PINNED = {
     "grok": {"version": "1.0.77", "published": "2026-11-05", "bin": "grok", "files": {
         "linux-x64": {
@@ -83,14 +85,24 @@ PINNED = {
                 "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-1.0.77-linux-x86_64"],
             "sha512": ("05a5285e23d2a8276c4f89b1399c1d515527349af64fd4fc01f93e38787ff8f9"
                        "5726d015ef9c44709cd6cc4fc138a8a536ba2a5aa5ab0e02c981da958fde0254"),
-            "member": None},
+            "member": None,
+            "packed": {
+                "url": "https://registry.npmjs.org/@xai-official/grok-linux-x64/-/grok-linux-x64-1.0.77.tgz",
+                "sha512": ("0ee3d2130d4d623fdbc0b3822bfecb270f37375ae029cf2112c220e0282027dc"
+                           "bbe3269b00e51d6a6af895f23e8b670a2cfabd87c4d07f628d6f213fcd7f3dca"),
+                "member": "package/bin/grok.br"}},
         "linux-arm64": {
             "urls": [
                 "https://x.ai/cli/grok-1.0.77-linux-aarch64",
                 "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-1.0.77-linux-aarch64"],
             "sha512": ("8ade765c405e9f47c481686018c5e0b35666170cc3ce54f77d43e615d5fc711e"
                        "f05fd3b3eb38007eb301f0ec710d8eb27e2c80234618f8cca7c47dd7c4abb78c"),
-            "member": None}}},
+            "member": None,
+            "packed": {
+                "url": "https://registry.npmjs.org/@xai-official/grok-linux-arm64/-/grok-linux-arm64-1.0.77.tgz",
+                "sha512": ("29be3229b544ced5f4ee233b72f281d8bff18903f533f90b8c99f2464f3880db"
+                           "6bdc81bb6a1a89a7ad34e6e07f54bbf0d22b2fd428f9d3327d8d84caecd88eab"),
+                "member": "package/bin/grok.br"}}}},
     "opencode": {"version": "2.2.5", "published": "2026-10-30", "bin": "opencode", "files": {
         "linux-x64": {
             "urls": [
