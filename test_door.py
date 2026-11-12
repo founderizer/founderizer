@@ -14,6 +14,7 @@
 Everything runs locally: the hosts' sshd and the providers are stubs that record what the door sends."""
 import base64
 import contextlib
+import copy
 import datetime
 import errno
 import hashlib
@@ -26,6 +27,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -36,6 +38,7 @@ from unittest.mock import patch
 
 import door
 import door_providers
+import door_render
 import door_targets
 import ops
 import vault
@@ -110,7 +113,8 @@ def load_tests(loader, _tests, _pattern):
                                                     HubLine, HubRights, GitHubFacts, Vault, AuditReplay, AWSRole,
                                                     OwnerYes, CallHash, ScriptsAndRuns, FullAccess, Routes, MadeDeletes,
                                                     HostPath, AppSettingsPath, ScriptPath, HostUpdates, KeyCardAccount,
-                                                    Workflows, RunnerNew, Probe, CallerGone)
+                                                    Workflows, RunnerNew, Probe, CallerGone, Rendered, RenderPath,
+                                                    RenderBoxUnit, RenderBoxLive)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -152,6 +156,10 @@ class DoorCase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.write_access(ACCESS)
+        # no test asks the network for a pinned program of the render box (door.ensure_render)
+        patcher = patch.object(door, "http_raw", lambda method, url, headers, limit, timeout=120: (599, b""))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         os.makedirs(self.root + door.SECRETS_DIR, exist_ok=True)
         for r in [c["secret"] for c in ACCESS["credentials"].values() if "secret" in c]:
             with open(os.path.join(self.root + door.SECRETS_DIR, hashlib.sha256(r.encode()).hexdigest()), "w") as f:
@@ -362,22 +370,29 @@ class Access(DoorCase):
                     self.assertIn("door.py follow", f.read())
                 ran.clear()
         self.assertEqual(asked, [("GET", f"http://{HUB}:8765/door/release", {"X-Fleet-Client": "door"})] * 2)
-        self.assertEqual(ran, [])
+        # nothing of the release runs again; the render box, whose socket is not there, is asked for once more
+        self.assertEqual(ran, [["systemctl", "enable", "--now", "fleet-door-render.socket"]])
         # the door keeps the signed manifest of the release that it runs, for its hosts' self-update, also when the
         # code before it took that release and kept none
         self.assertEqual(door.read_json(door.RELEASE_JSON, None), {"revision": new, "version": "2026.11.9"})
         os.remove(self.root + door.RELEASE_JSON)
         with patch("releases.check", lambda raw, keys: dict(raw)), patch("releases.read_keys", lambda f, n: []), \
-                patch.object(door.door_providers, "http", http), contextlib.redirect_stdout(io.StringIO()):
+                patch.object(door.door_providers, "http", http), patch.object(door, "run_program", program), \
+                contextlib.redirect_stdout(io.StringIO()):
             door.cmd_follow(None)
         self.assertEqual(door.read_json(door.RELEASE_JSON, None), {"revision": new, "version": "2026.11.9"})
 
     def test_follow_waits_while_the_access_file_names_no_hub(self):
         self.write_access(dict(ACCESS, hub={}))
+        ran = []
         with patch.object(door.door_providers, "http", lambda *a, **k: self.fail("asked the hub")), \
+                patch.object(door, "run_program", lambda argv, stdin, env, timeout=600: (ran.append(argv), (0, ""))[1]), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             door.cmd_follow(None)
         self.assertIn("names no hub", out.getvalue())
+        # the render box does not wait for the hub: every run of follow puts it in place
+        self.assertIn(["systemctl", "enable", "--now", "fleet-door-render.socket"], ran)
+        self.assertTrue(os.path.exists(self.root + door.SYSTEMD + "/fleet-door-render@.service"))
 
     def test_a_broken_file_names_nobody(self):
         with open(self.root + door.ACCESS_FILE, "w") as f:
@@ -1819,44 +1834,49 @@ class HubRights(Served):
         self.assertEqual(self.get("/record?after=1", self.secrets["record"])[1]["entries"], [])
 
 
+def github_stubs(self):
+    "GitHub as a test of the door reads it: the answers of its API by method and address, and the calls that came."
+    door.GitHub.TOKENS.clear()
+    door.GitHub.BRANCHES.clear()
+    patcher = patch.object(door_providers, "app_jwt", lambda app_id, pem, sign=None: "jwt")
+    patcher.start()
+    self.addCleanup(patcher.stop)
+    self.calls, self.answers = [], {}
+    api = "https://api.github.com"
+    deployment = base64.b64encode(OLD_DEPLOYMENT.encode()).decode()
+    self.answers.update({
+        ("GET", f"{api}/repos/one-org/cluster/installation"): (200, {"id": 9}),
+        ("GET", f"{api}/repos/one-org/shop/installation"): (200, {"id": 9}),
+        ("POST", f"{api}/app/installations/9/access_tokens"): (201, {"token": "ghs_door"}),
+        ("GET", f"{api}/repos/one-org/cluster"): (200, {"default_branch": "master"}),
+        ("GET", f"{api}/repos/one-org/cluster/contents/apps/shop/deployment.yaml?ref=master"):
+            (200, {"encoding": "base64", "content": deployment}),
+        ("GET", f"{api}/repos/one-org/cluster/git/ref/heads/master"): (200, {"object": {"sha": "h1"}}),
+        ("GET", f"{api}/repos/one-org/cluster/git/commits/h1"): (200, {"tree": {"sha": "t1"}}),
+        ("POST", f"{api}/repos/one-org/cluster/git/blobs"): (201, {"sha": "b1"}),
+        ("POST", f"{api}/repos/one-org/cluster/git/trees"): (201, {"sha": "t2"}),
+        ("POST", f"{api}/repos/one-org/cluster/git/commits"): (201, {"sha": "c2"}),
+        ("PATCH", f"{api}/repos/one-org/cluster/git/refs/heads/master"): (200, {}),
+        ("POST", f"{api}/repos/one-org/cluster/actions/workflows/sync-app.yml/dispatches"): (204, {}),
+        ("GET", f"{api}/repos/one-org/shop/actions/runs?branch=v2.0.1&status=success&per_page=20"):
+            (200, {"workflow_runs": [{"head_branch": "v2.0.1"}]}),
+        ("GET", f"{api}/repos/one-org/web/actions/runs?status=success&per_page=100"):
+            (200, {"workflow_runs": [{"head_sha": "3333333abcdef"}]}),
+    })
+
+    def http(method, url, headers, data):
+        self.calls.append((method, url, None if data is None else json.loads(data)))
+        return self.answers.get((method, url), (404, {"message": "not stubbed"}))
+    self.door.http = http
+
+
 class GitHubFacts(DoorCase):
     """What the door reads from GitHub for its checks: each repository's default branch (one has only `master`), and
     the runs of the repository that built an image, never those of the GitOps repository."""
 
     def setUp(self):
         super().setUp()
-        door.GitHub.TOKENS.clear()
-        door.GitHub.BRANCHES.clear()
-        patcher = patch.object(door_providers, "app_jwt", lambda app_id, pem, sign=None: "jwt")
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        self.calls, self.answers = [], {}
-        api = "https://api.github.com"
-        deployment = base64.b64encode(OLD_DEPLOYMENT.encode()).decode()
-        self.answers.update({
-            ("GET", f"{api}/repos/one-org/cluster/installation"): (200, {"id": 9}),
-            ("GET", f"{api}/repos/one-org/shop/installation"): (200, {"id": 9}),
-            ("POST", f"{api}/app/installations/9/access_tokens"): (201, {"token": "ghs_door"}),
-            ("GET", f"{api}/repos/one-org/cluster"): (200, {"default_branch": "master"}),
-            ("GET", f"{api}/repos/one-org/cluster/contents/apps/shop/deployment.yaml?ref=master"):
-                (200, {"encoding": "base64", "content": deployment}),
-            ("GET", f"{api}/repos/one-org/cluster/git/ref/heads/master"): (200, {"object": {"sha": "h1"}}),
-            ("GET", f"{api}/repos/one-org/cluster/git/commits/h1"): (200, {"tree": {"sha": "t1"}}),
-            ("POST", f"{api}/repos/one-org/cluster/git/blobs"): (201, {"sha": "b1"}),
-            ("POST", f"{api}/repos/one-org/cluster/git/trees"): (201, {"sha": "t2"}),
-            ("POST", f"{api}/repos/one-org/cluster/git/commits"): (201, {"sha": "c2"}),
-            ("PATCH", f"{api}/repos/one-org/cluster/git/refs/heads/master"): (200, {}),
-            ("POST", f"{api}/repos/one-org/cluster/actions/workflows/sync-app.yml/dispatches"): (204, {}),
-            ("GET", f"{api}/repos/one-org/shop/actions/runs?branch=v2.0.1&status=success&per_page=20"):
-                (200, {"workflow_runs": [{"head_branch": "v2.0.1"}]}),
-            ("GET", f"{api}/repos/one-org/web/actions/runs?status=success&per_page=100"):
-                (200, {"workflow_runs": [{"head_sha": "3333333abcdef"}]}),
-        })
-
-        def http(method, url, headers, data):
-            self.calls.append((method, url, None if data is None else json.loads(data)))
-            return self.answers.get((method, url), (404, {"message": "not stubbed"}))
-        self.door.http = http
+        github_stubs(self)
 
     def test_the_filter_of_a_read_keeps_back_a_secret_in_any_spelling_and_what_it_cannot_read(self):
         """No Secret object leaves the door. Before, the filter read `kind: Secret` only at the start of a line with
@@ -3437,7 +3457,9 @@ class Vault(DoorCase):
         door.fetch_sealed(self.door)
         door.fetch_approvals(self.door)
         with patch.object(door.door_providers, "http", lambda method, url, headers, body: self.door.http(
-                method, url, headers, body)), self.assertRaises(SystemExit):
+                method, url, headers, body)), self.assertRaises(SystemExit), \
+                patch.object(door, "run_program", lambda argv, stdin, env, timeout=600: (0, "")), \
+                contextlib.redirect_stdout(io.StringIO()):
             door.cmd_follow(None)
         self.assertEqual(asked, [f"http://[fd7a:115c:a1e0::2]:8765/door/{what}"
                                  for what in ("sealed", "approvals", "release")])
@@ -3839,3 +3861,986 @@ class Probe(DoorCase):
             door.main(["probe", "nowhere"])
         self.assertIn("no host of the access file", str(ended.exception.code))
 
+
+
+# ---------------------------------------------------------------- chart rendering (door_render.py)
+
+def render_tools(folder):
+    """The two programs of the render as this machine has them, or None: the door's pinned ones, or helm with
+    kustomize, or helm with the kustomize that kubectl carries, behind a script of two lines."""
+    pinned = door_render.installed_tools()
+    if pinned:
+        return pinned
+    helm, kustomize, kubectl = shutil.which("helm"), shutil.which("kustomize"), shutil.which("kubectl")
+    if not helm or not (kustomize or kubectl):
+        return None
+    if not kustomize:
+        kustomize = os.path.join(folder, "kustomize")
+        with open(kustomize, "w") as f:
+            f.write(f'#!/bin/sh\nshift\nexec "{kubectl}" kustomize "$@"\n')
+        os.chmod(kustomize, 0o755)
+    return {"helm": [helm], "kustomize": [kustomize]}
+
+
+def tarball(tree, links=None):
+    "A repository's tree as GitHub packs it: one top folder, and gzip."
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w:gz") as tar:
+        for path, data in sorted(tree.items()):
+            data = data.encode() if isinstance(data, str) else data
+            info = tarfile.TarInfo("one-org-cluster-0123abc/" + path)
+            info.size, info.mode = len(data), 0o644
+            tar.addfile(info, io.BytesIO(data))
+        for path, target in sorted((links or {}).items()):
+            info = tarfile.TarInfo("one-org-cluster-0123abc/" + path)
+            info.type, info.linkname = tarfile.SYMTYPE, target
+            tar.addfile(info)
+    return out.getvalue()
+
+
+def subchart(name, templates):
+    "A packed chart, as `helm package` makes one for a chart's charts/ folder."
+    out = io.BytesIO()
+    files = dict({"Chart.yaml": f"apiVersion: v2\nname: {name}\nversion: 1.0.0\n", "values.yaml": "{}\n"},
+                 **{"templates/" + n: t for n, t in templates.items()})
+    with tarfile.open(fileobj=out, mode="w:gz") as tar:
+        for path, text in files.items():
+            info = tarfile.TarInfo(f"{name}/{path}")
+            info.size, info.mode = len(text.encode()), 0o644
+            tar.addfile(info, io.BytesIO(text.encode()))
+    return out.getvalue()
+
+
+def b64(value):
+    return base64.b64encode(json.dumps(value).encode()).decode()
+
+
+def at(obj, pointer, value):
+    "A copy of an object with a value at a JSON pointer."
+    obj = copy.deepcopy(obj)
+    node, parts = obj, pointer.strip("/").split("/")
+    for part in parts[:-1]:
+        node = node[int(part)] if isinstance(node, list) else node.setdefault(part, {})
+    node[parts[-1]] = value
+    return obj
+
+
+HEAD_SHA = "0123abc" + "0" * 33
+POD = "/spec/template/spec"
+DEPLOYMENT = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "web"},
+              "spec": {"replicas": 2, "selector": {"matchLabels": {"app": "web"}},
+                       "template": {"metadata": {"labels": {"app": "web"}},
+                                    "spec": {"hostNetwork": False, "containers": [
+                                        {"name": "web", "image": "ghcr.io/one-org/web:1111111",
+                                         "securityContext": {"privileged": False}}]}}}}
+SERVICE = {"apiVersion": "v1", "kind": "Service", "metadata": {"name": "web"},
+           "spec": {"type": "ClusterIP", "selector": {"app": "web"}, "ports": [{"port": 80}]}}
+CLAIM = {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": {"name": "data"},
+         "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "10Gi"}}}}
+CONFIG = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "extra"}, "data": {"mode": "plain"}}
+BASE = {"deployment": DEPLOYMENT, "service": SERVICE, "pvc": CLAIM}
+# Each refused form of door_targets.MANIFEST_REFUSED and the three counts beside it: (the form, the object that takes
+# it and where, the value) or (the form, "new", a whole object of a refused kind).
+FORMS = [
+    ("a new secretKeyRef", "deployment", POD + "/containers/0/env",
+     [{"name": "KEY", "valueFrom": {"secretKeyRef": {"name": "db", "key": "password"}}}]),
+    ("a new secretRef", "deployment", POD + "/containers/0/envFrom", [{"secretRef": {"name": "db"}}]),
+    ("a new secret volume", "deployment", POD + "/volumes", [{"name": "keys", "secret": {"secretName": "db"}}]),
+    ("a hostPath", "deployment", POD + "/volumes", [{"name": "root", "hostPath": {"path": "/"}}]),
+    ("privileged", "deployment", POD + "/containers/0/securityContext", {"privileged": True}),
+    ("a host namespace", "deployment", POD + "/hostPID", True),
+    ("a changed serviceAccountName", "deployment", POD + "/serviceAccountName", "cluster-admin"),
+    ("a new LoadBalancer", "service", "/spec/type", "LoadBalancer"),
+    ("a bigger volume claim", "pvc", "/spec/resources/requests/storage", "500Gi"),
+    ("a Tailscale operator setting", "service", "/metadata/annotations", {"tailscale.com/tags": "tag:k8s"}),
+    ("an Application", "new", {"apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
+                               "metadata": {"name": "more"}, "spec": {"project": "default"}}),
+    ("an external-secrets kind", "new", {"apiVersion": "external-secrets.io/v1beta1", "kind": "ExternalSecret",
+                                         "metadata": {"name": "db"}, "spec": {"refreshInterval": "1h"}}),
+    ("a CRD", "new", {"apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+                      "metadata": {"name": "things.example.com"}, "spec": {"group": "example.com"}}),
+    ("a webhook", "new", {"apiVersion": "admissionregistration.k8s.io/v1", "kind": "MutatingWebhookConfiguration",
+                          "metadata": {"name": "hook"}, "webhooks": []}),
+    ("Secret object", "new", {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "db"},
+                              "stringData": {"password": "example"}}),
+    ("RBAC", "new", {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding",
+                     "metadata": {"name": "all"}, "roleRef": {"kind": "ClusterRole", "name": "cluster-admin"}}),
+    ("a k3s upgrade channel", "new", {"apiVersion": "upgrade.cattle.io/v1", "kind": "Plan",
+                                      "metadata": {"name": "server"},
+                                      "spec": {"channel": "https://update.k3s.io/v1-release/channels/stable"}}),
+]
+STACK_VALUES = "replicas: 2\nimage:\n  repository: ghcr.io/one-org/web\n  tag: \"1111111\"\ndebug: false\n" \
+               "hostNetwork: false\nstorage: 10Gi\nextraTemplate: \"\"\n"
+STACK_DEPLOYMENT = """apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-web
+  labels: {{- include "stack.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      hostNetwork: {{ .Values.hostNetwork }}
+      containers:
+        - name: web
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          securityContext:
+            privileged: {{ .Values.debug }}
+"""
+# The layout of a cluster repository that ArgoCD reads, with example names: Applications in a secret path that name a
+# path only, a chart with templates and a packed subchart, a Kustomize folder, and a folder of plain manifests.
+CLUSTER = {
+    "_config/cluster/stack-argocd.yaml":
+        "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: stack\n  namespace: argocd\nspec:\n"
+        "  project: default\n  source:\n    repoURL: ssh://git@github.com/one-org/cluster.git\n"
+        "    targetRevision: master\n    path: monitoring/stack\n  destination:\n    namespace: monitoring\n",
+    "_config/cluster/core-argocd.yaml":
+        "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: core\nspec:\n  source:\n"
+        "    repoURL: ssh://git@github.com/one-org/cluster.git\n    path: apps/core/app\n    directory:\n"
+        "      recurse: true\n  destination:\n    namespace: core\n",
+    "monitoring/stack/Chart.yaml": "apiVersion: v2\nname: stack\nversion: 0.1.0\ndependencies:\n  - name: logs\n"
+                                   "    version: 1.0.0\n    repository: https://charts.example.com\n",
+    "monitoring/stack/charts/logs-1.0.0.tgz": subchart("logs", {
+        "config.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: logs\ndata: {level: info}\n"}),
+    "monitoring/stack/values.yaml": STACK_VALUES,
+    "monitoring/stack/templates/_helpers.tpl": '{{- define "stack.labels" -}}\napp: web\n{{- end }}\n',
+    "monitoring/stack/templates/deployment.yaml": STACK_DEPLOYMENT,
+    "monitoring/stack/templates/service.yaml":
+        "apiVersion: v1\nkind: Service\nmetadata: {name: {{ .Release.Name }}-web}\n"
+        "spec: {type: ClusterIP, selector: {app: web}, ports: [{port: 80}]}\n",
+    "monitoring/stack/templates/pvc.yaml":
+        "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: data\nspec:\n  accessModes: [ReadWriteOnce]\n"
+        "  resources:\n    requests:\n      storage: {{ .Values.storage }}\n",
+    "monitoring/stack/templates/secrets/basic-auth.yaml":
+        "apiVersion: v1\nkind: Secret\nmetadata:\n  name: basic-auth\nstringData:\n  auth: example\n",
+    "monitoring/stack/templates/extra.yaml": "{{- with .Values.extraTemplate }}{{ tpl . $ }}{{- end }}\n",
+    "knative/kustomization.yaml": "resources:\n  - deployment.yaml\n  - service.yaml\n  - pvc.yaml\n  - config.yaml\n",
+    "knative/deployment.yaml": json.dumps(DEPLOYMENT) + "\n",
+    "knative/service.yaml": json.dumps(SERVICE) + "\n",
+    "knative/pvc.yaml": json.dumps(CLAIM) + "\n",
+    "knative/config.yaml": json.dumps(CONFIG) + "\n",
+    "apps/core/app/web.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web\ndata:\n  mode: plain\n",
+    "README.md": "# The cluster\n",
+}
+GITOPS = "gitops:one-org/cluster"
+
+
+class RenderCase(unittest.TestCase):
+    """A GitOps commit decided with a real render: door_render.answer with this machine's helm and kustomize, with no
+    box (the box is the unit's, RenderBoxLive)."""
+    tools = folder = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.folder = tempfile.mkdtemp(prefix="door-render-tools-")
+        cls.addClassCleanup(shutil.rmtree, cls.folder, True)
+        cls.tools = render_tools(cls.folder)
+        cls.packed = tarball(CLUSTER)
+
+    def setUp(self):
+        if not self.tools:
+            self.skipTest("this machine has no helm, or no kustomize and no kubectl")
+
+    def lookup(self, tree=None, links=None):
+        "The door's render lookup for one tree at HEAD."
+        packed = self.packed if (tree is None or tree is CLUSTER) and not links else tarball(tree, links)
+
+        def render(files):
+            scratch = tempfile.mkdtemp(prefix="door-render-test-")
+            self.addCleanup(shutil.rmtree, scratch, True)
+            header = {"v": 1, "op": "render", "exposure": ACCESS["exposure"], "files": [
+                {"path": p, "size": None if d is None else len(d), "mode": m} for p, d, m in files]}
+            report = door_render.answer(header, packed, [d for _p, d, _m in files], self.tools, scratch)
+            self.last = report
+            return dict(report, head=HEAD_SHA) if report.get("ok") else report
+        return render
+
+    def push(self, files, tree=None, links=None, render=True):
+        content = json.dumps({"message": "change", "files": [
+            {"path": p, "delete": True} if t is None else
+            {"path": p, "content": base64.b64encode(t if isinstance(t, bytes) else t.encode()).decode()}
+            for p, t in files.items()]}).encode()
+        tree = CLUSTER if tree is None else tree
+        lookups = {"render": self.lookup(tree, links)} if render else \
+            {"base_file": lambda p: tree[p].encode() if isinstance(tree.get(p), str) else tree.get(p)}
+        return door_targets.decide(ACCESS, "ops-one", GITOPS, "push", [], content, lookups)
+
+
+class Rendered(RenderCase):
+    """Done-when (b) of the chart rendering task: in a copy of the layout of a cluster repository, an ordinary line of
+    a Helm template and a new template are the agent's own call, and each refused form is refused through a template
+    function, a values file, a flow mapping, a Kustomize patch and a JSON 6902 patch."""
+
+    def test_an_ordinary_line_of_a_template_and_a_new_template_are_the_agent_s_own_call(self):
+        path = "monitoring/stack/templates/deployment.yaml"
+        without = self.push({path: STACK_DEPLOYMENT.replace("matchLabels: {app: web}", "matchLabels: {app: web, x: y}")},
+                            render=False)
+        self.assertEqual(without.kind, "refused", without)          # the limit of version 1.124, with no render
+        self.assertIn("only an image, a tag, a replica count and a restart time", without.why)
+        d = self.push({path: STACK_DEPLOYMENT.replace("        - name: web\n", "        - name: web\n"
+                                                      "          args: [\"--verbose\", {{ .Values.replicas | quote }}]\n")})
+        self.assertEqual((d.kind, d.why), ("own", f"{path} changes more than its values"), d)
+        self.assertEqual(d.plan["parent"], HEAD_SHA)                # the commit goes on the commit that was rendered
+        new = "monitoring/stack/templates/policy.yaml"
+        policy = "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n" \
+                 "  name: {{ .Release.Name }}-web\nspec:\n  podSelector: {matchLabels: {{ include \"stack.labels\" . " \
+                 "| fromYaml | toJson }}}\n  policyTypes: [Ingress]\n"
+        self.assertEqual(self.push({new: policy}, render=False).kind, "refused")
+        d = self.push({new: policy})
+        self.assertEqual((d.kind, d.why), ("own", f"{new} is a new manifest"), d)
+        # a helper file with another name, with a word that the loose reading counts, and a new packed subchart
+        d = self.push({"monitoring/stack/templates/_helpers.tpl":
+                       CLUSTER["monitoring/stack/templates/_helpers.tpl"] + "{{/* no hostPath here */}}\n"})
+        self.assertEqual(d.kind, "own", d)
+        d = self.push({"monitoring/stack/charts/logs-1.0.0.tgz": subchart("logs", {
+            "config.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: logs\ndata: {level: debug}\n"})})
+        self.assertEqual(d.kind, "own", d)
+        # the listed values of a template stay rule calls
+        d = self.push({"monitoring/stack/values.yaml": STACK_VALUES.replace("replicas: 2", "replicas: 3")})
+        self.assertEqual((d.kind, d.why), ("rule", "a listed GitOps change"), d)
+
+    def commits(self, form):
+        "{route: the files of a commit that writes one refused form by that route}."
+        name, kind = form[0], form[1]
+        if kind == "new":
+            new = fresh = form[2]
+            ops = [{"op": "replace", "path": "/" + k, "value": v} for k, v in new.items() if k in ("apiVersion", "kind")] \
+                + [{"op": "add", "path": "/" + k, "value": v} for k, v in new.items()
+                   if k not in ("apiVersion", "kind", "metadata")]
+            target, merge = "kind: ConfigMap\n      name: extra", None
+        else:
+            new = at(BASE[kind], form[2], form[3])
+            # by a template, a value and a plain file the form comes in an object of its own; a patch changes the one
+            # that is there
+            fresh = at(new, "/metadata/name", new["metadata"]["name"] + "-2")
+            ops = [{"op": "add", "path": form[2], "value": form[3]}]
+            target, merge = f"kind: {new['kind']}\n      name: {new['metadata']['name']}", new
+        text = f'{{{{ "{b64(fresh)}" | b64dec }}}}'
+        kustomization = CLUSTER["knative/kustomization.yaml"] + "patches:\n  - path: patch.yaml\n"
+        routes = {
+            "a template function": {"monitoring/stack/templates/built.yaml": text + "\n"},
+            "a values file": {"monitoring/stack/values.yaml": STACK_VALUES.replace('extraTemplate: ""',
+                                                                                 f"extraTemplate: '{text}'")},
+            "a flow mapping": {"apps/core/app/more.yaml": json.dumps(fresh) + "\n"},
+            "a JSON 6902 patch": {"knative/patch.yaml": json.dumps(ops) + "\n",
+                                  "knative/kustomization.yaml": kustomization + f"    target:\n      {target}\n"},
+        }
+        if merge:       # a merge patch changes no kind: a form that is a kind comes by the 6902 patch
+            routes["a Kustomize patch"] = {"knative/patch.yaml": json.dumps(merge) + "\n",
+                                           "knative/kustomization.yaml": kustomization}
+        return routes
+
+    def test_each_refused_form_is_refused_by_each_route(self):
+        self.assertEqual({f[0] for f in FORMS} - {"Secret object"} | {"a Secret object"},
+                         set(door_targets.MANIFEST_REFUSED) | {"a k3s upgrade channel", "a changed serviceAccountName",
+                                                               "a bigger volume claim"})
+        count = 0
+        for form in FORMS:
+            for route, files in self.commits(form).items():
+                with self.subTest(form=form[0], route=route):
+                    d = self.push(files)
+                    self.assertEqual(d.kind, "refused", (d, self.last))
+                    self.assertIn(form[0], d.why)
+                    count += 1
+        self.assertEqual(count, 17 * 4 + 10)
+
+    def test_the_same_routes_pass_what_is_no_refused_form(self):
+        "Each route of the test above with a harmless change is the agent's own call: the routes themselves work."
+        harmless = ("ok", "deployment", POD + "/containers/0/args", ["--verbose"])
+        for route, files in self.commits(harmless).items():
+            with self.subTest(route=route):
+                d = self.push(files)
+                self.assertEqual(d.kind, "own", (route, d, self.last))
+        added = ("ok", "new", {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "more"},
+                               "data": {"a": "b"}})
+        for route, files in self.commits(added).items():
+            with self.subTest(route=route, new=True):
+                self.assertEqual(self.push(files).kind, "own", (route, self.last))
+
+    def test_a_value_that_a_template_of_head_turns_into_a_refused_form(self):
+        """The hole that no line reader closes: the value and its template are two files. `debug: true` is no refused
+        line, and the template that is there already makes it `privileged: true`."""
+        flip = {"monitoring/stack/values.yaml": STACK_VALUES.replace("debug: false", "debug: true")}
+        self.assertEqual(self.push(flip, render=False).kind, "own")         # before the render: it passed
+        d = self.push(flip)
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("the chart monitoring/stack, rendered with its own values: an object of "
+                      "stack/templates/deployment.yaml: privileged", d.why)
+        d = self.push({"monitoring/stack/values.yaml": STACK_VALUES.replace("hostNetwork: false", "hostNetwork: yes")})
+        self.assertIn("a host namespace", d.why)
+        d = self.push({"monitoring/stack/values.yaml": STACK_VALUES.replace("storage: 10Gi", "storage: 20Gi")})
+        self.assertIn("a bigger volume claim", d.why)       # the block reader says it of the values file itself
+        # a template that builds the key from parts, in a branch of a value: no word of it is in the file
+        built = STACK_DEPLOYMENT + '      {{ printf "host%s" "PID" }}: {{ gt (int .Values.replicas) 1 }}\n'
+        d = self.push({"monitoring/stack/templates/deployment.yaml": built})
+        self.assertIn("a host namespace", d.why)
+        # and a packed subchart with a privileged pod
+        d = self.push({"monitoring/stack/charts/logs-1.0.0.tgz": subchart("logs", {
+            "pod.yaml": "apiVersion: v1\nkind: Pod\nmetadata:\n  name: logs\nspec:\n  containers:\n"
+                        "    - name: logs\n      image: x\n      securityContext: {privileged: true}\n"})})
+        self.assertIn("an object of stack/charts/logs/templates/pod.yaml: privileged", d.why)
+
+    def test_a_form_does_not_move_from_one_object_to_another(self):
+        "The count is of one object: a hostPath that leaves one workload does not pay for one in another."
+        tree = dict(CLUSTER)
+        tree["knative/deployment.yaml"] = json.dumps(at(DEPLOYMENT, POD + "/volumes",
+                                                        [{"name": "root", "hostPath": {"path": "/var/log"}}])) + "\n"
+        other = at(at(DEPLOYMENT, "/metadata/name", "other"), POD + "/volumes",
+                   [{"name": "root", "hostPath": {"path": "/"}}])
+        d = self.push({"knative/deployment.yaml": json.dumps(DEPLOYMENT) + "\n",
+                       "knative/other.yaml": json.dumps(at(other, "/kind", "Deployment")) + "\n",
+                       "knative/kustomization.yaml": tree["knative/kustomization.yaml"] + "  - other.yaml\n"}, tree)
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("a hostPath", d.why)
+        # and the same path in the same object is no new form
+        moved = at(DEPLOYMENT, POD + "/volumes", [{"name": "root", "hostPath": {"path": "/var/log"}}])
+        d = self.push({"knative/deployment.yaml": json.dumps(at(moved, "/spec/replicas", 3)) + "\n"}, tree)
+        self.assertEqual(d.kind, "own", (d, self.last))
+
+    def test_a_secret_of_the_render_is_neither_new_nor_changed(self):
+        path = "monitoring/stack/templates/secrets/basic-auth.yaml"
+        d = self.push({path: CLUSTER[path].replace("auth: example", "auth: {{ .Values.replicas | quote }}")})
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("an object of stack/templates/secrets/basic-auth.yaml is a new or a changed Secret object", d.why)
+        # the Secret that the chart holds at HEAD stops no other change of the chart
+        d = self.push({"monitoring/stack/values.yaml": STACK_VALUES.replace("replicas: 2", "replicas: 4")})
+        self.assertEqual(d.kind, "rule", d)
+
+    def test_an_application_of_the_tree_gives_its_values(self):
+        """A chart is rendered with each value set that an Application of the tree gives it, and each one must pass:
+        a values file elsewhere in the repository, a parameter, the release name and the namespace."""
+        tree = dict(CLUSTER)
+        tree["argocd/stack-live.yaml"] = (
+            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: stack-live\nspec:\n  source:\n"
+            "    repoURL: ssh://git@github.com/one-org/cluster.git\n    path: monitoring/stack\n    helm:\n"
+            "      releaseName: live\n      valueFiles:\n        - ../../envs/live/stack.yaml\n      parameters:\n"
+            "        - name: replicas\n          value: \"5\"\n  destination:\n    namespace: live\n")
+        tree["envs/live/stack.yaml"] = "debug: false\n"
+        d = self.push({"envs/live/stack.yaml": "debug: true\n"}, tree)
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("rendered with the values of the Application stack-live: an object of "
+                      "stack/templates/deployment.yaml: privileged", d.why)
+        d = self.push({"envs/live/stack.yaml": "debug: false\nhostNetwork: false\n"}, tree)
+        self.assertEqual(d.kind, "own", (d, self.last))
+        sets = {c["set"] for u in self.last["units"].values() for c in u["changed"]}
+        self.assertEqual(sets, set())                       # nothing differs, with either value set
+        d = self.push({"monitoring/stack/values.yaml": STACK_VALUES.replace("ghcr.io/one-org/web", "ghcr.io/one-org/w")},
+                      tree)
+        self.assertEqual({c["set"] for u in self.last["units"].values() for c in u["changed"]},
+                         {"its own values", "the values of an Application",       # of a secret path: no name
+                          "the values of the Application stack-live"})
+        # an input that the door cannot give the chart: its files keep the limit of version 1.124
+        for odd, words in (("      valueFiles:\n        - https://example.com/values.yaml\n", "at a URL"),
+                           ("      valueFiles:\n        - $values/stack.yaml\n", "another repository or revision"),
+                           ("      postRenderers: []\n", "the helm setting postRenderers")):
+            with self.subTest(odd=odd):
+                other = dict(tree)
+                other["argocd/stack-live.yaml"] = tree["argocd/stack-live.yaml"].replace(
+                    "      valueFiles:\n        - ../../envs/live/stack.yaml\n", odd)
+                d = self.push({"monitoring/stack/templates/deployment.yaml": STACK_DEPLOYMENT + "# a comment\n"}, other)
+                self.assertEqual(d.kind, "refused", d)
+                self.assertIn("The door could not render monitoring/stack (an Application gives it", d.why)
+                self.assertIn(words, d.why)
+
+    def test_a_unit_that_does_not_render_keeps_the_limit(self):
+        template = "monitoring/stack/templates/deployment.yaml"
+        change = {template: STACK_DEPLOYMENT.replace("app: web}", "app: web, tier: front}")}
+        # a dependency that is not in charts/: no network gets it
+        tree = {k: v for k, v in CLUSTER.items() if not k.endswith(".tgz")}
+        d = self.push(change, tree)
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("only an image, a tag, a replica count and a restart time", d.why)
+        self.assertIn("The door could not render monitoring/stack (its render fails at HEAD too", d.why)
+        self.assertEqual(self.push({"monitoring/stack/values.yaml": STACK_VALUES.replace("replicas: 2", "replicas: 3")},
+                                   tree).kind, "rule")
+        # a template with a random function: two renders differ, so the door did not read what a cluster applies
+        tree = dict(CLUSTER)
+        tree["monitoring/stack/templates/token.yaml"] = \
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: token\ndata:\n  salt: {{ randAlphaNum 12 | quote }}\n"
+        d = self.push(change, tree)
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("two renders of the same tree differ", d.why)
+        # a commit that breaks the render of a chart that rendered at HEAD
+        d = self.push({template: STACK_DEPLOYMENT + "{{ if }}\n"})
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("the chart monitoring/stack renders at HEAD and not after this commit", d.why)
+        d = self.push({"knative/kustomization.yaml": "resources:\n  - https://example.com/install.yaml\n"})
+        self.assertIn("the Kustomize folder knative renders at HEAD and not after this commit", d.why)
+        # a line that ends a document: one reader of a cluster stops there and another does not
+        d = self.push({"monitoring/stack/templates/more.yaml":
+                       "kind: ConfigMap\nmetadata: {name: x}\n...\nkind: Pod\nspec: {hostPID: true}\n"})
+        self.assertIn("a line that ends a document", d.why)
+        with self.assertRaises(door_render.Failed):
+            door_render.split_docs("a: b\n--- kind: Pod\n")
+        self.assertEqual(door_render.split_docs("---\na: b\n---  \n# only a comment\n---\r\nc: d\n"),
+                         ["a: b\n", "c: d\n"])
+
+    def test_no_commit_takes_a_unit_out_of_the_render(self):
+        """Inside a unit that rendered, a template changed with no line rule. So the rules that read lines are no
+        fallback there, and a commit that would leave the door unable to render the unit is refused: else an agent
+        could first write a template that turns a value into a refused form, then stop the render, then set the
+        value."""
+        # a block style template, which the line rules pass, with a random function in a quoted text
+        salt = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: salt\ndata:\n  salt: \"{{ randAlphaNum 12 }}\"\n"
+        self.assertEqual(self.push({"monitoring/stack/templates/salt.yaml": salt}, render=False).kind, "own")
+        d = self.push({"monitoring/stack/templates/salt.yaml": salt})
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("renders at HEAD and not after this commit (two renders of the same tree differ", d.why)
+        # an Application in a path that the agent may write, changed to give the chart an input that the door cannot
+        tree = dict(CLUSTER)
+        app = CLUSTER["_config/cluster/stack-argocd.yaml"]
+        tree["argocd/stack.yaml"] = app
+        d = self.push({"argocd/stack.yaml": app.replace("    path: monitoring/stack\n", "    path: monitoring/stack\n"
+                                                        "    plugin:\n      name: other\n")}, tree)
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("after this commit, an Application gives it a plugin", d.why)
+        # and one that gives the chart a parameter: the chart is rendered with it, though no file of the chart changed
+        d = self.push({"argocd/stack.yaml": app.replace("    path: monitoring/stack\n", "    path: monitoring/stack\n"
+                                                        "    helm:\n      parameters:\n        - name: debug\n"
+                                                        "          value: \"true\"\n")}, tree)
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("rendered with the values of the Application stack: an object of "
+                      "stack/templates/deployment.yaml: privileged", d.why)
+        d = self.push({"argocd/stack.yaml": app.replace("    path: monitoring/stack\n", "    path: monitoring/stack\n"
+                                                        "    helm:\n      parameters:\n        - name: replicas\n"
+                                                        "          value: \"3\"\n")}, tree)
+        self.assertEqual(d.kind, "own", (d, self.last))
+        # a new chart that does not render
+        d = self.push({"apps/new/Chart.yaml": "apiVersion: v2\nname: new\nversion: 0.1.0\ndependencies:\n"
+                                              "  - name: far\n    version: 1.0.0\n    repository: https://charts.example.com\n",
+                       "apps/new/templates/config.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: new\n"})
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("the chart apps/new renders at HEAD and not after this commit", d.why)
+        self.assertIn("missing in charts/ directory", d.why)
+        # more units in one commit than the door renders, and a path that is a folder at HEAD: refusals, no fallback
+        tree = dict(CLUSTER)
+        files = {}
+        for n in range(door_render.UNITS_MOST + 1):
+            tree[f"many/c{n}/Chart.yaml"] = f"apiVersion: v2\nname: c{n}\nversion: 0.1.0\n"
+            tree[f"many/c{n}/values.yaml"] = "a: 1\n"
+            files[f"many/c{n}/values.yaml"] = "a: 2\n"
+        d = self.push(files, tree)
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("touches more than 16 charts and Kustomize folders", d.why)
+        d = self.push({"monitoring/stack/values.yaml": STACK_VALUES.replace("debug: false", "debug: true"),
+                       "knative": "a file where a folder is\n"})
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("knative is a folder at HEAD", d.why)
+
+    def test_a_file_of_no_unit_keeps_its_rules_and_the_real_parser_reads_flow_style(self):
+        d = self.push({"apps/core/app/flow.yaml": '{apiVersion: v1, kind: ConfigMap, metadata: {name: f}, data: {}}\n'})
+        self.assertEqual((d.kind, d.why), ("own", "apps/core/app/flow.yaml is a new manifest"), d)
+        # spellings that a line reader does not read, read as the cluster reads them
+        for text, what in (('{kind: Pod, spec: {"hostNetwork": yes}}\n', "a host namespace"),
+                           ("a: &k Secret\nkind: *k\nstringData: {x: y}\n", "holds a Secret object"),
+                           ("kind: Pod\nspec:\n  !!str hostPID: !!bool \"true\"\n", "a host namespace"),
+                           ("kind: Pod\nspec: {containers: [{securityContext: {<<: {privileged: on}}}]}\n",
+                            "privileged")):
+            with self.subTest(text=text):
+                d = self.push({"apps/core/app/odd.yaml": text})
+                self.assertEqual(d.kind, "refused", d)
+                self.assertIn(what, d.why)
+        # a template outside every chart is read by nothing: it keeps the block reader's refusal
+        d = self.push({"apps/core/app/t.yaml": "kind: ConfigMap\ndata:\n  a: {{ .Values.a }}\n"})
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("the door takes it only in block style", d.why)
+        # and a file with another name outside a unit keeps the loose reading
+        d = self.push({"docs/notes.txt": "set hostPath here\n"})
+        self.assertIn("the word hostpath", d.why)
+        self.assertEqual(self.push({"README.md": "# The cluster, again\n"}).kind, "own")
+        # the path rules come first, with a render too
+        self.assertIn("secret path", self.push({"_config/cluster/x.yaml": "a: b\n"}).why)
+
+    def test_a_delete_and_a_link_are_rendered_too(self):
+        tree = dict(CLUSTER)
+        tree["knative/kustomization.yaml"] += "patches:\n  - path: safe.yaml\n"
+        tree["knative/deployment.yaml"] = json.dumps(at(DEPLOYMENT, POD + "/hostNetwork", True)) + "\n"
+        tree["knative/safe.yaml"] = json.dumps(DEPLOYMENT) + "\n"       # the patch that turns the host network off
+        d = self.push({"knative/safe.yaml": None, "knative/kustomization.yaml": CLUSTER["knative/kustomization.yaml"]},
+                      tree)
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("the Kustomize folder knative, rendered with its own values: an object: a host namespace", d.why)
+        d = self.push({"knative/config.yaml": None,
+                       "knative/kustomization.yaml": CLUSTER["knative/kustomization.yaml"].replace("  - config.yaml\n", "")})
+        self.assertEqual((d.kind, d.why), ("own", "knative/config.yaml is deleted"), (d, self.last))
+        # a chart reads a file of another folder through a link: the file's change is the chart's change
+        tree = dict(CLUSTER)
+        tree["shared/extra.yaml"] = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: shared\ndata:\n  a: b\n"
+        links = {"monitoring/stack/templates/shared.yaml": "../../../shared/extra.yaml"}
+        d = self.push({"shared/extra.yaml": tree["shared/extra.yaml"] +
+                       '  c: "{{ "x\\"\\nkind: Secret\\nstringData:\\n  k: v\\n#" }}"\n'}, tree, links)
+        self.assertEqual(d.kind, "refused", (d, self.last))
+        self.assertIn("Secret object", d.why)
+
+    def test_a_unit_that_reads_what_no_agent_may_read_names_nothing(self):
+        """A template can copy what it reads into an object's name or into its own error. So no refusal has a name
+        out of a render, in any unit. And a chart or a folder that can read a path that the door gives no agent (a
+        secret path, a path of the exposure register, also through a link, or the values of an Application of such
+        a path) is closed: it is rendered and decided, its refusal says only "an object" and the form, and its files
+        keep the rules that need no render."""
+        token = "s3cr3t-Value_42"
+        leak = '{{ fail (printf "file: %s.yaml" (.Files.Get "_config/token.txt" | trim)) }}\n'
+        named = "apiVersion: v1\nkind: Service\nmetadata:\n  name: \"{{ .Files.Get \"_config/token.txt\" | trim | lower }}\"\n" \
+                "spec:\n  ports:\n    - port: 80\n  externalIPs:\n    - \"{{ .Values.replicas }}\"\n"
+        flip = {"monitoring/stack/values.yaml": STACK_VALUES.replace("debug: false", "debug: true")}
+        app = CLUSTER["_config/cluster/stack-argocd.yaml"].replace(
+            "    path: monitoring/stack\n", "    path: monitoring/stack\n    helm:\n      parameters:\n"
+            f"        - name: image.tag\n          value: {token}\n")
+        sub = {"monitoring/stack/files/db.yaml": f"kind: Secret\nstringData:\n  pw: {token}\n"}
+        live = CLUSTER["_config/cluster/stack-argocd.yaml"].replace(
+            "    path: monitoring/stack\n", "    path: monitoring/stack\n    helm:\n      valueFiles:\n"
+            "        - ../../values/live.yaml\n")
+        trees = {"a file of a secret path": (dict(CLUSTER, **{"monitoring/stack/_config/token.txt": token + "\n"}), {}),
+                 "a file of the exposure register": (dict(CLUSTER, **{"monitoring/stack/apps/legacy/token.txt": token}),
+                                                     {}),
+                 "a link in the chart to a secret path": (dict(CLUSTER, **{"live/Secrets/token.txt": token}),
+                                                          {"monitoring/stack/files": "../../live/Secrets"}),
+                 "a values file that is a link to a secret path": (
+                     dict(CLUSTER, **{"argocd/stack-live.yaml": live, "live/Secrets/values.yaml": f"t: {token}\n"}),
+                     {"values/live.yaml": "../live/Secrets/values.yaml"}),
+                 "the values of an Application of a secret path": (dict(CLUSTER, **{
+                     "_config/cluster/stack-argocd.yaml": app}), {})}
+        for what, (tree, links) in trees.items():
+            with self.subTest(what=what):
+                d = self.push(flip, tree, links)                    # the render still decides
+                self.assertEqual(d.kind, "refused", (d, self.last))
+                self.assertIn(": an object: privileged", d.why)
+                self.assertTrue(self.last["units"]["helm:monitoring/stack"]["closed"])
+                for files in ({"monitoring/stack/templates/leak.yaml": leak},
+                              {"monitoring/stack/templates/named.yaml": named},
+                              {"monitoring/stack/templates/deployment.yaml": STACK_DEPLOYMENT + "# a comment\n"}):
+                    d = self.push(files, tree, links)
+                    self.assertNotIn(token.lower(), d.why.lower())
+                    if "leak.yaml" in str(files):                   # the program's own words are in no refusal
+                        self.assertEqual(d.kind, "refused", d)
+                        self.assertTrue(d.why.endswith("(helm failed)"), d.why)
+                    if "deployment.yaml" in str(files):             # the door widens nothing there
+                        self.assertEqual(d.kind, "refused", d)
+                        self.assertIn("can read a path that the door gives no agent", d.why)
+        # A Kustomize folder whose resource is a link to a secret path
+        tree = dict(CLUSTER, **{"live/Secrets/config.yaml": json.dumps(CONFIG) + "\n"})
+        self.push({"knative/kustomization.yaml": CLUSTER["knative/kustomization.yaml"] + "namePrefix: a-\n"}, tree,
+                  {"knative/more.yaml": "../live/Secrets/config.yaml"})
+        self.assertTrue(self.last["units"]["kustomize:knative"]["closed"], self.last)
+        # What a file holds closes nothing: a chart's templates read its other templates, files and values whatever
+        # the door does. But no word of a refusal is a name out of a render, so none of it reaches a refusal.
+        held = dict(CLUSTER, **sub, **{"monitoring/stack/files/tls.key": "-----BEGIN PRIVATE KEY-----\n" + token})
+        for text in ('apiVersion: v1\nkind: Secret\nmetadata:\n  name: {{ .Files.Get "files/tls.key" | b64enc | '
+                     'trunc 60 | quote }}\n',
+                     '{{ fail (printf "file: %s.yaml" (.Files.Get "files/tls.key" | b64enc | trunc 40)) }}\n'):
+            d = self.push({"monitoring/stack/templates/leak.yaml": text}, held)
+            self.assertEqual(d.kind, "refused", d)
+            self.assertFalse(self.last["units"]["helm:monitoring/stack"]["closed"])
+            self.assertNotIn(base64.b64encode(b"-----BEGIN PRIVATE KEY").decode()[:20], d.why)
+            self.assertNotIn(token, d.why)
+        # an Application of a secret path that names only a path closes nothing, and its name is in no word
+        d = self.push(flip)
+        self.assertFalse(self.last["units"]["helm:monitoring/stack"]["closed"])
+        self.assertIn("an object of stack/templates/deployment.yaml: privileged", d.why)
+        # No refusal has a name out of a render, in any unit: a template writes an object's kind and name, and can
+        # write there what it read. Here: the release name and the namespace that the hidden Application gives.
+        d = self.push({"monitoring/stack/templates/leak.yaml":
+                       '{{ if ne .Release.Namespace "default" }}apiVersion: v1\nkind: {{ print "Se" "cret" }}\n'
+                       'metadata:\n  name: {{ .Release.Name }}.{{ .Release.Namespace }}\n{{ end }}\n'})
+        self.assertEqual(d.why, "the chart monitoring/stack, rendered with the values of an Application: an object "
+                                "is a new or a changed Secret object, which no commit passes")
+        d = self.push({"monitoring/stack/templates/leak.yaml":
+                       'apiVersion: v1\nkind: Service\nmetadata:\n  name: {{ .Values.image.tag | quote }}\n'
+                       'spec:\n  type: LoadBalancer\n'})
+        self.assertNotIn("1111111", d.why)
+        self.assertIn("an object of stack/templates/leak.yaml: a new LoadBalancer", d.why)
+        sets = {c["set"] for c in self.last["units"]["helm:monitoring/stack"]["changed"]}
+        self.assertEqual(sets, {"its own values", "the values of an Application"})
+        # the helper's rule of a hidden path is the door's rule of a path that it refuses
+        for path in ("_config/x.yaml", "a/_config/x", "live/Secrets/db.yaml", "Secrets/x", "apps/legacy/a/b.yaml",
+                     "apps/shop/x.yaml", "secrets/x.yaml", "config/x", "x_config/y", "apps/legacyx/a.yaml"):
+            self.assertEqual(door_render.hidden_path(path, ACCESS["exposure"]),
+                             door_targets.gitops_path_refused(path, ACCESS) is not None, path)
+
+    def test_a_file_under_a_chart_that_the_chart_does_not_read(self):
+        """A folder below a chart's root can be the path of another Application, which applies its files as they are.
+        The chart's render shows nothing of such a file, so the file itself is read: a jsonnet file keeps the loose
+        reading, a YAML file is read by the parser document by document, and a stream that the door does not split
+        is refused."""
+        pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"},
+               "spec": {"hostNetwork": True, "containers": [{"name": "c", "image": "x"}]}}
+        for path, text, words in (
+                ("monitoring/stack/extra/pod.jsonnet", json.dumps(pod), "the word hostnetwork"),
+                ("monitoring/stack/extra/list.yaml", json.dumps({"Error": "none", "kind": "List", "items": [pod]}),
+                 "a host namespace"),
+                ("monitoring/stack/extra/two.yaml", json.dumps(pod) + "\n---\na: {{ .Values.x }}\n", "a host namespace"),
+                ("monitoring/stack/extra/ends.yaml", "kind: ConfigMap\n...\n" + json.dumps(pod) + "\n",
+                 "the door takes it only in block style"),
+                ("monitoring/stack/extra/twice.json", '{"kind": "ConfigMap", "kind": "Pod", "spec": {"hostPID": true}}',
+                 "a JSON file that is not JSON with each key once")):
+            with self.subTest(path=path):
+                d = self.push({path: text})
+                self.assertEqual(d.kind, "refused", (d, self.last))
+                self.assertIn(words, d.why)
+        d = self.push({"monitoring/stack/extra/ok.yaml": "a: {{ .Values.x }}\n---\n{kind: ConfigMap, data: {a: b}}\n"})
+        self.assertEqual(d.kind, "own", d)
+        # a report that is no object is no report to fall back from
+        content = json.dumps({"message": "m", "files": [{"path": "README.md", "content": "eA=="}]}).encode()
+        for report in (["ok"], "ok", 1):
+            d = door_targets.decide(ACCESS, "ops-one", GITOPS, "push", [], content, {"render": lambda files: report})
+            self.assertEqual((d.kind, d.route), ("refused", "again"), d)
+
+    def test_what_a_program_says_reaches_the_agent_only_as_fixed_words(self):
+        "A program quotes the text that it could not read, and that text can be a file that the agent may not read."
+        error = ("Error: unable to parse SM or JSON patch from [apiVersion: v1\nkind: Secret\nstringData:\n"
+                 "  password: example-key-value\n]: yaml: line 4: mapping values are not allowed\n"
+                 "template: stack/templates/deployment.yaml:12:20: executing at <.Values.x.y>: nil pointer evaluating")
+        said = door_render.hint(error)
+        self.assertNotIn("example-key-value", said)
+        self.assertEqual(said, ": nil pointer evaluating")              # one fixed phrase, the first of the list
+        self.assertEqual(door_render.hint("password: example-key-value"), "")
+        # Where helm names a template at the start of its error, only that file: a template chooses the line where
+        # it fails, the kind of its error and its text, and can choose them by what it read.
+        self.assertEqual(door_render.hint("Error: template: stack/templates/deployment.yaml:12:20: executing at "
+                                          "<.Values.x.y>: nil pointer evaluating interface {}.y"),
+                         ": in stack/templates/deployment.yaml")
+        self.assertEqual(door_render.hint("Error: execution error at (stack/templates/leak.yaml:31:3): file: "
+                                          "example-key-value.yaml template: other/example-key-value.yaml:77 "
+                                          "no such host"), ": in stack/templates/leak.yaml")
+        self.assertEqual(door_render.hint("Error: an error occurred while checking for chart dependencies: found in "
+                                          "Chart.yaml, but missing in charts/ directory: logs"),
+                         ": missing in charts/ directory")
+
+    def test_a_link_of_the_tarball_stays_in_the_tree(self):
+        """A link can name its target through another link, so its text does not say where it ends. The helper keeps
+        no link that ends outside the tree or above itself, and makes no folder under a link."""
+        scratch = tempfile.mkdtemp(prefix="door-render-test-")
+        self.addCleanup(shutil.rmtree, scratch, True)
+        into = os.path.join(scratch, "inner", "before")
+        os.makedirs(into)
+        packed = tarball({"a/keep.txt": "x", "chart/Chart.yaml": "apiVersion: v2\nname: c\nversion: 0.1.0\n",
+                          "shared/values.yaml": "a: b\n"},
+                         {"a/b": "..", "chart/c": "../a/b/..", "e": "chart/c/..", "e/made/z": "../../a",
+                          "chart/ok": "../shared", "chart/abs": "/etc", "chart/up": "../../.."})
+        kept = door_render.unpack(packed, into)
+        self.assertEqual(kept, [("chart/ok", "shared")])
+        self.assertEqual(sorted(os.listdir(os.path.join(scratch, "inner"))), ["before"])   # nothing beside the tree
+        self.assertEqual(sorted(os.listdir(scratch)), ["inner"])
+        root = os.path.realpath(into)
+        for folder, dirs, names in os.walk(into):
+            for name in dirs + names:
+                self.assertTrue(os.path.realpath(os.path.join(folder, name)).startswith(root + os.sep), name)
+        self.assertEqual(door_render.stray_links(into), [])
+        # each link to a folder is given by its own path, also the second one to the same folder
+        os.makedirs(os.path.join(into, "chart", "zz", "Secrets"))
+        os.symlink("../../../shared", os.path.join(into, "chart", "zz", "Secrets", "b"))
+        self.assertEqual(sorted(door_render.tree_files(into, "chart")),
+                         [("chart/Chart.yaml", "chart/Chart.yaml"), ("chart/ok", "shared"),
+                          ("chart/ok/values.yaml", "shared/values.yaml"), ("chart/zz/Secrets/b", "shared")])
+        # a chain of links that is longer than this Python reads (3.12 reads a path link by link, by recursion) is a
+        # repository that the door does not render, and no error of the helper
+        chain = {f"l{n}": f"l{n + 1}" for n in range(1500)}
+        other = os.path.join(scratch, "inner", "chain")
+        os.makedirs(other)
+        try:
+            self.assertEqual(len(door_render.unpack(tarball({"l1500": "x"}, chain), other)), 1500)
+        except door_render.Skip as e:
+            self.assertIn("links cannot be made", str(e))
+        shutil.rmtree(other)
+        # a file of the commit in the place of a link can turn another link of HEAD to a place outside the tree:
+        # such a commit is refused
+        tree = dict(CLUSTER, **{"a/b/S/keep.txt": "x", "a/b/c/keep.txt": "x", "r/keep.txt": "x"})
+        links = {"p/q/D": "../../a/b/c", "p/q/S": "../../r", "p/q/L1": "D/../S/../.."}
+        d = self.push({"p/q/D": None, "p/q/D/f": "x\n"}, tree, links)
+        self.assertEqual(d.kind, "refused", (d, self.last))
+        self.assertIn("after this commit a link of the repository ends outside it", d.why)
+
+
+class RenderPath(RenderCase, DoorCase):
+    """The door's own path of a rendered commit: the tarball of one commit, the box, and the commit on that parent."""
+
+    def setUp(self):
+        RenderCase.setUp(self)
+        DoorCase.setUp(self)
+        github_stubs(self)
+        api = "https://api.github.com/repos/one-org/cluster"
+        self.answers[("GET", f"{api}/git/ref/heads/master")] = (200, {"object": {"sha": HEAD_SHA}})
+        self.answers[("GET", f"{api}/git/commits/{HEAD_SHA}")] = (200, {"tree": {"sha": "t1"}})
+        self.asked_raw = []
+
+        def raw(method, url, headers, limit, timeout=120):
+            self.asked_raw.append((method, url, headers.get("Authorization")))
+            return 200, tarball(CLUSTER)
+        self.door.raw = raw
+
+        def box(header, blobs):         # the helper as the socket would start it, without the box's check
+            out = io.BytesIO()
+            door_render.serve(io.BytesIO(json.dumps(header).encode() + b"\n" + b"".join(blobs)), out, self.tools,
+                              check=False)
+            return json.loads(out.getvalue())
+        self.door.box = box
+
+    def test_a_template_change_is_committed_on_the_commit_that_was_rendered(self):
+        path = "monitoring/stack/templates/deployment.yaml"
+        got = self.call(ONE, GITOPS, "push", content=change((path, STACK_DEPLOYMENT + "# a comment\n")))
+        self.assertEqual((got["ok"], got["kind"]), (True, "own"), got)
+        api = "https://api.github.com/repos/one-org/cluster"
+        self.assertEqual(self.asked_raw, [("GET", f"{api}/tarball/{HEAD_SHA}", "Bearer ghs_door")])
+        made = next(body for method, url, body in self.calls if (method, url) == ("POST", f"{api}/git/commits"))
+        self.assertEqual(made["parents"], [HEAD_SHA])
+        # a branch that somebody set back to an earlier commit while the door rendered: GitHub would take the move as
+        # a fast-forward, so the door reads the branch once more before it moves it
+        reads = iter([(200, {"object": {"sha": HEAD_SHA}}), (200, {"object": {"sha": "f" * 40}})])
+        answers, moves = dict(self.answers), len([c for c in self.calls if c[0] == "PATCH"])
+
+        def http(method, url, headers, data):
+            self.calls.append((method, url, None if data is None else json.loads(data)))
+            if (method, url) == ("GET", f"{api}/git/ref/heads/master"):
+                return next(reads)
+            return answers.get((method, url), (404, {}))
+        self.door.http = http
+        got = self.call(ONE, GITOPS, "push", content=change((path, STACK_DEPLOYMENT + "# another comment\n")))
+        self.assertEqual(got["ok"], False, got)
+        self.assertIn("moved while the door rendered the commit", got["why"])
+        self.assertEqual(len([c for c in self.calls if c[0] == "PATCH"]), moves)
+        github_stubs(self)
+        self.answers[("GET", f"{api}/git/ref/heads/master")] = (200, {"object": {"sha": HEAD_SHA}})
+        self.answers[("GET", f"{api}/git/commits/{HEAD_SHA}")] = (200, {"tree": {"sha": "t1"}})
+        # each file at HEAD came from the tarball: the door asked GitHub for no file
+        self.assertFalse([url for _m, url, _b in self.calls if "/contents/" in url])
+        got = self.call(ONE, GITOPS, "push", content=change(
+            ("monitoring/stack/values.yaml", STACK_VALUES.replace("debug: false", "debug: true"))))
+        self.assertEqual((got["ok"], got["kind"], got["route"]), (False, "refused", "none"), got)
+        self.assertIn("privileged", got["why"])
+        # The door has rendered this repository, so its templates changed with no line rule. From now on a render that
+        # cannot be made is a refusal, and no return to the rules that read lines: not when the box says that it
+        # cannot render the repository (an agent can make a repository grow), and not when the box is gone.
+        self.assertEqual(list(door.read_json(door.RENDERED_FILE, {})), ["one-org/cluster"])
+        flip = change(("monitoring/stack/values.yaml", STACK_VALUES.replace("debug: false", "debug: true")))
+        for box in (lambda header, blobs: {"v": 1, "ok": False, "skip": "the repository has more than 100000 files"},
+                    None):
+            self.door.box = box
+            got = self.call(ONE, GITOPS, "push", content=flip)
+            self.assertEqual((got["kind"], got["route"]), ("refused", "again"), got)
+            self.assertIn("the door rendered one-org/cluster before and cannot now", got["why"])
+
+    def test_a_box_that_gives_no_answer_refuses_and_a_door_with_no_box_keeps_the_limit(self):
+        path = "monitoring/stack/templates/deployment.yaml"
+        content = change((path, STACK_DEPLOYMENT + "# a comment\n"))
+        self.door.box = lambda header, blobs: {"v": 1, "ok": False, "again": True, "why": "the render box gave no answer"}
+        got = self.call(ONE, GITOPS, "push", content=content)
+        self.assertEqual((got["kind"], got["route"]), ("refused", "again"), got)
+        self.assertIn("the door could not render this commit", got["why"])
+        api = "https://api.github.com/repos/one-org/cluster/contents/"
+        self.answers[("GET", f"{api}{path}?ref=master")] = (200, {
+            "encoding": "base64", "content": base64.b64encode(STACK_DEPLOYMENT.encode()).decode()})
+        for box in (lambda header, blobs: {"v": 1, "ok": False, "skip": "the pinned helm is not on the door yet"}, None):
+            self.door.box = box         # None: no socket, so no render lookup at all
+            got = self.call(ONE, GITOPS, "push", content=content)
+            self.assertEqual(got["kind"], "refused", got)
+            self.assertIn("only an image, a tag, a replica count and a restart time", got["why"])
+        self.assertEqual(len(self.asked_raw), 2)            # the door with no box asked for no tarball
+        # a tarball that GitHub does not give is a check that failed now
+        self.door.box = lambda header, blobs: self.fail("the box was asked")
+        self.door.raw = lambda method, url, headers, limit, timeout=120: (502, b"")
+        got = self.call(ONE, GITOPS, "push", content=content)
+        self.assertEqual((got["kind"], got["route"]), ("refused", "again"), got)
+
+    def test_the_socket_carries_one_request_and_one_answer(self):
+        "door.box_call against a socket that answers as the box's service does (door_render.serve)."
+        short = tempfile.mkdtemp(prefix="fd-", dir="/tmp")      # a socket's path is 104 bytes at most
+        self.addCleanup(shutil.rmtree, short, True)
+        os.makedirs(short + "/run")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(short + door.RENDER_SOCKET)
+        server.listen(2)
+        self.addCleanup(server.close)
+
+        def serve():
+            for _ in range(2):
+                conn, _addr = server.accept()
+                with conn, conn.makefile("rb") as stream, conn.makefile("wb") as out:
+                    door_render.serve(stream, out, self.tools, check=False)
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        with patch.dict(os.environ, {"FLEET_DOOR_ROOT": short}):
+            facts = door.box_call({"v": 1, "op": "probe"}, [])
+            self.assertEqual((facts["ok"], facts["boxed"]), (True, False))      # a test's process is in no box
+            blob = b"replicas: 3\n"
+            report = door.box_call({"v": 1, "op": "render", "tar": len(tarball(CLUSTER)), "files": [
+                {"path": "monitoring/stack/values.yaml", "size": len(blob), "mode": "100644"}]},
+                [tarball(CLUSTER), blob])
+            self.assertEqual((report["ok"], list(report["units"])), (True, ["helm:monitoring/stack"]), report)
+            thread.join(10)
+            server.close()
+            os.remove(short + door.RENDER_SOCKET)
+            self.assertIn("skip", door.box_call({"v": 1, "op": "probe"}, []))   # no socket: no box
+
+
+class RenderBoxUnit(DoorCase):
+    """Done-when (c), the part that every machine can check: the unit that is the box, and the install of its programs."""
+
+    def test_the_unit_has_no_network_no_key_path_and_a_user_of_its_own(self):
+        unit = door.RENDER_SERVICE
+        for line in ("DynamicUser=yes", "PrivateNetwork=yes", "RestrictAddressFamilies=none", "IPAddressDeny=any",
+                     "ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes", "NoNewPrivileges=yes",
+                     "CapabilityBoundingSet=", "RuntimeMaxSec=150", "MemoryMax=1G", "StandardInput=socket",
+                     "ExecStart=/usr/bin/python3 -I /opt/fleet-door/current/door_render.py box"):
+            self.assertIn(line + "\n", unit)
+        hidden = next(line for line in unit.split("\n") if line.startswith("InaccessiblePaths="))
+        for path in door_render.KEY_PATHS + (door.ETC, door.STATE, os.path.dirname(door.AWS_TOKEN_FILE)):
+            self.assertIn(f"-{path} ", hidden + " ")
+        self.assertNotIn("Environment", unit)
+        self.assertIn("SocketMode=0660\n", door.RENDER_SOCKET_UNIT)
+        self.assertIn("SocketGroup=door\n", door.RENDER_SOCKET_UNIT)
+        self.assertEqual(door.RENDER_SOCKET_UNIT.count("ListenStream=" + door.RENDER_SOCKET), 1)
+
+    def test_a_helper_outside_the_box_renders_nothing(self):
+        out = io.BytesIO()
+        request = json.dumps({"v": 1, "op": "render", "tar": 0, "files": []}).encode() + b"\n"
+        door_render.serve(io.BytesIO(request), out, {"helm": ["/bin/false"], "kustomize": ["/bin/false"]})
+        self.assertEqual(json.loads(out.getvalue()), {"v": 1, "ok": False, "skip": "the render helper is not in its box"})
+        out = io.BytesIO()
+        door_render.serve(io.BytesIO(b"not a request\n"), out, None)
+        self.assertEqual(json.loads(out.getvalue())["ok"], False)
+        with self.assertRaises(SystemExit):
+            door_render.main(["render"])
+
+    def test_the_update_installs_only_the_pinned_programs(self):
+        def archive(member, data):
+            out = io.BytesIO()
+            with tarfile.open(fileobj=out, mode="w:gz") as tar:
+                info = tarfile.TarInfo(member)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+            return out.getvalue()
+        arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}[os.uname().machine]
+        programs = {"helm": b"#!/bin/sh\necho helm\n", "kustomize": b"#!/bin/sh\necho kustomize\n"}
+        archives = {name: archive(door_render.PINS[name]["member"].format(arch=arch), data)
+                    for name, data in programs.items()}
+        pins = {name: dict(pin, **{arch: {"archive": hashlib.sha256(archives[name]).hexdigest(),
+                                          "program": hashlib.sha256(programs[name]).hexdigest()}})
+                for name, pin in door_render.PINS.items()}
+        asked, ran = [], []
+
+        def raw(method, url, headers, limit, timeout=120):
+            asked.append(url)
+            return 200, archives["helm" if "helm" in url else "kustomize"]
+
+        def program(argv, stdin, env, timeout=600):
+            ran.append(argv)
+            return 0, ""
+        old = self.root + door_render.TOOLS_DIR + "/helm-v0.0.1"
+        os.makedirs(old)
+        with patch.object(door, "http_raw", raw), patch.object(door, "run_program", program):
+            # the publisher's archive is not the pinned one: nothing is installed, and the door says so
+            said = door.ensure_render()
+            self.assertEqual(len(said), 2, said)
+            self.assertIn("is not the pinned one", said[0])
+            self.assertFalse(os.path.exists(self.root + door_render.tool_path("helm")))
+            self.assertTrue(os.path.isdir(old))
+            with patch.object(door_render, "PINS", pins):
+                self.assertEqual(door.ensure_render(), [])
+                for name, data in programs.items():
+                    path = self.root + door_render.tool_path(name)
+                    self.assertEqual(slurp(path), data)
+                    self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o755")
+                self.assertFalse(os.path.exists(old))           # the version before goes
+                asked.clear()
+                ran.clear()
+                self.assertEqual(door.ensure_render(), [])
+                self.assertEqual(asked, [])                     # both programs are the pinned ones: no download
+                # a program that is not the pinned one is replaced
+                with open(self.root + door_render.tool_path("helm"), "wb") as f:
+                    f.write(b"another program")
+                self.assertEqual(door.ensure_render(), [])
+                self.assertEqual(slurp(self.root + door_render.tool_path("helm")), programs["helm"])
+                # an archive that holds another program than the pinned one
+                bad = dict(pins, helm=dict(pins["helm"], **{arch: dict(pins["helm"][arch], program="0" * 64)}))
+                with patch.object(door_render, "PINS", bad):
+                    self.assertIn("the program in its archive is not the pinned one", door.ensure_render()[0])
+        self.assertEqual(asked[0], door_render.PINS["helm"]["url"].format(arch=arch))
+        self.assertEqual(slurp(self.root + door.SYSTEMD + "/fleet-door-render@.service", "r"), door.RENDER_SERVICE)
+        self.assertEqual(slurp(self.root + door.SYSTEMD + "/fleet-door-render.socket", "r"), door.RENDER_SOCKET_UNIT)
+        self.assertEqual(ran[0], ["systemctl", "enable", "--now", "fleet-door-render.socket"])
+        for name, pin in door_render.PINS.items():      # the real pins: an https address, and four SHA-256
+            self.assertTrue(pin["url"].startswith("https://"))
+            for arch in ("amd64", "arm64"):
+                self.assertTrue(all(len(pin[arch][k]) == 64 for k in ("archive", "program")), name)
+
+
+@unittest.skipUnless(sys.platform == "linux" and os.geteuid() == 0 and os.path.isdir("/run/systemd/system") and
+                     os.environ.get("FLEET_DOOR_BOX_TEST") == "1",
+                     "the render box is systemd's: a Linux machine with systemd, as root, with FLEET_DOOR_BOX_TEST=1 "
+                     "(it installs the door's render units and its pinned programs on that machine)")
+class RenderBoxLive(unittest.TestCase):
+    """Done-when (c): the render cannot reach the network or the door's keys. On a machine that is only for this test:
+    the door's own code installs the units and the pinned programs, and then the box itself is asked what it reaches,
+    and renders a commit that asks for the network."""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.pop("FLEET_DOOR_ROOT", None)
+        subprocess.run(["groupadd", "--system", "--force", "door"], check=True)
+        for folder in (door.ETC, door.STATE, door.CODE):
+            os.makedirs(folder, exist_ok=True)
+        cls.planted = [door.ACCESS_FILE, door.VAULT_KEY]
+        for path in cls.planted:
+            if not os.path.exists(path):
+                with open(path, "w") as f:
+                    f.write("a key that the box must not read\n")
+                os.chmod(path, 0o644)           # readable by every user: only the unit keeps the box from it
+        os.chmod(door.ETC, 0o755)
+        os.chmod(door.STATE, 0o755)
+        here = os.path.dirname(os.path.abspath(door.__file__))
+        current = os.path.join(door.CODE, "current")
+        if not os.path.lexists(current):
+            os.symlink(here, current)
+        cls.said = door.ensure_render()
+
+    def test_the_box_reaches_no_network_and_no_key_and_renders(self):
+        self.assertEqual(self.said, [])                         # both pinned programs came, with their SHA-256
+        self.assertIsNotNone(door_render.installed_tools())
+        facts = door.box_call({"v": 1, "op": "probe"}, [])
+        self.assertEqual((facts["ok"], facts["boxed"], facts["sockets"], facts["keys"]), (True, True, [], []), facts)
+        self.assertEqual(facts["interfaces"], [])               # no interface is up beside the loopback
+        self.assertNotEqual(facts["user"], 0)
+        self.assertEqual(facts["tools"], {"helm": True, "kustomize": True})
+        # outside the box the same paths are readable, so the unit is what closes them
+        self.assertTrue(all(slurp(path) for path in self.planted))
+        self.assertFalse(door_render.probe()["boxed"])
+        # a listener on this machine, which a render with a network would reach
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        listener.settimeout(0.2)
+        port = listener.getsockname()[1]
+        self.addCleanup(listener.close)
+        tar = tarball(CLUSTER)
+
+        def render(files):
+            blobs = [t.encode() for t in files.values()]
+            return door.box_call({"v": 1, "op": "render", "tar": len(tar), "files": [
+                {"path": p, "size": len(b), "mode": "100644"} for p, b in zip(files, blobs)]}, [tar] + blobs)
+        report = render({"monitoring/stack/values.yaml": STACK_VALUES.replace("debug: false", "debug: true"),
+                         "knative/kustomization.yaml": CLUSTER["knative/kustomization.yaml"] + "namePrefix: a-\n"})
+        self.assertTrue(report["ok"], report)
+        self.assertEqual({u: (i["ok"], bool(i["changed"])) for u, i in report["units"].items()},
+                         {"helm:monitoring/stack": (True, True), "kustomize:knative": (True, True)}, report)
+        self.assertIn("privileged", door_targets.render_refusal(report))
+        for address in (f"http://127.0.0.1:{port}/install.yaml", "https://example.com/install.yaml"):
+            report = render({"knative/kustomization.yaml": f"resources:\n  - {address}\n"})
+            self.assertEqual((report["units"]["kustomize:knative"]["ok"], report["units"]["kustomize:knative"]["broke"]),
+                             (False, True), report)
+        with self.assertRaises(socket.timeout):
+            listener.accept()                                   # no render reached the listener
+        # a template that asks DNS for a name and reads a key path gets nothing
+        report = render({"monitoring/stack/templates/probe.yaml":
+                         'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: probe\ndata:\n'
+                         '  address: {{ getHostByName "example.com" | quote }}\n'
+                         '  key: {{ .Files.Get "/etc/fleet-door/access.json" | quote }}\n'})
+        probe = next(c["after"][0] for c in report["units"]["helm:monitoring/stack"]["changed"])
+        self.assertEqual(probe["data"], {"address": "", "key": ""})
+        with patch.object(sys, "argv", ["door.py", "render-check"]), contextlib.redirect_stdout(io.StringIO()) as out, \
+                self.assertRaises(SystemExit) as ended:
+            door.main(["render-check"])
+        self.assertEqual((ended.exception.code, json.loads(out.getvalue())["boxed"]), (0, True))

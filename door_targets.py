@@ -71,8 +71,9 @@ NEVER_PATHS = (".claude/**", ".codex/**", ".mcp.json", "AGENTS.md", "CLAUDE.md",
                ".roorules", ".continue/**", ".aider.conf.yml", ".opencode/**", "opencode.json", ".kiro/**",
                ".junie/**")
 # Manifest forms that code refuses in rendered output: a new one of these is never committed. Each pattern reads one
-# line of block style, which is all that a YAML file of the GitOps repository may hold (unread): a key at any depth,
-# after the dashes of a list too, its value quoted or not and in any case, with a comment after it.
+# line of block style: a key at any depth, after the dashes of a list too, its value quoted or not and in any case,
+# with a comment after it. Block style is all that the door reads by lines: a file that it reads as it is (unread),
+# and the objects of a render and of a file that the real parser read, written out in it (objects_text).
 ITEM = r"^[ \t]*(?:-[ \t]+)*"                 # the start of a line: its indentation and the dashes of its lists
 END = r"[\"']?[ \t\r]*(?:#.*)?$"              # the end of a value: its closing quote, a comment, and the CR of a CRLF
 TRUE = r"\s*[\"']?(?i:true|yes|on|y)\b"       # the words that YAML 1.1 reads as true, which a cluster's readers take
@@ -884,6 +885,26 @@ def loose_secret(text):
     return False
 
 
+def kept_back(path, data):
+    """Why the filter of a read keeps one file of a GitOps repository back from every agent, or None: no Secret
+    object leaves the door. The file as the patterns read it holds a Secret or a private key; or it is not block
+    style, or has another name than .yaml, .yml or .json, and a loose reading of its text says that it may hold one;
+    or it is not UTF-8 text, where the filter sees nothing. The render box asks the same of each file that a chart
+    or a Kustomize folder can read (door_render.closed)."""
+    text, why = manifest_text(path, data)
+    if why:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return "is not UTF-8 text, so it may hold a Secret that the filter cannot see: the filter keeps it back"
+    elif secret_object(text) or "-----BEGIN" in text:
+        return "holds a Secret, which the filter keeps back"
+    # the loose reading too for a file with another name than .yaml, .yml or .json, which no reader reads by lines
+    if (why or not manifest_name(path)) and (loose_secret(text) or "-----BEGIN" in text):
+        return "may hold a Secret, which the filter keeps back"
+    return None
+
+
 # The lines that a commit changes in a YAML file that code reads only loosely: the values of decide_gitops's rule calls
 LISTED_LINE = re.compile(r"\s*-?\s*replicas\s*:\s*\d{1,2}\s*|"
                          r"\s*[\w./-]*restartedAt['\"]?\s*:\s*['\"]?[0-9T:.Z+-]{10,40}['\"]?\s*|"
@@ -986,19 +1007,104 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
     if files is None:
         return refused(message, target=target)
     plan = {"repo": repo, "files": files, "message": message, "branch": entry.get("branch")}
-    own = None
     for path, data, mode in files:
         if mode in ("120000", "160000") or never_path(path):
             return refused(f"{path} is under the commit rules", target=target)
         why = gitops_path_refused(path, access)
         if why:
             return refused(why, target=target)
+    # What the commit makes a cluster apply (door_render.py): the door gives the lookup only where its render box is.
+    # With no report, every file keeps the rules that need no render, as before the box.
+    report = (lookups.get("render") or (lambda files: None))(files)
+    if report is not None and not isinstance(report, dict):
+        return refused("the door could not read the render of this commit", target=target, route="again")
+    if report is not None and not report.get("ok"):
+        if "skip" not in report:
+            return refused(f"the door could not render this commit: {report.get('why')}", target=target,
+                           route="again" if report.get("again") else None)
+        report = None
+    try:
+        return gitops_files(lookups, op, target, plan, files, report)
+    except (KeyError, TypeError, AttributeError, ValueError, RecursionError):
+        return refused("the door could not read the render of this commit", target=target, route="again")
+
+
+def objects_text(docs):
+    """Objects as the block style lines that say the same, one document each: what the patterns read of a render,
+    and of a file that the real parser read."""
+    return "---\n".join(as_block(doc) for doc in docs)
+
+
+def unit_name(unit):
+    return f"the {'chart' if unit['kind'] == 'helm' else 'Kustomize folder'} {unit['root']}"
+
+
+def render_broken(report):
+    "The words for the first unit that rendered at HEAD and does not render after the commit, or None."
+    return next((f"{unit_name(unit)} renders at HEAD and not after this commit ({unit.get('why')})"
+                 for _uid, unit in sorted(report["units"].items()) if unit.get("broke")), None)
+
+
+def render_refusal(report):
+    """Why the render of a commit refuses it, or None. For each chart and each Kustomize folder that the door
+    rendered, with each value set: an object that the cluster gets after the commit has no more of a refused form
+    than the same object at HEAD, a new object has none, and no Secret object is new or changed."""
+    for _uid, unit in sorted(report["units"].items()):
+        where = unit_name(unit)
+        if not unit.get("ok"):
+            continue                # the door did not render it: its files kept the rules that need no render
+        for group in unit["changed"]:
+            before, after = group["before"], group["after"]
+            if not after:
+                continue            # an object that the commit takes away adds nothing
+            what = f"{where}, rendered with {group['set']}: {group['object']}"
+            if any(isinstance(o.get("kind"), str) and o["kind"].lower() == "secret" and o not in before
+                   for o in after):
+                return f"{what} is a new or a changed Secret object, which no commit passes"
+            hit = manifest_refusal(objects_text(before), objects_text(after))
+            if hit:
+                return f"{what}: {hit}, more than at HEAD, which no commit passes"
+    return None
+
+
+def gitops_files(lookups, op, target, plan, files, report):
+    """The decision on the files of a GitOps commit, after the path rules. report: the render of the commit, or None."""
+    if report:
+        plan["parent"] = report.get("head")         # the commit that the door rendered: the commit's only parent
+        why = render_broken(report)
+        if why:
+            return refused(why, target=target)
+    own = None
+    for path, data, mode in files:
         if data is None:
             own = own or f"{path} is deleted"
             continue
-        old = (lookups.get("base_file") or (lambda p: None))(path)
-        loose_yaml = block = False
-        if loose_read(path, data, old):
+        info = report["files"].get(path) or {} if report else {}
+        if report:
+            old = None if info.get("head") is None else base64.b64decode(info["head"])
+        else:
+            old = (lookups.get("base_file") or (lambda p: None))(path)
+        units = [report["units"][u] for u in info.get("units") or []]
+        # whole: every chart and Kustomize folder that reads this file rendered, so the render says what the file
+        # does. A unit that can read a path that the door gives no agent (closed) is rendered and decided, and the
+        # door widens nothing there: its files keep the rules that need no render.
+        whole = bool(units) and all(u.get("ok") and not u.get("closed") for u in units)
+        # docs: each document of a YAML file as the real parser reads it, or None for one that it does not read (a
+        # template, or no object). parsed: the parser reads them all. A file of a unit that did not render is a
+        # template that nobody read, whatever its text parses to.
+        yaml_name = path.lower().endswith((".yaml", ".yml"))
+        docs = info.get("after") if yaml_name and isinstance(info.get("after"), list) else None
+        parsed = docs if docs is not None and (whole or not units) and all(isinstance(d, dict) for d in docs) else None
+        unrendered = next((f". The door could not render {u['root']} ({u.get('why')}), so its files keep the rules "
+                           f"that need no render" if not u.get("ok") else
+                           f". {u['root']} can read a path that the door gives no agent, so its files "
+                           f"keep the rules that need no render" for u in units if not u.get("ok") or u.get("closed")),
+                          "")
+        # ArgoCD runs a jsonnet file of a folder that it applies file by file, and no render of a chart shows it
+        runs = path.lower().endswith((".jsonnet", ".libsonnet"))
+        loose_yaml = block = lines = False
+        text = None                 # None: nothing applies this file as it is, and only its render says what it does
+        if loose_read(path, data, old) and parsed is None and (not whole or runs or (yaml_name and docs is None)):
             loose_yaml = manifest_name(path)
             # Read as it is, and then decided as the code before the block reader decided it, so that a tag or a
             # replica count in such a file stays a rule call. Such a file holds no more of each of the loose reading's
@@ -1012,38 +1118,56 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
             if hit:
                 return refused(f"{path}: {hit}, more than the file holds at HEAD, which no commit passes in a file "
                                f"that code reads only loosely: one with another name than .yaml, .yml or .json, or "
-                               f"a YAML file that is not block style at HEAD", target=target)
-        else:
+                               f"a YAML file that is not block style at HEAD{unrendered}", target=target)
+            lines = True
+        elif manifest_name(path):
             text, why = manifest_text(path, data)
-            if why:
+            if not why:
+                # the file at HEAD as the patterns read it; one that is not block style is counted as it is
+                before = manifest_text(path, old)[0] if old else ""
+                before = (old or b"").decode("utf-8", "replace") if before is None else before
+                block = lines = True
+            elif parsed is not None:
+                # no block style, and the real parser reads every document of it: the same lines, from its reading
+                head = info.get("before")
+                text = objects_text(parsed)
+                before = objects_text(head) if isinstance(head, list) else (old or b"").decode("utf-8", "replace")
+                block = True
+            elif not whole or docs is None:
+                # Also in a unit that rendered: a JSON file that is no JSON with each key once, and a YAML stream
+                # that the door does not split, are read by a cluster's tools in a way that the door does not know.
                 return refused(f"{path} has {why}. Code reads a manifest line by line, so the door takes it only in "
-                               f"block style: one plain key with its value, or one item of a list, on each line",
-                               target=target)
-            # the file at HEAD as the patterns read it; one that is not block style is counted as it is
-            before = manifest_text(path, old)[0] if old else ""
-            before = (old or b"").decode("utf-8", "replace") if before is None else before
-            block = True
-        if secret_object(text) if block else SECRET_KIND.search(text):
-            return refused(f"{path} holds a Secret object", target=target)
-        rendered = lookups.get("render") or (lambda p, before, after: (before, after))
-        before, after = rendered(path, before, text)
-        hit = manifest_refusal(before, after)
-        if hit:
-            return refused(f"{path}: {hit}, which no commit passes", target=target)
+                               f"block style: one plain key with its value, or one item of a list, on each line"
+                               f"{unrendered}", target=target)
+            elif any(isinstance(d, dict) for d in docs):
+                # a template with documents that the parser reads: those are read as they are, beside the render
+                head = info.get("before") if isinstance(info.get("before"), list) else []
+                text = objects_text([d for d in docs if isinstance(d, dict)])
+                before = objects_text([d for d in head if isinstance(d, dict)])
+                block = True
+        if text is not None:
+            if secret_object(text) if block else SECRET_KIND.search(text):
+                return refused(f"{path} holds a Secret object", target=target)
+            hit = manifest_refusal(before, text)
+            if hit:
+                return refused(f"{path}: {hit}, which no commit passes", target=target)
         if old is None:
             own = own or f"{path} is a new manifest"
             continue
         changed = changed_lines(old, data)
         kept = same_keys(old, data)
-        if loose_yaml and (changed is None or not kept or not listed_before(old, data) or
-                           not all(LISTED_LINE.fullmatch(line) for line in changed)):
+        listed = changed is not None and kept and listed_before(old, data) and \
+            all(LISTED_LINE.fullmatch(line) for line in changed)
+        if loose_yaml and not listed:
             # A count of words cannot say what such a change does: a key that a template builds, a tag before a value
             # and a word that moves out of a comment add none. So only the listed values change in such a file.
             return refused(f"{path} is not block style, so code cannot read what this change of it does: only an "
                            f"image, a tag, a replica count and a restart time change in such a file. Write a "
-                           f"manifest in block style first, as a commit of its own; a template has no such commit",
-                           target=target)
-        if changed is None or not kept:
+                           f"manifest in block style first, as a commit of its own; a template has no such commit"
+                           f"{unrendered}", target=target)
+        if changed is None or not kept or not (lines or listed):
+            # in a file that code does not read by lines, a line can hold more than its first key: a rule call
+            # there is a change of listed lines only
             own = own or f"{path} changes more than its values"
         elif all(re.fullmatch(r"\s*-?\s*replicas\s*:\s*\d{1,2}\s*", line) for line in changed):
             continue
@@ -1058,6 +1182,10 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
                 return refused(f"the schema check of {path} failed: no rollback", target=target)
         else:
             own = own or f"{path}: other manifest lines"
+    if report:
+        why = render_refusal(report)
+        if why:
+            return refused(why, target=target)
     if own:
         return Decision("own", own, target=target, plan=plan, window="deploy")
     return Decision("rule", "a listed GitOps change", target=target, plan=plan, window="deploy")

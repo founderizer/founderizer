@@ -9,8 +9,11 @@
 # network and the local patch timer, and pins the release keys of this checkout. The code comes from the public
 # repository at the manifest's revision (door.py update), never from this checkout. The update also installs the
 # follow timer (fleet-door-follow.timer), by which the door takes each signed release of the hub by itself, every 10
-# minutes, and checks the release key, the hold and the floor itself (plan 13, item 2). A second run is safe, and keeps
-# every key. It prints no secret: its last lines are the vault recipient, the SSH public key and the address of the door.
+# minutes, and checks the release key, the hold and the floor itself (plan 13, item 2). The same update puts the render
+# box of GitOps commits in place (door.py ensure_render): the pinned helm and kustomize, each held to its SHA-256, and
+# a socket unit whose service has no network and no path of the door's keys. A second run is safe, and keeps every key.
+# It prints no secret: its last lines are the state of the render box, the vault recipient, the SSH public key and the
+# address of the door.
 set -euo pipefail
 umask 022
 
@@ -127,5 +130,8 @@ systemctl enable --now unattended-upgrades.service apt-daily.timer apt-daily-upg
 
 systemctl is-active --quiet fleet-door.service || die "the door did not start: journalctl -u fleet-door"
 echo "the door runs on $ADDRESS:$PORT"
+# what the render box can reach, asked of the box itself by the door's own user; a box that is not there yet comes
+# with the follow timer, and until then the door keeps the rules that need no render
+echo "render-box: $(runuser -u door -- /usr/bin/python3 -I /opt/fleet-door/current/door.py render-check 2>&1 || true)"
 echo "vault-recipient: $(age-keygen -y /var/lib/fleet-door/vault.key)"
 echo "ssh-key: $(cut -d' ' -f1,2 /var/lib/fleet-door/ssh/id_ed25519.pub) door"

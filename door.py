@@ -8,6 +8,7 @@ write of an Operator and every read of a host passes through it. Standard librar
                                     older one, cloned from the public repository at that revision
     python3 door.py hub-secrets     root: the hub's two secrets, made here; their SHA-256 stays, the secrets go once
                                     to stdout for the hub's own file
+    python3 door.py render-check    what the render box can reach, as one JSON line; status 0 when it is closed
     python3 door.py status          one line
 
 Who may ask. The door knows a caller by its tailnet address, which Tailscale proves, and only by that: the access file
@@ -29,6 +30,9 @@ one host wait for each other, one reboot-class call runs at a time in each busin
 file a deploy, a restart, a script or a reboot is refused. A script or a run arms the host's rollback timer first, and
 the door ends the countdown when the host answers it after the call. Each host takes the host parts of the release that
 the door runs (update_hosts, by ops-root's self-update), within a minute of the door's start on that release.
+A commit on a GitOps repository is decided on what it makes a cluster apply: a box with no network and no key of the
+door renders each chart and each Kustomize folder that the commit touches (door_render.py, ensure_render), and a door
+that has no box keeps the rules that need no render.
 Every call leaves one numbered line in the record, which the hub reads each minute; if the hub is down, the door
 still works. No value reaches an agent: the door's tokens and keys are secrets of the central vault with the door as
 their holder, sealed to the door's own key, and only this OS user opens them.
@@ -39,23 +43,30 @@ import contextlib
 import datetime
 import hashlib
 import hmac
+import io
 import ipaddress
 import json
 import os
+import platform
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))     # python3 -I leaves the code's own folder out
 import door_providers       # noqa: E402
+import door_render          # noqa: E402  the helper of the render box, and the pins of its two programs
 import door_targets         # noqa: E402
 import vault                # noqa: E402  the central vault's own check of an owner's signed statement
 
@@ -83,6 +94,7 @@ SECRETS_DIR = STATE + "/secrets"            # opened values, one file each, mode
 VAULT_KEY = STATE + "/vault.key"            # the door's own age identity (its recipient is pinned in the vault)
 SSH_KEY = STATE + "/ssh/id_ed25519"         # the door's SSH key to the second sshd of each host
 AWS_TOKEN_FILE = "/opt/machine-id/jwt_svid"  # the door's own Teleport bot writes its JWT-SVID here (plan 5.4)
+RENDERED_FILE = STATE + "/rendered.json"    # the GitOps repositories whose commits this door has rendered
 APPROVALS_FILE = STATE + "/approvals.json"  # the owner's signed yeses for exact calls that are his, from the hub
 APPROVED_FILE = STATE + "/approved.json"    # the yeses that were used: each lets its one call through once
 APPROVAL_DAYS = 7                           # a signed yes older than this lets nothing through
@@ -121,6 +133,76 @@ RandomizedDelaySec=60
 [Install]
 WantedBy=timers.target
 """
+# The render box (door_render.py): systemd starts one instance of the service for each connection to the socket, as a
+# user of its own that exists for that run, with no network, no socket of any family and no path of the door's keys.
+# The door's own service has no capability, so it can start no unit: it only connects.
+RENDER_UNIT = "fleet-door-render"
+RENDER_SOCKET = "/run/fleet-door-render.sock"
+RENDER_SOCKET_UNIT = """[Unit]
+Description=The render box of the door: one instance for each GitOps commit (Founderizer)
+
+[Socket]
+ListenStream=/run/fleet-door-render.sock
+SocketUser=root
+SocketGroup=door
+SocketMode=0660
+Accept=yes
+MaxConnections=4
+
+[Install]
+WantedBy=sockets.target
+"""
+RENDER_SERVICE = """[Unit]
+Description=One render of a chart or a Kustomize folder, with no network and no key (Founderizer)
+CollectMode=inactive-or-failed
+
+[Service]
+ExecStart=/usr/bin/python3 -I /opt/fleet-door/current/door_render.py box
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+DynamicUser=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=none
+IPAddressDeny=any
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+PrivateIPC=yes
+InaccessiblePaths=-/etc/fleet-door -/var/lib/fleet-door -/opt/machine-id -/dev/shm -/run/tailscale -/var/lib/tailscale
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+KeyringMode=private
+UMask=0077
+RuntimeMaxSec=150
+TimeoutStopSec=5
+MemoryMax=1G
+TasksMax=256
+LimitNOFILE=4096
+LimitCORE=0
+"""
+RENDER_WAIT = 170           # seconds that the door waits for the box, which systemd stops after 150
+RENDER_ANSWER_MAX = 32 * 1024 * 1024
+TOOL_MAX = 128 * 1024 * 1024    # bytes of one archive of a pinned program
 REBOOT_BACK = 900           # seconds a reboot-class call holds its business while the host comes back
 BODY_MAX = 512 * 1024
 RECORD_PAGE = 500
@@ -568,9 +650,11 @@ class Record:
 class Door:
     """The door's state in one process. call(), run() and the order of calls; the HTTP handler only parses."""
 
-    def __init__(self, conf=None, http=None, ssh=None, clock=None):
+    def __init__(self, conf=None, http=None, ssh=None, clock=None, raw=None, box=None):
         self.conf = conf if conf is not None else read_json(CONF_FILE, {})
         self.http = http or door_providers.http
+        self.raw = raw or http_raw      # a GET of bytes: the tarball of a GitOps repository
+        self.box = box                  # the render box of a test; the door's own is its socket (box_call)
         self.ssh = ssh or self.ssh_call
         self.clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
         self.record = Record()
@@ -1009,7 +1093,57 @@ class Door:
         branch = entry.get("branch") if isinstance(entry, dict) else None
         facts.update(base_file=lambda path: hub.file_at_head(path, branch), image_made=hub.image_made,
                      deploy_facts=hub.deploy_facts, npm=self.npm, schema_ok=lambda path, data: True)
+        box = self.box or (box_call if os.path.exists(P(RENDER_SOCKET)) else None)
+        # A door with no render box gives no render, and the rules that need none stay. But only for a repository that
+        # this door never rendered: where it did, templates changed under the render, and the rules that read lines
+        # no longer say what a commit does.
+        if kind == "gitops" and (box or self.rendered(repo)):
+            facts["render"] = lambda files: self.render(hub, branch, files, box or box_call)
         return facts
+
+    def rendered(self, repo, keep=False):
+        "True when this door has rendered a commit of this repository. keep: it has now."
+        with self.lock:
+            known = read_json(RENDERED_FILE, {})
+            known = known if isinstance(known, dict) else {}
+            if keep and repo.lower() not in known:
+                write_json(RENDERED_FILE, dict(known, **{repo.lower(): round(now())}))
+            return repo.lower() in known
+
+    def render(self, hub, branch, files, box):
+        """The render of one GitOps commit (door_render.answer). The door reads the commit id of the branch, gets the
+        tarball of that one commit, and gives it to the box with the commit's files. The report names that commit
+        (head): each file at HEAD comes from it, and the door makes its commit on it, so what the door rendered is
+        what the commit changes. A report with `skip` says that this repository cannot be rendered here (no programs
+        yet, a tarball over the cap), and its commits keep the rules that need no render: but not once the door has
+        rendered the repository, because an agent can make a repository grow. Then it is a refusal."""
+        name = branch or hub.branch()
+        status, ref = hub.call("GET", f"/repos/{hub.repo}/git/ref/heads/{name}")
+        head = (ref.get("object") or {}).get("sha") if status == 200 and isinstance(ref, dict) else None
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40,64}", head):
+            raise door_providers.Stop(f"GitHub answered {status} for {name}")
+        status, tar = self.raw("GET", f"{GitHub.API}/repos/{hub.repo}/tarball/{head}", {
+            "Authorization": "Bearer " + hub.token(), "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"}, door_render.TAR_MAX + 1)
+        if status != 200:
+            raise door_providers.Stop(f"GitHub answered {status} for the tarball of {hub.repo}")
+        if len(tar) > door_render.TAR_MAX:
+            report = {"v": 1, "ok": False, "skip": f"its tarball is over {door_render.TAR_MAX // 2 ** 20} MiB"}
+        else:
+            header = {"v": 1, "op": "render", "repo": hub.repo, "tar": len(tar),
+                      "exposure": [p for p in self.access().get("exposure") or [] if isinstance(p, str)],
+                      "files": [{"path": path, "size": None if data is None else len(data), "mode": mode}
+                                for path, data, mode in files]}
+            report = box(header, [tar] + [data for _path, data, _mode in files if data is not None])
+        if not isinstance(report, dict):
+            report = {"v": 1, "ok": False, "again": True, "why": "the render box gave no report"}
+        if report.get("ok"):
+            report["head"] = head
+            self.rendered(hub.repo, keep=True)
+        elif "skip" in report and self.rendered(hub.repo):
+            report = {"v": 1, "ok": False, "again": True,
+                      "why": f"the door rendered {hub.repo} before and cannot now ({report['skip']})"}
+        return report
 
     def npm(self, name):
         if not re.fullmatch(r"(@[a-z0-9._-]+/)?[a-z0-9._-]{1,214}", name or ""):
@@ -1371,29 +1505,24 @@ class GitHub:
             raise Refused(f"{path} is not a file at HEAD")
         # The file as the patterns read it. One that is not block style is no refusal here, as it is in a commit: the
         # repository's own people wrote it, and the door is the agent's only way to read it. So it comes back, unless
-        # a loose reading of its text says that it may hold a Secret (door_targets.loose_secret).
+        # the filter keeps it back (door_targets.kept_back).
+        kept = door_targets.kept_back(path, data)
+        if kept:
+            raise Refused(f"{path} {kept}")
         text, why = door_targets.manifest_text(path, data)
-        if why:
-            try:
-                text = data.decode("utf-8")
-            except UnicodeDecodeError:
-                raise Refused(f"{path} is not UTF-8 text, so it may hold a Secret that the filter cannot see: the "
-                              f"filter keeps it back") from None
-        elif door_targets.secret_object(text) or "-----BEGIN" in text:
-            raise Refused(f"{path} holds a Secret, which the filter keeps back")
-        # the loose reading too for a file with another name than .yaml, .yml or .json, which no reader reads by lines
-        if (why or not door_targets.manifest_name(path)) and (door_targets.loose_secret(text) or "-----BEGIN" in text):
-            raise Refused(f"{path} may hold a Secret, which the filter keeps back")
-        return text if why else data.decode("utf-8", "replace")
+        return data.decode("utf-8") if why else data.decode("utf-8", "replace")
 
     def commit(self, plan):
         """One commit on the branch's head, made through the API: the blobs, one tree on the head's tree, the commit,
-        and the branch moved to it only when nothing moved it meanwhile."""
+        and the branch moved to it only when nothing moved it meanwhile. A commit that the door rendered goes on the
+        commit that it rendered (plan parent), not on a head that it reads now."""
         branch = plan.get("branch") or self.branch()
-        status, ref = self.call("GET", f"/repos/{self.repo}/git/ref/heads/{branch}")
-        if status != 200:
-            raise door_providers.Stop(f"GitHub answered {status} for {branch}")
-        head = ref["object"]["sha"]
+        head = plan.get("parent")       # the commit that the door rendered: GitHub refuses the move if the branch left it
+        if not head:
+            status, ref = self.call("GET", f"/repos/{self.repo}/git/ref/heads/{branch}")
+            if status != 200:
+                raise door_providers.Stop(f"GitHub answered {status} for {branch}")
+            head = ref["object"]["sha"]
         status, base = self.call("GET", f"/repos/{self.repo}/git/commits/{head}")
         if status != 200:
             raise door_providers.Stop(f"GitHub answered {status} for the head commit")
@@ -1415,6 +1544,12 @@ class GitHub:
                                  {"message": plan["message"], "tree": tree["sha"], "parents": [head]})
         if status != 201:
             raise door_providers.Stop(f"GitHub answered {status} for the commit")
+        if plan.get("parent"):
+            # GitHub takes every move that is a fast-forward, also from a commit before the one that was rendered (a
+            # branch that somebody set back). So the door reads the branch once more, just before it moves it.
+            status, ref = self.call("GET", f"/repos/{self.repo}/git/ref/heads/{branch}")
+            if status != 200 or ((ref or {}).get("object") or {}).get("sha") != head:
+                raise door_providers.Stop(f"{branch} moved while the door rendered the commit: nothing changed")
         status, moved = self.call("PATCH", f"/repos/{self.repo}/git/refs/heads/{branch}",
                                   {"sha": made["sha"], "force": False})
         if status != 200:
@@ -1494,6 +1629,50 @@ def token_permissions(level, held):
     if level in ("read", "write") and isinstance(held, dict) and held.get("actions") in ("read", "write"):
         asked["actions"] = "read"
     return asked
+
+
+def http_raw(method, url, headers, limit, timeout=120):
+    """(status, the bytes of the answer, at most `limit`): a tarball, or the archive of a pinned program."""
+    req = urllib.request.Request(url, method=method, headers=dict(headers, **{"User-Agent": "fleet-door"}))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read(limit)
+    except urllib.error.HTTPError as e:
+        return e.code, b""
+    except (urllib.error.URLError, OSError):
+        return 599, b""
+
+
+def box_call(header, blobs):
+    """One request to the render box, and its answer (door_render.serve): the header as one JSON line, then the bytes
+    that it names. {ok: False, skip} when the box is not there, and {ok: False, why, again} when it took the request
+    and gave no answer: a render that ended early says nothing about the commit, so the commit is refused."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(RENDER_WAIT)
+        s.connect(P(RENDER_SOCKET))
+    except OSError as e:
+        s.close()
+        return {"v": 1, "ok": False, "skip": f"the render box is not there ({e.__class__.__name__})"}
+    try:
+        with s:
+            s.sendall(json.dumps(header).encode() + b"\n")
+            for blob in blobs:
+                s.sendall(blob)
+            s.shutdown(socket.SHUT_WR)
+            got = bytearray()
+            while len(got) <= RENDER_ANSWER_MAX:
+                chunk = s.recv(1024 * 1024)
+                if not chunk:
+                    break
+                got += chunk
+        said = json.loads(got)
+        if not isinstance(said, dict) or said.get("v") != 1:
+            raise ValueError("no answer of version 1")
+        return said
+    except (OSError, ValueError, RecursionError) as e:
+        return {"v": 1, "ok": False, "again": True,
+                "why": f"the render box gave no answer ({e.__class__.__name__}): send the same call again"}
 
 
 def run_program(argv, stdin, env, timeout=600, limit=None):
@@ -1966,6 +2145,91 @@ def ensure_follow_units():
     return changed
 
 
+def write_unit(name, text):
+    "One unit file of systemd, replaced whole when its text differs. True when it changed."
+    path = P(os.path.join(SYSTEMD, name))
+    old = None
+    with contextlib.suppress(OSError):
+        with open(path, encoding="utf-8") as f:
+            old = f.read()
+    if old == text:
+        return False
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".new", "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(path + ".new", 0o644)
+    os.replace(path + ".new", path)
+    return True
+
+
+def file_sha256(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def ensure_render():
+    """root: the render box of GitOps commits, put in place by the door's own update, with no step of a person. The
+    two pinned programs (door_render.PINS) come from their publishers: the archive has the pinned SHA-256, and so has
+    the one program that is taken out of it, which becomes root's file in TOOLS_DIR; an older version goes. The
+    socket and the service of the box are written when their text differs. `take` calls it, and so does every run of
+    `follow`: the release that brings this code is taken by the code before it, and a download that failed is tried
+    again 10 minutes later. Returns what it could not do, one line each: the door then keeps the rules that need no
+    render."""
+    said = []
+    arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine())
+    tools = P(door_render.TOOLS_DIR)
+    for name, pin in sorted(door_render.PINS.items()):
+        path, sums = P(door_render.tool_path(name)), pin.get(arch)
+        if sums is None:
+            said.append(f"no {name} is pinned for {platform.machine()}")
+            continue
+        if file_sha256(path) == sums["program"]:
+            continue
+        status, raw = http_raw("GET", pin["url"].format(arch=arch), {}, TOOL_MAX)
+        if status != 200 or hashlib.sha256(raw).hexdigest() != sums["archive"]:
+            said.append(f"{name} {pin['version']}: its archive did not come, or is not the pinned one ({status})")
+            continue
+        try:
+            with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
+                data = tar.extractfile(pin["member"].format(arch=arch)).read(TOOL_MAX)
+        except (tarfile.TarError, KeyError, AttributeError, OSError, EOFError):
+            data = b""
+        if hashlib.sha256(data).hexdigest() != sums["program"]:
+            said.append(f"{name} {pin['version']}: the program in its archive is not the pinned one")
+            continue
+        folder = os.path.dirname(path)
+        os.makedirs(folder, mode=0o755, exist_ok=True)
+        with open(path + ".new", "wb") as f:
+            f.write(data)
+        for made, mode in ((path + ".new", 0o755), (folder, 0o755), (tools, 0o755)):
+            os.chmod(made, mode)
+        os.replace(path + ".new", path)
+        for other in os.listdir(tools):
+            if other.startswith(name + "-") and other != os.path.basename(folder):
+                shutil.rmtree(os.path.join(tools, other), ignore_errors=True)
+    changed = [write_unit(RENDER_UNIT + ".socket", RENDER_SOCKET_UNIT),
+               write_unit(RENDER_UNIT + "@.service", RENDER_SERVICE)]
+    if any(changed):
+        run_program(["systemctl", "daemon-reload"], None, {})
+    if changed[0] and os.path.exists(P(RENDER_SOCKET)):
+        run_program(["systemctl", "restart", RENDER_UNIT + ".socket"], None, {})
+    elif any(changed) or not os.path.exists(P(RENDER_SOCKET)):
+        run_program(["systemctl", "enable", "--now", RENDER_UNIT + ".socket"], None, {})
+    return said
+
+
+def render_ready():
+    "ensure_render, for an update: its lines are printed, and nothing that it meets stops the update."
+    try:
+        for line in ensure_render():
+            print(f"the render box: {line}")
+    except Exception as e:      # noqa: BLE001  the door's release is taken whatever the box does
+        print(f"the render box: {e.__class__.__name__}: {e}")
+
+
 def take(raw):
     """One signed release for the door, the same for `update` and `follow`: the release keys pinned at install, of
     either file, check the manifest (a fleet that takes releases early runs one that the early key signed); a held
@@ -2006,6 +2270,7 @@ def take(raw):
         os.rename(repo, target)
     if running == revision:
         ensure_follow_units()
+        render_ready()
         keep_release(manifest)
         return f"the door runs release {manifest['version']} ({revision[:12]}) already"
     link = os.path.join(P(CODE), "current")
@@ -2020,6 +2285,7 @@ def take(raw):
         if re.fullmatch(r"[0-9a-f]{40}", name) and name not in (revision, running):
             shutil.rmtree(os.path.join(P(CODE), name), ignore_errors=True)
     ensure_follow_units()
+    render_ready()
     keep_release(manifest)
     return f"the door runs release {manifest['version']} ({revision[:12]})"
 
@@ -2050,6 +2316,9 @@ def cmd_follow(args):
     that runs. The door checks it with its own pinned keys, so the hub only carries it."""
     if os.geteuid() != 0 and not os.environ.get("FLEET_DOOR_ROOT"):
         sys.exit("door.py follow runs as root")
+    # The render box and its programs, in every run: the code before this one took the release that brought them, a
+    # download that failed is tried again, and neither waits for the hub.
+    render_ready()
     hub = read_json(ACCESS_FILE, {}).get("hub") or {}
     if not hub.get("address"):
         print("the access file names no hub yet")
@@ -2129,6 +2398,15 @@ def cmd_probe(args):
     sys.exit(0 if passed else 1)
 
 
+def cmd_render_check(args):
+    """What the render box can reach, as one JSON line (door_render.probe, run inside the box): the families of socket
+    that it can make, the network interfaces that it sees, the key paths that it can read, its user and its programs.
+    The status is 0 only when the box is closed and holds both programs."""
+    facts = box_call({"v": 1, "op": "probe"}, [])
+    print(json.dumps(facts, sort_keys=True))
+    sys.exit(0 if facts.get("ok") and facts.get("boxed") and all((facts.get("tools") or {"": False}).values()) else 1)
+
+
 def cmd_status(args):
     access = read_json(ACCESS_FILE, {})
     print(f"door: {len(access.get('agents') or {})} agents, {len(access.get('hosts') or {})} hosts, record "
@@ -2144,6 +2422,7 @@ def main(argv=None):
     sub.add_parser("follow").set_defaults(fn=cmd_follow)
     sub.add_parser("hub-secrets").set_defaults(fn=cmd_hub_secrets)
     sub.add_parser("status").set_defaults(fn=cmd_status)
+    sub.add_parser("render-check").set_defaults(fn=cmd_render_check)
     probing = sub.add_parser("probe")
     probing.add_argument("host")
     probing.set_defaults(fn=cmd_probe)
