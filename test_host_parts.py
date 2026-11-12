@@ -28,7 +28,8 @@ SEED = bytes(range(32))         # the test's own release key; never the product'
 
 
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite(cls(name) for cls in (Files, ModeAndLock, ScriptForms, Runners, Accounts, SelfUpdate,
+    return unittest.TestSuite(cls(name) for cls in (Files, ModeAndLock, ScriptForms, Runners, PristineRunners,
+                                                    Accounts, SelfUpdate,
                                                     Reader, Scripts, NewApp, AppUnitAndSettings, AppRunner, AppVhost,
                                                     ReleaseHelper)
                               for name in cls.__dict__ if name.startswith("test_"))
@@ -975,6 +976,20 @@ class Runners(HostCase):
             self.call("grow-file", "5")                 # an install that named one: only what it named
         self.assertEqual([c for c in self.calls if "--types" in c], [])
 
+    def test_a_pristine_account_is_no_user_of_runner_containers(self):
+        """12 November 2026: root restores a pristine runner account's home before each job, and its runner is a unit,
+        so the search for the runners' rootless Docker passes it by. An install that names it still names it."""
+        os.remove(self.tmp + "/etc/ops-root/build-file")
+        os.remove(self.tmp + "/etc/ops-root/runner-user")
+        self.socket_of(os.getuid())
+        os.makedirs(self.tmp + f"/var/lib/ci-runner/{self.ME}/golden")
+        self.put(f"/var/lib/ci-runner/{self.ME}/golden/sealed", "1794500000\n")
+        with self.assertRaisesRegex(ROOT.Refused, "names no build file"):
+            self.call("grow-file", "5")
+        self.assertEqual(self.call("runner-status"), "no runner")
+        os.remove(self.tmp + f"/var/lib/ci-runner/{self.ME}/golden/sealed")
+        self.assertIn("runner-01\tidle\tcontainer", self.call("runner-status"))
+
     def test_the_build_file_grows_from_free_space_and_keeps_its_margin(self):
         said = self.call("grow-file", "20")             # 4 + 20: one GiB is 1 KiB here
         self.assertEqual(said, "/var/lib/ci-build.ext4 grew to 24 GiB, and its file system with it")
@@ -1016,6 +1031,171 @@ class Runners(HostCase):
         self.assertNotIn("network", [c[9] for c in self.calls if c[0] == "runuser"])
         with self.assertRaisesRegex(ROOT.Refused, "not a runner of this host"):
             self.call("runner-restart", "runner-09")
+
+
+class PristineRunners(HostCase):
+    """A pristine CI runner (12 November 2026, the devops repository's ci-runner tools): root restores the runner
+    account's home from a trusted state before each one-job start, so a registration goes through
+    ci-runner-reregister, whose every end state has its own exit code; runner-seal is the one repair; runner-new
+    refuses such an account; and no form writes the trusted state, the tools or a pristine unit."""
+    UNIT = "actions.runner.one-org-ci.runner-1.service"
+    PLAIN = "actions.runner.one-org-web.runner-2.service"
+    TOKEN = "AAAABBBBCCCCDDDDEEEEFFFFGGGG1"
+    ME = __import__("pwd").getpwuid(os.getuid()).pw_name
+
+    def setUp(self):
+        super().setUp()
+        for folder in (f"/etc/systemd/system/{self.UNIT}.d", "/var/lib/ci-runner/ghrunner/golden",
+                       "/home/ghrunner/actions-runner", "/home/web/actions-runner"):
+            os.makedirs(self.tmp + folder, exist_ok=True)
+        self.put(f"/etc/systemd/system/{self.UNIT}.d/pristine.conf", "[Service]\nExecStartPre=+/usr/local/sbin/"
+                                                                     "ci-runner-reset reset ghrunner\n")
+        self.put("/var/lib/ci-runner/ghrunner/golden/sealed", "1794500000\n")
+        self.put("/home/web/actions-runner/.runner", json.dumps({"gitHubUrl": "https://github.com/one-org/web"}))
+        for tool in (ROOT.REREGISTER, ROOT.CI_RESET):
+            self.put(tool, "#!/bin/sh\nexit 9\n", 0o755)      # never run: run() is the stand-in
+        self.calls, self.busy, self.active = [], set(), {}
+        self.tool = (0, "registering\nRunner runner-1 of one-org/ci has a new registration, recorded in the trusted "
+                        "state.\n")
+        self.seal = (0, "Trusted state of ghrunner recorded: 1.2G\n")
+        patcher = patch.object(ROOT, "run", self.run_stub)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_stub(self, argv, stdin=None, timeout=900, env=None):
+        self.calls.append((argv, stdin, env))
+        words = argv[3:] if argv[0] == "systemctl" else []
+        units = {self.UNIT: "/home/ghrunner/actions-runner", self.PLAIN: "/home/web/actions-runner"}
+        if words[:1] == ["list-units"]:
+            return 0, "".join(f"{u} loaded active running GitHub Actions Runner\n" for u in units)
+        if words[:2] == ["show", "--property=WorkingDirectory,MainPID"]:
+            return 0, f"WorkingDirectory={units[words[2]]}\nMainPID={'77' if words[2] in self.busy else '0'}\n"
+        if words[:3] == ["show", "--property=User", "--value"]:
+            return 0, {self.UNIT: "ghrunner\n", self.PLAIN: "web\n"}[words[3]]
+        if words[:1] == ["is-active"]:
+            return 0, self.active.get(words[1], "inactive") + "\n"
+        if argv[:3] == ["ps", "-o", "comm="]:
+            return 0, "Runner.Worker\n"
+        if argv[0] == ROOT.REREGISTER:
+            return self.tool
+        if argv[:2] == [ROOT.CI_RESET, "units"]:
+            return 0, self.UNIT + "\n"
+        if argv[:2] == [ROOT.CI_RESET, "seal"]:
+            return self.seal
+        return 0, ""
+
+    def leaked(self):
+        "Every place where the token showed, beside the tool's stdin: an argument, an environment of another program."
+        return [argv for argv, stdin, env in self.calls if any(self.TOKEN in a for a in argv) or
+                (env and self.TOKEN in json.dumps(env) and not argv[-1].endswith("config.sh") and
+                 "config.sh" not in " ".join(argv))]
+
+    def test_a_pristine_runner_registers_through_its_trusted_state_and_no_answer_holds_the_token(self):
+        said = self.call("runner-register", "runner-1", data=self.TOKEN.encode())
+        self.assertEqual(said, "Runner runner-1 of one-org/ci has a new registration, recorded in the trusted state.")
+        tool = [(argv, stdin) for argv, stdin, _env in self.calls if argv[0] == ROOT.REREGISTER]
+        self.assertEqual(tool, [([ROOT.REREGISTER, "ghrunner"], (self.TOKEN + "\n").encode())])
+        self.assertEqual(self.leaked(), [])
+        self.assertFalse([argv for argv, _s, _e in self.calls if argv and argv[0] == "runuser"])    # no config.sh here
+
+    def test_each_end_state_of_the_tool_is_its_own_answer_and_none_holds_the_token(self):
+        ends = {1: (ROOT.Refused, "refused before any change, and runner-1 was not touched"),
+                3: (ROOT.Failed, "runs again with its old registration"),
+                4: (ROOT.Failed, "stays stopped on purpose: repair the cause, then `runner-seal runner-1`"),
+                5: (ROOT.Failed, "nothing was registered, and the units start again by themselves"),
+                6: (ROOT.Failed, "Do not register it again: read its journal"),
+                2: (ROOT.Failed, "2 is a wrong use, a fault of ops-root"),
+                124: (ROOT.Failed, "ended with 124")}
+        for status, (error, words) in ends.items():
+            with self.subTest(status=status):
+                # a tool that printed the token after all: no answer of ops-root holds it
+                self.tool = (status, f"config.sh said {self.TOKEN}\nci-runner-reregister: the last line\n")
+                with self.assertRaises(error) as caught:
+                    self.call("runner-register", "runner-1", data=self.TOKEN.encode())
+                self.assertIn(words, str(caught.exception))
+                self.assertIn("the last line", str(caught.exception))
+                self.assertNotIn(self.TOKEN, str(caught.exception))
+                self.assertIn("<token>", str(caught.exception))
+        self.assertEqual(self.leaked(), [])
+
+    def test_without_the_tool_or_a_trusted_state_nothing_is_registered(self):
+        os.remove(self.tmp + ROOT.REREGISTER)
+        with self.assertRaisesRegex(ROOT.Refused, "ci-runner-reregister is not on this host: a registration in its "
+                                                  "home would not last its next start"):
+            self.call("runner-register", "runner-1", data=self.TOKEN.encode())
+        self.put(ROOT.REREGISTER, "#!/bin/sh\n", 0o755)
+        os.remove(self.tmp + "/var/lib/ci-runner/ghrunner/golden/sealed")
+        with self.assertRaisesRegex(ROOT.Refused, "ghrunner has no trusted state"):
+            self.call("runner-register", "runner-1", data=self.TOKEN.encode())
+        self.busy.add(self.UNIT)
+        with self.assertRaisesRegex(ROOT.Refused, "runs a job now"):
+            self.call("runner-register", "runner-1", data=self.TOKEN.encode())
+        self.assertFalse([argv for argv, _s, _e in self.calls if argv[0] == ROOT.REREGISTER])
+
+    def test_a_runner_that_is_not_pristine_gets_the_token_in_config_sh_s_environment(self):
+        self.assertEqual(self.call("runner-register", "runner-2", data=self.TOKEN.encode()), "runner-2 registered")
+        [(argv, _stdin, env)] = [c for c in self.calls if c[0][0] == "runuser"]
+        self.assertEqual(argv[-6:], ["--unattended", "--replace", "--url", "https://github.com/one-org/web", "--name",
+                                     "runner-2"])
+        self.assertEqual(env, {"ACTIONS_RUNNER_INPUT_TOKEN": self.TOKEN})
+        self.assertFalse([a for a in argv if self.TOKEN in a])
+
+    def test_runner_seal_records_the_trusted_state_and_starts_the_units_only_when_every_one_is_stopped(self):
+        self.active[self.UNIT] = "active"
+        with self.assertRaisesRegex(ROOT.Refused, f"{self.UNIT} runs: runner-seal records the trusted state only "
+                                                  f"while every runner unit of ghrunner is stopped"):
+            self.call("runner-seal", "runner-1")
+        self.active[self.UNIT] = "inactive"
+        self.seal = (1, "ci-runner-reset: the trusted state of ghrunner changed after its last reset\n")
+        with self.assertRaisesRegex(ROOT.Failed, "the seal failed, and the runner units of ghrunner stay stopped: "
+                                                 "ci-runner-reset: the trusted state"):
+            self.call("runner-seal", "runner-1")
+        self.assertFalse([argv for argv, _s, _e in self.calls if argv[:4] == ["systemctl", "--no-pager",
+                                                                              "--no-ask-password", "start"]])
+        self.seal = (0, "Trusted state of ghrunner recorded: 1.2G\n")
+        self.calls = []
+        self.assertEqual(self.call("runner-seal", "runner-1"),
+                         f"the trusted state of ghrunner is recorded, and {self.UNIT} started")
+        self.assertEqual([argv for argv, _s, _e in self.calls if argv[0] == ROOT.CI_RESET or argv[3:4] == ["start"]],
+                         [[ROOT.CI_RESET, "units", "ghrunner"], [ROOT.CI_RESET, "seal", "ghrunner"],
+                          ["systemctl", "--no-pager", "--no-ask-password", "start", "--no-block", self.UNIT]])
+        with self.assertRaisesRegex(ROOT.Refused, "runner-2 is no pristine runner"):
+            self.call("runner-seal", "runner-2")
+        with self.assertRaisesRegex(ROOT.Refused, "runner-9 is not a runner of this host"):
+            self.call("runner-seal", "runner-9")
+        self.assertEqual(ROOT.FORMS["runner-seal"]["kind"], "rule")
+
+    def test_runner_new_refuses_a_pristine_account(self):
+        self.put("/etc/ops-root/mode", "fix\n")
+        os.makedirs(self.tmp + "/var/lib/ci-runner/shop-deploy/golden")
+        self.put("/var/lib/ci-runner/shop-deploy/golden/sealed", "1794500000\n")
+        with self.assertRaisesRegex(ROOT.Refused, "shop-deploy is a pristine runner account"):
+            self.call("runner-new", "shop", data=b"{}")
+
+    def test_no_form_writes_the_trusted_state_the_tools_or_a_pristine_unit(self):
+        for op, args in (("file", ["/var/lib/ci-runner/ghrunner/golden/sealed", "0644", "root"]),
+                         ("file", ["/var/lib/ci-runner/ghrunner/registration", "0600", "root"]),
+                         ("file", ["/usr/local/sbin/ci-runner-reset", "0755", "root"]),
+                         ("file", [f"/etc/systemd/system/{self.UNIT}", "0644", "root"]),
+                         ("file", [f"/etc/systemd/system/{self.UNIT}.d/zz-override.conf", "0644", "root"]),
+                         ("file", [f"/run/systemd/system/{self.UNIT}.d/zz-override.conf", "0644", "root"]),
+                         ("file", [f"/etc/systemd/system.control/{self.UNIT}.d/50-x.conf", "0644", "root"]),
+                         ("drop", [f"/etc/systemd/system/{self.UNIT}.d/pristine.conf"]),
+                         ("exec", ["rm", "-rf", "/var/lib/ci-runner/ghrunner"])):
+            with self.subTest(op=op, path=args[-1] if op == "exec" else args[0]):
+                with self.assertRaisesRegex(ROOT.Refused, "protected"):
+                    ROOT.check_args(op, args)
+        # the drop-ins of a runner unit that is not pristine stay as they were
+        self.assertEqual(ROOT.check_args("file", [f"/etc/systemd/system/{self.PLAIN}.d/x.conf", "0644", "root"])[0],
+                         f"/etc/systemd/system/{self.PLAIN}.d/x.conf")
+
+    def test_the_egress_proxy_restarts_only_between_jobs(self):
+        self.busy.add(self.UNIT)
+        with self.assertRaisesRegex(ROOT.Refused, "a runner runs a job now, and its unit requires "
+                                                  "ci-runner-egress.service: restart it between jobs"):
+            self.call("restart", "ci-runner-egress")
+        self.busy.clear()
+        self.assertEqual(self.call("restart", "ci-runner-egress"), "ci-runner-egress.service restarted")
 
 
 class Accounts(HostCase):

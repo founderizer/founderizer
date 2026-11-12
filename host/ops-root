@@ -55,6 +55,16 @@ KIT_FILE = ETC + "/fleet-kit"               # a Fleet machine's checkout, whose 
 POOL_FILE = ETC + "/pool"                   # a CI host's pool volume (an LVM path) for grow-pool
 BUILD_FILE = ETC + "/build-file"            # a CI host's build file (sparse ext4 on a loop device) for grow-file
 RUNNER_USER_FILE = ETC + "/runner-user"     # a CI host's rootless Docker user: each of its containers is a runner
+# A pristine CI runner (the devops repository's ci-runner tools): before each one-job start, root restores the runner
+# account's home from a trusted state that only root writes. Its marks, as root reads them: the drop-in PRISTINE of the
+# runner unit (/etc/systemd/system/<unit>.d/pristine.conf) and the account's <CI_STATE>/<user>/golden/sealed. No form
+# writes in CI_STATE or the ci-runner tools, or in a pristine unit's file or drop-in folders (protected).
+CI_STATE = "/var/lib/ci-runner"
+PRISTINE = "pristine.conf"
+CI_TOOLS = "/usr/local/sbin/ci-runner-"
+REREGISTER = CI_TOOLS + "reregister"        # a new registration through the trusted state, the token on stdin
+CI_RESET = CI_TOOLS + "reset"               # its seal records the trusted state, and units lists an account's units
+EGRESS_UNIT = "ci-runner-egress.service"    # the pristine runner units require it while a job runs
 LAYOUT = {}                                 # ci_layout's answer, found once in each call
 RELEASE_FILE = ETC + "/release"             # the release revision this file came from: self-update's floor
 STATE = "/var/lib/ops-root"
@@ -115,7 +125,7 @@ PROTECTED = ("/usr/local/sbin/ops-root", LIB + "/", ETC + "/", STATE + "/", "/va
              "/etc/ld.so.preload", "/etc/pam.d/", "/etc/ssh/", "/etc/security/",
              "/etc/systemd/system/" + SSHD_UNIT, "/etc/systemd/system/" + SSHD_UNIT + ".d/",
              "/etc/systemd/system/" + BOOT_UNIT, "/etc/systemd/system/" + BOOT_UNIT + ".d/",
-             "/etc/fleet-door/", "/var/lib/fleet-door/", "/opt/fleet-door/")
+             "/etc/fleet-door/", "/var/lib/fleet-door/", "/opt/fleet-door/", CI_STATE + "/")
 # The app trees and secret paths of every host, beside the host's own list (HIDDEN_FILE). The door's keys and state
 # are in it (its code is under /opt), and the keys and the store of the central vault on a hub's server.
 HIDDEN = ("/var/www", "/srv", "/opt", "/home", "/root", "/etc/letsencrypt", "/etc/ssl/private", "/etc/credstore",
@@ -379,12 +389,39 @@ def protected(path):
         names.add(os.path.realpath(P(path))[len(ROOT):] if ROOT else os.path.realpath(path))
     for name in names:
         base = os.path.basename(name)
-        if base.startswith("authorized_keys"):
+        if base.startswith("authorized_keys") or name.startswith(CI_TOOLS) or pristine_path(name):
             return True
         for p in PROTECTED:
             if name == p.rstrip("/") or (p.endswith("/") and name.startswith(p)):
                 return True
     return False
+
+
+def pristine_path(path):
+    """True for the unit file or a drop-in of a pristine runner unit, in each folder that systemd reads them from: a
+    change there could take away the reset before each start."""
+    found = re.fullmatch(r"/(?:etc|run)/systemd/(?:system|system\.control|transient)/([^/]+\.service)(?:\.d(?:/.*)?)?",
+                         path)
+    return bool(found) and pristine_unit(found.group(1))
+
+
+def pristine_unit(unit):
+    "True when the runner unit has the pristine drop-in."
+    return os.path.isfile(P(f"/etc/systemd/system/{unit}.d/{PRISTINE}"))
+
+
+def pristine_account(user):
+    "True when the account has a trusted state that root restores before each start of its runner."
+    return os.path.isfile(P(f"{CI_STATE}/{user}/golden/sealed"))
+
+
+def unit_user(unit):
+    "The account that a unit runs as, or Refused."
+    status, out = systemctl("show", "--property=User", "--value", unit)
+    user = out.strip()
+    if status != 0 or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user) or user == "root":
+        raise Refused(f"{unit} names no account that it runs as")
+    return user
 
 
 def real(path):
@@ -454,6 +491,7 @@ CHECKS = {
     "runner-restart": lambda a: check_runner(a, "runner-restart"),
     "runner-prune": lambda a: check_runner(a, "runner-prune"),
     "runner-register": lambda a: check_runner(a, "runner-register"),
+    "runner-seal": lambda a: check_runner(a, "runner-seal"),
     "grow-pool": check_grow,
     "grow-file": lambda a: check_grow(a, "grow-file"),
     "passwd-lock": check_user,
@@ -495,6 +533,8 @@ def do_upgrade(req, data):
 
 @form("restart", window="restart", help="systemctl restart <service>")
 def do_restart(req, data):
+    if req["args"][0] == EGRESS_UNIT and any(busy for _name, _unit, _folder, busy in runners()):
+        raise Refused(f"a runner runs a job now, and its unit requires {EGRESS_UNIT}: restart it between jobs")
     return checked(systemctl("restart", req["args"][0]), f"{req['args'][0]} restarted")
 
 
@@ -633,13 +673,16 @@ def do_runner_prune(req, data):
     return f"the work folder of {req['args'][0]} is empty"
 
 
-@form("runner-register", help="register one runner, with the token on stdin (the door's)")
+@form("runner-register", help="register one runner, with the token on stdin (the door's); a pristine runner through "
+                              "its trusted state (ci-runner-reregister)")
 def do_runner_register(req, data):
     unit, folder = idle_runner(req["args"][0])
     token = (data or b"").decode("ascii", "replace").strip()
-    url = read(os.path.join(folder, ".runner")).strip()
     if not re.fullmatch(r"[A-Z0-9]{20,100}", token):
         raise Refused("runner-register needs the registration token on stdin")
+    if pristine_unit(unit):
+        return reregister(req["args"][0], unit, token)
+    url = read(os.path.join(folder, ".runner")).strip()
     try:
         found = json.loads(url).get("gitHubUrl")
     except ValueError:
@@ -647,9 +690,81 @@ def do_runner_register(req, data):
     if not isinstance(found, str) or not found.startswith("https://github.com/"):
         raise Refused("this runner names no GitHub address")
     user = os.stat(P(folder)).st_uid
+    # the token in config.sh's environment, never in an argument, which every user of the host can read
     status, out = run(["runuser", "-u", pwd.getpwuid(user).pw_name, "--", os.path.join(folder, "config.sh"),
-                       "--unattended", "--replace", "--url", found, "--token", token, "--name", req["args"][0]])
+                       "--unattended", "--replace", "--url", found, "--name", req["args"][0]],
+                      env={"ACTIONS_RUNNER_INPUT_TOKEN": token})
     return checked((status, out.replace(token, "<token>")), f"{req['args'][0]} registered")
+
+
+def reregister(name, unit, token):
+    """A new registration of a pristine runner (12 November 2026): one in its home would not last, because the next
+    start restores the old credential files, which GitHub no longer takes. REREGISTER stops the account's runner
+    units, restores the trusted state, registers with --disableupdate, records the new trusted state and starts them.
+    The token goes to it on stdin and to config.sh in its environment, and no answer holds it. Each end state has its
+    own exit code (the devops repository, scripts/runner/ci-runner-reregister.sh)."""
+    user = unit_user(unit)
+    if not pristine_account(user):
+        raise Refused(f"{unit} has the pristine drop-in, and {user} has no trusted state: nothing is registered")
+    if not os.access(P(REREGISTER), os.X_OK):
+        raise Refused(f"{name} is a pristine runner, and {REREGISTER} is not on this host: a registration in its home "
+                      f"would not last its next start")
+    status, out = run([REREGISTER, user], stdin=(token + "\n").encode(), timeout=600)
+    lines = out.replace(token, "<token>").strip().splitlines()
+    tail = " ".join(line.strip() for line in lines[-4:])
+    if status == 0:
+        return lines[-1].strip() if lines else f"{name} registered"
+    if status == 1:
+        raise Refused(f"ci-runner-reregister refused before any change, and {name} was not touched: {tail}")
+    if status == 3:
+        raise Failed(f"config.sh failed: the trusted state is unchanged, and {name} runs again with its old "
+                     f"registration. {tail}")
+    if status == 4:
+        raise Failed(f"{name} is registered at GitHub, but its new trusted state was not recorded, so its runner stays "
+                     f"stopped on purpose: repair the cause, then `runner-seal {name}` records it and starts the "
+                     f"runner. {tail}")
+    if status == 5:
+        raise Failed(f"a runner unit of {user} did not stop, or the reset before the registration failed: nothing was "
+                     f"registered, and the units start again by themselves. {tail}")
+    if status == 6:
+        raise Failed(f"{name} is registered and its trusted state is recorded, but a runner unit of {user} did not "
+                     f"start; it tries again by itself. Do not register it again: read its journal. {tail}")
+    raise Failed(f"ci-runner-reregister ended with {status}, which ops-root did not expect (2 is a wrong use, a fault "
+                 f"of ops-root). {tail}")
+
+
+@form("runner-seal", window="restart", help="record a pristine runner's trusted state (ci-runner-reset seal) and start "
+                                            "its units: the repair after a registration whose seal failed, only while "
+                                            "every runner unit of its account is stopped")
+def do_runner_seal(req, data):
+    name = req["args"][0]
+    unit = next((u for runner, u, _folder, _busy in runners() if runner == name), None)
+    if unit is None:
+        raise Refused(f"{name} is not a runner of this host")
+    if not pristine_unit(unit):
+        raise Refused(f"{name} is no pristine runner: runner-seal records only a pristine runner's trusted state")
+    user = unit_user(unit)
+    if not pristine_account(user):
+        raise Refused(f"{user} has no trusted state: runner-seal only records a new one after ci-runner-reregister")
+    if not os.access(P(CI_RESET), os.X_OK):
+        raise Refused(f"{CI_RESET} is not on this host")
+    status, out = run([CI_RESET, "units", user], timeout=60)
+    units = [u for u in out.split() if re.fullmatch(r"actions\.runner\.[A-Za-z0-9@_.:-]+\.service", u)]
+    if status != 0 or unit not in units:
+        raise Failed(f"ci-runner-reset did not list the runner units of {user}: {out.strip()[-300:]}")
+    going = [u for u in units if systemctl("is-active", u)[1].strip() in ("active", "activating", "deactivating",
+                                                                         "reloading")]
+    if going:
+        raise Refused(f"{', '.join(going)} runs: runner-seal records the trusted state only while every runner unit of "
+                      f"{user} is stopped, as after ci-runner-reregister ended with 4")
+    status, out = run([CI_RESET, "seal", user], timeout=900)
+    if status != 0:
+        raise Failed(f"the seal failed, and the runner units of {user} stay stopped: {out.strip()[-500:]}")
+    failed = [u for u in units if systemctl("start", "--no-block", u)[0] != 0]
+    if failed:
+        raise Failed(f"the trusted state of {user} is recorded, but {', '.join(failed)} did not start: read its "
+                     f"journal")
+    return f"the trusted state of {user} is recorded, and {', '.join(units)} started"
 
 
 @form("grow-pool", help=f"grow the pool volume from free space, at most {GROW_MAX} GiB at a time")
@@ -1482,6 +1597,9 @@ def fetch(url, path, limit):
                          "release on stdin (the door's), on a fix host only")
 def do_runner_new(req, data):
     app = req["args"][0]
+    if pristine_account(f"{app}-deploy"):
+        raise Refused(f"{app}-deploy is a pristine runner account, whose runner the devops repository's install makes: "
+                      f"runner-new makes none there")
     n, given = app_names(app), runner_input(data)
     user, folder = f"{app}-deploy", runner_folder(app)
     if not os.path.isfile(P(n["settings"])):
@@ -1853,6 +1971,8 @@ def find_layout():
     loops = {word for word in out.split() if re.fullmatch(r"/dev/loop[0-9]{1,4}", word)} if status == 0 else set()
     found = []
     for user in rootless_users() if loops else []:
+        if pristine_account(user):      # its runner is a unit, and root restores its home before each job
+            continue
         status, out = rootless_as(user, "info", "--format", "{{.DockerRootDir}}", timeout=30)
         roots = [line.strip() for line in out.splitlines() if line.strip().startswith("/")]   # a warning is no path
         root = roots[0] if len(roots) == 1 else ""
