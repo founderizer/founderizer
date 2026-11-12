@@ -1779,6 +1779,17 @@ def need_words(title, why, todo="", options=(), details=""):
     return None
 
 
+# What the tool tells an agent that asks for the key of a Cloudflare account of the door (the owner, 12 November 2026,
+# to a card that listed seven rights: "why do I have to do that?"): one key that only makes tokens, given one time,
+# from which the door makes each narrow key (door_providers.cloudflare_work_key). The agent writes the card in its own
+# words: the owner chose no fixed words for it.
+DOOR_CLOUDFLARE_KEY = (
+    "A cloudflare key is one that only makes tokens. The owner makes it one time for that account, in Cloudflare "
+    "under Manage Account, then Account API Tokens: an account-owned token with two permissions, Account API Tokens: "
+    "Edit and Account Settings: Read, and with no end date. Write those steps in details, in your own words. Ask for "
+    "no other permission: the door makes its own work key from this key each day, with the permissions that its "
+    "Cloudflare forms need")
+
 DOOR_SCRIPT_CHARS = 4000        # characters of the script of a door card: what the card shows whole, as details
 DOOR_CARD_TITLE = "Run one root script on {host}?"         # the title of the door's card, as the owner approved it
 # The widest run of spaces in a script, and the most blank lines in a row: more of either moves a command away from
@@ -25571,7 +25582,8 @@ TOOLS = [
                                                   "rules, <provider>:<account> (cloudflare, hetzner, backblaze, "
                                                   "azure or tailscale), or "
                                                   "app:<app>:<NAME> for one setting of an app on a host. The card "
-                                                  "gives it to the door alone. The door uses it for one agent "
+                                                  "gives it to the door alone. " + DOOR_CLOUDFLARE_KEY + ". The "
+                                                  "door uses it for one agent "
                                                   "that holds servers through it: you when you hold them, else the "
                                                   "one agent that does; with several such agents, name the one in "
                                                   "give_to. A key that the door holds for no agent goes to the "
@@ -25611,8 +25623,9 @@ TOOLS = [
                                                   "of an app on a host, for example app:shop:STRIPE_SECRET_KEY, "
                                                   "which `ops <host> env-new <app> <NAME> key` puts in the app's "
                                                   "settings. The card gives it to the door, not to you, and you "
-                                                  "never hold it. Only an agent that holds servers through the "
-                                                  "door asks for one: the door knows no other agent."}},
+                                                  "never hold it. " + DOOR_CLOUDFLARE_KEY + ". Only an agent "
+                                                  "that holds servers through the door asks for one: the door knows "
+                                                  "no other agent."}},
        ["why", "site"])),
     # owner API 1.13: the standing duties of an agent (RESPONSIBILITIES.md)
     ("all", "see_responsibilities", t_see_responsibilities,
@@ -36547,6 +36560,9 @@ def history_door(a, days, start, before):
               for r in rows if r["kind"] == "own" and r["outcome"] == "done"][-20:]
     lines += [f"refused: {r['caller']} {r['target']} {r['action']}: {r['why']}" for r in rows
               if r["kind"] == "refused"][-20:]
+    # a work key that the door could not make for itself: the calls of that account stop until it can
+    lines += [f"the door's own key of {r['target']} failed: {r['why']}" for r in rows
+              if r["kind"] == "key" and r["outcome"] == "failed"][-5:]
     return lines
 
 

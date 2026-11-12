@@ -750,6 +750,22 @@ class DoorCalls(Access):
                 hub.t_request_secret("manager", {"kind": "api_key", "env": "OTHER_KEY", "door": bad,
                                                  "site": "https://api.stripe.com", "why": "a test"})
 
+    def test_the_tool_says_which_cloudflare_key_to_ask_for_and_the_card_keeps_the_asker_s_words(self):
+        """12 November 2026 (the owner, to a card that listed seven rights: "why do I have to do that?"): the key of a
+        Cloudflare account of the door is one that only makes tokens, given one time, and the door makes its own work
+        key from it. The tool tells each asker which key that is, and the card is the asker's own words: the owner
+        chose no fixed words for it ("No fixed steps")."""
+        doors = [json.dumps(t[4]["properties"]["door"]) for t in hub.TOOLS if t[1] == "request_secret"]
+        self.assertEqual(len(doors), 2)                                 # the manager's entry, and a worker's
+        for words in doors:
+            for part in ("only makes tokens", "one time for that account", "Account API Tokens: Edit",
+                         "Account Settings: Read", "no end date", "Ask for no other permission"):
+                self.assertIn(part, words)
+        ask = {"kind": "api_key", "site": "https://api.cloudflare.com", "why": "Acme's DNS through the door"}
+        hub.t_request_secret("manager", dict(ask, door="cloudflare:acme", details="One key that only makes tokens."))
+        row = hub.q1("SELECT why, details FROM needs WHERE kind='secret' ORDER BY id DESC LIMIT 1")
+        self.assertEqual((row["why"], row["details"]), ("Acme's DNS through the door", "One key that only makes tokens."))
+
     def door_key(self, name="cloudflare:acme", users=None):
         """The door holds self.ref under this name of its rules, for these agents."""
         self.owner("/ui/secrets/grant", login=self.ref, agent="door", grant="use")

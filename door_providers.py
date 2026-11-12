@@ -6,7 +6,10 @@ agent's own calls, which run on the agent's grant and for which the agent answer
 turns one call into a plan of steps, and execute() runs a plan with the token that the door holds for that account. A
 token never leaves the door: no answer carries one, and a key that the door mints stays on the door until it places it
 on a host itself, through that host's ops-root (`place`), where the old value is, found by its hash. An AWS account
-holds no key at all: the door assumes that account's role with its own bot's web identity token.
+holds no key at all: the door assumes that account's role with its own bot's web identity token. The key that the
+owner saves for a Cloudflare account can be one that only makes tokens: the door then makes its own work key from it,
+with the rights that these forms need, which Cloudflare ends after a day, and no call is sent with the saved key
+(cloudflare_work_key).
 
     ops backblaze:<account> buckets | keys | files <bucket-id> [prefix]
     ops backblaze:<account> key-mint <host> <bucket-id>            rule: a key for one host, its name as the prefix,
@@ -49,6 +52,7 @@ door (made_keys, deletes); any other delete, and every AWS delete, goes to the o
 call.
 """
 import base64
+import contextlib
 import datetime
 import hashlib
 import hmac
@@ -1068,6 +1072,8 @@ def execute(plan, ctx):
             path = s["path"].format(**dict(session.get("fill", {}), **kept))
             status, answer = send(provider, s, path, session, ctx, kept, plan)
         if status >= 400:
+            if provider == "cloudflare" and session.get("work") and status in (401, 403):
+                raise cloudflare_refused(session, status, answer, ctx)
             raise Stop(f"{provider} answered {status}: {short(answer)}")
         if provider != "aws" and ctx.get("made"):
             for key in made_keys(provider, s["method"], path, status, answer):
@@ -1176,31 +1182,360 @@ def open_session(provider, conf, ctx, plan=None):
         if status != 200 or not isinstance(answer, dict) or not isinstance(answer.get("access_token"), str):
             raise Stop(f"Tailscale refused the door's OAuth client ({status})")
         return {"base": BASES["tailscale"], "headers": {"Authorization": "Bearer " + answer["access_token"]}}
-    session = {"base": BASES[provider], "headers": {"Authorization": "Bearer " + secret},
-               "fill": {"account_id": conf.get("account_id") or ""}}
-    if provider == "cloudflare" and not session["fill"]["account_id"] and \
-            any("{account_id}" in s["path"] for s in (plan or {}).get("steps") or []):
-        session["fill"]["account_id"] = cloudflare_account(session, ctx)
+    if provider == "cloudflare":
+        return cloudflare_session(conf, secret, ctx)
+    return {"base": BASES[provider], "headers": {"Authorization": "Bearer " + secret},
+            "fill": {"account_id": conf.get("account_id") or ""}}
+
+
+# ---- Cloudflare: a key that makes tokens, and the door's work key
+#
+# The owner, 12 November 2026, to the key card that listed seven rights for one agent's need: "why do I have to do
+# that?". Since then the key that he saves for a Cloudflare account can be one that only makes tokens (a token with
+# Account API Tokens Edit for that one account), given once. The door asks Cloudflare what a saved key is
+# (cloudflare_key). A key that makes tokens is never sent with a call: the door makes its own work key from it, with
+# the rights of CF_KEY_RIGHTS for that one account, which Cloudflare ends after CF_KEY_LIFE, and sends each call with
+# that one (cloudflare_work_key). A key that makes no tokens is the hand-made narrow key of before, and is used as
+# before. A token that the first key makes can hold any right of the account, so this code is the only limit on what
+# the door makes: the rights are a constant, each is taken from the account's own list by its exact name and scope,
+# and a new key whose answer shows another right, or another account, is deleted before any call uses it.
+
+# What the listed forms need. An agent's `change` reaches no more than these, whatever the saved key could make.
+CF_KEY_RIGHTS = (("Zone Read", "zone"), ("DNS Read", "zone"), ("DNS Write", "zone"), ("Cache Purge", "zone"),
+                 ("Zone WAF Read", "zone"), ("Cloudflare Tunnel Read", "account"),
+                 ("Cloudflare Tunnel Write", "account"))
+CF_SCOPES = {"zone": "com.cloudflare.api.account.zone", "account": "com.cloudflare.api.account"}
+CF_KEY_LIFE = 24 * 3600     # seconds until Cloudflare ends a work key by itself, whatever becomes of the door
+CF_KEY_FRESH = 3600         # a work key with less than this left is replaced before the call
+CF_KEY_TRIES = 4            # times that the door asks whether a new work key signs in, CF_KEY_PAUSE seconds apart
+CF_KEY_PAUSE = 2
+CF_KEY_SETTLE = 300         # seconds in which a new work key that Cloudflare refuses is not yet taken for a dead one
+CF_KEY_NAME = "Founderizer door: {target}"      # the name of a work key in Cloudflare's own list of tokens
+CF_KIND_LIFE = 24 * 3600    # seconds until the door asks again what a saved key is: its rights can change at Cloudflare
+CF_ACCOUNTS_ASKED = 8       # accounts of one key that the door asks about: a key that reaches more is no key of the door
+CF_ID = re.compile(r"[0-9a-f]{32}")
+
+
+class Unsaid(Stop):
+    """Cloudflare did not say: a time-out, a limit or a fault. It says nothing about a key."""
+
+
+def cloudflare_session(conf, saved, ctx):
+    """What every Cloudflare request of a plan carries. `saved` is the key that the owner saved for this account. When
+    it makes tokens, the requests carry the door's work key and never that one; else they carry it, as before. No
+    request of a plan goes out before the door knows what the saved key is and which one account it is for."""
+    key = cloudflare_key(conf, saved, ctx)
+    session = {"base": BASES["cloudflare"], "headers": {"Authorization": "Bearer " + saved},
+               "fill": {"account_id": key["account_id"]}}
+    if key["kind"] == "maker":
+        if key["named"] and key["named"] != key["account_id"]:
+            raise Stop("the door's file names another Cloudflare account than the one that this key makes tokens for")
+        work = cloudflare_work_key(conf, saved, key["account_id"], ctx)
+        session.update(headers={"Authorization": "Bearer " + work}, work=work, maker=saved)
+    elif ctx.get("keep_work_key"):      # the key before made tokens, and this one makes none: its work key goes
+        with ctx.get("key_lock") or contextlib.nullcontext():
+            left = (ctx.get("work_key") or (lambda: None))()
+            if isinstance(left, dict):
+                # the saved key deletes it if it can, which a key that makes no tokens cannot: then its day ends it
+                ended = cloudflare_end(saved, left.get("account_id"), left.get("id"), ctx)
+                ctx["keep_work_key"](None)
+                (ctx.get("said") or (lambda action, outcome, why: None))(
+                    "key-end", "done", f"the saved key makes no tokens, so the work key of the key before left the "
+                                       f"door" + ("" if 200 <= ended < 300 or ended == 404 else
+                                                  ", and Cloudflare ends it within the day") +
+                                       f" (token {left.get('id')})")
     return session
 
 
-def cloudflare_account(session, ctx):
-    """The one account that a Cloudflare token reaches, for a credential that names none: a key card gives the door
-    the token only (plan N1). A token that reaches no account, or more than one, stops the call. The door keeps the
-    id with the credential (ctx["account"]), so that the next call and the names of deletes() have it too."""
-    status, answer = ctx["http"]("GET", session["base"] + "/accounts?per_page=50", session["headers"], None)
-    found = answer.get("result") if status == 200 and isinstance(answer, dict) else None
-    if not isinstance(found, list):
-        raise Stop(f"Cloudflare gave no list of the token's accounts ({status})")
-    if len(found) != 1:
-        raise Stop("the token reaches no Cloudflare account" if not found else
-                   "the token reaches more than one Cloudflare account: its credential must name its account_id")
-    account = found[0].get("id") if isinstance(found[0], dict) else None
-    if not isinstance(account, str) or not re.fullmatch(r"[0-9a-f]{32}", account):
+def key_mark(value):
+    """The name by which the door knows one key's value in its own files, never the value: a new value under the same
+    reference is another key."""
+    return hashlib.sha256(b"door key\0" + value.encode()).hexdigest()
+
+
+def cf_get(ctx, token, path):
+    return ctx["http"]("GET", BASES["cloudflare"] + path, {"Authorization": "Bearer " + token}, None)
+
+
+def cf_errors(answer):
+    """Cloudflare's own words for a call that failed. Never the answer itself: a new token's answer is its value."""
+    errors = answer.get("errors") if isinstance(answer, dict) else None
+    said = "; ".join(str(e.get("message"))[:200] for e in errors if isinstance(e, dict) and e.get("message")) \
+        if isinstance(errors, list) else ""
+    return said[:300]
+
+
+def cf_listed(what, status, answer):
+    """The list that Cloudflare gave, or None for its clear no (the key may not read it: a 4xx that is no 401).
+    Anything else stops the call: a time-out, a limit, a fault and a 401 say nothing about what a key is, and no key
+    is taken for a kind that it may not be."""
+    if status == 200 and isinstance(answer, dict) and answer.get("success") is not False and \
+            isinstance(answer.get("result"), list):
+        return answer["result"]
+    if status == 401:
+        # Cloudflare does not know the key (now): a new key gets this for a minute, also after its verify said
+        # active, and a deleted key gets it for good. It is no "the key may not read this".
+        raise Unsaid(f"Cloudflare does not take the door's key now (401, when the door asked {what}). A new key can "
+                     f"need a minute: send the same call again. If it stays so, Cloudflare no longer takes the key, "
+                     f"and the owner makes a new one")
+    if 400 <= status < 500 and status not in (408, 425, 429):
+        return None
+    raise Unsaid(f"Cloudflare did not say {what} ({status}), so the door cannot tell what its key is: send the same "
+                 f"call again")
+
+
+def cf_active(what, status, answer):
+    """True when Cloudflare's own verify says that a token is active, False for its clear no; a time-out, a limit or
+    a fault stops the call. Here a 401 is a clear no: the verify of a user's token gives it to the token of an
+    account, and each verify gives it to a token that Cloudflare does not take."""
+    if status == 200 and isinstance(answer, dict) and isinstance(answer.get("result"), dict):
+        return answer["result"].get("status") == "active"
+    if 400 <= status < 500 and status not in (408, 425, 429):
+        return False
+    raise Unsaid(f"Cloudflare did not say {what} ({status}), so the door cannot tell what its key is: send the same "
+                 f"call again")
+
+
+def cloudflare_key(conf, saved, ctx):
+    """What a saved Cloudflare key is: {"kind": "maker" for a key that makes tokens for one account, or "plain",
+    "account_id": the one account that it is for}. The door asks Cloudflare once for each value and each account that
+    its file names, and again after CF_KIND_LIFE, because a token's rights can change at Cloudflare while its value
+    stays. It keeps the answer by the value's mark (ctx key_kind). When Cloudflare does not say at the later asking,
+    the answer before stands, until it is two times CF_KIND_LIFE old."""
+    mark, now = key_mark(saved), (ctx.get("now") or time.time)()
+    # the account that the door's file names: never the door's own reading of the key before (Door.credential)
+    named = conf.get("account_id") if isinstance(conf.get("account_id"), str) and \
+        CF_ID.fullmatch(conf["account_id"]) and not conf.get("account_kept") else None
+    known = (ctx.get("key_kind") or (lambda mark: None))(mark)
+    known = known if isinstance(known, dict) and known.get("kind") in ("maker", "plain") and \
+        CF_ID.fullmatch(str(known.get("account_id"))) and known.get("named") == named and \
+        isinstance(known.get("at"), (int, float)) and not isinstance(known.get("at"), bool) else None
+    if known and 0 <= now - known["at"] < CF_KIND_LIFE:
+        return known
+    try:
+        key = dict(cloudflare_asked(saved, named, ctx), named=named, at=int(now))
+    except Unsaid:
+        if known and 0 <= now - known["at"] < 2 * CF_KIND_LIFE:
+            return known
+        raise
+    if ctx.get("keep_key_kind"):
+        ctx["keep_key_kind"](mark, key)
+    if not named and ctx.get("account"):        # with the credential too: what a call makes is named by its account
+        ctx["account"](key["account_id"])
+    return key
+
+
+def cloudflare_asked(saved, named, ctx):
+    """cloudflare_key's questions to Cloudflare, with the saved key: {kind, account_id}, or a Stop.
+
+    The accounts are the one that the door's file names and those that Cloudflare lists for the key (plan N1: a key
+    card gives the door the key only). With none, or with more than CF_ACCOUNTS_ASKED, the call stops: a key of the
+    door is for one business's account. Then the key must work: Cloudflare's verify takes it as a token of its user,
+    or as the token of one of those accounts. Only a key that works is asked what it is, and only its answer is kept:
+    a new key that Cloudflare does not know yet is no hand-made key.
+
+    A key makes tokens when it lists permission groups, which Cloudflare gives only to a key with a right on API
+    tokens. One that lists the groups of its user makes tokens in each account that its user reaches: refused. One
+    that lists the groups of an account makes tokens there: it is for that one account, and for no other."""
+    status, answer = cf_get(ctx, saved, "/accounts?per_page=50")
+    ids = [a.get("id") if isinstance(a, dict) else None
+           for a in cf_listed("which accounts its key reaches", status, answer) or []]
+    if any(not isinstance(i, str) or not CF_ID.fullmatch(i) for i in ids):
         raise Stop("Cloudflare gave no account id that the door can use")
-    if ctx.get("account"):
-        ctx["account"](account)
-    return account
+    asked = list(dict.fromkeys(([named] if named else []) + ids))
+    if not asked:
+        raise Stop(f"the token reaches no Cloudflare account that Cloudflare lists for it ({status}), so the door "
+                   f"cannot tell what it is, and uses no key whose one account it does not know. A new key can need "
+                   f"a minute: send the same call again. If it stays so, Cloudflare no longer takes the key, or the "
+                   f"key may not read its account: a key that makes tokens needs Account Settings: Read beside "
+                   f"Account API Tokens: Edit, and a hand-made key needs a right of its account")
+    if len(asked) > CF_ACCOUNTS_ASKED:
+        raise Stop(f"the token reaches more than {CF_ACCOUNTS_ASKED} Cloudflare accounts: a key of the door is for "
+                   f"one account")
+    user = cf_active("whether it takes its key", *cf_get(ctx, saved, "/user/tokens/verify"))
+    if not user and not any(cf_active("whether it takes its key", *cf_get(ctx, saved, f"/accounts/{a}/tokens/verify"))
+                            for a in asked):
+        raise Stop("Cloudflare does not take the door's key, as a token of its user or of its account: a new key "
+                   "can need a minute, so send the same call again. If it stays so, the owner makes a new key")
+    if user and cf_listed("whether its key makes tokens for a user",
+                          *cf_get(ctx, saved, "/user/tokens/permission_groups")):
+        raise Stop("this Cloudflare key makes tokens for its user, in each account that the user reaches: the door "
+                   "takes a key that makes tokens for one account (Manage Account, Account API Tokens)")
+    makes = [a for a in asked if cf_listed("whether its key makes tokens",
+                                           *cf_get(ctx, saved, f"/accounts/{a}/tokens/permission_groups"))]
+    if makes and (len(makes) > 1 or len(ids) > 1):
+        raise Stop("this Cloudflare key makes tokens and reaches more than one account: a key that makes tokens is "
+                   "for one account")
+    if not makes and not named and len(ids) > 1:
+        raise Stop("the token reaches more than one Cloudflare account: a key of the door is for one account")
+    return {"kind": "maker" if makes else "plain", "account_id": makes[0] if makes else named or ids[0]}
+
+
+def cloudflare_work_key(conf, maker, account, ctx):
+    """The door's work key of one Cloudflare account, from the key that makes tokens: the one that the door holds,
+    while it has more than CF_KEY_FRESH left, the same key made it and the code's rights are the same; else a new one.
+    A new key signs in before anything uses it, and only then the door keeps it and deletes the one before, so a new
+    key that fails costs no key that works: while the one before still has a minute left, with the same rights and
+    from the same key, the call goes with it. One call of an account at a time comes here (ctx key_lock)."""
+    with ctx.get("key_lock") or contextlib.nullcontext():
+        now = (ctx.get("now") or time.time)()
+        mark = key_mark(maker)
+        rights = hashlib.sha256(json.dumps([CF_KEY_RIGHTS, account]).encode()).hexdigest()[:16]
+        held = (ctx.get("work_key") or (lambda: None))()
+        held = held if isinstance(held, dict) else {}
+        same = held.get("maker") == mark and held.get("rights") == rights and isinstance(held.get("value"), str) and \
+            bool(held["value"]) and isinstance(held.get("until"), (int, float)) and \
+            not isinstance(held.get("until"), bool)
+        if same and held["until"] - now > CF_KEY_FRESH:
+            return held["value"]
+        said = ctx.get("said") or (lambda action, outcome, why: None)
+        try:
+            made = cloudflare_mint(maker, account, CF_KEY_NAME.format(target=f"cloudflare:{conf.get('owner')}"), ctx,
+                                   now, held.get("groups") if held.get("account_id") == account else None)
+            try:
+                cloudflare_signs_in(made["value"], account, ctx)
+                if ctx.get("keep_work_key"):
+                    try:
+                        ctx["keep_work_key"](dict(made, maker=mark, rights=rights, account_id=account,
+                                                  secret=conf.get("secret"), value_mark=key_mark(made["value"])))
+                    except OSError as e:
+                        raise Stop(f"the door could not keep its new work key ({e.__class__.__name__}), and deleted "
+                                   f"it") from None
+            except Stop:
+                cloudflare_end(maker, account, made["id"], ctx)
+                raise
+        except Stop as e:
+            said("key-new", "failed", str(e))
+            if same and held["until"] - now > 60:
+                return held["value"]
+            raise
+        if isinstance(held.get("id"), str) and held["id"] != made["id"]:
+            cloudflare_end(maker, held.get("account_id") or account, held["id"], ctx)
+        ends = datetime.datetime.fromtimestamp(made["until"], datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        said("key-new", "done", f"a work key of {len(CF_KEY_RIGHTS)} rights for one Cloudflare account, which "
+                                f"Cloudflare ends at {ends} (token {made['id']})")
+        return made["value"]
+
+
+def cloudflare_mint(maker, account, name, ctx, now, kept=None):
+    """One new token of the account, made with the key that makes tokens: {id, value, until, groups}. Its rights are
+    CF_KEY_RIGHTS, each taken from the account's own list by its exact name and scope, for this one account and its
+    zones, and it ends CF_KEY_LIFE from now. Cloudflare's documents call a group's name subject to change: for a
+    right whose name the list no longer has, the door takes the id that the same name gave it for the work key before
+    (kept), and for a door that never had one, the call stops. The answer must show those rights and that account and
+    nothing else: a key that shows anything else is deleted, and the call stops."""
+    head = {"Authorization": "Bearer " + maker, "Content-Type": "application/json"}
+    kept = kept if isinstance(kept, dict) else {}
+    groups = {}
+    for right, scope in CF_KEY_RIGHTS:
+        # the list by the documented filters: the whole list has no documented page size
+        status, answer = cf_get(ctx, maker, f"/accounts/{account}/tokens/permission_groups?" + urllib.parse.urlencode(
+            {"name": right, "scope": CF_SCOPES[scope]}))
+        listed = answer.get("result") if status == 200 and isinstance(answer, dict) else None
+        if not isinstance(listed, list):
+            raise Stop(f"Cloudflare no longer takes the key that makes tokens ({status}): the owner makes a new one, "
+                       f"which request_secret asks for with this door name" if status == 401 else
+                       f"Cloudflare gave the door no list of the account's permission groups ({status}): the key "
+                       f"that makes tokens needs Account API Tokens: Edit")
+        found = [g["id"] for g in listed if isinstance(g, dict) and g.get("name") == right and
+                 isinstance(g.get("scopes"), list) and CF_SCOPES[scope] in g["scopes"] and
+                 isinstance(g.get("id"), str) and CF_ID.fullmatch(g["id"])]
+        if not found and isinstance(kept.get(right), str) and CF_ID.fullmatch(kept[right]):
+            found = [kept[right]]
+        if len(found) != 1:
+            raise Stop(f"Cloudflare lists {'no' if not found else 'more than one'} permission group {right!r} for "
+                       f"{'a zone' if scope == 'zone' else 'an account'}: the door makes no key whose rights it cannot "
+                       f"name")
+        groups[right] = found[0]
+    want = {scope: [groups[right] for right, s in CF_KEY_RIGHTS if s == scope] for scope in CF_SCOPES}
+    resource = f"com.cloudflare.api.account.{account}"
+    until = round(now) + CF_KEY_LIFE
+    body = {"name": name[:120],
+            "expires_on": datetime.datetime.fromtimestamp(until, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "policies": [{"effect": "allow", "resources": {resource: "*"},
+                          "permission_groups": [{"id": i} for i in want["account"]]},
+                         {"effect": "allow", "resources": {resource: {"com.cloudflare.api.account.zone.*": "*"}},
+                          "permission_groups": [{"id": i} for i in want["zone"]]}]}
+    status, answer = ctx["http"]("POST", f"{BASES['cloudflare']}/accounts/{account}/tokens", head,
+                                 json.dumps(body).encode())
+    made = answer.get("result") if status == 200 and isinstance(answer, dict) else None
+    new = made.get("id") if isinstance(made, dict) and isinstance(made.get("id"), str) and \
+        CF_ID.fullmatch(made["id"]) else None
+    if new is None or not isinstance(made.get("value"), str) or not 20 <= len(made["value"]) <= 400:
+        if new:
+            cloudflare_end(maker, account, new, ctx)
+        raise Stop(f"Cloudflare made the door no work key ({status}): {cf_errors(answer) or 'no id and value'}")
+    # Whatever stands under the account's own key is inside that account, so the answer's resources are read by
+    # their key alone, and the answer's rights one by one.
+    asked, policies = set(groups.values()), made.get("policies")
+    shown = isinstance(policies, list) and bool(policies) and all(
+        isinstance(p, dict) and p.get("effect") == "allow" and isinstance(p.get("resources"), dict) and
+        set(p["resources"]) == {resource} and isinstance(p.get("permission_groups"), list) and
+        all(isinstance(g, dict) and isinstance(g.get("id"), str) for g in p["permission_groups"]) for p in policies)
+    if not shown or {g["id"] for p in policies for g in p["permission_groups"]} != asked:
+        cloudflare_end(maker, account, new, ctx)
+        raise Stop("Cloudflare's answer does not show the rights and the one account that the door asked for: the "
+                   "door deleted the new key, and no call uses a key that it could not check")
+    return {"id": new, "value": made["value"], "until": until, "groups": groups}
+
+
+def cloudflare_signs_in(value, account, ctx):
+    """A work key that the door just made signs in, before anything uses it and before the door keeps it."""
+    status = None
+    for attempt in range(CF_KEY_TRIES):
+        if attempt:
+            (ctx.get("sleep") or time.sleep)(CF_KEY_PAUSE)
+        status, answer = cf_get(ctx, value, f"/accounts/{account}/tokens/verify")
+        result = answer.get("result") if isinstance(answer, dict) else None
+        if status == 200 and isinstance(result, dict) and result.get("status") == "active":
+            return
+    raise Stop(f"the new work key does not sign in at Cloudflare ({status}): the door deleted it")
+
+
+def cloudflare_end(maker, account, token_id, ctx):
+    """Delete one token that the door made, with the key that makes tokens: the status of Cloudflare's answer. A key
+    that the door could not delete ends by itself, CF_KEY_LIFE after it was made."""
+    if not isinstance(token_id, str) or not CF_ID.fullmatch(token_id) or not CF_ID.fullmatch(str(account)):
+        return 400
+    status, _ = ctx["http"]("DELETE", f"{BASES['cloudflare']}/accounts/{account}/tokens/{token_id}",
+                            {"Authorization": "Bearer " + maker}, None)
+    return status
+
+
+def cloudflare_refused(session, status, answer, ctx):
+    """The Stop for a step that Cloudflare refused (401 or 403) with the door's work key. A work key that Cloudflare
+    no longer takes (somebody deleted it there) is deleted at Cloudflare, and leaves the door only when that delete
+    says that it is gone: then the next call makes a new one, and no refused call leaves a live token behind. A key
+    that the door made less than CF_KEY_SETTLE ago stays: Cloudflare can need a minute for a new token. For
+    a key that is active, the words name its rights: a call outside them is what Cloudflare refused, and no wider key
+    of the owner's is the answer to that."""
+    work, account = session["work"], session["fill"]["account_id"]
+    try:
+        active = cf_active("whether it takes the door's work key",
+                           *cf_get(ctx, work, f"/accounts/{account}/tokens/verify"))
+    except Stop:
+        active = None
+    if active is False:
+        with ctx.get("key_lock") or contextlib.nullcontext():
+            held = (ctx.get("work_key") or (lambda: None))()
+            if isinstance(held, dict) and held.get("value") == work and ctx.get("keep_work_key"):
+                made = held.get("at")
+                if isinstance(made, (int, float)) and (ctx.get("now") or time.time)() - made < CF_KEY_SETTLE:
+                    return Stop(f"Cloudflare does not take the door's new work key yet ({status}): send the same "
+                                f"call again in a minute")
+                ended = cloudflare_end(session["maker"], account, held.get("id"), ctx)
+                if not (200 <= ended < 300 or ended == 404):    # it may be live: the door makes no key beside it
+                    return Stop(f"Cloudflare does not take the door's work key ({status}), and the door could not "
+                                f"delete it there now ({ended}): send the same call again")
+                ctx["keep_work_key"](None)
+                (ctx.get("said") or (lambda action, outcome, why: None))(
+                    "key-end", "done", f"Cloudflare no longer takes the work key, so it left the door (token "
+                                       f"{held.get('id')}): the next call makes a new one")
+        return Stop(f"Cloudflare no longer takes the door's work key ({status}): the door makes a new one, so send "
+                    f"the same call again")
+    return Stop(f"cloudflare answered {status}: {short(answer)}. The door's work key for this account holds these "
+                f"rights and no other: {', '.join(right for right, _ in CF_KEY_RIGHTS)}. A call outside them is not "
+                f"the door's to make")
 
 
 def send(provider, s, path, session, ctx, kept, plan):

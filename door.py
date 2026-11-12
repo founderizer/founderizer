@@ -35,7 +35,10 @@ door renders each chart and each Kustomize folder that the commit touches (door_
 that has no box keeps the rules that need no render.
 Every call leaves one numbered line in the record, which the hub reads each minute; if the hub is down, the door
 still works. No value reaches an agent: the door's tokens and keys are secrets of the central vault with the door as
-their holder, sealed to the door's own key, and only this OS user opens them.
+their holder, sealed to the door's own key, and only this OS user opens them. Where a provider has an API that makes
+keys, the key that the owner saves once can be one that only makes keys: the door then makes its own work key from it,
+with the rights that its rules need, which the provider ends after a day, and the door ends it when the grant ends
+(door_providers.cloudflare_work_key, end_keys).
 """
 import argparse
 import base64
@@ -90,6 +93,8 @@ MINTED_FILE = STATE + "/minted.json"        # ids of the keys this door minted (
 MADE_FILE = STATE + "/made.json"            # names of what writes through the door made, by provider account (D25)
 REPOS_FILE = STATE + "/repos.json"          # the repositories that the door made, and a repo-new that is pending (N3)
 ACCOUNTS_FILE = STATE + "/accounts.json"    # the Cloudflare account of a token whose credential names none (plan N1)
+KEYS_FILE = STATE + "/keys.json"            # what each saved Cloudflare key is, and the work keys that the door made
+KEY_SAID_AGAIN = 600                        # seconds before the same failure of a work key gets a second record line
 SECRETS_DIR = STATE + "/secrets"            # opened values, one file each, mode 600, this user only
 VAULT_KEY = STATE + "/vault.key"            # the door's own age identity (its recipient is pinned in the vault)
 SSH_KEY = STATE + "/ssh/id_ed25519"         # the door's SSH key to the second sshd of each host
@@ -661,6 +666,7 @@ class Door:
         self.record = Record()
         self.lock = threading.Lock()
         self.host_locks, self.business_locks, self.repo_locks, self.tunnel_locks = {}, {}, {}, {}
+        self.key_locks, self.key_failures = {}, {}      # one call of an account makes its work key; what failed last
         self.access_cache = (None, None)
         self.aws_sessions = {}          # each AWS role's session of an hour, in memory only (door_providers.aws_session)
 
@@ -1173,7 +1179,9 @@ class Door:
         conf = dict((access.get("credentials") or {}).get(target) or {})
         kept = read_json(ACCOUNTS_FILE, {}).get(target) or {}
         if not conf.get("account_id") and kept.get("account_id") and kept.get("secret") == conf.get("secret"):
-            conf["account_id"] = kept["account_id"]
+            # account_kept: the door's own reading of the key before, not the file's word. The names of what a call
+            # makes and deletes take it; what a saved key is, and which account it is for, is asked of its provider
+            conf.update(account_id=kept["account_id"], account_kept=True)
         return conf
 
     def keep_account(self, access, target, account_id):
@@ -1185,9 +1193,84 @@ class Door:
             kept[target] = {"secret": secret, "account_id": account_id}
             write_json(ACCOUNTS_FILE, kept)
 
+    # ---- the keys that the door makes for itself (door_providers.cloudflare_work_key)
+    def key_kind(self, target, mark):
+        """What the door knows of the key that is saved for this account, by the mark of its value, or None."""
+        known = kept_keys()["kinds"].get(target)
+        return known if isinstance(known, dict) and known.get("mark") == mark else None
+
+    def keep_key_kind(self, target, mark, key):
+        with self.lock:
+            held = kept_keys()
+            held["kinds"][target] = dict(key, mark=mark)
+            write_json(KEYS_FILE, held)
+
+    def work_path(self, target):
+        return os.path.join(P(SECRETS_DIR), "work-" + hashlib.sha256(target.encode()).hexdigest())
+
+    def work_key(self, target):
+        """The work key that the door holds for this account, with its value, or None. One whose value the door cannot
+        read, or whose value file is not the one that its entry names (value_mark: a write of one of the two files
+        failed), comes without a value: the door then makes a new key, and deletes this one by its id."""
+        entry = kept_keys()["work"].get(target)
+        if not isinstance(entry, dict):
+            return None
+        try:
+            with open(self.work_path(target), encoding="utf-8") as f:
+                value = f.read().strip()
+        except (OSError, ValueError):       # not there, or no text
+            value = ""
+        return dict(entry, value=value) if value and door_providers.key_mark(value) == entry.get("value_mark") \
+            else dict(entry)
+
+    def keep_work_key(self, target, made):
+        """A work key that the door made and that signed in: its value in the door's own secrets, where only the door
+        reads it, and its id, its end and what made it in the list. None takes both away."""
+        path = self.work_path(target)
+        if made is None:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(path)
+        else:           # whole or not at all: a file that a stop of the door cut would be a key that signs in nowhere
+            os.makedirs(P(SECRETS_DIR), mode=0o700, exist_ok=True)
+            try:
+                with open(os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+                    os.fchmod(f.fileno(), 0o600)
+                    f.write(made["value"])
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(path + ".new", path)
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(path + ".new")
+        with self.lock:
+            held = kept_keys()
+            if made is None:
+                held["work"].pop(target, None)
+            else:
+                held["work"][target] = dict({k: v for k, v in made.items() if k != "value"}, at=round(now()))
+            write_json(KEYS_FILE, held)
+
+    def key_said(self, target, action, outcome, why):
+        """One line of the record for a work key that the door made or ended. A failure with the same words is said
+        once in KEY_SAID_AGAIN seconds, so a call that an agent sends again and again fills no record."""
+        if outcome == "failed":
+            last = self.key_failures.get(target)
+            if last and last[0] == why and now() - last[1] < KEY_SAID_AGAIN:
+                return
+            self.key_failures[target] = (why, now())
+        else:
+            self.key_failures.pop(target, None)
+        self.record.add(caller="door", target=target, action=action, kind="key", outcome=outcome, why=why)
+
     def provider_ctx(self, access, target):
         return {"credentials": dict(self.credential(access, target), owner=target.partition(":")[2]),
                 "http": self.http, "secret": self.secret,
+                "key_kind": lambda mark: self.key_kind(target, mark),
+                "keep_key_kind": lambda mark, key: self.keep_key_kind(target, mark, key),
+                "work_key": lambda: self.work_key(target),
+                "keep_work_key": lambda made: self.keep_work_key(target, made),
+                "key_lock": self.held(self.key_locks, target), "now": now,
+                "said": lambda action, outcome, why: self.key_said(target, action, outcome, why),
                 "keep": lambda kind, value: self.forget_minted(value) if kind == "revoked" else self.keep_minted(value),
                 "made": lambda key: self.keep_made(target, key),
                 "repos": self.repo_record,
@@ -1990,9 +2073,72 @@ def vault_sweep(door, once=False):
             fetch_sealed(door)
         with contextlib.suppress(Exception):
             fetch_approvals(door)
+        with contextlib.suppress(Exception):
+            end_keys(door)
         if once:
             return
         time.sleep(60)
+
+
+def kept_keys():
+    """The door's file of its keys, in its two parts: what each saved key is ("kinds", by account), and the work keys
+    that the door made ("work", by account). A file that is not there, or that holds anything else, is an empty one:
+    the door then asks what its keys are again, and makes its work keys again."""
+    held = read_json(KEYS_FILE, {})
+    held = held if isinstance(held, dict) else {}
+    return {part: held[part] if isinstance(held.get(part), dict) else {} for part in ("kinds", "work")}
+
+
+def end_keys(door):
+    """The door's work keys whose grant ended, each minute: a key of an account that left the access file, or that no
+    agent holds any more, is deleted at its provider with the key that made it, and leaves the door's list and its
+    secrets, with one line in the record. A key that the door cannot delete now is asked again while it lives; one
+    that it can no longer delete (the key that made it is gone, or the provider refuses it) only leaves the door, and
+    its provider ends it within the day (door_providers.CF_KEY_LIFE). An access file that the door could not read
+    ends nothing. Returns the accounts whose key left the door."""
+    access = door.access()
+    if not isinstance(access.get("hub"), dict):         # no file, or a broken one: it names nobody, and ends nothing
+        return []
+    credentials = access.get("credentials") or {}
+    used = {t for a in (access.get("agents") or {}).values() if isinstance(a, dict) for t in a.get("providers") or []}
+    if set(kept_keys()["kinds"]) - set(credentials):        # what the door knew of a key that left its file
+        with door.lock:
+            held = kept_keys()
+            held["kinds"] = {t: k for t, k in held["kinds"].items() if t in credentials}
+            write_json(KEYS_FILE, held)
+    ended = []
+    for target in sorted(kept_keys()["work"]):
+        if target in credentials and target in used:
+            continue
+        with contextlib.suppress(Exception):        # one account that fails holds no other account's key
+            if end_key(door, target, (credentials.get(target) or {}).get("secret")):
+                ended.append(target)
+    return ended
+
+
+def end_key(door, target, ref):
+    """end_keys for one account; True when its work key left the door. ref: the saved key of the account now, if the
+    access file still has one; else the one that made the work key."""
+    with door.held(door.key_locks, target):
+        entry = kept_keys()["work"].get(target)
+        if not isinstance(entry, dict):
+            door.keep_work_key(target, None)
+            return False
+        try:
+            status = door_providers.cloudflare_end(door.secret(ref or entry.get("secret")), entry.get("account_id"),
+                                                   entry.get("id"), {"http": door.http})
+        except Refused:
+            status = None           # the door no longer holds the key that made it
+        alive = isinstance(entry.get("until"), (int, float)) and entry["until"] > now()
+        if status is not None and alive and (status >= 500 or status in (408, 425, 429)):
+            return False            # the provider did not answer: the next minute asks again
+        door.keep_work_key(target, None)
+        done = status is not None and (200 <= status < 300 or status == 404)
+        door.key_said(target, "key-end", "done",
+                      (f"the grant ended: the door deleted its work key (token {entry.get('id')})" if done else
+                       f"the grant ended: the work key left the door, and its provider ends it within the day (token "
+                       f"{entry.get('id')})"))
+        return True
 
 
 def hub_url(hub):

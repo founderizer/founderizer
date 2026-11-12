@@ -6,6 +6,7 @@ comes later, at the plan's step X3."""
 import base64
 import calendar
 import json
+import time
 import unittest
 from unittest.mock import patch
 
@@ -39,6 +40,10 @@ class Stub:
     def ctx(self, target, secret="token-of-the-door"):
         credentials = dict((ACCESS["credentials"]).get(target) or {}, owner=target.partition(":")[2])
         return {"credentials": credentials, "http": self.http, "secret": lambda ref: secret,
+                # the door knows each saved Cloudflare key of these tests as a hand-made one, which makes no tokens;
+                # test_door.WorkKeys asks Cloudflare's stand-in what a key is
+                "key_kind": lambda mark: {"kind": "plain", "account_id": credentials.get("account_id"),
+                                          "named": credentials.get("account_id"), "at": time.time() - 60},
                 "keep": lambda kind, answer: self.kept.append(answer),
                 "minted_secret": lambda key: "id-new:secret-new",
                 "host": lambda host, op, args, stdin: (self.hosts.append((host, op, args, stdin)), (0, "placed"))[1],

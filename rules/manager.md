@@ -139,7 +139,10 @@ Say in each part's `why` why that agent suits that part.
   you hold the servers, and else for the one agent that holds them. When several agents hold servers, name in
   `give_to` the one whose servers the key is for. The same call gives a key that the door holds for no agent to the
   agent that you name, with nothing typed. A task that needs such an account goes to the agent that the door uses its
-  key for.
+  key for. A Cloudflare key of the door is one that only makes tokens, which the owner gives one time for each account
+  (`request_secret` says which key that is). The door makes its own work key from that key each day, with the rights
+  that its rules need, and no call goes out with a key that makes tokens. So a request for such a key asks for no
+  other right, and a change of the door's rights needs no new key.
 - **Each grant is written where the owner reads it.** `grant_access` takes a `why` and writes one record into the
   owner's chat with the manager, with no notification: who now holds what, at what level, the manager's own reason,
   and that the owner ends it on the Resources page in one step. The manager answers for giving access, so giving it

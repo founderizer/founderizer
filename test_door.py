@@ -13,6 +13,7 @@
 
 Everything runs locally: the hosts' sshd and the providers are stubs that record what the door sends."""
 import base64
+import calendar
 import contextlib
 import copy
 import datetime
@@ -21,6 +22,7 @@ import hashlib
 import io
 import json
 import os
+import pathlib
 import pwd
 import shutil
 import socket
@@ -33,6 +35,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 from http.server import ThreadingHTTPServer
 from unittest.mock import patch
 
@@ -113,6 +116,7 @@ def load_tests(loader, _tests, _pattern):
                                                     HubLine, HubRights, GitHubFacts, Vault, AuditReplay, AWSRole,
                                                     OwnerYes, CallHash, ScriptsAndRuns, FullAccess, Routes, MadeDeletes,
                                                     HostPath, AppSettingsPath, ScriptPath, HostUpdates, KeyCardAccount,
+                                                    WorkKeys,
                                                     Workflows, RunnerNew, Probe, CallerGone, Rendered, RenderPath,
                                                     RenderBoxUnit, RenderBoxLive)
                               for name in cls.__dict__ if name.startswith("test_"))
@@ -164,6 +168,13 @@ class DoorCase(unittest.TestCase):
         for r in [c["secret"] for c in ACCESS["credentials"].values() if "secret" in c]:
             with open(os.path.join(self.root + door.SECRETS_DIR, hashlib.sha256(r.encode()).hexdigest()), "w") as f:
                 f.write("value-of-" + r[-4:])
+        # The door of these tests knows each saved Cloudflare key as a hand-made one that Cloudflare takes, for the
+        # account that the file names: it asked before. KeyCardAccount and WorkKeys ask Cloudflare's stand-in.
+        door.write_json(door.KEYS_FILE, {"kinds": {
+            name: {"kind": "plain", "account_id": c["account_id"], "named": c["account_id"],
+                   "at": int(time.time()) - 60,
+                   "mark": door_providers.key_mark("value-of-" + c["secret"][-4:])}
+            for name, c in ACCESS["credentials"].items() if name.startswith("cloudflare:")}})
         self.stubs = Stubs()
         self.door = door.Door(conf={"address": "127.0.0.1"}, http=self.stubs.http, ssh=self.stubs.ssh,
                               clock=lambda: self.clock_at)
@@ -3382,9 +3393,12 @@ class KeyCardAccount(DoorCase):
         data = json.loads(json.dumps(ACCESS))
         del data["credentials"]["cloudflare:one"]["account_id"]
         self.write_access(data)
+        os.remove(self.root + door.KEYS_FILE)           # this door has not asked Cloudflare what its key is
         self.accounts, self.calls = [{"id": self.ACCOUNT, "name": "One"}], []
         tunnel = f"{CF}/accounts/{self.ACCOUNT}/cfd_tunnel/{TUNNEL}"
         answers = {("GET", f"{CF}/accounts?per_page=50"): lambda: (200, {"result": self.accounts, "success": True}),
+                   ("GET", f"{CF}/accounts/{self.ACCOUNT}/tokens/verify"):
+                       lambda: (200, {"result": {"id": "9" * 32, "status": "active"}, "success": True}),
                    ("GET", tunnel + "/configurations"):
                        lambda: (200, {"result": {"config": {"ingress": [{"service": "http_status:404"}]}}}),
                    ("PUT", tunnel + "/configurations"): lambda: (200, {"success": True}),
@@ -3406,6 +3420,10 @@ class KeyCardAccount(DoorCase):
         self.assertEqual((got["ok"], got["kind"]), (True, "rule"), got)
         self.assertEqual([c for c in self.calls if "/accounts" in c[1]],
                          [("GET", f"{CF}/accounts?per_page=50"),
+                          # once a day for each saved key: Cloudflare takes it, and does it make tokens? This one
+                          # does not (WorkKeys has one that does)
+                          ("GET", f"{CF}/accounts/{self.ACCOUNT}/tokens/verify"),
+                          ("GET", f"{CF}/accounts/{self.ACCOUNT}/tokens/permission_groups"),
                           ("GET", f"{CF}/accounts/{self.ACCOUNT}/cfd_tunnel/{TUNNEL}/configurations"),
                           ("PUT", f"{CF}/accounts/{self.ACCOUNT}/cfd_tunnel/{TUNNEL}/configurations")])
         self.assertEqual(door.read_json(door.ACCOUNTS_FILE, {}),
@@ -3432,6 +3450,793 @@ class KeyCardAccount(DoorCase):
                 self.assertIn(words, got["why"])
                 self.assertFalse([c for c in self.calls if c[0] == "PUT"])
                 self.assertEqual(door.read_json(door.ACCOUNTS_FILE, {}), {})
+
+
+class Cloud:
+    """Cloudflare's API for tokens, as its documents give it, for the door's tests: the accounts that a token lists,
+    the verify of a user's token and of an account's token, the permission groups of an account, which only a token
+    with a right on that account's API tokens lists (with the documented filters `name` and `scope`), the tokens that
+    such a token makes, with their rights, their one account and their end, and their delete. A read of zones passes
+    only for a token with Zone Read, a read of tunnels with Cloudflare Tunnel Read, and no token of these tests
+    writes a Worker. Every request is kept with the name of the token that sent it."""
+    RIGHTS = [name for name, _ in door_providers.CF_KEY_RIGHTS]
+    GROUPS = ([{"id": f"{n:032x}", "name": name, "scopes": [door_providers.CF_SCOPES[scope]]}
+               for n, (name, scope) in enumerate(door_providers.CF_KEY_RIGHTS, 1)] +
+              [{"id": "f" * 31 + "1", "name": "Account API Tokens Write", "scopes": ["com.cloudflare.api.account"]},
+               {"id": "f" * 31 + "2", "name": "Workers Scripts Write", "scopes": ["com.cloudflare.api.account"]},
+               # the same name in another scope is another group, which the door never takes
+               {"id": "f" * 31 + "3", "name": "Zone Read", "scopes": ["com.cloudflare.api.user"]},
+               # a name that holds another one: the filter gives both, and the door takes the exact one
+               {"id": "f" * 31 + "4", "name": "DNS Write Extra", "scopes": ["com.cloudflare.api.account.zone"]}])
+    INVALID = (401, {"success": False, "errors": [{"code": 1000, "message": "Invalid API Token"}]})
+    NO = (403, {"success": False, "errors": [{"code": 10000, "message": "Authentication error"}]})
+
+    def __init__(self, clock, account="e" * 32):
+        self.clock, self.account, self.calls, self.made, self.fault = clock, account, [], 0, {}
+        self.groups = json.loads(json.dumps(self.GROUPS))
+        self.page = None            # the size of one page of the list of permission groups, when it comes in pages
+        self.filters = True         # False: the list comes whole, whatever filter a request names
+        # value: {name, id, owner (account or user), accounts, makes (None, "account" or "user"), rights, until, gone}
+        self.tokens = {"cfat_" + "M" * 40: {"name": "maker", "id": "a" * 31 + "0", "owner": "account",
+                                            "accounts": [account], "makes": "account", "rights": [], "until": None}}
+        self.change = None          # what the answer of the next new token says in place of what was asked
+        self.no_value = False       # the next new token's answer has an id and no value
+
+    def token(self, **fields):
+        value = f"cfat_{fields['name']}_" + "x" * 30
+        self.tokens[value] = dict({"id": hashlib.sha256(value.encode()).hexdigest()[:32], "owner": "account",
+                                   "accounts": [self.account], "makes": None, "rights": [], "until": None}, **fields)
+        return value
+
+    def named(self, name):
+        return next(t for t in self.tokens.values() if t["name"] == name)
+
+    def alive(self, t):
+        return t is not None and not t.get("gone") and (t["until"] is None or t["until"] > self.clock())
+
+    def http(self, method, url, headers, data):
+        full = url.removeprefix("https://api.cloudflare.com/client/v4")
+        path, _, query = full.partition("?")
+        t = self.tokens.get(headers.get("Authorization", "")[7:])
+        self.calls.append((method, path if path.endswith("/permission_groups") else full, t["name"] if t else None))
+        fault = next((status for part, status in self.fault.items() if part in full), None)
+        if fault:
+            return fault, {"success": False, "errors": [{"message": "a fault of the stand-in"}]}
+        if not self.alive(t):
+            return self.INVALID
+        if full == "/accounts?per_page=50":
+            return 200, {"success": True, "result": [{"id": a, "name": "An account"} for a in t["accounts"]]}
+        if path == "/user/tokens/verify":
+            return (200, {"success": True, "result": {"id": t["id"], "status": "active"}}) \
+                if t["owner"] == "user" else self.INVALID
+        if path == "/user/tokens/permission_groups":
+            return (200, {"success": True, "result": self.groups}) if t["makes"] == "user" else self.NO
+        account, _, rest = path.removeprefix("/accounts/").partition("/")
+        if path.startswith("/accounts/") and rest.startswith("tokens"):
+            if rest == "tokens/verify":
+                return (200, {"success": True, "result": {"id": t["id"], "status": "active"}}) \
+                    if t["owner"] == "account" and account in t["accounts"] else self.INVALID
+            if t["makes"] != "account" or account not in t["accounts"]:
+                return self.NO
+            if method == "GET" and rest == "tokens/permission_groups":
+                return self.listed(urllib.parse.parse_qs(query))
+            if method == "POST" and rest == "tokens":
+                return self.new(account, json.loads(data))
+            if method == "DELETE":
+                one = next((x for x in self.tokens.values() if x["id"] == rest.removeprefix("tokens/")), None)
+                if one is None or one.get("gone"):
+                    return 404, {"success": False, "errors": [{"message": "no such token"}]}
+                one["gone"] = True
+                return 200, {"success": True, "result": {"id": one["id"]}}
+        for start, right, result in (("/zones", "Zone Read", [{"id": ZONE, "name": "example.com"}]),
+                                     (f"/accounts/{account}/cfd_tunnel", "Cloudflare Tunnel Read", [])):
+            if method == "GET" and path.startswith(start):
+                return (200, {"success": True, "result": result}) \
+                    if right in t["rights"] and (start == "/zones" or account in t["accounts"]) else self.NO
+        if "/workers/" in path:
+            return self.NO
+        return 404, {"success": False, "errors": [{"message": "not in the stand-in"}]}
+
+    def listed(self, query):
+        """The account's permission groups, by the filters when the request has them, and in pages when the test
+        says so: Cloudflare's documents show a page size in the answer and name no parameter for the next page."""
+        name, scope = (query.get(k, [None])[0] if self.filters else None for k in ("name", "scope"))
+        found = [g for g in self.groups if (name is None or name in g["name"]) and (scope is None or scope in g["scopes"])]
+        answer = {"success": True, "result": found[:self.page] if self.page else found}
+        if self.page:
+            answer["result_info"] = {"page": 1, "per_page": self.page, "count": len(answer["result"]),
+                                     "total_count": len(found)}
+        return 200, answer
+
+    def new(self, account, body):
+        names = {g["id"]: g["name"] for g in self.groups}
+        self.made += 1
+        until = calendar.timegm(time.strptime(body["expires_on"], "%Y-%m-%dT%H:%M:%SZ"))
+        value = self.token(name=f"work{self.made}", until=until, said=body["name"], policies=body["policies"],
+                           accounts=[account],
+                           rights=[names[g["id"]] for p in body["policies"] for g in p["permission_groups"]])
+        policies = [dict(p, id=f"{n:032x}", permission_groups=[dict(g, name=names[g["id"]], meta={})
+                                                                 for g in p["permission_groups"]])
+                    for n, p in enumerate(body["policies"], 1)]
+        if self.change:
+            policies = self.change(policies)
+        result = {"id": self.tokens[value]["id"], "value": value, "name": body["name"], "status": "active",
+                  "policies": policies, "expires_on": body["expires_on"]}
+        if self.no_value:
+            del result["value"]
+        return 200, {"success": True, "result": result}
+
+    def sent_by(self, name):
+        return [(method, path) for method, path, who in self.calls if who == name]
+
+
+class WorkKeys(DoorCase):
+    """The key that the owner saves for a Cloudflare account can be one that only makes tokens (12 November 2026).
+    The door asks Cloudflare what a saved key is, and never sends a call with a key that makes tokens: it makes its
+    own work key, with the rights of door_providers.CF_KEY_RIGHTS for that one account, which Cloudflare ends after a
+    day. A new key replaces it when less than an hour is left, the key before is deleted, and the key ends with the
+    grant. Only a key that Cloudflare takes is asked what it is, whatever Cloudflare does not say clearly stops the
+    call, and no value shows in an answer or the record."""
+    T0 = 1794500000
+
+    def setUp(self):
+        super().setUp()
+        self.t = self.T0
+        patcher = patch.object(door, "now", lambda: self.t)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        data = json.loads(json.dumps(ACCESS))
+        del data["credentials"]["cloudflare:one"]["account_id"]     # a key card gives the door the key only
+        self.data = data
+        self.write_access(data)
+        os.remove(self.root + door.KEYS_FILE)                       # this door has asked Cloudflare nothing yet
+        self.cloud = Cloud(lambda: self.t)
+        self.account = self.cloud.account
+        self.maker = next(iter(self.cloud.tokens))
+        self.save(self.maker)
+        self.door.http = self.cloud.http
+        # what the saved key may send: its questions, and the making and the end of the door's own keys
+        self.asks = [("GET", "/accounts?per_page=50"), ("GET", "/user/tokens/verify"),
+                     ("GET", f"/accounts/{self.account}/tokens/verify"),
+                     ("GET", f"/accounts/{self.account}/tokens/permission_groups")]
+        self.mints = [("GET", f"/accounts/{self.account}/tokens/permission_groups")] * len(Cloud.RIGHTS) + \
+            [("POST", f"/accounts/{self.account}/tokens")]
+
+    def save(self, value, n=1):
+        with open(os.path.join(self.root + door.SECRETS_DIR, hashlib.sha256(ref(n).encode()).hexdigest()), "w") as f:
+            f.write(value)
+
+    def zones(self):
+        return self.call(ONE, "cloudflare:one", "zones")
+
+    def work(self):
+        return door.read_json(door.KEYS_FILE, {}).get("work", {}).get("cloudflare:one")
+
+    def kind(self):
+        return door.read_json(door.KEYS_FILE, {}).get("kinds", {}).get("cloudflare:one")
+
+    def lines(self, action):
+        return [e for e in self.door.record.after(0) if e["action"] == action]
+
+    def names_file(self, account):
+        data = json.loads(json.dumps(self.data))
+        data["credentials"]["cloudflare:one"]["account_id"] = account
+        self.write_access(data)
+
+    def test_a_key_that_makes_tokens_is_never_sent_with_a_call(self):
+        got = self.zones()
+        self.assertEqual((got["ok"], got["kind"]), (True, "read"), got)
+        # the saved key asks what it is, makes the work key and nothing else; the work key signs in and makes the call
+        self.assertEqual(self.cloud.sent_by("maker"), self.asks + self.mints)
+        self.assertEqual(self.cloud.sent_by("work1"),
+                         [("GET", f"/accounts/{self.account}/tokens/verify"), ("GET", "/zones?per_page=50")])
+        made = self.cloud.named("work1")
+        self.assertEqual(sorted(made["rights"]), sorted(Cloud.RIGHTS))
+        self.assertEqual(made["said"], "Founderizer door: cloudflare:one")
+        self.assertEqual(made["until"], self.T0 + 24 * 3600)
+        resource = f"com.cloudflare.api.account.{self.account}"
+        self.assertEqual([p["resources"] for p in made["policies"]],
+                         [{resource: "*"}, {resource: {"com.cloudflare.api.account.zone.*": "*"}}])
+        self.assertEqual([[g["id"] for g in p["permission_groups"]] for p in made["policies"]],
+                         [[f"{n:032x}" for n in (6, 7)], [f"{n:032x}" for n in (1, 2, 3, 4, 5)]])
+        self.assertTrue(all(p["effect"] == "allow" for p in made["policies"]))
+        # the door keeps the key's id and its end, and its value only in its own secrets, for its own user
+        value = next(v for v, t in self.cloud.tokens.items() if t["name"] == "work1")
+        work = self.work()
+        self.assertEqual((work["id"], work["until"], work["account_id"], work["secret"]),
+                         (made["id"], self.T0 + 24 * 3600, self.account, ref(1)))
+        self.assertEqual(work["groups"], {g["name"]: g["id"] for g in Cloud.GROUPS[:7]})
+        self.assertNotIn("value", work)
+        path = self.door.work_path("cloudflare:one")
+        self.assertEqual((slurp(path, "r"), os.stat(path).st_mode & 0o777), (value, 0o600))
+        self.assertEqual(os.listdir(os.path.dirname(path)).count(os.path.basename(path) + ".new"), 0)
+        self.assertEqual(door.read_json(door.ACCOUNTS_FILE, {}),
+                         {"cloudflare:one": {"secret": ref(1), "account_id": self.account}})
+        self.assertEqual({k: self.kind()[k] for k in ("kind", "account_id", "named", "at")},
+                         {"kind": "maker", "account_id": self.account, "named": None, "at": self.T0})
+        # no value in an answer, in the record or in the door's list
+        record = json.dumps(self.door.record.after(0))
+        for secret in (self.maker, value, self.maker[5:], value[5:]):
+            self.assertNotIn(secret, json.dumps(got) + record + slurp(self.root + door.KEYS_FILE, "r"))
+        line, = self.lines("key-new")
+        self.assertEqual((line["caller"], line["target"], line["kind"], line["outcome"]),
+                         ("door", "cloudflare:one", "key", "done"))
+        self.assertIn("7 rights for one Cloudflare account", line["why"])
+        self.assertIn(made["id"], line["why"])
+
+    def test_one_work_key_serves_its_day_and_the_next_one_replaces_it(self):
+        self.assertTrue(self.zones()["ok"])
+        first = self.work()["id"]
+        self.cloud.calls.clear()
+        self.t += 22 * 3600                 # more than an hour is left: the same key, and the saved one asks nothing
+        self.assertTrue(self.zones()["ok"])
+        self.assertEqual(self.cloud.calls, [("GET", "/zones?per_page=50", "work1")])
+        self.t += 3600 + 1                  # less than an hour is left
+        self.assertTrue(self.zones()["ok"])
+        self.assertEqual(self.cloud.sent_by("maker"),
+                         self.mints + [("DELETE", f"/accounts/{self.account}/tokens/{first}")])
+        self.assertEqual(self.cloud.sent_by("work2"),
+                         [("GET", f"/accounts/{self.account}/tokens/verify"), ("GET", "/zones?per_page=50")])
+        self.assertTrue(self.cloud.named("work1")["gone"])
+        self.assertNotEqual(self.work()["id"], first)
+        self.assertEqual(self.work()["until"], self.t + 24 * 3600)
+        self.assertEqual(len(self.lines("key-new")), 2)
+
+    def test_two_calls_at_once_make_one_key(self):
+        slow = self.cloud.http
+
+        def http(method, url, headers, data):
+            if method == "POST":
+                time.sleep(0.2)
+            return slow(method, url, headers, data)
+        self.door.http = http
+        got = []
+        threads = [threading.Thread(target=lambda: got.append(self.zones())) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual([g["ok"] for g in got], [True] * 3, got)
+        self.assertEqual(self.cloud.made, 1)
+
+    def test_a_new_value_under_the_same_name_is_asked_again(self):
+        self.assertTrue(self.zones()["ok"])
+        first = self.work()["id"]
+        other = self.cloud.token(name="maker2", makes="account")
+        self.save(other)
+        self.cloud.calls.clear()
+        self.assertTrue(self.zones()["ok"])
+        self.assertEqual(self.cloud.sent_by("maker"), [])               # the key before sends nothing more
+        self.assertEqual(self.cloud.sent_by("maker2"),
+                         self.asks + self.mints + [("DELETE", f"/accounts/{self.account}/tokens/{first}")])
+        self.assertEqual(self.cloud.made, 2)
+
+    def test_a_new_value_that_cloudflare_does_not_take_yet_is_never_taken_for_a_hand_made_key(self):
+        """The fault that both reviews of 12 November 2026 found: the owner saves a new key that makes tokens under
+        the same reference, the door knows the account from the key before, and Cloudflare answers 401 to each
+        question while it does not know the new key yet. The door took it for a hand-made key, kept that for good,
+        and sent each call with it. Only a key that Cloudflare's verify takes is asked what it is."""
+        self.assertTrue(self.zones()["ok"])
+        mark = self.kind()["mark"]
+        new = "cfat_" + "N" * 40
+        self.save(new)
+        # the door knows the account from the key before; then its file names the account too
+        for names in (None, self.account):
+            with self.subTest(names=names):
+                self.names_file(names) if names else None
+                self.cloud.calls.clear()
+                got = self.zones()
+                self.assertFalse(got["ok"], got)
+                self.assertIn("Cloudflare does not take the door's key now (401", got["why"])
+                self.assertFalse([c for c in self.cloud.calls if c[1].startswith("/zones")])
+                self.assertEqual(self.kind()["mark"], mark)     # nothing is kept of the new value
+        # The second review's case: Cloudflare's verify takes the new key already, and its question about the
+        # permission groups still gets 401. That is no "it makes no tokens" either.
+        self.cloud.tokens[new] = dict(self.cloud.tokens[self.maker], name="maker-new")
+        self.cloud.fault = {f"/accounts/{self.account}/tokens/permission_groups": 401}
+        self.cloud.calls.clear()
+        got = self.zones()
+        self.assertFalse(got["ok"], got)
+        self.assertIn("Cloudflare does not take the door's key now (401, when the door asked whether its key makes "
+                      "tokens)", got["why"])
+        self.assertIn(("GET", f"/accounts/{self.account}/tokens/verify"), self.cloud.sent_by("maker-new"))
+        self.assertFalse([c for c in self.cloud.calls if c[1].startswith("/zones")])
+        self.assertEqual(self.kind()["mark"], mark)
+        self.cloud.fault = {}
+        self.cloud.calls.clear()
+        self.assertTrue(self.zones()["ok"])
+        self.assertEqual(self.kind()["kind"], "maker")
+        self.assertFalse([c for c in self.cloud.sent_by("maker-new") if c[1].startswith("/zones")])
+        self.assertEqual(self.cloud.calls[-1], ("GET", "/zones?per_page=50", "work2"))
+
+    def test_a_change_of_the_rights_in_the_code_makes_a_new_key(self):
+        self.assertTrue(self.zones()["ok"])
+        with patch.object(door_providers, "CF_KEY_RIGHTS", door_providers.CF_KEY_RIGHTS[:5]):
+            self.assertTrue(self.zones()["ok"])
+        self.assertEqual(sorted(self.cloud.named("work2")["rights"]), sorted(Cloud.RIGHTS[:5]))
+        self.assertTrue(self.cloud.named("work1")["gone"])
+
+    def test_a_hand_made_key_that_makes_no_tokens_is_used_as_before(self):
+        plain = self.cloud.token(name="plain", rights=["Zone Read"])
+        self.save(plain)
+        self.assertTrue(self.zones()["ok"])
+        self.assertEqual(self.cloud.sent_by("plain"), self.asks + [("GET", "/zones?per_page=50")])
+        self.cloud.calls.clear()
+        self.assertTrue(self.zones()["ok"])
+        self.assertEqual(self.cloud.calls, [("GET", "/zones?per_page=50", "plain")])    # asked once a day
+        self.assertEqual((self.cloud.made, self.work(), self.lines("key-new")), (0, None, []))
+        user = self.cloud.token(name="user-plain", owner="user", rights=["Zone Read"])
+        self.save(user)                             # a user's hand-made token: its verify is the user's
+        self.assertTrue(self.zones()["ok"])
+        self.assertEqual(self.cloud.sent_by("user-plain"),
+                         [("GET", "/accounts?per_page=50"), ("GET", "/user/tokens/verify"),
+                          ("GET", "/user/tokens/permission_groups"),
+                          ("GET", f"/accounts/{self.account}/tokens/permission_groups"), ("GET", "/zones?per_page=50")])
+
+    def test_a_key_that_makes_tokens_for_a_user_or_in_two_accounts_is_refused(self):
+        many = [f"{n:032x}" for n in range(100, 109)]
+        for fields, words in (({"owner": "user", "makes": "user", "accounts": [self.account]},
+                               "makes tokens for its user"),
+                              ({"makes": "account", "accounts": [self.account, "c" * 32]},
+                               "makes tokens and reaches more than one account"),
+                              ({"owner": "user", "rights": ["Zone Read"], "accounts": many},
+                               "reaches more than 8 Cloudflare accounts")):
+            with self.subTest(fields=fields):
+                self.save(self.cloud.token(name=f"wide{len(self.cloud.tokens)}", **fields))
+                self.cloud.calls.clear()
+                got = self.zones()
+                self.assertFalse(got["ok"], got)
+                self.assertIn(words, got["why"])
+                self.assertEqual((self.cloud.made, self.work(), self.kind()), (0, None, None))
+                self.assertFalse([c for c in self.cloud.calls if c[1].startswith("/zones")])
+
+    def test_a_user_s_key_that_makes_tokens_for_one_account_makes_the_work_key_there(self):
+        self.save(self.cloud.token(name="user-maker", owner="user", makes="account"))
+        self.assertTrue(self.zones()["ok"])
+        self.assertEqual(self.kind()["kind"], "maker")
+        self.assertFalse([c for c in self.cloud.sent_by("user-maker") if c[1].startswith("/zones")])
+        self.assertEqual(self.cloud.calls[-1], ("GET", "/zones?per_page=50", "work1"))
+
+    def test_what_cloudflare_does_not_say_clearly_stops_the_call_and_the_saved_key_makes_none(self):
+        unsaid, unknown = "so the door cannot tell what its key is", "Cloudflare does not take the door's key now (401"
+        for part, status, words in (("/accounts?per_page=50", 500, unsaid), ("/user/tokens/verify", 429, unsaid),
+                                    (f"/accounts/{self.account}/tokens/verify", 599, unsaid),
+                                    (f"/accounts/{self.account}/tokens/permission_groups", 503, unsaid),
+                                    ("/accounts?per_page=50", 401, unknown),
+                                    (f"/accounts/{self.account}/tokens/permission_groups", 401, unknown)):
+            with self.subTest(part=part, status=status):
+                self.cloud.fault = {part: status}
+                self.cloud.calls.clear()
+                got = self.zones()
+                self.assertFalse(got["ok"], got)
+                self.assertIn(words, got["why"])
+                self.assertFalse([c for c in self.cloud.calls if c[1].startswith("/zones")])
+                self.assertEqual(door.read_json(door.KEYS_FILE, {}), {})        # nothing is taken for a kind
+        self.cloud.fault = {}
+        self.assertTrue(self.zones()["ok"])
+
+    def test_the_door_asks_again_after_a_day_and_the_answer_before_stands_while_cloudflare_is_silent(self):
+        plain = self.cloud.token(name="plain", rights=["Zone Read"])
+        self.save(plain)
+        self.assertTrue(self.zones()["ok"])
+        self.cloud.tokens[plain]["makes"] = "account"       # the owner gives the same token the right to make tokens
+        self.t += 23 * 3600
+        self.cloud.calls.clear()
+        self.assertTrue(self.zones()["ok"])
+        self.assertEqual(self.cloud.calls, [("GET", "/zones?per_page=50", "plain")])    # inside the day: not asked
+        self.t += 3600 + 1
+        self.cloud.fault = {"/accounts?per_page=50": 502}   # the day is over, and Cloudflare does not say
+        self.assertTrue(self.zones()["ok"])
+        self.assertEqual(self.cloud.calls[-1], ("GET", "/zones?per_page=50", "plain"))  # the answer before stands
+        self.t += 24 * 3600                                 # but not for more than two days
+        got = self.zones()
+        self.assertFalse(got["ok"], got)
+        self.assertIn("so the door cannot tell what its key is", got["why"])
+        self.t -= 3 * 24 * 3600                             # and not when the clock went back before its asking
+        got = self.zones()
+        self.assertFalse(got["ok"], got)
+        self.assertIn("so the door cannot tell what its key is", got["why"])
+        self.t += 3 * 24 * 3600
+        self.cloud.fault = {}
+        self.cloud.calls.clear()
+        self.assertTrue(self.zones()["ok"])                 # asked again: it makes tokens now
+        self.assertEqual(self.kind()["kind"], "maker")
+        self.assertFalse([c for c in self.cloud.sent_by("plain") if c[1].startswith("/zones")])
+        self.assertEqual(self.cloud.calls[-1], ("GET", "/zones?per_page=50", "work1"))
+
+    def test_no_call_goes_out_with_a_key_whose_one_account_the_door_does_not_know(self):
+        none = self.cloud.token(name="none", makes="account", accounts=[])
+        self.cloud.tokens[none]["owner"] = "account"
+        self.save(none)
+        got = self.zones()                          # Cloudflare lists no account for it: it may not read its account
+        self.assertFalse(got["ok"], got)
+        self.assertIn("reaches no Cloudflare account", got["why"])
+        self.assertIn("Account Settings: Read", got["why"])
+        two = self.cloud.token(name="two", owner="user", rights=["Zone Read"], accounts=[self.account, "c" * 32])
+        self.save(two)
+        got = self.zones()                          # a hand-made key of two accounts, and the file names neither
+        self.assertFalse(got["ok"], got)
+        self.assertIn("more than one Cloudflare account", got["why"])
+        self.assertFalse([c for c in self.cloud.calls if c[1].startswith("/zones")])       # neither made a call
+        self.assertEqual(door.read_json(door.KEYS_FILE, {}), {})                           # and nothing is kept of them
+
+    def test_a_hand_made_key_goes_to_the_account_that_the_door_s_file_names_now(self):
+        other = "c" * 32
+        self.save(self.cloud.token(name="two", owner="user", rights=["Zone Read", "Cloudflare Tunnel Read"],
+                                   accounts=[self.account, other]))
+        self.names_file(self.account)
+        self.assertTrue(self.call(ONE, "cloudflare:one", "tunnels")["ok"])
+        self.assertEqual(self.cloud.calls[-1][1], f"/accounts/{self.account}/cfd_tunnel?is_deleted=false")
+        self.names_file(other)                      # the file names the other account: the same value goes there
+        self.assertTrue(self.call(ONE, "cloudflare:one", "tunnels")["ok"])
+        self.assertEqual(self.cloud.calls[-1][1], f"/accounts/{other}/cfd_tunnel?is_deleted=false")
+        self.assertEqual((self.kind()["account_id"], self.kind()["named"]), (other, other))
+        # and a key that makes tokens for another account than the file's is refused
+        self.save(self.cloud.token(name="maker-e", makes="account"))
+        got = self.zones()
+        self.assertFalse(got["ok"], got)
+        self.assertIn("names another Cloudflare account than the one that this key makes tokens for", got["why"])
+        self.assertEqual(self.cloud.made, 0)
+
+    def test_a_new_key_whose_answer_shows_another_right_or_account_is_deleted(self):
+        other = f"com.cloudflare.api.account.{'c' * 32}"
+
+        def more(policies):
+            policies[0]["permission_groups"].append({"id": "f" * 31 + "2", "name": "Workers Scripts Write"})
+            return policies
+
+        def elsewhere(policies):
+            policies[0]["resources"] = {other: "*"}
+            return policies
+
+        def every(policies):
+            policies[1]["resources"] = {"com.cloudflare.api.account.zone.*": "*"}
+            return policies
+
+        def fewer(policies):
+            policies[1]["permission_groups"].pop()
+            return policies
+
+        def deny(policies):
+            policies[0]["effect"] = "deny"
+            return policies
+        changes = (more, elsewhere, every, fewer, deny, lambda policies: [], lambda policies: None)
+        for n, change in enumerate(changes, 1):
+            with self.subTest(change=change):
+                self.cloud.change = change
+                got = self.zones()
+                self.assertFalse(got["ok"], got)
+                self.assertIn("does not show the rights and the one account that the door asked for", got["why"])
+                self.assertTrue(self.cloud.named(f"work{n}")["gone"])           # deleted with the key that makes tokens
+                self.assertEqual(self.cloud.sent_by(f"work{n}"), [])            # and never used
+                self.assertIsNone(self.work())
+        failed = self.lines("key-new")
+        self.assertEqual(({e["outcome"] for e in failed}, len(failed)), ({"failed"}, 1))    # the same words: one line
+        self.cloud.change, self.cloud.no_value = None, True
+        got = self.zones()                          # an answer with an id and no value: that token is deleted too
+        self.assertFalse(got["ok"], got)
+        self.assertIn("Cloudflare made the door no work key (200): no id and value", got["why"])
+        self.assertTrue(self.cloud.named(f"work{len(changes) + 1}")["gone"])
+
+    def test_each_right_is_one_group_of_the_account_s_own_list_by_its_exact_name_and_scope(self):
+        for name, groups, words in (
+                ("none", [g for g in Cloud.GROUPS if g["name"] != "Cache Purge"],
+                 "lists no permission group 'Cache Purge' for a zone"),
+                ("twice", Cloud.GROUPS + [{"id": "9" * 32, "name": "DNS Write",
+                                           "scopes": ["com.cloudflare.api.account.zone"]}],
+                 "lists more than one permission group 'DNS Write' for a zone")):
+            with self.subTest(name=name):
+                self.cloud.groups = groups
+                got = self.zones()
+                self.assertFalse(got["ok"], got)
+                self.assertIn(words, got["why"])
+                self.assertEqual(self.cloud.made, 0)
+        self.cloud.groups, self.cloud.page = json.loads(json.dumps(Cloud.GROUPS)), 2
+        self.assertTrue(self.zones()["ok"])         # a list in pages of two: each right is asked for by its own name
+        self.assertEqual(sorted(self.cloud.named("work1")["rights"]), sorted(Cloud.RIGHTS))
+        # a list that comes whole, whatever the filter: the door itself takes the exact name in the right scope, so
+        # neither the Zone Read of a user nor DNS Write Extra is in the key
+        os.remove(self.root + door.KEYS_FILE)
+        self.cloud.page, self.cloud.filters = None, False
+        self.assertTrue(self.zones()["ok"])
+        self.assertEqual([[g["id"] for g in p["permission_groups"]] for p in self.cloud.named("work2")["policies"]],
+                         [[f"{n:032x}" for n in (6, 7)], [f"{n:032x}" for n in (1, 2, 3, 4, 5)]])
+
+    def test_a_right_whose_name_changed_keeps_the_id_that_its_name_gave_the_key_before(self):
+        self.assertTrue(self.zones()["ok"])
+        purge = next(g for g in self.cloud.groups if g["name"] == "Cache Purge")
+        purge["name"] = "Cache Purge of a Zone"     # Cloudflare's documents: a group's name is subject to change
+        self.t += 23 * 3600 + 60
+        self.assertTrue(self.zones()["ok"])
+        self.assertIn(purge["id"], [g["id"] for p in self.cloud.named("work2")["policies"]
+                                    for g in p["permission_groups"]])
+        os.remove(self.root + door.KEYS_FILE)       # a door that never had the key cannot name the right
+        got = self.zones()
+        self.assertFalse(got["ok"], got)
+        self.assertIn("lists no permission group 'Cache Purge' for a zone", got["why"])
+
+    def test_a_new_key_that_does_not_sign_in_is_deleted_and_the_one_before_serves_its_last_minutes(self):
+        self.assertTrue(self.zones()["ok"])
+        first = self.work()["id"]
+        self.t += 23 * 3600 + 60                # less than an hour is left, and the new key does not sign in
+        slept, real = [], self.cloud.http
+
+        def http(method, url, headers, data):
+            status, answer = real(method, url, headers, data)
+            if url.endswith("/tokens/verify") and self.cloud.calls[-1][2] not in ("work1", "maker"):
+                return 401, {"success": False}
+            return status, answer
+        self.door.http = http
+        with patch.object(door_providers.time, "sleep", slept.append):
+            got = self.zones()
+        self.assertTrue(got["ok"], got)                                 # the key before still has minutes left
+        self.assertEqual(slept, [door_providers.CF_KEY_PAUSE] * (door_providers.CF_KEY_TRIES - 1))
+        self.assertTrue(self.cloud.named("work2")["gone"])
+        self.assertEqual(self.work()["id"], first)
+        self.assertEqual(self.cloud.calls[-1], ("GET", "/zones?per_page=50", "work1"))
+        self.assertIn("does not sign in", self.lines("key-new")[-1]["why"])
+        self.t += 3600                          # its day ended: no key is left to go on with
+        with patch.object(door_providers.time, "sleep", slept.append):
+            got = self.zones()
+        self.assertFalse(got["ok"], got)
+        self.assertIn("does not sign in", got["why"])
+
+    def test_a_new_key_that_the_door_cannot_keep_is_deleted(self):
+        with patch.object(self.door, "keep_work_key", side_effect=OSError(28, "No space left on device")):
+            got = self.zones()
+        self.assertFalse(got["ok"], got)
+        self.assertIn("could not keep its new work key (OSError), and deleted it", got["why"])
+        self.assertTrue(self.cloud.named("work1")["gone"])
+        self.assertEqual(self.cloud.sent_by("work1"), [("GET", f"/accounts/{self.account}/tokens/verify")])
+        self.assertTrue(self.zones()["ok"])
+
+    def test_a_key_that_makes_tokens_and_was_deleted_stops_the_next_key_with_words(self):
+        self.assertTrue(self.zones()["ok"])
+        self.cloud.tokens[self.maker]["gone"] = True
+        self.t += 3600
+        self.assertTrue(self.zones()["ok"])     # the work key goes on until less than an hour is left
+        self.t += 22 * 3600 + 1
+        self.assertTrue(self.zones()["ok"])     # and then until its last minute, with one line that says why
+        self.assertIn("no longer takes the key that makes tokens (401)", self.lines("key-new")[-1]["why"])
+        self.t += 3600
+        got = self.zones()
+        self.assertFalse(got["ok"], got)
+        # the day is over: Cloudflare answers 401 to the door's questions, which says nothing about what the key
+        # is, so the answer before stands, and the making of the next work key says why it stops
+        self.assertIn("no longer takes the key that makes tokens (401): the owner makes a new one", got["why"])
+        self.t += 2 * 24 * 3600                 # and after two days with no answer, the answer before no longer stands
+        got = self.zones()
+        self.assertFalse(got["ok"], got)
+        self.assertIn("Cloudflare does not take the door's key now (401, when the door asked which accounts its key "
+                      "reaches)", got["why"])
+
+    def test_a_work_key_that_cloudflare_no_longer_takes_leaves_the_door_and_the_next_call_makes_one(self):
+        self.assertTrue(self.zones()["ok"])
+        first = self.work()["id"]
+        real = self.cloud.http
+
+        def unsettled(method, url, headers, data):      # Cloudflare takes the new token at one place and not at another
+            status, answer = real(method, url, headers, data)
+            return Cloud.INVALID if self.cloud.calls[-1][2] == "work1" else (status, answer)
+        self.door.http = unsettled
+        for _ in range(3):                          # a key of less than five minutes stays, however often it is refused
+            got = self.zones()
+            self.assertFalse(got["ok"], got)
+            self.assertIn("does not take the door's new work key yet (401): send the same call again in a minute",
+                          got["why"])
+        self.assertEqual((self.work()["id"], self.cloud.made, self.lines("key-end")), (first, 1, []))
+        self.door.http = real
+        self.assertTrue(self.zones()["ok"])
+        self.t += door_providers.CF_KEY_SETTLE + 1
+        # Cloudflare's verify does not take the key, and the door cannot delete it there now: the key may be live,
+        # so it stays, and the door makes no second key beside it
+        self.door.http = unsettled
+        self.cloud.fault = {f"/tokens/{first}": 500}
+        got = self.zones()
+        self.assertFalse(got["ok"], got)
+        self.assertIn("could not delete it there now (500): send the same call again", got["why"])
+        self.assertEqual((self.work()["id"], self.cloud.made, self.lines("key-end")), (first, 1, []))
+        self.door.http, self.cloud.fault = real, {}
+        self.cloud.named("work1")["gone"] = True    # somebody deleted the token named Founderizer door at Cloudflare
+        self.cloud.calls.clear()
+        got = self.zones()
+        self.assertFalse(got["ok"], got)
+        self.assertIn("no longer takes the door's work key (401): the door makes a new one", got["why"])
+        self.assertIsNone(self.work())
+        self.assertFalse(os.path.exists(self.door.work_path("cloudflare:one")))
+        # the door deletes it at Cloudflare too, with the key that makes tokens, so that no call leaves a token behind
+        self.assertEqual(self.cloud.sent_by("maker"), [("DELETE", f"/accounts/{self.account}/tokens/{first}")])
+        line, = self.lines("key-end")
+        self.assertIn(f"Cloudflare no longer takes the work key, so it left the door (token {first})", line["why"])
+        self.assertTrue(self.zones()["ok"])
+        self.assertEqual(self.cloud.calls[-1], ("GET", "/zones?per_page=50", "work2"))
+        self.assertEqual(self.cloud.made, 2)
+
+    def test_a_saved_key_that_makes_no_tokens_any_more_has_no_work_key(self):
+        self.assertTrue(self.zones()["ok"])
+        first = self.work()["id"]
+        self.save(self.cloud.token(name="plain", rights=["Zone Read"]))     # the owner saves a hand-made key in its place
+        self.assertTrue(self.zones()["ok"])
+        self.assertEqual(self.cloud.calls[-1], ("GET", "/zones?per_page=50", "plain"))
+        self.assertIsNone(self.work())
+        self.assertFalse(os.path.exists(self.door.work_path("cloudflare:one")))
+        line, = self.lines("key-end")
+        self.assertIn(f"the saved key makes no tokens, so the work key of the key before left the door, and "
+                      f"Cloudflare ends it within the day (token {first})", line["why"])
+        self.assertIn(("DELETE", f"/accounts/{self.account}/tokens/{first}"), self.cloud.sent_by("plain"))  # it tried
+        self.assertTrue(self.zones()["ok"])
+        self.assertEqual(len(self.lines("key-end")), 1)
+
+    def test_the_words_of_each_refusal_while_the_door_makes_a_key(self):
+        reader = self.cloud.token(name="reader", makes="account")       # Account API Tokens: Read, and no Edit
+        self.save(reader)
+        real = self.cloud.http
+
+        def read_only(method, url, headers, data):
+            if method == "POST" and url.endswith("/tokens"):
+                self.cloud.calls.append((method, url.rpartition("/v4")[2], "reader"))
+                return 403, {"success": False, "errors": [{"code": 9109, "message": "Unauthorized to access requested "
+                                                                                      "resource"}]}
+            return real(method, url, headers, data)
+        self.door.http = read_only
+        got = self.zones()
+        self.assertFalse(got["ok"], got)
+        self.assertIn("Cloudflare made the door no work key (403): Unauthorized to access requested resource", got["why"])
+        self.door.http = real
+        self.cloud.fault = {"permission_groups?name=": 403}             # the list is refused when the key is made
+        got = self.zones()
+        self.assertFalse(got["ok"], got)
+        self.assertIn("gave the door no list of the account's permission groups (403): the key that makes tokens "
+                      "needs Account API Tokens: Edit", got["why"])
+        self.cloud.fault = {}
+        self.assertEqual(self.cloud.made, 0)
+        bad = self.cloud.token(name="bad", accounts=["not-an-account-id"])
+        self.save(bad)
+        got = self.zones()
+        self.assertFalse(got["ok"], got)
+        self.assertIn("Cloudflare gave no account id that the door can use", got["why"])
+        # a hand-made key that Cloudflare refuses a step for gets Cloudflare's own words, and no word of a work key
+        self.save(self.cloud.token(name="narrow", rights=[]))
+        got = self.zones()
+        self.assertFalse(got["ok"], got)
+        self.assertIn("cloudflare answered 403", got["why"])
+        self.assertNotIn("work key", got["why"])
+
+    def test_a_call_outside_the_work_key_s_rights_says_which_rights_it_has(self):
+        got = self.call(ONE, "cloudflare:one", "change", "PUT", "/accounts/{account_id}/workers/scripts/edge",
+                        content=b"{}")
+        self.assertEqual((got["ok"], got["kind"]), (False, "own"), got)
+        self.assertIn("cloudflare answered 403", got["why"])
+        self.assertIn("holds these rights and no other: Zone Read, DNS Read, DNS Write, Cache Purge, Zone WAF Read, "
+                      "Cloudflare Tunnel Read, Cloudflare Tunnel Write", got["why"])
+        self.assertEqual(self.cloud.calls[-2:],
+                         [("PUT", f"/accounts/{self.account}/workers/scripts/edge", "work1"),
+                          ("GET", f"/accounts/{self.account}/tokens/verify", "work1")])
+        self.assertIsNotNone(self.work())           # the key is active: it stays
+
+    def test_the_work_key_ends_with_the_grant(self):
+        self.assertTrue(self.zones()["ok"])
+        first = self.work()["id"]
+        self.assertEqual(door.end_keys(self.door), [])              # the grant stands: nothing ends
+        self.assertIsNotNone(self.work())
+        data = json.loads(json.dumps(self.data))
+        data["agents"]["ops-one"]["providers"].remove("cloudflare:one")     # no agent holds the account any more
+        self.write_access(data)
+        self.cloud.calls.clear()
+        self.assertEqual(door.end_keys(self.door), ["cloudflare:one"])
+        self.assertEqual(self.cloud.calls, [("DELETE", f"/accounts/{self.account}/tokens/{first}", "maker")])
+        self.assertTrue(self.cloud.named("work1")["gone"])
+        self.assertIsNone(self.work())
+        self.assertFalse(os.path.exists(self.door.work_path("cloudflare:one")))
+        line, = self.lines("key-end")
+        self.assertEqual((line["caller"], line["target"], line["kind"], line["outcome"]),
+                         ("door", "cloudflare:one", "key", "done"))
+        self.assertIn(f"the door deleted its work key (token {first})", line["why"])
+        self.assertEqual(door.end_keys(self.door), [])
+
+    def test_a_key_of_an_account_that_left_the_file_ends_and_one_that_cannot_be_deleted_leaves_the_door(self):
+        self.assertTrue(self.zones()["ok"])
+        data = json.loads(json.dumps(self.data))
+        del data["credentials"]["cloudflare:one"]
+        data["agents"]["ops-one"]["providers"].remove("cloudflare:one")
+        self.write_access(data)
+        self.cloud.fault = {"/tokens/": 503}                        # Cloudflare does not answer: asked again later
+        self.assertEqual(door.end_keys(self.door), [])
+        self.assertIsNotNone(self.work())
+        self.cloud.fault = {}
+        os.remove(os.path.join(self.root + door.SECRETS_DIR, hashlib.sha256(ref(1).encode()).hexdigest()))
+        self.cloud.calls.clear()
+        self.assertEqual(door.end_keys(self.door), ["cloudflare:one"])      # the key that made it is gone too
+        self.assertEqual(self.cloud.calls, [])
+        self.assertIsNone(self.work())
+        self.assertIn("its provider ends it within the day", self.lines("key-end")[0]["why"])
+        self.assertEqual(door.read_json(door.KEYS_FILE, {}), {"kinds": {}, "work": {}})
+
+    def test_the_end_of_a_grant_by_each_answer_of_cloudflare(self):
+        data = json.loads(json.dumps(self.data))
+        data["agents"]["ops-one"]["providers"].remove("cloudflare:one")
+        for name, before, said in (
+                ("the token is gone at Cloudflare already", lambda: self.cloud.named("work1").update(gone=True),
+                 "the door deleted its work key"),
+                ("the saved key may not delete it", lambda: self.cloud.tokens[self.maker].update(makes=None),
+                 "its provider ends it within the day"),
+                ("Cloudflare does not answer, and the key's day is over",
+                 lambda: (self.cloud.fault.update({"/tokens/": 503}), setattr(self, "t", self.t + 25 * 3600)),
+                 "its provider ends it within the day")):
+            with self.subTest(name=name):
+                self.cloud = Cloud(lambda: self.t)
+                self.door.http = self.cloud.http
+                self.write_access(self.data)
+                self.assertTrue(self.zones()["ok"])
+                before()
+                self.write_access(data)
+                self.assertEqual(door.end_keys(self.door), ["cloudflare:one"])
+                self.assertIn(said, self.lines("key-end")[-1]["why"])
+                self.assertIsNone(self.work())
+        held = door.kept_keys()
+        held["work"]["cloudflare:one"] = "not an entry"
+        door.write_json(door.KEYS_FILE, held)
+        self.assertEqual(door.end_keys(self.door), [])
+        self.assertEqual(door.kept_keys()["work"], {})
+
+    def test_one_account_that_fails_holds_no_other_account_s_key(self):
+        self.assertTrue(self.zones()["ok"])
+        held = door.kept_keys()
+        held["work"]["cloudflare:a-first"] = dict(held["work"]["cloudflare:one"], id="1" * 32)
+        door.write_json(door.KEYS_FILE, held)
+        data = json.loads(json.dumps(self.data))
+        data["agents"]["ops-one"]["providers"].remove("cloudflare:one")
+        self.write_access(data)
+        real = door_providers.cloudflare_end
+
+        def end(maker, account, token_id, ctx):
+            if token_id == "1" * 32:
+                raise RuntimeError("a fault of this test")
+            return real(maker, account, token_id, ctx)
+        with patch.object(door_providers, "cloudflare_end", end):
+            self.assertEqual(door.end_keys(self.door), ["cloudflare:one"])
+        self.assertTrue(self.cloud.named("work1")["gone"])
+
+    def test_an_access_file_that_the_door_cannot_read_ends_no_key(self):
+        self.assertTrue(self.zones()["ok"])
+        with open(self.root + door.ACCESS_FILE, "w") as f:
+            f.write("{")
+        self.assertEqual(door.end_keys(self.door), [])
+        self.assertIsNotNone(self.work())
+        self.assertEqual(self.cloud.sent_by("maker")[-1][0], "POST")
+
+    def test_a_key_file_that_is_lost_or_broken_costs_one_new_key(self):
+        self.assertTrue(self.zones()["ok"])
+        first = self.work()["id"]
+        for text in ("[]", '{"work": 7, "kinds": "x"}', "{"):
+            with self.subTest(text=text):
+                with open(self.root + door.KEYS_FILE, "w") as f:
+                    f.write(text)
+                self.assertEqual(door.end_keys(self.door), [])
+                self.assertTrue(self.zones()["ok"])             # asked again, and made again
+        self.assertEqual(self.cloud.made, 4)
+        self.assertFalse(self.cloud.named("work1").get("gone"))     # the door lost its id: its day ends it
+        self.assertEqual(self.cloud.named("work1")["id"], first)
+        for n, damage in enumerate((os.remove, lambda path: pathlib.Path(path).write_text(""),
+                                    lambda path: pathlib.Path(path).write_bytes(b"\xff\xfe\x00"),
+                                    # the value of another key than the one that the list names
+                                    lambda path: pathlib.Path(path).write_text("cfat_" + "o" * 40)), 5):
+            with self.subTest(damage=n):
+                last = self.work()["id"]
+                damage(self.door.work_path("cloudflare:one"))   # the value is gone, empty or no text; the list is not
+                self.assertTrue(self.zones()["ok"])
+                self.assertEqual(self.cloud.made, n)
+                self.assertTrue(next(t for t in self.cloud.tokens.values() if t["id"] == last)["gone"])    # by its id
+
+    def test_an_agent_s_own_call_reaches_no_token_of_the_account(self):
+        for method, path in (("POST", "/accounts/{account_id}/tokens"),
+                             ("DELETE", f"/accounts/{self.account}/tokens/{'a' * 32}"),
+                             ("PUT", f"/accounts/{self.account}/tokens/{'a' * 32}/value")):
+            with self.subTest(path=path):
+                got = self.call(ONE, "cloudflare:one", "change", method, path, content=b"{}")
+                self.assertEqual(got["kind"], "refused", got)
+                self.assertIn("an API token's answer is its secret", got["why"])
+        self.assertEqual(self.cloud.calls, [])
 
 
 class Vault(DoorCase):
