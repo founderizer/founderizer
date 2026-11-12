@@ -296,6 +296,64 @@ class MessageHeader(Base):
         self.assertTrue(hub.q1("SELECT text FROM events WHERE id=?", (event,))["text"]
                         .startswith(f"[owner via app:Claude] Answer to Needs-you N-{need} "))
 
+    def sent(self, connection, recipient, words="First words"):
+        """One message that a connected app sent, as capp_act writes it: its request id."""
+        rid = str(uuid.uuid4())
+        with hub.committed():
+            hub.owner_message_rows(rid, "message", None, words, f"connected:{connection}", recipient, None, hub.now(),
+                                   connection={"id": connection, "name": "Claude"})
+        return rid
+
+    def words(self, rid):
+        """(what the agent reads of this message, the row's connection, the row's own words)"""
+        row = hub.q1("SELECT * FROM ui_requests WHERE request_id=?", (rid,))
+        return hub.q1("SELECT text FROM events WHERE id=?", (row["event_id"],))["text"], row["connection"], row["text"]
+
+    def test_an_edit_before_anything_read_it_keeps_the_mark_of_the_connected_app(self):
+        """The owner's edit path builds the message again (owner_message_replace). The header comes from the row's
+        connection, so no client that the edit names, and no device, takes the app's mark away."""
+        connection = self.connection()
+        claimed = {"Content-Type": "application/json", "X-Fleet-Client": f"connected:{connection}"}
+        for recipient, head in (("manager", "[owner via app:Claude] "),
+                                ("worker", "[owner chat request_id={rid} via=app:Claude] ")):
+            with self.subTest(recipient=recipient):
+                rid = self.sent(connection, recipient)
+                self.assertEqual(self.words(rid), (head.format(rid=rid) + "First words", connection, "First words"))
+                # the owner's Mac names the app's client, which is the only way to this message's edit path
+                code, answer = self.request("/ui/messages", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                             "text": "Other words", "recipient": recipient,
+                                                             "replaces_request_id": rid}, headers=claimed)
+                self.assertEqual((code, answer.get("edited"), answer.get("message_request_id")), (200, True, rid),
+                                 answer)
+                self.assertEqual(self.words(rid), (head.format(rid=rid) + "Other words", connection, "Other words"))
+                # and an edit that comes with a device's mark: the connection comes before a device
+                previous = hub.q1("SELECT * FROM ui_requests WHERE request_id=?", (rid,))
+                with hub.committed():
+                    hub.owner_message_replace(previous, "Third words", str(uuid.uuid4()), hub.now(), device=True)
+                self.assertEqual(self.words(rid), (head.format(rid=rid) + "Third words", connection, "Third words"))
+        self.assertEqual(self.count("ui_requests"), 2)          # each edit changed its message where it stands
+        # the history reads the edited message with the app's mark too (history_rewrite_message)
+        hub.history_catch_up()
+        previous = hub.q1("SELECT * FROM ui_requests WHERE request_id=?", (rid,))
+        with hub.committed():
+            hub.owner_message_replace(previous, "Last words", str(uuid.uuid4()), hub.now())
+        row = hub.q1("SELECT rowid FROM ui_requests WHERE request_id=?", (rid,))["rowid"]
+        self.assertEqual([r["text"] for r in hub.q("SELECT text FROM history WHERE src='owner_message' AND src_id=?",
+                                                    (row,))], ["The owner (through the app Claude): Last words"])
+        # a row whose connection the hub cannot read still says that an app sent it, and never reads as his own Mac
+        hub.q("DELETE FROM capp_connections WHERE id=?", (connection,))
+        previous = hub.q1("SELECT * FROM ui_requests WHERE request_id=?", (rid,))
+        with hub.committed():
+            hub.owner_message_replace(previous, "No row", str(uuid.uuid4()), hub.now())
+        self.assertEqual(self.words(rid)[0], f"[owner chat request_id={rid} via=app:App] No row")
+        # the owner's own message has no mark before or after an edit
+        own = str(uuid.uuid4())
+        self.assertEqual(self.request("/ui/messages", {"request_id": own, "db": "test-generation",
+                                                       "text": "My words"})[0], 200)
+        self.assertEqual(self.request("/ui/messages", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                       "text": "My other words", "replaces_request_id": own})[0], 200)
+        self.assertEqual(self.words(own), ("[owner] My other words", None, "My other words"))
+
 
 # ---------------------------------------------------------------- the socket, the endpoints and the tools (commit 4)
 
@@ -935,6 +993,65 @@ class Tokens(Socket):
         self.assertEqual(self.exchange(client_id, code)[1]["error"], "invalid_grant")
         self.assertEqual(self.count("capp_connections"), 0)         # no failed exchange made a connection
 
+    def approved(self, client_id):
+        """One more approval for a client that is registered: its authorization code, not exchanged yet."""
+        self.owner_code()
+        status, head, _ = self.approve(self.handle(self.authorize(client_id)[2]), self.last_code)
+        self.assertEqual(status, 303)
+        return self.code_of(head)
+
+    def test_a_dynamic_client_whose_row_went_after_the_approval_cannot_exchange_its_code(self):
+        """The two ways a dynamic client's row goes between the approval and the exchange (the confirm review of 12
+        November 2026): with the revoke of its last connection, and as the oldest of more than 50 idle clients."""
+        # 1. its only connection is revoked while a second approval waits for its exchange
+        client_id, code = self.grant()
+        self.assertEqual(self.exchange(client_id, code)[0], 200)
+        first = hub.q1("SELECT id FROM capp_connections")["id"]
+        waiting = self.approved(client_id)
+        self.assertEqual(self.command(f"/ui/connect/{first}/revoke")[0], 200)
+        self.assertEqual(self.count("capp_clients"), 0)
+        status, answer = self.exchange(client_id, waiting)
+        self.assertEqual((status, answer["error"]), (400, "invalid_grant"), answer)
+        self.assertEqual([r["id"] for r in hub.q("SELECT id FROM capp_connections WHERE revoked IS NULL")], [])
+        self.assertEqual((self.count("capp_connections"), self.count("capp_tokens")), (1, 0))
+        self.assertIsNotNone(hub.q1("SELECT used FROM capp_grants")["used"])        # the code is used: no second try
+        self.assertEqual(self.exchange(client_id, waiting)[1]["error"], "invalid_grant")
+        self.assertEqual(self.request("/ui/connect?db=test-generation")[1]["connections"], [])
+        # 2. the cap of idle clients takes the row of the oldest, which has an approval that waits
+        hub.q("DELETE FROM capp_grants")
+        client_id, code = self.grant()
+        for _ in range(oauth_server.CLIENTS_MAX):
+            self.register()
+        self.assertIsNone(hub.q1("SELECT 1 FROM capp_clients WHERE client_id=?", (client_id,)))
+        status, answer = self.exchange(client_id, code)
+        self.assertEqual((status, answer["error"]), (400, "invalid_grant"), answer)
+        self.assertEqual((self.count("capp_connections"), self.count("capp_tokens")), (1, 0))
+        # a client of a metadata document has no row before its first connection, and its exchange is not refused
+        self.documents[CLAUDE_CIMD] = {"client_id": CLAUDE_CIMD, "client_name": "Claude", "redirect_uris": [CLAUDE_CB],
+                                       "token_endpoint_auth_method": "none"}
+        self.assertEqual(self.exchange(CLAUDE_CIMD, self.approved(CLAUDE_CIMD))[0], 200)
+
+    def test_a_restore_takes_the_key_of_the_page_handle_away(self):
+        """A backup holds the key that signs a sign-in page's handle (kv capp_handle_key), so a restore starts a new
+        one: a page that the copy's key signed is refused, also with the owner's right code."""
+        client_id = self.register()
+        old_page = self.handle(self.authorize(client_id)[2])
+        old_key = hub.kv_get("capp_handle_key")
+        self.assertTrue(old_key)
+        hub.capp_restored()
+        self.assertIsNone(hub.kv_get("capp_handle_key"))
+        right = self.owner_code()
+        status, head, page = self.approve(old_page, right)
+        self.assertEqual(status, 400)
+        self.assertNotIn("Location", head)
+        self.assertIn(hub.CAPP_PAGE_ERRORS["client"], page.decode())
+        self.assertIsNone(hub.q1("SELECT used FROM capp_codes")["used"])      # the code stays the owner's
+        new_key = hub.kv_get("capp_handle_key")
+        self.assertTrue(new_key and new_key != old_key and len(new_key) == 64)
+        status, head, _ = self.approve(self.handle(self.authorize(client_id)[2]), right)     # a page of the new key
+        self.assertEqual(status, 303)
+        self.assertEqual(self.exchange(client_id, self.code_of(head))[0], 200)
+
     def test_no_client_authentication_of_any_kind(self):
         client_id, code = self.grant()
         for extra, head in (({"client_secret": "x"}, None), ({"client_assertion": "x.y.z"}, None),
@@ -1230,6 +1347,30 @@ class Tools(Socket):
                          ["discuss_need", "steer_task", "control_task"])
         self.assertEqual({r["client"] for r in hub.q("SELECT client FROM ui_controls WHERE route NOT LIKE 'connect/%'")},
                          {f"connected:{connection}"})
+
+    def test_a_steer_of_a_connected_app_says_so_in_the_history_and_the_owners_own_does_not(self):
+        _, connection, act, _ = self.signed_in("act")
+        task = hub.ins("INSERT INTO tasks(title,details,done_when,owner,requester,state,created,needs,attempt) "
+                       "VALUES('Work','d','done','manager','manager','working',?,'none',1)", (hub.now(),))
+        status, _, answer = self.call(act, "steer_task", task=task, text="Use plain words.")
+        self.assertFalse(answer["result"]["isError"], answer)
+        code, own = self.command(f"/ui/tasks/{task}/steer", text="Keep it short.")       # the owner's Mac
+        self.assertEqual(code, 200, own)
+        self.assertEqual([(r["client"], r["connection"]) for r in hub.q("SELECT * FROM steers ORDER BY id")],
+                         [(f"connected:{connection}", connection), ("deterministic-test", None)])
+        self.assertNotIn("connection", own["steer"])                # the apps read no new field of a steer
+        hub.history_catch_up()
+        rows = hub.q("SELECT * FROM history WHERE src='steer' ORDER BY src_id")
+        self.assertEqual([r["text"] for r in rows],
+                         [f"The owner (through the app Claude), on T-{task}: Use plain words.",
+                          f"The owner, on T-{task}: Keep it short."])
+        # the search card shows the record's own words, with neither head (HISTORY_HEADS)
+        self.assertEqual([hub.history_own_words(r) for r in rows], ["Use plain words.", "Keep it short."])
+        # a database of a release before this column gets it at the start (migrate), and its steers read as his own
+        hub.q("ALTER TABLE steers DROP COLUMN connection")
+        self.assertNotIn("connection", [c["name"] for c in hub.q("PRAGMA table_info(steers)")])
+        hub.migrate()
+        self.assertEqual([r["connection"] for r in hub.q("SELECT connection FROM steers ORDER BY id")], [None, None])
 
     def test_a_registered_login_in_an_act_text_gets_422_as_on_the_phone(self):
         _, _, act, _ = self.signed_in("act")

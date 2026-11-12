@@ -260,7 +260,8 @@ CREATE TABLE IF NOT EXISTS session_tokens(agent TEXT NOT NULL, session_id TEXT N
 CREATE TABLE IF NOT EXISTS model_changes(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, by TEXT NOT NULL, "from" TEXT,
   "to" TEXT, why TEXT, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS steers(id INTEGER PRIMARY KEY, task INTEGER NOT NULL, attempt INTEGER NOT NULL,
-  text TEXT NOT NULL, event_id INTEGER NOT NULL, request_id TEXT NOT NULL, client TEXT NOT NULL, created REAL NOT NULL);
+  text TEXT NOT NULL, event_id INTEGER NOT NULL, request_id TEXT NOT NULL, client TEXT NOT NULL, created REAL NOT NULL,
+  connection INTEGER);
 CREATE TABLE IF NOT EXISTS triggers(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, state TEXT NOT NULL, paused_by TEXT,
   paused_reason TEXT, revision INTEGER NOT NULL, schedule TEXT NOT NULL, check_spec TEXT, task TEXT NOT NULL,
   late_minutes INTEGER NOT NULL, max_tasks_per_day INTEGER NOT NULL, anchor REAL NOT NULL, next_due REAL,
@@ -3212,6 +3213,8 @@ def migrate():
         "door_record": {"made": "TEXT", "call": "TEXT"},     # new-projects plan N3: what the door's call made, a repository by name
         "triggers": {"failures": "INTEGER NOT NULL DEFAULT 0", "created_by": "TEXT NOT NULL DEFAULT 'owner'",
                      "responsibility": "INTEGER", "watch": "TEXT"},         # owner API 1.13: a duty's watch
+        # the connected app that sent the steer (capp_connections.id), as ui_requests.connection: the history's mark
+        "steers": {"connection": "INTEGER"},
         # the task that open_case opened the case in: a task that opened two carries neither (t_open_case)
         "duty_cases": {"opened_in": "INTEGER"},
         # the handover design of 12 November 2026: the reporter's own short words for the report's reader
@@ -11679,11 +11682,17 @@ def owner_message_replace(previous, value, request_id, t0, device=False):
     ui_requests row and its event keep their id and their time, which is why the bubble changes where it stands;
     their text becomes the new words with nothing appended, and the words they replace go into the log, so the
     record still holds what he first said. The files it carries stay with it: an edit brings none. device: as
-    owner_message_text's, for the request of the edit (an edit comes only from the client that sent the message)."""
+    owner_message_text's, for the request of the edit (an edit comes only from the client that sent the message).
+    A message that a connected app sent (ui_requests.connection) keeps the mark of that app, whatever client the
+    edit names: the row says who sent it, and the header is built from the row."""
     in_transaction("owner_message_replace")
     files = DB.execute("SELECT * FROM attachments WHERE message=? ORDER BY id", (previous["request_id"],)).fetchall()
     origin = json.loads(previous["origin"]) if previous["origin"] else None
-    text = owner_message_text(previous["request_id"], value, previous["recipient"], origin, None, files, device)
+    via = None
+    if previous["connection"] is not None:
+        app = DB.execute("SELECT name FROM capp_connections WHERE id=?", (previous["connection"],)).fetchone()
+        via = app["name"] if app else "App"     # a connection's row stays as the record; "App" as shown_name's last name
+    text = owner_message_text(previous["request_id"], value, previous["recipient"], origin, None, files, device, via)
     edits = json.loads(previous["edits"] or "[]") + [{"request_id": request_id, "text": value, "at": t0}]
     DB.execute("UPDATE events SET text=? WHERE id=?", (text, previous["event_id"]))
     DB.execute("UPDATE ui_requests SET text=?,edits=? WHERE request_id=?",
@@ -21680,8 +21689,11 @@ def history_need(n):
 
 
 def history_steer(s):
-    """The owner's guidance on a task, in the history of the agent that does it: his own words."""
-    return [history_rec(a, "owner_chat", tref(s["task"]), f"The owner, on {tref(s['task'])}: {s['text'] or ''}",
+    """The owner's guidance on a task, in the history of the agent that does it: his own words. One that a connected
+    app sent says so, as history_owner_message does: "The owner (through the app Claude), on T-12: ..."
+    (HISTORY_HEADS takes that head too)."""
+    who = f"The owner (through the app {s['cc_name']})" if s["cc_name"] else "The owner"
+    return [history_rec(a, "owner_chat", tref(s["task"]), f"{who}, on {tref(s['task'])}: {s['text'] or ''}",
                         s["created"], person="owner", task=s["task"], owner_chat=True)
             for a in history_who(s["t_owner"])]
 
@@ -21918,8 +21930,9 @@ def history_streams():
         HistoryStream("owner_report", "owner_reports", "SELECT r.*, r.id AS _id FROM owner_reports r", "r.id",
                       history_owner_report),
         HistoryStream("need", "needs", "SELECT n.*, n.id AS _id FROM needs n", "n.id", history_need),
-        HistoryStream("steer", "steers", "SELECT s.*, s.id AS _id, t.owner AS t_owner FROM steers s "
-                      "LEFT JOIN tasks t ON t.id=s.task", "s.id", history_steer),
+        HistoryStream("steer", "steers", "SELECT s.*, s.id AS _id, t.owner AS t_owner, cc.name AS cc_name "
+                      "FROM steers s LEFT JOIN tasks t ON t.id=s.task "
+                      "LEFT JOIN capp_connections cc ON cc.id=s.connection", "s.id", history_steer),
         HistoryStream("message", "agent_messages", "SELECT m.*, m.id AS _id FROM agent_messages m", "m.id",
                       history_message),
         HistoryStream("standing", "standing", "SELECT s.*, s.id AS _id FROM standing s", "s.id", history_standing),
@@ -22650,7 +22663,7 @@ HISTORY_HEADS = {
     "owner_message": re.compile(r"The owner(?: \(through the app [^\n()]*\))?(?: answered N-\d+(?: \([^\n]*?\))?)?: "),
     "owner_report": re.compile(r"\S+ to the owner(?: \([^\n]*?\))?: "),
     "need": re.compile(r"N-\d+ "),
-    "steer": re.compile(r"The owner, on T-\d+: "),
+    "steer": re.compile(r"The owner(?: \(through the app [^\n()]*\))?, on T-\d+: "),
     "message": re.compile(r"\S+ to \S+(?: \(answering AM-\d+\))?: "),
     "task": re.compile(r"T-\d+ "),
     "result": re.compile(r"T-\d+ \S+: "),
@@ -40409,11 +40422,13 @@ def capp_restored():
     """At the start of a hub that took a restore (main, after take_restore): the copy's token rows can be of a
     connection that the owner revoked after the copy was made, so every connection ends with ended_by 'restore'. Its
     tokens and grants go, every one of the copy, also a row of a connection that had ended; the app connects again
-    with a new code. Returns how many ended."""
+    with a new code. The key of the sign-in page's handle goes too (capp_handle_key), because the copy held it: the
+    next page makes a new one, and a handle that the copy's key signed is refused. Returns how many ended."""
     with transaction():
         ended = capp_all_off_rows(now(), "restore")
         DB.execute("DELETE FROM capp_tokens")
         DB.execute("DELETE FROM capp_grants")
+        DB.execute("DELETE FROM kv WHERE k='capp_handle_key'")
     if ended:
         log("hub", f"{ended} connected app connection(s) ended, because the records came from a copy")
     return ended
@@ -40637,10 +40652,11 @@ def task_steer_read(task_id, data):
             "text": goal_text(data.get("text"), "text", 4000)}
 
 
-def task_steer_act(task_id, body, client, via=None):
+def task_steer_act(task_id, body, client, via=None, connection=None):
     """POST /ui/tasks/<id>/steer, under LOCK (command_run): an inbox message to the task's session, with a copy to its
     requester. client: the X-Fleet-Client of the command; via: the shown name of the connected app that sent it
-    (capp_act), which both messages say: [owner via app:<name>] and "through the app <name>"."""
+    (capp_act), which both messages say: [owner via app:<name>] and "through the app <name>"; connection: that app's
+    connection id, which the steer's row keeps (steers.connection), so that the history says it too (history_steer)."""
     t = q1("SELECT * FROM tasks WHERE id=?", (task_id,))
     if not t:
         raise Refusal(404, "no such task")
@@ -40657,8 +40673,9 @@ def task_steer_act(task_id, body, client, via=None):
                extra={"steer": True, "attempt": t["attempt"]})
     emit(t["requester"], "say", f"[hub] The owner steered {tref(task_id)} ({t['title']}, owner {t['owner']})"
          f"{f' through the app {via}' if via else ''}: {text}", task=task_id)
-    sid = ins("INSERT INTO steers(task,attempt,text,event_id,request_id,client,created) VALUES(?,?,?,?,?,?,?)",
-              (task_id, t["attempt"], text, eid, body["request_id"], client, now()))
+    sid = ins("INSERT INTO steers(task,attempt,text,event_id,request_id,client,created,connection) "
+              "VALUES(?,?,?,?,?,?,?,?)", (task_id, t["attempt"], text, eid, body["request_id"], client, now(),
+                                          connection))
     log("owner", f"steered {tref(task_id)}")
     return {"steer": steer_view(q1("SELECT s.*, e.read_at FROM steers s JOIN events e ON e.id=s.event_id "
                                    "WHERE s.id=?", (sid,)))}
@@ -41083,7 +41100,8 @@ def capp_act(connection, tool, args):
         task_id = capp_task_arg(args.get("task"))
         body = task_steer_read(task_id, {"request_id": request_id, "text": capp_text_arg(args, "text", 4000)})
         return request_id, command_run(f"tasks/{task_id}/steer", request_id, client, db, body,
-                                       lambda b: task_steer_act(task_id, b, client, via=who["name"]))
+                                       lambda b: task_steer_act(task_id, b, client, via=who["name"],
+                                                                connection=who["id"]))
     raise ValueError("no such tool")
 
 
@@ -41399,7 +41417,8 @@ def capp_token(form, name):
     """POST /token: (status, JSON body). No client authentication: a client_secret, a client assertion or an
     Authorization header is refused with invalid_client. The checks of each grant in the specification's order; a
     failed check after the code was found still uses the code, so a stolen code with a wrong verifier cannot be
-    tried again.
+    tried again. A dynamic client whose row went between the approval and the exchange gets invalid_grant, so no
+    connection is made for a client that the hub no longer knows.
 
     A refresh token rotates. A refresh token that was replaced is a race of two refreshes only while its live
     successor pair was not used: then that pair is dropped (not deleted, so that its use later is seen) and a new pair
@@ -41424,6 +41443,11 @@ def capp_token(form, name):
                     refused["error"] = ("invalid_grant", "the code is not valid")
                 elif form.get("client_id") != row["client"]:
                     refused["error"] = ("invalid_grant", "the code is for another client")
+                elif oauth_server.client_kind(row["client"]) == "dcr" and not DB.execute(
+                        "SELECT 1 FROM capp_clients WHERE client_id=? AND kind='dcr'", (row["client"],)).fetchone():
+                    # the row went after the approval: with the client's last connection (capp_revoke_rows), or as
+                    # the oldest of more than 50 idle ones (capp_register). As capp_authorize_post refuses it.
+                    refused["error"] = ("invalid_grant", "the client is not registered any more")
                 elif form.get("redirect_uri") != row["redirect_uri"]:
                     refused["error"] = ("invalid_grant", "redirect_uri is not the one of the code")
                 elif not oauth_server.verifier_matches(form.get("code_verifier"), row["code_challenge"]):
