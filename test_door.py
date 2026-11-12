@@ -118,7 +118,7 @@ def load_tests(loader, _tests, _pattern):
                                                     HostPath, AppSettingsPath, ScriptPath, HostUpdates, KeyCardAccount,
                                                     WorkKeys,
                                                     Workflows, RunnerNew, Probe, CallerGone, Rendered, RenderPath,
-                                                    RenderBoxUnit, RenderBoxLive)
+                                                    GeneratedFiles, GeneratedPath, RenderBoxUnit, RenderBoxLive)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -2188,9 +2188,14 @@ class PruneParts(unittest.TestCase):
                           (listing_line(["ConfigMap/a"]), "not GROUP:KIND:NAMESPACE/NAME"),
                           (listing_line([":ConfigMap:shop/a", ":ConfigMap:shop/a"]), "names one twice"),
                           (listing_line([]) * 2, "2 lines"), ("no line\n", "0 lines"),
-                          ("DOOR-PRUNE-LIST !!!\n", "not base64 JSON")):
+                          ("DOOR-PRUNE-LIST bm90IGpzb24=\n", "not base64 JSON"), ("DOOR-PRUNE-LIST !!!\n", "0 lines")):
             with self.subTest(why=why):
                 self.assertIn(why, door_targets.listing(text, "shop"))
+        # GitHub's log shows the step's script too: a script line that names the mark is no listing line
+        echoed = ('2026-11-12T19:21:50.3320684Z \x1b[36;1mecho "DOOR-PRUNE-LIST $(printf \'{"app":"%s"}\' "${APP}" | '
+                  'base64 -w0)"\x1b[0m\n+ echo \'DOOR-PRUNE-LIST e30=\'\n')
+        self.assertEqual(door_targets.listing(echoed + listing_line([":ConfigMap:shop/a"]) + echoed, "shop"),
+                         {"prune": [":ConfigMap:shop/a"], "lb": []})
 
     def decide(self, keys, lb=(), removed=(), made=()):
         found = {"prune": sorted(keys), "lb": sorted(lb)}
@@ -5323,6 +5328,42 @@ CLUSTER = {
     "README.md": "# The cluster\n",
 }
 GITOPS = "gitops:one-org/cluster"
+# A repository that generates a file (door_render.generated): its declaration, a generator that this machine's Python
+# runs in the place of the pinned Ruby, a rule that the generator reads, and the file as the generator writes it at HEAD
+GEN_PATH = "monitoring/inventory/hosts.yaml"
+GEN_SCRIPT = """import glob, hashlib, os, sys
+prefix = open("tools/rules.txt").read().strip()
+rows = []
+for path in sorted(glob.glob("apps/core/app/*.yaml")):
+    for line in open(path):
+        if line.strip().startswith("host:"):
+            host = line.split(":", 1)[1].strip()
+            if host == "fail":
+                sys.exit("no inventory")
+            rows.append(f"    {prefix} {host} {hashlib.sha256(host.encode()).hexdigest()[:12]}")
+os.makedirs("monitoring/inventory", exist_ok=True)
+with open("monitoring/inventory/hosts.yaml", "w") as f:
+    f.write("apiVersion: v1\\nkind: ConfigMap\\nmetadata:\\n  name: inventory\\ndata:\\n  hosts: |\\n"
+            + "".join(row + "\\n" for row in rows))
+"""
+
+
+def inventory(*hosts, prefix="public"):
+    "The file of GEN_PATH as GEN_SCRIPT writes it for these hosts."
+    return "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: inventory\ndata:\n  hosts: |\n" + "".join(
+        f"    {prefix} {h} {hashlib.sha256(h.encode()).hexdigest()[:12]}\n" for h in hosts)
+
+
+def host_map(name, host):
+    return f"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {name}\ndata:\n  host: {host}\n"
+
+
+GEN_TREE = dict(CLUSTER, **{
+    ".founderizer/door.json": json.dumps({"generated": [
+        {"path": GEN_PATH, "run": ["ruby", "tools/gen.py"], "rules": ["tools/rules.txt"]}]}),
+    "tools/gen.py": GEN_SCRIPT, "tools/rules.txt": "public\n",
+    "apps/core/app/a.yaml": host_map("a", "a.example.com"), "apps/core/app/b.yaml": host_map("b", "b.example.com"),
+    GEN_PATH: inventory("a.example.com", "b.example.com")})
 
 
 class RenderCase(unittest.TestCase):
@@ -5362,7 +5403,8 @@ class RenderCase(unittest.TestCase):
             for p, t in files.items()]}).encode()
         tree = CLUSTER if tree is None else tree
         lookups = {"render": self.lookup(tree, links)} if render else \
-            {"base_file": lambda p: tree[p].encode() if isinstance(tree.get(p), str) else tree.get(p)}
+            {"base_file": lambda p: tree[p].encode() if isinstance(tree.get(p), str) else tree.get(p),
+             "declared": lambda: door_targets.DOOR_DECLARATION in tree}
         return door_targets.decide(ACCESS, "ops-one", GITOPS, "push", [], content, lookups)
 
 
@@ -5851,8 +5893,9 @@ class Rendered(RenderCase):
         self.assertIn("after this commit a link of the repository ends outside it", d.why)
 
 
-class RenderPath(RenderCase, DoorCase):
-    """The door's own path of a rendered commit: the tarball of one commit, the box, and the commit on that parent."""
+class RenderDoor(RenderCase, DoorCase):
+    """The door with its render box: GitHub's answers, the tarball of the tree at HEAD (tree), and the box's helper."""
+    tree = CLUSTER
 
     def setUp(self):
         RenderCase.setUp(self)
@@ -5865,7 +5908,7 @@ class RenderPath(RenderCase, DoorCase):
 
         def raw(method, url, headers, limit, timeout=120):
             self.asked_raw.append((method, url, headers.get("Authorization")))
-            return 200, tarball(CLUSTER)
+            return 200, tarball(self.tree)
         self.door.raw = raw
 
         def box(header, blobs):         # the helper as the socket would start it, without the box's check
@@ -5874,6 +5917,10 @@ class RenderPath(RenderCase, DoorCase):
                               check=False)
             return json.loads(out.getvalue())
         self.door.box = box
+
+
+class RenderPath(RenderDoor):
+    """The door's own path of a rendered commit: the tarball of one commit, the box, and the commit on that parent."""
 
     def test_a_template_change_is_committed_on_the_commit_that_was_rendered(self):
         path = "monitoring/stack/templates/deployment.yaml"
@@ -5972,6 +6019,202 @@ class RenderPath(RenderCase, DoorCase):
             self.assertIn("skip", door.box_call({"v": 1, "op": "probe"}, []))   # no socket: no box
 
 
+class GeneratedFiles(RenderCase):
+    """A file that the repository generates, on the decision's side (DevOps plan X3, way A; the owner, 12 November 2026,
+    "Me, one card each time (Recommended)"): the box writes it again with the generator at HEAD, an entry that leaves
+    it goes with the commit, any other change of it is the owner's card, and a commit through the door never changes the
+    declaration, the file or a rule of it."""
+
+    def setUp(self):
+        super().setUp()
+        self.tools = dict(self.tools, ruby=[sys.executable, "-I"])     # Python in the place of the pinned Ruby
+
+    def push_gen(self, files, tree=GEN_TREE, render=True):
+        return self.push(files, tree=tree, render=render)
+
+    def test_an_entry_that_leaves_goes_with_the_commit_which_keeps_its_kind(self):
+        d = self.push_gen({"apps/core/app/b.yaml": None})
+        self.assertEqual(d.kind, "own", d)
+        self.assertIn("apps/core/app/b.yaml is deleted", d.why)
+        self.assertIn(f"with {GEN_PATH} written again, from which entries leave", d.why)
+        written = inventory("a.example.com").encode()
+        self.assertEqual(d.plan["files"][-1], (GEN_PATH, written, "100644"))
+        self.assertEqual([p for p, _d, _m in d.plan["files"]], ["apps/core/app/b.yaml", GEN_PATH])
+        self.assertEqual(d.hash_content, GEN_PATH.encode() + b"\0" + written + b"\0")
+        self.assertTrue(d.plan["message"].startswith("change\n\nThe door wrote " + GEN_PATH + " again"), d.plan)
+        # the objects that the commit removed are its own files', not the written file's
+        self.assertEqual(d.plan["objects"], {"removed": [":ConfigMap:/b"], "added": []})
+
+    def test_a_new_entry_is_his_card_with_the_exact_change(self):
+        d = self.push_gen({"apps/core/app/c.yaml": host_map("c", "c.example.com")})
+        self.assertEqual(d.kind, "full", d)
+        self.assertIn('the owner\'s (12 November 2026: "Me, one card each time (Recommended)")', d.why)
+        row = inventory("c.example.com").splitlines()[-1].strip()
+        self.assertIn(f"{GEN_PATH} gains 1 lines and loses 0; it gains: {row}", d.why)
+        written = inventory("a.example.com", "b.example.com", "c.example.com").encode()
+        self.assertEqual(d.plan["files"][-1], (GEN_PATH, written, "100644"))
+        self.assertEqual(d.hash_content, GEN_PATH.encode() + b"\0" + written + b"\0")
+        self.assertEqual(d.window, "deploy")
+        # an entry that changes, as one that narrows: its digest line changes, so it is a change too
+        d = self.push_gen({"apps/core/app/b.yaml": host_map("b", "b2.example.com")})
+        self.assertEqual(d.kind, "full", d)
+        self.assertIn(f"{GEN_PATH} gains 1 lines and loses 1", d.why)
+        # the same lines in another order: no line leaves and none comes, but the file says something else
+        d = self.push_gen({"apps/core/app/a.yaml": None, "apps/core/app/z.yaml": host_map("a", "a.example.com")})
+        self.assertEqual(d.kind, "full", d)
+        self.assertIn(f"{GEN_PATH} loses 0 lines, and lines of it move", d.why)
+        # many new lines: the words show GEN_SHOWN of them, and say how many more
+        many = {f"apps/core/app/n{i:02}.yaml": host_map(f"n{i:02}", f"n{i:02}.example.com") for i in range(45)}
+        d = self.push_gen(many)
+        self.assertEqual(d.kind, "full", d)
+        self.assertIn("gains 45 lines and loses 0", d.why)
+        self.assertTrue(d.why.endswith("| and 5 lines more"), d.why[-80:])
+
+    def test_a_commit_that_leaves_the_file_as_it_is_adds_nothing(self):
+        d = self.push_gen({"apps/core/app/web.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web\n"
+                                                      "data:\n  mode: fast\n"})
+        self.assertEqual(d.kind, "own", d)
+        self.assertEqual([p for p, _d, _m in d.plan["files"]], ["apps/core/app/web.yaml"])
+        self.assertIsNone(d.hash_content)
+        self.assertEqual(d.plan["message"], "change")
+        self.assertEqual(self.last["generated"][0]["status"], "same")
+
+    def test_a_file_that_the_door_cannot_write_refuses_the_commit(self):
+        d = self.push_gen({"apps/core/app/c.yaml": host_map("c", "fail")})
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn(f"the door could not write {GEN_PATH} again (ruby failed", d.why)
+        self.assertIn("a commit without it fails the repository's checks", d.why)
+        # a door whose update has not brought the pinned Ruby yet
+        self.tools = {k: v for k, v in self.tools.items() if k != "ruby"}
+        with patch.object(door_render, "tree_tool_path", lambda name: "/nonexistent/ruby"):
+            d = self.push_gen({"apps/core/app/b.yaml": None})
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("the pinned ruby is not on the door yet", d.why)
+        self.tools = dict(self.tools, ruby=[sys.executable, "-I"])
+        # a declaration that the door cannot follow, at HEAD
+        for text, words in (("{", "is not {generated: [1 to 4 files]}"),
+                            (json.dumps({"generated": [{"path": GEN_PATH, "run": ["sh", "tools/gen.py"]}]}),
+                             "is not {path, run: [ruby, paths], rules: [paths]}"),
+                            (json.dumps({"generated": [{"path": "../x", "run": ["ruby", "tools/gen.py"]}]}),
+                             "is not {path, run: [ruby, paths], rules: [paths]}")):
+            d = self.push_gen({"apps/core/app/b.yaml": None}, tree=dict(GEN_TREE, **{".founderizer/door.json": text}))
+            self.assertEqual(d.kind, "refused", d)
+            self.assertIn(words, d.why)
+
+    def test_the_declaration_the_file_and_its_rules_are_no_door_commit(self):
+        for path in (".founderizer/door.json", ".Founderizer/Door.json"):
+            d = self.push_gen({path: "{}\n"})
+            self.assertEqual(d.kind, "refused", d)
+            self.assertIn("names the files that the door writes itself", d.why)
+        for path in (GEN_PATH, "tools/gen.py", "tools/rules.txt"):
+            d = self.push_gen({path: "changed\n", "apps/core/app/b.yaml": None})
+            self.assertEqual(d.kind, "refused", (path, d))
+            self.assertIn(f"{path} is named in .founderizer/door.json: the door writes {GEN_PATH} itself", d.why)
+
+    def test_the_box_runs_the_generator_as_it_is_at_head(self):
+        "The box itself, asked for a commit that door_targets refuses: the generator and its rules come from HEAD."
+        files = [("tools/rules.txt", b"private\n", "100644"),
+                 ("tools/gen.py", b"open('monitoring/inventory/hosts.yaml', 'w').write('nothing')\n", "100644"),
+                 ("apps/core/app/b.yaml", None, "100644")]
+        scratch = tempfile.mkdtemp(prefix="door-render-test-")
+        self.addCleanup(shutil.rmtree, scratch, True)
+        header = {"v": 1, "op": "render", "exposure": ACCESS["exposure"], "files": [
+            {"path": p, "size": None if d is None else len(d), "mode": m} for p, d, m in files]}
+        report = door_render.answer(header, tarball(GEN_TREE), [d for _p, d, _m in files], self.tools, scratch)
+        self.assertTrue(report["ok"], report)
+        [g] = report["generated"]
+        self.assertEqual((g["path"], g["status"], g["rules"]), (GEN_PATH, "removes", ["tools/rules.txt", "tools/gen.py"]))
+        self.assertEqual(base64.b64decode(g["content"]).decode(), inventory("a.example.com"))
+        # a repository with no declaration: nothing is generated
+        report = door_render.answer(dict(header, files=[]), tarball(CLUSTER), [], self.tools, scratch + "/2")
+        self.assertEqual(report["generated"], [])
+
+    def test_a_door_with_no_render_refuses_a_repository_that_generates_files(self):
+        d = self.push_gen({"apps/core/app/b.yaml": None}, render=False)
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("the door has no render of this commit that writes them again", d.why)
+        d = self.push({"apps/core/app/web.yaml": None}, render=False)
+        self.assertNotIn("writes them again", d.why)
+
+
+class GeneratedPath(RenderDoor):
+    """A file that the repository generates, on the door's whole path: the owner's signed yes to the exact call, which covers
+    the written file, lets the commit through once, with the file in it; a commit from which an entry leaves is made
+    at once, with the file."""
+    tree = GEN_TREE
+
+    def setUp(self):
+        super().setUp()
+        self.tools = dict(self.tools, ruby=[sys.executable, "-I"])
+        from test_vault_central import OWNER_C, owner_sign
+        self.sign = owner_sign
+        data = json.loads(json.dumps(ACCESS))
+        data.update(owner_keys=[OWNER_C], fleet="fleet-1")
+        self.write_access(data)
+        github, self.yeses = self.door.http, []
+        self.door.http = lambda method, url, headers, body: (200, {"approvals": self.yeses, "devices": []}) \
+            if url.endswith("/door/approvals") else github(method, url, headers, body)
+
+    def yes(self, call, need=9):
+        said = vault.canonical({"v": 1, "kind": "door-call", "fleet": "fleet-1", "need": need, "call": call,
+                                "at": round(time.time())})
+        self.yeses.append({"need": need, "statement": said, "signature": self.sign(said)})
+        return door.fetch_approvals(self.door)
+
+    def made(self):
+        "The files and the message of the commit that the door made last."
+        api = "https://api.github.com/repos/one-org/cluster/git"
+        blobs = [base64.b64decode(b["content"]) for m, u, b in self.calls if (m, u) == ("POST", f"{api}/blobs")]
+        tree = [b for m, u, b in self.calls if (m, u) == ("POST", f"{api}/trees")][-1]
+        commit = [b for m, u, b in self.calls if (m, u) == ("POST", f"{api}/commits")][-1]
+        return blobs, [e["path"] for e in tree["tree"]], commit["message"]
+
+    def test_his_yes_lets_the_commit_through_once_with_the_written_file(self):
+        content = change(("apps/core/app/c.yaml", host_map("c", "c.example.com")))
+        got = self.call(ONE, GITOPS, "push", content=content)
+        self.assertEqual((got["ok"], got["kind"], got["route"]), (False, "refused", "yes"), got)
+        written = inventory("a.example.com", "b.example.com", "c.example.com").encode()
+        sha = door.call_hash(GITOPS, "push", [], content + GEN_PATH.encode() + b"\0" + written + b"\0")
+        self.assertEqual(got["call"], sha)
+        self.assertIn("Me, one card each time (Recommended)", got["why"])
+        self.assertFalse([u for _m, u, _b in self.calls if u.endswith("/git/commits")])
+        self.yes(sha)
+        got = self.call(ONE, GITOPS, "push", content=content)
+        self.assertEqual((got["ok"], got["kind"]), (True, "approved"), got)
+        blobs, paths, message = self.made()
+        self.assertEqual(paths, ["apps/core/app/c.yaml", GEN_PATH])
+        self.assertEqual(blobs[-1], written)
+        self.assertIn(f"The door wrote {GEN_PATH} again, with the generator at HEAD.", message)
+        got = self.call(ONE, GITOPS, "push", content=content)          # the owner's yes was used once
+        self.assertEqual((got["ok"], got["route"]), (False, "yes"), got)
+
+    def test_a_door_with_no_box_asks_github_for_the_declaration(self):
+        self.door.box = None            # and it never rendered this repository: no render, and no tarball
+        api = "https://api.github.com/repos/one-org/cluster/contents/"
+        content = change(("apps/core/app/web.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web\n"
+                                                    "data:\n  mode: fast\n"))
+        self.answers[("GET", f"{api}apps/core/app/web.yaml?ref=master")] = (200, {
+            "encoding": "base64", "content": base64.b64encode(GEN_TREE["apps/core/app/web.yaml"].encode()).decode()})
+        self.answers[("GET", f"{api}.founderizer/door.json?ref=master")] = (200, {
+            "encoding": "base64", "content": base64.b64encode(GEN_TREE[".founderizer/door.json"].encode()).decode()})
+        got = self.call(ONE, GITOPS, "push", content=content)
+        self.assertEqual((got["ok"], got["kind"]), (False, "refused"), got)
+        self.assertIn("the door has no render of this commit that writes them again", got["why"])
+        self.assertEqual(self.asked_raw, [])
+        del self.answers[("GET", f"{api}.founderizer/door.json?ref=master")]       # a repository with none
+        got = self.call(ONE, GITOPS, "push", content=content)
+        self.assertNotIn("writes them again", got.get("why", ""))
+
+    def test_a_commit_from_which_an_entry_leaves_is_made_at_once_with_the_file(self):
+        content = json.dumps({"message": "retire b", "files": [{"path": "apps/core/app/b.yaml", "delete": True}]}).encode()
+        got = self.call(ONE, GITOPS, "push", content=content)
+        self.assertEqual((got["ok"], got["kind"]), (True, "own"), got)
+        blobs, paths, message = self.made()
+        self.assertEqual(paths, ["apps/core/app/b.yaml", GEN_PATH])
+        self.assertEqual(blobs, [inventory("a.example.com").encode()])
+        self.assertEqual(message, f"retire b\n\nThe door wrote {GEN_PATH} again, with the generator at HEAD.")
+
+
 class RenderBoxUnit(DoorCase):
     """Done-when (c), the part that every machine can check: the unit that is the box, and the install of its programs."""
 
@@ -6002,6 +6245,10 @@ class RenderBoxUnit(DoorCase):
             door_render.main(["render"])
 
     def test_the_update_installs_only_the_pinned_programs(self):
+        patcher = patch.object(door_render, "TREE_PINS", {})      # the pinned folder has a test of its own
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
         def archive(member, data):
             out = io.BytesIO()
             with tarfile.open(fileobj=out, mode="w:gz") as tar:
@@ -6062,6 +6309,82 @@ class RenderBoxUnit(DoorCase):
             self.assertTrue(pin["url"].startswith("https://"))
             for arch in ("amd64", "arm64"):
                 self.assertTrue(all(len(pin[arch][k]) == 64 for k in ("archive", "program")), name)
+
+
+    def test_the_update_unpacks_a_pinned_folder_whole_and_only_that(self):
+        "door.ensure_tree: the portable Ruby that a repository's generator runs in the box (DevOps plan X3)."
+        arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}[os.uname().machine]
+        program = b"#!/bin/sh\necho ruby\n"
+
+        def archive(*members):
+            out = io.BytesIO()
+            with tarfile.open(fileobj=out, mode="w:gz") as tar:
+                for name, data, mode in members:
+                    info = tarfile.TarInfo(name)
+                    if data is None:
+                        info.type, info.mode = tarfile.DIRTYPE, 0o700
+                        tar.addfile(info)
+                    elif isinstance(data, tuple):           # a link
+                        info.type, info.linkname = tarfile.SYMTYPE, data[0]
+                        tar.addfile(info)
+                    else:
+                        info.size, info.mode = len(data), mode
+                        tar.addfile(info, io.BytesIO(data))
+            return out.getvalue()
+        whole = [("portable-ruby/", None, 0), ("portable-ruby/3.4.6/", None, 0),
+                 ("portable-ruby/3.4.6/bin/ruby", program, 0o555),
+                 ("portable-ruby/3.4.6/lib/ruby/3.4.0/set.rb", b"# set\n", 0o444)]
+        served = {"now": archive(*whole)}
+        pins = {"ruby": dict(door_render.TREE_PINS["ruby"], **{arch: {
+            "archive": hashlib.sha256(served["now"]).hexdigest(), "program": hashlib.sha256(program).hexdigest()}})}
+        asked = []
+
+        def raw(method, url, headers, limit, timeout=120):
+            asked.append(url)
+            return 200, served["now"]
+        older = self.root + door_render.TOOLS_DIR + "/ruby-3.4.5"
+        os.makedirs(older)
+        path = self.root + door_render.tree_tool_path("ruby")
+        with patch.object(door, "http_raw", raw), patch.object(door, "run_program", lambda *a, **k: (0, "")), \
+                patch.object(door_render, "PINS", {}), patch.object(door_render, "TREE_PINS", pins):
+            self.assertEqual(door.ensure_render(), [])
+            self.assertEqual(slurp(path), program)
+            self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o755")
+            folder = os.path.dirname(os.path.dirname(path))
+            self.assertEqual(oct(os.stat(folder + "/lib/ruby/3.4.0/set.rb").st_mode & 0o777), "0o644")
+            self.assertEqual(oct(os.stat(folder + "/lib/ruby").st_mode & 0o777), "0o755")
+            self.assertFalse(os.path.exists(older))                 # the version before goes
+            brew = door_render.TREE_PINS["ruby"]["brew"][arch]
+            self.assertEqual(asked, [pins["ruby"]["url"].format(brew=brew)])
+            self.assertIn(f"portable-ruby-3.4.6.{brew}_linux.bottle.tar.gz", asked[0])
+            asked.clear()
+            self.assertEqual(door.ensure_render(), [])
+            self.assertEqual(asked, [])                             # the pinned program is there: no download
+            # each archive that is not whole and only the folder: nothing of it lands, and the folder stays
+            with open(path, "wb") as f:
+                f.write(b"another program")
+            for members, words in ((whole + [("portable-ruby/3.4.6/bin/irb", ("ruby",), 0)], "could not be unpacked"),
+                                   (whole + [("elsewhere/x", b"x", 0o644)], "could not be unpacked"),
+                                   (whole + [("portable-ruby/../x", b"x", 0o644)], "could not be unpacked"),
+                                   ([m for m in whole if not m[0].endswith("bin/ruby")] +
+                                    [("portable-ruby/3.4.6/bin/ruby", b"not ruby", 0o555)], "is not the pinned one")):
+                served["now"] = archive(*members)
+                bad = {"ruby": dict(pins["ruby"], **{arch: dict(pins["ruby"][arch],
+                                                               archive=hashlib.sha256(served["now"]).hexdigest())})}
+                with patch.object(door_render, "TREE_PINS", bad):
+                    said = door.ensure_render()
+                self.assertEqual(len(said), 1, said)
+                self.assertIn(words, said[0])
+                self.assertEqual(slurp(path), b"another program")
+                self.assertFalse(os.path.exists(self.root + door_render.TOOLS_DIR + "/ruby-3.4.6.new"))
+                self.assertFalse(os.path.exists(self.root + door_render.TOOLS_DIR + "/x"))
+            served["now"] = b"not the pinned archive"
+            self.assertIn("its archive did not come, or is not the pinned one", door.ensure_render()[0])
+        for name, pin in door_render.TREE_PINS.items():     # the real pins: an https address, and four SHA-256
+            self.assertTrue(pin["url"].startswith("https://"))
+            for arch in ("amd64", "arm64"):
+                self.assertTrue(all(len(pin[arch][k]) == 64 for k in ("archive", "program")), name)
+            self.assertEqual(pin["member"], pin["tree"] + "bin/" + name)
 
 
 @unittest.skipUnless(sys.platform == "linux" and os.geteuid() == 0 and os.path.isdir("/run/systemd/system") and

@@ -975,8 +975,9 @@ class Door:
             why = window_refusal(access, d.host or target, d.window, self.clock())
             if why:
                 d = door_targets.refused(why, target=d.target, route="window")
-        if content is None and getattr(d, "hash_content", None) is not None:
-            content = d.hash_content        # a prune's list, which the door made: his yes is to that exact list (X3)
+        if getattr(d, "hash_content", None) is not None:
+            # what the door adds to the call: a prune's list, a commit's regenerated file. The owner's yes is to them too (X3)
+            content = (content or b"") + d.hash_content
         sha = call_hash(target, op, args, content)
         hashed = d.kind in ("own", "full")      # a refusal of these two kinds is the owner's to lift: it gives the hash
         full_host = d.host if d.kind == "full" else None
@@ -1200,7 +1201,9 @@ class Door:
                      deploy_facts=hub.deploy_facts, npm=self.npm, schema_ok=lambda path, data: True)
         if kind == "gitops":    # a sync with prune (DevOps plan X3): the listing, and the door's own record
             facts.update(prune_listing=listing, removed_object=lambda key: self.removed_object(repo, key),
-                         made_object=lambda key: self.made(target, "object:" + key))
+                         made_object=lambda key: self.made(target, "object:" + key),
+                         # a repository that generates files, for a commit that no render writes them for (X3)
+                         declared=lambda: hub.file_at_head(door_targets.DOOR_DECLARATION, branch) is not None)
         box = self.box or (box_call if os.path.exists(P(RENDER_SOCKET)) else None)
         # A door with no render box gives no render, and the rules that need none stay. But only for a repository that
         # this door never rendered: where it did, templates changed under the render, and the rules that read lines
@@ -2654,6 +2657,7 @@ def ensure_render():
         for other in os.listdir(tools):
             if other.startswith(name + "-") and other != os.path.basename(folder):
                 shutil.rmtree(os.path.join(tools, other), ignore_errors=True)
+    said += ensure_tree(arch, tools)
     changed = [write_unit(RENDER_UNIT + ".socket", RENDER_SOCKET_UNIT),
                write_unit(RENDER_UNIT + "@.service", RENDER_SERVICE)]
     if any(changed):
@@ -2662,6 +2666,63 @@ def ensure_render():
         run_program(["systemctl", "restart", RENDER_UNIT + ".socket"], None, {})
     elif any(changed) or not os.path.exists(P(RENDER_SOCKET)):
         run_program(["systemctl", "enable", "--now", RENDER_UNIT + ".socket"], None, {})
+    return said
+
+
+def ensure_tree(arch, tools):
+    """root: each pinned folder (door_render.TREE_PINS), such as the portable Ruby that a repository's own generator
+    runs in the box. Its archive has the pinned SHA-256; the door unpacks it whole into TOOLS_DIR, files and folders
+    only, each on a path of the folder and no link; and the program in it has its pinned SHA-256 too. The folder
+    takes the place of the one before it at once, and an older version goes. Returns what it could not do, one line
+    each: a repository that generates files then waits, and the render's own programs do not."""
+    said = []
+    for name, pin in sorted(door_render.TREE_PINS.items()):
+        path, sums = P(door_render.tree_tool_path(name)), pin.get(arch)
+        if sums is None:
+            said.append(f"no {name} is pinned for {platform.machine()}")
+            continue
+        if file_sha256(path) == sums["program"]:
+            continue
+        url = pin["url"].format(arch=arch, brew=(pin.get("brew") or {}).get(arch, arch))
+        status, raw = http_raw("GET", url, {}, TOOL_MAX)
+        if status != 200 or hashlib.sha256(raw).hexdigest() != sums["archive"]:
+            said.append(f"{name} {pin['version']}: its archive did not come, or is not the pinned one ({status})")
+            continue
+        folder = os.path.join(tools, f"{name}-{pin['version']}")
+        fresh, top = folder + ".new", pin["tree"].split("/")[0]
+        shutil.rmtree(fresh, ignore_errors=True)
+        try:
+            with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
+                for member in tar:
+                    parts = door_render.safe(member.name.rstrip("/"))
+                    if parts is None or parts[0] != top or not (member.isreg() or member.isdir()):
+                        raise ValueError(f"{member.name!r} is not a file or a folder of {top}")
+                    dest = os.path.join(fresh, *parts)
+                    if member.isdir():
+                        os.makedirs(dest, mode=0o755, exist_ok=True)
+                        continue
+                    os.makedirs(os.path.dirname(dest), mode=0o755, exist_ok=True)
+                    with tar.extractfile(member) as src, open(dest, "wb") as f:
+                        shutil.copyfileobj(src, f)
+                    os.chmod(dest, 0o755 if member.mode & 0o111 else 0o644)
+        except (tarfile.TarError, OSError, ValueError, EOFError) as e:
+            shutil.rmtree(fresh, ignore_errors=True)
+            said.append(f"{name} {pin['version']}: its archive could not be unpacked ({e})"[:300])
+            continue
+        if file_sha256(os.path.join(fresh, *pin["member"].split("/"))) != sums["program"]:
+            shutil.rmtree(fresh, ignore_errors=True)
+            said.append(f"{name} {pin['version']}: the program in its archive is not the pinned one")
+            continue
+        for folder_in, _dirs, _names in os.walk(fresh):
+            os.chmod(folder_in, 0o755)      # whatever the umask: the box's own user reads the folder
+        os.chmod(tools, 0o755)
+        if os.path.lexists(folder):
+            os.rename(folder, folder + ".old")
+        os.rename(fresh, folder)
+        shutil.rmtree(folder + ".old", ignore_errors=True)
+        for other in os.listdir(tools):
+            if other.startswith(name + "-") and other != os.path.basename(folder):
+                shutil.rmtree(os.path.join(tools, other), ignore_errors=True)
     return said
 
 

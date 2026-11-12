@@ -1018,6 +1018,9 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
     for path, data, mode in files:
         if mode in ("120000", "160000") or never_path(path):
             return refused(f"{path} is under the commit rules", target=target)
+        if path.casefold() == DOOR_DECLARATION:
+            return refused(f"{path} names the files that the door writes itself: a person changes it, outside the "
+                           f"door", target=target)
         why = gitops_path_refused(path, access)
         if why:
             return refused(why, target=target)
@@ -1032,11 +1035,82 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
                            route="again" if report.get("again") else None)
         report = None
     try:
+        why = declared_refusal(report, files)      # before the rules of the files: it is the reason
+        if why:
+            return refused(why, target=target)
         d = gitops_files(lookups, op, target, plan, files, report)
+        if d.kind != "refused":
+            plan["objects"] = commit_objects(files, report, lookups)     # door.py keeps them once the commit is made
+        return with_generated(d, report, lookups, files, plan, target)
     except (KeyError, TypeError, AttributeError, ValueError, RecursionError):
         return refused("the door could not read the render of this commit", target=target, route="again")
-    if d.kind != "refused":
-        plan["objects"] = commit_objects(files, report, lookups)     # door.py keeps them once the commit is made
+
+
+# ---------------------------------------------------------------- the files that a repository generates (X3)
+#
+# A GitOps repository can name, in DOOR_DECLARATION at HEAD, files that its own generator writes from the rest of the
+# tree, such as an inventory of what the cluster exposes, which its own checks compare with the tree. A commit through
+# the door that changes what such a file says must carry it, or those checks fail (11 November 2026: for about 31
+# hours). The render box writes each file again on the tree after the commit, with the generator as it is at HEAD
+# (door_render.generated). The owner, 12 November 2026, "Me, one card each time (Recommended)": a file that only loses
+# lines (an entry leaves it) goes with the commit, which keeps its kind; any other change of it makes the commit the
+# owner's, as the door's card (kind full) with the exact change, and after the owner's yes the door makes that commit
+# once, with the file. A commit through the door changes neither the declaration, nor a file that it names, nor a
+# rule of one.
+
+DOOR_DECLARATION = ".founderizer/door.json"     # door_render.DECLARATION
+GEN_LINE = 160              # characters of one line of a change in the decision's words
+
+
+def declared_refusal(report, files):
+    "Why a commit refuses because it changes a file that the repository generates, or a rule of one, or None."
+    paths = {path for path, _data, _mode in files}
+    for g in (report or {}).get("generated") or []:
+        for path in [g["path"]] + list(g["rules"]):
+            if path in paths:
+                return (f"{path} is named in {DOOR_DECLARATION}: the door writes {g['path']} itself, with the generator "
+                        f"as it is at HEAD, so a commit through the door changes neither the file nor its rules")
+    return None
+
+
+def with_generated(d, report, lookups, files, plan, target):
+    """The decision on a GitOps commit with the files that its repository generates. d: the decision on the commit's
+    own files. Each written file joins the commit, and its bytes join what the call hash covers, so that the owner's yes
+    is to those bytes too."""
+    if d.kind == "refused":
+        return d
+    if report is None:
+        if (lookups.get("declared") or (lambda: False))():
+            return refused(f"the repository names files that its generator writes ({DOOR_DECLARATION}), and the door "
+                           f"has no render of this commit that writes them again", target=target)
+        return d
+    entries = report.get("generated") or []
+    written, changes = [], []
+    for g in entries:
+        if g["status"] == "same":
+            continue
+        if g["status"] == "failed":
+            return refused(f"the door could not write {g['path']} again ({g.get('why')}), and a commit without it "
+                           f"fails the repository's checks", target=target)
+        written.append((g["path"], base64.b64decode(g["content"]), "100644"))
+        if g["status"] != "removes":
+            lines = " | ".join(line.strip()[:GEN_LINE] for line in g["added"])
+            more = g["gained"] - len(g["added"])
+            changes.append(f"{g['path']} gains {g['gained']} lines and loses {g['removed']}; it gains: {lines}"
+                           + (f" | and {more} lines more" if more > 0 else "") if g["gained"] else
+                           f"{g['path']} loses {g['removed']} lines, and lines of it move")
+    if not written:
+        return d
+    plan["files"] = list(files) + written
+    plan["message"] = f"{(plan.get('message') or '').rstrip()}\n\nThe door wrote " \
+                      f"{', '.join(path for path, _data, _mode in written)} again, with the generator at HEAD."
+    covered = b"".join(path.encode() + b"\0" + data + b"\0" for path, data, _mode in written)
+    if changes:
+        return Decision("full", f"{d.why}; and the commit changes what the repository generates, which is the "
+                        f"owner's (12 November 2026: \"Me, one card each time (Recommended)\"): {'; '.join(changes)}",
+                        target=target, plan=plan, window="deploy", hash_content=covered)
+    d.why = f"{d.why}; with {', '.join(path for path, _data, _mode in written)} written again, from which entries leave"
+    d.hash_content = covered
     return d
 
 
@@ -1057,6 +1131,9 @@ PRUNE_OWNER_KINDS = ("Namespace", "CustomResourceDefinition", "PersistentVolume"
 PRUNE_MOST = 20              # objects in one prune that is no card
 PRUNE_LISTED = 200           # objects that a listing may name
 LISTING_MARK = "DOOR-PRUNE-LIST"
+# The one line of a job's log that is the listing: GitHub's time, the mark and base64, and nothing else. The log also
+# shows the step's script, and a script line that names the mark is no listing (12 November 2026, the first live run).
+LISTING_LINE = re.compile(r"(?:\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z )?" + LISTING_MARK + r" ([A-Za-z0-9+/]+={0,2})")
 
 
 def object_key(doc):
@@ -1163,8 +1240,7 @@ def listing(text, app):
     lb: [key of a Service of type LoadBalancer]}, or why the line is no listing. The run is on a shared runner, so the
     line is only a list to check: each key must have the form, the app must be this one, and the door decides with its
     own record."""
-    found = [line.split(LISTING_MARK + " ", 1)[1].strip() for line in (text or "").splitlines()
-             if LISTING_MARK + " " in line]
+    found = [m.group(1) for m in (LISTING_LINE.fullmatch(line.strip()) for line in (text or "").splitlines()) if m]
     if len(found) != 1:
         return f"the listing run printed {len(found)} lines {LISTING_MARK}, not one"
     try:

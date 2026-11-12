@@ -56,6 +56,21 @@ PINS = {
         "arm64": {"archive": "9867b76482cfc6d25b546abc1d2b5a32bd137505aba640649b4b378f64f6d68f",
                   "program": "dd14c7e37e65cd2ec6dd07dfaf0bf02355113d9b925dfa47c1354134a6f8051b"}},
 }
+# A repository's own generator of a file that the door adds to a commit (DECLARATION, generated): a program that is a
+# whole folder, not one file. Homebrew's portable Ruby runs from where it lies; its release of 17 September 2025. The
+# SHA-256 of each archive is GitHub's digest of the release's asset, and the program's is of bin/ruby in it. The door's
+# update unpacks the folder (door.ensure_tree), and the render's own two programs do not wait for it.
+TREE_PINS = {
+    "ruby": {
+        "version": "3.4.6", "tree": "portable-ruby/3.4.6/", "member": "portable-ruby/3.4.6/bin/ruby",
+        "url": "https://github.com/Homebrew/homebrew-portable-ruby/releases/download/3.4.6/"
+               "portable-ruby-3.4.6.{brew}_linux.bottle.tar.gz",
+        "brew": {"amd64": "x86_64", "arm64": "arm64"},
+        "amd64": {"archive": "40932a3950ccc8bf9d13d98e692e5518427cc66b4f9520956cec349629d25259",
+                  "program": "b1a45dd9bc274a34d7b35642f7785365857e60b90cdd4c3fbac16d85239aec20"},
+        "arm64": {"archive": "8e99050efd36456f4740f1c5f048b75290dd646554b0c1b153eb831a9ae1e3e8",
+                  "program": "cc8afeed9680585b0846a4c59dd935330b2b27623724d34fc224e0c4ab347903"}},
+}
 # What the box must not reach: the door's two folders and its Teleport bot's token (door.py ETC, STATE, AWS_TOKEN_FILE)
 KEY_PATHS = ("/etc/fleet-door", "/var/lib/fleet-door", "/opt/machine-id")
 RUN_SECONDS = 30                    # one run of a program
@@ -111,6 +126,12 @@ class Skip(Exception):
 
 def tool_path(name):
     return f"{TOOLS_DIR}/{name}-{PINS[name]['version']}/{name}"
+
+
+def tree_tool_path(name):
+    "The program of a pinned folder (TREE_PINS), where the door's update unpacks it."
+    pin = TREE_PINS[name]
+    return f"{TOOLS_DIR}/{name}-{pin['version']}/{pin['member']}"
 
 
 def installed_tools():
@@ -962,6 +983,103 @@ def closed(runner, trees, kind, root, kustomize, pairs, exposure):
     return False
 
 
+# ---------------------------------------------------------------- the files that a repository generates
+#
+# A repository can name, in DECLARATION at HEAD, files that its own generator writes from the rest of the tree, such
+# as an inventory of what the cluster exposes, which its own checks compare with the tree. A commit through the door
+# that changes what such a file says must carry it, or the repository's checks fail (11 November 2026: for about 31
+# hours). The box writes each one with the generator as it is at HEAD, on the tree after the commit, and door_targets
+# decides: the owner, 12 November 2026, "Me, one card each time (Recommended)". A file that only loses lines (a
+# removal) goes with the commit, and every other change of it comes to the owner as the door's card.
+
+DECLARATION = ".founderizer/door.json"
+GEN_PROGRAMS = ("ruby",)        # TREE_PINS: a generator runs one of these, never a program of the repository
+GEN_MOST = 4                    # files that a declaration may name
+GEN_BYTES = 4 * 2 ** 20         # the largest generated file
+GEN_SHOWN = 40                  # lines of a change that the answer shows
+
+
+def generated(runner, before, after):
+    """[{path, rules, status, why, content, added, gained, removed}]: each file that DECLARATION at HEAD names,
+    written again by its generator on the tree after the commit. status: same (no change), removes (it only loses
+    lines: each line of the new file is a line of HEAD's, as often), changes (any other change: content, the first
+    GEN_SHOWN lines that it gains in added, how many it gains and loses), or failed (no file came: never a commit
+    without it). An inventory that gives each entry a digest of what it says, as the exposure inventory does, loses
+    lines only when entries leave it: an entry that narrows changes its digest line, and so is a change too, and so is
+    a line that moves. The
+    generator's rules (rules: the generator, the check and their inputs) are taken from HEAD, and HEAD's file is read
+    before the run: copy_tree's hard links make the trees share each file that the commit leaves alone."""
+    raw = read(before, DECLARATION, most=65536)
+    if raw is None:
+        if not os.path.lexists(os.path.join(before, *DECLARATION.split("/"))):
+            return []
+        raw = b""                       # a link, a folder or a large file: no declaration that the door can follow
+    try:
+        entries = json.loads(raw.decode("utf-8"))["generated"]
+        if not isinstance(entries, list) or not 0 < len(entries) <= GEN_MOST:
+            raise ValueError
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError):
+        return [{"path": DECLARATION, "rules": [], "status": "failed",
+                 "why": f"{DECLARATION} at HEAD is not {{generated: [1 to {GEN_MOST} files]}}"}]
+    out = []
+    for entry in entries:
+        entry = entry if isinstance(entry, dict) else {}
+        path, run, rules = entry.get("path"), entry.get("run"), entry.get("rules") or []
+        item = {"path": path if isinstance(path, str) else "", "rules": rules if isinstance(rules, list) else []}
+        if safe(path) is None or not isinstance(run, list) or not run or run[0] not in GEN_PROGRAMS or \
+                not all(safe(a) for a in run[1:]) or not isinstance(rules, list) or not all(safe(r) for r in rules):
+            out.append(dict(item, status="failed", why=f"an entry of {DECLARATION} at HEAD is not "
+                                                       f"{{path, run: [ruby, paths], rules: [paths]}}"))
+            continue
+        tool = run[0]
+        rules = item["rules"] = rules + [a for a in run[1:] if a not in rules]   # the generator's own script is a rule
+        if tool not in runner.tools:
+            program = tree_tool_path(tool)
+            if not os.access(program, os.X_OK):
+                out.append(dict(item, status="failed", why=f"the pinned {tool} is not on the door yet"))
+                continue
+            runner.tools[tool] = [program]
+        old = read(before, path, most=GEN_BYTES)
+        work = os.path.join(runner.scratch, f"generate-{len(out) + 1}")
+        try:
+            copy_tree(after, work)
+            for rule in rules:
+                put(work, rule, read(before, rule, most=GEN_BYTES), "100644")
+            put(work, path, None, "100644")             # the generator makes a new file, never through a link
+            runner.run(tool, run[1:], cwd=work)
+            new = read(work, path, most=GEN_BYTES)
+        except Failed as e:
+            out.append(dict(item, status="failed", why=str(e)))
+            continue
+        except OSError as e:
+            out.append(dict(item, status="failed", why=f"the box could not copy the tree ({e.__class__.__name__})"))
+            continue
+        if new is None:
+            out.append(dict(item, status="failed", why=f"the generator wrote no {path}"))
+            continue
+        if new == old:
+            out.append(dict(item, status="same"))
+            continue
+        lines_old, lines_new = (old or b"").splitlines(), new.splitlines()
+        added = collections.Counter(lines_new) - collections.Counter(lines_old)
+        removed = collections.Counter(lines_old) - collections.Counter(lines_new)
+        left, shown = collections.Counter(added), []
+        for line in lines_new:
+            if left[line] > 0 and len(shown) < GEN_SHOWN:
+                left[line] -= 1
+                shown.append(line.decode("utf-8", "replace"))
+        out.append(dict(item, status="removes" if old is not None and only_loses(lines_old, lines_new) else "changes",
+                        content=base64.b64encode(new).decode(), added=shown, gained=sum(added.values()),
+                        removed=sum(removed.values())))
+    return out
+
+
+def only_loses(old, new):
+    "True when the lines `new` are the lines `old` with some taken out, in the same order."
+    at = iter(old)
+    return all(any(line == was for was in at) for line in new)
+
+
 def answer(header, tar, blobs, tools, scratch, log=False):
     """The report of one commit: {ok, files: {path: {head, units, before, after}}, units: {id: unit_report}}. files:
     the bytes at HEAD of each path of the commit (base64, or None), the units that read it, and its documents at HEAD
@@ -1081,7 +1199,7 @@ def answer(header, tar, blobs, tools, scratch, log=False):
                         pairs.append(pair)
                 units[uid] = unit_report(runner, trees, kind, root, pairs,
                                          shut=closed(runner, trees, kind, root, kustomize, pairs, exposure))
-        report = {"v": 1, "ok": True, "files": files, "units": units}
+        report = {"v": 1, "ok": True, "files": files, "units": units, "generated": generated(runner, before, after)}
     except Skip as e:
         return {"v": 1, "ok": False, "skip": str(e)}
     except Late:
