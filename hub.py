@@ -24399,7 +24399,9 @@ def report_line(r):
             + (f" on {tref(r['from_task'])}" if r["from_task"] else "")
             + (f", about {r['about']}" if r["about"] else "")
             + (f", said by {r['repeats'] + 1} of them" if r["repeats"] else "")
-            + f", {ago(r['created'])} ago: {clip(r['text'], 300)}")
+            # the hub's own finding is read whole: its options are what the manager takes to the owner (settings_check)
+            + f", {ago(r['created'])} ago: "
+            + clip(r["text"], REPORT_TEXT_MAX if r["from_agent"] == HUB_REPORTER else 300))
 
 
 def open_reports(to_agent=None, kinds=True):
@@ -24591,7 +24593,175 @@ def t_decide_report(agent, a):
     return (f"{upref(rid)} is decided: {decision}" + (f" ({note})" if note else "")
             + (f", {tref(became)}" if became else "") + ". "
             + (f"The {also} report(s) that say the same take this decision with it. " if also else "")
-            + f"{r['from_agent']} reads it at the start of its next task session.")
+            + (f"{r['from_agent']} reads it at the start of its next task session." if r["from_agent"] != HUB_REPORTER
+               else "The hub makes no new finding about these settings until they change."))
+
+
+# ---------------------------------------------------------------- the settings check: a key, a shell and the web
+#
+# An agent that reads text from outside, holds a credential and has a shell is the case that the guide for self-hosted
+# agents names ("Keep untrusted input away from powerful tools"): a web page can tell such an agent to send the key to
+# another place, and its shell can do that. The grant is the authorization, so the hub refuses and stops nothing here.
+# It finds an agent whose settings put the three together, and it puts one finding about it on the fleet manager's list
+# of proposals for the owner, as the hub's own report (the owner's yes of 12 November 2026: "A check can find an agent
+# that holds read keys, a shell and the web together, and put the finding in the manager's weekly list").
+#
+# One finding for each state, and no clock: the check runs where the settings change (apply_team) and at the hub's
+# start. kv `settings_finding:<agent>` holds the settings that the last finding named and its report. The same
+# settings make no second finding, while that report is open and after the manager decided it. Other settings of the
+# three make a new finding, and the hub ends the old one itself when nobody decided it yet. A rename moves the mark
+# (AGENT_KV), and a removal deletes it (remove_rows).
+
+HUB_REPORTER = "hub"                    # the sender of the hub's own reports: no agent has it (RESERVED_AGENT_NAMES)
+SETTINGS_KV = "settings_finding:"       # + the agent: {"keys", "boxes", "report"} of its last finding
+SETTINGS_REQUEST = "settings:"          # the start of the request_id of each finding of this check
+SETTINGS_BOXES = ("web", "browser")     # the Tools boxes that bring text from outside to an agent
+SETTINGS_KEYS_NAMED = 8                 # key names in one finding, before the rest become a count: the finding of
+                                        # an agent with the longest role and key names stays under REPORT_TEXT_MAX
+
+
+def session_keys(agent):
+    """The names of the API keys whose values the sessions of this agent hold, sorted; [] when they hold none. This is
+    the one answer of the hub to "do this agent's sessions hold the value of a key", so a change of how a key reaches
+    a session changes it here. Today: a read grant of an API key (read_secrets), for an agent whose vault is its
+    machine's broker and whose Shell box is on. The helper asks for the values only where team.json says `"vault":
+    "broker"` (fleet.vault_mode: "none", the old "file" and an entry that says nothing are no credential access), and
+    a session of an agent whose Shell box is off gets no key, only its checks do (the helper's key read, support plan
+    F1). test_settings_check.Keys compares this answer with what the helper's and the hub's own code give."""
+    if shell_off(agent) or (agents().get(agent) or {}).get("vault") != "broker":
+        return []
+    return sorted({env for _ref, env in read_secrets(agent)})
+
+
+def settings_junction(agent):
+    """(the key names, the boxes) when the settings of this agent put the three together, else None: its sessions hold
+    the value of a key (session_keys), it has a shell, and it has the web. For a worker or a lead with a Tools list,
+    the web is one of SETTINGS_BOXES in that list. boxes is None where no box decides it: for an agent with no Tools
+    list, which has the shell and the web tools of its runtime, and for a manager, whose sessions have both whatever
+    its Tools boxes say, because nothing reads them (shell_off, fleet.settings_arg)."""
+    keys = session_keys(agent)
+    if not keys or shell_off(agent):        # the shell is one of the three by itself, whatever session_keys says later
+        return None
+    a = agents().get(agent) or {}
+    can = a.get("can")
+    if a.get("role") not in ("worker", "lead") or not isinstance(can, list):
+        return keys, None
+    boxes = [b for b in SETTINGS_BOXES if b in can]
+    return (keys, boxes) if boxes else None
+
+
+def settings_words(agent, keys, boxes):
+    """The finding about one agent, for the manager's list of proposals: the agent by its role, the keys by name and
+    never a value, the boxes, and the options, each with its cost and how to undo it. Each sentence is true of the
+    agent's own case. Only a worker's or a lead's task start names its boxes, and only they take a browser task and
+    have call_api, so the Tools boxes are an option for them alone. With Shell on the Web box removes no tool
+    (fleet.settings_arg reads no box), and call_api needs the site of the key's login."""
+    who = shown_role(agent)
+    on = [b.capitalize() for b in boxes or ()]
+    worker = (agents().get(agent) or {}).get("role") in ("worker", "lead")
+    tools = "Tools: Shell, " + ", ".join(on) if on else "it has no Tools list, so its sessions have both" if worker \
+        else "its sessions have both, whatever its Tools boxes say"
+    several = len(keys) > 1
+    catalog = logins()
+    bare = len({env for ref, env in read_secrets(agent)
+                if env in keys and not login_site((catalog.get(ref) or {}).get("site"))})
+    sites = "" if not bare else " This login names no site yet." if not several else \
+        " None of these logins names a site yet." if bare == len(keys) else \
+        f" {bare} of these logins name{'s' if bare == 1 else ''} no site yet."
+    caller = who if worker else "a worker or a lead that has a use grant of it"
+    options = [f"Change the grant of {'each key' if several else 'the key'} from read to use: the vault keeps the key, "
+               f"and {caller} calls the service with call_api. call_api sends an HTTP request to the site that the "
+               f"login of the key names.{sites} call_api cannot use a key that is not for HTTP, for example a database "
+               f"password. Cost: each command or saved check that reads the key from its variable fails until "
+               f"somebody changes it. To undo: give read again."]
+    if worker:
+        step = f"Set {' and '.join(on)} off for {who}" if on else f"Give {who} a Tools list with Shell on and Web off"
+        costs = (["its start no longer tells it that it has the web"] if "Web" in on else []) + \
+            (["it takes no browser task"] if "Browser" in on else [])
+        undo = "set them on again" if len(on) > 1 else "set it on again" if on else "set Web on again"
+        web = " With Shell on, Web off removes no tool from its sessions." if boxes is None or "web" in boxes else ""
+        options.append(f"{step}. Cost: {', and '.join(costs) or 'none'}.{web} Its shell still reaches the internet, "
+                       f"so most of the risk stays. To undo: {undo}.")
+    options.append("Leave it as it is. Cost: the risk stays. When the owner chooses this, decide this report as noted.")
+    return (f"{who} reads {len(keys)} API key{'s' if several else ''} in its sessions "
+            f"({named_few(keys, SETTINGS_KEYS_NAMED)}), and it has a shell and the web ({tools}). A text from outside, "
+            f"a web page for example, can then make it send a key to another place. The choice is the owner's: put "
+            f"these {'three' if worker else 'two'} options on your weekly list. "
+            + " ".join(f"({n}) {text}" for n, text in enumerate(options, 1))
+            + " The hub makes no second finding while these settings stay.")
+
+
+def settings_check():
+    """One pass over the team: a finding for each agent whose settings newly put the three together, and the end of
+    each open finding whose settings are no longer there. Returns the ids of the reports that it made."""
+    # the manager, by a read that an entry of a wrong shape cannot stop (manager_name reads each entry before it)
+    mgr = next((n for n, a in agents().items() if isinstance(a, dict) and a.get("role") == "manager"), "manager")
+    t0, made = now(), []
+    ended = "UPDATE reports SET decided=?, decided_by=?, decision='noted', note=? WHERE (id=? OR collapsed_into=?) " \
+            "AND decided IS NULL"
+    with transaction():
+        marks = {}
+        # the marks, by the key's own index: `;` is the character after `:`. A write names the key in full
+        # (f"settings_finding:{agent}"), so that test_rename finds the prefix and holds it to AGENT_KV.
+        for row in read_rows("SELECT k, v FROM kv WHERE k>=? AND k<?", (SETTINGS_KV, SETTINGS_KV[:-1] + ";")):
+            try:
+                mark = json.loads(row["v"])
+            except ValueError:
+                mark = None
+            known = isinstance(mark, dict) and read_row("SELECT 1 FROM reports WHERE id=? AND from_agent=?",
+                                                        (mark.get("report"), HUB_REPORTER))
+            marks[row["k"][len(SETTINGS_KV):]] = mark if known else None
+        for agent in [name for name in marks if name not in agents()]:      # it left by a reload, with no removal
+            DB.execute("DELETE FROM kv WHERE k=?", (f"settings_finding:{agent}",))
+            del marks[agent]
+        for agent in agents():
+            try:
+                found = settings_junction(agent)
+                words = settings_words(agent, *found) if found else None
+            except Exception:       # an entry of a wrong shape, in a team.json that the hub started with: it writes
+                continue            # nothing about that agent, and it checks the others
+            mark = marks.get(agent)
+            if not found:
+                if agent in marks:          # the three are no longer together: the next time is a new finding
+                    DB.execute("DELETE FROM kv WHERE k=?", (f"settings_finding:{agent}",))
+                    del marks[agent]
+                continue
+            keys, boxes = found
+            if mark and [mark.get("keys"), mark.get("boxes")] == [keys, boxes]:
+                # The same settings: their finding is open, or the manager decided it. An open one names the agent as
+                # it is named now, after a rename or a new role, and a decided one stays as it was read. The history
+                # search keeps the words of the first time, as it keeps each record as it was said.
+                DB.execute("UPDATE reports SET about=?, text=? WHERE id=? AND decided IS NULL AND "
+                           "(about IS NOT ? OR text IS NOT ?)", (agent, words, mark["report"], agent, words))
+                continue
+            rid = DB.execute("INSERT INTO reports(from_agent,from_task,to_agent,kind,text,about,severity,delivered,"
+                             "created,request_id) VALUES(?,NULL,?,'proposal',?,?,'note','note',?,?)",
+                             (HUB_REPORTER, mgr, words, agent, t0, SETTINGS_REQUEST + uuid.uuid4().hex)).lastrowid
+            if mark:
+                DB.execute(ended, (t0, HUB_REPORTER, f"The settings changed. {upref(rid)} replaces this finding.",
+                                   mark["report"], mark["report"]))
+            marks[agent] = {"keys": keys, "boxes": boxes, "report": rid}
+            DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                       (f"settings_finding:{agent}", json.dumps(marks[agent])))
+            log_row(HUB_REPORTER, f"settings check: {upref(rid)} is on {mgr}'s list of proposals, about {agent}")
+            made.append(rid)
+        live = {mark["report"] for mark in marks.values() if mark}
+        for r in read_rows("SELECT id FROM reports WHERE from_agent=? AND decided IS NULL AND collapsed_into IS NULL "
+                           "AND substr(request_id, 1, ?)=?", (HUB_REPORTER, len(SETTINGS_REQUEST), SETTINGS_REQUEST)):
+            if r["id"] not in live:
+                DB.execute(ended, (t0, HUB_REPORTER, "The settings changed: what this finding says is no longer there.",
+                                   r["id"], r["id"]))
+    return made
+
+
+def settings_checked():
+    """settings_check for the two places that run it, the end of apply_team and the hub's start: a check that fails
+    stops neither of them (print: log() commits, and the records can be what failed)."""
+    try:
+        return settings_check()
+    except Exception as e:
+        print(f"WARNING: the settings check did not run: {type(e).__name__}: {e}", flush=True)
+        return []
 
 
 # ---------------------------------------------------------------- see_history: a number with the window before it
@@ -33040,6 +33210,7 @@ def apply_team(new):
                 log_row("owner", f"{ended} conversation session(s) ended: contacts.v2 is {'on' if not was_v2 else 'off'} "
                                  f"now, so each starts again with its new tools at its next message")
     contacts_v2_on()            # plan P1: the one conversion of the roles, the first time the setting is on
+    settings_checked()          # the grants and the Tools boxes change here: a key, a shell and the web together
     changed()                   # team.json is not in the database: its change is counted here (live_changes)
     capp_sync_later()           # the connected apps' socket follows hub.connect (nothing runs while it cannot be on)
 
@@ -34803,7 +34974,7 @@ AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent"
 # kv key the code builds from a value, so a new prefix is placed here or named there with what it holds.
 AGENT_KV = ("tools:", "offline_told:", "runtime_since:", "switched:", "switching:", "history_agent:", "default_vault:",
             "default_desktop:", "checks_brief:", "chat_team:", "duty_review:", "presence:", "turn_ended:",
-            "first_message:")
+            "first_message:", "settings_finding:")
 # The same, with more after the name: `<prefix><agent>:<window, task or item>`.
 AGENT_KV_SCOPED = ("listed:", "untaken:", "chased:")
 # Columns that hold a JSON list of agents' names: the agents that passed a question up (question_passers).
@@ -48170,6 +48341,7 @@ def main():
     settle_releases(ask=not restored)
     settle_task_numbers()
     settle_people_names()
+    settings_checked()          # the team that this hub starts with: a release that brings the check finds what is there
     # The heartbeat starts here and not at the first complete pass (tick_heartbeat), so that a hub whose very first
     # pass raises -- a bad row is there before the timers are -- is visible on the owner's screen after TICK_WARN
     # instead of for ever reading as a hub that has not ticked yet. A process with no timers thread (every test)
