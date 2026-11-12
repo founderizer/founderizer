@@ -6112,7 +6112,21 @@ def t_see_earlier_work(agent, a):
     """The work that came before this task: the task it follows, what that one followed, and its own earlier
     attempts. A short default, one of them in full on request, and a plain text search, so that a long chain of
     follow-ups and restarts never has to sit in the session. mine=true reads the agent's own finished work instead,
-    and a lead reads one of its team's with agent=."""
+    and a lead reads one of its team's with agent=.
+
+    The answer is masked line by line where a login stays that the mask cannot place (mask_message): call_tool's mask
+    of the whole answer made all of it MASK for one such login in one title, result or note, as JSON writes one with a
+    quote. The answer is made under the lock, and masked after it with the logins read there (logins_held), so
+    call_tool runs this tool outside its lock; get_task fences the session's task inside it."""
+    with LOCK:
+        said = earlier_work_said(agent, a)
+        key = secret_key()
+    with logins_held(key):
+        return mask_message(said)
+
+
+def earlier_work_said(agent, a):
+    """t_see_earlier_work's answer before its mask, made under the lock."""
     t = get_task(parse_task(a.get("task_id")), owner=agent)
     chain = earlier_chain(t)
     attempts = read_rows("SELECT * FROM attempts WHERE task=? AND attempt<? ORDER BY attempt", (t["id"], t["attempt"]))
@@ -14479,8 +14493,8 @@ def mask_words(words):
     """mask_secrets of the words that a JSON line quotes (json_one_line), before they are quoted. A login takes the
     whole run of non-whitespace that holds it: in the line each quote of the words is escaped, and the mask of the
     line takes an escaped quote into the run (MASK_PIECE), so no part of a later login that overlaps this one stays,
-    as none stays in the line. Where a login stays that the mask cannot place, the words go whole, or each line of
-    them that holds one."""
+    as none stays in the line. Where a login stays that the mask cannot place, or one escaped twice that a JSON text in
+    them quotes (escaped_twice), the words go whole, or each line of them that holds one."""
     words = str(words or "")
     spans = secret_spans(words)
     out, last = [], 0
@@ -14490,7 +14504,7 @@ def mask_words(words):
                 out += [words[last:m.start()], MASK]
                 last = m.end()
     said = "".join(out) + words[last:]
-    if "\\" not in words or not secret_hit(said):
+    if "\\" not in words or not (secret_hit(said) or escaped_twice(said)):
         return said
     lines = words.split("\n")
     return MASK if len(lines) == 1 else "\n".join(mask_words(line) for line in lines)
@@ -14507,22 +14521,33 @@ def mask_message(text):
     one that the words held escaped already is escaped twice there, which no mask finds. So one such login, registered
     after its message was stored, held back the whole read, every message of which was already marked read, or went
     out. Now it costs that login, or at most the line that holds it. Each line that it gives passes mask_secrets too,
-    so the masked message needs no mask after it (unread_tail). A message with no login keeps its bytes."""
+    so the masked message needs no mask after it (unread_tail). A message with no login keeps its bytes.
+
+    A JSON string inside a line, not a line of its own, is no JSON line: a note that quotes a person's words as a read
+    gave them, or a text that clip made one line. A login escaped twice there is found only when two levels of escapes
+    are undone (escaped_twice), and such a line goes whole: it went out, or a whole-text MASK hid it only when another
+    login of the same text made all of it MASK."""
     text = str(text or "")
     lines = text.split("\n")
     quoted = [json_words(line) for line in lines]
     if all(words is None for words in quoted):
         said = mask_secrets(text)
-        if said != MASK:
+        if said != MASK and not escaped_twice(said):
             return said
     out = []
     for line, words in zip(lines, quoted):
-        if words is None:
-            out.append(mask_secrets(line))
-            continue
-        masked = mask_words(words)
-        out.append(mask_secrets(line if masked == words else json_one_line(masked)))
+        if words is not None:
+            masked = mask_words(words)
+            line = line if masked == words else json_one_line(masked)
+        line = mask_secrets(line)
+        out.append(MASK if escaped_twice(line) else line)
     return "\n".join(out)
+
+
+def escaped_twice(text):
+    """Whether a text holds a registered login escaped twice, as a JSON string inside a JSON text has one that holds a
+    quote or a backslash: secret_hit undoes one level of escapes (json_plain), and this one level more."""
+    return "\\" in text and secret_hit(json_plain(text))
 
 
 def conversation_pass_rows(conv, person, tid, rows, t0):
@@ -14632,8 +14657,10 @@ def conversation_brief(agent, conv, person, t):
                  [f"{said[r['who']]}: {mask_secrets(clip(r['text'], 600))}" for r in reversed(rows)]
     first = "\n".join(lines) + "\n"
     # how this session started (conversation_start), which says whether its stable text lists the agent's skills
-    return start_text(agent, t["id"], first=first, opening=stable_opening(agent, "none")) if t else \
-        mask_secrets(first)
+    if t:
+        return start_text(agent, t["id"], first=first, opening=stable_opening(agent, "none"))
+    with logins_held(secret_key()):         # line by line, as start_text masks the brief of a window with a task
+        return mask_message(first)
 
 
 def conversation_work_prompt(agent, conv, person, opening=None):
@@ -25454,17 +25481,20 @@ def manager_resume_text(parts=True):
     name the manager's parts of the rules first, for a session whose start does not hold them (stable_standing)."""
     t0 = now()
     # Masked on the way out, as start_text is: these lines carry what agents wrote — report texts, task titles,
-    # question texts — and a login registered after any of them was stored was never masked at the write.
-    return mask_secrets((manager_parts_line() if parts else "")
-                        + "Where the fleet stands, as the hub has it (nothing here is only in this session):\n"
-                        + "\n".join(resume_lines(t0))
-                        + team_start_text(manager_name())               # the team directory (P9.1)
-                        + standing_start_text(manager_name()).rstrip("\n")   # its standing items (L3, 6.4)
-                        # its skills, where its stable text does not list them (design v4 D3)
-                        + skills_start_text(manager_name(), not parts).rstrip("\n")
-                        + knowledge_start_text(manager_name()).rstrip("\n")     # the knowledge files, never their text
-                        + manager_checks_text(t0).rstrip("\n")         # its checks and its reports' new ones (L4)
-                        + "\nThen call read_messages: its read is the receipt.")
+    # question texts — and a login registered after any of them was stored was never masked at the write. Line by line
+    # where a login stays that the mask cannot place (mask_message), with the logins read once (logins_held): one such
+    # login, as JSON writes one with a quote, made the whole brief MASK, and the manager's session started blind.
+    with logins_held(secret_key()):
+        return mask_message((manager_parts_line() if parts else "")
+                            + "Where the fleet stands, as the hub has it (nothing here is only in this session):\n"
+                            + "\n".join(resume_lines(t0))
+                            + team_start_text(manager_name())               # the team directory (P9.1)
+                            + standing_start_text(manager_name()).rstrip("\n")   # its standing items (L3, 6.4)
+                            # its skills, where its stable text does not list them (design v4 D3)
+                            + skills_start_text(manager_name(), not parts).rstrip("\n")
+                            + knowledge_start_text(manager_name()).rstrip("\n")     # the knowledge files, no text
+                            + manager_checks_text(t0).rstrip("\n")         # its checks and its reports' new ones (L4)
+                            + "\nThen call read_messages: its read is the receipt.")
 
 
 def S(props, required=()):
@@ -27236,10 +27266,11 @@ def call_tool(agent, name, args, context=None):
                 # These wait for an answer, a helper or Google, or read many files (search_knowledge): not under LOCK.
                 # deliver_result waits for the helper to send the task's files (deliver_outputs). The history's two
                 # take the lock for each step of their own, so the hub answers between the steps of a long search.
-                # read_messages and list_my_tasks take it for their reads and writes, and mask after it.
+                # read_messages, list_my_tasks and see_earlier_work take it for their reads and writes, and mask after.
                 if name in ("ask_my_requester", "sign_in", "hand_over", "create_login", "save_key", "call_api",
                             "message_agent", "search_knowledge", "read_knowledge", "write_knowledge", "write_skill",
-                            "deliver_result", "search_history", "read_history", "read_messages", "list_my_tasks") or \
+                            "deliver_result", "search_history", "read_history", "read_messages", "list_my_tasks",
+                            "see_earlier_work") or \
                         name in GOOGLE_TOOLS or name in REPO_CALLS or \
                         (name == "set_reminder" and args.get("ci") not in (None, "")):    # these ask GitHub
                     # (set_reminder ci reads the commit's runs once, and takes LOCK for its own write: ci_reminder)

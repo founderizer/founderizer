@@ -350,6 +350,99 @@ class SecretThroughAnEscape(Base):
         self.assertIn("End.", said.splitlines())
         self.assertNotIn("assw0rd", said)
 
+    def earlier(self, n):
+        """A task of vps that follows a chain of n finished tasks, the newest of which reports a result with the
+        login in a JSON text, which the mask finds but cannot place."""
+        before = None
+        for k in range(n):
+            tid = self.new_task(title=f"Earlier step {k}", details="Done before.")
+            what = "Set the config " + json.dumps({"login": self.LOGIN}) if k == n - 1 else f"Step {k} is done."
+            hub.q("UPDATE tasks SET state='completed', what=?, follows=? WHERE id=?", (what, before, tid))
+            before = tid
+        after = self.new_task(title="Rotate the shop's login", details="Use the new one.")
+        hub.q("UPDATE tasks SET follows=? WHERE id=?", (before, after))
+        return after
+
+    def test_one_earlier_result_with_a_login_that_the_mask_cannot_place_costs_its_own_line(self):
+        """see_earlier_work joins a line or more for each task that came before, and call_tool masked the whole
+        answer once: one login that the mask could not place in one result, as a JSON text has one with a quote, made
+        all of it MASK. The answer is masked line by line now (mask_message), after the lock."""
+        after = self.earlier(2)
+        self.register()
+        said = self.ok("vps", "see_earlier_work", task=after).splitlines()
+        self.assertIn(f"{hub.tref(after)} follows 2 earlier task(s), the nearest first:", said)
+        self.assertEqual(said.count(hub.MASK), 1, said)
+        self.assertTrue(any("Earlier step 0" in line for line in said), said)
+        self.assertNotIn("assw0rd", "\n".join(said))
+
+    def test_a_login_escaped_twice_inside_a_line_is_masked_with_its_line(self):
+        """A note that quotes a person's words as a read gave them holds a JSON string inside its line, and
+        see_earlier_work shows the note inside one more line: a login that the words held escaped already is escaped
+        twice there, which secret_hit, undoing one level of escapes, never finds, so it went out. Such a line goes
+        whole now (escaped_twice), also when another login of the answer goes on its own line."""
+        quoted = hub.json_one_line("Use " + json.dumps({"pw": self.LOGIN}) + " please")
+        self.ok("vps", "report_progress", note=f"Kim wrote: {quoted}")
+        hub.q("UPDATE tasks SET state='completed', what='Rotated it.' WHERE id=?", (self.task,))
+        after = self.new_task(title="Rotate the shop's login", details="Use the new one.")
+        hub.q("UPDATE tasks SET follows=? WHERE id=?", (self.task, after))
+        self.register()
+        text, error = hub.call_tool("vps", "see_earlier_work",
+                                    {"task_id": hub.tref(after), "task": hub.tref(self.task)},
+                                    ("test-generation", hub.tref(after), 1))
+        self.assertFalse(error, text)
+        self.assertTrue(text.startswith(f"{hub.tref(self.task)} [completed] Fix the acme/web deploy"), text[:80])
+        self.assertIn(hub.MASK, text.splitlines())
+        self.assertNotIn("assw0rd", text)
+        # mask_message: such a line beside a line whose login escaped once the mask cannot place, a JSON string that
+        # clip cut before its closing quote, and a text with no login
+        line = f"60s ago, vps: Kim wrote: {quoted}"
+        self.assertEqual(hub.mask_message(f"The shop answered {json.dumps({'pw': self.LOGIN})}\n{line}\nEnd."),
+                         f"{hub.MASK}\n{hub.MASK}\nEnd.")
+        self.assertEqual(hub.mask_message(line[:-len(' please"')]), hub.MASK)        # the login whole, no end quote
+        plain = 'Kim wrote: "Use {\\"pw\\": \\"not-a-login\\"} please"'
+        self.assertEqual(hub.mask_message(plain), plain)
+
+    def test_words_that_quote_a_json_text_of_a_json_text_go_whole(self):
+        """A person's words in a JSON line (json_one_line) can themselves hold a JSON string of a JSON text, as a
+        webhook's body that they paste: the login is escaped twice in the words and three times in the line, which
+        mask_words found at neither level. Such words go whole now (escaped_twice in mask_words)."""
+        self.register()
+        words = "Its body: " + json.dumps(json.dumps({"pw": self.LOGIN}))
+        self.assertEqual(hub.mask_words(words), hub.MASK)
+        self.assertEqual(hub.mask_message(f"Header\n{hub.json_one_line(words)}"),
+                         f"Header\n{hub.json_one_line(hub.MASK)}")
+        self.assertEqual(hub.mask_words("Its body: " + json.dumps(json.dumps({"pw": "not-a-login"}))),
+                         "Its body: " + json.dumps(json.dumps({"pw": "not-a-login"})))
+
+    def test_see_earlier_work_reads_the_logins_once_for_all_its_masks(self):
+        """see_earlier_work masks after the lock with the logins that it read in the lock (logins_held): a mask that
+        read them again would take the lock again for each line, where TeamLock raises Left for an agent that left
+        meanwhile. It reads them as often for a chain of 5 as for a chain of 1. A guard of that design: the parent
+        commit, which masked only in call_tool, passes it too."""
+        self.register()
+
+        def reads(n):
+            after = self.earlier(n)
+            seen, real = [], hub.read_rows
+            with patch.object(hub, "read_rows", lambda sql, args=(): seen.append(sql) or real(sql, args)):
+                said = self.ok("vps", "see_earlier_work", task=after)
+            self.assertIn(hub.MASK, said.splitlines())
+            return sum("FROM secrets" in sql for sql in seen)
+        self.assertEqual(reads(1), reads(5))
+
+    def test_one_title_with_a_login_that_the_mask_cannot_place_costs_its_line_of_the_resume_brief(self):
+        """The manager's resume brief is the first prompt of its standing session, and it was masked whole: one login
+        that the mask could not place in one open task's title made all of it MASK, so the session started blind. It
+        is masked line by line now (mask_message)."""
+        held = self.new_task(title="Rotate " + json.dumps({"login": self.LOGIN}), details="Use the new one.")
+        hub.q("UPDATE tasks SET state='working' WHERE id IN (?,?)", (held, self.task))
+        self.register()
+        brief = hub.manager_resume_text(parts=False)
+        self.assertTrue(brief.startswith("Where the fleet stands, as the hub has it"), brief[:80])
+        self.assertIn(f"  {hub.tref(self.task)} [working] Fix the acme/web deploy -- vps", brief)
+        self.assertIn(hub.MASK, brief.splitlines())
+        self.assertNotIn("assw0rd", brief)
+
     def test_list_my_tasks_reads_the_logins_once_for_all_its_masks(self):
         """list_my_tasks masks its task after the lock, with the logins that it read in the lock (logins_held), so its
         own masks take the lock no more after it marked the task started, where TeamLock raises Left for an agent that

@@ -477,6 +477,22 @@ class Conversations(Base):
         self.assertIn(f"Pat: {hub.MASK}", lines)
         self.assertNotIn("w0rd-731", text)
 
+    def test_the_brief_of_a_window_with_no_task_masks_each_line_on_its_own(self):
+        """A new window whose conversation task has ended gets its brief with no per-task block, masked whole with one
+        mask_secrets: words that hold a JSON text of a JSON text have a login escaped twice in the recap line, which
+        that mask never found. The brief is masked line by line now (mask_message), as start_text masks one."""
+        login = 'Synth"Pass\\w0rd-731-example'
+        cid = self.says(PAT, "Its body: " + json.dumps(json.dumps({"password": login})))["conversation"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        self.ok("reply", self.context(cid), text="Thanks, noted.", in_reply_to="CM-1")
+        test_people.register(login)
+        hub.conversation_start("studio", cid)                  # a new window, with no open conversation task
+        text = self.ok("read_messages", self.context(cid))
+        self.assertTrue(text.startswith(f"CONVERSATION C-{cid} with Pat, who is peer: "), text[:80])
+        self.assertIn(hub.MASK, text.splitlines())
+        self.assertNotIn("w0rd-731", text)
+
     def test_a_question_that_holds_a_json_text_with_a_login_loses_that_login_in_its_tasks_start(self):
         """ask_team puts the person's words into the task's details as one JSON string, which escapes again a login
         that a JSON text in them held escaped already. No mask found it there, so a start of that task after the
