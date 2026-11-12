@@ -33,11 +33,15 @@ class PushError(Exception):
     `retry_after` is set when our side held the ping back because a count of its is full (429, the website's
     docs/CONTRACTS.md, "The limits"): the seconds after which the same ping may go again. Our side sent nothing to
     Apple, so the ping still reaches Apple once at most. Its count of each caller counts the refused requests too, so
-    the hub sends no ping before that time."""
+    the hub sends no ping before that time.
 
-    def __init__(self, says, retry_after=None):
+    `status` is our side's own HTTP status when it answered with a refusal (400 for a shape that it does not take),
+    and None when it could not be reached."""
+
+    def __init__(self, says, retry_after=None, status=None):
         super().__init__(says)
         self.retry_after = retry_after
+        self.status = status
 
 
 def _retry_after(headers):
@@ -174,7 +178,8 @@ def send(channel, entitlement, device_token, payload, environment, collapse=None
     except urllib.error.HTTPError as answer:
         with answer:
             says = _refusal(answer.code, answer.read(65536).decode("utf-8", "replace"))
-            raise PushError(says, retry_after=_retry_after(answer.headers) if answer.code == 429 else None) from None
+            raise PushError(says, retry_after=_retry_after(answer.headers) if answer.code == 429 else None,
+                            status=answer.code) from None
     except urllib.error.URLError as e:          # the request did not get out: no connection, no name, no TLS
         raise PushError(f"founderizer.com cannot be reached: {str(e.reason)[:200]}") from None
     except (OSError, ValueError):               # it went, and the answer did not come back

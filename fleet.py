@@ -294,7 +294,7 @@ PLACE_PUBLIC = re.compile(r"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{4
 ENV_RESERVED = lifecycle.ENV_RESERVED
 
 
-def session_env(agent, conf, kind, place=None, closed=False):
+def session_env(agent, conf, kind, place=None, closed=False, attempt=None):
     """{NAME: value} for the environment of a session of this agent that starts now (kind: task, chat or manager). Each
     session start uses this one hook: the API keys that the owner lets this agent read (read_env), and for a task
     session its GitHub repositories, their credentials and its tools (integration_env, owner feature integrations). A
@@ -303,11 +303,13 @@ def session_env(agent, conf, kind, place=None, closed=False):
 
     Support plan F1: a session of an agent whose Shell box is off gets no key and no GitHub token. A task session of
     it gets only what its own MCP servers need, which closed_task_command writes into its MCP file, never into its
-    environment. closed: the hub's start says the Shell box is off, whatever this checkout's team.json says yet."""
+    environment. closed: the hub's start says the Shell box is off, whatever this checkout's team.json says yet.
+    attempt: the attempt of a task session, so that a later one gets its clones' facts (attempt_note)."""
     if closed or shell_off(conf):
         return integration_env(agent, conf, {}, closed=True) if kind == "task" else {}
     keys = read_env(agent, conf, kind)
-    return dict(keys, **(integration_env(agent, conf, keys, place) if kind == "task" else {}))
+    later = {"attempt": attempt} if attempt else {}
+    return dict(keys, **(integration_env(agent, conf, keys, place, **later) if kind == "task" else {}))
 
 
 def shell_off(conf):
@@ -457,6 +459,26 @@ FROZEN_GAP = 2
 # doubling up to RESIGNAL_MAX.
 SIGNAL_GAP = 20
 HOOK_TIMEOUT = 2_000_000    # seconds: Claude Code's limit for the permission hook, which asks until a decision (C7)
+# The tools whose results the clean hook reads (hook_clean.py): the built-in tools that read outside text, and every MCP
+# tool but the fleet server's, whose answers the hub cleans itself (hub.call_tool). Claude Code reads a matcher with
+# a character other than letters, digits, "_", "-", spaces, "," and "|" as an unanchored JavaScript regular expression.
+# (BashOutput, TaskOutput and Monitor: the output of a command in the background, which RULES.md asks for when a
+# command is long. Agent and Task: a subagent's answer. Glob and NotebookRead: names and cells of a repository.)
+CLEAN_MATCHER = (r"^(Bash|BashOutput|TaskOutput|Monitor|Read|NotebookRead|Grep|Glob|WebFetch|WebSearch|Agent|Task|"
+                 r"ReadMcpResourceTool)$|^mcp__(?!fleet__)")
+CLEAN_TIMEOUT = 10          # seconds: at its limit, Claude Code keeps the original output
+
+
+def clean_hook():
+    """The synchronous PostToolUse entry that removes hidden characters from what a tool read (hook_clean.py). A
+    synchronous hook, because an async one cannot change the output; a program of its own with python3 -S, because it
+    runs at each such call and fleet.py compiles 8,000 lines at each start."""
+    return {"matcher": CLEAN_MATCHER, "hooks": [{
+        "type": "command", "timeout": CLEAN_TIMEOUT,
+        # 2>/dev/null || true: a program that cannot start says nothing and exits 0, never 2, which Claude Code would
+        # show to the model; with no output, Claude Code keeps the original
+        "command": f"{shlex.quote(sys.executable)} -S {shlex.quote(os.path.join(KIT, 'hook_clean.py'))} "
+                   f"2>/dev/null || true"}]}
 HOOK_ASK = 45               # seconds for one ask of the hook; the hub answers `pending` after 25
 IDLE_READINGS = 3           # a session whose tools never list gets its first line after this many idle readings
 RESIGNAL_FIRST = 60
@@ -690,7 +712,7 @@ DENY = ["Read(~/.fleet/**)", "Edit(~/.fleet/**)", "Bash(*.fleet/*)"] + UNSEEN_TO
 CHROME_TOOLS = "mcp__claude-in-chrome__*"      # the tools that Claude Code's --chrome adds to a browser task
 # The files of this checkout that no worker session edits: Fleet's code, the rules, the owner's files, and the agents'
 # skills, which an agent changes with write_skill only (design v4 D1).
-PROTECTED = ("fleet.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.py", "acp_programs.py", "prices/**", "pins.py", "prices.py", "screen_runner.py", "desktop.py", "FleetWorker.swift", "worker_install.py", "install-worker.sh", "Install Fleet Worker.command", "hub.py", "wakeups.py", "usage.py", "threads.py", "selftest.py", "test_logins.py", "verify.py", "verify_case.py", "pilot.py", "publish.py", "publish/**", "team.json", "RULES.md", "rules/**", "CLAUDE.md", "AGENTS.md", "profiles/**", "skills/**")
+PROTECTED = ("fleet.py", "hook_clean.py", "hidden.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.py", "acp_programs.py", "prices/**", "pins.py", "prices.py", "screen_runner.py", "desktop.py", "FleetWorker.swift", "worker_install.py", "install-worker.sh", "Install Fleet Worker.command", "hub.py", "wakeups.py", "usage.py", "threads.py", "selftest.py", "test_logins.py", "verify.py", "verify_case.py", "pilot.py", "publish.py", "publish/**", "team.json", "RULES.md", "rules/**", "CLAUDE.md", "AGENTS.md", "profiles/**", "skills/**")
 # No Claude session that a helper starts loads a setting source of its machine (--setting-sources ''). A Mac keeps one
 # desktop user for its agents (PRODUCT.md P2), so that person's own CLAUDE.md, rules, skills, agents, plugins and hooks
 # would steer every agent there unseen, and an agent could write them to steer its own later sessions; and the
@@ -756,8 +778,8 @@ NO_SUGGESTION = {"promptSuggestionEnabled": False}
 
 
 def settings_arg(agent, conf, task, tools=(), needs="none"):
-    """Claude Code settings for one session: what runs without asking, what never runs, and the two hooks
-    that carry a worker's permission prompts and activity to the hub. The owner's full-access manager has no
+    """Claude Code settings for one session: what runs without asking, what never runs, the two hooks
+    that carry a worker's permission prompts and activity to the hub, and the clean hook, which the manager has too. The owner's full-access manager has no
     Fleet-added deny rule that limits a command or a file, only UNSEEN_TOOLS and its runtime's manager_denied, and
     starts with the recorded unattended permission-mode choice. tools: the catalog tools
     of this task session, which the owner gave the agent; they run without asking (owner feature integrations).
@@ -804,8 +826,15 @@ def settings_arg(agent, conf, task, tools=(), needs="none"):
             "PermissionRequest": [{"hooks": [{"type": "command", "timeout": HOOK_TIMEOUT,
                                               "command": f"{hook} permission {agent} {task}"}]}],
             "PostToolUse": [{"hooks": [{"type": "command", "async": True, "timeout": 10,
-                                        "command": f"{hook} activity {agent} {task}"}]}],
+                                        "command": f"{hook} activity {agent} {task}"}]},
+                            clean_hook()],      # hidden characters out of what a tool read (hook_clean.py)
+            # a failed call keeps its output, so the same program only says that hidden characters are in it
+            "PostToolUseFailure": [clean_hook()],
         }
+    elif conf.get("role") == "manager":
+        # The manager's session has WebFetch and Bash too: the clean hook alone, and no permission or activity hook,
+        # which are a task's
+        settings["hooks"] = {"PostToolUse": [clean_hook()], "PostToolUseFailure": [clean_hook()]}
     settings.update(kept_user_settings())
     return "--settings " + shlex.quote(json.dumps(settings))
 
@@ -871,7 +900,7 @@ def team_catalog():
         return tool_catalog(TEAM)
 
 
-def integration_env(agent, conf, keys=None, place=None, closed=False):
+def integration_env(agent, conf, keys=None, place=None, closed=False, attempt=None):
     """A task session's GitHub repositories and tools, as the hub gives them at its start (owner feature integrations):
     FLEET_REPOS, GH_TOKEN and git's credentials for them (FLEET_GIT_TOKENS, GIT_CONFIG_*), FLEET_TOOLS with the
     tools' own variables, and FLEET_GITHUB_NOTE for what the session lacks. With a place (task_place), which FLEET_WORK
@@ -880,7 +909,8 @@ def integration_env(agent, conf, keys=None, place=None, closed=False):
     tools; {} for an agent without them, and from a hub without the route. keys: the API keys of this session
     (read_env), which a tool of the owner may need; they are already in the session's environment, so they are not
     given again. closed: a session of an agent whose Shell box is off (support plan F1), which gets its MCP servers and
-    no repository or GitHub token."""
+    no repository or GitHub token. attempt: a later attempt of the task gets, for each clone that the task has, a
+    snapshot ref and one line of facts in FLEET_GITHUB_NOTE (attempt_note)."""
     mine = checkout_conf(agent)
     if conf.get("role") not in ("worker", "lead") or not (mine.get("tools") or (mine.get("repos") and not closed)):
         return {}
@@ -916,8 +946,14 @@ def integration_env(agent, conf, keys=None, place=None, closed=False):
                           f"your other {len(others)} repositories use git only."))
     if repos and place:
         values["FLEET_WORK"] = place
-    for repo, problem in prepare_repos(held_repos(repos, place), values, place).items():
+    held = held_repos(repos, place)
+    for repo, problem in prepare_repos(held, values, place).items():
         notes.append(f"{repo} was not fetched: {problem}.")
+    # T3 Code idea 4: what the attempts before this one left in each clone, before the session touches it
+    for repo in sorted(held) if place and isinstance(attempt, int) and attempt > 1 else []:
+        line = attempt_note(os.path.join(place, *repo.split("/")), repo, attempt, capture=True)
+        if line:
+            notes.append(line)
     refresh_shared(repos, values)
     # The access token of each oauth MCP server that the hub gave for this session (owner feature mcp): it goes into
     # the session's mode-600 env file, as GH_TOKEN does, and it stops when the server's token life ends.
@@ -1130,6 +1166,152 @@ def own_clone(repo, shared, place, env):
     with contextlib.suppress(OSError):
         os.removedirs(os.path.dirname(new))         # .new/<owner> and .new, when nothing else is in them
     return None
+
+
+ATTEMPT_REF = "refs/fleet-attempt/"     # the snapshot of a task's clone as each later attempt starts
+ATTEMPT_MOST = 50 * 1024 * 1024         # bytes of changed and new files above which no snapshot is made
+ATTEMPT_IDS = 5                         # pushes that the line names by their short commit id
+ATTEMPT_WHO = {"GIT_AUTHOR_NAME": "Founderizer", "GIT_AUTHOR_EMAIL": "helper@founderizer.invalid",
+               "GIT_COMMITTER_NAME": "Founderizer", "GIT_COMMITTER_EMAIL": "helper@founderizer.invalid"}
+STOPPED_GIT = (("rebase-merge", "a rebase"), ("rebase-apply", "a rebase"), ("MERGE_HEAD", "a merge"),
+               ("CHERRY_PICK_HEAD", "a cherry-pick"), ("REVERT_HEAD", "a revert"))
+
+
+def attempt_changed(own):
+    """The paths of a clone that are not committed (git status, untracked files one by one), read with no optional
+    lock, so that the read does not write the index either. None when git cannot read it."""
+    try:            # not git_out: its strip() would take the first entry's leading space
+        # (attempt_safe: git status runs a filter's clean command on each changed file, and the file-system monitor)
+        r = subprocess.run(["git", "--no-optional-locks", *attempt_safe(own), "-C", own, "status", "--porcelain=v1", "-z",
+                            "--untracked-files=all"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    except OSError:
+        return None
+    if r.returncode != 0:
+        return None
+    paths, parts = [], r.stdout.split("\0")
+    i = 0
+    while i < len(parts):
+        entry = parts[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        paths.append(entry[3:])
+        if entry[0] in "RC":            # a rename or a copy: its first path follows
+            i += 1
+    return paths
+
+
+ATTEMPT_QUIET = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]
+
+
+def attempt_safe(own):
+    """git options that keep a command of the helper from running a program that the clone's own config names:
+    no file-system monitor, no hook, and each filter that the config has with an empty command, which passes a file
+    through as it is."""
+    names = git_out(["git", *ATTEMPT_QUIET, "-C", own, "config", "--name-only", "--get-regexp",
+                     r"^filter\..*\.(clean|smudge|process)$"]) or ""
+    return ATTEMPT_QUIET + [x for name in names.split() for x in ("-c", f"{name}=")]
+
+
+def attempt_capture(own, attempt, changed):
+    """refs/fleet-attempt/<attempt> in a task's own clone: one commit of its work tree as this attempt starts, with
+    HEAD as its parent, made as T3 Code makes its checkpoints: a temporary index outside the clone, git add -A (an
+    ignored file stays out), write-tree, commit-tree, update-ref. No file, no index, no branch and no HEAD of the clone
+    changes; only its objects and that one ref are new. "made", "too big" (above ATTEMPT_MOST, no snapshot), or
+    "failed"."""
+    size = 0
+    for path in changed:
+        with contextlib.suppress(OSError):
+            st = os.lstat(os.path.join(own, path))
+            size += st.st_size if stat.S_ISREG(st.st_mode) else 0
+    if size > ATTEMPT_MOST:
+        return "too big"
+    safe = attempt_safe(own)        # on each git call here: write-tree asks the file-system monitor too
+    folder = tempfile.mkdtemp(prefix="fleet-attempt-")
+    try:
+        index = os.path.join(folder, "index")
+        real = git_out(["git", *safe, "-C", own, "rev-parse", "--path-format=absolute", "--git-path", "index"])
+        if real and os.path.isfile(real):
+            shutil.copyfile(real, index)        # a copy: git add then reads the stat data that is there already
+        # The clone's own git config is the session's to write, and git add runs what it names (a filter's clean
+        # command, a file-system monitor). So those are switched off for this call, and it gets a small environment
+        # and not the helper's own.
+        env = {**{k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")},
+               **ATTEMPT_WHO, "GIT_INDEX_FILE": index, "GIT_OPTIONAL_LOCKS": "0"}
+        if git_problem(["git", *safe, "-C", own, "add", "-A"], env):
+            return "failed"
+        tree = git_out(["git", *safe, "-C", own, "write-tree"], env)
+        head = git_out(["git", *safe, "-C", own, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+        # --no-gpg-sign: a machine whose git signs every commit must not ask for a key here, where nobody answers
+        commit = tree and git_out(["git", *safe, "-C", own, "commit-tree", "--no-gpg-sign", tree,
+                                   *(["-p", head] if head else []), "-m",
+                                   f"The work tree as attempt {attempt} of this task started"], env)
+        if not commit or git_problem(["git", *safe, "-C", own, "update-ref", f"{ATTEMPT_REF}{attempt}", commit], env):
+            return "failed"
+        return "made"
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def attempt_pushes(own, since):
+    """The short ids of the pushes to origin from this clone after `since` (epoch seconds), oldest first: each push
+    writes "update by push" in the reflog of the branch of origin that it moved, and gc.auto 0 keeps that reflog."""
+    found = []
+    for ref in (git_out(["git", "-C", own, "for-each-ref", "--format=%(refname)", "refs/remotes/origin/"]) or
+                "").split():
+        if ref.endswith("/HEAD"):
+            continue
+        for line in (git_out(["git", "-C", own, "reflog", "show", "--date=unix", "--format=%h%x09%gd%x09%gs", ref,
+                              "--"]) or "").splitlines():
+            short, _, rest = line.partition("\t")
+            at, _, subject = rest.partition("\t")
+            when = re.search(r"@\{(\d+)\}$", at)
+            if subject.startswith("update by push") and when and int(when.group(1)) > since:
+                found.append((int(when.group(1)), short))
+    return [short for _, short in sorted(found)]
+
+
+def attempt_note(own, repo, attempt, capture=False):
+    """One line for a later attempt of a task about its own clone of repo: the commits that origin does not have, the
+    files not committed, a rebase or a merge that stopped half way, and the pushes since the attempt before this one
+    started (since the clone was made, for attempt 2), with their short ids, so that rule 9 sees a push too. Counts
+    and short commit ids only, never a path or a file's text. capture: the start of the attempt, which first makes
+    refs/fleet-attempt/<attempt> (attempt_capture); cmd_repo gives the same line later in the session, with no new
+    snapshot. None when the clone is not there; a failure leaves the start as before, and the helper's log says it."""
+    try:
+        if not os.path.isdir(os.path.join(own, ".git")):
+            return None
+        changed = attempt_changed(own)
+        if changed is None:
+            return None
+        made = attempt_capture(own, attempt, changed) if capture else \
+            "made" if git_out(["git", "-C", own, "rev-parse", "--verify", "--quiet", f"{ATTEMPT_REF}{attempt}"]) \
+            else None
+        ahead = len((git_out(["git", "-C", own, "rev-list", "--branches", "--not", "--remotes"]) or "").split())
+        stopped = next((what for name, what in STOPPED_GIT if os.path.exists(
+            git_out(["git", "-C", own, "rev-parse", "--path-format=absolute", "--git-path", name]) or "\0")), None)
+        before = git_out(["git", "-C", own, "log", "-1", "--format=%ct", f"{ATTEMPT_REF}{attempt - 1}", "--"])
+        pushes = attempt_pushes(own, int(before) if before and before.isdigit() else 0)
+        line = (f"Your clone of {repo} {'as attempt ' + str(attempt) + ' starts' if capture else 'now'}: "
+                f"{ahead} commit(s) that origin does not have, {len(changed)} file(s) not committed"
+                + (f", {stopped} that stopped half way" if stopped else "")
+                + f", {len(pushes)} push(es) to origin since "
+                + (f"attempt {attempt - 1} started" if before else "the task made this clone")
+                + (f" (the last: {' '.join(pushes[-ATTEMPT_IDS:])})" if pushes else "") + ". ")
+        if made == "made":
+            line += (f"{ATTEMPT_REF}{attempt} holds all its files as this attempt started (`git diff "
+                     f"{ATTEMPT_REF}{attempt} -- <path>` compares one with it)")
+            line += (f", and `git diff {ATTEMPT_REF}{attempt - 1} {ATTEMPT_REF}{attempt}` shows what attempt "
+                     f"{attempt - 1} changed. " if before else ". ")
+        elif made == "too big":
+            line += "Its changed files are too big for a snapshot, so this attempt has no refs/fleet-attempt ref. "
+        elif capture:
+            line += "No snapshot of it was made. "
+        return line + "Check these before you repeat a commit or a push (rule 9)."
+    except Exception as e:          # a new part never stops the start that it helps
+        print(time.strftime("%H:%M:%S"), f"the facts of the clone of {repo} were not read: {type(e).__name__}",
+              flush=True)
+        return None
 
 
 def drop_place(place, say):
@@ -1709,7 +1891,9 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
                      "permissions": {"allow": allow, "deny": deny},
                      # the activity of its tool calls for the hub's views, as every task session sends it (C7)
                      "hooks": {"PostToolUse": [{"hooks": [{"type": "command", "async": True, "timeout": 10,
-                                                           "command": f"{hook} activity {agent} {task}"}]}]}},
+                                                           "command": f"{hook} activity {agent} {task}"}]},
+                                               clean_hook()],      # and hidden characters out (hook_clean.py)
+                               "PostToolUseFailure": [clean_hook()]}},
                     **{k: v for k, v in kept_user_settings().items() if k != "env"})   # the pinned version's updater
     # its rules, its profile and its knowledge files in its start, because it reads no file; no skill list, whose
     # SKILL.md it could not open either. A start without that text would tell it to read files: none is made.
@@ -2042,7 +2226,7 @@ CHAT_SIGNAL = "New fleet messages. Call read_messages now."     # the helper's s
 # test_chat_agents pin on both sides. request_secret is allowed here one release before the hub offers it to a
 # worker's chat (owner feature secret_requests), so that no machine that has not updated yet refuses it.
 CHAT_TOOLS = ("read_messages", "tell_owner", "message_owner", "message_agent", "see_responsibilities", "recall",
-              "start_task", "request_secret")
+              "start_task", "request_secret", "search_history", "read_history")
 # Characters of a chat's quoted first prompt. A tmux command must stay under 16 KiB (start_window; tmux refuses a
 # longer one with "command too long"), and a Codex chat has nowhere else to put its prompt. The instructions and the
 # profile are what the chat is, so the recap is what gives way.
@@ -4863,7 +5047,7 @@ class Helper:
                 def command():          # after the checkout's sync, which Helper.start runs first
                     env = session_env(self.agent, self.conf, "task",
                                       task_place(self.agent, extra.get("generation"), task),
-                                      closed=isinstance(extra.get("shell_off"), dict))
+                                      closed=isinstance(extra.get("shell_off"), dict), attempt=extra.get("attempt", 1))
                     return session_command(self.agent, self.runner_conf(needs) if runner else self.run_conf(), ev["text"],
                         task=task, needs=needs, attempt=extra.get("attempt",1), generation=extra.get("generation",""),
                         session=session, token=token, env=env, opening=extra.get("opening"), rules=extra.get("rules"),
@@ -8202,13 +8386,15 @@ def cmd_repo(args):
     needs it (owner feature integrations; held_repos says why a start no longer fetches them all). With FLEET_WORK,
     the task's own clone, made from the shared clone in WORK, or fetched when the task has it already; without it, the
     shared clone. The session's own credentials, and only a repository of its FLEET_REPOS. Prints each folder, one a
-    line, and on stderr what failed, with exit status 1."""
+    line, and on stderr what failed, with exit status 1. In a later attempt (FLEET_ATTEMPT), a clone that the task had
+    already also gets the line of its facts on stderr (attempt_note), as the start of the attempt gave it."""
     granted = dict(pair.rsplit(":", 1) for pair in os.environ.get("FLEET_REPOS", "").split() if ":" in pair)
     place = os.environ.get("FLEET_WORK") or None
     tasks = os.path.realpath(task_work()) + os.sep
     if place and not os.path.realpath(place).startswith(tasks):
         die(f"FLEET_WORK is not a task's folder in {tasks}")
     failed = False
+    attempt = int(os.environ["FLEET_ATTEMPT"]) if os.environ.get("FLEET_ATTEMPT", "").isdigit() else 1
     for name in args.repos:
         repo = re.sub(r"^(https://github\.com/|git@github\.com:)", "", name.strip().lower()).strip("/")
         repo = repo[:-4] if repo.endswith(".git") else repo
@@ -8217,12 +8403,16 @@ def cmd_repo(args):
                   f"requester with needs_access=\"repo:{repo}\".", file=sys.stderr)
             failed = True
             continue
+        had = bool(place) and bool(held_repos({repo: granted[repo]}, place))
         problem = prepare_repos({repo: granted[repo]}, {}, place).get(repo)
         if problem:
             print(f"{repo}: {problem}", file=sys.stderr)
             failed = True
             continue
         print(os.path.join(place or WORK, *repo.split("/")), flush=True)
+        line = attempt_note(os.path.join(place, *repo.split("/")), repo, attempt) if had and attempt > 1 else None
+        if line:
+            print(line, file=sys.stderr, flush=True)
     if failed:
         sys.exit(1)
 

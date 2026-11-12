@@ -626,6 +626,25 @@ class HelperSide(unittest.TestCase):
             self.assertEqual(fleet.integration_env("dev", CLAUDE), {})     # a hub without the route
             self.assertEqual(fleet.integration_env("manager", dict(CLAUDE, role="manager")), {})
 
+    def test_a_later_attempt_gets_the_facts_of_each_clone_that_the_task_has_in_its_note(self):
+        """T3 Code idea 4: the route of the helper's repository notes (FLEET_GITHUB_NOTE, "In this session:") carries
+        one line for each clone that the task has, at each attempt after the first, and none at the first."""
+        place = str(self.tmp / "work/.tasks/dev/0123456789ab/T-3")
+        os.makedirs(os.path.join(place, "acme", "web", ".git"))
+        asked = []
+        with patch.object(fleet, "checkout_conf", return_value={"repos": {"acme/web": "write"}}), \
+                patch.object(fleet, "http", self.answer()), \
+                patch.object(fleet, "prepare_repos", return_value={}), \
+                patch.object(fleet, "exe", return_value=None), \
+                patch.object(fleet, "attempt_note", lambda own, repo, attempt, capture=False:
+                             asked.append((own, repo, attempt, capture)) or f"Your clone of {repo}: 2 facts."):
+            first = fleet.integration_env("dev", CLAUDE, None, place)
+            later = fleet.integration_env("dev", CLAUDE, None, place, attempt=3)
+        self.assertEqual(asked, [(os.path.join(place, "acme", "web"), "acme/web", 3, True)])
+        self.assertNotIn("Your clone of", first.get("FLEET_GITHUB_NOTE", ""))
+        self.assertIn("Your clone of acme/web: 2 facts.", later["FLEET_GITHUB_NOTE"])
+        self.assertIn("In this session: ", fleet.github_text(later, []))
+
     def test_a_task_with_its_own_clones_gets_fleet_work_and_one_text_for_every_task(self):
         """4 November 2026: each task works in its own clone of each repository, which FLEET_WORK names. The start text
         says $FLEET_WORK and not its path, so the cached start stays the same from one task to the next. Since
@@ -795,7 +814,8 @@ class HelperSide(unittest.TestCase):
                 patch.object(helper, "sync_checkout", side_effect=lambda: order.append("sync")), \
                 patch("fleet.session_credential", return_value=None), \
                 patch("fleet.session_env",
-                      side_effect=lambda agent, conf, kind, place=None, closed=False: order.append(kind) or {}), \
+                      side_effect=lambda agent, conf, kind, place=None, closed=False, attempt=None:
+                      order.append(kind) or {}), \
                 patch("fleet.session_command", side_effect=lambda *a, **kw: order.append("command") or "true"), \
                 patch("fleet.start_window", side_effect=lambda session, name, command: order.append(command)), \
                 patch("fleet.tmux", return_value=attempt):

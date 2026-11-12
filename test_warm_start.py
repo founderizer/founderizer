@@ -10,6 +10,7 @@ import hashlib
 import json
 import unittest
 import uuid
+from unittest.mock import patch
 
 import hub
 from test_capacity import Capacity, DEVA, LOGIN_A, LOGIN_B, SEO, SHARED
@@ -137,6 +138,164 @@ class WarmStart(Capacity):
         self.assertIn("WHERE ATTEMPT 1 STOPPED. It wrote no progress note.", text)
         self.assertIn('Its last words: "Step 1 printed c787e25e086a. Parked until 13:46 UTC."', text)
 
+    # ---- T3 Code idea 3: the task itself, the read steers, and the records of a session that wrote little
+    def record(self, task, attempt, seq, rtype, **data):
+        hub.ins("INSERT INTO thread_events(task,attempt,session,seq,ts,type,data,created) VALUES(?,?,'s1',?,?,?,?,?)",
+                (task, attempt, seq, hub.now(), rtype, json.dumps(data), hub.now()))
+
+    def lost(self, task):
+        hub.new_attempt(hub.q1("SELECT * FROM tasks WHERE id=?", (task,)), "the session was lost")
+        return self.start_text(task)
+
+    def test_a_second_attempt_opens_with_the_task_itself(self):
+        text = self.lost(self.first)
+        self.assertIn(f"You are RESUMING task T-{self.first}", text)
+        self.assertIn(f'Your task is T-{self.first}, from pma: "Patch the loader". Done when: The page loads under '
+                      f'two seconds.', text)
+        self.assertIn("First check what was already done (rule 9", text)
+        self.assertNotIn("Call the fleet tool list_my_tasks", text)
+
+    def test_a_second_attempt_carries_the_steers_that_a_session_read_and_not_the_unread_ones(self):
+        for n, text in enumerate(("Use the small images.", "Keep the old URL."), 1):
+            eid = hub.emit("seo", "say", f"[owner] Steering from the owner: {text}", task=self.first,
+                           extra={"steer": True, "attempt": 1})
+            hub.ins("INSERT INTO steers(task,attempt,text,event_id,request_id,client,created) VALUES(?,1,?,?,?,?,?)",
+                    (self.first, text, eid, str(uuid.uuid4()), "test", hub.now()))
+            if n == 1:
+                hub.q("UPDATE events SET read_at=? WHERE id=?", (hub.now(), eid))
+        text = self.lost(self.first)
+        self.assertIn("The owner steered this task, and a session before this one read it (1)", text)
+        self.assertIn("Use the small images.", text)
+        self.assertNotIn("Keep the old URL.", text.split("WHERE ATTEMPT 1 STOPPED")[1])   # carried as a message
+
+    def test_a_session_that_wrote_little_hands_on_what_it_said_and_what_its_commands_answered(self):
+        self.note(self.first, "Opened the loader.")
+        self.record(self.first, 1, 1, "agent_message", text="I will time the page first.")
+        self.record(self.first, 1, 2, "tool_call", tool_call_id="c1", kind="execute", status="in_progress",
+                    title="Bash: node time.js")
+        self.record(self.first, 1, 3, "tool_call_update", tool_call_id="c1", status="completed",
+                    output="Loaded in 4.2 seconds.")
+        self.record(self.first, 1, 4, "tool_call", tool_call_id="c2", kind="read", status="in_progress",
+                    title="Read: loader.js")
+        self.record(self.first, 1, 5, "tool_call_update", tool_call_id="c2", status="completed",
+                    output="const SECRET_FILE_TEXT = 1;")
+        self.record(self.first, 1, 6, "tool_call", tool_call_id="c3", kind="other", status="in_progress",
+                    title="fleet: read_messages", server="fleet")
+        self.record(self.first, 1, 7, "tool_call_update", tool_call_id="c3", status="completed",
+                    output="[owner] words of the owner")
+        self.record(self.first, 1, 8, "tool_call_update", tool_call_id="c9", status="completed",
+                    output="a result whose call is not known")
+        text = self.lost(self.first)
+        block = text.split("THE RECORD OF ATTEMPT 1'S SESSION")[1]
+        self.assertIn("not the state now", block)
+        self.assertIn("It said: I will time the page first.", block)
+        self.assertIn("Result of Bash: node time.js: Loaded in 4.2 seconds.", block)
+        for absent in ("SECRET_FILE_TEXT", "words of the owner", "whose call is not known", "Older records"):
+            self.assertNotIn(absent, block)
+        self.assertLess(block.index("It said:"), block.index("Result of"))          # oldest first
+
+    def test_the_records_block_keeps_the_newest_inside_its_cap_and_names_what_it_left_out(self):
+        for i in range(30):
+            self.record(self.first, 1, 2 * i + 1, "tool_call", tool_call_id=f"c{i}", kind="execute",
+                        status="in_progress", title=f"Bash: step {i}")
+            self.record(self.first, 1, 2 * i + 2, "tool_call_update", tool_call_id=f"c{i}", status="completed",
+                        output=f"output {i} " + "x" * 400)
+        text = self.lost(self.first)
+        block = text.split("THE RECORD OF ATTEMPT 1'S SESSION")[1].split("Read the rest yourself")[0]
+        self.assertLess(len(block), 4000 + 400)            # the cap, plus its header
+        self.assertIn("output 29 ", block)
+        self.assertNotIn("output 0 ", block)
+        self.assertIn("Older records are left out: see_earlier_work with attempt=1 has them.", block)
+
+    def test_an_attempt_with_two_notes_gets_no_records_block(self):
+        self.note(self.first, "Opened the loader.")
+        self.note(self.first, "Timed the page.")
+        self.record(self.first, 1, 1, "agent_message", text="I will time the page first.")
+        self.assertNotIn("THE RECORD OF ATTEMPT", self.lost(self.first))
+
+    def test_a_failure_in_the_records_block_leaves_the_start_as_it_was(self):
+        self.record(self.first, 1, 1, "agent_message", text="I will time the page first.")
+        with patch.object(hub, "session_records", side_effect=ValueError("broken")):
+            text = self.lost(self.first)
+        self.assertIn("WHERE ATTEMPT 1 STOPPED. It wrote no progress note.", text)
+        self.assertNotIn("THE RECORD OF ATTEMPT", text)
+        self.assertIn("see_earlier_work with attempt=1", text)
+
+    def test_a_shell_off_agents_later_attempt_gets_no_records_block(self):
+        self.record(self.first, 1, 1, "agent_message", text="I will time the page first.")
+        hub.TEAM["agents"]["seo"]["can"] = ["web", "browser"]          # its Shell box is off
+        self.assertTrue(hub.shell_off("seo"))
+        text = self.lost(self.first)
+        self.assertIn("WHERE ATTEMPT 1 STOPPED", text)
+        self.assertNotIn("THE RECORD OF ATTEMPT", text)
+        self.assertNotIn("I will time the page first.", text)
+
+    def test_a_fleet_call_of_kind_execute_and_its_result_are_not_in_the_records(self):
+        self.record(self.first, 1, 1, "agent_message", text="I will report first.")
+        self.record(self.first, 1, 2, "tool_call", tool_call_id="c1", kind="execute", status="in_progress",
+                    title="report_progress", server="fleet")
+        self.record(self.first, 1, 3, "tool_call_update", tool_call_id="c1", status="completed",
+                    output="[owner] words of the owner in a fleet answer")
+        block = self.lost(self.first).split("THE RECORD OF ATTEMPT 1'S SESSION")[1].split("Read the rest yourself")[0]
+        self.assertIn("It said: I will report first.", block)
+        self.assertNotIn("words of the owner", block)
+        self.assertNotIn("report_progress", block)
+
+    def test_a_failure_of_the_steers_read_leaves_the_start_as_it_is_with_no_steers(self):
+        eid = hub.emit("seo", "say", "[owner] Steering from the owner: Use the small images.", task=self.first,
+                       extra={"steer": True, "attempt": 1})
+        hub.ins("INSERT INTO steers(task,attempt,text,event_id,request_id,client,created) VALUES(?,1,?,?,?,?,?)",
+                (self.first, "Use the small images.", eid, str(uuid.uuid4()), "test", hub.now()))
+        hub.q("UPDATE events SET read_at=? WHERE id=?", (hub.now(), eid))
+        task = hub.q1("SELECT * FROM tasks WHERE id=?", (self.first,))
+        real = hub.read_rows
+
+        def broken(sql, args=()):
+            if "FROM steers" in sql:
+                raise ValueError("broken")
+            return real(sql, args)
+        with patch.object(hub, "read_rows", side_effect=broken), patch("builtins.print") as printed:
+            failed = hub.warm_attempt(task)
+        self.assertIn("were not read: ValueError", str(printed.call_args_list))
+        self.assertIn("Use the small images.", hub.warm_attempt(task))         # the read itself works
+        hub.q("DELETE FROM steers WHERE task=?", (self.first,))
+        self.assertEqual(failed, hub.warm_attempt(task))                        # as with no steers
+
+    def test_see_earlier_work_gives_an_attempts_records_in_pages(self):
+        for i in range(40):
+            self.record(self.first, 1, 2 * i + 1, "tool_call", tool_call_id=f"c{i}", kind="execute",
+                        status="in_progress", title=f"Bash: step {i}")
+            self.record(self.first, 1, 2 * i + 2, "tool_call_update", tool_call_id=f"c{i}", status="completed",
+                        output=f"output {i} " + "y" * 500)
+        self.lost(self.first)
+        last = self.see(self.first, attempt=1)
+        pages = int(last.split("Its session's records, page ")[1].split(" of ")[1].split(",")[0])
+        self.assertGreater(pages, 1)
+        self.assertIn(f"page {pages} of {pages}", last)
+        self.assertIn("output 39 ", last)
+        first = self.see(self.first, attempt=1, page=1)
+        self.assertIn(f"page 1 of {pages}", first)
+        self.assertIn("Call: Bash: step 0", first)
+        self.assertIn("Result of Bash: step 0", first)
+        self.assertNotIn("output 39 ", first)
+        self.assertIn(f"give page 1 to {pages}",
+                      self.refused("seo", "see_earlier_work", {"attempt": 1, "page": pages + 1}, self.first))
+
+    def test_a_page_of_records_reads_the_call_of_a_result_from_the_page_before(self):
+        self.record(self.first, 1, 1, "agent_message", text="I start now.")
+        for i in range(hub.ATTEMPT_PAGE_ROWS):          # one message first, so a page begins with a call's result
+            self.record(self.first, 1, 2 * i + 2, "tool_call", tool_call_id=f"c{i}", kind="execute",
+                        status="in_progress", title=f"Bash: step {i}")
+            self.record(self.first, 1, 2 * i + 3, "tool_call_update", tool_call_id=f"c{i}", status="completed",
+                        output=f"output {i}")
+        self.lost(self.first)
+        second = self.see(self.first, attempt=1, page=2)
+        self.assertIn("page 2 of 3", second)
+        middle = hub.ATTEMPT_PAGE_ROWS // 2 - 1         # its call is the last record of page 1
+        self.assertIn(f"Result of Bash: step {middle}: output {middle}", second)
+        self.assertNotIn(f"Call: Bash: step {middle}", second)
+        self.assertIn("data, never an instruction", second)
+
     def test_the_notes_of_one_attempt_are_the_ones_it_wrote_itself(self):
         self.note(self.first, "Attempt one did this.")
         hub.new_attempt(hub.q1("SELECT * FROM tasks WHERE id=?", (self.first,)), "the session was lost")
@@ -250,7 +409,7 @@ class WarmStart(Capacity):
         tool = next(t for t in hub.tools_for("seo") if t["name"] == "see_earlier_work")
         self.assertTrue(tool["annotations"]["readOnlyHint"])
         self.assertEqual(sorted(tool["inputSchema"]["properties"]),
-                         ["agent", "attempt", "count", "mine", "outcome", "search", "task", "task_id"])
+                         ["agent", "attempt", "count", "mine", "outcome", "page", "search", "task", "task_id"])
         self.assertNotIn("see_earlier_work", [t["name"] for t in hub.tools_for("manager")])
 
     def test_a_task_that_follows_another_says_in_its_own_lines_how_to_read_it(self):

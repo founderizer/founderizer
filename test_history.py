@@ -47,7 +47,7 @@ def at(text):
 def load_tests(loader, _tests, _pattern):
     """Only the tests of this file: the fixture it borrows from test_ui_api.py carries its own."""
     suite = unittest.TestSuite()
-    for cls in (Finding, Own, ContactDriven, Owner, LongTask, Indexing, ToolRecords, Keeping, Tools):
+    for cls in (Finding, Own, ContactDriven, Owner, Messages, LongTask, Indexing, ToolRecords, Keeping, Tools):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 
@@ -286,6 +286,23 @@ class ContactDriven(Base):
         self.assertEqual(len(self.refs(self.search("vps", task=self.task(), query="invoice"))),
                          self.theirs + self.owner_records)
 
+    def test_the_owner_chat_finds_the_owners_chats_and_a_contact_session_still_does_not(self):
+        """T3 Code idea 9A: the owner asks the agent in its chat where it said something, and the agent finds its own
+        records, his chats included. The owner chat is no contact's session, and a contact's session keeps its limit."""
+        chat = ("test-generation", "owner-chat", "1")
+        self.assertFalse(hub.contact_session("vps", chat))
+        found, error = hub.call_tool("vps", "search_history", {"query": "invoice"}, chat)
+        self.assertFalse(error, found)
+        self.assertEqual(len(self.refs(found)), self.theirs + self.owner_records, found)
+        self.assertIn("OM-1", self.refs(found))
+        self.assertNotIn("the owner's chats are not searched", found)
+        text, error = hub.call_tool("vps", "read_history", {"ref": "OM-1"}, chat)
+        self.assertFalse(error, text)
+        self.assertIn("Keep the invoice for Bruno until he pays", text)
+        self.assertEqual(self.refs(self.search("vps", task=self.contact_task(), query="invoice")), ["CM-1"])
+        mine, _ = hub.call_tool("studio", "search_history", {"query": "invoice"}, chat)     # another agent's chat
+        self.assertEqual(self.refs(mine), [], mine)
+
     def test_a_task_the_owner_asked_for_in_the_older_words_stays_the_owners(self):
         """start_task's details began with other words before 3 November 2026, and those tasks are still the
         owner's chat."""
@@ -343,6 +360,91 @@ class Owner(Base):
         self.assertEqual(asked, [("/ui/history", {"agent": "vps", "query": "refund", "from": "2026-10-25", "to": None,
                                                   "person": None, "task": None, "kind": None, "ref": None,
                                                   "limit": None})])
+
+
+class Messages(Base):
+    """GET /ui/history?mode=messages: the owner's search card in the Mac app (UI-API.md 1.128)."""
+
+    def messages(self, words, **query):
+        code, found = self.owner(mode="messages", query=words, **query)
+        self.assertEqual(code, 200, found)
+        return found
+
+    def test_every_word_must_match_and_the_last_one_begins_words(self):
+        tid = self.task(owner="vps", requester="manager", title="Rotate the staging certificate")
+        self.clock += 30
+        self.owner_says("Rotate the production certificate first", agent="vps")
+        hub.ins("INSERT INTO agent_messages(sender,recipient,text,created,request_id) VALUES('vps','studio',"
+                "'The staging certificate expires on Friday',?,'r1')", (self.clock + 60,))
+        hub.history_catch_up()
+        found = self.messages("staging certif")
+        self.assertEqual([r["ref"] for r in found["results"]], ["AM-1", f"T-{tid}"], found)     # the newest first
+        self.assertEqual([r["ref"] for r in self.messages("certificate rotate")["results"]], ["OM-1", f"T-{tid}"])
+        self.assertEqual(self.messages("staging certificate monday")["results"], [])           # every word
+        self.assertEqual(self.messages("stag certificate")["results"], [])        # only the last word is a start
+        # one row for each record: the task is in the history of vps and of the manager, the message of vps and studio
+        self.assertEqual([(r["ref"], r["agent"]) for r in found["results"]], [("AM-1", "vps"), (f"T-{tid}", "vps")])
+        self.assertEqual(found["results"][1]["task"], f"T-{tid}")
+        self.assertEqual((found["mode"], found["more"], found["index"]["zone"]), ("messages", False, "Europe/Madrid"))
+        self.assertEqual(self.messages(" -- ")["results"], [])                    # no letter and no digit: nothing
+        self.assertEqual(len(self.messages("certificate", limit="1")["results"]), 1)
+        self.assertTrue(self.messages("certificate", limit="1")["more"])
+
+    def test_a_row_carries_what_opens_its_chat_and_the_records_own_words(self):
+        mine = self.owner_says("Please renew the domain before the end of the month", agent="studio")
+        request = hub.q1("SELECT request_id FROM ui_requests WHERE rowid=?", (mine,))["request_id"]
+        report = hub.ins("INSERT INTO owner_reports(text,about,created,agent) VALUES('The domain renews on the 30th',"
+                         "'renewal',?,'studio')", (self.clock + 60,))
+        hub.history_catch_up()
+        rows = {r["ref"]: r for r in self.messages("domain")["results"]}
+        self.assertEqual(set(rows), {f"OM-{mine}", f"OR-{report}"})
+        self.assertEqual((rows[f"OM-{mine}"]["message"], rows[f"OM-{mine}"]["owner_chat"]), (request, True))
+        self.assertIsNone(rows[f"OR-{report}"]["message"])
+        self.assertEqual(rows[f"OM-{mine}"]["snippet"], "Please renew the domain before the end of the month")
+        self.assertEqual(rows[f"OR-{report}"]["snippet"], "The domain renews on the 30th")   # no "studio to the owner"
+
+    def test_no_tool_record_lesson_standing_item_or_conversation(self):
+        tid = self.task(title="Session")
+        self.records(tid, [{"seq": 1, "type": "agent_message", "text": "The parrot backup ran"}])
+        hub.ins("INSERT INTO memories(agent,about,text,prevents,created,request_id) VALUES('vps','backups',"
+                "'The parrot bucket rotates keys','a failed backup',?,'m1')", (self.clock,))
+        hub.ins("INSERT INTO standing(agent,scope,kind,words,author_kind,author,created) VALUES('vps','agent',"
+                "'instruction','Feed the parrot daily','owner','owner',?)", (self.clock,))
+        self.said(self.conversation(self.person("Bruno")), "person", "My parrot is lost")
+        hub.history_catch_up()
+        self.assertGreaterEqual(hub.q1("SELECT COUNT(*) n FROM history")["n"], 4)
+        self.assertEqual(self.messages("parrot")["results"], [])
+        self.assertTrue(self.owner(query="parrot")[1]["results"])             # the route's own search finds them
+
+    def test_no_index_work_comes_before_the_answer(self):
+        self.task(title="Renew the TLS certificate")
+        calls = []
+        with patch.object(hub, "history_catch_up", lambda budget=None: calls.append(budget) or True):
+            self.assertEqual(self.messages("certificate")["results"], [])     # not in the index yet
+            self.assertEqual(calls, [])
+            self.owner(query="certificate")                                  # the route's own search does it
+            self.assertEqual(calls, [hub.HISTORY_SEARCH_STEP])
+        hub.history_catch_up()                                                # the tick's pass
+        self.assertEqual(len(self.messages("certificate")["results"]), 1)
+
+    def test_a_registered_login_is_masked(self):
+        salt = "c0ffee"
+        hub.ins("INSERT INTO secrets(label,salt,hash,len,username) VALUES('crm',?,?,?,'')",
+                (salt, hashlib.sha256((salt + SECRET).encode()).hexdigest(), len(SECRET)))
+        self.owner_says(f"The crm password is {SECRET} now")
+        hub.history_catch_up()
+        found = self.messages("crm password")
+        self.assertEqual(len(found["results"]), 1)
+        self.assertIn(hub.MASK, found["results"][0]["snippet"])
+        self.assertNotIn(SECRET, json.dumps(found))
+
+    def test_refusals_and_the_feature(self):
+        for bad in ({"mode": "everything"}, {"mode": "messages", "agent": "vps"}, {"mode": "messages", "kind": "task"},
+                    {"mode": "messages", "ref": "T-1"}, {"mode": "messages", "limit": "101"}):
+            code, said = self.owner(**bad)
+            self.assertEqual(code, 400, (bad, said))
+        self.assertEqual(self.owner(mode="messages", query="x", db="old")[0], 409)
+        self.assertIn("history_messages", self.request("/ui/state")[1]["ui_features"])
 
 
 class LongTask(Base):
@@ -883,7 +985,8 @@ class Tools(Base):
         names = lambda agent, context: {t["name"] for t in hub.tools_for(agent, context)}
         for agent, context in (("vps", ("test-generation", f"T-{tid}", 1)), ("manager", None)):
             self.assertLessEqual({"search_history", "read_history"}, names(agent, context))
-        self.assertFalse({"search_history", "read_history"} & names("vps", ("test-generation", "owner-chat", 1)))
+        # T3 Code idea 9A (12 November 2026): the owner chat finds what the agent said there before
+        self.assertLessEqual({"search_history", "read_history"}, names("vps", ("test-generation", "owner-chat", 1)))
         person = self.person("Bruno")
         hub.ins("INSERT INTO person_agents(person,agent,added) VALUES(?,'vps',?)", (person, self.clock))
         talk = self.conversation(person)

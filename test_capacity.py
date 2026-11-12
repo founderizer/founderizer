@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+import urllib.parse
 import uuid
 
 import hub
@@ -358,6 +359,32 @@ class Capacity(OwnerAPI):
                     {"shop": {"title": "Shop"}}, [fresh]):
             with self.subTest(logins=bad), self.assertRaises(ValueError):
                 hub.validate_team(dict(json.loads(json.dumps(TEAM)), logins=bad))
+
+    def test_the_import_page_asks_whether_a_value_is_the_one_the_hub_holds(self):
+        """GET /ui/secrets/same (UI-API.md 1.129): "Changed in 1Password" from salted fingerprints, with no value out."""
+        login = "bws://31111111-2222-4333-8444-55555555555c"
+        digest = lambda salt, value: hashlib.sha256((salt + value).encode()).hexdigest()
+        salts = self.request(f"/ui/secrets/salts?db=test-generation&login={login}")[1]
+        words = lambda *items: ",".join(f"{kind}:{digest(salts[kind], text)}:{len(text)}" for kind, text in items)
+        same = lambda prints, **query: self.request("/ui/secrets/same?" + urllib.parse.urlencode(
+            dict(dict(db="test-generation", login=login, fingerprints=prints), **query)))
+        value, seed = "Pr4ct!ce-Login#2026", "JBSWY3DPEHPK3PXP"
+        self.assertIn("secret_compare", self.request()[1]["ui_features"])
+        self.assertEqual(same(words(("password", value))), (200, {"login": login, "same": None}))   # it holds none
+        hub.register_fingerprints(login, [{"kind": "password", "hash": digest(salts["password"], value), "len": len(value)},
+                                          {"kind": "totp", "hash": digest(salts["totp"], seed), "len": len(seed)}])
+        before = hub.q1("SELECT COUNT(*) n FROM secrets")["n"]
+        self.assertEqual(same(words(("password", value), ("totp", seed)))[1]["same"], True)
+        self.assertEqual(same(words(("password", "An0ther-Value#2026"), ("totp", seed)))[1]["same"], False)
+        self.assertEqual(same(words(("password", value), ("totp", "KRSXG5CTMVRXEZLU")))[1]["same"], False)
+        self.assertEqual(same(words(("password", value)))[1]["same"], False)          # the seed that it had is gone
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM secrets")["n"], before)       # a question writes nothing
+        good = words(("password", value))
+        for bad in ({"fingerprints": ""}, {"fingerprints": "password:abc:20"}, {"fingerprints": good.replace(":19", ":7")},
+                    {"fingerprints": good + ":1"}, {"fingerprints": ",".join([good] * 2)}, {"login": "sealed:4"}):
+            with self.subTest(bad=bad):
+                self.assertEqual(same(good, **bad)[0], 400)
+        self.assertEqual(same(good, db="old")[0], 409)
 
     # ---- capacity
     def reading(self, name, primary=None, screen=None):

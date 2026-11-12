@@ -233,7 +233,7 @@ class Devices(OwnerAPI):
         for path in ("/ui/mobile", "/ui/mobile/chat/manager", "/ui/state", "/ui/owner/devices"):
             with self.subTest(path=path):
                 self.assertEqual(self.call(path, source=PHONE, token=key)[0], 200)
-        for path in ("/ui/team", "/ui/machines", "/ui/capacity", "/ui/secrets/salts", "/ui/people"):
+        for path in ("/ui/team", "/ui/machines", "/ui/capacity", "/ui/secrets/salts", "/ui/secrets/same", "/ui/people"):
             with self.subTest(path=path):
                 status, body = self.call(path, source=PHONE, token=key)
                 self.assertEqual((status, body["auth"]), (403, "device_not_allowed"))
@@ -249,6 +249,38 @@ class Devices(OwnerAPI):
                 status, body = self.call(path, {"request_id": str(uuid.uuid4()), "db": "test-generation"},
                                          source=PHONE, token=key)
                 self.assertEqual(status, 403, body)
+
+    def test_a_message_from_the_phone_says_via_iphone_and_names_no_device(self):
+        """T3 Code idea 5: the agent reads that a message came from the phone, as the class only. The Mac's message
+        and an answer to a Needs-you item keep their words, and a client label alone gives no mark."""
+        hub.TEAM["owner_devices"] = {"iphone-2": {"label": "iPhone 2", "address": PHONE}}
+        hub.TEAM["addresses"]["dev-host"] = "127.0.0.9"
+        hub.TEAM["agents"]["dev-lead"] = {"role": "worker", "runtime": "claude", "machine": "dev-host", "can": []}
+        key = self.enrolled("iphone-2")
+        text = lambda receipt: hub.q1("SELECT text FROM events WHERE id=?", (receipt["event_id"],))["text"]
+        status, boss = self.call("/ui/messages", self.command(text="A goal from the phone"), source=PHONE, token=key)
+        self.assertEqual(status, 200, boss)
+        self.assertEqual(text(boss), "[owner via iPhone] A goal from the phone")
+        body = self.command(recipient="dev-lead", text="Look at the build")
+        status, worker = self.call("/ui/messages", body, source=PHONE, token=key)
+        self.assertEqual(status, 200, worker)
+        self.assertEqual(text(worker), f"[owner chat request_id={body['request_id']} via=iPhone] Look at the build")
+        edit = self.command(recipient="dev-lead", text="Look at the tests", replaces_request_id=body["request_id"])
+        status, edited = self.call("/ui/messages", edit, source=PHONE, token=key)
+        self.assertTrue(edited["edited"], edited)
+        self.assertEqual(text(worker), f"[owner chat request_id={body['request_id']} via=iPhone] Look at the tests")
+        for said in (text(boss), text(worker)):
+            self.assertNotIn("iPhone 2", said)
+            self.assertNotIn("iphone-2", said)
+            self.assertNotIn("deterministic-test", said)
+        status, mac = self.call("/ui/messages", self.command(text="From the Mac"),
+                                headers={"X-Fleet-Client": "founderizer-ios/1/00000000-0000-4000-8000-000000000000"})
+        self.assertEqual(status, 200, mac)
+        self.assertEqual(text(mac), "[owner] From the Mac")
+        nid = self.need()
+        status, answer = self.call(f"/ui/needs/{nid}", {"request_id": str(uuid.uuid4()), "db": "test-generation", "answer": "Yes"}, source=PHONE, token=key)
+        self.assertEqual(status, 200, answer)
+        self.assertTrue(text(answer).startswith(f"[owner] Answer to Needs-you N-{nid} "), text(answer))
 
     # ---- the devices page of the Mac
     def test_the_mac_sees_each_device_its_key_and_its_open_code(self):

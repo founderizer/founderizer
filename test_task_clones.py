@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -324,6 +325,124 @@ class TaskClones(unittest.TestCase):
         self.assertIn("acme/lib: ", err)
         self.assertFalse(os.path.lexists(self.shared("acme/lib")) or Path(fleet.task_work(), ".cloning", "acme",
                                                                            "lib").exists())
+
+    # ---- T3 Code idea 4: a snapshot ref and one line of facts at each later attempt
+    def clone_state(self, own):
+        """Everything of a clone that a snapshot must not change: each file of the work tree with its bytes and its
+        time, the index and HEAD with theirs, the branches, and what git status says."""
+        files = {}
+        for root, dirs, names in os.walk(own):
+            dirs[:] = [d for d in dirs if d != ".git"]
+            for name in names:
+                path = os.path.join(root, name)
+                files[os.path.relpath(path, own)] = (Path(path).read_bytes(), os.stat(path).st_mtime_ns)
+        meta = {name: (Path(own, ".git", name).read_bytes(), os.stat(os.path.join(own, ".git", name)).st_mtime_ns)
+                for name in ("index", "HEAD")}
+        return (files, meta, self.git("for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/remotes",
+                                      cwd=own),
+                self.git("--no-optional-locks", "status", "--porcelain", "--untracked-files=all", cwd=own))
+
+    def worked(self, place):
+        """Attempt 1 of T-3 leaves: one push, one commit that origin does not have, a changed file, a staged new file,
+        a new file and an ignored one."""
+        own = self.own(place)
+        Path(own, ".gitignore").write_text("*.log\n")
+        self.git("add", ".gitignore", cwd=own)
+        self.git("commit", "--quiet", "-m", "ignore logs", cwd=own)
+        self.git("push", "--quiet", cwd=own)
+        pushed = self.git("rev-parse", "--short", "HEAD", cwd=own)
+        Path(own, "a.txt").write_text("committed, not pushed\n")
+        self.git("add", "a.txt", cwd=own)
+        self.git("commit", "--quiet", "-m", "not pushed", cwd=own)
+        Path(own, "README.md").write_text("changed, not staged\n")
+        Path(own, "staged.txt").write_text("staged\n")
+        self.git("add", "staged.txt", cwd=own)
+        Path(own, "draft.txt").write_text("new, not added\n")
+        Path(own, "debug.log").write_text("ignored\n")
+        return own, pushed
+
+    def test_integration_env_puts_the_line_of_a_real_clone_in_the_github_note(self):
+        place = self.prepare("T-3")
+        self.worked(place)
+        answer = (200, {"repos": {"acme/web": "write"}, "tokens": []})
+        with patch.object(fleet, "checkout_conf", return_value={"repos": {"acme/web": "write"}}), \
+                patch.object(fleet, "http", return_value=answer), \
+                patch.object(fleet, "prepare_repos", return_value={}), \
+                patch.object(fleet, "refresh_shared", return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()):
+            values = fleet.integration_env("ivy", {"role": "worker", "runtime": "claude"}, None, place, attempt=2)
+        self.assertIn("Your clone of acme/web as attempt 2 starts: 1 commit(s) that origin does not have",
+                      values["FLEET_GITHUB_NOTE"])
+
+    def test_a_later_attempt_snapshots_its_clone_says_its_facts_and_changes_nothing(self):
+        own, pushed = self.worked(self.prepare("T-3"))
+        before = self.clone_state(own)
+        line = fleet.attempt_note(own, "acme/web", 2, capture=True)
+        self.assertEqual(self.clone_state(own), before)             # no file, no index, no HEAD, no branch
+        self.assertEqual(line, f"Your clone of acme/web as attempt 2 starts: 1 commit(s) that origin does not have, "
+                               f"3 file(s) not committed, 1 push(es) to origin since the task made this clone (the "
+                               f"last: {pushed}). refs/fleet-attempt/2 holds all its files as this attempt started (`git "
+                               f"diff refs/fleet-attempt/2 -- <path>` compares one with it). Check these before you "
+                               f"repeat a commit or a push (rule 9).")
+        for path in ("draft", "staged", "README", "debug", "a.txt"):
+            self.assertNotIn(path, line)                            # counts and short ids only
+        ref = "refs/fleet-attempt/2"
+        self.assertEqual(self.git("rev-parse", f"{ref}^", cwd=own), self.git("rev-parse", "HEAD", cwd=own))
+        self.assertEqual(self.git("show", f"{ref}:README.md", cwd=own), "changed, not staged")
+        self.assertEqual(self.git("show", f"{ref}:draft.txt", cwd=own), "new, not added")
+        self.assertEqual(self.git("show", f"{ref}:staged.txt", cwd=own), "staged")
+        self.assertNotIn("debug.log", self.git("ls-tree", "--name-only", ref, cwd=own).split())
+        self.assertEqual(self.git("diff", "--name-only", ref, "--", "README.md", "staged.txt", cwd=own), "")
+        # attempt 3: the pushes since attempt 2 started, and the ref of each attempt
+        time.sleep(1.1)                                             # the reflog counts in whole seconds
+        self.git("commit", "--quiet", "-am", "attempt 2's work", cwd=own)
+        self.git("push", "--quiet", "origin", "HEAD", cwd=own)
+        second = self.git("rev-parse", "--short", "HEAD", cwd=own)
+        line = fleet.attempt_note(own, "acme/web", 3, capture=True)
+        self.assertIn(f"1 push(es) to origin since attempt 2 started (the last: {second})", line)
+        self.assertIn("`git diff refs/fleet-attempt/2 refs/fleet-attempt/3` shows what attempt 2 changed", line)
+        self.assertEqual(self.git("diff", "--name-only", "refs/fleet-attempt/2", "refs/fleet-attempt/3", cwd=own),
+                         "")        # attempt 2 committed and pushed what was there: the files are the same
+        self.assertIn("0 commit(s) that origin does not have, 1 file(s) not committed", line)   # draft.txt
+        # fleet.py repo gives the same facts later in the session, on stderr, with no new snapshot
+        place = self.place("T-3")
+        with patch.dict(os.environ, {"FLEET_ATTEMPT": "3"}):
+            status, out, err = self.ask("acme/web", place=place)
+        self.assertEqual((status, out), (0, own + "\n"))
+        self.assertIn("Your clone of acme/web now: 0 commit(s) that origin does not have", err)
+        self.assertIn("refs/fleet-attempt/3 holds all its files as this attempt started", err)
+        self.assertEqual(self.ask("acme/web", place=place)[2], "")            # attempt 1: no line
+        # the end of the task: the refs go with the folder, and none reaches the shared clone
+        self.assertTrue(fleet.drop_place(place, self.said.append))
+        self.assertFalse(os.path.exists(own))
+        self.assertEqual(self.git("for-each-ref", "refs/fleet-attempt", cwd=self.shared()), "")
+
+    def test_the_snapshot_runs_no_program_that_the_clones_own_config_names(self):
+        own, _ = self.worked(self.prepare("T-3"))
+        ran = os.path.join(str(self.tmp), "ran")
+        program = os.path.join(str(self.tmp), "program.sh")
+        Path(program).write_text(f"#!/bin/sh\ntouch {ran}\ncat\n")
+        os.chmod(program, 0o755)
+        for key in ("filter.any.clean", "filter.any.process", "core.fsmonitor"):
+            self.git("config", key, program, cwd=own)
+        Path(own, ".git", "info", "attributes").write_text("* filter=any\n")
+        line = fleet.attempt_note(own, "acme/web", 2, capture=True)
+        self.assertIn("refs/fleet-attempt/2 holds all its files", line)
+        self.assertFalse(os.path.exists(ran))
+        self.assertIn("draft.txt", self.git("ls-tree", "-r", "--name-only", "refs/fleet-attempt/2", cwd=own))
+
+    def test_a_stopped_rebase_is_said_and_files_above_the_limit_make_no_snapshot(self):
+        own = self.own(self.prepare("T-3"))
+        Path(own, "big.bin").write_bytes(b"x" * 64)
+        Path(own, ".git", "MERGE_HEAD").write_text(self.git("rev-parse", "HEAD", cwd=own) + "\n")
+        with patch.object(fleet, "ATTEMPT_MOST", 10):
+            line = fleet.attempt_note(own, "acme/web", 2, capture=True)
+        self.assertIn("1 file(s) not committed, a merge that stopped half way, 0 push(es)", line)
+        self.assertIn("too big for a snapshot, so this attempt has no refs/fleet-attempt ref", line)
+        self.assertEqual(self.git("for-each-ref", "refs/fleet-attempt", cwd=own), "")
+        with patch.object(fleet, "attempt_capture", side_effect=OSError("disk full")):     # a failure: no line
+            self.assertIsNone(fleet.attempt_note(own, "acme/web", 2, capture=True))
+        self.assertIsNone(fleet.attempt_note(self.own(self.place("T-9")), "acme/web", 2, capture=True))
 
 
 if __name__ == "__main__":

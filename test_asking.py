@@ -260,8 +260,8 @@ class ComingBack(Tools, Runtime):
 
     def test_either_a_time_or_minutes_and_a_note_of_your_own(self):
         tid = self.task()
-        for args, word in (({}, "Give either minutes"),
-                           ({"minutes": 5, "at": "2030-01-01"}, "not both"),
+        for args, word in (({}, "Give one of minutes"),
+                           ({"minutes": 5, "at": "2030-01-01"}, "not two of them"),
                            ({"minutes": "soon"}, "must be a number"),
                            ({"minutes": -5}, "minutes from now"),
                            ({"at": "tomorrow at nine"}, "ISO date"),

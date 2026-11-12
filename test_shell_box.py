@@ -137,7 +137,7 @@ class Helper(unittest.TestCase):
                                                    "deny": fleet.DENY})
         self.assertFalse(settings["autoMemoryEnabled"])
         self.assertNotIn("enableWorkflows", settings)
-        self.assertEqual(list(settings["hooks"]), ["PostToolUse"])
+        self.assertEqual(list(settings["hooks"]), ["PostToolUse", "PostToolUseFailure"])
         self.assertNotIn(TOKEN, self.build())
 
     def test_the_web_box_and_the_duty_decide_the_built_in_tools(self):
@@ -702,7 +702,7 @@ class Tools(Fleet):
         chat = (hub.kv_get("db_id"), "owner-chat", 1)
         self.assertEqual(sorted(self.names("desk", chat)), H1_CHAT)
         self.assertEqual(set(self.names("desk", chat)) & (FORBIDDEN - {"recall"}), set())
-        for name in ("message_agent", "start_task", "request_secret"):
+        for name in ("message_agent", "start_task", "request_secret", "search_history", "read_history"):
             self.assertIn(name, self.names("ops", chat))
             self.assertNotIn(name, self.names("desk", chat))
 

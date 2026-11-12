@@ -25,7 +25,7 @@ ENTITLEMENT = "eyJmbGVldCI6IjBmMWUyZDNjNGI1YTY5NzgifQ.c2lnbmVk"
 def load_tests(loader, _tests, _pattern):
     """Only this file's checks: the harness comes from test_mobile, whose own tests stay in their own file."""
     suite = unittest.TestSuite()
-    for cls in (Seal, Token, Queue, Sender):
+    for cls in (Seal, Token, Queue, Sender, Present, Badge):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 
@@ -71,12 +71,16 @@ class PushCase(Devices):
         hub.q("INSERT INTO entitlement(id,fleet,token,plan,until,machines,agents,verified,stored) "
               "VALUES(1,'0f1e2d3c4b5a6978',?,'founder-monthly',?,5,10,1,?)", (ENTITLEMENT, hub.now() + 86400, hub.now()))
         hub._ping_hold["until"] = 0.0           # a hold is in memory: none comes from another test
+        hub.BADGE.update(off=False, until=0.0)
+        hub.BADGE_TRIED.clear()
 
     def tearDown(self):
         self.side.shutdown()
         self.side.server_close()
         hub.CFG.pop("release_channel", None)
         hub._ping_hold["until"] = 0.0
+        hub.BADGE.update(off=False, until=0.0)
+        hub.BADGE_TRIED.clear()
         super().tearDown()
 
     def give(self, key, device="iphone", source=PHONE, **body):
@@ -254,7 +258,8 @@ class Sender(PushCase):
         payload = body["payload"]
         self.assertEqual({k: v for k, v in payload.items() if k != "sealed"}, {
             "need": nid, "db": "test-generation",
-            "aps": {"alert": {"title": "Needs you"}, "sound": "default", "thread-id": "needs", "mutable-content": 1}})
+            "aps": {"alert": {"title": "Needs you"}, "sound": "default", "thread-id": "needs", "mutable-content": 1,
+                    "badge": 1}})
         for word in ("domain", "€12", "year", "Manager", "card"):      # nothing of the item, readable or not
             self.assertNotIn(word, got["raw"])
         self.assertEqual(self.opened(payload), {"need": nid, "db": "test-generation", "title": "Manager",
@@ -267,7 +272,7 @@ class Sender(PushCase):
         self.assertEqual(self.sent()["state"], "sent")
         self.assertEqual(self.side.got[0]["body"]["payload"], {
             "need": nid, "db": "test-generation",
-            "aps": {"alert": {"title": "Needs you"}, "sound": "default", "thread-id": "needs"}})
+            "aps": {"alert": {"title": "Needs you"}, "sound": "default", "thread-id": "needs", "badge": 1}})
 
     def test_the_banner_names_the_agent_that_asks(self):
         """T-39: the banner's title is the asking agent as the apps name it, over its question; "Needs you" only
@@ -518,6 +523,255 @@ class Sender(PushCase):
         self.assertEqual(self.pings()[0]["state"], "unknown")
         self.assertFalse(hub.send_ping())
         self.assertEqual(self.side.got, [])
+
+
+class Present(Sender):
+    """Quiet phone (plan section 10): while the owner's Mac app says that he is at it, a Needs-you ping waits in the
+    queue, and it goes when his presence ends, if its item is still open. Only the Mac's reads count."""
+
+    def setUp(self):
+        super().setUp()
+        hub.PRESENT.clear()             # in memory: none comes from another test
+        self.addCleanup(hub.PRESENT.clear)
+
+    def read_state(self, source=MAC, token=None, present=True):
+        return self.call("/ui/state", source=source, token=token,
+                         headers={"X-Fleet-Present": "1"} if present else None)
+
+    def later(self, seconds):
+        real = hub.now
+        return patch.object(hub, "now", lambda: real() + seconds)
+
+    def test_a_ping_waits_while_the_owner_is_at_the_mac_and_goes_when_he_leaves(self):
+        self.give(self.enrolled())
+        self.raise_item()
+        self.assertEqual(self.read_state()[0], 200)
+        self.assertGreater(hub.owner_present_until(), hub.now())
+        self.assertFalse(hub.send_ping())
+        self.assertEqual([p["state"] for p in self.pings()], ["queued"])
+        self.assertLessEqual(hub.ping_wait(), hub.PRESENCE_HOLD)        # the sender looks again when presence ends
+        with self.later(hub.PRESENCE_HOLD + 1):
+            self.assertEqual(hub.owner_present_until(), 0.0)
+            self.assertEqual(hub.ping_wait(), hub.PING_EVERY)
+            self.assertTrue(hub.send_ping())
+        self.assertEqual(self.pings()[0]["state"], "sent")
+        self.assertEqual(len(self.side.got), 1)
+
+    def test_an_item_answered_while_he_is_at_the_mac_never_rings(self):
+        self.give(self.enrolled())
+        nid = self.raise_item()
+        self.read_state()
+        self.assertFalse(hub.send_ping())
+        hub.q("UPDATE needs SET answer='Pay it', answered=? WHERE id=?", (hub.now(), nid))
+        with self.later(hub.PRESENCE_HOLD + 1):
+            self.assertTrue(hub.send_ping())
+        self.assertEqual((self.pings()[0]["state"], self.pings()[0]["error"]),
+                         ("skipped", "the item was answered before the ping went"))
+        self.assertEqual(self.side.got, [])
+
+    def test_an_app_that_sends_no_header_and_a_phone_that_sends_it_change_nothing(self):
+        key = self.enrolled()
+        self.give(key)
+        self.raise_item()
+        self.assertEqual(self.read_state(present=False)[0], 200)        # an older Mac app
+        self.read_state(source=PHONE, token=key)                        # a phone's read, whatever it answers
+        self.read_state(source=OTHER)                                   # an address that is no owner's
+        self.assertEqual(hub.owner_present_until(), 0.0)
+        self.assertEqual(self.sent()["state"], "sent")
+
+    def test_a_mac_read_with_a_bearer_token_is_refused_and_sets_no_presence(self):
+        status, body = self.read_state(token="not-a-device-key")
+        self.assertEqual((status, body.get("auth")), (403, "key_not_expected"))
+        self.assertEqual(hub.PRESENT, {})
+        self.assertEqual(hub.owner_present_until(), 0.0)
+
+    def test_a_hub_restart_forgets_presence_and_the_held_ping_goes(self):
+        self.give(self.enrolled())
+        self.raise_item()
+        self.read_state()
+        self.assertFalse(hub.send_ping())
+        hub.PRESENT.clear()                                             # what a restart of the hub leaves
+        self.assertEqual(self.sent()["state"], "sent")
+
+
+class Badge(PushCase):
+    """The number on the app's icon (the owner's yes of 12 November 2026, point 1): the count of what needs him, in
+    each Needs-you ping, and alone in a push with no word when it changes and no Needs-you ping carries it."""
+
+    def setUp(self):
+        super().setUp()
+        hub.PRESENT.clear()
+        self.addCleanup(hub.PRESENT.clear)
+
+    def drain(self):
+        """What the sender thread does at each wake: every ping that may go, then a look at each icon's number."""
+        while hub.send_ping() or hub.badge_look():
+            pass
+
+    def badges(self):
+        """What our side got of the badge-only pushes, in order."""
+        return [one["body"]["payload"] for one in self.side.got if "alert" not in one["body"]["payload"]["aps"]]
+
+    def badge_rows(self):
+        return [(p["item"], p["state"], p["error"]) for p in self.pings() if p["kind"] == "badge"]
+
+    def answer(self, nid):
+        hub.q("UPDATE needs SET answer='Pay it', answered=? WHERE id=?", (hub.now(), nid))
+
+    def test_the_count_is_the_tabs_open_items_and_tasks_only_he_can_move(self):
+        """The twin of MobileStore.needsYouCount: open items, and each task once whose outcome is not known or whose
+        stop was not confirmed. An answered item, a known outcome and a released hold are not counted."""
+        self.assertEqual(hub.owner_count(), 0)
+        first, _ = self.raise_item(), self.raise_item(title="Second")
+        self.answer(first)
+        t0 = hub.now()
+        for task, state, resolved in ((7, "unknown", None), (7, "unknown", None), (8, "unknown", t0), (9, "done", None)):
+            hub.q("INSERT INTO outcomes(task,attempt,hold,tool_call_id,state,created,resolved) VALUES(?,1,0,?,?,?,?)",
+                  (task, uuid.uuid4().hex, state, t0, resolved))
+        for task, state, released in ((7, "not_confirmed", None), (10, "not_confirmed", None),
+                                      (11, "not_confirmed", t0), (12, "stopped", None)):
+            hub.q("INSERT INTO holds(task,kind,by,state,created,attempt,released) VALUES(?,'stop','owner',?,?,1,?)",
+                  (task, state, t0, released))
+        self.assertEqual(hub.owner_count(), 1 + 2)                      # one open item; tasks 7 and 10
+        with patch.object(hub, "PUSH_BADGE_MOST", 2):
+            self.assertEqual(hub.owner_count(), 2)                      # never more than our side takes
+
+    def test_each_needs_you_ping_carries_the_count(self):
+        self.give(self.enrolled(), seal=SEAL)
+        self.raise_item()
+        self.raise_item(title="Second")
+        self.drain()
+        self.assertEqual([one["body"]["payload"]["aps"]["badge"] for one in self.side.got], [2, 2])
+        self.assertEqual(self.badges(), [])                             # the pings carried it: no badge-only push
+        self.assertEqual(hub.q1("SELECT badge FROM owner_device_push")["badge"], 2)
+
+    def test_an_answer_sends_the_new_number_alone_once(self):
+        self.give(self.enrolled(), seal=SEAL)
+        nid = self.raise_item()
+        self.drain()
+        self.answer(nid)
+        self.drain()
+        self.drain()
+        sent = self.side.got[-1]["body"]
+        self.assertEqual(sent["payload"], {"aps": {"badge": 0}})        # no banner, no sound, no sealed part
+        self.assertEqual((sent["collapse"], sent["expires"]), ("badge", 0))     # Apple keeps none for a phone that is off
+        self.assertEqual(self.badges(), [{"aps": {"badge": 0}}])
+        self.assertEqual([(p["kind"], p["item"], p["state"]) for p in self.pings()],
+                         [("needs", nid, "sent"), ("badge", 0, "sent")])
+
+    def test_one_badge_push_waits_for_each_phone_and_goes_with_the_number_of_then(self):
+        self.give(self.enrolled(), seal=SEAL)
+        items = [self.raise_item(title=f"Item {n}") for n in range(3)]
+        self.drain()
+        self.answer(items[0])
+        self.assertTrue(hub.badge_look())
+        self.answer(items[1])
+        self.assertTrue(hub.badge_look())                               # the waiting one takes the new number
+        self.assertFalse(hub.badge_look())
+        self.assertEqual(self.badge_rows(), [(1, "queued", None)])
+        self.drain()
+        self.assertEqual(self.badges(), [{"aps": {"badge": 1}}])
+
+    def test_a_needs_you_ping_that_waits_carries_the_new_number(self):
+        self.give(self.enrolled(), seal=SEAL)
+        self.raise_item()
+        self.drain()
+        self.raise_item(title="Second")                                 # 2 now, and its ping waits
+        self.assertFalse(hub.badge_look())
+        self.drain()
+        self.assertEqual(self.badges(), [])
+        self.assertEqual(self.side.got[-1]["body"]["payload"]["aps"]["badge"], 2)
+
+    def test_a_badge_push_goes_after_the_needs_you_pings(self):
+        self.give(self.enrolled(), seal=SEAL)
+        first = self.raise_item()
+        self.drain()
+        self.answer(first)
+        self.assertTrue(hub.badge_look())                               # 0 waits
+        second = self.raise_item(title="Second")                        # 1 again, in a ping queued after it
+        self.drain()
+        self.assertEqual([one["body"]["payload"].get("need") for one in self.side.got], [first, second])
+        self.assertEqual(self.badge_rows(), [(1, "skipped", "the icon shows that number already")])
+
+    def test_the_owner_at_the_mac_holds_the_ping_and_not_the_number(self):
+        self.give(self.enrolled(), seal=SEAL)
+        first = self.raise_item()
+        self.drain()
+        self.call("/ui/state", headers={"X-Fleet-Present": "1"})
+        self.raise_item(title="Second")
+        self.answer(first)
+        self.raise_item(title="Third")                                  # 2 now; both pings wait
+        self.drain()
+        self.assertEqual(self.badges(), [{"aps": {"badge": 2}}])
+        self.assertEqual([p["state"] for p in self.pings() if p["kind"] == "needs"], ["sent", "queued", "queued"])
+
+    def test_a_site_that_refuses_the_shape_ends_badge_pushes_and_no_ping_waits_for_it(self):
+        """The relay from before badge-only pushes answers 400 to {"aps": {"badge": n}} (aps.alert is not the banner).
+        The hub then sends none until it starts again, and the next Needs-you ping goes as before."""
+        self.give(self.enrolled(), seal=SEAL)
+        first = self.raise_item()
+        self.drain()
+        self.answer(first)
+        self.side.answer = (400, {"error": "invalid", "says": "aps.alert must be the banner"})
+        self.drain()
+        self.assertTrue(hub.BADGE["off"])
+        self.side.answer = (200, {"status": 200, "reason": ""})
+        before = len(self.side.got)
+        second = self.raise_item(title="Second")
+        self.answer(second)
+        third = self.raise_item(title="Third")
+        self.drain()
+        self.assertEqual([one["body"]["payload"].get("need") for one in self.side.got[before:]], [third])
+        self.assertEqual(hub._ping_hold["until"], 0.0)
+
+    def test_a_held_back_badge_push_holds_back_no_needs_you_ping(self):
+        self.give(self.enrolled(), seal=SEAL)
+        first = self.raise_item()
+        self.drain()
+        self.answer(first)
+        self.side.answer = (429, {"error": "too_many", "says": "a count is full"}, {"Retry-After": "120"})
+        self.drain()
+        self.assertEqual([row[:2] for row in self.badge_rows()], [(0, "queued")])
+        self.assertEqual(hub._ping_hold["until"], 0.0)
+        self.assertGreater(hub.BADGE["until"], hub.now() + 100)
+        self.assertLessEqual(hub.ping_wait(), 120)
+        self.side.answer = (200, {"status": 200, "reason": ""})
+        second = self.raise_item(title="Second")
+        self.drain()
+        self.assertEqual(self.side.got[-1]["body"]["payload"]["need"], second)      # it went at once
+        hub.BADGE["until"] = 0.0                                        # that time has come
+        self.drain()
+        self.assertEqual(self.badge_rows(), [(1, "skipped", "the icon shows that number already")])
+
+    def test_a_number_that_did_not_get_through_is_not_tried_again_until_it_changes(self):
+        self.give(self.enrolled(), seal=SEAL)
+        first, second = self.raise_item(), self.raise_item(title="Second")
+        self.drain()
+        self.answer(first)
+        self.side.answer = (502, {"error": "unreachable", "says": "Apple cannot be reached"})
+        self.drain()
+        self.assertFalse(hub.badge_look())                              # no loop
+        self.side.answer = (200, {"status": 200, "reason": ""})
+        self.answer(second)
+        self.drain()
+        self.assertEqual(self.badges(), [{"aps": {"badge": 1}}, {"aps": {"badge": 0}}])
+
+    def test_a_phone_with_no_token_and_a_new_token(self):
+        key = self.enrolled()
+        self.raise_item()
+        self.drain()
+        self.assertEqual(self.side.got, [])                             # no token, nothing
+        self.give(key)
+        self.drain()
+        self.assertEqual(self.badges(), [{"aps": {"badge": 1}}])        # a new token: its number is not known
+        self.give(key)                                                  # the same token at the next start
+        self.drain()
+        self.assertEqual(len(self.badges()), 1)
+
+    def test_the_sender_wakes_when_the_records_change(self):
+        hub.PING_WAKE.clear()
+        self.raise_item()
+        self.assertTrue(hub.PING_WAKE.is_set())
 
 
 if __name__ == "__main__":
