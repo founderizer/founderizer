@@ -2499,6 +2499,33 @@ class FullAccess(Signed, DoorCase):
         self.assertEqual((self.run_on()["kind"], self.kept()["mode"]), ("refused", "auto"))
         self.assertGreaterEqual(door.MODES_READ, 2000)
 
+    def test_a_statement_that_the_door_refuses_does_not_hold_back_the_signed_one_before_it(self):
+        """The hub checks no signature, so it serves its newest few statements of each server, the newest first. A
+        later one in the right form with no good signature must not keep the owner's signed Auto from the door; and
+        the door checks at most MODE_CHECKS signatures of one server in one refresh, so that a hub cannot make it
+        check thousands."""
+        t = round(time.time())
+        self.mode("web-1", at=t - 100)
+        self.assertEqual(self.run_on()["kind"], "own")
+        auto = self.statement("web-1", "auto", at=t - 50)
+        forged = [{"statement": self.statement("web-1", at=t - 10 - n), "signature": "bm90LXNpZ25lZA=="} for n in range(4)]
+        self.modes = forged + [{"statement": auto, "signature": self.sign(auto)}]
+        door.fetch_approvals(self.door)
+        self.assertEqual((self.run_on()["kind"], self.kept()["statement"]), ("refused", auto))
+        # more of one name than the hub ever serves: the door reads MODE_CHECKS of them, and every other name
+        newer = self.statement("web-1", at=t - 5)
+        other = self.statement("web-2", at=t - 5)
+        flood = [{"statement": self.statement("web-1", at=t - 40 + n), "signature": "bm90LXNpZ25lZA=="}
+                 for n in range(door.MODE_CHECKS)]
+        self.modes = flood + [{"statement": newer, "signature": self.sign(newer)},
+                              {"statement": other, "signature": self.sign(other)}]
+        door.fetch_approvals(self.door)
+        self.assertEqual(self.kept()["statement"], auto)
+        self.assertEqual(door.read_json(door.MODES_FILE, {})["web-2"]["statement"], other)
+        self.modes = flood[:door.MODE_CHECKS - 1] + [{"statement": newer, "signature": self.sign(newer)}]
+        door.fetch_approvals(self.door)
+        self.assertEqual(self.kept()["statement"], newer)
+
     def test_an_auto_that_the_owner_key_did_not_sign_ends_no_full_access(self):
         """The hub carries a statement and checks no signature. An Auto that the door does not take leaves Full
         access as it was, and the door's own word (modes_said, which the hub reads with the record) says so."""

@@ -1026,7 +1026,8 @@ class DoorCalls(Access):
                          sort_keys=True, separators=(",", ":"))
         self.assertEqual(self.owner(f"/ui/needs/{once_id}", choice=0, statement=yes, signature="c2ln")[0], 200)
         answer = self.request("/door/approvals", source=DOOR)[1]
-        self.assertEqual(answer["modes"], [{"statement": newer, "signature": "c2ln"}])        # the newest of web-1
+        self.assertEqual(answer["modes"], [{"statement": newer, "signature": "c2ln"},         # the newest of web-1
+                                           {"statement": mode, "signature": "c2ln"}])         # first, then the older
         self.assertEqual(answer["approvals"], [{"need": once_id, "statement": yes, "signature": "c2ln"}])
 
     def mode_of(self, host, mode, at, fleet=None):
@@ -1036,6 +1037,12 @@ class DoorCalls(Access):
     def set_mode(self, statement, host="web-1", signature="c2lnbmF0dXJl", **more):
         return self.owner("/ui/door/mode", **dict({"host": host, "statement": statement, "signature": signature},
                                                   **more))
+
+    def served(self, host="web-1"):
+        """The statements of one server that the door gets, in the order of the hub's answer."""
+        status, answer = self.request("/door/approvals", source=DOOR)
+        self.assertEqual(status, 200, answer)
+        return [m["statement"] for m in answer["modes"] if json.loads(m["statement"])["host"] == host]
 
     def app_server(self, name="web-1"):
         status, view = self.request("/ui/servers?db=test-generation", source=OWNER)
@@ -1053,7 +1060,11 @@ class DoorCalls(Access):
         status, answer = self.set_mode(full)
         self.assertEqual(status, 409, answer)                   # no agent holds web-1 yet
         self.assertIn("no agent holds web-1 at Fix through the door", answer["error"])
-        self.assertEqual(self.set_mode(auto)[0], 409)
+        # An Auto is taken for every server's name, also one that no agent holds and that the hub knows nothing of:
+        # it opens nothing, and the door may keep a Full access that a restored hub no longer carries.
+        lost = self.mode_of("db-9", "auto", t - 300)
+        self.assertEqual(self.set_mode(lost, host="db-9")[0], 200)
+        self.assertEqual(self.served("db-9"), [lost])
         self.grant(agent="vps", server="web-1", level="read")
         self.assertEqual(self.set_mode(full)[0], 409)           # Read is no holder of a mode
         self.grant(agent="vps", server="web-1", level="fix")
@@ -1084,22 +1095,23 @@ class DoorCalls(Access):
                 status, answer = self.set_mode(bad, host=json.loads(bad)["host"])
                 self.assertEqual(status, 409, answer)
                 self.assertIn(why, answer["error"])
-        self.assertEqual(self.request("/door/approvals", source=DOOR)[1]["modes"], [])
+        self.assertEqual(self.served(), [])
         self.assertEqual(self.request("/ui/door/mode", {"request_id": str(uuid.uuid4()), "db": "test-generation",
                                                         "host": "web-1", "statement": full,
                                                         "signature": "c2lnbmF0dXJl"}, source=OTHER)[0], 403)
-        # Full access, then Auto: each is served to the door as it came, and /ui/servers gives the newest
+        # Full access, then Auto: each is served to the door as it came, the newest first, and /ui/servers gives the
+        # newest. The hub keeps the ones before it too: it cannot tell a signed statement from one that the door
+        # refuses, so no statement is the only one that the door gets.
         status, answer = self.set_mode(full)
         self.assertEqual((status, {k: answer[k] for k in ("host", "mode", "at", "changed")}),
                          (200, {"host": "web-1", "mode": "full", "at": t - 100, "changed": True}), answer)
-        self.assertEqual(self.request("/door/approvals", source=DOOR)[1]["modes"],
-                         [{"statement": full, "signature": "c2lnbmF0dXJl"}])
+        self.assertEqual([m for m in self.request("/door/approvals", source=DOOR)[1]["modes"]
+                          if '"web-1"' in m["statement"]], [{"statement": full, "signature": "c2lnbmF0dXJl"}])
         self.assertEqual((self.app_server()["mode"], self.app_server()["mode_at"]), ("full", t - 100))
         self.assertEqual(self.set_mode(full)[1]["changed"], False)              # the same statement again
         status, answer = self.set_mode(auto, signature="YXV0by1zaWduYXR1cmU=")
         self.assertEqual((status, answer.get("mode"), answer.get("changed")), (200, "auto", True), answer)
-        self.assertEqual(self.request("/door/approvals", source=DOOR)[1]["modes"],
-                         [{"statement": auto, "signature": "YXV0by1zaWduYXR1cmU="}])
+        self.assertEqual(self.served(), [auto, full])
         self.assertEqual((self.app_server()["mode"], self.app_server()["mode_at"]), ("auto", t - 50))
         # the door takes only a newer statement, so the hub takes no other: not the Full access from before, not
         # one of the Auto's own second, and it says the time that a new one must pass
@@ -1108,20 +1120,17 @@ class DoorCalls(Access):
                 status, answer = self.set_mode(old)
                 self.assertEqual((status, answer.get("at")), (409, t - 50), answer)
                 self.assertIn("the door takes only a newer one", answer["error"])
-        self.assertEqual(self.request("/door/approvals", source=DOOR)[1]["modes"],
-                         [{"statement": auto, "signature": "YXV0by1zaWduYXR1cmU="}])
+        self.assertEqual(self.served(), [auto, full])
         # the door's card signs Full access later: the newest of the two ways is served, and then the row's Auto
         nid = int(hub.t_raise_needs_you("manager", run_card()).split("N-")[1].split(".")[0])
         card = self.mode_of("web-1", "full", t - 20)
         self.assertEqual(self.owner(f"/ui/needs/{nid}", choice=1, statement=card, signature="Y2FyZA==")[0], 200)
-        self.assertEqual(self.request("/door/approvals", source=DOOR)[1]["modes"],
-                         [{"statement": card, "signature": "Y2FyZA=="}])
+        self.assertEqual(self.served(), [card, auto, full])
         self.assertEqual((self.app_server()["mode"], self.app_server()["mode_at"]), ("full", t - 20))
         self.assertEqual(self.set_mode(self.mode_of("web-1", "auto", t - 20))[0], 409)     # the card's own second
         back = self.mode_of("web-1", "auto", t - 10)
         self.assertEqual(self.set_mode(back)[0], 200)
-        self.assertEqual(self.request("/door/approvals", source=DOOR)[1]["modes"],
-                         [{"statement": back, "signature": "c2lnbmF0dXJl"}])
+        self.assertEqual(self.served(), [back, card, auto, full])
         # a card's Full access that is not newer than the row's Auto, or of another fleet: the door would take
         # neither, so neither takes the place of the Auto that the hub serves and shows
         nid = int(hub.t_raise_needs_you("manager", run_card(script="id\n")).split("N-")[1].split(".")[0])
@@ -1131,26 +1140,55 @@ class DoorCalls(Access):
             status, answer = self.owner(f"/ui/needs/{nid}", choice=1, statement=bad, signature="Y2FyZA==")
             self.assertEqual(status, 400, answer)
             self.assertIn(why, answer["error"])
-        self.assertEqual(self.request("/door/approvals", source=DOOR)[1]["modes"],
-                         [{"statement": back, "signature": "c2lnbmF0dXJl"}])
+        self.assertEqual(self.served(), [back, card, auto, full])
         self.assertEqual(self.app_server()["mode"], "auto")
         # the agent loses the server: no Full access is set, and an Auto still is, so Full access can always end
-        self.assertEqual(self.set_mode(self.mode_of("web-1", "full", t - 5))[0], 200)
+        again = self.mode_of("web-1", "full", t - 5)
+        self.assertEqual(self.set_mode(again)[0], 200)
         self.grant(agent="vps", server="web-1", level=None)
         self.assertEqual(self.set_mode(self.mode_of("web-1", "full", t - 4))[0], 409)
         last = self.mode_of("web-1", "auto", t - 3)
         self.assertEqual(self.set_mode(last)[0], 200)
-        # the door gets that Auto though no agent holds the server now: it must have it before one holds it again
-        self.assertEqual(self.request("/door/approvals", source=DOOR)[1]["modes"],
-                         [{"statement": last, "signature": "c2lnbmF0dXJl"}])
+        # the door gets that Auto though no agent holds the server now: it must have it before one holds it again.
+        # And the hub serves the newest five of a server, from its row and from its cards.
+        self.assertEqual(self.served(), [last, again, back, card, auto])
+        self.assertEqual(len(hub.door_mode_rows("web-1")), hub.DOOR_MODES_KEPT)
         self.assertEqual(self.request("/door/approvals", source=OWNER)[0], 403)
         # the door reads a bounded list: the servers that an agent holds come first, whatever their names
         self.grant(agent="vps", server="web-1", level="read")
         for name in ("aa-1", "zz-1"):
             hub.kv_set(f"door_mode:{name}", json.dumps({"statement": self.mode_of(name, "auto", t), "received": t,
                                                          "signature": "c2lnbmF0dXJl"}))
-        self.assertEqual([json.loads(m["statement"])["host"]
-                          for m in self.request("/door/approvals", source=DOOR)[1]["modes"]], ["web-1", "aa-1", "zz-1"])
+        hosts = [json.loads(m["statement"])["host"] for m in self.request("/door/approvals", source=DOOR)[1]["modes"]]
+        # the newest of every server before the second of any: the held server first in each round
+        self.assertEqual(hosts, ["web-1", "aa-1", "db-9", "zz-1"] + ["web-1"] * 4)
+        # A statement in the right form that the door will refuse (no signature of the owner key) does not take the
+        # place of the signed ones before it: the door still gets them, and takes the newest that it can check.
+        self.grant(agent="vps", server="web-1", level="fix")
+        forged = self.mode_of("web-1", "full", t - 2)
+        self.assertEqual(self.set_mode(forged, signature="bm90LXNpZ25lZA==")[0], 200)
+        self.assertEqual(self.served()[:2], [forged, last])
+        self.assertEqual(self.app_server()["mode"], "full")         # what was sent last; mode_door says what holds
+        # A row that holds more than statements of this server (an older shape, something written by hand) loses
+        # only that, and keeps its newest five by the statements' own times, whatever their order in the row.
+        many = [{"statement": self.mode_of("zz-1", "auto", t - 60 + n), "signature": "c2lnbmF0dXJl", "received": t}
+                for n in range(8)]
+        hub.kv_set("door_mode:zz-1", json.dumps([{"x": 1}, 5, None] + many))
+        newest = self.mode_of("zz-1", "auto", t - 1)
+        self.assertEqual(self.set_mode(newest, host="zz-1")[0], 200)
+        self.assertEqual([json.loads(r["statement"])["at"] for r in hub.door_mode_rows("zz-1")],
+                         [t - 1, t - 53, t - 54, t - 55, t - 56])
+        # the limit of names is for a new name only: a server whose Full access came from the door's card takes
+        # its Auto from the row though the row is new
+        with patch.object(hub, "DOOR_MODE_HOSTS", 1):
+            self.assertEqual(self.set_mode(self.mode_of("new-9", "auto", t), host="new-9")[0], 409)
+            self.grant(agent="vps", server="db-1", level="fix")
+            nid = int(hub.t_raise_needs_you("manager", run_card(host="db-1")).split("N-")[1].split(".")[0])
+            self.assertEqual(self.owner(f"/ui/needs/{nid}", choice=1, statement=self.mode_of("db-1", "full", t - 9),
+                                        signature="Y2FyZA==")[0], 200)
+            self.assertEqual(hub.door_mode_rows("db-1"), [])
+            self.assertEqual(self.set_mode(self.mode_of("db-1", "auto", t - 8), host="db-1")[0], 200)
+            self.assertEqual(self.set_mode(self.mode_of("zz-1", "auto", t), host="zz-1")[0], 200)
         # the card's Full access takes no time from the future either
         self.grant(agent="vps", server="web-1", level="fix")
         nid = int(hub.t_raise_needs_you("manager", run_card(script="uptime\n")).split("N-")[1].split(".")[0])
@@ -1310,6 +1348,10 @@ class DoorCalls(Access):
         self.assertEqual(json.loads(hub.kv_get("door_modes_said"))["at"], t + 60)
         hub.door_modes_said({"modes": {"web-1": {"mode": "auto", "at": t - 5}}}, t + 120)   # the same: no write
         self.assertEqual(json.loads(hub.kv_get("door_modes_said"))["at"], t + 60)
+        # while the door does not answer the hub's read of its record, its last word is no word
+        with patch.dict(hub.DOOR, error=t + 180):
+            self.assertIsNone(self.app_server()["mode_door"])
+        self.assertEqual(self.app_server()["mode_door"], "auto")
 
     def test_a_door_card_carries_the_script_that_the_owner_s_mac_hashes(self):
         """Review point 5.6 of 11 November 2026: the owner signed a hash, and the card's script was the manager's

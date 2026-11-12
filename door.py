@@ -90,8 +90,11 @@ DEVICES_FILE = STATE + "/devices.json"      # the owner's phones whose signing k
 MODES_FILE = STATE + "/modes.json"          # the owner's signed mode of each host: the newest statement of each
 MODES = ("auto", "full")                    # door-modes proposal, step 4: Auto, the default, and Full access
 MODES_READ = 2000                           # statements that the door reads of one answer of the hub: the hub serves
-                                            # one for each server that an agent holds, and a signed Auto past the cut
-                                            # would leave Full access standing (it was 200)
+                                            # the newest of every server first, the held ones before the others,
+                                            # then the older ones; a signed Auto past the cut would leave Full
+                                            # access standing (it was 200)
+MODE_CHECKS = 8                             # signature checks of one host's statements in one refresh: the hub serves
+                                            # its newest 5 of each host (hub.DOOR_MODES_KEPT)
 MODE_SKEW = 300                             # seconds that the clock of the owner's Mac may be behind the door's
 UPSTREAM = "https://github.com/founderizer/founderizer.git"
 SYSTEMD = "/etc/systemd/system"
@@ -1875,11 +1878,15 @@ def fetch_approvals(door):
     seen = read_json(MODES_FILE, {})
     seen = json.loads(json.dumps(seen)) if isinstance(seen, dict) else {}
     settle_modes(access, seen)
-    signed = []
+    signed, checks = [], {}
     for item in given[:MODES_READ]:
         form = mode_form(access, item.get("statement")) if isinstance(item, dict) else None
-        if form and isinstance(seen.get(form[0]), dict) and form[2] > mode_floor(seen[form[0]]) and \
-                mode_statement(access, item.get("statement"), item.get("signature")) == form:
+        if not form or not isinstance(seen.get(form[0]), dict) or form[2] <= mode_floor(seen[form[0]]):
+            continue
+        checks[form[0]] = checks.get(form[0], 0) + 1
+        if checks[form[0]] > MODE_CHECKS:       # the hub serves a few of each host: more of one name are not read
+            continue
+        if mode_statement(access, item.get("statement"), item.get("signature")) == form:
             signed.append((form, item))
     with door.lock:
         write_json(DEVICES_FILE, devices)

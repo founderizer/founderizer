@@ -32646,7 +32646,8 @@ def app_servers_view(team):
     names = sorted(set(held) | {h for h, w in words.items() if w.get("added") is True and h not in machines})
     # owner feature door_mode_set: the mode of the owner's newest signed statement of each server that the hub
     # carries (auto with no statement), when he signed it, and what the door itself says that it keeps
-    modes, said = door_modes_held(), door_modes_word() or {}
+    # the door's word is null while the door does not answer the hub's read of its record: an old word is no word
+    modes, said = door_modes_held(), {} if DOOR["error"] is not None else door_modes_word() or {}
 
     def door_says(h):
         word = said.get(h)
@@ -35811,7 +35812,7 @@ DOOR_MODES = ("auto", "full")           # door.MODES: Auto, the default, and Ful
 DOOR_MODE_AHEAD = 300                   # seconds that a statement's time may be ahead of the hub's clock, as the door's
 
 
-def door_mode_said(statement):
+def door_mode_form(statement):
     """A door-mode statement as a dict, or None: {v: 1, kind: "door-mode", fleet, host, mode, at} in its canonical
     form (vault.canonical), with a host's name, a mode of DOOR_MODES and a whole number of seconds. This is the form
     and nothing more: the hub holds no owner key, so it cannot check the owner's signature and does not try (the door
@@ -35840,7 +35841,7 @@ def door_mode_statement(need, statement):
     host = need["door_host"] if "door_host" in need.keys() else None
     if not host:
         return "this Needs-you item names no server whose mode it sets"
-    said = door_mode_said(statement)
+    said = door_mode_form(statement)
     if said is None:
         return "the statement is not a door-mode statement in its canonical form"
     if said["host"] != host or said["mode"] != "full":
@@ -35866,25 +35867,41 @@ def approval_kind(approval):
     return said.get("kind") if isinstance(said, dict) else None
 
 
-def door_modes_held():
-    """{host: {statement, signature, mode, at, received}}: the owner's newest signed mode of each server that the
-    hub carries, whichever way it came: as the second answer of the door's card (a Needs-you item's approval) or
-    from the server's own row (POST /ui/door/mode, kept as door_mode:<host>). The newest is the one with the latest
-    time in the statement, and of two with the same time the one that the hub got first, because the door takes
-    only a statement that is newer than the one it keeps (door.mode_floor). A statement of any age stands, because
-    a mode stands. The hub checked the form of each and the signature of none."""
+DOOR_MODES_KEPT = 5         # statements of one server that the hub keeps from its row, and serves to the door
+DOOR_MODE_HOSTS = 2000      # names of servers whose modes the hub keeps, at most
+
+
+def door_mode_rows(host):
+    """The statements of one server that came from its own row, as the hub keeps them under door_mode:<host>:
+    [{statement, signature, received}], or [] when the row does not read. Before the list, the row was one of them."""
+    try:
+        kept = json.loads(kv_get(f"door_mode:{host}") or "null")
+    except (ValueError, RecursionError):
+        return []
+    kept = [kept] if isinstance(kept, dict) else kept if isinstance(kept, list) else []
+    return [item for item in kept if isinstance(item, dict)]
+
+
+def door_mode_statements():
+    """{host: [{statement, signature, mode, at, received}]}: the owner's signed modes of each server that the hub
+    carries, the newest first, whichever way each came: as the second answer of the door's card (a Needs-you item's
+    approval) or from the server's own row (POST /ui/door/mode, kept as door_mode:<host>). The newest is the one with
+    the latest time in the statement, and of two with the same time the one that the hub got first, because the
+    door takes only a statement that is newer than the one it keeps (door.mode_floor). A statement of any age
+    stands, because a mode stands. The hub checked the form of each and the signature of none, which is why it
+    keeps more than one of a server: a statement in the right form that the door refuses (another key signed it, or
+    no key) must not take the place of the signed one before it (door_approvals)."""
     found = []
     for r in q("SELECT approval, answered FROM needs WHERE approval IS NOT NULL AND door_host IS NOT NULL ORDER BY id"):
         with contextlib.suppress(ValueError, TypeError, KeyError, RecursionError):
             item = json.loads(r["approval"])
             found.append((item["statement"], item["signature"], r["answered"] or 0))
-    for r in q("SELECT v FROM kv WHERE k LIKE 'door_mode:%' ORDER BY k"):
-        with contextlib.suppress(ValueError, TypeError, KeyError, RecursionError):
-            item = json.loads(r["v"])
-            found.append((item["statement"], item["signature"], item["received"]))
+    for r in q("SELECT k FROM kv WHERE k LIKE 'door_mode:%' ORDER BY k"):
+        for item in door_mode_rows(r["k"][len("door_mode:"):]):
+            found.append((item.get("statement"), item.get("signature"), item.get("received")))
     held, fleet = {}, kv_get("fleet_id")
     for statement, signature, received in found:
-        said = door_mode_said(statement)
+        said = door_mode_form(statement)
         if said is None or not isinstance(signature, str) or type(received) not in (int, float) or \
                 received != received:
             continue
@@ -35893,11 +35910,27 @@ def door_modes_held():
         # release before version 1.125, which checked no time).
         if said["at"] > received + DOOR_MODE_AHEAD or said["fleet"] != fleet:
             continue
-        old = held.get(said["host"])
-        if old is None or (said["at"], -received) > (old["at"], -old["received"]):
-            held[said["host"]] = {"statement": statement, "signature": signature, "mode": said["mode"],
-                                  "at": said["at"], "received": received}
+        held.setdefault(said["host"], []).append({"statement": statement, "signature": signature,
+                                                  "mode": said["mode"], "at": said["at"], "received": received})
+    for items in held.values():
+        items.sort(key=lambda item: (-item["at"], item["received"]))
     return held
+
+
+def door_modes_served():
+    """[{statement, signature}] for GET /door/approvals: of each server its newest DOOR_MODES_KEPT statements, in
+    rounds: the newest of every server, then the second of every server, and so on; in each round the servers that an
+    agent holds come first, then the others, by name."""
+    held = held_servers(TEAM)
+    hosts = sorted(door_mode_statements().items(), key=lambda kv: (kv[0] not in held, kv[0]))
+    return [{"statement": items[n]["statement"], "signature": items[n]["signature"]}
+            for n in range(DOOR_MODES_KEPT) for _, items in hosts if n < len(items)]
+
+
+def door_modes_held():
+    """{host: {statement, signature, mode, at, received}}: the newest statement of each server that the hub carries
+    (door_mode_statements): what the owner signed last, by its form."""
+    return {host: items[0] for host, items in door_mode_statements().items()}
 
 
 def held_servers(team):
@@ -35918,7 +35951,7 @@ def door_mode_servers(team):
 def door_mode_set(body):
     """POST /ui/door/mode (owner feature door_mode_set; the owner's "Yes, as shown" of 11 November 2026 to the row
     "Managed by <agent>" with Auto and Full access): the owner's signed mode of one server, with no Needs-you item.
-    The hub checks the form (door_mode_said), that the statement is of this fleet and of this server, that its time
+    The hub checks the form (door_mode_form), that the statement is of this fleet and of this server, that its time
     is not from the future, that an agent holds the server at Fix (for Auto, also a server whose mode the hub
     carries already, so that Full access can always be ended), and that it is newer than the newest statement of
     that server that the hub carries, because the door takes no other. Then it keeps the statement, in place of the
@@ -35926,7 +35959,7 @@ def door_mode_set(body):
     cannot check the owner's signature and does not say that it did: only the door knows whether it takes the
     statement, and GET /ui/servers gives the door's own word beside the hub's (mode_door). Called with LOCK held."""
     host, statement, signature = body["host"], body["statement"], body["signature"]
-    said = door_mode_said(statement)        # read() checked the form: this is the same statement
+    said = door_mode_form(statement)        # read() checked the form: this is the same statement
     if said["fleet"] != fleet_id():
         raise Refusal(409, "the statement is not of this fleet: sign it with this fleet's id, which the vault's "
                            "reading gives")
@@ -35936,16 +35969,28 @@ def door_mode_set(body):
     held = door_modes_held().get(host)
     if held and (held["statement"], held["signature"]) == (statement, signature):
         return {"host": host, "mode": said["mode"], "at": said["at"], "changed": False}
-    if host not in door_mode_servers(TEAM) and not (said["mode"] == "auto" and held):
+    # An Auto is taken for every server's name: it opens nothing, and the door may keep a Full access that the hub
+    # no longer carries (a restore of the hub), which would come back with no card when an agent holds the server.
+    if said["mode"] == "full" and host not in door_mode_servers(TEAM):
         raise Refusal(409, f"no agent holds {host} at Fix through the door, so it has no mode to set: Full access is "
                            f"for a server that an agent manages")
+    # the statements of this row that still read as this server's, the newest first: a row that held anything else
+    # (an older shape, something written by hand) loses only that
+    rows = [(form["at"], item) for item in door_mode_rows(host)
+            for form in [door_mode_form(item.get("statement"))] if form and form["host"] == host]
+    rows = [item for _, item in sorted(rows, key=lambda pair: -pair[0])]
+    if not rows and not held and \
+            q1("SELECT COUNT(*) n FROM kv WHERE k LIKE 'door_mode:%'")["n"] >= DOOR_MODE_HOSTS:
+        raise Refusal(409, f"the hub carries the modes of {DOOR_MODE_HOSTS} servers already, and takes no other name")
     if held and said["at"] <= held["at"]:
         e = Refusal(409, f"the hub carries a mode of {host} that is as new as this statement or newer, and the door "
                          f"takes only a newer one: sign it again with a later time")
         e.extra = {"at": held["at"]}
         raise e
-    kv_set(f"door_mode:{host}", json.dumps({"statement": statement, "signature": signature, "received": now()},
-                                           sort_keys=True))
+    # the newest ones of this row, this one first: the hub cannot tell a signed statement from one that the door
+    # will refuse, so one statement must not be the only one that the door gets
+    rows = [{"statement": statement, "signature": signature, "received": now()}] + rows
+    kv_set(f"door_mode:{host}", json.dumps(rows[:DOOR_MODES_KEPT], sort_keys=True))
     log("owner", f"signed mode of {host} carried to the door: {said['mode']} (the door checks the signature)")
     return {"host": host, "mode": said["mode"], "at": said["at"], "changed": True}
 
@@ -35996,9 +36041,11 @@ def door_approvals(src):
             # of every server, and first of those that an agent holds: the door reads a bounded list, which the
             # names of servers that left the fleet must not push a held server out of, and an Auto of a server that
             # no agent holds now must still reach the door before an agent holds it again
-            "modes": [{"statement": item["statement"], "signature": item["signature"]}
-                      for host, item in sorted(door_modes_held().items(),
-                                               key=lambda kv: (kv[0] not in held_servers(TEAM), kv[0]))]}
+            # The newest DOOR_MODES_KEPT of each: the door takes the newest one whose signature is the owner key's,
+            # so a statement that it refuses does not hold back the signed one before it. The newest of every
+            # server comes before the second of any, so that the older ones of many names never push the newest
+            # one of a name past what the door reads (door.MODES_READ).
+            "modes": door_modes_served()}
 
 
 def door_release(src):
@@ -40512,7 +40559,7 @@ class Handler(BaseHTTPRequestHandler):
                     not isinstance(signature, str) or not CENTRAL_SIGNATURE.fullmatch(signature):
                 raise ValueError("statement and signature are the owner's signed mode of the server: the statement "
                                  "as text, and the base64 of its DER signature")
-            said = door_mode_said(statement)
+            said = door_mode_form(statement)
             if said is None:
                 raise ValueError("the statement is not a door-mode statement in its canonical form: {v: 1, kind: "
                                  "\"door-mode\", fleet, host, mode: auto or full, at}")
