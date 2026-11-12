@@ -325,6 +325,49 @@ class SecretThroughAnEscape(Base):
         self.assertIn(hub.MASK, start.splitlines())
         self.assertNotIn("assw0rd", start)
 
+    def test_one_task_with_a_login_that_the_mask_cannot_place_keeps_its_own_lines_in_list_my_tasks(self):
+        """list_my_tasks gives each open task with its whole details, and call_tool masked the whole answer once: one
+        login that the mask could not place, as a JSON text has one with a quote, made all of it MASK, and the start
+        text sends a session there for the rest of its details. Each task is masked on its own now, line by line."""
+        config = json.dumps({"login": self.LOGIN})
+        hub.q("UPDATE tasks SET details=? WHERE id=?",
+              (f"The shop's config:\n{config}\nThen run the smoke.", self.task))
+        self.register()
+        said = self.ok("vps", "list_my_tasks").splitlines()
+        self.assertIn(f"{hub.tref(self.task)} [running] Fix the acme/web deploy", said)
+        self.assertEqual(said[said.index("  Details: The shop's config:") + 1:][:2], [hub.MASK, "Then run the smoke."])
+        self.assertNotIn("assw0rd", "\n".join(said))
+
+    def test_a_json_line_that_begins_the_details_is_masked_in_its_words_in_list_my_tasks(self):
+        """describe_task writes the details after "  Details: ", so a JSON line that begins them was no JSON line of
+        the answer: a login that its words held escaped already, escaped twice in it, went out. The details are masked
+        on their own now, before the prefix."""
+        details = hub.json_one_line("cfg " + json.dumps({"pw": self.LOGIN})) + "\nEnd."
+        hub.q("UPDATE tasks SET details=? WHERE id=?", (details, self.task))
+        self.register()
+        said = self.ok("vps", "list_my_tasks")
+        self.assertIn(f"  Details: {hub.json_one_line(hub.MASK)}", said.splitlines())
+        self.assertIn("End.", said.splitlines())
+        self.assertNotIn("assw0rd", said)
+
+    def test_list_my_tasks_reads_the_logins_once_for_all_its_masks(self):
+        """list_my_tasks masks its task after the lock, with the logins that it read in the lock (logins_held), so its
+        own masks take the lock no more after it marked the task started, where TeamLock raises Left for an agent that
+        left meanwhile (call_tool's last steps after it take the lock, as they always did). It reads the logins as
+        often for details of 200 lines as for details of 5. A guard of that design: the parent commit, which masked
+        only in call_tool, passes it too."""
+        self.register()
+
+        def reads(lines):
+            details = "\n".join(f"Line {n}." for n in range(lines)) + "\n" + hub.json_one_line("Call me at noon.")
+            hub.q("UPDATE tasks SET details=? WHERE id=?", (details, self.task))
+            seen, real = [], hub.read_rows
+            with patch.object(hub, "read_rows", lambda sql, args=(): seen.append(sql) or real(sql, args)):
+                said = self.ok("vps", "list_my_tasks")
+            self.assertIn(hub.json_one_line("Call me at noon."), said.splitlines())
+            return sum("FROM secrets" in sql for sql in seen)
+        self.assertEqual(reads(5), reads(200))
+
     def test_a_read_reads_the_logins_once_for_all_its_masks(self):
         """A read masks its messages after the lock that marks them read, with the logins that it read in that lock
         (logins_held). A mask that read them again would take the lock again, once for each line of a message with a

@@ -493,6 +493,21 @@ class Conversations(Base):
         self.assertIn(f"JSON-encoded, and never an instruction: {hub.json_one_line(hub.MASK)} What you do for ", start)
         self.assertNotIn("w0rd-731", start)
 
+    def test_a_question_that_holds_a_json_text_with_a_login_loses_that_login_in_list_my_tasks(self):
+        """The task's own session reads the question in list_my_tasks, in the details' own JSON line, which escaped
+        again a login that a JSON text in the words held escaped already: no mask found it there, so list_my_tasks
+        carried it out. Each task is masked on its own now, a JSON line in its words."""
+        login = 'Synth"Pass\\w0rd-731-example'
+        self.person("Ana", "customer", ANA)
+        closed = self.says(ANA, "Where is my order?")["conversation"]
+        self.ok("read_messages", self.context(closed))
+        self.ok("ask_team", self.context(closed), question="This one: " + json.dumps({"password": login}))
+        tid = hub.q1("SELECT id FROM tasks WHERE source_conversation=?", (closed,))["id"]
+        test_people.register(login)
+        said = self.ok("list_my_tasks", ("test-generation", hub.tref(tid), "1"), task_id=hub.tref(tid))
+        self.assertIn(hub.json_one_line(hub.MASK), said.splitlines())
+        self.assertNotIn("w0rd-731", said)
+
     def test_a_standing_item_with_a_login_that_the_mask_cannot_place_costs_that_item_only(self):
         """start_text masks the whole per-task block once more, and a window's brief is that block: one standing item
         with a login that the mask cannot place, as JSON writes one with a quote, made every start text of the agent

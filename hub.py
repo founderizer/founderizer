@@ -5280,7 +5280,10 @@ def went_on_with(task_id):
             + "; ".join(f"Q-{r['id']} \"{clip(r['assumed'], 200)}\"" for r in rows) + ". ")
 
 
-def describe_task(t):
+def describe_task(t, details=None):
+    """One task as list_my_tasks gives it. details: what stands on its Details line in place of the details, which
+    t_list_my_tasks masks on their own, so that their first line, after the prefix here, is masked as a JSON line
+    too."""
     lines = [f"{tref(t['id'])} [{t['state']}] {t['title']}",
              f"  Requester: {t['requester']}",
              f"  Needs: {t['needs']}",
@@ -5289,7 +5292,7 @@ def describe_task(t):
         lines.append(f"  Goal: {t['goal']}")
     lines += goal_why_lines(t)
     if t["details"]:
-        lines.append(f"  Details: {t['details']}")
+        lines.append(f"  Details: {t['details'] if details is None else details}")
     said = report_said_text(t["id"])        # a report's task: its reporter's summary, as data
     if said:
         lines.append(f"  {said}")
@@ -5789,24 +5792,38 @@ def t_see_earlier_work(agent, a):
 
 
 def t_list_my_tasks(agent, a):
-    if a.get("task_id"):
-        tid = parse_task(a["task_id"])
-        t = get_task(tid, owner=agent)
-        if t["state"] in TERMINAL:
-            raise ToolError(f"STOP: {tref(tid)} is already {t['state']}.")
-        if t["state"] == "submitted":
-            q("UPDATE tasks SET state='working', started=? WHERE id=?", (now(), tid))
-        elif not t["started"]:
-            q("UPDATE tasks SET started=? WHERE id=?", (now(), tid))
-        q("UPDATE attempts SET started=COALESCE(started,?) WHERE task=? AND attempt=?", (now(), tid, t["attempt"]))
-        activity(tid, "list_my_tasks")
-    rows = q("SELECT * FROM tasks WHERE owner=? AND state NOT IN ('completed','failed','rejected','canceled') "
-             "ORDER BY id", (agent,))
-    if not rows:
-        return f"You are {agent}. You have no open tasks."
-    if getattr(CALL, "context", None):
-        rows = [t for t in rows if tref(t["id"]) == CALL.context[1]]
-    return f"You are {agent}. Open tasks: {len(rows)}.\n\n" + "\n\n".join(describe_task(t) for t in rows)
+    """The agent's open tasks, each as describe_task gives it: a task session, the only one with this tool, gets its own
+    task. Each task is masked on its own, line by line where a login stays that the mask cannot place (mask_message),
+    and a JSON line in it in its words: call_tool's mask of the whole answer made all of it MASK for one such login in
+    the task's words, as JSON writes one with a quote, and the start text sends a session here for the rest of its
+    details; and an ask_team question's JSON line escaped again a login that a JSON text in it held escaped already,
+    which no mask found. The masks run after the lock, with the logins read in it (logins_held): the details are whole
+    here, and the mask of a long run takes seconds, while the lock holds every other call of the hub. So call_tool
+    runs this tool outside its lock; get_task fences the session's task inside it."""
+    with LOCK:
+        if a.get("task_id"):
+            tid = parse_task(a["task_id"])
+            t = get_task(tid, owner=agent)
+            if t["state"] in TERMINAL:
+                raise ToolError(f"STOP: {tref(tid)} is already {t['state']}.")
+            if t["state"] == "submitted":
+                q("UPDATE tasks SET state='working', started=? WHERE id=?", (now(), tid))
+            elif not t["started"]:
+                q("UPDATE tasks SET started=? WHERE id=?", (now(), tid))
+            q("UPDATE attempts SET started=COALESCE(started,?) WHERE task=? AND attempt=?", (now(), tid, t["attempt"]))
+            activity(tid, "list_my_tasks")
+        rows = q("SELECT * FROM tasks WHERE owner=? AND state NOT IN ('completed','failed','rejected','canceled') "
+                 "ORDER BY id", (agent,))
+        if not rows:
+            return f"You are {agent}. You have no open tasks."
+        if getattr(CALL, "context", None):
+            rows = [t for t in rows if tref(t["id"]) == CALL.context[1]]
+        slot = f"\x00{uuid.uuid4().hex}\x00"       # where a task's details go, masked on their own: a JSON line
+        said = [(describe_task(t, slot), t["details"]) for t in rows]       # that begins them stands after a prefix
+        key = secret_key()
+    with logins_held(key):
+        return f"You are {agent}. Open tasks: {len(rows)}.\n\n" + "\n\n".join(
+            mask_message(text).replace(slot, mask_message(details or ""), 1) for text, details in said)
 
 
 def t_report_progress(agent, a):
@@ -26332,10 +26349,10 @@ def call_tool(agent, name, args, context=None):
                 # These wait for an answer, a helper or Google, or read many files (search_knowledge): not under LOCK.
                 # deliver_result waits for the helper to send the task's files (deliver_outputs). The history's two
                 # take the lock for each step of their own, so the hub answers between the steps of a long search.
-                # read_messages takes it for its reads and writes, and masks each message after it (t_read_messages).
+                # read_messages and list_my_tasks take it for their reads and writes, and mask after it.
                 if name in ("ask_my_requester", "sign_in", "hand_over", "create_login", "save_key", "call_api",
                             "message_agent", "search_knowledge", "read_knowledge", "write_knowledge", "write_skill",
-                            "deliver_result", "search_history", "read_history", "read_messages") or \
+                            "deliver_result", "search_history", "read_history", "read_messages", "list_my_tasks") or \
                         name in GOOGLE_TOOLS or name in REPO_CALLS:     # the door for threads asks GitHub
                     text = fn(agent, args)
                 else:
@@ -26354,8 +26371,10 @@ def call_tool(agent, name, args, context=None):
                 # guard refuses a login that is registered at the moment of the write; this catches the ones
                 # registered after it, which is every login the owner added since.
                 text = mask_secrets(text)
-                if tid:
-                    task_started(get_task(tid))         # a refused call leaves no trace, a done one starts the task
+                if tid:                                 # a refused call leaves no trace, a done one starts the task:
+                    t = get_task(tid)                   # its own attempt, never one that a restart made meanwhile
+                    if t["attempt"] == attempt:
+                        task_started(t)
                 with area("activity"):
                     ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail) VALUES(?,?,?,?,?,?,1,?)",
                         (now(), agent, tid, attempt, name,
