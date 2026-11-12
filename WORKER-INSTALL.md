@@ -440,3 +440,58 @@ of started requests (no answer and no key), comes with the first request.
 runs, so no request goes on without its broker. To undo: remove the key and
 restart; the broker then sends no requests, and `requests.json` stays. A later run
 of `hubsetup.py vault` adds the key again.
+
+### The key swap on a Linux broker (`hubsetup.py vault --swap`)
+
+An API key that an agent reads is a variable in its sessions. With the key swap, a key
+that has a site stays out of them: the session holds a placeholder, and the vault's
+swap proxy puts the key into the `Authorization` header of an HTTPS request to that
+site only (VAULT.md, "The key swap"). **No install switches it on.** Root does, for one
+machine, in a checkout at the release:
+
+```bash
+python3 hubsetup.py vault --hub http://100.80.1.2:8765 --kit "$PWD" --swap --check   # says what it would make
+python3 hubsetup.py vault --hub http://100.80.1.2:8765 --kit "$PWD" --swap
+```
+
+What the step makes, after the broker's own step:
+
+- The user `founderizer-swap`, with a group of its own. It is in no group of the agents
+  or of the broker, so it reads neither the store nor its key.
+- The part `"swap"` of `/etc/fleet-vault/vault.json`: `{"user", "vault", "port",
+  "openssl"}`. The file stays root's with mode 644 and holds no secret. This part is the
+  switch: with it, the broker gives a key that has a site as a placeholder or not at
+  all, never as the key. A `vault.py` from before the key swap does not start on a
+  configuration with this part, so a release with an older program is not taken on such
+  a machine: the machine keeps the program that was serving.
+- The service `fleet-vault-swap`: the same program file as the broker's
+  (`vault.py swap`), on `127.0.0.1:876`. It starts again with the broker
+  (`PartOf=fleet-vault.service`), so it runs the program that the broker runs.
+
+The step stops, and changes nothing, on a machine whose kernel setting
+`net.ipv4.ip_unprivileged_port_start` is 876 or lower: there each user can listen on
+the proxy's port, and an agent could take its place. It changes no line of
+`fleet-agent-user`, of `fleet-vault-program` or of the sudoers file. A second run
+changes nothing while the proxy runs, and it starts a proxy that is down again. A later
+run of `hubsetup.py vault` without `--swap` keeps the part. On a machine that is not a
+Linux server, `--swap` switches nothing on and says so.
+
+Check: `systemctl is-active fleet-vault fleet-vault-swap` says `active` two times; the
+first line of `journalctl -u fleet-vault-swap -n 5` names the port; `/run/fleet-vault`
+has mode 751, `vault.sock` 660 and `swap.sock` 666 (the broker answers on `swap.sock`
+only the proxy's user, which it reads from the kernel).
+
+After the step, a key swaps when the owner gave it a site (`POST /ui/team/logins` with
+`site`, and `form` when the key does not go as `Bearer`), an agent of this machine
+reads it, and the agent's program is Claude Code or Codex. Its next session then gets
+the placeholder. On such a machine the vault also sends that key in a `call_api`
+request only to that site, in the `Authorization` header and in the key's own form.
+
+What a machine that swaps costs: each new `vault.py` starts the proxy again, and that
+cuts the open HTTPS connections of the sessions that hold a placeholder. A session that
+holds none does not use the proxy.
+
+To undo, as root: `systemctl disable --now fleet-vault-swap`, take the part `"swap"`
+out of `/etc/fleet-vault/vault.json`, `systemctl restart fleet-vault`. The next
+sessions get each key as a variable again. A session that holds a placeholder must
+start again.

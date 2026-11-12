@@ -337,6 +337,10 @@ def web_hosts(value):
 RUNTIMES = {
     "codex": {
         "label": "Codex",
+        # The key swap (VAULT.md): the hosts of this program's own provider, which a session's NO_PROXY names, so that
+        # its model calls and its sign-in never go through the vault's proxy. None: nobody proved this program with
+        # the proxy's variables, so a session of it gets each key as a variable, as before.
+        "own_hosts": ("openai.com", "chatgpt.com"),
         "driver": "terminal",
         "acp_command": None,
         "can": {"shell", "web", "screen"},              # screen tasks use the agent's own screen runtime
@@ -402,6 +406,7 @@ RUNTIMES = {
     },
     "claude": {
         "label": "Claude Code",
+        "own_hosts": ("anthropic.com", "claude.ai", "claude.com"),     # as Codex's
         "driver": "terminal",
         "acp_command": None,
         "can": {"shell", "web", "browser", "screen"},
@@ -481,6 +486,7 @@ RUNTIMES = {
     # pin, against a stand-in model with no account (step 0 of the AI providers build spec, 12 November 2026).
     "grok": {
         "label": "Grok",
+        "own_hosts": None,              # not proved: its sessions run through the ACP runner
         "driver": "acp",
         "acp_command": "grok agent stdio",
         "can": {"shell", "web"},
@@ -539,6 +545,7 @@ RUNTIMES = {
     # OpenCode, for each other API key and for the owner's own model server, through ACP.
     "opencode": {
         "label": "OpenCode",
+        "own_hosts": None,              # as Grok's: its own program is proved in a terminal only
         "driver": "acp",
         "acp_command": "opencode acp",
         "can": {"shell", "web"},
@@ -601,7 +608,7 @@ RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manage
                  "compact_tokens", "routine", "default_model", "task_denied", "task_allowed", "conversation_denied",
                  "manager_denied", "task_opening", "token_weights", "memory_off",
                  "acp_auth", "acp_quiet", "acp_models", "acp_allowance", "key_env", "own_env", "pinned", "continues",
-                 "acp_adapter")
+                 "acp_adapter", "own_hosts")
 
 
 # The session reuse rule (AUTONOMY.md P9.10) and its setting (section 4), one object in team.json "settings":
@@ -1866,6 +1873,87 @@ def key_env(name):
     and it is not reserved (ENV_RESERVED)."""
     return isinstance(name, str) and bool(KEY_ENV.fullmatch(name)) and name.endswith(KEY_SUFFIXES) \
         and not ENV_RESERVED.fullmatch(name)
+
+
+# ---------------------------------------------------------------- the key swap (VAULT.md, "The key swap")
+#
+# An API key that an agent reads can stay out of its sessions: the session holds a placeholder, and the vault of the
+# agent's machine puts the key into the Authorization header of an HTTPS request to the key's own site (vault.py).
+# Here is what the hub and the helper share: which key can swap, and the variables of a session that holds one.
+
+# The one form in which a key goes into the Authorization header: its catalog entry names it (`form`), and the first
+# one holds for an entry that names none. basic-user: the key is the user name of Basic credentials; basic-password:
+# it is the password.
+KEY_FORMS = ("bearer", "token", "basic-user", "basic-password")
+KEY_SITE_HOST = re.compile(r"(?=.{1,240}$)(?![0-9.]+$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+                           r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*")
+
+
+def key_site(value):
+    """The site of a key in its one written form, `https://host` or `https://host:port`, or None: an https address
+    with no user part, whose host is a plain ASCII DNS name (no IP address) of at most 240 characters. The path of
+    the address is not a part of it."""
+    try:
+        parts = urllib.parse.urlsplit(value) if isinstance(value, str) and len(value) <= 300 else None
+        host, port = (parts.hostname or "", parts.port) if parts else ("", None)
+    except ValueError:
+        return None
+    if not parts or parts.scheme != "https" or parts.username is not None or parts.password is not None:
+        return None
+    host = host[:-1] if host.endswith(".") else host
+    if not KEY_SITE_HOST.fullmatch(host):
+        return None
+    return f"https://{host}" + (f":{port}" if port not in (None, 443) else "")
+
+
+def key_swap(team, agent, ref):
+    """(the site, the form) of the API key `ref` when a session of `agent` can hold a placeholder for it and not the
+    key, or None. All of these hold, and each one is the owner's own setting in team.json, so no agent changes one:
+    the agent reads the key (its grant is "read"); the key's catalog entry has a site (key_site); the agent's program
+    has its own hosts in the table (RUNTIMES "own_hosts": it is proved with the proxy's variables); the key is not
+    the key of a model account, which the program itself sends; no MCP server names the key, whose own program
+    would need the proxy's variables; and the site is not a host of the program's own provider, which a session
+    reaches without the proxy. Whether the agent's machine swaps keys is not asked here: its vault decides
+    that by its own root-owned configuration (vault.py), and nothing that an agent's side reports."""
+    team = team if isinstance(team, dict) else {}
+    conf = (team.get("agents") or {}).get(agent) or {}
+    entry = (team.get("logins") or {}).get(ref)
+    if not isinstance(entry, dict) or entry.get("kind") != "api_key" or (conf.get("secrets") or {}).get(ref) != "read":
+        return None
+    site, form = key_site(entry.get("site")), entry.get("form", KEY_FORMS[0])
+    own = runtime_fact(conf.get("runtime"), "own_hosts")
+    if not site or form not in KEY_FORMS or not own:
+        return None
+    host = site.split("://", 1)[1].split(":")[0]
+    if any(host == name or host.endswith("." + name) for name in own):
+        return None             # NO_PROXY keeps this host out of the proxy: the program's own provider
+    if any(isinstance(a, dict) and a.get("secret") == ref for a in (team.get("accounts") or {}).values()):
+        return None
+    name = entry.get("env")
+    for server in (team.get("mcp") or {}).values():
+        if isinstance(server, dict) and (server.get("key") == name or name in (server.get("env") or {}).values()):
+            return None
+    return site, form
+
+
+def key_swap_env(proxy, bundle, sites, own_hosts=(), hub=None):
+    """The variables of a session that holds one placeholder or more (VAULT.md, "The key swap"), which make its HTTPS
+    programs use the vault's proxy and trust the CAs of its own keys' sites, and nothing else of the proxy.
+
+    proxy: the proxy's address, http://127.0.0.1:<port>. bundle: a file with the system's CAs and the CAs of this
+    session's sites. sites: a file with those CAs alone, for Node, which has its own list of public CAs. own_hosts:
+    the hosts of the session's own program (RUNTIMES "own_hosts"), which never go through the proxy. hub: the hub's
+    host, which does not either.
+
+    Both spellings of each proxy variable, because wget reads only the small letters. Each host of NO_PROXY in two
+    forms, `name` and `.name`: Claude Code obeys only the second one for the names under it, and Go and wget only the
+    first one for the name itself (measured, 12 November 2026)."""
+    direct = ["localhost", "127.0.0.1", "::1", ".localhost"] + ([hub] if hub else [])
+    for host in own_hosts or ():
+        direct += [host, "." + host]
+    return {"HTTPS_PROXY": proxy, "https_proxy": proxy, "NO_PROXY": ",".join(direct), "no_proxy": ",".join(direct),
+            "SSL_CERT_FILE": bundle, "CURL_CA_BUNDLE": bundle, "REQUESTS_CA_BUNDLE": bundle, "GIT_SSL_CAINFO": bundle,
+            "NODE_EXTRA_CA_CERTS": sites, "NODE_USE_ENV_PROXY": "1"}
 
 
 # ---------------------------------------------------------------- model accounts (the AI providers build spec, 3.1 to 3.3)

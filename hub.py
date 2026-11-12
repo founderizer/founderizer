@@ -1224,6 +1224,48 @@ def read_secrets(agent):
                    if grant == "read" and (catalog.get(ref) or {}).get("kind") == "api_key"), key=lambda x: x[1])
 
 
+# ---------------------------------------------------------------- the key swap (VAULT.md, "The key swap")
+#
+# An API key that an agent reads can stay out of its sessions. On a machine whose vault swaps keys, the session holds
+# a placeholder, and the vault's proxy puts the key into the Authorization header of an HTTPS request to the key's own
+# site (vault.py). The hub's part: it names the site and the form of each key that can swap in its answer to the
+# vault's read, and it answers the vault's question at each use, "does this agent still read this key at this site?".
+# Whether a machine swaps is its vault's own root-owned setting, and no report of an agent's side: the hub does not
+# ask it and does not decide by it.
+
+def key_swap(agent, ref):
+    """(the site, the form) of an API key that a session of this agent holds as a placeholder on a machine whose vault
+    swaps keys, or None: the rule is lifecycle.key_swap, and each part of it is the owner's setting in team.json."""
+    return lifecycle.key_swap(TEAM, agent, ref)
+
+
+def swap_token(agent, ref):
+    """The token of one agent and key, which the vault of the agent's machine gets with a read and sends back with each
+    question (helper_vault_swap): an HMAC under the hub's own key, the one of its fingerprint salts, so it is the same
+    after a restart and the hub keeps no list. It opens nothing: its question has the answers yes and no. Under the
+    caller's LOCK, as fingerprint_salt may write that key at its first use."""
+    fingerprint_salt("key swap")
+    return hmac.new(bytes.fromhex(kv_get("fingerprint_key")),
+                    f"key swap\n{kv_get('db_id')}\n{agent}\n{ref.lower()}".encode(), hashlib.sha256).hexdigest()
+
+
+def key_words(agent, short=False):
+    """What a start text says of this agent's keys that can swap, after their names, or "": which host each one is
+    for, and what a placeholder is. The hub does not know whether the agent's machine swaps keys, so the words say
+    how the session sees it: the value begins with vaultswap_. From team.json only: a start text reads nothing else."""
+    held = [(name, key_swap(agent, ref)) for ref, name in read_secrets(agent)]
+    held = [(name, found[0].split("://", 1)[1]) for name, found in held if found]
+    if not held:
+        return ""
+    if short:
+        return " (a placeholder when its value begins with vaultswap_: " + \
+            ", ".join(f"{name} for {host}" for name, host in held) + ")"
+    return (" (" + ", ".join(f"{name} is for {host} only" for name, host in held) + ": when its value begins with "
+            "vaultswap_, it is a placeholder, and this machine's vault puts the key into the Authorization header of an "
+            "HTTPS request to that host, and nowhere else; a program that needs the key itself does not work with a "
+            "placeholder, so ask your requester then, and do not look for the key)")
+
+
 def machine_agents(name):
     """The agents on the address of this agent's machine (owner API 1.12), itself included."""
     here = address_of(name)
@@ -3596,7 +3638,7 @@ def holdings_parts(agent):
                      named_few(f"{h} ({v})" for h, v in sorted(a["servers"].items())))
     keys = [name for _, name in read_secrets(agent)]
     if keys:
-        parts.append("API keys in this session: " + named_few(keys))
+        parts.append("API keys in this session: " + named_few(keys) + key_words(agent))
     refs = sorted(secret_grants(agent)) if a.get("vault") != "none" else []
     if refs:
         # secret_words is see_capacity's, so the clause names it as the catalog's own words and not as a sentence
@@ -17773,7 +17815,7 @@ def duty_toolbox(agent):
         parts.append("tools " + ", ".join(sorted(a["tools"])))
     keys = [name for _, name in read_secrets(agent)]
     if keys:
-        parts.append("API keys in your session: " + ", ".join(keys))
+        parts.append("API keys in your session: " + ", ".join(keys) + key_words(agent, short=True))
     logins = granted_logins(agent)
     if logins:
         parts.append(f"{len(logins)} saved logins by name (sign_in, call_api)")
@@ -33088,13 +33130,16 @@ def validate_team(team):
         raise ValueError("logins must map up to 256 bws://<uuid> references to {title}")
     for ref, entry in catalog.items():
         if not (isinstance(ref, str) and BWS_REF.fullmatch(ref) and ref == ref.lower()) or not isinstance(entry, dict) \
-                or "title" not in entry or set(entry) - {"title", "kind", "env", "site"} \
+                or "title" not in entry or set(entry) - {"title", "kind", "env", "site", "form"} \
                 or not (isinstance(entry["title"], str) and "\n" not in entry["title"]
                         and 1 <= len(entry["title"].strip()) <= 60):
             raise ValueError(f"login {ref!r} needs a bws://<uuid> reference in lower case and a title of one line of "
                              f"1 to 60 characters")
         if "site" in entry and not login_site(entry["site"]):
             raise ValueError(f"login {ref!r}: site is the https address where it is used, with a host")
+        if "form" in entry and (entry["form"] not in lifecycle.KEY_FORMS or entry.get("kind") != "api_key"):
+            raise ValueError(f"login {ref!r}: form is how an API key goes into the Authorization header, one of "
+                             f"{', '.join(lifecycle.KEY_FORMS)}")
         if entry.get("kind", "login") not in SECRET_KINDS or ("env" in entry) != (entry.get("kind") == "api_key") or \
                 ("env" in entry and not env_name(entry["env"])):
             raise ValueError(f"login {ref!r}: kind is login or api_key, and an API key has env, a variable name of "
@@ -35829,11 +35874,19 @@ def save_login(body):
         if users:
             raise Conflict(f"{ref} is still listed (profiles and grants: {', '.join(users)}); remove it there first",
                            agents=users)
-    # A new title keeps the kind, the variable name and the site of the entry; a site that comes replaces its own.
+    # A new title keeps the kind, the variable name, the site and the form of the entry; a site or a form that comes
+    # replaces its own, and an empty one takes it away (the key swap: a key with no site is a variable again).
     entry = None if body.get("delete") else dict(logins().get(body["login"]) or {}, title=body["title"],
-                                                 **({"site": body["site"]} if body.get("site") else {}))
+                                                 **{k: body[k] for k in ("site", "form") if body.get(k)})
+    for k in ("site", "form"):
+        if entry is not None and body.get(k) == "":
+            entry.pop(k, None)
     result = save_team_entry(body, "logins", "login", entry, busy)
     result.pop("done", None)
+    if entry and entry.get("kind") == "api_key" and entry.get("site"):
+        # the key swap: the site as a vault that swaps keys reads it, or None for a site that cannot swap (it must
+        # be an https address whose host is a DNS name), so that such a key does not stay a variable with no sign
+        result["swap_site"] = lifecycle.key_site(entry["site"])
     return result
 
 
@@ -35847,6 +35900,10 @@ def save_secret(body):
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     entry = {k: body[k] for k in ("title", "kind", "env") if body.get(k) is not None}
+    # A reference that is saved again keeps its site, and an API key its form (the key swap): without them the key
+    # would be a variable in the sessions again, with no sign.
+    before = (team.get("logins") or {}).get(ref) or {}
+    entry.update({k: before[k] for k in ("site",) + (("form",) if entry.get("kind") == "api_key" else ()) if k in before})
     result = {"login": ref, "stored": stored, "known": known, "revision": rev, "sha256": current, "changed": False}
     if (team.get("logins") or {}).get(ref) == entry:
         return result
@@ -43368,10 +43425,14 @@ class Handler(BaseHTTPRequestHandler):
             title = data.get("title")
             if not (isinstance(title, str) and "\n" not in title and 1 <= len(title.strip()) <= 60):
                 raise ValueError("title must be one line of 1 to 60 characters")
-            if "site" in data and not login_site(data["site"]):
-                raise ValueError("site must be the https address where the login is used, with a host")
-            return dict({"title": title.strip()}, **({"site": data["site"]} if "site" in data else {}))
-        return self.team_entry("team/logins", "login", ("title", "site"), check, save_login,
+            if data.get("site", "") != "" and not login_site(data["site"]):
+                raise ValueError("site must be the https address where the login is used, with a host, or \"\" to "
+                                 "take it away")
+            if data.get("form", "") != "" and data["form"] not in lifecycle.KEY_FORMS:   # the key swap (VAULT.md)
+                raise ValueError("form must be how the key goes into the Authorization header: " +
+                                 ", ".join(lifecycle.KEY_FORMS) + ", or \"\" to take it away")
+            return dict({"title": title.strip()}, **{k: data[k] for k in ("site", "form") if k in data})
+        return self.team_entry("team/logins", "login", ("title", "site", "form"), check, save_login,
                                ident=self.login_reference)
 
     @staticmethod
@@ -46587,6 +46648,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.helper_vault_created(parts[2])
         if parts[:2] == ["helper", "vault"] and len(parts) == 4 and parts[3] == "read":
             return self.helper_vault_read(parts[2])
+        if parts[:2] == ["helper", "vault"] and len(parts) == 4 and parts[3] == "swap":
+            return self.helper_vault_swap(parts[2])
         if parts[:2] == ["helper", "ack"] and len(parts) == 3:
             agent = parts[2]
             if agent not in agents():       # it sent no answer at all, and the helper of a deleted agent waited it out
@@ -47461,9 +47524,48 @@ class Handler(BaseHTTPRequestHandler):
             found = [{"login": ref, "env": env, "fingerprint_salts": {k: fingerprint_salt(fingerprint_label(ref, k))
                                                                       for k in ("password", "totp")}}
                      for ref, env in read_secrets(agent)]
+            for x in found:         # the key swap: a vault that swaps keys gives such a key as a placeholder
+                swap = key_swap(agent, x["login"])
+                if swap:
+                    x.update(site=swap[0], form=swap[1], swap=swap_token(agent, x["login"]))
         if found:
             log(agent, f"vault reads {', '.join(x['env'] for x in found)} for a session")
         return self.json(200, {"ok": True, "secrets": found})
+
+    def helper_vault_swap(self, agent):
+        """The key swap: the vault of this agent's machine asks, before it puts a key into one request of a session
+        that holds its placeholder, whether the agent still reads this key at this site and in this form now. The
+        answer is yes (200) or no (409), and nothing else: no value comes in or goes out, and nothing is written.
+
+        The vault has no agent key at that time, so this route asks for none. The call must come from the address of
+        the agent's machine, and it must carry the token that the hub gave that vault with the read (swap_token). An
+        agent can get its own token and ask this too: it learns what it holds."""
+        if agent not in agents():
+            return self.json(404, {"error": "unknown agent"})
+        if unplaced(agent):
+            return self.no_server(agent)
+        want, src = address_of(agent), self.client_address[0]
+        if not want or src != want:
+            log("hub", f"REFUSED a key swap question from {src} that named {agent}")
+            return self.json(403, {"error": f"{src} is not {agent}'s machine"})
+        self.works_for(agent)
+        sent = self.bearer()            # no key is asked for; one that is sent and is wrong is refused, as on each route
+        if sent is not None and not key_matches(agent, sent):
+            return self.refuse(agent, "key_mismatch" if agent_key(agent) is not None else "no_key",
+                               f"this is not {agent}'s agent key")
+        f = self.form()
+        ref, site, form, token = (f.get(k) for k in ("login", "site", "form", "swap")) if isinstance(f, dict) else [None] * 4
+        if not (isinstance(ref, str) and BWS_REF.fullmatch(ref) and isinstance(site, str) and isinstance(form, str)
+                and isinstance(token, str) and re.fullmatch(r"[0-9a-f]{64}", token)):
+            return self.json(400, {"error": "send {login, site, form, swap}"})
+        ref = ref.lower()
+        with LOCK:
+            good = hmac.compare_digest(token, swap_token(agent, ref)) and agent in agents() \
+                and agents()[agent].get("vault") != "none" and key_swap(agent, ref) == (site, form)
+        if not good:
+            log(agent, f"REFUSED a key swap: {agent} does not read {ref} at that site and in that form now")
+            return self.json(409, {"error": f"{agent} does not read this key at this site now"})
+        return self.json(200, {"ok": True, "login": ref})
 
     def helper_vault(self, agent):
         """The vault broker on the agent's machine asks before it opens a login: once, for an open sign-in or
@@ -47551,6 +47653,9 @@ class Handler(BaseHTTPRequestHandler):
                               headers=json.loads(row["headers"] or "{}"),
                               **({"body": row["body"]} if row["body"] is not None else {}),
                               **({"timeout": row["timeout"]} if row["timeout"] else {}))   # plan C7
+                swap = key_swap(agent, row["login"].lower())    # the key swap: a vault that swaps keys sends this key
+                if swap:                                        # only as its proxy does (vault.swap_call)
+                    answer.update(site=swap[0], form=swap[1])
             q("UPDATE jobs SET released=? WHERE id=?", (now(), job))
         log(agent, f"vault broker opened {row['login']} for {kind} job {job}" +
             (f" (made by {made['kind']} job {made['id']})" if made else ""))

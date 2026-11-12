@@ -135,6 +135,15 @@ VAULT_UNIT = "/etc/systemd/system/fleet-vault.service"
 VAULT_SOCKET = "/run/fleet-vault/vault.sock"
 VAULT_SETTLE = 3                                    # seconds before the service is read: see vault_install()
 VAULT_SOURCE = VAULT_LIB + "/source.git"            # root's own bare clone of the ref: see vault_program_script()
+# The key swap (VAULT.md): the proxy that puts an API key into a request to the key's own site, as a second service of
+# the same program with a user of its own. That user is not in RESERVED_USERS on purpose: a name there changes the
+# bytes of the root helper fleet-agent-user, and no agent's user has this name anyway (each one begins with fleet-).
+SWAP_USER = "founderizer-swap"
+SWAP_SERVICE = "fleet-vault-swap"
+SWAP_UNIT = "/etc/systemd/system/fleet-vault-swap.service"
+SWAP_STATE = "/var/lib/fleet-vault-swap"
+SWAP_PORT = 876                                     # below 1024: no user without the right can listen on it
+SWAP_LOW_PORTS = "/proc/sys/net/ipv4/ip_unprivileged_port_start"
 ROOT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"   # a root command's own PATH
 HELPER = "/usr/local/sbin/fleet-agent-user"         # one of the two root commands the server service may run
 VAULT_UPDATE = "/usr/local/sbin/fleet-vault-program"    # the other: the broker's program, and nothing else
@@ -1338,6 +1347,119 @@ def vault_install(kit=None, hub_address=None, user=VAULT_USER, group=AGENT_GROUP
     say(f"  its public handover key is {after['recipient']}; Founderizer records it when you first give an agent of "
         f"this machine its vault")
     return {"state": "made", "store": store, "recipient": after["recipient"], "active": True}
+
+
+def swap_reading(user=SWAP_USER):
+    """The shell that reads this machine's key swap, so that a second run of its step changes nothing."""
+    return ("id -u %(u)s >/dev/null 2>&1 && echo user=yes || echo user=no\n"
+            "echo low=$(cat %(low)s 2>/dev/null)\n"
+            "echo unit=$(sha256sum %(unit)s 2>/dev/null | cut -d' ' -f1)\n"
+            "echo broker=$(systemctl is-active fleet-vault 2>/dev/null || true)\n"
+            "echo broker_restarts=$(systemctl show -p NRestarts --value fleet-vault 2>/dev/null || echo unknown)\n"
+            "echo active=$(systemctl is-active %(service)s 2>/dev/null || true)\n"
+            "echo restarts=$(systemctl show -p NRestarts --value %(service)s 2>/dev/null || echo unknown)\n") % {
+                "u": user, "low": SWAP_LOW_PORTS, "unit": SWAP_UNIT, "service": SWAP_SERVICE}
+
+
+def swap_install(user=SWAP_USER, port=SWAP_PORT, check=False, run=None, read=None):
+    """This machine's key swap (VAULT.md, "The key swap"), on a machine that has its vault broker: an API key that an
+    agent reads then stays out of its sessions. `hubsetup.py vault --swap` runs it after vault_install, and nothing
+    else does: a machine that nobody ran it on gives each key as a variable, as before.
+
+    It makes the proxy's own user, which is in no group of the agents or of the broker; writes the part "swap" into
+    the broker's configuration, which stays root's with mode 644 and holds no secret; restarts the broker, so that it
+    reads the part and opens its socket for the proxy; and installs and starts the proxy's service. It changes no
+    line of the root helpers and of the sudoers file. That part of the configuration is the switch: with it, the
+    broker gives a key that has a site as a placeholder or not at all, and a vault.py from before the swap does not
+    start on it, so no release steps the machine down.
+
+    The order matters. The installed broker program prints the proxy's unit before anything changes: a program that
+    does not know the swap fails there. A broker that does not stay up on the new configuration gets the old one
+    back.
+
+    It stops on a machine where each user can listen on the proxy's port (the kernel's setting of the low ports):
+    there an agent could take the proxy's place. Safe to run again. Returns "made", "there" or "would make"."""
+    run = run or _shell
+    read = read or (lambda path: pathlib.Path(path).read_text(encoding="utf-8"))
+    before = kv(run(swap_reading(user))[1])
+    try:
+        current = json.loads(read(VAULT_CONF))
+        current = current if isinstance(current, dict) else None
+    except (OSError, ValueError):
+        current = None
+    if current is None or not current.get("worker_group"):
+        if check:
+            say("  would switch this machine's key swap on, after its vault broker is in place")
+            return "would make"
+        raise Stop("the key swap needs this machine's vault broker, with worker_group in its configuration: run "
+                   "`hubsetup.py vault` first.")
+    low = before.get("low", "")
+    if low.isdigit() and int(low) <= port:
+        raise Stop(f"on this machine each user can listen on port {port} (net.ipv4.ip_unprivileged_port_start is "
+                   f"{low}), so an agent could take the place of the vault's proxy. The key swap is not switched on. "
+                   f"Set net.ipv4.ip_unprivileged_port_start to 1024, its default, and run this step again.")
+    part = {"user": user, "vault": VAULT_USER, "port": port, "openssl": "/usr/bin/openssl"}
+    conf = dict(current, swap=part)
+    # The installed program prints the proxy's unit, which changes nothing: a program that does not know the swap
+    # fails here, before the configuration has the part that it would refuse.
+    code, unit, err = run(f"python3 {VAULT_LIB}/vault.py unit --swap --config {VAULT_CONF} --user {user}")
+    unit = unit if unit.endswith("\n") or not unit else unit + "\n"
+    known = code == 0 and "ExecStart=" in unit
+    done = (known and before.get("user") == "yes" and current == conf
+            and before.get("unit") == hashlib.sha256(unit.encode()).hexdigest()
+            and before.get("broker") == "active" and before.get("active") == "active")
+    if done:
+        say(f"this machine's key swap is in place already: {user} runs the vault's proxy on 127.0.0.1:{port}")
+        return "there"
+    if check:
+        say(f"  would switch this machine's key swap on: the user {user}, the part swap of {VAULT_CONF}, and the "
+            f"service {SWAP_SERVICE}, which puts an API key into a request to the key's own site and cannot read the "
+            f"store")
+        return "would make"
+    if not known:
+        raise Stop(f"the vault broker program of this machine does not know the key swap, so nothing changed: "
+                   f"{(err or unit).strip()[-300:]}. Run `hubsetup.py vault` from a checkout at the release first.")
+    code, out, err = run("id -u %(u)s >/dev/null 2>&1 || useradd --system --user-group --home-dir %(state)s "
+                         "--shell /usr/sbin/nologin %(u)s\n" % {"u": user, "state": SWAP_STATE})
+    if code != 0:
+        raise Stop(f"the user {user} of the vault's proxy could not be made: {(err or out).strip()[-300:]}")
+    folder = tempfile.mkdtemp(prefix="fleet-vault-swap-")
+    try:
+        new, old, service = (os.path.join(folder, name) for name in ("vault.json", "vault.json.before", "unit"))
+        for path, text in ((new, json.dumps(conf, indent=2) + "\n"), (old, json.dumps(current, indent=2) + "\n"),
+                           (service, unit)):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        restart = ("systemctl reset-failed fleet-vault >/dev/null 2>&1 || true\n"
+                   "systemctl restart fleet-vault\nsleep %d\n" % VAULT_SETTLE)
+        if current != conf:
+            code, out, err = run("install -o root -g root -m 644 %s %s\n" % (shlex.quote(new), VAULT_CONF) + restart,
+                                 timeout=300)
+            now = kv(run(swap_reading(user))[1])
+            if code != 0 or now.get("broker") != "active" or now.get("broker_restarts") not in ("0", "unknown"):
+                run("install -o root -g root -m 644 %s %s\n" % (shlex.quote(old), VAULT_CONF) + restart, timeout=300)
+                raise Stop("the vault broker of this machine did not stay up with the key swap in its configuration, "
+                           "so the configuration is as it was. Read `journalctl -u fleet-vault -n 30` on this machine.")
+        code, out, err = run("install -o root -g root -m 644 %s %s\nsystemctl daemon-reload\n"
+                             "systemctl enable %s >/dev/null 2>&1\n"
+                             "systemctl reset-failed %s >/dev/null 2>&1 || true\n"
+                             "systemctl restart %s\nsleep %d\n"
+                             % (shlex.quote(service), SWAP_UNIT, SWAP_SERVICE, SWAP_SERVICE, SWAP_SERVICE, VAULT_SETTLE),
+                             timeout=300)
+        if code != 0:
+            raise Stop(f"the service of the vault's proxy could not be started: {(err or out).strip()[-300:]}")
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    after = kv(run(swap_reading(user))[1])
+    if after.get("active") != "active" or after.get("restarts") not in ("0", "unknown"):
+        raise Stop(f"the vault's proxy of this machine is {after.get('active') or 'not running'} {VAULT_SETTLE} "
+                   f"seconds after its start. The broker serves, and a key that has a site is not given to a session "
+                   f"until the proxy runs. Read `journalctl -u {SWAP_SERVICE} -n 30` on this machine: a proxy that "
+                   f"does not start says why on its first line.")
+    say(f"this machine's key swap is on: {user} runs the vault's proxy on 127.0.0.1:{port}. A key that an agent "
+        f"reads and that has a site now reaches a session as a placeholder, and the proxy puts the key into the "
+        f"Authorization header of a request to that site only")
+    return "made"
 
 
 def keep_fleet_id(db=None):
@@ -2730,6 +2852,10 @@ def cmd_vault(args):
         raise Stop("--owner-key and --fleet go together: the owner's public keys and the fleet's 16-character ID")
     vault_install(kit=args.kit or KIT, hub_address=args.hub, check=args.check, system=platform.system(),
                   owner_keys=args.owner_key, fleet=args.fleet)
+    if args.swap and platform.system() == "Linux":      # only when asked: no install gives a machine the key swap
+        swap_install(check=args.check)
+    elif args.swap:
+        say("the key swap is for a Linux server: nothing was switched on for it on this machine")
 
 
 def cmd_firewall(args):
@@ -2855,6 +2981,9 @@ def main(argv=None):
                                                          "that the owner signed a pin for")
     va.add_argument("--fleet", help="the fleet's ID, 16 lowercase hex characters")
     va.add_argument("--check", action="store_true")
+    va.add_argument("--swap", action="store_true",
+                    help="also switch this machine's key swap on (VAULT.md): an API key that an agent reads and that "
+                         "has a site then stays out of its sessions. Without it, the step is as it was")
     va.set_defaults(fn=cmd_vault)
     fw = sub.add_parser("firewall")
     fw.add_argument("--check", action="store_true", help="say what it would do, change nothing")

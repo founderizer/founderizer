@@ -1795,9 +1795,15 @@ def tools():
                                      "this runtime account")),
         tool("save_login", "The owner's own title for one login of the vault, by its bws://<uuid> reference, or "
                            "delete true to take it out of the catalog. This is the label only: no value of a login "
-                           "passes here, and the vault is not touched.",
-             {"login": S["text"], "title": S["text"], "delete": S["bool"], **rid}, ("login",),
-             with_base("/ui/team/logins", ("login", "title", "delete"), "this login's title")),
+                           "passes here, and the vault is not touched. For an API key also: site, the https address "
+                           "of the service that the key is for, and form, how the key goes into the Authorization "
+                           "header there: bearer (when none is given), token, basic-user (the key is the user name "
+                           "of Basic) or basic-password. On a server whose vault swaps keys, an agent that reads a "
+                           "key with a site holds a placeholder in its sessions, and the vault puts the key into "
+                           "requests to that site only. An empty site or form takes it away.",
+             {"login": S["text"], "title": S["text"], "site": S["text"], "form": S["text"], "delete": S["bool"], **rid},
+             ("login",),
+             with_base("/ui/team/logins", ("login", "title", "site", "form", "delete"), "this login's title")),
         tool("machine_access", "How the fleet reaches one machine: its SSH user, its SSH port and whether Screen "
                                "Sharing answers there. delete true takes that record out. The user is the one thing "
                                "nothing can work out by itself.",

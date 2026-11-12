@@ -194,7 +194,7 @@ would read as an empty fleet instead of as a mistake.
 | `grant_access` | `/ui/team/repos`, `/ui/team/tools`, `/ui/team/google`, `/ui/secrets/grant` | One agent's hold of one resource, as `<kind>:<what>` and a level. |
 | `share_resource` / `take_resource` | `/ui/resources`, `/ui/resources/take` | The pool's standing; and end one hold. |
 | `save_account` | `/ui/team/accounts` | One runtime account: its provider and the owner's title for it. |
-| `save_login` | `/ui/team/logins` | The owner's title for one vault login, by its `bws://` reference. The label only. |
+| `save_login` | `/ui/team/logins` | The owner's title for one vault login, by its `bws://` reference. The label only. For an API key also its `site` and its `form` (the key swap, `VAULT.md`). |
 | `machine_access` | `/ui/team/access` | How the fleet reaches a machine: its SSH user, port, Screen Sharing. |
 | `save_knowledge` | `/ui/knowledge` | The owner's own knowledge files: text, new text in place, a page the hub fetches, a kept file, a delete. |
 | `remove_skill` | `/ui/skills/remove` | Remove one agent's own skill in one commit. The agents write their skills; `fleet_read(page="skills")` lists them. |

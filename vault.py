@@ -42,6 +42,12 @@ A Linux broker also gives such a delivered secret back (withdraw) when no agent 
 hub names the reference for one confirmed job, and the broker removes the item only when its store says that the
 owner's vault delivered it, never a login that the owner saved there himself or that this vault made.
 
+With the part "swap" in its configuration, which only a root step writes, a Linux broker also keeps such a key out
+of the sessions (the key swap): the session start gets a placeholder, and a second process of this program, the swap
+proxy (`vault.py swap`), which runs as a user of its own that cannot read the store, puts the real key into the
+Authorization header of an HTTPS request to that key's own site. The broker gives the proxy one value for one
+placeholder, one OS user and one host, after the hub said that the grant is live now.
+
 A broker writes no key into another host: place, which wrote one into an application's .env file or a Kubernetes
 Secret over SSH, left the broker (DevOps plan 0.3). It hands a login over to another machine (handover) only when the
 owner's keys in its own configuration show that he signed a pin of the receiving key.
@@ -65,6 +71,9 @@ configuration and programs, because an agent can change every file in its own ch
     python3 /usr/local/lib/fleet-vault/vault.py store-list --config /etc/fleet-vault/vault.json
                                                                  (as the vault user; names only, never a value)
     python3 vault.py unit --central --config /etc/fleet-vault-central/vault.json --group <the hub user's group>
+    python3 /usr/local/lib/fleet-vault/vault.py swap --config /etc/fleet-vault/vault.json
+                                                                 (as the swap proxy's own user; its service runs it)
+    python3 vault.py unit --swap --config /etc/fleet-vault/vault.json     (the swap proxy's service)
 Protocol 2: one JSON line in, one JSON line out, on a Unix socket. See UI-API.md, "Vault isolation (V3)", and for the
 central vault "the central vault (central_vault)".
 Standard library only; Python 3.9+.
@@ -96,6 +105,7 @@ import secrets
 import shutil
 import signal
 import socket
+import ssl
 import stat
 import struct
 import subprocess
@@ -277,15 +287,22 @@ def load_config(path):
     if given & BITWARDEN_KEYS:          # the one clear refusal of an old configuration: the broker does not start
         raise SystemExit(NO_BITWARDEN.format(keys=", ".join(sorted(given & BITWARDEN_KEYS))))
     if not isinstance(conf, dict) or given - KEYS - CALLER_KEYS - STORE_KEYS - {REQUEST_KEY, PLACE_KEY, "agent"} \
-            - OWNER_PIN_KEYS or (given & OWNER_PIN_KEYS) not in (set(), OWNER_PIN_KEYS) or \
+            - OWNER_PIN_KEYS - {SWAP_KEY} or (given & OWNER_PIN_KEYS) not in (set(), OWNER_PIN_KEYS) or \
             not KEYS <= given or not given & CALLER_KEYS or not STORE_KEYS <= given:
         raise SystemExit("The vault configuration needs exactly: " + ", ".join(sorted(KEYS)) + "; optionally agent, "
                          "the one agent whose vault it is; who may ask it: " +
                          " or ".join(sorted(CALLER_KEYS)) + ", or both; its one store: " +
                          " and ".join(sorted(STORE_KEYS)) + " (the fleet's own, made by store-init); optionally the "
                          "owner's keys: " + " and ".join(sorted(OWNER_PIN_KEYS)) + ", both or neither; for API "
-                         "requests also: " + REQUEST_KEY + "; and " + PLACE_KEY + " (read and not used), as older "
-                         "installers wrote it")
+                         "requests also: " + REQUEST_KEY + "; for the key swap also: " + SWAP_KEY + "; and " +
+                         PLACE_KEY + " (read and not used), as older installers wrote it")
+    # The key swap: only the form of its part is checked here, because each refusal here stops the broker. What a
+    # machine can lose later (the proxy's user, the openssl program) is read at each start, and stops only the swap
+    # (with_swaps).
+    if SWAP_KEY in conf and not swap_shape(conf[SWAP_KEY]):
+        raise SystemExit(SWAP_KEY + " must be the key swap of this machine: {\"user\": the swap proxy's OS user, "
+                         "\"vault\": the vault's OS user, \"port\": the proxy's port on 127.0.0.1, \"openssl\": "
+                         "the absolute path of the openssl program}")
     if "agent" in conf and (not isinstance(conf["agent"], str) or not AGENT_NAME.match(conf["agent"])):
         raise SystemExit("agent must be the Fleet name of the one agent whose vault this is, or be left out")
     if OWNER_PIN_KEYS <= given:
@@ -647,12 +664,18 @@ def handover(conf, job):
     return {"ok": True, "v": PROTOCOL, "job": job, "to": confirmed["target"], "label": label, "ciphertext": r.stdout}
 
 
-def read(conf, purpose=None):
+def read(conf, purpose=None, uid=None):
     """read (owner feature secrets): the API keys that the calling agent reads in its sessions, as {variable name:
     value}. The hub names them for this agent now; the broker reads each value itself and registers its fingerprints
     before it gives it, so that the hub masks it in texts. The worker's user may read exactly these values. A value
     that the broker cannot read or protect is left out, and its name is in missing. purpose: "check" or "session", which
-    the hub is told: it gives no key to a session of an agent whose Shell box is off (support plan F1)."""
+    the hub is told: it gives no key to a session of an agent whose Shell box is off (support plan F1).
+
+    The key swap: on a machine whose configuration has the part "swap", a key that the hub names with a site is
+    given as a placeholder, which this broker keeps for the calling OS user (uid) and that site, and never as the
+    value; when it cannot be a placeholder, it is left out. The answer's `swap` then names the proxy, the folder of
+    the sites' CA certificates, and each such variable with its host. On a machine without that part, each value is
+    given as before."""
     store = LocalStore(conf)
     code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}/read",
                      {"for": purpose} if purpose in ("check", "session") else {})
@@ -660,7 +683,7 @@ def read(conf, purpose=None):
     if code != 200 or not isinstance(found, list) or data.get("ok") is not True or len(found) > READS:
         reason = data.get("error") if isinstance(data, dict) else None
         raise Refused("the hub did not name the secrets to read" + (f": {reason}" if isinstance(reason, str) else ""))
-    env, missing = {}, []
+    env, missing, swapped, named = {}, [], {}, set()
     for x in found:
         name, ref = x.get("env") if isinstance(x, dict) else None, x.get("login") if isinstance(x, dict) else None
         salts = x.get("fingerprint_salts") if isinstance(x, dict) else None
@@ -668,15 +691,36 @@ def read(conf, purpose=None):
                 and SECRET_REF.fullmatch(ref) and isinstance(salts, dict)
                 and all(re.fullmatch(r"[0-9a-f]{32}", str(salts.get(k))) for k in ("password", "totp"))):
             raise Refused("the hub named no valid secrets to read")
+        site = None
+        if "_swap" in conf and (x.get("site") is not None or x.get("swap") is not None):
+            # this machine swaps keys, and the hub names this key's site: a placeholder, or nothing
+            named.add(ref.lower())
+            site, token, form = swap_site(x.get("site")), x.get("swap"), x.get("form", SWAP_FORMS[0])
+            if conf.get("_swaps") is None or type(uid) is not int or not site or form not in SWAP_FORMS \
+                    or not (isinstance(token, str) and SWAP_TOKEN.fullmatch(token)):
+                missing.append(name)
+                continue
         try:
             value = check_value(store.item(SECRET_REF.fullmatch(ref).group(1))["value"])
             protect(conf, {"fingerprint_salts": salts}, value, read=ref.lower())
+            if site:
+                value = {"password": conf["_swaps"].place(uid, conf["agent"], ref.lower(), site[0], site[1], form, token)}
+                swapped[name] = swap_origin(*site)
         except Refused:
             missing.append(name)
             continue
         env[name] = value["password"]
-    log(f"read {len(env)} of {len(found)} value(s) for a session of {conf['agent']}")
-    return {"ok": True, "v": PROTOCOL, "env": env, "missing": missing}
+    if conf.get("_swaps") is not None and type(uid) is int:
+        try:                    # the placeholders of keys that the hub names with a site no more
+            conf["_swaps"].only(uid, conf["agent"], named)
+        except Refused:
+            pass                # the list stays as it is: each use of an entry still asks the hub
+    log(f"read {len(env)} of {len(found)} value(s) for a session of {conf['agent']}"
+        + (f", {len(swapped)} of them as a placeholder" if swapped else ""))
+    reply = {"ok": True, "v": PROTOCOL, "env": env, "missing": missing}
+    if swapped:
+        reply["swap"] = {"proxy": f"http://127.0.0.1:{conf['_swap']['port']}", "ca": SWAP_RUN, "names": swapped}
+    return reply
 
 
 def probe(conf, job):
@@ -1506,6 +1550,8 @@ def send(conf, job):
     if scope in calls.stopped:          # a cancel named this task attempt: no login is read
         raise Refused(STOPPED)
     login = open_login(conf, confirmed["login"], call["task"], store)[0]
+    if not swap_call(conf, confirmed, call, login):
+        raise Refused(SWAP_CALL)
     protect(conf, confirmed, login)
     body = None
     try:
@@ -2083,6 +2129,8 @@ def handle(conf, line, uid):
             status["creates"] = True
         if conf.get("_requests") is not None:       # only with a curl program: this broker can send a request
             status["requests"] = True
+        if conf.get("_swaps") is not None:          # only with the part "swap": this broker keeps keys out of sessions
+            status["swaps"] = True
         return status
     who = caller(req)
     if who:                             # this request acts for its caller; the store does not change
@@ -2122,7 +2170,7 @@ def handle(conf, line, uid):
     if op == "signin":
         raise Refused("signing in needs a browser: only the Mac vault helper signs in")
     if op == "read":
-        return read(conf, req.get("for"))
+        return read(conf, req.get("for"), uid)
     if op == "probe":
         job = req.get("job")
         if not isinstance(job, int) or isinstance(job, bool) or job < 1:
@@ -2208,8 +2256,9 @@ class Broker:
         if conf.get("central") is True:     # the central vault makes no login, sends no request and has no target key
             self.conf = with_source(conf)
         else:
-            self.conf = with_source(with_requests(with_writes(conf), self.lock))
+            self.conf = with_source(with_swaps(with_requests(with_writes(conf), self.lock)))
         self.conf, self.sock = dict(self.conf, _lock=self.lock), None
+        self.swap_sock, self.swap_room = None, threading.BoundedSemaphore(SWAP_ROOM)
 
     def open(self):
         path = self.conf["socket"]
@@ -2226,7 +2275,72 @@ class Broker:
         finally:
             os.umask(old)
         self.sock.listen(8)
+        if self.conf.get("_swaps") is not None:
+            self.open_swaps()
         return self
+
+    def open_swaps(self):
+        """The broker's second socket, for the swap proxy, only on a machine whose configuration has the part "swap".
+        The proxy's user is in no group of the broker's, so the broker's runtime folder is made passable (mode 751:
+        no other user lists it or makes a file in it) and the socket is open for each user (mode 666). What keeps
+        each other user out is swap_served: it reads the caller's user from the kernel before it reads a byte.
+        When the socket cannot be opened, the broker serves without it, and a key with a site is not given."""
+        path = self.conf["_swap"]["broker"]
+        try:
+            os.chmod(os.path.dirname(path), 0o751)
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            old = os.umask(0o111)
+            try:
+                sock.bind(path)
+            finally:
+                os.umask(old)
+            sock.listen(64)
+        except OSError as e:
+            log(f"no key swap: the socket for the proxy could not be opened ({type(e).__name__})")
+            self.conf = {k: v for k, v in self.conf.items() if k != "_swaps"}
+            return
+        self.swap_sock = sock
+        threading.Thread(target=self.serve_swaps, daemon=True).start()
+
+    def serve_swaps(self):
+        while True:
+            self.swap_room.acquire()
+            try:
+                conn, _ = self.swap_sock.accept()
+            except OSError:
+                return                  # closed
+            try:
+                threading.Thread(target=self.swap_served, args=(conn,), daemon=True).start()
+            except RuntimeError:        # no new thread now: this question gets no answer, and the loop goes on
+                conn.close()
+                self.swap_room.release()
+
+    def swap_served(self, conn):
+        """One question of the swap proxy. Only the proxy's own user is answered, and nothing is read from another
+        one. The broker's one lock is not taken: a swap must not wait for the hub call of another operation."""
+        try:
+            with conn:
+                conn.settimeout(10)
+                if peer_uid(conn) != self.conf["_swap"]["uid"]:
+                    return
+                try:
+                    reply = swap_handle(self.conf, read_line(conn))
+                except Refused as e:
+                    reply = {"ok": False, "error": str(e)}
+                except Exception as e:          # never pass details on
+                    reply = {"ok": False, "error": f"the vault broker hit an error ({type(e).__name__})"}
+                    log(f"swap: error {type(e).__name__}")
+                if reply.get("code"):
+                    log(f"swap refused: {reply['code']}")
+                conn.sendall((json.dumps(reply) + "\n").encode())
+        except OSError:
+            pass
+        finally:
+            self.swap_room.release()
 
     def serve(self):
         while True:
@@ -2272,12 +2386,900 @@ class Broker:
     def close(self):
         if self.sock:
             self.sock.close()
+        if self.swap_sock:
+            self.swap_sock.close()
         if self.conf.get("_journal") is not None:
             self.conf["_journal"].close()
             self.conf = {k: v for k, v in self.conf.items() if k != "_journal"}
         if self.conf.get("_requests") is not None:
             self.conf["_requests"].close()
             self.conf = {k: v for k, v in self.conf.items() if k != "_requests"}
+
+
+# ---------------------------------------------------------------- the key swap
+#
+# An API key that an agent reads can stay out of its sessions (VAULT.md, "The key swap"). The session holds a
+# placeholder, and this machine's vault puts the real key into an outgoing HTTPS request: only in the Authorization
+# header, and only for that key's own site. Two processes do it, as two OS users:
+#
+#   the broker (above, the vault user)   keeps the list of placeholders (Swaps), and gives the swap proxy the header
+#                                        value of one placeholder, for one OS user and one host, after the hub said
+#                                        that the grant is live now;
+#   the swap proxy (`vault.py swap`)     a user of its own, which reads neither the store nor its key. A session's
+#                                        HTTPS_PROXY names it. It passes a connection to any other host as it is,
+#                                        unread. For a key's site it ends TLS with a certificate of a CA of its own
+#                                        that is limited to that host name, reads the head of one request, replaces
+#                                        the placeholders in its Authorization header, and sends it on a TLS
+#                                        connection of its own to the site.
+#
+# Root switches it on for a machine with one part of the broker's own configuration, "swap" (SWAP_KEYS,
+# hubsetup.swap_install). With that part, a key that the hub names with a site reaches a session as a placeholder or
+# not at all, never as the key. Without it, nothing here runs, and each key is a variable as before. No agent can
+# change the configuration. A release cannot switch it off either: a vault.py from before the swap refuses a
+# configuration with a part that it does not know, so it does not start, and the machine keeps the program that was
+# serving (hubsetup.vault_program_script).
+#
+# The proxy reads hostile bytes, so it is small and it reads strictly. It reads the CONNECT line, and for a key's
+# site one request head: no byte of an answer, and no byte of a request after its head. A fault in it does not open
+# the store: what it can get is the keys that swap on this machine, and the traffic to their sites.
+SWAP_KEY = "swap"                           # optional, in the broker's configuration: this machine swaps keys
+SWAP_USER = "founderizer-swap"              # the proxy's own user. Not a fleet-* name: the service user can change
+                                            # each fleet-* user (fleet-agent-user)
+SWAP_KEYS = {"user", "vault", "port", "openssl"}    # the proxy's OS user, the broker's, the proxy's port, a program
+SWAP_SOCKET = "swap.sock"                   # the broker's socket for the proxy, beside its own
+SWAP_STATE = "/var/lib/fleet-vault-swap"    # the keys of the proxy's CAs and certificates: the proxy's user alone
+SWAP_RUN = "/run/fleet-vault-swap"          # the public certificate of each site's CA, <host>.pem, for the sessions
+SWAPS = "swaps.json"                        # the broker's list of placeholders, in its state folder
+PLACEHOLDER = re.compile(r"vaultswap_[0-9a-f]{40}")
+PLACEHOLDER_BYTES = re.compile(rb"vaultswap_[0-9a-f]{40}")
+SWAP_TOKEN = re.compile(r"[0-9a-f]{64}")    # the hub's token of one agent and key: it asks "is this grant live?" only
+# The one form in which a key goes into the Authorization header, which the key's catalog entry names (the hub
+# gives it with the site): the key is the whole credential, and never text beside other text of the agent's choice.
+SWAP_FORMS = ("bearer", "token", "basic-user", "basic-password")
+# A site's host: a DNS name of small letters, digits, dots and hyphens, at most 240 characters and never an IP
+# address, so that it is safe in a file name and in openssl's files, and so that its CA has one kind of limit.
+SWAP_HOST = re.compile(r"(?=.{1,240}$)(?![0-9.]+$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+                       r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*")
+SWAP_BEARER = re.compile(rb"((?i:bearer|token)) (vaultswap_[0-9a-f]{40})")
+SWAP_BASIC = re.compile(rb"(?:([^:]*):(vaultswap_[0-9a-f]{40})|(vaultswap_[0-9a-f]{40}):(.*))", re.S)
+SWAP_LOW_PORTS = "/proc/sys/net/ipv4/ip_unprivileged_port_start"    # the first port that each user can listen on
+SWAP_HEAD = 65536                           # bytes of one request head
+SWAP_HEADERS = 100
+SWAP_PATIENCE = 15                          # seconds for a CONNECT line, a TLS handshake, a request head, a connect
+SWAP_PER_USER = 256                         # connections of one OS user at one time. No limit for all users
+                                            # together: some agents must not hold each place of the others
+SWAP_CONNECT = re.compile(rb"CONNECT (?:\[([0-9A-Fa-f:.]{2,45})\]|([A-Za-z0-9.-]{1,253})):([0-9]{1,5}) HTTP/1\.[01]")
+SWAP_REQUEST = re.compile(rb"([A-Z]{1,16}) (/[!-~]{0,8000}|\*) HTTP/1\.1")
+SWAP_HEADER = re.compile(rb"([!#$%&'*+.^_`|~0-9A-Za-z-]{1,256}):[ \t]*"
+                         rb"((?:[!-~\x80-\xff](?:[ \t!-~\x80-\xff]*[!-~\x80-\xff])?)?)[ \t]*")
+# One request for each connection to a key's site, so these headers of the client are not passed: the proxy says
+# `Connection: close` itself, and no upgrade to another protocol goes through it.
+SWAP_NOT_PASSED = (b"connection", b"proxy-connection", b"proxy-authorization", b"keep-alive", b"upgrade")
+# No key goes into a request with one of these methods: a server answers TRACE (and the older TRACK) with the request
+# that it got, headers and all, and many servers have it on.
+SWAP_NO_KEY_METHODS = (b"TRACE", b"TRACK", b"CONNECT")
+SWAP_ASKS = 8                               # questions for a key that one OS user has open at the broker at one time
+SWAP_MARK = b"X-Founderizer-Vault: key-swap\r\n"
+# The proxy's own answers. Each one is a sentence for the agent's program, and none has a value.
+SWAP_ONLY_CONNECT = "The vault's proxy takes only CONNECT for HTTPS. Plain HTTP is refused."
+SWAP_BAD_TARGET = "The CONNECT line names no host and port that the vault's proxy can reach."
+SWAP_UNREACHABLE = "The vault's proxy could not reach this host."
+SWAP_BAD_SITE = ("The vault's proxy could not reach this key's site with a certificate that is the site's own. "
+                 "Nothing was sent.")
+SWAP_BAD_HEAD = "The vault's proxy does not pass this request to a key's site: {why}. Nothing was sent."
+SWAP_PLACE = ("The vault puts a key only into the Authorization header of a request to the key's own site, as the "
+              "whole credential and in the one form of that key: `Bearer <placeholder>`, `token <placeholder>`, or "
+              "Basic with the placeholder as the user name or as the password. This request has a placeholder in "
+              "another place or form. Nothing was sent.")
+SWAP_REFUSED = ("The vault did not put the key into this request: this placeholder is not a key that this agent holds "
+                "for this host now. Nothing was sent. If the work needs the key, ask your requester.")
+SWAP_NO_HUB = ("The vault did not put the key into this request: the hub did not confirm the grant now. Nothing was "
+               "sent. Try again.")
+SWAP_NO_VAULT = "The vault's proxy got no answer from this machine's vault. Nothing was sent. Try again."
+SWAP_BUSY = "The vault's proxy has too many connections of this user. Close some, and try again."
+SWAP_CALL = ("On this machine the vault sends this key only to the key's own site, in the Authorization header and in "
+             "the key's own form, as its proxy does. Nothing was sent.")
+SWAP_ROOM = 256                             # questions of the proxy that the broker answers at one time
+
+
+def swap_shape(part):
+    """True for the part "swap" of a broker's configuration in its form: {"user", "vault", "port", "openssl"}.
+    load_config asks this, so that a configuration whose part is not in this form stops the broker as each other
+    wrong key does. What a machine can lose later (a user, a program) is read by swap_part, and stops only the swap."""
+    return isinstance(part, dict) and set(part) == SWAP_KEYS and all(
+        isinstance(part[k], str) and part[k] for k in ("user", "vault", "openssl")) \
+        and os.path.isabs(part["openssl"]) and type(part["port"]) is int and 0 < part["port"] < 65536
+
+
+def swap_part(conf):
+    """The part "swap" of this configuration as the broker and the proxy use it: its own fields, with "uid" and
+    "vault_uid" (the user IDs of the proxy and of the broker), "group" (the group of this machine's agent users) and
+    "broker" (the broker's socket for the proxy). Refused when the machine does not have what it names: the proxy's
+    own user, which is not root, not the broker's user and no agent user; the broker's user; the group; and an
+    openssl program that no agent can change."""
+    part, group = conf[SWAP_KEY], conf.get("worker_group")
+    try:
+        who, keeper = pwd.getpwnam(part["user"]), pwd.getpwnam(part["vault"])
+        members = grp.getgrnam(group) if isinstance(group, str) else None
+    except KeyError:
+        who = keeper = members = None
+    if not (who and keeper and members) or who.pw_uid in (0, keeper.pw_uid) or who.pw_name in members.gr_mem \
+            or who.pw_gid == members.gr_gid:
+        raise Refused("the key swap needs the proxy's own OS user (not root, not the vault's user and no agent "
+                      "user), the vault's user, and worker_group, the group of this machine's agent users")
+    try:
+        unchangeable(part["openssl"], "The openssl program")       # no agent can put another program in its place
+    except (SystemExit, OSError) as e:
+        raise Refused(str(e) or "the openssl program is not there") from None
+    return dict(part, uid=who.pw_uid, vault_uid=keeper.pw_uid, group=group,
+                broker=os.path.join(os.path.dirname(conf["socket"]), SWAP_SOCKET))
+
+
+def swap_site(value):
+    """(host, port) of a key's site as the hub names it, an https address, or None: the host in small letters, a
+    plain ASCII DNS name and no IP address; the port of the address, or 443."""
+    try:
+        parts = urllib.parse.urlsplit(value) if isinstance(value, str) and len(value) <= 300 else None
+        host, port = (parts.hostname or "", parts.port) if parts else ("", None)
+    except ValueError:
+        return None
+    if not parts or parts.scheme != "https" or parts.username is not None or parts.password is not None:
+        return None
+    host = host[:-1] if host.endswith(".") else host
+    return (host, port or 443) if SWAP_HOST.fullmatch(host) else None
+
+
+def swap_origin(host, port):
+    """host[:port] as a session reads it: the port only when it is not 443."""
+    return host if port == 443 else f"{host}:{port}"
+
+
+def swap_user(uid):
+    """The name of this OS user now, or None. An entry of the list of placeholders is for an OS user by number and by
+    name: when a user is removed and a new user gets its number, the first user's entries open nothing for it."""
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except (KeyError, TypeError, OverflowError):
+        return None
+
+
+class Swaps:
+    """The broker's list of placeholders, in its private state folder: {placeholder: {uid, user, agent, login, host,
+    port, form, token}}, with "off": true in an entry that is switched off. One placeholder for one OS user, agent and
+    key of this machine: it is the same in each session of that agent. It is kept on disk, so that a session that runs
+    goes on after a restart of the broker. No entry has a value, and an entry opens nothing by itself: each use asks
+    the hub (swap_value). An entry that is off opens no connection and gives no value (only); it keeps its name, so a
+    key that the hub names again gets the same placeholder (place)."""
+    FIELDS = {"uid", "user", "agent", "login", "host", "port", "form", "token"}
+    LIMIT = 4 * 1024 * 1024
+
+    def __init__(self, path):
+        self.path, self.lock = path, threading.Lock()
+        info = os.stat(os.path.dirname(os.path.abspath(path)))
+        if info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise Refused("the vault's state folder must belong to the vault user and have mode 700")
+        try:
+            self.entries = self.load()
+        except (OSError, ValueError):
+            raise Refused("the vault's list of placeholders cannot be read") from None
+
+    def load(self):
+        try:
+            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return {}
+        with os.fdopen(fd, "rb") as f:
+            info = os.fstat(f.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 \
+                    or info.st_size > self.LIMIT:
+                raise ValueError()
+            entries = json.loads(f.read().decode())
+        if not isinstance(entries, dict) or not all(
+                isinstance(p, str) and PLACEHOLDER.fullmatch(p) and isinstance(e, dict)
+                and set(e) - {"off"} == self.FIELDS and e.get("off", True) is True
+                and type(e["uid"]) is int and isinstance(e["user"], str) and 0 < len(e["user"]) <= 64
+                and isinstance(e["agent"], str) and AGENT_NAME.fullmatch(e["agent"])
+                and isinstance(e["login"], str) and SECRET_REF.fullmatch(e["login"]) and isinstance(e["host"], str)
+                and SWAP_HOST.fullmatch(e["host"]) and type(e["port"]) is int and 0 < e["port"] < 65536
+                and e["form"] in SWAP_FORMS and isinstance(e["token"], str) and SWAP_TOKEN.fullmatch(e["token"])
+                for p, e in entries.items()):
+            raise ValueError()
+        return entries
+
+    def keep(self, entries):
+        """Write the list whole: a new file of mode 600, made complete beside the old one and then put in its place."""
+        temp = self.path + ".new"
+        try:
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(json.dumps(entries, sort_keys=True).encode())
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp, self.path)
+        except OSError:
+            raise Refused("the vault could not keep its list of placeholders") from None
+        self.entries = entries
+
+    def place(self, uid, agent, login, host, port, form, token):
+        """The placeholder of this OS user, agent and key, with the site, the form and the token that the hub names
+        now. A new one is made only when the list has none for them; one that was switched off is on again."""
+        user = swap_user(uid)
+        if not user:
+            raise Refused("the vault does not know the OS user that asks for this key")
+        entry = {"uid": uid, "user": user, "agent": agent, "login": login, "host": host, "port": port, "form": form,
+                 "token": token}
+        with self.lock:
+            for name, old in self.entries.items():
+                if (old["uid"], old["agent"], old["login"]) == (uid, agent, login):
+                    if old != entry:
+                        self.keep(dict(self.entries, **{name: entry}))
+                    return name
+            name = "vaultswap_" + secrets.token_hex(20)
+            self.keep(dict(self.entries, **{name: entry}))
+            return name
+
+    def only(self, uid, agent, logins):
+        """Switch off each placeholder of this OS user that is not for one of `logins`: the keys that the hub names
+        with a site for this agent now. Without this, the proxy would go on opening the connections of that user to
+        the site of a key that it reads no more, with a certificate that its new sessions do not trust. An entry of
+        another agent name is switched off too: an OS user has one agent, so such an entry is from before the agent
+        got a new name. An entry of this user number with another user name is removed: it is of a user that is
+        gone, and nothing can switch it on again. (Nothing is removed while the name of this user number cannot be
+        read.)"""
+        user = swap_user(uid)
+        with self.lock:
+            kept = {name: e for name, e in self.entries.items() if e["uid"] != uid or not user or e["user"] == user}
+            off = {name for name, e in kept.items()
+                   if e["uid"] == uid and not e.get("off") and (e["agent"] != agent or e["login"] not in logins)}
+            if off or len(kept) != len(self.entries):
+                self.keep({name: dict(e, off=True) if name in off else e for name, e in kept.items()})
+
+    def site(self, uid, host, port):
+        """True when this host and port are the site of a placeholder of this OS user that is not switched off."""
+        user = swap_user(uid)
+        with self.lock:
+            return any((e["uid"], e["user"], e["host"], e["port"]) == (uid, user, host, port) and not e.get("off")
+                       for e in self.entries.values())
+
+    def get(self, name):
+        with self.lock:
+            entry = self.entries.get(name)
+            return dict(entry) if entry else None
+
+
+def with_swaps(conf):
+    """The configuration of a broker that swaps keys: `_swap`, its part "swap" as swap_part reads it, and `_swaps`,
+    the list of placeholders. A configuration without the part comes back as it is: each key is given as before.
+    When the machine does not have what the part names, or the list cannot be read, `_swap` is {} and `_swaps` is
+    not there: the broker serves each other operation, and a key that the hub names with a site is not given (read)."""
+    if SWAP_KEY not in conf:
+        return conf
+    try:
+        swap = swap_part(conf)
+        if swap["vault_uid"] != os.getuid():
+            raise Refused("the part swap names another vault user than the one that this broker runs as")
+        return dict(conf, _swap=swap, _swaps=Swaps(os.path.join(state_folder(conf), SWAPS)))
+    except Refused as e:
+        log(f"no key swap: {e}")
+        return dict(conf, _swap={})
+
+
+def swap_value(conf, uid, host, port, name, form):
+    """The header value of this placeholder, for the swap proxy: it must be a placeholder of this OS user (by number
+    and by name) and of this host that is not switched off, the proxy must have found it in the form of that key, and
+    the hub must say now that its agent still reads its key at this site. A hub that does not answer is a refusal. Then the value is read from the store. No lock of
+    the broker is held here: the hub call must not wait for another operation, and the store is one file that a save
+    puts in place whole. A refusal has one fixed code and no value: "refused" or "hub"."""
+    entry = conf["_swaps"].get(name) if isinstance(name, str) and PLACEHOLDER.fullmatch(name) else None
+    if not entry or entry.get("off") or (entry["uid"], entry["user"], entry["host"], entry["port"], entry["form"]) != (
+            uid, swap_user(uid), host, port, form):
+        return {"ok": False, "code": "refused"}
+    try:        # with no agent key: the token is what the hub knows this question by
+        code, data = hub(dict(conf, agent=entry["agent"], agent_key=None), "POST",
+                         f"/helper/vault/{entry['agent']}/swap",
+                         {"login": entry["login"], "site": "https://" + swap_origin(host, port), "form": form,
+                          "swap": entry["token"]})
+    except Refused:
+        return {"ok": False, "code": "hub"}
+    if code != 200 or not isinstance(data, dict) or data.get("ok") is not True or data.get("login") != entry["login"]:
+        return {"ok": False, "code": "refused" if code in (403, 404, 409) else "hub"}
+    try:
+        value = check_value(LocalStore(conf).item(SECRET_REF.fullmatch(entry["login"]).group(1))["value"])["password"]
+    except Refused:
+        return {"ok": False, "code": "refused"}
+    if re.search(r"[\x00-\x08\x0a-\x1f\x7f]", value):      # a line end or another control character: no header value
+        return {"ok": False, "code": "refused"}
+    if form == "basic-user" and ":" in value:       # a site cuts the user name at the first colon: not the whole key
+        return {"ok": False, "code": "refused"}
+    return {"ok": True, "value": value}
+
+
+def swap_call(conf, confirmed, call, login):
+    """May this broker send this call_api request with this key? On a machine that swaps keys, a key that the hub
+    names with a site goes into a request only as the proxy puts it there: to that site, in the Authorization header,
+    and in the key's own form. So call_api is no second road with looser rules (a header of the agent's choice, the
+    address of the saved item). `bearer` is call_api's bearer, and `basic-password` its basic, whose user name is the
+    saved item's own. A key of another form goes through the proxy only. True on a machine that does not swap, and for
+    a key that the hub names no site for: as before."""
+    if "_swap" not in conf or confirmed.get("site") is None:
+        return True
+    site, where = swap_site(confirmed.get("site")), origin(login.get("url") or "")
+    return bool(site and where and where[2] == "https://" + swap_origin(*site)
+                and {"bearer": "bearer", "basic-password": "basic"}.get(confirmed.get("form")) == call["auth"])
+
+
+def swap_handle(conf, line):
+    """One request of the swap proxy on the broker's second socket: site (is this host a site of a placeholder of
+    this OS user?) and swap (the header value of one placeholder). The caller is the proxy's user, which
+    Broker.swap_served read from the kernel before this."""
+    try:
+        req = json.loads(line)
+    except ValueError:
+        raise Refused("send one JSON request line") from None
+    if not isinstance(req, dict):
+        raise Refused("send one JSON request line")
+    uid, host, port = req.get("uid"), req.get("host"), req.get("port")
+    if not (type(uid) is int and uid > 0 and isinstance(host, str) and SWAP_HOST.fullmatch(host)
+            and type(port) is int and 0 < port < 65536):
+        raise Refused("a swap request needs uid, host and port")
+    if req.get("op") == "site":
+        return {"ok": True, "site": conf["_swaps"].site(uid, host, port)}
+    if req.get("op") == "swap":
+        return swap_value(conf, uid, host, port, req.get("name"), req.get("form"))
+    raise Refused("unknown operation")
+
+
+# ---- the swap proxy's own code: nothing below reads the store, and the proxy's user cannot
+
+# The kernel's tables of TCP sockets, and whether a row has an IPv4 address in its form of IPv6.
+SWAP_TABLES = (("/proc/net/tcp", False), ("/proc/net/tcp6", True))
+
+
+def swap_peer(conn):
+    """The user ID that owns the other end of this TCP connection on this machine, from the kernel's table of sockets,
+    or None. The row must have exactly this connection's two addresses and ports: while this process holds the
+    connection, no other socket has them. A program with one socket for both IP versions (.NET, Java) is in the IPv6
+    table, with the IPv4 address in its mapped form."""
+    try:
+        (peer_ip, peer_port), (own_ip, own_port) = conn.getpeername()[:2], conn.getsockname()[:2]
+        one, two = socket.inet_aton(peer_ip), socket.inet_aton(own_ip)
+    except (OSError, ValueError):
+        return None
+
+    def form(raw, port, mapped):
+        four = "%08X" % int.from_bytes(raw, sys.byteorder)
+        return ("0000000000000000" + ("FFFF0000" if sys.byteorder == "little" else "0000FFFF") + four
+                if mapped else four) + ":%04X" % port
+    for table, mapped in SWAP_TABLES:
+        local, remote = form(one, peer_port, mapped), form(two, own_port, mapped)
+        try:
+            with open(table, encoding="ascii") as f:
+                for row in f:
+                    parts = row.split()
+                    if len(parts) > 7 and parts[1] == local and parts[2] == remote and parts[7].isdigit():
+                        return int(parts[7])
+        except OSError:
+            continue
+    return None
+
+
+def swap_head(sock, limit):
+    """(the bytes before the first empty line, the bytes that came after it), or (None, b"") for a head that is longer
+    than `limit` or that ends early."""
+    data = b""
+    while b"\r\n\r\n" not in data:
+        if len(data) > limit:
+            return None, b""
+        chunk = sock.recv(8192)
+        if not chunk:
+            return None, b""
+        data += chunk
+    head, _, rest = data.partition(b"\r\n\r\n")
+    return (head, rest) if len(head) <= limit else (None, b"")
+
+
+def swap_request(head, host, port):
+    """(method, target, [(name, value)]) of one request head for this host, read strictly, or the words of why it is
+    not passed. Strict, so that the line that this proxy reads as the Authorization header is that header for the site
+    too, and not a part of another header that the site gives back: each line ends with CR LF and has no other CR, LF
+    or NUL; the request line is `METHOD /path HTTP/1.1`; a header is `name: value` with no space before the colon and
+    no fold; and exactly one Host header, which is this host."""
+    lines = head.split(b"\r\n")
+    if any(b"\r" in x or b"\n" in x or b"\0" in x for x in lines):
+        return "a line does not end with CR LF"
+    found = SWAP_REQUEST.fullmatch(lines[0])
+    if not found:
+        return "its first line is not `METHOD /path HTTP/1.1`"
+    headers = []
+    for line in lines[1:]:
+        h = SWAP_HEADER.fullmatch(line)
+        if not h:
+            return "a header line is not `name: value`"
+        headers.append((h.group(1), h.group(2)))
+    if len(headers) > SWAP_HEADERS:
+        return "it has too many headers"
+    hosts = [v.lower() for n, v in headers if n.lower() == b"host"]
+    own = [b"%s:%d" % (host.encode(), port)] + ([host.encode()] if port == 443 else [])
+    if len(hosts) != 1 or hosts[0] not in own:
+        return "its Host header is not this host"
+    return found.group(1), found.group(2), headers
+
+
+def swap_basic(value):
+    """The text of Basic credentials in an Authorization value, or None for another form."""
+    if value[:6].lower() != b"basic ":
+        return None
+    try:
+        return base64.b64decode(value[6:].strip(), validate=True)
+    except ValueError:
+        return None
+
+
+def swap_found(target, headers):
+    """(the placeholder that this request head asks a key for, or None; the form in which it stands, one of
+    SWAP_FORMS; True when the head has a placeholder in a place or a form where no key goes). A key goes into the one
+    Authorization header only, and as the whole credential: `Bearer <placeholder>`, `token <placeholder>`, or Basic
+    credentials that are exactly `<placeholder>:<text>` (basic-user) or `<text>:<placeholder>` (basic-password). The
+    broker gives the value only for the one form of that key (swap_value): with other text beside the placeholder, or
+    with the key on the wrong side of a Basic credential, an agent could make the key a refused credential on purpose,
+    and a site that writes one into its error would give it back. The request line, each other header, a header name
+    and a second Authorization header are no place for one."""
+    grants = [v for n, v in headers if n.lower() == b"authorization"]
+    elsewhere = bool(PLACEHOLDER_BYTES.search(target)) or any(
+        PLACEHOLDER_BYTES.search(n) or (n.lower() != b"authorization" and PLACEHOLDER_BYTES.search(v))
+        for n, v in headers)
+    found = []
+    for value in grants:
+        plain = swap_basic(value)
+        word = SWAP_BEARER.fullmatch(value)
+        basic = SWAP_BASIC.fullmatch(plain) if plain is not None else None
+        if word:
+            found.append((word.group(2).decode(), word.group(1).decode().lower()))
+        elif basic and len(PLACEHOLDER_BYTES.findall(plain)) == 1:
+            found.append((basic.group(3).decode(), "basic-user") if basic.group(3) else
+                         (basic.group(2).decode(), "basic-password"))
+        elif PLACEHOLDER_BYTES.search(value) or (plain is not None and PLACEHOLDER_BYTES.search(plain)):
+            elsewhere = True
+    if (found or elsewhere) and len(grants) > 1:
+        elsewhere = True
+    name, form = found[0] if len(found) == 1 else (None, None)
+    return name, form, elsewhere
+
+
+def swap_put(headers, name, value):
+    """The headers with the placeholder `name` of the Authorization header replaced by `value`, in the form that
+    swap_found accepted."""
+    old, new = name.encode(), value.encode()
+    out = []
+    for header, text in headers:
+        if header.lower() == b"authorization":
+            plain = swap_basic(text)
+            text = b"Basic " + base64.b64encode(plain.replace(old, new)) if plain is not None else text.replace(old, new)
+        out.append((header, text))
+    return out
+
+
+def swap_relay(source, target):
+    """Pass the bytes of one direction until its end, unread, then say the end to the other side."""
+    try:
+        while True:
+            data = source.recv(65536)
+            if not data:
+                break
+            target.sendall(data)
+    except (OSError, ValueError):
+        pass
+    try:
+        target.shutdown(socket.SHUT_WR)
+    except (OSError, ValueError):
+        pass
+
+
+def swap_both(client, site, first=b""):
+    """Pass the bytes of both directions until both ended. first: bytes of the client that came with its request
+    head."""
+    def up():
+        try:
+            if first:
+                site.sendall(first)
+        except (OSError, ValueError):
+            return
+        swap_relay(client, site)
+    back = threading.Thread(target=up, daemon=True)
+    back.start()
+    swap_relay(site, client)
+    for sock in (client, site):         # the answer ended: the other direction ends with it
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except (OSError, ValueError):
+            pass
+    back.join()
+
+
+def swap_say(sock, status, text):
+    """One answer of the proxy's own: a status, one sentence as JSON, and the header that says who answers."""
+    body = (json.dumps({"error": text}) + "\n").encode()
+    try:
+        sock.sendall(b"HTTP/1.1 " + status.encode() + b"\r\nContent-Type: application/json\r\nContent-Length: "
+                     + str(len(body)).encode() + b"\r\nConnection: close\r\n" + SWAP_MARK + b"\r\n" + body)
+    except (OSError, ValueError):
+        pass
+
+
+def swap_reach(host, port):
+    """A TCP connection to this host and port, or None."""
+    try:
+        sock = socket.create_connection((host, port), timeout=SWAP_PATIENCE)
+    except (OSError, UnicodeError):
+        return None
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    return sock
+
+
+class SwapAuthority:
+    """The proxy's certificates. For each host that is a key's site: one CA that critical X.509 name constraints limit
+    to that one DNS name (permitted: the name; excluded: each name under it, and each IPv4 and IPv6 address), and that
+    host's certificate, which the CA signs. A session trusts only the CAs of its own keys' sites, so nothing here can
+    speak for another host to it. The openssl program makes them: the standard library makes no certificate. The keys
+    are in the proxy's state folder, which only its user reads. The public certificate of each CA goes to
+    `public`/<host>.pem, where a session's start reads it. A host name has only small letters, digits, dots and
+    hyphens (SWAP_HOST), so it is safe in a file name and in openssl's files. The same commands run with OpenSSL 3
+    and with LibreSSL."""
+    DAYS, LEAF_DAYS, AGAIN = 3650, 90, 30 * 86400
+
+    def __init__(self, folder, public, openssl):
+        self.folder, self.public, self.openssl = folder, public, openssl
+        self.lock, self.made = threading.Lock(), {}
+        self.leaf_key = os.path.join(folder, "leaf.key")
+        if not os.path.exists(self.leaf_key):
+            self.run("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", self.leaf_key)
+
+    def run(self, *args):
+        r = subprocess.run([self.openssl, *args], capture_output=True, timeout=60, cwd=self.folder,
+                           env={"PATH": "/usr/bin:/bin"})
+        if r.returncode != 0:
+            raise OSError("openssl " + args[0] + " failed")
+
+    def authority(self, host):
+        """(the key, the certificate) of this host's own CA, made at the first use and kept."""
+        key, cert, conf = (os.path.join(self.folder, f"{host}.ca.{end}") for end in ("key", "pem", "cnf"))
+        if not (os.path.exists(key) and os.path.exists(cert)):
+            with open(conf, "w", encoding="ascii") as f:
+                f.write("[req]\ndistinguished_name=dn\nx509_extensions=ca\nprompt=no\n[dn]\n"
+                        f"CN=Founderizer key swap, {host[:40]}\n[ca]\nbasicConstraints=critical,CA:TRUE,pathlen:0\n"
+                        "keyUsage=critical,keyCertSign\nsubjectKeyIdentifier=hash\n"
+                        f"nameConstraints=critical,permitted;DNS:{host},excluded;DNS:.{host},"
+                        "excluded;IP:0.0.0.0/0.0.0.0,excluded;IP:0:0:0:0:0:0:0:0/0:0:0:0:0:0:0:0\n")
+            self.run("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", key + ".new")
+            self.run("req", "-x509", "-new", "-key", key + ".new", "-sha256", "-days", str(self.DAYS), "-config", conf,
+                     "-out", cert + ".new")
+            os.replace(key + ".new", key)
+            os.replace(cert + ".new", cert)
+        return key, cert
+
+    def context(self, host):
+        """The TLS server context for this host name: its certificate, made at the first use in this process and
+        again when it is 30 days old. HTTP/1.1 only. The public certificate of its CA is in place before this
+        returns."""
+        with self.lock:
+            have = self.made.get(host)
+            if have and time.time() - have[0] < self.AGAIN:
+                return have[1]
+            key, cert = self.authority(host)
+            ext, csr, leaf = (os.path.join(self.folder, f"{host}.leaf.{end}") for end in ("cnf", "csr", "pem"))
+            with open(ext, "w", encoding="ascii") as f:
+                # the two key identifiers by name: a client that checks strictly asks for them, and an openssl
+                # before 3.2 does not add them by itself
+                f.write(f"subjectAltName=DNS:{host}\nbasicConstraints=critical,CA:FALSE\n"
+                        "extendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\n"
+                        "authorityKeyIdentifier=keyid:always\n")
+            self.run("req", "-new", "-key", self.leaf_key, "-subj", "/CN=Founderizer key swap", "-out", csr)
+            self.run("x509", "-req", "-in", csr, "-CA", cert, "-CAkey", key, "-set_serial",
+                     "0x" + secrets.token_hex(16), "-days", str(self.LEAF_DAYS), "-sha256", "-extfile", ext, "-out", leaf)
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx.load_cert_chain(leaf, self.leaf_key)
+            ctx.set_alpn_protocols(["http/1.1"])
+            with open(cert, "rb") as f:
+                text = f.read()
+            shown = os.path.join(self.public, host + ".pem")
+            try:
+                with open(shown, "rb") as f:
+                    same = f.read() == text
+            except OSError:
+                same = False
+            if not same:                # readable by each user: it is the public half
+                with open(shown + ".new", "wb") as f:
+                    f.write(text)
+                os.chmod(shown + ".new", 0o644)
+                os.replace(shown + ".new", shown)
+            self.made[host] = (time.time(), ctx)
+            return ctx
+
+
+def swap_ask(swap, request):
+    """One question to the broker on its socket for the proxy: the answer, or None when the broker gives none. The
+    other end must be the vault's own user, so that no other program answers in its place."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(30)
+            s.connect(swap["broker"])
+            if peer_uid(s) != swap["vault_uid"]:
+                return None
+            s.sendall((json.dumps(request) + "\n").encode())
+            data = b""
+            while not data.endswith(b"\n") and len(data) < 65536:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        reply = json.loads(data)
+    except (OSError, ValueError):
+        return None
+    return reply if isinstance(reply, dict) else None
+
+
+class SwapProxy:
+    """The swap proxy: one listener on 127.0.0.1, and two threads for each connection.
+
+    swap: the part "swap" of the configuration (swap_part). authority: a SwapAuthority. ask: one question to the
+    broker, a dict in and a dict or None out (swap_ask). site: the TLS client context for the connection to a key's
+    site, which checks the site's certificate against the system's CAs. peer: the OS user of a connection
+    (swap_peer). reach: a connection to a host (swap_reach). A test gives its own of the last four, and a port."""
+    def __init__(self, swap, authority, ask=None, site=None, peer=swap_peer, reach=swap_reach, port=None):
+        self.swap, self.authority, self.peer, self.reach = swap, authority, peer, reach
+        self.ask = ask or (lambda request: swap_ask(swap, request))
+        self.site = site or ssl.create_default_context()
+        self.site.set_alpn_protocols(["http/1.1"])
+        self.lock, self.open, self.asking = threading.Lock(), {}, {}
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", swap["port"] if port is None else port))
+        self.sock.listen(128)
+        self.port = self.sock.getsockname()[1]
+
+    def reads_users(self):
+        """True when this process reads the OS user of a connection to its own port: its own. A machine where it
+        cannot (a /proc that it does not read) must not serve, because then it knows no caller."""
+        try:
+            with socket.create_connection(("127.0.0.1", self.port), timeout=5):
+                self.sock.settimeout(5)
+                conn, _ = self.sock.accept()
+                with conn:
+                    return self.peer(conn) == os.getuid()
+        except OSError:
+            return False
+        finally:
+            self.sock.settimeout(None)
+
+    def serve(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                if self.sock.fileno() < 0:
+                    return              # closed
+                time.sleep(0.2)         # no free file or no memory now: no new connection, and the proxy goes on
+                continue
+            conn.settimeout(SWAP_PATIENCE)
+            try:
+                threading.Thread(target=self.served, args=(conn,), daemon=True).start()
+            except RuntimeError:        # no new thread now: this connection is not served
+                conn.close()
+
+    def close(self):
+        self.sock.close()
+
+    def agent_user(self, uid):
+        """True for a user of the group of this machine's agent users, as the broker reads it (admitted)."""
+        try:
+            who, members = pwd.getpwuid(uid), grp.getgrnam(self.swap["group"])
+        except KeyError:
+            return False
+        return who.pw_name in members.gr_mem or who.pw_gid == members.gr_gid
+
+    def served(self, conn):
+        uid = None
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            who = self.peer(conn)
+            if who is None or not self.agent_user(who):
+                return                  # no agent user of this machine: no answer
+            with self.lock:
+                if self.open.get(who, 0) >= SWAP_PER_USER:
+                    return swap_say(conn, "503 Service Unavailable", SWAP_BUSY)
+                self.open[who] = self.open.get(who, 0) + 1
+                uid = who
+            self.one(conn, uid)
+        except (OSError, ValueError):       # a connection that ended, a TLS error: this connection only
+            pass
+        except Exception as e:              # never a detail of a request
+            log(f"swap: error {type(e).__name__}")
+        finally:
+            if uid is not None:
+                with self.lock:
+                    self.open[uid] -= 1
+                    if not self.open[uid]:
+                        del self.open[uid]
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def one(self, conn, uid):
+        head, rest = swap_head(conn, 8192)
+        found = SWAP_CONNECT.fullmatch(head.split(b"\r\n")[0]) if head is not None else None
+        if not found:
+            return swap_say(conn, "405 Method Not Allowed", SWAP_ONLY_CONNECT) if head is not None else None
+        literal = found.group(1) is not None            # an IPv6 address in brackets: a tunnel only
+        host = (found.group(1) or found.group(2)).decode().lower()
+        host, port = (host[:-1] if host.endswith(".") and not literal else host), int(found.group(3))
+        if rest or not 0 < port < 65536 or not host:
+            return swap_say(conn, "400 Bad Request", SWAP_BAD_TARGET)
+        if not literal and SWAP_HOST.fullmatch(host):
+            # No answer of the broker (it starts again): a tunnel. The site then gets the placeholder, and nothing
+            # else of the session fails.
+            said = self.ask({"op": "site", "uid": uid, "host": host, "port": port})
+            if said and said.get("site") is True:
+                return self.opened(conn, uid, host, port)
+        site = self.reach(host, port)
+        if site is None:
+            return swap_say(conn, "502 Bad Gateway", SWAP_UNREACHABLE)
+        with site:
+            conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            conn.settimeout(None)
+            site.settimeout(None)
+            swap_both(conn, site)       # not read, and no line in the log
+
+    def opened(self, conn, uid, host, port):
+        """A connection to a key's site: TLS ends here, the head of one request is read, and the placeholder of its
+        Authorization header is replaced. The request goes to the site on a TLS connection that checks the site's
+        own certificate. A connection that ends before its TLS (a session's start asks for the site's CA in this way)
+        ends here with no line in the log."""
+        context = self.authority.context(host)          # the CA's public certificate is in place before the answer
+        conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        client = context.wrap_socket(conn, server_side=True)
+        try:
+            head, rest = swap_head(client, SWAP_HEAD)
+            if head is None:
+                return swap_say(client, "431 Request Header Fields Too Large",
+                                SWAP_BAD_HEAD.format(why="its head is too long, or it ended early"))
+            where = swap_origin(host, port)
+            request = swap_request(head, host, port)
+            if isinstance(request, str):
+                log(f"swap: uid {uid} to {where}: not passed ({request})")
+                return swap_say(client, "400 Bad Request", SWAP_BAD_HEAD.format(why=request))
+            method, target, headers = request
+            name, form, elsewhere = swap_found(target, headers)
+            if elsewhere:
+                log(f"swap: uid {uid} to {where}: not passed (a placeholder where no key goes)")
+                return swap_say(client, "400 Bad Request", SWAP_PLACE)
+            if name and method in SWAP_NO_KEY_METHODS:
+                log(f"swap: uid {uid} to {where}: not passed (a {method.decode()} request with a placeholder)")
+                return swap_say(client, "400 Bad Request", SWAP_BAD_HEAD.format(
+                    why="a server sends a " + method.decode() + " request back, so no key goes into one"))
+            kept = [(n, v) for n, v in headers if n.lower() not in SWAP_NOT_PASSED] + [(b"Connection", b"close")]
+            if name:
+                with self.lock:         # a few questions of one user at one time: the others keep their places
+                    room = self.asking.get(uid, 0) < SWAP_ASKS
+                    if room:
+                        self.asking[uid] = self.asking.get(uid, 0) + 1
+                if not room:
+                    return swap_say(client, "503 Service Unavailable", SWAP_BUSY)
+                try:
+                    said = self.ask({"op": "swap", "uid": uid, "host": host, "port": port, "name": name, "form": form})
+                finally:
+                    with self.lock:
+                        self.asking[uid] -= 1
+                        if not self.asking[uid]:
+                            del self.asking[uid]
+                value = said.get("value") if said and said.get("ok") is True else None
+                if not (isinstance(value, str) and value and not re.search(r"[\x00-\x08\x0a-\x1f\x7f]", value)):
+                    code = said.get("code") if said else None
+                    log(f"swap: uid {uid} to {where}: no key "
+                        f"({code if code in ('refused', 'hub') else 'no answer of the vault'})")
+                    if code == "refused":
+                        return swap_say(client, "403 Forbidden", SWAP_REFUSED)
+                    return swap_say(client, "503 Service Unavailable", SWAP_NO_HUB if code == "hub" else SWAP_NO_VAULT)
+                kept = swap_put(kept, name, value)
+                del value, said
+            out = method + b" " + target + b" HTTP/1.1\r\n" + b"".join(n + b": " + v + b"\r\n" for n, v in kept) + b"\r\n"
+            del kept
+            raw = self.reach(host, port)
+            if raw is None:
+                return swap_say(client, "502 Bad Gateway", SWAP_BAD_SITE)
+            with raw:
+                try:
+                    site = self.site.wrap_socket(raw, server_hostname=host)
+                except (OSError, ValueError):
+                    return swap_say(client, "502 Bad Gateway", SWAP_BAD_SITE)
+                with site:
+                    site.sendall(out)
+                    del out
+                    if name:
+                        log(f"swap: uid {uid} to {where}: the key of one placeholder in a {method.decode()} request")
+                    client.settimeout(None)
+                    site.settimeout(None)
+                    swap_both(client, site, rest)
+        finally:
+            try:
+                client.close()
+            except (OSError, ValueError):
+                pass
+
+
+def swap_main(config):
+    """`vault.py swap`: the swap proxy of this machine, as its own user. It reads the broker's configuration, which is
+    root's and holds no secret, for its part "swap"."""
+    unchangeable(os.path.realpath(__file__), "The vault broker program")       # never a checkout that an agent can change
+    conf = load_config(config)
+    if conf.get("central") is True or SWAP_KEY not in conf:
+        raise SystemExit(f"{config} has no part swap: this machine does not swap keys.")
+    try:
+        swap = swap_part(conf)
+    except Refused as e:
+        raise SystemExit(f"The swap proxy does not start: {e}.") from None
+    if os.getuid() != swap["uid"]:
+        raise SystemExit(f"The swap proxy runs as {swap['user']}, and as no other user.")
+    try:                    # a machine that lets each user listen on the proxy's port: an agent could take its place
+        with open(SWAP_LOW_PORTS, encoding="ascii") as f:
+            low = int(f.read().strip())
+    except (OSError, ValueError):
+        low = None
+    if low is not None and low <= swap["port"]:
+        raise SystemExit(f"The swap proxy does not start: on this machine each user can listen on port "
+                         f"{swap['port']} (net.ipv4.ip_unprivileged_port_start is {low}), so an agent could take "
+                         f"the proxy's place.")
+    state, public = os.environ.get("STATE_DIRECTORY") or SWAP_STATE, os.environ.get("RUNTIME_DIRECTORY") or SWAP_RUN
+    info = os.stat(state)
+    if info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise SystemExit("The swap proxy's state folder must belong to its user and have mode 700.")
+    proxy = SwapProxy(swap, SwapAuthority(state, public, swap["openssl"]))
+    if not proxy.reads_users():
+        raise SystemExit("The swap proxy does not start: it cannot read the user of a connection from /proc/net/tcp "
+                         "on this machine, so it would know no caller.")
+    log(f"swap proxy for the agents of this machine on 127.0.0.1:{proxy.port}")
+    proxy.serve()
+    return 0
+
+
+# The swap proxy's service (`unit --swap`): its own user, the right to its one low port and no other, and no part of
+# the store. It starts again with the broker (PartOf), so it runs the program that the broker runs. No ProtectProc, no
+# ProcSubset and no RestrictAddressFamilies: it reads /proc/net/tcp, and it connects to any address.
+SWAP_UNIT = """[Unit]
+Description=Fleet vault key swap proxy (puts an API key into a request to the key's own site; it cannot read the store)
+After=network-online.target fleet-vault.service
+Wants=network-online.target
+PartOf=fleet-vault.service
+StartLimitIntervalSec=0
+
+[Service]
+User={user}
+Group={user}
+ExecStart=/usr/bin/python3 {script} swap --config {config}
+StateDirectory=fleet-vault-swap
+StateDirectoryMode=0700
+RuntimeDirectory=fleet-vault-swap
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+UMask=0077
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+LimitCORE=0
+LimitNOFILE=65536
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+"""
 
 
 # ---------------------------------------------------------------- the fleet's own store: its operations
@@ -2433,9 +3435,14 @@ def main(argv=None):
     p = sub.add_parser("unit", help="Print the systemd unit for this broker")
     p.add_argument("--config", required=True)
     p.add_argument("--user", help="the vault user; default: fleet-vault, and always " + CENTRAL_USER + " for --central")
-    p.add_argument("--group", required=True, help="the worker's group, or with --central the hub user's group: it may "
-                                                  "open the socket")
+    p.add_argument("--group", help="the worker's group, or with --central the hub user's group: it may open the "
+                                   "socket. Not for --swap")
     p.add_argument("--central", action="store_true", help="the unit of the central vault on the hub's server")
+    p.add_argument("--swap", action="store_true", help="the unit of this machine's key swap proxy; --user is its own "
+                                                       "user, default: " + SWAP_USER)
+    p = sub.add_parser("swap", help="Run this machine's key swap proxy, as its own user: it puts an API key into a "
+                                    "request to the key's own site, and it cannot read the store")
+    p.add_argument("--config", required=True, help="the broker's configuration, which has the part swap")
     p = sub.add_parser("store-init", help="The fleet's own store, as root: make the store key and an empty store "
                                           "that only the vault user can read. Safe to run again")
     p.add_argument("--config", required=True)
@@ -2455,7 +3462,19 @@ def main(argv=None):
         else:
             print(json.dumps(store_list(args.config), indent=2))
         return 0
+    if args.cmd == "swap":
+        return swap_main(args.config)
+    if args.cmd == "unit" and args.swap:        # the same program file as the broker's, and its own user
+        if args.central or args.group:
+            raise SystemExit("unit --swap takes --config and --user, and no other option.")
+        user = args.user or SWAP_USER
+        if not GROUP_NAME.match(user) or user.startswith("fleet-"):
+            raise SystemExit("The swap proxy's user is a user of its own, with no fleet- name.")
+        print(SWAP_UNIT.format(user=user, config=args.config, script=os.path.abspath(__file__)), end="")
+        return 0
     if args.cmd == "unit":
+        if not args.group:
+            raise SystemExit("unit needs --group: the worker's group, or with --central the hub user's group.")
         with open(args.config, encoding="utf-8") as f:
             said = json.load(f)
         if args.central != (said.get("central") is True):      # the unit and the configuration are of one kind

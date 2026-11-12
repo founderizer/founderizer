@@ -345,7 +345,81 @@ def read_env(agent, conf, kind):
     missing = [x for x in done.get("missing") or [] if isinstance(x, str) and ENV_NAME.fullmatch(x)]
     if missing:
         print(time.strftime("%H:%M:%S"), f"{kind}: the vault did not give {', '.join(missing)}", flush=True)
+    # The key swap (VAULT.md): a key can come as a placeholder, which works only through the vault's proxy. Then the
+    # session gets the proxy's variables too. When they cannot be made, it starts without each placeholder and
+    # without them, so that its other HTTPS programs work.
+    held = sorted(k for k, v in env.items() if SWAP_NAME.fullmatch(v))
+    if held:
+        try:
+            env.update(swap_variables(conf, done.get("swap"), held))
+        except Exception as e:
+            for name in held:
+                del env[name]
+            print(time.strftime("%H:%M:%S"), f"{kind}: the vault's proxy is not ready for {', '.join(held)}, so the "
+                  f"session starts without them: {e if isinstance(e, Refused) else type(e).__name__}", flush=True)
     return env
+
+
+SWAP_NAME = re.compile(r"vaultswap_[0-9a-f]{40}")          # a placeholder of the key swap, as vault.py makes it
+SWAP_SITE = re.compile(r"([a-z0-9][a-z0-9.-]{0,239})(?::([0-9]{1,5}))?")
+SWAP_PROXY = re.compile(r"http://127\.0\.0\.1:([0-9]{1,5})")
+SWAP_CA_LIST = "/etc/ssl/certs/ca-certificates.crt"        # the system's list of CAs on Debian and Ubuntu
+SWAP_CA_FILES = ("key-swap-ca.pem", "key-swap-sites.pem")  # in ~/.fleet: that list with the sites' CAs, and they alone
+
+
+def swap_variables(conf, swap, held):
+    """The variables of a session that holds a placeholder (VAULT.md, "The key swap"), from the `swap` part of the
+    vault's answer to a read: {"proxy": the proxy's address on this machine, "ca": the folder of the sites' CA
+    certificates, "names": {variable: the host of its site}}. held: the variables that hold a placeholder.
+
+    For each site, one CONNECT goes through the proxy and is closed: the proxy makes the site's CA before it answers,
+    and this proves that the proxy runs. Then the two CA files of this agent are written into ~/.fleet, each one whole
+    and then put in its place: the system's CAs with the CAs of this agent's sites, and those CAs alone. Each session
+    and each check of one agent has the same keys, so each write gives the same files. A session trusts the proxy
+    through these files for the sites of its own keys only: each CA is limited to its one host name. Refused when a
+    step fails; the caller then leaves the placeholders out."""
+    names = swap.get("names") if isinstance(swap, dict) else None
+    proxy = SWAP_PROXY.fullmatch(swap["proxy"]) if isinstance(names, dict) and isinstance(swap.get("proxy"), str) else None
+    folder = swap.get("ca") if proxy else None
+    if not (proxy and isinstance(folder, str) and os.path.isabs(folder) and sorted(names) == held
+            and all(isinstance(v, str) and SWAP_SITE.fullmatch(v) for v in names.values())):
+        raise Refused("the vault named no proxy for its placeholders")
+    certificates = {}
+    for where in sorted(set(names.values())):
+        host, port = SWAP_SITE.fullmatch(where).groups()
+        target = f"{host}:{port or 443}"
+        try:
+            with socket.create_connection(("127.0.0.1", int(proxy.group(1))), timeout=20) as s:
+                s.settimeout(20)
+                s.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+                answer = s.recv(4096)
+            with open(os.path.join(folder, host + ".pem"), encoding="ascii") as f:
+                certificates[host] = f.read(65536)
+        except (OSError, ValueError):
+            raise Refused(f"the vault's proxy did not answer for {host}") from None
+        if not answer.startswith(b"HTTP/1.1 200") or "-----BEGIN CERTIFICATE-----" not in certificates[host]:
+            raise Refused(f"the vault's proxy did not open {host} as a key's site")
+    try:
+        with open(SWAP_CA_LIST, encoding="utf-8") as f:
+            system = f.read()
+    except (OSError, ValueError):
+        raise Refused(f"this machine has no {SWAP_CA_LIST}") from None
+    sites = "".join(text if text.endswith("\n") else text + "\n" for _, text in sorted(certificates.items()))
+    paths = [os.path.join(HOME, name) for name in SWAP_CA_FILES]
+    try:
+        os.makedirs(HOME, mode=0o700, exist_ok=True)
+        for path, text in zip(paths, ((system if system.endswith("\n") else system + "\n") + sites, sites)):
+            temp = f"{path}.{secrets.token_hex(8)}.new"
+            write_private(temp, text)
+            os.replace(temp, path)
+    except OSError:
+        raise Refused("the CA files of the key swap could not be written") from None
+    try:
+        hub_host = urllib.parse.urlsplit(HUB).hostname
+    except ValueError:
+        hub_host = None
+    return lifecycle.key_swap_env(proxy.group(0), paths[0], paths[1],
+                                  runtime_fact((conf or {}).get("runtime"), "own_hosts") or (), hub_host)
 
 
 def codex_env(names):
