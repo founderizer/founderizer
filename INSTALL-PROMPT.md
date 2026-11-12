@@ -161,10 +161,27 @@ approved it, run the last line again. If it again prints no address, stop and te
 Then set `HOST` to that address, and reach the server there for every step after this one:
 
     HOST=<the address the last command printed>
-    ssh -o BatchMode=yes "$SSHUSER@$HOST" 'id -u'
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$SSHUSER@$HOST" 'id -u'
 
-If this SSH fails, stop and tell the owner: their Tailscale access rules must let this machine
-reach the server's port 22, because after the install SSH comes in over the private network only.
+SSH on this machine knows the server's key at the address that the owner gave, but not at this new
+address. In BatchMode, and when it cannot ask on a terminal, SSH refuses a server whose key it does
+not know. So this first SSH to the new address keeps the key that the server gives there, in the
+`known_hosts` file of this machine, and the steps after this one find it. SSH can say that it added
+the address to the list of known hosts: that is correct. On the fleet's private network, only the
+server that has this address can answer at it. SSH still refuses a key that is not the key that it
+keeps for this address.
+
+Check: it prints `0`. If this SSH fails, stop, give the owner SSH's error as it came, and tell them
+the cause that agrees with its words:
+
+- `REMOTE HOST IDENTIFICATION HAS CHANGED` or `Host key verification failed.`: SSH on this machine
+  keeps another key for this address, usually the key of an earlier machine. The owner removes that
+  key, with `ssh-keygen -R <the address>`, when they know that this server is the one that they
+  install. Do not remove it yourself.
+- `timed out` or `No route to host`: their Tailscale access rules must let this machine reach the
+  server's port 22, because after the install SSH comes in over the private network only.
+- `Permission denied` or `Connection refused`: the owner's SSH settings can give a key or a port for
+  the name or the address that they gave you, and not for this address.
 
 ### A3. Put the Founderizer code on the server
 
@@ -277,10 +294,23 @@ approved it, run the last line again. If it again prints no address, stop and te
 Then set `HOST` to that address, and reach the server there from now on, as in A2:
 
     HOST=<the address the last command printed>
-    ssh -o BatchMode=yes "$SSHUSER@$HOST" 'id -u'
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$SSHUSER@$HOST" 'id -u'
 
-If this SSH fails, stop and tell the owner: their Tailscale access rules must let this machine
-reach the server's port 22, because the join lets SSH in over the private network only.
+SSH on this machine does not know the server's key at this new address yet. So, as in A2, this
+first SSH to the new address keeps the key that the server gives there, and the steps after this one
+find it. SSH can say that it added the address to the list of known hosts: that is correct.
+
+Check: it prints `0`. If this SSH fails, stop, give the owner SSH's error as it came, and tell them
+the cause that agrees with its words:
+
+- `REMOTE HOST IDENTIFICATION HAS CHANGED` or `Host key verification failed.`: SSH on this machine
+  keeps another key for this address, usually the key of an earlier machine. The owner removes that
+  key, with `ssh-keygen -R <the address>`, when they know that this server is the one that they
+  join. Do not remove it yourself.
+- `timed out` or `No route to host`: their Tailscale access rules must let this machine reach the
+  server's port 22, because the join lets SSH in over the private network only.
+- `Permission denied` or `Connection refused`: the owner's SSH settings can give a key or a port for
+  the name or the address that they gave you, and not for this address.
 
 ### B3. Run the join line of the app
 
@@ -330,4 +360,8 @@ last step of both jobs is `verify`. Its `PromptThroughSudo` runs each later step
 for `sudo -i`, for root and for a user who is not root, and fails when a part of a step does not run
 as root. It also runs the first lines of A2, A3 and B2 on a stand-in server whose first updates
 hold apt's lock, and fails when a line does not wait for it. The first line of A2 and of B2 must
-also try Tailscale's installer again when the server's own updates got in its way.
+also try Tailscale's installer again when the server's own updates got in its way. The steps after
+A2 and B2 go to the server's new address, with an `ssh` that knows the server's key only at the
+address that the owner gave, and that refuses an unknown key in BatchMode and with no terminal, as
+OpenSSH does: the check of A2 and of B2 must keep the server's key at the new address, and it must
+still refuse a key that changed.
