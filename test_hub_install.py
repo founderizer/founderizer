@@ -2306,6 +2306,8 @@ class StandInServer:
     VERIFY = "Founderizer step 16: verify: is this machine of the fleet healthy?\nFounderizer:   ok  the hub answers\nREADY\n"
     INSTALL_LOG = ("Founderizer step 1: this server and this copy of Founderizer\n"
                    f'FLEET_CLAIM={CODE} sh -c "$(curl -fsS http://{ADDRESS}:8765/claim)"\n' + VERIFY)
+    # The start of /etc/os-release on Ubuntu 24.04, which A1 reads (`readable`).
+    OS_RELEASE = 'PRETTY_NAME="Ubuntu 24.04.3 LTS"\nNAME="Ubuntu"\nVERSION_ID="24.04"\nID=ubuntu\nID_LIKE=debian\n'
 
     # sudo, as far as the prompt uses it. With -i, root's login shell gets the words joined with spaces, with a
     # backslash before each byte that is not a letter, a digit, "_", "-" or "$" (`man sudo`, -i), and an environment of
@@ -2632,8 +2634,8 @@ echo READY
         (self.local / "sh").symlink_to("/bin/sh")      # on the server itself, the agent's own `sh -c`
         self.keyfile.write_text(self.KEY)
         self.keyfile.chmod(0o600)
-        # The agent's known_hosts (SSH): it knows the server at the address that the owner gave, because A1 reads the
-        # server there with SSH in BatchMode.
+        # The agent's known_hosts (SSH): it knows the server at the address that the owner gave, because A1 keeps the
+        # key that the server gives there.
         self.known = self.folder / "known_hosts"
         self.known.write_text(f"{self.PUBLIC} {self.HOSTKEY}\n")
         self.root.chmod(0)
@@ -2748,6 +2750,16 @@ echo READY
         path = self.state / "slept"
         return [int(word) for word in path.read_text().split()] if path.exists() else []
 
+    def readable(self):
+        """The server as A1 reads it: `id -un` gives root, its /etc/os-release names Ubuntu 24.04 (OS_RELEASE, in
+        `files`), and systemd's `systemctl` is among root's programs."""
+        programs = {"id": "#!/bin/sh\ncase $1 in -u) echo 0 ;; -un) echo root ;; *) exit 2 ;; esac\n",
+                    "systemctl": "#!/bin/sh\nexit 0\n"}
+        for name, text in programs.items():
+            (self.tools / name).write_text(text)
+            (self.tools / name).chmod(0o755)
+        (self.files / "os-release").write_text(self.OS_RELEASE)
+
     def write_install_log(self):
         """The install's log, as the install that A5 starts should have written it."""
         with self.opened():
@@ -2803,8 +2815,8 @@ echo READY
         with `prefix` inside the quotes of its remote command (None: the user is root) and, on the server itself, with
         `local` in place of `ssh`, its options and "$SSHUSER@$HOST". Over ssh, the user's login shell is `login_sh`.
         HOST is `host`, or the address that the owner gave when None, and the agent's SSH checks the server's key there
-        against `known` (SSH). /root/ stands for this server's folder."""
-        text = line.replace("/root/", f"{self.root}/")
+        against `known` (SSH). /root/ stands for this server's folder, and /etc/os-release for its file in `files`."""
+        text = line.replace("/root/", f"{self.root}/").replace("/etc/os-release", f"{self.files}/os-release")
         if prefix is not None:
             text, count = re.subn(r'("\$SSHUSER@\$HOST" )([\'"])', lambda found: found[1] + found[2] + prefix, text)
             if count != 1:
@@ -3267,6 +3279,59 @@ class PromptThroughSudo(unittest.TestCase):
             if went.status or went.errors() or len(went.logged("ssh sends")) != 1:
                 issues.append(f"{who}: the first line of {after} on the new address, after {step}'s check, ended "
                               f"with {went.status}: {went.err.strip()[-200:]!r}")
+        self.assertNoIssues(issues)
+
+    def test_a1_reads_a_new_server_whose_key_the_agents_ssh_has_never_seen(self):
+        """**A1 reads a new server with SSH in BatchMode, also when the agent's SSH has never seen the server's key at
+        the address that the owner gave, and after it the steps at that address work for SSH that cannot ask on a
+        terminal.** A new server has a key of its own, which the agent's SSH does not know yet. SSH in BatchMode
+        refuses a server whose key it does not know, and so does SSH that cannot ask on a terminal, as in the shell of
+        an agent: "Host key verification failed.", with status 255 (OpenSSH 10.3p1 on this Mac). Until 12 November
+        2026 A1 was `ssh -o BatchMode=yes "$SSHUSER@$HOST" '…'`, and its words said only to give the owner SSH's
+        error. So the install stopped at its first command on each new server, and the owner got no words about what
+        to do.
+        Now A1 keeps the key that the server gives at the first connection (`StrictHostKeyChecking=accept-new`), as the
+        Mac app's install does on each SSH (`InstallPlan.arguments`), and the agent's known_hosts keeps it once. A key
+        that is not the key that the agent's SSH keeps for that address still stops A1 with SSH's words, the agent's
+        known_hosts stays as it was, and the words of A1 say what the owner does then. B1 runs the command of A1. A1
+        runs over ssh with each login shell of the walk, and so does the first line of A2 and of B2 after it."""
+        lines, issues = self.lines(), []
+        [read] = lines["A1"]
+        words = self.words("### A1.", "### A2.")
+        for wanted in ("REMOTE HOST IDENTIFICATION HAS CHANGED", "`ssh-keygen -R <the address>`",
+                       "Do not remove it yourself"):
+            if wanted not in words:
+                issues.append(f"the words of A1 do not say: {wanted}")
+        if "The command of A1, with the same checks and the same stops" not in self.words("### B1.", "### B2."):
+            issues.append("B1 does not run the command of A1 with its checks and its stops")
+        earlier = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEFuRWFybGllck1hY2hpbmVBdFRoaXNBZGRyZXNzMDE"
+        shells = [login_sh for login_sh in ("/bin/bash", "/bin/dash") if os.access(login_sh, os.X_OK)]
+        for login_sh, kept in itertools.product(shells, ("no key", "the key of an earlier machine", "its key")):
+            server = StandInServer()
+            self.addCleanup(server.remove)
+            server.readable()
+            server.known.write_text({"no key": "", "its key": f"{server.PUBLIC} {server.HOSTKEY}\n",
+                                     "the key of an earlier machine": f"{server.PUBLIC} {earlier}\n"}[kept])
+            before = server.known_keys()
+            case = f"A1 over ssh with {login_sh}, where the agent's SSH keeps {kept} for the owner's address"
+            with server.opened():
+                ran = server.run(read, login_sh=login_sh)
+                if kept == "the key of an earlier machine":
+                    if (ran.status != 255 or "REMOTE HOST IDENTIFICATION HAS CHANGED" not in ran.err
+                            or ran.logged("ssh sends") or server.known_keys() != before):
+                        issues.append(f"{case}, ended with {ran.status}, sent {ran.logged('ssh sends')}, and SSH keeps "
+                                      f"{server.known_keys()}: {ran.err.strip()[-200:]!r}")
+                    continue
+                reading = f"root\n0\n{''.join(server.OS_RELEASE.splitlines(True)[:2])}{server.tools}/systemctl\n"
+                if (ran.status or ran.errors() or ran.out != reading or len(ran.logged("ssh sends")) != 1
+                        or server.known_keys() != [f"{server.PUBLIC} {server.HOSTKEY}"]):
+                    issues.append(f"{case}, ended with {ran.status}, printed {ran.out!r} and "
+                                  f"{ran.err.strip()[-200:]!r}, and SSH keeps {server.known_keys()}")
+                for step in ("A2", "B2"):
+                    went = server.run(lines[step][0], login_sh=login_sh)
+                    if went.status or went.errors() or len(went.logged("ssh sends")) != 1:
+                        issues.append(f"{case}: the first line of {step} after it ended with {went.status}: "
+                                      f"{went.err.strip()[-200:]!r}")
         self.assertNoIssues(issues)
 
     def test_the_walk_knows_every_ssh_line_of_the_prompt(self):

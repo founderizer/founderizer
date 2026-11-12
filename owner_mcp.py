@@ -141,11 +141,12 @@ TAILNET = ipaddress.ip_network("100.64.0.0/10")         # the addresses of a Tai
 SSH_KEYS = "/etc/ssh/ssh_host_*_key.pub"
 # This server's own known_hosts file: the keys of the SSH server of each server whose address on the fleet's private
 # network this server found (`join_network`). A root step reads them on that server over the owner's own SSH to the
-# address that the owner gave, which the owner's own known_hosts knows. The owner's known_hosts does not know the
-# private address, and SSH in BatchMode refuses a server whose key it does not know. So SSH to such an address checks
-# the server against this file, and against nothing else (`ssh`). Each line is "<host>@<address> <type> <key>", and
-# "port=<port>" when the server's SSH said its port: <host> is the address that the owner gave. SSH looks up the keys
-# by that whole name (HostKeyAlias), so the keys that one server gave count only for the commands of its own host.
+# address that the owner gave, whose key the owner's own known_hosts knows, or keeps from the first SSH there (`ssh`).
+# The owner's known_hosts does not know the private address, and SSH in BatchMode refuses a server whose key it does
+# not know. So SSH to such an address checks the server against this file, and against nothing else (`ssh`). Each line
+# is "<host>@<address> <type> <key>", and "port=<port>" when the server's SSH said its port: <host> is the address
+# that the owner gave. SSH looks up the keys by that whole name (HostKeyAlias), so the keys that one server gave count
+# only for the commands of its own host.
 KNOWN_HOSTS = HOME / "known_hosts"
 # A line of a public key of an SSH server, as `cat` prints it: its type, its key, and a comment.
 KEY_LINE = re.compile(r"(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com|"
@@ -797,7 +798,15 @@ def ssh(host, user, remote, stdin=None, timeout=120, late="", lost=False, via=No
     directly, with no jump host and no proxy command, because the private network is this Mac's own network, and on
     the port that the server's SSH listens on, when the network step read it. Such a command, and a command whose
     `host` is a private address that this server found, check the server against the keys that the network step read
-    (KNOWN_HOSTS, `kept`), and against nothing else."""
+    (KNOWN_HOSTS, `kept`), and against nothing else.
+
+    Each other command checks the server at `host` against the owner's own known_hosts, and keeps the key of a server
+    that SSH does not know yet at the first connection (StrictHostKeyChecking=accept-new), as the Mac app's install
+    does on each SSH (`InstallPlan.arguments`) and as INSTALL-PROMPT.md A1 does. SSH writes that key into the owner's
+    own known_hosts, and it refuses a key that changed later (`key_changed`). Until 12 November 2026 SSH in BatchMode
+    refused each new server with "Host key verification failed.", so install_hub and add_machine stopped at their
+    first read, and the agent could give the owner only that error. A command with `via` whose keys this server does
+    not keep gets no such option: the network step read no keys there, and its caller says so."""
     next_step(f"the command on {host}")
     where = f"{host} at {via}" if via else host
     line = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30"]
@@ -807,6 +816,8 @@ def ssh(host, user, remote, stdin=None, timeout=120, late="", lost=False, via=No
     if found:
         line += ["-o", f"HostKeyAlias={found[0]}", "-o", f'UserKnownHostsFile="{KNOWN_HOSTS}"',
                  "-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no"] + (["-p", found[1]] if found[1] else [])
+    elif not via:
+        line += ["-o", "StrictHostKeyChecking=accept-new"]
     line += [f"{user}@{host}", remote]
     try:
         done = subprocess.run(line, stdin=stdin or subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
@@ -936,16 +947,27 @@ def ssh_failed(host, user, said, tried):
     address that it tried. When SSH got no connection and tried no other address, the words also say what can be the
     cause: for an address on the private network, that this Mac is not on that network; for another host, the
     firewall of the install, when this server knows no private address of `host`."""
-    hint = ""
+    hint = key_changed(host, said["error"])
     if not tried and CONNECT_FAILED in said["error"]:
         hint = (f" {host} is an address on the fleet's private network: check that this Mac is on that network. "
                 f"`tailscale ip -4` on this Mac gives its address." if on_tailnet(host) else
                 f" If an install turned on the firewall of {host}, SSH comes in over the fleet's private network only, "
-                f"and this server knows no address of {host} there. The owner can give that address as the host, "
-                f"when the owner's own SSH knows the key of the server at that address.")
+                f"and this server knows no address of {host} there. The owner can give that address as the host.")
     return Refused(f"SSH to {user}@{host} failed, as it came: {said['error'] or 'no output'}.{tried}{hint} Nothing on "
                    f"{host} was changed. Do not try another user, another port or another key: give the owner this "
                    f"error.")
+
+
+def key_changed(host, error):
+    """The words for SSH's refusal of a key that is not the key that the owner's own known_hosts keeps for `host`, or
+    "" for another error. The first SSH to a host keeps the key that the server gives (`ssh`), so this refusal names a
+    key that changed: usually the key of an earlier machine that had the same address. The owner removes that key, and
+    the agent does not, as INSTALL-PROMPT.md A1 says and as the Mac app says (`ServerCheck.hostKeyChanged`)."""
+    if "IDENTIFICATION HAS CHANGED" not in error and "Host key verification failed" not in error:
+        return ""
+    return (f" SSH on this Mac keeps another key for {host}, usually the key of an earlier machine that had the same "
+            f"address. The owner removes that key, with `ssh-keygen -R {host}` on this Mac, when they know that this "
+            f"server is the one that they mean. Do not remove it yourself.")
 
 
 def sudo_prefix(reading):
@@ -1083,10 +1105,11 @@ def join_network(host, user, root, key_path, via=None, tool="add_machine", stopp
     again, unless it has --reset, so without it each new try fails in the same way. The step runs only on a server
     that is not on the network, so the settings that --reset removes do not work there now.
 
-    The read of the network also gives the public keys of the server's SSH, over the owner's own SSH to `host`, which
-    the owner's known_hosts knows. This server keeps them for the server's address on the private network (`pin`), so
-    that SSH can reach the server there in BatchMode too. The firewall of the install and of the join lets SSH in over
-    that network only. A session that is already open keeps going (hubsetup.py firewall_script), so the join runs on
+    The read of the network also gives the public keys of the server's SSH, over the owner's own SSH to `host`, whose
+    key the owner's known_hosts knows or kept at the first read (`ssh`). This server keeps them for the server's
+    address on the private network (`pin`), so that SSH can reach the server there in BatchMode too. The firewall of
+    the install and of the join lets SSH in over that network only. A session that is already open keeps going
+    (hubsetup.py firewall_script), so the join runs on
     its own SSH connection to `host` (B3), and its output comes back. install_hub sends each command after this step to
     that address (`first_read`). B2 tells the agent to reach the server at the new address after this step. add_machine
     does not, because `host` can be a name in the owner's SSH configuration, with its own port, user and key.
@@ -1409,8 +1432,9 @@ def add_machine(args):
             key_path = key_file(args)
         reading = ssh(host, user, "id -un; id -u; uname -s", late="No join line was made.")
         if reading["exit"] != 0:
-            raise Refused(f"SSH to {user}@{host} failed, as it came: {reading['error'] or 'no output'}. No join line "
-                          f"was made. Do not try another user, another port or another key: give the owner this error.")
+            raise Refused(f"SSH to {user}@{host} failed, as it came: {reading['error'] or 'no output'}."
+                          f"{key_changed(host, reading['error'])} No join line was made. Do not try another user, "
+                          f"another port or another key: give the owner this error.")
         system = "".join(reading["out"].splitlines()[2:3]).strip()
         if system and (system == "Darwin") != mac:
             raise Refused(f"{host} is {'a Mac' if system == 'Darwin' else 'not a Mac'} (uname -s says {system}), and "

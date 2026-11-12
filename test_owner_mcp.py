@@ -2359,6 +2359,84 @@ exec /bin/cat "$FILES/install.log"
                     issues.append(f"{why}: the command to {place} is {line!r}: {wrong}")
         self.assertNoIssues(issues)
 
+    def test_the_first_ssh_keeps_the_key_of_a_new_server_and_a_changed_key_stops_with_the_owners_step(self):
+        """**The first read of install_hub, install_log and add_machine works for a new server whose key the owner's
+        SSH has never seen, and a key that changed still stops it, with words that say what the owner does.** SSH in
+        BatchMode refuses a server whose key it does not know: "Host key verification failed.", with status 255. Until
+        12 November 2026 `ssh` gave SSH no value of StrictHostKeyChecking at the address that the owner gave. So
+        install_hub and add_machine stopped at their first read on each new server, and the agent could give the
+        owner only SSH's error. Now SSH keeps the key that the server gives at the first connection (accept-new), in
+        the owner's own known_hosts, as the Mac app's install and INSTALL-PROMPT.md A1 do. `run` plays SSH's check as
+        OpenSSH does it with the first value of StrictHostKeyChecking that it gets: against the owner's known_hosts (a
+        file of this test), or against the file that UserKnownHostsFile names, under the name of HostKeyAlias. A key
+        that it keeps goes on, another key stops it, and an unknown key goes on only with accept-new, which keeps it.
+        A command to the private address with the keys that the network step kept still checks them strictly."""
+        folder = pathlib.Path(tempfile.mkdtemp(prefix="fleet-owner-known-hosts-"))
+        self.addCleanup(shutil.rmtree, str(folder), True)
+        owner, key, sent = folder / "known_hosts", " ".join(self.HOST_KEY.split()[:2]), []
+        owner.write_text("")                                        # the owner's SSH has never seen a server
+        earlier = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEFuRWFybGllck1hY2hpbmVBdFRoaXNBZGRyZXNzMDE"
+        changed = ("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+                   "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n"
+                   "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+                   "Host key verification failed.\n")
+
+        def run(line, stdin=None, capture_output=False, text=False, timeout=None):
+            options, at = {}, 1
+            while line[at].startswith("-"):
+                if line[at] == "-o":
+                    name, _, value = line[at + 1].partition("=")
+                    options.setdefault(name.lower(), value)         # as in ssh, the first value of an option counts
+                at += 2
+            known = pathlib.Path(options.get("userknownhostsfile", str(owner)).strip('"'))
+            name = options.get("hostkeyalias", options.get("hostname", line[at].partition("@")[2]))
+            sent.append((name, options.get("stricthostkeychecking", "ask")))
+            keys = [" ".join(entry.split()[1:3]) for entry in (known.read_text().splitlines() if known.exists() else [])
+                    if entry.split()[:1] == [name]]
+            if keys and key not in keys:
+                return subprocess.CompletedProcess(line, 255, "", changed)
+            if not keys and sent[-1][1] != "accept-new":
+                return subprocess.CompletedProcess(line, 255, "", "Host key verification failed.\n")
+            if not keys:
+                with open(known, "a") as kept:
+                    kept.write(f"{name} {key}\n")
+            return subprocess.CompletedProcess(line, 0, "root\n0\nLinux\n", "" if keys else (
+                f"Warning: Permanently added '{name}' (ED25519) to the list of known hosts.\n"))
+
+        played = types.SimpleNamespace(run=run, DEVNULL=subprocess.DEVNULL, TimeoutExpired=subprocess.TimeoutExpired)
+        issues, private = [], "100.101.102.103"
+        with patch.object(owner_mcp, "subprocess", played):
+            for read in ("the first read of a new server", "the read after it"):
+                _via, said, _tried = owner_mcp.first_read(self.HOST, "root", "id -un; id -u", "late")
+                if (said["exit"], sent[-1], owner.read_text().splitlines()) != (
+                        0, (self.HOST, "accept-new"), [f"{self.HOST} {key}"]):
+                    issues.append(f"{read} ended with {said['exit']} ({said['error']!r}), SSH got {sent[-1]}, and the "
+                                  f"owner's known_hosts holds {owner.read_text().splitlines()}")
+            owner.write_text(f"{self.HOST} {earlier}\n")
+            _via, said, tried = owner_mcp.first_read(self.HOST, "root", "id -un; id -u", "late")
+            words = str(owner_mcp.ssh_failed(self.HOST, "root", said, tried))
+            try:
+                owner_mcp.add_machine({"kind": "linux", "host": self.HOST, "ssh_user": "root"})
+                joined = "no refusal"
+            except owner_mcp.Refused as refused:
+                joined = str(refused)
+            for tool, said_words in (("install_hub", words), ("add_machine", joined)):
+                if (f"`ssh-keygen -R {self.HOST}`" not in said_words or "Do not remove it yourself" not in said_words
+                        or "REMOTE HOST IDENTIFICATION HAS CHANGED" not in said_words):
+                    issues.append(f"{tool}, where the owner's known_hosts keeps the key of an earlier machine for the "
+                                  f"address, said: {said_words}")
+            if said["exit"] != 255 or owner.read_text() != f"{self.HOST} {earlier}\n":
+                issues.append(f"the read where the owner's known_hosts keeps the key of an earlier machine ended with "
+                              f"{said['exit']}, and the owner's known_hosts holds {owner.read_text().splitlines()}")
+            owner_mcp.pin(self.HOST, private, f"{self.HOST_KEY}\n{private}\n")
+            pinned = owner_mcp.KNOWN_HOSTS.read_text()
+            said = owner_mcp.ssh(self.HOST, "root", "id -u", via=private)
+            if (said["exit"], sent[-1], owner_mcp.KNOWN_HOSTS.read_text()) != (
+                    0, (f"{self.HOST}@{private}", "yes"), pinned):
+                issues.append(f"the command to the private address ended with {said['exit']} ({said['error']!r}), "
+                              f"and SSH got {sent[-1]}")
+        self.assertNoIssues(issues)
+
     def test_the_keys_that_a_server_gives_count_for_its_own_host_and_change_no_other(self):
         """**`pin` keeps only lines of keys, under "<host>@<address>", and it changes no line of another host.** A
         server that a hostile owner of it controls can say that it has the hub's address, and print lines of

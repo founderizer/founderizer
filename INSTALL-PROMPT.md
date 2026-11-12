@@ -113,7 +113,14 @@ there: `HOST` changes once, and only at the step that says so.
 
 ### A1. Read the server
 
-    ssh -o BatchMode=yes "$SSHUSER@$HOST" 'id -un; id -u; sed -n "1,2p" /etc/os-release; command -v systemctl'
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$SSHUSER@$HOST" 'id -un; id -u; sed -n "1,2p" /etc/os-release; command -v systemctl'
+
+The server has a key of its own. When the server is new, SSH on this machine does not know that key
+yet. In BatchMode, and when it cannot ask on a terminal, SSH refuses a server whose key it does not
+know. So this first SSH keeps the key that the server gives, in the `known_hosts` file of this
+machine, and the steps after this one find it. This is what SSH does when a person answers `yes` at
+a first connection. SSH can say that it added the address to the list of known hosts: that is
+correct. SSH still refuses a key that is not the key that it keeps for this address.
 
 Check: the system is Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, and `systemctl` has a path.
 If the system is another one, or there is no `systemctl`, stop: this install needs one of those
@@ -127,7 +134,11 @@ change them. If `sudo` says that it needs a password, or refuses, stop and give 
 as they came.
 
 If SSH itself fails, stop and give the owner the error as it came. Do not try another user, another
-port or another key.
+port or another key. If its words are `REMOTE HOST IDENTIFICATION HAS CHANGED` or `Host key
+verification failed.`, SSH on this machine keeps another key for this address, usually the key of
+an earlier machine that had the same address. Tell the owner so. The owner removes that key, with
+`ssh-keygen -R <the address>`, when they know that this server is the one that they install. Do
+not remove it yourself. When they say that they removed it, run A1 again.
 
 ### A2. Put the server on the fleet's private network
 
@@ -267,8 +278,9 @@ prompt; otherwise give it to the owner and stop.
 
 ### B1. Read the server
 
-The command of A1, with the same checks and the same stops. If `id -u` is not `0`, put
-`sudo -n -i -- ` in front of the remote command of every later step, as A1 says.
+The command of A1, with the same checks and the same stops. As in A1, it keeps the key of a new
+server. If `id -u` is not `0`, put `sudo -n -i -- ` in front of the remote command of every later
+step, as A1 says.
 
 ### B2. Put the server on the fleet's private network
 
@@ -360,8 +372,10 @@ last step of both jobs is `verify`. Its `PromptThroughSudo` runs each later step
 for `sudo -i`, for root and for a user who is not root, and fails when a part of a step does not run
 as root. It also runs the first lines of A2, A3 and B2 on a stand-in server whose first updates
 hold apt's lock, and fails when a line does not wait for it. The first line of A2 and of B2 must
-also try Tailscale's installer again when the server's own updates got in its way. The steps after
-A2 and B2 go to the server's new address, with an `ssh` that knows the server's key only at the
-address that the owner gave, and that refuses an unknown key in BatchMode and with no terminal, as
-OpenSSH does: the check of A2 and of B2 must keep the server's key at the new address, and it must
-still refuse a key that changed.
+also try Tailscale's installer again when the server's own updates got in its way. Its `ssh`
+refuses an unknown key in BatchMode and with no terminal, as OpenSSH does. A1 meets a new server
+that this `ssh` has never seen: A1 must keep the server's key at the address that the owner gave,
+the steps after it must find that key, and A1 must still refuse a key that changed. The steps after
+A2 and B2 go to the server's new address, where this `ssh` does not know the server's key: the
+check of A2 and of B2 must keep the server's key at the new address, and it must still refuse a key
+that changed.

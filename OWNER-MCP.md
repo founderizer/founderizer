@@ -34,16 +34,19 @@ local server:
 The install's firewall lets SSH in over the fleet's private network only. So `install_hub` puts the
 server on that network itself, before the install starts, and keeps the public keys of the server's
 SSH, and the port of its SSH, in `~/.founderizer/known_hosts`, for its address on that network. It
-reads them over the owner's own SSH to the address that the owner gave, which the owner's own
-`known_hosts` knows. The first read of `install_hub` and `install_log` goes to the address that the
+reads them over the owner's own SSH to the address that the owner gave. The owner's own
+`known_hosts` knows the key of that address, or the first SSH there keeps the key that the server
+gives (`StrictHostKeyChecking=accept-new`), as the Mac app's install does: then SSH refuses a key
+that changed. The first read of `install_hub` and `install_log` goes to the address that the
 owner gave; when SSH gets no connection there, the read and the later steps go to the private
 address, and SSH checks the server there against those keys only. In BatchMode, SSH refuses a server
 whose key it does not know, and the owner's `known_hosts` does not know the private address. Each
 line has the name `<host>@<address>`, so the keys that one server gave count for the commands of its
 own host. They count for a command whose host is that private address itself only when each host
 that found the address gave the same keys and port, because a server can say that it has the
-address of another server. That file is no credential either, and the owner's own
-`~/.ssh/known_hosts` does not change.
+address of another server. That file is no credential either. The owner's own
+`~/.ssh/known_hosts` changes only at the first SSH to an address that it does not know: then SSH
+adds the key of that address.
 
 The server runs the code of that folder, as it was when the agent's session started it. So a tool that a later
 release adds reaches the agent only when the folder holds that release and a new session starts.
