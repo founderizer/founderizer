@@ -747,7 +747,7 @@ def kept_user_settings():
 
 # Claude Code's prompt suggestions, off in every session that Fleet starts (5 November 2026). From 2.1.318 a finished
 # turn puts a suggested next message into the empty input box, dim, and capture-pane gives no dim: so the screen watch
-# read "❯ The GitHub App installation now shows Actions and Workflows" in ac-lead's owner chat as a line not taken,
+# read "❯ The GitHub App installation now shows Actions and Workflows" in an agent's owner chat as a line not taken,
 # never as its empty input line, and each suggestion is one more model call on the account. 2.1.308 to 2.1.318 all
 # read this setting ("When false, prompt suggestions are disabled").
 NO_SUGGESTION = {"promptSuggestionEnabled": False}
@@ -7072,7 +7072,7 @@ def cmd_check(args):
             stored = TEAM.get("settings")
             track = " --track early" if isinstance(stored, dict) and stored.get("releases.early") is True else ""
             catch_up = ("Fleet Vault's updater puts the newer vault in place within the hour; a Mac without it, as "
-                        f"root: python3 app/Vault/install.py --updater-only --fleet <fleet id>{track} "
+                        f"root: python3 Vault/install.py --updater-only --fleet <fleet id>{track} "
                         "(WORKER-INSTALL.md, \"Vault broker (macOS)\")" if sys.platform == "darwin" else
                         "as root: /usr/local/sbin/fleet-vault-program (WORKER-INSTALL.md, \"When a release "
                         "changes vault.py\")")

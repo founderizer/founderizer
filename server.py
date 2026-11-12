@@ -722,11 +722,11 @@ class Service:
         self.post(job, "done", "user" if user else "files", f"{shown_name(agent)} is removed from {self.name}.")
 
     def own_files(self, agent):
-        """The files of one agent in this service's own home, each by its whole name, so that removing `ac` leaves the
-        files of `ac-lead`: its checkout (only one that this service made), its helper's files in ~/.fleet as fleet.py
-        names them (its key, its usage reading, its chat and manager records and locks, its log, its checkout's
-        mark), its session credentials, an onboarding record, and the transcripts that Claude Code keeps for its
-        checkout."""
+        """The files of one agent in this service's own home, each by its whole name, so that removing `scout` leaves
+        the files of `scout-two`: its checkout (only one that this service made), its helper's files in ~/.fleet as
+        fleet.py names them (its key, its usage reading, its chat and manager records and locks, its log, its
+        checkout's mark), its session credentials, an onboarding record, and the transcripts that Claude Code keeps
+        for its checkout."""
         fleet, folder = os.path.join(self.home, ".fleet"), os.path.join(self.home, f"fleet-{agent}")
         real = os.path.realpath(folder)
         paths = [os.path.join(fleet, name) for name in (

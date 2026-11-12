@@ -9072,12 +9072,12 @@ def t_door_hold(agent, a):
     """door_hold (the manager, new-projects plan N8 (b)): team.json door.holds[host]. parts: the app puts no door parts
     on the server, and nobody gets it through the door. rule-only: it gets its parts and its Operator, and the door's
     file holds it as rule-only, so only rule calls run there, none of an agent's own calls. none ends the hold. The
-    coordinator's word of 6 November 2026: hel1-1 waits for plan 2.23, and five servers stay rule-only for 2.14 to
+    coordinator's word of 6 November 2026: one server waits for plan 2.23, and five servers stay rule-only for 2.14 to
     2.17. judged is the old name of rule-only (DOOR_HOLD_NAMES)."""
     host = str(a.get("host") or "").strip().lower()
     hold = DOOR_HOLD_NAMES.get(a.get("hold"), a.get("hold"))
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", host):
-        raise ToolError("host is the server's name, as Tailscale gives it, for example hel1-1.")
+        raise ToolError("host is the server's name, as Tailscale gives it, for example app-1.")
     if hold not in DOOR_HOLDS + ("none",):
         raise ToolError("hold is parts (no door parts and no grant), rule-only (its parts, and only rule calls there) "
                         "or none (the hold ends).")
@@ -17916,7 +17916,7 @@ def agent_old_names():
 
 def duty_old_names(text, renames=None):
     """(old, new) for each agent that a duty's words name by a name it no longer has. A rename moves every record of
-    an agent and leaves words as they were written, so a duty that routes its work to "ac-lead" goes on naming an
+    an agent and leaves words as they were written, so a duty that routes its work to "dev-lead" goes on naming an
     agent that is gone (3 November 2026: ten agents took new names). A name inside another, such as the OS user
     fleet-<name> that a renamed agent keeps, is not the agent."""
     return [(old, new) for old, new in (agent_old_names() if renames is None else renames)
@@ -31656,7 +31656,7 @@ def save_access(body):
     hub's own machine, with the user the hub installer was given; the join of a server, which writes `root` because
     the join line ran as root, and only when that line reported a Linux SSH port; and `onboard.register_in_kit` on
     the owner's Mac. So a machine that already existed could not be corrected, a Mac that joined got no entry at
-    all, and nothing could take an entry out. The Studio, which the owner reaches as `fab` every day, stood in the
+    all, and nothing could take an entry out. The Studio, which the owner reaches over SSH every day, stood in the
     fleet's own record with `ssh: null` and `no_ssh` against it: reachable in fact and unreachable on paper. The
     owner, 19 October 2026:
     "ssh works for the studio from here, so please make sure you fix it -- make sure we get this right for future

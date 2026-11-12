@@ -261,11 +261,11 @@ signed vault of the release channel's newest Mac build of the fleet's track (see
 below), checks it against our Developer ID, and runs the `install.py` that the vault carries
 as root, named after the Mac, with the fleet's own store. macOS asks for the Mac user's
 password once, at that step. A Mac that joined before then, or one whose step failed, gets
-it from the join line run again, or by hand from the app repository (`miguelpieras/agents`),
-with the signed build:
+it from the join line run again, or by hand from a clone of the app repository
+(`founderizer/founderizer-apps`), with the signed build:
 
 ```sh
-sudo python3 app/Vault/install.py --app "<build>/Fleet Vault.app" --user <mac user> --agent <agent> --hub http://100.80.1.2:8765 --store --fleet <fleet id>
+sudo python3 Vault/install.py --app "<build>/Fleet Vault.app" --user <mac user> --agent <agent> --hub http://100.80.1.2:8765 --store --fleet <fleet id>
 ```
 
 **It updates itself.** The install also puts the vault's updater there: the root daemon
@@ -278,7 +278,7 @@ beside it. A Mac whose vault was installed before the updater gets it alone, wit
 change to the app or its configuration:
 
 ```sh
-sudo python3 app/Vault/install.py --updater-only --fleet <fleet id>
+sudo python3 Vault/install.py --updater-only --fleet <fleet id>
 ```
 
 **The track.** The updater reads the fleet's track from the root-owned `update.json` beside
