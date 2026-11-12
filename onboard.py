@@ -67,6 +67,50 @@ TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"      # th
 # Both at least 7 days old on 10 October 2026. A Codex version stays until someone installs another one. The Claude
 # version is only the first build: Claude Code's own installation updates itself (see CLAUDE_CHANNEL).
 RUNTIME_PINS = {"codex": "0.160.0", "claude": "2.1.287"}
+# The programs that the fleet downloads by itself, each at one version and never at its vendor's newest (the AI
+# providers build spec, section 3.9). For each Linux platform: the addresses of its file, in the order to try them; the
+# SHA-512 of that file as it is downloaded; and `member`, the program's path in a .tgz, or None for a file that is the
+# program. `python3 pins.py <name> <version>` makes an entry. It takes only a version that npm published at least
+# lifecycle.NPM_DAYS days before, it holds each file of npm to npm's own digest, and it holds Grok Build's files, which
+# come from the vendor's own store, to the copy that npm holds of them. These two are of 12 November 2026. At OpenCode
+# 2.2.5 the program of linux-x64-baseline is byte for byte the program of linux-x64. No code reads this before step 1
+# of that spec.
+PINNED = {
+    "grok": {"version": "1.0.77", "published": "2026-11-05", "bin": "grok", "files": {
+        "linux-x64": {
+            "urls": [
+                "https://x.ai/cli/grok-1.0.77-linux-x86_64",
+                "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-1.0.77-linux-x86_64"],
+            "sha512": ("05a5285e23d2a8276c4f89b1399c1d515527349af64fd4fc01f93e38787ff8f9"
+                       "5726d015ef9c44709cd6cc4fc138a8a536ba2a5aa5ab0e02c981da958fde0254"),
+            "member": None},
+        "linux-arm64": {
+            "urls": [
+                "https://x.ai/cli/grok-1.0.77-linux-aarch64",
+                "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-1.0.77-linux-aarch64"],
+            "sha512": ("8ade765c405e9f47c481686018c5e0b35666170cc3ce54f77d43e615d5fc711e"
+                       "f05fd3b3eb38007eb301f0ec710d8eb27e2c80234618f8cca7c47dd7c4abb78c"),
+            "member": None}}},
+    "opencode": {"version": "2.2.5", "published": "2026-10-30", "bin": "opencode", "files": {
+        "linux-x64": {
+            "urls": [
+                "https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-2.2.5.tgz"],
+            "sha512": ("0641c07d3a8db20feaa61c8736b9c7f831a43b166c1a36a63693390efc2812fc"
+                       "fb6403cdc3c9846cc5c64c20ce007fbffb8d04a9e89ee8a359059650c0f0a368"),
+            "member": "package/bin/opencode"},
+        "linux-x64-baseline": {
+            "urls": [
+                "https://registry.npmjs.org/@opencode/cli-linux-x64-baseline/-/cli-linux-x64-baseline-2.2.5.tgz"],
+            "sha512": ("a0f393f84326773e7a1e74853d157067441354be5d79f84e69c9f0cdaceed173"
+                       "ae09652d10a87c89c227df6dd27422eda99b738ee5359adea9dbfd7757ddd65a"),
+            "member": "package/bin/opencode"},
+        "linux-arm64": {
+            "urls": [
+                "https://registry.npmjs.org/@opencode/cli-linux-arm64/-/cli-linux-arm64-2.2.5.tgz"],
+            "sha512": ("3b8a8ecbf5916109a10a5301ff9a816a861fcda0cad7e3c945039f53cd22c728"
+                       "f9aee41b0b1ada1fe556d94c876fa4563a552fe357de73e8ac77ad8bbc2bb0b8"),
+            "member": "package/bin/opencode"}}},
+}
 SECRET_MAX_BYTES = 2048
 SUPPORTED_OS = {("ubuntu", "22.04"), ("ubuntu", "24.04"), ("ubuntu", "26.04"), ("debian", "12"), ("debian", "13")}
 PACKAGES = "git tmux python3 curl ca-certificates ufw unattended-upgrades"
