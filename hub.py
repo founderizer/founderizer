@@ -34725,12 +34725,51 @@ def join_input(data):
     return {"code": code, "key_sha256": key, "kind": kind, "user": user, "ssh_port": port}
 
 
+# The name of the hub's own repository, as its git service serves it. hub.sh gives the repository and the hub's
+# checkout one name (repo_name): `founderizer` on a new hub, `fleet-pilot` on each hub made before that name. A hub
+# reads the name from where it runs and holds no constant of it, so a hub made before answers its old name, and no
+# machine of its fleet changes. The old name is what a hub answers when it cannot read its own.
+OLD_REPOSITORY = "fleet-pilot.git"
+_SERVED = {}
+
+
+def served_repository():
+    """The path under which the git service of this hub (fleet.py service git) serves its repository: the origin of
+    the hub's checkout, a bare repository in the home folder of the hub's user, as hub.sh makes it, which is that
+    service's base path. A link to the repository serves under its own name, so the path is not resolved.
+    OLD_REPOSITORY when the origin is no such folder (another place, or a folder deeper in that home), as on a hub
+    that runs from a copy for a test: then the hub answers what every hub answered before. Read again when the
+    checkout's git configuration changes (a new origin), and else from memory: GET /ui/state reads it."""
+    kit = kit_dir()
+    try:
+        stamp = os.stat(os.path.join(kit, ".git", "config")).st_mtime_ns
+    except OSError:
+        stamp = None
+    known = _SERVED.get(kit)
+    if known and known[0] == stamp:
+        return known[1]
+    code, url, _ = git_kit("remote", "get-url", "origin", folder=kit)
+    name, home = OLD_REPOSITORY, os.path.expanduser("~")
+    if code == 0 and os.path.isabs(url) and os.path.isdir(url):
+        inside = os.path.relpath(os.path.abspath(url), home)
+        if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,199}\.git", inside):
+            name = inside           # one folder of that home: never .., and nothing a URL path reads in another way
+    _SERVED[kit] = (stamp, name)
+    return name
+
+
+def repo_address(ip=None):
+    """The address from which each machine of this fleet clones and fetches the hub's repository (join.sh, onboard.py,
+    hub.sh): git:// on the hub's private address, with the path of served_repository()."""
+    return f"git://{ip or hub_address()[0]}/{served_repository()}"
+
+
 def join_answer(name, row=None):
     """extension: the runtime of a Mac's sitting works in Chrome, so Chrome gets the file that offers its extension
     (server.py, join). reboot_time: the restart time that team.json keeps for this server, or None; join.sh installs
     the fleet patch policy with it."""
     ip, port = hub_address()
-    return {"server": name, "hub": f"http://{ip}:{port}", "repo": f"git://{ip}/fleet-pilot.git",
+    return {"server": name, "hub": f"http://{ip}:{port}", "repo": repo_address(ip),
             "extension": row is None or "browser" in RUNTIME_CAN.get(row["runtime"], {"browser"}),
             "reboot_time": ((TEAM.get("servers") or {}).get(name) or {}).get("reboot_time")}
 
@@ -42458,13 +42497,14 @@ class Handler(BaseHTTPRequestHandler):
         if not self.ui_allowed():
             return
         plain_rows = {}
+        repository = repo_address()     # before LOCK: its first reading asks git
         with state_moment() as (token, at):
             # The rows, the token and the team of one moment (state_moment): LOCK is held for that moment only. A write
             # after it is not in this answer, and it moves the token past this answer's (live_changes).
             result = {"schema_version": 1, "db": kv_get("db_id"), "time": at, "token": token,
                       "manager_flag": kv_get("mgr_flag"),
                       "manager_warning": manager_warning(),
-                      "ui_features": ui_features()}
+                      "ui_features": ui_features(), "repository": repository}
             for table, key in (("tasks", "tasks"), ("notes", "notes"),
                                ("prompts", "permissions"), ("holds", "holds"), ("outcomes", "outcomes")):
                 plain_rows[key] = q(f"SELECT * FROM {table} ORDER BY id")
@@ -42810,7 +42850,7 @@ class Handler(BaseHTTPRequestHandler):
         if data is None:
             return self.send(404, "This hub has no join script.\n", "text/plain; charset=utf-8")
         text = data.decode().replace("__FLEET_HUB__", f"http://{ip}:{port}").replace(
-            "__FLEET_REPO__", f"git://{ip}/fleet-pilot.git").replace(
+            "__FLEET_REPO__", repo_address(ip)).replace(
             "__FLEET_ID__", kv_get("fleet_id") or "").replace("__FLEET_CHANNEL__", release_channel().rstrip("/"))
         text = text.replace("__FLEET_TRACK__", "early" if setting("releases.early") else "approved")
         return self.send(200, text, "text/plain; charset=utf-8", {"Cache-Control": "no-store"})

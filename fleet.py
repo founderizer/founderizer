@@ -7367,6 +7367,34 @@ def cmd_run(args):
             time.sleep(5)
 
 
+OLD_REPOSITORY = "fleet-pilot.git"     # the repository of every hub made before the name founderizer
+
+
+def served_repositories():
+    """The folders that the hub's git service (fleet-git) serves, on the hub's machine: the hub's own repository, which
+    is the origin of this checkout, and each other name in the same home folder that leads to the same repository
+    (a link, or the real folder of a link), so that the repository answers under each of its names. hub.sh gives it its
+    name, which this reads and does not hold: a hub made before the name founderizer serves fleet-pilot.git, a newer
+    one founderizer.git (hub.served_repository says which of them the hub gives its machines). A checkout whose origin
+    is no folder of this machine serves what every hub served before, when that folder is there."""
+    r = subprocess.run(["git", "-C", KIT, "remote", "get-url", "origin"], capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL)
+    origin, home = r.stdout.strip(), os.path.expanduser("~")
+    if r.returncode != 0 or not os.path.isabs(origin) or not os.path.isdir(origin):
+        if os.path.isdir(os.path.join(home, OLD_REPOSITORY)):
+            origin = os.path.join(home, OLD_REPOSITORY)
+        else:
+            die(f"the checkout {KIT} has no origin in a folder of this machine, so fleet-git has no repository to "
+                f"serve")
+    origin, real = os.path.abspath(origin), os.path.realpath(origin)
+    names = [origin]
+    for entry in sorted(os.listdir(home)):
+        path = os.path.join(home, entry)
+        if entry.endswith(".git") and path != origin and os.path.realpath(path) == real:
+            names.append(path)
+    return names
+
+
 def cmd_service(args):
     """Install only this pilot's service definitions; leave activation explicit."""
     path_env = os.pathsep.join([os.path.expanduser("~/.local/bin"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
@@ -7400,7 +7428,7 @@ def cmd_service(args):
     elif name == "git":     # fetch only: git:// has no authentication, so pushes go over SSH (PILOT.md "Pushes")
         host = TEAM["addresses"][TEAM["hub"]["machine"]]
         argv = [shutil.which("git"), "daemon", "--reuseaddr", f"--listen={host}", "--forbid-override=receive-pack",
-                "--base-path=" + os.path.expanduser("~"), os.path.expanduser("~/fleet-pilot.git")]
+                "--base-path=" + os.path.expanduser("~"), *served_repositories()]
     elif name == "channels":    # the chat apps bridge (CHAT-APPS.md): it reads the hub from team.json beside it
         argv = [sys.executable, os.path.join(KIT, "channels.py"), "run"]
     else:

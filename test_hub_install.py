@@ -3442,6 +3442,22 @@ class CheckMode(unittest.TestCase):
             self.assertIn(wanted, out, f"the plan does not mention {wanted}")
         self.assertEqual(sorted(p.relative_to(self.tmp).as_posix() for p in self.tmp.rglob("*")), before)
 
+    def test_roots_own_step_reads_the_hubs_checkout_under_its_real_name(self):
+        """kit-clone, which root runs on the hub's machine with no folder named (the app's central vault and TCP
+        steps), reads release.json in the hub's own checkout: founderizer on a new hub, fleet-pilot on a hub made
+        before. A link of the new name to the folder of before, as step 4 of the rename makes it, is not followed:
+        root reads the real folder."""
+        home = self.tmp / "home" / "fleet"
+        home.mkdir(parents=True)
+        self.assertEqual(hubsetup.hub_checkout(str(home)), str(home / "founderizer"))     # nothing there yet
+        (home / "fleet-pilot").mkdir()
+        self.assertEqual(hubsetup.hub_checkout(str(home)), str(home / "fleet-pilot"))
+        (home / "founderizer").symlink_to(home / "fleet-pilot")
+        self.assertEqual(hubsetup.hub_checkout(str(home)), str(home / "fleet-pilot"))
+        (home / "founderizer").unlink()
+        (home / "founderizer").mkdir()
+        self.assertEqual(hubsetup.hub_checkout(str(home)), str(home / "founderizer"))
+
     def test_the_plan_reads_the_system_it_is_given(self):
         self.assertIn("Ubuntu 24.04", self.run_check())
         for system, version in sorted(SYSTEMS):

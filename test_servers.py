@@ -1047,6 +1047,32 @@ class Servers(OwnerAPI):
         self.assertIn('TRACK="approved"', text)
         self.assertNotIn("__FLEET_", text)
 
+    def test_the_hub_names_the_repository_that_its_git_service_serves(self):
+        """hub.sh names the repository of a new hub founderizer.git, and a hub made before that name has
+        fleet-pilot.git. The join answer, the join script and GET /ui/state name the one that this hub serves: the
+        origin of its checkout, under the home folder of its user (hub.served_repository). The new name as a link to
+        the folder of before (step 4 of the rename) serves under the new name. An origin that is no such folder names
+        the repository of a hub of before, which is what this fixture's origin gives the other tests."""
+        with patch.dict(os.environ, {"HOME": str(self.root)}):
+            for served in ("founderizer.git", "fleet-pilot.git"):
+                git("clone", "-q", "--bare", str(self.root / "origin.git"), str(self.root / served))
+                git("remote", "set-url", "origin", str(self.root / served), cwd=self.kit)
+                self.assertEqual(hub.served_repository(), served)
+                self.assertIn(f'REPO="git://{HUB}/{served}"', self.text("/join")[1])
+                status, state = self.request(source=OWNER)
+                self.assertEqual((status, state["repository"]), (200, f"git://{HUB}/{served}"))
+            shutil.rmtree(self.root / "founderizer.git")
+            (self.root / "founderizer.git").symlink_to(self.root / "fleet-pilot.git")
+            git("remote", "set-url", "origin", str(self.root / "founderizer.git"), cwd=self.kit)
+            status, result = self.join(self.code()["code"])
+            self.assertEqual((status, result["repo"]), (200, f"git://{HUB}/founderizer.git"), result)
+            deeper = self.root / "repos" / "founderizer.git"     # a folder of that home, but not one in it
+            git("clone", "-q", "--bare", str(self.root / "origin.git"), str(deeper))
+            for origin in (str(self.root.parent), "git://elsewhere.example/founderizer.git", "/nowhere/founderizer.git",
+                           str(deeper), str(self.root / "kit")):
+                git("remote", "set-url", "origin", origin, cwd=self.kit)
+                self.assertEqual(hub.served_repository(), "fleet-pilot.git", origin)
+
     def test_the_join_script_of_an_early_fleet_names_the_early_track(self):
         """PRODUCT.md 4.3, "Two tracks": a Mac of a fleet whose setting releases.early is on takes its vault from the
         early track, as the hub takes its releases from it."""

@@ -196,6 +196,9 @@ CONNECT_UNIT = "/etc/systemd/system/founderizer-connect.service"
 CONNECT_TARGET = "http://127.0.0.1:8767"            # gate.LISTEN and gate.PORT: the one target that Funnel publishes
 CONNECT_HTTPS = 443                                 # the public port of the address
 CONNECT_SETTLE = 2                                  # seconds before the gate's service is read after its start
+# The names of the hub's own checkout in its user's home, as hub.sh gives them: founderizer on a new hub, fleet-pilot
+# on each hub made before that name. hub.sh holds the same two, and test_hub_install holds them equal.
+HUB_CHECKOUTS = ("founderizer", "fleet-pilot")
 PRIVATE = re.compile(r"100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.(?:[0-9]{1,3})\.(?:[0-9]{1,3})$")
 
 
@@ -1533,17 +1536,31 @@ def give_to_root(path):
         raise Stop(f"root's own clone could not be given to root: {(err or out).strip()[-200:]}")
 
 
+def hub_checkout(home):
+    """The hub's own checkout in the home folder of its user: the first name of HUB_CHECKOUTS that is a folder there,
+    and the first name when none is. A link is not taken: root reads that folder, and a link of the hub's user could
+    lead it to another one, so a hub with a link of the new name to its old folder is read in the old folder."""
+    for name in HUB_CHECKOUTS:
+        path = os.path.join(home, name)
+        try:
+            if stat.S_ISDIR(os.lstat(path).st_mode):
+                return path
+        except OSError:
+            pass
+    return os.path.join(home, HUB_CHECKOUTS[0])
+
+
 def kit_clone(hub_user="fleet", source=None, root_kit=None, checkout=None, git=None, own=None, keys=None):
     """As root on the hub's machine: root's own clone of the published repository at the revision of the hub's signed
     release.json (the section above). Returns {"revision", "version", "state": "made"|"moved"|"there"}.
 
-    checkout: the hub's own checkout, where release.json is read (default: the hub user's ~/fleet-pilot). source: the
+    checkout: the hub's own checkout, where release.json is read (default: hub_checkout of the hub user). source: the
     published repository (releases.DEFAULT_UPSTREAM); the signature names the commit, so it is the same commit from
     any source. git, own and keys are for the tests: git_root, the step that gives the clone to root, and the release
     keys a run trusts when it cannot read them from the clone itself."""
     git, root_kit = git or git_root, root_kit or ROOT_KIT
     source = source or releases.DEFAULT_UPSTREAM
-    checkout = checkout or os.path.join(hub_account(hub_user)["home"], "fleet-pilot")
+    checkout = checkout or hub_checkout(hub_account(hub_user)["home"])
     try:
         # The hub's user writes this folder: root reads a plain file of it, never a link or a pipe of that user's
         fd = os.open(os.path.join(checkout, RELEASE_FILE), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -3001,7 +3018,7 @@ def main(argv=None):
     ah = sub.add_parser("agent-helper")
     ah.add_argument("--user", default="fleet", help="the user that runs this machine's Founderizer services")
     ah.add_argument("--repo", help="the address of the fleet's configuration ref, which the vault helper fetches "
-                                   "the broker's program from, for example git://100.80.1.2/fleet-pilot.git")
+                                   "the broker's program from, for example git://100.80.1.2/founderizer.git")
     ah.add_argument("--check", action="store_true", help="say what it would write, change nothing")
     ah.set_defaults(fn=cmd_agent_helper)
     al = sub.add_parser("agent-list")

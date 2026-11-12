@@ -499,7 +499,8 @@ class SameBytes(StateCase):
         self.fill()
         keys = list(json.loads(self.state_bytes()))
         self.assertEqual(keys, ["schema_version", "db", "time", "token", "manager_flag", "manager_warning",
-                                "ui_features", "tasks", "notes", "permissions", "holds", "outcomes", "needs", "agents",
+                                "ui_features", "repository", "tasks", "notes", "permissions", "holds", "outcomes",
+                                "needs", "agents",
                                 "messages", "reports", "chat_apps", "goals", "responsibilities", "steers", "secrets",
                                 "knowledge"])
 

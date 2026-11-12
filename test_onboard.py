@@ -326,8 +326,12 @@ class FakeSystem:
 
     def http(self, method, url, body=None, headers=None):
         if url.endswith("/ui/state"):
-            return 200, {"db": "g1", "ui_features": self.features,
-                         "agents": [{"name": n, "last_seen": self.clock} for n in sorted(self.hub_agents)]}
+            named = getattr(self, "repository", None)       # what a hub since owner API 1.139 names
+            if named == 503:
+                return 503, {"error": "the hub restarts"}
+            return 200, dict({"db": "g1", "ui_features": self.features,
+                              "agents": [{"name": n, "last_seen": self.clock} for n in sorted(self.hub_agents)]},
+                             **({"repository": named} if named else {}))
         if "/ui/machines?db=" in url:
             return 200, {"db": "g1", "machines": [
                 {"agent": n, "machine": a["machine"], "address": self.team["addresses"].get(a["machine"]),
@@ -509,6 +513,22 @@ class FullRun(Base):
         subprocess.run(["git", "--git-dir", str(self.bare), "cat-file", "-e", "main:profiles/vps2.md"], check=True)
         self.assertEqual(len(fake.reloads), 1)
         self.assertTrue(fake.reloads[0][1]["X-Fleet-Client"].startswith("fleet-onboard/1/"))
+
+    def test_each_clone_takes_the_repository_that_the_hub_names(self):
+        """A hub since owner API 1.139 names its repository in GET /ui/state, and its name can be new: the run
+        clones that one, and asks once. The address that the run was given is the one of a hub that names none, of a
+        hub that names no git:// repository, and of a hub that does not answer now."""
+        for named, wanted in (("git://hub.test/founderizer.git", "git://hub.test/founderizer.git"),
+                              (None, str(self.bare)), ("file:///etc", str(self.bare)),
+                              ("git://hub.test/../x.git", str(self.bare)), (503, str(self.bare))):
+            ob, fake, _out, _path = self.make()
+            fake.repository = named
+            self.assertEqual((ob.repo, ob.repo), (wanted, wanted), named)
+        ob, fake, _out, _path = self.make()
+        fake.repository, asked, real = "git://hub.test/founderizer.git", [], fake.http
+        fake.http = lambda method, url, *a, **k: (asked.append(url), real(method, url, *a, **k))[1]
+        self.assertEqual([ob.repo, ob.repo], ["git://hub.test/founderizer.git"] * 2)
+        self.assertEqual(sum(url.endswith("/ui/state") for url in asked), 1)
 
     def test_firewall_rollback_is_armed_before_proofs_and_cancelled_after(self):
         ob, fake, out, _ = self.make()

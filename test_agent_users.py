@@ -346,7 +346,7 @@ class OneName(unittest.TestCase):
             # machine's broker behind with nothing saying why.
             call = re.search(r'agent-helper --user "\$\w+" --repo "(\S+?)"', text)
             self.assertTrue(call, f"{script.name} runs agent-helper without --repo")
-            self.assertRegex(call.group(1), r'^(\$REPO|git://\$address/fleet-pilot\.git)$')
+            self.assertRegex(call.group(1), r'^(\$REPO|git://\$address/\$repo_name\.git)$')
             self.assertIn('hubsetup.py" agent-users', text, script.name)
             self.assertNotIn("useradd --create-home --shell /bin/bash --user-group fleet-", text, script.name)
             # the one place that writes the helper and the sudoers file is hubsetup.agent_helper

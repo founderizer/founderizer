@@ -53,6 +53,10 @@ EXECUTOR_VERSION = "1.3.3"
 CAPABILITIES = ["existing_machine", "prepare_runtime"]
 WORKER_USER = "fleet"
 CONFIG_BRANCH = "config"     # the hub's configuration ref: a team.json change belongs there, never on the code branch
+# The address of a hub's repository as the hub names it: git:// on the hub's address, and a path of the hub's served
+# names (hub.served_repository). Nothing else that a hub could name is cloned.
+HUB_REPO = re.compile(r"git://[A-Za-z0-9.:\[\]-]{1,255}"
+                      r"/[A-Za-z0-9_][A-Za-z0-9._-]{0,199}(/[A-Za-z0-9_][A-Za-z0-9._-]{0,199}){0,3}")
 # How a checkout on a worker takes its ref, in its own folder: fetched, and taken only where `lifecycle.py may-take`
 # lets it (DevOps plan 0.1). A refusal leaves the checkout where it is, as a failed pull did. The ref is read once, as
 # one commit: the commit checked is the commit taken.
@@ -715,9 +719,23 @@ def as_user(login, user, cmd):
 class Onboarding:
     def __init__(self, channel: Channel, system: System, state_path: Path, state: dict, auth: dict, hub: str, repo: str):
         self.ch, self.sys, self.state_path, self.state, self.auth = channel, system, state_path, state, auth
-        self.hub, self.repo = hub.rstrip("/"), repo
+        self.hub, self.given_repo, self.hub_repo = hub.rstrip("/"), repo, None
         self.askpass = None
         self.provider_secret = None
+
+    @property
+    def repo(self):
+        """The address of the hub's repository, which each checkout of the new agent clones: the one that the hub
+        names in GET /ui/state (`repository`, owner API 1.139), read once in a run, so that a hub whose repository has
+        a new name gets that name. The address that this run was given when the hub names none, as a hub before
+        owner API 1.139 names none, or when the hub cannot be read now."""
+        if self.hub_repo is None:
+            try:
+                named = self.hub_state().get("repository")
+            except (StepFailed, OSError, ValueError, AttributeError):
+                named = None
+            self.hub_repo = named if isinstance(named, str) and HUB_REPO.fullmatch(named) else self.given_repo
+        return self.hub_repo
 
     # ---- state
     def save(self):
@@ -2025,14 +2043,24 @@ def register_in_kit(kit: Path, name, runtime, address, ssh_user=None, ssh_port=2
 # ---------------------------------------------------------------- command line
 
 def kit_defaults():
-    team_file = Path(__file__).resolve().parent / "team.json"
+    """The hub and the repository of the fleet whose checkout holds this file, when it runs from one: the hub of its
+    team.json, and the checkout's own origin, the address that its hub serves (hub.served_repository). The address of
+    a hub made before the name founderizer when the origin is no git:// address. The run asks the hub itself too
+    (Onboarding.repo)."""
+    folder = Path(__file__).resolve().parent
     try:
-        team = json.loads(team_file.read_text())
+        team = json.loads((folder / "team.json").read_text())
         hub = team["hub"]
         ip = team["addresses"][hub["machine"]]
-        return "http://%s:%d" % (ip, int(hub.get("port") or 8765)), "git://%s/fleet-pilot.git" % ip
+        address = "http://%s:%d" % (ip, int(hub.get("port") or 8765))
     except (OSError, ValueError, KeyError, TypeError):
         return "", ""
+    try:
+        origin = subprocess.run(["git", "-C", str(folder), "remote", "get-url", "origin"], capture_output=True,
+                                text=True, timeout=30, stdin=subprocess.DEVNULL).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        origin = ""
+    return address, origin if HUB_REPO.fullmatch(origin) else "git://%s/fleet-pilot.git" % ip
 
 
 def main(argv=None):

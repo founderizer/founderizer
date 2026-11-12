@@ -138,8 +138,11 @@ if [ "$check" = yes ]; then
 fi
 
 home="$root/home/$HUB_USER"
-bare="$home/fleet-pilot.git"
-kit="$home/fleet-pilot"
+# The one name of the hub's repository and of its checkout. Nothing else holds the name: the hub gives it to its
+# machines (hub.py served_repository).
+repo_name=fleet-pilot
+bare="$home/$repo_name.git"
+kit="$home/$repo_name"
 tree=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 as_user() {     # the command as the user of the services, from its home folder, with its user services reachable
@@ -450,7 +453,7 @@ agents() {      # each agent of this machine under its own OS user: its checkout
     heading "each agent of this machine, under its own OS user"
     if [ "$check" = yes ]; then
         plan "read this machine's agents: python3 $kit/hubsetup.py agent-list --team $kit/team.json"
-        plan "for each agent, as its own user fleet-<agent>: clone git://$address/fleet-pilot.git on the \
+        plan "for each agent, as its own user fleet-<agent>: clone git://$address/$repo_name.git on the \
 configuration ref into /home/fleet-<agent>/fleet-<agent>, install its runtime into that user's own ~/.local/bin, \
 write its service with fleet.py service <agent>, and enable and start it in that user's own systemd manager"
         if [ "$manager_later" = yes ]; then
@@ -482,8 +485,8 @@ lingering: loginctl show-user $user -p Linger"
         if [ -d "$folder/.git" ]; then
             take "$folder" as_agent "$user" || say "  $folder could not update; it stays as it is"
         else
-            as_agent "$user" git clone -q -b config "git://$address/fleet-pilot.git" "$folder" </dev/null \
-                || stop "The checkout of $agent could not be cloned from git://$address/fleet-pilot.git. Check that \
+            as_agent "$user" git clone -q -b config "git://$address/$repo_name.git" "$folder" </dev/null \
+                || stop "The checkout of $agent could not be cloned from git://$address/$repo_name.git. Check that \
 fleet-git runs: runuser -u $HUB_USER -- systemctl --user status fleet-git"
         fi
         as_agent "$user" python3 "$folder/hubsetup.py" runtime --runtime "$agent_runtime" </dev/null \
@@ -556,7 +559,7 @@ own that sets the value keeps it"
 agent_helper() { # the two root commands of this machine, and the sudoers file that says who may run them
     heading "the root helpers that make an agent's OS user and update this machine's vault broker"
     if [ "$check" = yes ]; then
-        plan "run: python3 $kit/hubsetup.py agent-helper --user $HUB_USER --repo git://$address/fleet-pilot.git"
+        plan "run: python3 $kit/hubsetup.py agent-helper --user $HUB_USER --repo git://$address/$repo_name.git"
         plan "write /usr/local/sbin/fleet-agent-user, the one root command that makes the OS user of one agent, \
 /usr/local/sbin/fleet-vault-program, which takes no argument and brings this machine's vault broker onto the \
 vault.py of the fleet's configuration ref, and /etc/sudoers.d/fleet-agents, which lets $HUB_USER run those two \
@@ -567,7 +570,7 @@ user of its own, so that fleet.py verify can read each agent (PRODUCT.md 4.1), a
 vault.py reach a vault broker on this machine, which no checkout holds"
         return 0
     fi
-    python3 "$kit/hubsetup.py" agent-helper --user "$HUB_USER" --repo "git://$address/fleet-pilot.git" \
+    python3 "$kit/hubsetup.py" agent-helper --user "$HUB_USER" --repo "git://$address/$repo_name.git" \
         || stop "the root helpers of this machine's agent users and its vault broker could not be put in place."
 }
 

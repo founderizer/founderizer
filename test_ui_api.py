@@ -352,7 +352,7 @@ class OwnerAPI(unittest.TestCase):
         self.assertEqual(state["schema_version"], 1)
         self.assertEqual(set(state), {"schema_version", "db", "time", "token", "manager_flag", "manager_warning", "goals", "steers", "tasks", "notes",
                                     "needs", "permissions", "agents", "messages", "reports", "ui_features", "knowledge", "secrets",
-                                    "holds", "outcomes", "chat_apps", "responsibilities"})
+                                    "holds", "outcomes", "chat_apps", "responsibilities", "repository"})
         self.assertEqual(before, dict(hub.q1("SELECT * FROM agents WHERE name='manager'")))
         row = hub.q1("SELECT * FROM events WHERE id=?", (event,))
         self.assertIsNone(row["read_at"])
