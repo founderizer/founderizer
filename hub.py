@@ -18781,8 +18781,13 @@ REPORTS_PER_TICKET = 2          # the cost limit: one ticket has at most two ope
 COVERS_MAX = 200                # the tickets that one close names
 SUPPLIER_ID = re.compile(r"[0-9]{1,18}")
 # An id that a report carries: one with a digit, of at most 32 characters and four parts, so that no sentence fits in
-# one ("run-curl-evil-example-sh" is no id). It reaches a session that has a shell (H7).
-REPORT_ID = re.compile(r"(?=.*[0-9])(?!(?:[^_-]*[_-]){4})[A-Za-z0-9][A-Za-z0-9_-]{0,31}")
+# one ("run-curl-evil-example-sh" is no id), or a GUID, alone or after its kind in letters ("user-<guid>"), whose
+# five parts are hex digits of fixed lengths, so that no sentence fits in one either. A GUID is how many systems name
+# a user, and a report that may not carry it whole carries a cut one, which nobody can find (12 November 2026). It
+# reaches a session that has a shell (H7).
+REPORT_ID = re.compile(r"(?:(?=.*[0-9])(?!(?:[^_-]*[_-]){4})[A-Za-z0-9][A-Za-z0-9_-]{0,31})"
+                       r"|(?:(?:[A-Za-z]{1,16}-)?[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+                       r"[0-9A-Fa-f]{12})")
 # A report that still waits for a case's fix: not covered, and its task still open or its case still open. Only
 # such a report stands for its ticket's defect: one whose case closed without covering it, or whose task ended
 # before a join, leaves the ticket free to report again.
@@ -18801,7 +18806,8 @@ def report_ids(value):
     if not isinstance(value, list) or len(value) > TYPED_IDS or \
             not all(isinstance(x, str) and REPORT_ID.fullmatch(x) for x in value):
         raise ToolError(f"ids must be a list of at most {TYPED_IDS} ids, each with a digit, at most 32 characters of "
-                        f"A-Z a-z 0-9 _ - and at most four parts.")
+                        f"A-Z a-z 0-9 _ - and at most four parts, or a whole GUID, alone or after its kind (user-<guid>). "
+                        f"Never cut an id to fit: give the whole one.")
     return list(dict.fromkeys(value))
 
 
@@ -25142,7 +25148,8 @@ TOOLS = [
         "component": {"type": "string", "description": "Where it shows: one value of the list component"},
         "supplier": {"type": "string", "description": "The supplier's numeric id, when the defect is about one"},
         "ids": {"type": "array", "items": {"type": "string"}, "description": "Up to 20 ids of what it touched, each "
-                "a letter or a digit and then up to 63 of A-Z a-z 0-9 _ -"},
+                "whole and with its kind, such as store-1234 or user-<guid>: one with a digit, of at most 32 "
+                "characters of A-Z a-z 0-9 _ - and at most four parts, or a whole GUID, alone or after its kind"},
         "task_id": TASK_ID}, ["request_id", "duty", "symptom", "component"])),
     ("all", "join_report", t_join_report,
      "Join a typed report (D-<n>) that reached your duty to one open case of that duty, so that one incident is one "

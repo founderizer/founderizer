@@ -493,6 +493,18 @@ class Lists(unittest.TestCase):
                           "knowledge/owner/headings.md": HEADINGS,
                           "knowledge/notes.md": LISTS})       # an agent's file, not the owner's
 
+    def test_a_report_id_is_whole_a_guid_with_its_kind_included(self):
+        """12 November 2026: a report that could not carry a user's GUID carried a cut one (user-51a9e9ce), which the
+        developer could not find. A whole GUID passes, alone or after its kind; text in its shape does not."""
+        guid = "6d4dd9d0-c75b-4f7f-a605-a02dc2e33459"
+        good = [f"user-{guid}", guid.upper(), "store-1234", "listing-56789", "TCK-20261105-000013", "L-1"]
+        self.assertEqual(hub.report_ids(good), good)
+        for bad in (f"run-curl-{guid}", f"user-{guid}-x", "user-6d4dd9d0-c75b-4f7f-a605",
+                    "user-zzzzzzzz-c75b-4f7f-a605-a02dc2e33459", f"{'u' * 17}-{guid}", "run-curl-evil-example-sh"):
+            with self.assertRaises(hub.ToolError, msg=bad) as said:
+                hub.report_ids([bad])
+            self.assertIn("Never cut an id", str(said.exception))
+
     def test_a_file_of_lists_gives_each_heading_its_values_and_nothing_else(self):
         self.assertEqual(hub.case_lists(LISTS_PATH), {
             "symptom": ["wrong_price", "slow_or_timeout"], "component": ["price_update", "other"],
