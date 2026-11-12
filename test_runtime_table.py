@@ -78,15 +78,55 @@ BEFORE = {
         "label": "Grok",
         "driver": "acp",
         "acp_command": "grok agent stdio",
-        "can": None, "full_access": None, "manager_access": None, "first_worker": None,
+        # Since the AI providers build (its spec, section 3.4): a Grok agent is a worker with a shell and the web, in
+        # Fleet's one form for it, and its task sessions load the owner's MCP servers.
+        "can": {"shell", "web"}, "full_access": {"start": "grok agent stdio"}, "manager_access": None,
+        "first_worker": "grok agent stdio",
         "manager": False, "owner_chat": False, "agent_messages": False, "conversation": False,
-        "mcp_servers": False, "app_server": False, "switch": False, "session_settings": False, "token_in_env": True,
+        "mcp_servers": True, "app_server": False, "switch": False, "session_settings": False, "token_in_env": True,
         "local_model": None,
         "model_flags": None,
         "sign_in_url": None, "shows_code": None, "wants_code": None,
         "no_sign_in": ("Fleet drives no Grok sign-in: xAI's terms do not let a third party run it this way. "
                        "Sign in to Grok yourself on {where} machine."),
     },
+    # The same build's second program. It was never a constant: this is its entry, written out a second time.
+    "opencode": {
+        "label": "OpenCode",
+        "driver": "acp",
+        "acp_command": "opencode acp",
+        "can": {"shell", "web"}, "full_access": {"start": "opencode acp"}, "manager_access": None,
+        "first_worker": "opencode acp",
+        "manager": False, "owner_chat": False, "agent_messages": False, "conversation": False,
+        "mcp_servers": True, "app_server": False, "switch": False, "session_settings": False, "token_in_env": True,
+        "local_model": None,
+        "model_flags": None,
+        "sign_in_url": None, "shows_code": None, "wants_code": None,
+        "no_sign_in": "OpenCode needs no sign-in on {where} machine.",
+    },
+}
+# The facts that the AI providers build added to each entry, written out by hand as well (its spec, section 3.4).
+ACP_FACTS = {
+    "codex": {"acp_auth": None, "acp_quiet": None, "acp_models": None, "acp_allowance": None, "key_env": None,
+              "own_env": None, "pinned": False, "continues": True, "task_opening": "prompt"},
+    "claude": {"acp_auth": None, "acp_quiet": None, "acp_models": None, "acp_allowance": None, "key_env": None,
+               "own_env": None, "pinned": False, "continues": True, "task_opening": "read"},
+    "grok": {"acp_auth": {"plan": "cached_token", "key": "xai.api_key"},
+             "acp_quiet": {"GROK_DISABLE_AUTOUPDATER": "1",
+                           "GROK_CLAUDE_SKILLS_ENABLED": "0", "GROK_CLAUDE_RULES_ENABLED": "0",
+                           "GROK_CLAUDE_AGENTS_ENABLED": "0", "GROK_CLAUDE_MCPS_ENABLED": "0",
+                           "GROK_CLAUDE_HOOKS_ENABLED": "0", "GROK_CURSOR_SKILLS_ENABLED": "0",
+                           "GROK_CURSOR_RULES_ENABLED": "0", "GROK_CURSOR_AGENTS_ENABLED": "0",
+                           "GROK_CURSOR_MCPS_ENABLED": "0", "GROK_CURSOR_HOOKS_ENABLED": "0"},
+             "acp_models": "initialize", "acp_allowance": "_x.ai/billing", "key_env": "XAI_API_KEY",
+             "own_env": ("GROK_", "XAI_"), "pinned": True, "continues": False, "task_opening": "system",
+             "memory_off": {"env": {"GROK_MEMORY": "0"}}, "closed_versions": (), "sign_out": None},
+    "opencode": {"acp_auth": None,
+                 "acp_quiet": {"OPENCODE_DISABLE_PROJECT_CONFIG": "1", "OPENCODE_DISABLE_CLAUDE_CODE": "1",
+                               "OPENCODE_DISABLE_AUTOUPDATE": "1", "OPENCODE_DISABLE_MODELS_FETCH": "1"},
+                 "acp_models": "session", "acp_allowance": None, "key_env": "FLEET_MODEL_KEY",
+                 "own_env": ("OPENCODE_",), "pinned": True, "continues": False, "task_opening": "system",
+                 "memory_off": {"env": {}}, "closed_versions": (), "sign_out": None},
 }
 
 # The functions that still compare a runtime against a name, and why each one is code and not a fact. A new name
@@ -97,7 +137,8 @@ MECHANICS = {
     "lifecycle.py": {
         "runtime": "each provider's own status command, and the words it answers a sign-in reading with",
         "read_models": "whether the names of a provider's model options are its own",
-        "model_options": "each provider's own route to its model options, which a runtime update's check reads too",
+        "model_options": "each terminal provider's own route to its model options, which a runtime update's check "
+                         "reads too; an ACP program's list is read by the fact acp_models, with no name",
         "update_runtime": "only Claude Code's own updates read a channel and a floor from its settings, which a "
                           "vendor's installation that the helper adopts is given (onboard.CLAUDE_CHANNEL)",
     },
@@ -165,6 +206,64 @@ class TheFacts(unittest.TestCase):
         for name, entry in lifecycle.RUNTIMES.items():
             self.assertEqual(set(entry), set(lifecycle.RUNTIME_FACTS), f"{name} is missing or invents a fact")
 
+    def test_the_facts_of_the_acp_programs_are_the_ones_of_their_spec(self):
+        """The AI providers build: each new fact of each entry, by hand. Both programs stay workers that the owner
+        cannot switch to, talk to or put the manager on, until a later step says so."""
+        self.assertEqual(set(ACP_FACTS), set(lifecycle.RUNTIMES))
+        for name, facts in ACP_FACTS.items():
+            for fact, want in facts.items():
+                with self.subTest(name=name, fact=fact):
+                    self.assertEqual(lifecycle.RUNTIMES[name][fact], want)
+        for name in ("grok", "opencode"):
+            entry = lifecycle.RUNTIMES[name]
+            for fact in ("manager_access", "sandbox", "cache_seconds", "compact_tokens", "routine", "default_model",
+                         "task_denied", "task_allowed", "conversation_denied", "manager_denied", "conversation_why"):
+                self.assertIsNone(entry[fact], f"{name}: {fact}")
+            for fact in ("manager", "owner_chat", "agent_messages", "conversation", "switch", "app_server",
+                         "session_settings", "browser_tabs", "screen_counter"):
+                self.assertIs(entry[fact], False, f"{name}: {fact}")
+
+    def test_a_pinned_program_has_its_pin_and_no_vendor_installer(self):
+        """A runtime with `pinned` comes from the fleet's own download (fleet.install_pinned), so its pin has a file
+        for both Linux processors, and no installer of its vendor is written for it (onboard.RUNTIME_PINS)."""
+        for name, entry in lifecycle.RUNTIMES.items():
+            with self.subTest(name):
+                self.assertIsInstance(entry["pinned"], bool)
+                self.assertEqual(name in onboard.PINNED, entry["pinned"])
+                if entry["pinned"]:
+                    self.assertLessEqual({"linux-x64", "linux-arm64"}, set(onboard.PINNED[name]["files"]))
+                    self.assertNotIn(name, onboard.RUNTIME_PINS)
+                    self.assertTrue(lifecycle.pinned_path(name, "/home/a").startswith("/home/a/.fleet/runtimes/"))
+                else:
+                    self.assertIsNone(lifecycle.pinned_path(name, "/home/a"))
+
+    def test_the_names_of_a_programs_own_variables_and_of_its_key(self):
+        """own_env is what keeps a program's own settings out of its session without a new reserved name (a new one
+        in ENV_RESERVED could refuse a live team.json): prefixes that end in _. key_env has the shape of a variable's
+        name. And a runtime of driver acp holds each fact of its kind, or says None for it."""
+        for name, entry in lifecycle.RUNTIMES.items():
+            with self.subTest(name):
+                acp = entry["driver"] == "acp"
+                self.assertEqual(entry["own_env"] is not None, acp)
+                self.assertEqual(entry["key_env"] is not None, acp)
+                self.assertEqual(entry["acp_quiet"] is not None, acp)
+                if acp:
+                    self.assertIsInstance(entry["own_env"], tuple)
+                    self.assertTrue(entry["own_env"])
+                    for prefix in entry["own_env"]:
+                        self.assertRegex(prefix, r"\A[A-Z][A-Z0-9]*_\Z")
+                    self.assertTrue(lifecycle.KEY_ENV.fullmatch(entry["key_env"]), entry["key_env"])
+                    self.assertTrue(entry["key_env"].endswith(lifecycle.KEY_SUFFIXES), entry["key_env"])
+                    self.assertIn(entry["acp_models"], ("initialize", "session", None))
+                    for variable, value in {**entry["acp_quiet"], **(entry["memory_off"].get("env") or {})}.items():
+                        self.assertTrue(lifecycle.KEY_ENV.fullmatch(variable), variable)
+                        self.assertIsInstance(value, str)
+                        # each variable that the fleet's own start sets is one of the program's own names
+                        self.assertTrue(variable.startswith(entry["own_env"]), variable)
+        self.assertEqual(lifecycle.ENV_RESERVED.pattern,
+                         r"(?:FLEET|BWS|LD|DYLD|ANTHROPIC|CLAUDE|CODEX|XAI)_[A-Z0-9_]*|PATH|HOME|SHELL|USER|LOGNAME|"
+                         r"TMPDIR|TERM|PWD|IFS|ENV|BASH_ENV|ZDOTDIR|NODE_OPTIONS|PYTHONPATH|PYTHONHOME")
+
     def test_every_runtime_says_how_its_own_memory_stays_off_and_its_starts_do_it(self):
         """What an agent learns lives in the hub, where the owner reads it: a memory of the runtime's own would steer
         later sessions where nobody sees it. So each entry names its switch, and a new provider must name its own."""
@@ -211,20 +310,22 @@ class TheFacts(unittest.TestCase):
         self.assertEqual(hub.SWITCH_RUNTIMES, ("codex", "claude"))
         self.assertEqual(lifecycle.SWITCH_RUNTIMES, ("codex", "claude"))
         self.assertEqual(hub.LOGIN_RUNTIMES, ("claude", "codex"))
-        self.assertEqual(lifecycle.MCP_RUNTIMES, ("claude", "codex"))
+        self.assertEqual(lifecycle.MCP_RUNTIMES, ("claude", "codex", "grok", "opencode"))
         self.assertEqual(fleet.MANAGER_RUNTIMES, ("claude", "codex"))
         self.assertEqual(lifecycle.APP_SERVER_RUNTIME, "codex")
-        self.assertEqual(hub.FULL_ACCESS, {n: BEFORE[n]["full_access"] for n in ("codex", "claude")})
+        self.assertEqual(hub.FULL_ACCESS, {n: BEFORE[n]["full_access"] for n in ("codex", "claude", "grok", "opencode")})
         self.assertEqual(hub.MANAGER_ACCESS, {n: BEFORE[n]["manager_access"] for n in ("codex", "claude")})
-        self.assertEqual(hub.RUNTIME_CAN, {n: BEFORE[n]["can"] for n in ("codex", "claude")})
+        self.assertEqual(hub.RUNTIME_CAN, {n: BEFORE[n]["can"] for n in ("codex", "claude", "grok", "opencode")})
         self.assertEqual(hubsetup.STARTS, {n: BEFORE[n]["manager_access"]["start"] for n in ("codex", "claude")})
-        self.assertEqual(hubsetup.WORKER_STARTS, {n: BEFORE[n]["first_worker"] for n in ("codex", "claude")})
-        self.assertEqual(server.LABELS, {"codex": "Codex", "claude": "Claude Code"})
+        self.assertEqual(hubsetup.WORKER_STARTS,
+                         {n: BEFORE[n]["first_worker"] for n in ("codex", "claude", "grok", "opencode")})
+        self.assertEqual(server.LABELS, {"codex": "Codex", "claude": "Claude Code", "grok": "Grok",
+                                         "opencode": "OpenCode"})
         self.assertEqual(fleet.LOGIN_LABELS, {"codex": "Codex", "claude": "Claude Code"})
         self.assertEqual(fleet.LOGIN_WANTS_CODE, ("claude",))
         self.assertEqual(sorted(fleet.LOGIN_SHOWN_CODE), ["codex"])
         self.assertEqual(sorted(fleet.LOGIN_URLS), ["claude", "codex"])
-        self.assertEqual(lifecycle.TOOL_CATALOG["github"]["runtimes"], ["claude", "codex"])
+        self.assertEqual(lifecycle.TOOL_CATALOG["github"]["runtimes"], ["claude", "codex", "grok", "opencode"])
 
     def test_the_derived_forms_are_copies_and_not_the_table_itself(self):
         """team.json takes a start form from these, so a caller that keeps or edits one must not reach the table."""
@@ -260,15 +361,20 @@ class TheFacts(unittest.TestCase):
                 self.assertFalse(entry["switch"] and not entry["can"])
 
     def test_a_driven_sign_in_needs_an_installer_of_its_own_as_well(self):
-        """Two dicts that must agree. `server.LABELS` now derives from the table's `sign_in`, and the install step
-        lets a runtime through on it and then reads `onboard.RUNTIME_PINS[runtime]` for the version to install. An
-        entry with a sign-in and no pin makes that step raise instead of refusing, so this is the fence. The pin and
-        the vendor's own install and update lines stay in onboard.py, which the helper loads for its runtime updates,
-        because they are shell and not facts: a fourth provider writes them there."""
+        """Two dicts that must agree. `server.LABELS` derives from the table's `sign_in` and `pinned`, and the install
+        step lets a runtime through on it and then reads `onboard.RUNTIME_PINS[runtime]` for the version to install,
+        or the pinned program of `onboard.PINNED`. An entry with a sign-in and no pin makes that step raise instead
+        of refusing, so this is the fence. The pin and the vendor's own install and update lines stay in onboard.py,
+        which the helper loads for its runtime updates, because they are shell and not facts: a fourth provider
+        writes them there."""
         for name, entry in lifecycle.RUNTIMES.items():
             if entry["sign_in"]:
-                self.assertIn(name, onboard.RUNTIME_PINS, f"{name} has a driven sign-in and no installer pin")
+                self.assertTrue(name in onboard.RUNTIME_PINS or name in onboard.PINNED,
+                                f"{name} has a driven sign-in and no installer pin")
+            if entry["sign_in"] or entry["pinned"]:
                 self.assertIn(name, server.LABELS, name)
+            else:
+                self.assertNotIn(name, server.LABELS, name)
 
     def test_a_name_that_is_no_runtime_answers_the_question_and_does_not_raise(self):
         for fact in lifecycle.RUNTIME_FACTS:
@@ -374,7 +480,7 @@ class AFourthEntry(unittest.TestCase):
         team["agents"]["manager"]["runtime"] = "fifth"
         with self.assertRaises(ValueError) as refused:
             hub.validate_team(team)
-        self.assertIn("claude, codex, fourth or grok", str(refused.exception))
+        self.assertIn("claude, codex, fourth, grok or opencode", str(refused.exception))
 
     def test_a_task_session_starts_it_from_its_own_start_form(self):
         conf = {"role": "worker", "runtime": "fourth", "start": FOURTH["full_access"]["start"], "can": ["shell"]}
@@ -402,10 +508,10 @@ class AFourthEntry(unittest.TestCase):
         that holds the fourth entry."""
         starts = {n: e["manager_access"]["start"] for n, e in lifecycle.RUNTIMES.items() if e["manager_access"]}
         workers = {n: e["first_worker"] for n, e in lifecycle.RUNTIMES.items() if e["first_worker"]}
-        labels = {n: e["label"] for n, e in lifecycle.RUNTIMES.items() if e["sign_in"]}
+        labels = {n: e["label"] for n, e in lifecycle.RUNTIMES.items() if e["sign_in"] or e.get("pinned")}
         self.assertEqual(starts["fourth"], FOURTH["manager_access"]["start"])
         self.assertEqual(workers["fourth"], FOURTH["first_worker"])
-        self.assertNotIn("fourth", labels)              # no sign-in of its own, so this service installs none
+        self.assertNotIn("fourth", labels)      # no sign-in of its own and no pinned program: this service installs none
         self.assertEqual(hubsetup.STARTS, {k: v for k, v in starts.items() if k != "fourth"})
         self.assertEqual(hubsetup.WORKER_STARTS, {k: v for k, v in workers.items() if k != "fourth"})
         self.assertEqual(server.LABELS, labels)

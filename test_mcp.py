@@ -192,7 +192,8 @@ class HubSide(OwnerAPI):
         tools = self.view()["tools"]
         self.assertEqual({k: v for k, v in tools["crm"].items() if k not in ("connected_at", "problem")},
                          {"title": "Acme CRM", "url": self.stand.url + "/mcp", "auth": "oauth", "custom": True,
-                          "runtimes": ["claude", "codex"], "needs": [TOKEN], "connected": False, "scopes": [],
+                          "runtimes": ["claude", "codex", "grok", "opencode"], "needs": [TOKEN],
+                          "connected": False, "scopes": [],
                           "server": None, "tools": [], "access_ends": None})
         self.assertIs(tools["github"]["custom"], False)
 

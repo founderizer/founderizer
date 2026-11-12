@@ -222,7 +222,8 @@ class HubSide(OwnerAPI):
                          ({"acme/web": "write"}, {"acme/web": "read"}, {}))
         self.assertEqual(lines["dev"]["tools"], [])
         self.assertEqual(view["tools"]["github"], {"title": "GitHub", "command": "github-mcp-server", "args": ["stdio"],
-                                                   "runtimes": ["claude", "codex"], "custom": False, "auth": "none",
+                                                   "runtimes": ["claude", "codex", "grok", "opencode"],
+                                                   "custom": False, "auth": "none",
                                                    "needs": ["GH_TOKEN"]})
         self.assertEqual(view["github"], {"app": True, "app_id": APP_ID, "problem": None, "unreached": {},
                                           "door": False, "renew": False})

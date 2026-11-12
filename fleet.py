@@ -70,6 +70,7 @@ from lifecycle import (APP_SERVER_RUNTIME, CHECK_FILE, CHECK_STORE, FLOOR_FILE, 
                        facts_now, follow_config_ref, key_env, mcp_variable, no_sign_in, reuse_settings, runtime_fact,
                        runtimes_with, screen_program, session_reuse, skills_text, start_form, tool_catalog, tool_needs)
 from desktop import Publisher
+import onboard
 from onboard import CLAUDE_UPDATES_OFF
 
 KIT = os.path.dirname(os.path.abspath(__file__))
@@ -2184,6 +2185,156 @@ def closed_program(runtime, version):
         install["thread"].start()
     raise Installing(f"Claude Code {version}, the version that closed conversations run at, is being installed on "
                      f"this machine")
+
+
+# ---------------------------------------------------------------- the pinned programs (AI providers spec, 3.9)
+#
+# A runtime whose entry says `pinned` is a program that the fleet downloads itself: one version of it, at the addresses
+# and the SHA-512 that onboard.PINNED carries (`python3 pins.py` makes an entry). No vendor's install script and no
+# npm runs, so no install script of a package runs either, and no PATH decides which program a session starts: each
+# start names the file below. Each OS user has its own copy, in its own ~/.fleet/runtimes.
+PINNED_INSTALLS = {}        # {name: {"thread", "error"}} of the installs that this helper started (pinned_program)
+PINNED_BLOCK = 1 << 20
+CPU_INFO = "/proc/cpuinfo"
+
+
+def pinned_file(name, system=None, machine=None, cpu_info=None):
+    """(the platform's name, its entry of onboard.PINNED[name]["files"]) for this machine. On x64 a processor whose
+    flags name no avx2 takes the baseline file when the pin has one. Raises Refused for a name with no pin and for a
+    machine that the pin has no file for: the pins are Linux programs."""
+    pin = onboard.PINNED.get(name) if runtime_fact(name, "pinned") else None
+    if not pin:
+        raise Refused(f"{runtime_fact(name, 'label', name)} is no program that the fleet downloads at a pin")
+    uname = os.uname()
+    system, machine = system or uname.sysname, machine or uname.machine
+    arch = {"x86_64": "x64", "amd64": "x64", "arm64": "arm64", "aarch64": "arm64"}.get(machine)
+    platform = f"linux-{arch}" if system == "Linux" and arch else None
+    if platform == "linux-x64" and f"{platform}-baseline" in pin["files"]:
+        try:
+            with open(cpu_info or CPU_INFO, encoding="utf-8", errors="replace") as f:
+                flags = {word for line in f if line.split(":")[0].strip() == "flags" for word in line.split()}
+        except OSError:
+            flags = {"avx2"}            # a machine that does not say: the file of each newer processor
+        if "avx2" not in flags:
+            platform += "-baseline"
+    if platform not in pin["files"]:
+        raise Refused(f"{runtime_fact(name, 'label', name)} {pin['version']} has no file for {system} on {machine}")
+    return platform, pin["files"][platform]
+
+
+def install_pinned(name, opener=None):
+    """The pinned program `name` into KEPT_RUNTIMES, beside install_closed and in its way: this platform's file of
+    onboard.PINNED, from each of its addresses in their order until one gives the file whole, into a .part file of
+    this process, held to the pin's SHA-512; then the program, which is that file or one member of it (a .tgz of npm),
+    at <name>-<version>/<bin> with mode 755. The program appears whole or not at all, and a file with other bytes
+    installs nothing. Returns the program's path; raises on any failure. opener: how an address is opened, for a
+    test."""
+    path = lifecycle.pinned_path(name, os.path.dirname(HOME))
+    platform, entry = pinned_file(name)
+    pin, label = onboard.PINNED[name], runtime_fact(name, "label", name)
+    digest_wanted, member = entry.get("sha512"), entry.get("member")
+    if not isinstance(digest_wanted, str) or not re.fullmatch(r"[0-9a-f]{128}", digest_wanted) or \
+            not (member is None or isinstance(member, str) and member):
+        raise Refused(f"the pin of {label} {pin['version']} for {platform} is not whole")
+    os.makedirs(KEPT_RUNTIMES, mode=0o700, exist_ok=True)
+    stem = os.path.join(KEPT_RUNTIMES, f".{name}-{pin['version']}.")
+    for left in glob.glob(glob.escape(stem) + "*.part"):
+        pid = left[len(stem):].split(".")[0]
+        if pid.isdigit() and int(pid) != os.getpid() and process_gone(int(pid)):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(left)
+    opener = opener or (lambda url: urllib.request.urlopen(
+        urllib.request.Request(url, headers={"User-Agent": OUTSIDE_AGENT}), timeout=60))
+    part, program, failures = f"{stem}{os.getpid()}.part", f"{stem}{os.getpid()}.program.part", []
+    try:
+        for url in entry.get("urls") or []:
+            digest = hashlib.sha512()
+            try:
+                with opener(url) as r, open(os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+                    for block in iter(lambda: r.read(PINNED_BLOCK), b""):
+                        digest.update(block)
+                        f.write(block)
+            except (OSError, HTTPException) as e:       # this address did not give the file: the next one
+                failures.append(f"{urllib.parse.urlsplit(url).hostname}: {type(e).__name__}")
+                continue
+            if digest.hexdigest() != digest_wanted:
+                # Never the next address after this: a file with other bytes is no failure of the network
+                raise Refused(f"the download of {label} {pin['version']} does not match the digest of its pin")
+            break
+        else:
+            raise Refused(f"{label} {pin['version']} could not be downloaded ({'; '.join(failures) or 'no address'})")
+        if member is None:
+            os.replace(part, program)
+        else:
+            with tarfile.open(part, mode="r:gz") as tar:
+                found = next((item for item in tar if item.name == member and item.isfile()), None)
+                if found is None:
+                    raise Refused(f"the file of {label} {pin['version']} has no {member}")
+                with tar.extractfile(found) as source, \
+                        open(os.open(program, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700), "wb") as f:
+                    shutil.copyfileobj(source, f, PINNED_BLOCK)
+        os.chmod(program, 0o755)
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        os.replace(program, path)
+    finally:
+        for left in (part, program):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(left)
+    return path
+
+
+def drop_old_pins(name):
+    """Remove the folders of other versions of a pinned program, when no window of this user runs from one: a release
+    that moves a pin then leaves no old program behind. With no answer of tmux, each stays."""
+    path = lifecycle.pinned_path(name, os.path.dirname(HOME))
+    old = [d for d in glob.glob(os.path.join(KEPT_RUNTIMES, glob.escape(name) + "-*"))
+           if os.path.isdir(d) and not os.path.islink(d) and d != os.path.dirname(path)
+           and RUNTIME_VERSION.fullmatch(os.path.basename(d)[len(name) + 1:])]
+    if not old:
+        return
+    r = tmux("list-panes", "-a", "-F", "#{pane_start_command}")
+    if r.returncode != 0 and "no server running" not in (r.stderr or ""):
+        return
+    for folder in old:
+        if folder + os.sep not in r.stdout:
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+def pinned_install_thread(name, install):
+    label, version = runtime_fact(name, "label", name), onboard.PINNED[name]["version"]
+    print(time.strftime("%H:%M:%S"), f"{label} {version} is not on this machine: the helper downloads it at its pin",
+          flush=True)
+    try:
+        install_pinned(name)
+        print(time.strftime("%H:%M:%S"), f"{label} {version} is installed", flush=True)
+    except Exception as e:
+        install["error"] = str(e)[:200] if isinstance(e, Refused) else f"{type(e).__name__}: {str(e)[:160]}"
+        print(time.strftime("%H:%M:%S"), f"{label} {version} was not installed: {install['error']}", flush=True)
+
+
+def pinned_program(name):
+    """The program that a session of a pinned runtime starts: the file of its pin, which the helper installs first
+    when it is missing, as closed_program does for a closed start. So a release that moves a pin needs no step of its
+    own: the next start takes the new version, in a thread of its own, and the start waits meanwhile (Installing). A
+    failed install is the reason for the next start, and the start after it tries the install again."""
+    path = lifecycle.pinned_path(name, os.path.dirname(HOME))
+    if not path:
+        raise Refused(f"{runtime_fact(name, 'label', name)} is no program that the fleet downloads at a pin")
+    label, version = runtime_fact(name, "label", name), onboard.PINNED[name]["version"]
+    if os.path.isfile(path) and os.access(path, os.X_OK):
+        drop_old_pins(name)
+        return path
+    install = PINNED_INSTALLS.get(name)
+    if install and install["error"]:
+        PINNED_INSTALLS.pop(name)
+        raise Refused(f"{label} {version} could not be installed on this machine: {install['error']}")
+    if not (install and install["thread"].is_alive()):
+        install = {"error": None}
+        install["thread"] = threading.Thread(target=pinned_install_thread, args=(name, install), daemon=True,
+                                             name=f"install-{name}-{version}")
+        PINNED_INSTALLS[name] = install
+        install["thread"].start()
+    raise Installing(f"{label} {version} is being installed on this machine")
 
 
 def conversation_folder(conversation):
@@ -7103,6 +7254,21 @@ def cmd_check(args):
     sys.exit(0 if ok else 1)
 
 
+def cmd_install_pinned(args):
+    """`fleet.py install-pinned <name>`: the pinned program of one runtime for this OS user (install_pinned), as a
+    server's install runs it for a new agent. It prints the program's path, and does nothing for a program that is
+    there."""
+    path = lifecycle.pinned_path(args.name, os.path.dirname(HOME))
+    try:
+        if not (path and os.path.isfile(path) and os.access(path, os.X_OK)):
+            path = install_pinned(args.name)
+    except Refused as e:
+        die(str(e))
+    except (OSError, HTTPException, tarfile.TarError, EOFError) as e:
+        die(f"{runtime_fact(args.name, 'label', args.name)} was not installed: {type(e).__name__}")
+    print(path)
+
+
 def cmd_verify(args):
     """PRODUCT.md 4.1: is this machine of the fleet healthy? Read-only, no root, Linux and macOS. The installers
     end with it, the app shows it as the owner's checklist, and the support duty runs it from a heartbeat."""
@@ -7963,6 +8129,7 @@ def main():
     p.add_argument("--runtime", choices=MANAGER_RUNTIMES,
                    help="the runtime of that conversation, when it is not the agent's runtime now (after a switch)")
     p.set_defaults(fn=cmd_chat_session)
+    p = sub.add_parser("install-pinned"); p.add_argument("name"); p.set_defaults(fn=cmd_install_pinned)
     p = sub.add_parser("verify"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_verify)
     p = sub.add_parser("verify-case"); p.add_argument("--case"); p.add_argument("--run")
     p.set_defaults(fn=cmd_verify_case)

@@ -262,6 +262,28 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
 #                     whose key is the longest part of its name, else "default". The owner's own prices are in
 #                     team.json runtime_facts (facts_now); None for no prices
 #
+# The facts of a runtime of driver "acp", and of how its program comes to a machine (the AI providers build spec,
+# section 3.4). For a terminal runtime each is None, `pinned` is False, and `continues` is its `manager` value.
+#
+#   acp_auth          the ACP sign-in method that a start names, by the kind of the agent's account, {"plan": a method
+#                     id, "key": a method id}; None for a program whose sign-in method does nothing
+#   acp_quiet         the variables of each start that keep the program from its own update and from the instruction
+#                     files, skills, MCP servers and hooks of other programs on the machine; a variable that holds a
+#                     path of one session is the session's own, and comes from its adapter
+#   acp_models        where its model list is read with no prompt: "initialize", in the answer of that call, or
+#                     "session", in the options of a new session; None for a program that gives none
+#   acp_allowance     the name on the wire of its method that reads a plan's allowance; None where it has none
+#   key_env           the variable by which the program takes the API key of a key account
+#   own_env           the prefixes of the variables that the program reads as its own settings: its session gets none
+#                     of that name but the ones that the fleet's own start sets
+#   pinned            the fleet downloads the program itself, at the version and the digest of onboard.PINNED
+#                     (fleet.install_pinned), and a session runs that file and never one of a PATH
+#   continues         a new process of it continues a conversation of an earlier one
+#   acp_adapter       the name of its adapter in acp_programs.py, which holds what the program does in its own way:
+#                     the session's folder and files, the road of the system text, the sign that its tools are there,
+#                     the tokens of a turn, its limit and its failures, and a tool call's own name. No other file
+#                     compares a runtime to a name for it (test_runtime_table)
+#
 # What is NOT here, because it is code and not a fact: how a runtime's records become a transcript (threads.py), how
 # its allowance is read (usage.py), what its own installer is (onboard.py), and how its sign-in window is driven to
 # the end (fleet.do_signin). A fourth provider needs real work in each of those.
@@ -328,6 +350,8 @@ RUNTIMES = {
         # it to later threads. Off by default, but one config line turns it on (the owner's own Mac has it on), and an
         # agent's Codex reads that user's config: so every Fleet session passes it off (fleet.CODEX_NO_MEMORY).
         "memory_off": {"config": {"features.memories": False}},
+        "acp_auth": None, "acp_quiet": None, "acp_models": None, "acp_allowance": None, "key_env": None,
+        "own_env": None, "pinned": False, "continues": True, "acp_adapter": None,
     },
     "claude": {
         "label": "Claude Code",
@@ -403,27 +427,31 @@ RUNTIMES = {
                           "haiku": {"input": 0.1, "cache_read": 0.01, "cache_write": 0.2, "output": 0.5}},
         # Claude Code's auto memory, in every session's settings (fleet.CLAUDE_NO_MEMORY).
         "memory_off": {"settings": {"autoMemoryEnabled": False}},
+        "acp_auth": None, "acp_quiet": None, "acp_models": None, "acp_allowance": None, "key_env": None,
+        "own_env": None, "pinned": False, "continues": True, "acp_adapter": None,
     },
+    # Grok Build, for SpaceXAI, through ACP. Each fact of it and of OpenCode below was read from the program at its
+    # pin, against a stand-in model with no account (step 0 of the AI providers build spec, 12 November 2026).
     "grok": {
         "label": "Grok",
         "driver": "acp",
         "acp_command": "grok agent stdio",
-        "can": None,
-        "full_access": None,
+        "can": {"shell", "web"},
+        "full_access": {"start": "grok agent stdio"},       # Fleet's one worker form: the runner answers each prompt
         "manager_access": None,
-        "first_worker": None,
+        "first_worker": "grok agent stdio",
         "manager": False,
         "owner_chat": False,
         "agent_messages": False,
         "conversation": False,
         "conversation_why": None,
         "closed_versions": (),
-        "mcp_servers": False,
+        "mcp_servers": True,            # both kinds of server of a new session start in it
         "app_server": False,
-        "switch": False,
+        "switch": False,                # a third switchable name would end the Claude and Codex switch of each agent
         "session_settings": False,
         "token_in_env": True,
-        "model_flags": None,
+        "model_flags": None,            # a model and an effort are options of the session, which the runner sets
         "local_model": None,
         "sign_in": None,
         "sign_out": None,
@@ -440,11 +468,79 @@ RUNTIMES = {
         "task_allowed": None,
         "conversation_denied": None,
         "manager_denied": None,
-        "task_opening": None,
+        "task_opening": "system",       # its stable text is the session's system text, and its task the first prompt
         "token_weights": None,
         # Grok Build's memory and its automatic dreaming: off by default, and on with GROK_MEMORY=1, its config or a
         # managed remote setting. GROK_MEMORY=0 turns it off for the whole process, whatever the others say.
         "memory_off": {"env": {"GROK_MEMORY": "0"}},
+        # It names "xai.api_key" in its initialize answer only while it has a key, and "cached_token" only while a
+        # sign-in is stored.
+        "acp_auth": {"plan": "cached_token", "key": "xai.api_key"},
+        # Its updater, and the rules, named files, skills, MCP servers and hooks of Claude Code and of Cursor. Two
+        # sources stay open: ~/.claude/agents/ and ~/.agents/skills/.
+        "acp_quiet": {"GROK_DISABLE_AUTOUPDATER": "1",
+                      **{f"GROK_{other}_{kind}_ENABLED": "0" for other in ("CLAUDE", "CURSOR")
+                         for kind in ("SKILLS", "RULES", "AGENTS", "MCPS", "HOOKS")}},
+        "acp_models": "initialize",     # _meta.modelState of the answer, each model with its efforts
+        "acp_allowance": "_x.ai/billing",
+        "key_env": "XAI_API_KEY",
+        "own_env": ("GROK_", "XAI_"),
+        "pinned": True,
+        "continues": False,             # its sessions are in the session's own folder, which goes with the window
+        "acp_adapter": "grok",
+    },
+    # OpenCode, for each other API key and for the owner's own model server, through ACP.
+    "opencode": {
+        "label": "OpenCode",
+        "driver": "acp",
+        "acp_command": "opencode acp",
+        "can": {"shell", "web"},
+        "full_access": {"start": "opencode acp"},
+        "manager_access": None,
+        "first_worker": "opencode acp",
+        "manager": False,
+        "owner_chat": False,
+        "agent_messages": False,
+        "conversation": False,
+        "conversation_why": None,
+        "closed_versions": (),
+        "mcp_servers": True,
+        "app_server": False,
+        "switch": False,
+        "session_settings": False,
+        "token_in_env": True,
+        "model_flags": None,
+        "local_model": None,
+        "sign_in": None,
+        "sign_out": None,
+        "no_sign_in": "OpenCode needs no sign-in on {where} machine.",
+        "sandbox": None,
+        "screen_counter": False,
+        "browser_tabs": False,
+        "cache_seconds": None,
+        "compact_tokens": None,
+        "routine": None,
+        "default_model": None,
+        "task_denied": None,
+        "task_allowed": None,
+        "conversation_denied": None,
+        "manager_denied": None,
+        "task_opening": "system",
+        "token_weights": None,
+        "memory_off": {"env": {}},      # the program has no memory of its own to switch off
+        "acp_auth": None,               # its one method, opencode-login, does nothing: the key is in its configuration
+        # The working folder's configuration and its .opencode folder, each AGENTS.md from the working folder to the
+        # home folder, Claude Code's skills, its own update, and the address of its model catalog. ~/.agents/skills/
+        # stays open, and so does an AGENTS.md below the working folder when the agent reads a file there.
+        "acp_quiet": {"OPENCODE_DISABLE_PROJECT_CONFIG": "1", "OPENCODE_DISABLE_CLAUDE_CODE": "1",
+                      "OPENCODE_DISABLE_AUTOUPDATE": "1", "OPENCODE_DISABLE_MODELS_FETCH": "1"},
+        "acp_models": "session",        # the option `model` of a new session, and the efforts of the current model
+        "acp_allowance": None,
+        "key_env": "FLEET_MODEL_KEY",   # the session's configuration names this variable as the provider's key
+        "own_env": ("OPENCODE_",),
+        "pinned": True,
+        "continues": False,
+        "acp_adapter": "opencode",
     },
 }
 # Claude's extension in the Chrome Web Store, the browser of a runtime with browser_tabs (offer_extension).
@@ -456,7 +552,9 @@ RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manage
                  "app_server", "switch", "session_settings", "token_in_env", "model_flags", "local_model", "sign_in",
                  "sign_out", "no_sign_in", "sandbox", "screen_counter", "browser_tabs", "cache_seconds",
                  "compact_tokens", "routine", "default_model", "task_denied", "task_allowed", "conversation_denied",
-                 "manager_denied", "task_opening", "token_weights", "memory_off")
+                 "manager_denied", "task_opening", "token_weights", "memory_off",
+                 "acp_auth", "acp_quiet", "acp_models", "acp_allowance", "key_env", "own_env", "pinned", "continues",
+                 "acp_adapter")
 
 
 # The session reuse rule (AUTONOMY.md P9.10) and its setting (section 4), one object in team.json "settings":
@@ -1119,8 +1217,21 @@ def desktop_items(run, home, user, tabs, connected=None):
             autologin_item(run, user), awake_item(run), session]
 
 
+def pinned_path(name, home=None):
+    """Where the pinned program of a runtime is for one OS user: ~/.fleet/runtimes/<name>-<version>/<bin>, by its
+    entry of onboard.PINNED (fleet.install_pinned puts it there). None for a runtime whose program is not pinned."""
+    pin = onboard.PINNED.get(name) if runtime_fact(name, "pinned") else None
+    if not pin:
+        return None
+    return os.path.join(home or os.path.expanduser("~"), FLEET_DIR, "runtimes", f"{name}-{pin['version']}", pin["bin"])
+
+
 def exe(name, home=None):
-    """A runtime's executable: on PATH, else in ~/.local/bin; None when neither has it."""
+    """A runtime's executable: on PATH, else in ~/.local/bin; None when neither has it. A pinned program is the file
+    of its pin and no other (pinned_path): no PATH decides which program runs."""
+    if runtime_fact(name, "pinned"):
+        path = pinned_path(name, home)
+        return path if path and os.path.isfile(path) else None
     local = os.path.join(home or os.path.expanduser("~"), ".local", "bin", name or "")
     return shutil.which(name or "") or (local if os.path.exists(local) else None)
 
