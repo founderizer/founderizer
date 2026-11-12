@@ -266,6 +266,65 @@ class SecretThroughAnEscape(Base):
         self.assertEqual(hub.mask_message(line), hub.mask_secrets(line))
         self.assertEqual(json.loads(hub.mask_message(line)), f"Use {hub.MASK} now.")
 
+    def test_a_task_whose_words_hold_a_login_that_the_mask_cannot_place_keeps_its_start(self):
+        """start_text masks the whole per-task block once more: one login that the mask could not place in the task's
+        details or its title, as a JSON text has one with a quote, made the whole start text MASK, so a new session of
+        the task got no task at all. The task's own words are masked each on its own now, the details line by line."""
+        config = json.dumps({"login": self.LOGIN})
+        tid = self.new_task(title="Fix the shop's sign-in",
+                            details=f"The shop's config:\n{config}\nThen run the smoke.")
+        held = self.new_task(title=f"Sign in with {json.dumps(self.LOGIN)}", details="Then run the smoke.")
+        self.register()
+        start = hub.start_text("vps", tid)
+        self.assertIn(f'Your task is {hub.tref(tid)}, from manager: "Fix the shop\'s sign-in". Done when: ', start)
+        self.assertIn(f"Details: The shop's config: {hub.MASK} Then run the smoke.", start.splitlines())
+        self.assertNotIn("assw0rd", start)
+        start = hub.start_text("vps", held)
+        self.assertIn(f'Your task is {hub.tref(held)}, from manager: "{hub.MASK}". Done when: ', start)
+        self.assertIn("Details: Then run the smoke.", start.splitlines())
+        self.assertNotIn("assw0rd", start)
+
+    def test_a_long_task_masks_only_the_details_that_its_start_shows(self):
+        """task_itself masks only the part of the details that the start shows (details_kept): the mask hashes each
+        registered login against each run, and 60 KB of minified JSON took a second under the lock, for words that the
+        cut then dropped. A login that the mask takes at the cut keeps its MASK whole (cut_shown)."""
+        blob = json.dumps({"rows": ["x" * 50] * 1200}, separators=(",", ":"))       # one run of 66 KB
+        tid = self.new_task(title="Load the export", details=f"The export:\n{blob}\nThen check it.")
+        lengths, real = [], hub.mask_message
+        with patch.object(hub, "mask_message", lambda text: lengths.append(len(text)) or real(text)):
+            start = hub.start_text("vps", tid)
+        self.assertEqual(lengths[0], len("The export:"))                 # the details' own mask, before the block's
+        self.assertIn("Details: The export: ... (list_my_tasks gives the rest)", start.splitlines())
+        glued, salt = "SYNTHETICGLUEDLOGIN-4410", "cd" * 16
+        hub.q("INSERT INTO secrets(label,salt,hash,len,username) VALUES(?,?,?,?,'')",
+              ("bws://22222222-2222-2222-2222-222222222222 token", salt,
+               hashlib.sha256((salt + glued).encode()).hexdigest(), len(glued)))
+        words = "w " * ((hub.TASK_DETAILS_CHARS - len(glued)) // 2)        # the login ends at the cut
+        tid = self.new_task(title="Rotate the token", details=words + glued + " and the words after it")
+        details = next(line for line in hub.start_text("vps", tid).splitlines() if line.startswith("Details: "))
+        self.assertTrue(details.endswith(f"w {hub.MASK} ... (list_my_tasks gives the rest)"), details[-80:])
+        self.assertNotIn(glued[:6], details)
+        # the same with characters glued to the login's end: the run that holds the end of the MASK crosses the cut
+        words = "w " * ((hub.TASK_DETAILS_CHARS - len('cf {"pw": "') - len(glued) - len('"}xxxxxxxxx')) // 2)
+        tid = self.new_task(title="Rotate the token", details=words + f'cf {{"pw": "{glued}"}}xxxxxxxxx and more')
+        details = next(line for line in hub.start_text("vps", tid).splitlines() if line.startswith("Details: "))
+        self.assertTrue(details.endswith(f'cf {{"pw": "{hub.MASK} ... (list_my_tasks gives the rest)'), details[-80:])
+        self.assertNotIn(glued[:6], details)
+
+    def test_one_line_of_a_start_with_a_login_that_the_mask_cannot_place_costs_that_line_only(self):
+        """Other parts of the per-task block render stored words too: a task that follows another reads at its start
+        what the agent of the earlier one wrote down (warm_follows). One login that the mask cannot place there made
+        the whole start text MASK. The block is masked line by line now (start_text, mask_message)."""
+        self.ok("vps", "report_progress", note="The shop's config: " + json.dumps({"login": self.LOGIN}))
+        after = self.new_task(title="Rotate the shop's login", details="Use the new one.")
+        hub.q("UPDATE tasks SET follows=? WHERE id=?", (self.task, after))
+        self.register()
+        start = hub.start_text("vps", after)
+        self.assertIn(f'Your task is {hub.tref(after)}, from manager: "Rotate the shop\'s login". Done when: ', start)
+        self.assertIn(f"WHAT CAME BEFORE. Your task follows {hub.tref(self.task)}", start)
+        self.assertIn(hub.MASK, start.splitlines())
+        self.assertNotIn("assw0rd", start)
+
     def test_a_read_reads_the_logins_once_for_all_its_masks(self):
         """A read masks its messages after the lock that marks them read, with the logins that it read in that lock
         (logins_held). A mask that read them again would take the lock again, once for each line of a message with a

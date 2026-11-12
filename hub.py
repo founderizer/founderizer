@@ -3526,24 +3526,31 @@ def start_text(agent, task_id, resume=False, note="", row=None, opening=None, fi
     a task's own: a conversation's brief, whose conversation task this is (conversation_brief, lane L2). The agent's
     skills belong to the stable text; this block lists them only where that text does not (skills_start_text).
     A task that a narrowed person's words drive (person access plan, section 3) gets no standing items and no checks:
-    other people's items and the agent's checks are not its to keep, end or run, and its tools reach none of them."""
+    other people's items and the agent's checks are not its to keep, end or run, and its tools reach none of them.
+
+    The block is masked line by line where a login stays that the mask cannot place (mask_message), with the logins
+    read once for all its masks (logins_held): one such login, as JSON writes one with a quote, in one part of it made
+    the whole start text MASK, so the session got no task. Each part that renders stored words masks its own as well:
+    the task's title, done-when line, details and goal title (task_itself), a new attempt's note (task_start_text),
+    the standing items, the notes and the lessons."""
     narrowed = task_id is not None and task_scope(read_row(
         "SELECT id, owner, scope_person, source_conversation FROM tasks WHERE id=?", (task_id,))) is not None
-    return mask_secrets(
-        (first if first is not None else
-         task_start_text(agent, task_id, resume, note, row, opening))   # 1. the task or wake (L8)
-        + holdings_team_text(agent, task_id)                            # 2. holdings and the team directory (L8)
-        + ("" if narrowed else standing_start_text(agent))              # 3. standing items (L3)
-        # (person access plan, section 5: a narrowed task reads none of the agent's notes, skills, lessons or
-        # knowledge, which speak of everything the agent holds, not of the person's list)
-        + ("" if narrowed else notes_start_text(agent, task_id))        # 4. its notes, its skills where its
-        + ("" if narrowed else skills_start_text(agent, bool(opening)))  #    stable text lists none (design v4 D3)
-        + ("" if narrowed else memory_start_text(agent, task_id))       #    and the matching lessons (L6)
-        + ("" if shell_off(agent) or narrowed else knowledge_start_text(agent))  # and the knowledge files it may read
-        # (support plan F1: a closed start carries the words of its own knowledge files, and has no read_knowledge)
-        + ("" if shell_off(agent) or narrowed else checks_start_text(agent, task_id))  # 5. the agent's checks (L4)
-        # (F1: its line keeps the watches of a Shell-off agent, which has no see_triggers and saves no check)
-    )
+    with logins_held(secret_key()):
+        return mask_message(
+            (first if first is not None else
+             task_start_text(agent, task_id, resume, note, row, opening))   # 1. the task or wake (L8)
+            + holdings_team_text(agent, task_id)                            # 2. holdings and the team directory (L8)
+            + ("" if narrowed else standing_start_text(agent))              # 3. standing items (L3)
+            # (person access plan, section 5: a narrowed task reads none of the agent's notes, skills, lessons or
+            # knowledge, which speak of everything the agent holds, not of the person's list)
+            + ("" if narrowed else notes_start_text(agent, task_id))        # 4. its notes, its skills where its
+            + ("" if narrowed else skills_start_text(agent, bool(opening)))  #    stable text lists none (design v4 D3)
+            + ("" if narrowed else memory_start_text(agent, task_id))       #    and the matching lessons (L6)
+            + ("" if shell_off(agent) or narrowed else knowledge_start_text(agent))  # and its knowledge files
+            # (support plan F1: a closed start carries the words of its own knowledge files, and has no read_knowledge)
+            + ("" if shell_off(agent) or narrowed else checks_start_text(agent, task_id))  # 5. its checks (L4)
+            # (F1: its line keeps the watches of a Shell-off agent, which has no see_triggers and saves no check)
+        )
 
 
 # The rules split by role (AUTONOMY.md P9.3): RULES.md is the core that every agent reads, and each part of
@@ -3633,7 +3640,7 @@ def task_start_text(agent, task_id, resume=False, note="", row=None, opening=Non
                  f'it writes a duty outside your team.')
     if resume:
         t = row or read_row("SELECT * FROM tasks WHERE id=?", (task_id,))
-        said += (" " + note if note else "") + (warm_attempt(t) if t else "")
+        said += (" " + mask_secrets(note) if note else "") + (warm_attempt(t) if t else "")
     else:
         t = read_row("SELECT follows FROM tasks WHERE id=?", (task_id,))
         said += warm_follows(t["follows"] if t else None, closed)
@@ -3643,25 +3650,68 @@ def task_start_text(agent, task_id, resume=False, note="", row=None, opening=Non
 TASK_DETAILS_CHARS = 6000       # the most of a task's details that its start carries; list_my_tasks has the rest
 
 
+def cut_shown(text, most):
+    """cut_whole of a text that holds MASK, but never in the middle of one: a cut there left "[Registered login" at the
+    end of a task's details, where the cut fell in the MASK or in a run of characters glued to its end, which cut_whole
+    gives back up to its start. A MASK that the cut falls in is kept whole, up to len(MASK) - 1 characters past
+    `most`; the characters glued to its end are not."""
+    cut = cut_whole(text, most)
+    at = text.rfind(MASK, 0, len(cut) + len(MASK) - 1)
+    return text[:at + len(MASK)] if 0 <= at < len(cut) < at + len(MASK) else cut
+
+
+def details_kept(text, most):
+    """The part of a task's details that its start can show, with the lines as they were written: each run of
+    non-whitespace that begins within the first `most` characters of their one-line form, but not a run of LOGIN_LEAST
+    or more that crosses that point, which cut_whole drops; and the whole line around that point when it is one JSON
+    string of at most 2 * most characters, so that its words are masked as a JSON line's are (an ask_team question has
+    at most CONVERSATION_ASK_MAX). Only this part is masked (task_itself): the mask hashes
+    each registered login against each run, and 60 KB of minified JSON took a second under the lock, for words that the
+    cut then dropped. str.split and SECRET_RUN take the same characters for whitespace."""
+    used, end = 0, 0
+    for m in SECRET_RUN.finditer(text):
+        start = used + 1 if used else 0             # where this run begins in the one-line form
+        size = m.end() - m.start()
+        if start >= most or (start + size > most and size >= LOGIN_LEAST):
+            break
+        used, end = start + size, m.end()
+    head, tail = text.rfind("\n", 0, end) + 1, text.find("\n", end)
+    line = text[head:len(text) if tail < 0 else tail]
+    if end < head + len(line) and len(line) <= 2 * most and json_words(line) is not None:
+        end = head + len(line)
+    return text[:end]
+
+
 def task_itself(task_id, closed=False):
     """The task as list_my_tasks gives it, in its own start (plan P9.4): its title, its requester, its done-when line
     and its details, so that a session needs no call to learn its task. Its first fleet call marks it started
     (task_started), and deliver_result keeps its last note. A goal's own words and limits are not here: they are read
     when the worker asks, so a goal that the manager corrects after the task was given out reads as corrected.
     closed: a session whose Shell box is off, which has no list_my_tasks and no report_progress (support plan F1).
-    read_row only: admit_task runs this inside its transaction."""
+    read_row only: admit_task runs this inside its transaction. The task's title, done-when line, details and goal
+    title are masked each on its own, the details line by line (mask_message), before they are joined into one line:
+    start_text masks the whole block once more, and there one login that the mask cannot place costs its whole line."""
     t = read_row("SELECT * FROM tasks WHERE id=?", (task_id,))
     if not t:
         return f"Your task is {tref(task_id)}." + (
             "" if closed else f" Call the fleet tool list_my_tasks with task_id \"{tref(task_id)}\".")
-    details = " ".join((t["details"] or "").split())
+    raw = t["details"] or ""
+    line = " ".join(raw.split())
+    kept = details_kept(raw, TASK_DETAILS_CHARS) if len(line) > TASK_DETAILS_CHARS else raw
+    said = " ".join(mask_message(kept).split())         # each line of them on its own, a JSON line in its words
+    if said == " ".join(kept.split()):                  # no login: the bytes as they always were
+        shown, more = cut_whole(line, TASK_DETAILS_CHARS), len(line) > TASK_DETAILS_CHARS
+    else:
+        shown = cut_shown(said, TASK_DETAILS_CHARS)
+        more = len(line) > TASK_DETAILS_CHARS or len(shown) < len(said)
     goal = read_row("SELECT id, title FROM goals WHERE id=?", (t["goal_id"],)) if t["goal_id"] else None
-    return (f'Your task is {tref(task_id)}, from {t["requester"]}: "{t["title"]}". Done when: {t["done_when"]}'
-            + (f"\nDetails: {cut_whole(details, TASK_DETAILS_CHARS)}" +
-               ((" ..." if closed else " ... (list_my_tasks gives the rest)") if len(details) > TASK_DETAILS_CHARS
-                else "") if details else "")
-            + ((f'\nIt belongs to {gref(goal["id"])} "{goal["title"]}".' if closed else
-                f'\nIt belongs to {gref(goal["id"])} "{goal["title"]}": list_my_tasks gives that goal\'s words, its '
+    aim = mask_secrets(str(goal["title"])) if goal else ""          # str: a NULL reads "None", as it always did
+    return (f'Your task is {tref(task_id)}, from {t["requester"]}: "{mask_secrets(str(t["title"]))}". Done when: '
+            f'{mask_secrets(str(t["done_when"]))}'
+            + (f"\nDetails: {shown}" + ((" ..." if closed else " ... (list_my_tasks gives the rest)") if more else "")
+               if line else "")
+            + ((f'\nIt belongs to {gref(goal["id"])} "{aim}".' if closed else
+                f'\nIt belongs to {gref(goal["id"])} "{aim}": list_my_tasks gives that goal\'s words, its '
                 f'plan step and its limits as they stand now, and they hold for this task.') if goal else "")
             + ("\nDo the task and finish with deliver_result." if closed else
                "\nDo the task and finish with deliver_result. Report progress at each real step of longer work; "
@@ -13959,7 +14009,8 @@ def mask_words(words):
 
 
 def mask_message(text):
-    """mask_secrets of one message of a read, before the read joins it with the others and masks the whole once more.
+    """mask_secrets of one message of a read, before the read joins it with the others and masks the whole once more,
+    and of any text that is read as lines (a task's details, a start text: start_text).
     A message is masked line by line when a line of it is one JSON string, as json_one_line writes a person's words,
     or when mask_secrets finds a login in it that it cannot place and so gives MASK for all of it.
 
