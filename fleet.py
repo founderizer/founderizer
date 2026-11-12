@@ -690,7 +690,7 @@ DENY = ["Read(~/.fleet/**)", "Edit(~/.fleet/**)", "Bash(*.fleet/*)"] + UNSEEN_TO
 CHROME_TOOLS = "mcp__claude-in-chrome__*"      # the tools that Claude Code's --chrome adds to a browser task
 # The files of this checkout that no worker session edits: Fleet's code, the rules, the owner's files, and the agents'
 # skills, which an agent changes with write_skill only (design v4 D1).
-PROTECTED = ("fleet.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.py", "acp_programs.py", "prices/**", "screen_runner.py", "desktop.py", "FleetWorker.swift", "worker_install.py", "install-worker.sh", "Install Fleet Worker.command", "hub.py", "wakeups.py", "usage.py", "threads.py", "selftest.py", "test_logins.py", "verify.py", "verify_case.py", "pilot.py", "publish.py", "publish/**", "team.json", "RULES.md", "rules/**", "CLAUDE.md", "AGENTS.md", "profiles/**", "skills/**")
+PROTECTED = ("fleet.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.py", "acp_programs.py", "prices/**", "pins.py", "prices.py", "screen_runner.py", "desktop.py", "FleetWorker.swift", "worker_install.py", "install-worker.sh", "Install Fleet Worker.command", "hub.py", "wakeups.py", "usage.py", "threads.py", "selftest.py", "test_logins.py", "verify.py", "verify_case.py", "pilot.py", "publish.py", "publish/**", "team.json", "RULES.md", "rules/**", "CLAUDE.md", "AGENTS.md", "profiles/**", "skills/**")
 # No Claude session that a helper starts loads a setting source of its machine (--setting-sources ''). A Mac keeps one
 # desktop user for its agents (PRODUCT.md P2), so that person's own CLAUDE.md, rules, skills, agents, plugins and hooks
 # would steer every agent there unseen, and an agent could write them to steer its own later sessions; and the
