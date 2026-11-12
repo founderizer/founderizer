@@ -21758,7 +21758,7 @@ def resource_entry(rid, entry, team):
         raise ValueError(f"resource {rid!r}: {what!r} is no email address" if kind in ("drive", "gmail") else
                          f"resource {rid!r}: {what!r} is no {RESOURCE_WORDS[kind]} that this team has")
     if kind == "server":
-        raise ValueError(f"resource {rid!r}: a server is the owner's alone to give: his app gives each server to the "
+        raise ValueError(f"resource {rid!r}: a server is the owner's alone to give: their app gives each server to the "
                          f"DevOps agent of the business whose Tailscale tag it carries, or to the manager while the "
                          f"business has none, and no pool holds it")
     if not isinstance(entry, dict) or not entry or set(entry) - {"max", "to"}:
@@ -22005,7 +22005,7 @@ def grant_check(agent, rid, level):
         raise ToolError(f"{agent} is the {a.get('role')}: a repository, a tool, a Google service and a secret reach "
                         f"task sessions, so only a worker or a lead gets one. You never grant to yourself.")
     if kind == "server":        # DevOps plan C4 and "Yes, by business": the owner's app gives it, by its tag
-        return (f"A server is the owner's alone to give: his app gives each server that carries a business's Tailscale "
+        return (f"A server is the owner's alone to give: their app gives each server that carries a business's Tailscale "
                 f"tag to that business's DevOps agent, by itself. Give the work on {what} to the agent that holds it, "
                 f"which does it through the door, and raise no Needs-you item that asks the owner to do the step by "
                 f"hand.")

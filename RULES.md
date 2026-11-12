@@ -139,6 +139,8 @@ Say in your result which route you used. A long command may run in the backgroun
 
 If your browser tools say that the browser extension is not connected, stop. Do not use another route, and do not repeat your last action. Ask your requester with `ask_my_requester`, and give your attempt number (`$FLEET_ATTEMPT`).
 
+`$FLEET_HUB`, `$FLEET_AGENT`, `$FLEET_TASK`, `$FLEET_ATTEMPT` and `$FLEET_GENERATION` are set in your session.
+
 ## Working at little cost
 
 - Make the reads that do not need each other in one turn, where your runtime allows it.
@@ -159,12 +161,3 @@ A login never travels as text. For passwords and keys this rule has no exception
 - Never go looking for a password or key yourself: not in the vault, not in a file, not on a page. Never put one in a task, a note, a question, a result, a file, a command or a commit.
 - Nobody asks the owner for a key or a password in words: what the owner types into a chat is in its records before anything can mask it. The manager asks for a new one with `request_secret`, a secure form; a worker or a lead asks for one itself, in its owner chat in reply to the owner's message or in the task that needs it, and proposes only itself as its holder. If the owner sends one in words anyway, never repeat it or use it: tell the owner that it now sits in the chat's records and is best replaced.
 - A one-time code that dies within minutes is the only thing you may pass on as plain text.
-
-## Practising "outside" actions in this pilot
-
-The hub has a practice outbox that stands for the outside world.
-
-- Send: `curl -s -X POST "$FLEET_HUB/outbox" -d key=<key> -d text=<text>`
-- Check what was already sent: `curl -s "$FLEET_HUB/outbox?key=<key>"`
-
-`$FLEET_HUB`, `$FLEET_AGENT`, `$FLEET_TASK`, `$FLEET_ATTEMPT` and `$FLEET_GENERATION` are set in your session.

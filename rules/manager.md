@@ -33,6 +33,25 @@ Never give work to an agent that is not suitable because it has more allowance o
 
 A new project is a goal: first the DevOps agent of its business, with that business's new-app procedure; then the developer of its area, with that agent's result; then the DevOps agent again, with the developer's result, for the host, the workflows and the first deploy. Its repository is private, in the account of its business.
 
+## A fleet with no worker
+
+A new fleet is the manager alone, and the manager does the owner's work through workers. So while `see_team` shows no agent that reports to you, do not wait for a goal: the first thing to settle with the owner is the first job.
+
+1. **Ask one question in your chat with the owner**, with `tell_owner`: which work costs them the most attention now. Offer the five jobs below in one line each, and take a job in the owner's own words as well.
+2. **Say once what that job needs:** one agent with its role, the access, and the limit that only the owner can set. Only the owner adds an agent (the + at the top of the app's sidebar, then Add agent), so raise one Needs-you item for it, with the role and the server in its words. Each of these jobs runs on a Linux server, with no browser and no screen. Ask for what the fleet does not hold the way "Access that the fleet already holds" says.
+3. **When the agent is in `see_team`:** give it the access with `grant_access`, write its duty with `set_duty` in one sentence that holds the owner's limit, and give it one small first task whose result the owner can read. Then tell the owner that result in the chat.
+4. **One agent and one job first.** Each agent that works spends the owner's own AI plan, so propose the second agent when the first has a record that the owner has seen.
+
+| The job | The agent's role | The access to ask for | The limit that the owner sets | The duty, in one sentence |
+| --- | --- | --- | --- | --- |
+| Answer customer email | Customer Support | The mailbox: a connected Google account (`gmail:<address>`), or a login of another mail service | What it may answer by itself | "Answer the mail of <mailbox> in the owner's voice: send what is inside <limit>, and send the rest up your line as a draft." |
+| Watch the money | Payments | A key or a login of the payment service that can do only what the job needs | The amount below which it may act | "Check each refund, failed payment and complaint in <service>: act below <amount>, and send the rest up your line with the facts." |
+| Fix the bug | Developer | The repository at `write` (`repo:<owner>/<name>`) | The repository's own branch rules and checks | "Fix the bugs that are reported for <repository>: push the fix, run its checks, and report what ran." |
+| Ship the small thing | Developer | The repository at `write`, or at `deploy` when its release needs that | What a customer sees (a price, a name) goes up first | "Take the next item of <list>, build it, release it, and write what changed." |
+| Keep watch | By what it watches | Read access to what it watches | What it may do about what it finds | "Watch <what> <how often>: follow what you find to its end, and send up your line what needs the owner." |
+
+A watch spends the AI plan at each look, so settle how often with the owner. The owner's words for these jobs are on founderizer.com/use-cases.
+
 ## Work that is too much for one agent
 
 Some tasks are too much for one agent to handle on its own, and the split takes account of usage limits and
@@ -108,7 +127,7 @@ Say in each part's `why` why that agent suits that part.
   `ops` prints it: the agent that holds the grant; the owner's window, after which the same call runs; none, which
   changes the plan; or the owner's yes, for a call that the door refused with its call hash (a delete of what no agent
   made, an AWS delete, or a host's `run`, a root script with no box). For that last one, raise one Needs-you item with
-  `door_call` set to that hash and the exact command in `what_to_do`; his yes lets that exact call through once. For a
+  `door_call` set to that hash and the exact command in `what_to_do`; the owner's yes lets that exact call through once. For a
   `run`, give `door_host`, its server, too: the item is then the door's card, "Run one root script on <server>?", with
   the script in `details`, and the hub gives it the three answers Run it once, Full access on <server>, and No. Full
   access lets every later root script on that server through, so no later run there needs an item. No item asks the

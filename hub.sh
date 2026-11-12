@@ -26,6 +26,10 @@
 # from before has no page that gives the manager a server, and this script is the newest release, which reaches a
 # new hub before the app that the download page gives does.
 #
+# With FLEET_VERIFY=caller, which the app sets when its own next step is `fleet.py verify`, the last step here runs
+# no verify: the app's step answers for this machine, and the self-test, about a minute, runs one time and not two.
+# Without it this script ends with verify, as it always did, so an agent or a person that ran this line knows.
+#
 # Each agent's session runs as its own user, `fleet-<agent>`, so its checkout, its runtime, that runtime's
 # credential and its vault token are in a home of mode 700 that no other agent of this machine can open
 # (PRODUCT.md 4.1).
@@ -126,6 +130,8 @@ case "$claim_wait" in ''|*[!0-9]*) stop "--claim-wait must be seconds" ;; esac
 case "$runtime" in claude|codex) ;; *) stop "--runtime must be claude or codex" ;; esac
 manager_later=no        # the app gives the manager a server of its own (see the top of this file)
 if [ "${FLEET_MANAGER_SERVER:-}" = later ]; then manager_later=yes; fi
+caller_verifies=no      # the app that started this install runs verify itself as its next step (see the top)
+if [ "${FLEET_VERIFY:-}" = caller ]; then caller_verifies=yes; fi
 if [ "$check" = yes ]; then
     root=${FLEET_CHECK_ROOT:-}
     say "check only: nothing on this machine changes."
@@ -497,11 +503,12 @@ runuser -u $user -- python3 $folder/fleet.py service $agent"
 checks() {
     heading "the checks the owner can act on"
     if [ "$check" = yes ]; then
-        plan "run: python3 $kit/hubsetup.py check --address $address --port $port (selftest.py and GET /health)"
+        plan "run: python3 $kit/hubsetup.py check --address $address --port $port --no-selftest (GET /health; \
+verify, the last step, runs selftest.py)"
         plan "print the hub's address as the line to paste in Founderizer"
         return 0
     fi
-    as_user python3 "$kit/hubsetup.py" check --address "$address" --port "$port" --kit "$kit" \
+    as_user python3 "$kit/hubsetup.py" check --address "$address" --port "$port" --kit "$kit" --no-selftest \
         || stop "the hub is installed but it does not answer. Look at: \
 runuser -u $HUB_USER -- systemctl --user status fleet-hub"
     # The hub works from here: the owner can paste the address while the last step installs the security updates.
@@ -592,6 +599,14 @@ store: it says nothing about its owner (PRODUCT.md 4.2)"
 
 verify_step() {  # the last step: the one health check of the whole product (PRODUCT.md 4.1), in its readable form
     heading "verify: is this machine of the fleet healthy?"
+    if [ "$caller_verifies" = yes ]; then
+        if [ "$check" = yes ]; then
+            plan "leave verify to the app that started this install: it runs python3 $kit/fleet.py verify next"
+        else
+            say "  the app that started this install reads this machine's checks next: READY for them"
+        fi
+        return 0
+    fi
     if [ "$check" = yes ]; then
         plan "run: python3 $kit/fleet.py verify, and print the line of every check it answers"
         plan "end with a failure when a check failed, so the agent or the app that ran this line knows"
@@ -612,6 +627,8 @@ done_text() {
         say "then the hub would be installed, and its address would be the line to paste in Founderizer:"
     elif [ "$ready" = no ]; then
         say "the hub is installed, and verify says it is not healthy yet. Its address, to paste in Founderizer:"
+    elif [ "$caller_verifies" = yes ]; then
+        say "the hub is installed, and the app that started this install checks it next. Its address:"
     else
         say "the hub is installed and verify says READY. Paste this address in Founderizer:"
     fi

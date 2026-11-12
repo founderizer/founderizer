@@ -32,8 +32,9 @@ Standard library only, and it reads no credential of a model provider.
     python3 hubsetup.py harden [--user NAME] [--check]
                                                     as root: SSH takes keys only with no X11 forwarding, npm takes no
                                                     package version newer than seven days, Tailscale updates itself
-    python3 hubsetup.py check --address IP [--port N] [--kit PATH]
-                                                    the end checks on this machine: selftest.py and GET /health
+    python3 hubsetup.py check --address IP [--port N] [--kit PATH] [--no-selftest]
+                                                    the end checks on this machine: selftest.py and GET /health;
+                                                    --no-selftest for a caller that runs verify next
     python3 hubsetup.py fleet-id [--db PATH]        this fleet's own id in the hub's key store, made once
     python3 hubsetup.py kit-clone [--hub-user fleet] [--source URL]
                                                     as root on the hub's machine: root's own clone of the published
@@ -2476,8 +2477,11 @@ def cmd_kit_clone(args):
 
 
 def cmd_check(args):
-    ok, last = selftest(args.kit)
-    say(f"selftest.py: {last}")
+    """check: selftest.py and GET /health. With --no-selftest only GET /health, for a caller whose own last step is
+    `fleet.py verify` (hub.sh): verify runs the self-test itself, so the install ran the same minute two times."""
+    ok, last = (True, None) if args.no_selftest else selftest(args.kit)
+    if last is not None:
+        say(f"selftest.py: {last}")
     live, agents = health(address(args.address, "the hub's address"), args.port)
     say(f"the hub answers /health: {agents}" if live else f"the hub does not answer /health: {agents}")
     if not live:
@@ -2557,6 +2561,7 @@ def main(argv=None):
         p.set_defaults(fn=fn)
         if name == "check":
             p.add_argument("--kit", default=KIT)
+            p.add_argument("--no-selftest", action="store_true", help="only GET /health: the caller runs verify next")
             continue
         p.add_argument("--timezone")
         p.add_argument("--runtime", default="claude", choices=sorted(STARTS))

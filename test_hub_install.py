@@ -85,7 +85,7 @@ def run_shell(body, extra=""):
             "step=0\n"
             "heading() { step=$((step + 1)); printf '\\nFounderizer step %d: %s\\n' \"$step\" \"$*\"; }\n"
             "plan() { [ \"$check\" = yes ] && printf 'Founderizer:   would %s\\n' \"$*\" || true; }\n"
-            "check=no\nready=yes\nkit=/kit\nHUB_USER=fleet\nWORKER=fleet\n" + extra + body)
+            "check=no\nready=yes\nkit=/kit\nHUB_USER=fleet\nWORKER=fleet\ncaller_verifies=no\n" + extra + body)
     done = subprocess.run(["sh", "-c", text], capture_output=True, text=True, timeout=60,
                           stdin=subprocess.DEVNULL)
     return done.returncode, done.stdout + done.stderr
@@ -1401,6 +1401,34 @@ class VerifyStep(unittest.TestCase):
             self.assertIn("NOT READY: services", out)
             self.assertIn("(fix: Start it again on this server.)  (run: systemctl --user restart fleet-hub)", out)
             self.assertIn("NOT ready", out)
+
+    def test_the_apps_word_leaves_verify_to_the_app_and_the_log_still_says_ready(self):
+        """FLEET_VERIFY=caller is the word of an app whose own next step is verify: the installer runs none, so the
+        self-test runs one time, and its log still holds the READY that the app waits for."""
+        code, out = run_shell(shell_function(SCRIPT, "verify_step") + '\nverify_step\n[ "$ready" = yes ] || exit 1\n',
+                              extra='caller_verifies=yes\nas_user() { echo "verify ran"; return 1; }\n')
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("verify ran", out)
+        self.assertIn("READY", out)
+        self.assertNotIn("NOT", out)
+        text = SCRIPT.read_text()
+        self.assertIn('if [ "${FLEET_VERIFY:-}" = caller ]; then caller_verifies=yes; fi', text)
+        self.assertIn("caller_verifies=no ", text)                  # without the word it ends with verify, as before
+
+    def test_the_installers_check_step_leaves_the_self_test_to_verify(self):
+        """`checks` ran selftest.py and verify ran it again, about a minute each: the step now reads only /health."""
+        self.assertIn('--kit "$kit" --no-selftest', shell_function(SCRIPT, "checks"))
+        with patch.object(hubsetup, "selftest", side_effect=AssertionError("the self-test ran")), \
+                patch.object(hubsetup, "health", return_value=(True, "manager")), \
+                contextlib.redirect_stdout(io.StringIO()) as said:
+            hubsetup.main(["check", "--address", "100.64.0.1", "--no-selftest"])
+        self.assertNotIn("selftest.py", said.getvalue())
+        with patch.object(hubsetup, "selftest", return_value=(True, "passed 3 of 3")) as ran, \
+                patch.object(hubsetup, "health", return_value=(True, "manager")), \
+                contextlib.redirect_stdout(io.StringIO()) as said:
+            hubsetup.main(["check", "--address", "100.64.0.1"])
+        self.assertEqual(ran.call_count, 1)
+        self.assertIn("selftest.py: passed 3 of 3", said.getvalue())
 
     def test_verify_is_the_last_step_of_the_hub_installer(self):
         main = shell_function(SCRIPT, "main")
@@ -3277,7 +3305,8 @@ class CheckMode(unittest.TestCase):
 
     def run_check(self, *args, tree=None, root=None, expect=0, more_env=None):
         env = dict(os.environ, FLEET_CHECK_ROOT=str(root if root is not None else self.tmp))
-        env.pop("FLEET_MANAGER_SERVER", None)           # the app's word, only where a test gives it
+        env.pop("FLEET_MANAGER_SERVER", None)           # the app's words, only where a test gives them
+        env.pop("FLEET_VERIFY", None)
         env.update(more_env or {})
         done = subprocess.run(["sh", str(tree or SCRIPT), "--check", *args], capture_output=True, text=True, env=env,
                               timeout=120, stdin=subprocess.DEVNULL)
@@ -3292,6 +3321,15 @@ class CheckMode(unittest.TestCase):
         out = self.run_check(more_env={"FLEET_MANAGER_SERVER": "later"})
         self.assertIn("one manager with no server yet", out)
         self.assertIn("find none on a new hub", out)
+
+    def test_the_plan_leaves_verify_to_the_app_only_on_the_apps_word(self):
+        out = self.run_check()
+        self.assertIn("fleet.py verify, and print the line of every check it answers", out)
+        self.assertNotIn("leave verify to the app", out)
+        self.assertIn("--no-selftest (GET /health;", out)
+        out = self.run_check(more_env={"FLEET_VERIFY": "caller"})
+        self.assertIn("leave verify to the app that started this install", out)
+        self.assertNotIn("and print the line of every check it answers", out)
 
     def test_the_script_is_valid_shell(self):
         subprocess.run(["sh", "-n", str(SCRIPT)], check=True, capture_output=True)
