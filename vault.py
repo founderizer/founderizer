@@ -3553,8 +3553,9 @@ def swap_main(config, take=None):
 # The swap proxy's service (`unit --swap`): its own user, the right to its one low port and no other, and no part of
 # the store. A restart of the broker does not touch it: when the broker runs a new program, the proxy lets that
 # program take over as a new process, with no cut of the open connections (SwapProxy.candidate), and NotifyAccess=all
-# lets that process tell systemd that it is the main process now. No ProtectProc, no ProcSubset and no
-# RestrictAddressFamilies: it reads /proc/net/tcp, and it connects to any address.
+# lets that process tell systemd that it is the main process now. The type stays simple: a program of the first
+# version tells systemd nothing, and with Type=notify its proxy would never count as started. No ProtectProc, no
+# ProcSubset and no RestrictAddressFamilies: it reads /proc/net/tcp, and it connects to any address.
 SWAP_UNIT = """[Unit]
 Description=Fleet vault key swap proxy (puts an API key into a request to the key's own site; it cannot read the store)
 After=network-online.target fleet-vault.service
