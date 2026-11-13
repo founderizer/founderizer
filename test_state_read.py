@@ -481,7 +481,8 @@ class SameBytes(StateCase):
                          [{"app": "whatsapp", "account": "wa1", "label": "Shop phone"}] + [None] * 3)
         self.assertEqual(list(state["agents"][0]), ["name", "role", "runtime", "title", "active", "can", "usage",
                                                     "reports_to", "direct_chat", "local_model", "signed_in",
-                                                    "chat_ready", "placed", "turn_ended_after", "limit",
+                                                    "chat_ready", "placed", "turn_ended_after",
+                                                    "chat_undelivered", "limit",
                                                     *hub.AGENT_SEEN])
         self.assertEqual(hub.AGENT_SEEN, ("last_seen", "alive", "alive_ts", "client", "client_seen"))
         self.assertEqual({tuple(a) for a in state["agents"]}, {tuple(state["agents"][0])})    # also with no agents row
@@ -604,8 +605,8 @@ class Reads(StateCase):
             reads, before = self.traced(hub.agent_reads)
             views, seen = self.traced(lambda: [hub.agent_view(name, config, reads) for name, config in team])
         self.assertEqual(views, own)
-        # agents, usage, limits, machine readings, server sign-ins, sign-ins, keys, turn ends
-        self.assertEqual(len([s for s in before if s.startswith("SELECT")]), 8)
+        # agents, usage, limits, machine readings, server sign-ins, sign-ins, keys, turn ends, late chat messages
+        self.assertEqual(len([s for s in before if s.startswith("SELECT")]), 9)
         self.assertEqual(sorted(s.split(" WHERE")[0] for s in seen),
                          ["SELECT MAX(u.created) AS created FROM ui_requests u JOIN events e ON e.id=u.event_id",
                           "SELECT agent, ready FROM session_credentials", "SELECT v FROM kv"])

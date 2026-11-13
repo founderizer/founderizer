@@ -96,12 +96,14 @@ class Refused(Exception):
 
 
 class Silent(Refused):
-    """tmux did not answer in time, so the windows of a session are not known, and nothing is decided on them."""
+    """tmux gave no list of a session's windows, so they are not known, and nothing is decided on them."""
 
 
 class Unlisted(list):
-    """The empty window list of a read that tmux did not answer in time: it says nothing about the windows. A reader
-    that only looks takes it as a list; one that decides asks first (Helper.look_sure)."""
+    """The empty window list of a read that tmux did not answer, or answered with a failure of its own: it says
+    nothing about the windows. A reader that only looks takes it as a list; one that decides asks first
+    (Helper.look_sure). why: tmux's own words, for the one that hears of it."""
+    why = ""
 
 
 def die(msg):
@@ -231,23 +233,35 @@ def tmux(*args, check=False, timeout=15):
         return subprocess.CompletedProcess(args, 124, "", "timed out")
 
 
+# What tmux says when the session, or the whole server, is not there: then a session has no windows. Each other
+# failure of a window list says nothing about the windows (windows).
+NO_SESSION = ("can't find session", "no server running", "No such file or directory")
+
+
 def windows(session, *, checked=False):
     """The names of a session's windows; none for a session that is not there.
 
-    **A read that tmux did not answer in time is no list**: it gives Unlisted, an empty list that says so (a checked
-    read raises for each failure, as before). On 12 November 2026 a server ran out of memory, tmux did not answer in
-    its 15 seconds, and the empty list read as "this agent has no owner chat window": its helper started a second
-    one. tmux refuses a name that two windows have, so no line could be typed into either, and the owner's next
-    message waited until a person closed one of them by hand. The same empty list read as "the task's window ended"
-    and as "no session ran". So the decisions that start a window, close one or report one as ended ask
+    **A read that tmux did not carry out is no list**: it gives Unlisted, an empty list that says so (a checked read
+    raises for each failure, as before). That is an answer that did not come in time, and each failure but the one
+    that says that the session or the server is not there (NO_SESSION): a server that is too loaded to take the
+    connection fails in more ways than by its silence. On 12 November 2026 a server ran out of memory, tmux did not
+    answer in its 15 seconds, and the empty list read as "this agent has no owner chat window": its helper started a
+    second one. tmux refuses a name that two windows have, so no line could be typed into either, and the owner's
+    next message waited until a person closed one of them by hand. The same empty list read as "the task's window
+    ended" and as "no session ran". So the decisions that start a window, close one or report one as ended ask
     Helper.look_sure, which stops at Unlisted (it names its callers), and their event comes again at the next
-    poll."""
+    poll. The helper makes its session again at each round (keep_session), so a session that is not there is listed
+    at the next one."""
     r = tmux("list-windows", "-t", f"={session}:", "-F", "#{window_name}")
     if checked and r.returncode != 0:
         raise Refused(f"cannot read windows in {session}; nothing was started")
-    if r.returncode == 124:
-        return Unlisted()
-    return [w for w in r.stdout.split("\n") if w] if r.returncode == 0 else []
+    if r.returncode == 0:
+        return [w for w in r.stdout.split("\n") if w]
+    if r.returncode == 1 and any(w in r.stderr for w in NO_SESSION):
+        return []
+    unlisted = Unlisted()
+    unlisted.why = " ".join(CONTROL.sub(" ", r.stderr).split())[:120]
+    return unlisted
 
 
 def ensure_session(session):
@@ -581,16 +595,8 @@ RESIGNAL_MAX = 900
 # The standing sessions, which read their messages once more at the end of each turn: nothing is typed into them while
 # a turn runs, because a line typed then waits in the runtime's queue and comes as one more turn that reads nothing.
 STANDING_WINDOWS = ("manager", "owner-chat")
-# The owner chat's line found no session ("gone", type_into) in a window that tmux lists, at this many polls in a row:
-# its helper closes that window, and the chat continues its conversation in a new one (Helper.chat_unreachable). A
-# count of polls and no clock.
-GONE_TRIES = 3
 # The windows that a helper starts itself: the standing session, the owner chat, a task and a conversation.
 OWN_WINDOW = re.compile(r"manager|owner-chat|T-\d+|C-\d+")
-# The owner chat's line could not be typed at this many polls in a row (a question on its screen, a person scrolled
-# back in it, no session in its window, a start that fails): its helper tells the hub once, so that the wait of the
-# owner's message is not silent (Helper.chat_blocked). A count of polls and no clock.
-CHAT_BLOCKED_POLLS = 10
 # Seconds between two looks at whether the idle owner chat would start fresh at its next message (Helper.chat_cold):
 # each look reads the chat's screen and its conversation file.
 CHAT_COLD_EVERY = 60
@@ -731,6 +737,13 @@ ENTER_AGAIN, ENTER_WAIT = 3, 1.0
 # still holds at a later poll gets its Enter there too (Helper.signal): one at each poll, ENTER_LATER times at most, and
 # the line is never typed again. Polls count, not a clock (plan C5).
 ENTER_LATER = 3
+# The owner chat has one count on the proof of a message's delivery, its session's read (Helper.chat_proof): the polls
+# at which its oldest unread message is still unread. At CHAT_PROOF_POLLS the chat is replaced. A count of polls and
+# no clock. Measured on the owner's fleet, 24 October to 13 November 2026, 104 chat messages: a poll took 2.35
+# seconds while a message waited, and the longest wait from a message to its read in a chat that worked was 35
+# seconds (15 polls, a chat that started first), the next ones 24, 23 and 21. The chat that starts after a repair is
+# such a start, so the count leaves it 10 polls more than the slowest one.
+CHAT_PROOF_POLLS = 25
 INPUT_LINE = re.compile(r"^[ \t\u2502]*[\u276f\u203a>][ \t]?(.*?)[ \t\u2502]*$", re.M)  # "❯ x", "› x", "│ > x │"
 
 
@@ -4003,6 +4016,8 @@ class Helper:
         self.idle_at = {}         # {window: the last screen reading that agreed on its idle input line}
         self.wanted = {}          # {window: ids of this poll's events that want a signal} (handle_events)
         self.typed_at = {}        # {window: when its last signal was typed}, a model call of its session (restart_fresh)
+        self.chat_wait = {}       # the count on the proof of the owner chat's oldest unread message (chat_proof)
+        self.started_as = {}      # {window: the @fleet_attempt that this helper started it with} (window_attempt)
         self.closed_due = False   # the manager's session closed at a question, and the hub has not heard it (tell_closed)
         self.keyed, self.enrolled_at = False, None      # owner API 1.12: it has its agent key; its last try to get one (enroll)
         self.key_by_server = False      # the hub takes no key from this helper: its server service registers it
@@ -4341,7 +4356,7 @@ class Helper:
             return False
         if window == "owner-chat" and (self.retired_left or self.window_runtime(window) != self.conf.get("runtime")):
             return False                # the previous runtime's chat closes the switch's way (retire_old_chat)
-        if window != "owner-chat" and self.conversation_kind(window) == "tools" and \
+        if window != "owner-chat" and self.conversation_kind(window) in ("tools", None) and \
                 hook_waits(self.agent, "conversation"):
             return False                # plan C7: the hub carries this question as a permission prompt
         with contextlib.suppress(subprocess.CalledProcessError, Refused):
@@ -4373,10 +4388,10 @@ class Helper:
                 pass            # the next ping tries again; the poll after the step reports as always
 
     def look(self):
-        """The windows of this agent's session, for a reader that only looks: empty, and Unlisted, when tmux did not
-        answer in time (windows). A decision asks look_sure."""
+        """The windows of this agent's session, for a reader that only looks: empty, and Unlisted, when tmux gave no
+        list (windows). A decision asks look_sure."""
         names = windows(self.session)
-        return Unlisted() if isinstance(names, Unlisted) else [w for w in names if w != "home"]
+        return names if isinstance(names, Unlisted) else [w for w in names if w != "home"]
 
     def look_sure(self):
         """look(), for a decision that starts a window, closes one, or reports one as ended or as not there: it
@@ -4385,8 +4400,9 @@ class Helper:
         (a chat, a conversation, a task, a stop), and control and interrupt up to their close (gone, after it)."""
         names = self.look()
         if isinstance(names, Unlisted):
-            raise Silent(f"tmux did not answer in time, so the windows of {self.session} are not known; nothing "
-                         f"was decided on them")
+            raise Silent(f"tmux gave no list of the windows of {self.session}" +
+                         (f" ({names.why})" if names.why else "") + ", so they are not known; nothing was decided "
+                         "on them")
         return names
 
     def gone(self, window):
@@ -4398,12 +4414,21 @@ class Helper:
 
     def window_attempt(self, window):
         """The @fleet_attempt of a window, "" for a window without one. Raises Silent when tmux did not answer in
-        time: an answer that did not come is not "another attempt", which closes the window."""
-        r = tmux("show-options", "-wv", "-t", f"={self.session}:={window}", "@fleet_attempt")
+        time: an answer that did not come is not "another attempt", which closes the window. A window that this
+        helper started is the attempt that it started as, also when tmux did not take the option then."""
+        target = f"={self.session}:={window}"
+        r = tmux("show-options", "-wv", "-t", target, "@fleet_attempt")
         if r.returncode == 124:
             raise Silent(f"tmux did not answer in time, so the start of {window} is not known; nothing was decided "
                          f"on it")
-        return r.stdout.strip()
+        value = r.stdout.strip()
+        started = self.__dict__.setdefault("started_as", {})        # a helper that a test made with no start of its own
+        if not value and started.get(window):
+            # This helper started the window, and tmux did not take the option at that start (Helper.start goes on
+            # at a tmux that does not answer): the window is that start's, and it gets its option now.
+            value = started[window]
+            tmux("set-option", "-w", "-t", target, "@fleet_attempt", value)
+        return value
 
     def look_known(self):
         """The windows, or None when tmux did not answer: a list that cannot be read is no list (plan C6)."""
@@ -4454,75 +4479,6 @@ class Helper:
             self.say(f"{name}: {len(same)} windows had this name, and tmux types into none of them then; the helper "
                      f"closed {', '.join(closed) or 'none (tmux refused)'}, and one window of it starts again")
         return doubled
-
-    def chat_note(self, why):
-        """What this poll did about the owner chat's line: False when it was typed, else why it could not be. The
-        poll's last word stands, and a typed line stands over each: handle_events counts one poll with it
-        (chat_blocked)."""
-        if self.__dict__.get("chat_outcome") is not False:
-            self.chat_outcome = why
-
-    def chat_blocked(self, why):
-        """One more poll at which the owner chat's line could not be typed (why), or None for a poll at which it
-        went or nothing waited for it. At CHAT_BLOCKED_POLLS in a row the helper tells the hub, one time for each
-        such run, with the last reason. What counts (chat_note): a chat event that failed (handle_events), a chat
-        window that was not there and started (handle), a new session that cannot take its first line yet, a question
-        on its screen, a person scrolled back in it, no screen of its window, and a line that was told twice and not
-        taken (signal). A start takes four or five polls, so it ends before the count does; a chat that ends at each
-        start does not. A turn that runs does not count: the session reads its messages at the end of it, and a
-        screen that stands still in a turn is a gap that stays.
-
-        **A message that cannot reach its session must not wait in silence.** On 13 November 2026 the helper wrote
-        "inbox signal gone" 190 times in seven minutes, to its own log only: the hub knew an unread message and
-        nothing else, and the owner's app said "Thinking". The repairs above (one_window_each, chat_unreachable)
-        end the cause that is known; this is for the ones that are not."""
-        if why is None:
-            self.chat_blocks = 0
-            return
-        self.chat_blocks = self.__dict__.get("chat_blocks", 0) + 1
-        if self.chat_blocks != CHAT_BLOCKED_POLLS:
-            return
-        try:
-            code, _ = http("POST", f"/helper/dialog/{self.agent}/owner-chat",
-                           {"kind": "undelivered", "reason": str(why)[:300]}, timeout=10)
-        except (urllib.error.URLError, OSError, ValueError):
-            code = None
-        if code is None or code >= 500:
-            self.chat_blocks -= 1           # the hub did not answer: the next such poll tells it
-            return
-        self.say(f"owner-chat: its line could not be typed at {CHAT_BLOCKED_POLLS} polls in a row ({why}); " +
-                 ("the hub knows" if code == 200 else f"the hub did not take the report ({code})"))
-
-    def chat_unreachable(self, got):
-        """The owner chat's line found no session ("gone") although tmux lists its window, at GONE_TRIES polls in a
-        row: close every window of that name by its id, so that the next poll starts the chat again on its own
-        conversation (handle, chat_resume). True when it closed one. A window that is not listed is the next poll's
-        to start anyway.
-
-        Only a refusal that tmux gave counts. type_into says "gone" also when tmux did not answer in time, and a
-        tmux that is slow says nothing about the window: so each such poll asks tmux for the window's screen once
-        more, and counts only an answer that refuses it. A line that went, a tmux that did not answer and a new
-        start of the chat (start_chat) each end the count.
-
-        This is the net under one_window_each: whatever makes a listed window take no keys, the owner's message is
-        not left with a line that the helper can never type."""
-        refused = False
-        if got == "gone":
-            r = tmux("capture-pane", "-p", "-t", f"={self.session}:=owner-chat")
-            refused = r.returncode not in (0, 124)
-        self.chat_gone = self.__dict__.get("chat_gone", 0) + 1 if refused else 0
-        if self.chat_gone < GONE_TRIES:
-            return False
-        same = (self.windows_named() or {}).get("owner-chat")
-        if not same:
-            return False
-        closed = [wid for wid, _ in same if tmux("kill-window", "-t", wid).returncode == 0]
-        if not closed:
-            return False
-        self.chat_gone, self.chat_started = 0, None     # closed here: not a start that ended (start_chat)
-        self.say(f"owner-chat: tmux lists its window and refused its screen at {GONE_TRIES} polls in a row; the "
-                 f"helper closed {', '.join(closed)}, and the chat continues its conversation in a new window")
-        return True
 
     def sweep_places(self):
         """At most every PLACES_EVERY seconds, the task clones of this agent that nothing holds (drop_place): those of
@@ -4604,8 +4560,7 @@ class Helper:
         r = tmux("list-windows", "-t", f"={self.session}:", "-F", "#{window_name}\t#{pane_start_command}")
         if r.returncode != 0:
             gone = tmux("has-session", "-t", f"={self.session}:")
-            missing = gone.returncode == 1 and any(w in gone.stderr for w in ("can't find session", "no server running",
-                                                                             "error connecting"))
+            missing = gone.returncode == 1 and any(w in gone.stderr for w in NO_SESSION)
             return {} if missing else None
         return {name: start for name, _, start in (line.partition("\t") for line in r.stdout.splitlines())
                 if name and name != "home"}
@@ -4881,6 +4836,8 @@ class Helper:
             self.signalled[name] = time.monotonic()
             self.ready_base[name] = self.listed.get(name, 0)
             self.lines.pop(name, None)
+            # for a tmux that takes no option below (window_attempt)
+            self.__dict__.setdefault("started_as", {})[name] = f"{generation}:{attempt}"
             if name in self.screens:
                 self.last_class[name] = self.screens.pop(name).get("class")     # as watch_screens keeps it
             standing = name == "manager" and session      # its session id is its link to its conversation record
@@ -4949,14 +4906,21 @@ class Helper:
         them, and the turn-end check sees it). The listing alone is not enough: Claude Code lists its tools during its
         start, before its input box is up, and a line typed then is not sent (ENTER_LATER). A runner's window has no
         input box, and its listing is enough. A runtime whose idle screen the helper cannot read gets it at its
-        listing, or after SIGNAL_GAP seconds. A window started before this helper ran is due at once."""
+        listing, or after SIGNAL_GAP seconds. A window started before this helper ran is due at once.
+
+        **A screen that the helper cannot read holds no first line for ever.** The manager's session and the owner
+        chat take their first line SIGNAL_GAP seconds after their start at the latest, as a runtime with no readable
+        screen does: on 5 November 2026 a new version of Claude Code drew its empty input line in another way, no
+        screen read idle any more, and the first line of every new session waited without an end. A line typed
+        before the input box is up gets its Enter again (ENTER_LATER), and none is typed over a question."""
         if window not in self.ready_base:
             return True
         listed = self.listed.get(window, 0) > self.ready_base[window]
         idle = (self.screens.get(window) or {}).get("idle_run", 0)
         if reads_its_screen(self.conf.get("runtime")):
             due = idle >= (1 if listed else IDLE_READINGS) or \
-                bool(listed and re.fullmatch(r"T-\d+", window) and self.runner(f"={self.session}:={window}"))
+                bool(listed and re.fullmatch(r"T-\d+", window) and self.runner(f"={self.session}:={window}")) or \
+                window in STANDING_WINDOWS and time.monotonic() - self.signalled.get(window, 0) >= SIGNAL_GAP
         else:
             due = listed or idle >= IDLE_READINGS or time.monotonic() - self.signalled.get(window, 0) >= SIGNAL_GAP
         if due:
@@ -5001,8 +4965,6 @@ class Helper:
         at all: it starts again on a new conversation, and that one is told (restart_fresh)."""
         target = f"={self.session}:={window}"
         if not self.first_line_due(window):
-            if window == "owner-chat":
-                self.chat_note("its new session cannot take its first line yet")
             return
         r = tmux("display-message", "-p", "-t", target, "#{window_id}")
         wid, ids = (r.stdout.strip() if r.returncode == 0 else ""), frozenset(ids)
@@ -5019,8 +4981,6 @@ class Helper:
                              f"{ENTER_LATER} times at most")
             return
         if line and line["retold"]:
-            if window == "owner-chat":
-                self.chat_note("its line was told twice and not taken")
             if not line["reported"]:
                 # owner-contact plan B3: the manager's session starts fresh for it first, and the report says so; a
                 # session that moves now is not closed, and a later poll reports its line, unless it takes it first
@@ -5064,12 +5024,6 @@ class Helper:
         else:
             got = type_into(self.session, window, text)
         self.signalled[window] = time.monotonic()
-        if window == "owner-chat":
-            self.chat_note(False if got == "typed" else
-                           {"asks": "its screen shows a question of its own", "gone": "tmux gives no screen of its "
-                            "window", "reading": "somebody is scrolled back in its window"}.get(got, got))
-            if self.chat_unreachable(got):
-                return              # its window closed: the next poll starts the chat again and tells it
         if got == "typed":
             self.typed_at[window] = time.monotonic()
             self.lines[window] = {"wid": wid, "ids": ids, "at": time.monotonic(), "retold": line is not None,
@@ -5114,6 +5068,65 @@ class Helper:
                 return False
         return True
 
+    def chat_proof(self, events):
+        """**A message to the owner chat is delivered when its session read it, and one count stands on that proof.**
+        One round of the helper's loop, before the chat is kept and the poll's events are handled: events is that
+        poll's list, in which the hub says of each chat message whether its session read it ("read"). A hub from
+        before that says nothing, and nothing is counted: a message that was read and waits for its reply would
+        count as unread there.
+
+        The count is the polls at which the oldest unread chat message is still unread. It asks for no cause and
+        reads no screen, so a turn that runs counts too: an owner chat answers or opens a task, and a turn that
+        outlasts the count while a message waits unread is a tool that hangs or a screen that shows a turn for ever.
+        The count ends at the read. What a session does after it is its own work, which no count closes.
+
+        **The repair is one, whatever the cause.** At CHAT_PROOF_POLLS the helper closes every window that has the
+        chat's name, each by its tmux id, because tmux closes no window by a name that two windows have. The chat
+        then starts a new conversation with the hub's recap (keep_chat or handle, in this same round): the start
+        that a cold chat makes anyway, which needs nothing of the old session, not its window, its input box, its
+        tools or its conversation. Only a repair that tmux carried out is one: a list that it does not give, or a
+        window that it does not close, is tried again at the next poll.
+
+        **And no end to the tries.** While the message stays unread the chat is replaced again, at twice the count
+        after the last time, at four times, and so on up to 32 times (half an hour): a cause that ends finds a chat
+        that reads, with no restart of this helper, and a cause that stays costs two starts an hour. A new chat
+        message is told to the session that stands there, because signal types no line into a window whose line
+        was told twice and not taken, also not for a new message; and after a repair it brings the next one two
+        counts after the last at the latest.
+
+        This tells the hub nothing. The hub holds the proof, and it says by its own clock when the owner's message is
+        late (hub.chat_late): the owner's app then says "Not answering", also when this helper cannot count.
+
+        What a repair costs: a session that read nothing lost nothing. A session that was in a turn on an earlier
+        message is closed in that turn: the hub gives an owner's message with no reply again to the new chat's first
+        read, so that one is answered, and an agent's message or a task's result that the closed turn read and did
+        not act on is not given again (the hub tells an agent that waits for an answer, and a task's result stays in
+        its task), as when a session ends in a turn for any other reason. The count is this helper's memory: a new
+        helper starts it again, and types the line again."""
+        unread = sorted(ev["id"] for ev in events if ev.get("kind") == "chat" and ev.get("read") is False)
+        if not unread:
+            self.chat_wait = {}
+            return
+        wait = self.chat_wait
+        if wait.get("id") != unread[0]:     # the one before it was read: this one has its own count
+            wait = self.chat_wait = {"id": unread[0], "polls": 0, "stage": 0, "newest": 0}
+        if unread[-1] > wait["newest"]:
+            self.lines.pop("owner-chat", None)      # a new message: the session that stands there is told of it
+            wait["newest"], wait["stage"] = unread[-1], min(wait["stage"], 1)
+        wait["polls"] += 1
+        if wait["polls"] < CHAT_PROOF_POLLS * min(32, 2 ** wait["stage"]):
+            return
+        named = self.windows_named()
+        same = [wid for wid, _ in (named or {}).get("owner-chat", [])]
+        if named is None or not all([tmux("kill-window", "-t", wid).returncode == 0 for wid in same]):
+            return                      # tmux carried out no repair: the next poll tries again
+        self.chat_fresh, self.chat_started = True, None     # a new conversation, and no start that ended
+        self.say(f"owner-chat: M-{unread[0]} is unread after {wait['polls']} polls" +
+                 (f", {wait['stage']} repair(s) after its first" if wait["stage"] else "") +
+                 f"; the helper closed {', '.join(same) or 'no window (none is listed)'}, and the chat starts a new "
+                 f"conversation with the hub's recap")
+        wait["stage"], wait["polls"] = wait["stage"] + 1, 0
+
     def handle_events(self, events):
         """The pending events of one poll. An event that fails stays pending, and the next poll tries it again: some
         wait there on purpose, such as a Stop until the task's processes have ended. A task event that failed waits
@@ -5128,7 +5141,6 @@ class Helper:
         self.wanted = {}
         # the newest pending message of each conversation window: its start guard counts starts for it
         self.newest = {}
-        self.chat_outcome = None    # what this poll does about the owner chat's line (chat_note)
         for ev in events:
             cid = str((ev.get("extra") or {}).get("conversation") or "")
             if ev.get("kind") == "conversation" and CONVERSATION_ID.fullmatch(cid):
@@ -5142,12 +5154,13 @@ class Helper:
                 self.handle(ev)
                 self.start_waits.pop(ev["id"], None)
             except Exception as e:
-                if ev.get("kind") == "chat":        # its line could not even be tried
-                    self.chat_note(str(e)[:300] if isinstance(e, Refused) else type(e).__name__)
                 if ev.get("kind") == "task":
                     wait = min(300, wait * 2 or 15)
                     self.start_waits[ev["id"]] = (wait, time.monotonic() + wait)
-                    if not isinstance(e, Silent):   # nothing is known about its window: no start failed (windows)
+                    # A list that tmux did not give says nothing about the task's window, so no start failed
+                    # (windows). One that it still does not give at the longest wait is a tmux that stays broken
+                    # (a client and a server of two versions, a socket that it may not open): the requester hears it.
+                    if not isinstance(e, Silent) or wait >= 300:
                         self.report_start(ev.get("task"), str(e)[:200] if isinstance(e, Refused) else type(e).__name__)
                 self.say(f"event {ev['id']} remains pending: {type(e).__name__}" +
                          (f"; next try in {wait} s" if ev.get("kind") == "task" else ""))
@@ -5160,13 +5173,6 @@ class Helper:
                 self.signal(window, ids)
             except Exception as e:      # the messages stay pending in the hub, and the next poll tells them
                 self.say(f"{window}: inbox signal failed: {type(e).__name__}")
-        # One count for each poll (chat_blocked): its line was typed, or nothing waits for the chat, which ends the
-        # count; or it could not be typed, with the poll's last reason. A poll that says neither, because a turn
-        # runs in the chat, changes nothing.
-        if self.chat_outcome is False or not any(ev.get("kind") == "chat" for ev in events):
-            self.chat_blocked(None)
-        elif self.chat_outcome:
-            self.chat_blocked(self.chat_outcome)
 
     def start_chat(self, generation):
         """Start the owner chat window of this generation: for his message (handle), or before any message when the
@@ -5177,9 +5183,9 @@ class Helper:
         # window there, and every caller closes before it starts.
         if window in self.look_sure():
             raise Refused("an owner chat window is open; no second one starts")
-        self.chat_gone = 0              # a new window: the count of chat_unreachable is the old one's
         # first: the conversation it continues, if any; none after the reuse rule closed the last one (restart_fresh)
-        resume = None if self.__dict__.pop("chat_fresh", False) else self.chat_resume(generation)
+        # (kept until this start worked: one that fails must not let the next one continue the old conversation)
+        resume = None if self.__dict__.get("chat_fresh") else self.chat_resume(generation)
         # **Two starts while its starts keep ending, and then a reason** (plan C5: a count, not a minute). A chat
         # whose window ended before its conversation began starts again once, but not at every poll: each start asks
         # the hub for a credential and starts the runtime. A chat with a conversation to continue starts at once, and
@@ -5201,6 +5207,7 @@ class Helper:
                                         recap=recap, env=session_env(self.agent, self.conf, "chat"),
                                         rules=opening_rules(data)),
                    1, generation)
+        self.__dict__.pop("chat_fresh", None)
         self.chat_started = (generation, (last[1] + 1) if resume is None and last and last[0] == generation else 1)
         # what this start gave it, for the next helper in its record and for this one here (restart_chat_for_tools)
         tools = self.chat_tools_for = chat_tools(getattr(self, "chat_served", None))
@@ -5318,7 +5325,6 @@ class Helper:
                     tmux("kill-window", "-t", f"={self.session}:={window}", check=True)
             if window not in self.look_sure():
                 self.start_chat(extra["generation"])
-                self.chat_note("its window was not there and started")      # one start is no fault; ten are
             else:
                 self.want(window, ev["id"])
         elif kind == "conversation":
@@ -6245,9 +6251,13 @@ class Helper:
         return len(words) >= 2 and os.path.basename(words[1]) in ("screen_runner.py", "acp_runner.py")
 
     def working(self, target):
-        """Both Claude Code and Codex show "esc to interrupt" while a turn runs."""
+        """Both Claude Code and Codex show "esc to interrupt" while a turn runs. A screen that tmux did not give in
+        time says nothing, so it counts as a turn that runs: each caller that closes a session, takes an update or
+        counts an interrupt as done when no turn runs waits then (the manager's restart for its tools, a conversation
+        that runs another way now, the previous runtime's chat, the helper's and the runtimes' updates, a Pause)."""
         r = tmux("capture-pane", "-p", "-t", target)
-        return r.returncode == 0 and bool(WORKING.search("\n".join(r.stdout.rstrip().split("\n")[-15:])))
+        return r.returncode == 124 or \
+            r.returncode == 0 and bool(WORKING.search("\n".join(r.stdout.rstrip().split("\n")[-15:])))
 
     def update_busy(self):
         """True while this helper's Fleet update waits (Lifecycle busy): a check or a login job that runs in it, the
@@ -6264,7 +6274,7 @@ class Helper:
             return True
         # AUTONOMY.md P2: a conversation's session with the agent's tools runs in this checkout, with its hooks
         windows = [w for w in names if re.fullmatch(r"T-\d+", w) or
-                   (CONVERSATION_WINDOW.fullmatch(w) and self.conversation_kind(w) == "tools")]
+                   (CONVERSATION_WINDOW.fullmatch(w) and self.conversation_kind(w) in ("tools", None))]
         if not windows:
             return False
         if self.hub_turns is None:
@@ -6814,9 +6824,10 @@ class Helper:
 
     def conversation_kind(self, window):
         """How a conversation window started (AUTONOMY.md P2): "tools", "closed", or "" for one from before
-        contacts.v2, from its tmux option @fleet_conversation."""
+        contacts.v2, from its tmux option @fleet_conversation. None when tmux did not answer in time: that is not
+        "another way than the hub runs it now", which closes the window (conversation_switched)."""
         r = tmux("show-options", "-wv", "-t", f"={self.session}:={window}", "@fleet_conversation")
-        return r.stdout.strip() if r.returncode == 0 else ""
+        return None if r.returncode == 124 else r.stdout.strip() if r.returncode == 0 else ""
 
     def conversation_switched(self, window):
         """True when a conversation window started another way than the hub runs its conversation now (AUTONOMY.md
@@ -6828,6 +6839,9 @@ class Helper:
         modes, kind = getattr(self, "conversation_modes", None), self.conversation_kind(window)
         if modes is False:
             return False
+        if kind is None:        # tmux did not say how it started: nothing is decided on it (handle, retire_conversations)
+            raise Silent(f"tmux did not answer in time, so the start of {window} is not known; nothing was decided "
+                         f"on it")
         if not isinstance(modes, dict):
             return kind == "tools"
         return modes.get(window[2:]) not in (None, kind)
@@ -6848,11 +6862,15 @@ class Helper:
         for window in open_windows:
             modes = getattr(self, "conversation_modes", None)
             narrowed = isinstance(modes, dict) and narrowed_mode(modes.get(window[2:]))
-            if narrowed and self.conversation_switched(window):
+            try:
+                switched = self.conversation_switched(window)
+            except Silent:
+                continue        # tmux did not say how it started: this round closes nothing of it
+            if narrowed and switched:
                 # the person access plan, section 7: the person's access was narrowed, so a window of another mode
                 # ends at once, in the middle of a turn too: its shell and its tokens must not outlive the list
                 why = "its person's access was narrowed"
-            elif self.conversation_switched(window) and not self.working(f"={self.session}:={window}"):
+            elif switched and not self.working(f"={self.session}:={window}"):
                 why = "its conversation runs another way now"
             elif self.conversations is not None:
                 if int(window[2:]) in self.conversations:
@@ -7035,7 +7053,12 @@ class Helper:
         target = f"={self.session}:={window}"
         rows = process_table(window, generation)
         args_of = {pid: args for pid, _, args, _ in rows}
-        pane = self.pane(target)[0] if window in self.look() else None
+        names = self.look()
+        pane = self.pane(target)[0] if window in names else None
+        if keep_runtime and (isinstance(names, Unlisted) or window in names and pane is None):
+            # A Pause keeps the session's own runtime. With no word of tmux about its window or its pane, that
+            # runtime is not known from the task's commands, and it would end with them.
+            raise Silent(f"tmux did not say which processes are the session of {window}; nothing of it was ended")
         found = {pid for pid, _, _, mine in rows if mine}
         if pane is not None:
             found |= descendants(rows, pane) | ({pane} if not keep_runtime else set())
@@ -7602,6 +7625,7 @@ def cmd_run(args):
             h.conversation_modes = data.get("conversation_modes") \
                 if isinstance(data.get("conversation_modes"), dict) else None
             h.close_revoked(data.get("revoked"), names)    # owner API 1.12: a key change revoked their credential
+            h.chat_proof(data.get("events", []))    # the one count on a chat message's proof, its read
             h.keep_chat(data.get("chat"), data.get("db"))
             h.open_tasks = data.get("open_tasks") if isinstance(data.get("open_tasks"), list) else None
             h.poll_db = data.get("db")

@@ -151,29 +151,6 @@ class HelperSession(unittest.TestCase):
             fleet.tmux("new-window", "-d", "-t", "=fleet-studio:", "-n", "zsh", "sleep 120", check=True)
         self.assertEqual((self.helper.one_window_each(), self.helper.look(), self.said[1:]), ([], ["zsh", "zsh"], []))
 
-    def test_a_listed_chat_window_that_refuses_its_screen_three_polls_in_a_row_is_closed_by_its_id(self):
-        """The net under the rule of one window for each name: whatever makes a listed window take no keys, the
-        helper does not write "gone" for ever. It closes the windows of that name, and the next poll starts the chat
-        again on its own conversation."""
-        self.assertTrue(self.helper.keep_session())
-        self.helper.start("owner-chat", "sleep 120", 1, "g1")
-        fleet.tmux("new-window", "-d", "-t", "=fleet-studio:", "-n", "owner-chat", "sleep 120", check=True)
-        for _ in range(fleet.GONE_TRIES - 1):
-            self.assertFalse(self.helper.chat_unreachable("gone"))
-        self.assertFalse(self.helper.chat_unreachable("typed"))                     # a line that went: the count ends
-        for _ in range(fleet.GONE_TRIES - 1):
-            self.assertFalse(self.helper.chat_unreachable("gone"))
-        self.assertEqual(self.helper.look(), ["owner-chat", "owner-chat"])
-        self.assertTrue(self.helper.chat_unreachable("gone"))
-        self.assertEqual(self.helper.look(), [])
-        self.assertIn("the chat continues its conversation in a new window", self.said[-1])
-        for _ in range(fleet.GONE_TRIES + 1):                                       # no window is listed: the next
-            self.assertFalse(self.helper.chat_unreachable("gone"))                  # poll's start, nothing to close
-        self.helper.start("owner-chat", "sleep 120", 1, "g1")                       # a window that gives its screen:
-        for _ in range(fleet.GONE_TRIES + 1):                                       # a "gone" of a slow tmux counts
-            self.assertFalse(self.helper.chat_unreachable("gone"))                  # nothing
-        self.assertEqual(self.helper.look(), ["owner-chat"])
-
     def test_a_tmux_that_cannot_be_reached_is_said_once_and_the_round_goes_on(self):
         """tmux itself refusing is not the same as a session that is gone. The round must not raise: the helper's
         loop would end and its process would be restarted over and over by its own service."""
@@ -300,7 +277,7 @@ class ChatDelivery(unittest.TestCase):
                 self.said.clear()
                 self.helper.chat_problem = (None, 0.0)                  # its words are said again in this case
                 self.chat()                                             # the poll of 12 November
-                self.assertIn("it did not start before a message: tmux did not answer in time", self.said[-1])
+                self.assertIn("it did not start before a message: tmux gave no list of the windows", self.said[-1])
                 with self.assertRaises(fleet.Silent):                   # his message: it stays pending in the hub
                     self.helper.handle(self.EVENTS[0])
                 self.helper.handle_events(self.EVENTS)
@@ -341,20 +318,41 @@ class ChatDelivery(unittest.TestCase):
                 again.handle_events(self.EVENTS)
                 typed.assert_called_once_with("fleet-studio", "owner-chat", fleet.CHAT_SIGNAL)
                 again.handle_events(self.EVENTS)                        # its line is not taken yet: no second one
-                again.handle_events(self.EVENTS + [dict(self.EVENTS[0], id=8)])     # also not for his next message
+                # also not for his next message, by signal's own rule; in the helper's loop the count on the proof
+                # forgets the line at a new message, so that it is told (chat_proof, test_chat_proof)
+                again.handle_events(self.EVENTS + [dict(self.EVENTS[0], id=8)])
             start.assert_not_called()
             self.assertEqual(typed.call_count, 1)
         self.assertEqual(self.said, ["owner-chat: inbox signal typed; only read_messages acknowledges delivery"])
 
     def test_a_missing_session_is_still_an_empty_list(self):
-        """Only tmux's silence is no list. A session that is not there has no windows, and the chat starts in the
-        session that the loop makes again (keep_session)."""
-        gone = subprocess.CompletedProcess([], 1, "", "can't find session: fleet-studio")
-        with patch.object(fleet, "tmux", return_value=gone):
-            self.assertEqual((fleet.windows("fleet-studio"), self.helper.look_sure()), ([], []))
-            self.assertNotIsInstance(fleet.windows("fleet-studio"), fleet.Unlisted)
-            with self.assertRaises(fleet.Refused):
-                fleet.windows("fleet-studio", checked=True)
+        """A session that is not there has no windows, and the chat starts in the session that the loop makes again
+        (keep_session). tmux says so in three ways: no such session, no server, and no socket of a server."""
+        for words in ("can't find session: fleet-studio", "no server running on /tmp/tmux-1000/default",
+                      "error connecting to /tmp/tmux-1000/default (No such file or directory)"):
+            gone = subprocess.CompletedProcess([], 1, "", words)
+            with patch.object(fleet, "tmux", return_value=gone):
+                self.assertEqual((fleet.windows("fleet-studio"), self.helper.look_sure()), ([], []), words)
+                self.assertNotIsInstance(fleet.windows("fleet-studio"), fleet.Unlisted)
+                with self.assertRaises(fleet.Refused):
+                    fleet.windows("fleet-studio", checked=True)
+
+    def test_each_other_failure_of_tmux_is_no_list_as_its_silence_is(self):
+        """A server with no memory left fails in more ways than by its silence: it refuses the connection, or the
+        command ends with an error of its own. None of these says that the session has no windows, so each one is
+        no list, as an answer that did not come in time is: no chat starts on it, and no window counts as ended."""
+        for code, words in ((1, "error connecting to /tmp/tmux-1000/default (Resource temporarily unavailable)"),
+                            (1, "server exited unexpectedly"), (1, ""), (2, "lost server"), (124, "timed out")):
+            failed = subprocess.CompletedProcess([], code, "", words)
+            with patch.object(fleet, "tmux", return_value=failed):
+                self.assertIsInstance(fleet.windows("fleet-studio"), fleet.Unlisted, words)
+                self.assertEqual(self.helper.look(), [])            # a reader that only looks gets its empty list
+                with self.assertRaises(fleet.Silent) as told:
+                    self.helper.look_sure()
+                self.assertIn(f" ({words})," if words else "fleet-studio,", str(told.exception))    # tmux's own words
+                self.assertFalse(self.helper.gone("owner-chat"))
+                self.chat()                                         # the chat's keeper decides nothing on it
+        self.started.assert_not_called()
 
     def test_a_task_event_at_a_silent_tmux_starts_nothing_and_reports_no_window_as_ended(self):
         """The same empty list read "the task's window ended before its session read the task" for a task that was
@@ -385,6 +383,82 @@ class ChatDelivery(unittest.TestCase):
                 patch.object(fleet.time, "monotonic", return_value=time.monotonic() + 60):
             self.helper.handle_events([event])
         self.helper.report_start.assert_called_once_with("T-5", "no checkout")
+
+    def test_a_tmux_that_stays_broken_is_told_for_a_task_when_its_wait_is_the_longest(self):
+        """A list that tmux does not give one time says nothing, and the hub hears of no failed start. A tmux that
+        stays so (a client and a server of two versions after an update, a socket that it may not open) starts no
+        session of a task at all, and its requester must not wait on a line of the helper's log: at the longest wait
+        between two tries the hub hears it, one time, with tmux's own words."""
+        self.silent = True
+        event = {"id": 8, "kind": "task", "task": "T-5", "text": "", "extra": {"generation": "g1", "attempt": 1}}
+        at = [time.monotonic()]
+        with patch.object(fleet.time, "monotonic", side_effect=lambda: at[0]):
+            for wait in (15, 30, 60, 120, 240):
+                self.helper.handle_events([event])
+                self.helper.report_start.assert_not_called()
+                self.assertIn(f"next try in {wait} s", self.said[-1])
+                at[0] += wait + 1
+            self.helper.handle_events([event])
+        self.helper.report_start.assert_called_once_with(
+            "T-5", "tmux gave no list of the windows of fleet-studio (timed out), so they are not known; nothing was "
+                   "decided on them")
+
+    def test_a_screen_that_tmux_does_not_give_is_no_idle_session(self):
+        """working read a screen with no answer as "no turn runs". On that word the helper closes the manager's
+        session for its new tools, a conversation window that runs another way now and the previous runtime's chat,
+        takes its own update and a runtime's, and counts a Pause as done: each one in a turn that may run. A screen
+        that tmux did not give says nothing, so it counts as a turn that runs, and each of them waits."""
+        target = "=fleet-studio:=owner-chat"
+        self.assertFalse(self.helper.working(target))               # tmux answers: an idle screen
+        self.silent = ("capture-pane",)
+        self.assertTrue(self.helper.working(target))
+        self.silent, self.refused = (), ("capture-pane",)
+        self.assertFalse(self.helper.working(target))               # no such window: no turn runs in it
+
+    def test_a_conversation_window_whose_start_tmux_does_not_tell_is_not_closed(self):
+        """How a conversation window started is its tmux option. An answer that did not come read as "", which is
+        another way than "tools" or "closed": its message closed the window in the middle of the person's turn, and
+        so did the round that retires windows."""
+        self.windows = ["C-4"]
+        self.helper.conversation_modes, self.helper.conversations = {"4": "tools"}, [4]
+        self.silent = ("show-options",)
+        self.assertIsNone(self.helper.conversation_kind("C-4"))
+        with self.assertRaises(fleet.Silent):
+            self.helper.conversation_switched("C-4")
+        self.helper.retire_conversations()                          # the round closes nothing of it and goes on
+        self.assertEqual((self.did("kill-window"), self.windows), ([], ["C-4"]))
+        self.silent = ()
+        self.assertEqual(self.helper.conversation_kind("C-4"), "g1:1")     # tmux answers again (the stand-in's value)
+        self.assertTrue(self.helper.conversation_switched("C-4"))
+
+    def test_a_pause_does_not_end_the_runtime_of_a_session_that_tmux_does_not_show(self):
+        """A Pause ends the task's commands and keeps the session's own runtime, which it knows from the window's
+        pane. With no answer of tmux about the window, or about its pane, nothing told that runtime from the
+        commands, and the Pause ended the session with them."""
+        self.windows = ["T-5"]
+        for silent in (("list-windows",), ("display-message",)):
+            self.silent = silent
+            with patch.object(fleet, "process_table", return_value=[(41, 1, "claude", True)]), \
+                    self.assertRaises(fleet.Silent):
+                self.helper.task_work("T-5", "g1", keep_runtime=True)
+        with patch.object(fleet, "process_table", return_value=[(41, 1, "claude", True)]):
+            self.assertEqual(self.helper.task_work("T-5", "g1", keep_runtime=False), {41: "claude"})    # a Stop ends all
+
+    def test_a_window_that_this_helper_started_keeps_its_attempt_when_tmux_took_no_option(self):
+        """Helper.start goes on at a tmux that does not answer, so a window can run without its @fleet_attempt. The
+        next message then read it as another attempt's window and closed a session that had just started. The helper
+        knows what it started: such a window is that start's, and it gets its option at that look."""
+        self.windows = []
+        unset = subprocess.CompletedProcess([], 1, "", "invalid option: @fleet_attempt")
+        with patch.object(fleet, "start_window", side_effect=lambda *a, **k: self.windows.append("T-5")):
+            self.silent = ("set-option",)
+            self.helper.start("T-5", "sleep 120", 2, "g1", "", needs="none")
+        self.silent = ()
+        answer = fleet.tmux.side_effect
+        with patch.object(fleet, "tmux", side_effect=lambda *a, **k: unset if a[0] == "show-options" else answer(*a)):
+            self.assertEqual(self.helper.window_attempt("T-5"), "g1:2")
+            self.assertEqual(self.helper.window_attempt("C-9"), "")        # a window that it did not start
+        self.assertIn(("set-option", "-w", "-t", "=fleet-studio:=T-5", "@fleet_attempt", "g1:2"), self.calls)
 
     def test_each_look_of_a_decision_stops_at_a_tmux_that_goes_silent_in_the_middle(self):
         """A tmux that answers one list and not the next: no later look of the same decision reads "no window"."""
@@ -521,96 +595,6 @@ class ChatDelivery(unittest.TestCase):
             self.chat()
         self.started.assert_not_called()
         self.assertIn("the look at its cache failed (OSError)", self.said[-1])
-
-    def blocked(self, **patches):
-        """The helper's own steps around a signal, each as this test needs it."""
-        values = dict(first_line_due=True, turn_runs=False, restart_fresh=False, chat_unreachable=False)
-        values.update(patches)
-        return [patch.object(self.helper, name, return_value=value) for name, value in values.items()]
-
-    def told(self):
-        return [c.args[2] for c in fleet.http.call_args_list if c.args[:2] == ("POST", "/helper/dialog/studio/owner-chat")]
-
-    def test_a_line_that_cannot_be_typed_at_ten_polls_in_a_row_is_told_to_the_hub_once(self):
-        """The helper wrote "inbox signal gone" 190 times in seven minutes, to its own log only. A count of polls,
-        one report for each run, and a line that went ends the run."""
-        for p in self.blocked():
-            p.start()
-            self.addCleanup(p.stop)
-        with patch("fleet.type_into", return_value="asks") as typed:
-            for _ in range(fleet.CHAT_BLOCKED_POLLS - 1):
-                self.helper.handle_events(self.EVENTS)
-            self.assertEqual(self.told(), [])
-            typed.return_value = "typed"                                # the question went: its line is typed
-            self.helper.handle_events(self.EVENTS)
-            self.helper.lines.clear()
-            typed.return_value = "asks"
-            for _ in range(fleet.CHAT_BLOCKED_POLLS + 5):
-                self.helper.handle_events(self.EVENTS)
-                self.helper.lines.clear()
-        self.assertEqual(self.told(), [{"kind": "undelivered", "reason": "its screen shows a question of its own"}])
-        self.assertEqual(len([line for line in self.said if "the hub knows" in line]), 1)
-        self.silent = True                                              # a chat event that fails counts too,
-        fleet.http.reset_mock()
-        self.helper.handle_events([])                                   # after a poll with nothing for the chat
-        for _ in range(fleet.CHAT_BLOCKED_POLLS):
-            self.helper.handle_events(self.EVENTS + [dict(self.EVENTS[0], id=8)])   # one count for each poll
-        self.assertEqual([body["kind"] for body in self.told()], ["undelivered"])
-        self.assertIn("tmux did not answer in time", self.told()[0]["reason"])
-
-    def test_a_session_that_never_takes_its_first_line_and_a_line_told_twice_are_told_too(self):
-        for p in self.blocked(first_line_due=False):
-            p.start()
-        for _ in range(fleet.CHAT_BLOCKED_POLLS):                       # a start takes four or five polls, not ten
-            self.helper.handle_events(self.EVENTS)
-        self.assertEqual(self.told(), [{"kind": "undelivered", "reason": "its new session cannot take its first line yet"}])
-        patch.stopall()
-        self.setUp()
-        for p in self.blocked():
-            p.start()
-            self.addCleanup(p.stop)
-        fleet.http.return_value = (400, {"error": "kind is shown, gone, …"})     # a hub from before this report
-        self.helper.lines["owner-chat"] = {"wid": "", "ids": frozenset({7}), "at": 0.0, "retold": True,
-                                           "reported": True, "text": fleet.CHAT_SIGNAL, "box": True, "enters": 3}
-        with patch.object(self.helper, "idle_since", return_value=True):        # its window can no longer call the hub
-            for _ in range(fleet.CHAT_BLOCKED_POLLS):
-                self.helper.handle_events(self.EVENTS)
-        self.assertEqual(self.told(), [{"kind": "undelivered", "reason": "its line was told twice and not taken"}])
-        self.assertIn("the hub did not take the report (400)", self.said[-1])
-
-    def test_a_chat_that_ends_at_each_start_is_told_and_one_start_is_not(self):
-        self.windows = []
-        self.started.side_effect = None                                 # a start whose window ends at once
-        for _ in range(fleet.CHAT_BLOCKED_POLLS - 1):
-            self.helper.handle_events(self.EVENTS)
-        self.assertEqual(self.told(), [])
-        self.helper.handle_events(self.EVENTS)
-        self.assertEqual(self.told(), [{"kind": "undelivered", "reason": "its window was not there and started"}])
-        self.assertEqual(self.started.call_count, fleet.CHAT_BLOCKED_POLLS)
-
-    def test_a_line_that_finds_no_session_in_a_listed_window_closes_it_at_the_third_poll(self):
-        """signal to chat_unreachable, whole: tmux lists the window and refuses its screen."""
-        self.refused = ("capture-pane", "display-message")
-        for p in self.blocked()[:3]:                                    # not chat_unreachable: the real one
-            p.start()
-            self.addCleanup(p.stop)
-        for n in range(fleet.GONE_TRIES):
-            self.assertEqual((self.did("kill-window"), self.windows), ([], ["owner-chat"]))
-            self.helper.handle_events(self.EVENTS)
-        self.assertEqual(([a[1:] for a in self.did("kill-window")], self.windows), ([("-t", "@1")], []))
-        self.assertEqual(self.said[-1], "owner-chat: tmux lists its window and refused its screen at 3 polls in a "
-                         "row; the helper closed @1, and the chat continues its conversation in a new window")
-        self.helper.handle_events(self.EVENTS)                          # the next poll starts it again
-        self.started.assert_called_once_with("g1")
-
-    def test_a_report_that_the_hub_does_not_take_goes_again_at_the_next_such_poll(self):
-        with patch.object(fleet, "http", side_effect=[OSError("refused"), (502, {}), (200, {})]) as sent:
-            for _ in range(fleet.CHAT_BLOCKED_POLLS + 2):
-                self.helper.chat_blocked("its screen shows a question of its own")
-            self.assertEqual(sent.call_count, 3)
-            for _ in range(3):
-                self.helper.chat_blocked("its screen shows a question of its own")
-            self.assertEqual(sent.call_count, 3)                        # told: no more for this run
 
     def test_the_pause_between_two_polls(self):
         """No pause after a poll that the hub held with no event, so that the poll which waits for the owner's next

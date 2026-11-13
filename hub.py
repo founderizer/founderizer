@@ -2329,6 +2329,7 @@ def mobile_agent(name, config):
                              "('completed','failed','rejected','canceled')", (name,))["n"],
             "limit": dict(since=lim["since"], until=lim["until"], reset_known=bool(lim["reset_known"])) if lim else None,
             "usage": windows, "turn_ended_after": turn_ended_after(name), "waits_since": chat_waits_since(name),
+            "chat_undelivered": bool(kv_get(f"chat_undelivered:{name}")),
             "last": {"ts": last["created"], "side": last["side"], "preview": last["text"] or ""} if last else None}
 
 
@@ -4329,6 +4330,51 @@ def turn_ended_after(agent, ended=None, reads=None):
     return row["created"] if row else None
 
 
+# Seconds after which an owner's chat message is late: with no read that long after it came, or with no reply that
+# long after its read (chat_late). The owner's rule of 26 October 2026: no clock of the fleet ends, judges or
+# interrupts work, and a heartbeat that labels and tells stays. This clock labels: it ends and closes nothing, and
+# the repair, which closes a session, is the helper's and goes by a count of its polls (fleet.CHAT_PROOF_POLLS, 25
+# polls of about 2.35 seconds). A chat that starts after that repair reads in 11 to 35 seconds, so a message is late
+# only when the repair did not help, or when the helper cannot make it.
+CHAT_LATE = 120
+
+
+def chat_late(name, t0):
+    """The event of the owner's newest chat message to this worker or lead when that message is late, else None.
+
+    The hub holds the proof of a delivery, the session's read, so the hub says when it does not come, by its own
+    clock and from its own records, with no word of the helper's: on 13 November 2026 an owner's message stood under
+    "Thinking" for seven minutes while its helper, which polled all the time, wrote "inbox signal gone" 190 times
+    to its own log. The message is the one under which the apps' waiting line stands (chat_waits_since). It is late
+    CHAT_LATE seconds after it came with no read, and CHAT_LATE seconds after its read with no reply; never while a
+    usage limit holds the agent, when the apps say "Usage limit", and never counted from before the last one ended."""
+    sent = chat_waits_since(name)
+    if sent is None or active_limit(name):
+        return None
+    e = q1("SELECT e.id, e.read_at FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE u.recipient=? AND "
+           "u.kind='message' AND e.kind='chat' ORDER BY u.created DESC, u.rowid DESC LIMIT 1", (name,))
+    return e["id"] if e and t0 - max(e["read_at"] or sent, limit_ended(name)) >= CHAT_LATE else None
+
+
+def chat_late_sweep(t0):
+    """Keep for each worker and lead whether the owner's newest chat message to it is late (chat_late; a step of
+    tick): the apps then say "Not answering" under that message, in place of "Thinking" (agents[].chat_undelivered).
+    The kept value is that message's event, and it goes when the message is late no longer: at its reply, at a read
+    that comes late (until that read is CHAT_LATE seconds old with no reply), and at a usage limit. Each change is
+    one write, which wakes the apps; a later message of the owner's takes the value away in its own transaction
+    (owner_message_rows), because its own wait starts there."""
+    for name, conf in agents().items():     # each agent: one that is a worker no longer keeps no value either
+        late = chat_late(name, t0) if conf.get("role") in ("worker", "lead") else None
+        kept = kv_get(f"chat_undelivered:{name}")
+        if late and kept != str(late):
+            kv_set(f"chat_undelivered:{name}", late)
+            log("hub", f"M-{late} to {name} has no " + ("reply" if q1("SELECT read_at FROM events WHERE id=?",
+                (late,))["read_at"] else "read") + f" after {CHAT_LATE} seconds; the owner's chat says so until it "
+                f"has")
+        elif kept and not late:
+            kv_set(f"chat_undelivered:{name}", None)
+
+
 AGENT_SEEN = ("last_seen", "alive", "alive_ts", "client", "client_seen")     # what the state shows of an agents row
 
 
@@ -4345,7 +4391,8 @@ class AgentReads:
     keys: the agents with a key.
     chats: {agent: `ready` of its newest live chat credential of this hub generation}, as chat_session_ready reads it,
     read at the first chat_ready().
-    turns: {agent: its stored turn end}."""
+    turns: {agent: its stored turn end}.
+    undelivered: {agent: the owner's chat message to it that is late} (chat_late_sweep)."""
     def __init__(self):
         self.rows = {r["name"]: {k: r[k] for k in AGENT_SEEN}
                      for r in q(f"SELECT name,{','.join(AGENT_SEEN)} FROM agents")}
@@ -4362,6 +4409,8 @@ class AgentReads:
         self.keys = {r["agent"] for r in q("SELECT agent FROM agent_keys")}
         self.turns = {r["k"][len("turn_ended:"):]: r["v"]
                       for r in q("SELECT k, v FROM kv WHERE k >= 'turn_ended:' AND k < 'turn_ended;'")}
+        self.undelivered = {r["k"][len("chat_undelivered:"):]: r["v"] for r in q(
+            "SELECT k, v FROM kv WHERE k >= 'chat_undelivered:' AND k < 'chat_undelivered;'")}
 
     def data(self, agent):
         if agent not in self.parsed:
@@ -4424,6 +4473,10 @@ def agent_view(name, config, reads=None):
                 # When the owner sent the newest chat message that it had read at its last turn end: its turn that took
                 # a message up to then is over, so the chat stops saying that it works on it (turn_ended_after).
                 turn_ended_after=turn_ended_after(name, reads=reads),
+                # True while the owner's newest chat message to it is late: the chat says "Not answering" under it,
+                # in place of "Thinking" (chat_late_sweep).
+                chat_undelivered=bool(reads.undelivered.get(name) if reads is not None else read_row(
+                    "SELECT v FROM kv WHERE k=?", (f"chat_undelivered:{name}",))),
                 limit=dict(since=lim["since"], until=lim["until"], reset_known=bool(lim["reset_known"]),
                            task=lim["task"]) if lim else None,
                 **(seen or dict.fromkeys(AGENT_SEEN)))
@@ -11793,6 +11846,8 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     event_id = DB.execute("INSERT INTO events(agent,kind,task,text,created,extra) VALUES(?,?,?,?,?,?)",
                           (recipient, "chat" if worker_chat or secret_chat else "say", task, text, t0,
                            extra)).lastrowid
+    if worker_chat:     # this message's own wait starts: the one before it is the late one no longer (chat_late_sweep)
+        DB.execute("DELETE FROM kv WHERE k=?", ("chat_undelivered:" + recipient,))
     DB.execute("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient,"
                "replaces_request_id,origin,connection) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                (request_id, kind, need["id"] if need is not None else None, value, event_id, t0, client, recipient,
@@ -31324,6 +31379,7 @@ def tick():
         step(wait_sweep, t0)            # plan C8: a waited message to an agent that is no longer active
         step(secret_wakes, t0)          # owner feature secret_requests: a saved secret that can reach its waiting task now
         step(chat_sweep, t0)            # owner feature chat_apps: a message item without a report for 120 seconds
+        step(chat_late_sweep, t0)       # an owner's chat message with no read, or no reply, for CHAT_LATE seconds
         # plan C9: no clock nudges a task. Each stored turn end decides once, at intake and here after a restart.
         step(turn_end_sweep, t0)
         step(liveness, t0, restarts=True)
@@ -46579,6 +46635,9 @@ class Handler(BaseHTTPRequestHandler):
                             "text": r["text"], "extra": json.loads(r["extra"] or "{}"),
                             # plan C6: the helper started this attempt once; only the hub starts it again
                             **({"started": True} if r["kind"] == "task" and r["helper_ack"] else {}),
+                            # the proof of a chat message's delivery, its session's read: an owner's message comes
+                            # until its reply, and its helper counts only one that is not read (Helper.chat_proof)
+                            **({"read": r["read_at"] is not None} if r["kind"] == "chat" else {}),
                             # AUTONOMY.md P2: a message filed under a conversation task signals that conversation
                             **event_window(r)}
                            for r in rows]})
@@ -47188,8 +47247,9 @@ class Handler(BaseHTTPRequestHandler):
         standing session failed twice in a row, and "untaken" with fresh that its helper starts a fresh session for
         the line that it reports (manager_flag_update).
 
-        "undelivered", for the window owner-chat: its helper could not type the chat's line at ten polls in a row,
-        with the reason (fleet.Helper.chat_blocked)."""
+        "undelivered" is the word of a helper of release 2026.11.399 only, for an owner chat whose line it could
+        not type at ten polls in a row. The hub takes it and keeps nothing of it: the hub itself says when an owner's
+        chat message is late, by its own clock (chat_late_sweep), and a helper of this version sends no such word."""
         if agent not in agents():
             return self.json(404, {"error": "unknown agent"})
         if not self.allowed(agent):
@@ -47232,22 +47292,6 @@ class Handler(BaseHTTPRequestHandler):
                 log("hub", f"{tref(tid)} cannot start on {agent}: {why}")
             return self.json(200, {})
         if kind == "undelivered":
-            # 13 November 2026: the helper could not type the line of the agent's owner chat at ten polls in a row (a
-            # question on the chat's screen, no session in its window, a start that fails). Until then such a wait
-            # was in the helper's own log only: the hub knew an unread message and nothing else, and the owner's app
-            # said "Thinking" for seven minutes. The hub keeps which message waits, one time for each message, and
-            # says so in its log; the helper goes on trying, and the message stays pending.
-            if task != "owner-chat":
-                return self.json(200, {})
-            why = text_field(body.get("reason"), 300, False)
-            waits = q1("SELECT id FROM events WHERE agent=? AND kind='chat' AND read_at IS NULL ORDER BY id LIMIT 1",
-                       (agent,))
-            if waits and str(kv_get(f"chat_undelivered:{agent}") or "") != str(waits["id"]):
-                with area("quiet"):
-                    kv_set(f"chat_undelivered:{agent}", waits["id"])
-                log("hub", f"M-{waits['id']} does not reach {agent}'s owner chat: its helper could not type the "
-                           f"chat's line at ten polls in a row" + (f" ({why})" if why else "") +
-                           "; the message stays pending, and its helper goes on trying")
             return self.json(200, {})
         if kind == "untaken":
             # plan C5: a line told twice that the session did not take, kept for the turn-end check and the
