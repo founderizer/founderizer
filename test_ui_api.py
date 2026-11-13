@@ -380,6 +380,35 @@ class OwnerAPI(unittest.TestCase):
         hub.q("UPDATE reminders SET done=1 WHERE task=?", (parked,))
         self.assertNotIn("parked_until", {t["id"]: t for t in self.request()[1]["tasks"]}[parked])
 
+    def test_state_says_whether_a_working_tasks_session_works_now(self):
+        """Owner API 1.147: `works` is on the row of a task in state working whose current attempt has a turn record:
+        true while a turn runs or a background call is open, false when its last turn ended and nothing of it runs.
+        The apps showed every task in state working as work, so an agent with a task parked for days moved for days."""
+        def task(title, turn, state="working", attempt=1):
+            tid = hub.ins("INSERT INTO tasks(title,owner,state,live_path,attempt) VALUES(?,'vps',?,'live session',?)",
+                          (title, state, attempt))
+            hub.ins("INSERT INTO attempts(task,attempt,created,reason,turn) VALUES(?,1,?,'created',?)",
+                    (tid, hub.now(), json.dumps(turn) if turn is not None else None))
+            return tid
+        running = task("A turn runs", {"running": True, "turns": 2, "calls": {}})
+        background = task("A command runs", {"running": False, "turns": 1, "calls": {"c1": ["npm test", 5.0, True]}})
+        between = task("Its turn ended", {"running": False, "turns": 3, "calls": {}})
+        asked = task("A tool call waits", {"running": False, "turns": 1, "calls": {"c2": ["a question", 5.0, False]}})
+        starting = task("Its session starts", {"running": False, "turns": 0, "calls": {}})
+        unknown = task("No turn record", None)
+        ended = task("Over", {"running": True, "turns": 1, "calls": {}}, state="completed")
+        older = task("Another attempt", {"running": True, "turns": 1, "calls": {}}, attempt=2)
+        code, state = self.request()
+        self.assertEqual(code, 200)
+        rows = {t["id"]: t for t in state["tasks"]}
+        self.assertIs(rows[running]["works"], True)
+        self.assertIs(rows[background]["works"], True)
+        self.assertIs(rows[between]["works"], False)
+        self.assertIs(rows[asked]["works"], False)              # a call in the foreground of a turn that ended runs nothing
+        for nothing_known in (starting, unknown, ended, older):
+            self.assertNotIn("works", rows[nothing_known])
+        self.assertEqual(hub.tasks_at_work(), {running: True, background: True, between: False, asked: False})
+
     def test_state_names_each_agents_role_in_the_team(self):
         """The owner, 3 November 2026: "a subtitle like their role in the team" under each agent's name: its team.json
         title, or null."""

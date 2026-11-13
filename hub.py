@@ -2373,6 +2373,10 @@ def mobile_state(generation, at=None):
     without it the answer has the time of now."""
     ended = "('completed','failed','rejected','canceled')"
     tasks = [{k: r[k] for k in MOBILE_HEAD} for r in q(f"SELECT * FROM tasks WHERE state NOT IN {ended} ORDER BY id")]
+    at_work = tasks_at_work()               # owner API 1.147: whether each working task's session works on it now
+    for task in tasks:
+        if task["id"] in at_work:
+            task["works"] = at_work[task["id"]]
     recent = [{k: r[k] for k in MOBILE_HEAD} for r in q(f"SELECT * FROM tasks WHERE state IN {ended} "
                                                         f"ORDER BY id DESC LIMIT {MOBILE_TASKS}")]
     needs = [need_view(r) for r in q("SELECT * FROM needs WHERE answer IS NULL ORDER BY id")]
@@ -4315,6 +4319,29 @@ def parked_until():
         park = parked(t["id"])
         if park:
             out[t["id"]] = park["due"]
+    return out
+
+
+def tasks_at_work():
+    """Owner API 1.147: by task, whether its session works on it now, for each task in state working whose current
+    attempt has a turn record of its helper (plan C1, turn_state). True while a turn of its session runs, or a tool
+    call that it started in the background is open (a command, a monitor, a subagent: each counts until its own end
+    notice). False when its last turn ended and nothing of it runs: the task then waits, for its reminder, for a
+    message or for the hub's next word, whatever its state says. A task whose attempt has no turn yet (its session
+    starts) is not here, and neither is a task of a helper that sends no turn records: nothing is known of them, and
+    an app goes on by the task's state. The apps showed each task in state working as work: on the first fleet, on
+    13 November 2026, 19 tasks were in that state, 12 of them parked on a reminder, and one had work that ran.
+    read_rows: it is read inside the state's own hold of the lock."""
+    out = {}
+    for r in read_rows("SELECT a.task, a.turn FROM attempts a JOIN tasks t ON t.id=a.task AND t.attempt=a.attempt "
+                       "WHERE t.state='working' AND a.turn IS NOT NULL"):
+        try:
+            state = json.loads(r["turn"])
+        except ValueError:
+            continue
+        busy = bool(state.get("running")) or any(len(c) > 2 and c[2] for c in (state.get("calls") or {}).values())
+        if busy or state.get("turns"):
+            out[r["task"]] = busy
     return out
 
 
@@ -43160,6 +43187,7 @@ class Handler(BaseHTTPRequestHandler):
                                                           "ON e.id=s.event_id ORDER BY s.id")]
             result["secrets"] = [dict(r) for r in q("SELECT id,COALESCE(label,'Registered login') AS label FROM secrets ORDER BY id")]
             parks = parked_until()
+            at_work = tasks_at_work()
         # A row holds its own values, so this needs no lock. On the first fleet the tasks were 977 KB of the state's
         # 1.70 MB, and in a copy of its database making their rows into dicts took 2.1 ms of each read's hold of the
         # lock (10 November 2026).
@@ -43168,6 +43196,8 @@ class Handler(BaseHTTPRequestHandler):
         for task in result["tasks"]:            # owner API 1.117: until when its agent parked it, on that task only
             if task["id"] in parks:
                 task["parked_until"] = parks[task["id"]]
+            if task["id"] in at_work:           # owner API 1.147: whether its session works on it now
+                task["works"] = at_work[task["id"]]
         # The needs, the messages, the reports and the duties from the rows read in the lock, after it too: with the
         # rows that they were given, these views read nothing themselves (11 November 2026).
         result["needs"] = [need_view(r, needs_read) for r in needs]
