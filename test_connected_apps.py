@@ -11,6 +11,7 @@ import http.client
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import stat
@@ -35,8 +36,8 @@ MAC, PHONE, OTHER = "127.0.0.1", "127.0.0.5", "127.0.0.9"
 def load_tests(loader, _tests, _pattern):
     """Only this file's cases, not the inherited OwnerAPI ones."""
     suite = unittest.TestSuite()
-    for cls in (Dormant, OwnerRoutes, Settings, MessageHeader, Opening, CimdCache, Separate, Endpoints, Codes, Tokens,
-                Tools):
+    for cls in (Dormant, OwnerRoutes, Offer, GateWords, Settings, MessageHeader, Opening, CimdCache, Separate, Endpoints,
+                Codes, Tokens, Tools):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 
@@ -137,8 +138,12 @@ class Dormant(Base):
 
     def test_the_apps_read_nothing_new(self):
         self.assertNotIn("connected_apps", hub.ui_features())
+        with patch.object(hub, "capp_linux", lambda: True):
+            self.assertNotIn("connect_offer", hub.ui_features())        # no hub of this release offers Turn on
+            self.assertFalse(hub.capp_can_turn_on())
         hub.TEAM["hub"] = {"machine": "hub", "connect": True}
         self.assertNotIn("connected_apps", hub.ui_features())
+        self.assertNotIn("connect_offer", hub.ui_features())
         event = hub.emit("manager", "say", "[owner] A goal")
         hub.ins("INSERT INTO ui_requests(request_id,kind,text,event_id,created,client,recipient,connection) "
                 "VALUES(?,'message','A goal',?,?,'mac','manager',3)", (str(uuid.uuid4()), event, hub.now()))
@@ -208,6 +213,84 @@ class OwnerRoutes(Base):
         self.assertEqual(self.count("capp_clients"), 0)         # its client went with its last connection
         self.assertEqual(self.command(f"/ui/connect/{mine}/revoke")[0], 404)
         self.assertEqual(self.command("/ui/connect/x/revoke")[0], 400)
+
+
+class Offer(Base):
+    """GET /ui/connect's can_turn_on and the feature name connect_offer: the Mac offers Turn on only on a Linux hub of a
+    release that allows the feature, while it is off, and reads the page before connected_apps is there."""
+
+    def setUp(self):
+        super().setUp()
+        switched_on(self, connect=False)
+        self.addCleanup(hub.CONNECT.update, dict(hub.CONNECT))
+
+    def linux(self, yes):
+        patcher = patch.object(hub, "capp_linux", lambda: yes)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_linux_hub_with_the_feature_off_offers_turn_on(self):
+        self.linux(True)
+        code, page = self.request("/ui/connect?db=test-generation")
+        self.assertEqual(code, 200, page)
+        self.assertEqual((page["on"], page["can_turn_on"]), (False, True))
+        self.assertIn("connect_offer", hub.ui_features())
+        self.assertNotIn("connected_apps", hub.ui_features())
+
+    def test_a_hub_on_a_mac_never_offers_it(self):
+        self.linux(False)
+        self.assertFalse(self.request("/ui/connect?db=test-generation")[1]["can_turn_on"])
+        self.assertNotIn("connect_offer", hub.ui_features())
+
+    def test_the_hub_reads_its_own_system(self):
+        import sys
+        self.assertEqual(hub.capp_linux(), sys.platform.startswith("linux"))
+
+    def test_on_and_not_ready_keeps_the_name_and_ready_drops_it(self):
+        self.linux(True)
+        hub.TEAM["hub"]["connect"] = True
+        page = self.request("/ui/connect?db=test-generation")[1]
+        self.assertEqual((page["on"], page["can_turn_on"]), (True, False))
+        self.assertIn("connect_offer", hub.ui_features())               # the Mac waits for connected_apps
+        hub.CONNECT.update(server=object(), gate=hub.GATE_VERSION)      # the socket is open and the gate forwarded
+        features = hub.ui_features()
+        self.assertIn("connected_apps", features)
+        self.assertNotIn("connect_offer", features)
+        hub.CONNECT.update(server=None, gate=None)
+
+    def test_the_parity_report_reads_the_new_name(self):
+        import importlib.util
+        source = Path(hub.__file__).parent / "app/windows/parity.py"
+        if not source.exists():         # the hub's own repository has no copy of the apps: nothing to hold there
+            self.skipTest("the apps' parity report is not in this tree")
+        spec = importlib.util.spec_from_file_location("parity", source)
+        parity = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(parity)
+        self.assertIn("connect_offer", parity.hub_features(hub.__file__))
+
+
+class GateWords(unittest.TestCase):
+    """The Mac app's sentence for each stop of the root step (app/Sources/FleetCore/ConnectGate.swift, ConnectGate
+    .matches) is chosen by words of the hub's own message. Each of those words stands in hubsetup.py or hub.py, so a
+    change of a message here cannot leave the Mac's match behind."""
+
+    def test_each_match_of_the_mac_is_in_the_hubs_own_messages(self):
+        import hubsetup
+        root = Path(hub.__file__).parent
+        source = root / "app/Sources/FleetCore/ConnectGate.swift"
+        if not source.exists():         # the hub's own repository has no copy of the apps: nothing to hold there
+            self.skipTest("the Mac app's source is not in this tree")
+        swift = source.read_text()
+        phrases = re.findall(r'Match\(\s*"((?:[^"\\]|\\.)*)"', swift)
+        self.assertGreaterEqual(len(phrases), 18, phrases)
+        sources = (root / "hubsetup.py").read_text() + (root / "hub.py").read_text()
+        built = [shlex.join(hubsetup.tailscale_argv("funnel-off")) + "` failed: ", hubsetup.CONNECT_NO_FUNNEL,
+                 hubsetup.CONNECT_NO_HTTPS, hubsetup.CONNECT_FUNNEL_WAITS, hub.CAPP_NO_FUNNEL, hub.CAPP_NO_FOLDER,
+                 hub.CAPP_NO_GATE]
+        for phrase in phrases:
+            text = phrase.replace('\\"', '"').replace("\\\\", "\\")
+            with self.subTest(phrase=text):
+                self.assertTrue(text in sources or any(text in b for b in built), text)
 
 
 class Settings(Base):
@@ -395,7 +478,7 @@ class Socket(Base):
         self.serve = IN_PLACE
         self.documents = {}
         self.addCleanup(hub.capp_close)
-        self.addCleanup(hub.CONNECT.update, said=None, gate=None)
+        self.addCleanup(hub.CONNECT.update, said=None, gate=None, why=None, gate_why=None)
 
     def cimd(self, client_id):
         if client_id not in self.documents:
@@ -669,6 +752,103 @@ class Opening(Socket):
             self.assertFalse(hub.capp_sync())
         said = [r["what"] for r in hub.q("SELECT what FROM log")]
         self.assertTrue(any("stays closed" in s for s in said), said)
+
+    def test_the_page_says_why_the_feature_is_on_and_does_not_work(self):
+        """GET /ui/connect `stopped`: the hub's own words while the feature is on and no connected app can reach it,
+        so that the owner's Mac does not wait for ever. Nothing while it is off, while it works, or before the hub
+        has looked."""
+        def stopped():
+            return self.request("/ui/connect?db=test-generation")[1]["stopped"]
+        hub.CONNECT.update(why=None, gate_why=None)     # as at the hub's start
+        self.assertIsNone(stopped())                    # on, and capp_sync has not looked yet
+        self.serve = {}                                 # Funnel publishes nothing: the root step turns it on again
+        self.assertFalse(hub.capp_sync())
+        self.assertEqual(stopped(), hub.CAPP_NO_FUNNEL)
+        other = json.loads(json.dumps(IN_PLACE))        # Funnel publishes another target beside the gate
+        other["Web"][f"{NAME}:8443"] = {"Handlers": {"/": {"Proxy": "http://127.0.0.1:9000"}}}
+        other["AllowFunnel"][f"{NAME}:8443"] = True
+        self.serve = other
+        self.assertFalse(hub.capp_sync())
+        self.assertIn("Tailscale Funnel does not publish only the gate", stopped())
+        self.assertIn(f"{NAME}:8443/ to http://127.0.0.1:9000", stopped())
+
+        def fails():
+            raise OSError("the stand-in has no tailscale")
+        with patch.object(hub, "capp_serve_status", fails):
+            self.assertFalse(hub.capp_sync())
+        self.assertIn("the hub cannot read the Tailscale serve status", stopped())
+        self.serve = IN_PLACE
+        with patch.object(hub, "CONNECT_DIR", self.folder + "/none"):
+            self.assertFalse(hub.capp_sync())
+            self.assertEqual(stopped(), hub.CAPP_NO_FOLDER)
+        # A hub that does not know its name yet says so in its log and gives the page no reason: it started before
+        # tailscaled had the name, and the socket opens when the hub learns it.
+        names = hub.TAILNET_NAMES["names"]
+        hub.TAILNET_NAMES["names"] = ()
+        self.assertFalse(hub.capp_sync())
+        self.assertIsNone(hub.CONNECT["why"])
+        self.assertIn(hub.CAPP_NO_NAME, [r["what"] for r in hub.q("SELECT what FROM log")])
+        hub.TAILNET_NAMES["names"] = names
+        # The socket opens: no reason. Then no gate forwards after the watch's asks, and then one does again. The
+        # watch's asks wait for this test, so that no ask comes between two of its checks.
+        port, go = self.free_port(), threading.Event()
+        real = hub.capp_gate_ask
+
+        def ask():
+            go.wait(10)
+            return real()
+        with patch.object(hub, "capp_gate_address", lambda: ("127.0.0.1", port)), \
+                patch.object(hub, "capp_gate_ask", ask), patch.object(hub, "CAPP_GATE_EVERY", 0.05):
+            self.opened()                               # the socket is open, and no gate listens
+            self.assertIsNone(hub.CONNECT["why"])
+            self.assertIsNone(stopped())                # the watch has not asked CAPP_GATE_MISSES times yet
+            go.set()
+            self.assertTrue(self.until(lambda: hub.CONNECT["gate_why"] == hub.CAPP_NO_GATE))
+            self.assertEqual(stopped(), hub.CAPP_NO_GATE)
+            self.front(port)                            # a gate is there again and forwards
+            self.assertTrue(self.until(hub.capp_ready))
+            self.assertTrue(self.until(lambda: hub.CONNECT["gate_why"] is None))
+            self.assertIsNone(stopped())
+        # off: the socket closes and nothing is said, whatever was said before
+        hub.CONNECT.update(gate_why=hub.CAPP_NO_GATE)
+        hub.TEAM["hub"]["connect"] = False
+        self.assertFalse(hub.capp_sync())
+        self.assertEqual((hub.CONNECT["why"], hub.CONNECT["gate_why"], stopped()), (None, None, None))
+
+    def test_a_reason_that_ended_is_found_again_with_no_change_of_the_team(self):
+        """The reason of a closed socket can end by itself (tailscaled answers again, the root step turned Funnel
+        on). A read of GET /ui/connect starts one more look, at most once in CAPP_GATE_LOOK seconds, and a write of
+        the setting that changes nothing starts one at once: so the owner's page and its Try again get out of it."""
+        def page():
+            return self.request("/ui/connect?db=test-generation")[1]
+        self.serve = {}
+        self.assertFalse(hub.capp_sync())
+        self.assertEqual(page()["stopped"], hub.CAPP_NO_FUNNEL)
+        self.serve = IN_PLACE                           # the reason ended, and nothing told the hub
+        self.assertEqual(page()["stopped"], hub.CAPP_NO_FUNNEL)     # a read of the same moment starts no look
+        self.assertIsNone(hub.CONNECT["server"])
+        hub.CAPP_SYNC_ASKED[0] = hub.now() - hub.CAPP_GATE_LOOK - 1
+        self.assertEqual(page()["stopped"], hub.CAPP_NO_FUNNEL)     # this read starts the look, and keeps the row
+        self.assertTrue(self.until(lambda: hub.CONNECT["server"] is not None))
+        self.assertIsNone(page()["stopped"])
+        # the setting, written again with no change (the Mac's Try again): a look at once, with no old reason
+        hub.capp_close()
+        self.serve = {}
+        self.assertFalse(hub.capp_sync())
+        self.serve = IN_PLACE
+        with patch.object(hub, "kit_revision", lambda fresh=False: "r1"), \
+                patch.object(hub, "team_view", lambda rev: ({"hub": dict(hub.TEAM["hub"])}, "sha", None)):
+            self.assertEqual(hub.save_connect(True)["on"], True)
+        self.assertTrue(self.until(lambda: hub.CONNECT["server"] is not None))
+        self.assertIsNone(page()["stopped"])
+        # off, or a socket that is open: a read starts no look
+        hub.CAPP_SYNC_ASKED[0] = 0.0
+        with patch.object(hub, "capp_sync_later") as later:
+            hub.capp_look_again()
+            hub.TEAM["hub"]["connect"] = False
+            hub.capp_close()
+            hub.capp_look_again()
+            later.assert_not_called()
 
     def test_a_stale_socket_file_goes_and_a_file_that_is_no_socket_stays(self):
         stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

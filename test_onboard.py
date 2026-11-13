@@ -1155,6 +1155,15 @@ class Protocol(Base):
         up = [x for x in fake.scripts if "tailscale up" in x][0]
         self.assertIn("tailscale up --accept-dns=false --ssh=false", up)
         self.assertNotIn("--advertise-tags", up)
+        # A saved run that holds the hub's own tag of the connected apps joins without it (ONE_MACHINE_TAG): its
+        # join key does not carry that tag, and no server but the hub's may publish an address.
+        for saved, line in (("tag:founderizer,tag:founderizer-hub", "tailscale up --advertise-tags=tag:founderizer "),
+                            ("tag:founderizer-hub", "tailscale up --accept-dns=false --ssh=false")):
+            ob, fake, _, _ = self.make(state=dict(state, tailscale_tag=saved))
+            self.assertEqual(ob.run(), 0)
+            up = [x for x in fake.scripts if "tailscale up" in x][0]
+            self.assertIn(line, up, saved)
+            self.assertNotIn("founderizer-hub", up, saved)
 
     def test_the_network_tags_are_the_hubs_else_the_product_tag_where_the_tailnet_has_it(self):
         hub_tagged = {"Self": {"TailscaleIPs": ["100.64.0.5"]},
@@ -1172,6 +1181,15 @@ class Protocol(Base):
                                  ["tag:a", "tag:founderizer", "tag:founderizer"])
             with answer(0, json.dumps(no_product)):
                 self.assertEqual(NETWORK_TAGS("http://100.64.0.1:8765"), "")       # the hub is this computer
+            # The hub's own tag of the connected apps is a tag of one machine (ONE_MACHINE_TAG): a new run takes the
+            # hub's other tags, and with no other tag the product tag where the tailnet has it.
+            with_hub_tag = json.loads(json.dumps(hub_tagged))
+            with_hub_tag["Peer"]["h"]["Tags"] = ["tag:founderizer-hub", "tag:a"]
+            with answer(0, json.dumps(with_hub_tag)):
+                self.assertEqual(NETWORK_TAGS("http://100.64.0.1:8765"), "tag:a")
+            with_hub_tag["Peer"]["h"]["Tags"] = ["tag:founderizer-hub"]
+            with answer(0, json.dumps(with_hub_tag)):
+                self.assertEqual(NETWORK_TAGS("http://100.64.0.1:8765"), "tag:founderizer")
             for code, out in ((1, ""), (0, "not json"), (0, "[]")):
                 with answer(code, out):
                     self.assertEqual(NETWORK_TAGS("http://100.64.0.1:8765"), "", (code, out))

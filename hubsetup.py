@@ -75,6 +75,7 @@ import errno
 import fnmatch
 import glob
 import hashlib
+import ipaddress
 import http.server
 import json
 import os
@@ -88,6 +89,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import ssl
 import stat
 import subprocess
 import sys
@@ -1971,6 +1973,67 @@ CONNECT_FUNNEL_WAITS = (f"Tailscale did not turn Funnel on in {CONNECT_FUNNEL_TI
                         f"not let this machine publish the address yet.")
 
 
+CONNECT_RIGHT_LOOKS = 7             # looks at the machine's rights before the step stops for one, 5 seconds apart
+CONNECT_RIGHT_PAUSE = 5             # seconds between two of them: a new tag's right reached a machine in about 4
+CONNECT_PUBLIC_TRIES = 36           # looks at the public address after Funnel is on, CONNECT_PUBLIC_PAUSE apart
+CONNECT_PUBLIC_PAUSE = 5            # seconds between two looks
+CONNECT_PUBLIC_TIME = 180           # seconds for the whole wait: no look starts after it, and no answer is waited for
+CONNECT_PUBLIC_ANSWER = 8           # seconds for one answer of one address, or what is left of the whole wait
+
+
+def public_addresses(name):
+    """The public IPv4 addresses that this machine's resolver gives for the hub's name. A fleet machine does not take
+    the private network's DNS (--accept-dns=false), so these are Tailscale's public addresses of Funnel. An address
+    of the private network (a machine that takes MagicDNS gets its own) is left out: tailscaled answers there with
+    the same certificate, and an answer would say nothing of the way from the Internet."""
+    found = {a[4][0] for a in socket.getaddrinfo(name, CONNECT_HTTPS, socket.AF_INET, socket.SOCK_STREAM)}
+    return sorted(a for a in found if ipaddress.ip_address(a).is_global)
+
+
+def public_answer(name, address, timeout=CONNECT_PUBLIC_ANSWER):
+    """True when https://<name>/ answers at this address: a TLS connection with a certificate that is valid for the
+    name, and any HTTP answer. Only this machine's tailscaled has that certificate, so an answer is the gate's, also a
+    502 while the hub's socket is not open yet. The first connection makes tailscaled ask for the certificate."""
+    try:
+        with socket.create_connection((address, CONNECT_HTTPS), timeout) as plain:
+            with ssl.create_default_context().wrap_socket(plain, server_hostname=name) as tls:
+                tls.settimeout(timeout)
+                tls.sendall(f"GET /.well-known/oauth-protected-resource HTTP/1.1\r\nHost: {name}\r\n"
+                            f"Connection: close\r\n\r\n".encode())
+                return tls.recv(16).startswith(b"HTTP/1.")
+    except (OSError, ValueError):
+        return False
+
+
+def connect_public(name, addresses=public_addresses, answer=public_answer, tries=CONNECT_PUBLIC_TRIES,
+                   pause=CONNECT_PUBLIC_PAUSE, sleep=time.sleep, clock=time.monotonic, limit=CONNECT_PUBLIC_TIME):
+    """Waits until the public address answers at every public IPv4 address of its name in one look: at most `tries`
+    looks, and at most `limit` seconds in all, whatever each address does (an address that drops every packet takes
+    its whole time for each answer, and the owner's Mac waits for this step). After Funnel turns on, each of
+    Tailscale's public addresses starts to serve the name at its own time, up to about 75 seconds later, and the
+    certificate comes with the first connection (a real Funnel test, 13 November 2026): a sign-in that the owner
+    starts before that fails. Returns (True, looks) when it answers, (False, looks) when it does not, where looks
+    counts the looks that had an address, and (None, 0) when no look found a public address of the name here. It
+    changes nothing."""
+    end, looks = clock() + limit, 0
+    for look in range(1, tries + 1):
+        try:
+            found = addresses(name)
+        except OSError:
+            found = []
+        if found:
+            looks += 1
+            # every address in each look, so that a slow one hides no other, each within what is left of the time
+            answers = [answer(name, a, timeout=min(CONNECT_PUBLIC_ANSWER, left))
+                       if (left := end - clock()) > 0 else False for a in found]
+            if all(answers):
+                return True, looks
+        if look == tries or clock() + pause >= end:
+            break
+        sleep(pause)
+    return (False, looks) if looks else (None, 0)
+
+
 def tailnet_self(run):
     """(this machine's full name on the private network, its rights) from one `tailscale status --json`. The name is
     Self.DNSName, the name of the public address. The rights are the names of Self.CapMap and Self.Capabilities,
@@ -2057,14 +2120,18 @@ def connect_in_place(conf, name):
         web.get("Handlers") == {"/": {"Proxy": CONNECT_TARGET}} and allow.get(f"{name}:{CONNECT_HTTPS}") is True
 
 
-def connect_on(hub_user="fleet", kit=None, run=None, read=None, account=None):
+def connect_on(hub_user="fleet", kit=None, run=None, read=None, account=None, public=None, sleep=None):
     """`connect on`, as root on the hub's Linux machine (the build specification of the remote MCP address, section
     7, step 2). First the checks that change nothing: the machine's name, port 443, which may hold no other Funnel or
     Serve target, and the two rights that the private network must give this machine, Funnel and HTTPS
     certificates. Without them `tailscale funnel` prints a link and waits for ever (a real Funnel test, 13 November
-    2026), so the run stops here with the reason, and no part is made. Then each part, read first: the user and
+    2026), so the run stops here with the reason, and no part is made; a right that is not there yet gets
+    CONNECT_RIGHT_LOOKS looks first, because it follows the owner's change of the network by some seconds. Then each part, read first: the user and
     group founderizer-connect, the folder of the hub's socket, gate.py in /usr/local/lib/founderizer-connect/, the
-    unit and its service, and Funnel. Returns {"name", "address", "state": "made"|"there"}."""
+    unit and its service, and Funnel. Last, it waits until the public address answers from the Internet side
+    (connect_public), so that the address works when this run ends; an address that does not answer in that time is a
+    line of this run and "public": false, never a stop, because the look can fail where Funnel works (a machine that
+    may not reach Tailscale's public addresses); the wait takes at most CONNECT_PUBLIC_TIME seconds. Returns {"name", "address", "state": "made"|"there", "public"}."""
     run = run or _shell
     read = read or (lambda path: pathlib.Path(path).read_text(encoding="utf-8"))
     kit = kit or KIT
@@ -2076,6 +2143,13 @@ def connect_on(hub_user="fleet", kit=None, run=None, read=None, account=None):
         raise Stop(f"this machine's Tailscale already publishes {other[0]}, so the connect gate is not put in place. "
                    f"Nothing was changed.")
     if rights is not None and not connect_in_place(conf, name):
+        # The owner's app writes the policy lines, the tag and the HTTPS setting a moment before it runs this step,
+        # and Tailscale gives a machine its new rights some seconds later: so the step looks again before it stops.
+        for _ in range(CONNECT_RIGHT_LOOKS - 1):
+            if connect_right(rights, "funnel") and connect_right(rights, "https"):
+                break
+            (sleep or time.sleep)(CONNECT_RIGHT_PAUSE)
+            rights = tailnet_self(run)[1] or set()
         if not connect_right(rights, "funnel"):
             raise Stop(CONNECT_NO_FUNNEL)
         if not connect_right(rights, "https"):
@@ -2175,8 +2249,17 @@ def connect_on(hub_user="fleet", kit=None, run=None, read=None, account=None):
     if not connect_in_place(_json_of(run, "funnel-status", empty={}), name):
         raise Stop(f"`{shlex.join(tailscale_argv('funnel-status'))}` does not show https://{name} published to "
                    f"{CONNECT_TARGET} alone. The Tailscale policy may not give this machine the funnel attribute.")
+    answers, looks = (public or connect_public)(name)
+    if answers:
+        say(f"https://{name} answers from the Internet")
+    elif answers is None:
+        say(f"this machine finds no public address of {name}, so it did not look at https://{name} from the Internet")
+    else:
+        say(f"https://{name} does not answer from the Internet yet, after {looks} looks: Tailscale can need some "
+            f"minutes more")
     say(f"the remote MCP address is https://{name}/mcp")
-    return {"name": name, "address": f"https://{name}/mcp", "state": "made" if made or changed else "there"}
+    return {"name": name, "address": f"https://{name}/mcp", "state": "made" if made or changed else "there",
+            "public": answers}
 
 
 def connect_off(run=None):

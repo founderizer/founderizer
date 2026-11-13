@@ -372,6 +372,32 @@ class Servers(OwnerAPI):
                          "tag:claude-code-dev,tag:terminal-relay-worker --accept-dns=false; curl -fsS "
                          f"http://{HUB}:8765/join | FLEET_JOIN={answer['code']} sh")
 
+    def test_the_hubs_own_tag_of_the_connected_apps_is_in_no_join_line(self):
+        """Turn on of the connected apps puts tag:founderizer-hub on the hub's machine, which gives that machine alone
+        the right to publish an address (Tailscale Funnel). It is a tag of one machine (hub.ONE_MACHINE_TAG): a new
+        server takes the hub's other tags and never this one. With it, the server's join would fail at Tailscale,
+        because its join key does not carry the tag, or the server would get the right to publish."""
+        tagged = lambda answer: answer["line"].split("--advertise-tags=")[1].split(" ")[0]
+        self.hub_tags = ["tag:founderizer", "tag:founderizer-hub"]
+        self.assertEqual(tagged(self.code("box", "linux")), "tag:founderizer")
+        self.hub_tags = ["tag:founderizer-hub", "tag:fleet-a", "tag:fleet-b"]
+        self.assertEqual(tagged(self.code("box", "linux")), "tag:fleet-a,tag:fleet-b")
+        self.assertEqual(hub.join_tags(), ["tag:fleet-a", "tag:fleet-b"])
+        # a hub that carries only that tag is a hub with no tag of the fleet: the product tag where the tailnet has
+        # it, and else none
+        hub.TAILNET_NAMES.pop("tags", None)
+        self.addCleanup(hub.TAILNET_NAMES.pop, "tags", None)
+        self.hub_tags = ["tag:founderizer-hub"]
+        self.assertNotIn("--advertise-tags", self.code("box", "linux")["line"])
+        self.peer_tags = {VPS: ["tag:founderizer"]}
+        self.assertEqual(tagged(self.code("box", "linux")), "tag:founderizer")
+        # only that one name: a tag that begins or ends like it is a tag of the fleet as before
+        self.assertIsNone(hub.ONE_MACHINE_TAG.fullmatch("tag:founderizer"))
+        self.assertIsNone(hub.ONE_MACHINE_TAG.fullmatch("tag:founderizer-hub-2"))
+        self.assertIsNotNone(hub.ONE_MACHINE_TAG.fullmatch("tag:founderizer-hub"))
+        import onboard
+        self.assertEqual(onboard.ONE_MACHINE_TAG.pattern, hub.ONE_MACHINE_TAG.pattern)
+
     def test_a_hub_with_no_tag_asks_for_the_product_tag_only_where_the_tailnet_has_it(self):
         """A hub that the app put on the network carries tag:founderizer already. A hub with no tag asks for it only
         where another machine of the tailnet carries it, which proves that the tailnet's policy defines it, and else

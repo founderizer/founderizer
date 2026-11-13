@@ -11059,12 +11059,14 @@ def central_replaces(t0=None, ok=None):
 def ui_features():
     """The owner features this hub serves now: UI_FEATURES, central_vault only while central_ok(), secret_replace
     only while the central vault also says that it replaces a value (central_replaces), contact_roles only while
-    contacts.v2 is on, and connected_apps only while the hub's socket for them is open and the gate has forwarded to
-    it (capp_ready)."""
+    contacts.v2 is on, connected_apps only while the hub's socket for them is open and the gate has forwarded to it
+    (capp_ready), and connect_offer only while the owner's Mac may turn connected apps on here or waits for them to be
+    ready (capp_offer)."""
     ok = central_ok()
     return list(UI_FEATURES) + (["central_vault"] if ok else []) + \
         (["secret_replace"] if central_replaces(ok=ok) else []) + \
-        (["contact_roles"] if contacts_v2() else []) + (["connected_apps"] if capp_ready() else [])
+        (["contact_roles"] if contacts_v2() else []) + (["connected_apps"] if capp_ready() else []) + \
+        (["connect_offer"] if capp_offer() else [])
 
 
 def central_due():
@@ -34551,6 +34553,11 @@ JOIN_WINDOW = 600
 JOIN_CODE = re.compile(r"[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{12}")       # LINK_ALPHABET: 12 characters, 60 bits
 FLEET_TAG = "tag:founderizer"  # the app's PrivateNetwork.tag: asked for where the hub has no tag and the tailnet has it
 TAILNET_TAG = re.compile(r"tag:[a-z0-9][a-z0-9-]{0,62}")    # a tag as the app reads one (PolicyFile.isTag)
+# A tag of one machine's part is no tag of every machine. The hub's own tag of the connected apps (the Mac app's
+# TailscaleFleetKey.hubTag) gives the hub's machine alone the right to publish an address with Tailscale Funnel: a
+# server that joined with it would ask Tailscale for a tag that its join key does not carry, or would get that right.
+# onboard.ONE_MACHINE_TAG is the same pattern.
+ONE_MACHINE_TAG = re.compile(r"tag:(founderizer-hub)")
 JOB_OPEN = ("queued", "running", "needs_owner")
 JOB_STEPS = ("user", "runtime", "checkout", "service", "sign_in",       # `user`: the agent's own OS user, on Linux
              "files")          # agent_remove: a removal's steps are service, files and, on Linux, user
@@ -35291,7 +35298,8 @@ def hub_tags(status):
     if not isinstance(me, dict):
         return None
     tags = me.get("Tags") if isinstance(me.get("Tags"), list) else []
-    tags = [t for t in tags if isinstance(t, str) and TAILNET_TAG.fullmatch(t)]
+    # A tag of the hub's machine alone (ONE_MACHINE_TAG) is no tag of the fleet: no join line asks for it.
+    tags = [t for t in tags if isinstance(t, str) and TAILNET_TAG.fullmatch(t) and not ONE_MACHINE_TAG.fullmatch(t)]
     if tags:
         return tags
     peers = status.get("Peer") if isinstance(status.get("Peer"), dict) else {}
@@ -41069,7 +41077,9 @@ CAPP_CLIENT = "connected:"          # the X-Fleet-Client of a connected app's co
 CAPP_NOT_HERE = "Connected apps are not in this release of the hub."
 CAPP_OFF = "Connected apps are off on this hub."
 CAPP_ENDED = ("owner", "reuse", "code_reuse", "off", "client", "restore")     # capp_connections.ended_by
-CONNECT = {"server": None, "thread": None, "gate": None, "said": None}    # the open socket, the gate's version
+# The open socket, the gate's version, the last line of capp_sync, and why the feature is on and does not work now:
+# "why" (capp_sync: the socket stays closed) and "gate_why" (capp_gate_watch: the socket is open and no gate forwards).
+CONNECT = {"server": None, "thread": None, "gate": None, "said": None, "why": None, "gate_why": None}
 
 
 def capp_allowed():
@@ -41193,12 +41203,65 @@ def capp_handle_key():
     return bytes.fromhex(kept)
 
 
+# Why the feature is on and does not work, beside the reasons of capp_funnel_ok. The owner's Mac reads these words
+# in GET /ui/connect (stopped) and chooses its own sentence by them (the Mac app's ConnectGate), so a change here is a
+# change there.
+CAPP_NO_NAME = "the hub does not know its DNS name on the private network, so its socket for connected apps stays closed"
+CAPP_NO_FUNNEL = ("Tailscale Funnel publishes nothing on the hub's machine, so the hub's socket for connected apps "
+                  "stays closed: `hubsetup.py connect on` as root turns it on")
+CAPP_NO_FOLDER = (f"the folder {CONNECT_DIR} is not on the hub's machine, so its socket for connected apps stays "
+                  f"closed: `hubsetup.py connect on` as root makes it")
+CAPP_NO_GATE = ("the gate of the connected apps does not forward to the hub's socket on this machine: `hubsetup.py "
+                "connect on` as root puts it right")
+
+
+def capp_stopped(on=None):
+    """Why the feature is on and connected apps cannot reach the hub now, in the hub's own words, or None: while it is
+    off, while it works, and in the first moments of a start or a reload, before capp_sync and the gate's watch have
+    looked or while it looks again (capp_sync_later, capp_look_again). The socket is closed (CONNECT["why"]: no
+    folder, guard 6(b), a socket that does not open; not a name that the hub does not know yet), or it is open and no
+    gate forwards to it after CAPP_GATE_MISSES asks (CONNECT["gate_why"])."""
+    if not (capp_on() if on is None else on):
+        return None
+    if CONNECT["server"] is None:
+        return CONNECT["why"]
+    return CONNECT["gate_why"] if CONNECT["gate"] is None else None
+
+
+def capp_linux():
+    """The hub runs on Linux: the gate, its service and Funnel are put in place only there (hubsetup.py connect)."""
+    return sys.platform.startswith("linux")
+
+
+def capp_can_turn_on(on=None):
+    """The owner's Mac may offer Turn on: the feature is allowed in this release (capp_allowed), the hub runs on Linux,
+    and the feature is off. A hub on a Mac never offers it (hubsetup.py connect refuses there)."""
+    if not capp_allowed():
+        return False
+    return capp_linux() and not (capp_on() if on is None else on)
+
+
+def capp_offer():
+    """connect_offer is in ui_features: the Mac may read GET /ui/connect before connected_apps is there, while the
+    feature can be turned on here (capp_can_turn_on) or is on and not ready yet (capp_ready). Never while
+    capp_allowed() is false, so that no hub of this release names it, and never on a hub that does not run on Linux,
+    whatever its team.json says: nothing can put the gate in place there."""
+    if not capp_allowed() or not capp_linux():
+        return False
+    on = capp_on()
+    return capp_can_turn_on(on) or (on and not capp_ready())
+
+
 def capp_view():
-    """GET /ui/connect: whether the feature is on, the public address, the open connections and the gate."""
+    """GET /ui/connect: whether the feature is on, whether the Mac may offer Turn on here (capp_can_turn_on), why it
+    is on and does not work now (capp_stopped), the public address, the open connections and the gate."""
     name = capp_name()
     capp_gate_nudge(look=True)      # the next read is true of a gate that stopped or was replaced since
+    capp_look_again()               # and of a closed socket whose reason ended since
     rows = q("SELECT id, name, level, last_used, created FROM capp_connections WHERE revoked IS NULL ORDER BY id")
-    return {"on": capp_on(), "address": oauth_server.resource(name) if name else None,
+    on = capp_on()
+    return {"on": on, "can_turn_on": capp_can_turn_on(on), "stopped": capp_stopped(on),
+            "address": oauth_server.resource(name) if name else None,
             "connections": [dict(r) for r in rows], "gate": {"version": CONNECT["gate"], "ok": capp_gate_ok()}}
 
 
@@ -41219,6 +41282,8 @@ def save_connect(on):
         with transaction():
             revoked = capp_all_off_rows(now())
     if hub_conf == team.get("hub"):
+        if on:
+            capp_sync_later()       # on already (a Try again of the owner's Mac): the hub looks at its socket again
         return {"on": on, "revoked": revoked, "revision": rev, "sha256": current}
     team["hub"] = hub_conf
     try:
@@ -42509,8 +42574,10 @@ def capp_funnel_ok(name):
                       f"closed: {e}"
     if not hubsetup.connect_in_place(conf, name):
         targets = ", ".join(f"{t['where']} to {t['target']}" for t in hubsetup.serve_targets(conf) if t["funnel"])
+        if not targets:                 # Funnel was turned off on the machine: the root step turns it on again
+            return False, CAPP_NO_FUNNEL
         return False, f"Tailscale Funnel does not publish only the gate ({hubsetup.CONNECT_TARGET}), so the hub's " \
-                      f"socket for connected apps stays closed. Funnel: {targets[:300] or 'none'}"
+                      f"socket for connected apps stays closed. Funnel: {targets[:300]}"
     return True, ""
 
 
@@ -42546,7 +42613,7 @@ def capp_close():
     with contextlib.suppress(OSError):
         if stat.S_ISSOCK(os.lstat(path).st_mode):
             os.unlink(path)
-    CONNECT["gate"] = None
+    CONNECT["gate"] = CONNECT["gate_why"] = None
 
 
 def capp_gate_address():
@@ -42619,10 +42686,14 @@ def capp_gate_watch(server):
             return
         if status == 200:
             misses, said = 0, None
+            if CONNECT["gate_why"] is not None:
+                CONNECT["gate_why"] = None
+                changed()
         else:
             misses += 1
-            if misses >= CAPP_GATE_MISSES and CONNECT["gate"] is not None:
-                CONNECT["gate"] = None
+            if misses >= CAPP_GATE_MISSES and (CONNECT["gate"] is not None or CONNECT["gate_why"] is None):
+                # the owner's app shows this while the feature is on and no gate forwards (capp_stopped)
+                CONNECT["gate"], CONNECT["gate_why"] = None, CAPP_NO_GATE
                 changed()
             if status is not None and status != said:
                 said = status
@@ -42641,14 +42712,18 @@ def capp_sync():
     (capp_on), the folder of section 7 is there, the hub knows its DNS name and guard 6(b) passes. Each new reason to
     keep it closed is one log line. At the start and at each team reload (capp_sync_later); never under LOCK."""
     with CAPP_SYNC:
+        CAPP_SYNC_ASKED[0] = now()      # each look counts, whoever started it (capp_look_again)
         name, said, was_open = capp_name(), "", CONNECT["server"] is not None
-        want = capp_on() and name is not None and os.path.isdir(CONNECT_DIR)
+        on = capp_on()
+        want = on and name is not None and os.path.isdir(CONNECT_DIR)
         if want:
             want, said = capp_funnel_ok(name)
+        elif on:        # on, and a part of the machine is missing: one line of the log
+            said = CAPP_NO_NAME if name is None else CAPP_NO_FOLDER
         if want and CONNECT["server"] is None:
             # A request of the socket before this one can still be in flight and write its gate's version after
             # capp_close cleared it: the new socket starts with none, so its watch asks.
-            CONNECT["gate"] = None
+            CONNECT["gate"] = CONNECT["gate_why"] = None
             try:
                 CONNECT["server"] = capp_open(capp_socket_path())
             except OSError as e:
@@ -42663,6 +42738,10 @@ def capp_sync():
         if not want and CONNECT["server"] is not None:
             capp_close()
             said = said or "the hub closed its socket for connected apps"
+        # Why the feature is on and the socket is closed, for the owner's app; nothing while it is off or open. A hub
+        # that does not know its name yet says nothing there: it started before tailscaled had the name, and the
+        # socket opens when the hub learns it (learn_tailnet_names). The root step refuses a machine with no name.
+        CONNECT["why"] = said if on and CONNECT["server"] is None and said and said != CAPP_NO_NAME else None
         if said and said != CONNECT["said"]:
             CONNECT["said"] = said
             log("hub", said)
@@ -42672,14 +42751,32 @@ def capp_sync():
         return CONNECT["server"] is not None
 
 
-def capp_sync_later():
+CAPP_SYNC_ASKED = [0.0]                     # when capp_sync_later last started a look
+
+
+def capp_sync_later(again=False):
     """capp_sync in the background, after a team reload or at the start: the serve status takes up to 5 seconds, and a
-    reload runs under LOCK. Nothing starts while the feature cannot be on and no socket is open."""
+    reload runs under LOCK. Nothing starts while the feature cannot be on and no socket is open. The reason of a
+    closed socket goes while the hub looks (CONNECT["why"]), so that GET /ui/connect never gives the reason from
+    before a reload or a write of the setting. again: a look that a read of the page started (capp_look_again), which
+    keeps the reason until the look ends, so that the page does not lose its row for a moment at each look."""
     if not capp_allowed() and CONNECT["server"] is None:
         return None
+    if not again:
+        CONNECT["why"] = None
     thread = threading.Thread(target=capp_sync, name="connected-apps-sync", daemon=True)
     thread.start()
     return thread
+
+
+def capp_look_again():
+    """From a read of GET /ui/connect while the feature is on and the hub's socket is closed: the hub looks again, at
+    most once in CAPP_GATE_LOOK seconds. A reason can end with no change of team.json (tailscaled answers again, the
+    root step made the folder or turned Funnel on), and the page of the owner's Mac reads this route while it shows
+    the reason and while its Try again waits, so the look needs no clock of its own."""
+    if capp_on() and CONNECT["server"] is None and now() - CAPP_SYNC_ASKED[0] >= CAPP_GATE_LOOK:
+        CAPP_SYNC_ASKED[0] = now()      # here too, so that two reads of one moment start one look
+        capp_sync_later(again=True)
 
 
 def capp_ready():

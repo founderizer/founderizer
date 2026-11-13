@@ -382,6 +382,8 @@ class Box:
     def __init__(self, conf=None, user="", funnel_works=True, rights=RIGHTS, old_rights=None, funnel_waits=False):
         # rights: the names of Self.CapMap, or None for a status with no CapMap; old_rights: Self.Capabilities
         self.rights, self.old_rights, self.funnel_waits = rights, old_rights, funnel_waits
+        self.slept = []                 # the pauses of the step, which no test waits for
+        self.late = {}                  # {the number of a status read: the rights from that read on}
         self.ran, self.files, self.conf = [], {}, json.loads(json.dumps(conf or {}))
         self.holds = True               # False: the gate is not active after its start
         self.state = {"user": user, "folder": "", "program": "", "started": "", "active": "inactive",
@@ -391,6 +393,9 @@ class Box:
     def run(self, script, timeout=120):
         self.ran.append(script)
         if script == "tailscale status --json":
+            reads = self.ran.count(script)
+            if reads in self.late:
+                self.rights = self.late[reads]
             me = {"DNSName": N.upper() + "."}
             if self.rights is not None:
                 me["CapMap"] = {r: None for r in self.rights}
@@ -431,6 +436,11 @@ class Box:
             raise FileNotFoundError(path)
         return self.files[path]
 
+    def public(self, name):
+        """A stand-in for the look at the public address (hubsetup.connect_public): no test reaches a network."""
+        self.looked = getattr(self, "looked", []) + [name]
+        return getattr(self, "answers", (True, 1))
+
     def changes(self):
         return [s for s in self.ran if not s.startswith(("echo user=", "tailscale status", "tailscale serve status",
                                                          "tailscale funnel status"))]
@@ -442,7 +452,8 @@ def account(user):
 
 class ConnectStep(unittest.TestCase):
     def on(self, box):
-        return hubsetup.connect_on(hub_user="fleet", kit=str(HERE), run=box.run, read=box.read, account=account)
+        return hubsetup.connect_on(hub_user="fleet", kit=str(HERE), run=box.run, read=box.read, account=account,
+                                   public=box.public, sleep=box.slept.append)
 
     def test_the_unit(self):
         unit = hubsetup.connect_unit_text(N)
@@ -496,7 +507,7 @@ class ConnectStep(unittest.TestCase):
     def test_on_a_new_machine_each_part_in_its_order(self):
         box = Box()
         done = self.on(box)
-        self.assertEqual(done, {"name": N, "address": f"https://{N}/mcp", "state": "made"})
+        self.assertEqual(done, {"name": N, "address": f"https://{N}/mcp", "state": "made", "public": True})
         changes = box.changes()
         self.assertEqual(len(changes), 7, changes)
         self.assertIn("useradd --system --gid founderizer-connect", changes[0])
@@ -603,11 +614,24 @@ class ConnectStep(unittest.TestCase):
                 self.assertEqual(str(e.exception), words)
                 self.assertIn("Nothing was changed.", words)
                 self.assertEqual(box.changes(), [])
+                # it looked CONNECT_RIGHT_LOOKS times, a pause apart, before it stopped
+                self.assertEqual(box.ran.count("tailscale status --json"), hubsetup.CONNECT_RIGHT_LOOKS)
+                self.assertEqual(box.slept, [hubsetup.CONNECT_RIGHT_PAUSE] * (hubsetup.CONNECT_RIGHT_LOOKS - 1))
         # the rights by their older names, and the real names with others beside them: the step runs
         for rights, old_rights in ((None, ["https://tailscale.com/cap/funnel", "https://tailscale.com/cap/https"]),
                                    (Box.RIGHTS, None)):
             with self.subTest(rights=rights, old_rights=old_rights):
                 self.assertEqual(self.on(Box(rights=rights, old_rights=old_rights))["state"], "made")
+        # A right that comes some seconds after the owner's app wrote the tag: the step waits for it and then runs.
+        box = Box(rights=("https",))
+        box.late = {3: Box.RIGHTS}
+        self.assertEqual(self.on(box)["state"], "made")
+        self.assertEqual(box.slept, [hubsetup.CONNECT_RIGHT_PAUSE] * 2)
+        self.assertEqual((hubsetup.CONNECT_RIGHT_LOOKS, hubsetup.CONNECT_RIGHT_PAUSE), (7, 5))
+        self.assertEqual(Box().slept, [])
+        ready = Box()
+        self.on(ready)
+        self.assertEqual(ready.slept, [])           # a machine that has its rights waits for nothing
         # a Funnel that stands is not asked about again: a second run of a working gate changes nothing
         box = Box(conf=OURS, rights=("https",))
         self.on(box)
@@ -629,6 +653,84 @@ class ConnectStep(unittest.TestCase):
         before = len(box.changes())
         self.assertEqual(self.on(box)["state"], "made")
         self.assertEqual(box.changes()[before:], [on])
+
+    def test_the_step_waits_for_the_public_address_and_an_address_that_does_not_answer_is_no_stop(self):
+        box = Box()
+        done = self.on(box)
+        self.assertEqual((done["public"], box.looked), (True, [N]))
+        for answers in ((False, 36), (None, 0)):
+            box = Box()
+            box.answers = answers
+            done = self.on(box)                     # no Stop: Funnel is on, and the address can need more time
+            self.assertEqual((done["state"], done["public"]), ("made", answers[0]))
+        # the look itself: every address of the name must answer in one look, and it ends at its count of looks
+        slept, asked = [], []
+        state = {"look": 0}
+
+        def addresses(name):
+            state["look"] += 1
+            return ["192.0.2.1", "192.0.2.2", "192.0.2.3"]
+
+        def answer(name, address, timeout=None):
+            asked.append((state["look"], address, timeout))
+            return state["look"] >= 3 or address != "192.0.2.1"     # one address serves the name later than the others
+
+        still = lambda: 0.0                         # a clock that stands still: only the count of looks ends the wait
+        self.assertEqual(hubsetup.connect_public(N, addresses, answer, tries=5, pause=5, sleep=slept.append,
+                                                 clock=still), (True, 3))
+        self.assertEqual(slept, [5, 5])
+        self.assertEqual(len(asked), 9)             # each address in each look: a slow one hides no other
+        self.assertEqual({t for _, _, t in asked}, {hubsetup.CONNECT_PUBLIC_ANSWER})
+        slept.clear()
+        self.assertEqual(hubsetup.connect_public(N, lambda n: ["192.0.2.1"], lambda n, a, timeout=None: False, tries=4,
+                                                 pause=5, sleep=slept.append, clock=still), (False, 4))
+        self.assertEqual(slept, [5, 5, 5])          # no pause after the last look
+        self.assertEqual(hubsetup.connect_public(N, lambda n: [], lambda n, a, timeout=None: True, tries=2, pause=5,
+                                                 sleep=slept.append, clock=still), (None, 0))
+
+        def no_name(name):
+            raise OSError("no such name")
+        self.assertEqual(hubsetup.connect_public(N, no_name, lambda n, a, timeout=None: True, tries=2, pause=0,
+                                                 sleep=slept.append, clock=still), (None, 0))
+        # a name that had an address in some look and none in the last one: looked, and no answer
+        seen = iter([["192.0.2.1"], ["192.0.2.1"], []])
+        self.assertEqual(hubsetup.connect_public(N, lambda n: next(seen), lambda n, a, timeout=None: False, tries=3,
+                                                 pause=0, sleep=slept.append, clock=still), (False, 2))
+        self.assertEqual((hubsetup.CONNECT_PUBLIC_TRIES, hubsetup.CONNECT_PUBLIC_PAUSE, hubsetup.CONNECT_PUBLIC_TIME,
+                          hubsetup.CONNECT_PUBLIC_ANSWER), (36, 5, 180, 8))
+        # The whole wait has one limit of time, whatever each address does: three addresses that drop every packet
+        # take their whole time for each answer. Each answer gets what is left, and no look starts after the limit.
+        now = [0.0]
+        given, naps = [], []
+
+        def slow(name, address, timeout=None):
+            given.append(timeout)
+            now[0] += timeout                       # the address takes all the time that it is given
+            return False
+
+        def nap(seconds):
+            naps.append(seconds)
+            now[0] += seconds
+        result = hubsetup.connect_public(N, lambda n: ["192.0.2.1", "192.0.2.2", "192.0.2.3"], slow, sleep=nap,
+                                         clock=lambda: now[0])
+        self.assertEqual(result[0], False)
+        self.assertLessEqual(now[0], hubsetup.CONNECT_PUBLIC_TIME)
+        self.assertLess(result[1], 10)              # not 36 looks of 24 seconds each
+        self.assertTrue(all(0 < t <= hubsetup.CONNECT_PUBLIC_ANSWER for t in given), given)
+        # Only a public address is asked: this machine's own address on the private network answers with the same
+        # certificate, and would say nothing of the way from the Internet.
+        mixed = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (a, 443)) for a in ("100.64.0.2", "8.8.8.8", "10.0.0.1")]
+        with patch.object(hubsetup.socket, "getaddrinfo", return_value=mixed):
+            self.assertEqual(hubsetup.public_addresses(N), ["8.8.8.8"])
+        with patch.object(hubsetup.socket, "getaddrinfo", return_value=mixed[:1]):
+            self.assertEqual(hubsetup.public_addresses(N), [])
+            self.assertEqual(hubsetup.connect_public(N, sleep=slept.append, tries=1), (None, 0))
+        # an address that refuses the connection is no answer, and raises nothing
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            port = closed.getsockname()[1]
+        with patch.object(hubsetup, "CONNECT_HTTPS", port):
+            self.assertIs(hubsetup.public_answer(N, "127.0.0.1", timeout=2), False)
 
     def test_off(self):
         box = Box()

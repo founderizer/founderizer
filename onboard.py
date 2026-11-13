@@ -67,6 +67,10 @@ TAKE = ('git fetch -q origin && t=$(git rev-parse --verify -q "@{upstream}^{comm
 # gives the fleet's machines their rights by other tags names them with --tailscale-tag or the config file.
 FLEET_TAG = "tag:founderizer"       # hub.FLEET_TAG, the app's PrivateNetwork.tag
 TAG_RE = re.compile(r"^tag:[A-Za-z][A-Za-z0-9-]*$")
+# A tag of one machine's part is no tag of every machine (hub.ONE_MACHINE_TAG): the hub's own tag of the connected
+# apps, which gives the hub's machine alone the right to publish an address. A machine that joined with it would ask
+# Tailscale for a tag that its join key does not carry, or would get that right.
+ONE_MACHINE_TAG = re.compile(r"tag:(founderizer-hub)")
 TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"      # the command on a Mac, as the hub reads it
 # Both at least 7 days old on 10 October 2026. A Codex version stays until someone installs another one. The Claude
 # version is only the first build: Claude Code's own installation updates itself (see CLAUDE_CHANNEL).
@@ -688,7 +692,7 @@ def network_tags(hub):
         nodes = [status.get("Self") or {}] + list((status.get("Peer") or {}).values())
         tagged = [n.get("Tags") or [] for n in nodes]
         own = next((t for n, t in zip(nodes, tagged) if host in (n.get("TailscaleIPs") or [])), [])
-        own = [t for t in own if isinstance(t, str) and TAG_RE.match(t)]
+        own = [t for t in own if isinstance(t, str) and TAG_RE.match(t) and not ONE_MACHINE_TAG.fullmatch(t)]
         return ",".join(own) if own else FLEET_TAG if any(FLEET_TAG in t for t in tagged) else ""
     except (OSError, ValueError, AttributeError, TypeError, subprocess.SubprocessError):
         return ""
@@ -1034,7 +1038,10 @@ class Onboarding:
             self.pin_tailscale(ip)
             return "skipped", "Joined as %s." % ip
         self.must(TAILSCALE_INSTALL, "Tailscale installation", timeout=2 * APT_LOCK_WAIT + 300)
-        tag = self.state.get("tailscale_tag") or ""
+        # A saved run can hold a tag of the hub's machine alone, from a run that began before this rule: it joins
+        # without it (ONE_MACHINE_TAG).
+        tag = ",".join(t for t in (self.state.get("tailscale_tag") or "").split(",")
+                       if t.strip() and not ONE_MACHINE_TAG.fullmatch(t.strip()))
         tags = " --advertise-tags=%s" % shlex.quote(tag) if tag else ""
         up = "tailscale up%s --accept-dns=false --ssh=false" % tags        # its own name
         if self.auth.get("tailscale") == "auth_key":
@@ -1126,8 +1133,10 @@ class Onboarding:
                         "Hub reach")
         info = kv(out)
         if info.get("health") != "yes" or info.get("git") != "yes":
+            tags = ",".join(t for t in (self.state.get("tailscale_tag") or "").split(",")
+                            if t.strip() and not ONE_MACHINE_TAG.fullmatch(t.strip()))     # as s_tailscale joined
             raise StepFailed("The worker cannot reach the hub over Tailscale. Check the access rule for "
-                             "%s to the hub ports 8765 and 9418." % (self.state.get("tailscale_tag") or "this machine"))
+                             "%s to the hub ports 8765 and 9418." % (tags or "this machine"))
         return "done", "The worker reaches the hub and its Git repository."
 
     def s_register(self):
