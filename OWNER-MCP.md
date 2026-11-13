@@ -175,6 +175,7 @@ would read as an empty fleet instead of as a mistake.
 | `add_machine` | `/ui/servers/join` | The one-time join line, and with `host` it runs it over SSH: as root on Linux, as the Mac user on a Mac. A Linux server that is not on the private network goes on it first, with `authkey_file` (B2); without that file, it stops before the hub makes a code. |
 | `add_agent` | `/ui/servers/<s>/agents` | An agent on an available server, with its install job. |
 | `remove_machine` | `/ui/servers/<s>/remove` | A server with no agent leaves. |
+| `server_key_swap` | `/ui/servers/<s>/key-swap` | The owner's word that the vault of a Linux server swaps keys, after root's step `hubsetup.py vault --swap` there (the key swap, `VAULT.md`), or its end. It changes only what the hub says about the keys of the agents there. |
 | `activate_agent` / `agent_settings` | `/ui/team/agents/<a>` | Turn an agent on or off; its model, effort, capabilities and host list. |
 | `agent_key` | `/ui/team/agents/<a>/key` | Register, replace or remove an agent's key, by its SHA-256. Never a key. A key that a server service registered is replaced, never removed. |
 | `rename_agent` | `/ui/team/agents/<a>/rename` | A new name for an agent: everything it has moves with it, and nobody signs in again. |

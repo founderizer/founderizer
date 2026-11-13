@@ -533,6 +533,15 @@ reads it, and the agent's program is Claude Code or Codex. Its next session then
 the placeholder. On such a machine the vault also sends that key in a `call_api`
 request only to that site, in the `Authorization` header and in the key's own form.
 
+The hub does not know that this machine swaps keys, and it reads no report of a machine
+for that. So after the step, the owner tells the hub: the tool `server_key_swap` of the
+owner MCP server with `on: true` (`POST /ui/servers/<server>/key-swap`). From then on
+the settings check does not count a key that swaps here as a key in the agent's
+sessions, and the start text of an agent whose sessions get the variable says that it
+holds a placeholder. The word opens nothing. Without it the key swap works the same:
+the settings check then counts such a key as a key in the sessions, which is more than
+is so, and the start text says "when its value begins with vaultswap_".
+
 What a machine that swaps costs: the HTTPS programs of a session that holds a
 placeholder go through the proxy. A new `vault.py` does not cut a connection of theirs
 that passes bytes; the second new `vault.py` after a connection opened does cut it (so
@@ -546,7 +555,8 @@ line into its log, goes on with its own program, and tries the new one again lat
 `systemctl restart fleet-vault-swap` makes the proxy start from the installed program
 at once. A session that holds no placeholder does not use the proxy.
 
-To undo, as root: `systemctl disable --now fleet-vault-swap`, take the part `"swap"`
-out of `/etc/fleet-vault/vault.json`, `systemctl restart fleet-vault`. The next
-sessions get each key as a variable again. A session that holds a placeholder must
-start again.
+To undo: first the owner takes the word back (`server_key_swap` with `on: false`), or
+the hub goes on saying that the keys of this machine's agents are placeholders. Then,
+as root: `systemctl disable --now fleet-vault-swap`, take the part `"swap"` out of
+`/etc/fleet-vault/vault.json`, `systemctl restart fleet-vault`. The next sessions get
+each key as a variable again. A session that holds a placeholder must start again.

@@ -1616,6 +1616,14 @@ def tools():
         tool("remove_machine", "A server with no agent leaves the fleet.",
              {"server": S["text"], **rid}, ("server",),
              with_base("/ui/servers/{server}/remove", (), "the removal of this server")),
+        tool("server_key_swap", "Say that the vault of one Linux server swaps keys (on true), or take that word back "
+                                "(on false). Give it only after root ran `hubsetup.py vault --swap` on that server, "
+                                "and take it back when that step is undone: the hub does not check the server. The "
+                                "word changes only what the hub says: the settings check does not count a key that "
+                                "swaps there as a key in the agent's sessions, and the agent's start text says that "
+                                "the variable holds a placeholder. It opens nothing, and no vault reads it.",
+             {"server": S["text"], "on": S["bool"], **rid}, ("server", "on"),
+             with_base("/ui/servers/{server}/key-swap", ("on",), "the key swap word of this server")),
         tool("activate_agent", "Turn one agent on or off. An agent in setup takes no work and no message.",
              {"agent": S["text"], "active": S["bool"], **rid}, ("agent", "active"),
              with_base("/ui/team/agents/{agent}", ("active",), "the activation of this agent")),

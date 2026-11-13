@@ -254,8 +254,15 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
   agent's own program (`lifecycle.py`, `hub.py`). Each part comes from the owner's settings in `team.json` and
   from a fixed table of each program's hosts (`lifecycle.py`). The site is also the address that a check of the
   key must keep to, so a key that has a site already swaps when root switches its server on (`hub.py`). The hub
-  does not decide by a report from an agent's machine, and it does not know which server swaps keys: each broker
-  decides that by its own configuration (`hub.py`, `vault.py`).
+  does not decide by a report from an agent's machine. Each broker decides by its own configuration whether its
+  server swaps keys (`hub.py`, `vault.py`).
+- **What the hub says about a server.** The owner can tell the hub that the vault of a server swaps keys, with the
+  tool `server_key_swap` of the owner's MCP server, after root's step on that server (`owner_mcp.py`). The hub does
+  not check the server, and it reads no report of a machine for this. It uses the owner's word only for what it
+  says. The settings check does not count a key that swaps there as a key in the agent's sessions. The start text
+  of an agent whose sessions get the variable says that the variable holds a placeholder, which begins with
+  `vaultswap_`, and not the key (`hub.py`). The word opens nothing, and no vault reads it. A wrong word makes the
+  settings check and the start text say a thing that is not so.
 - **The placeholder.** The broker makes one placeholder for each agent and key: `vaultswap_` and 160 random bits.
   It keeps a list of them with the OS user, the agent, the name of the key, the site and the form, and no value
   (`vault.py`). A placeholder is no secret: it is of use only on that server, to that OS user, for that site. At

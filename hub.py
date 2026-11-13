@@ -1232,12 +1232,25 @@ def read_secrets(agent):
 # site (vault.py). The hub's part: it names the site and the form of each key that can swap in its answer to the
 # vault's read, and it answers the vault's question at each use, "does this agent still read this key at this site?".
 # Whether a machine swaps is its vault's own root-owned setting, and no report of an agent's side: the hub does not
-# ask it and does not decide by it.
+# ask it, and its answers to a vault do not decide by it. What the hub SAYS about an agent's keys (the settings check,
+# a start text) goes by the owner's own word for the agent's server: team.json "servers", "key_swap": true, which
+# the owner's command writes after root's step there (key_swaps, server_key_swap).
 
 def key_swap(agent, ref):
     """(the site, the form) of an API key that a session of this agent holds as a placeholder on a machine whose vault
     swaps keys, or None: the rule is lifecycle.key_swap, and each part of it is the owner's setting in team.json."""
     return lifecycle.key_swap(TEAM, agent, ref)
+
+
+def key_swaps(agent, ref):
+    """(the site, the form) of an API key that the sessions of this agent hold as a placeholder and not as the key, or
+    None: the rule (key_swap), on a server that swaps keys by the owner's own word. That word is `"key_swap": true` in
+    the entry of the agent's server in team.json "servers". Only the owner's command writes it (server_key_swap),
+    after root's step on that server; no report of a helper, a vault or an agent is read for it. It opens nothing
+    and refuses nothing: three readers say what is so by it (session_keys, the settings check's words, key_words)."""
+    team = team_read()                  # one moment for the agent, its server and the rule
+    entry = (team.get("servers") or {}).get(((team.get("agents") or {}).get(agent) or {}).get("machine"))
+    return lifecycle.key_swap(team, agent, ref) if isinstance(entry, dict) and entry.get("key_swap") is True else None
 
 
 def swap_token(agent, ref):
@@ -1252,17 +1265,25 @@ def swap_token(agent, ref):
 
 def key_words(agent, short=False):
     """What a start text says of this agent's keys that can swap, after their names, or "": which host each one is
-    for, and what a placeholder is. The hub does not know whether the agent's machine swaps keys, so the words say
-    how the session sees it: the value begins with vaultswap_. From team.json only: a start text reads nothing else."""
+    for, and what a placeholder is. On a server that swaps keys by the owner's word (key_swaps), the words say that
+    the variable holds a placeholder, for an agent whose sessions get the variable (session_keys' first rule); they
+    keep the prefix, so a session sees a wrong word of the owner's itself. Elsewhere the hub does not know whether
+    the agent's machine swaps keys, so the words say how the session sees it: the value begins with vaultswap_. From
+    team.json only: a start text reads nothing else."""
     held = [(name, key_swap(agent, ref)) for ref, name in read_secrets(agent)]
     held = [(name, found[0].split("://", 1)[1]) for name, found in held if found]
     if not held:
         return ""
+    sure = not shell_off(agent) and (agents().get(agent) or {}).get("vault") == "broker" \
+        and any(key_swaps(agent, ref) for ref, _name in read_secrets(agent))    # one server, so each of them or none
     if short:
-        return " (a placeholder when its value begins with vaultswap_: " + \
-            ", ".join(f"{name} for {host}" for name, host in held) + ")"
-    return (" (" + ", ".join(f"{name} is for {host} only" for name, host in held) + ": when its value begins with "
-            "vaultswap_, it is a placeholder, and this machine's vault puts the key into the Authorization header of an "
+        return (" (a placeholder, which begins with vaultswap_, and not the key: " if sure else
+                " (a placeholder when its value begins with vaultswap_: ") \
+            + ", ".join(f"{name} for {host}" for name, host in held) + ")"
+    return (" (" + ", ".join(f"{name} is for {host} only" for name, host in held)
+            + (": the variable holds a placeholder, which begins with vaultswap_, and not the key, " if sure else
+               ": when its value begins with vaultswap_, it is a placeholder, ")
+            + "and this machine's vault puts the key into the Authorization header of an "
             "HTTPS request to that host, and nowhere else; a program that needs the key itself does not work with a "
             "placeholder, so ask your requester then, and do not look for the key)")
 
@@ -24692,19 +24713,22 @@ SETTINGS_REQUEST = "settings:"          # the start of the request_id of each fi
 SETTINGS_BOXES = ("web", "browser")     # the Tools boxes that bring text from outside to an agent
 SETTINGS_KEYS_NAMED = 8                 # key names in one finding, before the rest become a count: the finding of
                                         # an agent with the longest role and key names stays under REPORT_TEXT_MAX
+SETTINGS_PLACED_NAMED = 2               # and the names of the keys that its sessions hold as a placeholder (key swap)
 
 
 def session_keys(agent):
     """The names of the API keys whose values the sessions of this agent hold, sorted; [] when they hold none. This is
     the one answer of the hub to "do this agent's sessions hold the value of a key", so a change of how a key reaches
     a session changes it here. Today: a read grant of an API key (read_secrets), for an agent whose vault is its
-    machine's broker and whose Shell box is on. The helper asks for the values only where team.json says `"vault":
+    machine's broker and whose Shell box is on, and not a key that the agent's server swaps by the owner's word
+    (key_swaps, the key swap lane: such a session holds a placeholder, and the variable's name is still there, which
+    test_key_swap.Fact holds). The helper asks for the values only where team.json says `"vault":
     "broker"` (fleet.vault_mode: "none", the old "file" and an entry that says nothing are no credential access), and
     a session of an agent whose Shell box is off gets no key, only its checks do (the helper's key read, support plan
     F1). test_settings_check.Keys compares this answer with what the helper's and the hub's own code give."""
     if shell_off(agent) or (agents().get(agent) or {}).get("vault") != "broker":
         return []
-    return sorted({env for _ref, env in read_secrets(agent)})
+    return sorted({env for ref, env in read_secrets(agent) if not key_swaps(agent, ref)})
 
 
 def settings_junction(agent):
@@ -24757,12 +24781,24 @@ def settings_words(agent, keys, boxes):
         options.append(f"{step}. Cost: {', and '.join(costs) or 'none'}.{web} Its shell still reaches the internet, "
                        f"so most of the risk stays. To undo: {undo}.")
     options.append("Leave it as it is. Cost: the risk stays. When the owner chooses this, decide this report as noted.")
-    return (f"{who} reads {len(keys)} API key{'s' if several else ''} in its sessions "
-            f"({named_few(keys, SETTINGS_KEYS_NAMED)}), and it has a shell and the web ({tools}). A text from outside, "
-            f"a web page for example, can then make it send a key to another place. The choice is the owner's: put "
-            f"these {'three' if worker else 'two'} options on your weekly list. "
-            + " ".join(f"({n}) {text}" for n, text in enumerate(options, 1))
-            + " The hub makes no second finding while these settings stay.")
+    # the key swap lane: the keys that its sessions hold as a placeholder are no part of the case, and the words say
+    # so, with their names where the finding still fits into one report
+    placed = sorted({env for ref, env in read_secrets(agent) if key_swaps(agent, ref)})
+    rest = "" if not placed else \
+        (f" {len(placed)} more key{'s are' if len(placed) > 1 else ' is'} not in its sessions: the vault of its "
+         f"server swaps {'them' if len(placed) > 1 else 'it'}, so a session holds a placeholder")
+
+    def words(rest):
+        return (f"{who} reads {len(keys)} API key{'s' if several else ''} in its sessions "
+                f"({named_few(keys, SETTINGS_KEYS_NAMED)}), and it has a shell and the web ({tools}).{rest} A text "
+                f"from outside, a web page for example, can then make it send a key to another place. The choice is "
+                f"the owner's: put these {'three' if worker else 'two'} options on your weekly list. "
+                + " ".join(f"({n}) {text}" for n, text in enumerate(options, 1))
+                + " The hub makes no second finding while these settings stay.")
+    if not placed:
+        return words("")
+    named = words(f"{rest} ({named_few(placed, SETTINGS_PLACED_NAMED)}).")
+    return named if len(named) <= REPORT_TEXT_MAX else words(rest + ".")
 
 
 def settings_check():
@@ -32932,12 +32968,14 @@ def validate_team(team):
     servers = team.get("servers", {})          # owner feature servers: the facts of each server that joined
     if not isinstance(servers, dict) or not all(
             m in addresses and m != "owner" and isinstance(s, dict) and
-            set(s) - {"reboot_time"} == {"kind", "user"} and
+            set(s) - {"reboot_time", "key_swap"} == {"kind", "user"} and
             s["kind"] in SERVER_KINDS and isinstance(s["user"], str) and SSH_USER.fullmatch(s["user"]) and
-            ("reboot_time" not in s or isinstance(s["reboot_time"], str) and REBOOT_TIME.fullmatch(s["reboot_time"]))
+            ("reboot_time" not in s or isinstance(s["reboot_time"], str) and REBOOT_TIME.fullmatch(s["reboot_time"])) and
+            ("key_swap" not in s or s["key_swap"] is True and s["kind"] == "linux")       # the key swap (key_swaps)
             for m, s in servers.items()):
         raise ValueError('servers must map machines to {"kind": "linux" or "mac", "user": the OS user of its service}, '
-                         'and each may have the "reboot_time" "HH:MM" that the hub gave it')
+                         'and each may have the "reboot_time" "HH:MM" that the hub gave it; a Linux server may have '
+                         '"key_swap": true, the owner\'s word that its vault swaps keys')
     devices = team.get("owner_devices", {})     # MOBILE-APP.md: the owner's phone and its other devices
     if not isinstance(devices, dict) or len(devices) > OWNER_DEVICE_LIMIT:
         raise ValueError(f"owner_devices must map up to {OWNER_DEVICE_LIMIT} device names to a label and an address")
@@ -35154,6 +35192,41 @@ def remove_server(server, body):
                    "('queued','running','needs_owner')", (t0, server))
     log("owner", f"removed server {server} in {commit[:12]}")
     return {"server": server, "removed": True, "revision": commit, "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def server_key_swap(server, body):
+    """POST /ui/servers/<server>/key-swap {"on": true | false}: the owner's word that the vault of this Linux server
+    swaps keys (the key swap, VAULT.md), or its end. The owner gives it after root's step `hubsetup.py vault --swap`
+    on that server, and takes it back when that step is undone. The hub does not check the server: it reads no report
+    of a machine for this, because an agent's side can write one. The word changes what the hub says (key_swaps), and
+    nothing that a vault does: a wrong word makes the settings check and a start text say a thing that is not so."""
+    rev = kit_revision(fresh=True)
+    team, current, _ = team_view(rev)
+    if body["base_sha256"] != current:
+        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+    entry = (team.get("servers") or {}).get(server)
+    if not isinstance(entry, dict):
+        raise Refusal(404, "no such server")
+    if entry.get("kind") != "linux":
+        raise Refusal(409, "The key swap is for a Linux server.")
+    if entry.get("key_swap") is True if body["on"] else "key_swap" not in entry:
+        return {"server": server, "key_swap": body["on"], "changed": False, "revision": rev, "sha256": current}
+    if body["on"]:
+        entry["key_swap"] = True
+    else:
+        del entry["key_swap"]           # in each form: also one of a team.json that the hub started with
+    try:
+        validate_team(team)
+    except ValueError as e:
+        raise Refusal(400, str(e)) from None
+    data = (json.dumps(team, indent=2) + "\n").encode()
+    commit = commit_kit_file("team.json", data, f"Owner said that the vault of {server} "
+                                               f"{'swaps keys' if body['on'] else 'does not swap keys'}")
+    apply_team(team)
+    log("owner", f"said that the vault of {server} {'swaps keys' if body['on'] else 'does not swap keys'} in "
+                 f"{commit[:12]}")
+    return {"server": server, "key_swap": body["on"], "changed": True, "revision": commit,
+            "sha256": hashlib.sha256(data).hexdigest()}
 
 
 # ---- a new name for an agent (owner feature agent_rename)
@@ -42942,6 +43015,17 @@ class Handler(BaseHTTPRequestHandler):
             return {"server": server, "base_sha256": base}
         return self.ui_command(f"servers/{server}/remove", read, lambda body: remove_server(server, body))
 
+    def ui_server_key_swap(self, server):
+        """POST /ui/servers/<server>/key-swap: the owner's word that this server's vault swaps keys, or its end."""
+        def read(data):
+            base, on = data.get("base_sha256"), data.get("on")
+            if not (isinstance(base, str) and re.fullmatch(r"[0-9a-f]{64}", base)):
+                raise ValueError("base_sha256 must be the SHA-256 of team.json")
+            if not isinstance(on, bool):
+                raise ValueError("on must be true or false")
+            return {"server": server, "base_sha256": base, "on": on}
+        return self.ui_command(f"servers/{server}/key-swap", read, lambda body: server_key_swap(server, body))
+
     def server_caller(self, name):
         """A call of a server service: from a server's own address, with that server's key. The server's name, or None
         after a 403. The caller is the server at its address, whatever name the path gives, which proves as much as the
@@ -46760,6 +46844,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_server_agent(parts[2]) if parts[3] == "agents" else self.ui_server_remove(parts[2])
         if len(parts) == 4 and parts[:2] == ["ui", "servers"] and parts[3] == "prepare":
             return self.ui_server_prepare(parts[2])
+        if len(parts) == 4 and parts[:2] == ["ui", "servers"] and parts[3] == "key-swap":     # the key swap (key_swaps)
+            return self.ui_server_key_swap(parts[2])
         if parts == ["join"]:
             return self.join()
         if len(parts) == 2 and parts[0] == "mac-setup":

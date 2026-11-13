@@ -35,6 +35,7 @@ import hub
 import hubsetup
 import leftovers
 import lifecycle
+import owner_mcp
 import test_central_e2e
 import test_grants
 import test_vault
@@ -54,6 +55,7 @@ def load_tests(loader, _tests, _pattern):
     suite.addTests(BrokerPart(name) for name in BrokerPart.__dict__ if name.startswith("test_"))
     suite.addTests(HubRoutes(name) for name in HubRoutes.__dict__ if name.startswith("test_"))
     suite.addTests(Delivery(name) for name in Delivery.__dict__ if name.startswith("test_"))
+    suite.addTests(Fact(name) for name in Fact.__dict__ if name.startswith("test_"))
     return suite
 
 
@@ -2007,6 +2009,210 @@ class HubRoutes(test_grants.Grants):
                 lines.clear()
                 self.assertEqual(self.asks(**dict(asked, **use))[0], 409)
                 self.assertEqual([who for who, text in lines if text.startswith("REFUSED a key swap: alpha")], ["alpha"], use)
+
+
+class Fact(test_grants.Grants):
+    """The owner's word that the vault of a server swaps keys: `"key_swap": true` in the server's entry of team.json,
+    the owner's route that writes it, and the three readers that say what is so by it. The agent alpha is on the
+    Linux server box. It reads two keys, one with a site and one with none, and it has a shell and the web."""
+    SITE = "https://" + HOST
+    KEY, BARE = test_grants.KEY, test_grants.NEW            # OPENAI_API_KEY with a site, SHOP_API_KEY with none
+
+    def setUp(self):
+        team = json.loads(json.dumps(test_grants.TEAM))
+        team["servers"] = {"box": {"kind": "linux", "user": "fleet"}, "lone": {"kind": "mac", "user": "fleet"}}
+        team["logins"][self.KEY]["site"] = self.SITE
+        team["logins"][self.BARE] = {"title": "SHOP_API_KEY", "kind": "api_key", "env": "SHOP_API_KEY"}
+        team["agents"]["alpha"].update(can=["shell", "web"], title="Developer",
+                                       secrets={self.KEY: "read", self.BARE: "read"})
+        with patch.object(test_grants, "TEAM", team):
+            super().setUp()
+
+    def says(self, server, on, **more):
+        body = dict({"request_id": str(uuid.uuid4()), "db": "test-generation", "base_sha256": self.team()["sha256"],
+                     "on": on}, **more)
+        return self.request(f"/ui/servers/{server}/key-swap", body)
+
+    def test_the_owner_says_that_the_vault_of_a_server_swaps_keys_and_takes_the_word_back(self):
+        before = self.commits()
+        code, receipt = self.says("box", True)
+        self.assertEqual((code, receipt.get("server"), receipt.get("key_swap"), receipt.get("changed")),
+                         (200, "box", True, True), receipt)
+        self.assertEqual(self.committed()["servers"]["box"], {"kind": "linux", "user": "fleet", "key_swap": True})
+        self.assertEqual((receipt["sha256"], self.commits()), (self.team()["sha256"], before + 1))
+        code, receipt = self.says("box", True)                              # the same word again: nothing is written
+        self.assertEqual((code, receipt["key_swap"], receipt["changed"], self.commits()), (200, True, False, before + 1))
+        code, receipt = self.says("box", False)                             # and it takes the word back
+        self.assertEqual((code, receipt["key_swap"], receipt["changed"]), (200, False, True), receipt)
+        self.assertEqual(self.committed()["servers"]["box"], {"kind": "linux", "user": "fleet"})
+        self.assertEqual((self.says("box", False)[1]["changed"], self.commits()), (False, before + 2))
+        # a field in another form, in a team.json that the hub started with: the take-back removes it too
+        team = self.committed()
+        team["servers"]["box"]["key_swap"] = "yes"
+        written = []
+        commit = lambda path, data, why: written.append(json.loads(data)) or "c" * 40
+        with patch.object(hub, "team_view", lambda rev: (team, "a" * 64, None)), \
+                patch.object(hub, "commit_kit_file", commit), patch.object(hub, "apply_team", lambda new: None):
+            receipt = hub.server_key_swap("box", {"on": False, "base_sha256": "a" * 64})
+        self.assertEqual((receipt["changed"], receipt["key_swap"]), (True, False))
+        self.assertEqual(written[0]["servers"]["box"], {"kind": "linux", "user": "fleet"})
+
+    def test_the_word_is_for_a_linux_server_of_the_fleet_and_only_the_owner_gives_it(self):
+        before = self.commits()
+        code, said = self.says("lone", True)
+        self.assertEqual((code, said["error"]), (409, "The key swap is for a Linux server."))
+        for server in ("files", "hub", "nowhere", "owner"):                 # machines that are no joined server
+            with self.subTest(server):
+                self.assertEqual(self.says(server, True)[0], 404)
+        for bad in ("yes", 1, 0, None, [True]):
+            with self.subTest(on=bad):
+                self.assertEqual(self.says("box", bad)[0], 400)
+        self.assertEqual(self.says("box", True, base_sha256="0" * 64)[0], 409)      # another team.json than he read
+        self.assertEqual(self.says("box", True, base_sha256="short")[0], 400)
+        # no report and no request of a machine writes it: the route is the owner's
+        body = {"request_id": str(uuid.uuid4()), "db": "test-generation", "base_sha256": self.team()["sha256"], "on": True}
+        code, _ = self.request("/ui/servers/box/key-swap", body, source=hub.address_of("alpha"))
+        self.assertEqual(code, 403)
+        self.assertEqual(self.commits(), before)
+        self.assertNotIn("key_swap", self.committed()["servers"]["box"])
+        # team.json takes the field only as true, and only for a Linux server
+        team = self.committed()
+        for server, value in (("box", False), ("box", "yes"), ("box", 1), ("box", None), ("lone", True)):
+            with self.subTest(server=server, value=value):
+                changed = json.loads(json.dumps(team))
+                changed["servers"][server]["key_swap"] = value
+                with self.assertRaisesRegex(ValueError, "key_swap"):
+                    hub.validate_team(changed)
+        team["servers"]["box"]["key_swap"] = True
+        hub.validate_team(team)
+
+    def test_a_key_that_swaps_there_is_no_key_in_the_agents_sessions(self):
+        """hub.session_keys, the one answer to "do this agent's sessions hold the value of a key"."""
+        self.assertEqual(hub.session_keys("alpha"), ["OPENAI_API_KEY", "SHOP_API_KEY"])
+        self.assertIsNone(hub.key_swaps("alpha", self.KEY))                 # the rule holds, the owner's word is not there
+        self.assertEqual(hub.key_swap("alpha", self.KEY), (self.SITE, "bearer"))
+        before = self.vault_call("alpha", "read", {})
+        self.assertEqual(self.says("box", True)[0], 200)
+        self.assertEqual(hub.key_swaps("alpha", self.KEY), (self.SITE, "bearer"))
+        self.assertIsNone(hub.key_swaps("alpha", self.BARE))                # a key with no site is a value there too
+        self.assertEqual(hub.session_keys("alpha"), ["SHOP_API_KEY"])
+        # the session still gets both variables by name (one holds a placeholder), and what the hub tells a vault
+        # is the same with the word and without it: each vault decides by its own configuration
+        after = self.vault_call("alpha", "read", {})
+        self.assertEqual(after, before)
+        self.assertEqual([x["env"] for x in after[1]["secrets"]], ["OPENAI_API_KEY", "SHOP_API_KEY"])
+        asked = dict(login=self.KEY, site=self.SITE, form="bearer", swap=hub.swap_token("alpha", self.KEY))
+        self.assertEqual(self.request("/helper/vault/alpha/swap", asked, source=hub.address_of("alpha"),
+                                      headers={"Content-Type": "application/json"})[0], 200)
+        # each part of the rule is still needed: a use grant, another runtime, an agent of another server
+        with patch.dict(hub.agents()["alpha"], {"secrets": {self.KEY: "use", self.BARE: "read"}}):
+            self.assertEqual((hub.key_swaps("alpha", self.KEY), hub.session_keys("alpha")), (None, ["SHOP_API_KEY"]))
+        with patch.dict(hub.agents()["alpha"], {"runtime": "opencode"}):
+            self.assertEqual(hub.session_keys("alpha"), ["OPENAI_API_KEY", "SHOP_API_KEY"])
+        with patch.dict(hub.agents()["alpha"], {"machine": "files"}):
+            self.assertEqual(hub.session_keys("alpha"), ["OPENAI_API_KEY", "SHOP_API_KEY"])
+        self.assertIsNone(hub.key_swaps("nobody", self.KEY))
+        self.assertEqual(self.says("box", False)[0], 200)
+        self.assertEqual(hub.session_keys("alpha"), ["OPENAI_API_KEY", "SHOP_API_KEY"])
+
+    def findings(self):
+        return [dict(r) for r in hub.q("SELECT id, text, decided, note FROM reports WHERE from_agent='hub' ORDER BY id")]
+
+    def test_the_settings_check_counts_only_the_keys_that_are_values_and_says_which_are_placeholders(self):
+        hub.settings_check()
+        (first,) = self.findings()
+        self.assertTrue(first["text"].startswith(
+            "Developer reads 2 API keys in its sessions (OPENAI_API_KEY, SHOP_API_KEY), and it has a shell and the web "
+            "(Tools: Shell, Web). A text from outside, a web page for example, can then make it send a key"), first["text"])
+        self.assertNotIn("placeholder", first["text"])
+        self.assertEqual(self.says("box", True)[0], 200)                    # the hub checks the settings at each change
+        old, new = self.findings()
+        self.assertEqual((old["id"], old["note"]), (first["id"], f"The settings changed. UP-{new['id']} replaces this finding."))
+        self.assertTrue(new["text"].startswith(
+            "Developer reads 1 API key in its sessions (SHOP_API_KEY), and it has a shell and the web (Tools: Shell, "
+            "Web). 1 more key is not in its sessions: the vault of its server swaps it, so a session holds a "
+            "placeholder (OPENAI_API_KEY). A text from outside, a web page for example, can then make it send a key "
+            "to another place."), new["text"])
+        self.assertIsNone(new["decided"])
+        self.assertEqual(json.loads(hub.kv_get("settings_finding:alpha"))["keys"], ["SHOP_API_KEY"])
+        # each key swaps: the three are no longer together, and the open finding ends
+        with patch.dict(hub.logins()[self.BARE], {"site": "https://" + OTHER_HOST}):
+            self.assertEqual((hub.session_keys("alpha"), hub.settings_junction("alpha")), ([], None))
+            hub.settings_check()
+            self.assertEqual([f["note"] for f in self.findings()][-1],
+                             "The settings changed: what this finding says is no longer there.")
+            self.assertIsNone(hub.kv_get("settings_finding:alpha"))
+
+    def test_the_finding_names_two_placeholders_and_counts_the_rest_and_stays_inside_one_report(self):
+        self.assertEqual(self.says("box", True)[0], 200)
+        catalog, grants = hub.logins(), hub.agents()["alpha"]["secrets"]
+        with patch.dict(hub.agents()["alpha"], {"title": "R" * 60}):
+            for n in range(40):                                             # the longest names that team.json takes
+                ref = f"bws://11111111-2222-4333-8444-5555555555{n:02d}"
+                catalog[ref] = {"title": f"K{n:02d}", "kind": "api_key", "env": f"K{n:02d}_" + "A" * 56}
+                if n >= 36:
+                    catalog[ref]["site"] = f"https://s{n}.example.com"
+                grants[ref] = "read"
+            keys, boxes = hub.settings_junction("alpha")
+            text = hub.settings_words("alpha", keys, boxes)
+            self.assertEqual(len(keys), 37)                                 # 36 of these and SHOP_API_KEY are values
+            # with the longest role and key names, the names of the placeholders do not fit into one report: a count
+            self.assertIn(" 5 more keys are not in its sessions: the vault of its server swaps them, so a session "
+                          "holds a placeholder. A text from outside", text)
+            self.assertLessEqual(len(text), hub.REPORT_TEXT_MAX)
+            self.assertEqual(text, " ".join(text.split()))
+        with patch.dict(hub.agents()["alpha"], {"title": "Developer"}):     # with a shorter role they fit: two names
+            keys, boxes = hub.settings_junction("alpha")
+            text = hub.settings_words("alpha", keys, boxes)
+            placed = sorted(f"K{n:02d}_" + "A" * 56 for n in range(36, 40)) + ["OPENAI_API_KEY"]
+            self.assertIn(f" 5 more keys are not in its sessions: the vault of its server swaps them, so a session "
+                          f"holds a placeholder ({placed[0]}, {placed[1]} and 3 more). A text from outside", text)
+            self.assertLessEqual(len(text), hub.REPORT_TEXT_MAX)
+
+    def test_a_start_text_says_that_the_variable_holds_a_placeholder_on_such_a_server(self):
+        words = (hub.key_words("alpha"), hub.key_words("alpha", short=True))
+        self.assertEqual(words[0], " (OPENAI_API_KEY is for api.example.com only: when its value begins with "
+                                   "vaultswap_, it is a placeholder, and this machine's vault puts the key into the "
+                                   "Authorization header of an HTTPS request to that host, and nowhere else; a program "
+                                   "that needs the key itself does not work with a placeholder, so ask your requester "
+                                   "then, and do not look for the key)")
+        self.assertEqual(words[1], " (a placeholder when its value begins with vaultswap_: OPENAI_API_KEY for "
+                                   "api.example.com)")
+        self.assertEqual(self.says("box", True)[0], 200)
+        self.assertEqual(hub.key_words("alpha"),
+                         " (OPENAI_API_KEY is for api.example.com only: the variable holds a placeholder, which begins "
+                         "with vaultswap_, and not the key, and this machine's vault puts the key into the "
+                         "Authorization header of an HTTPS request to that host, and nowhere else; a program that "
+                         "needs the key itself does not work with a placeholder, so ask your requester then, and do "
+                         "not look for the key)")
+        self.assertEqual(hub.key_words("alpha", short=True),
+                         " (a placeholder, which begins with vaultswap_, and not the key: OPENAI_API_KEY for "
+                         "api.example.com)")
+        self.assertIn("API keys in this session: OPENAI_API_KEY, SHOP_API_KEY (OPENAI_API_KEY is for api.example.com "
+                      "only: the variable holds a placeholder, which begins with vaultswap_, and not the key,",
+                      " ".join(hub.holdings_parts("alpha")))
+        with patch.dict(hub.agents()["alpha"], {"secrets": {self.BARE: "read"}}):   # no key of it has a site
+            self.assertEqual(hub.key_words("alpha"), "")
+        # an agent whose sessions get no variable (no vault access, or its Shell box is off) reads no sentence that
+        # says what the variable holds: the words of before, which say "when"
+        for changed in ({"vault": "none"}, {"can": ["web"]}):
+            with self.subTest(changed=changed), patch.dict(hub.agents()["alpha"], changed):
+                self.assertEqual((hub.key_words("alpha"), hub.key_words("alpha", short=True)), words)
+        self.assertEqual(self.says("box", False)[0], 200)
+        self.assertEqual((hub.key_words("alpha"), hub.key_words("alpha", short=True)), words)
+
+    def test_the_owners_tool_sends_the_word_to_the_route(self):
+        found = {t["name"]: t for t in owner_mcp.tools()}["server_key_swap"]
+        self.assertEqual((found["inputSchema"]["required"], sorted(found["inputSchema"]["properties"])),
+                         (["server", "on"], ["on", "request_id", "server"]))
+        self.assertIn("after root ran `hubsetup.py vault --swap`", found["description"])
+        sent = []
+        with patch.object(owner_mcp, "team", lambda: {"sha256": "a" * 64}), \
+                patch.object(owner_mcp, "command", lambda route, body, what, rid=None: sent.append((route, body))):
+            found["run"]({"server": "box", "on": True})
+            found["run"]({"server": "box", "on": False})                    # false is a word too, not a field left out
+        self.assertEqual(sent, [("/ui/servers/box/key-swap", {"on": True, "base_sha256": "a" * 64}),
+                                ("/ui/servers/box/key-swap", {"on": False, "base_sha256": "a" * 64})])
 
 
 def proxy_asks(path, **request):
