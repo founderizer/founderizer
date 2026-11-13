@@ -35287,7 +35287,7 @@ AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent"
 # kv key the code builds from a value, so a new prefix is placed here or named there with what it holds.
 AGENT_KV = ("tools:", "offline_told:", "runtime_since:", "switched:", "switching:", "history_agent:", "default_vault:",
             "default_desktop:", "checks_brief:", "chat_team:", "duty_review:", "presence:", "turn_ended:",
-            "first_message:", "settings_finding:")
+            "first_message:", "settings_finding:", "chat_undelivered:")
 # The same, with more after the name: `<prefix><agent>:<window, task or item>`.
 AGENT_KV_SCOPED = ("listed:", "untaken:", "chased:")
 # Columns that hold a JSON list of agents' names: the agents that passed a question up (question_passers).
@@ -47186,16 +47186,20 @@ class Handler(BaseHTTPRequestHandler):
 
         Owner-contact plan B3, for the manager's window: "start_failed" says that its helper's own start of the
         standing session failed twice in a row, and "untaken" with fresh that its helper starts a fresh session for
-        the line that it reports (manager_flag_update)."""
+        the line that it reports (manager_flag_update).
+
+        "undelivered", for the window owner-chat: its helper could not type the chat's line at ten polls in a row,
+        with the reason (fleet.Helper.chat_blocked)."""
         if agent not in agents():
             return self.json(404, {"error": "unknown agent"})
         if not self.allowed(agent):
             return
         body = self.form() if self.body() else {}
         kind, seen, still = body.get("kind"), body.get("attempt"), body.get("still")
-        if kind not in (None, "shown", "gone", "untaken", "start_failed", "frozen", "moving", "limit", "closed"):
-            return self.json(400, {"error": "kind is shown, gone, untaken, start_failed, frozen, moving, limit or "
-                                            "closed"})
+        if kind not in (None, "shown", "gone", "untaken", "start_failed", "frozen", "moving", "limit", "closed",
+                        "undelivered"):
+            return self.json(400, {"error": "kind is shown, gone, untaken, start_failed, frozen, moving, limit, "
+                                            "closed or undelivered"})
         if seen is not None and (isinstance(seen, bool) or not isinstance(seen, int) or seen < 1) or \
                 still is not None and not isinstance(still, bool):
             return self.json(400, {"error": "attempt is a whole number of 1 or more, and still is true or false"})
@@ -47226,6 +47230,24 @@ class Handler(BaseHTTPRequestHandler):
                 emit(t["requester"], "say", f"[hub] The session of {tref(tid)} ({t['title']}) cannot start on {agent}: "
                      f"{why}. Its helper tries again, and the hub tells you if that does not help.", task=tid)
                 log("hub", f"{tref(tid)} cannot start on {agent}: {why}")
+            return self.json(200, {})
+        if kind == "undelivered":
+            # 13 November 2026: the helper could not type the line of the agent's owner chat at ten polls in a row (a
+            # question on the chat's screen, no session in its window, a start that fails). Until then such a wait
+            # was in the helper's own log only: the hub knew an unread message and nothing else, and the owner's app
+            # said "Thinking" for seven minutes. The hub keeps which message waits, one time for each message, and
+            # says so in its log; the helper goes on trying, and the message stays pending.
+            if task != "owner-chat":
+                return self.json(200, {})
+            why = text_field(body.get("reason"), 300, False)
+            waits = q1("SELECT id FROM events WHERE agent=? AND kind='chat' AND read_at IS NULL ORDER BY id LIMIT 1",
+                       (agent,))
+            if waits and str(kv_get(f"chat_undelivered:{agent}") or "") != str(waits["id"]):
+                with area("quiet"):
+                    kv_set(f"chat_undelivered:{agent}", waits["id"])
+                log("hub", f"M-{waits['id']} does not reach {agent}'s owner chat: its helper could not type the "
+                           f"chat's line at ten polls in a row" + (f" ({why})" if why else "") +
+                           "; the message stays pending, and its helper goes on trying")
             return self.json(200, {})
         if kind == "untaken":
             # plan C5: a line told twice that the session did not take, kept for the turn-end check and the

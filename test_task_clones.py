@@ -194,7 +194,7 @@ class TaskClones(unittest.TestCase):
     def test_a_stop_deletes_the_clones_only_once_the_window_is_gone(self):
         place = self.prepare("T-1")
         listed = {"windows": ["T-1"]}
-        helper = types.SimpleNamespace(agent="ivy", say=self.said.append, look=lambda: [],
+        helper = types.SimpleNamespace(agent="ivy", say=self.said.append, look=lambda: [], look_sure=lambda: [],
                                        closing=lambda task: False, look_known=lambda: listed["windows"])
         stop = {"id": 4, "kind": "stop", "task": "T-1", "extra": {"generation": GEN, "needs": "none"}}
         acks = []
