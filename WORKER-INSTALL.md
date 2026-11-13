@@ -256,6 +256,48 @@ machine run as the vault's own user, so only the helper's signature keeps the st
 shut, and the ciphertext alone opens nothing. The handover key is a separate key, so
 rotating one does not orphan the other's values.
 
+**The owner's keys** (Fleet Vault 0.3.9, build 12): with `owner_keys` (the owner's public
+keys) and `fleet` (the fleet's id) in that configuration, the helper hands a login over only
+to a key that the owner signed a pin of, as a Linux broker does with the keys that
+`hubsetup.py vault --owner-key` gives it. Only root adds them, on the Mac itself, with programs
+that macOS protects. Copy the key list exactly as the central vault's configuration holds it,
+read as root on the hub's server (`/etc/fleet-vault-central/vault.json`), and after a change of
+the owner's Mac add the earlier key too, until the pins are signed again. The first two lines
+only read: the build must be 12 or more, and the second prints the fleet id that goes in.
+
+```sh
+/usr/bin/plutil -extract CFBundleVersion raw "/Applications/Fleet Vault.app/Contents/Info.plist"
+/usr/bin/plutil -extract fleet raw "/Library/Application Support/Fleet Vault/update.json"
+f="/Library/Application Support/Fleet Vault/config.json"
+/usr/bin/sudo /bin/cp -p "$f" "$f.old"
+/usr/bin/sudo /bin/cp -p "$f" "$f.new"
+/usr/bin/sudo /usr/bin/plutil -replace owner_keys -json '["<the owner public key>"]' "$f.new"
+/usr/bin/sudo /usr/bin/plutil -replace fleet -string "$(/usr/bin/plutil -extract fleet raw \
+    "/Library/Application Support/Fleet Vault/update.json")" "$f.new"
+/usr/bin/sudo /bin/mv "$f.new" "$f"
+/usr/bin/sudo /bin/launchctl kickstart -k gui/<worker uid>/com.agentfleet.vault
+```
+
+The copy keeps root's ownership and mode, and the one `mv` puts both keys in place at once.
+Wait a few seconds; then the helper must answer its worker's user (try again before you undo):
+
+```sh
+printf '{"v":2,"op":"status"}\n' | /usr/bin/sudo -u <worker> /usr/bin/nc -w 10 -U \
+    "/Users/<worker>/Library/Application Support/AgentFleet/vault.sock"
+```
+
+If it does not, this and the same `kickstart` undo the step:
+
+```sh
+/usr/bin/sudo /bin/mv "/Library/Application Support/Fleet Vault/config.json.old" \
+    "/Library/Application Support/Fleet Vault/config.json"
+```
+
+Nothing of `/Applications` runs as root here, because an admin user can rename an app there.
+Type the password in an admin account that no agent uses where the Mac has one: what the agents'
+user's shell starts can read what is typed in its sessions. Without the keys the helper checks
+no pin, so nothing changes on a Mac until root gives them.
+
 **A Mac's join line installs it** (since 28 October 2026, `join.sh` `mac_vault`): it takes the
 signed vault of the release channel's newest Mac build of the fleet's track (see "The track"
 below), checks it against our Developer ID, and runs the `install.py` that the vault carries
