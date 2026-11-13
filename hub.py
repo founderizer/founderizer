@@ -33226,7 +33226,10 @@ def validate_status(data):
                  "withdrawals": _optional(vault.get("withdrawals"), bool),  # owner feature central_vault
                  "replaces": _optional(vault.get("replaces"), bool),        # owner feature secret_replace
                  "places": _optional(vault.get("places"), bool),            # vault.py `place`: unused here
-                 "place_key": place_key, "broker_source": source}
+                 "place_key": place_key, "broker_source": source,
+                 # package 7: a Mac vault's key generation; another value is null, never a refusal of the report
+                 "key_generation": vault.get("key_generation") if type(vault.get("key_generation")) is int
+                 and 0 < vault["key_generation"] < 1000 else None}
     features = data.get("features") or []
     # 128: a helper names each feature it has (lifecycle.FEATURES, 32 of them on 27 October 2026), and a report with
     # one name too many is refused whole, which takes the machine's broker and its deliveries with it. So this limit

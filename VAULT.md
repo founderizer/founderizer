@@ -149,9 +149,26 @@ The vault protects the value of each secret. The design gives these results:
 - Fleet Vault runs as the OS user of the Mac's agents, so file modes do not keep the store from the agents. What
   keeps the store shut is its key: an item of Fleet Vault's own Keychain access group, which macOS gives only to code
   with Fleet Vault's signature (`Sources/FleetVaultCore/VaultLocalStore.swift`).
-- Each build of Fleet Vault has that signature, an older one too. So an agent of the Mac can stop Fleet Vault and
-  start an older signed build, which opens the same store and does what that build does (limit 6). The root updater
-  installs only a newer build, but it does not stop such a program (`Vault/update.zsh`).
+- Each build of Fleet Vault has that signature, an older one too, and an agent of the Mac can stop Fleet Vault and
+  start an older signed build. So the keys are under the Keychain names of a key generation: `local.agent-fleet.vault`
+  for generation 1, and that name with the generation's number for each later one. A build reads only the names of
+  its own generation: builds 1 to 14 generation 1, and build 15 and later generation 2.
+  The name of each generation is a constant of each build's code, so no older build can be told to read another
+  (`Sources/FleetVaultCore/VaultKeychain.swift`).
+- The first start of a build of a newer generation moves the keys. It copies the four items, proves each copy by its
+  bytes, writes a marker, and only then deletes the old items. Each process moves under a lock of the vault's own
+  folder and reads the marker again inside it, so two processes never move at once. A move that stops goes on at the
+  next start, and loses no key. Until the move is done, the build reads and makes no key of its own generation
+  (`VaultKeyMove.swift`).
+- The lock is a file of the agents' user. An agent that holds it stops the move. One that removes or renames it can
+  make two moves run at once, but no move deletes a key of its generation or writes other bytes over one, no move takes
+  back a key, and a move takes back only a journal that it added itself, and nothing once the marker is there. So the worst case is a stop, or a journal
+  that goes back to older bytes: a loss that is smaller than the one that the agent can cause today by deleting the
+  store file. No key leaves the vault's Keychain group (`VaultKeyMove.swift`).
+- After the move, an older build finds no key. It makes new keys under its own names, cannot open the store, and
+  answers with another key, so the hub sends that Mac nothing until the newer build runs again (limit 6). The way back
+  after a bad release is a newer build with the fix, never an older build. The root updater installs only a newer
+  build (`Vault/update.zsh`).
 - Its items are in the data-protection Keychain, in the group `6EBZ756H9Q.local.agent-fleet.vault`. They can be read
   after the first unlock since a restart, only on this Mac, and they are never synchronized
   (`Sources/FleetVaultCore/VaultKeychain.swift`).
@@ -443,11 +460,15 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
    as a Linux broker without them does, so such a Mac hands no login over. The root step of
    `WORKER-INSTALL.md`, "Vault broker (macOS)", turns handovers on. A sign-in, a session's read, `call_api`, a delivery
    and a withdrawal do not need the keys (`Sources/FleetVaultCore/VaultHub.swift`,
-   `Sources/FleetVaultCore/VaultBroker.swift`). But the agents of a Mac run as the OS user of its Fleet Vault, so an
-   agent can start an older signed build in its place, which opens the same store: a build before 14 hands a login
-   over without the owner's keys, and a build before 12 checks no pin at all. So a hub that is broken into, together
-   with such an agent, can still get a login of that Mac's store locked for a key of the hub's choice
-   (`Sources/FleetVaultCore/VaultLocalStore.swift`, `Vault/update.zsh`).
+   `Sources/FleetVaultCore/VaultBroker.swift`). The agents of a Mac run as the OS user of its Fleet Vault, so an agent can
+   start an older signed build in its place. Since build 15, no older build opens the store of a Mac that made its
+   move to the newest key generation (see "In Fleet Vault on a Mac"). What stays:
+   - **The time before the move ends.** The move ends when the old items are deleted, and until then an older build
+     still opens that Mac's store. An agent can keep the new build from its first start, or keep the move from its
+     end: it can stop Fleet Vault, hold the move's lock, or keep the disk full so that the deletes fail. Then a build
+     before 14 hands a login over without the owner's keys, and a build before 12 checks no pin.
+   - **A check that comes with no new generation.** An older build of the same generation can undo it
+     (`Sources/FleetVaultCore/VaultKeychain.swift`, `Vault/update.zsh`).
 7. **An old pin, and an old owner key.** A broker that checks the owner's pin of the receiving key, on Linux or on a
    Mac, keeps no record of an unpin. So a hub that is broken into can send an old pin of a key that the owner removed
    (`vault.py`, `Sources/FleetVaultCore/VaultOwnerPin.swift`). Such a broker also keeps the owner keys of its root

@@ -8379,7 +8379,10 @@ def vault_status(agent):
               and PLACE_PUBLIC.fullmatch(status["place_key"]) else None,
               "broker_recipient": recipient if isinstance(recipient, str) else None,
               "broker_source": source if isinstance(source, str) and re.fullmatch(r"[0-9a-f]{64}", source) else None,
-              "broker_read_at": time.time() if status else None}
+              "broker_read_at": time.time() if status else None,
+              # package 7: the key generation of a Mac's Fleet Vault (None for a Linux broker, or a vault before it)
+              "key_generation": status.get("key_generation") if status and type(status.get("key_generation")) is int
+              and 0 < status["key_generation"] < 1000 else None}
     if vault_mode(agent) == "none":
         return dict(broker, mode="none", isolated=None)
     return dict(broker, mode="broker", isolated=status is not None and not vault_readable())

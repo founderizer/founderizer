@@ -716,10 +716,17 @@ class VaultBroker(OwnerAPI):
                   "broker_source": None, "broker_read_at": None, "deposits": None,     # deposits: secret_deliveries
                   "withdrawals": None,                                                 # withdrawals: central_vault
                   "replaces": None,                                                    # replaces: secret_replace
+                  "key_generation": None,                                              # package 7: a Mac's vault only
                   "places": None, "place_key": None}                                   # places: secret_targets
         self.assertEqual(fleet.vault_status("vps"), dict(unread, mode="broker", isolated=False))
         report = hub.validate_status({"security": {"vault": {"mode": "broker", "isolated": True, "token": "x"}}})
         self.assertEqual(report["security"]["vault"], dict(unread, mode="broker", isolated=True))
+        # package 7: a Mac vault's key generation passes as a number, and another value is null, never a refusal
+        for said, kept in ((2, 2), (0, None), ("2", None), (True, None), (1000, None)):
+            self.assertEqual(hub.validate_status({"security": {"vault": {"mode": "broker", "key_generation": said}}})
+                             ["security"]["vault"]["key_generation"], kept, said)
+        with patch.object(fleet, "broker_status", return_value={"recipient": None, "key_generation": 2}):
+            self.assertEqual(fleet.vault_status("vps")["key_generation"], 2)
         for wrong in ({"broker_recipient": "age1short"}, {"callers": "yes"}, {"broker_read_at": "now"}, {"creates": 1},
                       {"captures": "yes"}, {"requests": 1}):
             with self.assertRaises(ValueError):
