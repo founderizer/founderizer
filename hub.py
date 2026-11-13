@@ -11445,6 +11445,53 @@ def owner_report(agent, request_id):
     return q1("SELECT * FROM owner_reports WHERE agent=? AND in_reply_to=?", (agent, request_id))
 
 
+def early_word(agent, request_id):
+    """The sentence that a worker or a lead wrote before its start_task for this message of the owner's
+    (tell_owner with before_task), while it is not the message's reply yet; or None."""
+    return q1("SELECT * FROM owner_reports WHERE agent=? AND in_reply_to IS NULL AND turn=? ORDER BY id LIMIT 1",
+              (agent, request_id))
+
+
+def early_word_rows(agent, request_id):
+    """Inside a transaction: the task of this message exists, so the sentence before it becomes the message's reply.
+    True when it did. Never beside another reply: one message has one."""
+    in_transaction("early_word_rows")
+    if DB.execute("SELECT 1 FROM owner_reports WHERE agent=? AND in_reply_to=?", (agent, request_id)).fetchone():
+        return False
+    return DB.execute("UPDATE owner_reports SET in_reply_to=?, turn=NULL WHERE id=(SELECT MIN(id) FROM owner_reports "
+                      "WHERE agent=? AND in_reply_to IS NULL AND turn=?)", (request_id, agent, request_id)).rowcount > 0
+
+
+def task_of_message(agent, request_id):
+    """The task that this agent's start_task opened for this message of the owner's, from its receipt, or None."""
+    kept = q1("SELECT receipt FROM tool_commands WHERE agent=? AND request_id=? AND tool='start_task'",
+              (agent, wakeups.request_ref(request_id)))
+    receipt = json.loads(kept["receipt"]) if kept else None
+    return receipt.get("task") if isinstance(receipt, dict) else None
+
+
+def after_task_words(agent, request_id):
+    """Inside the transaction that opened the task of this message: what the chat writes to the owner now.
+
+    The sentence before the task becomes the reply (early_word_rows), and nothing more is written. With no such
+    sentence the chat tells one time, as before the rule: a chat that started before it, or a message whose reply
+    was a question, so that the owner's later message waits. And when the message has its reply and none of the
+    owner's read messages waits, there is nothing to tell: the hub would refuse a second reply (tell_owner), and a
+    message_owner would be one more message than the owner got before."""
+    in_transaction("after_task_words")
+    if early_word_rows(agent, request_id):
+        return ("Your sentence before this call is now the reply to the owner's message: write nothing more to them "
+                "about this task now. ")
+    replied = DB.execute("SELECT 1 FROM owner_reports WHERE agent=? AND in_reply_to=?", (agent, request_id)).fetchone()
+    waits = DB.execute(
+        "SELECT 1 FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE u.recipient=? AND u.kind='message' AND "
+        "u.need_id IS NULL AND e.read_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM owner_reports r WHERE "
+        "r.agent=u.recipient AND r.in_reply_to=u.request_id) LIMIT 1", (agent,)).fetchone()
+    if replied and not waits:
+        return "The owner's message has its reply already: write nothing more to them about this task now. "
+    return "Tell the owner with tell_owner that it started. "
+
+
 def owner_message(agent, reply):
     """The owner's own message to this agent, read in its chat, that the request UUID `reply` names: its ui_requests
     row, or a ToolError. Nothing else starts work from a chat: a message of another agent is in agent_messages, and a
@@ -11496,9 +11543,12 @@ def t_start_task(agent, a):
         tid = admit_task(requester, {"owner": agent, "title": title, "details": details, "done_when": done_when,
                                      "needs": "none", "goal": "", "goal_id": None, "parent": parent, "step": None,
                                      "follows": None, "case_id": None, "why": why})
+        # **The sentence before the task becomes the reply now** (after_task_words; the chat's rules since 13
+        # November 2026, fleet.chat_command): a request for work got its first words only after this call, which
+        # the model wrote for 5 to 8 seconds.
         text = (f"Opened {tref(tid)} ({title}) for you, with {requester} as its requester. It starts in its own task "
-                f"session; tell the owner with tell_owner that it started, and do the work there, not here. Its "
-                f"result comes back into this chat by itself when it ends: then tell the owner with message_owner.")
+                f"session: do the work there, not here. " + after_task_words(agent, source["request_id"]) +
+                f"Its result comes back into this chat by itself when it ends: then tell the owner with message_owner.")
         # with the receipt: a repeat of this call answers from the receipt alone, so a notice after it could be lost
         event_rows([(requester, "say", filed_under(requester, "say", tid),
                      f"[hub] The owner asked {agent} for work in its own chat, and {agent} opened {tref(tid)} "
@@ -11516,6 +11566,13 @@ def t_tell_owner(agent, a):
         raise ToolError("A report needs 1 to 16000 characters; about is at most 500 characters.")
     guard(agent, text, about)
     reply, role = a.get("in_reply_to"), agents()[agent].get("role")
+    before = a.get("before_task")
+    if before is not None and not isinstance(before, bool):
+        raise ToolError("before_task is true or false.")
+    closed = shell_tools(agent) if before else None      # the tools of a chat whose Shell box is off: no start_task
+    if before and (role not in ("worker", "lead") or closed is not None and "start_task" not in closed):
+        raise ToolError("before_task is for an owner chat that can open the work with start_task: the chat of a "
+                        "worker or a lead whose Shell box is on.")
     if role in ("worker", "lead"):
         chat_fence(agent)
         if not reply:
@@ -11606,6 +11663,29 @@ def t_tell_owner(agent, a):
             if (old["text"], old["about"]) != (text, about):
                 raise ToolError("This owner message already has a different reply. Do not replace it.")
             return f"Report R-{old['id']} already saved. No duplicate was sent."
+        if before:
+            # **The sentence before the task is shown at once, and it is the reply only when the task exists**
+            # (early_word). The reply is what ends the hub's giving of an owner message (the poll and read_messages
+            # give it while it has none). A reply before start_task would end that with no task: a turn that is cut
+            # between the two calls would leave the owner with "I open a task for this" and nothing behind it, and
+            # nothing would give the message again. So this report has no link: it takes the message's turn
+            # (owner_reports.turn, as a manager's report can), the owner reads it, the message stays open, and
+            # start_task links it. It still goes to the chat app that the message came from.
+            early, opened = early_word(agent, reply), task_of_message(agent, reply)
+            if early and (early["text"], early["about"]) != (text, about):
+                raise ToolError("You told the owner already what you will do for this message. Call start_task for "
+                                "it now; if you open no task, reply with tell_owner without before_task.")
+            if early:
+                return (f"Report R-{early['id']} already saved. No duplicate was sent. Call start_task for this "
+                        f"message now.")
+            if opened:      # the message is given again after a cut turn, and its task exists: nothing to wait for
+                note = (f" {tref(opened)} was opened for this message already, so this sentence is its reply: do "
+                        f"not call start_task for it again.")
+            else:
+                reply, also, turn = None, reply, reply
+                note = (" It is not the reply to the owner's message yet: call start_task with the same in_reply_to "
+                        "now, which makes it the reply. If you open no task, reply with tell_owner without "
+                        "before_task.")
     chat = chat_source(agent, reply or also, about)  # owner feature chat_apps: the reply goes back to that chat
     t0 = now()
     with transaction():
@@ -27015,7 +27095,12 @@ TOOLS = [
                                                    "tasks it came from"},
         "in_reply_to": {"type": "string", "description": "The message of the owner's that this answers: its "
                                                          "request_id in a worker's or a lead's chat, and for the "
-                                                         "manager the M-<id> that read_messages gives it"}},
+                                                         "manager the M-<id> that read_messages gives it"},
+        "before_task": {"type": "boolean", "description": "Only in a worker's or a lead's owner chat, and only for "
+                                                          "the one sentence that says what you will do before you "
+                                                          "call start_task for the same message: the owner reads it "
+                                                          "at once, and start_task makes it the reply to their "
+                                                          "message"}},
        ["text"])),
     ("all", "message_owner", t_message_owner,
      "Write to the owner first, for example the result of work they asked you for, or a question about their own "
@@ -27029,14 +27114,17 @@ TOOLS = [
        ["request_id", "text"])),
     ("worker", "start_task", t_start_task,
      "Only in your owner chat, and only when the owner asks you in their own words to do work: open it as a task of "
-     "your own. It runs in its own task session, with your line as its requester (the manager, or your lead), which "
-     "checks the result; tell the owner with tell_owner that it started. Its result comes back into this chat by "
-     "itself when it ends: tell them then with message_owner. Give in_reply_to, the request UUID of the owner's "
-     "message: one message is one task, and a message from another agent starts nothing.",
+     "your own. First tell the owner what you will do, with tell_owner(text, in_reply_to, before_task=true) and one "
+     "sentence that does not say that a task is open: call only tell_owner in that step, and call this when it "
+     "returns, with the same in_reply_to. The owner then reads your sentence while you write this call, and this call "
+     "makes it the reply to their message. It runs in its own task session, with your line as its requester (the "
+     "manager, or your lead), which checks the result. Its result comes back into this chat by itself when it ends: "
+     "tell them then with message_owner. Give in_reply_to, the request UUID of the owner's message: one message is "
+     "one task, and a message from another agent starts nothing.",
      S({"title": STR, "done_when": {"type": "string", "description": "The line a stranger could test the result "
                                                                    "against"},
         "in_reply_to": {"type": "string", "description": "The request UUID of the owner's message that asks for the "
-                                                         "work"}},
+                                                         "work: the one that your sentence before this call named"}},
        ["title", "done_when", "in_reply_to"])),
     ("all", "message_agent", t_message_agent,
      "Send a message to another agent: a question, an answer or coordination. It has your authority, never the "
