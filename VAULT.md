@@ -189,10 +189,17 @@ The vault protects the value of each secret. The design gives these results:
   (`Sources/Founderizer/GrantSigning.swift`).
 - The app pins a server's key only when the Mac's own Tailscale names the SSH address as that server, and when the key
   that it reads there over SSH is the key that the hub reports (`Sources/Founderizer/CentralVaultSection.swift`).
+  It reads the key of a Linux server as root, from the key file that the broker's configuration names. It reads the
+  key of a Mac from the answer on Fleet Vault's socket, as the OS user of that Mac's agents
+  (`Sources/FleetCore/CentralVault.swift`).
 - Before a Linux broker hands a login to another machine, it checks that the owner signed a pin of the receiving key.
   It uses the owner's public keys in its own configuration. Only a root step writes them there, and nothing that the
-  hub sends changes them (`vault.py`, `hubsetup.py`). Fleet Vault on a Mac does not make this check (see "What the
-  vault does not protect").
+  hub sends changes them. A Linux broker without these keys hands no login over (`vault.py`, `hubsetup.py`).
+- Fleet Vault on a Mac makes the same check only when its configuration has the owner's public keys and the id of
+  the fleet. Only root writes that configuration, and no install adds the keys: a root step of its own does
+  (`Sources/FleetVaultCore/VaultOwnerPin.swift`, `Sources/FleetVaultCore/VaultHub.swift`, `Vault/install.py`,
+  `WORKER-INSTALL.md`, "Vault broker (macOS)"). Without the keys, Fleet Vault checks no pin (see "What the vault
+  does not protect").
 
 ## What an agent gets
 
@@ -346,13 +353,16 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
    value of its own into a broker's store (`vault.py`). On a server that swaps keys, the hub's word also says which
    key swaps and what its site is. When the hub names no site for a key, the broker gives the key itself to the
    session (`vault.py`, `hub.py`).
-6. **A handover from a Mac.** Fleet Vault on a Mac does not check the owner's pin of the receiving key. It seals a
+6. **A handover from a Mac that does not have the owner's keys.** Fleet Vault on a Mac checks the owner's pin of the
+   receiving key only when root gave its configuration the owner's public keys and the id of the fleet. No install
+   gives them (`Sources/FleetVaultCore/VaultOwnerPin.swift`, `Vault/install.py`). Without them, Fleet Vault seals a
    handover to the key that the hub names. So a hub that is broken into can make it hand any login of its store to a
    key of the hub's choice (`Sources/FleetVaultCore/VaultBroker.swift`, `Sources/FleetVaultCore/VaultProtocol.swift`).
-7. **An old pin, and an old owner key.** A Linux broker checks that the owner signed a pin of the receiving key, but
-   it keeps no record of an unpin. So a hub that is broken into can send an old pin of a key that the owner removed
-   (`vault.py`). A Linux broker also keeps the owner keys of its root step after the owner changes Macs, until a root
-   step on that machine changes them (`hubsetup.py`).
+7. **An old pin, and an old owner key.** A broker that checks the owner's pin of the receiving key, on Linux or on a
+   Mac, keeps no record of an unpin. So a hub that is broken into can send an old pin of a key that the owner removed
+   (`vault.py`, `Sources/FleetVaultCore/VaultOwnerPin.swift`). Such a broker also keeps the owner keys of its root
+   step after the owner changes Macs, until a root step on that machine changes them (`hubsetup.py`,
+   `Vault/install.py`).
 8. **The end of a grant.** The end of a grant, of a pin and of a pool entry reaches the central vault only through
    the hub. A hub that is broken into can hold it back, and the central vault then still seals that secret
    (`Sources/Founderizer/GrantSigning.swift`).
@@ -426,6 +436,23 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
     the hub at each use, so the end of the grant stops the next request, also of a session and of a check that
     started before (`vault.py`, `hub.py`; see "The key swap"). Two things stay: what the agent did with the key at
     its site while it had the grant (limit 1), and the value in a session that started before the key swapped.
+21. **The first vault key of a machine.** The hub takes the first vault key of a machine from the report of an
+    agent's helper on that machine, and it keeps that key until the owner removes the machine from the fleet
+    (`hub.py`). The app pins a machine's key by itself when it reads the same key on the machine. On a Linux server,
+    it reads the key as root from the broker's key file. On a Mac, it asks Fleet Vault on its socket, as the OS user
+    of that Mac's agents
+    (`Sources/FleetCore/CentralVaultPlan.swift`, `Sources/Founderizer/CentralVaultSection.swift`,
+    `Sources/FleetCore/CentralVault.swift`). A program of that OS user can answer on that socket in the vault's
+    place. So on a Mac, the pin shows only what that OS user said. An agent that reports a key of its own before the
+    first grant, and answers with it on the socket, can get that key pinned. The central vault then seals the secrets
+    of that Mac to a key that the agent holds. The hub also locks each handover to an agent of that Mac for that
+    key, and the owner's pin of it lets a broker that checks pins hand the login over (`hub.py`). On a Linux server,
+    an agent that reports a key of its own before the first grant gets no pin: the app reads another key as root,
+    so it pins nothing for that server, and the central vault seals nothing to the false key. But the hub locks each
+    handover to an agent of that server for the false key. A broker that
+    checks pins refuses such a handover, because the owner signed no pin of that key. Fleet Vault on a Mac without
+    the owner's keys seals the login to the false key, so the agent can open it (limit 6) (`hub.py`,
+    `Sources/FleetVaultCore/VaultBroker.swift`).
 
 ## What the owner must do
 
@@ -433,7 +460,9 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
    with no prompt (`Sources/FleetCore/OwnerKey.swift`, `Sources/FleetCore/RecoveryCode.swift`).
 2. **Run the root steps.** Only a root step installs and updates the central vault. The Mac app runs it over the
    owner's own SSH connection (`hubsetup.py`, `Sources/FleetCore/CentralVault.swift`). On a Mac with agents, the
-   install of Fleet Vault needs an administrator, because it runs as root (`Vault/install.py`). For a machine whose
+   install of Fleet Vault needs an administrator, because it runs as root (`Vault/install.py`). After that install,
+   give Fleet Vault the owner's public keys with the root step of `WORKER-INSTALL.md`, "Vault broker (macOS)":
+   without them, it checks no pin of a handover (limit 6). For a machine whose
    host key the Mac does not know yet, the owner connects to it once with ssh from Terminal
    (`Sources/Founderizer/CentralVaultSection.swift`).
 3. **Give each secret on purpose.** The app makes the recovery key and the pins of the servers itself
@@ -456,8 +485,8 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
 7. **Know what a new Mac changes.** The root step from a new Mac makes its key the only owner key of the central vault
    (`hubsetup.py`, `Sources/FleetCore/OwnerKey.swift`). The recovery key does not change: a backup still opens only
    with the lost Mac's code, which only a phone that took a copy has (`Sources/FleetCore/CentralVaultPlan.swift`,
-   `Sources/Founderizer/RecoveryCopy.swift`). A Linux broker keeps the old owner key until a root step on that machine
-   changes it (`hubsetup.py`).
+   `Sources/Founderizer/RecoveryCopy.swift`). A Linux broker, and Fleet Vault on a Mac that has the owner's keys,
+   keep the old owner key until a root step on that machine changes it (`hubsetup.py`, `Vault/install.py`).
 8. **Replace a key after the end of "Reads it".** When you take "Reads it" from an agent, replace the key at its
    service. A session of the agent that runs keeps the old value until it ends, and the agent could copy the value
    while it had the grant (`fleet.py`, `hub.py`). A key that swaps is different: the agent had only a placeholder,
