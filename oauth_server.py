@@ -82,8 +82,9 @@ SHARED_SECRET_METHODS = ("client_secret_basic", "client_secret_post", "client_se
 CLAIMED_NAMES = re.compile(r"claude|chatgpt", re.I)
 # Nor a whole name, in any case and with any spaces, that the owner's apps or the agents read as another channel or as
 # part of the fleet: a device, a chat app, the owner, the hub, an agent's role, the product. Such a name shows as App.
-RESERVED_NAMES = frozenset(("iphone", "ipad", "mac", "whatsapp", "discord", "owner", "hub", "manager", "founderizer",
-                            "fleet", "app"))
+# "windows" and "pc" since an owner device can be a PC, whose messages say via=Windows (hub.OWNER_DEVICE_KINDS).
+RESERVED_NAMES = frozenset(("iphone", "ipad", "mac", "windows", "pc", "whatsapp", "discord", "owner", "hub", "manager",
+                            "founderizer", "fleet", "app"))
 TAILNET = ipaddress.ip_network("100.64.0.0/10")
 NAT64 = ipaddress.ip_network("64:ff9b::/96")
 SITE_LOCAL = ipaddress.ip_network("fec0::/10")

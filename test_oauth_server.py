@@ -197,12 +197,13 @@ class Redirects(unittest.TestCase):
         self.assertEqual(o.shown_name("http://localhost:1/callback", "x", "Сlaude tool"), "laude tool")
         self.assertEqual(len(o.shown_name("http://localhost:1/callback", "x", "a" * 99)), 40)
         # a reserved name, as a whole name in any case and with any spaces, shows as App (fix 7 of the reviews)
-        for reserved in ("iPhone", "I Phone", "IPAD", "mac", "WhatsApp", "Whats App", "discord", "Owner", "HUB",
-                         "Manager", "Founderizer", "Fleet", "App", "a p p", "iPhone!"):
+        for reserved in ("iPhone", "I Phone", "IPAD", "mac", "Windows", "windows", "PC", "p c", "WhatsApp",
+                         "Whats App", "discord", "Owner", "HUB", "Manager", "Founderizer", "Fleet", "App", "a p p",
+                         "iPhone!"):
             with self.subTest(reserved=reserved):
                 self.assertEqual(o.clean_name(reserved), "")
                 self.assertEqual(o.shown_name("http://localhost:1/callback", "x", reserved), "App")
-        for kept in ("My Mac tool", "Fleet Watch", "Hubble", "Owners club"):
+        for kept in ("My Mac tool", "Fleet Watch", "Hubble", "Owners club", "Windows tool", "PC Desk"):
             self.assertEqual(o.shown_name("http://localhost:1/callback", "x", kept), kept)
         with self.assertRaises(ValueError):
             o.shown_name("https://example.com/cb", CC, "x")
