@@ -882,17 +882,35 @@ class Endpoints(Socket):
         self.assertIn("<p><strong>Claude</strong> wants to connect to your fleet.</p>", text)
         self.assertNotIn("read", re.sub(r'<input type="hidden"[^>]*>', "", text))
         self.assertIn("It returns to claude.ai", text)
-        self.assertIn("Code from your Mac", text)
+        self.assertIn('<label for="code">Code from your Mac</label>', text)
         self.assertIn(">Approve</button>", text)
         self.assertNotIn(hub.CAPP_LOOPBACK_LINE, text)
-        for never in ("<script", "<img", "<link", "src=", "http://", "https://"):
+        self.assertNotIn('class="no"', text)                # no line of a refusal on the first page
+        for never in ("<script", "<img", "<link", "src=", "http://", "https://", "url(", "@import", "@font-face"):
             self.assertNotIn(never, text)
+        # the apps' look (the owner's yes of 13 November 2026): one inline style, dark, and nothing from anywhere
+        self.assertEqual(text.count("<style>"), 1)
+        self.assertIn(f"<style>{hub.CAPP_PAGE_STYLE}</style>", text)
+        for part in (":root{color-scheme:dark}", "background:#191919", "max-width:380px", "p.no{color:#ff9f0a",
+                     "height:44px", "min-height:44px", "border-radius:22px"):
+            self.assertIn(part, hub.CAPP_PAGE_STYLE)
+        self.assertIn("<main>\n<h1>Founderizer</h1>\n", text)
         local = self.register((LOOPBACK_CB,), name="Example CLI")
         status, _, page = self.authorize(local, "http://localhost:9999/callback")
         self.assertEqual(status, 200, page)
         self.assertIn("<strong>Example CLI</strong>", page.decode())
         self.assertIn("It returns to localhost", page.decode())
-        self.assertIn(hub.CAPP_LOOPBACK_LINE, page.decode())
+        self.assertIn(f"<p>{hub.CAPP_LOOPBACK_LINE}</p>", page.decode())
+        # a wrong code: the same page with the line of a refusal, in its own class and with no markup of its own
+        status, head, page = self.approve(self.handle(page), "AAAA-BBBB-CCCC")
+        self.assertEqual(status, 403)
+        self.assertIn(f'<p>{hub.CAPP_LOOPBACK_LINE}</p>\n<p class="no">{hub.CAPP_PAGE_ERRORS["code"]}</p>\n<form ',
+                      page.decode())
+        self.assertIn("style-src 'unsafe-inline'", head["Content-Security-Policy"])
+        self.assertNotIn("script-src", head["Content-Security-Policy"])
+        # the line of a refusal is escaped by the page, whatever it is given
+        self.assertIn('<p class="no">a &lt;b&gt; &amp; c</p>', hub.capp_page(["x"], None, "a <b> & c"))
+        self.assertNotIn('class="no"', hub.capp_page([hub.CAPP_PAGE_ERRORS["client"]]))
 
     def test_a_client_or_a_redirect_that_is_not_proved_gets_a_page_and_no_redirect(self):
         client_id = self.register()

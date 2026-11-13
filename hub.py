@@ -41977,25 +41977,51 @@ def capp_register(meta):
     return client_id
 
 
-def capp_page(lines, handle=None):
-    """The sign-in page (section 9, point 1): a title, lines of text, and with a handle the code field and Approve.
-    No script, no picture and no file from anywhere. Every line is escaped here."""
+# The look of the sign-in page: the apps' dark look (charcoal, the system's own font, the setup's two sizes, one centered
+# column, the white capsule of a main button, a field and a button 44 px tall for a phone). One inline style, which the
+# page's Content-Security-Policy allows (style-src 'unsafe-inline'); no colour, font or file from anywhere else.
+CAPP_PAGE_STYLE = (
+    ":root{color-scheme:dark}"
+    "html,body{height:100%;margin:0}"
+    "body{background:#191919;color:#e6e6e6;font:15px/1.45 -apple-system,BlinkMacSystemFont,system-ui,sans-serif;"
+    "display:flex;align-items:center;justify-content:center;text-align:center;-webkit-font-smoothing:antialiased}"
+    "main{width:100%;max-width:380px;padding:0 16px 8vh}"
+    "h1{font-size:22px;font-weight:600;margin:0 0 18px}"
+    "p{margin:0 0 6px}"
+    "p.no{color:#ff9f0a;margin-top:12px}"
+    "form{margin-top:26px}"
+    "label{display:block;color:#999;margin-bottom:8px}"
+    "input{box-sizing:border-box;width:100%;height:44px;padding:0 12px;font:inherit;font-size:17px;"
+    "text-align:center;text-transform:uppercase;color:#e6e6e6;background:#222;"
+    "border:1px solid rgba(255,255,255,.32);border-radius:8px}"
+    "input:focus{outline:2px solid rgba(255,255,255,.55);outline-offset:1px}"
+    "button{margin-top:18px;min-height:44px;padding:0 24px;font:inherit;font-weight:500;color:#191919;"
+    "background:#f2f2f2;border:0;border-radius:22px;cursor:pointer}"
+)
+
+
+def capp_page(lines, handle=None, error=None):
+    """The sign-in page (section 9, point 1; the owner's yes of 13 November 2026 to its pictures in the apps' look): a
+    title, lines of text, then the line of a refusal in the apps' orange (error: plain text, escaped here), and with a
+    handle the code field and Approve. No script, no picture and no file from anywhere. The caller escapes what it puts
+    into a line. The field shows the code in capitals; the hub reads a code in any case."""
     body = "".join(f"<p>{line}</p>\n" for line in lines)
+    if error:
+        body += f'<p class="no">{html.escape(error)}</p>\n'
     if handle is not None:
         body += ('<form method="post" action="/authorize">\n'
                  f'<input type="hidden" name="handle" value="{html.escape(handle, quote=True)}">\n'
-                 '<p><label for="code">Code from your Mac</label><br>\n'
+                 '<label for="code">Code from your Mac</label>\n'
                  '<input id="code" name="code" autocomplete="one-time-code" autocapitalize="characters" '
-                 'spellcheck="false" maxlength="20" required autofocus></p>\n'
-                 '<p><button type="submit">Approve</button></p>\n</form>\n')
+                 'spellcheck="false" maxlength="20" required autofocus>\n'
+                 '<button type="submit">Approve</button>\n</form>\n')
     return ('<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
             '<meta name="viewport" content="width=device-width, initial-scale=1">\n<title>Founderizer</title>\n'
-            '<style>body{font-family:system-ui,sans-serif;max-width:26rem;margin:3rem auto;padding:0 1rem;'
-            'line-height:1.5}input,button{font:inherit;padding:.4rem .6rem}</style>\n</head>\n<body>\n'
-            f'<h1>Founderizer</h1>\n{body}</body>\n</html>\n')
+            f'<style>{CAPP_PAGE_STYLE}</style>\n</head>\n<body>\n<main>\n'
+            f'<h1>Founderizer</h1>\n{body}</main>\n</body>\n</html>\n')
 
 
-def capp_signin_lines(page, error=None):
+def capp_signin_lines(page):
     """The lines of the sign-in page for one request: who wants to connect, where it returns to, and the loopback
     line. No level: the level is the one that the owner chose with the code, and the page tells nobody whether a
     code is open."""
@@ -42004,8 +42030,6 @@ def capp_signin_lines(page, error=None):
              f"It returns to {html.escape(found.get('host') or '')}"]
     if found.get("kind") == "loopback":
         lines.append(CAPP_LOOPBACK_LINE)
-    if error:
-        lines.append(f"<strong>{html.escape(error)}</strong>")
     return lines
 
 
@@ -42052,13 +42076,13 @@ def capp_authorize_post(form, name):
         dcr = page is not None and oauth_server.client_kind(page["client"]) == "dcr"
         if page is None or dcr and not DB.execute("SELECT 1 FROM capp_clients WHERE client_id=? AND kind='dcr'",
                                                   (page["client"],)).fetchone():
-            outcome["page"] = (400, [CAPP_PAGE_ERRORS["client"]], False)
+            outcome["page"] = (400, [CAPP_PAGE_ERRORS["client"]], False, None)
         else:
             code = DB.execute("SELECT * FROM capp_codes WHERE used IS NULL AND expires>? ORDER BY id DESC LIMIT 1",
                               (t0,)).fetchone()
             given = oauth_server.code_sha256(typed)
             if not code or not given or not hmac.compare_digest(given, code["sha256"]):
-                outcome["page"] = (403, capp_signin_lines(page, CAPP_PAGE_ERRORS["code"]), True)
+                outcome["page"] = (403, capp_signin_lines(page), True, CAPP_PAGE_ERRORS["code"])
             else:
                 DB.execute("UPDATE capp_codes SET used=? WHERE id=?", (t0, code["id"]))
                 DB.execute("DELETE FROM capp_grants WHERE connection IS NULL AND expires<=?", (t0,))
@@ -42071,8 +42095,9 @@ def capp_authorize_post(form, name):
                 outcome.update(redirect=oauth_server.code_redirect(page["redirect_uri"], raw, page["state"], name),
                                level=code["level"], shown=page["name"])
     if "page" in outcome:
-        status, lines, again = outcome["page"]
-        return status, capp_page(lines, handle if again else None), None, page["redirect_uri"] if again else None
+        status, lines, again, refusal = outcome["page"]
+        return (status, capp_page(lines, handle if again else None, refusal), None,
+                page["redirect_uri"] if again else None)
     log("owner", f"approved the connected app {outcome['shown']} ({outcome['level']}); it connects at its exchange")
     return 303, None, outcome["redirect"], None
 
