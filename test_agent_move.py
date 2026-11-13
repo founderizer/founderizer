@@ -9,8 +9,13 @@ from unittest.mock import patch
 import fleet
 import hub
 from test_servers import HUB, NEW, OTHER, OWNER, Servers, git
+from leftovers import scratch_home
 
 SPARE = "127.0.0.11"            # the address of the empty server that the agent moves to
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real home folder (leftovers.scratch_home)
 
 
 def load_tests(loader, _tests, _pattern):

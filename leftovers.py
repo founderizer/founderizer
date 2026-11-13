@@ -17,7 +17,8 @@ child of a process that ends at once, so that the test process leaves no child o
 It imports nothing of the fleet's own, so a test that takes it pays for no import of hub.py (scratch_home loads
 fleet.py when a test file calls it). test_ui_api.HubProcesses checks all of it.
 
-And no test reads or writes the helper's folder of the machine that runs it (scratch_home)."""
+And no test reads or writes the home folder of the person who runs it: the helper's side with scratch_home, a hub's
+own files with hub_files."""
 import contextlib
 import json
 import os
@@ -133,24 +134,55 @@ def tmux_socket(name):
     return removed_when_gone(path)
 
 
-def scratch_home():
-    """In a test file's setUpModule: the helper's folder (fleet.HOME, with fleet.SESSIONS and fleet.KEPT_RUNTIMES,
-    which fleet.py makes from it at its import) is a folder of this run for every test of the file, and it is removed
-    at the module's end. A class that gives the helper a folder of its own still does, inside this one. Returns the
-    folder.
+HUB_FILES = {"attachment_dir": "attachments", "google_file": "google.json", "github_app": "github-app.pem",
+             "mcp_file": "mcp.json", "door_secrets": "door.json"}       # hub.CFG key: hub.py's own name below ~/.fleet
 
-    Each test file that builds a fleet.Helper calls it (test_helper_session.OwnFolder checks that). On 13 November
-    2026 a test class built a Helper with stand-in tmux answers and no folder of its own, because its tests reached
-    no code that writes there. Then a mutation run took one guard out of the code, the real start of a chat ran, and
-    it wrote a chat record and a session file into ~/.fleet of the owner's Mac; a later run read that record and
-    failed for it. A test must not depend on which code it reaches for that."""
+
+def hub_files(folder):
+    """The hub.CFG settings that give a hub its own files in `folder`. A hub with none of them reads and writes those
+    of ~/.fleet on the machine that runs it, and its timer removes every file of ~/.fleet/attachments that its own
+    database does not name. Each tool that serves a hub in its own process passes them (ui_fixture.py and the decode
+    check: test_ui_api.OwnFiles reads that), and in a test process the writers fail before they write
+    (test_ui_api.own_file_first). On 13 November 2026 each run of the decode check left a file of its upload in
+    ~/.fleet/attachments of the owner's Mac."""
+    return {key: os.path.join(folder, name) for key, name in HUB_FILES.items()}
+
+
+def scratch_home():
+    """In a test file's setUpModule: the home folder is a folder of this run for every test of the file, and it is
+    removed at the module's end. That is HOME in the environment, for each `~` that the code under test and the
+    programs it starts read, and the folders that fleet.py made from it at its import: the helper's own (fleet.HOME,
+    fleet.SESSIONS, fleet.KEPT_RUNTIMES), the repositories (fleet.WORK) and the conversation folders (fleet.CHATS).
+    CLAUDE_CONFIG_DIR and CODEX_HOME, which win over HOME, are not set while it holds. A class that gives the helper a
+    folder of its own still does, inside this one. Returns the folder.
+
+    git keeps the name and the settings of the person who runs the test (GIT_CONFIG_GLOBAL), for the commits that
+    tests make. fleet.CLAUDE_VERSIONS stays: the helper only reads it, and with an empty one a closed conversation
+    would get its program from the vendor.
+
+    Each test file that names fleet.Helper calls it (test_helper_session.OwnFolder checks that). On 13 November 2026
+    a test class built a Helper with stand-in tmux answers and no folder of its own, because its tests reached no code
+    that writes there. Then a mutation run took one guard out of the code, the real start of a chat ran, and it wrote
+    a chat record and a session file into ~/.fleet of the owner's Mac; a later run read that record and failed for
+    it. The same day two tests of the machine sign-in, which make their helper with no call of its constructor, wrote
+    the trust answers of their folders into the owner's own ~/.claude.json at each run. A test must not depend on
+    which code it reaches for that."""
     import fleet
     folder = removed_when_gone(tempfile.mkdtemp(prefix="fleet-test-home-"))
     unittest.addModuleCleanup(shutil.rmtree, folder, True)
+    env = {"HOME": folder}
+    for own in (os.path.expanduser("~/.gitconfig"), os.path.expanduser("~/.config/git/config")):
+        if "GIT_CONFIG_GLOBAL" not in os.environ and "GIT_CONFIG_GLOBAL" not in env and os.path.isfile(own):
+            env["GIT_CONFIG_GLOBAL"] = own
+    patchers = [patch.dict(os.environ, env)]
     home = os.path.join(folder, ".fleet")
     for name, path in (("HOME", home), ("SESSIONS", os.path.join(home, "sessions")),
-                       ("KEPT_RUNTIMES", os.path.join(home, "runtimes"))):
-        patcher = patch.object(fleet, name, path)
+                       ("KEPT_RUNTIMES", os.path.join(home, "runtimes")),
+                       ("WORK", os.path.join(folder, "fleet-work")), ("CHATS", os.path.join(folder, "fleet-chats"))):
+        patchers.append(patch.object(fleet, name, path))
+    for patcher in patchers:
         patcher.start()
         unittest.addModuleCleanup(patcher.stop)
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME"):        # the stop of patch.dict gives them back
+        os.environ.pop(name, None)
     return folder

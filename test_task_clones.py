@@ -16,8 +16,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import fleet
+from leftovers import scratch_home
 
 GEN, OLD = "0123456789ab", "ba9876543210"
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real home folder (leftovers.scratch_home)
 
 
 class TaskClones(unittest.TestCase):

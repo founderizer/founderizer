@@ -33,6 +33,7 @@ import uuid
 
 import hub
 import threads
+from leftovers import hub_files
 
 KIT = os.path.dirname(os.path.abspath(__file__))
 TEAM = {"hub": {"machine": "hub", "port": 8765},
@@ -83,7 +84,8 @@ class Fixture:
         self.tmp = tempfile.mkdtemp(prefix="fleet-ui-fixture-")
         hub.TEAM.clear()
         hub.TEAM.update(TEAM)
-        hub.CFG.update(silence=180, question_wait=120, manager_silence=120, ask_wait=45, ask_max=55, hook_wait=240,
+        hub.CFG.update(**hub_files(self.tmp),       # its own files: the timers below sweep the attachment folder
+                       silence=180, question_wait=120, manager_silence=120, ask_wait=45, ask_max=55, hook_wait=240,
                        job_wait=50, stop_after=60, offline_after=90, tick=2)
         hub.CFG["team_path"] = self.private_kit()
         hub.DB = sqlite3.connect(os.path.join(self.tmp, "fixture.db"), check_same_thread=False)

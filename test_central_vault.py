@@ -35,6 +35,7 @@ import lifecycle
 import releases
 from test_backup_restore import Fixture
 from test_ui_api import OwnerAPI
+from leftovers import scratch_home
 
 LOGIN_A = "bws://11111111-2222-4333-8444-55555555555b"      # an API key: vps reads it, studio uses it
 LOGIN_B = "bws://21111111-2222-4333-8444-55555555555b"      # a login: vps uses it
@@ -57,6 +58,10 @@ TEAM = {"hub": {"machine": "hub", "port": 8765},
                    "studio": {"role": "worker", "runtime": "claude", "machine": "studio", "can": ["shell"],
                               "vault": "broker", "vault_recipient": STORE_B, "secrets": {LOGIN_A: "use"}}}}
 KIT = os.path.dirname(os.path.abspath(__file__))
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real home folder (leftovers.scratch_home)
 
 
 def armored(payload=b"x" * 40):

@@ -17,6 +17,7 @@ import fleet
 import hub
 import lifecycle
 from test_capacity import LOGIN_A, LOGIN_B, Capacity
+from leftovers import scratch_home
 
 MADE = "bws://41111111-2222-4333-8444-55555555555b"         # the login that the stand-in vault reports
 OTHER = "bws://51111111-2222-4333-8444-55555555555b"        # a login that the hub has never seen
@@ -30,6 +31,10 @@ KEY_ARGS = {"request_id": KID, "label": "Shop API key", "username": "shop-key-1"
 NO_GRANT = "This login is not in your profile"
 OLD_BROKER = ("this vault broker does not compare a login that a task made with its own record of the logins that it "
               "made; update it before it opens one without the owner's grant")
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real home folder (leftovers.scratch_home)
 
 
 def load_tests(loader, _tests, _pattern):

@@ -31,11 +31,16 @@ import vault
 from test_setup import git
 from test_ui_api import OwnerAPI
 from test_vault_central import OWNER_C, canon, owner_sign
+from leftovers import scratch_home
 
 AGE, KEYGEN = shutil.which("age"), shutil.which("age-keygen")
 KEY_REF = "bws://5a3b1c2d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
 VALUE = {"password": "sk-e2e-only-" + "q7" * 12}          # a fake API key, in this test only
 NEW = {"password": "sk-e2e-new-" + "w3" * 12}             # the value that the owner puts in its place
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real home folder (leftovers.scratch_home)
 
 
 def load_tests(loader, _tests, _pattern):

@@ -31,14 +31,23 @@ from pathlib import Path
 from unittest.mock import patch
 
 import hub
-from leftovers import parent_pipe, removed_when_gone, tmux_socket, when_gone, while_this_test_runs
+from leftovers import (HUB_FILES, hub_files, parent_pipe, removed_when_gone, tmux_socket, when_gone,
+                       while_this_test_runs)
 
 KIT = os.path.dirname(os.path.abspath(__file__))
 
-# ---- the attachment folder. hub.tick() sweeps it and removes every file there that the test's database does not name,
-# so a test that ticks with no folder of its own empties the real ~/.fleet/attachments of the machine that runs it.
+# ---- the hub's own files. hub.tick() sweeps the attachment folder and removes every file there that the test's database
+# does not name, so a test that ticks with no folder of its own empties the real ~/.fleet/attachments of the machine
+# that runs it. And a hub with no file of its own for an upload, the Google accounts, the GitHub App's key, the MCP
+# servers or the door's secrets reads and writes the one in ~/.fleet (leftovers.hub_files, for a tool's own hub).
 
-REAL_ATTACHMENTS = os.path.realpath(hub.ATTACH_DIR)
+REAL_FILES = {key: os.path.realpath(path) for key, path in (
+    ("attachment_dir", hub.ATTACH_DIR), ("google_file", hub.GOOGLE_FILE), ("github_app", hub.GITHUB_APP),
+    ("mcp_file", hub.MCP_FILE), ("door_secrets", hub.DOOR_SECRETS_FILE))}
+# what the check holds: the sweep and its caller, and each function of hub.py that makes, writes or removes one of them
+OWN_FILE_FIRST = {"tick": "attachment_dir", "attachment_sweep": "attachment_dir", "attachment_dir": "attachment_dir",
+                  "google_store": "google_file", "github_app_file": "github_app", "github_app_remove": "github_app",
+                  "mcp_store": "mcp_file", "save_door_secrets": "door_secrets"}
 
 
 def own_attachments(test, folder):
@@ -48,20 +57,23 @@ def own_attachments(test, folder):
     test.addCleanup(lambda: hub.CFG.update(attachment_dir=old) if had else hub.CFG.pop("attachment_dir", None))
 
 
-def sweeps_only_a_test_folder(sweep):
-    """hub.tick and hub.attachment_sweep in every test process that loads this module: each fails before it runs when
-    the test has no folder of its own (own_attachments), or has the machine's own."""
-    @functools.wraps(sweep)
+def own_file_first(function, key):
+    """Each function of OWN_FILE_FIRST, in every test process that loads this module: it fails before it runs when
+    the test's hub has no file of its own for it (hub.CFG[key]; own_attachments for the folder), or has the
+    machine's own."""
+    @functools.wraps(function)
     def checked(*args, **kwargs):
-        folder = hub.CFG.get("attachment_dir")
-        if not folder or os.path.realpath(folder) == REAL_ATTACHMENTS:
-            raise AssertionError(f"hub.{sweep.__name__}() would sweep {folder or hub.ATTACH_DIR}: give the test a "
-                                 "folder of its own with test_ui_api.own_attachments")
-        return sweep(*args, **kwargs)
+        path = hub.CFG.get(key)
+        if not path or os.path.realpath(path) == REAL_FILES[key]:
+            raise AssertionError(f"hub.{function.__name__}() would use {path or REAL_FILES[key]} of this machine: give "
+                                 f"the test its own with hub.CFG[{key!r}]"
+                                 + (" (test_ui_api.own_attachments)" if key == "attachment_dir" else ""))
+        return function(*args, **kwargs)
     return checked
 
 
-hub.tick, hub.attachment_sweep = sweeps_only_a_test_folder(hub.tick), sweeps_only_a_test_folder(hub.attachment_sweep)
+for _name, _key in OWN_FILE_FIRST.items():
+    setattr(hub, _name, own_file_first(getattr(hub, _name), _key))
 
 
 # ---- the test's database. A hub syncs every commit to the disk and keeps a rollback journal beside its records, so
@@ -621,8 +633,8 @@ class OwnerAPI(unittest.TestCase):
 
 
 class AttachmentFolder(unittest.TestCase):
-    """No test sweeps the machine's own ~/.fleet/attachments: the check of sweeps_only_a_test_folder, and the two
-    things that keep it whole."""
+    """No test sweeps the machine's own ~/.fleet/attachments or writes one of the hub's files there: the check of
+    own_file_first, and the things that keep it whole."""
     setUp, tearDown, connect = OwnerAPI.setUp, OwnerAPI.tearDown, OwnerAPI.connect
 
     def test_a_sweep_without_a_folder_of_the_tests_own_fails_before_it_runs(self):
@@ -640,6 +652,71 @@ class AttachmentFolder(unittest.TestCase):
         self.assertTrue(os.path.exists(stray))
         hub.attachment_sweep(hub.now())                     # with a folder of the test's own, it runs
         self.assertFalse(os.path.exists(stray))
+
+    def test_a_write_without_a_file_of_the_tests_own_fails_before_it_runs(self):
+        """Each writer, with no file of the test's own and with the machine's own. A folder of this test stands for
+        ~/.fleet here, so a check that let a write through would not reach the machine's own."""
+        calls = {"attachment_dir": lambda: hub.attachment_dir(),
+                 "google_store": lambda: hub.google_store({"accounts": {}}),
+                 "github_app_file": lambda: hub.github_app_file("1", "not a key"),
+                 "github_app_remove": lambda: hub.github_app_remove(),
+                 "mcp_store": lambda: hub.mcp_store({"servers": {}}),
+                 "save_door_secrets": lambda: hub.save_door_secrets({}, True)}
+        self.assertEqual(set(calls) | {"tick", "attachment_sweep"}, set(OWN_FILE_FIRST))
+        machine = hub_files(os.path.join(self.tmp.name, "machine"))
+        os.makedirs(os.path.join(self.tmp.name, "machine"))
+        with contextlib.ExitStack() as stack:
+            for constant, key in (("ATTACH_DIR", "attachment_dir"), ("GOOGLE_FILE", "google_file"),
+                                  ("GITHUB_APP", "github_app"), ("MCP_FILE", "mcp_file"),
+                                  ("DOOR_SECRETS_FILE", "door_secrets")):
+                stack.enter_context(patch.object(hub, constant, machine[key]))
+            stack.enter_context(patch.dict(REAL_FILES, {key: os.path.realpath(path) for key, path in machine.items()}))
+            for name, call in calls.items():
+                key = OWN_FILE_FIRST[name]
+                for setting in (None, machine[key]):
+                    with self.subTest(name, setting=setting), patch.dict(hub.CFG, {key: setting}):
+                        with self.assertRaisesRegex(AssertionError, "of this machine"):
+                            call()
+            self.assertEqual(os.listdir(os.path.join(self.tmp.name, "machine")), [])
+            own = hub_files(os.path.join(self.tmp.name, "own"))
+            with patch.dict(hub.CFG, own):                  # with files of the test's own, the writers run
+                hub.google_store({"accounts": {}})
+                hub.mcp_store({"servers": {}})
+                self.assertTrue(os.path.isdir(hub.attachment_dir()))
+            self.assertEqual(sorted(os.listdir(os.path.join(self.tmp.name, "own"))),
+                             ["attachments", "google.json", "mcp.json"])
+            self.assertEqual(os.listdir(os.path.join(self.tmp.name, "machine")), [])
+
+    def test_the_check_names_every_file_that_hub_py_keeps_below_the_home_folder(self):
+        """A file that hub.py keeps in ~/.fleet later has no check until it is in REAL_FILES and in
+        leftovers.HUB_FILES, and its writers are in OWN_FILE_FIRST: this fails for it. The database is the one that
+        each test connects."""
+        with open(os.path.join(KIT, "hub.py"), encoding="utf-8") as f:
+            source = f.read()
+        below = dict(re.findall(r'^([A-Z_]+) = os\.path\.expanduser\("~/\.fleet/([^"]+)"\)', source, re.M))
+        self.assertEqual(sorted(below.values()), sorted(HUB_FILES.values()))
+        self.assertEqual(re.findall(r'^[A-Z_]+ = .*"~".*$', source, re.M),
+                         ['DB_DEFAULT = os.path.join("~", ".fleet", "pilot.db")'
+                          '                                       # main()\'s --db'])
+        self.assertEqual(set(REAL_FILES), set(HUB_FILES))
+        for key, name in HUB_FILES.items():
+            self.assertEqual(os.path.basename(REAL_FILES[key]), name)
+            self.assertIn(f'CFG.get("{key}") or ', source)
+        self.assertLessEqual(set(OWN_FILE_FIRST.values()), set(HUB_FILES))
+
+    def test_a_tool_that_serves_a_hub_of_its_own_gives_it_files_of_its_own(self):
+        """ui_fixture.py and the decode check connect a database of their own and serve hub.py in their process,
+        where no check of this module runs: each passes leftovers.hub_files to hub.CFG. On 13 November 2026 each run
+        of the decode check left its upload in ~/.fleet/attachments of the owner's Mac, and the fixture's timer
+        swept that folder. hubsetup.py is the installer of a real hub."""
+        tools = {}
+        for path in Path(KIT).glob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            if not path.name.startswith("test_") and path.name not in ("hub.py", "hubsetup.py") \
+                    and re.search(r"^\s*hub\.DB = sqlite3\.connect\(", text, re.M):
+                tools[path.name] = "hub.CFG.update(**hub_files(" in text
+        self.assertIn("ui_fixture.py", tools, "the scan found none: its pattern no longer matches the tools")
+        self.assertEqual([name for name, own in sorted(tools.items()) if not own], [])
 
     def test_every_test_module_that_ticks_loads_the_check(self):
         """Itself or through a module of tests that it loads, so the check runs when that module runs alone."""

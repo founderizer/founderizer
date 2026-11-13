@@ -20,6 +20,7 @@ import lifecycle
 import wakeups as w
 from test_release_turns import helper_reports
 from test_ui_api import OwnerAPI
+from leftovers import scratch_home
 
 CODEX_FULL = "codex --no-daemon --sandbox danger-full-access --ask-for-approval never {prompt}"
 CLAUDE_FULL = "claude --permission-mode dontAsk {settings} {prompt}"
@@ -30,6 +31,10 @@ LINES = {"code": "print('T-81 new ticket')\n"}              # the line form: no 
 VALUE = {"code": "import json\nprint(json.dumps({'value': 11}))\n", "condition": {"op": ">", "value": 10}}
 FEATURES = ("trigger_check", "trigger_code", "check_lines")
 SECRET = "Pr4ct!ce-Login#2026"
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real home folder (leftovers.scratch_home)
 
 
 def load_tests(loader, _tests, _pattern):

@@ -34,12 +34,17 @@ import lifecycle
 import hub
 from test_release_turns import helper_reports
 from test_ui_api import OwnerAPI, SourceHandler
+from leftovers import scratch_home
 
 CLAUDE_URL = "https://claude.ai/oauth/authorize?code=1&state=abc"
 CODEX_URL = "https://auth.openai.com/activate?user_code=WXYZ-1234"
 CODE = "AbCd-1234-EfGh"             # what the provider gives the owner, and the one thing that must leave no trace
 KIT = Path(__file__).resolve().parent
 REAL_SLEEP = time.sleep             # the test's own waits, while a helper under test sleeps a stand-in
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real home folder (leftovers.scratch_home)
 
 
 def load_tests(loader, _tests, _pattern):

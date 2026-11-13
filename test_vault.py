@@ -300,6 +300,31 @@ class VaultBroker(OwnerAPI):
             fleet.vault_call({"op": "read"})
         self.assertIn("vps has no credential access", str(refused.exception))
 
+    def test_a_read_counts_the_values_with_a_user_name_or_a_seed_and_still_gives_them(self):
+        """C11, its first step: the broker writes into its own log how many of the values that it gives have the shape
+        of a login (a user name or an authenticator seed), and it leaves none of them out yet."""
+        named, seeded, plain = "sk-fake-named-20261113", "sk-fake-seeded-20261113", "sk-fake-plain-20261113"
+        seed = "JBSWY3DPEHPK3PXP"
+        refs = {"SHOP_API_KEY": self.item(SECRET_ID, {"username": "pilot-b", "password": named}),
+                "SEED_KEY": self.item(OTHER_ID, {"username": "", "password": seeded, "totp": seed}),
+                "PLAIN_KEY": self.item(THIRD_ID, {"username": "", "password": plain})}
+        hub.TEAM["logins"] = {ref: {"title": env, "kind": "api_key", "env": env} for env, ref in refs.items()}
+        self.addCleanup(hub.TEAM.pop, "logins", None)
+        hub.TEAM["agents"]["vps"]["secrets"] = {ref: "read" for ref in refs.values()}
+        self.addCleanup(hub.TEAM["agents"]["vps"].pop, "secrets", None)
+        logged = []
+        with patch.object(vault, "log", side_effect=logged.append):
+            raw = fleet.vault_call({"op": "read"})
+        self.assertEqual(raw["env"], {"SHOP_API_KEY": named, "SEED_KEY": seeded, "PLAIN_KEY": plain})
+        self.assertEqual(raw["missing"], [])
+        head = "a session read of vps gave 2 value(s) with a user name or an authenticator seed: "
+        line = next(line for line in logged if line.startswith(head))
+        self.assertEqual(sorted(line[len(head):].split(", ")), sorted([refs["SHOP_API_KEY"], refs["SEED_KEY"]]))
+        self.assertFalse([line for line in logged if any(v in line for v in (named, seeded, plain, seed, "pilot-b"))])
+        self.assertEqual([vault.login_shaped(text) for text in ('{"username": "", "password": "x"}', "not json", "[1]",
+                                                                 '{"username": 7, "password": "x"}')],
+                         [False, False, False, False])
+
     def test_a_sealed_handover_is_opened_only_inside_the_broker(self):
         # A copy names its source login (owner API 1.10), and a handover needs its receiver to hold that login
         # already (DevOps plan V1): studio does, in its profile here.

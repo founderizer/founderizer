@@ -276,6 +276,12 @@ The vault protects the value of each secret. The design gives these results:
   agent, the owner chat included, and in the agent's checks, because each of them gets its keys by the same read
   (`fleet.py`). The swap proxy puts the key into requests to the key's site (`vault.py`).
 - **Never a login's password in a session.** The hub names only API keys with a read grant for a session (`hub.py`).
+  But the hub knows a key by its kind in the catalog, and nothing ties that kind to the value under its reference. So
+  a change of the kind, by the owner's API or by a `team.json` of the configuration ref, can make a login's password a
+  key that sessions read (`hub.py`). At each read, a Linux broker writes into its own log how many of the values that
+  it gives have a user name or an authenticator seed, with their references, and it leaves none of them out yet
+  (`vault.py`). A login that was saved with no user name and no seed has the shape of a key, so no count tells it
+  apart.
 
 ## The key swap
 

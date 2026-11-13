@@ -26,12 +26,17 @@ import fleet
 import hub
 import lifecycle
 from test_capacity import LOGIN_A, LOGIN_B, Capacity
+from leftovers import scratch_home
 
 KEY = "seo-agent-key-".ljust(43, "k")               # the agent key of seo: the caller field of its vault requests
 SERVICE_KEY = "stand-in-service-key-0123456789"     # what a saved login would hold: only curl's stdin gets it
 R1, R2, R3 = (f"0d4e5f60-3333-4444-8555-66666666666{n}" for n in "123")
 NO_PROOF = "The vault cannot prove that its request ended."
 NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real home folder (leftovers.scratch_home)
 
 
 def load_tests(loader, _tests, _pattern):

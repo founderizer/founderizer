@@ -29,6 +29,7 @@ import wakeups
 from test_release_turns import helper_reports
 from test_login_cuts import across, assert_no_part, register
 from test_ui_api import OwnerAPI
+from leftovers import scratch_home
 
 KIT = os.path.dirname(os.path.abspath(__file__))
 CLAUDE_FULL = "claude --permission-mode dontAsk {settings} {prompt}"
@@ -61,6 +62,10 @@ FORBIDDEN = {"call_api", "message_agent", "report_up", "ask_my_requester", "ask_
              "list_my_tasks", "set_reminder", "set_target", "sign_in", "create_login", "save_key", "hand_over",
              "attach_watch", "open_case", "see_notes", "forget", "see_team", "see_capacity"}
 FEATURES = ("trigger_check", "trigger_code", "check_lines", "shell_box", "api_request", "task_outputs")
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real home folder (leftovers.scratch_home)
 
 
 def load_tests(loader, _tests, _pattern):

@@ -619,6 +619,16 @@ def check_value(value):
     return {k: item[k] for k in ("password", "totp") if item.get(k)}
 
 
+def login_shaped(value):
+    """True for a stored item with a user name or an authenticator seed: the shape of a login. The owner's choice C11 of
+    13 November 2026 keeps such an item out of a session; its first step only counts them at each read (`read`)."""
+    try:
+        item = json.loads(value)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(item, dict) and any(isinstance(item.get(k), str) and item[k] for k in ("username", "totp"))
+
+
 def provenance(text, data, sid):
     """The source login of a locked copy, after the provenance inside the copy matched the hub's record of the copy
     (its job and source login). Only the sending broker could put it there, because only that broker opened the
@@ -697,6 +707,7 @@ def read(conf, purpose=None, uid=None):
         reason = data.get("error") if isinstance(data, dict) else None
         raise Refused("the hub did not name the secrets to read" + (f": {reason}" if isinstance(reason, str) else ""))
     env, missing, swapped, named = {}, [], {}, set()
+    shaped = []             # C11, its first step: the references of the values given that have the shape of a login
     for x in found:
         name, ref = x.get("env") if isinstance(x, dict) else None, x.get("login") if isinstance(x, dict) else None
         salts = x.get("fingerprint_salts") if isinstance(x, dict) else None
@@ -714,7 +725,8 @@ def read(conf, purpose=None, uid=None):
                 missing.append(name)
                 continue
         try:
-            value = check_value(store.item(SECRET_REF.fullmatch(ref).group(1))["value"])
+            stored = store.item(SECRET_REF.fullmatch(ref).group(1))["value"]
+            value = check_value(stored)
             protect(conf, {"fingerprint_salts": salts}, value, read=ref.lower())
             if site:
                 value = {"password": conf["_swaps"].place(uid, conf["agent"], ref.lower(), site[0], site[1], form, token)}
@@ -722,6 +734,8 @@ def read(conf, purpose=None, uid=None):
         except Refused:
             missing.append(name)
             continue
+        if login_shaped(stored):
+            shaped.append(ref.lower())
         env[name] = value["password"]
     if conf.get("_swaps") is not None and type(uid) is int:
         try:                    # the placeholders of keys that the hub names with a site no more
@@ -730,6 +744,8 @@ def read(conf, purpose=None, uid=None):
             pass                # the list stays as it is: each use of an entry still asks the hub
     log(f"read {len(env)} of {len(found)} value(s) for a session of {conf['agent']}"
         + (f", {len(swapped)} of them as a placeholder" if swapped else ""))
+    log(f"a session read of {conf['agent']} gave {len(shaped)} value(s) with a user name or an authenticator seed"
+        + (f": {', '.join(shaped)}" if shaped else ""))     # a reference opens nothing; it names what root checks
     reply = {"ok": True, "v": PROTOCOL, "env": env, "missing": missing}
     if swapped:
         reply["swap"] = {"proxy": f"http://127.0.0.1:{conf['_swap']['port']}", "ca": SWAP_RUN, "names": swapped}

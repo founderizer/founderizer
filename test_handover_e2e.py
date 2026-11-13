@@ -15,9 +15,14 @@ import hub
 import vault
 from test_capacity import Capacity
 from test_vault import AGENT_KEY, LOGIN, REF, VaultBroker
+from leftovers import scratch_home
 
 WAKE = {"title": "Check the login", "details": "", "done_when": "A worker used the handed-over login.",
         "needs": "none", "goal_id": None}
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real home folder (leftovers.scratch_home)
 
 
 def load_tests(loader, _tests, _pattern):

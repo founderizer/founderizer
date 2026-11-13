@@ -4,6 +4,8 @@ Real tmux on a socket of this test, a stand-in command (`sleep`) in every window
 call. The helper's conf is this file's own, so no agent of the live team.json is read.
 """
 import os
+import pwd
+import re
 import shlex
 import shutil
 import subprocess
@@ -221,46 +223,81 @@ class TaskLessMessage(unittest.TestCase):
 
 
 class OwnFolder(unittest.TestCase):
-    """No test reads or writes the helper's folder of the machine that runs it (leftovers.scratch_home)."""
+    """No test reads or writes the home folder of the person who runs it (leftovers.scratch_home)."""
 
     @staticmethod
     def without_a_folder(text):
-        """True for the text of a test file that builds a fleet.Helper and does not call scratch_home in its
+        """True for the text of a test file that names fleet.Helper and does not call scratch_home in its
         setUpModule."""
-        return "fleet.Helper(" in text and "def setUpModule():\n    scratch_home()" not in text
+        return bool(re.search(r"\bfleet\.Helper\b", text)) and "def setUpModule():\n    scratch_home()" not in text
 
-    def test_each_test_file_that_builds_a_helper_gives_it_a_folder_of_this_run(self):
-        """One rule for every file, so that no class depends on which code its tests reach: a test file that builds
-        a fleet.Helper calls scratch_home in its setUpModule. A patch of the folder in one class is not enough: the
-        class of 13 November was in a file whose other classes had one. test_helper_control.py sets HOME, and
-        fleet.HOME with it, before it imports fleet, for its real hub and its real helper."""
+    def test_each_test_file_that_names_the_helper_gets_a_home_folder_of_this_run(self):
+        """One rule for every file, so that no class depends on which code its tests reach: a test file that names
+        fleet.Helper calls scratch_home in its setUpModule. A patch of the folder in one class is not enough: the
+        class of 13 November was in a file whose other classes had one. And a call of the constructor is not the only
+        way to a helper: the two tests of the machine sign-in that wrote into ~/.claude.json made theirs with
+        fleet.Helper.__new__. test_helper_control.py sets HOME, and fleet.HOME with it, before it imports fleet, for
+        its real hub and its real helper."""
         build = "class A(unittest.TestCase):\n    def test(self):\n        fleet.Helper('dev-lead', {})\n"
+        bare = "class C(unittest.TestCase):\n    def test(self):\n        h = fleet.Helper.__new__(fleet.Helper)\n"
+        method = "class D(unittest.TestCase):\n    def test(self):\n        fleet.Helper.handle(helper, job)\n"
         patched = "class B(unittest.TestCase):\n    def setUp(self):\n        patch.object(fleet, \"HOME\", 'x').start()\n"
-        self.assertTrue(self.without_a_folder(build))
-        self.assertTrue(self.without_a_folder(patched + build))        # one class with its own folder, one without
-        self.assertFalse(self.without_a_folder("def setUpModule():\n    scratch_home()      # why\n\n\n" + build))
-        self.assertFalse(self.without_a_folder(patched))               # it builds none
+        for text in (build, bare, method, "x = object.__new__(fleet.Helper)\n"):
+            self.assertTrue(self.without_a_folder(text), text)
+            self.assertTrue(self.without_a_folder(patched + text), text)   # one class with its own folder, one without
+            self.assertFalse(self.without_a_folder("def setUpModule():\n    scratch_home()      # why\n\n\n" + text))
+        self.assertFalse(self.without_a_folder(patched))               # it names none
+        self.assertFalse(self.without_a_folder("class Helper(unittest.TestCase):\n    x = fleet.HelperState\n"))
         here = os.path.dirname(os.path.abspath(__file__))
-        without = []
+        without, named = [], 0
         for name in sorted(os.listdir(here)):
             if not (name.startswith("test_") and name.endswith(".py")) or name == "test_helper_control.py":
                 continue
             with open(os.path.join(here, name), encoding="utf-8") as f:
-                if self.without_a_folder(f.read()):
-                    without.append(name)
-        self.assertEqual(without, [], "a test file that builds a fleet.Helper needs, before its first class: "
+                text = f.read()
+            named += "fleet.Helper" in text
+            if self.without_a_folder(text):
+                without.append(name)
+        self.assertEqual(without, [], "a test file that names fleet.Helper needs, before its first class: "
                          "def setUpModule(): scratch_home()  (from leftovers import scratch_home)")
+        self.assertGreater(named, 30, "the scan found too few: its pattern no longer matches the tests")
 
     def test_the_folder_is_one_of_this_run_and_a_class_keeps_its_own_inside_it(self):
-        real = os.path.expanduser("~/.fleet")
-        for path in (fleet.HOME, fleet.SESSIONS, fleet.KEPT_RUNTIMES):
-            self.assertFalse(os.path.abspath(path).startswith(real + os.sep) or os.path.abspath(path) == real, path)
-        self.assertEqual((fleet.SESSIONS, fleet.KEPT_RUNTIMES),
-                         (os.path.join(fleet.HOME, "sessions"), os.path.join(fleet.HOME, "runtimes")))
+        """HOME of the environment and each folder that fleet.py made from it at its import."""
+        real = pwd.getpwuid(os.getuid()).pw_dir         # not from HOME, which is the folder of this run here
+        scratch = os.environ["HOME"]
+        self.assertNotEqual(os.path.realpath(scratch), os.path.realpath(real))
+        self.assertEqual(os.path.expanduser("~"), scratch)
+        self.assertEqual((fleet.HOME, fleet.SESSIONS, fleet.KEPT_RUNTIMES, fleet.WORK, fleet.CHATS),
+                         tuple(os.path.join(scratch, *below) for below in (
+                             (".fleet",), (".fleet", "sessions"), (".fleet", "runtimes"), ("fleet-work",), ("fleet-chats",))))
+        for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME"):                # they win over HOME in the code under test
+            self.assertNotIn(name, os.environ)
+        with tempfile.TemporaryDirectory() as claude:   # the answers that the helper writes for Claude Code go there
+            self.assertTrue(fleet.ready_runtime_config(kit=claude))
+            self.assertTrue(os.path.isfile(os.path.join(scratch, ".claude.json")))
         module = fleet.HOME
         with tempfile.TemporaryDirectory() as own, patch.object(fleet, "HOME", own):
             self.assertEqual(fleet.HOME, own)
         self.assertEqual(fleet.HOME, module)
+
+    def test_it_gives_every_folder_back_at_the_end_of_the_file(self):
+        """So that the next test file of the same process starts from the real ones, and makes its own."""
+        def state():
+            return (os.environ.get("HOME"), os.environ.get("CODEX_HOME"), fleet.HOME, fleet.SESSIONS,
+                    fleet.KEPT_RUNTIMES, fleet.WORK, fleet.CHATS)
+
+        # The cleanups of a module are one list of the process, and this file's own are in it: a list for this test.
+        with patch.dict(os.environ, {"CODEX_HOME": "/x/codex"}), patch.object(unittest.case, "_module_cleanups", []):
+            before = state()
+            folder = scratch_home()
+            inside = state()
+            unittest.doModuleCleanups()
+            self.assertEqual(state(), before)                   # CODEX_HOME included
+        self.assertEqual(inside, (folder, None, *(os.path.join(folder, *below) for below in (
+            (".fleet",), (".fleet", "sessions"), (".fleet", "runtimes"), ("fleet-work",), ("fleet-chats",)))))
+        self.assertNotEqual(folder, before[0])
+        self.assertFalse(os.path.exists(folder))
 
 
 class StartText(unittest.TestCase):
