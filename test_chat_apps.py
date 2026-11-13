@@ -1148,6 +1148,14 @@ class ChatApps(OwnerAPI):
         self.assertNotIn("QRTEXT", json.dumps(self.request("/ui/chat-apps?db=test-generation")[1]))
         self.bridge("/bridge/link", {"account": "whatsapp-main", "state": "linked", "qr": None, "expires": None})
         self.assertIsNone(self.request("/ui/chat-apps/whatsapp-main/link?db=test-generation")[1]["qr"])
+        # a new request: the earlier report is not its answer, so the app waits for the bridge's next one
+        self.bridge("/bridge/link", {"account": "whatsapp-main", "state": "error", "qr": None, "expires": None,
+                                     "error": "wa-link is not running."})
+        self.assertEqual(self.post("/ui/chat-apps/whatsapp-main/link")[0], 200)
+        self.assertEqual([i["kind"] for i in self.out()], ["link"])
+        self.assertEqual(self.request("/ui/chat-apps/whatsapp-main/link?db=test-generation")[1],
+                         {"db": "test-generation", "state": None, "qr": None, "expires": None, "error": None})
+        self.assertIsNone(self.request("/ui/chat-apps?db=test-generation")[1]["accounts"][1]["link"])
         code, data = self.post("/ui/chat-apps/whatsapp-main/unlink")
         self.assertEqual(self.out(), [{"id": data["outbound"], "kind": "unlink", "account": "whatsapp-main"}])
         self.assertEqual(self.request("/ui/chat-apps?db=old")[0], 409)

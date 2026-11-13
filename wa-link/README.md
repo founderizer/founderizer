@@ -37,14 +37,8 @@ These details add to section 15.12.
 - **message.** `kind` is `text` (plain and extended text), `image`, `audio`, `file` (documents) or `other` (video, sticker, location, contact, poll, event). Captions go in `text`. `sender` and `sender_alt` have no device part.
 - **Ignored.** Status updates and broadcast lists (`@broadcast`), channels, Meta AI bots, edits, reactions, revokes and other protocol messages, history sync, and undecryptable messages give no event. Receipts give events only for `delivered` and `read` in direct chats.
 
-## Install on the hub machine
+## On the hub machine
 
-The hub machine is the Linux machine of the fleet, `fleet-hub` below. Build on the Mac, then copy:
+The bridge builds wa-link itself (`wa_link_program` in `channels.py`): the first time a WhatsApp account runs, and again when a release changes this source or the bridge's Go pin. It takes Go's own archive (`GO_VERSION`, held to the SHA-256 that go.dev publishes) and the modules that `go.sum` pins, from proxy.golang.org only, and builds at a low priority with one package at a time. It keeps only the program, `~/.fleet/bin/wa-link`, and beside it `wa-link.source`, the SHA-256 of what it was built from; the toolchain, the modules and the build cache go after the build. A failed build is tried again after 10 minutes, or at once when the owner asks for a link. While a build runs, a link request waits, and its QR code follows the build.
 
-```sh
-ssh fleet-hub 'uname -m && mkdir -p ~/.fleet/bin ~/.fleet/chat-apps && chmod 700 ~/.fleet/chat-apps'
-scp bin/wa-link-linux-amd64 fleet-hub:.fleet/bin/wa-link
-ssh fleet-hub 'chmod 755 ~/.fleet/bin/wa-link && ~/.fleet/bin/wa-link --db /dev/null/x </dev/null; echo "exit $?"'
-```
-
-`uname -m` must print `x86_64`. The last command must fail to open the database (exit 1); this shows that the binary runs. The bridge then starts wa-link with `--db ~/.fleet/chat-apps/<account>.db`.
+`FLEET_WA_LINK` names another program, which the bridge then starts as it is and never builds.

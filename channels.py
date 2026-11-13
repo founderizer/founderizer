@@ -5,10 +5,12 @@
   channels.py unit    print the systemd user unit fleet-channels.service
 
 It runs on the hub machine. It keeps the Discord bot tokens, the inbound journal and one wa-link child process for
-each WhatsApp account. It decides nothing: the hub keeps every rule. It never logs message text or tokens.
+each WhatsApp account, and it builds wa-link from the release's own source when it has none for it (wa_link_program).
+It decides nothing: the hub keeps every rule. It never logs message text or tokens.
 """
 import argparse
 import base64
+import contextlib
 import hashlib
 import http.client
 import json
@@ -16,12 +18,15 @@ import os
 import queue
 import random
 import re
+import shutil
 import signal
 import socket
 import ssl
 import struct
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
 import time
 import urllib.error
@@ -51,6 +56,33 @@ INVALID_WAIT = (1.0, 5.0)   # Discord: wait this long after INVALID_SESSION
 SEND_TRIES = 3              # Discord: tries of one part with the same nonce when no answer comes
 WA_SEND_TIMEOUT = 25        # WhatsApp: wait this long for wa-link's "sent" event (4 parts stay under the hub's 120)
 WA_STABLE = 60              # a wa-link that ran this long starts its backoff again
+CODE_CHECK = 60             # how often the bridge looks whether a release changed its own code
+
+# wa-link on the hub machine. The bridge builds it itself, so that no hub needs a step by hand: the first time a
+# WhatsApp account runs, and again when a release changes wa-link's source or this Go pin. The build takes Go's own
+# archive for this system, at a version at least seven days old (the owner's rule for packages) and held to the
+# SHA-256 that go.dev publishes, and the modules that go.sum pins, from proxy.golang.org only. It runs at a low
+# priority, and it is the first process that the kernel ends when memory runs out, so the hub keeps running. The
+# toolchain, the modules and the build cache go after the build: only the program stays, and beside it the SHA-256 of
+# what it was built from.
+GO_VERSION = "1.27.3"       # Go's release of 19 October 2026
+GO_DOWNLOADS = "https://go.dev/dl"
+GO_SYSTEMS = {"Linux": "linux", "Darwin": "darwin"}
+GO_ARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
+GO_ARCHIVES = {             # Go's name for a system: the SHA-256 of go<GO_VERSION>.<name>.tar.gz
+    "linux-amd64": "65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40",
+    "linux-arm64": "a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49",
+    "darwin-amd64": "b6f8e931e4ab497fcde6da8ae4499a58f9d258e55c8a80824a516eae5950a750",
+    "darwin-arm64": "dd3908cf20959d798c1e06ebe5b72213f0505ce01373b40ce3110975a6cd99c2",
+}
+GO_MOST = 128 << 20         # bytes of Go's archive: they are about 70 MB
+WA_ROOM = 2 << 30           # bytes free before a build: the toolchain, the modules and the build cache
+WA_BUILD_TIMEOUT = 1800     # seconds for the build
+WA_BUILD_RETRY = 600        # seconds after a failed build before the next try by itself; a link request tries at once
+WA_SOURCE = os.path.join(KIT, "wa-link")
+WA_PROGRAM = os.path.expanduser("~/.fleet/bin/wa-link")
+# The build's own commands: the kernel's out-of-memory killer takes it first (Linux), and it runs at a low priority.
+WA_LOW = '{ [ -w /proc/self/oom_score_adj ] && echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; exec nice -n 10 "$@"'
 
 LOG = sys.stderr
 _log_lock = threading.Lock()
@@ -919,10 +951,183 @@ class Discord(Account):
                 log(f"discord {self.id}: typing signal failed ({code})")
 
 
-def wa_link_binary():
-    """FLEET_WA_LINK, else ~/.fleet/bin/wa-link (where wa-link/README.md installs it)."""
-    path = os.environ.get("FLEET_WA_LINK") or os.path.expanduser("~/.fleet/bin/wa-link")
-    return path if os.path.isfile(path) and os.access(path, os.X_OK) else None
+class BuildFailed(Exception):
+    """No wa-link for this release can be had on this machine. The text says why, in a few words."""
+
+
+def runnable(path):
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def wa_link_source(folder=None):
+    """The SHA-256 of what wa-link is built from: the Go pin, and the go.mod, go.sum and Go files (not the tests) of
+    the release. None when the release has no wa-link source."""
+    folder = folder or WA_SOURCE
+    try:
+        names = sorted(n for n in os.listdir(folder)
+                       if n in ("go.mod", "go.sum") or (n.endswith(".go") and not n.endswith("_test.go")))
+        if "go.mod" not in names:
+            return None
+        digest = hashlib.sha256(f"go{GO_VERSION}\n".encode())
+        for name in names:
+            with open(os.path.join(folder, name), "rb") as f:
+                data = f.read()
+            digest.update(f"{name} {len(data)}\n".encode() + data)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def go_platform():
+    """Go's name for this system and processor (linux-amd64), or None where Go publishes no archive."""
+    name = f"{GO_SYSTEMS.get(os.uname().sysname)}-{GO_ARCH.get(os.uname().machine)}"
+    return name if name in GO_ARCHIVES else None
+
+
+def remove_tree(path):
+    """shutil.rmtree, also of Go's module cache, whose folders are read-only."""
+    for root, dirs, _ in os.walk(path):
+        for name in dirs:
+            inner = os.path.join(root, name)
+            if not os.path.islink(inner):
+                with contextlib.suppress(OSError):
+                    os.chmod(inner, 0o700)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+_wa_build = {"lock": threading.Lock(), "failed": None}     # failed: (monotonic time, source, reason)
+
+
+def wa_link_program(building=None, force=False, fetch=None, run=subprocess.run, program=None, source=None):
+    """The wa-link to start. FLEET_WA_LINK when it is set (None when that is no program); else the program that the
+    bridge built from this release's source, built now when it is missing or was built from another source.
+    building() is called just before a build. A failed build is tried again after WA_BUILD_RETRY seconds, or at once
+    with force. When it fails and a wa-link built from an older source is there, that one runs, because a WhatsApp
+    that keeps its link is better than none; else BuildFailed."""
+    if os.environ.get("FLEET_WA_LINK"):
+        path = os.environ["FLEET_WA_LINK"]
+        return path if runnable(path) else None
+    program, source = program or WA_PROGRAM, source or WA_SOURCE
+    want = wa_link_source(source)
+    if want is None:                    # no source in this release: only a program that was put there
+        return program if runnable(program) else None
+
+    def current():
+        try:
+            with open(program + ".source") as f:
+                return runnable(program) and f.read().strip() == want
+        except OSError:
+            return False
+
+    with _wa_build["lock"]:
+        if current():
+            return program
+        failed = _wa_build["failed"]
+        if not force and failed and failed[1] == want and time.monotonic() - failed[0] < WA_BUILD_RETRY:
+            if runnable(program):
+                return program
+            raise BuildFailed(failed[2])
+        if building:
+            building()
+        started = time.monotonic()
+        log(f"wa-link: building it from this release's source with Go {GO_VERSION}")
+        try:
+            build_wa_link(source, program, want, fetch, run)
+        except BuildFailed as e:
+            _wa_build["failed"] = (time.monotonic(), want, str(e))
+            log(f"wa-link: the build failed: {e}")
+            if runnable(program):
+                log("wa-link: the program of an older source runs until a build succeeds")
+                return program
+            raise
+        _wa_build["failed"] = None
+        log(f"wa-link: built in {time.monotonic() - started:.0f} s")
+        return program
+
+
+def build_wa_link(source, program, want, fetch=None, run=subprocess.run):
+    """Builds wa-link from the folder source into program, with Go's pinned archive, in a folder beside program that
+    goes after the build. The program appears whole or not at all, and program.source says what it was built from."""
+    name = go_platform()
+    if name is None:
+        raise BuildFailed(f"Go publishes no build for {os.uname().sysname} {os.uname().machine}")
+    folder = os.path.dirname(program)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    for left in os.listdir(folder):     # what a bridge that ended in the middle of a build left; one bridge builds
+        if left.startswith(".wa-link-build-"):
+            remove_tree(os.path.join(folder, left))
+    if shutil.disk_usage(folder).free < WA_ROOM:
+        raise BuildFailed(f"the disk of the hub machine has less than {WA_ROOM >> 30} GB free")
+    work = tempfile.mkdtemp(prefix=".wa-link-build-", dir=folder)
+    try:
+        archive = os.path.join(work, "go.tar.gz")
+        digest, size = hashlib.sha256(), 0
+        try:
+            with (fetch or urllib.request.urlopen)(urllib.request.Request(
+                    f"{GO_DOWNLOADS}/go{GO_VERSION}.{name}.tar.gz", headers={"User-Agent": "founderizer-channels"}),
+                    timeout=60) as r, open(archive, "wb") as f:
+                for block in iter(lambda: r.read(1 << 20), b""):
+                    size += len(block)
+                    if size > GO_MOST:
+                        raise BuildFailed(f"the download of Go {GO_VERSION} is larger than {GO_MOST >> 20} MB")
+                    digest.update(block)
+                    f.write(block)
+        except (OSError, http.client.HTTPException, ValueError) as e:      # URLError is an OSError
+            raise BuildFailed(f"the download of Go {GO_VERSION} failed ({type(e).__name__})") from None
+        if digest.hexdigest() != GO_ARCHIVES[name]:
+            raise BuildFailed(f"the download of Go {GO_VERSION} does not match the SHA-256 that go.dev publishes")
+        try:
+            with tarfile.open(archive, "r:gz") as tar:
+                tar.extractall(work, filter="data")     # nothing outside work, no device and no set-user-ID file
+        except (tarfile.TarError, OSError, EOFError, TypeError) as e:
+            raise BuildFailed(f"the archive of Go {GO_VERSION} cannot be unpacked ({type(e).__name__})") from None
+        os.remove(archive)
+        go = os.path.join(work, "go", "bin", "go")
+        for inner in ("home", "tmp"):
+            os.mkdir(os.path.join(work, inner))
+        home = os.path.join(work, "home")
+        env = {"PATH": os.pathsep.join([os.path.dirname(go), "/usr/local/bin", "/usr/bin", "/bin"]), "HOME": home,
+               "XDG_CONFIG_HOME": os.path.join(home, ".config"), "TMPDIR": os.path.join(work, "tmp"),
+               "GOPATH": os.path.join(work, "path"), "GOMODCACHE": os.path.join(work, "mod"),
+               "GOCACHE": os.path.join(work, "cache"), "GOENV": "off", "GOTOOLCHAIN": "local",
+               "GOFLAGS": "-mod=readonly", "GOPROXY": "https://proxy.golang.org", "GOSUMDB": "sum.golang.org",
+               "GONOSUMDB": "", "GONOPROXY": "", "GOPRIVATE": "", "CGO_ENABLED": "0"}
+        out = os.path.join(work, "wa-link")
+        try:    # -p 1: one package at a time, so that a hub with little memory builds it too
+            done = run(["sh", "-c", WA_LOW, "sh", go, "build", "-p", "1", "-trimpath", "-buildvcs=false", "-o", out,
+                        "."], cwd=source, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                       timeout=WA_BUILD_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise BuildFailed(f"the build took longer than {WA_BUILD_TIMEOUT // 60} minutes") from None
+        except OSError as e:
+            raise BuildFailed(f"Go cannot start ({type(e).__name__})") from None
+        if done.returncode != 0:
+            last = [line.strip() for line in (done.stderr or "").splitlines() if line.strip()][-1:]
+            raise BuildFailed("go build failed: " + (last[0][:200] if last else f"exit {done.returncode}"))
+        try:    # the program runs: it starts and cannot open a database in a folder that is not there
+            check = run([out, "--db", "/dev/null/x"], stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise BuildFailed(f"the new wa-link does not run ({type(e).__name__})") from None
+        if check.returncode != 1:
+            raise BuildFailed(f"the new wa-link does not run (exit {check.returncode})")
+        os.chmod(out, 0o755)
+        os.replace(out, program)
+        with open(os.path.join(work, "source"), "w") as f:
+            f.write(want + "\n")
+        os.replace(os.path.join(work, "source"), program + ".source")
+    finally:
+        remove_tree(work)
+
+
+def own_code():
+    """The SHA-256 of this file and of wa-link's source. When a release changes either, the bridge stops, and its
+    service starts the new code (a release restarts the hub, not the bridge)."""
+    digest = hashlib.sha256()
+    with contextlib.suppress(OSError):
+        with open(os.path.abspath(__file__), "rb") as f:
+            digest.update(f.read())
+    digest.update((wa_link_source() or "").encode())
+    return digest.hexdigest()
 
 
 class WhatsApp(Account):
@@ -937,22 +1142,58 @@ class WhatsApp(Account):
         self.waiting = {}           # message ID -> [Event, the "sent" event or None]
         self.wa_state = None
         self.link_state = None
+        # A link request while no wa-link runs (it is built, or it starts again): the pair goes at wa-link's first
+        # state, and the next try to start it does not wait. Both under plock.
+        self.pair_wanted = False
+        self.force_build = False
+        self.wake = threading.Event()
+
+    def stop(self):
+        super().stop()
+        self.wake.set()
+
+    def pause(self, seconds):
+        """The wait between two tries to start wa-link. A link request or the stop ends it."""
+        self.wake.wait(seconds)
+        self.wake.clear()
+
+    def cannot_start(self, reason):
+        """No wa-link runs: the account's error, and the link request's too, when one waits."""
+        self.set_state("error", reason)
+        with self.plock:
+            wanted, self.pair_wanted = self.pair_wanted, False
+        if wanted:
+            self.post_link("error", error=reason)
+
+    def building(self):
+        self.set_state("connecting")
 
     def run(self):
         backoff = Backoff()
         while not self.stopping.is_set():
-            binary = wa_link_binary()
+            with self.plock:
+                force, self.force_build = self.force_build, False
+            try:
+                binary = wa_link_program(self.building, force=force)
+            except BuildFailed as e:
+                binary, reason = None, f"wa-link could not be built on the hub machine: {e}."
+            except Exception as e:      # a fault of the build must not end this account's thread
+                binary, reason = None, f"wa-link could not be built on the hub machine ({type(e).__name__})."
+            else:
+                reason = "wa-link is not installed on the hub machine."
+            if self.stopping.is_set():
+                return
             if not binary:
-                self.set_state("error", "wa-link is not installed on the hub machine.")
-                self.stopping.wait(backoff.next())
+                self.cannot_start(reason)
+                self.pause(backoff.next())
                 continue
             started = time.monotonic()
             try:
                 proc = subprocess.Popen([binary, "--db", self.db_path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         text=True, encoding="utf-8", errors="replace", bufsize=1)
             except OSError as e:
-                self.set_state("error", f"wa-link cannot start ({type(e).__name__}).")
-                self.stopping.wait(backoff.next())
+                self.cannot_start(f"wa-link cannot start ({type(e).__name__}).")
+                self.pause(backoff.next())
                 continue
             with self.plock:
                 self.proc = proc
@@ -988,7 +1229,7 @@ class WhatsApp(Account):
             self.set_state("error", f"wa-link stopped (exit {code}).")
             if time.monotonic() - started >= WA_STABLE:
                 backoff.reset()
-            self.stopping.wait(backoff.next())
+            self.pause(backoff.next())
 
     def halt(self):
         with self.plock:
@@ -1045,6 +1286,11 @@ class WhatsApp(Account):
             self.user = self.name = None
         mapped = {"linked": "connected", "connecting": "connecting", "logged_out": "logged_out"}.get(state, "error")
         self.set_state(mapped, str(error) if error else "wa-link reported an error." if mapped == "error" else None)
+        if state in ("linked", "logged_out", "error"):
+            with self.plock:
+                wanted, self.pair_wanted = self.pair_wanted, False
+            if wanted and state == "logged_out" and self.command({"op": "pair"}):
+                return      # the start of a wa-link with no device, not the end of a link: its QR code follows
         if state in ("linked", "logged_out", "error") and state != self.link_state:
             self.post_link(state, error=str(error) if error else None)
 
@@ -1099,6 +1345,14 @@ class WhatsApp(Account):
                           "ids": [str(i) for i in item.get("ids") or []]})
         elif kind in ("link", "unlink"):
             self.link_state = None              # the hub gets the next state, also when it did not change
+            if kind == "link":
+                with self.plock:
+                    running = self.proc is not None and self.proc.poll() is None
+                    if not running:             # wa-link is built or starts again: the pair waits for it
+                        self.pair_wanted = self.force_build = True
+                if not running:
+                    self.wake.set()
+                    return
             if not self.command({"op": "pair" if kind == "link" else "logout"}):
                 self.post_link("error", error="wa-link is not running.")
         else:
@@ -1343,8 +1597,13 @@ def main(argv=None):
         signal.signal(sig, lambda *_: bridge.stopping.set())
     log(f"bridge started; hub {hub}; journal holds {len(bridge.journal.pending())} event(s)")
     bridge.start()
+    code, looked = own_code(), time.monotonic()
     while not bridge.stopping.wait(1):
-        pass
+        if time.monotonic() - looked >= CODE_CHECK:
+            looked = time.monotonic()
+            if own_code() != code:
+                log("the bridge's code changed: it stops, and its service starts the new code")
+                break
     bridge.stop()
     log("bridge stopped")
     return 0

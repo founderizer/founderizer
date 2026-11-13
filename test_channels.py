@@ -14,6 +14,7 @@ import socketserver
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -1035,6 +1036,57 @@ class WhatsAppTests(Base):
                         "reply_to": None, "prefix": None})
         self.assertEqual(self.result(91)["error"], "WhatsApp is not linked.")
 
+    def building(self, build):
+        """The bridge builds wa-link into this test's folder with build in place of build_wa_link."""
+        program = os.path.join(self.tmp.name, "bin", "wa-link")
+        for change in (patch.object(channels, "build_wa_link", build), patch.object(channels, "WA_PROGRAM", program),
+                       patch.dict(channels._wa_build, failed=None), patch.dict(os.environ)):
+            change.start()
+            self.addCleanup(change.stop)
+        return os.environ.pop("FLEET_WA_LINK")
+
+    def test_a_link_request_waits_for_the_build_and_gets_its_qr_code(self):
+        release, calls = threading.Event(), []
+
+        def build(source, program, want, fetch=None, run=None):
+            calls.append(want)
+            release.wait(5)
+            os.makedirs(os.path.dirname(program), exist_ok=True)
+            shutil.copy(stub, program)
+            with open(program + ".source", "w") as f:
+                f.write(want + "\n")
+        stub = self.building(build)
+        self.start()
+        self.wait_for(lambda: calls, "the build")
+        self.wait_for(lambda: self.has_state("whatsapp-main", "connecting"), "connecting while it builds")
+        self.hub.queue({"id": 72, "kind": "link", "account": "whatsapp-main"})
+        self.wait_for(lambda: "out 72: link for whatsapp-main" in self.log.getvalue(), "the link item at the bridge")
+        release.set()
+        self.wait_for(lambda: len(self.hub.links) >= 2, "two link reports")
+        waiting, linked = self.hub.links[:2]
+        self.assertEqual((waiting["state"], waiting["qr"]), ("waiting", "QR-CODE-1"),
+                         "the logged_out of wa-link's start is not the answer to the request")
+        self.assertEqual(linked["state"], "linked")
+        self.assertEqual(calls, [channels.wa_link_source()])
+        self.assertEqual(len(self.commands("pair")), 1)
+
+    def test_a_build_that_fails_answers_the_link_request(self):
+        calls = []
+
+        def build(source, program, want, fetch=None, run=None):
+            calls.append(want)
+            raise channels.BuildFailed("the download of Go 1.27.3 failed (URLError)")
+        self.building(build)
+        reason = "wa-link could not be built on the hub machine: the download of Go 1.27.3 failed (URLError)."
+        self.start()
+        self.assertEqual(self.wait_for(lambda: self.has_state("whatsapp-main", "error"), "the error")[-1]["error"], reason)
+        time.sleep(0.3)         # several tries to start wa-link, at the test's short backoff
+        self.assertEqual(len(calls), 1, "a failed build is not tried again at once by itself")
+        self.hub.queue({"id": 73, "kind": "link", "account": "whatsapp-main"})
+        link = self.wait_for(lambda: self.hub.links, "the link report")[0]
+        self.assertEqual((link["state"], link["error"]), ("error", reason))
+        self.assertEqual(len(calls), 2, "a link request tries the build again at once")
+
 
 # ---------------------------------------------------------------- the real hub
 
@@ -1227,10 +1279,126 @@ class Functions(unittest.TestCase):
         self.assertEqual(channels.hub_url(team), "http://100.1.2.3:8765")
         self.assertEqual(channels.hub_url({"hub": "http://CHANGE-ME:8765"}), "")
 
+    def test_a_change_of_wa_link_source_changes_the_bridge_code(self):
+        with tempfile.TemporaryDirectory() as source, patch.object(channels, "WA_SOURCE", source):
+            write_files(source, {"go.mod": "module x\n", "main.go": "package main\n"})
+            first = channels.own_code()
+            write_files(source, {"main_test.go": "package main\n"})
+            self.assertEqual(channels.own_code(), first, "a test file is not built")
+            write_files(source, {"main.go": "package main\n\nfunc f() {}\n"})
+            self.assertNotEqual(channels.own_code(), first)
+
+
+def write_files(folder, files):
+    for name, text in files.items():
+        with open(os.path.join(folder, name), "w") as f:
+            f.write(text)
+
+
+# go in the stand-in archive: it writes what it was given to GO_LOG, and a program that exits with EXIT
+FAKE_GO = r'''#!/bin/sh
+echo "mod=$(head -1 go.mod) GOFLAGS=$GOFLAGS GOPROXY=$GOPROXY CGO_ENABLED=$CGO_ENABLED GOTOOLCHAIN=$GOTOOLCHAIN args=$*" >> GO_LOG
+mkdir -p "$GOMODCACHE/m/x" && touch "$GOMODCACHE/m/x/f" && chmod 555 "$GOMODCACHE/m/x" "$GOMODCACHE/m"
+FAIL
+while [ "$1" != "-o" ]; do shift; done
+printf '#!/bin/sh\nexit EXIT\n' > "$2"
+chmod 755 "$2"
+'''
+
+
+class WaLinkBuild(unittest.TestCase):
+    """wa_link_program builds wa-link with Go's pinned archive: here a stand-in archive whose go writes a program."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.source, self.program = os.path.join(tmp.name, "src"), os.path.join(tmp.name, "bin", "wa-link")
+        os.makedirs(self.source)
+        write_files(self.source, {"go.mod": "module founderizer/wa-link\n", "go.sum": "", "main.go": "package main\n",
+                                  "main_test.go": "package main\n"})
+        self.go_log, self.urls, self.log = os.path.join(tmp.name, "go.log"), [], io.StringIO()
+        for change in (patch.object(channels, "LOG", self.log), patch.dict(channels._wa_build, failed=None),
+                       patch.object(channels, "WA_ROOM", 0), patch.dict(channels.GO_ARCHIVES), patch.dict(os.environ)):
+            change.start()
+            self.addCleanup(change.stop)
+        os.environ.pop("FLEET_WA_LINK", None)
+        self.serve()
+
+    def serve(self, fail="", exit_code=1, members=None):
+        """The archive that the download gives, with its SHA-256 as the pinned one."""
+        script = FAKE_GO.replace("GO_LOG", shlex.quote(self.go_log)).replace("FAIL", fail).replace("EXIT", str(exit_code))
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+            for name, data in (members or {"go/bin/go": script.encode()}).items():
+                info = tarfile.TarInfo(name)
+                info.size, info.mode = len(data), 0o755
+                tar.addfile(info, io.BytesIO(data))
+        self.archive = buffer.getvalue()
+        channels.GO_ARCHIVES[channels.go_platform()] = hashlib.sha256(self.archive).hexdigest()
+
+    def fetch(self, request, timeout):
+        self.urls.append(request.full_url)
+        return io.BytesIO(self.archive)
+
+    def program_for(self, **options):
+        return channels.wa_link_program(fetch=self.fetch, program=self.program, source=self.source, **options)
+
+    def test_it_builds_once_for_each_source(self):
+        seen = []
+        self.assertEqual(self.program_for(building=lambda: seen.append("building")), self.program)
+        self.assertEqual(seen, ["building"])
+        self.assertEqual(self.urls, [f"https://go.dev/dl/go{channels.GO_VERSION}.{channels.go_platform()}.tar.gz"])
+        self.assertEqual(subprocess.run([self.program]).returncode, 1)
+        with open(self.program + ".source") as f:
+            self.assertEqual(f.read().strip(), channels.wa_link_source(self.source))
+        self.assertEqual(sorted(os.listdir(os.path.dirname(self.program))), ["wa-link", "wa-link.source"],
+                         "the toolchain, its read-only module folders and the build cache are gone")
+        with open(self.go_log) as f:
+            self.assertRegex(f.read(), "^mod=module founderizer/wa-link GOFLAGS=-mod=readonly "
+                                       "GOPROXY=https://proxy.golang.org CGO_ENABLED=0 GOTOOLCHAIN=local "
+                                       "args=build -p 1 -trimpath -buildvcs=false -o "
+                                       + re.escape(os.path.dirname(self.program)) + r"/\.wa-link-build-[^/]+/wa-link \.\n$")
+        self.program_for()
+        write_files(self.source, {"main_test.go": "package main\n\nfunc g() {}\n"})
+        self.program_for()
+        self.assertEqual(len(self.urls), 1, "the same source, and a changed test file, build nothing")
+        write_files(self.source, {"main.go": "package main\n\nfunc f() {}\n"})
+        self.program_for()
+        self.assertEqual(len(self.urls), 2, "changed Go code builds again")
+
+    def test_a_failed_build(self):
+        right = channels.GO_ARCHIVES[channels.go_platform()]
+        channels.GO_ARCHIVES[channels.go_platform()] = "0" * 64
+        for force in (False, False, True):
+            with self.assertRaisesRegex(channels.BuildFailed, "does not match the SHA-256 that go.dev publishes"):
+                self.program_for(force=force)
+        self.assertEqual(len(self.urls), 2, "the second try waits for WA_BUILD_RETRY; a forced one does not")
+        self.assertFalse(os.path.exists(self.program))
+        channels.GO_ARCHIVES[channels.go_platform()] = right
+        self.assertEqual(self.program_for(force=True), self.program)
+
+        write_files(self.source, {"main.go": "package main\n\nfunc f() {}\n"})
+        self.serve(fail='echo "./main.go:3:1: undefined: x" >&2; exit 2')
+        self.assertEqual(self.program_for(force=True), self.program, "the program of the older source runs")
+        self.assertIn("go build failed: ./main.go:3:1: undefined: x", self.log.getvalue())
+        self.assertNotEqual(open(self.program + ".source").read().strip(), channels.wa_link_source(self.source))
+        os.remove(self.program)
+        with self.assertRaisesRegex(channels.BuildFailed, "^go build failed: ./main.go:3:1: undefined: x$"):
+            self.program_for(force=True)
+        self.serve(exit_code=0)
+        with self.assertRaisesRegex(channels.BuildFailed, r"the new wa-link does not run \(exit 0\)"):
+            self.program_for(force=True)
+        self.serve(members={"go/bin/go": b"#!/bin/sh\n", "../outside": b"x"})
+        with self.assertRaisesRegex(channels.BuildFailed, "cannot be unpacked"):
+            self.program_for(force=True)
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(os.path.dirname(self.program)), "outside")))
+        self.assertEqual(os.listdir(os.path.dirname(self.program)), ["wa-link.source"],
+                         "no build folder is left, and no program of a failed build")
+
 
 def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
-    for case in (DiscordTests, WhatsAppTests, Functions):
+    for case in (DiscordTests, WhatsAppTests, Functions, WaLinkBuild):
         suite.addTests(loader.loadTestsFromTestCase(case))
     if hasattr(fleet_hub, "ensure_bridge_key"):     # only RealHub's own tests, not those of OwnerAPI
         suite.addTests(RealHub(name) for name in RealHub.__dict__ if name.startswith("test_"))

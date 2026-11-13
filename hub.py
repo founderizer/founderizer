@@ -46114,6 +46114,8 @@ class Handler(BaseHTTPRequestHandler):
             if acc["app"] != "whatsapp":
                 raise Refusal(409, f"{action} is for a WhatsApp account")
             with transaction():
+                if action == "link":    # the bridge's next report answers this request: an earlier error is not its answer
+                    DB.execute("DELETE FROM chat_link WHERE account=?", (aid,))
                 item = chat_queue(action, aid, now())
             log("owner", f"asked the bridge to {action} {aid}")
             return {"id": aid, "outbound": item}
