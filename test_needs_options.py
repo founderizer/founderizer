@@ -314,11 +314,7 @@ if __name__ == "__main__":
 
 class Talk(NeedsCase):
     """Owner feature need_talk (the owner, 9 November 2026): a short card with its long part behind Details and no code,
-    options that combine, and a discussion of the item with the manager before he decides."""
-
-    def talk(self, text, nid=1, **extra):
-        return self.request(f"/ui/needs/{nid}/talk",
-                            dict({"request_id": str(uuid.uuid4()), "db": "test-generation", "text": text}, **extra))
+    and options that combine. Its Discuss left the apps on 13 November 2026: his own words are his one reply."""
 
     def test_a_card_is_short_and_its_long_part_goes_behind_details(self):
         with self.assertRaisesRegex(hub.ToolError, "The title is at most 70 characters"):
@@ -373,83 +369,51 @@ class Talk(NeedsCase):
         self.assertEqual(code, 200, receipt)
         self.assertEqual((self.row()["answer"], json.loads(self.row()["chose"])), ("B", [1]))
 
-    def test_he_discusses_an_item_and_the_manager_replies_under_it(self):
+    def test_his_own_words_are_also_his_reply_and_a_question_back_gets_a_new_item(self):
+        """The owner, 13 November 2026: "lets use the free-type text input as the general reply too, so we can remove
+        the discuss option completely". Words close the item as every answer does, and the manager reads how to
+        reply to a question back: with a new item, where the owner answered."""
         self.raise_item(options=["Read on both", "Read on one"])
-        code, receipt = self.talk("Does read on the second one show anything secret?")
+        code, receipt = self.request("/ui/needs/1", self.command(answer="Does read on the second one show anything?"))
         self.assertEqual(code, 200, receipt)
-        self.assertEqual([t["who"] for t in receipt["talk"]], ["owner"])
+        self.assertEqual(self.row()["answer"], "Does read on the second one show anything?")
         said = hub.t_read_messages("manager", {})
-        self.assertIn("[owner] About the Needs-you item N-1 (Which name?), before the owner decides: Does read on the "
-                      "second one show anything secret?", said)
-        self.assertIn('discuss_need(need="N-1"', said)
-        self.assertIn('raise it again with raise_needs_you(replaces="N-1")', said)
+        self.assertIn("[owner] Answer to Needs-you N-1 (Which name?): Does read on the second one show anything? The "
+                      "owner wrote this in their own words. If it asks you something back or does not settle the "
+                      "item, reply with a new item (raise_needs_you) whose why answers what they asked.", said)
         self.assertNotRegex(said, r"\b(he|his|him)\b")                 # the hub's words name no owner "he"
-        replied = hub.t_discuss_need("manager", {"need": "N-1", "text": "Yes, it holds stored keys."})
-        self.assertIn("Your reply is under N-1 on the owner's card.", replied)
-        self.assertIn('raise it again with raise_needs_you(replaces="N-1")', replied)
-        self.assertIn("replied about: Which name?",
-                      hub.q1("SELECT text FROM events WHERE agent='owner' AND kind='notify' ORDER BY id DESC")["text"])
-        item = self.item()
-        self.assertEqual([(t["who"], t["text"]) for t in item["talk"]],
-                         [("owner", "Does read on the second one show anything secret?"),
-                          ("manager", "Yes, it holds stored keys.")])
-        self.assertIsNone(self.row()["answer"])                         # the discussion is no answer
-        with self.assertRaisesRegex(hub.ToolError, "in plain words"):
-            hub.t_discuss_need("manager", {"need": "N-1", "text": "See T-12."})
+        # a press is the agent's own words, so it gets no such sentence
+        self.raise_item(options=["Tide", "Harbour"])
+        self.assertEqual(self.request("/ui/needs/2", self.command(choice=1))[0], 200)
+        self.assertNotIn("their own words", hub.t_read_messages("manager", {}))
 
-    def test_an_item_that_is_not_replaced_gets_no_word_about_replaces(self):
-        """A key request closes by its own route, and raise_needs_you refuses to take its place (need_replaced). So
-        the hub does not tell the manager to raise it again with replaces, in the message or after its reply."""
-        hub.q("INSERT INTO needs(id,title,why,todo,raised,by,kind,secret) VALUES(1,'Enter the API key X_KEY','For the "
-              "deploy.','Enter it',?,'manager','secret','{}')", (hub.now(),))
-        self.assertEqual(self.talk("What is this key for?")[0], 200)
-        said = hub.t_read_messages("manager", {})
-        self.assertIn("[owner] About the Needs-you item N-1 (Enter the API key X_KEY), before the owner decides: What is "
-                      "this key for?", said)
-        self.assertIn('discuss_need(need="N-1"', said)
-        self.assertNotIn("replaces", said)
-        self.assertIn("The owner's answer to the item still comes as its own message.", said)
-        replied = hub.t_discuss_need("manager", {"need": "N-1", "text": "The deploy of the site reads it."})
-        self.assertIn("Your reply is under N-1 on the owner's card.", replied)
-        self.assertNotIn("replaces", replied)
-        with self.assertRaisesRegex(hub.ToolError, "closes by its own route"):
-            hub.t_raise_needs_you("manager", {"title": "The key again", "why": "W", "what_to_do": "P",
-                                              "replaces": "N-1"})
-        # an item that another agent raised is not the manager's to replace, so that has no such word either
-        hub.q("INSERT INTO needs(id,title,why,todo,raised,by) VALUES(2,'Pick a region','For the new server.',"
+    def test_an_item_of_another_agent_gets_no_word_about_a_new_item(self):
+        """raise_needs_you is the manager's, so the words of an answer to another agent's item name no such step."""
+        hub.q("INSERT INTO needs(id,title,why,todo,raised,by) VALUES(1,'Pick a region','For the new server.',"
               "'Press one',?,'dev')", (hub.now(),))
-        self.assertEqual(self.talk("Why two regions?", nid=2)[0], 200)
-        said = hub.t_read_messages("manager", {})
-        self.assertIn("About the Needs-you item N-2 (Pick a region), which Dev raised, before the owner decides: Why two "
-                      "regions?", said)
-        self.assertNotIn("replaces", said)
-        self.assertNotIn("replaces", hub.t_discuss_need("manager", {"need": "N-2", "text": "One is the copy."}))
+        self.assertEqual(self.request("/ui/needs/1", self.command(answer="Why two regions?"))[0], 200)
+        said = hub.q1("SELECT text FROM events WHERE agent='dev' ORDER BY id DESC")["text"]
+        self.assertTrue(said.startswith("[owner] Answer to Needs-you N-1 (Pick a region): Why two regions?"), said)
+        self.assertNotIn("raise_needs_you", said)
 
-    def test_a_resent_message_is_one_message_and_an_answered_item_takes_none(self):
+    def test_discuss_is_gone_from_the_route_and_the_tools(self):
         self.raise_item()
-        body = {"request_id": str(uuid.uuid4()), "db": "test-generation", "text": "Why now?"}
-        self.assertEqual(self.request("/ui/needs/1/talk", body)[0], 200)
-        code, again = self.request("/ui/needs/1/talk", body)
-        self.assertEqual((code, again["replayed"]), (200, True))
-        self.assertEqual(len(hub.need_talk(1)), 1)
-        self.request("/ui/needs/1", self.command(answer="Later"))
-        self.assertEqual(self.talk("And now?")[0], 409)
-        with self.assertRaisesRegex(hub.ToolError, "answered already"):
-            hub.t_discuss_need("manager", {"need": "N-1", "text": "Too late."})
-        for body, code in (({"text": ""}, 400), ({"text": "x" * 2001}, 400), ({"text": "Hi", "extra": 1}, 400)):
-            with self.subTest(body=body):
-                self.assertEqual(self.request("/ui/needs/1/talk", dict({"request_id": str(uuid.uuid4()),
-                                                                         "db": "test-generation"}, **body))[0], code)
-        self.assertEqual(self.talk("Hi", nid=99)[0], 404)
+        code, _ = self.request("/ui/needs/1/talk", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                     "text": "Why now?"})
+        self.assertEqual(code, 404)
+        self.assertNotIn("discuss_need", [t[1] for t in hub.TOOLS])
+        self.assertNotIn("discuss_need", [t["name"] for t in hub.CAPP_TOOLS])
+        self.assertIsNone(self.row()["answer"])
 
-    def test_after_the_talk_the_manager_replaces_the_item_and_the_discussion_follows(self):
+    def test_a_replaced_item_takes_the_record_of_its_earlier_discussion_along(self):
         self.raise_item(options=["A", "B"])
-        self.talk("Can you add a third way?")
+        hub.q("INSERT INTO need_talk(need, ts, who, text) VALUES(1, ?, 'owner', 'Can you add a third way?')",
+              (hub.now(),))                                             # a record from before 13 November 2026
         out = hub.t_raise_needs_you("manager", {"title": "Which name now?", "why": "With the third way.",
                                                 "what_to_do": "Press one", "options": ["A", "B", "C"],
                                                 "replaces": "N-1"})
         self.assertIn("Raised N-2", out)
-        self.assertIn("Replaced by manager", self.row(1)["answer"])
+        self.assertEqual(self.row(1)["answer"], "Replaced by manager with a new item: Which name now?")
         self.assertEqual([t["text"] for t in self.item(2)["talk"]], ["Can you add a third way?"])
         self.assertEqual(hub.need_talk(1), [])
         with self.assertRaisesRegex(hub.ToolError, "closed already"):

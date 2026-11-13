@@ -954,7 +954,7 @@ class Separate(unittest.TestCase):
                          ["fleet_status", "read_task", "read_chat", "read_knowledge"])
         self.assertEqual([t["name"] for t in hub.capp_tools("act")],
                          ["fleet_status", "read_task", "read_chat", "read_knowledge", "send_message", "answer_need",
-                          "discuss_need", "control_task", "steer_task"])
+                          "control_task", "steer_task"])
         for tool in hub.CAPP_TOOLS:
             with self.subTest(tool=tool["name"]):
                 self.assertTrue(hub.device_may(*tool["route"]), tool["route"])
@@ -1667,13 +1667,8 @@ class Tools(Socket):
         self.assertEqual([r["outcome"] for r in hub.q("SELECT outcome FROM capp_receipts ORDER BY id")],
                          ["refused", "refused", "refused", "ok"])
 
-    def test_discuss_steer_and_control_say_where_they_came_from(self):
+    def test_steer_and_control_say_where_they_came_from(self):
         _, connection, act, _ = self.signed_in("act")
-        need = self.need()
-        status, _, answer = self.call(act, "discuss_need", need=need, text="Which one is cheaper?")
-        self.assertFalse(answer["result"]["isError"], answer)
-        said = hub.q1("SELECT text FROM events WHERE agent='manager' ORDER BY id DESC")["text"]
-        self.assertTrue(said.startswith(f"[owner via app:Claude] About the Needs-you item N-{need}"), said)
         task = hub.ins("INSERT INTO tasks(title,details,done_when,owner,requester,state,created,needs,attempt) "
                        "VALUES('Work','d','done','manager','manager','working',?,'none',1)", (hub.now(),))
         status, _, answer = self.call(act, "steer_task", task=task, text="Use plain words.")
@@ -1685,7 +1680,7 @@ class Tools(Socket):
         status, _, answer = self.call(act, "control_task", task=task, action="pause", note="Wait")
         self.assertFalse(answer["result"]["isError"], answer)
         self.assertEqual([r["tool"] for r in hub.q("SELECT tool FROM capp_receipts WHERE outcome='ok' ORDER BY id")],
-                         ["discuss_need", "steer_task", "control_task"])
+                         ["steer_task", "control_task"])
         self.assertEqual({r["client"] for r in hub.q("SELECT client FROM ui_controls WHERE route NOT LIKE 'connect/%'")},
                          {f"connected:{connection}"})
 

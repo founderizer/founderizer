@@ -1403,7 +1403,7 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "door_setup",        # the owner, 6 November 2026 (DevOps D24): the app keeps the door, no hand step
                "agent_remove",      # the owner, 7 November 2026: "an option to Delete an agent (after confirmation)"
                "repo_picker",       # the owner, 9 November 2026: "ok yes" to the list that gives an agent repositories
-               "need_talk",         # the owner, 9 November 2026: short Needs-you cards, Details, Discuss, ticked options
+               "need_talk",         # the owner, 9 November 2026: short Needs-you cards, Details, ticked options
                "person_scope",      # the owner, 11 November 2026: "Yes, build it" (All access, or only these)
                "history_messages",  # the owner, 12 November 2026 ("Yes, all four"): "In messages" in the search
                                     # card, from GET /ui/history?mode=messages (UI-API.md 1.128)
@@ -2077,7 +2077,6 @@ NEED_OPTION_CHARS = 120         # a short sentence on one row, not a paragraph
 NEED_TITLE_CHARS = 70
 NEED_WHY_CHARS = 240
 NEED_DETAILS_CHARS = 4000
-NEED_TALK_CHARS = 2000          # one message of the owner's discussion of an item, or of the manager's reply
 NEED_CODES = re.compile(r"(?<![A-Za-z0-9-])(?:AM|UP|OR|[CGIMNPQRT])-[0-9]+(?![0-9])")
 
 
@@ -2314,7 +2313,7 @@ def need_view(row, reads=None):
     view = dict(row, options=need_options(row), secret=need_secret(row))
     view.pop("approval", None)
     # owner feature need_talk: the long part behind Details, whether the options combine, the indexes he ticked, and
-    # his discussion of the item with the manager
+    # the record of his discussion of the item, which nothing adds to since Discuss left the apps (13 November 2026)
     keys = row.keys() if hasattr(row, "keys") else ()
     view["multi"] = bool(row["multi"]) if "multi" in keys else False
     try:
@@ -9778,7 +9777,7 @@ def t_raise_needs_you(agent, a):
                         "posts it with no notification.")
     options = check_need_options(a.get("options"))
     # owner feature need_talk: a short card, its long part behind Details, options that combine, and the item that
-    # this one takes the place of after the owner's discussion of it
+    # this one takes the place of
     details = str(a.get("details") or "").strip()
     multi = a.get("multi")
     if multi is not None and not isinstance(multi, bool):
@@ -9883,9 +9882,9 @@ def t_raise_needs_you(agent, a):
                   (unused_id("needs"), title, why, todo, now(), agent, options, qu["id"] if qu else None, door_call,
                    door_host, github_app, 1 if add_device else None, github_key, details or None,
                    1 if multi else None, door_script))
-        if old:                 # the discussion goes on under the new item, and the old one leaves Needs you
+        if old:                 # the old item leaves Needs you, and the record of an earlier discussion moves along
             q("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
-              (f"Replaced by {agent} with a new item after the owner's discussion: {title}", now(), agent, old["id"]))
+              (f"Replaced by {agent} with a new item: {title}", now(), agent, old["id"]))
             q("UPDATE need_talk SET need=? WHERE need=?", (nid, old["id"]))
     emit("owner", "notify", f"Needs you: {title}")
     ping_need(nid)                                      # owner feature push: the phone rings, also when it is closed
@@ -9922,8 +9921,8 @@ def t_raise_needs_you(agent, a):
 
 
 def need_replaced(agent, nid):
-    """The open item that raise_needs_you takes the place of (owner feature need_talk: after his discussion of it the
-    manager offers new options or new words), checked: one of this agent's that he has not answered, of a kind whose
+    """The open item that raise_needs_you takes the place of (owner feature need_talk: the manager offers new options
+    or new words), checked: one of this agent's that he has not answered, of a kind whose
     answer comes back to this agent. A key request, a door call, an App, a phone or a renewal has its own route."""
     need = q1("SELECT * FROM needs WHERE id=?", (nid,))
     if not need:
@@ -10034,68 +10033,6 @@ def open_items_line(agent, t):
     return (f" Your Needs-you items about {gref(t['goal_id'])} are still open: {named}{more}. If this result did what "
             f"one of them asks, answer its question now with what was done: the item then closes by itself, and the "
             f"owner does not do the same work again.")
-
-
-def need_talk_said(body, via=None):
-    """POST /ui/needs/<id>/talk, under LOCK: the owner's message in the discussion of one open item goes to the manager,
-    which answers it under the item (discuss_need). An item of a conversation is that person's question, so it has none.
-    via: the shown name of the connected app that sent it (capp_act), which its header says as app:<name>."""
-    need = q1("SELECT * FROM needs WHERE id=?", (body["need"],))
-    if not need:
-        raise Refusal(404, "owner request does not exist")
-    if need["answer"] is not None:
-        raise Refusal(409, "owner request is already answered")
-    if need["conversation"]:
-        raise Refusal(409, "an item of a conversation is that person's question: answer it, or ask the manager in its chat")
-    ins("INSERT INTO need_talk(need, ts, who, text) VALUES(?,?,?,?)", (need["id"], now(), "owner", body["text"]))
-    raised = "" if need["by"] == manager_name() else f", which {shown_role(need['by'])} raised"
-    emit(manager_name(), "say",
-         f"[owner{f' via {capp_via(via)}' if via else ''}] About the Needs-you item N-{need['id']} ({need['title']})"
-         f"{raised}, "
-         f"before the owner decides: "
-         f"{body['text']}\nAnswer the owner under the item with discuss_need(need=\"N-{need['id']}\", text=...), in "
-         f"plain words.{need_again(manager_name(), need)} The owner's answer to the item still comes as its own "
-         f"message.")
-    return {"need": need["id"], "talk": need_talk(need["id"])}
-
-
-def need_again(agent, need):
-    """The sentence that says how a discussion changes an open item: this agent raises it again with replaces. "" for
-    an item that raise_needs_you does not take the place of (need_replaced: another agent's, a key request, a door
-    call, an App, a phone or a key renewal), so the hub never names a call that it then refuses."""
-    try:
-        need_replaced(agent, need["id"])
-    except ToolError:
-        return ""
-    return (f" If the talk changes its options or its words, raise it again with "
-            f"raise_needs_you(replaces=\"N-{need['id']}\").")
-
-
-def t_discuss_need(agent, a):
-    """discuss_need (the manager; owner feature need_talk): one reply in the owner's discussion of an open Needs-you
-    item, which his card shows under the item while he has not decided. His messages there come to the manager."""
-    nid = parse_id(a.get("need"), "Needs-you item")
-    text = str(a.get("text") or "").strip()
-    if not text or len(text) > NEED_TALK_CHARS:
-        raise ToolError(f"text is your reply, 1 to {NEED_TALK_CHARS} characters.")
-    code = NEED_CODES.search(text)
-    if code:
-        raise ToolError(f"Say {code.group(0)} in plain words: the owner reads names and what a thing is about, never "
-                        f"a code.")
-    guard(agent, text)
-    with LOCK:
-        need = q1("SELECT * FROM needs WHERE id=?", (nid,))
-        if not need:
-            raise ToolError(f"There is no Needs-you item N-{nid}.")
-        if need["answer"] is not None:
-            raise ToolError(f"N-{nid} is answered already: {clip(need['answer'], 200)}")
-        if need["conversation"]:
-            raise ToolError(f"N-{nid} is a question of a conversation, which its person answers.")
-        ins("INSERT INTO need_talk(need, ts, who, text) VALUES(?,?,?,?)", (nid, now(), agent, text))
-        again = need_again(agent, need)
-    emit("owner", "notify", f"{shown_role(agent)} replied about: {need['title']}")
-    return (f"Your reply is under N-{nid} on the owner's card. Their next message there comes to you; their answer to "
-            f"the item comes as its own message.{again}")
 
 
 # ---------------------------------------------------------------- secret requests (owner feature secret_requests)
@@ -26960,8 +26897,10 @@ TOOLS = [
      f"sentences (at most {NEED_WHY_CHARS} characters) on what they decide and why it matters now; the reasoning, an "
      "agent's words and the facts go in details, which the card shows behind Details. When the owner may pick several "
      "of the options, set multi: they tick any of them and send them together, so never write combined options such as "
-     "\"Yes to A and C\". The owner can discuss an item before they decide: their messages come to you, and you answer "
-     "each with discuss_need; when the talk changes the options or the words, raise the item again with replaces.",
+     "\"Yes to A and C\". The owner answers with an option or in their own words, and either one closes the item. "
+     "When their words ask you something back or do not settle it, reply with a new item: its why answers what they "
+     "asked, with the options that follow from it. When an open item's options or words change, raise it again with "
+     "replaces.",
      S({"title": {"type": "string",
                   "description": f"What the owner decides, in at most {NEED_TITLE_CHARS} characters."},
         "why": {"type": "string", "description": f"One or two plain sentences, at most {NEED_WHY_CHARS} characters: "
@@ -26972,9 +26911,8 @@ TOOLS = [
         "multi": {"type": "boolean", "description": "True when the owner may tick several of the options: they send "
                   "the ones they ticked, and the words of those options, joined, are the answer."},
         "replaces": {"type": "string", "description": "An open item of yours that this one takes the place of, for "
-                     "example N-12, after the owner's discussion of it changed the options or the words: that item "
-                     "leaves Needs you, and the discussion goes on under this one. Give question_id again if it had "
-                     "one."},
+                     "example N-12, when its options or its words changed: that item leaves Needs you. Give "
+                     "question_id again if it had one."},
         "what_to_do": {"type": "string", "description": "The one thing that only the owner can do or decide now. "
                                                         "If there is none, do not raise the item."},
         "options": {"type": "array", "items": {"type": "string"},
@@ -27020,14 +26958,6 @@ TOOLS = [
                        "key the door got from the hub, for the item that makes its new key or the one that deletes "
                        "the old key. No options: the hub closes it by itself, and the hub's message gives its words."}},
        ["title", "why", "what_to_do"])),
-    ("manager", "discuss_need", t_discuss_need,
-     "Reply to the owner in their discussion of one of your open Needs-you items: their questions about it come to you "
-     "as messages before they decide, and your reply shows under the item on their card. Plain words and no codes; "
-     "answer what the owner asked, with the facts they need to decide. When the talk changes the options or the words, "
-     "raise the item again with raise_needs_you replaces.",
-     S({"need": {"type": "string", "description": "The item, for example N-12."},
-        "text": {"type": "string", "description": f"Your reply, at most {NEED_TALK_CHARS} characters."}},
-       ["need", "text"])),
     ("manager", "withdraw_need", t_withdraw_need,
      "Close an open Needs-you item that you raised and that nothing needs any more: a plan change replaced it, the "
      "fix is live, or the work found another route. It leaves the owner's Needs you with no notification, and why "
@@ -41567,15 +41497,17 @@ def task_steer_act(task_id, body, client, via=None, connection=None):
                                    "WHERE s.id=?", (sid,)))}
 
 
-def need_talk_read(need_id, data):
-    """The body of POST /ui/needs/<id>/talk (owner feature need_talk), for need_talk_said. ValueError."""
-    extra = sorted(set(data) - {"request_id", "db", "text"})
-    if extra:
-        raise ValueError(f"unknown field {extra[0]}")
-    text = data.get("text")
-    if not isinstance(text, str) or not text.strip() or len(text.strip()) > NEED_TALK_CHARS:
-        raise ValueError(f"text is the owner's message, 1 to {NEED_TALK_CHARS} characters")
-    return {"need": need_id, "text": text.strip()}
+def need_words_note(need, choice, ticked):
+    """The hub's words after an answer that the owner typed to a Needs-you item of the manager's: their own words are
+    also their one reply on the card (the owner, 13 November 2026: "lets use the free-type text input as the general
+    reply too, so we can remove the discuss option completely"). The words close the item as every answer does, so a
+    question back gets its reply as a new item, where the owner answered. "" for an option, ticked options, a person's
+    question and an item of another agent."""
+    if need is None or choice is not None or ticked is not None or need["conversation"] or \
+            need["by"] != manager_name():
+        return ""
+    return (" The owner wrote this in their own words. If it asks you something back or does not settle the item, "
+            "reply with a new item (raise_needs_you) whose why answers what they asked.")
 
 
 def phone_submit(data, client, need_id=None, address=None, connection=None):
@@ -41784,7 +41716,8 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
             else:
                 event_id = owner_message_rows(request_id, kind, need, value, client, recipient, replaces, created,
                                               files=rows, chosen=None if ticked is not None else choice,
-                                              device=device, connection=connection)
+                                              device=device, connection=connection,
+                                              note=need_words_note(need, choice, ticked))
                 if ticked is not None and need is not None:
                     DB.execute("UPDATE needs SET chose=? WHERE id=?", (json.dumps(ticked), need["id"]))
                 if yes is not None:
@@ -41887,12 +41820,6 @@ CAPP_TOOLS = (
                                  "choice": {"type": "integer"},
                                  "choices": {"type": "array", "items": {"type": "integer"}}}, ("need",)),
      "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False}},
-    {"name": "discuss_need", "level": "act", "route": ("/ui/needs/1/talk", "POST"),
-     "description": "Ask about one open Needs-you item before the owner decides: the words go to the manager, which "
-                    "answers under the item. The item stays open.",
-     "inputSchema": capp_schema({"need": {"type": ["integer", "string"]}, "text": {"type": "string"}},
-                                ("need", "text")),
-     "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False}},
     {"name": "control_task", "level": "act", "route": ("/ui/tasks/1/control", "POST"),
      "description": "Pause, stop or resume one task as the owner. action: pause, stop, resume, or resume_check (it "
                     "goes on after a check). note: why, for the agent.",
@@ -41972,12 +41899,6 @@ def capp_act(connection, tool, args):
                                                f"person's question"})
         data = {"request_id": request_id, "db": db, given[0]: args[given[0]]}
         return request_id, phone_submit(data, client, need_id, None, who)
-    if tool == "discuss_need":
-        need_id = capp_need_arg(args.get("need"))
-        body = need_talk_read(need_id, {"request_id": request_id, "db": db,
-                                        "text": capp_text_arg(args, "text", NEED_TALK_CHARS)})
-        return request_id, command_run(f"needs/{need_id}/talk", request_id, client, db, body,
-                                       lambda b: need_talk_said(b, via=who["name"]))
     if tool == "control_task":
         task_id = capp_task_arg(args.get("task"))
         body = task_control_read(task_id, {"action": args.get("action"), "note": args.get("note", "")})
@@ -45147,16 +45068,6 @@ class Handler(BaseHTTPRequestHandler):
                     "fingerprints": [{k: x[k] for k in ("kind", "hash", "len")} for x in prints]}
         return self.ui_command("secrets/add", read, save_secret)
 
-    def ui_need_talk(self, need_id):
-        """POST /ui/needs/<id>/talk (owner feature need_talk): the owner's message in the discussion of one open item,
-        apart from his answer. The owner, 9 November 2026: "apart from Your Answer, do you think there should be a way to
-        clarify some points and have a conversation with the agent?" It goes to the manager, which replies under the
-        item (discuss_need), and the item stays open until he answers it."""
-        def read(data):
-            self.only(data, ("text",))      # need_talk_read checks the same; here the self-test reads the fields
-            return need_talk_read(need_id, data)
-        return self.ui_command(f"needs/{need_id}/talk", read, need_talk_said)
-
     def ui_need_secret(self, need_id):
         """POST /ui/needs/<id>/secret (owner feature secret_requests): the answer of one request_secret, from the app's
         secure form once the value is in the vault and registered: login, the reference of the secret that answers
@@ -47711,8 +47622,6 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_submit(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["ui", "needs"] and parts[3] == "secret" and re.fullmatch(r"[1-9][0-9]{0,17}", parts[2]):
             return self.ui_need_secret(int(parts[2]))
-        if len(parts) == 4 and parts[:2] == ["ui", "needs"] and parts[3] == "talk" and re.fullmatch(r"[1-9][0-9]{0,17}", parts[2]):
-            return self.ui_need_talk(int(parts[2]))          # owner feature need_talk
         if len(parts) == 4 and parts[:2] == ["ui", "tasks"] and parts[3] == "control" and re.fullmatch(r"[1-9][0-9]*", parts[2]):
             return self.ui_control(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["ui", "tasks"] and parts[3] == "steer" and re.fullmatch(r"[1-9][0-9]*", parts[2]):

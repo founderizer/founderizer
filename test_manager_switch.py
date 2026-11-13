@@ -352,7 +352,9 @@ class ManagerSwitch(OwnerAPI):
         # message that has its answer. Each report is about the owner's message that it names: none takes the turn.
         notice = hub.emit("manager", "say", "[hub] Result for T-12: completed.")
         other = self.need()
-        self.assertEqual(self.request(f"/ui/needs/{other}/talk", self.command(text="Why this one?"))[0], 200)
+        # a word of the discussion that the apps had until 13 November 2026, as the records keep it
+        hub.emit("manager", "say", f"[owner] About the Needs-you item N-{other} (Which one?), before the owner "
+                                   f"decides: Why this one?")
         board = self.need()
         code, _ = self.request(f"/needs/{board}", {"answer": "Yes, do it."}, headers={
             "Content-Type": "application/json", "Accept": "application/json"})
