@@ -4345,15 +4345,19 @@ def chat_late(name, t0):
     The hub holds the proof of a delivery, the session's read, so the hub says when it does not come, by its own
     clock and from its own records, with no word of the helper's: on 13 November 2026 an owner's message stood under
     "Thinking" for seven minutes while its helper, which polled all the time, wrote "inbox signal gone" 190 times
-    to its own log. The message is the one under which the apps' waiting line stands (chat_waits_since). It is late
-    CHAT_LATE seconds after it came with no read, and CHAT_LATE seconds after its read with no reply; never while a
-    usage limit holds the agent, when the apps say "Usage limit", and never counted from before the last one ended."""
-    sent = chat_waits_since(name)
-    if sent is None or active_limit(name):
+    to its own log. The message is late CHAT_LATE seconds after it came with no read, and CHAT_LATE seconds after
+    its read with no reply; never while a usage limit holds the agent, when the apps say "Usage limit", and never
+    counted from before the last one ended. A reply is a report of the agent that names the message, which is what
+    the helper's poll gives the message for (Handler.events) and what read_messages gives it again for: a report
+    with no such name at or after it does not end the wait here, as it ends the apps' own line (chat_waits_since),
+    so a chat that said a first word and then opened no task is late too."""
+    e = q1("SELECT e.id, e.read_at, u.created, u.request_id FROM ui_requests u JOIN events e ON e.id=u.event_id "
+           "WHERE u.recipient=? AND u.kind='message' AND e.kind='chat' ORDER BY u.created DESC, u.rowid DESC LIMIT 1",
+           (name,))
+    if not e or active_limit(name) or \
+            q1("SELECT 1 FROM owner_reports WHERE agent=? AND in_reply_to=? LIMIT 1", (name, e["request_id"])):
         return None
-    e = q1("SELECT e.id, e.read_at FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE u.recipient=? AND "
-           "u.kind='message' AND e.kind='chat' ORDER BY u.created DESC, u.rowid DESC LIMIT 1", (name,))
-    return e["id"] if e and t0 - max(e["read_at"] or sent, limit_ended(name)) >= CHAT_LATE else None
+    return e["id"] if t0 - max(e["read_at"] or e["created"], limit_ended(name)) >= CHAT_LATE else None
 
 
 def chat_late_sweep(t0):
