@@ -1868,16 +1868,14 @@ def central_install(owner_key, hub_user="fleet", fleet=None, kit=None, run=None,
 
 def tailscale_argv(what, target=CONNECT_TARGET):
     """The Tailscale commands of this step, with their exact arguments. what: status, serve-status, funnel-on,
-    funnel-off or funnel-status. The funnel forms are those of the CLI since Tailscale 1.52; on the hub's own version
-    they are not confirmed (the build specification, section 7), so each is marked where it is."""
+    funnel-off or funnel-status. The funnel forms are those of the CLI since Tailscale 1.52. A real Funnel took each
+    of them with Tailscale 1.104.7 on 13 November 2026: on, off, and `funnel status --json`, which prints the serve
+    config, also for a user that is not root."""
     return {
         "status": ["tailscale", "status", "--json"],
         "serve-status": ["tailscale", "serve", "status", "--json"],
-        # Not confirmed on the hub's Tailscale version: --bg, --yes and --https=<port> (the CLI changed in 1.52).
         "funnel-on": ["tailscale", "funnel", "--bg", "--yes", f"--https={CONNECT_HTTPS}", target],
-        # Not confirmed on the hub's Tailscale version: `off` after the flags of the port, with no target.
         "funnel-off": ["tailscale", "funnel", f"--https={CONNECT_HTTPS}", "off"],
-        # Not confirmed on the hub's Tailscale version: --json of `funnel status`, and that it is the serve config.
         "funnel-status": ["tailscale", "funnel", "status", "--json"],
     }[what]
 
@@ -1962,13 +1960,37 @@ def _json_of(run, what, empty=None):
     return value
 
 
-def tailnet_name(run):
-    """This machine's full name on the private network (Self.DNSName of `tailscale status --json`): the name of the
-    public address."""
-    name = str((_json_of(run, "status").get("Self") or {}).get("DNSName") or "").rstrip(".").lower()
+CONNECT_FUNNEL_TIME = 60            # seconds for `tailscale funnel` to turn Funnel on: it waits for ever without the right
+# What stops `connect on` before it changes anything, when the private network does not let this machine publish.
+# The owner's app reads these words (the Mac app's ConnectGate), so a change here is a change there.
+CONNECT_NO_FUNNEL = ("the policy of the private network does not give this machine the funnel attribute, so Tailscale "
+                     "Funnel cannot publish the address. Nothing was changed.")
+CONNECT_NO_HTTPS = ("HTTPS certificates are off for the private network, so Tailscale Funnel cannot publish the "
+                    "address. Nothing was changed.")
+CONNECT_FUNNEL_WAITS = (f"Tailscale did not turn Funnel on in {CONNECT_FUNNEL_TIME} seconds: the private network does "
+                        f"not let this machine publish the address yet.")
+
+
+def tailnet_self(run):
+    """(this machine's full name on the private network, its rights) from one `tailscale status --json`. The name is
+    Self.DNSName, the name of the public address. The rights are the names of Self.CapMap and Self.Capabilities,
+    where the network says what this machine may do ("funnel", "https"), or None when the status has neither field
+    (an older Tailscale): then nothing is known, and nothing is refused on it."""
+    me = _json_of(run, "status").get("Self") or {}
+    name = str(me.get("DNSName") or "").rstrip(".").lower()
     if not hub.HOST_NAME.fullmatch(name) or "." not in name:
         raise Stop("Tailscale gives this machine no full DNS name: turn on MagicDNS for the private network.")
-    return name
+    caps, old = me.get("CapMap"), me.get("Capabilities")
+    if not isinstance(caps, dict) and not isinstance(old, list):
+        return name, None
+    return name, {str(c) for c in (caps if isinstance(caps, dict) else {})} | \
+        {str(c) for c in (old if isinstance(old, list) else [])}
+
+
+def connect_right(rights, what):
+    """True when the network gives this machine the right `what` ("funnel" or "https"), by its short name or by the
+    older address form (https://tailscale.com/cap/funnel)."""
+    return what in rights or f"https://tailscale.com/cap/{what}" in rights
 
 
 def serve_configs(conf):
@@ -2037,20 +2059,27 @@ def connect_in_place(conf, name):
 
 def connect_on(hub_user="fleet", kit=None, run=None, read=None, account=None):
     """`connect on`, as root on the hub's Linux machine (the build specification of the remote MCP address, section
-    7, step 2). First the checks that change nothing: the machine's name, and port 443, which may hold no other
-    Funnel or Serve target. Then each part, read first: the user and group founderizer-connect, the folder of the
-    hub's socket, gate.py in /usr/local/lib/founderizer-connect/, the unit and its service, and Funnel. Returns
-    {"name", "address", "state": "made"|"there"}."""
+    7, step 2). First the checks that change nothing: the machine's name, port 443, which may hold no other Funnel or
+    Serve target, and the two rights that the private network must give this machine, Funnel and HTTPS
+    certificates. Without them `tailscale funnel` prints a link and waits for ever (a real Funnel test, 13 November
+    2026), so the run stops here with the reason, and no part is made. Then each part, read first: the user and
+    group founderizer-connect, the folder of the hub's socket, gate.py in /usr/local/lib/founderizer-connect/, the
+    unit and its service, and Funnel. Returns {"name", "address", "state": "made"|"there"}."""
     run = run or _shell
     read = read or (lambda path: pathlib.Path(path).read_text(encoding="utf-8"))
     kit = kit or KIT
     (account or hub_account)(hub_user)
-    name = tailnet_name(run)
+    name, rights = tailnet_self(run)
     conf = _json_of(run, "serve-status", empty={})
     other = connect_conflicts(conf)
     if other:
         raise Stop(f"this machine's Tailscale already publishes {other[0]}, so the connect gate is not put in place. "
                    f"Nothing was changed.")
+    if rights is not None and not connect_in_place(conf, name):
+        if not connect_right(rights, "funnel"):
+            raise Stop(CONNECT_NO_FUNNEL)
+        if not connect_right(rights, "https"):
+            raise Stop(CONNECT_NO_HTTPS)
     try:
         program = hashlib.sha256(pathlib.Path(kit, "gate.py").read_bytes()).hexdigest()
     except OSError:
@@ -2136,7 +2165,11 @@ def connect_on(hub_user="fleet", kit=None, run=None, read=None, account=None):
     if connect_in_place(conf, name):
         say(f"Funnel publishes https://{name} to the gate already")
     else:
-        step(shlex.join(tailscale_argv("funnel-on")), "Tailscale Funnel on port 443", timeout=60)
+        try:
+            step(shlex.join(tailscale_argv("funnel-on")), "Tailscale Funnel on port 443", timeout=CONNECT_FUNNEL_TIME)
+        except subprocess.TimeoutExpired:
+            # a status that names no rights (an older Tailscale), or a right that went after the check above
+            raise Stop(CONNECT_FUNNEL_WAITS) from None
         made = True
         say(f"Funnel publishes https://{name} to the gate")
     if not connect_in_place(_json_of(run, "funnel-status", empty={}), name):

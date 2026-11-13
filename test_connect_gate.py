@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import select
 import shlex
+import subprocess
 import shutil
 import socket
 import socketserver
@@ -374,7 +375,13 @@ OURS = {"TCP": {"443": {"HTTPS": True}}, "Web": {f"{N}:443": {"Handlers": {"/": 
 
 class Box:
     """A stand-in for root's shell on the hub's machine: what ran, and the state it changed."""
-    def __init__(self, conf=None, user="", funnel_works=True):
+    # The rights of a machine that may publish, as a real `tailscale status --json` named them (Tailscale 1.104.7).
+    RIGHTS = ("funnel", "https", "https://tailscale.com/cap/funnel-ports?ports=443,8443,10000",
+              "https://tailscale.com/cap/ssh")
+
+    def __init__(self, conf=None, user="", funnel_works=True, rights=RIGHTS, old_rights=None, funnel_waits=False):
+        # rights: the names of Self.CapMap, or None for a status with no CapMap; old_rights: Self.Capabilities
+        self.rights, self.old_rights, self.funnel_waits = rights, old_rights, funnel_waits
         self.ran, self.files, self.conf = [], {}, json.loads(json.dumps(conf or {}))
         self.holds = True               # False: the gate is not active after its start
         self.state = {"user": user, "folder": "", "program": "", "started": "", "active": "inactive",
@@ -384,7 +391,12 @@ class Box:
     def run(self, script, timeout=120):
         self.ran.append(script)
         if script == "tailscale status --json":
-            return 0, json.dumps({"Self": {"DNSName": N.upper() + "."}}), ""
+            me = {"DNSName": N.upper() + "."}
+            if self.rights is not None:
+                me["CapMap"] = {r: None for r in self.rights}
+            if self.old_rights is not None:
+                me["Capabilities"] = list(self.old_rights)
+            return 0, json.dumps({"Self": me}), ""
         if script in ("tailscale serve status --json", "tailscale funnel status --json"):
             return 0, json.dumps(self.conf) if self.conf else "", ""
         if script.startswith("echo user="):
@@ -405,6 +417,8 @@ class Box:
         if "systemctl disable --now" in script:
             self.state.update(active="inactive", enabled="disabled")
         if script.startswith("tailscale funnel --bg"):
+            if self.funnel_waits:           # the real command prints a link and waits for the right
+                raise subprocess.TimeoutExpired(script, timeout)
             if not self.funnel_works:
                 return 1, "", "Funnel is not enabled on your tailnet."
             self.conf = json.loads(json.dumps(OURS))
@@ -570,6 +584,51 @@ class ConnectStep(unittest.TestCase):
         with self.assertRaises(hubsetup.Stop) as e:
             self.on(box)
         self.assertIn("Funnel is not enabled", str(e.exception))
+
+    def test_a_machine_that_may_not_publish_stops_the_step_before_any_change(self):
+        """`tailscale funnel` prints a link and waits for ever on a machine with no funnel attribute, or in a network
+        with no HTTPS certificates (a real Funnel test, 13 November 2026). So the step reads the machine's rights
+        first, and no part is made."""
+        only_ports = ("https", "https://tailscale.com/cap/funnel-ports?ports=443,8443,10000")
+        for rights, old_rights, words in ((only_ports, None, hubsetup.CONNECT_NO_FUNNEL),
+                                          (("https",), [], hubsetup.CONNECT_NO_FUNNEL),
+                                          ((), None, hubsetup.CONNECT_NO_FUNNEL),
+                                          (None, ["https://tailscale.com/cap/https"], hubsetup.CONNECT_NO_FUNNEL),
+                                          (("funnel",), None, hubsetup.CONNECT_NO_HTTPS),
+                                          (None, ["https://tailscale.com/cap/funnel"], hubsetup.CONNECT_NO_HTTPS)):
+            with self.subTest(rights=rights, old_rights=old_rights):
+                box = Box(rights=rights, old_rights=old_rights)
+                with self.assertRaises(hubsetup.Stop) as e:
+                    self.on(box)
+                self.assertEqual(str(e.exception), words)
+                self.assertIn("Nothing was changed.", words)
+                self.assertEqual(box.changes(), [])
+        # the rights by their older names, and the real names with others beside them: the step runs
+        for rights, old_rights in ((None, ["https://tailscale.com/cap/funnel", "https://tailscale.com/cap/https"]),
+                                   (Box.RIGHTS, None)):
+            with self.subTest(rights=rights, old_rights=old_rights):
+                self.assertEqual(self.on(Box(rights=rights, old_rights=old_rights))["state"], "made")
+        # a Funnel that stands is not asked about again: a second run of a working gate changes nothing
+        box = Box(conf=OURS, rights=("https",))
+        self.on(box)
+        self.assertNotIn("tailscale funnel --bg --yes --https=443 http://127.0.0.1:8767", box.changes())
+
+    def test_a_status_that_names_no_rights_goes_on_and_a_funnel_command_that_waits_is_a_stop_with_its_reason(self):
+        self.assertEqual(self.on(Box(rights=None))["state"], "made")        # an older Tailscale: nothing is refused
+        box = Box(rights=None, funnel_waits=True)
+        with self.assertRaises(hubsetup.Stop) as e:
+            self.on(box)
+        self.assertEqual(str(e.exception), hubsetup.CONNECT_FUNNEL_WAITS)
+        self.assertIn("60 seconds", hubsetup.CONNECT_FUNNEL_WAITS)
+        self.assertEqual(hubsetup.CONNECT_FUNNEL_TIME, 60)
+        # the gate's parts are there by then, so the next run after the policy change only turns Funnel on
+        on = "tailscale funnel --bg --yes --https=443 http://127.0.0.1:8767"
+        self.assertEqual(box.changes().count(on), 1)
+        self.assertEqual(box.state["active"], "active")
+        box.funnel_waits = False
+        before = len(box.changes())
+        self.assertEqual(self.on(box)["state"], "made")
+        self.assertEqual(box.changes()[before:], [on])
 
     def test_off(self):
         box = Box()
