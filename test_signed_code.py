@@ -35,7 +35,7 @@ import server
 import vault
 from test_hub_install import run_shell, shell_function
 from test_ui_api import OwnerAPI
-from test_vault import AGENT_KEY, OWNER, STUDIO_KEY, VaultBroker, owner_pin
+from test_vault import AGENT_KEY, OWNER, REF, STUDIO_KEY, VaultBroker, owner_pin
 
 KIT = Path(__file__).resolve().parent
 SEED = bytes(range(160, 192))           # this file's release key: the real one lives only on the website host
@@ -676,13 +676,48 @@ class HandoverRecipients(VaultBroker):
         self.assertEqual((raw["to"], self.opens(raw["ciphertext"], "studio")["password"]),
                          ("studio", "FakeOnlyPassword-987654321"))
 
+    def broken_in_hub(self):
+        """The hub's own rule taken away, as a hub that is broken into would: it names the key of team.json, pinned or
+        not. The broker's check is then the only one that is left."""
+        return patch.object(hub, "handover_key", lambda name: (hub.agents().get(name) or {}).get("vault_recipient"))
+
     def test_a_key_the_hub_names_in_place_of_the_pinned_one_is_refused(self):
         hub.TEAM["agents"]["studio"]["vault_recipient"] = AGENT_KEY         # a forged team.json
-        self.refused("the owner's pin names another key")
+        self.refused("has no vault broker with a pinned handover key")    # the hub's own rule refuses it first
+        self.assertIsNone(hub.handover_key("studio"))
+        with self.broken_in_hub():
+            self.refused("the owner's pin names another key")
 
     def test_a_machine_with_no_pin_of_the_owner_gets_nothing(self):
         hub.kv_set("owner_pin:studio", None)
-        self.refused("the owner has signed no pin")
+        self.refused("has no vault broker with a pinned handover key")
+        with self.broken_in_hub():
+            self.refused("the owner has signed no pin")
+
+    def test_hand_over_says_why_nothing_can_be_locked_for_the_receiver(self):
+        """One sentence for each reason of the hub's own rule (hub.handover_unpinned), and a damaged kept row is no pin
+        and stops nothing."""
+        def says():
+            with self.assertRaises(hub.ToolError) as caught:
+                hub.t_hand_over("vps", {"task_id": f"T-{self.task}", "login": REF, "to": "studio"})
+            return str(caught.exception)
+        hub.kv_set("owner_pin:studio", None)
+        self.assertIn("The owner has not pinned the vault key of", says())
+        hub.kv_set("owner_pin:studio", "not json at all")
+        self.assertIn("The owner has not pinned the vault key of", says())
+        hub.kv_set("owner_pin:studio", json.dumps(owner_pin("studio", AGENT_KEY)))
+        self.assertIn("names another key than its vault's", says())
+        hub.kv_set("owner_pin:studio", None)
+        machine = hub.TEAM["agents"]["studio"]["machine"]
+        with patch.object(hub, "deposit_machines", return_value={machine: {"carrier": "studio"}}):
+            self.assertIn("The owner's Founderizer app pins it by itself.", says())
+        with patch.object(hub, "deposit_machines", return_value={machine: {"carrier": None}}):   # no delivery can go there
+            self.assertIn("once that server's vault can take deliveries, and it cannot now", says())
+        with patch.object(hub, "deposit_machines", return_value={}):         # a machine with no worker or lead
+            self.assertIn("pins only the servers that have a worker or a lead", says())
+        hub.kv_set("owner_pin:studio", json.dumps(owner_pin("studio", STUDIO_KEY)))
+        hub.TEAM["agents"]["studio"].pop("vault_recipient")
+        self.assertIn("has no key with the hub yet", says())
 
     def test_a_pin_that_another_key_signed_is_refused(self):
         stranger = owner_pin("studio", STUDIO_KEY, d=12345678901234567890)

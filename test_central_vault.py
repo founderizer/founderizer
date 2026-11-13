@@ -356,14 +356,29 @@ class Central(WithCentral, OwnerAPI):
         machines = {m["machine"]: m for m in view["machines"]}
         self.assertEqual(sorted(machines), ["studio", "vps", "w4"])
         for m in machines.values():
-            self.assertEqual(set(m), {"machine", "carrier", "broker_recipient", "pinned", "matches", "missing"})
+            self.assertEqual(set(m), {"machine", "carrier", "broker_recipient", "pinned", "matches", "missing",
+                                      "kept_pin_at"})
         self.assertEqual(machines["vps"], {"machine": "vps", "carrier": "vps", "broker_recipient": STORE_A,
-                                           "pinned": None, "matches": False, "missing": []})
+                                           "pinned": None, "matches": False, "missing": [], "kept_pin_at": None})
         self.assertEqual(machines["w4"]["missing"], ["no_broker_access"])
         self.assertEqual(view["held"], {"studio": [], "vps": [], "w4": []})
         self.assertEqual(self.request("/ui/vault?db=other")[0], 409)
         self.assertEqual(self.request("/ui/vault")[0], 409)
         self.assertEqual(self.vault.requests, [])           # a read of the page asks the central vault nothing
+
+    def test_the_vault_page_says_when_the_kept_pin_of_each_machine_was_signed(self):
+        """kept_pin_at: the time of the pin that the hub keeps of a machine (owner_pin), which the owner's app signs
+        again when it is missing or 7 days old (feature kept_pins). None while it keeps none."""
+        fleet = hub.fleet_id()
+        pin = statement(kind="pin", fleet=fleet, machine="vps", recipient=STORE_A)
+        self.assertEqual(self.signed("/ui/vault/pin", pin)[0], 200)
+        machines = {m["machine"]: m for m in self.view()["machines"]}
+        self.assertEqual(machines["vps"]["kept_pin_at"], json.loads(pin)["at"])
+        self.assertIsNone(machines["studio"]["kept_pin_at"])
+        for damaged in (json.dumps({"statement": "not json", "signature": SIGNATURE}), "not json at all", "[]"):
+            hub.kv_set("owner_pin:vps", damaged)                   # a damaged row is no pin and stops no page
+            self.assertIsNone({m["machine"]: m for m in self.view()["machines"]}["vps"]["kept_pin_at"])
+        self.assertIn("kept_pins", hub.ui_features())
 
     def test_the_vault_page_says_which_machine_is_pinned_and_which_is_not(self):
         self.vault.pins = {"vps": STORE_A, "studio": OTHER}

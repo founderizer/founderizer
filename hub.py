@@ -1379,6 +1379,7 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
                "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
                "signed_grants", "agent_rename", "agent_memory", "live_changes",
+               "kept_pins",         # GET /ui/vault names when each machine's kept pin was signed (kept_pin_at)
                "settings", "standing", "history", "costs",
                "server_names",      # the owner, 30 October 2026: a server's name is its name in Tailscale
                "mac_setup",         # the owner, 31 October 2026: one sitting at a new Mac
@@ -8980,11 +8981,18 @@ def fingerprint_salt(label):
 
 
 def handover_key(name):
-    """The public key that locks a handover for this agent: the pinned key of its vault broker (team.json), or the
-    key that its helper registered."""
+    """The public key that locks a handover for this agent: for an agent with broker access, the key of its vault
+    broker (team.json `vault_recipient`) only when the owner's kept pin of its machine names that same key; else the key
+    that its helper registered.
+
+    The first key of a machine comes from its own helper's report at its first broker grant (`offered_store`), and a
+    helper runs as the agents' user, so an agent could have reported a key of its own. The owner's app pins a key only
+    after it read it itself (as root on a Linux server), so the kept pin, which the central vault took as the owner's
+    signed statement (`central_statement`), is what a handover may trust: no pin, no handover, also when the giving
+    broker does not check pins itself (a Mac's vault without the owner's keys)."""
     conf = agents().get(name) or {}
     if conf.get("vault") == "broker":
-        return conf.get("vault_recipient")
+        return conf.get("vault_recipient") if handover_unpinned(name) is None else None
     if conf.get("vault") == "none":
         return None                     # owner API 1.12: no credential access, so nothing is locked for it
     row = q1("SELECT pubkey FROM agents WHERE name=?", (name,))
@@ -9681,6 +9689,8 @@ def t_hand_over(agent, a):
     if agents()[to].get("vault") == "none":
         raise ToolError(f"{to} has no credential access, so it could not use this login.")
     if not handover_key(to):
+        if agents()[to].get("vault") == "broker":
+            raise ToolError(handover_unpinned(to) or f"Nothing can be locked for {to} now.")
         raise ToolError(f"{to} has no key with the hub yet, so nothing can be locked for it. "
                         f"Its helper must be running with age installed.")
     return helper_job(agent, tid, "handover", a.get("login"), to)
@@ -11580,8 +11590,11 @@ def vault_view(t0=None):
         missing = list(m["missing"])
         if status is not None:
             missing += ["not_pinned"] if not pinned else ["pin_mismatch"] if pinned != key else []
+        # When the owner's app signed the pin that the hub keeps of this machine (owner_pin), or None when it keeps
+        # none: the app signs a trusted machine's pin again when it is missing or old (feature kept_pins).
         machines.append({"machine": name, "carrier": m["carrier"], "broker_recipient": key, "pinned": pinned,
-                         "matches": pinned is not None and pinned == key, "missing": missing})
+                         "matches": pinned is not None and pinned == key, "missing": missing,
+                         "kept_pin_at": pin_at(machine_pin(name))})
     held = dict({m["machine"]: [] for m in machines}, **central_held(None if status is None else pins))
     own = (TEAM.get("hub") or {}).get("machine")
     ways = (TEAM.get("access") or {}).get(own) or {}
@@ -11669,12 +11682,68 @@ def central_statement(body):
     return answer
 
 
+def handover_unpinned(name):
+    """Why nothing may be locked for this broker agent now, in one sentence for its `hand_over` refusal, or None: it
+    has a vault key with the hub, and the owner's kept pin of its machine names that key."""
+    conf = agents().get(name) or {}
+    recipient, pin = conf.get("vault_recipient"), owner_pin(name)
+    who = f"{shown_role(name)}'s server"
+    if not recipient:
+        return f"The vault of {who} has no key with the hub yet, so nothing can be locked for it."
+    if pin_said(pin) is None:
+        entry = deposit_machines(None).get(conf.get("machine"))     # the machines of the vault page, which the app pins
+        if entry is None:
+            return (f"The owner has not pinned the vault key of {who}, so nothing can be locked for it. The owner's "
+                    f"Founderizer app pins only the servers that have a worker or a lead.")
+        if not entry["carrier"]:
+            return (f"The owner has not pinned the vault key of {who} yet, so nothing can be locked for it. The owner's "
+                    f"Founderizer app pins it by itself once that server's vault can take deliveries, and it cannot now.")
+        return (f"The owner has not pinned the vault key of {who} yet, so nothing can be locked for it. The owner's "
+                f"Founderizer app pins it by itself.")
+    if pin_recipient(pin) != recipient:
+        return (f"The owner's pin of {who} names another key than its vault's, so nothing is locked for it. The owner "
+                f"looks at that server first.")
+    return None
+
+
+def pin_said(pin):
+    """The fields of a kept pin's statement ({v, kind, fleet, machine, recipient, at}), or None for anything else."""
+    try:
+        said = json.loads(pin["statement"]) if isinstance(pin, dict) and isinstance(pin.get("statement"), str) else None
+    except ValueError:
+        said = None
+    return said if isinstance(said, dict) and said.get("kind") == "pin" else None
+
+
+def pin_recipient(pin):
+    """The key that a kept pin names, or None."""
+    said = pin_said(pin)
+    return said.get("recipient") if said and isinstance(said.get("recipient"), str) else None
+
+
+def pin_at(pin):
+    """The time that a kept pin names (when the owner's app signed it), or None."""
+    said = pin_said(pin)
+    at = said.get("at") if said else None
+    return at if isinstance(at, int) and not isinstance(at, bool) else None
+
+
+def machine_pin(machine):
+    """The owner's kept pin of one machine, {statement, signature}, or None: also for a damaged row, which never stops
+    the vault page or a handover check."""
+    kept = kv_get(f"owner_pin:{machine}")
+    try:
+        pin = json.loads(kept) if kept else None
+    except ValueError:
+        return None
+    return pin if isinstance(pin, dict) else None
+
+
 def owner_pin(agent):
     """The owner's signed pin of the machine of this agent, {statement, signature} as the app sent it and the central
     vault took it, or None: what a giving broker checks a handover's recipient with (vault.owner_pinned)."""
     machine = (agents().get(agent) or {}).get("machine")
-    kept = kv_get(f"owner_pin:{machine}") if machine else None
-    return json.loads(kept) if kept else None
+    return machine_pin(machine) if machine else None
 
 
 def withdrawal_waiting(wid, agent):
