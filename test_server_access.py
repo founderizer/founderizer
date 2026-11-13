@@ -1475,16 +1475,29 @@ class DoorCalls(Access):
             self.assertEqual(asked, [])                         # not signed for the door: nothing is asked
             self.assertEqual(hub.door_sealed(DOOR)["keep"], [])
             status["grants"] = [{"login": self.ref, "agent": "door", "machine": "door"}]
-            with patch.object(hub, "central_sealed", lambda answer, ref, machine, pin: "armored"), \
-                    patch.object(hub, "door_deliver", lambda ref, text: 41):
+            # The time BEFORE the seal goes with the copy: door_deliver keeps no copy that was sealed before a
+            # replace, and a time from after the seal would not see a replace between the seal and the write. The
+            # clock here goes one second on at each reading, so the seal has a later time than the reading before it.
+            times, sealed, clock = [], [], iter(range(1, 1000))
+            start = hub.now()
+
+            def seal(answer, ref, machine, pin):
+                sealed.append(hub.now())
+                return "armored"
+            with patch.object(hub, "now", lambda: start + next(clock)), patch.object(hub, "central_sealed", seal), \
+                    patch.object(hub, "door_deliver", lambda ref, text, t0=None: times.append(t0) or 41):
                 self.assertEqual(hub.door_reconcile(), [41])
+            self.assertTrue(len(times) == 1 and start < times[0] < sealed[0], (times, sealed))
             self.assertEqual(asked, [("seal", {"login": self.ref, "machine": "door"})])
+            with patch.object(hub, "central_sealed", lambda answer, ref, machine, pin: "armored"), \
+                    patch.object(hub, "door_deliver", lambda ref, text, t0=None: None):
+                self.assertEqual(hub.door_reconcile(), [])      # a copy that was not kept is no copy
             self.assertEqual(hub.door_sealed(DOOR)["keep"], [self.ref])
             hub.q("INSERT INTO door_copies(login,sealed,created) VALUES(?,?,?)", (self.ref, "old", hub.now() - 8 * 86400))
             hub.q("INSERT INTO door_copies(login,sealed,created) VALUES(?,?,?)",
                   ("bws://00000002-0000-4000-8000-000000000000", "gone", hub.now()))
             with patch.object(hub, "central_sealed", lambda answer, ref, machine, pin: "armored"), \
-                    patch.object(hub, "door_deliver", lambda ref, text: 42):
+                    patch.object(hub, "door_deliver", lambda ref, text, t0=None: 42):
                 hub.door_reconcile()
             self.assertEqual(hub.q1("SELECT COUNT(*) n FROM door_copies")["n"], 0)
         with patch.dict(hub.CENTRAL, status=None):

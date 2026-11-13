@@ -36,7 +36,8 @@ names them, and the broker reads each value and registers its fingerprints befor
 A Linux broker also takes a key or a login that the owner typed into Founderizer on his Mac (deposit): the central
 vault seals the value to this broker's pinned key, for a grant that the owner signed, the hub carries the sealed copy,
 and the broker opens it, has the hub compare the value's fingerprints with the owner's, and saves it under the same
-reference.
+reference. When the owner replaced the value of that reference (the central vault's signed replace), the hub says so
+with the delivery, and the broker puts the new value in the place of the one that an earlier delivery saved.
 
 A Linux broker also gives such a delivered secret back (withdraw) when no agent of its machine holds it any more: the
 hub names the reference for one confirmed job, and the broker removes the item only when its store says that the
@@ -54,7 +55,8 @@ owner's keys in its own configuration show that he signed a pin of the receiving
 
 With `"central": true` in its configuration, the same program is the fleet's **central vault** on the hub's server:
 one store that holds every secret of the fleet, which answers only the hub's user, never calls the hub and needs no
-network. It takes a value that the owner sealed to its key in his app (intake), and it seals a copy of a value only to
+network. It takes a value that the owner sealed to its key in his app (intake), and a new value under a reference
+that it holds only with the owner's signed statement about that very copy (replace). It seals a copy of a value only to
 a machine key that the owner signed (pin, unpin, seal), only for a grant of that value to an agent of that machine
 that the owner signed, or for a value that he signed into the grantable pool (grant, ungrant, pool, unpool), and its
 backup only to a recovery key that the owner signed (recovery, export). The owner signs with an ECDSA P-256 key of his Mac and the vault verifies every statement itself,
@@ -231,7 +233,10 @@ STATEMENTS = {"pin": {"v", "kind", "fleet", "machine", "recipient", "at"},
               "grant": {"v", "kind", "fleet", "login", "agent", "machine", "at"},
               "ungrant": {"v", "kind", "fleet", "login", "agent", "at"},
               "pool": {"v", "kind", "fleet", "login", "at"},
-              "unpool": {"v", "kind", "fleet", "login", "at"}}
+              "unpool": {"v", "kind", "fleet", "login", "at"},
+              # replace: the owner puts a new value under a reference that the vault holds. sha256 is of the sealed
+              # copy that his app made, so the statement is about that one copy and no other (intake).
+              "replace": {"v", "kind", "fleet", "login", "sha256", "at"}}
 COPY_MAX = 16384            # characters of one sealed copy that the owner gives, as the hub's DEPOSIT_COPY_MAX
 CENTRAL_LINE = 65536        # bytes of one request line to the central vault: an intake carries a sealed copy
 # The central vault's own user. Not a fleet-* name: the hub's user may put any fleet-* user into the agents' group
@@ -762,7 +767,12 @@ def deposit(conf, number):
     secret's reference, title and kind, and the salts of its fingerprints; the copy is opened here with the handover
     key, and the hub compares the value's fingerprints with the ones that the owner's vault registered under that
     reference before anything is saved. It is saved under the same reference, so `bws://<id>` names one value in every
-    vault of the fleet, and the answer holds no part of it."""
+    vault of the fleet, and the answer holds no part of it.
+
+    replaces: the hub's word, in its answer for this delivery and never in the helper's request, that the owner
+    replaced the value of this reference. Then the value goes into the place of the one that an earlier delivery
+    saved here (LocalStore.put), and the answer says "replaced". The key swap needs nothing more: its proxy reads the
+    store at each use, so the next request of a session carries the new value under the same placeholder."""
     store = LocalStore(conf)            # a store that does not open refuses before the hub gives the copy
     read_private(conf["age_key"], "handover key")
     code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}", {"job": number, "kind": "deposit"})
@@ -771,6 +781,7 @@ def deposit(conf, number):
         reason = data.get("error") if isinstance(data, dict) else None
         raise Refused("the hub did not give this delivery" + (f": {reason}" if isinstance(reason, str) else ""))
     ref, title, item, text, salts = (data.get(k) for k in ("login", "title", "item", "ciphertext", "fingerprint_salts"))
+    replaces = data.get("replaces") is True     # the hub's word in this answer: the owner replaced this value
     m = SECRET_REF.fullmatch(ref) if isinstance(ref, str) else None
     if not (m and plain_line(title, 200) and item in ("login", "api_key") and isinstance(text, str) and ARMOR in text
             and isinstance(salts, dict)
@@ -786,7 +797,7 @@ def deposit(conf, number):
         reason = data.get("error") if isinstance(data, dict) else None
         raise Refused("the hub did not confirm this value" + (f": {reason}" if isinstance(reason, str) else ""))
     saved = store.put(m.group(1).lower(), title, json.dumps(value, sort_keys=True, separators=(",", ":"),
-                                                            ensure_ascii=False), DELIVERED)
+                                                            ensure_ascii=False), DELIVERED, replace=replaces)
     log(f"deposit job={number}: {ref.lower()} {saved}")
     swap_given(conf, ref.lower())
     return {"ok": True, "v": PROTOCOL, "deposit": number, "login": ref.lower(), "saved": saved}
@@ -929,10 +940,16 @@ class LocalStore:
             os.close(fd)
         return sid
 
-    def put(self, sid, name, value, note=""):
+    def put(self, sid, name, value, note="", replace=False):
         """Save one item under the id that it has in the owner's vault (deposit): "new", or "same" when the store holds
         that value under that id already. Another value under that id is refused, because one reference names one
-        value in every vault of the fleet: a delivery never changes what a name already means here."""
+        value in every vault of the fleet: a delivery never changes what a name already means here.
+
+        replace: the owner replaced the value of this reference (the central vault's signed replace, and the hub's
+        word with a delivery of it). Then another value goes into the place of the stored one, "replaced", but only
+        over an item with this same note: a delivery replaces what a delivery saved, never a login that this vault
+        made or that the owner saved here himself. The store is one file that is made whole beside the old one and
+        then takes its place (keep), so a replace that fails leaves the old value whole."""
         if canonical_id(sid) != sid or not plain_line(name, 200) or not isinstance(value, str) or \
                 not isinstance(note, str):
             raise Refused("the vault store needs an id and a name of 1 to 200 characters for an item")
@@ -946,13 +963,18 @@ class LocalStore:
                     same = items[sid]["value"] == value
                 if same:
                     return "same"
-                raise Refused("this machine's vault store holds another value under this reference, so nothing was "
-                              "saved")
+                if not replace:
+                    raise Refused("this machine's vault store holds another value under this reference, so nothing "
+                                  "was saved")
+                if items[sid]["note"] != note:
+                    raise Refused("the value under this reference did not come here from the owner's vault, so it is "
+                                  "not replaced")
+            saved = "replaced" if sid in items else "new"
             items[sid] = {"key": name, "value": value, "note": note, "made_at": time.time()}
             self.keep(items)
         finally:
             os.close(fd)
-        return "new"
+        return saved
 
     def remove(self, sid, note):
         """Remove the item with this id when its note is exactly `note` (withdraw): "removed", or "absent" when the
@@ -1746,7 +1768,7 @@ def canonical(value):
 
 
 def owner_statement(conf, req, kind):
-    """The owner's statement of this kind ({v, kind, fleet, at, and its machine, recipient, login and agent as
+    """The owner's statement of this kind ({v, kind, fleet, at, and its machine, recipient, login, agent and sha256 as
     STATEMENTS says}), after its form, its fleet and its signature. The statement must be the canonical text of what it holds, so the vault checks
     the very bytes that the app signed; and it must name this fleet, so a statement of another fleet is no use here."""
     statement, signature = req.get("statement"), req.get("signature")
@@ -1760,7 +1782,8 @@ def owner_statement(conf, req, kind):
         raise Refused("the statement is not in its canonical form")
     if set(said) != STATEMENTS[kind] or said["kind"] != kind or type(said["v"]) is not int or said["v"] != 1 \
             or type(said["at"]) is not int or said["at"] < 0 or not isinstance(said["fleet"], str) \
-            or not all(isinstance(said.get(k, ""), str) for k in ("machine", "recipient", "login", "agent")) \
+            or not all(isinstance(said.get(k, ""), str) for k in ("machine", "recipient", "login", "agent", "sha256")) \
+            or ("sha256" in said and not re.fullmatch(r"[0-9a-f]{64}", said["sha256"])) \
             or ("machine" in said and not MACHINE.fullmatch(said["machine"])) \
             or ("recipient" in said and not RECIPIENT.fullmatch(said["recipient"])) \
             or ("login" in said and not (SECRET_REF.fullmatch(said["login"]) and said["login"] == said["login"].lower())) \
@@ -1824,19 +1847,22 @@ def kept_pool(record):
 def central_state(conf):
     """The owner's signed records, read again for every request: {"v": 1, "pins": {machine: {recipient, at}},
     "recovery": {recipient, at} or None, "grants": {login: {agent: {machine, at}}}, "pool": {login: {in, at}},
-    "removed": {login: at}}. An unpin keeps its machine's record, with no recipient, and an ungrant and an unpool keep
-    theirs too, so a statement older than them, which the hub could send again, is refused as old. "removed" is not
-    the owner's: it names each login that remove took out, so that no value comes in under its name again (intake).
-    No file is no record, and a state of the format before grants, or before remove, has none."""
+    "removed": {login: at}, "values": {login: {sha256, at}}}. An unpin keeps its machine's record, with no recipient,
+    and an ungrant and an unpool keep theirs too, so a statement older than them, which the hub could send again, is
+    refused as old. "removed" is not the owner's: it names each login that remove took out, so that no value comes in
+    under its name again (intake). "values" has the owner's newest replace statement of each login: the checksum of
+    the copy that it is about, and its time, so an older copy cannot come back (intake). No file is no record, and a
+    state of the format before grants, before remove or before replace has none."""
     if not os.path.lexists(conf["state"]):
-        return {"v": STATE, "pins": {}, "recovery": None, "grants": {}, "pool": {}, "removed": {}}
+        return {"v": STATE, "pins": {}, "recovery": None, "grants": {}, "pool": {}, "removed": {}, "values": {}}
     try:
         data = json.loads(read_private(conf["state"], "state"))
         if isinstance(data, dict):
             data.setdefault("grants", {})
             data.setdefault("pool", {})
             data.setdefault("removed", {})
-        good = isinstance(data, dict) and set(data) == {"v", "pins", "recovery", "grants", "pool", "removed"} \
+            data.setdefault("values", {})
+        good = isinstance(data, dict) and set(data) == {"v", "pins", "recovery", "grants", "pool", "removed", "values"} \
             and data["v"] == STATE and isinstance(data["pins"], dict) \
             and all(MACHINE.fullmatch(m) and kept_record(x, unpinned=True) for m, x in data["pins"].items()) \
             and (data["recovery"] is None or kept_record(data["recovery"])) \
@@ -1847,7 +1873,11 @@ def central_state(conf):
             and isinstance(data["pool"], dict) and all(SECRET_REF.fullmatch(ref) and kept_pool(x)
                                                        for ref, x in data["pool"].items()) \
             and isinstance(data["removed"], dict) and all(SECRET_REF.fullmatch(ref) and ref == ref.lower()
-                                                          and type(at) is int for ref, at in data["removed"].items())
+                                                          and type(at) is int for ref, at in data["removed"].items()) \
+            and isinstance(data["values"], dict) and all(
+                SECRET_REF.fullmatch(ref) and ref == ref.lower() and isinstance(x, dict) and set(x) == {"sha256", "at"}
+                and isinstance(x["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", x["sha256"]) is not None
+                and type(x["at"]) is int for ref, x in data["values"].items())
     except ValueError:
         good = False
     if not good:
@@ -1857,7 +1887,9 @@ def central_state(conf):
 
 def keep_state(conf, state):
     """Write the central vault's state whole: a new file of mode 600, made complete beside the old one and then put in
-    its place, as the store is kept."""
+    its place, as the store is kept. "values" is written only when it has a record: until the owner's first replace,
+    the file is one that the program from before replace reads."""
+    state = {k: v for k, v in state.items() if k != "values" or v}
     path, temp = conf["state"], conf["state"] + ".new"
     try:
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
@@ -1892,7 +1924,11 @@ def central_status(conf):
             "store_recipient": store.recipient, "fleet": conf["fleet"], "owner_keys": len(conf["owner_keys"]),
             "pins": pins(state), "recovery": state["recovery"]["recipient"] if state["recovery"] else None,
             "grants": granted(state), "pool": pooled(state), "items": len(store.opened()),
-            "removes": True, "source": conf.get("_source")}     # removes: this program serves remove (the hub asks)
+            "removes": True, "replaces": True,      # this program serves remove, and replace in intake (the hub asks)
+            # the checksum of the copy of the newest replace of each login: no secret. A hub that stopped between
+            # this vault's write and its own record of a replace reads here that a value changed.
+            "values": {ref: x["sha256"] for ref, x in sorted(state["values"].items())},
+            "source": conf.get("_source")}
 
 
 def fingerprint_list(items):
@@ -1911,7 +1947,18 @@ def intake(conf, req):
     rule of a deposit (the hub's helper_deposit_check), so the hub cannot put another value under a name that the
     owner gave. It is saved under the same reference, and another value under it is refused, as a deposit is. A name
     that remove took out takes no value again: else a hub that is broken into could remove a value that nobody holds
-    yet and put its own under the owner's name, for his next grant to send."""
+    yet and put its own under the owner's name, for his next grant to send.
+
+    replace: with a statement that the owner signed (STATEMENTS "replace") about this login and this very copy (the
+    SHA-256 of the sealed text), another value goes into the place of the one that the store holds: "replaced". Only
+    the owner's key can say that, so the rule above stands: no hub puts a value of its own under his name. The
+    statement must be newer than the newest one of this login, so that an older copy, which a hub can keep, cannot
+    come back; the very same statement again is a retry. Its record is kept first and the store is written after it,
+    one file that takes the place of the old one whole: a replace that stops between the two leaves the old value
+    whole, and the same statement again ends it. With a statement, a login that the store does not hold is saved as
+    new. A new value that names no address keeps the address of the stored one (kept_address). The answer names the
+    fingerprints of the value that the store holds now, which are no secret: the hub compares a delivered copy with
+    them (its helper_deposit_check)."""
     ref, title, item, text, salts, given = (req.get(k) for k in ("login", "title", "item", "ciphertext", "salts",
                                                                  "fingerprints"))
     m = SECRET_REF.fullmatch(ref) if isinstance(ref, str) else None
@@ -1920,8 +1967,19 @@ def intake(conf, req):
             and all(re.fullmatch(r"[0-9a-f]{32}", str(salts.get(k))) for k in ("password", "totp"))
             and fingerprint_list(given)):
         raise Refused("the intake request is not valid")
-    if ref.lower() in central_state(conf)["removed"]:
+    state = central_state(conf)
+    if ref.lower() in state["removed"]:
         raise Refused("this login was removed from the fleet, so no value is taken under its name again")
+    said = None
+    if "statement" in req or "signature" in req:
+        said = owner_statement(conf, req, "replace")
+        if said["login"] != ref.lower():
+            raise Refused("the statement is about another login")
+        if said["sha256"] != hashlib.sha256(text.encode("utf-8")).hexdigest():
+            raise Refused("the statement is about another copy than this one")
+        record, last = {"sha256": said["sha256"], "at": said["at"]}, state["values"].get(ref.lower())
+        if last is not None and last != record and said["at"] <= last["at"]:
+            raise Refused("the vault holds a statement that is as new or newer, so nothing changed")
     store = LocalStore(conf)
     read_private(conf["age_key"], "key")            # owner and mode are checked before age reads it
     r = run([conf["age"], "-d", "-i", conf["age_key"]], text)
@@ -1933,9 +1991,33 @@ def intake(conf, req):
     if not (mine <= registered and (all(k[0] != "password" for k in registered)
                                     or any(k[0] == "password" for k in mine))):
         raise Refused("the value does not match what the owner registered")
-    saved = store.put(m.group(1).lower(), title, canonical(value), TAKEN)
-    log(f"intake: {ref.lower()} {saved}")
-    return {"ok": True, "login": ref.lower(), "saved": saved}
+    if said is not None:
+        value = kept_address(value, store.opened().get(m.group(1).lower()))     # the key changes, its address stays
+        if state["values"].get(ref.lower()) != record:
+            state["values"][ref.lower()] = record   # first: from here no older statement of this login is taken
+            keep_state(conf, state)
+    saved = store.put(m.group(1).lower(), title, canonical(value), TAKEN, replace=said is not None)
+    log(f"intake: {ref.lower()} {saved}" + (", with the owner's replace statement" if said is not None else ""))
+    return {"ok": True, "login": ref.lower(), "saved": saved,
+            "fingerprints": [{"kind": k, "hash": h, "len": n} for k, h, n in sorted(mine)]}
+
+
+def kept_address(value, held):
+    """The value that a replace saves: the new one, with the address and the user name of the stored one when the new
+    one names no address. A replace puts a new key in the place of the old one, and the address of the key's
+    service is no part of the key: an API key that the owner saved with an address keeps it when his new save names
+    none, so that an agent whose vault sends the key for it (call_api) still has the place to send it to. An address
+    in the new value takes the place of the old one. held: the stored item, or None."""
+    try:
+        old = json.loads(held["value"]) if held else None
+    except ValueError:
+        old = None
+    if "url" in value or not isinstance(old, dict) or not isinstance(old.get("url"), str):
+        return value
+    try:
+        return check_login(dict(value, url=old["url"], username=old.get("username", "")))
+    except Refused:
+        return value                    # an address that is no address any more: the new value as it came
 
 
 def central_signed(conf, req, kind):
@@ -2124,10 +2206,12 @@ def handle(conf, line, uid):
     if op == "status":
         # backend: the store that this broker opens, which is always the fleet's own now. fleet.py's doctor and the
         # Mac app read the field, so it stays. The fleet's own store takes a secret that the owner delivers (deposits),
-        # and gives it back when no agent of the machine holds it (withdrawals).
+        # and gives it back when no agent of the machine holds it (withdrawals). A delivery that the hub marks so
+        # replaces the value that an earlier one saved (replaces): the hub sends such a delivery only to a broker
+        # that says this word.
         status = {"ok": True, "v": PROTOCOL, "agent": conf.get("agent"), "store": "user", "backend": "store",
                   "user": pwd.getpwuid(os.getuid()).pw_name, "recipient": recipient(conf), "callers": True,
-                  "source": conf.get("_source"), "deposits": True, "withdrawals": True}
+                  "source": conf.get("_source"), "deposits": True, "withdrawals": True, "replaces": True}
         if conf.get("_journal") is not None:        # this broker can make a login: its record of saves is open
             status["creates"] = True
         if conf.get("_requests") is not None:       # only with a curl program: this broker can send a request

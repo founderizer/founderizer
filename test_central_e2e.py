@@ -7,7 +7,10 @@ is played here: it seals a value to the central vault's key with age, and signs 
 grant with a P-256 owner key of this test (test_vault_central.owner_sign). The helper is fleet.py's own Helper code.
 
 Six cases: a wrong pin, a key change, an agent that moved, the vault down, a grant removed, and a secret removed from
-Founderizer. Every process here is this user, so the boundary between OS users (the hub's user and the manager's
+Founderizer. Then the owner's replace of a value under its reference (owner feature secret_replace): the new value
+reaches each vault that holds a copy and the old one leaves each store, a replace that is not the owner's changes
+nothing, a copy that waited is never saved, and a delivery that fails leaves the old value whole. Every process here
+is this user, so the boundary between OS users (the hub's user and the manager's
 cannot read the vault's keys) is checked on the hub itself, as root, at the cut-over (V10).
 """
 import base64
@@ -32,6 +35,7 @@ from test_vault_central import OWNER_C, canon, owner_sign
 AGE, KEYGEN = shutil.which("age"), shutil.which("age-keygen")
 KEY_REF = "bws://5a3b1c2d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
 VALUE = {"password": "sk-e2e-only-" + "q7" * 12}          # a fake API key, in this test only
+NEW = {"password": "sk-e2e-new-" + "w3" * 12}             # the value that the owner puts in its place
 
 
 def load_tests(loader, _tests, _pattern):
@@ -131,12 +135,15 @@ class EndToEnd(OwnerAPI):
         self.brokers[machine].conf = conf
         return public
 
-    def report(self, machine, agent=None, withdrawals=True):
+    def report(self, machine, agent=None, withdrawals=True, replaces=True):
         """The helper status of the agent on this machine, as it reports its broker (hub.broker_report). withdrawals
-        False: a vault that cannot give a copy back, as the Mac Studio's could not on 6 November 2026."""
+        False: a vault that cannot give a copy back, as the Mac Studio's could not on 6 November 2026. replaces
+        False: a vault whose program is from before the owner's replace."""
         data = {"features": ["secret_deposits", "secret_withdrawals", "broker_callers"],
                 "security": {"vault": {"broker_recipient": self.keys[machine], "callers": True, "deposits": True,
-                                       "withdrawals": withdrawals, "broker_read_at": hub.now(), "mode": "broker"}}}
+                                       "withdrawals": withdrawals, "replaces": replaces, "broker_read_at": hub.now(),
+                                       "mode": "broker"}}}
+        data = dict(hub.validate_status(data), features=data["features"])    # what the hub keeps of a helper's report
         hub.q("INSERT INTO machine_status(agent,data,reported) VALUES(?,?,?) ON CONFLICT(agent) DO UPDATE SET "
               "data=excluded.data, reported=excluded.reported", (agent or machine, json.dumps(data), hub.now()))
 
@@ -173,17 +180,63 @@ class EndToEnd(OwnerAPI):
         else:
             self.app("ungrant", login=KEY_REF, agent=agent)
 
-    def pass_once(self):
+    def pass_once(self, t0=None):
         """One pass of the hub's reconciler, then each carrier's helper does its deliveries and withdrawals with
         fleet.py's own Helper code, against its machine's broker."""
         hub.central_read()
-        hub.central_reconcile()
+        hub.central_reconcile(t0)
         for kind, table in (("deposit", "deposits"), ("withdraw", "withdrawals")):
             for row in hub.q(f"SELECT * FROM {table} WHERE finished IS NULL ORDER BY id"):
-                helper = type("Helper", (), {"agent": row["agent"], "say": lambda self, text: None})()
-                with patch.object(fleet, "AGENT", row["agent"]), \
-                        patch.object(fleet, "vault_socket", lambda m=row["machine"]: self.brokers[m].conf["socket"]):
-                    getattr(fleet.Helper, kind)(helper, {kind: row["id"]})
+                self.carry(kind, row)
+
+    def carry(self, kind, row):
+        """The helper of this delivery's or withdrawal's carrier does it, with fleet.py's own Helper code."""
+        helper = type("Helper", (), {"agent": row["agent"], "say": lambda self, text: None})()
+        with patch.object(fleet, "AGENT", row["agent"]), \
+                patch.object(fleet, "vault_socket", lambda m=row["machine"]: self.brokers[m].conf["socket"]):
+            getattr(fleet.Helper, kind)(helper, {kind: row["id"]})
+
+    def session_keys(self, machine):
+        """What the vault of this machine gives a session start of its agent (the broker's read): {variable: value}."""
+        with patch.object(fleet, "AGENT", machine), \
+                patch.object(fleet, "vault_socket", lambda: self.brokers[machine].conf["socket"]):
+            return fleet.broker_job_request(machine, {"op": "read", "for": "session"}, timeout=60)["env"]
+
+    def sealed(self, value):
+        """A copy of this value as the owner's app seals it: to the central vault's own key, with age."""
+        hub.central_read()
+        return subprocess.run([AGE, "-a", "-r", hub.CENTRAL["status"]["recipient"]], input=json.dumps(value),
+                              capture_output=True, text=True, check=True).stdout
+
+    def register(self, value):
+        """The app's hub step for a new value under the reference that the list has: its fingerprints, and the same
+        entry, so nothing is committed."""
+        salts = self.request(f"/ui/secrets/salts?db=test-generation&login={KEY_REF}")[1]
+        prints = [{"kind": "password", "hash": hashlib.sha256((salts["password"] + value["password"]).encode())
+                   .hexdigest(), "len": len(value["password"])}]
+        code, body = self.request("/ui/secrets/add", self.cmd(login=KEY_REF, title="SHOP_API_KEY", kind="api_key",
+                                                                  env="SHOP_API_KEY", fingerprints=prints))
+        self.assertEqual((code, body.get("changed")), (200, False), body)
+
+    def statement(self, copy, at=None, **other):
+        """The owner's replace statement about this sealed copy, in its canonical form."""
+        self.at = at or max(getattr(self, "at", 0) + 1, int(hub.now()) + len(hub.q("SELECT 1 FROM ui_controls")))
+        return canon(dict({"v": 1, "kind": "replace", "fleet": hub.fleet_id(), "login": KEY_REF, "at": self.at,
+                           "sha256": hashlib.sha256(copy.encode()).hexdigest()}, **other))
+
+    def replace(self, value=NEW, sign=owner_sign, **other):
+        """Add secret for a name that the list has: the hub step, then the sealed copy with the owner's signed
+        statement about it. (code, body) of the intake."""
+        self.register(value)
+        copy = self.sealed(value)
+        said = self.statement(copy, **other)
+        return self.request("/ui/vault/intake", self.cmd(login=KEY_REF, ciphertext=copy, statement=said,
+                                                         signature=sign(said)))
+
+    def stores(self):
+        """Each store of this fleet, opened with its own key, as one text: the central vault's and each machine's."""
+        return json.dumps([vault.LocalStore(conf).opened() for conf in
+                           [self.central] + [self.brokers[m].conf for m in sorted(self.brokers)]])
 
     def held(self, machine):
         """What this machine's store holds, opened with its own key: {reference: value}."""
@@ -312,6 +365,192 @@ class EndToEnd(OwnerAPI):
                                                 (salts["password"] + other["password"]).encode()).hexdigest()}]})
         self.assertIn("removed from the fleet", str(refused.exception))
         self.assertEqual(hub.central_call("inventory")["logins"], [])
+
+    # ---- the owner replaces a value under its reference (owner feature secret_replace)
+    def test_the_owner_replaces_a_value_and_each_vault_that_holds_a_copy_gets_the_new_one(self):
+        self.add_and_give("vps")
+        self.give("vps", "read")                    # its sessions read the key
+        self.give("studio")
+        self.pass_once()
+        self.assertEqual((self.held("vps"), self.held("studio")), ({KEY_REF: VALUE}, {KEY_REF: VALUE}))
+        self.assertEqual(self.session_keys("vps"), {"SHOP_API_KEY": VALUE["password"]})
+        self.assertIn("secret_replace", hub.ui_features())
+        team, stamp = json.dumps(hub.TEAM, sort_keys=True), hub.key_stamp("vps")
+        commits = git("rev-list", "--count", "HEAD", cwd=self.dir / "kit")
+        self.report("studio", replaces=False)       # a vault whose program is from before the replace
+
+        before = hub.now()
+        code, body = self.replace()
+        self.assertEqual((code, body["login"], body["saved"]), (200, KEY_REF, "replaced"), body)
+        # a pass of the reconciler that started before the replace makes no delivery: its seal can hold the old value
+        self.pass_once(before)
+        self.assertEqual((self.held("vps"), hub.q1("SELECT COUNT(*) n FROM deposits")["n"]), ({KEY_REF: VALUE}, 2))
+        # the same reference, the same entry and the same grants: nothing of team.json changed, and no commit
+        self.assertEqual(json.dumps(hub.TEAM, sort_keys=True), team)
+        self.assertEqual(git("rev-list", "--count", "HEAD", cwd=self.dir / "kit"), commits)
+        self.assertEqual(vault.LocalStore(self.central).opened()[KEY_REF[6:]]["value"], canon(NEW))
+        self.assertEqual(len(vault.LocalStore(self.central).opened()), 1)
+        # the hub masks the new value, and goes on masking the old one
+        self.assertTrue(hub.secret_hit("a text with " + NEW["password"]))
+        self.assertTrue(hub.secret_hit("a text with " + VALUE["password"]))
+        value = hub.q1("SELECT * FROM secret_values WHERE login=?", (KEY_REF,))
+        self.assertEqual(len(json.loads(value["prints"])), 1)
+        self.assertNotIn(NEW["password"], json.dumps([dict(r) for r in hub.q("SELECT * FROM ui_controls")]))
+
+        self.pass_once()
+        self.assertEqual(self.held("vps"), {KEY_REF: NEW})              # its vault put it in the place of the old one
+        self.assertEqual(hub.q1("SELECT result FROM deposits WHERE machine='vps' ORDER BY id DESC")["result"],
+                         "Saved in this machine's vault.")               # the helper's words for a replaced value
+        self.assertEqual(self.held("studio"), {KEY_REF: VALUE})         # this vault cannot yet: it keeps the old value
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM deposits WHERE machine='studio'")["n"], 1)
+        self.assertEqual(self.session_keys("vps"), {"SHOP_API_KEY": NEW["password"]})      # the next session start
+        self.assertGreater(hub.key_stamp("vps"), stamp)                 # a helper reads its kept keys again
+        self.report("studio")                                           # its program is the new one now
+        self.pass_once()
+        self.assertEqual(self.held("studio"), {KEY_REF: NEW})
+        self.assertNotIn(VALUE["password"], self.stores())              # the old value left each store
+        self.assertEqual(hub.central_held(), {"studio": [KEY_REF], "vps": [KEY_REF]})
+        self.assertEqual([(r["machine"], r["ok"]) for r in hub.q("SELECT * FROM deposits ORDER BY id")],
+                         [("studio", 1), ("vps", 1), ("vps", 1), ("studio", 1)])
+        self.pass_once()                                                # and nothing more is sent
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM deposits")["n"], 4)
+        # the old copy cannot come back: not as a plain intake, and not with the owner's older statement
+        code, body = self.request("/ui/vault/intake", self.cmd(login=KEY_REF, ciphertext=self.sealed(VALUE)))
+        self.assertEqual(code, 409, body)
+        self.assertIn("holds another value under this reference", body["error"])
+        code, body = self.replace(VALUE, at=self.at - 1)
+        self.assertEqual(code, 409, body)
+        self.assertIn("as new or newer", body["error"])
+        self.assertEqual(vault.LocalStore(self.central).opened()[KEY_REF[6:]]["value"], canon(NEW))
+        # a grant that goes takes the new value back, as any delivered secret
+        self.give("studio", None)
+        self.pass_once()
+        self.assertEqual(self.held("studio"), {})
+
+    def test_a_replace_that_is_not_the_owners_changes_nothing(self):
+        """The hub cannot make the owner's statement, so a hub that is broken into puts no value under his name."""
+        self.add_and_give("vps")
+        self.pass_once()
+        stranger = 0x2B0C0FFEE5EED0F7E57B1A5ED0D1E7C0A2B3C4D5E6F708192A3B4C5D6E7F8011      # no owner key
+        copy = self.sealed(NEW)
+        said = self.statement(copy)
+        cases = ((dict(ciphertext=copy), "holds another value under this reference"),
+                 (dict(ciphertext=copy, statement=said, signature=owner_sign(said, stranger)), "valid signature of the owner"),
+                 (dict(ciphertext=self.sealed({"password": "sk-the-hubs-own-" + "h1" * 10}), statement=said,
+                       signature=owner_sign(said)), "another copy than this one"),
+                 (dict(ciphertext=copy, statement=self.statement(copy, fleet="0123456789abcdef"),
+                       signature=owner_sign(self.statement(copy, fleet="0123456789abcdef"))), "another fleet"))
+        self.register(NEW)
+        for fields, why in cases:
+            code, body = self.request("/ui/vault/intake", self.cmd(login=KEY_REF, **fields))
+            self.assertEqual(code, 409, body)
+            self.assertIn(why, body["error"])
+        for fields in (dict(ciphertext=copy, statement=said), dict(ciphertext=copy, signature=owner_sign(said)),
+                       dict(ciphertext=copy, statement=canon({"v": 1, "kind": "grant"}), signature=owner_sign(said))):
+            self.assertEqual(self.request("/ui/vault/intake", self.cmd(login=KEY_REF, **fields))[0], 400)
+        self.assertEqual(vault.LocalStore(self.central).opened()[KEY_REF[6:]]["value"], canon(VALUE))
+        self.assertEqual(hub.q("SELECT * FROM secret_values"), [])
+        self.pass_once()
+        self.assertEqual(self.held("vps"), {KEY_REF: VALUE})
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM deposits")["n"], 1)
+        self.assertNotIn(NEW["password"], self.stores())
+        # a central vault from before the replace: the hub serves no such feature and passes no statement on
+        with patch.dict(hub.CENTRAL, status={k: v for k, v in hub.CENTRAL["status"].items() if k != "replaces"}):
+            self.assertNotIn("secret_replace", hub.ui_features())
+            code, body = self.request("/ui/vault/intake", self.cmd(login=KEY_REF, ciphertext=copy, statement=said,
+                                                                   signature=owner_sign(said)))
+            self.assertEqual((code, body["error"]), (409, "the central vault's program does not replace a value yet"))
+
+    def test_a_copy_that_waits_at_a_replace_is_never_saved_and_the_same_save_ends_a_replace_that_stopped(self):
+        self.add_and_give("vps")
+        self.pass_once()
+        self.give("studio")
+        hub.central_read()
+        hub.central_reconcile()                     # a copy of the old value waits for studio, which did not take it
+        waits = hub.q1("SELECT * FROM deposits WHERE machine='studio'")
+        self.assertIsNone(waits["finished"])
+        # The hub stops between the central vault's write and its own record: the vault holds the new value, and the
+        # hub knows nothing of it.
+        self.register(NEW)
+        copy = self.sealed(NEW)
+        said = self.statement(copy)
+        self.assertEqual(hub.central_intake(KEY_REF, hub.sealed_copy(copy), said, owner_sign(said))["saved"], "replaced")
+        self.assertEqual(hub.q("SELECT * FROM secret_values"), [])
+        # The same Save again (the form keeps the copy and the statement): the vault says "same", and the hub's
+        # record is written now. The copy that waited ends, and no vault gets it.
+        code, body = self.request("/ui/vault/intake", self.cmd(login=KEY_REF, ciphertext=copy, statement=said,
+                                                               signature=owner_sign(said)))
+        self.assertEqual((code, body["saved"]), (200, "same"), body)
+        ended = hub.q1("SELECT * FROM deposits WHERE id=?", (waits["id"],))
+        self.assertEqual((ended["ok"], ended["ciphertext"], ended["result"]),
+                         (0, None, "The owner replaced its value after this copy was sealed."))
+        with patch.object(fleet, "AGENT", "studio"), \
+                patch.object(fleet, "vault_socket", lambda: self.brokers["studio"].conf["socket"]), \
+                self.assertRaises(fleet.Refused):
+            fleet.broker_job_request("studio", {"op": "deposit", "job": waits["id"]}, timeout=60)
+        self.assertEqual(self.held("studio"), {})
+        # The same save a third time changes nothing more: the record keeps its time, and the copies of the new
+        # value that wait now are not ended.
+        record = dict(hub.q1("SELECT * FROM secret_values"))
+        hub.central_read()
+        waiting = hub.central_reconcile()["delivered"]
+        self.assertEqual(len(waiting), 2)
+        self.assertEqual(self.request("/ui/vault/intake", self.cmd(login=KEY_REF, ciphertext=copy, statement=said,
+                                                                   signature=owner_sign(said)))[1]["saved"], "same")
+        self.assertEqual(dict(hub.q1("SELECT * FROM secret_values")), record)
+        self.assertEqual([r["id"] for r in hub.q("SELECT id FROM deposits WHERE finished IS NULL ORDER BY id")], waiting)
+        self.pass_once()
+        self.assertEqual((self.held("vps"), self.held("studio")), ({KEY_REF: NEW}, {KEY_REF: NEW}))
+        self.assertNotIn(VALUE["password"], self.stores())
+
+    def test_a_hub_that_stopped_at_a_replace_reads_it_in_the_vault_s_status(self):
+        """The same stop, and the owner does not save again. The hub's next read of the central vault's status
+        finds the replace that it has no record of, and each vault that holds a copy gets the new value."""
+        self.add_and_give("vps")
+        self.pass_once()
+        self.register(NEW)
+        copy = self.sealed(NEW)
+        said = self.statement(copy)
+        self.assertEqual(hub.central_intake(KEY_REF, hub.sealed_copy(copy), said, owner_sign(said))["saved"], "replaced")
+        self.assertEqual((hub.q("SELECT * FROM secret_values"), self.held("vps")), ([], {KEY_REF: VALUE}))
+        self.pass_once()                            # it reads the status first, as the hub's timer does
+        self.assertEqual(hub.q1("SELECT sha256 FROM secret_values")["sha256"], hashlib.sha256(copy.encode()).hexdigest())
+        self.assertEqual(self.held("vps"), {KEY_REF: NEW})
+        self.assertNotIn(VALUE["password"], self.stores())
+        self.pass_once()
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM deposits")["n"], 2)
+
+    def test_a_delivery_that_fails_leaves_the_old_value_whole_and_its_copy_still_counts(self):
+        self.add_and_give("vps")
+        self.pass_once()
+        self.assertEqual(self.replace()[0], 200)
+        store = self.brokers["vps"].conf["store"]
+        keep = vault.LocalStore.keep
+
+        def broken(this, items):                    # the store of vps cannot be written; the central vault's can
+            if this.conf["store"] == store:
+                raise vault.Refused("the vault store could not be saved")
+            return keep(this, items)
+        with patch.object(vault.LocalStore, "keep", broken):
+            self.pass_once()
+        failed = hub.q1("SELECT * FROM deposits ORDER BY id DESC")
+        self.assertEqual((failed["ok"], failed["result"]), (0, "the vault broker refused: the vault store could not be "
+                                                               "saved"))
+        self.assertEqual(self.held("vps"), {KEY_REF: VALUE})            # the old value, whole
+        self.assertEqual(hub.central_held(), {"vps": [KEY_REF]})        # the copy of the earlier delivery counts
+        self.pass_once()                                                # a delivery that failed waits before the next
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM deposits")["n"], 2)
+        hub.q("UPDATE deposits SET finished=finished-? WHERE id=?", (hub.CENTRAL_RETRY + 1, failed["id"]))
+        self.pass_once()                                                # after the wait, the hub sends it again
+        self.assertEqual(self.held("vps"), {KEY_REF: NEW})
+        # and a copy that failed to be replaced still goes back when its grant goes
+        self.assertEqual(self.replace({"password": "sk-e2e-third-" + "t5" * 12})[0], 200)
+        with patch.object(vault.LocalStore, "keep", broken):
+            self.pass_once()
+        self.assertEqual(self.held("vps"), {KEY_REF: NEW})
+        self.give("vps", None)
+        self.pass_once()
+        self.assertEqual(self.held("vps"), {})
 
 
 if __name__ == "__main__":

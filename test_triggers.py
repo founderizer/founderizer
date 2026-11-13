@@ -682,6 +682,15 @@ class Checks(OwnerAPI):
         self.assertIn("trigger_checks", self.request()[1]["ui_features"])
 
     # ---- runs
+    def test_a_check_event_names_the_stamp_of_its_agents_keys(self):
+        """The hub's stamp of the keys of the agent whose helper runs the check (hub.key_stamp): the helper reads the
+        keys that it kept again when the stamp is another one, as after the owner replaced a key's value."""
+        anchor, asked = self.clock, []
+        self.create()
+        with patch.object(hub, "key_stamp", lambda agent: asked.append(agent) or 41):
+            self.tick(anchor + 3600)
+        self.assertEqual((self.sent()["keys"], asked), (41, ["vps"]))
+
     def test_quiet_checks_wake_nothing_and_an_alert_waits_for_a_quiet_check(self):
         anchor = self.clock
         tid = self.create()["trigger"]["id"]
@@ -689,7 +698,8 @@ class Checks(OwnerAPI):
         self.tick(anchor + 3600)
         extra = self.sent()
         self.assertEqual(set(extra), {"trigger", "run", "token", "path", "commit", "sha256", "args",
-                                      "timeout_seconds", "generation"})            # plan C12: no claim expires
+                                      "timeout_seconds", "generation", "keys"})    # plan C12: no claim expires
+        self.assertEqual(extra["keys"], 0)      # the stamp of the agent's keys: it reads none, so no delivery counts
         self.assertEqual((extra["trigger"], extra["path"], extra["commit"], extra["sha256"], extra["args"],
                           extra["timeout_seconds"], extra["generation"]),
                          (tid, "checks/synthetic_value.py", self.commit, self.sha, {"value": 11}, 30, "test-generation"))

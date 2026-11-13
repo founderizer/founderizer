@@ -4080,6 +4080,7 @@ class Helper:
         self.check_runs = set()         # plan C12: the check runs this helper holds, until the hub took their result
         # plan P4: the agent's read keys for its checks, kept in memory, and the grants they were read for (check_keys)
         self.check_env, self.check_env_grants, self.check_env_lock = None, None, threading.Lock()
+        self.check_env_stamp = None         # the hub's stamp of the agent's keys when they were read (check_keys)
         self.screen_attempts = {}       # {task: (attempt, told)} of the runners (app_server_task) that this helper started
         self.start_waits = {}           # {event id: (seconds, monotonic time of the next try)} of failed task events
         self.step = None                # (name, task or None, monotonic start) of the main loop's step now (doing)
@@ -6077,7 +6078,7 @@ class Helper:
     def check_thread(self, extra):
         try:
             try:
-                result = run_check(extra, agent=self.agent, keys=self.check_keys())
+                result = run_check(extra, agent=self.agent, keys=self.check_keys(extra.get("keys")))
             except Exception as e:
                 result = {"ok": False, "error": "exit", "detail": f"the runner failed: {type(e).__name__}", "elapsed_ms": 0}
             finally:
@@ -6088,16 +6089,23 @@ class Helper:
         finally:
             self.end_outside()
 
-    def check_keys(self):
+    def check_keys(self, stamp=None):
         """The agent's own read keys for its checks (plan P4): the API keys that its sessions read (read_env), read
-        from the vault once and kept in memory, and read again after a failed run or when the agent's grants in
-        team.json change. A check runs only on its own agent's machine, so these are that agent's keys and no
-        other's. Its sessions already hold the same keys, shell and network, so a check adds no capability; the
-        sessions of an agent whose Shell box is off hold none of them, and the hub gives them only to its checks."""
+        from the vault once and kept in memory, and read again after a failed run, when the agent's grants in
+        team.json change, or when the hub's stamp of the agent's keys is another one. A check runs only on its own
+        agent's machine, so these are that agent's keys and no other's. Its sessions already hold the same keys,
+        shell and network, so a check adds no capability; the sessions of an agent whose Shell box is off hold none
+        of them, and the hub gives them only to its checks.
+
+        stamp: `keys` of the check event (the hub's key_stamp): it changes when this machine's vault took a new
+        delivery of a key that the agent reads, as after the owner replaced a key's value. Without it the kept keys
+        would be the old value for as long as this helper runs. A hub from before the stamp names none."""
         grants = check_grants(self.agent)
         with self.check_env_lock:
-            if self.check_env is None or grants != self.check_env_grants:
+            if self.check_env is None or grants != self.check_env_grants \
+                    or stamp != getattr(self, "check_env_stamp", None):
                 self.check_env, self.check_env_grants = read_env(self.agent, None, "check"), grants
+                self.check_env_stamp = stamp
             return dict(self.check_env)
 
     def begin_outside(self):
@@ -7249,7 +7257,7 @@ class Helper:
             raise Refused("a delivery without its number")
         try:
             reply = broker_job_request(self.agent, {"op": "deposit", "job": number}, timeout=60)
-            ok, text = True, "Saved in this machine's vault." if reply.get("saved") == "new" else \
+            ok, text = True, "Saved in this machine's vault." if reply.get("saved") in ("new", "replaced") else \
                 "This machine's vault already had it."
         except Refused as e:
             ok, text = False, str(e)[:300]
@@ -8236,6 +8244,7 @@ def vault_status(agent):
               "requests": (status.get("requests") is True) if status else None,     # call_api
               "deposits": (status.get("deposits") is True) if status else None,     # a delivered secret of the owner's
               "withdrawals": (status.get("withdrawals") is True) if status else None,   # and taking one back
+              "replaces": (status.get("replaces") is True) if status else None,     # and a new value over a delivered one
               "places": (status.get("places") is True) if status else None,         # vault.py place: unused now
               "place_key": status.get("place_key") if status and isinstance(status.get("place_key"), str)
               and PLACE_PUBLIC.fullmatch(status["place_key"]) else None,

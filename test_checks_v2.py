@@ -902,6 +902,16 @@ class Runner(unittest.TestCase):
                 helper.check_thread(CHECK)
             helper.check_keys()
             self.assertEqual(len(reads), 3)
+            # The hub's stamp of the agent's keys (the `keys` of a check event) is another one: this machine's vault
+            # took a new delivery of a key, as after the owner replaced its value. The kept keys are read again.
+            CHECK["keys"] = 7
+            with patch.object(fleet, "run_check", lambda extra, agent, keys: {"ok": True, "lines": []}):
+                fleet.CHECK_SLOTS.acquire()
+                helper.check_thread(CHECK)
+                self.assertEqual(len(reads), 4)
+                fleet.CHECK_SLOTS.acquire()
+                helper.check_thread(CHECK)
+            self.assertEqual(len(reads), 4)                                 # the same stamp: kept in memory
 
 
 if __name__ == "__main__":

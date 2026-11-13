@@ -2334,6 +2334,26 @@ class Delivery(test_central_e2e.EndToEnd):
         self.assertEqual([text for text in lines if "REFUSED a key swap" in text], [])     # no line of a refused use
         self.assertEqual(self.read()["env"]["SHOP_API_KEY"], self.name)     # and its next read gives the same one
 
+    def test_a_replaced_value_keeps_its_placeholder_and_the_next_request_carries_the_new_value(self):
+        """The owner replaces the value of the key in Add secret (owner feature secret_replace). The list of
+        placeholders is not touched: a session that runs keeps its placeholder, and the proxy's next question for it
+        gets the new value, because the broker reads its store at each use."""
+        old, new = test_central_e2e.VALUE["password"], test_central_e2e.NEW["password"]
+        self.assertEqual(self.use(), {"ok": True, "value": old})
+        entries = json.dumps(self.swaps.entries, sort_keys=True)
+        code, body = self.replace()
+        self.assertEqual((code, body["saved"]), (200, "replaced"), body)
+        self.assertEqual(hub.logins()[test_central_e2e.KEY_REF]["site"], self.SITE)     # the key's site stays
+        self.assertEqual(self.use(), {"ok": True, "value": old})            # until the delivery lands: the old value
+        self.pass_once()                                                    # the hub delivers the new value
+        self.assertEqual(self.held("vps"), {test_central_e2e.KEY_REF: test_central_e2e.NEW})
+        self.assertEqual(self.ended("deposits"), 1)
+        self.assertEqual(self.off(), set())                                 # no placeholder went off in between
+        self.assertEqual(json.dumps(self.swaps.entries, sort_keys=True), entries)
+        self.assertEqual((self.opens(), self.use()), (True, {"ok": True, "value": new}))   # the next request
+        self.assertEqual(self.read()["env"]["SHOP_API_KEY"], self.name)     # and the next read: the same placeholder
+        self.assertNotIn(old, self.stores())
+
     def test_a_name_that_changed_hands_opens_nothing_for_the_os_user_that_had_it_before(self):
         """The owner renames an agent, which keeps its OS user, and gives its old name to another agent of the same
         server. The hub's yes is for the name; the list's entry is for an OS user. The first holder's placeholder

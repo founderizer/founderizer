@@ -24,6 +24,7 @@ import json
 import os
 import pathlib
 import pwd
+import re
 import shutil
 import socket
 import struct
@@ -4713,6 +4714,28 @@ class Vault(DoorCase):
         self.assertEqual(calls[0][1], f"http://{HUB}:8765/door/sealed")
         self.assertEqual(calls[1][1], f"http://{HUB}:8765/door/sealed/5")
         self.assertEqual(json.loads(calls[1][2]), {"sha256": hashlib.sha256(b"the-new-value").hexdigest()})
+
+    def test_a_new_value_takes_the_place_of_the_old_one_as_one_whole_file(self):
+        """Since the owner can replace a value, a copy comes for a secret that the door holds and uses. A call reads
+        the old value or the new one, never a part: the new file is written beside the old one and then put in its
+        place, so a write that stops leaves the old value."""
+        values = iter(["the-old-value\n", "the-new-value\n", "the-third-value\n"])
+        self.door.http = lambda method, url, headers, data: (200, {"copies": [
+            {"id": 8, "login": ref(6), "sealed": "-----BEGIN AGE ENCRYPTED FILE-----"}]}) \
+            if url.endswith("/door/sealed") else (200, {})
+        folder = self.root + door.SECRETS_DIR
+        with patch.object(door, "run_program", lambda argv, stdin, env, timeout=600: (0, next(values))):
+            self.assertEqual(door.fetch_sealed(self.door), 1)
+            self.assertEqual(self.door.secret(ref(6)), "the-old-value")
+            with patch.object(door.os, "replace", side_effect=OSError("the disk is full")), self.assertRaises(OSError):
+                door.fetch_sealed(self.door)
+            self.assertEqual(self.door.secret(ref(6)), "the-old-value")     # the old value, whole
+            self.assertEqual(door.fetch_sealed(self.door), 1)
+        self.assertEqual(self.door.secret(ref(6)), "the-third-value")
+        name = hashlib.sha256(ref(6).encode()).hexdigest()
+        self.assertEqual([n for n in os.listdir(folder) if not re.fullmatch(r"[0-9a-f]{64}", n)
+                          and not n.startswith(("minted-", "work-"))], [])  # and no file beside it is left
+        self.assertEqual(oct(os.stat(os.path.join(folder, name)).st_mode & 0o777), "0o600")
 
     def test_the_door_keeps_the_key_of_an_item_and_not_the_item(self):
         """The central vault seals the item as the owner's app saved it: {"password": <the key>, "username": ""}. The

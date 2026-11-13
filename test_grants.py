@@ -207,8 +207,129 @@ class Grants(VaultAccess):
         twice["agents"]["alpha"]["secrets"] = {KEY: "read", NEW: "use"}
         hub.validate_team(twice)
         twice["agents"]["alpha"]["secrets"][NEW] = "read"           # two values for one variable name
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "agent alpha: it reads two keys named OPENAI_API_KEY"):
             hub.validate_team(twice)
+
+    def second_key(self):
+        """A second API key of the catalog with the variable name of KEY, as a second Save of Add secret made one
+        until 13 November 2026. The hub refuses a new one since, so this is a list from before."""
+        with patch.object(hub, "key_named", lambda team, name, but=None: []):
+            code, receipt = self.add(login=NEW, title="OPENAI_API_KEY", kind="api_key", env="OPENAI_API_KEY",
+                                     fingerprints=self.prints(NEW, "sk-test-0ther-V4lue-2026"))
+        self.assertEqual((code, receipt["changed"]), (200, True), receipt)
+
+    def test_the_list_takes_no_second_key_of_one_name_and_a_list_from_before_stays_writable(self):
+        """The owner, 13 November 2026: "having 2 keys named the same should not be possible". Each path that makes a
+        key ends in this one hub step (Add secret, a request's card, an import), so the refusal is here."""
+        before, other = self.commits(), "sk-test-0ther-V4lue-2026"
+        code, answer = self.add(login=NEW, title="OPENAI_API_KEY", kind="api_key", env="OPENAI_API_KEY",
+                                fingerprints=self.prints(NEW, other))
+        self.assertEqual((code, answer["error"]), (409, "The list already has an API key named OPENAI_API_KEY, and it "
+                                                        "takes no second key of that name."), answer)
+        self.assertEqual((self.commits(), sorted(self.committed()["logins"])), (before, [LOGIN, KEY]))
+        self.assertFalse(hub.secret_hit("the key is " + other))         # nothing was registered for it
+        self.assertEqual(self.add(login=NEW, title="A second title", kind="api_key", env="OPENAI_API_KEY")[0], 409)
+        # another name, and a login with that title, are no second key
+        self.assertEqual(self.add(login=NEW, title="OPENAI_ORG_KEY", kind="api_key", env="OPENAI_ORG_KEY")[0], 200)
+        login = "bws://41111111-2222-4333-8444-55555555555b"
+        self.assertEqual(self.add(login=login, title="OPENAI_API_KEY", kind="login")[0], 200)
+        # The key that is there is saved again under its own reference: the hub step of a replace of its value. It
+        # adds the fingerprints of the new value and leaves the entry, so nothing is committed.
+        commits = self.commits()
+        code, receipt = self.add(login=KEY, title="OPENAI_API_KEY", kind="api_key", env="OPENAI_API_KEY",
+                                 fingerprints=self.prints(KEY, other))
+        self.assertEqual((code, receipt["stored"], receipt["changed"], self.commits()), (200, 1, False, commits), receipt)
+        self.assertTrue(hub.secret_hit("the key is " + other))
+        # The owner saves the first value again: its fingerprint is the newest one of the reference now, with no
+        # second row of it, because an intake gives the central vault only the newest of each kind.
+        newest = lambda: hub.q1("SELECT hash FROM secrets WHERE label=? ORDER BY id DESC",
+                                (hub.fingerprint_label(KEY, "password"),))["hash"]
+        self.assertEqual(newest(), self.prints(KEY, other)[0]["hash"])
+        code, receipt = self.add(login=KEY, title="OPENAI_API_KEY", kind="api_key", env="OPENAI_API_KEY",
+                                 fingerprints=self.prints(KEY))
+        self.assertEqual((code, receipt["stored"], receipt["known"], receipt["changed"]), (200, 1, 0, False), receipt)
+        code, receipt = self.add(login=KEY, title="OPENAI_API_KEY", kind="api_key", env="OPENAI_API_KEY",
+                                 fingerprints=self.prints(KEY, other))
+        self.assertEqual((code, receipt["stored"], receipt["known"], newest()),
+                         (200, 0, 1, self.prints(KEY, other)[0]["hash"]), receipt)
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM secrets WHERE label=?",
+                                (hub.fingerprint_label(KEY, "password"),))["n"], 2)
+        # a key cannot take the name of another one either
+        code, answer = self.add(login=NEW, title="OPENAI_API_KEY", kind="api_key", env="OPENAI_API_KEY")
+        self.assertEqual(code, 409, answer)
+        # A list from before has two keys of one name. No write fails that leaves them as they are: the same step
+        # again for either one, a new title, a grant; and validate_team takes the file.
+        fourth = "bws://61111111-2222-4333-8444-55555555555b"
+        with patch.object(hub, "key_named", lambda team, name, but=None: []):
+            self.assertEqual(self.add(login=fourth, title="OPENAI_API_KEY", kind="api_key", env="OPENAI_API_KEY")[0], 200)
+        self.assertEqual(hub.key_named(hub.TEAM, "OPENAI_API_KEY"), sorted([KEY, fourth]))
+        self.assertEqual(hub.key_named(hub.TEAM, "OPENAI_API_KEY", KEY), [fourth])
+        self.assertIsNone(hub.team_problem(json.loads(json.dumps(hub.TEAM))))
+        for ref in (KEY, fourth):
+            code, receipt = self.add(login=ref, title="OPENAI_API_KEY", kind="api_key", env="OPENAI_API_KEY",
+                                     fingerprints=self.prints(ref, "sk-test-Th1rd-V4lue-2026"))
+            self.assertEqual((code, receipt["changed"]), (200, False), receipt)
+        code, _ = self.request("/ui/team/logins", dict(request_id=str(uuid.uuid4()), db="test-generation",
+                                                       base_sha256=self.team()["sha256"], login=fourth, title="OpenAI old"))
+        self.assertEqual(code, 200)
+        self.assertEqual(self.grant(fourth, "alpha", "use")[0], 200)
+        self.assertEqual(self.grant(KEY, "alpha", "read")[0], 200)
+        # and a third one of that name is refused as the second one is
+        self.assertEqual(self.add(login="bws://71111111-2222-4333-8444-55555555555b", title="OPENAI_API_KEY",
+                                  kind="api_key", env="OPENAI_API_KEY")[0], 409)
+
+    def test_one_agent_never_reads_two_keys_of_one_variable_name(self):
+        """The guard of 13 November 2026: a vault that gets one variable name two times refuses the whole read, so
+        the agent's sessions start with none of its keys. The hub refuses the grant that would make that state, in
+        words for the row that shows the grant, and it commits nothing."""
+        self.second_key()
+        self.assertEqual(self.grant(KEY, "alpha", "read")[0], 200)
+        before = self.commits()
+        code, answer = self.grant(NEW, "alpha", "read")
+        self.assertEqual((code, answer["error"]), (409, "This agent already reads another key named OPENAI_API_KEY. A "
+                                                        "session has one value for one name. Take the other key back "
+                                                        "from this agent first."), answer)
+        self.assertEqual((self.commits(), self.committed()["agents"]["alpha"]["secrets"]), (before, {KEY: "read"}))
+        self.assertEqual(hub.read_secrets("alpha"), [(KEY, "OPENAI_API_KEY")])
+        # the manager's grant goes the same way (grant_access calls save_grant)
+        with hub.LOCK, self.assertRaises(hub.Refusal) as refused:
+            hub.save_grant({"login": NEW, "agent": "alpha", "grant": "read"}, by="manager")
+        self.assertEqual(refused.exception.status, 409)
+        # the key is another agent's to read, and this agent can use it: neither puts two values under one name
+        self.assertEqual(self.grant(NEW, "beta", "read")[0], 200)
+        self.assertEqual(self.grant(NEW, "alpha", "use")[0], 200)
+        self.assertEqual(self.vault_call("alpha", "read", {})[1]["secrets"][0]["login"], KEY)
+        # use to read is the same grant: refused, and the use stays
+        self.assertEqual(self.grant(NEW, "alpha", "read")[0], 409)
+        self.assertEqual(self.committed()["agents"]["alpha"]["secrets"], {KEY: "read", NEW: "use"})
+        # after the take-back of the first key, the agent reads the second one
+        self.assertEqual(self.grant(KEY, "alpha", None)[0], 200)
+        self.assertEqual(self.grant(NEW, "alpha", "read")[0], 200)
+        self.assertEqual(hub.read_secrets("alpha"), [(NEW, "OPENAI_API_KEY")])
+        self.assertEqual(self.grant(KEY, "alpha", "read")[0], 409)          # and now the first one is the second
+        # a key that an agent only uses is no value of its sessions: it reads the other key of that name
+        self.assertEqual(self.grant(NEW, "lone", "use")[0], 200)
+        self.assertEqual(self.grant(KEY, "lone", "read")[0], 200)
+        self.assertEqual(hub.read_secrets("lone"), [(KEY, "OPENAI_API_KEY")])
+
+    def test_a_read_names_no_variable_two_times(self):
+        """A team.json that no owner write made can give one agent two read keys of one name (the hub starts on such
+        a file and says the rule). The hub's answer to the vault then leaves both out and names the agent's other
+        keys, so one fault does not cost the agent each of its keys."""
+        self.second_key()
+        other = "bws://51111111-2222-4333-8444-55555555555b"
+        self.assertEqual(self.add(login=other, title="GITHUB_PAT", kind="api_key", env="GITHUB_PAT")[0], 200)
+        team = json.loads(json.dumps(hub.TEAM))
+        team["agents"]["alpha"]["secrets"] = {KEY: "read", NEW: "read", other: "read"}
+        self.assertIn("it reads two keys named OPENAI_API_KEY", hub.team_problem(team))
+        with patch.object(hub, "TEAM", team):
+            self.assertEqual(hub.read_twice(team, "alpha", KEY), [NEW])
+            self.assertEqual(hub.read_twice(team, "alpha", other), [])
+            code, answer = self.vault_call("alpha", "read", {})
+        self.assertEqual((code, [x["env"] for x in answer["secrets"]]), (200, ["GITHUB_PAT"]), answer)
+        said = [r["what"] for r in hub.q("SELECT what FROM log WHERE agent='alpha' AND what LIKE 'REFUSED the keys%'")]
+        self.assertEqual(len(said), 1, said)
+        self.assertIn("OPENAI_API_KEY", said[0])
 
 
 if __name__ == "__main__":

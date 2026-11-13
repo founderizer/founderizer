@@ -266,7 +266,7 @@ class VaultBroker(OwnerAPI):
         self.assertIsNone(self.released(job))                               # refused before the hub was asked
         status = fleet.vault_call({"op": "status"})
         self.assertEqual(set(status), {"ok", "v", "agent", "store", "user", "recipient", "callers", "backend", "source",
-                                       "creates", "deposits", "withdrawals"})
+                                       "creates", "deposits", "withdrawals", "replaces"})
         self.assertEqual(status["backend"], "store")            # the one store a broker opens (P5)
         self.assertEqual((status["recipient"], status["callers"]), (VPS_KEY, True))
         self.assertEqual(self.reads(), [])
@@ -678,11 +678,19 @@ class VaultBroker(OwnerAPI):
         self.assertEqual(mode("filey"), {"mode": "none", "isolated": None})
         public = fleet.vault_status("filey")        # every mode reports the broker's public status
         self.assertEqual((public["callers"], public["broker_recipient"]), (True, VPS_KEY))
+        # the broker's word that it puts a new value over a delivered one: the helper passes it on, the hub keeps it,
+        # and the hub sends a replaced value only to a vault whose report says it (hub.can_replace)
+        self.assertIs(public["replaces"], True)
+        kept = hub.validate_status({"security": {"vault": public}})["security"]["vault"]
+        self.assertIs(kept["replaces"], True)
+        with self.assertRaises(ValueError):
+            hub.validate_status({"security": {"vault": dict(public, replaces="yes")}})
         self.assertIsInstance(public["broker_read_at"], float)
         self.broker.close()
         unread = {"callers": None, "creates": None, "captures": None, "requests": None, "broker_recipient": None,
                   "broker_source": None, "broker_read_at": None, "deposits": None,     # deposits: secret_deliveries
                   "withdrawals": None,                                                 # withdrawals: central_vault
+                  "replaces": None,                                                    # replaces: secret_replace
                   "places": None, "place_key": None}                                   # places: secret_targets
         self.assertEqual(fleet.vault_status("vps"), dict(unread, mode="broker", isolated=False))
         report = hub.validate_status({"security": {"vault": {"mode": "broker", "isolated": True, "token": "x"}}})

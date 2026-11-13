@@ -503,6 +503,12 @@ CREATE INDEX IF NOT EXISTS deposit_of ON deposits(login, machine, id);
 CREATE TABLE IF NOT EXISTS withdrawals(id INTEGER PRIMARY KEY, login TEXT NOT NULL, machine TEXT NOT NULL,
   agent TEXT NOT NULL, created REAL NOT NULL, released REAL, finished REAL, ok INTEGER, result TEXT);
 CREATE INDEX IF NOT EXISTS withdrawal_of ON withdrawals(login, machine, id);
+-- Owner feature secret_replace: the value of one reference that the owner replaced in the central vault (the vault's
+-- signed replace): when the hub knew it, the newest delivery that there was then (`after`), the checksum of the
+-- owner's sealed copy, and the fingerprints of the value that the central vault holds since, as that vault named
+-- them. A delivery up to `after`, and one that was made before `at`, holds the old value. Never a value.
+CREATE TABLE IF NOT EXISTS secret_values(login TEXT PRIMARY KEY, at REAL NOT NULL, after INTEGER NOT NULL,
+  sha256 TEXT NOT NULL, prints TEXT NOT NULL);
 -- Unused since 24 October 2026, when Targets left the hub (the owner rejected them): nothing writes or reads the
 -- three tables below any more. They stay as they are, with whatever a hub already holds in them, so that no database
 -- changes its shape. `placements` was one key that a machine's vault placed into a target of the owner's, or one
@@ -1223,6 +1229,27 @@ def read_secrets(agent):
     catalog = logins()
     return sorted(((ref, catalog[ref]["env"]) for ref, grant in secret_grants(agent).items()
                    if grant == "read" and (catalog.get(ref) or {}).get("kind") == "api_key"), key=lambda x: x[1])
+
+
+def key_named(team, name, but=None):
+    """The references of the catalog's API keys with this variable name, sorted, without `but`. The catalog takes no
+    second key of one name (save_secret), so this has at most one in a list that only the hub wrote since 13 November
+    2026; a list from before can have more, and validate_team leaves them: the owner removes one."""
+    return sorted(ref for ref, e in (team.get("logins") or {}).items()
+                  if ref != but and e.get("kind") == "api_key" and e.get("env") == name)
+
+
+def read_twice(team, agent, ref):
+    """The other API keys that this agent reads under the variable name of `ref`, as sorted references: a session has
+    one value for one name, so one agent never reads two keys of one name. save_grant refuses the grant that would
+    make it, validate_team refuses a team.json that has it, and the hub's answer to a vault's read names no variable
+    two times (helper_vault_read): a vault that gets a name two times gives the agent none of its keys (vault.py
+    read)."""
+    catalog = team.get("logins") or {}
+    name = (catalog.get(ref) or {}).get("env")
+    return sorted(other for other, grant in secret_grants(agent, team).items()
+                  if other != ref and grant == "read" and name is not None
+                  and (catalog.get(other) or {}).get("kind") == "api_key" and catalog[other].get("env") == name)
 
 
 # ---------------------------------------------------------------- the key swap (VAULT.md, "The key swap")
@@ -8746,16 +8773,27 @@ def fingerprint_label(login, kind):
     return f"{login.lower() if login.lower().startswith('bws://') else login} {kind}"
 
 
-def register_fingerprints(login, items):
-    """Store the fingerprints of one login that are not there yet. (stored, known)."""
+def register_fingerprints(login, items, newest=False):
+    """Store the fingerprints of one login that are not there yet. (stored, known).
+
+    newest: the owner's own save of this value (save_secret). A fingerprint that is there already then gets a new
+    row at the end, and its old row goes after that, so the hub never has no row of it. The newest rows of a
+    reference are so the ones of its newest save, and central_intake gives the central vault only the newest of
+    each kind: a key that the owner replaces many times, or with a value that it had before, still goes in."""
     stored = known = 0
     for x in items:
         label = fingerprint_label(login, x["kind"])
         salt = fingerprint_salt(label)
-        if q1("SELECT id FROM secrets WHERE salt=? AND hash=? AND len=?", (salt, x["hash"], x["len"])):
+        old = q1("SELECT id FROM secrets WHERE salt=? AND hash=? AND len=? ORDER BY id DESC",
+                 (salt, x["hash"], x["len"]))
+        if old and not newest:
+            known += 1
+            continue
+        ins("INSERT INTO secrets(label,salt,hash,len,username) VALUES(?,?,?,?,'')", (label, salt, x["hash"], x["len"]))
+        if old:
+            q("DELETE FROM secrets WHERE salt=? AND hash=? AND len=? AND id<=?", (salt, x["hash"], x["len"], old["id"]))
             known += 1
         else:
-            ins("INSERT INTO secrets(label,salt,hash,len,username) VALUES(?,?,?,?,'')", (label, salt, x["hash"], x["len"]))
             stored += 1
     return stored, known
 
@@ -8789,6 +8827,10 @@ def fingerprints_same(login, items):
     for kind in ("password", "totp"):
         salt = fingerprint_salt(fingerprint_label(login, kind))
         held[kind] = {(r["hash"], r["len"]) for r in read_rows("SELECT hash, len FROM secrets WHERE salt=?", (salt,))}
+    value = secret_value(login)
+    if value is not None:       # the owner replaced the value: the fingerprints of the value now, not of one before
+        held = {kind: {(x["hash"], x["len"]) for x in json.loads(value["prints"]) if x["kind"] == kind}
+                for kind in ("password", "totp")}
     if not any(held.values()):
         return None
     given = {(x["kind"], x["hash"], x["len"]) for x in items}
@@ -10289,8 +10331,9 @@ def t_request_secret(agent, a):
                      f"it is not in the grantable pool, so the owner gives it to an agent on the Secrets page: "
                      f"raise_needs_you, naming {have} and the agent")
             raise ToolError(f"The fleet already holds the API key {env}, as {have}, so there is nothing to type: "
-                            f"{route}. If its value is wrong or was revoked, tell the owner with raise_needs_you that "
-                            f"{have} must be removed on the Secrets page; then request_secret asks for the new one.")
+                            f"{route}. If its value is wrong or was revoked, tell the owner with raise_needs_you to "
+                            f"save the new value with Add secret under the name {env}: it goes in the place of the "
+                            f"old one, and each agent that holds {have} keeps it.")
     waits = ("This task waits for the owner's answer: end your turn. If they save it, this session goes on once your "
              "machine's vault has it; if they decline, their words come here.")
     if tid:
@@ -10568,8 +10611,9 @@ def secret_woken_words(r, spec):
 def secret_wakes(t0=None):
     """Wake the tasks of each saved request whose secret can reach them now, decided by the asker's vault in team.json
     now: "file" reads his project, and so does a broker with no store of the fleet's own, so at once; a broker with the
-    fleet's own store when its machine's newest delivery of the secret is done, while one that waits, or a central
-    one that is tried again, keeps the wait; a delivery that failed for good, none on its way, or no vault at all
+    fleet's own store when its machine's newest delivery of the secret is done, while one that waits, one that holds
+    the value from before the owner replaced it (value_old), or a central one that is tried again, keeps the wait; a
+    delivery that failed for good, none on its way, or no vault at all
     (his grant can give one) is told once, and the task keeps waiting. Run at his answer, after the end of a delivery
     and from the tick, so that no delivery is missed; each request is read again and written in one transaction."""
     t0 = t0 or now()
@@ -10590,9 +10634,11 @@ def secret_wakes(t0=None):
                 elif a.get("vault") == "broker":
                     d = DB.execute("SELECT * FROM deposits WHERE login=? AND machine=? ORDER BY id DESC LIMIT 1",
                                    (spec["saved"], a.get("machine"))).fetchone()
-                    if d and d["finished"] and d["ok"]:
+                    # a copy from before the owner replaced the value is not the secret that his answer saved:
+                    # the new one is on its way, and a session that started now would read the old value
+                    if d and d["finished"] and d["ok"] and not value_old(d, secret_value(spec["saved"])):
                         state = "delivered"
-                    elif d and (not d["finished"] or str(d["request_id"]).startswith(CENTRAL_REQUEST)):
+                    elif d and (not d["finished"] or d["ok"] or str(d["request_id"]).startswith(CENTRAL_REQUEST)):
                         state = "waiting"
                 if state == "waiting" or (state == "missing" and spec.get("told")):
                     continue
@@ -10699,8 +10745,10 @@ def deposit_machines(team=None, t0=None):
 
 
 def deposit_view(row):
-    """One delivery, for the owner: never its copy."""
-    return {"id": row["id"], "state": DEPOSIT_STATES[row["ok"]] if row["finished"] else "waiting",
+    """One delivery, for the owner: never its copy. A delivery that ended well before the owner replaced the value
+    of its secret holds the old value: the new one is on its way, so its state is waiting."""
+    old = row["finished"] and row["ok"] == 1 and value_old(row, secret_value(row["login"]))
+    return {"id": row["id"], "state": "waiting" if old or not row["finished"] else DEPOSIT_STATES[row["ok"]],
             "agent": row["agent"], "created": row["created"], "taken": row["released"], "finished": row["finished"],
             "result": row["result"]}
 
@@ -10766,14 +10814,16 @@ def held_on(machine, ref):
 
 def deposit_refusal(r):
     """None while a waiting delivery can still go into its machine's vault, else why not, in one sentence: its carrier
-    lost its broker access, the machine's pinned key changed since the copy was sealed, or no agent there holds the
-    secret any more (the grant again, as at its sealing)."""
+    lost its broker access, the machine's pinned key changed since the copy was sealed, no agent there holds the
+    secret any more (the grant again, as at its sealing), or the owner replaced the value since (value_old)."""
     if agents().get(r["agent"], {}).get("vault") != "broker":
         return f"{r['agent']} has no broker access any more."
     if store_key(TEAM, r["machine"]) != r["recipient"]:
         return "Its server's vault key changed since the copy was sealed."
     if not held_on(r["machine"], r["login"]):
         return "No agent of its server holds it any more."
+    if value_old(r, secret_value(r["login"])):
+        return "The owner replaced its value after this copy was sealed."
     return None
 
 
@@ -10870,11 +10920,23 @@ def central_ok(t0=None):
     return status is not None and error is None and at is not None and (t0 or now()) - at < CENTRAL_FRESH
 
 
+def central_replaces(t0=None, ok=None):
+    """True while the central vault answers and its program takes the owner's signed replace of a value (its status
+    says replaces: true). Only then is `secret_replace` an owner feature: the app sends a replace to no other. ok:
+    central_ok() of now, when the caller has read it already (ui_features reads it one time for a state)."""
+    with CENTRAL_LOCK:
+        status = CENTRAL["status"]
+    return (central_ok(t0) if ok is None else ok) and (status or {}).get("replaces") is True
+
+
 def ui_features():
-    """The owner features this hub serves now: UI_FEATURES, central_vault only while central_ok(), contact_roles
-    only while contacts.v2 is on, and connected_apps only while the hub's socket for them is open and the gate has
-    forwarded to it (capp_ready)."""
-    return list(UI_FEATURES) + (["central_vault"] if central_ok() else []) + \
+    """The owner features this hub serves now: UI_FEATURES, central_vault only while central_ok(), secret_replace
+    only while the central vault also says that it replaces a value (central_replaces), contact_roles only while
+    contacts.v2 is on, and connected_apps only while the hub's socket for them is open and the gate has forwarded to
+    it (capp_ready)."""
+    ok = central_ok()
+    return list(UI_FEATURES) + (["central_vault"] if ok else []) + \
+        (["secret_replace"] if central_replaces(ok=ok) else []) + \
         (["contact_roles"] if contacts_v2() else []) + (["connected_apps"] if capp_ready() else [])
 
 
@@ -10910,7 +10972,7 @@ def central_read(t0=None):
     """Read the central vault's status and keep it. An ok answer is kept with its time; otherwise the one sentence
     that says why is kept, and the last ok answer stays with its own time, so the owner sees how old it is. A vault
     that is not central, or that serves another fleet, is not one this hub uses. Never under LOCK."""
-    t0 = t0 or now()
+    t0, asked = t0 or now(), now()      # asked: the hub's own clock before the call, whatever time a caller names
     try:
         answer = central_call("status")
         if answer.get("central") is not True or not isinstance(answer.get("pins"), dict):
@@ -10932,7 +10994,36 @@ def central_read(t0=None):
     if news:
         changed()
     central_down_news(t0, None)
+    central_values(answer, asked)
     return answer
+
+
+def central_values(status, asked):
+    """The hub's record of each replace that the central vault's status names (`values`: the checksum of the copy of
+    the newest replace of each login), where the hub has none of it. That is a hub that stopped between the central
+    vault's write and its own record (value_replaced): the vault holds the new value, each machine holds the old
+    one, and without this only the owner's same Save again would send the new one. The fingerprints of the value
+    are not in a status, so such a record takes each one that the owner registered under the reference. asked: the
+    time before the status was asked for. A record that the hub made after that is newer than this status, which can
+    still name the replace before it: such a record stays. Never under LOCK: it takes LOCK itself. Returns the
+    references that it recorded."""
+    found, made = (status or {}).get("values"), []
+    if not isinstance(found, dict) or not found:
+        return made
+    with LOCK:
+        catalog = logins()      # only a secret of the catalog: a status can name nothing else into the hub's records
+        for ref, sha in sorted(found.items(), key=lambda x: str(x[0])):
+            if not (isinstance(ref, str) and ref in catalog and isinstance(sha, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", sha)):
+                continue
+            row = secret_value(ref)
+            if row is not None and (row["sha256"] == sha or row["at"] >= asked):
+                continue
+            if value_replaced(ref, sha, {"saved": "replaced"}):
+                made.append(ref)
+    if made:
+        central_due()
+    return made
 
 
 def central_down_news(t0, error):
@@ -10982,9 +11073,13 @@ def central_grants():
 
 
 def newest_holding(machine, ref):
-    """(the newest delivery, the newest withdrawal) of one secret on one machine, or None for each. read_row, because
-    the reconciler reads these under LOCK next to its own writes."""
-    return (read_row("SELECT * FROM deposits WHERE login=? AND machine=? ORDER BY id DESC LIMIT 1", (ref, machine)),
+    """(the delivery that says what the vault of one machine holds of one secret, the newest withdrawal), or None for
+    each. The delivery: the newest one that ended well or still waits, and only when there is none, the newest one.
+    A delivery that failed left the vault as it was, so it does not hide the copy that an earlier one saved: since the
+    owner can replace a value, a vault gets a second delivery of a secret that it holds, and that one can fail.
+    read_row, because the reconciler reads these under LOCK next to its own writes."""
+    return (read_row("SELECT * FROM deposits WHERE login=? AND machine=? ORDER BY (finished IS NULL OR ok=1) DESC, "
+                     "id DESC LIMIT 1", (ref, machine)),
             read_row("SELECT * FROM withdrawals WHERE login=? AND machine=? ORDER BY id DESC LIMIT 1", (ref, machine)))
 
 
@@ -11000,9 +11095,11 @@ def vault_holds(d, w, pin=None):
 
 
 def central_holdings():
-    """{(machine, ref): (newest delivery, newest withdrawal)} of every secret the hub's records place on a machine."""
+    """{(machine, ref): (delivery, newest withdrawal)} of every secret the hub's records place on a machine, with the
+    delivery of newest_holding: the newest one that ended well or still waits, else the newest one."""
     out = {}
-    for r in read_rows("SELECT * FROM deposits WHERE id IN (SELECT MAX(id) FROM deposits GROUP BY login, machine)"):
+    for r in read_rows("SELECT * FROM deposits WHERE id IN (SELECT COALESCE(MAX(CASE WHEN finished IS NULL OR ok=1 "
+                       "THEN id END), MAX(id)) FROM deposits GROUP BY login, machine)"):
         out[(r["machine"], r["login"])] = (r, None)
     for r in read_rows("SELECT * FROM withdrawals WHERE id IN (SELECT MAX(id) FROM withdrawals GROUP BY login, "
                        "machine)"):
@@ -11028,6 +11125,93 @@ def can_withdraw(carrier, t0=None):
     return "secret_withdrawals" in (report.get("features") or []) and report.get("withdrawals") is True
 
 
+def key_stamp(agent):
+    """A number that changes when the vault of this agent's machine took a new delivery of a key that the agent
+    reads: the id of the newest such delivery that ended well, or 0. A check event carries it, and a helper that
+    kept the agent's keys for its checks in memory reads them again when it changes (fleet.py check_keys), so a
+    check gets the new value after the owner replaced one. read_row: a check is sent inside a transaction."""
+    machine, refs = (agents().get(agent) or {}).get("machine"), [ref for ref, _env in read_secrets(agent)]
+    if not machine or not refs:
+        return 0
+    row = read_row(f"SELECT MAX(id) n FROM deposits WHERE machine=? AND ok=1 AND login IN "
+                   f"({','.join('?' * len(refs))})", (machine, *refs))
+    return (row["n"] if row else None) or 0
+
+
+def can_replace(carrier, t0=None):
+    """True when the broker of this carrier's machine puts a new value in the place of a delivered one (its status
+    says replaces: true). An older broker refuses another value under a reference that it holds, so the hub sends it
+    no delivery of a replaced value while it holds the old one: its program follows the release, and the next pass
+    after its report sends it."""
+    return (broker_report(carrier, t0) or {}).get("replaces") is True
+
+
+def secret_value(ref):
+    """The record of the value that the owner replaced under this reference, or None when he replaced none:
+    {login, at, sha256, prints}. read_row: the reconciler and a vault's routes read it under LOCK."""
+    return read_row("SELECT * FROM secret_values WHERE login=?", (ref,))
+
+
+def value_old(delivery, value):
+    """True when this delivery was sealed before the owner replaced the value of its reference: its copy holds the
+    old value. Two rules, and either one says it. Its number is not after the newest delivery that there was when
+    the hub recorded the replace: no clock is in that. Or its time is before the record's: a delivery has the time
+    at which its pass of the reconciler started, which is before its seal, and the record has a time after the
+    central vault took the new value, so this also names a delivery that a pass from before the replace makes after
+    it. A delivery that is not old was sealed from the new value. value: the secret_values row, or None."""
+    return value is not None and delivery is not None and (
+        delivery["id"] <= value["after"] or delivery["created"] < value["at"])
+
+
+def value_replaced(ref, sha256, answer, t0=None):
+    """The owner replaced the value of this reference in the central vault (its answer to an intake with his signed
+    statement): the hub's own part of it, under the caller's LOCK. True when this is news.
+
+    The record: when, the checksum of the owner's copy, and the fingerprints of the value now, as the central vault
+    named them. From then on a copy that a machine took before is old (value_old), so the reconciler sends each
+    machine that holds one a new delivery, which its vault puts in the place of the old value (central_plan, and
+    `replaces` of helper_deposit). Each delivery of this reference that still waits ends here: its copy holds the old
+    value. The door's copy row goes too, so its next minute seals the new value for the door, which writes it over
+    its file of this reference (door_reconcile). The old value's fingerprints stay, as those of a secret that the
+    owner removed: the hub goes on masking the old value in texts.
+
+    "same" is the central vault's answer to a statement that it took before: a retry after a hub that stopped between
+    the vault's write and this record, so the record is written when it is not this replace's own. The hub also
+    reads such a replace in the vault's status by itself (central_values, with answer {"saved": "replaced"} and no
+    fingerprints). "new" is a login
+    that the central vault did not hold. A machine's vault can still hold a value under it, which came there before
+    the central vault held each secret, so the record is written for it too: nothing is sent to a machine that holds
+    no copy."""
+    t0 = t0 or now()
+    saved, row = answer.get("saved"), secret_value(ref)
+    if saved not in ("new", "replaced", "same"):
+        return False
+    found = answer.get("fingerprints")
+    prints = [{k: x[k] for k in ("kind", "hash", "len")} for x in found] \
+        if isinstance(found, list) and (found == [] or fingerprint_items(found)) else None
+    if saved == "same" and row is not None and row["sha256"] == sha256:
+        # This replace is on record: a repeat of it changes nothing. One thing more: a record that the hub made from
+        # the vault's status (central_values) has no exact fingerprints, and the vault's answer names them now.
+        if prints is not None and row["prints"] != json.dumps(prints, sort_keys=True):
+            with transaction():
+                DB.execute("UPDATE secret_values SET prints=? WHERE login=?", (json.dumps(prints, sort_keys=True), ref))
+        return False
+    if prints is None:      # a central vault that names none: each fingerprint under the reference, as before
+        prints = [{"kind": kind, "hash": r["hash"], "len": r["len"]} for kind in ("password", "totp")
+                  for r in read_rows("SELECT hash, len FROM secrets WHERE label=? ORDER BY id",
+                                     (fingerprint_label(ref, kind),))]
+    with transaction():
+        after = DB.execute("SELECT COALESCE(MAX(id), 0) FROM deposits").fetchone()[0]
+        DB.execute("INSERT INTO secret_values(login,at,after,sha256,prints) VALUES(?,?,?,?,?) ON CONFLICT(login) DO "
+                   "UPDATE SET at=excluded.at, after=excluded.after, sha256=excluded.sha256, prints=excluded.prints",
+                   (ref, t0, after, sha256, json.dumps(prints, sort_keys=True)))
+        DB.execute("UPDATE deposits SET ok=0, result=?, finished=?, ciphertext=NULL WHERE login=? AND finished IS NULL",
+                   ("The owner replaced its value after this copy was sealed.", t0, ref))
+        DB.execute("DELETE FROM door_copies WHERE login=?", (ref,))
+    log("owner", f"replaced the value of {ref} in the central vault: each vault that holds a copy gets the new one")
+    return True
+
+
 def central_plan(pins, inventory, t0, signed=(frozenset(), frozenset())):
     """What one pass of the reconciler does: ([(machine, ref, carrier)] to seal and deliver, [(machine, ref, carrier)]
     to withdraw). It writes nothing; called with LOCK held.
@@ -11040,24 +11224,36 @@ def central_plan(pins, inventory, t0, signed=(frozenset(), frozenset())):
     that the owner no longer signs for it, goes back, but only a secret the central vault holds: one it lacks came
     from somewhere else, and nothing here takes that away. What failed lately waits CENTRAL_RETRY first, unless it
     was sealed to another key than the pin of now. A secret that is not in the catalog is not sent, because the
-    carrier's vault would refuse it (helper_deposit), and it is not taken back either while an agent holds it."""
+    carrier's vault would refuse it (helper_deposit), and it is not taken back either while an agent holds it.
+
+    A copy that the vault took before the owner replaced the value of its reference is old (value_old): the vault
+    gets the new value in a delivery that it puts in the place of the old one, when its broker says that it does so
+    (can_replace); until then it keeps the old value. A delivery that failed before the replace waits for nothing."""
     holdings, catalog, deliver, withdraw = central_holdings(), logins(), [], []
     granted, pooled = signed
+    values = {r["login"]: r for r in read_rows("SELECT * FROM secret_values")}
+    # the newest delivery of each secret to each machine that failed: what waits CENTRAL_RETRY, when it is newer than
+    # the delivery of the holding and was sealed from the value of now
+    failed = {(r["machine"], r["login"]): r for r in read_rows(
+        "SELECT * FROM deposits WHERE id IN (SELECT MAX(id) FROM deposits WHERE ok=0 GROUP BY login, machine)")}
     for name, m in sorted(deposit_machines(None, t0).items()):
         pin = pins.get(name)
         if not m["carrier"] or not pin or pin != m["recipient"]:
             continue
         desired = {ref for agent in m["agents"] for ref in secret_grants(agent)
                    if ref in inventory and ((ref, name) in granted or ref in pooled)}
-        withdraws = can_withdraw(m["carrier"], t0)
+        withdraws, replaces = can_withdraw(m["carrier"], t0), can_replace(m["carrier"], t0)
         for ref in sorted(desired | {ref for machine, ref in holdings if machine == name}):
             d, w = holdings.get((name, ref), (None, None))
             held, waiting = vault_holds(d, w, pin)
             if waiting:
                 continue
-            if ref in desired and not held:
-                if ref in catalog and not (d is not None and d["ok"] == 0 and d["recipient"] == pin
-                                           and t0 - d["finished"] < CENTRAL_RETRY):
+            old = value_old(d, values.get(ref))     # the owner replaced the value after this copy was sealed
+            f = failed.get((name, ref))
+            lately = f is not None and (d is None or f["id"] >= d["id"]) and f["recipient"] == pin \
+                and not value_old(f, values.get(ref)) and t0 - f["finished"] < CENTRAL_RETRY
+            if ref in desired and (not held or (old and replaces)):
+                if ref in catalog and not lately:
                     deliver.append((name, ref, m["carrier"]))
             elif held and ref not in desired and ref in inventory and withdraws:
                 if not (w is not None and w["ok"] == 0 and w["created"] > d["created"]
@@ -11083,12 +11279,18 @@ def central_sealed(answer, ref, machine, pin):
 def central_deliver(machine, ref, text, pin, t0):
     """One sealed copy of the central vault's into a delivery, as deliver_secret makes one for a copy of the owner's
     app, if the machine still takes it now: a carrier, the pin still its broker's key, the secret still in the catalog
-    and held by one of its agents, and nothing of it held or waiting there. The seal came from the socket outside
-    LOCK, so each of those is read again here. Called with LOCK held; returns the delivery's id, or None."""
+    and held by one of its agents, and nothing of it held or waiting there, except a copy of a value that the owner
+    replaced since (value_old). The seal came from the socket outside LOCK, so each of those is read again here.
+    Called with LOCK held; returns the delivery's id, or None."""
     m, entry = deposit_machines(None, t0).get(machine), logins().get(ref)
+    d, w = newest_holding(machine, ref)
+    held, waiting = vault_holds(d, w, pin)
+    value = secret_value(ref)
+    # A copy that the vault holds stops a new one, but not a copy of the value that the owner replaced since. And a
+    # pass that started before the replace can carry a seal of the old value: it makes no delivery, the next one does.
     if not m or not m["carrier"] or m["recipient"] != pin or entry is None or \
             ref not in {one for agent in m["agents"] for one in secret_grants(agent)} or \
-            any(vault_holds(*newest_holding(machine, ref), pin)):
+            waiting or (held and not value_old(d, value)) or (value is not None and t0 < value["at"]):
         return None
     with transaction():
         did = DB.execute("INSERT INTO deposits(login,machine,agent,recipient,sha256,ciphertext,request_id,created) "
@@ -11260,29 +11462,41 @@ def vault_view(t0=None):
             "held": held, "program": vault_source(kit_revision()), "hub": reach if own else None}
 
 
-def central_intake(ref, text):
+def central_intake(ref, text, statement=None, signature=None):
     """POST /ui/vault/intake's call: the secret's title and kind from the catalog, the salts and the fingerprints the
     owner's vault registered under its reference (POST /ui/secrets/add), and the copy the owner's app sealed to the
     central vault's own key. The central vault keeps the value only when its fingerprints are those. Never under
-    LOCK."""
+    LOCK.
+
+    statement, signature: the owner's signed replace of this reference's value (owner feature secret_replace), as
+    they came. The hub cannot make one and does not read it: the central vault checks it against the owner's keys
+    and the copy, and only then puts the new value in the place of the old one (vault.py intake)."""
     entry = logins().get(ref)
     if entry is None:
         raise Refusal(404, "no such secret: its hub step (POST /ui/secrets/add) comes first")
     labels = {kind: fingerprint_label(ref, kind) for kind in ("password", "totp")}
+    # The newest CENTRAL_PRINTS of each kind, oldest first: the central vault takes 32 in all, and each save of the
+    # owner's under this reference puts its own at the end (register_fingerprints, newest). So the number of values
+    # that a reference had sets no limit to the next one.
     prints = [{"kind": kind, "hash": r["hash"], "len": r["len"]} for kind, label in labels.items()
-              for r in q("SELECT hash, len FROM secrets WHERE label=? ORDER BY id", (label,))]
+              for r in reversed(q("SELECT hash, len FROM secrets WHERE label=? ORDER BY id DESC LIMIT ?",
+                                  (label, CENTRAL_PRINTS)))]
     if not prints:
         raise Refusal(409, "the owner's vault registered no fingerprint of this secret, so the central vault could "
                            "not tell that it holds their value: POST /ui/secrets/add with its fingerprints comes "
                            "first")
-    answer = central_call("intake", {"login": ref, "title": entry["title"], "item": entry.get("kind") or "login",
-                                     "ciphertext": text, "fingerprints": prints,
-                                     "salts": {kind: fingerprint_salt(label) for kind, label in labels.items()}})
-    if answer.get("saved") not in ("new", "same") or str(answer.get("login") or "").lower() != ref:
+    signed = {"statement": statement, "signature": signature} if statement is not None else {}
+    answer = central_call("intake", dict({"login": ref, "title": entry["title"], "item": entry.get("kind") or "login",
+                                          "ciphertext": text, "fingerprints": prints,
+                                          "salts": {kind: fingerprint_salt(label) for kind, label in labels.items()}},
+                                         **signed))
+    if answer.get("saved") not in (("new", "same", "replaced") if signed else ("new", "same")) \
+            or str(answer.get("login") or "").lower() != ref:
         raise Refusal(502, "the central vault's answer is not about this secret")
     return answer
 
 
+CENTRAL_PRINTS = 16             # fingerprints of one kind that an intake gives the central vault: its newest ones
 CENTRAL_STATEMENT_MAX = 2000    # characters of one signed statement (pin, unpin or recovery)
 CENTRAL_SIGNATURE = re.compile(r"[A-Za-z0-9+/]{8,200}={0,2}")      # base64 of a DER signature: about 96 characters
 
@@ -11298,6 +11512,16 @@ def statement_kind(statement):
     except (ValueError, AttributeError, TypeError):
         return None
     return kind if kind in CENTRAL_KINDS else None
+
+
+def replace_statement(statement):
+    """True for a text that says it is the owner's replace statement (vault.py STATEMENTS "replace"): the one kind
+    that travels with an intake and not on a route of its own, so it is not one of CENTRAL_KINDS. The hub reads this
+    one field; the central vault checks the signature and everything else."""
+    try:
+        return json.loads(statement).get("kind") == "replace"
+    except (ValueError, AttributeError, TypeError, RecursionError):
+        return False
 
 
 def central_statement(body):
@@ -29296,7 +29520,7 @@ def dispatch_check(t, run, t0):
     DB.execute("DELETE FROM events WHERE kind='trigger_check' AND json_extract(extra, '$.run')=?", (run,))
     extra = {"trigger": t["id"], "run": run, "token": token, "sha256": spec["sha256"],
              "args": spec["args"], "timeout_seconds": spec["timeout_seconds"],
-             "generation": generation[0] if generation else None}
+             "generation": generation[0] if generation else None, "keys": key_stamp(runner_of(t))}
     extra.update({"code": "saved"} if spec.get("code") == "saved" else {"path": spec["path"], "commit": spec["commit"]})
     if wakeups.is_lines(spec):          # plan P4: the fleet's limits of one run, as they are now
         extra.update(form=wakeups.LINE_FORM, output_max=setting("checks.output_bytes"),
@@ -32740,6 +32964,7 @@ def validate_status(data):
                  "requests": _optional(vault.get("requests"), bool),                                # call_api
                  "deposits": _optional(vault.get("deposits"), bool),        # owner feature central_vault
                  "withdrawals": _optional(vault.get("withdrawals"), bool),  # owner feature central_vault
+                 "replaces": _optional(vault.get("replaces"), bool),        # owner feature secret_replace
                  "places": _optional(vault.get("places"), bool),            # vault.py `place`: unused here
                  "place_key": place_key, "broker_source": source}
     features = data.get("features") or []
@@ -33394,9 +33619,12 @@ def validate_team(team):
                 ref in catalog and grant in ("use", "read") for ref, grant in grants.items()):
             raise ValueError(f"agent {name}: secrets must map secrets of the catalog (logins) to use or read")
         names = [catalog[ref].get("env") for ref, grant in grants.items() if grant == "read"]
-        if None in names or len(set(names)) != len(names):
-            raise ValueError(f"agent {name}: only an API key can be read, and two that it reads cannot have one "
-                             f"variable name")
+        if None in names:
+            raise ValueError(f"agent {name}: only an API key can be read")
+        twice = sorted(n for n in set(names) if names.count(n) > 1)
+        if twice:           # a vault that gets one name two times gives the agent none of its keys (vault.py read)
+            raise ValueError(f"agent {name}: it reads two keys named {twice[0]}, and a session has one value for one "
+                             f"name")
     # "projects" is gone (the owner's decision of 18 October 2026). A team.json that a running fleet still has one
     # in is read as it is: the key is not checked, not written and not read anywhere. The same holds for "targets"
     # and an agent's "targets" since Targets left the hub (the owner, 24 October 2026).
@@ -36211,15 +36439,27 @@ def save_secret(body):
     """Add secret's hub step (owner feature secrets), after the owner's vault made the item: the fingerprints of its
     value, so that the hub masks it in texts, then its catalog entry, in one command and one commit. No value comes
     in. The same entry again commits nothing; a failed commit leaves the fingerprints, and the same step again
-    finds them."""
+    finds them.
+
+    A new API key whose variable name another key of the catalog has is refused (409), before anything is
+    registered: the catalog takes no second key of one name (key_named). The owner replaces the value of the key
+    that is there instead: this same step under that key's own reference, which adds the fingerprints of the new
+    value and leaves the entry as it is, and then the intake with his signed statement (owner feature
+    secret_replace)."""
     ref = body["login"]
-    stored, known = register_fingerprints(ref, body["fingerprints"]) if body["fingerprints"] else (0, 0)
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     entry = {k: body[k] for k in ("title", "kind", "env") if body.get(k) is not None}
     # A reference that is saved again keeps its site, and an API key its form (the key swap): without them the key
     # would be a variable in the sessions again, with no sign.
     before = (team.get("logins") or {}).get(ref) or {}
+    if entry.get("kind") == "api_key" and before.get("env") != entry["env"] and key_named(team, entry["env"], ref):
+        # The owner, 13 November 2026: "having 2 keys named the same should not be possible". This is the one write
+        # of a key's variable name, so each path ends here: Add secret, a request's card, an import. A write that
+        # leaves an entry's name as it is passes, so a list that has two of one name from before stays writable.
+        raise Refusal(409, f"The list already has an API key named {entry['env']}, and it takes no second key of "
+                           f"that name.")
+    stored, known = register_fingerprints(ref, body["fingerprints"], newest=True) if body["fingerprints"] else (0, 0)
     entry.update({k: before[k] for k in ("site",) + (("form",) if entry.get("kind") == "api_key" else ()) if k in before})
     result = {"login": ref, "stored": stored, "known": known, "revision": rev, "sha256": current, "changed": False}
     if (team.get("logins") or {}).get(ref) == entry:
@@ -36256,6 +36496,10 @@ def save_grant(body, by="owner"):
         raise Refusal(404, "no such secret")
     if grant == "read" and entry.get("kind") != "api_key":
         raise Refusal(400, "only an API key can be read; an agent uses a login without seeing it")
+    if grant == "read" and read_twice(team, agent, ref):
+        # validate_team refuses the same state below. This says it first, in words for the row that shows the grant.
+        raise Refusal(409, f"This agent already reads another key named {entry['env']}. A session has one value for "
+                           f"one name. Take the other key back from this agent first.")
     old = secret_grants(agent, team).get(ref)
     receipt = {"login": ref, "agent": agent, "grant": grant, "revision": rev, "sha256": current, "changed": False,
                "vault": None, "updates_requested": []}
@@ -38081,12 +38325,15 @@ def door_reconcile():
     for ref in held if pin else []:
         if q1("SELECT 1 FROM door_copies WHERE login=?", (ref,)):
             continue
+        t0 = now()              # before the seal: a copy that is sealed now holds the value of now, or a later one
         try:
             text = central_sealed(central_call("seal", {"login": ref, "machine": DOOR_PIN}), ref, DOOR_PIN, pin)
         except Refusal as e:
             central_said(f"the central vault did not seal {ref} for the door: {e}")
             continue
-        made.append(door_deliver(ref, text))
+        copy = door_deliver(ref, text, t0)
+        if copy is not None:
+            made.append(copy)
     return made
 
 
@@ -38469,12 +38716,20 @@ def door_fetched(src, copy, digest):
     return {"id": copy, "fetched": True}
 
 
-def door_deliver(login, sealed):
+def door_deliver(login, sealed, t0=None):
     """A copy that the central vault sealed to the door's pinned key, for the door to fetch: the central vault's
-    reconciler calls this for each secret of team.json "door".secrets. An older copy of the same secret goes."""
+    reconciler calls this for each secret of team.json "door".secrets. An older copy of the same secret goes.
+
+    t0: the time before this copy was sealed. When the owner replaced the value after it (value_replaced, whose
+    record is read here in the transaction that writes the copy), the copy can hold the old value: it is not kept,
+    None comes back, and the door's next minute seals the value of then. Without this the door kept an old value
+    until the next replace, because a copy row stops a new seal."""
     if login not in ((TEAM.get("door") or {}).get("secrets") or []) or not sealed_copy(sealed):
         raise Refusal(409, "the door holds no such secret, or this is no sealed copy")
     with transaction():
+        value = secret_value(login)
+        if t0 is not None and value is not None and t0 < value["at"]:
+            return None
         DB.execute("DELETE FROM door_copies WHERE login=? AND fetched IS NULL", (login,))
         return DB.execute("INSERT INTO door_copies(login,sealed,created) VALUES(?,?,?)",
                           (login, sealed, now())).lastrowid
@@ -44663,11 +44918,16 @@ class Handler(BaseHTTPRequestHandler):
     def ui_vault_intake(self):
         """POST /ui/vault/intake (owner feature central_vault): one secret of the catalog, sealed in the owner's app to
         the central vault's own key, into the central vault (central_intake). The receipt is {login, saved}. The
-        command record keeps the copy's checksum and never the copy, as POST /ui/secrets/deliver does."""
+        command record keeps the copy's checksum and never the copy, as POST /ui/secrets/deliver does.
+
+        statement and signature (owner feature secret_replace): the owner's signed replace of the value under a
+        reference that the central vault holds, as his app made them: {v, kind "replace", fleet, login, sha256 of this
+        sealed copy, at}. Both or neither. The central vault checks them; the hub passes them on, and after the
+        vault's "replaced" it sends the new value to each vault that holds a copy (value_replaced)."""
         copy = {}
 
         def read(data):
-            extra = sorted(set(data) - {"request_id", "db", "login", "ciphertext"})
+            extra = sorted(set(data) - {"request_id", "db", "login", "ciphertext", "statement", "signature"})
             if extra:
                 raise ValueError(f"unknown field {extra[0]}")
             text = sealed_copy(data.get("ciphertext"))
@@ -44676,16 +44936,29 @@ class Handler(BaseHTTPRequestHandler):
                                  f"{DEPOSIT_COPY_MAX} characters")
             if secret_hit(text):
                 raise Refusal(422, "the copy holds a registered value in plain text")
-            copy["text"] = text
-            return {"login": self.login_reference(data.get("login")),
-                    "sha256": hashlib.sha256(text.encode()).hexdigest()}
+            statement, signature = data.get("statement"), data.get("signature")
+            if (statement is None) != (signature is None) or statement is not None and not (
+                    isinstance(statement, str) and 0 < len(statement) <= CENTRAL_STATEMENT_MAX
+                    and isinstance(signature, str) and CENTRAL_SIGNATURE.fullmatch(signature)
+                    and replace_statement(statement)):
+                raise ValueError("a replace needs statement, the owner's replace statement in its canonical form, and "
+                                 "signature, the base64 of its signature")
+            if statement is not None and not central_replaces():
+                raise Refusal(409, "the central vault's program does not replace a value yet")
+            copy.update(text=text, statement=statement, signature=signature)
+            return dict({"login": self.login_reference(data.get("login")),
+                         "sha256": hashlib.sha256(text.encode()).hexdigest()},
+                        **({"statement": statement} if statement is not None else {}))
 
         def act(body, answer):
+            if "statement" in body:         # the owner replaced the value: each vault with a copy gets the new one
+                value_replaced(body["login"], body["sha256"], answer)
             central_due()           # the next pass delivers it to the machines whose agents hold it
             log("owner", f"put {body['login']} into the central vault ({answer['saved']})")
             return {"login": body["login"], "saved": answer["saved"]}
         return self.ui_command("vault/intake", read, act, limit=DEPOSIT_COPY_MAX + 8192,
-                               outside=lambda body: central_intake(body["login"], copy["text"]))
+                               outside=lambda body: central_intake(body["login"], copy["text"], copy["statement"],
+                                                                   copy["signature"]))
 
     def ui_vault_pin(self):
         """POST /ui/vault/pin (owner feature central_vault): the owner's signed statement that pins one machine's
@@ -47920,7 +48193,9 @@ class Handler(BaseHTTPRequestHandler):
         """Before it saves a delivered value, the vault sends its salted fingerprints, and the hub compares them with
         the ones that the owner's vault registered under that reference: each must be one of them, and the password's
         must be there when the hub has one. So a copy that holds another value than the one the owner saved under that
-        name is never kept, whoever sealed it. Nothing is registered here."""
+        name is never kept, whoever sealed it. After the owner replaced the value of the reference, the ones are those
+        of the value that the central vault holds now (secret_values), so a copy of the value before is not kept
+        either. Nothing is registered here."""
         did = f.get("deposit")
         if set(f) != {"deposit", "fingerprints"} or not isinstance(did, int) or isinstance(did, bool) or \
                 not (f["fingerprints"] == [] or fingerprint_items(f["fingerprints"])):
@@ -47933,6 +48208,10 @@ class Handler(BaseHTTPRequestHandler):
             known = {(r["label"], r["hash"], r["len"]) for r in q(
                 "SELECT label, hash, len FROM secrets WHERE label IN (?,?)",
                 tuple(fingerprint_label(row["login"], k) for k in ("password", "totp")))}
+            value = secret_value(row["login"])
+            if value is not None:       # the owner replaced the value: only the value of now, never the one before
+                known = {(fingerprint_label(row["login"], x["kind"]), x["hash"], x["len"])
+                         for x in json.loads(value["prints"])}
             sent = {(fingerprint_label(row["login"], x["kind"]), x["hash"], x["len"]) for x in f["fingerprints"]}
             password = fingerprint_label(row["login"], "password")
             same = sent <= known and (not any(k[0] == password for k in known) or any(k[0] == password for k in sent))
@@ -47985,9 +48264,16 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             if agents()[agent].get("vault") == "none":
                 return self.json(409, {"error": f"{agent} has no credential access"})
+            held = read_secrets(agent)
+            # A name that two keys have goes to no session: the vault would refuse the whole answer for it, and the
+            # agent would lose each of its keys (vault.py read). Only a team.json that no owner write made has one.
+            twice = sorted({env for _ref, env in held if [name for _r, name in held].count(env) > 1})
+            if twice:
+                log(agent, f"REFUSED the keys named {', '.join(twice)} for a session: {agent} reads two keys of one "
+                           f"name, and a session has one value for one name")
             found = [{"login": ref, "env": env, "fingerprint_salts": {k: fingerprint_salt(fingerprint_label(ref, k))
                                                                       for k in ("password", "totp")}}
-                     for ref, env in read_secrets(agent)]
+                     for ref, env in held if env not in twice]
             for x in found:         # the key swap: a vault that swaps keys gives such a key as a placeholder
                 swap = key_swap(agent, x["login"])
                 if swap:
@@ -48136,28 +48422,33 @@ class Handler(BaseHTTPRequestHandler):
         central_vault), and gets it with the secret's reference, title and kind and the salts of its fingerprints.
         It can ask again while the delivery waits: a copy that only this machine's vault opens can be given twice, and
         a save under the same reference is the same save. The grant is read again here, as when the copy was sealed:
-        a copy whose secret no agent of this machine holds any more is never given (deposit_refusal). Called with
-        LOCK held."""
+        a copy whose secret no agent of this machine holds any more is never given (deposit_refusal), and neither is
+        a copy that was sealed before the owner replaced the value (value_old). Called with LOCK held."""
         row = deposit_waiting(did, agent)
         if not row:
             return self.json(404, {"error": "no such delivery waits for this agent"})
         entry = logins().get(row["login"])
+        value = secret_value(row["login"])
         refused = ("this agent has no broker access" if agents()[agent].get("vault") != "broker" else
                    "the owner removed this secret from the catalog" if entry is None else
                    "this machine's pinned vault key changed since this copy was sealed"
                    if store_key(TEAM, row["machine"]) != row["recipient"] else
                    "no agent of this machine holds this secret any more" if not held_on(row["machine"], row["login"])
+                   else "the owner replaced this value after this copy was sealed" if value_old(row, value)
                    else None)
         if refused:
             return self.json(409, {"error": refused})
         if not row["released"]:
             q("UPDATE deposits SET released=? WHERE id=?", (now(), did))
         log(agent, f"vault took delivery {did} of {row['login']}")
-        return self.json(200, {"ok": True, "job": did, "kind": "deposit", "login": row["login"],
-                               "title": entry["title"], "item": entry.get("kind") or "login",
-                               "ciphertext": row["ciphertext"],
-                               "fingerprint_salts": {k: fingerprint_salt(fingerprint_label(row["login"], k))
-                                                     for k in ("password", "totp")}})
+        # replaces: the owner replaced the value of this reference, and this copy was sealed after it (above). The
+        # vault then puts it in the place of the value that an earlier delivery saved there (vault.py deposit).
+        return self.json(200, dict({"ok": True, "job": did, "kind": "deposit", "login": row["login"],
+                                    "title": entry["title"], "item": entry.get("kind") or "login",
+                                    "ciphertext": row["ciphertext"],
+                                    "fingerprint_salts": {k: fingerprint_salt(fingerprint_label(row["login"], k))
+                                                          for k in ("password", "totp")}},
+                                   **({"replaces": True} if value is not None else {})))
 
     def helper_withdraw(self, agent, wid):
         """The vault asks which secret a withdrawal that this agent's helper carries names (owner feature

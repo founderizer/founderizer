@@ -2464,9 +2464,12 @@ def fetch_sealed(door):
             continue
         os.makedirs(P(SECRETS_DIR), mode=0o700, exist_ok=True)
         path = os.path.join(P(SECRETS_DIR), hashlib.sha256(ref.lower().encode()).hexdigest())
-        with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        # A whole new file takes the place of the old one: since the owner can replace a value, a copy can come for
+        # a secret that the door holds and uses, and a call must read the old value or the new one, never a part.
+        with open(os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
             os.fchmod(f.fileno(), 0o600)
             f.write(item_secret(value.strip()))
+        os.replace(path + ".new", path)
         door.http("POST", f"{base}/door/sealed/{item.get('id')}", {"Content-Type": "application/json",
                                                                     "X-Fleet-Client": "door"},
                   json.dumps({"sha256": hashlib.sha256(value.strip().encode()).hexdigest()}).encode())

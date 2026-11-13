@@ -68,6 +68,13 @@ The vault protects the value of each secret. The design gives these results:
   the same key (`Sources/FleetCore/CentralVault.swift`, `Sources/Founderizer/CentralVaultSection.swift`).
 - With the sealed copy, the hub gets the secret's name, its catalog entry and salted SHA-256 fingerprints of the value
   (`Sources/Founderizer/SecretEntryView.swift`).
+- The catalog takes no second API key with the variable name of another one (`hub.py`). When the owner saves a key
+  under a variable name that one key of the catalog has, the app replaces the value of that key: the new value goes
+  under the same reference, with a `replace` statement that the owner key signs about that one sealed copy (see "The
+  owner's signatures"). The catalog entry, its site and each grant stay as they are
+  (`Sources/Founderizer/SecretEntryView.swift`, `Sources/FleetCore/Secrets.swift`,
+  `Sources/Founderizer/GrantSigning.swift`). The import leaves out a key whose variable name a key of the catalog has
+  (`Sources/Founderizer/SecretImportView.swift`).
 
 ### On the hub
 
@@ -77,6 +84,16 @@ The vault protects the value of each secret. The design gives these results:
 - It uses the fingerprints to find a value in a text. It refuses a text with a registered value when an agent writes
   it. It removes the value from each tool answer before the answer reaches a session. It masks each text of a
   session's record when it stores it (`hub.py`).
+- After the owner replaced a value, the hub keeps the fingerprints of the new value as the central vault named them,
+  the time, and the number of the newest delivery of then. It ends each sealed copy that still waits, and it sends a
+  new sealed copy to each machine whose store holds the old value, and to the door. From its record of the replace
+  on, it gives no machine's vault and no door a copy that was sealed before, and it confirms a delivered copy only
+  when its fingerprints are those of the new value. A vault that took an old copy in the moment before that record
+  gets the new one with the next delivery. It keeps the fingerprints of the old value too, so it goes on masking
+  the old value in texts (`hub.py`).
+- The central vault's status names the checksum of the copy of the newest replace of each reference. When the hub
+  has no record of such a replace, because it stopped between the central vault's write and its own record, it makes
+  the record at its next read of the status, and the new value goes to each machine as above (`vault.py`, `hub.py`).
 - It confirms a sign-in, a handover, a probe and a request of a broker only once. For each of these except a probe, it
   first checks again that the task belongs to the agent, that the task is open, and that the agent still holds the
   login. It gives a delivery, a withdrawal and a new login again while they wait (`hub.py`).
@@ -92,6 +109,15 @@ The vault protects the value of each secret. The design gives these results:
 - It opens a sealed copy from the owner with its own age key, which only its user can read (`vault.py`,
   `hubsetup.py`). It keeps the value only when its own fingerprints of the value are among the fingerprints that the
   hub gives as the owner's (`vault.py`).
+- It refuses another value under a reference that it holds. The one exception is a copy that comes with the owner's
+  `replace` statement: the statement names the reference and the SHA-256 of that sealed copy, so the hub cannot put
+  a copy of its own under it. The central vault keeps the newest statement of each reference and refuses an older
+  one, so an earlier copy cannot come back. It writes the record of the statement first and then the store, which
+  is one file that takes the place of the old one whole. A replace that stops between the two leaves the old value
+  whole, and the same statement again ends it (`vault.py`).
+- A replace changes the key and not the address of its service. When the stored value has an address and the new
+  value names none, the central vault keeps the address and the user name of the stored value, so a vault can still
+  send the key for an agent that uses it. An address in the new value takes the place of the old one (`vault.py`).
 - It seals a copy of a value for a machine only when the owner signed a pin of that machine's key, and also signed a
   grant of the value to an agent on that machine, or put the value into the pool. It seals a value of the pool to
   each machine whose key the owner pinned (`vault.py`, `Sources/FleetCore/OwnerKey.swift`).
@@ -111,6 +137,11 @@ The vault protects the value of each secret. The design gives these results:
 - A value comes into the broker's store only as a copy that is sealed to this machine's key and that the hub delivers
   and confirms (the central vault's copies come this way), or from the broker itself when it makes a new login
   (`vault.py`).
+- The broker refuses another value under a reference that its store holds. The one exception is a delivery for
+  which the hub's answer says that the owner replaced the value: the broker then puts the new value in the place of
+  the old one, and only over a value that an earlier delivery saved, never over a login that the broker made. The
+  helper's request cannot say this. The store is one file that takes the place of the old one whole, so a replace
+  that fails leaves the old value whole (`vault.py`, `hub.py`).
 - The broker gives a delivered value back when no agent of its machine holds it any more (`vault.py`).
 
 ### In Fleet Vault on a Mac
@@ -130,6 +161,10 @@ The vault protects the value of each secret. The design gives these results:
   hub key when the request names its caller, and else no key. The hub takes a call with no key only from an agent that
   is alone on its machine's address (`Sources/FleetVaultCore/VaultBroker.swift`,
   `Sources/FleetVaultCore/VaultHub.swift`, `hub.py`).
+- It takes a delivery, and gives a delivered value back, as a Linux broker does. It also puts a new value in the
+  place of a delivered one only when the hub's answer for the delivery says that the owner replaced the value
+  (`Sources/FleetVaultCore/VaultBroker.swift`, `Sources/FleetVaultCore/VaultLocalStore.swift`,
+  `Sources/FleetVaultCore/VaultProtocol.swift`).
 
 ### In the door
 
@@ -174,19 +209,20 @@ The vault protects the value of each secret. The design gives these results:
 
 ## The owner's signatures
 
-- The central vault reads seven kinds of statement that the owner key signs: `pin` and `unpin` (the key of a
-  machine), `recovery` (the key of the backup), `grant` and `ungrant` (a secret for an agent on a machine), and `pool`
-  and `unpool` (a secret that the fleet manager can give to an agent on any machine) (`vault.py`,
-  `Sources/FleetCore/OwnerKey.swift`).
+- The central vault reads eight kinds of statement that the owner key signs: `pin` and `unpin` (the key of a
+  machine), `recovery` (the key of the backup), `grant` and `ungrant` (a secret for an agent on a machine), `pool`
+  and `unpool` (a secret that the fleet manager can give to an agent on any machine), and `replace` (a new value
+  under a reference that the vault holds, for one sealed copy) (`vault.py`, `Sources/FleetCore/OwnerKey.swift`).
 - Each statement is the canonical JSON text of exactly its own fields, and it names the fleet and a time. The
   signature is ECDSA over SHA-256 of the statement's bytes (`vault.py`, `Sources/FleetCore/OwnerKey.swift`).
 - The central vault checks each statement itself, with the owner's public key. It refuses a statement of another
-  fleet. It keeps a dated record of each machine, recovery key, grant and pool entry, also after its end, and it
-  refuses a statement that is not newer than that record. So the hub cannot send an old statement again
-  (`vault.py`).
+  fleet. It keeps a dated record of each machine, recovery key, grant and pool entry, also after its end, and of the
+  newest replace of each reference, and it refuses a statement that is not newer than that record. So the hub cannot
+  send an old statement again (`vault.py`).
 - The app signs a grant before the hub records it, and it signs the end of a grant after the hub records the end. So
   the central vault's signed grants always include the hub's grants. The app sends each statement through the hub
-  (`Sources/Founderizer/GrantSigning.swift`).
+  (`Sources/Founderizer/GrantSigning.swift`). A `replace` statement goes with the sealed copy that it is about, in
+  the same request (`Sources/FleetCore/CentralVault.swift`).
 - The app pins a server's key only when the Mac's own Tailscale names the SSH address as that server, and when the key
   that it reads there over SSH is the key that the hub reports (`Sources/Founderizer/CentralVaultSection.swift`).
   It reads the key of a Linux server as root, from the key file that the broker's configuration names. It reads the
@@ -461,8 +497,8 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
     environment until the session ends (`fleet.py`). A session that starts after the change gets no value, because
     the hub names the keys of a session again at each start (`hub.py`, `vault.py`,
     `Sources/FleetVaultCore/VaultHub.swift`). The helper keeps the keys for the agent's checks in its memory. It reads
-    them again only after a check failed, or after it took the update, so until then a check still runs with the key
-    (`fleet.py`). With "Uses it", the value stays in the broker's store, and the broker still sends API requests with
+    them again only after a check failed, after it took the update, or after its machine's vault took a new delivery
+    of a key that the agent reads, so until then a check still runs with the key (`fleet.py`, `hub.py`). With "Uses it", the value stays in the broker's store, and the broker still sends API requests with
     it for the agent. When no agent of the machine holds the secret any more, and the central vault holds it, the hub
     asks a broker that takes withdrawals to give the value back (`hub.py`, `vault.py`). The agent could also copy the
     key while it had the grant (see limit 1). So the end of a read grant does not take the key from the agent.
@@ -488,6 +524,17 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
     checks pins refuses such a handover, because the owner signed no pin of that key. Fleet Vault on a Mac without
     the owner's keys seals the login to the false key, so the agent can open it (limit 6) (`hub.py`,
     `Sources/FleetVaultCore/VaultBroker.swift`).
+22. **The old value after a replace.** When the owner replaces the value of a key, the central vault holds the new
+    value at once, and the old value is in no store of the central vault after that (`vault.py`). The store of a
+    machine holds the old value until the machine took its new delivery: the hub makes that delivery at once, and the
+    machine's helper carries it at its next question to the hub. A machine that is off, and a machine whose vault
+    program is from before the replace, keep the old value until they are back and current (`hub.py`). Until then
+    that machine's vault gives the old value to a new session, to a check and to the swap proxy. After the machine's
+    vault took the new value, it gives only the new one. A session that started before keeps the old value in its
+    environment until it ends, on a machine that does not swap keys (`fleet.py`). A delivery that fails leaves the
+    old value in that machine's store, and the hub sends it again after 6 hours (`hub.py`, `vault.py`). The old
+    value also stays in each backup of the central vault that was made before the replace (`vault.py`). So a replace
+    in the vault does not end the old key: only the service that made the key can end it.
 
 ## What the owner must do
 
@@ -528,4 +575,6 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
    so the end of the grant stops its use (`vault.py`). Replace such a key when a session held its value at an
    earlier time: before the key swapped, or on a machine that does not swap keys. Replace it also when its site can
    send a key back in an answer (limit 1). If the service lets a key make more keys, look there for keys that the
-   agent made.
+   agent made. Then save the new key with Add secret under the same variable name: the app puts it in the place of
+   the old value, and the same agents keep it (`Sources/Founderizer/SecretEntryView.swift`). End the old key at its
+   service too, because the vault cannot end it (limit 22).

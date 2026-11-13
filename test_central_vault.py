@@ -21,6 +21,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+import uuid
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +30,7 @@ from unittest.mock import patch
 import fleet
 import hub
 import hubsetup
+import vault
 import lifecycle
 import releases
 from test_backup_restore import Fixture
@@ -91,6 +93,9 @@ class FakeCentral:
         self.pins, self.recovery, self.items = {}, None, {}
         self.grants, self.pool = [], []         # what the owner signed: {login, agent, machine}, and pooled logins
         self.removes = True                     # its status says that it serves remove; an older program's does not
+        self.replaces = True                    # and that it takes the owner's signed replace of a value
+        self.values = {}                        # the checksum of the copy of the newest replace of each login
+        self.prints = None                      # the fingerprints that it names for the value of an intake
         self.stop = threading.Event()
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.bind(path)
@@ -145,11 +150,15 @@ class FakeCentral:
                     "fleet": self.fleet, "owner_keys": 1,
                     "pins": {m: {"recipient": k, "at": 1761300000} for m, k in self.pins.items()},
                     "recovery": self.recovery, "grants": list(self.grants), "pool": list(self.pool),
-                    "items": len(self.items), "source": "0" * 64, **({"removes": True} if self.removes else {})}
+                    "items": len(self.items), "source": "0" * 64, **({"removes": True} if self.removes else {}),
+                    **({"replaces": True, "values": dict(self.values)} if self.replaces else {})}
         if op == "intake":
-            saved = "same" if r["login"] in self.items else "new"
+            saved = "new" if r["login"] not in self.items else "replaced" if "statement" in r else "same"
             self.items[r["login"]] = r["title"]
-            return {"ok": True, "v": 2, "login": r["login"], "saved": saved}
+            if "statement" in r:
+                self.values[r["login"]] = json.loads(r["statement"])["sha256"]
+            return dict({"ok": True, "v": 2, "login": r["login"], "saved": saved},
+                        **({"fingerprints": self.prints} if self.prints is not None else {}))
         if op in ("pin", "unpin", "recovery"):
             said = json.loads(r["statement"])
             if said["kind"] != op:
@@ -244,12 +253,14 @@ class Central(WithCentral, OwnerAPI):
         return [{"login": ref, "agent": name, "machine": a["machine"]} for name, a in sorted(hub.TEAM["agents"].items())
                 for ref in sorted(a.get("secrets") or {})]
 
-    def report(self, agent, key=None, features=("secret_deposits", "secret_withdrawals"), withdrawals=True):
+    def report(self, agent, key=None, features=("secret_deposits", "secret_withdrawals"), withdrawals=True,
+               replaces=True):
         """One helper status, as a machine reports its vault (hub.broker_report)."""
         key = key or {"vps": STORE_A, "studio": STORE_B}[agent]
         data = {"features": list(features),
                 "security": {"vault": {"broker_recipient": key, "callers": True, "deposits": True,
-                                       "withdrawals": withdrawals, "broker_read_at": hub.now(), "mode": "broker"}}}
+                                       "withdrawals": withdrawals, "replaces": replaces, "broker_read_at": hub.now(),
+                                       "mode": "broker"}}}
         hub.q("INSERT INTO machine_status(agent,data,reported) VALUES(?,?,?) ON CONFLICT(agent) DO UPDATE SET "
               "data=excluded.data, reported=excluded.reported", (agent, json.dumps(data), hub.now()))
 
@@ -293,7 +304,7 @@ class Central(WithCentral, OwnerAPI):
         self.assertNotIn("central_vault", self.request()[1]["ui_features"])       # never read yet
         hub.central_sweep()
         offered = self.request()[1]["ui_features"]
-        self.assertEqual(offered, hub.UI_FEATURES + ["central_vault"])
+        self.assertEqual(offered, hub.UI_FEATURES + ["central_vault", "secret_replace"])   # this vault replaces too
         with hub.LOCK:
             self.assertEqual(hub.mobile_state("test-generation")["ui_features"], offered)     # the phone: one list
         read_at = hub.CENTRAL["read_at"]
@@ -641,6 +652,378 @@ class Central(WithCentral, OwnerAPI):
         hub.finish_deposit(newest, False, "The vault did not save it.")
         hub.q("UPDATE deposits SET recipient=? WHERE id=?", (OTHER, newest["id"]))     # sealed to an older pin
         self.assertEqual(len(hub.central_reconcile()["delivered"]), 1)
+
+    # ---- the owner replaces a value under its reference (owner feature secret_replace)
+    NEW = [{"kind": "password", "hash": "c" * 64, "len": 40}]       # the fingerprints of the new value
+
+    def replace(self, at=1761400000, **changes):
+        """An intake of LOGIN_A with the owner's replace statement about its copy, as his app sends it."""
+        body = self.command(login=LOGIN_A, ciphertext=armored(b"the new value, sealed to the central vault"))
+        body.pop("text")
+        said = statement(kind="replace", login=LOGIN_A, at=at,
+                         sha256=hashlib.sha256(body["ciphertext"].encode()).hexdigest())
+        body = dict(dict(body, statement=said, signature=SIGNATURE), **changes)
+        return body, self.request("/ui/vault/intake", body)
+
+    def passed(self, machine=None, login=None):
+        """One pass of the reconciler: the deliveries that it made, as rows, for one machine or one secret."""
+        made = hub.central_reconcile()["delivered"]
+        return [r for r in self.deposits() if r["id"] in made and machine in (None, r["machine"])
+                and login in (None, r["login"])]
+
+    def test_secret_replace_is_served_only_while_the_central_vault_says_that_it_replaces(self):
+        hub.register_fingerprints(LOGIN_A, [{"kind": "password", "hash": "a" * 64, "len": 51}])
+        hub.central_read()
+        self.assertIn("secret_replace", self.request()[1]["ui_features"])
+        self.vault.replaces = False             # the program from before: the app sends no replace to it
+        hub.central_read()
+        self.assertNotIn("secret_replace", self.request()[1]["ui_features"])
+        self.assertIn("central_vault", self.request()[1]["ui_features"])
+        _body, (code, answer) = self.replace()
+        self.assertEqual((code, answer["error"]), (409, "the central vault's program does not replace a value yet"))
+        self.assertEqual(self.vault.ops("intake"), [])
+        self.assertEqual(hub.q("SELECT * FROM ui_controls WHERE route='vault/intake'"), [])
+
+    def test_a_replace_passes_the_owner_s_statement_as_it_came_and_the_hub_records_the_value_of_now(self):
+        old = [{"kind": "password", "hash": "a" * 64, "len": 51}]
+        hub.register_fingerprints(LOGIN_A, old)
+        self.deliver_and_keep()                             # vps holds LOGIN_A and LOGIN_B
+        self.vault.pins["studio"] = STORE_B
+        hub.central_read()
+        waits = hub.central_reconcile()["delivered"]        # a copy of LOGIN_A waits for studio
+        self.assertEqual(len(waits), 1)
+        hub.q("INSERT INTO door_copies(login,sealed,created) VALUES(?,?,?)", (LOGIN_A, armored(b"for the door"), hub.now()))
+        hub.q("INSERT INTO door_copies(login,sealed,created) VALUES(?,?,?)", (LOGIN_B, armored(b"for the door"), hub.now()))
+        hub.register_fingerprints(LOGIN_A, self.NEW)        # the app's hub step for the new value
+        self.vault.prints = self.NEW
+        body, (code, receipt) = self.replace()
+        self.assertEqual((code, receipt["login"], receipt["saved"]), (200, LOGIN_A, "replaced"), receipt)
+        sent = self.vault.ops("intake")[-1]
+        self.assertEqual((sent["statement"], sent["signature"], sent["ciphertext"]),
+                         (body["statement"], SIGNATURE, body["ciphertext"]))       # as they came
+        self.assertEqual(sent["fingerprints"], old + self.NEW)      # each one that the owner registered under it
+        value = hub.q1("SELECT * FROM secret_values WHERE login=?", (LOGIN_A,))
+        self.assertEqual((json.loads(value["prints"]), value["sha256"]),
+                         (self.NEW, hashlib.sha256(body["ciphertext"].encode()).hexdigest()))
+        ended = hub.q1("SELECT * FROM deposits WHERE id=?", (waits[0],))
+        self.assertEqual((ended["ok"], ended["ciphertext"]), (0, None))             # the copy that waited ends
+        self.assertEqual([r["login"] for r in hub.q("SELECT login FROM door_copies")], [LOGIN_B])   # the door's goes
+        self.assertTrue(hub.CENTRAL["due"])
+        kept = hub.q1("SELECT body, result FROM ui_controls WHERE route='vault/intake'")
+        self.assertNotIn(body["ciphertext"].split("\n")[1], kept["body"] + kept["result"])
+        self.assertEqual(self.vault.locked, [])
+        # an exact repeat is the first answer; the vault is not asked again and the record stays
+        self.assertEqual(self.request("/ui/vault/intake", body)[1]["replayed"], True)
+        self.assertEqual(len(self.vault.ops("intake")), 1)
+        # The reconciler: each vault that holds a copy from before gets the new one, studio too, whose copy ended.
+        made = hub.central_reconcile()["delivered"]
+        rows = {r["machine"]: r for r in self.deposits() if r["id"] in made}
+        self.assertEqual({m: r["login"] for m, r in rows.items()}, {"vps": LOGIN_A, "studio": LOGIN_A})
+        # the hub's answer for such a delivery says that it replaces; a copy from before the replace goes to no vault
+        code, given = self.request("/helper/vault/vps", {"job": rows["vps"]["id"], "kind": "deposit"})
+        self.assertEqual((code, given.get("replaces")), (200, True), given)
+        hub.q("UPDATE deposits SET created=? WHERE id=?", (value["at"] - 1, rows["studio"]["id"]))
+        code, given = self.request("/helper/vault/studio", {"job": rows["studio"]["id"], "kind": "deposit"})
+        self.assertEqual((code, given["error"]), (409, "the owner replaced this value after this copy was sealed"))
+        self.assertEqual(hub.deposit_refusal(hub.q1("SELECT * FROM deposits WHERE id=?", (rows["studio"]["id"],))),
+                         "The owner replaced its value after this copy was sealed.")
+        # the vault's own check of the value: only the value of now is the owner's, not the one before
+        for prints, code in ((old, 409), (self.NEW, 200)):
+            got, answer = self.request("/helper/vault/vps/fingerprints", {"deposit": rows["vps"]["id"], "fingerprints": prints})
+            self.assertEqual(got, code, answer)
+        # "Is this the value that the fleet holds?" (the import's question): the value of now, not the one before
+        with hub.LOCK:
+            self.assertEqual((hub.fingerprints_same(LOGIN_A, old), hub.fingerprints_same(LOGIN_A, self.NEW)),
+                             (False, True))
+
+    def deliveries(self, ref=LOGIN_A):
+        """What the owner's app reads of this secret's deliveries (GET /ui/team, `deliveries`): {machine: state}."""
+        return {m: hub.deposit_view(r)["state"] for m, r in hub.latest_deposits(ref).items()}
+
+    def test_after_a_replace_an_old_copy_is_on_its_way_and_not_delivered(self):
+        hub.register_fingerprints(LOGIN_A, self.NEW)
+        made = self.deliver_and_keep()
+        self.assertEqual(self.deliveries(), {"vps": "delivered"})
+        # the hub's clock was ahead when that delivery was made: its time says nothing, its number does
+        hub.q("UPDATE deposits SET created=? WHERE id IN (?,?)", (hub.now() + 86400, *made))
+        self.report("vps", replaces=False)
+        self.assertEqual(self.replace()[1][0], 200)
+        self.assertEqual(self.deliveries(), {"vps": "waiting"})         # the copy there holds the old value
+        self.assertEqual(self.deliveries(LOGIN_B), {"vps": "delivered"})
+        row = hub.q1("SELECT * FROM deposits WHERE login=? AND machine='vps'", (LOGIN_A,))
+        with hub.LOCK:
+            self.assertTrue(hub.value_old(row, hub.secret_value(LOGIN_A)))
+        self.report("vps")
+        again = hub.central_reconcile()["delivered"]
+        self.assertEqual(len(again), 1)                                 # old by its number, whatever its time says
+        hub.finish_deposit(hub.q1("SELECT * FROM deposits WHERE id=?", (again[0],)), True, "Saved.")
+        self.assertEqual(self.deliveries(), {"vps": "delivered"})
+        self.assertEqual(hub.central_reconcile()["delivered"], [])
+        # A second replace: the record takes the number of the newest delivery of now. The delivery of the first
+        # replace has a time that is ahead too, and it is old all the same.
+        hub.q("UPDATE deposits SET created=? WHERE id=?", (hub.now() + 86400, again[0]))
+        first = hub.q1("SELECT after FROM secret_values")["after"]
+        self.assertEqual(self.replace(at=1761400600, request_id=str(uuid.uuid4()))[1][0], 200)
+        self.assertEqual((first, hub.q1("SELECT after FROM secret_values")["after"]), (made[-1], again[0]))
+        self.assertEqual(self.deliveries(), {"vps": "waiting"})
+        third = self.passed("vps")
+        self.assertEqual([r["login"] for r in third], [LOGIN_A])
+        # a copy that waited at a replace and ended there did not reach its vault: failed, not on its way
+        self.assertEqual(self.replace(at=1761401200, request_id=str(uuid.uuid4()))[1][0], 200)
+        self.assertEqual(self.deliveries(), {"vps": "failed"})
+
+    def test_the_hub_reads_in_the_vault_s_status_a_replace_that_it_did_not_record(self):
+        """A hub that stopped between the central vault's write and its own record: the vault holds the new value,
+        the machines hold the old one, and the hub has no record. Its next read of the vault's status makes one."""
+        old = [{"kind": "password", "hash": "a" * 64, "len": 51}]
+        hub.register_fingerprints(LOGIN_A, old)
+        hub.register_fingerprints(LOGIN_A, self.NEW)
+        self.deliver_and_keep()
+        # a status names into the hub's records only a secret of the catalog (LOGIN_D is none), in its own form
+        self.vault.values = {LOGIN_A: "f" * 64, "bws://not-a-reference": "f" * 64, LOGIN_B: "not a checksum",
+                             LOGIN_D: "f" * 64, LOGIN_A.upper(): "e" * 64}
+        self.assertEqual(hub.central_read()["values"][LOGIN_A], "f" * 64)
+        rows = hub.q("SELECT * FROM secret_values")
+        self.assertEqual([(r["login"], r["sha256"]) for r in rows], [(LOGIN_A, "f" * 64)])
+        self.assertEqual(json.loads(rows[0]["prints"]), old + self.NEW)     # each one registered: a status names none
+        self.assertTrue(hub.CENTRAL["due"])
+        made = hub.central_reconcile()["delivered"]
+        self.assertEqual([hub.q1("SELECT login, machine FROM deposits WHERE id=?", (d,))["login"] for d in made],
+                         [LOGIN_A])
+        hub.central_read()                                              # the same status again: nothing more
+        self.assertEqual(hub.q1("SELECT at FROM secret_values")["at"], rows[0]["at"])
+        # A status that was asked for before the hub's own record names the replace before it: the record stays.
+        # Only a status from after it can say that the vault holds another value.
+        stale = {"values": {LOGIN_A: "e" * 64}}
+        self.assertEqual(hub.central_values(stale, rows[0]["at"] - 1), [])
+        self.assertEqual(hub.q1("SELECT sha256 FROM secret_values")["sha256"], "f" * 64)
+        self.assertEqual(hub.central_values({"values": {LOGIN_A: "f" * 64}}, hub.now()), [])
+        # a status in another form names nothing, and stops no read
+        for odd in ({}, {"values": [LOGIN_A]}, {"values": {LOGIN_A: 5}}, {"values": {LOGIN_A: None}}, {"values": "x"}):
+            self.assertEqual(hub.central_values(odd, hub.now()), [], odd)
+        self.assertEqual(hub.q1("SELECT sha256 FROM secret_values")["sha256"], "f" * 64)
+        # the time that central_read gives is from BEFORE it asks for the status: with a later one, a status that
+        # was on its way while the hub recorded a newer replace would put the older checksum back
+        asked, called, clock, real = [], [], iter(range(1, 1000)), hub.central_call
+        start = hub.now()
+
+        def call(op, fields=None):
+            called.append(hub.now())
+            return real(op, fields)
+        with patch.object(hub, "now", lambda: start + next(clock)), patch.object(hub, "central_call", call), \
+                patch.object(hub, "central_values", lambda status, at: asked.append(at)):
+            hub.central_read()
+        self.assertTrue(len(asked) == 1 and start < asked[0] < called[0], (asked, called))
+        # the owner's same Save again: the vault says "same" and names the fingerprints, which the record takes
+        with hub.LOCK:
+            self.assertFalse(hub.value_replaced(LOGIN_A, "f" * 64, {"saved": "same"}))      # it names none: as it is
+            self.assertEqual(json.loads(hub.q1("SELECT prints FROM secret_values")["prints"]), old + self.NEW)
+            self.assertFalse(hub.value_replaced(LOGIN_A, "f" * 64, {"saved": "same", "fingerprints": self.NEW}))
+        after = hub.q1("SELECT * FROM secret_values")
+        self.assertEqual((json.loads(after["prints"]), after["at"]), (self.NEW, rows[0]["at"]))
+        self.assertIsNone(hub.q1("SELECT finished FROM deposits WHERE id=?", (made[0],))["finished"])   # still on its way
+
+    def test_a_reference_takes_any_number_of_values(self):
+        """Each save of the owner's adds the fingerprints of its value, and none leaves: the hub goes on masking each
+        value. The central vault takes 32 fingerprints in one intake, so the hub gives it the newest of each kind,
+        and a save of a value that the reference had before puts its fingerprints at the end again."""
+        prints = [{"kind": "password", "hash": f"{n:064x}", "len": 40} for n in range(40)]
+        with hub.LOCK:
+            for one in prints:
+                self.assertEqual(hub.register_fingerprints(LOGIN_A, [one], newest=True), (1, 0))
+        self.assertEqual(self.intake()[0], 200)
+        sent = self.vault.ops("intake")[-1]["fingerprints"]
+        self.assertEqual(sent, prints[-hub.CENTRAL_PRINTS:])            # the newest, oldest first
+        with hub.LOCK:
+            self.assertEqual(hub.register_fingerprints(LOGIN_A, [prints[3]], newest=True), (0, 1))    # a value from before
+            self.assertEqual(hub.register_fingerprints(LOGIN_A, [prints[5]]), (0, 1))                 # a vault's read
+        self.assertEqual(self.intake(request_id=str(uuid.uuid4()))[0], 200)
+        sent = self.vault.ops("intake")[-1]["fingerprints"]
+        self.assertEqual((sent[-1], len(sent)), (prints[3], hub.CENTRAL_PRINTS))
+        self.assertNotIn(prints[5], sent)                               # a read moves nothing
+        label = hub.fingerprint_label(LOGIN_A, "password")
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM secrets WHERE label=?", (label,))["n"], 40)   # none left, none twice
+        # with as many seeds, the two kinds together are what the central vault takes in one intake, and no more
+        seeds = [{"kind": "totp", "hash": f"{n:064x}", "len": 32} for n in range(100, 140)]
+        with hub.LOCK:
+            for one in seeds:
+                hub.register_fingerprints(LOGIN_A, [one], newest=True)
+        self.assertEqual(self.intake(request_id=str(uuid.uuid4()))[0], 200)
+        sent = self.vault.ops("intake")[-1]["fingerprints"]
+        self.assertEqual((len(sent), sent[-1]), (32, seeds[-1]))
+        self.assertTrue(vault.fingerprint_list(sent))                   # the vault's own rule of the list's form
+        self.assertFalse(vault.fingerprint_list(sent + sent[:1]))
+
+    def test_the_door_gets_no_copy_that_was_sealed_before_a_replace(self):
+        """The door's minute seals a copy with no LOCK held. When the owner replaces the value between that seal and
+        the hub's write of the copy, the copy holds the old value: it is not kept, and the next minute seals again."""
+        with patch.dict(hub.TEAM, door={"secrets": [LOGIN_A]}):
+            before = hub.now() - 5
+            first = hub.door_deliver(LOGIN_A, armored(b"for the door, the old value"), before)
+            self.assertIsNotNone(first)                                 # no replace: as before
+            with hub.LOCK:
+                self.assertTrue(hub.value_replaced(LOGIN_A, "a" * 64, {"saved": "replaced"}))
+            self.assertEqual(hub.q("SELECT * FROM door_copies"), [])    # the replace took the door's copy row
+            self.assertIsNone(hub.door_deliver(LOGIN_A, armored(b"sealed before the replace"), before))
+            self.assertEqual(hub.q("SELECT * FROM door_copies"), [])
+            self.assertIsNotNone(hub.door_deliver(LOGIN_A, armored(b"sealed after the replace"), hub.now()))
+            self.assertIsNotNone(hub.door_deliver(LOGIN_A, armored(b"a copy with no time"), None))
+            self.assertEqual(hub.q1("SELECT COUNT(*) n FROM door_copies")["n"], 1)
+
+    def test_a_replace_of_a_login_that_the_central_vault_did_not_hold_is_on_record_too(self):
+        """A machine's vault can hold a value that came there before the central vault held each secret. The central
+        vault says "new" for the owner's replace of it, and the machines' copies are old all the same."""
+        hub.register_fingerprints(LOGIN_A, self.NEW)
+        self.deliver_and_keep()
+        self.vault.items = {LOGIN_B: "shop.example.com · ops"}
+        _body, (code, receipt) = self.replace()
+        self.assertEqual((code, receipt["saved"]), (200, "new"), receipt)
+        self.assertEqual(hub.q1("SELECT login FROM secret_values")["login"], LOGIN_A)
+        self.assertEqual([hub.q1("SELECT login FROM deposits WHERE id=?", (d,))["login"]
+                          for d in hub.central_reconcile()["delivered"]], [LOGIN_A])
+
+    def test_a_vault_that_cannot_replace_keeps_its_copy_until_it_can_and_a_failure_waits_as_before(self):
+        hub.register_fingerprints(LOGIN_A, self.NEW)
+        made = self.deliver_and_keep()
+        self.report("vps", replaces=False)
+        self.assertEqual(self.replace()[1][0], 200)
+        self.assertEqual(hub.central_reconcile()["delivered"], [])      # its program is from before the replace
+        self.assertEqual(self.view()["held"]["vps"], sorted([LOGIN_A, LOGIN_B]))
+        self.report("vps")
+        again = hub.central_reconcile()["delivered"]
+        self.assertEqual(len(again), 1)
+        # the new delivery fails: the copy of the first one still counts, and the next one waits CENTRAL_RETRY
+        hub.finish_deposit(hub.q1("SELECT * FROM deposits WHERE id=?", (again[0],)), False, "The vault did not save it.")
+        self.assertEqual(self.view()["held"]["vps"], sorted([LOGIN_A, LOGIN_B]))
+        self.assertEqual(hub.central_reconcile()["delivered"], [])
+        hub.q("UPDATE deposits SET finished=? WHERE id=?", (hub.now() - hub.CENTRAL_RETRY - 1, again[0]))
+        third = hub.central_reconcile()["delivered"]
+        self.assertEqual(len(third), 1)
+        # a second replace while that one waits: it ends, and a delivery that failed before a replace waits for nothing
+        hub.finish_deposit(hub.q1("SELECT * FROM deposits WHERE id=?", (third[0],)), False, "The vault did not save it.")
+        self.assertEqual(hub.central_reconcile()["delivered"], [])
+        self.assertEqual(self.replace(at=1761400600, request_id=str(uuid.uuid4()))[1][0], 200)
+        self.assertEqual(len(hub.central_reconcile()["delivered"]), 1)
+        # the grant goes: the old copy is still the hub's to take back
+        hub.finish_deposit(self.deposits()[-1], False, "The vault did not save it.")
+        del hub.TEAM["agents"]["vps"]["secrets"][LOGIN_A]
+        self.vault.grants = self.signed_grants()
+        hub.central_read()
+        self.assertEqual([hub.q1("SELECT login FROM withdrawals WHERE id=?", (w,))["login"]
+                          for w in hub.central_reconcile()["withdrawn"]], [LOGIN_A])
+        self.assertEqual(made[0] in [r["id"] for r in self.deposits()], True)
+
+    def test_the_stamp_of_an_agents_keys_changes_with_a_new_delivery_of_a_key_that_it_reads(self):
+        self.assertEqual(hub.key_stamp("vps"), 0)
+        made = self.deliver_and_keep()
+        key = next(d for d in made if hub.q1("SELECT login FROM deposits WHERE id=?", (d,))["login"] == LOGIN_A)
+        self.assertEqual(hub.key_stamp("vps"), key)         # LOGIN_B is a login that it uses: not one of its keys
+        self.assertEqual(hub.key_stamp("studio"), 0)        # studio only uses LOGIN_A
+        self.assertEqual(hub.key_stamp("manager"), 0)
+        # a delivery of that key to another machine is not this machine's
+        self.vault.pins["studio"] = STORE_B
+        hub.central_read()
+        other = hub.central_reconcile()["delivered"]
+        hub.finish_deposit(hub.q1("SELECT * FROM deposits WHERE id=?", (other[0],)), True, "Saved.")
+        self.assertGreater(other[0], key)
+        self.assertEqual(hub.key_stamp("vps"), key)
+        # A new delivery of the key to this machine moves the stamp only when it ended well: while it waits, and when
+        # it failed, the vault still holds the value that the helper kept, and a read then would keep the old one.
+        hub.register_fingerprints(LOGIN_A, self.NEW)
+        self.assertEqual(self.replace()[1][0], 200)
+        new = self.passed("vps")[0]
+        self.assertEqual(hub.key_stamp("vps"), key)                     # it waits
+        hub.finish_deposit(new, False, "The vault did not save it.")
+        self.assertEqual(hub.key_stamp("vps"), key)                     # it failed
+        hub.q("UPDATE deposits SET finished=? WHERE id=?", (hub.now() - hub.CENTRAL_RETRY - 1, new["id"]))
+        again = self.passed("vps")[0]
+        hub.finish_deposit(again, True, "Saved.")
+        self.assertEqual(hub.key_stamp("vps"), again["id"])             # the vault holds the new value now
+
+    def test_the_hub_says_replaces_only_for_a_delivery_of_a_value_that_the_owner_replaced(self):
+        self.vault.pins = {"vps": STORE_A}
+        hub.central_read()
+        waits = {r["login"]: r["id"] for r in self.passed()}
+        for ref in (LOGIN_A, LOGIN_B):
+            code, given = self.request("/helper/vault/vps", {"job": waits[ref], "kind": "deposit"})
+            self.assertEqual((code, given["login"], "replaces" in given), (200, ref, False), given)
+        hub.register_fingerprints(LOGIN_A, self.NEW)
+        self.assertEqual(self.replace()[1][0], 200)         # the copy of LOGIN_A that waited ends
+        new = self.passed("vps")[0]
+        code, given = self.request("/helper/vault/vps", {"job": new["id"], "kind": "deposit"})
+        self.assertEqual((code, given["login"], given.get("replaces")), (200, LOGIN_A, True), given)
+        code, given = self.request("/helper/vault/vps", {"job": waits[LOGIN_B], "kind": "deposit"})    # asked again
+        self.assertEqual((code, "replaces" in given), (200, False), given)
+
+    def test_the_central_vault_s_replaced_is_taken_only_for_an_intake_with_a_statement(self):
+        hub.register_fingerprints(LOGIN_A, self.NEW)
+        hub.central_read()
+        real = hub.central_call
+        with patch.object(hub, "central_call", lambda op, fields=None: {"ok": True, "login": LOGIN_A, "saved": "replaced"}
+                          if op == "intake" else real(op, fields)):
+            code, answer = self.intake()
+            self.assertEqual((code, answer["error"]), (502, "the central vault's answer is not about this secret"))
+            self.assertEqual(self.replace()[1][0], 200)
+        # the route takes a statement and a signature only in their forms: the vault is not asked for another
+        asked = len(self.vault.ops("intake"))
+        for bad in ({"signature": "not base64 !!"}, {"signature": ""}, {"statement": ""},
+                    {"statement": statement(kind="replace", login=LOGIN_A, pad="x" * hub.CENTRAL_STATEMENT_MAX)}):
+            self.assertEqual(self.replace(request_id=str(uuid.uuid4()), **bad)[1][0], 400, bad)
+        self.assertEqual(len(self.vault.ops("intake")), asked)
+
+    def test_secret_replace_leaves_the_features_when_the_central_vault_does_not_answer(self):
+        hub.central_read()
+        self.assertTrue(hub.central_replaces())
+        with patch.dict(hub.CENTRAL, read_at=hub.now() - hub.CENTRAL_FRESH - 1):
+            self.assertFalse(hub.central_replaces())
+            self.assertNotIn("secret_replace", hub.ui_features())
+            self.assertEqual(self.replace()[1][0], 409)
+
+    def test_a_copy_is_made_for_a_vault_only_when_it_holds_none_of_the_value_of_now(self):
+        """central_deliver reads the holding again under LOCK, after the seal: a vault that holds the value of now
+        gets no second copy, also when a later delivery of it failed; and a pass that started before the owner's
+        replace makes no delivery, because its seal can hold the old value."""
+        made = self.deliver_and_keep()
+        key = next(r for r in self.deposits() if r["id"] in made and r["login"] == LOGIN_A)
+        with hub.LOCK:
+            self.assertIsNone(hub.central_deliver("vps", LOGIN_A, armored(b"a second copy"), STORE_A, hub.now()))
+            hub.DB.execute("INSERT INTO deposits(login,machine,agent,recipient,sha256,ciphertext,request_id,created,"
+                           "finished,ok,result) VALUES(?,?,?,?,?,NULL,?,?,?,0,?)",
+                           (LOGIN_A, "vps", "vps", STORE_A, "0" * 64, "central:test", hub.now(), hub.now(), "failed"))
+            hub.DB.commit()
+            self.assertEqual(hub.newest_holding("vps", LOGIN_A)[0]["id"], key["id"])    # the copy that it holds
+            self.assertIsNone(hub.central_deliver("vps", LOGIN_A, armored(b"a second copy"), STORE_A, hub.now()))
+        hub.register_fingerprints(LOGIN_A, self.NEW)
+        before = hub.now()
+        self.assertEqual(self.replace()[1][0], 200)
+        with hub.LOCK:
+            self.assertIsNone(hub.central_deliver("vps", LOGIN_A, armored(b"sealed before"), STORE_A, before - 1))
+            self.assertIsNotNone(hub.central_deliver("vps", LOGIN_A, armored(b"sealed after"), STORE_A, hub.now()))
+        self.assertEqual(hub.central_reconcile(before - 1)["delivered"], [])           # and the whole pass: nothing
+
+    def test_a_failure_from_before_a_delivery_that_ended_well_makes_no_wait(self):
+        """The wait after a failed delivery is for the newest thing that happened. A failure that a good delivery
+        followed says nothing any more: when the vault gave the value back and its agent holds it again, the copy
+        goes at once."""
+        self.vault.pins = {"vps": STORE_A}
+        hub.central_read()
+        first = self.passed(login=LOGIN_A)[0]
+        hub.finish_deposit(first, False, "The vault did not save it.")
+        hub.q("UPDATE deposits SET finished=? WHERE id=?", (hub.now() - hub.CENTRAL_RETRY - 1, first["id"]))
+        second = self.passed(login=LOGIN_A)[0]
+        hub.finish_deposit(second, True, "Saved.")
+        hub.q("UPDATE deposits SET finished=? WHERE id=?", (hub.now(), first["id"]))    # the failure is not long ago
+        grants = hub.TEAM["agents"]["vps"]["secrets"]
+        hub.TEAM["agents"]["vps"]["secrets"] = {k: v for k, v in grants.items() if k != LOGIN_A}
+        self.vault.grants = self.signed_grants()
+        hub.central_read()
+        wid = hub.central_reconcile()["withdrawn"][0]
+        hub.finish_withdrawal(hub.q1("SELECT * FROM withdrawals WHERE id=?", (wid,)), True, "Removed.")
+        hub.TEAM["agents"]["vps"]["secrets"] = grants
+        self.vault.grants = self.signed_grants()
+        hub.central_read()
+        self.assertEqual([hub.q1("SELECT login FROM deposits WHERE id=?", (d,))["login"]
+                          for d in hub.central_reconcile()["delivered"]], [LOGIN_A])
 
     def test_the_reconciler_seals_a_batch_at_a_time_and_asks_for_the_next_pass(self):
         self.vault.pins = {"vps": STORE_A}

@@ -435,7 +435,7 @@ class CentralVault(unittest.TestCase):
         self.assertEqual(self.ask("status"), {"ok": True, "v": 2, "central": True, "recipient": CENTRAL_KEY,
                                               "store_recipient": STORE_KEY, "fleet": FLEET, "owner_keys": 3,
                                               "pins": {}, "recovery": None, "grants": [], "pool": [], "items": 1,
-                                              "removes": True, "source": None})
+                                              "removes": True, "replaces": True, "values": {}, "source": None})
         self.signed("pin", PIN_1, SIG_PIN_1)
         self.signed("recovery", RECOVERY_1, SIG_RECOVERY_1)
         status = self.ask("status")
@@ -445,11 +445,13 @@ class CentralVault(unittest.TestCase):
 
     # ---- intake
     def test_intake_saves_the_owners_value_under_its_reference(self):
-        self.assertEqual(self.intake(), {"ok": True, "login": REF, "saved": "new"})
+        # the answer names the fingerprints of the value that the store holds now: no secret, the hub has them
+        prints = sorted(registered(LOGIN), key=lambda x: (x["kind"], x["hash"], x["len"]))
+        self.assertEqual(self.intake(), {"ok": True, "login": REF, "saved": "new", "fingerprints": prints})
         item = self.items()[SID]
         self.assertEqual((item["key"], item["note"]), ("example.org · pilot-b", "taken from the owner"))
         self.assertEqual(item["value"], canon(LOGIN))                   # the canonical JSON of the value
-        self.assertEqual(self.intake(), {"ok": True, "login": REF, "saved": "same"})       # a retry
+        self.assertEqual(self.intake(), {"ok": True, "login": REF, "saved": "same", "fingerprints": prints})   # a retry
         self.assertEqual(self.intake(ref=REF.upper().replace("BWS://", "bws://"))["login"], REF)
         other = dict(LOGIN, password="AnotherFakePassword-123456")      # another value under the same reference
         with self.assertRaises(vault.Refused) as refused:
@@ -571,7 +573,13 @@ class CentralVault(unittest.TestCase):
         for damaged in ("{}", "not json", json.dumps({"v": 1, "pins": {"vps": {"recipient": "age1x", "at": T1}},
                                                        "recovery": None}),
                         json.dumps({"v": 1, "pins": {}, "recovery": None, "removed": {REF.upper(): T1}}),
-                        json.dumps({"v": 1, "pins": {}, "recovery": None, "removed": {REF: "today"}})):
+                        json.dumps({"v": 1, "pins": {}, "recovery": None, "removed": {REF: "today"}}),
+                        json.dumps({"v": 1, "pins": {}, "recovery": None, "values": {REF: {"sha256": "0" * 64}}}),
+                        json.dumps({"v": 1, "pins": {}, "recovery": None, "values": {REF: {"sha256": "0" * 63, "at": T1}}}),
+                        json.dumps({"v": 1, "pins": {}, "recovery": None,
+                                    "values": {REF.upper(): {"sha256": "0" * 64, "at": T1}}}),
+                        json.dumps({"v": 1, "pins": {}, "recovery": None, "values": {REF: {"sha256": "0" * 64, "at": "now"}}}),
+                        json.dumps({"v": 1, "pins": {}, "recovery": None, "values": [REF]})):
             state.write_text(damaged)
             self.assertEqual(self.refused("seal", login=REF, machine="vps"), "the central vault's state cannot be read")
 
@@ -717,6 +725,161 @@ class CentralVault(unittest.TestCase):
         self.assertEqual(self.ask("remove", login=REF)["removed"], "removed")
         self.assertEqual(self.ask("inventory"), {"ok": True, "logins": []})
 
+    # ---- replace: a new value under a reference that the vault holds, only with the owner's signed statement
+    def replace_fields(self, value, at, ref=REF, sign=owner_sign, said=None, **given):
+        """An intake with the owner's replace statement about its own sealed copy, signed with the third owner key.
+        said: fields of the statement that are other than the right ones."""
+        fields = self.intake_fields(value=value, ref=ref, **given)
+        statement = canon(dict({"v": 1, "kind": "replace", "fleet": FLEET, "login": ref, "at": at,
+                                "sha256": hashlib.sha256(fields["ciphertext"].encode()).hexdigest()}, **(said or {})))
+        return dict(fields, statement=statement, signature=sign(statement))
+
+    def test_a_signed_replace_puts_the_new_value_in_the_place_of_the_old_one(self):
+        self.intake()
+        self.signed("pin", PIN_1, SIG_PIN_1)
+        self.assertNotIn("values", self.state())        # until the first replace, a file that the old program reads
+        new = dict(LOGIN, password="TheNewFakePassword-20261113")
+        fields = self.replace_fields(new, T2)
+        self.assertEqual(self.ask("intake", **fields),
+                         {"ok": True, "login": REF, "saved": "replaced",
+                          "fingerprints": sorted(registered(new), key=lambda x: (x["kind"], x["hash"], x["len"]))})
+        item = self.items()[SID]
+        self.assertEqual((item["value"], item["note"]), (canon(new), "taken from the owner"))
+        self.assertEqual(len(self.items()), 1)                          # the same reference: no second item
+        self.assertNotIn(LOGIN["password"], json.dumps(self.items()))   # the old value left the store
+        self.assertNotIn(LOGIN["password"], Path(self.conf["store"]).read_text())
+        self.assertEqual(self.state()["values"], {REF: {"sha256": json.loads(fields["statement"])["sha256"], "at": T2}})
+        self.assertEqual(self.ask("intake", **fields)["saved"], "same")     # the same statement again: a retry
+        # what the owner signed before stays: the pin, and a seal gives the new value
+        self.granted(grant(REF, "vps", "vps", T2))
+        sealed = self.ask("seal", login=REF, machine="vps")
+        self.assertEqual(json.loads(self.opened(sealed["ciphertext"], R1)), new)
+        # with a statement, a login that the store does not hold is saved as new
+        key = {"password": API_KEY}
+        self.assertEqual(self.ask("intake", **self.replace_fields(key, T2, ref=KEY_REF, title="OPENAI_API_KEY",
+                                                                  item="api_key"))["saved"], "new")
+        self.assertEqual([line for line in self.logged if line.startswith("intake:")][1:3],
+                         [f"intake: {REF} replaced, with the owner's replace statement",
+                          f"intake: {REF} same, with the owner's replace statement"])
+
+    def test_a_replace_keeps_the_address_of_the_key_when_the_new_value_names_none(self):
+        """The owner saved a key with the address of its service, and an agent's vault sends the key there for it
+        (call_api). In Add secret the address is optional, so the new value of a replace often names none. The key
+        changes; its address stays, or the agent that uses the key would have no place to send it to."""
+        key = {"password": API_KEY, "url": "https://api.example.org", "username": "api-user"}
+        self.intake(value=key, ref=KEY_REF, title="OPENAI_API_KEY", item="api_key")
+        # only a replace keeps an address: the same key with no address and no statement is another value, refused
+        self.assertIn("holds another value under this reference",
+                      self.refused("intake", **self.intake_fields(value={"password": API_KEY}, ref=KEY_REF,
+                                                                  title="OPENAI_API_KEY", item="api_key")))
+        new = {"password": "sk-fake-only-the-new-20261113"}             # the form's address field was empty
+        fields = self.replace_fields(new, T2, ref=KEY_REF, title="OPENAI_API_KEY", item="api_key")
+        self.assertEqual(self.ask("intake", **fields)["saved"], "replaced")
+        kept = {"password": new["password"], "url": "https://api.example.org", "username": "api-user"}
+        self.assertEqual(json.loads(self.items()[KEY_SID]["value"]), kept)
+        self.assertEqual(vault.check_login(self.items()[KEY_SID]["value"])["url"], "https://api.example.org")
+        self.assertEqual(self.ask("intake", **fields)["saved"], "same")     # the same statement again: the same save
+        self.assertEqual(json.loads(self.items()[KEY_SID]["value"]), kept)
+        # the status names the checksum of the copy of the newest replace, and nothing of a value
+        status = self.ask("status")
+        self.assertEqual(status["values"], {KEY_REF: json.loads(fields["statement"])["sha256"]})
+        self.assertNotIn(new["password"], json.dumps(status))
+        # an address in the new value takes the place of the old one
+        moved = {"password": "sk-fake-only-a-third-20261113", "url": "https://api2.example.org", "username": ""}
+        self.assertEqual(self.ask("intake", **self.replace_fields(moved, T3, ref=KEY_REF, title="OPENAI_API_KEY",
+                                                                  item="api_key"))["saved"], "replaced")
+        self.assertEqual(json.loads(self.items()[KEY_SID]["value"]), moved)
+        # a key that had no address gets none
+        self.intake(value={"password": "sk-fake-only-no-address-1"}, ref=OTHER_REF, title="OTHER_API_KEY", item="api_key")
+        self.ask("intake", **self.replace_fields({"password": "sk-fake-only-no-address-2"}, T2, ref=OTHER_REF,
+                                                 title="OTHER_API_KEY", item="api_key"))
+        self.assertEqual(json.loads(self.items()[OTHER_SID]["value"]), {"password": "sk-fake-only-no-address-2"})
+
+    def test_a_replace_needs_the_owners_signature_about_this_login_and_this_very_copy(self):
+        """Without the owner's own statement no value changes: the rule that keeps a hub that is broken into from
+        putting its own value under a name that the owner gave."""
+        self.intake()
+        new = dict(LOGIN, password="TheNewFakePassword-20261113")
+        good = self.replace_fields(new, T2)
+        stranger = 0x1D0C0FFEE5EED0F7E57B1A5ED0D1E7C0A2B3C4D5E6F708192A3B4C5D6E7F8099       # no owner's key
+        other_copy = self.replace_fields(new, T2, said={"sha256": hashlib.sha256(b"another copy").hexdigest()})
+        cases = (
+            (self.intake_fields(value=new), "holds another value under this reference"),          # no statement
+            (self.replace_fields(new, T2, sign=lambda text: owner_sign(text, stranger)), "valid signature of the owner"),
+            (dict(good, signature=owner_sign(good["statement"] + " ")), "valid signature of the owner"),
+            (self.replace_fields(new, T2, said={"login": KEY_REF}), "the statement is about another login"),
+            (other_copy, "the statement is about another copy than this one"),
+            (dict(good, ciphertext=self.lock(CENTRAL_KEY, json.dumps(dict(new, password="TheHubsOwnValue-000001")))),
+             "the statement is about another copy than this one"),         # the hub puts its own copy under his statement
+            (self.replace_fields(new, T2, said={"fleet": OTHER_FLEET}), "the statement is for another fleet"),
+            (self.replace_fields(new, T2, said={"kind": "pool"}), "not a valid replace statement"),
+            (self.replace_fields(new, T2, said={"sha256": "0" * 63}), "not a valid replace statement"),
+            (self.replace_fields(new, T2, said={"sha256": 5}), "not a valid replace statement"),
+            (self.replace_fields(new, T2, said={"at": True}), "not a valid replace statement"),
+            (self.replace_fields(new, T2, said={"machine": "vps"}), "not a valid replace statement"),
+            ({k: v for k, v in good.items() if k != "signature"}, "needs its statement and its signature"),
+            ({k: v for k, v in good.items() if k != "statement"}, "needs its statement and its signature"),
+            (dict(good, statement=json.dumps(json.loads(good["statement"]))), "not in its canonical form"),
+            (self.replace_fields(new, T2, prints=registered(LOGIN)), "does not match what the owner registered"))
+        for fields, said in cases:
+            with self.subTest(said=said):
+                self.assertIn(said, self.refused("intake", **fields))
+                self.assertEqual(self.items()[SID]["value"], canon(LOGIN))      # the old value is whole
+                self.assertNotIn("values", self.state() if Path(self.conf["state"]).exists() else {})
+        # a statement of another kind opens no other operation with a copy, and a grant is no replace
+        self.assertIn("not a valid replace statement",
+                      self.refused("intake", **dict(self.intake_fields(value=new), statement=grant(REF, "vps", "vps", T2),
+                                                    signature=owner_sign(grant(REF, "vps", "vps", T2)))))
+        self.assertIn("unknown operation", self.refused("replace", **good))
+        # a name that remove took out takes no value, also with the owner's statement
+        self.ask("remove", login=REF)
+        self.assertIn("removed from the fleet", self.refused("intake", **self.replace_fields(new, T3)))
+
+    def test_an_older_replace_cannot_come_back(self):
+        """A hub can keep each copy and statement that passed it. The newest statement of a login wins: an older
+        one, and another copy at the same time, change nothing."""
+        self.intake()
+        second, third = dict(LOGIN, password="SecondFakePassword-20261113"), dict(LOGIN, password="ThirdFakePassword-20261113")
+        prints = registered(LOGIN) + registered(second) + registered(third)     # the hub gives each one registered
+        early = self.replace_fields(second, T1, prints=prints)
+        late = self.replace_fields(third, T2, prints=prints)
+        self.assertEqual(self.ask("intake", **late)["saved"], "replaced")
+        for fields in (early, self.replace_fields(second, T2, prints=prints)):   # older, and as old with another copy
+            self.assertIn("as new or newer", self.refused("intake", **fields))
+            self.assertEqual(self.items()[SID]["value"], canon(third))
+        self.assertEqual(self.state()["values"][REF]["at"], T2)
+        self.assertIn("holds another value", self.refused("intake", **self.intake_fields(prints=prints)))   # the first copy
+        self.assertEqual(self.ask("intake", **self.replace_fields(second, T3, prints=prints))["saved"], "replaced")
+        self.assertEqual(self.items()[SID]["value"], canon(second))
+
+    def test_a_replace_that_stops_halfway_leaves_the_old_value_whole_and_the_same_statement_ends_it(self):
+        self.intake()
+        new = dict(LOGIN, password="TheNewFakePassword-20261113")
+        prints = registered(LOGIN) + registered(new)
+        fields = self.replace_fields(new, T2, prints=prints)
+        # the state cannot be written: nothing changed at all
+        with patch.object(vault, "keep_state", side_effect=vault.Refused("the central vault's state could not be saved, "
+                                                                         "so nothing changed")):
+            self.assertIn("state could not be saved", self.refused("intake", **fields))
+        self.assertEqual(self.items()[SID]["value"], canon(LOGIN))
+        self.assertFalse(Path(self.conf["state"]).exists())
+        # the record is kept and then the store cannot be written: the old value is whole, and no older statement
+        # is taken from here on
+        with patch.object(vault.LocalStore, "keep", side_effect=vault.Refused("the vault store could not be saved")):
+            self.assertEqual(self.refused("intake", **fields), "the vault store could not be saved")
+        self.assertEqual(self.items()[SID]["value"], canon(LOGIN))
+        self.assertNotIn(new["password"], json.dumps(self.items()))
+        self.assertEqual(self.state()["values"][REF]["at"], T2)
+        self.assertIn("as new or newer", self.refused("intake", **self.replace_fields(new, T1, prints=prints)))
+        self.assertEqual(self.ask("intake", **fields)["saved"], "replaced")      # the same statement ends it
+        self.assertEqual(self.items()[SID]["value"], canon(new))
+        # a store that is not locked is not written: the old value stays
+        newer = dict(LOGIN, password="NewerFakePassword-20261113")
+        with patch.object(vault, "run", leaky_age(vault.run)):
+            self.assertIn("was not locked", self.refused("intake", **self.replace_fields(
+                newer, T3, prints=prints + registered(newer))))
+        self.assertEqual(self.items()[SID]["value"], canon(new))
+
     def test_export_locks_the_stores_key_only_to_the_owners_recovery_key(self):
         self.intake()
         self.assertEqual(self.refused("export"), "the owner has not signed a recovery key, so nothing is exported")
@@ -760,7 +923,8 @@ class CentralVault(unittest.TestCase):
         request = dict({"v": 2, "op": "intake"}, **self.intake_fields(value=big, ref=KEY_REF, title="BIG_API_KEY",
                                                                       item="api_key"))
         self.assertGreater(len(json.dumps(request)), 8192)
-        self.assertEqual(call(conf["socket"], request), {"ok": True, "login": KEY_REF, "saved": "new"})
+        self.assertEqual(call(conf["socket"], request), {"ok": True, "login": KEY_REF, "saved": "new",
+                                                         "fingerprints": registered(big)})
         self.assertEqual(self.items()[KEY_SID]["value"], canon(big))
         other = vault.Broker(dict(self.conf, socket=str(self.dir / "o.sock"))).open()   # of another hub user
         threading.Thread(target=other.serve, daemon=True).start()
@@ -884,6 +1048,89 @@ class Withdrawals(unittest.TestCase):
                     vault.handle(self.conf, line, os.getuid())
                 self.assertEqual(str(refused.exception), "unknown operation", op)
         self.assertEqual(self.asked, [])
+
+
+class Replacing(unittest.TestCase):
+    """deposit on a machine's own broker, for a value that the owner replaced: the hub's answer for the delivery says
+    `replaces`, and the broker puts the new value in the place of the one that an earlier delivery saved. Nothing in
+    the helper's request can say it."""
+
+    def setUp(self):
+        Withdrawals.setUp(self)
+        self.replaces, self.value, self.confirmed = True, {"password": "sk-fake-only-the-new-20261113"}, True
+
+        def hub(conf, method, path, body=None):     # the hub's two helper routes of a delivery
+            self.asked.append((path, body))
+            if path.endswith("/fingerprints"):
+                return (200, {"ok": True, "deposit": body["deposit"]}) if self.confirmed else \
+                    (409, {"error": "this copy holds another value than the one the owner saved under this reference, "
+                                    "so it is not kept"})
+            copy = subprocess.run([self.conf["age"], "-a", "-r", VPS_STORE], input=json.dumps(self.value),
+                                  capture_output=True, text=True, check=True).stdout
+            return 200, dict({"ok": True, "job": body["job"], "kind": "deposit", "login": KEY_REF,
+                              "title": "OPENAI_API_KEY", "item": "api_key", "ciphertext": copy, "fingerprint_salts": SALTS},
+                             **({"replaces": True} if self.replaces else {}))
+        p = patch.object(vault, "hub", hub)
+        p.start()
+        self.addCleanup(p.stop)
+
+    saved = Withdrawals.saved
+
+    def deposit(self, **fields):
+        request = dict({"v": 2, "op": "deposit", "job": 9, "agent": "vps", "agent_key": AKEY}, **fields)
+        return vault.handle(self.conf, json.dumps(request), os.getuid())
+
+    def held(self):
+        return json.loads(vault.LocalStore(self.conf).opened()[KEY_SID]["value"])
+
+    def test_a_machines_broker_says_that_it_replaces(self):
+        self.assertIs(vault.handle(self.conf, json.dumps({"v": 2, "op": "status"}), os.getuid())["replaces"], True)
+
+    def test_a_delivery_that_the_hub_marks_so_replaces_the_delivered_value(self):
+        self.assertEqual(self.saved(KEY_SID, vault.DELIVERED), "new")       # the old value, from an earlier delivery
+        self.assertEqual(self.deposit(), {"ok": True, "v": 2, "deposit": 9, "login": KEY_REF, "saved": "replaced"})
+        self.assertEqual(self.held(), self.value)
+        self.assertEqual(len(vault.LocalStore(self.conf).opened()), 1)
+        self.assertNotIn(API_KEY, json.dumps(vault.LocalStore(self.conf).opened()))     # the old value left the store
+        self.assertEqual(self.deposit()["saved"], "same")                   # asked again, it ends the same way
+        self.assertEqual(vault.LocalStore(self.conf).opened()[KEY_SID]["note"], vault.DELIVERED)
+
+    def test_without_the_hubs_word_another_value_is_refused_as_before(self):
+        self.saved(KEY_SID, vault.DELIVERED)
+        self.replaces = False
+        for request in ({}, {"replaces": True}, {"replace": True}):         # the helper's request cannot say it
+            with self.assertRaises(vault.Refused) as refused:
+                self.deposit(**request)
+            self.assertIn("holds another value under this reference", str(refused.exception))
+            self.assertEqual(self.held(), {"password": API_KEY})
+
+    def test_a_delivery_replaces_only_what_a_delivery_saved(self):
+        """A login that this vault made, or that the owner saved here himself, is not the hub's to change."""
+        for note in ("", "fleet-create:vps:5c2f9a10-7d41-4c88-9b55-0e3a1f6c2d90", "taken from the owner"):
+            vault.LocalStore(self.conf).remove(KEY_SID, note) if KEY_SID in vault.LocalStore(self.conf).opened() else None
+            self.saved(KEY_SID, note)
+            with self.assertRaises(vault.Refused) as refused:
+                self.deposit()
+            self.assertIn("did not come here from the owner's vault, so it is not replaced", str(refused.exception))
+            self.assertEqual(self.held(), {"password": API_KEY})
+            vault.LocalStore(self.conf).remove(KEY_SID, note)
+
+    def test_a_replace_that_fails_leaves_the_old_value_whole(self):
+        self.saved(KEY_SID, vault.DELIVERED)
+        self.confirmed = False                      # the hub does not confirm the value: nothing is saved
+        with self.assertRaises(vault.Refused):
+            self.deposit()
+        self.assertEqual(self.held(), {"password": API_KEY})
+        self.confirmed = True
+        with patch.object(vault.LocalStore, "keep", side_effect=vault.Refused("the vault store could not be saved")), \
+                self.assertRaises(vault.Refused):
+            self.deposit()
+        self.assertEqual(self.held(), {"password": API_KEY})        # a store that cannot be written: the old one, whole
+        with patch.object(vault, "run", leaky_age(vault.run)), self.assertRaises(vault.Refused):
+            self.deposit()                                          # a store that is not locked is not written
+        self.assertEqual(self.held(), {"password": API_KEY})
+        self.assertEqual(self.deposit()["saved"], "replaced")
+        self.assertEqual(self.held(), self.value)
 
 
 class CentralSetup(unittest.TestCase):
