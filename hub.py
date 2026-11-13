@@ -14589,8 +14589,9 @@ def mask_words(words):
     """mask_secrets of the words that a JSON line quotes (json_one_line), before they are quoted. A login takes the
     whole run of non-whitespace that holds it: in the line each quote of the words is escaped, and the mask of the
     line takes an escaped quote into the run (MASK_PIECE), so no part of a later login that overlaps this one stays,
-    as none stays in the line. Where a login stays that the mask cannot place, or one escaped twice that a JSON text in
-    them quotes (escaped_twice), the words go whole, or each line of them that holds one."""
+    as none stays in the line. Where a login stays that the mask cannot place, or one under more levels of escapes,
+    as a JSON text in them that quotes another has one (escaped_deep), the words go whole, or each line of them that
+    holds one."""
     words = str(words or "")
     spans = secret_spans(words)
     out, last = [], 0
@@ -14600,7 +14601,7 @@ def mask_words(words):
                 out += [words[last:m.start()], MASK]
                 last = m.end()
     said = "".join(out) + words[last:]
-    if "\\" not in words or not (secret_hit(said) or escaped_twice(said)):
+    if "\\" not in words or not (secret_hit(said) or escaped_deep(said)):
         return said
     lines = words.split("\n")
     return MASK if len(lines) == 1 else "\n".join(mask_words(line) for line in lines)
@@ -14620,15 +14621,15 @@ def mask_message(text):
     so the masked message needs no mask after it (unread_tail). A message with no login keeps its bytes.
 
     A JSON string inside a line, not a line of its own, is no JSON line: a note that quotes a person's words as a read
-    gave them, or a text that clip made one line. A login escaped twice there is found only when two levels of escapes
-    are undone (escaped_twice), and such a line goes whole: it went out, or a whole-text MASK hid it only when another
-    login of the same text made all of it MASK."""
+    gave them, or a text that clip made one line. A login escaped twice or more there is found only when those levels
+    of escapes are undone (escaped_deep), and such a line goes whole: it went out, or a whole-text MASK hid it only
+    when another login of the same text made all of it MASK."""
     text = str(text or "")
     lines = text.split("\n")
     quoted = [json_words(line) for line in lines]
     if all(words is None for words in quoted):
         said = mask_secrets(text)
-        if said != MASK and not escaped_twice(said):
+        if said != MASK and not escaped_deep(said):
             return said
     out = []
     for line, words in zip(lines, quoted):
@@ -14636,14 +14637,28 @@ def mask_message(text):
             masked = mask_words(words)
             line = line if masked == words else json_one_line(masked)
         line = mask_secrets(line)
-        out.append(MASK if escaped_twice(line) else line)
+        out.append(MASK if escaped_deep(line) else line)
     return "\n".join(out)
 
 
-def escaped_twice(text):
-    """Whether a text holds a registered login escaped twice, as a JSON string inside a JSON text has one that holds a
-    quote or a backslash: secret_hit undoes one level of escapes (json_plain), and this one level more."""
-    return "\\" in text and secret_hit(json_plain(text))
+ESCAPE_LEVELS = 6       # the most levels of JSON escapes over a login that the masks look through (escaped_deep)
+
+
+def escaped_deep(text):
+    """Whether a text holds a registered login under two or more levels of JSON escapes: a JSON string inside a JSON
+    text holds one with a quote or a backslash escaped twice, and a webhook's body that a person pastes into a note,
+    three times or more. secret_hit undoes one level (json_plain); this undoes one more at each step while a backslash
+    stays and the step changes the text, up to ESCAPE_LEVELS. A step searches the text that the step before made, and
+    the cache of spans_of holds that search already, so each step costs one search more, and only a text escaped that
+    deep pays it."""
+    for _ in range(ESCAPE_LEVELS - 1):
+        plain = json_plain(text) if "\\" in text else text
+        if plain == text:
+            return False
+        if secret_hit(plain):
+            return True
+        text = plain
+    return False
 
 
 def conversation_pass_rows(conv, person, tid, rows, t0):

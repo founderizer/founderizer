@@ -379,7 +379,7 @@ class SecretThroughAnEscape(Base):
         """A note that quotes a person's words as a read gave them holds a JSON string inside its line, and
         see_earlier_work shows the note inside one more line: a login that the words held escaped already is escaped
         twice there, which secret_hit, undoing one level of escapes, never finds, so it went out. Such a line goes
-        whole now (escaped_twice), also when another login of the answer goes on its own line."""
+        whole now (escaped_deep), also when another login of the answer goes on its own line."""
         quoted = hub.json_one_line("Use " + json.dumps({"pw": self.LOGIN}) + " please")
         self.ok("vps", "report_progress", note=f"Kim wrote: {quoted}")
         hub.q("UPDATE tasks SET state='completed', what='Rotated it.' WHERE id=?", (self.task,))
@@ -402,10 +402,28 @@ class SecretThroughAnEscape(Base):
         plain = 'Kim wrote: "Use {\\"pw\\": \\"not-a-login\\"} please"'
         self.assertEqual(hub.mask_message(plain), plain)
 
+    def test_a_login_under_three_or_more_levels_of_escapes_is_masked_with_its_line(self):
+        """A webhook's body that a person pastes holds JSON in JSON, and a note that quotes their words as a read gave
+        them escapes it once more: the login is three, four or five levels deep in the note's line, where the masks
+        looked through two. escaped_deep undoes one level more at each step while a backslash stays."""
+        self.register()
+        body = json.dumps({"pw": self.LOGIN})
+        for depth in (1, 2, 3, 4):                  # the levels of JSON over the body in the person's words
+            words = "Webhook body: " + body
+            for _ in range(depth - 1):
+                words = "Webhook body: " + json.dumps(words)
+            line = "60s ago, vps: Kim wrote: " + hub.json_one_line(words)
+            self.assertEqual(hub.mask_message(f"Before.\n{line}\nAfter."), f"Before.\n{hub.MASK}\nAfter.", depth)
+            self.assertEqual(hub.mask_message(hub.json_one_line(words)), hub.json_one_line(hub.MASK), depth)
+        deep = "Webhook body: " + json.dumps(json.dumps(json.dumps({"pw": "not-a-login"})))
+        line = "Kim wrote: " + hub.json_one_line(deep)
+        self.assertEqual(hub.mask_message(line), line)
+        self.assertEqual(hub.mask_message(hub.json_one_line(deep)), hub.json_one_line(deep))
+
     def test_words_that_quote_a_json_text_of_a_json_text_go_whole(self):
         """A person's words in a JSON line (json_one_line) can themselves hold a JSON string of a JSON text, as a
         webhook's body that they paste: the login is escaped twice in the words and three times in the line, which
-        mask_words found at neither level. Such words go whole now (escaped_twice in mask_words)."""
+        mask_words found at neither level. Such words go whole now (escaped_deep in mask_words)."""
         self.register()
         words = "Its body: " + json.dumps(json.dumps({"pw": self.LOGIN}))
         self.assertEqual(hub.mask_words(words), hub.MASK)
