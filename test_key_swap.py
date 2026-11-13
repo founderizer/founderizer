@@ -4,8 +4,9 @@ and the vault's swap proxy puts the real key into the Authorization header of an
 Five parts. The proxy's reading of a request head. A real proxy in this process, with a local HTTPS site, real
 certificates that the openssl program makes, and stand-ins for the kernel's table of sockets and for the broker. The
 broker's part, with the in-process hub of the vault tests: the placeholder, the question at each use, and the end of a
-grant. The hub's rule and routes. The helper's variables and the installer's step. Made-up keys and example hosts
-only; nothing here touches this computer's own vault, and no test leaves a folder or a server.
+grant. The hub's rule and routes. The helper's variables and the installer's step. The hub's take-back and delivery
+of a value on a machine that swaps keys, with the pieces of the central vault's end-to-end test. Made-up keys and
+example hosts only; nothing here touches this computer's own vault, and no test leaves a folder or a server.
 
 What no test here proves is in test_key_swap_e2e.py (the two OS users, the kernel's table, real clients) and on the
 first server (the units under systemd)."""
@@ -34,6 +35,7 @@ import hub
 import hubsetup
 import leftovers
 import lifecycle
+import test_central_e2e
 import test_grants
 import test_vault
 import vault
@@ -51,6 +53,7 @@ def load_tests(loader, _tests, _pattern):
     suite.addTests(Configuration(name) for name in Configuration.__dict__ if name.startswith("test_"))
     suite.addTests(BrokerPart(name) for name in BrokerPart.__dict__ if name.startswith("test_"))
     suite.addTests(HubRoutes(name) for name in HubRoutes.__dict__ if name.startswith("test_"))
+    suite.addTests(Delivery(name) for name in Delivery.__dict__ if name.startswith("test_"))
     return suite
 
 
@@ -1405,6 +1408,11 @@ class BrokerPart(test_vault.VaultBroker):
         self.swap_sock = str(self.dir / "swap.sock")
         self.programs = []
         self.part = dict(self.PART, uid=os.getuid(), vault_uid=os.getuid(), group="fleet-agents", broker=self.swap_sock)
+        # this test's own user stands in for the OS user of the agent vps, as the hub names it (fleet-<name>)
+        real = vault.swap_user
+        named = patch.object(vault, "swap_user", lambda uid: "fleet-vps" if uid == os.getuid() else real(uid))
+        named.start()
+        self.addCleanup(named.stop)
 
     def started(self, part=None, fault=None):
         """The fixture's broker, started again: with the part swap (or a part whose machine facts are a fault)."""
@@ -1470,7 +1478,7 @@ class BrokerPart(test_vault.VaultBroker):
         kept = json.loads((self.dir / "state" / vault.SWAPS).read_text())
         self.assertEqual(set(kept), {name})
         self.assertEqual({k: v for k, v in kept[name].items() if k != "token"},
-                         {"uid": os.getuid(), "user": pwd.getpwuid(os.getuid()).pw_name, "agent": "vps",
+                         {"uid": os.getuid(), "user": "fleet-vps", "agent": "vps",
                           "login": test_vault.REF, "host": HOST, "port": 443, "form": "bearer"})
         self.assertNotIn(self.VALUE, (self.dir / "state" / vault.SWAPS).read_text())
         self.assertEqual((self.dir / "state" / vault.SWAPS).stat().st_mode & 0o777, 0o600)
@@ -1514,36 +1522,155 @@ class BrokerPart(test_vault.VaultBroker):
         self.assertFalse(self.proxy_asks(op="read")["ok"])                  # no other operation on this socket
         self.assertFalse(self.proxy_asks(op="swap", uid="1", host=HOST, port=443, name=name, form="bearer")["ok"])
 
-    def test_the_end_of_a_grant_stops_the_next_request_and_a_silent_hub_is_a_refusal(self):
+    def off(self):
+        """The placeholders of the broker's list that are switched off. The list has one form of off, true, and it is
+        a list that a broker reads at its start: a vault.py of the first version takes the same form and no other."""
+        path = self.dir / "state" / vault.SWAPS
+        entries = json.loads(path.read_text())
+        self.assertEqual([e["off"] for e in entries.values() if "off" in e and e["off"] is not True], [])
+        self.assertEqual(vault.Swaps(str(path)).entries, entries)
+        return {name for name, e in entries.items() if e.get("off")}
+
+    def test_the_hubs_no_switches_off_that_one_placeholder_and_no_other(self):
+        """Not each placeholder of that key (another agent of the machine still reads it), and not each one of that
+        OS user (it still reads its other keys)."""
+        broker = self.started()
+        other_value = "sk-example-other-key-20261112"
+        third = "bws://" + test_vault.THIRD_ID
+        self.item(test_vault.THIRD_ID, {"username": "", "password": other_value}, key="OTHER_KEY")
+        hub.TEAM["logins"][third] = {"title": "OTHER_KEY", "kind": "api_key", "env": "OTHER_KEY",
+                                     "site": "https://" + OTHER_HOST}
+        hub.TEAM["agents"]["vps"]["secrets"][third] = "read"
+        env = fleet.vault_call({"op": "read"})["env"]
+        name, second = env["SHOP_API_KEY"], env["OTHER_KEY"]
+        far = broker.conf["_swaps"].place(0, "another", test_vault.REF, HOST, 443, "bearer", "0" * 64)   # another OS user
+        self.assertEqual(len({name, second, far}), 3)
+        hub.TEAM["agents"]["vps"]["secrets"] = {third: "read"}              # the owner ends the grant of the one key
+        self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})
+        self.assertEqual(self.off(), {name})
+        self.assertEqual(self.swap(second, host=OTHER_HOST), {"ok": True, "value": other_value})
+        self.assertIs(broker.conf["_swaps"].site(0, HOST, 443), True)
+
+    def test_the_hubs_no_to_a_use_stops_the_request_and_switches_the_placeholder_off_with_no_read(self):
+        """An agent with no read grant left makes no read of its keys, so the hub's no itself is what switches its
+        placeholder off. The agent's next read that names the key with its site switches it on again."""
+        self.started()
+        read = lambda: fleet.vault_call({"op": "read"})["env"].get("SHOP_API_KEY")
+        open_now = dict(op="site", uid=os.getuid(), host=HOST, port=443)
+        name = read()
+        agent, entry = hub.TEAM["agents"]["vps"], hub.TEAM["logins"][test_vault.REF]
+        for why, where, key, changed in (
+                ("the owner ends the grant", agent, "secrets", {}),
+                ("or makes it a use grant", agent, "secrets", {test_vault.REF: "use"}),
+                ("the key loses its site", entry, "site", None),
+                ("or gets another one", entry, "site", "https://files.example.com"),
+                ("or another form", entry, "form", "basic-user"),
+                ("its name is another OS user's agent now", agent, "user", "fleet-renamed")):
+            with self.subTest(why):
+                self.assertEqual((self.swap(name)["value"], self.off(), self.proxy_asks(**open_now)["site"]),
+                                 (self.VALUE, set(), True))
+                before = where.get(key)
+                if changed is None:
+                    del where[key]
+                else:
+                    where[key] = changed
+                try:
+                    self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})     # the request that asked
+                    self.assertEqual(self.off(), {name})                    # and the placeholder is off, with no read
+                    self.assertEqual(self.proxy_asks(**open_now), {"ok": True, "site": False})  # the proxy opens it no more
+                finally:
+                    if before is None:
+                        del where[key]
+                    else:
+                        where[key] = before
+                # what was changed is as before, and no read came: an entry that is off gives nothing, and asks nothing
+                with patch.object(vault, "hub", side_effect=AssertionError("the hub was asked")):
+                    self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})
+                self.assertEqual(read(), name)                              # the agent's next read: the same placeholder
+        self.assertEqual((self.swap(name)["value"], self.off()), (self.VALUE, set()))
+
+    def test_a_hub_that_is_silent_or_gives_another_answer_is_a_refusal_and_switches_nothing_off(self):
         self.started()
         name = fleet.vault_call({"op": "read"})["env"]["SHOP_API_KEY"]
-        self.assertEqual(self.swap(name)["value"], self.VALUE)
-        grants = hub.TEAM["agents"]["vps"]["secrets"]
-        hub.TEAM["agents"]["vps"]["secrets"] = {}                           # the owner ends the grant
-        self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})
-        hub.TEAM["agents"]["vps"]["secrets"] = {test_vault.REF: "use"}      # or makes it a use grant
-        self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})
-        hub.TEAM["agents"]["vps"]["secrets"] = grants                       # and gives it again: the same placeholder works
-        self.assertEqual(self.swap(name)["value"], self.VALUE)
-        site = hub.TEAM["logins"][test_vault.REF].pop("site")               # the key loses its site
-        self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})
-        hub.TEAM["logins"][test_vault.REF]["site"] = "https://files.example.com"    # or gets another one
-        self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})
-        hub.TEAM["logins"][test_vault.REF].update(site=site, form="basic-user")     # or another form
-        self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})
-        del hub.TEAM["logins"][test_vault.REF]["form"]
-        self.assertEqual(self.swap(name)["value"], self.VALUE)
-        with patch.object(vault, "hub", side_effect=vault.Refused("the vault broker could not reach the hub")):
-            self.assertEqual(self.swap(name), {"ok": False, "code": "hub"})
-        with patch.object(vault, "hub", return_value=(500, {})):
-            self.assertEqual(self.swap(name), {"ok": False, "code": "hub"})
-        with patch.object(vault, "hub", return_value=(200, {"ok": True, "login": "bws://" + test_vault.OTHER_ID})):
-            self.assertEqual(self.swap(name), {"ok": False, "code": "hub"})    # not an exact yes for this key
-        self.assertEqual(self.swap(name)["value"], self.VALUE)
+        for said, code in ((vault.Refused("the vault broker could not reach the hub"), "hub"), ((500, {}), "hub"),
+                           ((200, {"ok": True, "login": "bws://" + test_vault.OTHER_ID}), "hub"),    # not an exact yes
+                           ((200, {"ok": False, "login": test_vault.REF}), "hub"),
+                           ((403, {"error": "127.0.0.9 is not vps's machine"}), "refused"),     # not a word on the grant
+                           # a hub that does not know the route says 404 too: it must not switch each used one off
+                           ((404, {"error": "unknown agent"}), "refused"),
+                           ((400, {"error": "send {login, site, form, swap}"}), "hub")):
+            with self.subTest(said=said):
+                how = dict(side_effect=said) if isinstance(said, Exception) else dict(return_value=said)
+                with patch.object(vault, "hub", **how):
+                    self.assertEqual(self.swap(name), {"ok": False, "code": code})
+                self.assertEqual(self.off(), set())
+                self.assertEqual(self.swap(name)["value"], self.VALUE)
+        # the real hub's 404, for an agent that it does not know: refused, and nothing is switched off
+        gone = hub.TEAM["agents"].pop("vps")
+        try:
+            self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})
+        finally:
+            hub.TEAM["agents"]["vps"] = gone
+        self.assertEqual((self.off(), self.swap(name)["value"]), (set(), self.VALUE))
+        # a hub from before it named the agent's OS user: a use is as before
+        with patch.object(vault, "hub", return_value=(200, {"ok": True, "login": test_vault.REF})):
+            self.assertEqual(self.swap(name), {"ok": True, "value": self.VALUE})
+        # the hub's no for another token than the entry has now (a read gave it a new one while the hub was asked)
+        # does not switch the entry of now off
+        broker = self.broker
+        asked = broker.conf["_swaps"].get(name)
+        broker.conf["_swaps"].refused(name, dict(asked, token="0" * 64))
+        self.assertEqual(self.off(), set())
+        # a list that cannot be written: the request is refused as before, and each use still asks the hub
+        hub.TEAM["agents"]["vps"]["secrets"] = {}
+        with patch.object(vault.Swaps, "keep", side_effect=vault.Refused("the vault could not keep its list")):
+            self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})
+            self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})
+        self.assertEqual(self.off(), set())
 
-    def off(self):
-        """The placeholders of the broker's list that are switched off."""
-        return {name for name, e in json.loads((self.dir / "state" / vault.SWAPS).read_text()).items() if e.get("off")}
+    def test_the_question_after_a_delivery_is_marked_as_no_use_and_a_use_is_not(self):
+        broker = self.started()
+        name = fleet.vault_call({"op": "read"})["env"]["SHOP_API_KEY"]
+        entry, asked = broker.conf["_swaps"].get(name), []
+        real = vault.hub
+
+        def hub_call(conf, method, path, body=None, **more):
+            asked.append((conf.get("agent"), conf.get("agent_key"), method, path, body))
+            return real(conf, method, path, body, **more)
+        with patch.object(vault, "hub", hub_call):
+            self.assertEqual(vault.swap_asks(broker.conf, entry), (200, True))     # the hub named this entry's OS user
+            self.assertEqual(vault.swap_asks(broker.conf, entry, use=False), (200, True))
+            self.assertEqual(vault.swap_asks(broker.conf, dict(entry, token="0" * 64), use=False), (409, False))
+        question = {"login": test_vault.REF, "site": "https://" + HOST, "form": "bearer", "swap": entry["token"]}
+        self.assertEqual(asked, [("vps", None, "POST", "/helper/vault/vps/swap", question),
+                                 ("vps", None, "POST", "/helper/vault/vps/swap", dict(question, use=False)),
+                                 ("vps", None, "POST", "/helper/vault/vps/swap", dict(question, swap="0" * 64, use=False))])
+        # A delivery comes with the fields of the agent that carries it. The question is about the placeholder's
+        # own agent, on that agent's route, and with no agent key: the carrier's key is not that agent's.
+        del asked[:]
+        with patch.object(vault, "hub", hub_call):
+            self.assertEqual(vault.swap_asks(dict(broker.conf, agent="studio", agent_key="k" * 43), entry, use=False),
+                             (200, True))
+            # and the site of the question has the entry's port, when that is not 443
+            self.assertEqual(vault.swap_asks(broker.conf, dict(entry, port=8443), use=False), (409, False))
+        self.assertEqual(asked, [("vps", None, "POST", "/helper/vault/vps/swap", dict(question, use=False)),
+                                 ("vps", None, "POST", "/helper/vault/vps/swap",
+                                  dict(question, site="https://" + HOST + ":8443", use=False))])
+        with patch.object(vault, "hub", side_effect=vault.Refused("no hub")):
+            self.assertEqual(vault.swap_asks(broker.conf, entry), (None, False))
+        with patch.object(vault, "hub", return_value=(200, {"ok": True, "login": "bws://" + test_vault.OTHER_ID})):
+            self.assertEqual(vault.swap_asks(broker.conf, entry), (0, False))
+        # the agent's name is one thing and the entry's OS user another: the hub's yes for the name of an agent that
+        # is another OS user's now is its no for this entry, and a hub that names no OS user says nothing of it
+        for said, wanted in (({"ok": True, "login": test_vault.REF, "user": "fleet-vps"}, (200, True)),
+                             ({"ok": True, "login": test_vault.REF}, (200, False)),
+                             ({"ok": True, "login": test_vault.REF, "user": None}, (200, False)),
+                             ({"ok": True, "login": test_vault.REF, "user": "fleet-other"}, (409, True)),
+                             ({"ok": True, "login": test_vault.REF, "user": ""}, (409, True)),
+                             ({"ok": True, "login": test_vault.REF, "user": ["fleet-vps"]}, (409, True)),
+                             ({"ok": False, "login": test_vault.REF, "user": "fleet-vps"}, (0, False))):
+            with self.subTest(said=said), patch.object(vault, "hub", return_value=(200, said)):
+                self.assertEqual(vault.swap_asks(broker.conf, entry), wanted)
 
     def test_a_key_that_the_hub_names_no_more_opens_no_connection_and_keeps_its_placeholder(self):
         """Else the proxy would open that host for this user for ever, with a certificate that its next sessions do
@@ -1828,7 +1955,12 @@ class HubRoutes(test_grants.Grants):
         self.assertRegex(key["swap"], r"^[0-9a-f]{64}$")
         self.assertEqual(self.vault_call("alpha", "read", {})[1]["secrets"][0]["swap"], key["swap"])   # the same each time
         asked = dict(login=test_grants.KEY, site=self.SITE, form="bearer", swap=key["swap"])
-        self.assertEqual(self.asks(**asked), (200, {"ok": True, "login": test_grants.KEY}))
+        self.assertEqual(self.asks(**asked), (200, {"ok": True, "login": test_grants.KEY, "user": "fleet-alpha"}))
+        with patch.dict(hub.agents()["alpha"], {"user": "fleet-first-name"}):     # the user that it kept after a rename
+            self.assertEqual(self.asks(**asked)[1]["user"], "fleet-first-name")
+        for role in ("lead", "manager"):                    # each agent of a server has its OS user by the same rule
+            with self.subTest(role=role), patch.dict(hub.agents()["alpha"], {"role": role}):
+                self.assertEqual(self.asks(**asked), (200, {"ok": True, "login": test_grants.KEY, "user": "fleet-alpha"}))
         for why, changes in (("another token", dict(swap="0" * 64)), ("another site", dict(site="https://files.example.com")),
                              ("another form", dict(form="token")), ("another key", dict(login=test_grants.NEW))):
             with self.subTest(why):
@@ -1856,6 +1988,233 @@ class HubRoutes(test_grants.Grants):
         self.assertEqual(self.label(site="")[0], 200)                       # or takes the site away
         self.assertEqual(self.asks(**asked)[0], 409)
         self.assertEqual(self.commits(), before + 3)                        # the questions wrote nothing
+
+    def test_a_refused_use_gets_a_line_in_the_hubs_log_and_a_question_after_a_delivery_gets_none(self):
+        self.assertEqual(self.grant(test_grants.KEY, "alpha", "read")[0], 200)
+        self.assertEqual(self.label(site=self.SITE)[0], 200)
+        asked = dict(login=test_grants.KEY, site=self.SITE, form="bearer", swap=hub.swap_token("alpha", test_grants.KEY))
+        self.assertEqual(self.asks(use=False, **asked)[0], 200)             # the answer is the same one
+        self.assertEqual(self.grant(test_grants.KEY, "alpha", None)[0], 200)
+        lines, real = [], hub.log
+
+        def log(who, text, *more, **named):
+            lines.append((who, text))
+            return real(who, text, *more, **named)
+        with patch.object(hub, "log", log):
+            self.assertEqual(self.asks(use=False, **asked)[0], 409)
+            self.assertEqual([text for _, text in lines if "key swap" in text], [])
+            for use in ({}, {"use": True}, {"use": None}, {"use": 0}, {"use": "false"}):    # only false itself
+                lines.clear()
+                self.assertEqual(self.asks(**dict(asked, **use))[0], 409)
+                self.assertEqual([who for who, text in lines if text.startswith("REFUSED a key swap: alpha")], ["alpha"], use)
+
+
+def proxy_asks(path, **request):
+    """One question of the proxy on a broker's second socket: the answer, without the broker's program."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(30)
+        s.connect(path)
+        s.sendall((json.dumps(request) + "\n").encode())
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    said = json.loads(data)
+    said.pop("program", None)
+    return said
+
+
+@unittest.skipUnless(test_central_e2e.AGE and test_central_e2e.KEYGEN, "the real age program is not installed")
+class Delivery(test_central_e2e.EndToEnd):
+    """The hub's take-back and delivery of a key's value on a machine that swaps keys, with the pieces of the central
+    vault's end-to-end test: the hub's reconciler and routes, the real age program and fleet.py's own helper code.
+    The broker of vps has the part "swap". No agent reads its keys between the take-back and the delivery."""
+    SITE = "https://" + HOST
+
+    def setUp(self):
+        def facts(conf):                # the machine's users are stand-ins, as in BrokerPart
+            return dict(conf[vault.SWAP_KEY], uid=os.getuid(), vault_uid=os.getuid(), group="fleet-agents",
+                        broker=os.path.join(os.path.dirname(conf["socket"]), "vps-" + vault.SWAP_SOCKET))
+        # this test's own user stands in for the OS user of the agent vps, as the hub names it; two more users of
+        # this computer stand in for the OS user of studio, and for a user that had the name vps before a rename
+        users, real = {os.getuid(): "fleet-vps", 0: "fleet-studio", 1: "fleet-first-vps"}, vault.swap_user
+        for patched in (patch.object(vault, "swap_part", facts), patch.object(vault, "log", lambda text: None),
+                        patch.object(vault, "swap_user", lambda uid: users.get(uid) or real(uid))):
+            patched.start()
+            self.addCleanup(patched.stop)
+        super().setUp()
+        self.server.machines = True     # each request comes from the machine that its route names
+        self.swaps = self.brokers["vps"].conf["_swaps"]
+        self.add_and_give("vps")
+        self.give("vps", "read")
+        code, said = self.request("/ui/team/logins", self.cmd(base_sha256=self.request("/ui/team?db=test-generation")[1]["sha256"],
+                                                             login=test_central_e2e.KEY_REF, title="SHOP_API_KEY",
+                                                             site=self.SITE))
+        self.assertEqual((code, said.get("swap_site")), (200, self.SITE), said)
+        self.pass_once()
+        self.assertEqual(self.held("vps"), {test_central_e2e.KEY_REF: test_central_e2e.VALUE})
+        self.name = self.read()["env"]["SHOP_API_KEY"]
+        self.assertRegex(self.name, r"^vaultswap_[0-9a-f]{40}$")
+
+    def broker(self, machine):
+        public = super().broker(machine)
+        if machine == "vps":            # the same broker again, with the part "swap"
+            conf = dict(self.brokers[machine].conf, swap=dict(BrokerPart.PART))
+            self.brokers[machine].close()
+            self.brokers[machine] = self.serve(conf)
+        return public
+
+    def read(self):
+        """The agent's read of its keys, as the helper makes it at the start of a session."""
+        with patch.object(fleet, "vault_socket", lambda: self.brokers["vps"].conf["socket"]):
+            return fleet.broker_job_request("vps", {"op": "read", "for": "session"})
+
+    def asks(self, **request):
+        return proxy_asks(self.brokers["vps"].conf["_swap"]["broker"], **request)
+
+    def opens(self):
+        return self.asks(op="site", uid=os.getuid(), host=HOST, port=443)["site"]
+
+    def use(self):
+        return self.asks(op="swap", uid=os.getuid(), host=HOST, port=443, name=self.name, form="bearer")
+
+    def off(self):
+        """The placeholders that are off. One form of off, and a list that a broker reads at its start (BrokerPart)."""
+        entries = self.swaps.entries
+        self.assertEqual([e["off"] for e in entries.values() if "off" in e and e["off"] is not True], [])
+        self.assertEqual(vault.Swaps(self.swaps.path).entries, entries)
+        return {name for name, e in entries.items() if e.get("off")}
+
+    def token(self, token):
+        """Give this agent's entry another token, as a read of its keys does."""
+        self.swaps.keep(dict(self.swaps.entries, **{self.name: dict(self.swaps.entries[self.name], token=token)}))
+
+    def ended(self, table):
+        """How the hub's newest delivery or withdrawal ended: 1 when the broker's step ended well."""
+        return hub.q1(f"SELECT ok FROM {table} ORDER BY id DESC LIMIT 1")["ok"]
+
+    def test_a_take_back_switches_each_placeholder_of_the_key_off_and_a_delivery_switches_a_live_one_on(self):
+        value = test_central_e2e.VALUE["password"]
+        # a placeholder of another OS user and agent for the same key, from a grant that it has no more
+        other = self.swaps.place(0, "studio", test_central_e2e.KEY_REF, HOST, 443, "bearer",
+                                 hub.swap_token("studio", test_central_e2e.KEY_REF))
+        # and a placeholder of another key, which the hub does not take back
+        kept = self.swaps.place(os.getuid(), "vps", "bws://" + test_vault.THIRD_ID, OTHER_HOST, 443, "bearer", "3" * 64)
+        self.assertEqual((self.opens(), self.use(), self.off()), (True, {"ok": True, "value": value}, set()))
+        self.assertIs(self.swaps.site(0, HOST, 443), True)
+        self.give("vps", None)                                              # the owner ends the grant
+        self.pass_once()                                                    # the hub takes the value back
+        self.assertEqual(self.held("vps"), {})
+        self.assertEqual(self.off(), {self.name, other})                    # off for each user, with no read and no use
+        self.assertEqual((self.opens(), self.swaps.site(0, HOST, 443)), (False, False))
+        self.assertIs(self.swaps.site(os.getuid(), OTHER_HOST, 443), True)  # the other key's placeholder is as it was
+        self.assertNotIn(kept, self.off())
+        with patch.object(vault, "hub", side_effect=AssertionError("the hub was asked")):
+            self.assertEqual(self.use(), {"ok": False, "code": "refused"})
+        self.give("vps", "read")                                            # the owner gives it again
+        lines, real = [], hub.log
+
+        def log(who, text, *more, **named):
+            lines.append(text)
+            return real(who, text, *more, **named)
+        with patch.object(hub, "log", log):
+            self.pass_once()                                                # the hub delivers the value
+        self.assertEqual(self.held("vps"), {test_central_e2e.KEY_REF: test_central_e2e.VALUE})
+        self.assertEqual(self.off(), {other})                               # on again: the hub calls it live. The other
+        self.assertEqual((self.opens(), self.swaps.site(0, HOST, 443)), (True, False))     # agent holds no grant
+        self.assertEqual(self.use(), {"ok": True, "value": value})          # a session that still runs has its key again
+        self.assertEqual([text for text in lines if "REFUSED a key swap" in text], [])     # no line of a refused use
+        self.assertEqual(self.read()["env"]["SHOP_API_KEY"], self.name)     # and its next read gives the same one
+
+    def test_a_name_that_changed_hands_opens_nothing_for_the_os_user_that_had_it_before(self):
+        """The owner renames an agent, which keeps its OS user, and gives its old name to another agent of the same
+        server. The hub's yes is for the name; the list's entry is for an OS user. The first holder's placeholder
+        gets no key at a use, and no delivery switches it on."""
+        token = hub.swap_token("vps", test_central_e2e.KEY_REF)
+        first = self.swaps.place(1, "vps", test_central_e2e.KEY_REF, HOST, 443, "bearer", token)   # from before the rename
+        asked = dict(op="swap", uid=1, host=HOST, port=443, name=first, form="bearer")
+        self.assertEqual(self.swaps.get(first)["user"], "fleet-first-vps")
+        self.assertIs(self.swaps.site(1, HOST, 443), True)                  # still on: its user made no read since
+        said = []
+        with patch.object(vault, "log", said.append):
+            self.assertEqual(self.asks(**asked), {"ok": False, "code": "refused"})  # the hub says yes for the name vps
+        self.assertEqual(self.off(), {first})                               # and that is a no for this OS user
+        self.assertEqual([line for line in said if "another OS user" in line],     # the broker's log says why
+                         ["swap: the hub names another OS user for the agent vps than fleet-first-vps, whose "
+                          "placeholder this is: the name is another agent's now"])
+        self.assertEqual(self.use(), {"ok": True, "value": test_central_e2e.VALUE["password"]})    # the holder of now
+        self.give("vps", None)
+        self.pass_once()
+        self.give("vps", "read")
+        self.pass_once()                                                    # a take-back and a delivery
+        self.assertEqual(self.off(), {first})                               # its own entry is on again, this one is not
+        self.assertEqual((self.opens(), self.swaps.site(1, HOST, 443)), (True, False))
+        self.assertEqual(self.asks(**asked), {"ok": False, "code": "refused"})
+
+    def test_a_delivery_switches_nothing_on_when_the_hub_does_not_call_it_live_or_does_not_answer(self):
+        self.give("vps", None)
+        self.pass_once()
+        self.assertEqual(self.off(), {self.name})
+        self.give("vps", "read")
+        real = vault.swap_asks
+        for said in ((409, False), (409, True), (404, False), (403, False), (500, False), (0, False), (None, False),
+                     (200, False)):                     # the last one: a hub from before it named the agent's OS user
+            with self.subTest(said=said):
+                with patch.object(vault, "swap_asks", lambda conf, entry, use=True: said):
+                    vault.swap_given(self.brokers["vps"].conf, test_central_e2e.KEY_REF)
+                self.assertEqual(self.off(), {self.name})
+        # a hub that does not answer is asked one time, whatever the number of entries: the broker holds its lock
+        more = self.swaps.place(0, "studio", test_central_e2e.KEY_REF, HOST, 443, "bearer", "2" * 64)
+        self.swaps.taken(test_central_e2e.KEY_REF)
+        silent = []
+        with patch.object(vault, "swap_asks", lambda conf, entry, use=True: silent.append(entry["agent"]) or (None, False)):
+            vault.swap_given(self.brokers["vps"].conf, test_central_e2e.KEY_REF)
+        self.assertEqual((len(silent), self.off()), (1, {self.name, more}))
+        # a fault of this part is no fault of the delivery
+        with patch.object(vault, "swap_asks", side_effect=ZeroDivisionError):
+            vault.swap_given(self.brokers["vps"].conf, test_central_e2e.KEY_REF)
+        self.assertEqual(self.off(), {self.name, more})
+        self.swaps.keep({name: e for name, e in self.swaps.entries.items() if name != more})
+        asked = []
+
+        def asks(conf, entry, use=True):
+            asked.append((entry["agent"], use))
+            return real(conf, entry, use)
+        # the entry changed while the hub was asked (the agent's read gave it another token): not switched on here
+        def changed(conf, entry, use=True):
+            self.token("1" * 64)
+            return 200, True
+        with patch.object(vault, "swap_asks", changed):
+            vault.swap_given(self.brokers["vps"].conf, test_central_e2e.KEY_REF)
+        self.assertEqual(self.off(), {self.name})
+        self.token(hub.swap_token("vps", test_central_e2e.KEY_REF))
+        vault.swap_given(self.brokers["vps"].conf, "bws://" + "0" * 8 + "-0000-4000-8000-" + "0" * 12)     # another key
+        self.assertEqual(self.off(), {self.name})
+        with patch.object(vault, "swap_asks", asks):
+            self.pass_once()                                                # the real delivery
+        self.assertEqual((asked, self.off()), ([("vps", False)], set()))    # one question, marked as no use
+        with patch.object(vault, "swap_asks", asks):
+            vault.swap_given(self.brokers["vps"].conf, test_central_e2e.KEY_REF)
+        self.assertEqual(len(asked), 1)                                     # nothing is off: no question
+
+    def test_a_list_that_cannot_be_written_stops_no_take_back_and_no_delivery(self):
+        self.give("vps", None)
+        with patch.object(vault.Swaps, "keep", side_effect=vault.Refused("the vault could not keep its list")):
+            self.pass_once()
+        self.assertEqual((self.held("vps"), self.off()), ({}, set()))       # the value left; the entry is as it was
+        self.assertEqual(self.ended("withdrawals"), 1)                      # and the hub heard that the step ended well
+        self.assertEqual(self.use(), {"ok": False, "code": "refused"})      # and a use gets the hub's no, which
+        self.assertEqual(self.off(), {self.name})                           # switches it off
+        self.give("vps", "read")
+        with patch.object(vault.Swaps, "keep", side_effect=vault.Refused("the vault could not keep its list")):
+            self.pass_once()
+        self.assertEqual(self.held("vps"), {test_central_e2e.KEY_REF: test_central_e2e.VALUE})
+        self.assertEqual(self.ended("deposits"), 1)
+        self.assertEqual(self.off(), {self.name})                           # still off: the agent's next read
+        self.assertEqual(self.read()["env"]["SHOP_API_KEY"], self.name)
+        self.assertEqual((self.off(), self.use().get("value")), (set(), test_central_e2e.VALUE["password"]))
 
 
 class Machine:

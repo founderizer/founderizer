@@ -13,7 +13,9 @@ agent's user. It proves:
   no variable of the session and no file of the agent has the key;
   another host gets the placeholder, and a direct connection too;
   the placeholder of another agent of the same server is refused;
-  the end of the grant stops the next request, and the grant given again works with the same placeholder;
+  the end of the grant stops the next request and switches the placeholder off, with no read of the agent: the
+  site then gets the placeholder; after the grant is given again, the agent's next read gives the same placeholder,
+  and it works;
   a hub that does not answer is a refusal;
   the proxy's CA for the site is not taken for another host;
   a new vault program takes over from the proxy that runs, with no cut: a tunnel from before still passes bytes, a
@@ -86,6 +88,10 @@ class EndToEnd(unittest.TestCase):
 
     def test_the_end_of_the_grant_stops_the_next_request(self):
         self.assertEqual(self.got["after the end of the grant"], {"status": 403, "site got a request": False})
+        # the hub's no switched the placeholder off: the proxy opens that site for the agent no more
+        self.assertEqual(self.got["the next request after the hub's no"], "placeholder")
+        self.assertEqual(self.got["grant given again, before the agent's next read"], "placeholder")
+        self.assertEqual(self.got["the next read gives the same placeholder"], True)
         self.assertEqual(self.got["grant given again"], "key of alpha")
 
     def test_a_hub_that_does_not_answer_is_a_refusal(self):
@@ -133,7 +139,8 @@ class H(http.server.BaseHTTPRequestHandler):
         elif agent in REFS and what == "swap":      # the grant is live while no file says that it ended
             live = not os.path.exists("/srv/hub/ended-" + agent) and body == {"login": REFS[agent],
                 "site": "https://" + SITE, "form": "bearer", "swap": token(agent)}
-            code, out = (200, {"ok": True, "login": REFS[agent]}) if live else (409, {"error": "no such grant now"})
+            code, out = (200, {"ok": True, "login": REFS[agent], "user": "fleet-" + agent}) if live else \
+                (409, {"error": "no such grant now"})
         data = json.dumps(out).encode()
         self.send_response(code); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
@@ -417,7 +424,15 @@ def inside():
     result["beta with its own"] = call("beta", "curl")
     open("/srv/hub/ended-alpha", "w").close()                   # the owner ends the grant of alpha
     result["after the end of the grant"] = status("alpha", alpha["SHOP_API_KEY"])
+    result["the next request after the hub's no"] = call("alpha", "curl")
     os.unlink("/srv/hub/ended-alpha")
+    result["grant given again, before the agent's next read"] = call("alpha", "curl")
+    out, done = as_user("fleet-alpha", ["python3", "-c", SESSION, "alpha"])     # the start of its next session
+    try:
+        again = json.loads(out.splitlines()[-1])
+    except (ValueError, IndexError):
+        raise SystemExit(f"the helper's second step of alpha gave no variables:\n{out}\n{done.stderr[-3000:]}")
+    result["the next read gives the same placeholder"] = again.get("SHOP_API_KEY") == alpha["SHOP_API_KEY"]
     result["grant given again"] = call("alpha", "curl")
     hub.kill()
     hub.wait()

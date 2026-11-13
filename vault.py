@@ -788,6 +788,7 @@ def deposit(conf, number):
     saved = store.put(m.group(1).lower(), title, json.dumps(value, sort_keys=True, separators=(",", ":"),
                                                             ensure_ascii=False), DELIVERED)
     log(f"deposit job={number}: {ref.lower()} {saved}")
+    swap_given(conf, ref.lower())
     return {"ok": True, "v": PROTOCOL, "deposit": number, "login": ref.lower(), "saved": saved}
 
 
@@ -809,6 +810,7 @@ def withdraw(conf, number):
         raise Refused("the hub named no valid login for this withdrawal")
     removed = store.remove(m.group(1).lower(), DELIVERED)
     log(f"withdraw job={number}: {ref.lower()} {removed}")
+    swap_taken(conf, ref.lower())
     return {"ok": True, "v": PROTOCOL, "withdrawal": number, "login": ref.lower(), "removed": removed}
 
 
@@ -2558,8 +2560,14 @@ class Swaps:
     port, form, token}}, with "off": true in an entry that is switched off. One placeholder for one OS user, agent and
     key of this machine: it is the same in each session of that agent. It is kept on disk, so that a session that runs
     goes on after a restart of the broker. No entry has a value, and an entry opens nothing by itself: each use asks
-    the hub (swap_value). An entry that is off opens no connection and gives no value (only); it keeps its name, so a
-    key that the hub names again gets the same placeholder (place)."""
+    the hub (swap_value). An entry that is off opens no connection and gives no value; it keeps its name, so a key
+    that the hub names again gets the same placeholder (place).
+
+    Each switch is the hub's own word, and none is the agent's. Off: a read of the agent's keys that names the key
+    with a site no more (only); the hub's no to a use (refused); the hub's take-back of the value from this machine
+    (taken). On: the agent's next read that names the key with a site (place); a delivery of the value, for an entry
+    that the hub then calls live for the entry's own OS user (waiting, on). "off" has one form, true, so a list that
+    this version wrote is one that the first version reads."""
     FIELDS = {"uid", "user", "agent", "login", "host", "port", "form", "token"}
     LIMIT = 4 * 1024 * 1024
 
@@ -2644,6 +2652,35 @@ class Swaps:
             if off or len(kept) != len(self.entries):
                 self.keep({name: dict(e, off=True) if name in off else e for name, e in kept.items()})
 
+    def refused(self, name, entry):
+        """The hub said no to a use of this placeholder: its agent does not read its key at its site now. Off, with
+        no read of the agent: an agent with no read grant left makes none. Only when the entry is still the one
+        that the hub was asked about: a read can give it another token in between."""
+        with self.lock:
+            if self.entries.get(name) == entry and not entry.get("off"):
+                self.keep(dict(self.entries, **{name: dict(entry, off=True)}))
+
+    def taken(self, login):
+        """The hub took the value of this key back from this machine, because no agent here holds it: each
+        placeholder of the key is off, of each user."""
+        with self.lock:
+            off = {name: dict(e, off=True) for name, e in self.entries.items()
+                   if e["login"] == login and not e.get("off")}
+            if off:
+                self.keep(dict(self.entries, **off))
+
+    def waiting(self, login):
+        """The placeholders of this key that are off, as copies: {placeholder: entry}."""
+        with self.lock:
+            return {name: dict(e) for name, e in self.entries.items() if e["login"] == login and e.get("off")}
+
+    def on(self, name, entry):
+        """Switch this placeholder on again, when it is still the entry that the hub was asked about. That opens
+        nothing by itself: each use still asks the hub."""
+        with self.lock:
+            if self.entries.get(name) == entry and entry.get("off"):
+                self.keep(dict(self.entries, **{name: {k: v for k, v in entry.items() if k != "off"}}))
+
     def site(self, uid, host, port):
         """True when this host and port are the site of a placeholder of this OS user that is not switched off."""
         user = swap_user(uid)
@@ -2674,24 +2711,98 @@ def with_swaps(conf):
         return dict(conf, _swap={})
 
 
+def swap_asks(conf, entry, use=True):
+    """Ask the hub now whether the agent of this placeholder reads its key at its site and in its form: (the code,
+    whether the hub named the agent's OS user). 200 for the hub's exact yes, the hub's code for each other answer (0
+    for a yes that is not exact), None when the hub did not answer. With no agent key: the token is what the hub
+    knows this question by. use=False says that no request of a session waits for the answer (swap_given), so the
+    hub writes no line about a refused use.
+
+    The hub knows an agent by its name, and this list knows an entry by its OS user. A name can change hands on one
+    machine (the owner renames an agent, and then gives its old name to another one), and then the hub's yes for
+    the name is a yes for the new holder. So a yes that names another OS user than the entry's is the hub's no for
+    this entry (409). A hub from before this answer names none."""
+    asked = {"login": entry["login"], "site": "https://" + swap_origin(entry["host"], entry["port"]),
+             "form": entry["form"], "swap": entry["token"]}
+    if not use:
+        asked["use"] = False
+    try:
+        code, data = hub(dict(conf, agent=entry["agent"], agent_key=None), "POST",
+                         f"/helper/vault/{entry['agent']}/swap", asked)
+    except Refused:
+        return None, False
+    if code != 200:
+        return code, False
+    if not (isinstance(data, dict) and data.get("ok") is True and data.get("login") == entry["login"]):
+        return 0, False
+    if data.get("user") is None:
+        return 200, False
+    if data["user"] == entry["user"]:
+        return 200, True
+    # the hub's log has no line for this (it said yes), so this one says why the placeholder gets nothing
+    log(f"swap: the hub names another OS user for the agent {entry['agent']} than {entry['user']}, whose "
+        f"placeholder this is: the name is another agent's now")
+    return 409, True
+
+
+def swap_given(conf, login):
+    """The key swap's part of a delivery of this key's value to this machine (deposit): each placeholder of the key
+    that is off comes on again when the hub says now that its agent reads the key at its site, and names the
+    entry's own OS user as that agent's. So a session that still runs gets the key again with no new start, and the
+    placeholder of an agent that does not hold the key stays off, also when its name is another agent's now. A hub
+    that names no OS user switches nothing on: the agent's next read does. Nothing on a broker that does not swap,
+    and nothing here stops the delivery: the value is saved, and the broker holds its lock, so the first question
+    with no answer of the hub is the last one."""
+    swaps = conf.get("_swaps")
+    if swaps is None:
+        return
+    try:
+        for name, entry in sorted(swaps.waiting(login).items()):
+            code, named = swap_asks(conf, entry, use=False)
+            if code is None:
+                return                  # the hub does not answer now: the agent's next read switches it on
+            if code == 200 and named:
+                try:
+                    swaps.on(name, entry)
+                except Refused:
+                    pass                # the list could not be written: the agent's next read switches it on
+    except Exception as e:              # never a fault of this part in the answer of a delivery that is saved
+        log(f"deposit: the placeholders of {login} stay as they are ({type(e).__name__})")
+
+
+def swap_taken(conf, login):
+    """The key swap's part of a take-back of this key's value from this machine (withdraw): each placeholder of the
+    key is off, with no read of an agent. Nothing on a broker that does not swap."""
+    swaps = conf.get("_swaps")
+    if swaps is None:
+        return
+    try:
+        swaps.taken(login)
+    except Refused:
+        pass                            # the list could not be written: each use still asks the hub
+
+
 def swap_value(conf, uid, host, port, name, form):
     """The header value of this placeholder, for the swap proxy: it must be a placeholder of this OS user (by number
     and by name) and of this host that is not switched off, the proxy must have found it in the form of that key, and
-    the hub must say now that its agent still reads its key at this site. A hub that does not answer is a refusal. Then the value is read from the store. No lock of
-    the broker is held here: the hub call must not wait for another operation, and the store is one file that a save
-    puts in place whole. A refusal has one fixed code and no value: "refused" or "hub"."""
+    the hub must say now that its agent still reads its key at this site. A hub that does not answer is a refusal.
+    Then the value is read from the store. No lock of the broker is held here: the hub call must not wait for another
+    operation, and the store is one file that a save puts in place whole. A refusal has one fixed code and no value:
+    "refused" or "hub"."""
     entry = conf["_swaps"].get(name) if isinstance(name, str) and PLACEHOLDER.fullmatch(name) else None
     if not entry or entry.get("off") or (entry["uid"], entry["user"], entry["host"], entry["port"], entry["form"]) != (
             uid, swap_user(uid), host, port, form):
         return {"ok": False, "code": "refused"}
-    try:        # with no agent key: the token is what the hub knows this question by
-        code, data = hub(dict(conf, agent=entry["agent"], agent_key=None), "POST",
-                         f"/helper/vault/{entry['agent']}/swap",
-                         {"login": entry["login"], "site": "https://" + swap_origin(host, port), "form": form,
-                          "swap": entry["token"]})
-    except Refused:
-        return {"ok": False, "code": "hub"}
-    if code != 200 or not isinstance(data, dict) or data.get("ok") is not True or data.get("login") != entry["login"]:
+    code, _named = swap_asks(conf, entry)   # the entry's host, port and form are the ones of this request (above)
+    if code != 200:
+        # Only the hub's 409 switches off: this agent does not read this key so now, or its name is another OS
+        # user's agent now. Not a 404: a hub that does not know the route gives one too, and so would switch off
+        # each placeholder that is used.
+        if code == 409:
+            try:
+                conf["_swaps"].refused(name, entry)
+            except Refused:
+                pass                    # the list could not be written: each use still asks the hub
         return {"ok": False, "code": "refused" if code in (403, 404, 409) else "hub"}
     try:
         value = check_value(LocalStore(conf).item(SECRET_REF.fullmatch(entry["login"]).group(1))["value"])["password"]

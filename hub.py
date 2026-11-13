@@ -47747,12 +47747,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(400, {"error": "send {login, site, form, swap}"})
         ref = ref.lower()
         with LOCK:
+            a = agents().get(agent) or {}
             good = hmac.compare_digest(token, swap_token(agent, ref)) and agent in agents() \
-                and agents()[agent].get("vault") != "none" and key_swap(agent, ref) == (site, form)
+                and a.get("vault") != "none" and key_swap(agent, ref) == (site, form)
         if not good:
-            log(agent, f"REFUSED a key swap: {agent} does not read {ref} at that site and in that form now")
+            if f.get("use") is not False:   # false: the vault asks after a delivery, and no request of a session waits
+                log(agent, f"REFUSED a key swap: {agent} does not read {ref} at that site and in that form now")
             return self.json(409, {"error": f"{agent} does not read this key at this site now"})
-        return self.json(200, {"ok": True, "login": ref})
+        # The OS user of this agent's name on a Linux server, as validate_team holds it to one agent of a machine
+        # and as the server makes it for each agent, the manager too (hubsetup.agent_user): the user that it kept
+        # after a rename, else fleet-<name>. A vault keeps its placeholders by OS user, and a name can change hands
+        # on one machine, so the vault takes this yes only for an entry of this user (vault.swap_asks).
+        return self.json(200, {"ok": True, "login": ref, "user": a.get("user") or f"fleet-{agent}"})
 
     def helper_vault(self, agent):
         """The vault broker on the agent's machine asks before it opens a login: once, for an open sign-in or

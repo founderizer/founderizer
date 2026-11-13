@@ -262,8 +262,24 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
   each read of an agent's keys, the broker switches off the placeholders of that OS user for keys that the hub
   names with a site no more. The broker gives no value for a placeholder that is off, and the proxy does not read
   a connection to a site that only such a placeholder names. An entry is for its OS user by number and by name
-  (`vault.py`). When the agent has no read grant left, its helper asks for no read (`fleet.py`). The entries then
-  stay on until the next read, and the hub refuses each use (`hub.py`).
+  (`vault.py`).
+- **A placeholder with no read.** When the agent has no read grant left, its helper asks for no read (`fleet.py`).
+  So the broker also switches a placeholder off on the hub's own word. When the hub says no to a use, the broker
+  switches that placeholder off. When the hub takes the value of a key back from the server, the broker switches
+  off each placeholder of that key (`vault.py`, `hub.py`). A placeholder comes on again at the agent's next read
+  that gives the key as a placeholder. It also comes on when the hub delivers the value to the server again and
+  then says that the agent reads the key now. The hub's answer names the OS user that the agent has on a Linux
+  server, and the broker takes the answer only for a placeholder of that OS user: a name that the owner gave to
+  another agent of the same server opens nothing for the OS user that had the name before (`vault.py`, `hub.py`).
+  So after the hub's no, a grant
+  that comes back with no new delivery reaches a session that still runs only at the agent's next read, which is
+  the start of its next session or check. Some placeholders stay on with no use: the one of an agent that lost its
+  grant and does not use it again, on a server where another agent still holds the key or where no helper carries
+  the hub's take-back; the one of an agent that moved to another server, because the hub answers the old
+  server's vault with a refusal that says nothing of the grant; and the one that an agent got under its old name,
+  when it has a new name and makes no read, because the hub knows no agent of the old name. The hub refuses each
+  use of such a placeholder, and a use that gets the hub's no for the grant switches it off (`vault.py`,
+  `hub.py`).
 - **The swap proxy.** A session that holds a placeholder gets the variables that make its HTTPS programs use the
   proxy on `127.0.0.1` (`fleet.py`, `lifecycle.py`). The proxy runs as `founderizer-swap`, which can read neither
   the store nor its key (`vault.py`, `hubsetup.py`). It reads the OS user of each connection from the kernel's
