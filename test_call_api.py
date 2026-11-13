@@ -15,6 +15,7 @@ import uuid
 from unittest.mock import patch
 
 import fleet
+from leftovers import scratch_home
 import hub
 from test_create_login import MADE, NO_GRANT, OLD_BROKER, RID, STAND_IN, CreateLogin
 from test_capacity import LOGIN_A, LOGIN_B
@@ -22,6 +23,10 @@ from test_capacity import LOGIN_A, LOGIN_B
 QID = "0c3d4e5f-2222-4333-8444-555555555555"
 API = {"request_id": QID, "login": LOGIN_A, "method": "POST", "path": "/v1/orders?dry=0", "body": '{"sku": "A-1", "n": 2}',
        "auth": "bearer"}
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def load_tests(loader, _tests, _pattern):

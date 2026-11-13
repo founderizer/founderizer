@@ -423,7 +423,7 @@ class WarmStart(Capacity):
     def test_the_start_text_says_what_the_agent_holds_from_the_record_and_not_from_its_profile(self):
         hub.TEAM["agents"]["seo"].update(repos={"acme/agents": "write"}, tools=["github"],
                                          google={"gmail": {"account": "a@b.com", "level": "send"}},
-                                         vault_create=True,
+                                         vault_create=True, vault="broker",
                                          secrets={LOGIN_A: "use", LOGIN_B: "read"})
         hub.TEAM["logins"] = {LOGIN_A: {"title": "Stripe", "kind": "login"},
                               LOGIN_B: {"kind": "api_key", "env": "OPENAI_API_KEY"}}
@@ -434,6 +434,9 @@ class WarmStart(Capacity):
         self.assertIn("Gmail of a@b.com at the level send", said)
         self.assertIn("MCP servers github", said)
         self.assertIn("API keys in this session: OPENAI_API_KEY", said)
+        del hub.TEAM["agents"]["seo"]["vault"]              # no vault broker: its helper asks for no key (fleet.vault_mode)
+        self.assertNotIn("API keys in this session", hub.start_text("seo", self.first))
+        hub.TEAM["agents"]["seo"]["vault"] = "broker"
         self.assertIn(f"Stripe (login) {LOGIN_A}", said)                    # by name, never by value
         self.assertIn("create_login and save_key are on for you", said)
 

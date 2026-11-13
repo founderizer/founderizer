@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import patch
 
 import fleet
+from leftovers import scratch_home
 
 KEY = "bws://21111111-2222-4333-8444-55555555555b"
 VALUE = "sk-fake-only-key-20261014"
@@ -28,6 +29,10 @@ TEAM = {"agents": {
               "secrets": {KEY: "read"}},
     "manager": {"role": "manager", "runtime": "claude", "machine": "hub", "can": [],
                 "start": "claude --permission-mode bypassPermissions --tools default {settings} {prompt}", "secrets": {KEY: "read"}}}}
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def load_tests(loader, _tests, _pattern):

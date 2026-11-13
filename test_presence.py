@@ -9,6 +9,11 @@ from unittest.mock import patch
 
 import hub
 import test_runtime
+from leftovers import scratch_home
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def load_tests(loader, _tests, _pattern):

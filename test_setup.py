@@ -17,6 +17,7 @@ import uuid
 from unittest.mock import patch
 
 import fleet
+from leftovers import scratch_home
 import hub
 import lifecycle
 import onboard
@@ -53,6 +54,10 @@ OPTIONS = [{"model": "gpt-6.1-sol", "display_name": "GPT-6.1 Sol", "default": Tr
             "default_effort": "low"},
            {"model": "gpt-6-luna", "display_name": "GPT-6 Luna", "default": False, "efforts": ["low", "medium"],
             "default_effort": "medium"}]
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def git(*args, cwd=None):

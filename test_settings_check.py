@@ -7,13 +7,16 @@ What it holds: one finding for each state and never one for each run, a new find
 of an open finding whose settings are gone, no message and no chase for it, and a check that stops nothing.
 """
 import inspect
+import itertools
 import json
+import re
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import fleet
 import hub
+from leftovers import scratch_home
 from test_ui_api import OwnerAPI
 
 KEY_A = "bws://11111111-2222-4333-8444-55555555550a"
@@ -50,10 +53,14 @@ TEAM = {"hub": {"machine": "hub", "port": 8765},
         "goals": {"timezone": "Europe/Madrid", "review_hour": 9, "sweep_minutes": 15}}
 
 
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
+
+
 def load_tests(loader, _tests, _pattern):
     """Only this file's cases, not the inherited OwnerAPI ones."""
     suite = unittest.TestSuite()
-    for cls in (Keys, Finding, States, Manager, Junctions):
+    for cls in (Keys, Start, Finding, States, Manager, Junctions):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 
@@ -164,6 +171,7 @@ class Keys(Base):
                         self.agent(name)[field] = value
                 got[case] = self.session_gets(name)
                 self.assertEqual(hub.session_keys(name), got[case])
+                self.assertEqual([env for _ref, env in hub.session_variables(name)], got[case])
         self.assertEqual(got["dev-lead"], ["ACME_API_KEY", "SHOP_API_KEY"])        # and the route does give names
         self.assertEqual((got["manager"], got["writer"], got["support with Shell on"]),
                          (["MAIL_API_KEY"], ["ACME_API_KEY"], ["ACME_API_KEY"]))
@@ -177,6 +185,49 @@ class Keys(Base):
         self.assertEqual((code, data["error"]), (409, "a session of support gets no key: its Shell box is off"))
         code, data = self.request("/helper/vault/support/read", {"for": "check"}, source=hub.address_of("support"))
         self.assertEqual((code, [x["env"] for x in data["secrets"]]), (200, ["ACME_API_KEY"]))    # its checks do
+
+
+class Start(Keys):
+    """What a start text says of the keys of a session (hub.holdings_parts in a task's start, hub.duty_toolbox in a
+    duty's task): the variables that the session gets, and no key that it does not get."""
+
+    def named(self, name):
+        """The key names of the two clauses, each as a list: the task start's, and the duty toolbox's."""
+        texts = (("; ".join(hub.holdings_parts(name)), "API keys in this session: "),
+                 (hub.duty_toolbox(name), "API keys in your session: "))
+        found = [re.search(re.escape(head) + "([A-Z0-9_, ]+)", text) for text, head in texts]
+        return [m.group(1).strip().split(", ") if m else [] for m in found]
+
+    def test_it_names_the_keys_that_the_session_gets(self):
+        self.agent("manager").update(vault="broker", secrets={KEY_C: "read"})
+        for name, keys in (("dev-lead", ["ACME_API_KEY", "SHOP_API_KEY"]), ("writer", ["ACME_API_KEY"]),
+                           ("manager", ["MAIL_API_KEY"]), ("caller", [])):
+            with self.subTest(name):
+                self.assertEqual(self.session_gets(name), keys)
+                self.assertEqual(self.named(name), [keys, keys])
+
+    def test_it_names_no_key_for_an_agent_with_no_vault_broker(self):
+        """A read grant waits while the vault of the agent's machine is not ready (hub.save_grant), and the helper
+        asks for no value then (fleet.vault_mode). The start text said "API keys in this session" all the same."""
+        for vault in ("none", "file", None):
+            with self.subTest(vault):
+                self.agent().pop("vault", None)
+                if vault:
+                    self.agent()["vault"] = vault
+                self.assertEqual(self.session_gets("dev-lead"), [])
+                self.assertEqual(self.named("dev-lead"), [[], []])
+                self.assertNotIn("API keys in", hub.holdings_start_text("dev-lead") + hub.duty_toolbox("dev-lead"))
+
+    def test_it_names_no_key_for_an_agent_whose_shell_box_is_off(self):
+        self.assertEqual((self.session_gets("support"), self.named("support")), ([], [[], []]))
+
+    def test_it_still_names_a_key_that_swaps_because_the_variable_is_there(self):
+        """On a server whose vault swaps keys the session gets the variable with a placeholder: the start text names
+        it and says what it holds (hub.key_words, the key swap lane), and the settings check does not count it."""
+        hub.TEAM["servers"] = {"box-1": {"kind": "linux", "key_swap": True}}
+        self.assertEqual(self.named("dev-lead"), [["ACME_API_KEY", "SHOP_API_KEY"]] * 2)
+        self.assertIn("the variable holds a placeholder", "; ".join(hub.holdings_parts("dev-lead")))
+        self.assertEqual(hub.session_keys("dev-lead"), [])
 
 
 class Finding(Base):
@@ -230,10 +281,8 @@ class Finding(Base):
         one, two, three = text.split(" (1) ")[1].split(" (2) ")[0], text.split(" (2) ")[1].split(" (3) ")[0], \
             text.split(" (3) ")[1]
         self.assertEqual(one, "Change the grant of each key from read to use: the vault keeps the key, and Developer "
-                              "calls the service with call_api. call_api sends an HTTP request to the site that the "
-                              "login of the key names. call_api cannot use a key that is not for HTTP, for example a "
-                              "database password. Cost: each command or saved check that reads the key from its "
-                              "variable fails until somebody changes it. To undo: give read again.")
+                              "calls the service with call_api. Cost: each command or saved check that reads the key "
+                              "from its variable fails until somebody changes it. To undo: give read again.")
         self.assertEqual(two, "Set Web off for Developer. Cost: its start no longer tells it that it has the web. With "
                               "Shell on, Web off removes no tool from its sessions. Its shell still reaches the "
                               "internet, so most of the risk stays. To undo: set it on again.")
@@ -269,16 +318,16 @@ class Finding(Base):
         whatever they say. So a manager whose sessions hold a key is the case with each list of boxes, a change of
         its boxes is no new state, and its finding does not give the boxes as an option."""
         self.agent().pop("secrets")                             # only the manager is the case here
-        self.agent("manager").update(title="Fleet Manager", vault="broker", secrets={KEY_D: "read"})
+        self.agent("manager").update(title="Fleet Manager", vault="broker", secrets={KEY_C: "read"})
         for can in (["shell", "web"], [], ["web", "browser"], None):
             with self.subTest(can):
                 self.agent("manager").pop("can", None)
                 if can is not None:
                     self.agent("manager")["can"] = can
-                self.assertEqual(hub.settings_junction("manager"), (["DB_READ_PASSWORD"], None))
+                self.assertEqual(hub.settings_junction("manager"), (["MAIL_API_KEY"], None))
                 self.assertEqual(hub.settings_check(), [1] if can == ["shell", "web"] else [])
         text = self.reports()[0]["text"]
-        self.assertTrue(text.startswith("Fleet Manager reads 1 API key in its sessions (DB_READ_PASSWORD), and it has "
+        self.assertTrue(text.startswith("Fleet Manager reads 1 API key in its sessions (MAIL_API_KEY), and it has "
                                         "a shell and the web (its sessions have both, whatever its Tools boxes say)."))
         self.assertIn("The choice is the owner's: put these two options on your weekly list. (1) Change the grant of "
                       "the key from read to use: the vault keeps the key, and a worker or a lead that has a use grant "
@@ -289,39 +338,207 @@ class Finding(Base):
         for words in ("(3)", "Tools list", "Set Web", "off for"):
             self.assertNotIn(words, text)
 
-    def test_the_first_option_says_which_logins_name_no_site(self):
-        """call_api sends its request to the site of the key's login, so a key with no site cannot go that way yet."""
-        cases = (({KEY_A: "read"}, "of the key names. call_api cannot use a key"),
-                 ({KEY_D: "read"}, "of the key names. This login names no site yet. call_api cannot use a key"),
-                 ({KEY_A: "read", KEY_D: "read"}, "of the key names. 1 of these logins names no site yet. call_api "),
-                 ({KEY_A: "read", KEY_D: "read", KEY_E: "read"}, "names. 2 of these logins name no site yet. call_api "),
-                 ({KEY_D: "read", KEY_E: "read"}, "of the key names. None of these logins names a site yet. call_api "))
-        for secrets, words in cases:
-            with self.subTest(words):
-                self.agent()["secrets"] = secrets
-                keys, boxes = hub.settings_junction("dev-lead")
-                self.assertIn(words, hub.settings_words("dev-lead", keys, boxes))
+    def test_a_manager_whose_key_fits_no_option_has_one_option(self):
+        self.agent("manager").update(title="Fleet Manager", vault="broker", secrets={KEY_D: "read"})
+        text = hub.settings_words("manager", ["DB_READ_PASSWORD"], None)
+        self.assertTrue(text.endswith(
+            "can then make it send a key to another place. Nothing takes a key out of its sessions now: a use grant "
+            "needs the https site of the key on its login, and this login names none. The choice is the owner's: put "
+            "this one option on your weekly list. (1) Leave it as it is. Cost: the risk stays. When the owner chooses "
+            "this, decide this report as noted. The hub makes no second finding while these settings stay."), text)
+
+    def words(self, secrets, **team):
+        """The finding about dev-lead with these grants, and with these parts of team.json."""
+        self.agent()["secrets"] = secrets
+        hub.TEAM.update(team)
+        keys, boxes = hub.settings_junction("dev-lead")
+        return hub.settings_words("dev-lead", keys, boxes)
+
+    def test_a_use_grant_is_an_option_only_for_a_key_whose_login_names_its_site(self):
+        """call_api sends its request to the https site of the key's login. A key with no site there, a database
+        password for example, cannot go that way, so the option does not name it."""
+        place = "can then make it send a key to another place."
+        each = self.words({KEY_A: "read", KEY_B: "read"})
+        self.assertIn(f"{place} The choice is the owner's: put these three options on your weekly list. (1) Change "
+                      f"the grant of each key from read to use: the vault", each)
+        one = self.words({KEY_A: "read", KEY_D: "read"})
+        self.assertIn(f"{place} Only ACME_API_KEY fits the next option: a use grant needs the https site of the key on "
+                      f"its login. The choice is the owner's: put these three options on your weekly list. (1) Change "
+                      f"the grant of that key from read to use: the vault keeps the key, and Developer calls", one)
+        two = self.words({KEY_A: "read", KEY_B: "read", KEY_D: "read", KEY_E: "read"})
+        self.assertIn(f"{place} Only ACME_API_KEY, SHOP_API_KEY fit the next option: a use grant needs the https site "
+                      f"of the key on its login. The choice", two)
+        self.assertIn("(1) Change the grant of those keys from read to use: the vault", two)
+        for text in (each, one, two):
+            self.assertIn(" (2) Set Web off for Developer.", text)
+
+    def test_the_words_say_plainly_when_no_option_takes_a_key_out_of_the_sessions(self):
+        none = self.words({KEY_D: "read", KEY_E: "read"})
+        self.assertTrue(none.endswith(
+            "can then make it send a key to another place. Nothing takes a key out of its sessions now: a use grant "
+            "needs the https site of the key on its login, and none of these logins names one. The choice is the "
+            "owner's: put these two options on your weekly list. (1) Set Web off for Developer. Cost: its start no "
+            "longer tells it that it has the web. With Shell on, Web off removes no tool from its sessions. Its shell "
+            "still reaches the internet, so most of the risk stays. To undo: set it on again. (2) Leave it as it is. "
+            "Cost: the risk stays. When the owner chooses this, decide this report as noted. The hub makes no second "
+            "finding while these settings stay."), none)
+        for words in ("call_api", "read to use", "Switch the key swap"):
+            self.assertNotIn(words, none)
+        one = self.words({KEY_D: "read"})
+        self.assertIn("of the key on its login, and this login names none. The choice", one)
+        linux = self.words({KEY_D: "read"}, servers={"box-1": {"kind": "linux"}})      # where the key swap can be
+        self.assertIn("now: a use grant and the key swap need the https site of the key on its login, and this", linux)
+
+    SWAP = ("Switch the key swap on for its server box-1 (WORKER-INSTALL.md says how): the vault then keeps {} out "
+            "of its sessions, and it puts the key into the Authorization header of an HTTPS request to the key's "
+            "site. Cost: a program that uses the key in another way fails. To undo: switch it off again.")
+
+    def test_the_key_swap_is_an_option_for_a_key_that_can_swap_on_a_linux_server_that_does_not_swap_yet(self):
+        """The key swap lane's rule (hub.key_swap) says which key can swap, and the owner's command takes the word
+        only for a Linux server (hub.server_key_swap). A key that swaps already is no key of the case."""
+        linux = {"box-1": {"kind": "linux"}}
+        text = self.words({KEY_A: "read", KEY_B: "read"}, servers=linux)
+        self.assertIn("put these four options on your weekly list. (1) Change the grant of each key from read", text)
+        self.assertIn(f"To undo: give read again. (2) {self.SWAP.format('each key')} (3) Set Web off for", text)
+        self.assertIn("so most of the risk stays. To undo: set it on again. (4) Leave it as it is.", text)
+        part = self.words({KEY_A: "read", KEY_D: "read"}, servers=linux)
+        self.assertIn(" Only ACME_API_KEY fits the next two options: a use grant and the key swap need the https site "
+                      "of the key on its login. The choice is the owner's: put these four options", part)
+        self.assertIn(f"(2) {self.SWAP.format('that key')} (3)", part)
+        # a key that an MCP server names does not swap, and a use grant still fits it: the option names the other
+        named = self.words({KEY_A: "read", KEY_B: "read"}, servers=linux, mcp={"crm": {"key": "ACME_API_KEY"}})
+        self.assertIn("(1) Change the grant of each key from read to use", named)
+        self.assertIn(f"(2) {self.SWAP.format('SHOP_API_KEY')} (3)", named)
+        self.assertEqual(hub.key_swap("dev-lead", KEY_A), None)
+        self.assertEqual(hub.key_swap("dev-lead", KEY_B), ("https://shop.example.com", "bearer"))
+        # the sentence before the options says "two options" only where both fit the same keys
+        mixed = self.words({KEY_A: "read", KEY_B: "read", KEY_D: "read"})
+        self.assertIn(" Only ACME_API_KEY, SHOP_API_KEY fit the next option: a use grant and the key swap need the "
+                      "https site of the key on its login. The choice", mixed)
+        self.assertIn("(1) Change the grant of those keys from read to use", mixed)
+        self.assertIn(f"(2) {self.SWAP.format('SHOP_API_KEY')} (3)", mixed)
+
+    def test_the_key_swap_option_counts_the_keys_of_the_other_agents_of_the_server_that_swap_with_it(self):
+        """Root switches the key swap on for a whole server: each key there that can swap, in the sessions of each
+        agent there, swaps then. The cost says how many keys of how many other agents that is, and nothing where no
+        key of another agent swaps."""
+        both, linux = {KEY_A: "read", KEY_B: "read"}, {"box-1": {"kind": "linux"}}
+        cost = "HTTPS request to the key's site. Cost: {}a program that uses the key in another way fails. To undo: "
+        self.assertIn(cost.format(""), self.words(both, servers=linux))    # alone on its server
+        self.agent("writer")["machine"] = "box-1"               # it reads ACME_API_KEY, which has a site
+        self.assertIn(cost.format("it also swaps 1 key of another agent of that server, and "), self.words(both))
+        self.agent("writer")["secrets"] = {KEY_A: "read", KEY_C: "read", KEY_D: "read"}     # the third has no site
+        self.assertIn(cost.format("it also swaps 2 keys of another agent of that server, and "), self.words(both))
+        self.agent("manager").update(machine="box-1", vault="broker", secrets={KEY_C: "read"})
+        # a key that two of them read is one key
+        self.assertIn(cost.format("it also swaps 2 keys of 2 other agents of that server, and "), self.words(both))
+        self.agent("writer")["secrets"] = {KEY_C: "read"}
+        self.assertIn(cost.format("it also swaps 1 key of 2 other agents of that server, and "), self.words(both))
+        # no key of these agents swaps with it: a use grant, a key with no site, a Shell box that is off, no vault
+        # broker, an agent of another server, and an entry that cannot be read
+        self.agent("manager")["machine"] = "hub"
+        self.agent("writer")["secrets"] = {KEY_A: "use", KEY_D: "read"}
+        self.agent("caller")["machine"] = "box-1"
+        self.agent("support")["machine"] = "box-1"
+        hub.TEAM["agents"]["plain"] = {"role": "worker", "runtime": "claude", "machine": "box-1", "can": ["shell"],
+                                       "secrets": {KEY_A: "read"}}
+        hub.TEAM["agents"]["odd"] = "no entry"
+        hub.TEAM["agents"]["bent"] = {"role": "worker", "machine": "box-1", "vault": "broker", "secrets": ["no map"]}
+        self.assertIn(cost.format(""), self.words(both))
+        self.assertIn(f"(2) {self.SWAP.format('each key')} (3)", self.words(both))
+
+    def test_the_key_swap_is_no_option_where_it_cannot_be_switched_on(self):
+        both = {KEY_A: "read", KEY_B: "read"}
+        cases = {"a Mac": dict(servers={"box-1": {"kind": "mac"}}), "no joined server": dict(servers={}),
+                 "an entry of a wrong shape": dict(servers={"box-1": "linux"})}
+        for case, team in cases.items():
+            with self.subTest(case):
+                text = self.words(both, **team)
+                self.assertIn("put these three options on your weekly list", text)
+                self.assertNotIn("key swap", text)
+        self.agent()["runtime"] = "opencode"                    # a program with no hosts in the table: no key swaps
+        text = self.words(both, servers={"box-1": {"kind": "linux"}})
+        self.assertIn("put these three options on your weekly list", text)
+        self.assertNotIn("key swap", text)
+        text = self.words({KEY_A: "read", KEY_D: "read"})       # and a site makes no key swap there: the words name none
+        self.assertIn(" Only ACME_API_KEY fits the next option: a use grant needs the https site of the key on", text)
+        self.assertNotIn("key swap", text)
+
+    def test_on_a_server_that_swaps_keys_the_option_is_not_there_and_the_placeholders_are_no_keys_of_the_case(self):
+        swaps = {"box-1": {"kind": "linux", "key_swap": True}}
+        self.agent()["secrets"] = {KEY_A: "read", KEY_B: "read"}
+        hub.TEAM["servers"] = swaps
+        self.assertIsNone(hub.settings_junction("dev-lead"))    # each key is a placeholder: no case
+        text = self.words({KEY_A: "read", KEY_D: "read"}, servers=swaps)
+        self.assertTrue(text.startswith(
+            "Developer reads 1 API key in its sessions (DB_READ_PASSWORD), and it has a shell and the web (Tools: "
+            "Shell, Web). 1 more key is not in its sessions: the vault of its server swaps it, so a session holds a "
+            "placeholder (ACME_API_KEY). A text from outside, a web page for example, can then make it send a key to "
+            "another place. Nothing takes a key out of its sessions now: a use grant and the key swap need the https "
+            "site of the key on its login, and this login names none. The choice is the owner's: put these two "
+            "options on your weekly list. (1) Set Web off for Developer."), text)
+        self.assertNotIn("Switch the key swap", text)
+
+    def long_team(self, sites, kind="linux", swap=False, can=("shell", "web", "browser"), mcp=0, role="worker"):
+        """dev-lead with the longest role, server name and 40 key names that team.json takes. sites: which of the
+        keys have a site. mcp: how many of those an MCP server names, so that they do not swap."""
+        server, keys = "a" + "b" * 30, [f"K{n:02d}_" + "A" * 56 for n in range(40)]
+        refs = [f"bws://11111111-2222-4333-8444-5555555555{n:02d}" for n in range(40)]
+        hub.TEAM["logins"] = {ref: dict({"title": f"K{n:02d}", "kind": "api_key", "env": keys[n]},
+                                        **({"site": f"https://s{n}.example.com"} if n in sites else {}))
+                              for n, ref in enumerate(refs)}
+        hub.TEAM["servers"] = {server: dict({"kind": kind}, **({"key_swap": True} if swap else {}))}
+        hub.TEAM["mcp"] = {f"tool-{n}": {"key": keys[n]} for n in sorted(sites)[:mcp]}
+        self.agent().update(title="R" * 60, machine=server, role=role, secrets={ref: "read" for ref in refs})
+        self.agent().pop("can", None)
+        if can is not None:
+            self.agent()["can"] = list(can)
+        self.assertTrue(hub.ENV_NAME.fullmatch(keys[0]) and hub.SERVER_NAME.fullmatch(server))
+        return keys
 
     def test_the_longest_finding_stays_inside_one_report(self):
-        self.agent()["title"] = "R" * 60                        # the longest role and key names that team.json takes
-        hub.TEAM["logins"] = {f"bws://11111111-2222-4333-8444-5555555555{n:02d}":
-                              {"title": f"K{n:02d}", "kind": "api_key", "env": f"K{n:02d}_" + "A" * 56}
-                              for n in range(40)}
-        self.agent()["secrets"] = {ref: "read" for ref in hub.TEAM["logins"]}
-        for can in (["shell", "web", "browser"], None):
-            with self.subTest(can):
-                self.agent().pop("can", None)
-                if can:
-                    self.agent()["can"] = can
-                keys, boxes = hub.settings_junction("dev-lead")
-                text = hub.settings_words("dev-lead", keys, boxes)
-                self.assertEqual((len(keys), len(keys[0])), (40, 60))
-                self.assertIn("reads 40 API keys in its sessions", text)
-                self.assertIn(f"{keys[7]} and 32 more)", text)
-                self.assertNotIn(keys[8], text)
-                self.assertIn("None of these logins names a site yet.", text)
-                self.assertLessEqual(len(text), hub.REPORT_TEXT_MAX)
-                self.assertTrue(hub.ENV_NAME.fullmatch(keys[0]))
+        patterns = {"each": range(40), "half": range(1, 40, 2), "one": [0], "none": []}
+        longest = 0
+        for sites, kind, swap, can, mcp, role in itertools.product(
+                patterns, ("linux", "mac"), (False, True),
+                (("shell", "web", "browser"), ("shell", "web"), ("shell", "browser"), None), (0, 1, 6),
+                ("worker", "manager")):
+            if swap and kind != "linux":
+                continue
+            with self.subTest(sites=sites, kind=kind, swap=swap, can=can, mcp=mcp, role=role):
+                self.long_team(set(patterns[sites]), kind, swap, can, mcp, role)
+                found = hub.settings_junction("dev-lead")
+                if found:
+                    text = hub.settings_words("dev-lead", *found)
+                    self.assertLessEqual(len(text), hub.REPORT_TEXT_MAX)
+                    self.assertEqual(text, " ".join(text.split()))
+                    longest = max(longest, len(text))
+        self.assertGreater(longest, hub.REPORT_TEXT_MAX - 200)  # and the cases do reach the length of one report
+
+    def test_a_finding_that_is_too_long_names_fewer_of_its_keys_and_then_counts_the_keys_of_an_option(self):
+        def text():
+            found = hub.settings_words("dev-lead", *hub.settings_junction("dev-lead"))
+            self.assertLessEqual(len(found), hub.REPORT_TEXT_MAX)
+            return found
+        keys = self.long_team(set())                            # no key with a site: eight names
+        self.assertIn(f"reads 40 API keys in its sessions ({', '.join(keys[:8])} and 32 more)", text())
+        self.assertIn("none of these logins names one", text())
+        keys = self.long_team({1, 3})                           # two keys fit both options: four names, and those two
+        self.agent()["title"] = "Developer"
+        self.assertIn(f"sessions ({', '.join(keys[:4])} and 36 more)", text())
+        self.assertIn(f" Only {keys[1]}, {keys[3]} fit the next two options: a use grant and the key swap", text())
+        keys = self.long_team(set(range(1, 40, 2)))             # 20 fit, and the longest role: four names and a count
+        self.assertIn(f"sessions ({', '.join(keys[:4])} and 36 more)", text())
+        self.assertIn(" Only 20 of these keys fit the next two options: a use grant and the key swap need", text())
+        self.assertIn("(1) Change the grant of those keys from read to use", text())
+        self.assertIn("the vault then keeps those keys out of its sessions, and it puts", text())
+        self.assertNotIn("Only K", text())
+        # on a server that swaps: the placeholders as a number too, where their names do not fit
+        keys = self.long_team(set(range(1, 40, 2)), swap=True, mcp=6)
+        self.assertIn(" 14 more keys are not in its sessions: the vault of its server swaps them, so a session holds "
+                      "a placeholder. A text from outside", text())
+        self.assertIn(" fit the next option: a use grant needs the https site", text())    # no site makes one swap
+        self.assertNotIn("Switch the key swap", text())
         hub.settings_check()                                    # and the manager's list gives it whole
         self.assertTrue(hub.report_line(hub.q1("SELECT * FROM reports")).endswith("while these settings stay."))
 

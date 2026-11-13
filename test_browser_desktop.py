@@ -5,8 +5,13 @@ from unittest.mock import MagicMock, patch
 
 import desktop
 import fleet
+from leftovers import scratch_home
 import hub
 from test_ui_api import OwnerAPI
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def load_tests(loader, _tests, _pattern):

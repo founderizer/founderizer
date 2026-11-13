@@ -14,14 +14,20 @@ process that starts them at once (a tmux server), and then removes the folders a
 runs in a session of its own, so that a Ctrl-C or a kill of the test's process group does not reach it, and as the
 child of a process that ends at once, so that the test process leaves no child of its own running when it ends.
 
-It imports nothing of the fleet's own, so a test that takes it pays for no import of hub.py. test_ui_api.HubProcesses
-checks all of it."""
+It imports nothing of the fleet's own, so a test that takes it pays for no import of hub.py (scratch_home loads
+fleet.py when a test file calls it). test_ui_api.HubProcesses checks all of it.
+
+And no test reads or writes the helper's folder of the machine that runs it (scratch_home)."""
 import contextlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
+import unittest
 import uuid
+from unittest.mock import patch
 
 GUARD = """import json, os, shutil, subprocess, sys
 if os.fork():
@@ -125,3 +131,26 @@ def tmux_socket(name):
     path = f"/tmp/{name}-{uuid.uuid4().hex[:8]}"
     when_gone(["tmux", "-S", path, "kill-server"])
     return removed_when_gone(path)
+
+
+def scratch_home():
+    """In a test file's setUpModule: the helper's folder (fleet.HOME, with fleet.SESSIONS and fleet.KEPT_RUNTIMES,
+    which fleet.py makes from it at its import) is a folder of this run for every test of the file, and it is removed
+    at the module's end. A class that gives the helper a folder of its own still does, inside this one. Returns the
+    folder.
+
+    Each test file that builds a fleet.Helper calls it (test_helper_session.OwnFolder checks that). On 13 November
+    2026 a test class built a Helper with stand-in tmux answers and no folder of its own, because its tests reached
+    no code that writes there. Then a mutation run took one guard out of the code, the real start of a chat ran, and
+    it wrote a chat record and a session file into ~/.fleet of the owner's Mac; a later run read that record and
+    failed for it. A test must not depend on which code it reaches for that."""
+    import fleet
+    folder = removed_when_gone(tempfile.mkdtemp(prefix="fleet-test-home-"))
+    unittest.addModuleCleanup(shutil.rmtree, folder, True)
+    home = os.path.join(folder, ".fleet")
+    for name, path in (("HOME", home), ("SESSIONS", os.path.join(home, "sessions")),
+                       ("KEPT_RUNTIMES", os.path.join(home, "runtimes"))):
+        patcher = patch.object(fleet, name, path)
+        patcher.start()
+        unittest.addModuleCleanup(patcher.stop)
+    return folder

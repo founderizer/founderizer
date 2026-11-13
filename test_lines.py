@@ -11,12 +11,17 @@ from unittest.mock import patch
 
 import hub
 from test_ui_api import OwnerAPI
+from leftovers import scratch_home
 
 TEAM = {"hub": {"machine": "hub", "port": 8765},
         "addresses": {"owner": "127.0.0.1", "hub": "127.0.0.2", "vps": "127.0.0.3", "mac-studio": "127.0.0.4"},
         "agents": {"manager": {"role": "manager", "runtime": "claude", "machine": "hub", "can": []},
                    "vps": {"role": "worker", "runtime": "codex", "machine": "vps", "can": ["shell"]},
                    "studio": {"role": "worker", "runtime": "claude", "machine": "mac-studio", "can": ["shell", "browser"]}}}
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def git(*args, cwd=None):

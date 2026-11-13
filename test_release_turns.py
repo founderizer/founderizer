@@ -31,6 +31,7 @@ import unittest
 from unittest.mock import patch
 
 import fleet
+from leftovers import scratch_home
 import hub
 import lifecycle
 import releases
@@ -46,6 +47,10 @@ TEAM = {"hub": {"machine": "hub", "port": 8765},
         "addresses": {"hub": "127.0.0.2", "vps": "127.0.0.1", "owner": "127.0.0.3"},
         "agents": {"manager": {"role": "manager", "machine": "hub", "runtime": "claude", "can": ["shell"]},
                    "vps": {"role": "worker", "machine": "vps", "runtime": "claude", "can": ["shell"]}}}
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def free_port():

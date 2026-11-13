@@ -19,6 +19,7 @@ from unittest.mock import patch
 import uuid
 
 import fleet
+from leftovers import scratch_home
 import hub
 from test_ui_api import OwnerAPI
 
@@ -36,6 +37,10 @@ CLAUDE = {"role": "worker", "runtime": "claude", "machine": "w1", "can": ["shell
           "start": "claude --permission-mode dontAsk {chrome} {settings} {prompt}"}
 CODEX_CONF = {"role": "worker", "runtime": "codex", "machine": "w2", "can": ["shell"], "start": CODEX}
 PROGRAM = "/opt/fleet-test/bin/github-mcp-server"
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def git(*args, cwd=None, env=None):

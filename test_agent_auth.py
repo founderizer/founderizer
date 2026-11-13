@@ -20,6 +20,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import fleet
+from leftovers import scratch_home
 import hub
 import lifecycle
 import vault
@@ -29,6 +30,10 @@ from test_ui_api import OwnerAPI
 KEYS = {"solo": "solo-key-" + "a" * 34, "alpha": "alpha-key-" + "b" * 33, "beta": "beta-key-" + "c" * 34}
 SOLO, BOX = "127.0.0.4", "127.0.0.3"           # the machine of solo, and the machine that alpha and beta share
 LOGIN = "bws://11111111-2222-4333-8444-55555555555b"
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def sha(text):

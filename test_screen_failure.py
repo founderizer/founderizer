@@ -19,6 +19,7 @@ from http.server import ThreadingHTTPServer
 from unittest.mock import patch
 
 import fleet
+from leftovers import scratch_home
 import hub
 import threads
 from test_ui_api import own_attachments
@@ -30,6 +31,10 @@ RUNNER_STOP = {"method": "turn/completed", "params": {"turn": {"id": "fleet-stop
                                                                "error": {"message": REASON}}}}
 DANA = {"role": "worker", "runtime": "claude", "machine": "dana-mac", "can": ["shell", "browser", "screen"],
        "screen_command": "/synthetic/codex"}
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def error(seq, code="bad_request", message="The model `synthetic-old` is not supported.", **more):

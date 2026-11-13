@@ -2156,9 +2156,12 @@ class Fact(test_grants.Grants):
             keys, boxes = hub.settings_junction("alpha")
             text = hub.settings_words("alpha", keys, boxes)
             self.assertEqual(len(keys), 37)                                 # 36 of these and SHOP_API_KEY are values
-            # with the longest role and key names, the names of the placeholders do not fit into one report: a count
-            self.assertIn(" 5 more keys are not in its sessions: the vault of its server swaps them, so a session "
-                          "holds a placeholder. A text from outside", text)
+            # With the longest role and key names, two names of the placeholders still fit into one report, since
+            # the finding gives only the options that fit its keys (13 November 2026). The form with their number
+            # alone is for a longer finding: test_settings_check.Finding holds it.
+            placed = sorted(f"K{n:02d}_" + "A" * 56 for n in range(36, 40)) + ["OPENAI_API_KEY"]
+            self.assertIn(f" 5 more keys are not in its sessions: the vault of its server swaps them, so a session "
+                          f"holds a placeholder ({placed[0]}, {placed[1]} and 3 more). A text from outside", text)
             self.assertLessEqual(len(text), hub.REPORT_TEXT_MAX)
             self.assertEqual(text, " ".join(text.split()))
         with patch.dict(hub.agents()["alpha"], {"title": "Developer"}):     # with a shorter role they fit: two names

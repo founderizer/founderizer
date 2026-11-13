@@ -12,11 +12,15 @@ import unittest
 from unittest.mock import Mock, patch
 
 import fleet
-from leftovers import tmux_socket
+from leftovers import scratch_home, tmux_socket
 
 WORKER = {"role": "worker", "runtime": "claude", "machine": "mac-studio", "can": ["shell"],
           "start": "claude --permission-mode bypassPermissions --tools default {settings} {prompt}"}
 POLLS = fleet.CHAT_PROOF_POLLS
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux is not installed")
@@ -32,6 +36,9 @@ class ChatProof(unittest.TestCase):
         self.refuse = ()            # the tmux commands that give no answer in this test (their first word)
         self.hub = Mock(return_value=(200, {}))
         for p in (patch.object(fleet, "tmux", self.tmux),
+                  # the tmux server starts the login shell of the person who runs the test in its first window: with
+                  # a HOME of this test, that shell reads none of their start files and writes its history here
+                  patch.dict(os.environ, {"HOME": self.tmp}),
                   patch.object(fleet, "HOME", os.path.join(self.tmp, ".fleet")),
                   patch.object(fleet, "SESSIONS", os.path.join(self.tmp, ".fleet", "sessions")),
                   patch.object(fleet, "HUB", "http://127.0.0.1:9"),          # never a real hub

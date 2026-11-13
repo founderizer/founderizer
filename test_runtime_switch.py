@@ -15,6 +15,7 @@ import uuid
 from unittest.mock import Mock, patch
 
 import fleet
+from leftovers import scratch_home
 import hub
 import lifecycle
 import usage
@@ -42,6 +43,10 @@ FEATURES = ["trigger_check", "trigger_code", "agent_setup", "agent_key", "runtim
 APP_SERVER = FEATURES + ["app_server_tasks"]        # a helper that runs Codex app-server tasks (lifecycle.app_server_task)
 THREAD = "01a1245d-3a00-76a3-9ed4-299dcc277ae6"
 CHAT = "You are vps, speaking directly with the owner in this agent's chat. The owner explicitly permits"
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def git(*args, cwd=None):

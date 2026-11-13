@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import fleet
+from leftovers import scratch_home
 import lifecycle
 from threads import Tailer
 
@@ -40,6 +41,10 @@ CODEX_END = {"type": "event_msg", "payload": {"type": "task_complete", "turn_id"
 CODEX_LIMIT_END = {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t2", "last_agent_message": None,
                                                     "error": {"message": "You've hit your usage limit.",
                                                               "codex_error_info": "usage_limit_exceeded"}}}
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def read_answer(*ids, body=None):

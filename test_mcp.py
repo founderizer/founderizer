@@ -22,6 +22,7 @@ from unittest.mock import patch
 import uuid
 
 import fleet
+from leftovers import scratch_home
 import hub
 import lifecycle
 import mcp
@@ -45,6 +46,10 @@ LOCAL = {"title": "Notes", "command": "notes-mcp", "runtimes": ["claude"]}     #
 ACCESS, ACCESS2, REFRESH, SECRET, CODE = "mcp-ACCESS", "mcp-ACCESS-2", "mcp-REFRESH-TOKEN", "mcp-CLIENT-SECRET", "mcp-CODE"
 CLIENT = "client-abc123"
 TOKEN = "FLEET_MCP_CRM"
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def load_tests(loader, _tests, _pattern):

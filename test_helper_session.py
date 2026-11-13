@@ -15,11 +15,15 @@ import uuid
 from unittest.mock import patch
 
 import fleet
-from leftovers import tmux_socket
+from leftovers import scratch_home, tmux_socket
 
 SOCKET = tmux_socket("fleet-session-test")
 WORKER = {"role": "worker", "runtime": "claude", "machine": "mac-studio", "can": ["shell"],
           "start": "claude --permission-mode bypassPermissions --tools default {settings} {prompt}"}
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux is not installed")
@@ -30,6 +34,9 @@ class HelperSession(unittest.TestCase):
         self.addCleanup(subprocess.run, ["tmux", "-S", SOCKET, "kill-server"], capture_output=True)
         real = fleet.tmux
         for p in (patch.object(fleet, "tmux", lambda *args, **kw: real("-S", SOCKET, *args, **kw)),
+                  # the tmux server starts the login shell of the person who runs the test in its first window: with
+                  # a HOME of this test, that shell reads none of their start files and writes its history here
+                  patch.dict(os.environ, {"HOME": self.tmp}),
                   patch.object(fleet, "HOME", os.path.join(self.tmp, ".fleet")),
                   patch.object(fleet, "SESSIONS", os.path.join(self.tmp, ".fleet", "sessions")),
                   patch.object(fleet, "HUB", "http://127.0.0.1:9"),          # never a real hub
@@ -211,6 +218,49 @@ class TaskLessMessage(unittest.TestCase):
     def test_the_manager_is_still_signalled_in_its_standing_session(self):
         self.helper("manager", []).handle_events([self.event()])
         self.assertEqual([w for w, _ in self.typed], ["manager"])
+
+
+class OwnFolder(unittest.TestCase):
+    """No test reads or writes the helper's folder of the machine that runs it (leftovers.scratch_home)."""
+
+    @staticmethod
+    def without_a_folder(text):
+        """True for the text of a test file that builds a fleet.Helper and does not call scratch_home in its
+        setUpModule."""
+        return "fleet.Helper(" in text and "def setUpModule():\n    scratch_home()" not in text
+
+    def test_each_test_file_that_builds_a_helper_gives_it_a_folder_of_this_run(self):
+        """One rule for every file, so that no class depends on which code its tests reach: a test file that builds
+        a fleet.Helper calls scratch_home in its setUpModule. A patch of the folder in one class is not enough: the
+        class of 13 November was in a file whose other classes had one. test_helper_control.py sets HOME, and
+        fleet.HOME with it, before it imports fleet, for its real hub and its real helper."""
+        build = "class A(unittest.TestCase):\n    def test(self):\n        fleet.Helper('dev-lead', {})\n"
+        patched = "class B(unittest.TestCase):\n    def setUp(self):\n        patch.object(fleet, \"HOME\", 'x').start()\n"
+        self.assertTrue(self.without_a_folder(build))
+        self.assertTrue(self.without_a_folder(patched + build))        # one class with its own folder, one without
+        self.assertFalse(self.without_a_folder("def setUpModule():\n    scratch_home()      # why\n\n\n" + build))
+        self.assertFalse(self.without_a_folder(patched))               # it builds none
+        here = os.path.dirname(os.path.abspath(__file__))
+        without = []
+        for name in sorted(os.listdir(here)):
+            if not (name.startswith("test_") and name.endswith(".py")) or name == "test_helper_control.py":
+                continue
+            with open(os.path.join(here, name), encoding="utf-8") as f:
+                if self.without_a_folder(f.read()):
+                    without.append(name)
+        self.assertEqual(without, [], "a test file that builds a fleet.Helper needs, before its first class: "
+                         "def setUpModule(): scratch_home()  (from leftovers import scratch_home)")
+
+    def test_the_folder_is_one_of_this_run_and_a_class_keeps_its_own_inside_it(self):
+        real = os.path.expanduser("~/.fleet")
+        for path in (fleet.HOME, fleet.SESSIONS, fleet.KEPT_RUNTIMES):
+            self.assertFalse(os.path.abspath(path).startswith(real + os.sep) or os.path.abspath(path) == real, path)
+        self.assertEqual((fleet.SESSIONS, fleet.KEPT_RUNTIMES),
+                         (os.path.join(fleet.HOME, "sessions"), os.path.join(fleet.HOME, "runtimes")))
+        module = fleet.HOME
+        with tempfile.TemporaryDirectory() as own, patch.object(fleet, "HOME", own):
+            self.assertEqual(fleet.HOME, own)
+        self.assertEqual(fleet.HOME, module)
 
 
 class StartText(unittest.TestCase):

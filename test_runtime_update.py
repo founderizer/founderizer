@@ -23,13 +23,17 @@ import fleet
 import hub
 import lifecycle
 import onboard
-from leftovers import tmux_socket
+from leftovers import scratch_home, tmux_socket
 from lifecycle import RUNTIME_INSTALL_WAIT, RUNTIME_UPDATE_EVERY, Lifecycle, Updating
 
 HELP = ("Usage: claude [options] [command] [prompt]\n  --model <model>  Model for the current session. Provide an "
         "alias for the latest model (e.g. 'sonnet' or 'opus').\n  --effort <level>  Effort level (low, medium, high)\n")
 OPTIONS = [{"model": "gpt-6", "display_name": "GPT-6", "default": True, "efforts": ["low"], "default_effort": "low"}]
 BINARY = b"\x7fELF\x02\x01\x01 a vendor's program"
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 class Machine:

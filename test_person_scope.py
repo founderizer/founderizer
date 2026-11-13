@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import fleet
+from leftovers import scratch_home
 import hub
 import test_contacts_v2
 import test_thread_door
@@ -18,6 +19,10 @@ REPO, OTHER = "acme/crm", "acme/web"        # OTHER is test_thread_door's reposi
 ORIGINAL_THREAD_REQUEST = hub.thread_request      # the real one, which the Door class patches for most of its tests
 KEY = "bws://11111111-2222-4333-8444-555555555555"         # an API key that the agent reads
 LOGIN = "bws://66666666-7777-4888-9999-000000000000"       # a login that the agent's vault uses for it
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def load_tests(loader, _tests, _pattern):

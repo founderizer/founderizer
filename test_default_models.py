@@ -14,6 +14,7 @@ import unittest.mock
 import uuid
 
 import fleet
+from leftovers import scratch_home
 import hub
 import lifecycle
 import threads
@@ -26,6 +27,10 @@ TERRA = {"model": "gpt-5.6-terra", "display_name": "GPT-5.6-Terra", "default": F
 CLAUDE = [{"model": m, "display_name": m.capitalize(), "default": False,
            "efforts": ["low", "medium", "high", "xhigh", "max"], "default_effort": None}
           for m in ("fable", "opus", "sonnet")]
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def reading(runtime, options, at=None, ok=True):

@@ -3753,7 +3753,7 @@ def holdings_parts(agent):
         parts.append("servers through the door, each with `ops <server> <action>` (`ops <server> help` lists its "
                      "forms, `ops status` what the door gives you): " +
                      named_few(f"{h} ({v})" for h, v in sorted(a["servers"].items())))
-    keys = [name for _, name in read_secrets(agent)]
+    keys = [name for _, name in session_variables(agent)]       # none for an agent with no vault broker
     if keys:
         parts.append("API keys in this session: " + named_few(keys) + key_words(agent))
     refs = sorted(secret_grants(agent)) if a.get("vault") != "none" else []
@@ -18375,7 +18375,7 @@ def duty_toolbox(agent):
         parts.append("GitHub " + ", ".join(f"{r} ({v})" for r, v in sorted(a["repos"].items())))
     if a.get("tools"):
         parts.append("tools " + ", ".join(sorted(a["tools"])))
-    keys = [name for _, name in read_secrets(agent)]
+    keys = [name for _, name in session_variables(agent)]       # none for an agent with no vault broker
     if keys:
         parts.append("API keys in your session: " + ", ".join(keys) + key_words(agent, short=True))
     logins = granted_logins(agent)
@@ -25231,21 +25231,30 @@ SETTINGS_BOXES = ("web", "browser")     # the Tools boxes that bring text from o
 SETTINGS_KEYS_NAMED = 8                 # key names in one finding, before the rest become a count: the finding of
                                         # an agent with the longest role and key names stays under REPORT_TEXT_MAX
 SETTINGS_PLACED_NAMED = 2               # and the names of the keys that its sessions hold as a placeholder (key swap)
+SETTINGS_FIT_NAMED = 3                  # and the names of the keys that an option fits, where it does not fit each key
+
+
+def session_variables(agent):
+    """[(reference, variable name)] of the API keys that a session of this agent gets as variables, sorted by name:
+    its read grants (read_secrets), for an agent whose vault is its machine's broker and whose Shell box is on. The
+    variable holds the key, or a placeholder on a server whose vault swaps that key (key_swaps). [] for each other
+    agent: the helper asks for the values only where team.json says `"vault": "broker"` (fleet.vault_mode: "none",
+    the old "file" and an entry that says nothing are no credential access), and a session of an agent whose Shell
+    box is off gets no key, only its checks do (the helper's key read, support plan F1). A start text names the keys
+    of a session from here too (holdings_parts, duty_toolbox), so it names no key that the session does not get."""
+    if shell_off(agent) or (agents().get(agent) or {}).get("vault") != "broker":
+        return []
+    return read_secrets(agent)
 
 
 def session_keys(agent):
     """The names of the API keys whose values the sessions of this agent hold, sorted; [] when they hold none. This is
     the one answer of the hub to "do this agent's sessions hold the value of a key", so a change of how a key reaches
-    a session changes it here. Today: a read grant of an API key (read_secrets), for an agent whose vault is its
-    machine's broker and whose Shell box is on, and not a key that the agent's server swaps by the owner's word
-    (key_swaps, the key swap lane: such a session holds a placeholder, and the variable's name is still there, which
-    test_key_swap.Fact holds). The helper asks for the values only where team.json says `"vault":
-    "broker"` (fleet.vault_mode: "none", the old "file" and an entry that says nothing are no credential access), and
-    a session of an agent whose Shell box is off gets no key, only its checks do (the helper's key read, support plan
-    F1). test_settings_check.Keys compares this answer with what the helper's and the hub's own code give."""
-    if shell_off(agent) or (agents().get(agent) or {}).get("vault") != "broker":
-        return []
-    return sorted({env for ref, env in read_secrets(agent) if not key_swaps(agent, ref)})
+    a session changes it here. Today: a variable of its sessions (session_variables), and not a key that the agent's
+    server swaps by the owner's word (key_swaps, the key swap lane: such a session holds a placeholder, and the
+    variable's name is still there, which test_key_swap.Fact holds). test_settings_check.Keys compares this answer
+    with what the helper's and the hub's own code give."""
+    return sorted({env for ref, env in session_variables(agent) if not key_swaps(agent, ref)})
 
 
 def settings_junction(agent):
@@ -25268,54 +25277,104 @@ def settings_junction(agent):
 def settings_words(agent, keys, boxes):
     """The finding about one agent, for the manager's list of proposals: the agent by its role, the keys by name and
     never a value, the boxes, and the options, each with its cost and how to undo it. Each sentence is true of the
-    agent's own case. Only a worker's or a lead's task start names its boxes, and only they take a browser task and
-    have call_api, so the Tools boxes are an option for them alone. With Shell on the Web box removes no tool
-    (fleet.settings_arg reads no box), and call_api needs the site of the key's login."""
-    who = shown_role(agent)
+    agent's own case, and an option names only the keys that it fits. A use grant with call_api needs the https site
+    of the key on its login (login_site). The key swap needs the rule of the key swap lane (key_swap) and a Linux
+    server whose vault does not swap yet by the owner's word; a key that swaps already is no key of the case
+    (session_keys). Root switches the key swap on for a whole server, so its cost counts the keys of the other
+    agents there that swap with it.
+    Where neither fits a key, the words say so, and the option is not there. Only a worker's or a
+    lead's task start names its boxes, and only they take a browser task and have call_api, so the Tools boxes are
+    an option for them alone. With Shell on the Web box removes no tool (fleet.settings_arg reads no box)."""
+    who, a = shown_role(agent), agents().get(agent) or {}
     on = [b.capitalize() for b in boxes or ()]
-    worker = (agents().get(agent) or {}).get("role") in ("worker", "lead")
+    worker = a.get("role") in ("worker", "lead")
     tools = "Tools: Shell, " + ", ".join(on) if on else "it has no Tools list, so its sessions have both" if worker \
         else "its sessions have both, whatever its Tools boxes say"
-    several = len(keys) > 1
-    catalog = logins()
-    bare = len({env for ref, env in read_secrets(agent)
-                if env in keys and not login_site((catalog.get(ref) or {}).get("site"))})
-    sites = "" if not bare else " This login names no site yet." if not several else \
-        " None of these logins names a site yet." if bare == len(keys) else \
-        f" {bare} of these logins name{'s' if bare == 1 else ''} no site yet."
-    caller = who if worker else "a worker or a lead that has a use grant of it"
-    options = [f"Change the grant of {'each key' if several else 'the key'} from read to use: the vault keeps the key, "
-               f"and {caller} calls the service with call_api. call_api sends an HTTP request to the site that the "
-               f"login of the key names.{sites} call_api cannot use a key that is not for HTTP, for example a database "
-               f"password. Cost: each command or saved check that reads the key from its variable fails until "
-               f"somebody changes it. To undo: give read again."]
-    if worker:
-        step = f"Set {' and '.join(on)} off for {who}" if on else f"Give {who} a Tools list with Shell on and Web off"
-        costs = (["its start no longer tells it that it has the web"] if "Web" in on else []) + \
-            (["it takes no browser task"] if "Browser" in on else [])
-        undo = "set them on again" if len(on) > 1 else "set it on again" if on else "set Web on again"
-        web = " With Shell on, Web off removes no tool from its sessions." if boxes is None or "web" in boxes else ""
-        options.append(f"{step}. Cost: {', and '.join(costs) or 'none'}.{web} Its shell still reaches the internet, "
-                       f"so most of the risk stays. To undo: {undo}.")
-    options.append("Leave it as it is. Cost: the risk stays. When the owner chooses this, decide this report as noted.")
+    several, catalog = len(keys) > 1, logins()
+    held = [(ref, env) for ref, env in read_secrets(agent) if env in keys]
+    calls = sorted({env for ref, env in held if login_site((catalog.get(ref) or {}).get("site"))})
+    server = (team_read().get("servers") or {}).get(a.get("machine"))
+    linux = isinstance(server, dict) and server.get("kind") == "linux"        # as the owner's command asks it
+    swaps = sorted({env for ref, env in held if key_swap(agent, ref)}) if linux else []
     # the key swap lane: the keys that its sessions hold as a placeholder are no part of the case, and the words say
     # so, with their names where the finding still fits into one report
     placed = sorted({env for ref, env in read_secrets(agent) if key_swaps(agent, ref)})
     rest = "" if not placed else \
         (f" {len(placed)} more key{'s are' if len(placed) > 1 else ' is'} not in its sessions: the vault of its "
          f"server swaps {'them' if len(placed) > 1 else 'it'}, so a session holds a placeholder")
+    caller = who if worker else "a worker or a lead that has a use grant of it"
+    each, those = "each key" if several else "the key", "that key" if len(calls) == 1 else "those keys"
+    # the key swap is in the sentence about the site only where a site can make a key swap: an option for it follows,
+    # or no key of the case has a site
+    need = "a use grant and the key swap need" if linux and (swaps or not calls) else "a use grant needs"
 
-    def words(rest):
+    def too(name, entry):
+        """The keys of another agent that swap with this agent's: root switches the key swap on for a whole server,
+        so each key there that can swap (key_swap), in the sessions of each agent there, swaps then. None for an
+        agent of another server, and for an entry that cannot be read."""
+        try:
+            there = name != agent and isinstance(entry, dict) and entry.get("machine") == a.get("machine")
+            return [ref for ref, _env in session_variables(name) if key_swap(name, ref)] if there else []
+        except Exception:
+            return []
+    others = [found for found in (too(name, entry) for name, entry in agents().items()) if found] if swaps else []
+    also = len({ref for found in others for ref in found})      # a key that two of them read is one key
+
+    def words(rest, names, shown):
+        """The finding with this sentence about the placeholders, with the names of the keys that an option fits
+        (names) or their number, and with `shown` names of its keys before the rest become a count."""
+        fits = "" if len(calls) == len(keys) else \
+            (f" Nothing takes a key out of its sessions now: {need} the https site of the key on its login, and "
+             + ("none of these logins names one." if several else "this login names none.")) if not calls else \
+            (f" Only {named_few(calls, SETTINGS_FIT_NAMED) if names else f'{len(calls)} of these keys'} "
+             f"{'fits' if len(calls) == 1 else 'fit'} the next "
+             + ("two options" if swaps == calls else "option") + f": {need} the https site of the key on its login.")
+        options = []
+        if calls:
+            options.append(f"Change the grant of {each if len(calls) == len(keys) else those} from read to use: the "
+                           f"vault keeps the key, and {caller} calls the service with call_api. Cost: each command or "
+                           f"saved check that reads the key from its variable fails until somebody changes it. To "
+                           f"undo: give read again.")
+        if swaps:
+            target = each if len(swaps) == len(keys) else those if swaps == calls else \
+                named_few(swaps, SETTINGS_FIT_NAMED) if names else f"{len(swaps)} of these keys"
+            options.append(f"Switch the key swap on for its server {a.get('machine')} (WORKER-INSTALL.md says how): "
+                           f"the vault then keeps {target} out of its sessions, and it puts the key into the "
+                           f"Authorization header of an HTTPS request to the key's site. Cost: "
+                           + (f"it also swaps {also} key{'s' if also > 1 else ''} of "
+                              f"{'another agent' if len(others) == 1 else f'{len(others)} other agents'} of that "
+                              f"server, and " if others else "")
+                           + "a program that uses the key in another way fails. To undo: switch it off again.")
+        if worker:
+            step = f"Set {' and '.join(on)} off for {who}" if on else \
+                f"Give {who} a Tools list with Shell on and Web off"
+            costs = (["its start no longer tells it that it has the web"] if "Web" in on else []) + \
+                (["it takes no browser task"] if "Browser" in on else [])
+            undo = "set them on again" if len(on) > 1 else "set it on again" if on else "set Web on again"
+            web = " With Shell on, Web off removes no tool from its sessions." if boxes is None or "web" in boxes \
+                else ""
+            options.append(f"{step}. Cost: {', and '.join(costs) or 'none'}.{web} Its shell still reaches the "
+                           f"internet, so most of the risk stays. To undo: {undo}.")
+        options.append("Leave it as it is. Cost: the risk stays. When the owner chooses this, decide this report as "
+                       "noted.")
+        ask = "this one option" if len(options) == 1 else f"these {('two', 'three', 'four')[len(options) - 2]} options"
         return (f"{who} reads {len(keys)} API key{'s' if several else ''} in its sessions "
-                f"({named_few(keys, SETTINGS_KEYS_NAMED)}), and it has a shell and the web ({tools}).{rest} A text "
-                f"from outside, a web page for example, can then make it send a key to another place. The choice is "
-                f"the owner's: put these {'three' if worker else 'two'} options on your weekly list. "
+                f"({named_few(keys, shown)}), and it has a shell and the web ({tools}).{rest} A text "
+                f"from outside, a web page for example, can then make it send a key to another place.{fits} The "
+                f"choice is the owner's: put {ask} on your weekly list. "
                 + " ".join(f"({n}) {text}" for n, text in enumerate(options, 1))
                 + " The hub makes no second finding while these settings stay.")
-    if not placed:
-        return words("")
-    named = words(f"{rest} ({named_few(placed, SETTINGS_PLACED_NAMED)}).")
-    return named if len(named) <= REPORT_TEXT_MAX else words(rest + ".")
+    # Each name where the finding still fits into one report. Else the placeholders as a number, then half of the
+    # names of its keys, then the keys of an option as a number, then one name: the longest role, server and key
+    # names fit so.
+    named = f"{rest} ({named_few(placed, SETTINGS_PLACED_NAMED)})." if placed else ""
+    bare = rest + "." if placed else ""
+    for form in ((named, True, SETTINGS_KEYS_NAMED), (bare, True, SETTINGS_KEYS_NAMED),
+                 (bare, True, SETTINGS_KEYS_NAMED // 2), (bare, False, SETTINGS_KEYS_NAMED // 2), (bare, False, 1)):
+        text = words(*form)
+        if len(text) <= REPORT_TEXT_MAX:
+            break
+    return text
 
 
 def settings_check():

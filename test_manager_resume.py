@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import fleet
+from leftovers import scratch_home
 
 MANAGER = {"role": "manager", "runtime": "claude", "machine": "vps", "can": ["shell"],
            "start": "claude --permission-mode dontAsk {settings} {prompt}", "allow": ["mcp__fleet__*"],
@@ -27,6 +28,10 @@ SESSION = "11111111-2222-4333-8444-555555555555"
 OTHER = "99999999-8888-4777-8666-555555555555"
 TOKEN = "standing-credential-" + "s" * 24
 PROMPT = fleet.MANAGER_START.format(agent="manager", resume=fleet.MANAGER_COLD)
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 class ManagerResume(unittest.TestCase):
