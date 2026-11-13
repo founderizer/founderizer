@@ -149,6 +149,9 @@ The vault protects the value of each secret. The design gives these results:
 - Fleet Vault runs as the OS user of the Mac's agents, so file modes do not keep the store from the agents. What
   keeps the store shut is its key: an item of Fleet Vault's own Keychain access group, which macOS gives only to code
   with Fleet Vault's signature (`Sources/FleetVaultCore/VaultLocalStore.swift`).
+- Each build of Fleet Vault has that signature, an older one too. So an agent of the Mac can stop Fleet Vault and
+  start an older signed build, which opens the same store and does what that build does (limit 6). The root updater
+  installs only a newer build, but it does not stop such a program (`Vault/update.zsh`).
 - Its items are in the data-protection Keychain, in the group `6EBZ756H9Q.local.agent-fleet.vault`. They can be read
   after the first unlock since a restart, only on this Mac, and they are never synchronized
   (`Sources/FleetVaultCore/VaultKeychain.swift`).
@@ -235,11 +238,11 @@ The vault protects the value of each secret. The design gives these results:
   (`hub.py`). The app signs the pin of each trusted machine again when the pin that the hub keeps is 7 days old, or
   when the hub keeps none (`Sources/FleetCore/CentralVaultPlan.swift`). It signs the pins of the machines that have a
   worker or a lead, so the hub hands no login over to an agent on another machine.
-- Fleet Vault on a Mac makes the same check only when its configuration has the owner's public keys and the id of
-  the fleet. Only root writes that configuration, and no install adds the keys: a root step of its own does
+- Fleet Vault on a Mac makes the same check, with the owner's public keys and the id of the fleet in its
+  configuration. Only root writes that configuration, and no install adds the keys: a root step of its own does
   (`Sources/FleetVaultCore/VaultOwnerPin.swift`, `Sources/FleetVaultCore/VaultHub.swift`, `Vault/install.py`,
-  `WORKER-INSTALL.md`, "Vault broker (macOS)"). Without the keys, Fleet Vault checks no pin (see "What the vault
-  does not protect").
+  `WORKER-INSTALL.md`, "Vault broker (macOS)"). Without the keys, Fleet Vault hands no login over, as a Linux broker
+  without them does. So that root step turns handovers on for a Mac.
 
 ## What an agent gets
 
@@ -428,11 +431,17 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
    value of its own into a broker's store (`vault.py`). On a server that swaps keys, the hub's word also says which
    key swaps and what its site is. When the hub names no site for a key, the broker gives the key itself to the
    session (`vault.py`, `hub.py`).
-6. **A handover from a Mac that does not have the owner's keys.** Fleet Vault on a Mac checks the owner's pin of the
-   receiving key only when root gave its configuration the owner's public keys and the id of the fleet. No install
-   gives them (`Sources/FleetVaultCore/VaultOwnerPin.swift`, `Vault/install.py`). Without them, Fleet Vault seals a
-   handover to the key that the hub names. So a hub that is broken into can make it hand any login of its store to a
-   key of the hub's choice (`Sources/FleetVaultCore/VaultBroker.swift`, `Sources/FleetVaultCore/VaultProtocol.swift`).
+6. **A Mac that does not have the owner's keys.** Fleet Vault on a Mac checks the owner's pin of the receiving key
+   with the owner's public keys and the id of the fleet that root gave its configuration. No install gives them
+   (`Sources/FleetVaultCore/VaultOwnerPin.swift`, `Vault/install.py`). Without them, Fleet Vault refuses each handover,
+   as a Linux broker without them does, so such a Mac hands no login over. The root step of
+   `WORKER-INSTALL.md`, "Vault broker (macOS)", turns handovers on. A sign-in, a session's read, `call_api`, a delivery
+   and a withdrawal do not need the keys (`Sources/FleetVaultCore/VaultHub.swift`,
+   `Sources/FleetVaultCore/VaultBroker.swift`). But the agents of a Mac run as the OS user of its Fleet Vault, so an
+   agent can start an older signed build in its place, which opens the same store: a build before 14 hands a login
+   over without the owner's keys, and a build before 12 checks no pin at all. So a hub that is broken into, together
+   with such an agent, can still get a login of that Mac's store locked for a key of the hub's choice
+   (`Sources/FleetVaultCore/VaultLocalStore.swift`, `Vault/update.zsh`).
 7. **An old pin, and an old owner key.** A broker that checks the owner's pin of the receiving key, on Linux or on a
    Mac, keeps no record of an unpin. So a hub that is broken into can send an old pin of a key that the owner removed
    (`vault.py`, `Sources/FleetVaultCore/VaultOwnerPin.swift`). Such a broker also keeps the owner keys of its root
@@ -526,8 +535,9 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
     an agent that reports a key of its own before the first grant gets no pin: the app reads another key as root,
     so it pins nothing for that server, and the central vault seals nothing to the false key. The hub then hands no
     login over to an agent of that server, because it keeps no pin of the owner for it (`hub.py`). A hub that is broken
-    into can still name the false key: a broker that checks pins refuses it, and Fleet Vault on a Mac without the
-    owner's keys seals the login to it (limit 6) (`Sources/FleetVaultCore/VaultBroker.swift`).
+    into can still name the false key: a broker that checks pins refuses it, because the owner signed no pin of it, and
+    a broker without the owner's keys hands no login over at all (limit 6) (`vault.py`,
+    `Sources/FleetVaultCore/VaultOwnerPin.swift`).
 22. **The old value after a replace.** When the owner replaces the value of a key, the central vault holds the new
     value at once, and the old value is in no store of the central vault after that (`vault.py`). The store of a
     machine holds the old value until the machine took its new delivery: the hub makes that delivery at once, and the
@@ -547,8 +557,8 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
 2. **Run the root steps.** Only a root step installs and updates the central vault. The Mac app runs it over the
    owner's own SSH connection (`hubsetup.py`, `Sources/FleetCore/CentralVault.swift`). On a Mac with agents, the
    install of Fleet Vault needs an administrator, because it runs as root (`Vault/install.py`). After that install,
-   give Fleet Vault the owner's public keys with the root step of `WORKER-INSTALL.md`, "Vault broker (macOS)":
-   without them, it checks no pin of a handover (limit 6). For a machine whose
+   the root step of `WORKER-INSTALL.md`, "Vault broker (macOS)", gives Fleet Vault the owner's public keys. That step
+   turns handovers on for the Mac, which hands no login over without them (limit 6). For a machine whose
    host key the Mac does not know yet, the owner connects to it once with ssh from Terminal
    (`Sources/Founderizer/CentralVaultSection.swift`).
 3. **Give each secret on purpose.** The app makes the recovery key and the pins of the servers itself

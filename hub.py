@@ -8989,7 +8989,7 @@ def handover_key(name):
     helper runs as the agents' user, so an agent could have reported a key of its own. The owner's app pins a key only
     after it read it itself (as root on a Linux server), so the kept pin, which the central vault took as the owner's
     signed statement (`central_statement`), is what a handover may trust: no pin, no handover, also when the giving
-    broker does not check pins itself (a Mac's vault without the owner's keys)."""
+    broker does not check pins itself (an older Fleet Vault on a Mac without the owner's keys)."""
     conf = agents().get(name) or {}
     if conf.get("vault") == "broker":
         return conf.get("vault_recipient") if handover_unpinned(name) is None else None

@@ -458,13 +458,19 @@ def owner_pin_config(conf):
                              "04, X, Y) that is a point of the curve") from None
 
 
+def owner_keys_held(conf):
+    """Refused when this broker's configuration has no owner keys: such a vault hands no login over. `handover` asks
+    this before it confirms the hub's one-use job, so such a vault uses up no job."""
+    if not OWNER_PIN_KEYS <= set(conf):
+        raise Refused("this machine's vault holds no key of the owner, so it hands no login over")
+
+
 def owner_pinned(conf, confirmed):
     """Refused unless the owner signed a pin of the recipient that the hub named for this handover: the pin statement
     that the hub carries beside the job, checked here with the owner's keys of this broker's own configuration. The hub
     names the receiving agent and its key, and a hub that is broken into could name a key of its own; it cannot sign
     for the owner (DevOps plan 0.3)."""
-    if not OWNER_PIN_KEYS <= set(conf):
-        raise Refused("this machine's vault holds no key of the owner, so it hands no login over")
+    owner_keys_held(conf)
     pin = confirmed.get("pin")
     if not isinstance(pin, dict):
         raise Refused("the owner has signed no pin of the receiving machine's key, so the login is not handed over")
@@ -652,6 +658,7 @@ def open_login(conf, ref, task, store):
 
 def handover(conf, job):
     """Lock one login for the receiving agent's broker. The answer holds only the locked copy."""
+    owner_keys_held(conf)               # a vault that hands nothing over must not use up the job either
     store = LocalStore(conf)            # a broken vault must not use up the job
     read_private(conf["age_key"], "handover key")
     confirmed = confirm_job(conf, job, "handover")

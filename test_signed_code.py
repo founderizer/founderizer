@@ -734,7 +734,12 @@ class HandoverRecipients(VaultBroker):
         broker = vault.Broker(plain).open()
         threading.Thread(target=broker.serve, daemon=True).start()
         self.addCleanup(broker.close)
-        self.refused("holds no key of the owner")
+        job = self.job()
+        with self.assertRaises(fleet.Refused) as caught:
+            fleet.vault_call({"op": "handover", "job": job})
+        self.assertIn("this machine's vault holds no key of the owner, so it hands no login over", str(caught.exception))
+        self.assertEqual(self.reads(), [])                      # the login was never opened
+        self.assertIsNone(self.released(job))                   # and the hub's one-use job was not asked for
 
     def test_the_hub_keeps_the_owners_pin_as_it_came_and_an_unpin_ends_it(self):
         pin = owner_pin("studio", STUDIO_KEY)
