@@ -27,6 +27,7 @@ MAC = "127.0.0.1"                               # the owner's Mac, as OwnerAPI s
 T0 = 1794322671.5               # MobileMoment: the hub's clock stands still, so two reads of a page are the same bytes
 LOGIN = "Pr4ct!ce-Login#2026"   # MobileMoment: a registered login, inside a text of each part of the phone's page
 LATER = "L4ter-Login!9090"      # MobileMoment: registered while the phone's page is built
+PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(64))  # a file that the phone sends with a message
 
 
 class Devices(OwnerAPI):
@@ -86,6 +87,22 @@ class Devices(OwnerAPI):
     def report(self, agent="manager", text="A reply"):
         return hub.ins("INSERT INTO owner_reports(text,about,created,agent) VALUES(?,'',?,?)",
                        (text, hub.now(), agent))
+
+    def upload(self, data=PNG, source=PHONE, token=None):
+        """POST /ui/attachments with the raw bytes, as the phone's MobileClient.upload sends them."""
+        head = {"Content-Type": "image/png", "X-Fleet-Client": "deterministic-test", "X-Fleet-Name": "shot.png",
+                "X-Fleet-Request-Id": str(uuid.uuid4()), "X-Test-Source": source}
+        if token is not None:
+            head["Authorization"] = "Bearer " + token
+        req = urllib.request.Request(self.base + "/ui/attachments?db=test-generation", data=data, headers=head,
+                                     method="POST")
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with op.open(req, timeout=PATIENCE) as r:
+                return r.status, json.load(r)
+        except urllib.error.HTTPError as r:
+            with r:
+                return r.code, json.load(r)
 
     # ---- team.json: what an owner device may be
     def test_validate_team_takes_a_device_and_refuses_a_bad_one(self):
@@ -249,6 +266,55 @@ class Devices(OwnerAPI):
                 status, body = self.call(path, {"request_id": str(uuid.uuid4()), "db": "test-generation"},
                                          source=PHONE, token=key)
                 self.assertEqual(status, 403, body)
+
+    def test_a_device_sends_a_file_and_reads_the_same_bytes_from_its_chat(self):
+        """The phone's client sends a file before its message and reads it from the chat (MobileClient.upload and
+        .attachment). A device reads only a file that a message carries: an upload alone is in none of its reads."""
+        key = self.enrolled()
+        status, sent = self.upload(token=key)
+        self.assertEqual(status, 200, sent)
+        self.assertEqual((sent["size"], sent["sha256"]), (len(PNG), hashlib.sha256(PNG).hexdigest()))
+        path = f"/ui/attachments/{sent['id']}?db=test-generation"
+        self.assertEqual(self.raw(path, source=PHONE, token=key)[0], 404)       # no message carries it yet
+        self.assertEqual(self.raw(path)[2], PNG)                                # the owner's Mac reads it as before
+        status, receipt = self.call("/ui/messages", self.command(text="", attachments=[sent["id"]]), source=PHONE,
+                                    token=key)
+        self.assertEqual(status, 200, receipt)
+        status, chat = self.call("/ui/mobile/chat/manager", source=PHONE, token=key)
+        self.assertEqual(status, 200, chat)
+        self.assertEqual([[f["id"] for f in i["attachments"]] for i in chat["items"]], [[sent["id"]]])
+        status, headers, data = self.raw(path, source=PHONE, token=key)
+        self.assertEqual((status, data), (200, PNG))
+        self.assertEqual(headers["X-Fleet-SHA256"], sent["sha256"])
+        self.assertEqual(self.raw(f"/ui/attachments/{sent['id'] + 1}?db=test-generation", source=PHONE,
+                                  token=key)[0], 404)
+
+    def test_a_device_never_keeps_a_file_and_its_key_is_checked_on_each_file_route(self):
+        key = self.enrolled()
+        status, sent = self.upload(token=key)
+        self.assertEqual(status, 200, sent)
+        self.assertEqual(self.call("/ui/messages", self.command(attachments=[sent["id"]]), source=PHONE,
+                                   token=key)[0], 200)
+        keep = f"/ui/attachments/{sent['id']}/keep"
+        mark = lambda: {"request_id": str(uuid.uuid4()), "db": "test-generation", "keep": True}
+        status, body = self.call(keep, mark(), source=PHONE, token=key)
+        self.assertEqual((status, body["auth"]), (403, "device_not_allowed"))   # it writes the owner's knowledge
+        self.assertIsNone(hub.q1("SELECT kept FROM attachments WHERE id=?", (sent["id"],))["kept"])
+        status, body = self.call(keep, mark())                                  # the route is there, on the Mac
+        self.assertEqual(status, 200, body)
+        files = hub.q1("SELECT COUNT(*) AS n FROM attachments")["n"]
+        for token, auth in ((None, "device_key_required"), ("wrong-key", "device_key_mismatch")):
+            with self.subTest(auth=auth):
+                status, body = self.upload(token=token)
+                self.assertEqual((status, body["auth"]), (403, auth))
+                status, _, data = self.raw(f"/ui/attachments/{sent['id']}?db=test-generation", source=PHONE,
+                                           token=token)
+                self.assertEqual((status, json.loads(data)["auth"]), (403, auth))
+        self.assertEqual(hub.q1("SELECT COUNT(*) AS n FROM attachments")["n"], files)  # no file came in
+        self.assertEqual([hub.device_may(path, method) for method, path in (
+            ("POST", "/ui/attachments"), ("GET", "/ui/attachments/3"), ("POST", "/ui/attachments/3/keep"),
+            ("GET", "/ui/attachments"), ("POST", "/ui/attachments/3"), ("GET", "/ui/attachments/3/keep"))],
+            [True, True, False, False, False, False])
 
     def test_a_message_from_the_phone_says_via_iphone_and_names_no_device(self):
         """T3 Code idea 5: the agent reads that a message came from the phone, as the class only. The Mac's message

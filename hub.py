@@ -1409,6 +1409,10 @@ DEVICE_PATHS = (("/ui/mobile", ("GET",)), ("/ui/state", ("GET",)), ("/ui/knowled
                 ("/ui/tasks", ("GET", "POST")), ("/ui/wait", ("GET",)))
 DEVICE_PUSH = re.compile(r"/ui/owner/devices/[a-z][a-z0-9-]{1,30}/(push|recovery/held)")   # a device's own token
 #                                                       (push), and that it holds its copy of the recovery code (V12)
+# The owner's files (owner feature attachments), by their own rule: POST /ui/attachments sends one before its message,
+# and GET /ui/attachments/<id> reads the bytes of one that a chat shows (ui_attachment_file). The prefix rule of
+# DEVICE_PATHS would also take POST /ui/attachments/<id>/keep, which stays on the owner's Mac.
+DEVICE_FILE = re.compile(r"/ui/attachments/[^/]+")
 
 
 def owner_devices():
@@ -1454,6 +1458,8 @@ def device_may(path, method):
     method = "GET" if method == "HEAD" else method
     if method == "POST" and DEVICE_PUSH.fullmatch(path):      # the one device write under /ui/owner/devices
         return True
+    if (method, path) == ("POST", "/ui/attachments") or (method == "GET" and DEVICE_FILE.fullmatch(path)):
+        return True                                             # a file of a chat, never its keep (DEVICE_FILE)
     return any(method in methods and (path == p or path.startswith(p + "/")) for p, methods in DEVICE_PATHS)
 
 
@@ -42684,7 +42690,11 @@ class Handler(BaseHTTPRequestHandler):
                                    sha256=digest, created=t0, kept=None))     # a fresh upload is never kept yet
 
     def ui_attachment_file(self, attachment_id, query):
-        """GET /ui/attachments/<id> (owner feature attachments): the bytes, for the owner's own apps."""
+        """GET /ui/attachments/<id> (owner feature attachments): the bytes, for the owner's own apps.
+
+        An owner device reads the file of a chat that it reads: one that a message carries, as GET /ui/state and
+        GET /ui/mobile/chat/<agent> show it. An upload that no message carries yet is in none of its routes (the
+        device keeps its own copy until it sends), so it gets the answer of a file that is not there."""
         if not self.ui_allowed():
             return
         if query.get("db") != kv_get("db_id"):
@@ -42692,6 +42702,9 @@ class Handler(BaseHTTPRequestHandler):
         if not re.fullmatch(r"[1-9][0-9]*", attachment_id):
             return self.json(400, {"error": "invalid attachment id"})
         row = q1("SELECT * FROM attachments WHERE id=?", (int(attachment_id),))
+        if row and owner_device_at(self.client_address[0]) is not None and not (
+                row["message"] and q1("SELECT 1 FROM ui_requests WHERE request_id=?", (row["message"],))):
+            row = None
         if not row:
             return self.json(404, {"error": "no such attachment"})
         data = attachment_bytes(row)
