@@ -333,9 +333,21 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
      read the traffic to those keys' sites. That person also sees the names of the other hosts to which the
      sessions connect through the proxy. That person does not get the store, a login's password, or a key that
      does not swap (`vault.py`).
-   - Each restart of the vault broker, also for a new vault program, starts the proxy again. That cuts the open
-     HTTPS connections of the sessions that hold a placeholder, except to the hosts that `NO_PROXY` names
-     (`vault.py`).
+   - On a server whose proxy service has no `PartOf=fleet-vault.service` line (the root step of this version
+     writes it so), a new vault program does not cut a connection that passes bytes: the proxy that runs lets the
+     new program take over as a new process, and ends with its own connections. A connection that is open for
+     two new programs is cut at the second one, and so is a connection that only waited at the hand-over
+     (`vault.py`). These cut each open HTTPS connection of the sessions that hold a placeholder, except to the
+     hosts that `NO_PROXY` names: a restart of the proxy's own service, by root or by the root step when it
+     changes the service (`hubsetup.py`); the end of the new process by a fault while the old one still has
+     connections; and, on a server with the `PartOf` line, each restart of the broker (`vault.py`).
+   - A new vault program whose proxy does not start is not taken by a proxy that runs, which tries it again
+     later. After a start of the server, or of the proxy's service, that program's proxy stays down, and a session
+     that holds a placeholder has no HTTPS until a later program (`vault.py`).
+   - An agent of the server can make each such try fail, for example when it takes each free local port at that
+     moment. The proxy then goes on with the older program for as long as the agent does that. The proxy's log has
+     a line for each failed try, and the broker's status does not say which program the proxy runs. A restart of
+     the proxy's service by root starts the installed program (`vault.py`).
 2. **Short and simple values.** The hub finds only a value of 8 or more characters with no space in it. The vault uses
    a shorter value, but the hub cannot mask it, and `call_api` can give it back in a body (`vault.py`,
    `Sources/FleetVaultCore/VaultProtocol.swift`, `Sources/FleetVaultCore/VaultAnswer.swift`). Also, the hub's database

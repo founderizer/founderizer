@@ -507,14 +507,18 @@ What the step makes, after the broker's own step:
   configuration with this part, so a release with an older program is not taken on such
   a machine: the machine keeps the program that was serving.
 - The service `fleet-vault-swap`: the same program file as the broker's
-  (`vault.py swap`), on `127.0.0.1:876`. It starts again with the broker
-  (`PartOf=fleet-vault.service`), so it runs the program that the broker runs.
+  (`vault.py swap`), on `127.0.0.1:876`. A restart of the broker does not touch it. When
+  the broker runs a new `vault.py`, the proxy starts that program as a new process that
+  takes over its listener, and the old process ends with its last open connection, or
+  at the next hand-over (`NotifyAccess=all` lets the new process tell systemd that it
+  is the main one).
 
 The step stops, and changes nothing, on a machine whose kernel setting
 `net.ipv4.ip_unprivileged_port_start` is 876 or lower: there each user can listen on
 the proxy's port, and an agent could take its place. It changes no line of
 `fleet-agent-user`, of `fleet-vault-program` or of the sudoers file. A second run
-changes nothing while the proxy runs, and it starts a proxy that is down again. A later
+changes nothing while the proxy runs with the unit that the installed program prints,
+and it starts a proxy that is down again. A later
 run of `hubsetup.py vault` without `--swap` keeps the part. On a machine that is not a
 Linux server, `--swap` switches nothing on and says so.
 
@@ -529,9 +533,18 @@ reads it, and the agent's program is Claude Code or Codex. Its next session then
 the placeholder. On such a machine the vault also sends that key in a `call_api`
 request only to that site, in the `Authorization` header and in the key's own form.
 
-What a machine that swaps costs: each new `vault.py` starts the proxy again, and that
-cuts the open HTTPS connections of the sessions that hold a placeholder. A session that
-holds none does not use the proxy.
+What a machine that swaps costs: the HTTPS programs of a session that holds a
+placeholder go through the proxy. A new `vault.py` does not cut a connection of theirs
+that passes bytes; the second new `vault.py` after a connection opened does cut it (so
+do two hand-overs in a row, when the installer puts an older program back).
+`systemctl restart fleet-vault-swap` does, and so does this step when it writes another
+unit. A server whose unit has the line `PartOf=fleet-vault.service`
+(`systemctl cat fleet-vault-swap`) got the key swap from the first version: there each
+restart of the broker still restarts the proxy, until this step runs one time again.
+A new `vault.py` whose proxy does not start is not taken: the proxy that runs writes one
+line into its log, goes on with its own program, and tries the new one again later.
+`systemctl restart fleet-vault-swap` makes the proxy start from the installed program
+at once. A session that holds no placeholder does not use the proxy.
 
 To undo, as root: `systemctl disable --now fleet-vault-swap`, take the part `"swap"`
 out of `/etc/fleet-vault/vault.json`, `systemctl restart fleet-vault`. The next

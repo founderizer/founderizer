@@ -15,7 +15,10 @@ agent's user. It proves:
   the placeholder of another agent of the same server is refused;
   the end of the grant stops the next request, and the grant given again works with the same placeholder;
   a hub that does not answer is a refusal;
-  the proxy's CA for the site is not taken for another host.
+  the proxy's CA for the site is not taken for another host;
+  a new vault program takes over from the proxy that runs, with no cut: a tunnel from before still passes bytes, a
+  key call works after it, and the old process ends after its tunnel (with a stand-in for systemd's notify socket);
+  a new vault program whose proxy does not start is not taken: the proxy that runs goes on.
 
 All keys are made up. Nothing is written outside the container, which is removed at the end."""
 import json
@@ -89,6 +92,19 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.got["hub does not answer"], {"status": 503, "site got a request": False})
         self.assertEqual(self.got["hub answers again"], "key of alpha")
 
+    def test_a_new_program_takes_over_with_no_cut_of_an_open_connection(self):
+        self.assertEqual(self.got["hand-over"], {
+            "a normal start says": "READY=1", "a tunnel before it": "open",
+            "the new process says": "MAINPID=<pid>\nREADY=1",
+            "the new process is another one, started to take over": True,
+            "the old process lives on with its tunnel": True, "a key call after it": "key of alpha",
+            "the tunnel from before still works": "other", "the old process ended after its tunnel": 0}, self.log)
+
+    def test_a_new_program_whose_proxy_does_not_start_is_not_taken(self):
+        self.assertEqual(self.got["take-back"], {"systemd hears": "MAINPID=<the process that serves>",
+                                                 "the main process is still there": True,
+                                                 "a key call": "key of alpha", "the proxy's log says why": True}, self.log)
+
     def test_the_two_processes_run_as_their_own_users(self):
         self.assertEqual(self.got["users"], {"broker": "fleet-vault", "proxy": "founderizer-swap"})
         self.assertEqual(self.got["modes"], {"/run/fleet-vault": "751", "/run/fleet-vault/vault.sock": "660",
@@ -153,6 +169,28 @@ import fleet
 agent = sys.argv[1]
 env = fleet.read_env(agent, {"runtime": "claude", "role": "worker", "can": ["shell"]}, "task")
 print(json.dumps(env))
+'''
+
+# One tunnel through the proxy to another host that stays open: it says "open", waits for a file, and then sends one
+# request through the same tunnel.
+HOLD = r'''
+import os, socket, ssl, sys, time
+host, proxy = sys.argv[1], os.environ["HTTPS_PROXY"].split("://")[1]
+s = socket.create_connection((proxy.split(":")[0], int(proxy.split(":")[1])), timeout=60)
+s.sendall(f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n".encode())
+assert b" 200 " in s.recv(4096)
+t = ssl.create_default_context().wrap_socket(s, server_hostname=host)
+print("open", flush=True)
+while not os.path.exists("/tmp/hold-go"):
+    time.sleep(0.2)
+t.sendall(f"GET /held HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
+data = b""
+while True:
+    chunk = t.recv(4096)
+    if not chunk:
+        break
+    data += chunk
+print(data.split(b"\r\n\r\n", 1)[1].decode().strip(), flush=True)
 '''
 
 NODE = ('fetch("https://%s/x", {headers: {Authorization: "Bearer " + process.env.SHOP_API_KEY}})'
@@ -274,18 +312,27 @@ def inside():
         return start(["setpriv", "--reuid", "site", "--regid", "site", "--clear-groups", "python3", "-c", HUB,
                       json.dumps(AGENT_KEYS), json.dumps(REFS), SITE])
     hub = start_hub()
-    start(["setpriv", "--reuid", "fleet-vault", "--regid", "fleet-agents", "--clear-groups", "bash", "-c",
-           f"umask 077; exec python3 /usr/local/lib/fleet-vault/vault.py serve --config {conf}"])
-    start(["setpriv", "--reuid", "founderizer-swap", "--regid", "founderizer-swap", "--clear-groups",
-           "--inh-caps", "+net_bind_service", "--ambient-caps", "+net_bind_service", "env",
-           "STATE_DIRECTORY=/var/lib/fleet-vault-swap", "RUNTIME_DIRECTORY=/run/fleet-vault-swap", "bash", "-c",
-           f"umask 077; exec python3 /usr/local/lib/fleet-vault/vault.py swap --config {conf}"])
-    for _ in range(100):                # until both sockets and the proxy's port are there
-        if os.path.exists("/run/fleet-vault/swap.sock") and listens(876):
-            break
-        time.sleep(0.2)
-    else:
+
+    def start_broker():
+        return start(["setpriv", "--reuid", "fleet-vault", "--regid", "fleet-agents", "--clear-groups", "bash", "-c",
+                      f"umask 077; exec python3 /usr/local/lib/fleet-vault/vault.py serve --config {conf}"])
+
+    def start_proxy(notify=None):
+        """The proxy as its unit starts it. notify: a stand-in for systemd's socket, as NotifyAccess=all gives it."""
+        return start(["setpriv", "--reuid", "founderizer-swap", "--regid", "founderizer-swap", "--clear-groups",
+                      "--inh-caps", "+net_bind_service", "--ambient-caps", "+net_bind_service", "env",
+                      "STATE_DIRECTORY=/var/lib/fleet-vault-swap", "RUNTIME_DIRECTORY=/run/fleet-vault-swap",
+                      *(["NOTIFY_SOCKET=" + notify] if notify else []), "bash", "-c",
+                      f"umask 077; exec python3 /usr/local/lib/fleet-vault/vault.py swap --config {conf}"])
+
+    def up():
+        for _ in range(100):            # until both sockets and the proxy's port are there
+            if os.path.exists("/run/fleet-vault/swap.sock") and listens(876):
+                return
+            time.sleep(0.2)
         raise SystemExit("the broker or the proxy did not start:\n" + open("/var/log/e2e/servers.err").read()[-3000:])
+    broker, proxy = start_broker(), start_proxy()
+    up()
     # the helper's own checkout: this kit, with a team of the two agents
     with open("/opt/kit/team.json", "w") as f:
         json.dump({"hub": {"machine": "hub", "port": 8765}, "addresses": {"hub": "127.0.0.1", "app-1": "127.0.0.1"},
@@ -387,6 +434,69 @@ def inside():
     result["modes"] = {path: oct(os.stat(path).st_mode & 0o777)[2:] for path in
                        ("/run/fleet-vault", "/run/fleet-vault/vault.sock", "/run/fleet-vault/swap.sock",
                         "/var/lib/fleet-vault-swap")}
+    # ---- a new vault program: the proxy gives way to it with no cut, and a program whose proxy fails is not taken
+    import socket
+    notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    notify.bind("/run/e2e-notify.sock")
+    os.chmod("/run/e2e-notify.sock", 0o666)
+    notify.settimeout(30)
+
+    def told():
+        try:
+            return notify.recv(4096).decode()
+        except OSError:
+            return "nothing"
+
+    def new_program(words):
+        """A release: another program file, and the broker starts again on it, as fleet-vault-program does."""
+        nonlocal broker
+        sh(f"printf '\\n# {words}\\n' >> /usr/local/lib/fleet-vault/vault.py")
+        broker.kill()
+        broker.wait()
+        broker = start_broker()
+        for _ in range(100):            # until the broker answers the proxy again; the proxy then sees its new program
+            if call("alpha", "curl") == "key of alpha":
+                return
+            time.sleep(0.2)
+    proxy.kill()
+    proxy.wait()
+    proxy = start_proxy("/run/e2e-notify.sock")         # as under the unit with NotifyAccess=all
+    up()
+    handover = {"a normal start says": told()}
+    hold = subprocess.Popen(["setpriv", "--reuid", "fleet-alpha", "--regid", "fleet-alpha", "--init-groups", "env", "-i",
+                             *[f"{k}={v}" for k, v in dict(alpha, PATH="/usr/bin:/bin", HOME="/home/fleet-alpha").items()],
+                             "python3", "-c", HOLD, OTHER], stdout=subprocess.PIPE, text=True)
+    handover["a tunnel before it"] = hold.stdout.readline().strip()
+    new_program("a newer program")                      # its calls also let the proxy see the broker's new program
+    said = told()
+    main = int(said.split("MAINPID=")[1].split()[0]) if "MAINPID=" in said else 0
+    handover["the new process says"] = said.replace(str(main), "<pid>")
+    time.sleep(2)                                       # the old process looks each second, then closes its listener
+    handover["the new process is another one, started to take over"] = bool(main) and main != proxy.pid and \
+        "--take" in open(f"/proc/{main}/cmdline").read().replace("\0", " ")
+    handover["a key call after it"] = call("alpha", "curl")
+    time.sleep(8)                                       # longer than the old process's grace (vault.SWAP_GRACE)
+    handover["the old process lives on with its tunnel"] = proxy.poll() is None
+    open("/tmp/hold-go", "w").close()
+    handover["the tunnel from before still works"] = got(hold.communicate(timeout=60)[0])
+    for _ in range(100):
+        if proxy.poll() is not None:
+            break
+        time.sleep(0.2)
+    handover["the old process ended after its tunnel"] = proxy.poll()
+    result["hand-over"] = handover
+    # a program whose proxy cannot start (its own check of its state folder fails): the proxy that runs goes on
+    os.chmod("/var/lib/fleet-vault-swap", 0o755)
+    new_program("a program whose proxy fails")
+    notify.settimeout(4)
+    # the proxy that runs tells systemd again that it is the main process: the candidate can have said otherwise
+    refused = {"systemd hears": told().replace(str(main), "<the process that serves>"),
+               "the main process is still there": os.path.exists(f"/proc/{main}"),
+               "a key call": call("alpha", "curl"),
+               "the proxy's log says why": "did not start (exit 1)" in open("/var/log/e2e/servers.err").read()}
+    os.chmod("/var/lib/fleet-vault-swap", 0o700)
+    result["take-back"] = refused
+    sh("pkill -f 'vault.py swap' || true", check=False)
     for process in running:
         process.kill()
     print("RESULT " + json.dumps(result))

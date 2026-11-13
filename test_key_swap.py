@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from unittest.mock import patch
@@ -223,18 +224,21 @@ class Reading(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertFalse(vault.swap_shape(bad))
 
-    def test_the_proxys_unit_has_its_own_user_and_starts_again_with_the_broker(self):
+    def test_the_proxys_unit_has_its_own_user_and_a_restart_of_the_broker_does_not_touch_it(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(vault.main(["unit", "--swap", "--config", "/etc/fleet-vault/vault.json"]), 0)
         unit = out.getvalue()
-        for line in ("User=founderizer-swap", "Group=founderizer-swap", "PartOf=fleet-vault.service",
+        for line in ("User=founderizer-swap", "Group=founderizer-swap", "After=network-online.target fleet-vault.service",
+                     "NotifyAccess=all",        # the process that takes over tells systemd that it is the main one
                      "AmbientCapabilities=CAP_NET_BIND_SERVICE", "CapabilityBoundingSet=CAP_NET_BIND_SERVICE",
                      "StateDirectoryMode=0700", "RuntimeDirectoryPreserve=yes", "NoNewPrivileges=yes", "Restart=always",
                      " swap --config /etc/fleet-vault/vault.json"):
             self.assertIn(line, unit)
         for absent in ("ProtectProc", "ProcSubset", "RestrictAddressFamilies", "Group=fleet-agents"):
             self.assertNotIn(absent, unit)             # it reads /proc/net/tcp, and it is no agent user
+        for absent in ("PartOf=", "BindsTo=", "Type="):
+            self.assertNotIn(absent, unit)             # a restart of the broker would cut each open connection
         for bad in (["--user", "fleet-swap"], ["--group", "fleet-agents"], ["--central"]):
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 vault.main(["unit", "--swap", "--config", "/etc/fleet-vault/vault.json"] + bad)
@@ -383,10 +387,11 @@ class Rule(unittest.TestCase):
 
 class Site(threading.Thread):
     """A local HTTPS site that keeps what it got: each request's first line and its headers. contexts: the TLS context
-    for each host name that a client asks for. only: one context for each client, whatever it asks for."""
+    for each host name that a client asks for. only: one context for each client, whatever it asks for. hold: an
+    Event that a test sets, and the site then answers a request that it got only after it."""
     def __init__(self, contexts, only=None):
         super().__init__(daemon=True)
-        self.contexts, self.only, self.got = contexts, only, []
+        self.contexts, self.only, self.got, self.hold = contexts, only, [], None
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(16)
@@ -421,6 +426,9 @@ class Site(threading.Thread):
                 while len(rest) < length:
                     rest += tls.recv(65536)
                 self.got.append({"line": lines[0], "headers": headers, "lines": lines[1:], "body": rest.decode("latin-1")})
+                hold = self.hold
+                if hold is not None:
+                    hold.wait(20)
                 body = b"it works\n"
                 tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body) + body)
         except (OSError, ssl.SSLError, KeyError):
@@ -574,7 +582,7 @@ class Proxy(unittest.TestCase):
         got = self.site.got[-1]
         self.assertEqual(sorted(got["lines"]), ["Authorization: Bearer " + KEY, "Connection: close", "Host: " + HOST])
 
-    def test_the_proxy_reads_its_own_user_from_a_connection_to_its_own_port(self):
+    def test_the_proxy_reads_its_own_user_from_a_connection_on_this_machine(self):
         for peer, good in ((lambda conn: os.getuid(), True), (lambda conn: os.getuid() + 1, False), (lambda conn: None, False)):
             with self.subTest(good=good):
                 proxy = vault.SwapProxy({"port": 0, "group": "fleet-agents"}, self.authority, ask=self.ask, peer=peer, port=0)
@@ -705,6 +713,348 @@ class Proxy(unittest.TestCase):
             for sock, _ in held:
                 sock.close()
 
+    def held_tunnel(self):
+        """One tunnel through self.proxy to the other host, open and not used yet: its TLS socket."""
+        s, first = self.connect(OTHER_HOST)
+        self.assertTrue(first.startswith(b"HTTP/1.1 200"), first)
+        context = ssl.create_default_context(cafile=str(self.dir / "world-public" / (OTHER_HOST + ".pem")))
+        return context.wrap_socket(s, server_hostname=OTHER_HOST)
+
+    def serving(self, proxy):
+        """The thread of this proxy's serve."""
+        thread = threading.Thread(target=proxy.serve, daemon=True)
+        thread.start()
+        return thread
+
+    def second(self, old, **more):
+        """A second proxy on the listener of `old`, as the process that takes over: (it, the questions that it asked)."""
+        asked = []
+        new = vault.SwapProxy({"port": 0, "group": "fleet-agents"}, self.authority,
+                              ask=lambda request: asked.append(request) or self.ask(request),
+                              site=old.site, peer=lambda conn: self.uid, reach=self.reach,
+                              sock=socket.socket(fileno=os.dup(old.sock.fileno())), **more)
+        self.addCleanup(new.close)
+        self.assertEqual(new.port, old.port)                                # the same listener
+        return new, asked
+
+    def fresh(self, **more):
+        """A proxy of this test's own, with its serve thread: (the proxy, the thread)."""
+        proxy = vault.SwapProxy({"port": 0, "group": "fleet-agents"}, self.authority, ask=self.ask, site=self.proxy.site,
+                                peer=lambda conn: self.uid, reach=self.reach, port=0, **more)
+        self.addCleanup(proxy.close)
+        return proxy, self.serving(proxy)
+
+    def timed(self, grace=0.6, patience=30):
+        for name, value in (("SWAP_GRACE", grace), ("SWAP_PATIENCE", patience)):
+            patched = patch.object(vault, name, value)
+            patched.start()
+            self.addCleanup(patched.stop)
+
+    def test_a_process_that_gave_way_takes_no_new_connection_and_ends_with_its_last_one(self):
+        """The hand-over to a new program: two proxies on one listener, as the old process and the new one."""
+        self.timed()
+        old, served = self.fresh()
+        self.proxy = old                                                    # the helpers of this class connect to it
+        tunnel = self.held_tunnel()                                         # open in the old process
+        self.addCleanup(tunnel.close)
+        new, asked = self.second(old)
+        self.serving(new)
+        old.heir, old.ending = True, True                                   # the new process said that it serves
+        for _ in range(60):
+            if old.sock.fileno() < 0:
+                break
+            time.sleep(0.1)
+        self.assertLess(old.sock.fileno(), 0)                               # the old one closed its copy of the listener
+        self.asked.clear()
+        self.assertEqual(self.get("Authorization: Bearer " + PLACE)[0], "HTTP/1.1 200 OK")
+        self.assertTrue(asked)                                              # the new process served this one
+        time.sleep(1.5)                                                     # longer than the grace
+        self.assertTrue(served.is_alive())                                  # the old one lives on for its one connection
+        tunnel.sendall(head("GET /held HTTP/1.1", "Host: " + OTHER_HOST) + b"\r\n\r\n")
+        self.assertIn(b"it works", tunnel.recv(65536) + tunnel.recv(65536))  # the old tunnel still passes bytes
+        tunnel.close()
+        served.join(10)
+        self.assertFalse(served.is_alive())                                 # its last connection ended: it ends
+        self.assertEqual(old.conns, {})
+
+    def test_a_process_with_no_connection_ends_after_the_grace_and_not_before(self):
+        self.timed(grace=1.5)
+        old, served = self.fresh()
+        old.heir, old.ending = True, True
+        time.sleep(1.2)                                                     # the accept loop saw it, the grace is not over
+        self.assertTrue(served.is_alive())
+        served.join(5)
+        self.assertFalse(served.is_alive())
+
+    def test_a_connection_that_came_in_the_last_second_is_kept_to_its_end(self):
+        """The old process still accepts for one second after the word. Such a connection is its own to the end, also
+        when an earlier one ended in between."""
+        self.timed(grace=0.3)
+        old, served = self.fresh()
+        self.proxy = old
+        first = self.held_tunnel()
+        old.heir, old.ending = True, True
+        late = self.held_tunnel()                                           # accepted in that last second
+        self.addCleanup(late.close)
+        first.close()
+        time.sleep(2)
+        self.assertTrue(served.is_alive())
+        self.assertEqual(len(old.conns), 1)
+        late.sendall(head("GET /late HTTP/1.1", "Host: " + OTHER_HOST) + b"\r\n\r\n")
+        self.assertIn(b"it works", late.recv(65536) + late.recv(65536))
+        late.close()
+        served.join(10)
+        self.assertFalse(served.is_alive())
+
+    def test_the_old_program_does_no_new_work_for_a_connection_that_only_waits(self):
+        """After the hand-over, a connection that did not start to pass bytes is closed, and a tunnel lives on."""
+        self.timed(grace=0.3, patience=60)         # each connection's own time limit is long: it does not end by itself
+        old, served = self.fresh()
+        self.proxy = old
+        tunnel = self.held_tunnel()
+        self.addCleanup(tunnel.close)
+        slow = socket.create_connection(("127.0.0.1", old.port), timeout=10)        # it never sends its CONNECT line
+        self.addCleanup(slow.close)
+        opened, first = self.connect()                                      # a key's site: the proxy waits for the TLS
+        self.assertTrue(first.startswith(b"HTTP/1.1 200"))
+        self.addCleanup(opened.close)
+        raw, first = self.connect()                                         # a key's site: the TLS is made, no request yet
+        context = ssl.create_default_context(cafile=str(self.dir / "public" / (HOST + ".pem")))
+        secure = context.wrap_socket(raw, server_hostname=HOST)
+        self.addCleanup(secure.close)
+        for _ in range(50):
+            if len(old.conns) == 4 and len(old.tls) == 2:
+                break
+            time.sleep(0.1)
+        self.assertEqual((sorted(old.conns.values()), len(old.tls)), ([False, False, False, True], 2))
+        with patch.object(vault, "SWAP_PATIENCE", 1.5):                     # the hand-over's own limit
+            old.heir, old.ending = True, True
+            for waiting in (slow, opened, secure):
+                waiting.settimeout(8)
+                try:
+                    self.assertEqual(waiting.recv(16), b"")                 # each was closed by the old process
+                except ssl.SSLError:
+                    pass                                                    # a TLS connection that was cut says so
+            self.assertTrue(served.is_alive())
+        tunnel.sendall(head("GET /held HTTP/1.1", "Host: " + OTHER_HOST) + b"\r\n\r\n")
+        self.assertIn(b"it works", tunnel.recv(65536) + tunnel.recv(65536))
+        tunnel.close()
+        served.join(10)
+        self.assertFalse(served.is_alive())
+
+    def test_a_request_to_a_keys_site_is_kept_across_the_hand_over_or_gets_no_key_at_all(self):
+        """Two requests with a placeholder are in the old process at the hand-over. The site has the first one, and
+        its answer comes later: the old process keeps that connection to its end. The second one waits for the
+        broker's answer: the old process closes it, and when the answer then comes, nothing goes to the site."""
+        self.timed(grace=0.3, patience=60)         # each connection's own time limit is long: it does not end by itself
+        late, swaps, real = threading.Event(), [], self.ask
+
+        def ask(request):
+            said = real(request)
+            if request["op"] == "swap":
+                swaps.append(request)
+                if len(swaps) == 2:
+                    late.wait(20)                                           # the broker's answer to the second request
+            return said
+        self.ask = ask
+        self.addCleanup(late.set)
+        reached, reach = [], self.reach
+
+        def counted(host, port):
+            reached.append(host)
+            return reach(host, port)
+        self.reach = counted                                                # each connection that the proxy makes to a site
+        old, served = self.fresh()
+        self.proxy = old
+        hold = self.site.hold = threading.Event()                           # the site's answer to the first request
+        self.addCleanup(setattr, self.site, "hold", None)
+        self.addCleanup(hold.set)
+        answers = {}
+
+        def asks(name):
+            answers[name] = self.get("Authorization: Bearer " + PLACE, target="/v1/" + name, method="POST", body="{}")
+
+        def until(test):
+            for _ in range(100):
+                if test():
+                    return
+                time.sleep(0.1)
+            self.fail("it did not come")
+        kept = threading.Thread(target=asks, args=("kept",), daemon=True)
+        kept.start()
+        until(lambda: len(self.site.got) == 1)                              # the site has it, and holds its answer
+        cut = threading.Thread(target=asks, args=("cut",), daemon=True)
+        cut.start()
+        until(lambda: len(swaps) == 2)                                      # it waits for the broker
+        self.assertEqual(sorted(old.conns.values()), [False, True])
+        with patch.object(vault, "SWAP_PATIENCE", 1.5):                     # the hand-over's own limit
+            old.heir, old.ending = True, True
+            cut.join(10)
+            self.assertFalse(cut.is_alive())
+            self.assertEqual(answers["cut"], ("", {}, ""))                  # closed by the old process, with no answer
+            time.sleep(1.2)                                                 # two more turns of the old process
+            self.assertTrue(kept.is_alive())                                # the first one is not closed
+            late.set()                                                      # now the broker gives the key
+            until(lambda: len(old.conns) == 1)                              # the second connection's thread ended
+            time.sleep(0.5)
+            self.assertEqual([got["line"] for got in self.site.got], ["POST /v1/kept HTTP/1.1"])    # no request, no key
+            self.assertEqual(reached, [HOST])                               # and no connection to the site for it
+            self.assertEqual(sum("the key of one placeholder" in line for line in self.logged), 1)
+            hold.set()
+            kept.join(10)
+        self.assertEqual((answers["kept"][0], answers["kept"][2]), ("HTTP/1.1 200 OK", "it works\n"))
+        self.assertEqual(self.site.got[0]["headers"]["Authorization"], "Bearer " + KEY)
+        served.join(10)
+        self.assertFalse(served.is_alive())                                 # its last connection ended: it ends
+
+    def test_when_the_process_that_took_over_ends_with_a_fault_the_old_one_ends_too(self):
+        """The new main process is the old one's child, so systemd does not see its end while the old one lives."""
+        self.timed(grace=30)
+
+        class Heir:
+            code = None
+
+            def poll(self):
+                return self.code
+        old, served = self.fresh()
+        failed = threading.Event()
+        old.fails = failed.set
+        old.heir, old.ending = Heir(), True
+        time.sleep(2)
+        self.assertFalse(failed.is_set())                                   # the new process runs: nothing
+        old.heir.code = 0                                                   # it gave way itself later, and ended well
+        time.sleep(1.2)
+        self.assertFalse(failed.is_set())
+        old.heir.code = -9                                                  # it was killed
+        self.assertTrue(failed.wait(5))
+        self.assertTrue(any("ended with a fault (-9)" in line for line in self.logged))
+
+    def test_at_most_one_old_process_the_one_before_ends_at_the_next_hand_over(self):
+        killed = []
+        with patch.object(vault.os, "kill", lambda pid, sig: killed.append((pid, sig))), \
+                patch.object(vault.os, "getppid", lambda: 4321):
+            for parent, wanted in ((4321, [(4321, vault.signal.SIGTERM)]), (999, []), (None, []), (1, [])):
+                with self.subTest(parent=parent):
+                    killed.clear()
+                    proxy = self.giving_way(lambda program, sock: True, parent=parent)
+                    self.said = {"ok": True, "site": False, "program": "b" * 64}
+                    proxy.ask({"op": "site"})
+                    self.settled(proxy)
+                    self.assertTrue(proxy.ending)
+                    self.assertEqual(killed, wanted)        # only the process that it took over from, while it lives
+
+    def giving_way(self, spawn, program="a" * 64, **more):
+        """A proxy that knows its own program and how a candidate starts."""
+        proxy = vault.SwapProxy({"port": 0, "group": "fleet-agents"}, self.authority, ask=lambda request: self.said,
+                                peer=lambda conn: self.uid, reach=self.reach, port=0, program=program, spawn=spawn, **more)
+        self.addCleanup(proxy.close)
+        return proxy
+
+    def settled(self, proxy):
+        for _ in range(100):
+            if not proxy.trying:
+                return
+            time.sleep(0.05)
+        self.fail("the candidate did not end")
+
+    def test_the_brokers_new_program_gets_its_try_and_a_program_that_failed_gets_later_ones(self):
+        tries, answer = [], ["exit 1"]
+        proxy = self.giving_way(lambda program, sock: tries.append((program, sock)) or answer[0])
+        new, newer = "b" * 64, "c" * 64
+
+        def asks(times=1):
+            for _ in range(times):
+                proxy.ask({"op": "site"})
+                self.settled(proxy)
+        for self.said in ({"ok": True, "site": False}, {"ok": True, "site": False, "program": "a" * 64},
+                          {"ok": True, "site": False, "program": "not a checksum"}, None):
+            asks()                                                          # the broker runs this program, or says none
+        self.assertEqual(tries, [])
+        self.said = {"ok": True, "site": False, "program": new}
+        self.assertEqual(proxy.ask({"op": "site"}), self.said)              # the answer itself is as it came
+        self.settled(proxy)
+        self.assertEqual(tries, [(new, proxy.sock)])
+        self.assertEqual((proxy.failed, proxy.ending), ((new, 1, 4), False))        # it did not start: this process goes on
+        self.assertTrue(any("did not start (exit 1)" in line and "goes on" in line for line in self.logged))
+        asks(4)
+        self.assertEqual(len(tries), 1)                                     # not at each connection
+        asks()
+        self.assertEqual((len(tries), proxy.failed), (2, (new, 2, 16)))     # and not never: a later try
+        asks(16)
+        self.assertEqual(len(tries), 2)
+        asks()
+        self.assertEqual((len(tries), proxy.failed), (3, (new, 3, 64)))
+        proxy.failed = (new, 9, 0)
+        asks()
+        self.assertEqual(proxy.failed, (new, 10, 1024))                     # at the most each 1024 answers
+        self.said = {"ok": True, "site": False, "program": newer}           # another program has its own count
+        answer[0] = None                                                    # not the time (the installed file is another)
+        before = len(tries)
+        asks(2)
+        self.assertEqual((len(tries), proxy.failed, proxy.ending), (before + 2, (new, 10, 1024), False))
+        answer[0] = "exit 3"
+        asks()
+        self.assertEqual(proxy.failed, (newer, 1, 4))
+        proxy.failed = None
+        heir = object()
+        answer[0] = heir                                                    # and then it serves
+        asks()
+        self.assertEqual((proxy.ending, proxy.heir), (True, heir))
+        before = len(tries)
+        self.said = {"ok": True, "site": False, "program": "d" * 64}
+        asks()
+        self.assertEqual(len(tries), before)                                # a process that ends starts no candidate
+
+    def test_one_candidate_at_a_time_and_none_without_a_way_to_start_one(self):
+        started, go = [], threading.Event()
+        proxy = self.giving_way(lambda program, sock: started.append(program) or go.wait(10) and "exit 2")
+        self.said = {"ok": True, "site": False, "program": "b" * 64}
+        proxy.ask({"op": "site"})
+        proxy.ask({"op": "site"})
+        self.said = {"ok": True, "site": False, "program": "c" * 64}
+        proxy.ask({"op": "site"})                                           # while the first one runs
+        go.set()
+        self.settled(proxy)
+        self.assertEqual(started, ["b" * 64])
+        alone = self.giving_way(None)                                       # the proxy of a test, or of the first version
+        alone.ask({"op": "site"})
+        self.assertFalse(alone.trying)
+        failing = self.giving_way(lambda program, sock: 1 / 0)              # a fault in the try is a failed try, not a crash
+        failing.ask({"op": "site"})
+        self.settled(failing)
+        self.assertEqual(failing.failed, ("c" * 64, 1, 4))
+
+    def test_the_check_of_the_callers_user_does_not_use_the_proxys_own_listener(self):
+        """In a hand-over another process accepts on that listener too."""
+        class Shared:
+            def getsockname(self):
+                return ("127.0.0.1", 876)
+
+            def accept(self):
+                raise AssertionError("the shared listener was used")
+            settimeout = close = accept
+        proxy = vault.SwapProxy({"port": 876, "group": "fleet-agents"}, self.authority, ask=self.ask,
+                                peer=lambda conn: os.getuid(), sock=Shared())
+        self.assertIs(proxy.reads_users(), True)
+
+    def test_one_process_at_a_time_makes_the_files_of_a_site(self):
+        """Two processes of the proxy share the state folder in a hand-over: a lock on a file there."""
+        import fcntl
+        folder = self.dir / "state"
+        with open(folder / "making", "a") as other:                         # as a second process reads there
+            fcntl.flock(other, fcntl.LOCK_SH)                               # a shared hold: only an exclusive one waits
+            made = []
+            thread = threading.Thread(target=lambda: made.append(self.authority.context("locked.example.com")), daemon=True)
+            thread.start()
+            thread.join(1.5)
+            self.assertTrue(thread.is_alive())                              # it waits
+            self.assertFalse((folder / "locked.example.com.ca.pem").exists())
+            fcntl.flock(other, fcntl.LOCK_UN)
+            thread.join(30)
+        self.assertEqual(len(made), 1)
+        with open(folder / "making", "a") as other:                         # and it gave the lock back
+            fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
     def test_the_proxy_goes_on_when_it_has_no_free_file(self):
         calls, real = [], self.proxy.sock
 
@@ -720,6 +1070,9 @@ class Proxy(unittest.TestCase):
 
             def close(self):
                 real.close()
+
+            def settimeout(self, seconds):
+                real.settimeout(seconds)
         with patch.object(vault.time, "sleep", lambda seconds: None):
             other = vault.SwapProxy({"port": 0, "group": "fleet-agents"}, self.authority, ask=self.ask, peer=lambda c: None,
                                     port=0)
@@ -781,12 +1134,13 @@ class Start(unittest.TestCase):
         self.conf = {"swap": {"user": "founderizer-swap", "vault": "fleet-vault", "port": 0, "openssl": OPENSSL}}
         self.part = dict(self.conf["swap"], uid=os.getuid(), vault_uid=os.getuid() + 1, group="fleet-agents",
                          broker=str(self.dir / "swap.sock"))
-        self.served, self.reads, self.said = [], True, []
+        self.served, self.reads, self.said, self.proxies = [], True, [], []
         for p in (patch.object(vault, "unchangeable", lambda path, what: None),
                   patch.object(vault, "load_config", lambda path: self.conf),
                   patch.object(vault, "swap_part", lambda conf: dict(self.part)),
                   patch.object(vault, "SWAP_LOW_PORTS", str(self.low)),
-                  patch.object(vault.SwapProxy, "serve", lambda proxy: self.served.append(proxy.port) or proxy.close()),
+                  patch.object(vault.SwapProxy, "serve",
+                               lambda proxy: self.served.append(proxy.port) or self.proxies.append(proxy) or proxy.close()),
                   patch.object(vault.SwapProxy, "reads_users", lambda proxy: self.reads or proxy.close() or False),
                   patch.object(vault, "log", self.said.append),
                   patch.dict(os.environ, {"STATE_DIRECTORY": str(self.dir / "state"),
@@ -800,6 +1154,207 @@ class Start(unittest.TestCase):
         self.assertIn("swap proxy for the agents of this machine", self.said[-1])
         self.low.unlink()                                                   # a machine with no such setting
         self.assertEqual(vault.swap_main("/etc/fleet-vault/vault.json"), 0)
+
+    def notify_socket(self):
+        """A stand-in for systemd's notify socket: (its path, the socket)."""
+        path = str(self.dir / "notify")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.bind(path)
+        sock.settimeout(1.5)
+        self.addCleanup(sock.close)
+        return path, sock
+
+    def listener(self):
+        """The proxy's listener, as the process that serves holds it; the configuration names its port."""
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        self.addCleanup(listener.close)
+        self.part["port"] = listener.getsockname()[1]
+        self.low.unlink(missing_ok=True)                    # this test's port is no low port
+        return listener
+
+    def taking(self, listener, notify_path, pipe=None):
+        """swap_main as the candidate: (what it returned or raised, what the old process reads on the pipe)."""
+        mine, theirs = pipe or os.pipe()
+        if pipe is None:
+            self.addCleanup(os.close, mine)
+        try:
+            with patch.dict(os.environ, {"NOTIFY_SOCKET": notify_path}):
+                out = vault.swap_main("/etc/fleet-vault/vault.json", take=(os.dup(listener.fileno()), theirs))
+        except SystemExit as e:
+            out = str(e)
+            try:
+                os.close(theirs)
+            except OSError:
+                pass
+        return out, (os.read(mine, 16) if pipe is None else None)
+
+    def test_a_candidate_takes_the_listener_and_says_that_it_is_the_main_process(self):
+        path, notify = self.notify_socket()
+        listener = self.listener()
+        self.assertEqual(self.taking(listener, path), (0, vault.SWAP_SERVES))       # the word comes after systemd knows
+        self.assertEqual(self.served, [listener.getsockname()[1]])          # it serves on the listener that it got
+        self.assertEqual(notify.recv(4096).decode(), f"MAINPID={os.getpid()}\nREADY=1")
+        self.assertIn("in the place of the process that served before", self.said[-1])
+        self.assertEqual(self.proxies[-1].parent, os.getppid())             # the process that it took over from
+        # each check of a normal start comes before those two words
+        self.reads = False
+        out, word = self.taking(listener, path)
+        self.assertIn("cannot read the user", out)
+        self.assertEqual(word, b"")                                         # no word: the old process goes on
+        with self.assertRaises(socket.timeout):
+            notify.recv(4096)
+
+    def test_a_candidate_stops_when_systemd_does_not_take_its_word(self):
+        listener = self.listener()
+        out, word = self.taking(listener, str(self.dir / "no-such-socket"))
+        self.assertIn("systemd did not take its word", out)
+        self.assertEqual((word, self.served), (b"", []))                    # no word for the old process, and it serves not
+
+    def test_a_candidate_takes_only_the_proxys_own_listener(self):
+        path, notify = self.notify_socket()
+        listener = self.listener()
+        other = socket.socket()                                             # a listener on another port
+        other.bind(("127.0.0.1", 0))
+        other.listen(1)
+        plain = socket.socket()                                             # the right port would not help: it does not listen
+        self.addCleanup(other.close)
+        self.addCleanup(plain.close)
+        for sock in (other, plain):
+            out, word = self.taking(sock, path)
+            self.assertIn("did not get the proxy's listener", out)
+            self.assertEqual(word, b"")
+        self.assertEqual(self.served, [])
+        self.assertEqual(self.taking(listener, path)[0], 0)
+
+    def test_a_candidate_whose_word_the_old_process_does_not_take_ends(self):
+        """The old process gave the try up (it closed the pipe) and still lives: two proxies must not serve."""
+        path, notify = self.notify_socket()
+        listener = self.listener()
+        mine, theirs = os.pipe()
+        os.close(mine)
+        out, _ = self.taking(listener, path, pipe=(mine, theirs))
+        self.assertIn("did not take its word", out)
+        self.assertEqual(self.served, [])
+        # the old process has ended in between (this process has another parent now): the candidate serves alone
+        mine, theirs = os.pipe()
+        os.close(mine)
+        parents = iter([4321] + [1] * 5)
+        with patch.object(vault.os, "getppid", lambda: next(parents)):
+            out, _ = self.taking(listener, path, pipe=(mine, theirs))
+        self.assertEqual((out, len(self.served)), (0, 1))
+
+    def test_a_candidate_needs_the_unit_that_lets_it_take_over(self):
+        with patch.dict(os.environ), self.assertRaisesRegex(SystemExit, "cannot take over under this unit"):
+            os.environ.pop("NOTIFY_SOCKET", None)
+            vault.swap_main("/etc/fleet-vault/vault.json", take=(0, 1))
+        self.assertEqual(self.served, [])
+        with self.assertRaisesRegex(SystemExit, "--take is for the swap proxy's own hand-over"):
+            vault.main(["swap", "--config", "/etc/fleet-vault/vault.json", "--take", "3"])
+        with patch.object(vault, "swap_main", lambda config, take=None: (config, take)):
+            self.assertEqual(vault.main(["swap", "--config", "/x/vault.json", "--take", "5,6"]), ("/x/vault.json", (5, 6)))
+            self.assertEqual(vault.main(["swap", "--config", "/x/vault.json"]), ("/x/vault.json", None))
+
+    def test_a_normal_start_tells_systemd_that_it_is_ready_and_knows_how_to_give_way(self):
+        path, notify = self.notify_socket()
+        with patch.dict(os.environ, {"NOTIFY_SOCKET": path}):
+            self.assertEqual(vault.swap_main("/etc/fleet-vault/vault.json"), 0)
+        self.assertEqual(notify.recv(4096), b"READY=1")
+        proxy = self.proxies[-1]
+        self.assertEqual((proxy.program, proxy.parent), (vault.swap_program(), None))
+        with open(vault.__file__, "rb") as f:
+            self.assertEqual(proxy.program, hashlib.sha256(f.read()).hexdigest())
+        with patch.object(vault, "swap_candidate", lambda config, program, sock: (config, program, sock)):
+            self.assertEqual(proxy.spawn("b" * 64, "the listener"), ("/etc/fleet-vault/vault.json", "b" * 64, "the listener"))
+        with patch.dict(os.environ, {"NOTIFY_SOCKET": str(self.dir / "none")}):
+            self.assertIs(vault.swap_notify("READY=1"), False)              # no socket there: no word, and no fault
+            self.assertEqual(vault.swap_main("/etc/fleet-vault/vault.json"), 0)
+
+    def child(self, script, pipe=None):
+        """swap_candidate, with a child of this test in the place of the installed program: (what it returns, the
+        command that it started, the children)."""
+        real = subprocess.Popen
+        made, children = [], []
+
+        def popen(argv, **more):
+            take = argv[argv.index("--take") + 1]
+            made.append(argv)
+            children.append(real([sys.executable, "-c", script, take], **more))
+            return children[-1]
+        listener = socket.socket()
+        self.addCleanup(listener.close)
+        with patch.object(vault.subprocess, "Popen", popen), \
+                patch.object(vault.os, "pipe", pipe or os.pipe):
+            return vault.swap_candidate("/etc/fleet-vault/vault.json", vault.swap_program(), listener), made, children
+
+    SAYS = "import os, sys, time; os.write(int(sys.argv[1].split(',')[1]), b'serves\\n'); time.sleep(30)"
+
+    def test_the_old_process_waits_for_the_candidates_word_and_else_ends_it(self):
+        path, notify = self.notify_socket()
+        with patch.dict(os.environ, {"NOTIFY_SOCKET": path}):
+            taken, made, children = self.child(self.SAYS)
+            self.addCleanup(children[0].kill)
+            self.assertIs(taken, children[0])                               # the process that serves now
+            self.assertIsNone(taken.poll())
+            self.assertEqual(made[0][1:5], [os.path.realpath(vault.__file__), "swap", "--config", "/etc/fleet-vault/vault.json"])
+            with self.assertRaises(socket.timeout):
+                notify.recv(4096)                                           # nothing to put right at systemd
+            self.assertEqual(self.child("import sys; sys.exit(7)")[0], "exit 7")
+            self.assertEqual(notify.recv(4096).decode(), f"MAINPID={os.getpid()}")      # this process is the main one again
+            self.assertEqual(self.child("import os, sys; os.write(int(sys.argv[1].split(',')[1]), b'other\\n')")[0], "exit 0")
+            with patch.object(vault, "SWAP_CANDIDATE", 0.3):
+                taken, made, children = self.child("import time; time.sleep(30)")
+            self.assertEqual(taken, "no word in 0.3 seconds, and it was ended")
+            self.assertIsNotNone(children[0].poll())                        # no child that could serve later
+            taken, made, children = self.child("import os, sys, time; os.write(int(sys.argv[1].split(',')[1]), b'other\\n'); time.sleep(30)")
+            self.assertEqual(taken, "it did not say that it serves, and it was ended")
+            self.assertIsNotNone(children[0].poll())
+            listener = socket.socket()
+            self.addCleanup(listener.close)
+            self.assertIsNone(vault.swap_candidate("/etc/fleet-vault/vault.json", "e" * 64, listener))    # not the installed file
+        with patch.dict(os.environ):
+            os.environ.pop("NOTIFY_SOCKET", None)
+            taken, made, children = self.child(self.SAYS)
+            self.assertEqual(taken, vault.SWAP_NO_UNIT)
+            self.assertEqual(made, [])                                      # nothing was started
+
+    def test_a_process_with_more_than_1024_open_files_still_reads_the_candidates_word(self):
+        """The unit lets the proxy have 65536 open files, and select.select fails above 1023."""
+        import fcntl
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft < 1300:
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (1300 if hard == resource.RLIM_INFINITY else min(1300, hard), hard))
+            except (ValueError, OSError):
+                self.skipTest("this machine does not let a process have 1300 open files")
+            self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        if resource.getrlimit(resource.RLIMIT_NOFILE)[0] < 1300:
+            self.skipTest("this machine does not let a process have 1300 open files")
+
+        real = os.pipe
+
+        def high():
+            low = real()
+            ends = tuple(fcntl.fcntl(fd, fcntl.F_DUPFD, 1100) for fd in low)
+            for fd in low:
+                os.close(fd)
+            return ends
+        path, notify = self.notify_socket()
+        with patch.dict(os.environ, {"NOTIFY_SOCKET": path}):
+            taken, made, children = self.child(self.SAYS, pipe=high)
+            self.addCleanup(children[0].kill)
+            self.assertIs(taken, children[0])
+            taken, made, children = self.child("import time; time.sleep(30)", pipe=lambda: 1 / 0)    # a fault before the child
+            self.assertEqual((taken, children), ("the try failed (ZeroDivisionError)", []))
+            with self.assertRaises(socket.timeout):
+                notify.recv(4096)                                           # no child: nothing to put right at systemd
+            with patch.object(vault.select, "poll", side_effect=OSError):   # a fault while the child runs
+                taken, made, children = self.child(self.SAYS)
+            self.assertEqual(taken, "the try failed (OSError), and it was ended")
+            self.assertIsNotNone(children[0].poll())                        # no child that could serve beside this process
+            self.assertEqual(notify.recv(4096).decode(), f"MAINPID={os.getpid()}")      # the child can have said its own
 
     def test_it_does_not_start_where_each_user_can_listen_on_its_port(self):
         self.part["port"] = 876
@@ -848,6 +1403,7 @@ class BrokerPart(test_vault.VaultBroker):
         hub.TEAM["agents"]["vps"]["secrets"] = {test_vault.REF: "read"}
         self.addCleanup(hub.TEAM["agents"]["vps"].pop, "secrets", None)
         self.swap_sock = str(self.dir / "swap.sock")
+        self.programs = []
         self.part = dict(self.PART, uid=os.getuid(), vault_uid=os.getuid(), group="fleet-agents", broker=self.swap_sock)
 
     def started(self, part=None, fault=None):
@@ -881,7 +1437,10 @@ class BrokerPart(test_vault.VaultBroker):
                     data += chunk
             except (ConnectionResetError, BrokenPipeError):     # the broker closed with nothing read: no answer
                 return None
-        return json.loads(data) if data else None
+        said = json.loads(data) if data else None
+        if isinstance(said, dict):
+            self.programs.append(said.pop("program", None))     # which program the broker runs: its own test below
+        return said
 
     def swap(self, placeholder, **changes):
         return self.proxy_asks(**dict({"op": "swap", "uid": os.getuid(), "host": HOST, "port": 443, "name": placeholder,
@@ -1189,7 +1748,13 @@ class BrokerPart(test_vault.VaultBroker):
         self.started()
         name = fleet.vault_call({"op": "read"})["env"]["SHOP_API_KEY"]
         question = {"op": "swap", "uid": os.getuid(), "host": HOST, "port": 443, "name": name, "form": "bearer"}
-        self.assertEqual(vault.swap_ask(self.part, question), {"ok": True, "value": self.VALUE})
+        with open(vault.__file__, "rb") as f:
+            program = hashlib.sha256(f.read()).hexdigest()
+        self.assertEqual(vault.swap_ask(self.part, question), {"ok": True, "value": self.VALUE, "program": program})
+        self.swap(self.programs.clear() or "vaultswap_" + "0" * 40)         # each answer names it, a refusal too
+        self.proxy_asks(op="site", uid=os.getuid(), host=HOST, port=443)
+        self.proxy_asks(op="read")
+        self.assertEqual(self.programs, [program] * 3)
         self.assertIsNone(vault.swap_ask(dict(self.part, vault_uid=os.getuid() + 1), question))
         self.assertIsNone(vault.swap_ask(dict(self.part, broker=str(self.dir / "none.sock")), question))
 
@@ -1296,7 +1861,7 @@ class HubRoutes(test_grants.Grants):
 class Machine:
     """The machine that the installer's swap step works on: it answers the step's one reading, records each script,
     and carries out the few effects that the step then reads."""
-    UNIT = "[Unit]\nPartOf=fleet-vault.service\n[Service]\nUser=founderizer-swap\nExecStart=/usr/bin/python3 x swap\n"
+    UNIT = "[Unit]\nAfter=fleet-vault.service\n[Service]\nUser=founderizer-swap\nExecStart=/usr/bin/python3 x swap\nNotifyAccess=all\n"
 
     def __init__(self, conf, **state):
         self.conf, self.ran, self.knows, self.proxy_stays, self.broker_stays = conf, [], True, True, True
@@ -1382,6 +1947,21 @@ class Installer(unittest.TestCase):
         self.assertTrue([s for s in machine.changes() if "systemctl restart fleet-vault-swap" in s])
         self.assertFalse([s for s in machine.changes() if "systemctl restart fleet-vault\n" in s])    # not the broker
         self.assertEqual((machine.state["active"], machine.conf), ("active", dict(self.BROKER, swap=self.PART)))
+
+    def test_a_second_run_with_another_unit_installs_it_and_starts_only_the_proxy_again(self):
+        """A server that got the key swap from the first version: its unit has PartOf, and the program prints another."""
+        machine = Machine(dict(self.BROKER))
+        self.install(machine)
+        first = machine.state["unit"]
+        machine.ran.clear()
+        machine.UNIT = Machine.UNIT + "LimitCORE=0\n"                       # the installed program prints another unit
+        state, said = self.install(machine)
+        self.assertEqual(state, "made")
+        self.assertNotEqual(machine.state["unit"], first)                   # the new unit is in place
+        self.assertTrue([s for s in machine.changes() if "systemctl restart fleet-vault-swap" in s])
+        self.assertFalse([s for s in machine.changes() if "systemctl restart fleet-vault\n" in s])    # not the broker
+        machine.ran.clear()
+        self.assertEqual((self.install(machine)[0], machine.changes()), ("there", []))
 
     def test_a_check_run_reads_and_changes_nothing(self):
         machine = Machine(dict(self.BROKER))

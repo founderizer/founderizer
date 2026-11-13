@@ -102,6 +102,7 @@ import os
 import pwd
 import re
 import secrets
+import select
 import shutil
 import signal
 import socket
@@ -2336,6 +2337,8 @@ class Broker:
                     log(f"swap: error {type(e).__name__}")
                 if reply.get("code"):
                     log(f"swap refused: {reply['code']}")
+                if self.conf.get("_source"):    # the program that this broker runs: a proxy on another one moves to it
+                    reply["program"] = self.conf["_source"]
                 conn.sendall((json.dumps(reply) + "\n").encode())
         except OSError:
             pass
@@ -2459,6 +2462,13 @@ SWAP_NOT_PASSED = (b"connection", b"proxy-connection", b"proxy-authorization", b
 # that it got, headers and all, and many servers have it on.
 SWAP_NO_KEY_METHODS = (b"TRACE", b"TRACK", b"CONNECT")
 SWAP_ASKS = 8                               # questions for a key that one OS user has open at the broker at one time
+SWAP_CANDIDATE = 60                         # seconds in which the proxy of a new program says that it serves
+SWAP_SERVES = b"serves\n"                   # that word, on the pipe of a hand-over
+SWAP_GRACE = 5                              # seconds that the old process lives at least after that word: systemd must
+                                            # know the new main process before the old one ends, or it starts the service again
+SWAP_NO_UNIT = ("this process has no word for systemd (no NOTIFY_SOCKET), so it cannot give way: after the root step "
+                "`hubsetup.py vault --swap`, `systemctl restart fleet-vault-swap` starts the proxy under the unit that "
+                "lets it")
 SWAP_MARK = b"X-Founderizer-Vault: key-swap\r\n"
 # The proxy's own answers. Each one is a sentence for the agent's program, and none has a value.
 SWAP_ONLY_CONNECT = "The vault's proxy takes only CONNECT for HTTPS. Plain HTTP is refused."
@@ -2932,7 +2942,7 @@ class SwapAuthority:
 
     def __init__(self, folder, public, openssl):
         self.folder, self.public, self.openssl = folder, public, openssl
-        self.lock, self.made = threading.Lock(), {}
+        self.lock, self.made, self.held = threading.Lock(), {}, None
         self.leaf_key = os.path.join(folder, "leaf.key")
         if not os.path.exists(self.leaf_key):
             self.run("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", self.leaf_key)
@@ -2968,36 +2978,48 @@ class SwapAuthority:
             have = self.made.get(host)
             if have and time.time() - have[0] < self.AGAIN:
                 return have[1]
-            key, cert = self.authority(host)
-            ext, csr, leaf = (os.path.join(self.folder, f"{host}.leaf.{end}") for end in ("cnf", "csr", "pem"))
-            with open(ext, "w", encoding="ascii") as f:
-                # the two key identifiers by name: a client that checks strictly asks for them, and an openssl
-                # before 3.2 does not add them by itself
-                f.write(f"subjectAltName=DNS:{host}\nbasicConstraints=critical,CA:FALSE\n"
-                        "extendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\n"
-                        "authorityKeyIdentifier=keyid:always\n")
-            self.run("req", "-new", "-key", self.leaf_key, "-subj", "/CN=Founderizer key swap", "-out", csr)
-            self.run("x509", "-req", "-in", csr, "-CA", cert, "-CAkey", key, "-set_serial",
-                     "0x" + secrets.token_hex(16), "-days", str(self.LEAF_DAYS), "-sha256", "-extfile", ext, "-out", leaf)
-            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-            ctx.load_cert_chain(leaf, self.leaf_key)
-            ctx.set_alpn_protocols(["http/1.1"])
-            with open(cert, "rb") as f:
-                text = f.read()
-            shown = os.path.join(self.public, host + ".pem")
+            # Two processes of the proxy run for as long as the old one has connections (a hand-over to a new
+            # program): one at a time makes the files of a site. The lock ends with this process.
+            if self.held is None:
+                self.held = open(os.path.join(self.folder, "making"), "a")
+            fcntl.flock(self.held, fcntl.LOCK_EX)
             try:
-                with open(shown, "rb") as f:
-                    same = f.read() == text
-            except OSError:
-                same = False
-            if not same:                # readable by each user: it is the public half
-                with open(shown + ".new", "wb") as f:
-                    f.write(text)
-                os.chmod(shown + ".new", 0o644)
-                os.replace(shown + ".new", shown)
-            self.made[host] = (time.time(), ctx)
-            return ctx
+                return self.context_made(host)
+            finally:
+                fcntl.flock(self.held, fcntl.LOCK_UN)
+
+    def context_made(self, host):
+        """context, with this process's lock and the lock between processes held."""
+        key, cert = self.authority(host)
+        ext, csr, leaf = (os.path.join(self.folder, f"{host}.leaf.{end}") for end in ("cnf", "csr", "pem"))
+        with open(ext, "w", encoding="ascii") as f:
+            # the two key identifiers by name: a client that checks strictly asks for them, and an openssl
+            # before 3.2 does not add them by itself
+            f.write(f"subjectAltName=DNS:{host}\nbasicConstraints=critical,CA:FALSE\n"
+                    "extendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\n"
+                    "authorityKeyIdentifier=keyid:always\n")
+        self.run("req", "-new", "-key", self.leaf_key, "-subj", "/CN=Founderizer key swap", "-out", csr)
+        self.run("x509", "-req", "-in", csr, "-CA", cert, "-CAkey", key, "-set_serial",
+                 "0x" + secrets.token_hex(16), "-days", str(self.LEAF_DAYS), "-sha256", "-extfile", ext, "-out", leaf)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(leaf, self.leaf_key)
+        ctx.set_alpn_protocols(["http/1.1"])
+        with open(cert, "rb") as f:
+            text = f.read()
+        shown = os.path.join(self.public, host + ".pem")
+        try:
+            with open(shown, "rb") as f:
+                same = f.read() == text
+        except OSError:
+            same = False
+        if not same:                # readable by each user: it is the public half
+            with open(shown + ".new", "wb") as f:
+                f.write(text)
+            os.chmod(shown + ".new", 0o644)
+            os.replace(shown + ".new", shown)
+        self.made[host] = (time.time(), ctx)
+        return ctx
 
 
 def swap_ask(swap, request):
@@ -3029,46 +3051,205 @@ class SwapProxy:
     broker, a dict in and a dict or None out (swap_ask). site: the TLS client context for the connection to a key's
     site, which checks the site's certificate against the system's CAs. peer: the OS user of a connection
     (swap_peer). reach: a connection to a host (swap_reach). A test gives its own of the last four, and a port."""
-    def __init__(self, swap, authority, ask=None, site=None, peer=swap_peer, reach=swap_reach, port=None):
+    def __init__(self, swap, authority, ask=None, site=None, peer=swap_peer, reach=swap_reach, port=None, sock=None,
+                 program=None, spawn=None, parent=None):
+        """sock: a listener that another process of the proxy made (a hand-over), in the place of a new one.
+        program: the SHA-256 of the program file that this process runs. spawn(program, sock): start the installed
+        program as the process that takes over (swap_candidate); it gives that process when it serves, None when it
+        is not the time, else the reason as text. Without the last two, this process never gives way. parent: the
+        process that this one took over from, or None."""
         self.swap, self.authority, self.peer, self.reach = swap, authority, peer, reach
-        self.ask = ask or (lambda request: swap_ask(swap, request))
+        self.asked = ask or (lambda request: swap_ask(swap, request))
         self.site = site or ssl.create_default_context()
         self.site.set_alpn_protocols(["http/1.1"])
         self.lock, self.open, self.asking = threading.Lock(), {}, {}
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("127.0.0.1", swap["port"] if port is None else port))
-        self.sock.listen(128)
+        self.program, self.spawn, self.parent = program, spawn, parent
+        # each connection of this process: False while it waits, True when it passes bytes, None when this process
+        # closed it at a hand-over
+        self.conns = {}
+        self.tls = {}                           # and the TLS socket that took it over, for a key's site
+        self.ending, self.heir = False, None    # a new process serves, and that process
+        self.trying, self.failed = False, None  # a candidate runs; (the program that failed, its tries, answers to skip)
+        if sock is None:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", swap["port"] if port is None else port))
+            sock.listen(128)
+        self.sock = sock
         self.port = self.sock.getsockname()[1]
 
-    def reads_users(self):
-        """True when this process reads the OS user of a connection to its own port: its own. A machine where it
-        cannot (a /proc that it does not read) must not serve, because then it knows no caller."""
+    def ask(self, request):
+        """One question to the broker. Its answer also says which program the broker runs: when that is not this
+        process's own, the installed program gets its try to take over (consider)."""
+        said = self.asked(request)
+        if said and self.program and said.get("program") != self.program:
+            self.consider(said.get("program"))
+        return said
+
+    def consider(self, program):
+        """The broker runs another program than this process. Start that program as a candidate: one at a time, and
+        never from a process that ends. A program that failed gets its next try only after more answers of the broker
+        (4, then 16, 64, 256 and then each 1024): a fault of one moment does not keep the old program for ever, and
+        a fault that stays does not start a process at each connection."""
+        if not (self.spawn and isinstance(program, str) and re.fullmatch(r"[0-9a-f]{64}", program)):
+            return
+        with self.lock:
+            if self.ending or self.trying:
+                return
+            if self.failed and self.failed[0] == program and self.failed[2] > 0:
+                self.failed = (program, self.failed[1], self.failed[2] - 1)
+                return
+            self.trying = True
         try:
-            with socket.create_connection(("127.0.0.1", self.port), timeout=5):
-                self.sock.settimeout(5)
-                conn, _ = self.sock.accept()
-                with conn:
-                    return self.peer(conn) == os.getuid()
+            threading.Thread(target=self.candidate, args=(program,), daemon=True).start()
+        except RuntimeError:
+            with self.lock:
+                self.trying = False
+
+    def candidate(self, program):
+        """Let the installed program take over. When it serves, this process takes no new connection and ends with
+        the connections that it has (serve). When it does not, nothing changes here: this process goes on with the
+        program that it runs."""
+        try:
+            taken = self.spawn(program, self.sock)
+        except Exception as e:              # never a detail
+            taken = f"the try failed ({type(e).__name__})"
+        with self.lock:
+            self.trying = False
+            if taken is None:
+                return                      # not the time: the installed file is not what the broker runs
+            if isinstance(taken, str):
+                tries = self.failed[1] + 1 if self.failed and self.failed[0] == program else 1
+                self.failed = (program, tries, min(4 ** tries, 1024))
+            else:
+                self.heir, self.ending = taken, True
+        if isinstance(taken, str):
+            log(f"swap: the proxy of the new vault program did not start ({taken}): this proxy goes on with the "
+                f"program that it runs, and tries that program again later (try {tries})")
+            return
+        log("swap: the proxy of a new vault program serves now")
+        # At most one old process: the one that this process took over from ends now, with what it still holds.
+        if self.parent and self.parent > 1 and os.getppid() == self.parent:
+            try:
+                os.kill(self.parent, signal.SIGTERM)
+            except OSError:
+                pass
+
+    def reads_users(self):
+        """True when this process reads the OS user of a connection on this machine: its own, for a connection to a
+        listener of its own. A machine where it cannot (a /proc that it does not read) must not serve, because then
+        it knows no caller. Not on the proxy's own listener: in a hand-over another process accepts there too."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as own:
+                own.bind(("127.0.0.1", 0))
+                own.listen(8)
+                own.settimeout(5)
+                with socket.create_connection(own.getsockname(), timeout=5) as client:
+                    for _ in range(8):      # another program of this machine can connect here too: only this one counts
+                        conn, _ = own.accept()
+                        with conn:
+                            if conn.getpeername() == client.getsockname():
+                                return self.peer(conn) == os.getuid()
         except OSError:
-            return False
-        finally:
-            self.sock.settimeout(None)
+            pass
+        return False
 
     def serve(self):
-        while True:
+        """Accept until the listener closes, or until a new process serves (ending). Then this process takes no new
+        connection, and this returns when its last connection ended (gives_way)."""
+        try:
+            self.sock.settimeout(1)     # a look at `ending` each second: for that second both processes accept
+        except OSError:
+            return                      # closed
+        while not self.ending:
             try:
                 conn, _ = self.sock.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 if self.sock.fileno() < 0:
                     return              # closed
                 time.sleep(0.2)         # no free file or no memory now: no new connection, and the proxy goes on
                 continue
             conn.settimeout(SWAP_PATIENCE)
+            with self.lock:
+                self.conns[conn] = False
             try:
                 threading.Thread(target=self.served, args=(conn,), daemon=True).start()
             except RuntimeError:        # no new thread now: this connection is not served
                 conn.close()
+                self.ended(conn)
+        try:
+            self.sock.close()           # this process's copy: the new process has its own
+        except OSError:
+            pass
+        self.gives_way()
+
+    def gives_way(self):
+        """The end of a process that a new one took over from. It goes on with each connection that passes bytes, to
+        that connection's own end. A connection that did not get that far in SWAP_PATIENCE seconds is closed: the
+        old program does no new work for it, and its thread sends nothing to a site after that (passes). This
+        returns after the last connection, and not before SWAP_GRACE seconds: systemd must know the new main process
+        first, or it would start the service again.
+
+        The new process is this one's child, so systemd does not see its end while this process lives. When it
+        ends with a fault, this process ends too (fails): with no process left, systemd starts the service again."""
+        with self.lock:
+            has = len(self.conns)
+        log(f"swap: this process takes no new connection, and ends with the {has} that it has")
+        since = time.monotonic()
+        while True:
+            code = self.heir.poll() if hasattr(self.heir, "poll") else None
+            if code not in (None, 0):
+                log(f"swap: the process that took over ended with a fault ({code}): this one ends too, so that the "
+                    f"service starts again")
+                return self.fails()
+            waited = time.monotonic() - since
+            with self.lock:
+                if not self.conns and waited >= SWAP_GRACE:
+                    return
+                waiting = []
+                if waited >= SWAP_PATIENCE:
+                    # The mark is made in the lock that passes() takes: a connection is closed here or it passes
+                    # bytes, never both. At each turn, not one time: a connection can get its TLS socket between
+                    # two turns.
+                    for conn, passes in self.conns.items():
+                        if not passes:
+                            self.conns[conn] = None
+                            waiting.append(self.tls.get(conn, conn))
+            for sock in waiting:
+                try:
+                    # the socket's own end, not the TLS socket's shutdown: that one takes the TLS state away from
+                    # the connection's thread, which still reads it
+                    socket.socket.shutdown(sock, socket.SHUT_RDWR)
+                except (OSError, ValueError):
+                    pass
+            time.sleep(0.5)
+
+    def fails(self):
+        os._exit(1)
+
+    def wrapped(self, conn, client):
+        """This connection is to a key's site: `client` is the TLS socket that took it over."""
+        with self.lock:
+            if conn in self.conns:
+                self.tls[conn] = client
+
+    def passes(self, conn):
+        """This connection passes bytes from now on (a tunnel, or a request to a key's site and its answer), and
+        this process keeps it to its end: True. False when this process closed it at a hand-over (gives_way): its
+        thread then sends nothing to a site, so no request and no key go there for a caller that hears no answer."""
+        with self.lock:
+            if self.conns.get(conn) is None:
+                return False
+            self.conns[conn] = True
+            return True
+
+    def ended(self, conn):
+        """One connection of this process ended."""
+        with self.lock:
+            self.conns.pop(conn, None)
+            self.tls.pop(conn, None)
 
     def close(self):
         self.sock.close()
@@ -3109,6 +3290,7 @@ class SwapProxy:
                 conn.close()
             except OSError:
                 pass
+            self.ended(conn)
 
     def one(self, conn, uid):
         head, rest = swap_head(conn, 8192)
@@ -3133,7 +3315,8 @@ class SwapProxy:
             conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
             conn.settimeout(None)
             site.settimeout(None)
-            swap_both(conn, site)       # not read, and no line in the log
+            if self.passes(conn):
+                swap_both(conn, site)   # not read, and no line in the log
 
     def opened(self, conn, uid, host, port):
         """A connection to a key's site: TLS ends here, the head of one request is read, and the placeholder of its
@@ -3142,8 +3325,12 @@ class SwapProxy:
         ends here with no line in the log."""
         context = self.authority.context(host)          # the CA's public certificate is in place before the answer
         conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
-        client = context.wrap_socket(conn, server_side=True)
+        # The TLS socket takes the connection over, and `conn` itself is then no socket any more: so this process
+        # keeps the TLS socket too, to end the connection at a hand-over while it waits here (gives_way).
+        client = context.wrap_socket(conn, server_side=True, do_handshake_on_connect=False)
+        self.wrapped(conn, client)
         try:
+            client.do_handshake()
             head, rest = swap_head(client, SWAP_HEAD)
             if head is None:
                 return swap_say(client, "431 Request Header Fields Too Large",
@@ -3189,6 +3376,8 @@ class SwapProxy:
                 del value, said
             out = method + b" " + target + b" HTTP/1.1\r\n" + b"".join(n + b": " + v + b"\r\n" for n, v in kept) + b"\r\n"
             del kept
+            if not self.passes(conn):   # closed at a hand-over while it waited: nothing goes to the site
+                return
             raw = self.reach(host, port)
             if raw is None:
                 return swap_say(client, "502 Bad Gateway", SWAP_BAD_SITE)
@@ -3212,10 +3401,94 @@ class SwapProxy:
                 pass
 
 
-def swap_main(config):
+def swap_notify(text):
+    """Tell systemd about this service (sd_notify). True when the words went out. The unit has NotifyAccess=all, so
+    that the process that takes over can say that it is the main process now."""
+    path = os.environ.get("NOTIFY_SOCKET")
+    if not path:
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.sendto(text.encode(), "\0" + path[1:] if path.startswith("@") else path)
+    except OSError:
+        return False
+    return True
+
+
+def swap_program():
+    """The SHA-256 of this program's file as it is now, or None."""
+    try:
+        with open(os.path.realpath(__file__), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def swap_candidate(config, program, sock):
+    """Start the installed program as the proxy that takes over from this process (SwapProxy.candidate): a child with
+    the listener and one pipe. It makes each check of a normal start, tells systemd that it is the main process, and
+    writes one line into the pipe. The child (a Popen) when that line came. None when the installed file is not the
+    program that the broker runs (an update is in the middle): no try now. Else the reason as text, and then the
+    child has ended on each path, and systemd hears again that this process is the main one.
+
+    Under a unit without NotifyAccess (the unit of the first version) there is no hand-over: systemd would start
+    the service a second time when this process ends.
+
+    The two processes run two versions of this program, so these are a contract that a later version keeps: the
+    arguments `swap --config <file> --take <listener>,<pipe>`; the word SWAP_SERVES on the pipe, and only after
+    systemd has MAINPID; exit code 0 for a process that gave way and ended with its connections, and another code
+    for a fault; and SIGTERM as the end of the process before (SwapProxy.candidate). A version that changes one of
+    them cannot take over from an older process: that one then goes on and writes a line at each try."""
+    if swap_program() != program:
+        return None
+    if not os.environ.get("NOTIFY_SOCKET"):
+        return SWAP_NO_UNIT
+    mine = theirs = child = None
+    try:
+        mine, theirs = os.pipe()
+        child = subprocess.Popen([sys.executable, os.path.realpath(__file__), "swap", "--config", config,
+                                  "--take", f"{sock.fileno()},{theirs}"],
+                                 pass_fds=(sock.fileno(), theirs), stdin=subprocess.DEVNULL)
+        os.close(theirs)
+        theirs = None
+        look = select.poll()            # not select.select: this process can have more than 1024 open files
+        look.register(mine, select.POLLIN)
+        ready = look.poll(SWAP_CANDIDATE * 1000)
+        if ready and os.read(mine, 16) == SWAP_SERVES:
+            return child
+        if ready:                       # the pipe closed, or another word came: the child ends by itself in a moment
+            try:
+                reason = f"exit {child.wait(timeout=5)}"
+            except subprocess.TimeoutExpired:
+                reason = "it did not say that it serves"
+        else:
+            reason = f"no word in {SWAP_CANDIDATE} seconds"
+    except Exception as e:              # never a detail
+        reason = f"the try failed ({type(e).__name__})"
+    finally:
+        for end in (mine, theirs):
+            if end is not None:
+                try:
+                    os.close(end)
+                except OSError:
+                    pass
+    if child is not None and child.poll() is None:      # no child that could serve beside this process
+        child.kill()
+        child.wait()
+        reason += ", and it was ended"
+    if child is not None:
+        swap_notify(f"MAINPID={os.getpid()}")           # the child can have said that it is the main process
+    return reason
+
+
+def swap_main(config, take=None):
     """`vault.py swap`: the swap proxy of this machine, as its own user. It reads the broker's configuration, which is
-    root's and holds no secret, for its part "swap"."""
+    root's and holds no secret, for its part "swap". take: (the listener, a pipe), two file numbers that the process
+    that serves now gave this one: after each check of a normal start, this process takes over (swap_candidate)."""
     unchangeable(os.path.realpath(__file__), "The vault broker program")       # never a checkout that an agent can change
+    program, parent = swap_program(), os.getppid()
+    if take and not os.environ.get("NOTIFY_SOCKET"):
+        raise SystemExit("The swap proxy cannot take over under this unit: systemd gave it no NOTIFY_SOCKET.")
     conf = load_config(config)
     if conf.get("central") is True or SWAP_KEY not in conf:
         raise SystemExit(f"{config} has no part swap: this machine does not swap keys.")
@@ -3238,29 +3511,61 @@ def swap_main(config):
     info = os.stat(state)
     if info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise SystemExit("The swap proxy's state folder must belong to its user and have mode 700.")
-    proxy = SwapProxy(swap, SwapAuthority(state, public, swap["openssl"]))
+    sock = None
+    if take:                    # the listener of the process that serves now: the proxy's own, and no other socket
+        try:
+            sock = socket.socket(fileno=take[0])
+            mine = sock.type == socket.SOCK_STREAM and sock.getsockname() == ("127.0.0.1", swap["port"])
+        except OSError:
+            mine = False
+        try:                    # and it listens (Linux says so; a system that cannot say is no server of the fleet)
+            mine = mine and sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 0
+        except OSError:
+            pass
+        if not mine:
+            raise SystemExit("The swap proxy cannot take over: it did not get the proxy's listener.")
+    proxy = SwapProxy(swap, SwapAuthority(state, public, swap["openssl"]), sock=sock, program=program,
+                      spawn=lambda new, listener: swap_candidate(config, new, listener),
+                      parent=parent if take else None)
     if not proxy.reads_users():
         raise SystemExit("The swap proxy does not start: it cannot read the user of a connection from /proc/net/tcp "
                          "on this machine, so it would know no caller.")
-    log(f"swap proxy for the agents of this machine on 127.0.0.1:{proxy.port}")
+    if take:
+        if not swap_notify(f"MAINPID={os.getpid()}\nREADY=1"):
+            raise SystemExit("The swap proxy cannot take over: systemd did not take its word.")
+        try:                    # the process that served takes no new connection from this line on
+            os.write(take[1], SWAP_SERVES)
+            os.close(take[1])
+        except OSError:
+            if os.getppid() == parent:      # it lives and does not listen for the word: it gave this try up
+                raise SystemExit("The swap proxy does not take over: the process that serves did not take its word.") \
+                    from None
+            # else it has ended: this process serves alone
+        log(f"swap proxy for the agents of this machine on 127.0.0.1:{proxy.port}, in the place of the process that "
+            f"served before")
+    else:
+        swap_notify("READY=1")
+        log(f"swap proxy for the agents of this machine on 127.0.0.1:{proxy.port}")
     proxy.serve()
     return 0
 
 
 # The swap proxy's service (`unit --swap`): its own user, the right to its one low port and no other, and no part of
-# the store. It starts again with the broker (PartOf), so it runs the program that the broker runs. No ProtectProc, no
-# ProcSubset and no RestrictAddressFamilies: it reads /proc/net/tcp, and it connects to any address.
+# the store. A restart of the broker does not touch it: when the broker runs a new program, the proxy lets that
+# program take over as a new process, with no cut of the open connections (SwapProxy.candidate), and NotifyAccess=all
+# lets that process tell systemd that it is the main process now. No ProtectProc, no ProcSubset and no
+# RestrictAddressFamilies: it reads /proc/net/tcp, and it connects to any address.
 SWAP_UNIT = """[Unit]
 Description=Fleet vault key swap proxy (puts an API key into a request to the key's own site; it cannot read the store)
 After=network-online.target fleet-vault.service
 Wants=network-online.target
-PartOf=fleet-vault.service
 StartLimitIntervalSec=0
 
 [Service]
 User={user}
 Group={user}
 ExecStart=/usr/bin/python3 {script} swap --config {config}
+NotifyAccess=all
 StateDirectory=fleet-vault-swap
 StateDirectoryMode=0700
 RuntimeDirectory=fleet-vault-swap
@@ -3445,6 +3750,7 @@ def main(argv=None):
     p = sub.add_parser("swap", help="Run this machine's key swap proxy, as its own user: it puts an API key into a "
                                     "request to the key's own site, and it cannot read the store")
     p.add_argument("--config", required=True, help="the broker's configuration, which has the part swap")
+    p.add_argument("--take", help=argparse.SUPPRESS)       # LISTENER,PIPE: from the process that serves now (a hand-over)
     p = sub.add_parser("store-init", help="The fleet's own store, as root: make the store key and an empty store "
                                           "that only the vault user can read. Safe to run again")
     p.add_argument("--config", required=True)
@@ -3465,7 +3771,10 @@ def main(argv=None):
             print(json.dumps(store_list(args.config), indent=2))
         return 0
     if args.cmd == "swap":
-        return swap_main(args.config)
+        take = re.fullmatch(r"([0-9]{1,6}),([0-9]{1,6})", args.take or "")
+        if args.take and not take:
+            raise SystemExit("--take is for the swap proxy's own hand-over.")
+        return swap_main(args.config, take=(int(take.group(1)), int(take.group(2))) if take else None)
     if args.cmd == "unit" and args.swap:        # the same program file as the broker's, and its own user
         if args.central or args.group:
             raise SystemExit("unit --swap takes --config and --user, and no other option.")
