@@ -98,7 +98,11 @@ class Base(unittest.TestCase):
         return Path(fleet.chat_record_file("manager", runtime, "manager"))
 
     def save(self, runtime, **record):
-        fleet.save_chat_record("manager", dict({"generation": "g1", "started": 1.0}, **record), runtime, "manager")
+        """A record of the standing session's conversation as a start writes it now, with the start text that it
+        began with (fleet.standing_text): the helper's round leaves a record without one for a new conversation."""
+        began = {"generation": "g1", "started": 1.0, "rules": None,
+                 "text": fleet.standing_text("manager", None, fleet.MANAGER_START)}
+        fleet.save_chat_record("manager", dict(began, **record), runtime, "manager")
         return self.record(runtime).read_bytes()
 
     def claude_conversation(self, session=CLAUDE_SESSION):
@@ -179,7 +183,9 @@ class Records(Base):
         words, window, record, note = self.words(CLAUDE)
         self.assertEqual((words[words.index("--resume") + 1], window, note),
                          (CLAUDE_SESSION, CLAUDE_SESSION, "it continues its recorded conversation"))
-        self.assertEqual(record, {"generation": "g1", "started": 1.0, "session": CLAUDE_SESSION, "begun": True})
+        self.assertEqual(record, {"generation": "g1", "started": 1.0, "session": CLAUDE_SESSION, "begun": True,
+                                  "text": fleet.standing_text("manager", None, fleet.MANAGER_START),
+                                  "rules": None})                       # what it began with stays
         fleet.save_chat_record("manager", record, "claude", "manager")
         self.assertIsNone(self.words(CLAUDE)[2])                        # marked: the saved one stays
 
@@ -323,6 +329,8 @@ class StandIn(Base):
                               for name, (session, start) in self.windows.items())      # tmux escapes newlines
             elif args[0] == "capture-pane":
                 out = self.screen[0]
+            elif args[0] == "display-message" and args[-1] == "#{pane_start_command}":
+                out = self.windows.get("manager", ("", ""))[1]          # what its window started (window_runtime)
             elif args[0] == "kill-window":
                 path = Path(fleet.closing_file("manager"))
                 self.killed.append(args[-1])
@@ -357,19 +365,62 @@ class StandIn(Base):
 
 class ToolsChanged(StandIn):
     """**A new team tool reaches the standing session only when it starts.** The hub serves the list once and
-    announces no change of it, so it tells the helper instead and the helper starts that session again, on the
-    same conversation (the owner, 21 October 2026: "how are agents going to get the updates automatically?")."""
+    announces no change of it, so it tells the helper instead and the helper starts that session again (the owner,
+    21 October 2026: "how are agents going to get the updates automatically?"). On a NEW conversation since 13
+    November 2026: one that continues keeps the tool definitions and the start text that it began with
+    (fleet.standing_text), so a changed tool and a changed rule never reached it."""
     def test_the_session_starts_again_when_its_tool_list_is_no_longer_the_one(self):
         h = self.helper(CLAUDE, {"home": ("", "bash"), "manager": (CLAUDE_SESSION, OLD_CLAUDE)}, ["> \n"])
         h.lifecycle.tools_changed = False
+        with patch.object(h, "manager_text_changed", return_value=""):
+            h.restart_for_tools()
+            self.assertEqual((self.killed, h.manager_due), ([], False), "nothing changed, nothing closes")
+            h.lifecycle.tools_changed = True
+            h.restart_for_tools()
+        self.assertEqual(self.killed, ["=fleet-manager:=manager"])
+        self.assertEqual((h.manager_due, h.manager_fresh), (True, True))    # its watch starts a new conversation
+        self.assertFalse(h.lifecycle.tools_changed)                     # and this round does not close it twice
+        self.assertEqual(h.say.call_args.args[0], "manager: its team tools changed, so its session starts again on a "
+                         "new conversation with the hub's brief")
+
+    def test_the_session_starts_again_when_its_rules_or_its_profile_changed(self):
+        h = self.helper(CLAUDE, {"home": ("", "bash"), "manager": (CLAUDE_SESSION, OLD_CLAUDE)}, ["> \n"])
+        h.lifecycle.tools_changed = False
+        with patch.object(h, "manager_text_changed", return_value="its rules or its profile changed"):
+            h.restart_for_tools()
+        self.assertEqual((self.killed, h.manager_due, h.manager_fresh), (["=fleet-manager:=manager"], True, True))
+        self.assertEqual(h.say.call_args.args[0], "manager: its rules or its profile changed, so its session starts "
+                         "again on a new conversation with the hub's brief")
+        self.assertEqual(self.killed, ["=fleet-manager:=manager"])
+        # a record from before the helper kept the start text is left one time, and the new one is not
+        h = self.helper(CLAUDE, {"home": ("", "bash"), "manager": (CLAUDE_SESSION, OLD_CLAUDE)}, ["> \n"])
+        self.save("claude", session=CLAUDE_SESSION, text=None)
         h.restart_for_tools()
-        self.assertEqual((self.killed, h.manager_due), ([], False), "nothing changed, nothing closes")
+        self.assertEqual((self.killed, h.manager_due, h.manager_fresh), (["=fleet-manager:=manager"], True, True))
+        self.assertIn("its record does not say what it began with, so its session starts again on a new "
+                      "conversation", h.say.call_args.args[0])
+        h = self.helper(CLAUDE, {"home": ("", "bash"), "manager": (CLAUDE_SESSION, OLD_CLAUDE)}, ["> \n"])
+        self.save("claude", session=CLAUDE_SESSION)
+        h.restart_for_tools()
+        self.assertEqual((self.killed, h.manager_due), ([], False))
+        # never a window of another runtime, which the switch closes with its own care, and never a session with
+        # a question on its screen, which a new conversation would lose
+        h = self.helper(CLAUDE, {"home": ("", "bash"), "manager": (MARKER, OLD_CODEX)}, ["> \n"])
+        self.save("claude", session=CLAUDE_SESSION, text=None)
+        h.restart_for_tools()
+        self.assertEqual((self.killed, h.manager_due), ([], False))
+        h = self.helper(CLAUDE, {"home": ("", "bash"), "manager": (CLAUDE_SESSION, OLD_CLAUDE)},
+                        ["Do you want to go on?\n❯ 1. Yes\n  2. No\n\nEnter to confirm · Esc to cancel\n"])
         h.lifecycle.tools_changed = True
         h.restart_for_tools()
-        self.assertEqual(self.killed, ["=fleet-manager:=manager"])
-        self.assertTrue(h.manager_due)                                  # its own watch starts it again
-        self.assertFalse(h.lifecycle.tools_changed)                     # and this round does not close it twice
-        self.assertIn("team tools changed", h.say.call_args.args[0])
+        self.assertEqual((self.killed, h.manager_due, h.lifecycle.tools_changed), ([], False, True))
+        self.screen[0] = "> \n"                                         # the question went: the next round acts
+        h.restart_for_tools()
+        self.assertEqual((self.killed, h.manager_due, h.manager_fresh), (["=fleet-manager:=manager"], True, True))
+        worker = self.helper(dict(CLAUDE, role="worker"), {"home": ("", "bash")}, ["> \n"])
+        with patch.object(worker, "manager_text_changed", return_value="its rules or its profile changed") as asked:
+            worker.restart_for_tools()                                  # a worker has no standing session
+        asked.assert_not_called()
 
     def test_a_running_turn_keeps_its_session_until_the_next_round(self):
         h = self.helper(CLAUDE, {"home": ("", "bash"), "manager": (CLAUDE_SESSION, OLD_CLAUDE)},

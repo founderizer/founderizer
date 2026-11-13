@@ -213,6 +213,53 @@ class TaskLessMessage(unittest.TestCase):
         self.assertEqual([w for w, _ in self.typed], ["manager"])
 
 
+class StartText(unittest.TestCase):
+    """The hash of a standing session's start text (fleet.standing_text): what a conversation began with, which one
+    that continues keeps. A scratch checkout; no session and no hub."""
+    def setUp(self):
+        self.kit = tempfile.mkdtemp(prefix="fleet-start-text-")
+        self.addCleanup(shutil.rmtree, self.kit, ignore_errors=True)
+        for name, text in (("RULES.md", "Rules for every agent."), ("rules/lead.md", "Rules for a lead."),
+                           ("rules/github.md", "Rules for GitHub."), ("profiles/dev-lead.md", "Looks after the web app."),
+                           ("profiles/dev-two.md", "Looks after the logs.")):
+            path = os.path.join(self.kit, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(text)
+        patcher = patch.object(fleet, "KIT", self.kit)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write(self, name, text):
+        with open(os.path.join(self.kit, name), "w") as f:
+            f.write(text)
+
+    def test_it_changes_with_each_part_of_the_start_text_and_with_nothing_else(self):
+        text = lambda: fleet.standing_text("dev-lead", ["lead"], "The chat's instructions.")
+        first = text()
+        self.assertEqual((first, len(first)), (text(), 12))                     # the same files, the same hash
+        for name, other in (("RULES.md", "Rules for every agent, with one more."),
+                            ("rules/lead.md", "Rules for a lead, with one more."),
+                            ("profiles/dev-lead.md", "Looks after the web app and its tests.")):
+            before = open(os.path.join(self.kit, name)).read()
+            self.write(name, other)
+            self.assertNotEqual(text(), first, name)
+            self.write(name, before)
+            self.assertEqual(text(), first, name)
+        self.assertNotEqual(fleet.standing_text("dev-lead", ["lead"], "Other instructions."), first)
+        self.assertNotEqual(fleet.standing_text("dev-lead", ["lead", "github"], "The chat's instructions."), first)
+        self.assertNotEqual(fleet.standing_text("dev-lead", None, "The chat's instructions."), first)
+        self.write("rules/github.md", "A part that this session does not start with.")
+        self.write("profiles/dev-two.md", "The profile of another agent.")
+        os.makedirs(os.path.join(self.kit, "skills", "dev-lead"))
+        self.write("skills/dev-lead/release.md", "A skill of its own: it changes with the agent's work.")
+        self.assertEqual(text(), first)
+        os.remove(os.path.join(self.kit, "profiles", "dev-lead.md"))            # a missing file is a text of its own
+        self.assertNotEqual(text(), first)
+        for rules in (5, "lead", {"lead": 1}):                                  # a record that something else wrote
+            self.assertEqual(fleet.standing_text("dev-two", rules), fleet.standing_text("dev-two", None))
+
+
 class ChatDelivery(unittest.TestCase):
     """The owner's chat message and the window it goes into: a tmux that does not answer, a chat whose cache went
     cold, and the helper's pause between two polls. Stand-in tmux answers; no hub, no session, no AI call.
@@ -251,7 +298,11 @@ class ChatDelivery(unittest.TestCase):
                                     else target.rpartition(":=")[2])
             return subprocess.CompletedProcess(args, 0, "", "")
         self.started = unittest.mock.Mock(side_effect=lambda generation: self.windows.append("owner-chat"))
+        home = tempfile.mkdtemp(prefix="fleet-chat-delivery-")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
         for p in (patch.object(fleet, "tmux", side_effect=tmux),
+                  patch.object(fleet, "HOME", os.path.join(home, ".fleet")),        # never the real ~/.fleet: the
+                  patch.object(fleet, "SESSIONS", os.path.join(home, ".fleet", "sessions")),   # chat reads its record
                   patch.object(fleet, "http", return_value=(200, {})),
                   patch.object(fleet, "session_credential", return_value="credential"),
                   patch.object(self.helper, "other_runtime_windows", return_value=[]),

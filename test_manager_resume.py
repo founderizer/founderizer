@@ -85,6 +85,39 @@ class ManagerResume(unittest.TestCase):
         self.assertEqual(self.said, [("mcp", "manager", "manager", "http://hub:8765/mcp/manager", TOKEN)] * 2)
         self.assertEqual(self.record.read_bytes(), saved)               # a continued conversation keeps its record
 
+    def test_a_conversation_whose_start_text_changed_is_not_continued(self):
+        """A conversation that continues keeps the rules and the profile that it began with (fleet.standing_text), so
+        a manager whose rules changed in a release ran the old ones for as long as its conversation went on. The
+        record of a new conversation keeps a hash of its start text, and a start after a change begins a new one."""
+        _, session, record, _ = self.words()
+        self.assertEqual(record["text"], fleet.standing_text("manager", record["rules"], fleet.MANAGER_START))
+        self.assertNotEqual(record["text"], fleet.standing_text("manager", record["rules"]))    # its first prompt's
+        fleet.save_chat_record("manager", record, "claude", "manager")
+        self.conversation(session)
+        again, continued, keep, note = self.words()                     # nothing changed: it continues
+        self.assertEqual((again[again.index("--resume") + 1], continued, note),
+                         (session, session, "it continues its recorded conversation"))
+        helper = fleet.Helper("manager", MANAGER)
+        self.assertEqual(helper.manager_text_changed(), "")
+        with patch.object(fleet, "standing_text", return_value="another-text"):     # a release changed its rules
+            self.assertEqual(helper.manager_text_changed(), "its rules or its profile changed")
+            words, new, kept, note = self.words()
+        self.assertNotIn("--resume", words)
+        self.assertEqual((words[words.index("--session-id") + 1], words[-1]), (new, PROMPT))
+        self.assertNotEqual(new, session)
+        self.assertEqual((kept["session"], kept["text"]), (new, "another-text"))
+        self.assertIn("its rules or its profile are not the ones that it began with", note)
+        # a record from before the helper kept the text: a start continues it, and the helper's round leaves it one
+        # time, because nothing says which tool definitions that conversation has
+        self.save()
+        self.conversation()
+        self.assertEqual(self.words()[3], "it continues its recorded conversation")
+        self.assertEqual(helper.manager_text_changed(), "its record does not say what it began with")
+        self.record.unlink()
+        self.assertEqual(helper.manager_text_changed(), "")             # no record: nothing to leave
+        self.record.write_text("not a record")
+        self.assertEqual(helper.manager_text_changed(), "")             # one that cannot be read stays (manager_start)
+
     def test_a_record_whose_conversation_is_not_found_stops_the_start_and_stays(self):
         saved = self.save()
         with self.assertRaises(fleet.Refused) as refused:
@@ -204,10 +237,19 @@ class ManagerResume(unittest.TestCase):
             self.conversation()
             self.assertEqual(adopt(), f"recorded its conversation {SESSION} in {self.record}: the next start continues it")
             record = json.loads(self.record.read_text())
+            # the owner names it as the one to continue: its record takes the start text of now, so the helper's
+            # round does not leave it for a new one
+            self.assertEqual(record["text"], fleet.standing_text("manager", None, fleet.MANAGER_START))
+            self.assertEqual(fleet.Helper("manager", MANAGER).manager_text_changed(), "")
             self.assertEqual((record["generation"], record["session"], record["adopted"]), ("g1", SESSION, True))
             self.assertEqual(os.stat(self.record).st_mode & 0o777, 0o600)
             saved = self.record.read_bytes()
             self.assertEqual(adopt(), f"its conversation {SESSION} is recorded: the next start continues it")
+            self.assertEqual(self.record.read_bytes(), saved)           # a record that says what it began with stays
+            self.record.write_text(json.dumps({k: v for k, v in record.items() if k not in ("text", "rules")}))
+            self.assertEqual(adopt(), f"its conversation {SESSION} is recorded: the next start continues it")
+            self.assertEqual(json.loads(self.record.read_text())["text"], record["text"])    # one from before: named now
+            saved = self.record.read_bytes()
             self.running = OTHER                                        # the record names another conversation
             self.conversation(OTHER)
             with self.assertRaises(fleet.Refused) as refused:

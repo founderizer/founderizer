@@ -1660,6 +1660,33 @@ def stable_text(agent, opening, parts, head=None, skills=True, knowledge=False):
     return "\n\n".join([head + STABLE_RULES.format(rules=rules)] + texts) + "\n"
 
 
+def standing_text(agent, rules, head=""):
+    """A short hash of the start text that a standing session of this agent gets when it starts now: `head` (an owner
+    chat's instructions), RULES.md, the parts of the rules that it starts with (`rules`, as the hub named them at its
+    start) and its profile.
+
+    **A conversation that continues keeps the start text and the tool definitions that it began with.** Claude Code
+    sends them again from the conversation and not from the new start (read with the real program on 2.1.311, 2.1.312
+    and 2.1.321, 13 November 2026: after `--resume` with another --append-system-prompt and another tool list, the
+    request had the old system text, each tool of before with its old description and fields, and only a tool with
+    a new name was added). A Codex thread gets no new first prompt at all. So a session whose rules, profile or tools
+    changed must begin a new conversation to get them, and the record of each conversation keeps this hash and its
+    tools for that (Helper.chat_changed, manager_start). `head` for the manager's session is the form of its first
+    prompt (MANAGER_START), and the words that name the rules in a stable start are in it too. The list of its skills
+    and its knowledge files are not in it: they change with the agent's own work, and a new one reaches its next new
+    conversation. rules that are no list (a record that something else wrote) count as none."""
+    parts = rules if isinstance(rules, (list, tuple)) else ()
+    digest = hashlib.sha256("\0".join([head, STABLE_RULES, json.dumps(STABLE_WHERE, sort_keys=True)]).encode())
+    for name in ["RULES.md"] + [f"rules/{part}.md" for part in RULES_PARTS if part in parts] + [f"profiles/{agent}.md"]:
+        try:
+            with open(os.path.join(KIT, name), "rb") as f:
+                text = f.read()
+        except OSError:
+            text = b""
+        digest.update(b"\0" + name.encode() + b"\0" + text)
+    return digest.hexdigest()[:12]
+
+
 def rules_file():
     """The file that gives a Claude start without its stable text (an older hub's event, a hub that could not be
     reached, a missing file, a standing session that continues its conversation) the rules that it read from the
@@ -2422,28 +2449,8 @@ def chat_fit(recap, room):
     return note + "\n" + "\n".join(lines) if lines else ""
 
 
-def chat_command(agent, conf, generation, token=None, marker=None, resume=None, recap=None, env=None, rules=None):
-    """A separate discussion session: no task tools, login jobs, browser or write sandbox. token: its session
-    credential (owner API 1.12). For Codex: marker goes at the end of a new chat's prompt, so that the helper can find
-    its conversation later; resume is the Codex thread of the same chat to continue, with the same settings and this
-    credential (codex resume keeps the thread and its file). For Claude: marker is a new chat's session id, and resume
-    the session of the same chat to continue. A continued chat starts without a new prompt: the hub delivers the
-    owner's chat event again until it has a reply, and the helper then signals the running window. A Claude chat
-    always starts so, with the instructions as its appended system prompt: interactive Claude Code runs a first
-    prompt before it has connected the fleet MCP server, and with no tools that turn writes tool calls as text. Its
-    first turn is the helper's first signal, after the signal throttle. recap: the hub's own record of what was said
-    in this chat before (chat_recap), for a chat that starts without its conversation; it goes last, after the
-    profile, says in its own first line that it is the hub's record and not this session's memory, and gives way
-    where a tmux command would otherwise be too long (chat_fit). env:
-    {NAME: value} of session_env, from a file that the window reads and removes, as the credential of a Codex
-    chat. rules: the parts of the rules that the hub names (opening_rules); with them the chat starts with its
-    instructions, the rules and its profile first, from a file, the recap last and whole, and no CLAUDE.md or
-    AGENTS.md of the folder besides (plan P9.2, helper feature stable_standing)."""
-    if not runtime_fact(conf.get("runtime"), "owner_chat"):
-        raise Refused(f"a {runtime_fact(conf.get('runtime'), 'label', conf.get('runtime'))} agent has no direct chat "
-                      f"yet: its tools cannot be limited to discussion")
-    with open(os.path.join(KIT, "profiles", agent + ".md"), encoding="utf-8") as file:
-        profile = file.read()
+def chat_instructions(agent, conf):
+    """The instructions of an owner chat, the head of its start text (chat_command, standing_text)."""
     prompt = (f'You are {agent}, speaking directly with the owner in this agent\'s chat. '
               'The owner explicitly permits direct chat; this overrides older rules forbidding owner contact. '
               'This window gets messages from the owner and from other agents; the header of each message says who '
@@ -2483,6 +2490,32 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
                   'see_responsibilities says what you answer for, and fleet recall gives your own lessons. '
                   'A terminal answer alone does not reach the app. Reply once per request, then read_messages once '
                   'more and wait for a signal. No polling. Never read or reveal credentials.')
+    return prompt
+
+
+def chat_command(agent, conf, generation, token=None, marker=None, resume=None, recap=None, env=None, rules=None):
+    """A separate discussion session: no task tools, login jobs, browser or write sandbox. token: its session
+    credential (owner API 1.12). For Codex: marker goes at the end of a new chat's prompt, so that the helper can find
+    its conversation later; resume is the Codex thread of the same chat to continue, with the same settings and this
+    credential (codex resume keeps the thread and its file). For Claude: marker is a new chat's session id, and resume
+    the session of the same chat to continue. A continued chat starts without a new prompt: the hub delivers the
+    owner's chat event again until it has a reply, and the helper then signals the running window. A Claude chat
+    always starts so, with the instructions as its appended system prompt: interactive Claude Code runs a first
+    prompt before it has connected the fleet MCP server, and with no tools that turn writes tool calls as text. Its
+    first turn is the helper's first signal, after the signal throttle. recap: the hub's own record of what was said
+    in this chat before (chat_recap), for a chat that starts without its conversation; it goes last, after the
+    profile, says in its own first line that it is the hub's record and not this session's memory, and gives way
+    where a tmux command would otherwise be too long (chat_fit). env:
+    {NAME: value} of session_env, from a file that the window reads and removes, as the credential of a Codex
+    chat. rules: the parts of the rules that the hub names (opening_rules); with them the chat starts with its
+    instructions, the rules and its profile first, from a file, the recap last and whole, and no CLAUDE.md or
+    AGENTS.md of the folder besides (plan P9.2, helper feature stable_standing)."""
+    if not runtime_fact(conf.get("runtime"), "owner_chat"):
+        raise Refused(f"a {runtime_fact(conf.get('runtime'), 'label', conf.get('runtime'))} agent has no direct chat "
+                      f"yet: its tools cannot be limited to discussion")
+    with open(os.path.join(KIT, "profiles", agent + ".md"), encoding="utf-8") as file:
+        profile = file.read()
+    prompt = chat_instructions(agent, conf)
     opening = standing_opening(conf, rules)
     stable = stable_text(agent, opening, rules, head=prompt, skills=False) if opening else None
     if stable is None:
@@ -2925,15 +2958,18 @@ def conversation_work_command(agent, conf, generation, conversation, token, prom
 
 def chat_record_file(agent, runtime="codex", kind="chat"):
     """The owner chat's binding to its conversation, one for each runtime (owner feature runtime_switch): Codex keeps
-    the file that it had before, Claude has its own, so that a switch back continues that runtime's conversation.
+    the file that it had before, Claude has its own, so that a switch back continues that runtime's conversation,
+    when its tools and its start text are still the ones that it began with (Helper.chat_changed).
     kind "manager": the same binding of the standing manager session (manager_start)."""
     return os.path.join(HOME, f"chat-{agent}.json" if (kind, runtime) == ("chat", "codex") else f"{kind}-{agent}.{runtime}.json")
 
 
 def load_chat_record(agent, runtime="codex", kind="chat"):
-    """This agent's owner chat on one runtime as the helper started it: {generation, marker, session, started, tools}
-    (tools: chat_tools of its last start; a chat that started before its helper kept it has none); None when there
-    is none. Refused when it is there but cannot be read: then nothing may take its place."""
+    """This agent's owner chat on one runtime as the helper started it: {generation, marker, session, started, tools,
+    text, rules}: what its conversation began with (tools: chat_tools; text: standing_text; rules: the parts of the
+    rules that it started with). A record from before the helper kept the text has none, and its conversation is
+    left one time (Helper.chat_changed). The manager's record (kind "manager") has text and rules too. None when
+    there is none. Refused when it is there but cannot be read: then nothing may take its place."""
     path, what = chat_record_file(agent, runtime, kind), "owner chat" if kind == "chat" else "manager session"
     if not os.path.lexists(path):
         return None
@@ -3028,9 +3064,14 @@ def cmd_chat_session(args):
     code, data = http("GET", f"/events/{agent}?after=-1&wait=0", timeout=10)
     if code != 200 or not data.get("db"):
         die(f"the hub gave no generation ({code})")
-    save_chat_record(agent, {"generation": data["db"], "marker": None, "session": args.session, "started": time.time()},
-                     runtime)
-    print(f"recorded: the next owner chat of {agent} in generation {data['db']} continues conversation {args.session}")
+    # The owner names this conversation as the one to continue, so its record takes the start text of now as the one
+    # that it began with (standing_text): the helper leaves a record without one. Its tools are not known here, and
+    # the helper compares none for a record that names none (Helper.chat_changed).
+    began = standing_text(agent, None, chat_instructions(agent, dict(conf, runtime=runtime)))
+    save_chat_record(agent, {"generation": data["db"], "marker": None, "session": args.session, "started": time.time(),
+                             "text": began, "rules": None}, runtime)
+    print(f"recorded: the next owner chat of {agent} in generation {data['db']} continues conversation {args.session}, "
+          f"while its rules, its instructions and its profile stay as they are now")
 
 
 def ask_permission(path, body, stopped=lambda: False, send=None):
@@ -3234,7 +3275,8 @@ def manager_conversation(agent, runtime, record):
 def manager_start(agent, conf, generation, token, fresh=False):
     """The one decision of both starts of the standing manager session, the helper's own and `fleet.py start`:
     (command, session id, record, note). Each runtime keeps its own record of its conversation (owner feature
-    runtime_switch), so that a switch back continues that runtime's conversation: ~/.fleet/manager-<agent>.claude.json
+    runtime_switch), so that a switch back continues that runtime's conversation, when its rules and its profile are
+    still the ones that it began with: ~/.fleet/manager-<agent>.claude.json
     {generation, session, started, begun}, and ~/.fleet/manager-<agent>.codex.json {generation, marker, session,
     started}. The session id is the window's @fleet_session: Claude's session, or the marker at the end of Codex's
     first prompt, by which the helper finds its thread (session, once known). A recorded conversation of this
@@ -3243,7 +3285,11 @@ def manager_start(agent, conf, generation, token, fresh=False):
     only with no record, with a record of another DB generation, or with a record whose start never began its
     conversation (a Codex record with no thread whose marker no rollout carries, a Claude record with "begun": false
     and no file; note says so), or with fresh: the helper closed the recorded one because it was cold and long
-    (Helper.restart_fresh), and its file stays where it is.
+    (Helper.restart_fresh) or because its tools changed (Helper.restart_for_tools), and its file stays where it is;
+    or with a record whose start text is not the one of a start now (standing_text: a conversation that continues
+    keeps the rules and the profile that it began with). The record of a new conversation keeps that text's hash and
+    the parts of the rules that it began with. A record from before that is continued here, and the helper's round
+    leaves it one time for a new conversation (Helper.manager_text_changed).
     Refused when the record cannot be read or is not valid, or when its conversation file is not found: then nothing
     starts and the record stays, so that the conversation is never replaced without notice. Another runtime starts as
     before and has no record."""
@@ -3253,7 +3299,13 @@ def manager_start(agent, conf, generation, token, fresh=False):
     env = session_env(agent, conf, "manager")
     note = "a new conversation: the recorded one is of another hub database" if record else ""
     if record and record["generation"] == generation and fresh:
-        note = "a new conversation with the hub's brief, in place of the recorded one, which was cold and long"
+        note = ("a new conversation with the hub's brief, in place of the recorded one, which the helper closed "
+                "(it was cold and long, or its tools, its rules or its profile changed)")
+    elif record and record["generation"] == generation and record.get("text") is not None and \
+            record["text"] != standing_text(agent, record.get("rules"), MANAGER_START):
+        # a conversation that continues keeps the start text that it began with (standing_text)
+        note = ("a new conversation with the hub's brief, in place of the recorded one: its rules or its profile "
+                "are not the ones that it began with")
     elif record and record["generation"] == generation:
         window, found = manager_conversation(agent, runtime, record)
         if found:
@@ -3276,8 +3328,10 @@ def manager_start(agent, conf, generation, token, fresh=False):
         new = {"generation": generation, "marker": session, "session": None, "started": time.time()}
     # plan P9.2: a new conversation starts with its rules and profile first, from the answer that gives its brief
     data = hub_opening(agent)
-    prompt = MANAGER_START.format(agent=agent, resume=manager_resume(agent, data))
-    return (session_command(agent, conf, prompt, session=session, token=token, env=env, rules=opening_rules(data)),
+    prompt, rules = MANAGER_START.format(agent=agent, resume=manager_resume(agent, data)), opening_rules(data)
+    if new is not None:     # what this conversation begins with (standing_text): a start after a change leaves it
+        new.update(text=standing_text(agent, rules, MANAGER_START), rules=rules)
+    return (session_command(agent, conf, prompt, session=session, token=token, env=env, rules=rules),
             session, new, note)
 
 
@@ -3677,10 +3731,15 @@ def adopt_manager(agent, conf, session):
     if not claude_chat_file(running):
         raise Refused(f"the conversation {running} of the manager session that runs is not found in this checkout's "
                       f"Claude project folder. Nothing was recorded or changed")
+    began = standing_text(agent, None, MANAGER_START)
     if record and record["generation"] == generation:
+        if record.get("text") is None:      # a record from before the helper kept it: the owner names it now
+            save_chat_record(agent, dict(record, text=began, rules=None), "claude", "manager")
         return f"its conversation {running} is recorded: the next start continues it"
+    # The owner names this conversation as the one to continue, so its record takes the start text of now as the one
+    # that it began with (standing_text): the helper's round leaves a record without one (manager_text_changed).
     save_chat_record(agent, {"generation": generation, "session": running, "started": time.time(), "adopted": True,
-                             "begun": True},
+                             "begun": True, "text": began, "rules": None},
                      "claude", "manager")
     return f"recorded its conversation {running} in {path}: the next start continues it"
 
@@ -4710,9 +4769,36 @@ class Helper:
             self.say_chat(f"its conversation {record.get('session') or record.get('marker')} is not found; a new chat "
                           f"starts with the hub's recap")
             return None
+        changed = self.chat_changed(record)
+        if changed:     # a conversation that continues keeps what it began with (standing_text): this one is left
+            self.say_chat(f"its conversation {thread} is left, because {changed}; a new chat starts with the hub's "
+                          f"recap")
+            self.chat_started = None    # it began: no start of it ended before its conversation (start_chat's count)
+            return None
         if not record.get("session"):
             save_chat_record(self.agent, dict(record, session=thread), runtime)
         return thread
+
+    def chat_changed(self, record):
+        """Why the owner chat's recorded conversation is not continued, or "" when it is: "its tools changed", "its
+        rules, its instructions or its profile changed", or "its record does not say what it began with".
+
+        A conversation that continues keeps what it began with (standing_text), so one whose tools or start text are
+        not the ones of a start now is left for a new one, at each start (chat_resume) and while it runs
+        (restart_chat_for_tools). The tools are not compared with a hub that gives no contract, nor for a record
+        that names none (the owner's own step, cmd_chat_session, which cannot know them). **A record with no
+        start text is from before 13 November 2026, and it is not believed**: until then a chat that started again
+        for new tools continued its conversation, and its helper wrote the new tools into the record of that
+        conversation, which did not have them. So such a conversation is left one time, and the record of the new one
+        says what it began with."""
+        tools = chat_tools(getattr(self, "chat_served", None))
+        if record.get("text") is None:
+            return "its record does not say what it began with"
+        if tools is not None and record.get("tools") is not None and record["tools"] != tools:
+            return "its tools changed"
+        if record["text"] != standing_text(self.agent, record.get("rules"), chat_instructions(self.agent, self.conf)):
+            return "its rules, its instructions or its profile changed"
+        return ""
 
     def say_chat(self, text):
         """A word about the owner chat's record: the same words at most every five minutes, because the event that
@@ -5209,24 +5295,22 @@ class Helper:
         # A chat that continues its conversation keeps its own start; a new one asks the hub once, for the recap and
         # for the parts of the rules that it starts with (plan P9.2).
         data = {} if resume else hub_opening(self.agent)
-        recap = "" if resume else chat_recap(self.agent, data)
+        recap, rules = "" if resume else chat_recap(self.agent, data), opening_rules(data)
         self.start(window, chat_command(self.agent, self.run_conf(), generation, token=token, marker=marker, resume=resume,
-                                        recap=recap, env=session_env(self.agent, self.conf, "chat"),
-                                        rules=opening_rules(data)),
+                                        recap=recap, env=session_env(self.agent, self.conf, "chat"), rules=rules),
                    1, generation)
         self.__dict__.pop("chat_fresh", None)
         self.chat_started = (generation, (last[1] + 1) if resume is None and last and last[0] == generation else 1)
-        # what this start gave it, for the next helper in its record and for this one here (restart_chat_for_tools)
-        tools = self.chat_tools_for = chat_tools(getattr(self, "chat_served", None))
-        if marker:      # Codex finds its thread by the marker later; Claude starts with the marker as session id
+        if marker:
+            # A new conversation: what it began with, for the next helper in its record and for this one here
+            # (chat_changed, restart_chat_for_tools). Codex finds its thread by the marker later; Claude starts with
+            # the marker as session id. A conversation that continues keeps its record: it began with what that says.
+            tools = chat_tools(getattr(self, "chat_served", None))
+            text = standing_text(self.agent, rules, chat_instructions(self.agent, self.conf))
+            self.chat_began, self.chat_rules = (tools, text), rules
             save_chat_record(self.agent, {"generation": generation, "marker": marker if runtime == "codex" else None,
-                                          "session": None if runtime == "codex" else marker,
-                                          "started": time.time(), "tools": tools}, runtime)
-        elif resume:    # the same conversation, with the tools of this start
-            with contextlib.suppress(Refused):
-                record = load_chat_record(self.agent, runtime)
-                if record and record.get("tools") != tools:
-                    save_chat_record(self.agent, dict(record, tools=tools), runtime)
+                                          "session": None if runtime == "codex" else marker, "started": time.time(),
+                                          "tools": tools, "text": text, "rules": rules}, runtime)
         self.say(f"owner-chat: {'conversation ' + resume + ' continued' if resume else 'session started'}"
                  f"{' with the hub\'s recap of this chat' if recap else ''}; agent read and reply are still pending")
 
@@ -5287,26 +5371,35 @@ class Helper:
             return False
 
     def restart_chat_for_tools(self, generation):
-        """True when this closed the owner chat of this generation because its tools changed, so that keep_chat
-        starts it again at once on the same conversation (chat_resume), with the tools that the chat has now.
+        """True when this closed the owner chat of this generation because its tools or its start text changed, so
+        that keep_chat starts it again at once on a NEW conversation, with the hub's recap (chat_resume).
 
-        **A running chat never sees a new tool.** A session gets its tool list once, at its start, and the hub
-        announces no change of it (listChanged false), so a tool that a release gives the chat never reached a chat
-        that ran before it: Mia's chat of 26 October had no start_task on 28 October, and the owner's request there
-        could not open a task. So the record of each start keeps what it started with (chat_tools), and a chat whose
-        record says other tools than the poll's starts again. A record without them is a chat that started before
-        its helper kept them: it starts again too. Never a chat that this helper started with the poll's tools, also
-        when its record could not be written; only between two turns, never while a turn runs or a question waits on
-        its screen; and never a chat without a record of this generation, whose conversation could not be continued."""
+        **A running chat never sees a new tool, and one that continues its conversation never sees a changed one.**
+        A session gets its tool list once, at its start, and the hub announces no change of it (listChanged false),
+        so a tool that a release gives the chat never reached a chat that ran before it: Mia's chat of 26 October had
+        no start_task on 28 October, and the owner's request there could not open a task. So the record of each
+        conversation keeps what it began with, and a chat whose record says other tools than the poll's starts again.
+        Until 13 November 2026 it started again on the same conversation, which gave it a tool with a new name and
+        nothing else: on that day a chat that was started so for a new field of tell_owner sent the old tool
+        definitions and the old start text, and answered by the old rule (standing_text says what a conversation
+        keeps). So the start that follows is a new conversation, and the same holds for a chat whose rules,
+        instructions or profile changed, and one time for a record that does not say what its conversation began
+        with (chat_changed). Never a chat that this helper began with what a start gives now, also when its record
+        could not be written; only between two turns, never while a turn runs or a question waits on its screen; and
+        never a chat without a record of this generation."""
         runtime, target = self.conf.get("runtime"), f"={self.session}:=owner-chat"
         tools = chat_tools(getattr(self, "chat_served", None))
-        if tools is None or runtime not in MANAGER_RUNTIMES or getattr(self, "chat_tools_for", None) == tools:
-            return False                # an older hub, a runtime without records, or this helper started it so
+        if runtime not in MANAGER_RUNTIMES:
+            return False                # a runtime without records
+        text = standing_text(self.agent, self.__dict__.get("chat_rules"), chat_instructions(self.agent, self.conf))
+        if self.__dict__.get("chat_began") == (tools, text):
+            return False                # this helper began it so
         try:
             record = load_chat_record(self.agent, runtime)
         except Refused:
             return False
-        if not record or record.get("generation") != generation or record.get("tools") == tools:
+        changed = self.chat_changed(record) if record and record.get("generation") == generation else ""
+        if not changed:
             return False
         screen = tmux("capture-pane", "-p", "-t", target)
         if screen.returncode != 0 or shows_question(screen.stdout) or \
@@ -5314,7 +5407,7 @@ class Helper:
             return False                # a turn runs, a question waits or it cannot be read: at a later poll
         tmux("kill-window", "-t", target, check=True)
         self.chat_started = None        # a chat closed for its tools is not a start that ended (start_chat)
-        self.say("owner-chat: its tools changed, so it starts again")
+        self.say(f"owner-chat: {changed}, so it starts again on a new conversation")
         return True
 
     def handle(self, ev):
@@ -5727,22 +5820,57 @@ class Helper:
         The owner asked how an agent gets an update of its tools by itself (21 October 2026).
 
         So when the hub says that list is no longer the one it would serve, this closes that session and its own
-        watch starts it again within ten seconds, on the same conversation (`--resume`): the manager is away for
-        the seconds of one restart, and only when there is something new for it to pick up. It waits while a turn
-        is running and while a switch is closing or starting that session, and the hub keeps saying it until the
-        new session has asked for the list."""
-        if self.conf.get("role") != "manager" or not self.lifecycle.tools_changed:
+        watch starts it again within ten seconds, on a NEW conversation with the hub's brief (manager_fresh): the
+        manager is away for the seconds of one restart, and only when there is something new for it to pick up.
+        Until 13 November 2026 it continued the same conversation, which keeps the tool definitions and the start
+        text that it began with (standing_text): a tool with a new name arrived, and a changed one did not. The same
+        restart when its rules or its profile are not the ones that its recorded conversation began with, and one
+        time for a record that does not say what it began with (manager_text_changed). It waits while a turn is
+        running and while a switch is closing or starting that session, and the hub keeps saying it until the new
+        session has asked for the list."""
+        if self.conf.get("role") != "manager":
+            return
+        why = "its team tools changed" if self.lifecycle.tools_changed else self.manager_text_changed()
+        if not why:
             return
         if self.manager_due or self.manager_left or self.manager_retiring is not None or self.outdated():
             return                      # a start or a switch is already going to give it the current list
         target = f"={self.session}:=manager"
-        if self.window_runtime("manager") is None or self.working(target) or self.background_open("manager"):
-            return                      # nothing to close, a turn runs, or a workflow or a command: at a later round
+        # As restart_fresh: never a window of another runtime, which the switch closes with its own care
+        # (retire_old_manager), and never a session with a question on its screen, which a new conversation would
+        # lose (the restart before 13 November 2026 continued the conversation, and the question with it).
+        if self.window_runtime("manager") != self.conf.get("runtime") or self.background_open("manager"):
+            return                      # nothing of this runtime to close, or a workflow or a command: a later round
+        screen = tmux("capture-pane", "-p", "-t", target)
+        if screen.returncode != 0 or shows_question(screen.stdout) or \
+                WORKING.search("\n".join(screen.stdout.rstrip().split("\n")[-15:])):
+            return                      # it cannot be read, a question waits or a turn runs: at a later round
         with contextlib.suppress(subprocess.CalledProcessError, Refused):
             tmux("kill-window", "-t", target)
         self.lifecycle.tools_changed = False
-        self.manager_due = True
-        self.say("manager: its team tools changed, so its session starts again on the same conversation")
+        self.manager_due, self.manager_fresh = True, True
+        self.say(f"manager: {why}, so its session starts again on a new conversation with the hub's brief")
+
+    def manager_text_changed(self):
+        """Why the standing session's recorded conversation is left for a new one, or "": "its rules or its profile
+        changed" when it began with another start text than a start gives now (standing_text), and "its record does
+        not say what it began with" for a record from before 13 November 2026, which is left one time: until then
+        this session continued its conversation over each change of its tools, so nothing says which definitions
+        that conversation has. "" for a record that cannot be read, for no record, and for a runtime without
+        records."""
+        runtime = self.conf.get("runtime")
+        if runtime not in MANAGER_RUNTIMES:
+            return ""
+        try:
+            record = load_chat_record(self.agent, runtime, "manager")
+        except Refused:
+            return ""
+        if not record:
+            return ""
+        if record.get("text") is None:
+            return "its record does not say what it began with"
+        return "" if record["text"] == standing_text(self.agent, record.get("rules"), MANAGER_START) else \
+            "its rules or its profile changed"
 
     def restart_fresh(self, target, window="manager"):
         """True when this closed a standing session -- the manager's, or an owner chat -- so that it starts again on a
@@ -6267,8 +6395,9 @@ class Helper:
     def working(self, target):
         """Both Claude Code and Codex show "esc to interrupt" while a turn runs. A screen that tmux did not give in
         time says nothing, so it counts as a turn that runs: each caller that closes a session, takes an update or
-        counts an interrupt as done when no turn runs waits then (the manager's restart for its tools, a conversation
-        that runs another way now, the previous runtime's chat, the helper's and the runtimes' updates, a Pause)."""
+        counts an interrupt as done when no turn runs waits then (a conversation that runs another way now, the
+        previous runtime's chat, the helper's and the runtimes' updates, a Pause). The manager's restart for its tools
+        reads its screen itself, and waits at a screen that tmux did not give (restart_for_tools)."""
         r = tmux("capture-pane", "-p", "-t", target)
         return r.returncode == 124 or \
             r.returncode == 0 and bool(WORKING.search("\n".join(r.stdout.rstrip().split("\n")[-15:])))
