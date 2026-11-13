@@ -23,6 +23,7 @@ READ_STEP = 8 * 1024 * 1024         # most bytes read from one file in one scan
 BATCH = 100
 BATCH_BYTES = 48 * 1024
 TEXT, THOUGHT, TITLE, OUTPUT, MESSAGE = 4000, 2000, 300, 800, 500
+SAYS = 120                          # what the agent says a command does, for the owner's apps (tool_call "says")
 APP_TEXT = 4000                     # screen_runner.py clips longer text in its record lines
 KINDS = ("read", "edit", "delete", "move", "search", "execute", "think", "fetch", "other")
 STATUSES = ("pending", "in_progress", "completed", "failed")
@@ -706,6 +707,11 @@ class Translator:
             self.delivered = self.delivered or name == "mcp__fleet__deliver_result"
         record = {"type": "tool_call", "tool_call_id": call, "title": clip(f"{label}: {detail}" if detail else label, TITLE),
                   "kind": kind, "status": "in_progress", "server": clip(server, 60) if server else None}
+        # What the agent itself says the command does, in its own plain words (Bash's description): the owner's apps
+        # show it as what the agent does now. The title keeps the command, which a person does not read at a glance.
+        says = first_line(args.get("description")) if name == "Bash" else ""
+        if says:
+            record["says"] = clip(says, SAYS)
         path = args.get("file_path") or args.get("notebook_path") or (args.get("path") if name in ("Grep", "Glob", "LS") else None)
         if isinstance(path, str) and path.strip():
             record["locations"] = [{"path": self.place(path)}]

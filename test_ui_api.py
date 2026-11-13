@@ -409,6 +409,58 @@ class OwnerAPI(unittest.TestCase):
             self.assertNotIn("works", rows[nothing_known])
         self.assertEqual(hub.tasks_at_work(), {running: True, background: True, between: False, asked: False})
 
+    def test_state_says_what_a_running_turn_does_now_in_plain_words(self):
+        """Owner API 1.148: `doing` is on the row of a working task while a turn of its session runs and its turn state
+        has words for its newest tool call. The words are the agent's own line of a command, or fixed plain words;
+        no code of a task or a case is in them, and no model writes them."""
+        def call(title, kind, **more):
+            return dict({"tool_call_id": title, "status": "in_progress", "title": title, "kind": kind, "server": None}, **more)
+        words = hub.doing_words
+        # The agent's own line of a command comes first; a command with none is "Running a command".
+        self.assertEqual(words(call("Bash: curl -s https://api.example.com/health", "execute",
+                                    says="Read live API health and public status")),
+                         "Read live API health and public status")
+        self.assertEqual(words(call("Bash: git fetch -q origin", "execute")), "Running a command")
+        # A tool of the fleet has fixed words with no code; one that the list does not have reads as its name.
+        self.assertEqual(words(call("fleet: read_messages: T-487", "read", server="fleet")), "Reading its messages")
+        self.assertEqual(words(call("fleet: deliver_result: T-485", "other", server="fleet")), "Delivering the result")
+        self.assertEqual(words(call("fleet: see_standing", "read", server="fleet")), "See standing")
+        self.assertEqual(words(call("github: list_issues: acme/web", "read", server="github")), "Using github")
+        # A file by its name without its folder; a search for a tool says nothing to a person.
+        self.assertEqual(words(call("Read: /home/fleet-leo/work/hub.py", "read",
+                                    locations=[{"path": "/home/fleet-leo/work/hub.py"}])), "Reading hub.py")
+        self.assertEqual(words(call("Write: notes.md", "edit", locations=[{"path": "outputs/T-9/notes.md"}])), "Editing notes.md")
+        self.assertEqual(words(call("Grep: def main", "search")), "Searching the files")
+        self.assertEqual(words(call("WebFetch: https://example.com", "fetch")), "Reading a web page")
+        self.assertIsNone(words(call("ToolSearch: select:mcp__fleet__read_messages", "search")))
+
+        # The turn state keeps the words of the newest call of a running turn, and a turn's end takes them away.
+        records = [(1, 10.0, "user_message", {"text": "go"}),
+                   (2, 11.0, "tool_call", call("fleet: read_messages: T-7", "read", server="fleet")),
+                   (3, 12.0, "tool_call", call("ToolSearch: select:x", "search")),
+                   (4, 13.0, "tool_call", call("Bash: npm test", "execute", says="Run the unit tests"))]
+        turn = hub.turn_records(None, "s-1", records[:3], 20.0)
+        self.assertEqual((turn["running"], turn["doing"]), (True, "Reading its messages"))     # a tool search keeps them
+        turn = hub.turn_records(turn, "s-1", records, 20.0)
+        self.assertEqual(turn["doing"], "Run the unit tests")
+        ended = hub.turn_records(turn, "s-1", [(5, 14.0, "result", {"stop_reason": "end_turn"})], 20.0)
+        self.assertEqual((ended["running"], ended["doing"]), (False, None))
+
+        def task(title, state):
+            tid = hub.ins("INSERT INTO tasks(title,owner,state,live_path,attempt) VALUES(?,'vps','working','live session',1)",
+                          (title,))
+            hub.ins("INSERT INTO attempts(task,attempt,created,reason,turn) VALUES(?,1,?,'created',?)",
+                    (tid, hub.now(), json.dumps(state)))
+            return tid
+        runs = task("A turn runs", turn)
+        over = task("Its turn ended", dict(ended, doing="Old words that a turn's end left"))
+        quiet = task("A turn that made no call yet", dict(turn, doing=None))
+        rows = {t["id"]: t for t in self.request()[1]["tasks"]}
+        self.assertEqual((rows[runs]["works"], rows[runs]["doing"]), (True, "Run the unit tests"))
+        self.assertIs(rows[over]["works"], False)
+        self.assertNotIn("doing", rows[over])                   # no turn runs: nothing is done now
+        self.assertNotIn("doing", rows[quiet])
+
     def test_state_names_each_agents_role_in_the_team(self):
         """The owner, 3 November 2026: "a subtitle like their role in the team" under each agent's name: its team.json
         title, or null."""

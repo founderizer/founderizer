@@ -147,6 +147,11 @@ class Translation(unittest.TestCase):
         self.assertEqual(out[0]["ts"], 1791619200.0)
         bash = out[4]
         self.assertEqual((bash["title"], bash["kind"], bash["status"], bash["server"]), ("Bash: pytest -q", "execute", "in_progress", None))
+        # What the agent itself says the command does (Bash's description) goes with the record, for the owner's apps:
+        # the title keeps the command. A command with no description has no such line, and no other tool has one.
+        self.assertEqual(bash["says"], "tests")
+        said = [r for r in out if r["type"] == "tool_call" and "says" in r]
+        self.assertEqual([r["tool_call_id"] for r in said], ["toolu_1"])
         self.assertEqual((out[5]["status"], out[5]["output"], out[5]["interrupted"]), ("completed", "3 passed", False))
         self.assertEqual(out[6]["entries"], [{"content": "Run tests", "status": "completed"},
                                              {"content": "Deliver", "status": "in_progress"}])

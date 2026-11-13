@@ -2373,10 +2373,12 @@ def mobile_state(generation, at=None):
     without it the answer has the time of now."""
     ended = "('completed','failed','rejected','canceled')"
     tasks = [{k: r[k] for k in MOBILE_HEAD} for r in q(f"SELECT * FROM tasks WHERE state NOT IN {ended} ORDER BY id")]
-    at_work = tasks_at_work()               # owner API 1.147: whether each working task's session works on it now
-    for task in tasks:
-        if task["id"] in at_work:
-            task["works"] = at_work[task["id"]]
+    turns = task_turns()                    # owner API 1.147, 1.148: whether each working task's session works on it
+    for task in tasks:                      # now, and what its running turn does
+        if task["id"] in turns:
+            task["works"] = turns[task["id"]]["works"]
+            if turns[task["id"]]["doing"]:
+                task["doing"] = turns[task["id"]]["doing"]
     recent = [{k: r[k] for k in MOBILE_HEAD} for r in q(f"SELECT * FROM tasks WHERE state IN {ended} "
                                                         f"ORDER BY id DESC LIMIT {MOBILE_TASKS}")]
     needs = [need_view(r) for r in q("SELECT * FROM needs WHERE answer IS NULL ORDER BY id")]
@@ -4322,16 +4324,74 @@ def parked_until():
     return out
 
 
-def tasks_at_work():
-    """Owner API 1.147: by task, whether its session works on it now, for each task in state working whose current
-    attempt has a turn record of its helper (plan C1, turn_state). True while a turn of its session runs, or a tool
-    call that it started in the background is open (a command, a monitor, a subagent: each counts until its own end
-    notice). False when its last turn ended and nothing of it runs: the task then waits, for its reminder, for a
-    message or for the hub's next word, whatever its state says. A task whose attempt has no turn yet (its session
-    starts) is not here, and neither is a task of a helper that sends no turn records: nothing is known of them, and
-    an app goes on by the task's state. The apps showed each task in state working as work: on the first fleet, on
-    13 November 2026, 19 tasks were in that state, 12 of them parked on a reminder, and one had work that ran.
-    read_rows: it is read inside the state's own hold of the lock."""
+DOING_TEXT = 120                # characters of what a session does now, for the owner's apps
+# The fleet's own tools in plain words, as the owner reads them in his apps ("you" is the owner). A tool that is not
+# here reads as its name with spaces ("See goals").
+DOING_FLEET = {
+    "read_messages": "Reading its messages", "list_my_tasks": "Reading its tasks",
+    "see_earlier_work": "Reading earlier work", "report_progress": "Writing a progress note",
+    "ask_my_requester": "Asking its requester", "deliver_result": "Delivering the result",
+    "set_reminder": "Setting a reminder", "check_result": "Checking a result", "create_task": "Giving a task",
+    "answer": "Answering a question", "see_team": "Reading its team", "see_capacity": "Reading who can take work",
+    "read_knowledge": "Reading a knowledge file", "search_knowledge": "Searching the knowledge files",
+    "write_knowledge": "Writing a knowledge file", "raise_needs_you": "Asking you",
+    "request_secret": "Asking you for a key", "start_task": "Starting a task", "tell_owner": "Writing to you",
+    "message_owner": "Writing to you", "message_agent": "Writing to a colleague",
+    "message_contact": "Writing to a person", "see_responsibilities": "Reading its duties",
+    "open_case": "Opening a case", "record_step": "Recording a step", "close_case": "Closing a case",
+    "see_notes": "Reading its notes", "write_notes": "Writing its notes", "remember": "Saving a lesson",
+    "recall": "Reading its lessons", "search_history": "Searching its history", "read_history": "Reading its history",
+    "report_up": "Reporting to its line", "write_skill": "Writing a skill", "read_attachment": "Reading a file",
+    "see_goals": "Reading the goals", "update_goal": "Updating a goal", "see_triggers": "Reading the wake-up rules",
+    "save_trigger": "Saving a wake-up rule", "sign_in": "Signing in", "call_api": "Calling an API",
+    "repo_read": "Reading a repository", "repo_search": "Searching a repository", "repo_change": "Changing a repository",
+    "gmail_search": "Searching the mail", "gmail_read": "Reading a mail", "gmail_send": "Sending a mail",
+    "drive_search": "Searching the Drive", "drive_read": "Reading a Drive file", "drive_write": "Writing a Drive file",
+}
+
+
+def doing_words(call):
+    """Owner API 1.148: what one tool call does, in plain words that the owner's apps show as what its session does
+    now, or None for a call that says nothing to a person (a search for a tool). The agent's own line of a command
+    comes first (`says`: Claude Code's description of a shell command, which the helper keeps since this version).
+    Then fixed words: for a tool of the fleet its line of DOING_FLEET, with no task, case or message code in it; for
+    another MCP server its name; for a file its name without its folder. No model writes any of it, and no text of
+    the call's output is in it. `call` is a cleaned tool_call record (clean_record)."""
+    if call.get("says"):
+        return call["says"]
+    parts = (call.get("title") or "").split(": ")
+    label, kind, server = parts[0], call.get("kind"), call.get("server")
+    if server == "fleet":
+        tool = parts[1] if len(parts) > 1 else ""
+        return DOING_FLEET.get(tool) or (tool.replace("_", " ").capitalize() if tool else "Using a fleet tool")
+    if server:
+        return f"Using {server}"
+    if label == "ToolSearch":
+        return None
+    if call.get("subagent"):
+        return "Working with a subagent"
+    paths = call.get("locations") or []
+    name = os.path.basename(str(paths[0].get("path") or "").rstrip("/")) if paths else ""
+    words = {"read": ("Reading", "a file"), "edit": ("Editing", "a file"), "delete": ("Deleting", "a file"),
+             "move": ("Moving", "a file")}.get(kind)
+    if words:
+        return cut_whole(f"{words[0]} {name or words[1]}", DOING_TEXT)
+    return {"search": "Searching the web" if label in ("WebSearch", "web_search") else "Searching the files",
+            "execute": "Running a command", "fetch": "Reading a web page"}.get(kind)
+
+
+def task_turns():
+    """Owner API 1.147 and 1.148: by task, what the hub knows of the session of each task in state working whose
+    current attempt has a turn record of its helper (plan C1, turn_state): {"works", "doing"}.
+    works: True while a turn of its session runs, or a tool call that it started in the background is open (a command,
+    a monitor, a subagent: each counts until its own end notice). False when its last turn ended and nothing of it
+    runs: the task then waits, for its reminder, for a message or for the hub's next word, whatever its state says.
+    doing: what its running turn does now, in plain words (doing_words of its newest tool call), or None: no turn runs,
+    or its turn has made no call that says something yet.
+    A task whose attempt has no turn yet (its session starts) is not here, and neither is a task of a helper that sends
+    no turn records: nothing is known of them, and an app goes on by the task's state. The apps showed each task in
+    state working as work: on the first fleet, on 13 November 2026, 19 tasks were in that state, 12 of them parked on
+    a reminder, and one had work that ran. read_rows: it is read inside the state's own hold of the lock."""
     out = {}
     for r in read_rows("SELECT a.task, a.turn FROM attempts a JOIN tasks t ON t.id=a.task AND t.attempt=a.attempt "
                        "WHERE t.state='working' AND a.turn IS NOT NULL"):
@@ -4341,8 +4401,14 @@ def tasks_at_work():
             continue
         busy = bool(state.get("running")) or any(len(c) > 2 and c[2] for c in (state.get("calls") or {}).values())
         if busy or state.get("turns"):
-            out[r["task"]] = busy
+            doing = state.get("doing") if state.get("running") else None
+            out[r["task"]] = {"works": busy, "doing": doing if isinstance(doing, str) and doing.strip() else None}
     return out
+
+
+def tasks_at_work():
+    """By task, whether its session works on it now (task_turns "works")."""
+    return {task: turn["works"] for task, turn in task_turns().items()}
 
 
 PRESENCE_SAME = 10              # seconds two pings may disagree about a step's start and still be the same step
@@ -4577,18 +4643,19 @@ def turn_records(state, session, records, t0):
     the main session, and its calls are open calls like any other."""
     if not state or state.get("session") != session:
         state = {"session": session, "seq": 0, "turns": 0, "running": False, "how": None, "at": None, "calls": {},
-                 "said": None}
+                 "said": None, "doing": None}
     state = json.loads(json.dumps(state))       # a new state: the caller compares it with the one it read
     for seq, ts, kind, data in records:
         if seq <= state["seq"]:
             continue
         state["seq"], at, main = seq, ts or t0, "parent" not in data
         if kind == "result" and main:
-            state.update(turns=state["turns"] + 1, running=False, how=data["stop_reason"], at=at)
+            state.update(turns=state["turns"] + 1, running=False, how=data["stop_reason"], at=at, doing=None)
         elif kind not in ("session", "model", "error", "result") and main and not state["running"]:
             state.update(running=True, how=None, at=at)         # the first record of a new turn
         if kind == "tool_call":
             state["calls"][data["tool_call_id"]] = [data.get("title"), at, False]
+            state["doing"] = doing_words(data) or state.get("doing")    # owner API 1.148: what the session does now
         elif kind == "tool_call_update" and data["status"] in ("completed", "failed"):
             state["calls"].pop(data["tool_call_id"], None)
         elif kind == "tool_call_update" and data.get("background"):
@@ -32756,6 +32823,8 @@ def clean_record(e):
                                 for c in changes[:50]]
             if isinstance(e.get("subagent"), dict) and isinstance(e["subagent"].get("name"), str):
                 d["subagent"] = {"name": text_field(e["subagent"]["name"], 100, False, sent_cut=True)}
+            if isinstance(e.get("says"), str) and e["says"].strip():   # owner API 1.148: the agent's own line of it
+                d["says"] = text_field(e["says"], DOING_TEXT, False, sent_cut=True)
         else:
             d["interrupted"] = e.get("interrupted") is True
             if e.get("background") is True:     # plan C1: it runs on after its result, until its own end notice
@@ -43187,7 +43256,7 @@ class Handler(BaseHTTPRequestHandler):
                                                           "ON e.id=s.event_id ORDER BY s.id")]
             result["secrets"] = [dict(r) for r in q("SELECT id,COALESCE(label,'Registered login') AS label FROM secrets ORDER BY id")]
             parks = parked_until()
-            at_work = tasks_at_work()
+            turns = task_turns()
         # A row holds its own values, so this needs no lock. On the first fleet the tasks were 977 KB of the state's
         # 1.70 MB, and in a copy of its database making their rows into dicts took 2.1 ms of each read's hold of the
         # lock (10 November 2026).
@@ -43196,8 +43265,10 @@ class Handler(BaseHTTPRequestHandler):
         for task in result["tasks"]:            # owner API 1.117: until when its agent parked it, on that task only
             if task["id"] in parks:
                 task["parked_until"] = parks[task["id"]]
-            if task["id"] in at_work:           # owner API 1.147: whether its session works on it now
-                task["works"] = at_work[task["id"]]
+            if task["id"] in turns:             # owner API 1.147, 1.148: whether its session works on it now, and
+                task["works"] = turns[task["id"]]["works"]      # what its running turn does
+                if turns[task["id"]]["doing"]:
+                    task["doing"] = turns[task["id"]]["doing"]
         # The needs, the messages, the reports and the duties from the rows read in the lock, after it too: with the
         # rows that they were given, these views read nothing themselves (11 November 2026).
         result["needs"] = [need_view(r, needs_read) for r in needs]
