@@ -568,6 +568,47 @@ class Devices(OwnerAPI):
                          {"manager": hub.MASK, "leo": hub.MASK, "mia": clean[:cut]})
         self.assertNotIn(password[:6], json.dumps(state))
 
+    def test_the_phones_list_knows_since_when_a_chat_waits_for_its_answer(self):
+        """Owner feature chat_waits (UI-API.md 1.142): agents[].waits_since is the time of the owner's newest chat
+        message to an agent that waits for its answer, by the apps' rule for "Thinking". The phone's list of chats had
+        only each conversation's last line, so it could say "Thinking" only for a chat that the phone itself had read."""
+        hub.TEAM["addresses"]["w1"] = "127.0.0.3"
+        hub.TEAM["agents"]["leo"] = {"role": "worker", "runtime": "claude", "machine": "w1", "can": []}
+
+        def waits():
+            state = self.call("/ui/mobile")[1]
+            self.assertIn("chat_waits", state["ui_features"])
+            return {a["name"]: a["waits_since"] for a in state["agents"]}
+
+        def says(agent, at, kind="message"):
+            rid = str(uuid.uuid4())
+            hub.ins("INSERT INTO ui_requests(request_id,kind,text,event_id,created,client,recipient) "
+                    "VALUES(?,?,'Is it live?',?,?,'deterministic-test',?)",
+                    (rid, kind, hub.emit(agent, "chat", "Is it live?"), at, agent))
+            return rid
+
+        def reports(agent, at, reply=None, pushed=0):
+            hub.ins("INSERT INTO owner_reports(text,about,created,agent,in_reply_to,pushed) VALUES('Yes.','',?,?,?,?)",
+                    (at, agent, reply, pushed))
+
+        self.assertEqual(waits(), {"manager": None, "leo": None})          # no message yet
+        first = says("leo", 100.0)
+        self.assertEqual(waits(), {"manager": None, "leo": 100.0})         # his message waits
+        reports("leo", 101.0, pushed=1)
+        self.assertEqual(waits()["leo"], 100.0)                            # a report that the agent wrote first is no reply
+        reports("leo", 102.0, reply=first)
+        self.assertIsNone(waits()["leo"])                                  # a report that names it answers it
+        second = says("leo", 103.0)
+        self.assertEqual(waits()["leo"], 103.0)                            # a reply to an older message answers no newer one
+        says("leo", 104.0, kind="answer")
+        self.assertEqual(waits()["leo"], 103.0)                            # an answer to a Needs-you item is no message that waits
+        reports("leo", 105.0)
+        self.assertIsNone(waits()["leo"])                                  # the agent wrote since, with no name: nothing is known
+        says("manager", 106.0)
+        reports("manager", 105.5)
+        self.assertEqual(waits(), {"manager": 106.0, "leo": None})         # what it wrote before the message says nothing
+        self.assertTrue(second)
+
 
 def register(secret, salt):
     hub.ins("INSERT INTO secrets(label,salt,hash,len,username) VALUES(?,?,?,?,?)",

@@ -1382,7 +1382,10 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # GET /ui/secrets/same (UI-API.md 1.129)
                "default_models",    # the owner, 9 November 2026: "a default for each [AI provider] somewhere under
                                     # settings, and then each agent can be changed individually"
-               "web_hosts"]         # the host list of an agent whose Shell box is off (UI-API.md, "the host list")
+               "web_hosts",         # the host list of an agent whose Shell box is off (UI-API.md, "the host list")
+               "chat_waits"]        # the owner, 13 November 2026 ("Yes, fix it"): the phone's list of chats says
+                                    # "Thinking" for every conversation, from agents[].waits_since of GET /ui/mobile
+                                    # (UI-API.md 1.142)
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -2288,6 +2291,23 @@ def check_need_options(given):
     return json.dumps(out)
 
 
+def chat_waits_since(name):
+    """When the owner sent the newest chat message to this agent that still waits for its answer (owner feature
+    chat_waits), or None. It is the apps' own rule for the line "Thinking" under that message, on the rows that the
+    phone's list of chats does not read: the message is the newest of kind message (an answer to a Needs-you item is
+    none: its card shows it), no report of the agent names it, and the agent has written no report without a name at
+    or after it. A report that the agent wrote first (pushed, message_owner) is no reply. The end of a turn is not in
+    it: turn_ended_after says that, and the app puts the two together."""
+    asked = q1("SELECT request_id, created FROM ui_requests WHERE recipient=? AND kind='message' "
+               "ORDER BY created DESC, rowid DESC LIMIT 1", (name,))
+    if not asked:
+        return None
+    said = q1("SELECT 1 FROM owner_reports WHERE agent=? AND pushed=0 AND "
+              "(in_reply_to=? OR (in_reply_to IS NULL AND created>=?)) LIMIT 1",
+              (name, asked["request_id"], asked["created"]))
+    return None if said else asked["created"]
+
+
 def mobile_agent(name, config):
     """One agent for the phone: what its row, its chat header and its page show, without the whole usage record.
     `machine` is the server it runs on (its team.json `machine`), which its page names under Runs on. The preview of
@@ -2308,7 +2328,7 @@ def mobile_agent(name, config):
             "open_tasks": q1("SELECT COUNT(*) n FROM tasks WHERE owner=? AND state NOT IN "
                              "('completed','failed','rejected','canceled')", (name,))["n"],
             "limit": dict(since=lim["since"], until=lim["until"], reset_known=bool(lim["reset_known"])) if lim else None,
-            "usage": windows, "turn_ended_after": turn_ended_after(name),
+            "usage": windows, "turn_ended_after": turn_ended_after(name), "waits_since": chat_waits_since(name),
             "last": {"ts": last["created"], "side": last["side"], "preview": last["text"] or ""} if last else None}
 
 
