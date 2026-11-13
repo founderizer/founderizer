@@ -1122,6 +1122,10 @@ class ChatApps(OwnerAPI):
             {"id": "gone", "state": "connected"}]})
         self.assertEqual((code, data), (200, {"db": "test-generation", "ok": True}))
         self.assertEqual(self.bridge("/bridge/status", {"accounts": [{"id": "x", "state": "fine"}]})[0], 400)
+        self.assertIsNone(hub.kv_get("bridge_code"), "a bridge from before its own code check sends none")
+        self.assertEqual(self.bridge("/bridge/status", {"accounts": [], "code": "c0de" * 16})[0], 200)
+        self.assertEqual(hub.kv_get("bridge_code"), "c0de" * 16)
+        self.assertEqual(self.bridge("/bridge/status", {"accounts": [], "code": "old"})[0], 400)
         self.assertEqual(self.bridge("/bridge/status", {"accounts": [{"id": "discord-studio", "state": "connected",
                                                                       "application_id": "1&x=2"}]})[0], 400)
         discord, wa = self.request("/ui/chat-apps?db=test-generation")[1]["accounts"]

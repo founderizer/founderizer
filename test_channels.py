@@ -321,6 +321,7 @@ class FakeHub:
         self.calls, self.inbound, self.posted, self.journaled, self.forced = [], [], [], [], []
         self.seen, self.items, self.results = set(), [], {}
         self.receipts, self.statuses, self.links = [], [], []
+        self.bridge_code = None
         self.server = serve(HubHandler, self)
         self.port = self.server.server_address[1]
         self.url = "http://127.0.0.1:%d" % self.port
@@ -359,6 +360,7 @@ class FakeHub:
                 self.receipts.append(body)
             elif path == "/bridge/status":
                 self.statuses.append(body["accounts"])
+                self.bridge_code = body.get("code")
             elif path == "/bridge/link":
                 self.links.append(body)
             else:
@@ -1032,6 +1034,7 @@ class WhatsAppTests(Base):
             self.start()
             state = self.wait_for(lambda: self.has_state("whatsapp-main", "error"), "the error state")[-1]
         self.assertEqual(state["error"], "wa-link is not installed on the hub machine.")
+        self.assertEqual(self.hub.bridge_code, channels.own_code(), "each status report carries the bridge's code")
         self.hub.queue({"id": 91, "kind": "message", "account": "whatsapp-main", "chat": WA_CHAT, "text": "x",
                         "reply_to": None, "prefix": None})
         self.assertEqual(self.result(91)["error"], "WhatsApp is not linked.")

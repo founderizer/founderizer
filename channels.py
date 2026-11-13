@@ -1385,6 +1385,7 @@ class Bridge:
         self.inbound_due = threading.Event()
         self.status_due = threading.Event()
         self.reports = queue.Queue()
+        self.code = own_code()      # the code this bridge runs; each status report carries it
 
     def start(self):
         for target in (self.inbound_loop, self.out_loop, self.status_loop, self.report_loop):
@@ -1558,7 +1559,7 @@ class Bridge:
                 return
             with self.lock:
                 accounts = [dict(s) for s in self.states.values()]
-            code, _ = self.hub.call("POST", "/bridge/status", {"accounts": accounts})
+            code, _ = self.hub.call("POST", "/bridge/status", {"accounts": accounts, "code": self.code})
             if code == 200:
                 backoff.reset()
             else:
@@ -1597,7 +1598,7 @@ def main(argv=None):
         signal.signal(sig, lambda *_: bridge.stopping.set())
     log(f"bridge started; hub {hub}; journal holds {len(bridge.journal.pending())} event(s)")
     bridge.start()
-    code, looked = own_code(), time.monotonic()
+    code, looked = bridge.code, time.monotonic()
     while not bridge.stopping.wait(1):
         if time.monotonic() - looked >= CODE_CHECK:
             looked = time.monotonic()

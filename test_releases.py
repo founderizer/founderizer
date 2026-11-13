@@ -1754,6 +1754,32 @@ class HubUpdates(Repositories, HubRoutes):
         self.assertIsNone(hub.restart_hub_soon(self.pinned, "0" * 40))
         time.sleep(hub.RESTART_DELAY + 0.5)         # the restart threads of this test end before the database does
 
+    def test_the_hub_restart_takes_an_old_bridge_to_the_new_code_until_the_bridge_sends_its_code(self):
+        """A bridge from before its own code check runs the code it started with until its server restarts, so the
+        hub's restart for a release restarts it first. Once a bridge sends its code, it restarts by itself, and the
+        hub's restart leaves it alone. A fleet with its own restart command (here every test's "true") gets neither."""
+        ran, real = [], subprocess.run
+
+        def run(argv, *args, **how):
+            if argv in (hub.BRIDGE_RESTART, hub.HUB_RESTART):
+                ran.append(argv)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return real(argv, *args, **how)
+
+        def restart():
+            ran.clear()
+            hub.restart_hub_soon(None, None, always=True)
+            for thread in threading.enumerate():
+                if thread.name == "release-restart":
+                    thread.join(5)
+            return list(ran)
+        with patch.object(hub, "RESTART_DELAY", 0), patch.object(hub.subprocess, "run", run):
+            self.assertEqual(restart(), [])
+            hub.CFG.pop("hub_restart")
+            self.assertEqual(restart(), [hub.BRIDGE_RESTART, hub.HUB_RESTART])
+            hub.kv_set("bridge_code", "c0de" * 16)
+            self.assertEqual(restart(), [hub.HUB_RESTART])
+
     def test_a_fleet_whose_file_carries_both_keys_takes_a_release_signed_with_the_new_one(self):
         """The hub hands the whole set to the check, so the second step of a rotation works end to end: this fleet
         took the release that added the next key, and the release after it is signed with that key alone."""

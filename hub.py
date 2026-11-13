@@ -906,7 +906,7 @@ def kv_get(k, default=None):
 
 
 # Times the hub keeps for itself, which no screen of the owner's shows: their writes are quiet (live_changes).
-QUIET_KEYS = ("tick_ok", "releases_swept", "bridge_seen")
+QUIET_KEYS = ("tick_ok", "releases_swept", "bridge_seen", "bridge_code")
 
 
 def kv_set(k, v):
@@ -40322,6 +40322,7 @@ RELEASE_ROWS = 10               # releases the app reads at once, newest first
 RELEASE_WALK = 50               # releases one poll goes back from the newest to the one this fleet can take
 RESTART_DELAY = 2               # seconds before the hub restarts itself, so this run's row is written first
 HUB_RESTART = ["systemctl", "--user", "restart", "fleet-hub"]       # CFG["hub_restart"] = [] turns it off
+BRIDGE_RESTART = ["systemctl", "--user", "try-restart", "fleet-channels"]     # an old bridge, with the hub
 # "verified" and "held" are a release this fleet knows about; "updating" is a run going on; the four of
 # releases.STATES are what a finished run came to.
 RELEASE_STATES = ("verified", "held", "updating") + releases.STATES
@@ -40877,9 +40878,16 @@ def restart_hub_soon(pinned, reached, always=False):
     argv = CFG.get("hub_restart", HUB_RESTART)
     if not argv:
         return None
+    # A bridge that never sent its code (POST /bridge/status) is older than its own code check, so it runs the code it
+    # started with until its server restarts. The hub's own restart takes it to the new code first, once: a bridge
+    # that sends its code restarts by itself from then on.
+    old_bridge = argv == HUB_RESTART and not kv_get("bridge_code")
 
     def run():
         time.sleep(RESTART_DELAY)        # this run's row and the owner's answer are written before the process goes
+        if old_bridge:
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                subprocess.run(BRIDGE_RESTART, capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
         try:
             done = subprocess.run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
             code, says = done.returncode, (done.stderr or done.stdout or "").strip()
@@ -46006,7 +46014,9 @@ class Handler(BaseHTTPRequestHandler):
         data = self.bridge_body()
         if data is None:
             return
-        db, rows = kv_get("db_id"), data.get("accounts")
+        db, rows, code = kv_get("db_id"), data.get("accounts"), data.get("code")
+        if code is not None and not (isinstance(code, str) and re.fullmatch(r"[0-9a-f]{64}", code)):
+            return self.json(400, {"db": db, "error": "code must be the SHA-256 of the bridge's code"})
 
         def text(v):
             return v is None or (isinstance(v, str) and len(v) <= 300)
@@ -46018,6 +46028,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(400, {"db": db, "error": "accounts must be a list of {id, state, user, name, application_id, "
                                                       "error}"})
         with LOCK:
+            if code:        # a bridge that sends it restarts by itself when a release changes its code
+                kv_set("bridge_code", code)
             t0 = now()
             fields = ("state", "user", "name", "application_id", "error")
             known = {r["account"]: tuple(r[k] for k in fields) for r in q("SELECT * FROM chat_status")}
