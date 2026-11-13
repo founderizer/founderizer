@@ -408,6 +408,60 @@ class Devices(OwnerAPI):
             self.assertEqual((status, got["device"], got["label"]), (200, "iphone-2", "iPhone 2"), got)
             self.assertEqual(hub.TEAM["owner_devices"]["iphone-2"], {"label": "iPhone 2", "address": OTHER})
 
+    def test_a_pc_enrolls_as_pc_and_its_messages_say_via_windows(self):
+        """Owner API 1.149: the app sends its kind at its enrollment. A PC is "PC" where a phone is "iPhone", its
+        message says via=Windows, and a device that names no kind stays an iPhone, as every phone of before the kind."""
+        text = lambda receipt: hub.q1("SELECT text FROM events WHERE id=?", (receipt["event_id"],))["text"]
+        with self.team_saves({}):
+            status, got = self.call("/ui/owner/enroll", {"code": self.new_code()[1]["code"], "kind": "windows"},
+                                    source=PHONE)
+            self.assertEqual((status, got["device"], got["label"]), (200, "pc", "PC"), got)
+            self.assertEqual(hub.TEAM["owner_devices"], {"pc": {"label": "PC", "address": PHONE}})
+            pc = got["key"]
+            status, second = self.call("/ui/owner/enroll", {"code": self.new_code()[1]["code"], "kind": "windows"},
+                                       source=OTHER)
+            self.assertEqual((status, second["device"], second["label"]), (200, "pc-2", "PC 2"), second)
+            status, said = self.call("/ui/messages", self.command(text="A goal from the PC"), source=PHONE, token=pc)
+            self.assertEqual((status, text(said)), (200, "[owner via Windows] A goal from the PC"), said)
+            hub.TEAM["addresses"]["dev-host"] = "127.0.0.9"
+            hub.TEAM["agents"]["dev-lead"] = {"role": "worker", "runtime": "claude", "machine": "dev-host", "can": []}
+            body = self.command(recipient="dev-lead", text="Look at the build")
+            status, worker = self.call("/ui/messages", body, source=PHONE, token=pc)
+            self.assertEqual(text(worker), f"[owner chat request_id={body['request_id']} via=Windows] Look at the build")
+            rows = {d["device"]: d for d in self.call("/ui/owner/devices")[1]["devices"]}
+            self.assertEqual((rows["pc"]["kind"], rows["pc-2"]["kind"]), ("windows", "windows"))
+        # A phone that names no kind: "iPhone", via=iPhone, and the kind iphone in the Mac's list.
+        hub.TEAM["owner_devices"] = {"iphone": {"label": "iPhone", "address": OTHER}}
+        self.code()
+        self.assertIsNone(self.call("/ui/owner/devices")[1]["devices"][0]["kind"], "no key, no kind")
+        phone = self.enrolled(source=OTHER)
+        status, said = self.call("/ui/messages", self.command(text="A goal from the phone"), source=OTHER, token=phone)
+        self.assertEqual((status, text(said)), (200, "[owner via iPhone] A goal from the phone"), said)
+        self.assertEqual(self.call("/ui/owner/devices")[1]["devices"][0]["kind"], "iphone")
+        # A key of before the kind (its row has none) is an iPhone's.
+        hub.q("UPDATE owner_devices SET kind=NULL WHERE device='iphone'")
+        self.assertEqual((hub.owner_device_class("iphone"), hub.owner_device_class(None)), ("iPhone", None))
+        self.assertEqual(self.call("/ui/owner/devices")[1]["devices"][0]["kind"], "iphone")
+        # The same device takes a new key as a PC: the kind is the newest enrollment's.
+        status, made = self.code()
+        status, got = self.call("/ui/owner/enroll", {"code": made["code"], "kind": "windows"}, source=OTHER)
+        self.assertEqual((status, got["label"], hub.owner_device_class("iphone")), (200, "iPhone", "Windows"), got)
+        # A database of before the kind gets the column from migrate, and its keys are iPhones'.
+        hub.q("ALTER TABLE owner_devices DROP COLUMN kind")
+        self.assertEqual(hub.migrate(), [])
+        self.assertEqual(hub.owner_device_class("iphone"), "iPhone")
+
+    def test_an_unknown_kind_is_refused_and_burns_no_code(self):
+        with self.team_saves({}):
+            made = self.new_code()[1]
+            for kind in ("android", "", 1, "Windows", ["windows"], {"kind": "windows"}):
+                with self.subTest(kind=kind):
+                    status, body = self.call("/ui/owner/enroll", {"code": made["code"], "kind": kind}, source=PHONE)
+                    self.assertEqual((status, body["error"]), (400, "kind is iphone or windows"), body)
+            self.assertEqual(hub.TEAM["owner_devices"], {})
+            status, got = self.call("/ui/owner/enroll", {"code": made["code"], "kind": "iphone"}, source=PHONE)
+            self.assertEqual((status, got["device"], got["label"]), (200, "iphone", "iPhone"), got)
+
     def test_no_machine_of_the_fleet_becomes_a_device_and_the_code_stays_open(self):
         with self.team_saves({}):
             made = self.new_code()[1]

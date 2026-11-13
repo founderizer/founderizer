@@ -426,8 +426,9 @@ CREATE TABLE IF NOT EXISTS door_copies(id INTEGER PRIMARY KEY, login TEXT NOT NU
 -- only because the owner's own step did not come in time, which the app does not show as a failure.
 CREATE TABLE IF NOT EXISTS signin_jobs(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, runtime TEXT NOT NULL,
   state TEXT NOT NULL, detail TEXT, created REAL NOT NULL, updated REAL NOT NULL, timed_out INTEGER);
+-- kind: the kind of app that took the device's key (OWNER_DEVICE_KINDS), NULL for an iPhone from before the kind.
 CREATE TABLE IF NOT EXISTS owner_devices(device TEXT PRIMARY KEY, sha256 TEXT NOT NULL, created REAL NOT NULL,
-  last_seen REAL);
+  last_seen REAL, kind TEXT);
 CREATE TABLE IF NOT EXISTS owner_device_codes(id INTEGER PRIMARY KEY, device TEXT NOT NULL, sha256 TEXT NOT NULL,
   created REAL NOT NULL, expires REAL NOT NULL, used REAL);
 CREATE TABLE IF NOT EXISTS owner_device_tries(id INTEGER PRIMARY KEY, device TEXT NOT NULL, ts REAL NOT NULL);
@@ -1452,9 +1453,36 @@ def owner_device_at(address):
     return next((name for name, d in sorted(owner_devices().items()) if d.get("address") == address), None)
 
 
-# The class of an enrolled owner device in the header of an owner message (T3 Code idea 5): every device that the hub
-# enrolls is an iPhone (enroll_new_device). Only the class goes to the agent, never the device's name or a client id.
+# The class of an enrolled owner device in the header of an owner message (T3 Code idea 5). Only the class goes to the
+# agent, never the device's name or a client id.
 OWNER_DEVICE_VIA = "iPhone"
+
+# The kinds of owner device (owner API 1.149, the plan of the Windows app, section 5): the app sends its kind at its
+# enrollment, and a device with none is an iPhone, so the phones and the App Store build of before the kind change
+# nothing. Each kind: the name and the label that the hub gives a new device of it in team.json (enroll_new_device),
+# and the class that the header of its messages says (owner_message_text).
+OWNER_DEVICE_KINDS = {"iphone": {"name": "iphone", "label": "iPhone", "via": OWNER_DEVICE_VIA},
+                      "windows": {"name": "pc", "label": "PC", "via": "Windows"}}
+
+
+def device_kind(form):
+    """The kind that an enrollment names, "iphone" when it names none. Checked before the code, so that a wrong kind
+    burns no code."""
+    kind = form.get("kind")
+    if kind is None:
+        return "iphone"
+    if not isinstance(kind, str) or kind not in OWNER_DEVICE_KINDS:
+        raise Refusal(400, "kind is " + " or ".join(sorted(OWNER_DEVICE_KINDS)))
+    return kind
+
+
+def owner_device_class(device):
+    """The class of an enrolled owner device for the header of its messages ("iPhone", "Windows"), or None when
+    device is None. A device whose key came before the kind is an iPhone."""
+    if device is None:
+        return None
+    row = q1("SELECT kind FROM owner_devices WHERE device=?", (device,))
+    return OWNER_DEVICE_KINDS.get((row["kind"] if row else None) or "iphone", OWNER_DEVICE_KINDS["iphone"])["via"]
 
 
 def owner_device_key(device):
@@ -1583,11 +1611,11 @@ def phone_signed(device, statement, signature):
     return bool(row) and owner_signed({"owner_keys": [row["key"]]}, statement, signature)
 
 
-def enroll_device(device, code, signing=None):
+def enroll_device(device, code, signing=None, kind="iphone"):
     """POST /ui/owner/enroll, from the device's own address: one unused code gives one key, once. The hub keeps only
     the SHA-256, and a new key replaces the device's old one. A lost answer burns the code: make another one. A phone's
     own signing key (device_signing) replaces its old one, which loses its certificate; an enrollment with none drops
-    it."""
+    it. kind (device_kind): the kind of app that takes the key, which the header of its messages says."""
     raw = re.sub(r"[^A-Z0-9]", "", code.upper()) if isinstance(code, str) else ""
     t0, key = now(), None
     if q1("SELECT COUNT(*) n FROM owner_device_tries WHERE device=? AND ts>?", (device, t0 - 3600))["n"] >= DEVICE_TRIES:
@@ -1598,9 +1626,10 @@ def enroll_device(device, code, signing=None):
         if row:
             key = secrets.token_urlsafe(32)
             DB.execute("UPDATE owner_device_codes SET used=? WHERE id=?", (t0, row["id"]))
-            DB.execute("INSERT INTO owner_devices(device,sha256,created,last_seen) VALUES(?,?,?,NULL) "
+            DB.execute("INSERT INTO owner_devices(device,sha256,created,last_seen,kind) VALUES(?,?,?,NULL,?) "
                        "ON CONFLICT(device) DO UPDATE SET sha256=excluded.sha256, created=excluded.created, "
-                       "last_seen=NULL", (device, hashlib.sha256(key.encode()).hexdigest(), t0))
+                       "last_seen=NULL, kind=excluded.kind", (device, hashlib.sha256(key.encode()).hexdigest(), t0,
+                                                              kind))
             DB.execute("DELETE FROM owner_device_tries WHERE device=?", (device,))
             if signing:
                 DB.execute("INSERT INTO owner_device_signing(device,key,binding,created,recovery_key,recovery_binding) "
@@ -1619,10 +1648,10 @@ def enroll_device(device, code, signing=None):
     return {"device": device, "label": owner_devices()[device]["label"], "key": key, "since": t0}
 
 
-def enroll_new_device(address, code, signing=None):
+def enroll_new_device(address, code, signing=None, kind="iphone"):
     """POST /ui/owner/enroll from an address that no owner device has (device_by_code): the open code for a new phone
     adds it to team.json as "iPhone" (then "iPhone 2", ...) with the address it calls from, and then gives its key as
-    enroll_device does. validate_team refuses the address of a machine of the fleet, so no agent's machine becomes an
+    enroll_device does. A PC (kind windows, owner API 1.149) is added as "PC" (then "PC 2", ...) in the same way. validate_team refuses the address of a machine of the fleet, so no agent's machine becomes an
     owner device; a refusal leaves the code open. Wrong codes count against the address, five in an hour. Run under
     LOCK: the team.json write and the code are one step."""
     raw = re.sub(r"[^A-Z0-9]", "", code.upper()) if isinstance(code, str) else ""
@@ -1634,10 +1663,11 @@ def enroll_new_device(address, code, signing=None):
     if not row:
         ins("INSERT INTO owner_device_tries(device,ts) VALUES(?,?)", (tries, t0))
         raise Refusal(403, f"{address} is not an owner device, and that is not a code for a new one")
-    taken, number = owner_devices(), 1
-    while ("iphone" if number == 1 else f"iphone-{number}") in taken:
+    taken, number, named = owner_devices(), 1, OWNER_DEVICE_KINDS[kind]
+    while (named["name"] if number == 1 else f"{named['name']}-{number}") in taken:
         number += 1
-    device, label = ("iphone", "iPhone") if number == 1 else (f"iphone-{number}", f"iPhone {number}")
+    device, label = (named["name"], named["label"]) if number == 1 else \
+        (f"{named['name']}-{number}", f"{named['label']} {number}")
 
     def change(team):
         team["owner_devices"] = dict(sorted(dict(team.get("owner_devices") or {},
@@ -1646,7 +1676,7 @@ def enroll_new_device(address, code, signing=None):
     save_integration(None, change, f"Owner added the device {device} with a code")
     q("UPDATE owner_device_codes SET device=? WHERE id=?", (device, row["id"]))
     q("DELETE FROM owner_device_tries WHERE device=?", (tries,))
-    return enroll_device(device, code, signing)
+    return enroll_device(device, code, signing, kind)
 
 
 def save_owner_device(body):
@@ -1686,13 +1716,15 @@ def device_rows(source):
         key = owner_device_key(name)
         code = q1("SELECT expires FROM owner_device_codes WHERE device=? AND used IS NULL AND expires>? "
                   "ORDER BY id DESC LIMIT 1", (name, t0))
-        row = q1("SELECT last_seen FROM owner_devices WHERE device=?", (name,))
+        row = q1("SELECT last_seen, kind FROM owner_devices WHERE device=?", (name,))
         seen = q1("SELECT ts, auth FROM owner_device_contacts WHERE device=?", (name,))
         pings = q1("SELECT 1 FROM owner_device_push WHERE device=?", (name,))
         signing = q1("SELECT key, binding, statement, recovery_key, recovery_binding FROM owner_device_signing "
                      "WHERE device=?", (name,))
         copy = q1("SELECT sealed IS NOT NULL sealed, held FROM owner_device_recovery WHERE device=?", (name,))
         out.append({"device": name, "label": d["label"], "address": d["address"], "key": key is not None,
+                    # owner API 1.149: the kind of app that took the key, null while the device has none
+                    "kind": ((row["kind"] if row else None) or "iphone") if key else None,
                     "since": key["created"] if key else None, "last_seen": row["last_seen"] if row else None,
                     "last_contact": seen["ts"] if seen else None, "last_answer": seen["auth"] if seen else None,
                     "code_expires": code["expires"] if code else None, "this_device": d["address"] == source,
@@ -3298,6 +3330,7 @@ def migrate():
         "steers": {"connection": "INTEGER"},
         # the task that open_case opened the case in: a task that opened two carries neither (t_open_case)
         "duty_cases": {"opened_in": "INTEGER"},
+        "owner_devices": {"kind": "TEXT"},      # owner API 1.149: the kind of app that took the device's key
         # the handover design of 12 November 2026: the reporter's own short words for the report's reader
         # (report_words), and when the customer saw the defect, a UTC day or minute (report_seen)
         "duty_reports": {"summary": "TEXT", "seen_at": "TEXT"},
@@ -12147,13 +12180,14 @@ def owner_message_text(request_id, value, recipient, origin, replaces, files, de
     wrote it, and for a worker or a lead the request id that its reply names. A correction says what it corrects; a
     message that the owner edited before anything read it says nothing, because it is the same message with other
     words. One builder for both, so a new message and an edited one cannot drift. device: the request came from an
-    enrolled owner device (owner_device_at, after device_allowed checked its key), so the header says via=iPhone; the
-    owner's Mac gets no mark, and a chat app's origin wins. connection: the shown name of the connected app that sent
+    enrolled owner device (owner_device_at, after device_allowed checked its key), so the header says via=iPhone, or
+    the class that device holds (owner_device_class: via=Windows for a PC); the owner's Mac gets no mark, and a chat
+    app's origin wins. connection: the shown name of the connected app that sent
     it (capp_connections.name, which the hub chose: never the app's own claim to be Claude or ChatGPT), which comes
     before a device. Its mark has a form that no other channel has (capp_via): via=app:Claude, [owner via app:Claude],
     so that no app's name reads as a chat app or a device."""
     via = CHAT_APP_NAMES[origin["app"]] if origin else capp_via(connection) if connection else \
-        OWNER_DEVICE_VIA if device else None
+        (device if isinstance(device, str) else OWNER_DEVICE_VIA) if device else None
     if agents()[recipient].get("role") in ("worker", "lead"):
         text = f"[owner chat request_id={request_id}" + (f" via={via}" if via else "") + f"] {value}"
     else:
@@ -41538,8 +41572,9 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
             return (409, {"error": "an attachment was sent up by another client"})
         created = now()
         # T3 Code idea 5: a message from the enrolled phone says so in its header. ui_allowed checked the
-        # device's key for this address, so the class comes from the request and not from the client's label.
-        device = (owner_device_at(address) if address else None) is not None
+        # device's key for this address, so the class comes from the request and not from the client's label:
+        # the kind that the device's key was given to (owner API 1.149), "iPhone" or "Windows".
+        device = owner_device_class(owner_device_at(address) if address else None)
         # The event, receipt, optional answer and the links of the files commit together. No helper ack claims
         # delivery.
         with committed():
@@ -43055,11 +43090,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(413, {"error": "request is too large"})
         try:
             signing = device_signing(self.form())      # checked first, so that a wrong one burns no code
+            kind = device_kind(self.form())             # and so is the kind of app (owner API 1.149)
             if device is None:          # a phone that the owner's Mac added with a code alone (device_by_code)
                 with LOCK:
-                    result = enroll_new_device(self.client_address[0], self.form().get("code"), signing)
+                    result = enroll_new_device(self.client_address[0], self.form().get("code"), signing, kind)
             else:
-                result = enroll_device(device, self.form().get("code"), signing)
+                result = enroll_device(device, self.form().get("code"), signing, kind)
         except Refusal as e:
             return self.json(e.status, {"error": str(e)})
         return self.json(200, result, {"Cache-Control": "no-store"})
