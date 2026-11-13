@@ -1923,6 +1923,7 @@ def connect_reading():
     return ("echo user=$(id -u %(u)s >/dev/null 2>&1 && id -gn %(u)s)\n"
             "echo folder=$(stat -c '%%U:%%G:%%a' %(state)s 2>/dev/null)\n"
             "echo program=$(sha256sum %(lib)s/gate.py 2>/dev/null | cut -d' ' -f1)\n"
+            "echo started=$(cat %(lib)s/started 2>/dev/null)\n"
             "echo active=$(systemctl is-active %(svc)s 2>/dev/null || true)\n"
             "echo enabled=$(systemctl is-enabled %(svc)s 2>/dev/null || true)\n"
             "echo restarts=$(systemctl show -p NRestarts --value %(svc)s 2>/dev/null || echo unknown)\n") % {
@@ -2055,6 +2056,11 @@ def connect_on(hub_user="fleet", kit=None, run=None, read=None, account=None):
     except OSError:
         raise Stop(f"{os.path.join(kit, 'gate.py')} is not readable, so the connect gate cannot be installed.") from None
     unit = connect_unit_text(name)
+    # What a start that ended well leaves behind (CONNECT_LIB/started): the program and the unit that it started.
+    # A run that put one of them in place and then stopped (a lost SSH connection, a reload that failed) leaves the
+    # old mark or none, so the next run starts the gate again, where it would have found each part in place and
+    # left an older gate running.
+    mark = hashlib.sha256((program + "\n" + unit).encode()).hexdigest()
     before = kv(run(connect_reading())[1])
     made = False
 
@@ -2098,19 +2104,23 @@ def connect_on(hub_user="fleet", kit=None, run=None, read=None, account=None):
             one = os.path.join(folder, CONNECT_SERVICE + ".service")
             with open(one, "w", encoding="utf-8") as f:
                 f.write(unit)
-            step(f"install -o root -g root -m 644 {shlex.quote(one)} {CONNECT_UNIT}\nsystemctl daemon-reload\n",
-                 f"the service {CONNECT_SERVICE}")
+            # set -e: without it the step's exit code is the reload's alone, and a unit that was not written passed
+            step(f"set -e\ninstall -o root -g root -m 644 {shlex.quote(one)} {CONNECT_UNIT}\n"
+                 f"systemctl daemon-reload\n", f"the service {CONNECT_SERVICE}")
         finally:
             shutil.rmtree(folder, ignore_errors=True)
         changed = True
         say(f"wrote the service {CONNECT_SERVICE}")
-    if not changed and before.get("active") == "active" and before.get("enabled") == "enabled":
+    if not changed and before.get("active") == "active" and before.get("enabled") == "enabled" \
+            and before.get("started") == mark:
         say(f"the gate runs as {CONNECT_USER} on {CONNECT_TARGET}")
     else:
         # A restart and not `enable --now` alone: a running gate reads a new program only when it starts again.
         # The reload first: a run that wrote the unit and then failed at its reload leaves the unit in place, and
-        # the next run writes nothing, so it would start the gate from a unit that systemd never read.
-        step("systemctl daemon-reload\nsystemctl enable %(s)s >/dev/null 2>&1\n"
+        # the next run writes nothing, so it would start the gate from a unit that systemd never read. A reload that
+        # fails stops the step: its exit code is the last command's, and a gate that started from the old unit would
+        # get the mark of the new one.
+        step("systemctl daemon-reload || exit 1\nsystemctl enable %(s)s >/dev/null 2>&1\n"
              "systemctl reset-failed %(s)s >/dev/null 2>&1 || true\n"
              "systemctl restart %(s)s\nsleep %(t)d\n" % {"s": CONNECT_SERVICE, "t": CONNECT_SETTLE},
              f"the service {CONNECT_SERVICE}", timeout=120)
@@ -2118,6 +2128,9 @@ def connect_on(hub_user="fleet", kit=None, run=None, read=None, account=None):
         if after.get("active") != "active" or after.get("restarts") not in ("0", "unknown"):
             raise Stop(f"the gate is {after.get('active') or 'not running'} {CONNECT_SETTLE} seconds after its start. "
                        f"Read `journalctl -u {CONNECT_SERVICE} -n 30` on this machine.")
+        step(f"set -e\nprintf '%s\\n' {mark} > {CONNECT_LIB}/started\n"
+             f"chown root:root {CONNECT_LIB}/started\nchmod 644 {CONNECT_LIB}/started\n",
+             "the mark of the gate's start")
         made = True
         say(f"started the gate as {CONNECT_USER} on {CONNECT_TARGET}")
     if connect_in_place(conf, name):

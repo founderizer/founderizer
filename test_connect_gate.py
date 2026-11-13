@@ -376,8 +376,9 @@ class Box:
     """A stand-in for root's shell on the hub's machine: what ran, and the state it changed."""
     def __init__(self, conf=None, user="", funnel_works=True):
         self.ran, self.files, self.conf = [], {}, json.loads(json.dumps(conf or {}))
-        self.state = {"user": user, "folder": "", "program": "", "active": "inactive", "enabled": "disabled",
-                      "restarts": "0"}
+        self.holds = True               # False: the gate is not active after its start
+        self.state = {"user": user, "folder": "", "program": "", "started": "", "active": "inactive",
+                      "enabled": "disabled", "restarts": "0"}
         self.funnel_works = funnel_works
 
     def run(self, script, timeout=120):
@@ -395,10 +396,12 @@ class Box:
         if "/gate.py" in script and script.startswith("install -d -o root"):
             self.state["program"] = hashlib.sha256((HERE / "gate.py").read_bytes()).hexdigest()
         if hubsetup.CONNECT_UNIT in script:
-            source = shlex.split(script.splitlines()[0])[-2]
+            source = shlex.split(next(line for line in script.splitlines() if hubsetup.CONNECT_UNIT in line))[-2]
             self.files[hubsetup.CONNECT_UNIT] = Path(source).read_text(encoding="utf-8")
         if "systemctl restart" in script:
-            self.state.update(active="active", enabled="enabled")
+            self.state.update(active="active" if self.holds else "failed", enabled="enabled")
+        if f"> {hubsetup.CONNECT_LIB}/started" in script:
+            self.state["started"] = shlex.split(script.splitlines()[1])[2]
         if "systemctl disable --now" in script:
             self.state.update(active="inactive", enabled="disabled")
         if script.startswith("tailscale funnel --bg"):
@@ -481,16 +484,20 @@ class ConnectStep(unittest.TestCase):
         done = self.on(box)
         self.assertEqual(done, {"name": N, "address": f"https://{N}/mcp", "state": "made"})
         changes = box.changes()
-        self.assertEqual(len(changes), 6, changes)
+        self.assertEqual(len(changes), 7, changes)
         self.assertIn("useradd --system --gid founderizer-connect", changes[0])
         self.assertTrue(changes[1].startswith("install -d -o fleet -g founderizer-connect -m 2750 "
                                               "/var/lib/founderizer-connect\n"))
         self.assertIn("install -o root -g root -m 644 " + shlex.quote(str(HERE / "gate.py")) +
                       " /usr/local/lib/founderizer-connect/gate.py", changes[2])
+        self.assertTrue(changes[3].startswith("set -e\n"), changes[3])      # a unit that was not written stops it
         self.assertIn("systemctl daemon-reload", changes[3])
-        self.assertTrue(changes[4].startswith("systemctl daemon-reload\n"), changes[4])
+        self.assertTrue(changes[4].startswith("systemctl daemon-reload || exit 1\n"), changes[4])
         self.assertIn("systemctl restart founderizer-connect", changes[4])
-        self.assertEqual(changes[5], "tailscale funnel --bg --yes --https=443 http://127.0.0.1:8767")
+        # after the start is seen to hold: the mark of the program and the unit that it started
+        self.assertIn(f"> {hubsetup.CONNECT_LIB}/started", changes[5])
+        self.assertEqual(len(box.state["started"]), 64)
+        self.assertEqual(changes[6], "tailscale funnel --bg --yes --https=443 http://127.0.0.1:8767")
         self.assertEqual(box.ran[-1], "tailscale funnel status --json")
         self.assertEqual(box.files[hubsetup.CONNECT_UNIT], hubsetup.connect_unit_text(N))
 
@@ -501,8 +508,28 @@ class ConnectStep(unittest.TestCase):
         self.assertEqual(self.on(box)["state"], "made")
         start = [s for s in box.changes() if "systemctl restart founderizer-connect" in s]
         self.assertEqual(len(start), 1, box.changes())
-        self.assertTrue(start[0].startswith("systemctl daemon-reload\n"), start[0])
+        self.assertTrue(start[0].startswith("systemctl daemon-reload || exit 1\n"), start[0])
         self.assertFalse([s for s in box.changes() if hubsetup.CONNECT_UNIT in s], box.changes())
+
+    def test_a_run_that_stopped_before_the_start_starts_the_gate_at_the_next_run(self):
+        # an update: the first run put the new program in place and was cut off (a lost connection). Each part is
+        # in place and an older gate still runs, so only the mark says that the start is owed.
+        box = Box()
+        self.on(box)
+        whole = box.state["started"]
+        box.state["started"] = "0" * 64                 # the mark of the gate that still runs
+        box.ran.clear()
+        self.assertEqual(self.on(box)["state"], "made")
+        changes = box.changes()
+        self.assertEqual(len(changes), 2, changes)
+        self.assertIn("systemctl restart founderizer-connect", changes[0])
+        self.assertIn(f"> {hubsetup.CONNECT_LIB}/started", changes[1])
+        self.assertEqual(box.state["started"], whole)
+        # a gate that did not hold after its start gets no mark, so the next run tries again
+        box.state["started"], box.holds = "", False
+        with self.assertRaises(hubsetup.Stop):
+            self.on(box)
+        self.assertEqual(box.state["started"], "")
 
     def test_a_second_run_changes_nothing(self):
         box = Box()
@@ -517,8 +544,9 @@ class ConnectStep(unittest.TestCase):
         box.state["program"] = "0" * 64
         box.ran.clear()
         self.assertEqual(self.on(box)["state"], "made")
-        self.assertEqual(len(box.changes()), 2, box.changes())
+        self.assertEqual(len(box.changes()), 3, box.changes())
         self.assertIn("systemctl restart", box.changes()[1])
+        self.assertIn(f"> {hubsetup.CONNECT_LIB}/started", box.changes()[2])
 
     def test_another_target_on_443_or_in_funnel_changes_nothing(self):
         for conf in ({"TCP": {"443": {"TCPForward": "127.0.0.1:8765"}}},

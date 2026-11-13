@@ -16,6 +16,7 @@ import socket
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 import urllib.parse
@@ -387,6 +388,7 @@ class Socket(Base):
         self.addCleanup(shutil.rmtree, self.folder, True)
         for patcher in (patch.object(hub, "CONNECT_DIR", self.folder),
                         patch.object(hub, "capp_serve_status", lambda: self.serve),
+                        patch.object(hub, "capp_gate_address", lambda: None),    # no test asks this machine's port
                         patch.object(hub, "capp_cimd", self.cimd)):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -527,6 +529,127 @@ class Opening(Socket):
         self.assertFalse(hub.capp_sync())
         self.assertFalse(os.path.exists(self.sock))
 
+    def front(self, port=0):
+        """The real gate program in front of this test's socket, on a port of its own."""
+        import gate
+        front = gate.Gate(NAME, socket_path=self.sock, port=port, log=lambda line: None)
+        thread = threading.Thread(target=front.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(front.close)
+        return front
+
+    def test_the_hub_learns_the_gates_version_with_no_request_from_outside(self):
+        self.opened()
+        self.assertFalse(hub.capp_ready())              # the socket is open, and nobody has forwarded anything
+        self.assertNotIn("connected_apps", hub.ui_features())
+        self.assertIsNone(hub.capp_gate_ask())          # no gate to ask: no answer, and nothing changes
+        self.assertFalse(hub.capp_ready())
+        front = self.front()
+        with patch.object(hub, "capp_gate_address", lambda: ("127.0.0.1", front.port)):
+            self.assertEqual(hub.capp_gate_ask(), 200)  # the hub's own ask, through the real gate
+        self.assertEqual(hub.CONNECT["gate"], hub.GATE_VERSION)
+        self.assertTrue(hub.capp_ready())
+        self.assertIn("connected_apps", hub.ui_features())
+        # a closed socket asks nothing
+        hub.capp_close()
+        with patch.object(hub, "capp_gate_address", lambda: ("127.0.0.1", front.port)):
+            self.assertIsNone(hub.capp_gate_ask())
+
+    def free_port(self):
+        with socket.socket() as probe:                  # a port that nothing listens on
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    def until(self, what, tries=200):
+        for _ in range(tries):
+            if what():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_a_gate_that_starts_after_the_hub_is_found_by_the_socket_s_watch(self):
+        port = self.free_port()
+        with patch.object(hub, "capp_gate_address", lambda: ("127.0.0.1", port)), \
+                patch.object(hub, "CAPP_GATE_EVERY", 0.05):
+            self.opened()                               # the watch starts with the socket, and the gate is not there
+            time.sleep(0.3)
+            self.assertFalse(hub.capp_ready())
+            self.front(port)
+            self.assertTrue(self.until(hub.capp_ready))
+        self.assertEqual(hub.CONNECT["gate"], hub.GATE_VERSION)
+
+    def test_a_gate_that_stops_is_seen_at_the_next_look_and_found_when_it_is_back(self):
+        import gate
+        where = [self.free_port()]
+        first = gate.Gate(NAME, socket_path=self.sock, port=where[0], log=lambda line: None)
+        thread = threading.Thread(target=first.serve_forever, daemon=True)
+        thread.start()
+        with patch.object(hub, "capp_gate_address", lambda: ("127.0.0.1", where[0])), \
+                patch.object(hub, "CAPP_GATE_EVERY", 0.05):
+            self.opened()
+            self.assertTrue(self.until(hub.capp_ready))
+            first.close()
+            thread.join(5)
+            time.sleep(0.3)
+            self.assertTrue(hub.capp_ready())           # nobody looked, so nothing asked: the watch waits for an event
+            hub.CAPP_GATE_ASKED[0] = 0.0
+            hub.capp_view()                             # a read of GET /ui/connect is such an event
+            self.assertTrue(self.until(lambda: not hub.capp_ready()))   # after CAPP_GATE_MISSES asks with no answer
+            self.assertIsNone(hub.CONNECT["gate"])
+            self.assertNotIn("connected_apps", hub.ui_features())
+            where[0] = self.front().port                # the gate is back (the root step started it again)
+            self.assertTrue(self.until(hub.capp_ready))  # the watch kept asking: nothing answers, nothing is written
+
+    def test_a_gate_that_cannot_forward_is_asked_three_times_and_then_only_at_an_event(self):
+        import gate
+        other = gate.Gate("hub-2.tail1234.ts.net", socket_path=self.sock, port=0, log=lambda line: None)
+        thread = threading.Thread(target=other.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(other.close)
+        asked, real = [], hub.capp_gate_ask
+
+        def ask():
+            asked.append(real())
+            return asked[-1]
+        with patch.object(hub, "capp_gate_address", lambda: ("127.0.0.1", other.port)), \
+                patch.object(hub, "CAPP_GATE_EVERY", 0.05), patch.object(hub, "capp_gate_ask", ask):
+            self.opened()
+            self.assertTrue(self.until(lambda: len(asked) >= hub.CAPP_GATE_MISSES))
+            time.sleep(0.5)                             # each ask is a line in the gate's journal: no more come
+            self.assertEqual(asked, [421] * hub.CAPP_GATE_MISSES)    # this gate serves another name
+            self.assertFalse(hub.capp_ready())
+            hub.capp_sync()                             # an event (a reload): one ask more, and no loop
+            self.assertTrue(self.until(lambda: len(asked) > hub.CAPP_GATE_MISSES))
+            time.sleep(0.5)
+            self.assertEqual(len(asked), hub.CAPP_GATE_MISSES + 1)
+        said = hub.q("SELECT what FROM log WHERE what LIKE '%answers 421%'")
+        self.assertEqual(len(said), 1, [r["what"] for r in said])       # said once, not at each ask
+
+    def test_a_look_asks_the_gate_again_at_most_once_in_a_while(self):
+        self.opened()
+        hub.CAPP_GATE_NUDGE.clear()
+        hub.CAPP_GATE_ASKED[0] = hub.now()
+        hub.capp_view()
+        self.assertFalse(hub.CAPP_GATE_NUDGE.is_set())  # the watch asked a moment ago
+        hub.CAPP_GATE_ASKED[0] = hub.now() - hub.CAPP_GATE_LOOK - 1
+        hub.capp_view()
+        self.assertTrue(hub.CAPP_GATE_NUDGE.is_set())
+        hub.capp_close()
+        hub.CAPP_GATE_NUDGE.clear()
+        hub.CAPP_GATE_ASKED[0] = 0.0
+        hub.capp_view()
+        self.assertFalse(hub.CAPP_GATE_NUDGE.is_set())  # no socket: nothing to ask
+
+    def test_a_name_that_the_hub_learns_late_opens_the_socket(self):
+        hub.TAILNET_NAMES["names"] = ()                 # the lookup at the hub's start found none
+        self.assertFalse(hub.capp_sync())
+        with patch.object(hub, "tailnet_names", lambda: (NAME, NAME.split(".")[0])):
+            hub.learn_tailnet_names().join(10)
+            self.assertTrue(self.until(lambda: hub.CONNECT["server"] is not None))
+        self.assertTrue(os.path.exists(self.sock))
+
     def test_funnel_to_anything_else_or_a_failed_read_keeps_it_closed(self):
         to_hub = json.loads(json.dumps(IN_PLACE))
         to_hub["Web"][f"{NAME}:443"]["Handlers"]["/"]["Proxy"] = "http://127.0.0.1:8765"
@@ -630,7 +753,7 @@ class Separate(unittest.TestCase):
             self.assertIsNot(value, vars(hub.Handler).get(key), key)
             # the base class's own hooks, by name: the routes, the log line and the Server header
             self.assertTrue(key.startswith("capp_") or key in ("do_GET", "do_POST", "do_DELETE", "log_message",
-                                                               "version_string"), key)
+                                                               "version_string", "send_error"), key)
 
     def test_the_connected_apps_code_never_calls_an_owner_gate_or_handler(self):
         tree = ast.parse(Path(hub.__file__).read_text())
@@ -671,6 +794,17 @@ class Endpoints(Socket):
     def setUp(self):
         super().setUp()
         self.opened()
+
+    def test_a_method_that_the_hub_does_not_know_gets_its_status_and_no_page(self):
+        # the base class answers a method with no do_ function itself: its page names the method and Python
+        out = self.raw(f"PUT /mcp HTTP/1.1\r\nHost: {NAME}\r\nContent-Length: 0\r\n\r\n".encode())
+        head, _, body = out.partition(b"\r\n\r\n")
+        self.assertTrue(head.startswith(b"HTTP/1.1 501 Not Implemented\r\n"), head)
+        self.assertEqual(body, b"")
+        self.assertIn(b"\r\nServer: Founderizer\r\n", head + b"\r\n")
+        self.assertIn(b"\r\nContent-Length: 0\r\n", head + b"\r\n")
+        for word in (b"PUT", b"Python", b"<html", b"Unsupported"):
+            self.assertNotIn(word, out)
 
     def test_an_answer_names_the_hub_and_no_version_of_python(self):
         # these answers reach the Internet: a good one, a refused one and a page

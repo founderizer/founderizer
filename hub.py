@@ -31557,7 +31557,10 @@ def learn_tailnet_names():
     """The names again, at a reload. In the background, because a reload runs under LOCK and the command may take 5
     seconds. A lookup that fails keeps the names that the hub has. Returns the thread."""
     def run():
+        had = bool(TAILNET_NAMES["names"])
         TAILNET_NAMES["names"] = tailnet_names() or TAILNET_NAMES["names"]
+        if not had and TAILNET_NAMES["names"]:
+            capp_sync_later()       # the connected apps' socket waited for the hub's name (capp_sync)
     thread = threading.Thread(target=run, name="tailnet-names", daemon=True)
     thread.start()
     return thread
@@ -40502,6 +40505,7 @@ def capp_handle_key():
 def capp_view():
     """GET /ui/connect: whether the feature is on, the public address, the open connections and the gate."""
     name = capp_name()
+    capp_gate_nudge(look=True)      # the next read is true of a gate that stopped or was replaced since
     rows = q("SELECT id, name, level, last_used, created FROM capp_connections WHERE revoked IS NULL ORDER BY id")
     return {"on": capp_on(), "address": oauth_server.resource(name) if name else None,
             "connections": [dict(r) for r in rows], "gate": {"version": CONNECT["gate"], "ok": capp_gate_ok()}}
@@ -41595,6 +41599,11 @@ class ConnectHandler(BaseHTTPRequestHandler):
         adds the version of Python (seen through the gate with a real client, 13 November 2026)."""
         return self.server_version
 
+    def send_error(self, code, message=None, explain=None):
+        """The base class's own refusals (a method with no do_ function, a request line or a header that it cannot
+        read): the status alone. Its page names the method and is the mark of Python's own server."""
+        self.capp_send(code, b"", {"Cache-Control": "no-store"})
+
     def capp_send(self, code, body=b"", headers=None):
         if isinstance(body, str):
             body = body.encode()
@@ -41661,7 +41670,8 @@ class ConnectHandler(BaseHTTPRequestHandler):
         version = self.headers.get("X-Gate-Version")
         if version is not None and CAPP_GATE.fullmatch(version) and CONNECT["gate"] != version:
             CONNECT["gate"] = version
-            changed()               # connected_apps joins ui_features at the gate's first forward (capp_ready)
+            changed()               # connected_apps joins ui_features at the gate's first forward (capp_ready),
+                                    # which the hub's own ask is when nobody else called first (capp_gate_ask)
         return path, query, body
 
     def do_GET(self):
@@ -41812,6 +41822,7 @@ def capp_close():
     server, CONNECT["server"] = CONNECT["server"], None
     if server is None:
         return
+    CAPP_GATE_NUDGE.set()           # the watch of this socket ends now (capp_gate_watch)
     server.shutdown()
     server.server_close()
     path = server.server_address if isinstance(server.server_address, str) else capp_socket_path()
@@ -41819,6 +41830,90 @@ def capp_close():
         if stat.S_ISSOCK(os.lstat(path).st_mode):
             os.unlink(path)
     CONNECT["gate"] = None
+
+
+def capp_gate_address():
+    """Where the gate listens on this machine, as (host, port): hubsetup.CONNECT_TARGET, the one target that Funnel
+    publishes."""
+    import hubsetup
+    target = urllib.parse.urlsplit(hubsetup.CONNECT_TARGET)
+    return target.hostname, target.port
+
+
+def capp_gate_ask():
+    """The hub asks its own gate for one of its public documents, and so learns the gate's version with no request
+    from outside: the gate forwards the request to the hub's socket as any other, and ConnectHandler keeps the version
+    that it carries (X-Gate-Version). Without it connected_apps came into ui_features only after somebody on the
+    Internet had called the address: the Mac app showed no address to give to an app after the feature was turned on,
+    and its two groups went away at each start of the hub (a review of 13 November 2026). Never under LOCK and never
+    under CAPP_SYNC, because the answer comes through the hub's own socket thread. Returns the status of the gate's
+    answer (200: it forwarded, and its version is kept), or None when nothing answered or there is nothing to ask.
+    Another program on that port can set no version: the hub takes one only from a request on its own socket, which
+    only the gate's group reaches."""
+    name, where = capp_name(), capp_gate_address()
+    if CONNECT["server"] is None or name is None or where is None:
+        return None
+    try:
+        conn = http.client.HTTPConnection(where[0], where[1], timeout=5)
+        try:
+            conn.request("GET", "/.well-known/oauth-protected-resource", headers={"Host": name})
+            answer = conn.getresponse()
+            answer.read()
+            return answer.status
+        finally:
+            conn.close()
+    except (OSError, http.client.HTTPException):
+        return None
+
+
+CAPP_GATE_EVERY = 5                 # seconds between two asks while no gate answers (it may start after the hub)
+CAPP_GATE_MISSES = 3                # asks in a row with no good answer, after which the hub takes the gate as gone
+CAPP_GATE_LOOK = 30                 # seconds in which a second read of GET /ui/connect asks nothing again
+CAPP_GATE_NUDGE = threading.Event()         # set: ask the gate now (a reload, a read of GET /ui/connect)
+CAPP_GATE_ASKED = [0.0]                     # when the watch last asked
+
+
+def capp_gate_nudge(look=False):
+    """Ask the gate again now. look: from a read of GET /ui/connect, which asks at most once in CAPP_GATE_LOOK
+    seconds, because the gate writes a line for each request and the page reads often."""
+    if CONNECT["server"] is not None and not (look and now() - CAPP_GATE_ASKED[0] < CAPP_GATE_LOOK):
+        CAPP_GATE_NUDGE.set()
+
+
+def capp_gate_watch(server):
+    """The thread of one open socket, which keeps what the hub knows of its gate true. It lives as long as that
+    socket: nothing else ends it, because a gate can start, stop or be replaced at any later time.
+
+    capp_gate_ask's answer decides what comes next. 200: the gate forwarded, and ConnectHandler has its version; the
+    thread then waits for an event (capp_gate_nudge: a reload, a read of GET /ui/connect). No answer: no gate
+    listens (it starts after the hub, or it stopped), and the thread asks again each CAPP_GATE_EVERY seconds, which
+    writes nothing anywhere. Any other status: a gate is there and cannot forward (502: it cannot reach this socket;
+    421: it serves another name), which is a fault of the install and no race, so the hub says it once in its log
+    and waits for an event, because each ask is a line in the gate's journal. After CAPP_GATE_MISSES asks in a row
+    with no 200, a version that the hub held goes: connected_apps leaves ui_features until the gate forwards again."""
+    misses, said = 0, None
+    while CONNECT["server"] is server:
+        if capp_gate_address() is None:
+            return
+        CAPP_GATE_NUDGE.clear()
+        CAPP_GATE_ASKED[0] = now()
+        status = capp_gate_ask()
+        if CONNECT["server"] is not server:
+            return
+        if status == 200:
+            misses, said = 0, None
+        else:
+            misses += 1
+            if misses >= CAPP_GATE_MISSES and CONNECT["gate"] is not None:
+                CONNECT["gate"] = None
+                changed()
+            if status is not None and status != said:
+                said = status
+                log("hub", f"the gate of the connected apps answers {status} to the hub's own request, so it does "
+                           f"not forward to the hub's socket (502: it cannot reach {capp_socket_path()}; 421: its "
+                           f"--name is not this hub's name). `hubsetup.py connect on` as root puts it right.")
+        retry = status is None or (status != 200 and misses < CAPP_GATE_MISSES)
+        CAPP_GATE_NUDGE.wait(CAPP_GATE_EVERY if retry else None)
 
 
 CAPP_SYNC = threading.Lock()
@@ -41829,11 +41924,14 @@ def capp_sync():
     (capp_on), the folder of section 7 is there, the hub knows its DNS name and guard 6(b) passes. Each new reason to
     keep it closed is one log line. At the start and at each team reload (capp_sync_later); never under LOCK."""
     with CAPP_SYNC:
-        name, said = capp_name(), ""
+        name, said, was_open = capp_name(), "", CONNECT["server"] is not None
         want = capp_on() and name is not None and os.path.isdir(CONNECT_DIR)
         if want:
             want, said = capp_funnel_ok(name)
         if want and CONNECT["server"] is None:
+            # A request of the socket before this one can still be in flight and write its gate's version after
+            # capp_close cleared it: the new socket starts with none, so its watch asks.
+            CONNECT["gate"] = None
             try:
                 CONNECT["server"] = capp_open(capp_socket_path())
             except OSError as e:
@@ -41842,6 +41940,8 @@ def capp_sync():
                 CONNECT["thread"] = threading.Thread(target=CONNECT["server"].serve_forever, name="connected-apps",
                                                      daemon=True)
                 CONNECT["thread"].start()
+                threading.Thread(target=capp_gate_watch, args=(CONNECT["server"],), name="connected-apps-gate",
+                                 daemon=True).start()
                 said = f"the hub serves connected apps at https://{name}/mcp through the gate"
         if not want and CONNECT["server"] is not None:
             capp_close()
@@ -41849,6 +41949,8 @@ def capp_sync():
         if said and said != CONNECT["said"]:
             CONNECT["said"] = said
             log("hub", said)
+        if was_open:
+            capp_gate_nudge()       # a reload is when the root step may have put a new gate in place
         changed()
         return CONNECT["server"] is not None
 
@@ -41864,7 +41966,8 @@ def capp_sync_later():
 
 
 def capp_ready():
-    """connected_apps is in ui_features: the socket is open and the gate forwarded with its version."""
+    """connected_apps is in ui_features: the socket is open and the gate forwarded with its version (the hub's own
+    ask after it opens the socket is enough: capp_gate_watch)."""
     return capp_on() and CONNECT["server"] is not None and CONNECT["gate"] is not None
 
 
