@@ -41821,8 +41821,15 @@ def phone_task(task_id, query):
         # "Guidance · Attempt 1 · Read" row in the thread.
         steers = [steer_view(r) for r in q("SELECT s.*, e.read_at FROM steers s JOIN events e ON e.id=s.event_id "
                                            "WHERE s.task=? ORDER BY s.id", (task_id,))]
+        # Owner API 1.163: the heads of its subtasks, by id, and of the task it is a subtask of, for the Mac panel's
+        # "Subtasks" and "Parent task · <title>" (GET /ui/state has every task; a device's heads only the open ones and
+        # the last 20 that ended).
+        subtasks = [{k: r[k] for k in MOBILE_HEAD} for r in q("SELECT * FROM tasks WHERE parent=? ORDER BY id", (task_id,))]
+        parent = q1("SELECT * FROM tasks WHERE id=?", (task["parent"],)) if task["parent"] else None
     return 200, scrub({"db": generation, "task": dict(task), "notes": notes, "holds": holds, "outcomes": outcomes,
-                       "permissions": permissions, "steers": steers, "cursor": notes[-1]["id"] if notes else since}), \
+                       "permissions": permissions, "steers": steers, "subtasks": subtasks,
+                       "parent_task": {k: parent[k] for k in MOBILE_HEAD} if parent else None,
+                       "cursor": notes[-1]["id"] if notes else since}), \
         {"Cache-Control": "no-store"}
 
 

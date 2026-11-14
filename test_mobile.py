@@ -702,6 +702,20 @@ class Devices(OwnerAPI):
         self.assertEqual((heads[child]["parent"], heads[lead]["parent"]), (lead, None))
         self.assertEqual(heads[child]["parent"], state[child]["parent"])
 
+    def test_a_task_page_holds_its_subtasks_and_its_parent(self):
+        """Owner API 1.163: the heads of its subtasks by id, an ended one too, and the head of its parent; a task with
+        neither has an empty list and null."""
+        lead, first, second, alone = (self.task(title=t) for t in ("Lead", "First", "Second", "Alone"))
+        hub.q("UPDATE tasks SET parent=? WHERE id IN (?,?)", (lead, first, second))
+        hub.q("UPDATE tasks SET state='completed' WHERE id=?", (first,))
+        page = self.call(f"/ui/mobile/task/{lead}")[1]
+        self.assertEqual([(t["id"], t["state"]) for t in page["subtasks"]], [(first, "completed"), (second, "working")])
+        self.assertEqual(set(page["subtasks"][0]), set(hub.MOBILE_HEAD))
+        self.assertIsNone(page["parent_task"])
+        child = self.call(f"/ui/mobile/task/{second}")[1]
+        self.assertEqual((child["parent_task"]["id"], child["parent_task"]["title"]), (lead, "Lead"))
+        self.assertEqual(self.call(f"/ui/mobile/task/{alone}")[1]["subtasks"], [])
+
     def test_a_parked_task_head_says_until_when_as_the_state_does(self):
         """Owner API 1.161: an open task that its agent parked until a time has parked_until in the device's heads, the
         same value as GET /ui/state, which a device may read already; a task that is not parked has no such key."""
