@@ -43,6 +43,7 @@ def sha(text):
 def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite(Routes(name) for name in Routes.__dict__ if name.startswith("test_"))
     suite.addTests(VaultAccess(name) for name in VaultAccess.__dict__ if name.startswith("test_"))
+    suite.addTests(FirstStores(name) for name in FirstStores.__dict__ if name.startswith("test_"))
     for cls in (HelperSide, FinishedDesktopTask, BrokerCallers):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return suite
@@ -1153,6 +1154,189 @@ class VaultAccess(OwnerAPI):
             change(broken)
             with self.assertRaises(ValueError):
                 hub.validate_team(broken)
+
+
+LONE = "127.0.0.5"                                  # lone's machine in GRANT_TEAM: no binding, a new machine here
+FIRST, LATER = "age1" + "u" * 58, "age1" + "v" * 58
+
+
+class FirstStores(VaultAccess):
+    """C9 (package 6): a machine's first vault key comes from its helpers' reports before the first session of any of
+    its agents. Through the real routes: the helper's status report, its session credential, a runtime's first MCP call,
+    the owner's vault command and the removal of a server."""
+
+    @staticmethod
+    def auth(agent):
+        return {"Content-Type": "application/json", "Authorization": "Bearer " + agent}     # setUp registers sha(agent)
+
+    def status(self, agent, recipient, source=LONE):
+        """A report of the agent's own helper on its own route (record_status), as a helper sends it."""
+        data = {"features": ["agent_key", "broker_callers"], "legacy_windows": [],
+                "security": {"vault": {"mode": hub.agents()[agent].get("vault", "none"), "isolated": True,
+                                       "callers": True, "broker_recipient": recipient, "broker_read_at": hub.now()}}}
+        code, answer = self.request(f"/helper/status/{agent}", data, headers=self.auth(agent), source=source)
+        self.assertEqual(code, 200, answer)
+
+    def credential(self, agent, source=LONE):
+        """The session credential that a helper asks for before it starts a window (fleet.session_credential)."""
+        code, answer = self.request(f"/helper/session/{agent}", {"kind": "chat", "generation": "test-generation"},
+                                    headers=self.auth(agent), source=source)
+        self.assertEqual(code, 200, answer)
+        return answer
+
+    def first_row(self, machine="lone"):
+        row = hub.q1("SELECT key, closed FROM first_stores WHERE machine=?", (machine,))
+        return None if row is None else (row["key"], row["closed"] is not None)
+
+    def offered(self, machine="lone"):
+        return hub.offered_store(hub.TEAM, machine)
+
+    def put(self, team):
+        """Commit a team.json, as the owner's own routes leave it (the routes read the commit, not hub.TEAM)."""
+        kit = self.root / "kit"
+        (kit / "team.json").write_text(json.dumps(team, indent=2) + "\n")
+        git("add", "-A", cwd=kit)
+        git("commit", "-q", "-m", "a server with no agent", cwd=kit)
+        git("push", "-q", "origin", "HEAD", cwd=kit)
+        hub._revision_cache.update(at=0.0, value=None)
+        hub.TEAM = json.loads(json.dumps(team))
+
+    def test_a_report_before_any_session_keeps_its_key_and_the_last_one_wins(self):
+        self.assertIsNone(self.first_row())                 # setUp's reports went around the route
+        self.status("lone", LATER)
+        self.assertEqual((self.first_row(), self.offered()), ((LATER, False), LATER))
+        self.status("lone", FIRST)                          # its broker was set up again, still before any session
+        self.assertEqual((self.first_row(), self.offered()), ((FIRST, False), FIRST))
+        code, receipt = self.vault("lone", "broker")
+        self.assertEqual(code, 200, receipt)
+        self.assertEqual(self.committed()["vault_stores"]["lone"], FIRST)
+
+    def test_a_key_from_a_report_after_the_first_session_is_not_kept(self):
+        self.status("lone", FIRST)
+        self.credential("lone")                             # its first session: the keep ends, and the hub says so
+        self.assertEqual(self.first_row(), (FIRST, True))
+        self.status("lone", LATER)          # what a session can report, or answer with on a Mac's vault socket
+        self.assertEqual((self.first_row(), self.offered()), ((FIRST, True), FIRST))
+        self.assertEqual(self.line("lone")["vault_grant"], {"ready": False, "missing": ["vault_store_mismatch"]})
+        hub.DEFAULT_ACCESS.update(at=0.0, retry={})
+        with hub.LOCK:
+            hub.default_access_sweep(hub.now())     # the default access binds no key for lone (beta gets box's vault)
+        status, answer = self.vault("lone", "broker")
+        self.assertEqual((status, answer.get("missing")), (409, ["vault_store_mismatch"]))
+        team = self.committed()
+        self.assertEqual((team["agents"]["lone"]["vault"], "lone" in team.get("vault_stores", {})), ("none", False))
+        self.status("lone", FIRST)                          # the machine names its first key again
+        status, receipt = self.vault("lone", "broker")
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual(self.committed()["vault_stores"]["lone"], FIRST)
+
+    def test_a_runtimes_first_mcp_call_ends_the_keep_too(self):
+        self.status("lone", FIRST)
+        hub.know("lone")
+        hub.rpc("lone", {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                         "params": {"clientInfo": {"name": "codex", "version": "0.1"}}}, {})
+        self.assertEqual(hub.q1("SELECT client FROM agents WHERE name='lone'")["client"], "codex 0.1")
+        self.assertEqual(self.first_row(), (FIRST, True))   # at the call itself, before any later report
+        self.status("lone", LATER)
+        self.assertEqual((self.first_row(), self.offered()), ((FIRST, True), FIRST))
+
+    def test_a_session_before_any_report_starts_at_once_and_keeps_nothing(self):
+        hub.q("DELETE FROM machine_status WHERE agent='lone'")      # no report of its helper at all yet
+        self.assertIn("token", self.credential("lone"))             # the session starts as before
+        self.assertEqual(self.first_row(), (None, True))            # the end of the keep, with no key
+        self.status("lone", LATER)
+        # The case that is left (VAULT.md, limit 21): the first grant takes the key that the machine reports, as before.
+        self.assertEqual((self.first_row(), self.offered()), ((None, True), LATER))
+        code, receipt = self.vault("lone", "broker")
+        self.assertEqual(code, 200, receipt)
+        self.assertEqual(self.committed()["vault_stores"]["lone"], LATER)
+
+    def test_the_end_of_the_keep_stays_when_the_agent_of_the_session_leaves(self):
+        self.status("lone", FIRST)
+        self.credential("lone")
+        # The owner removes lone: its own rows go (REMOVED_OWN, its session credentials among them) and so does its
+        # place in the team. A new agent comes to the same machine. With no record of the end, its report would read
+        # as one from before any session, and a program that lone left running there could have made it.
+        for table, column in hub.REMOVED_OWN:
+            hub.q(f"DELETE FROM {table} WHERE {column}=?", ("lone",))
+        del hub.TEAM["agents"]["lone"]
+        hub.TEAM["agents"]["late"] = {"role": "worker", "runtime": "codex", "machine": "lone", "can": ["shell"],
+                                      "vault": "none"}
+        hub.ins("INSERT INTO agent_keys(agent,sha256,created,source) VALUES('late',?,?,'owner')", (sha("late"), hub.now()))
+        self.assertFalse(hub.session_seen(hub.TEAM, "lone"))       # no sign of that session is left
+        self.status("late", LATER)
+        self.assertEqual((self.first_row(), self.offered()), ((FIRST, True), FIRST))       # as before that report
+
+    def test_a_sign_from_before_this_release_ends_the_keep_at_the_next_report(self):
+        hub.q("INSERT INTO session_credentials(sha256,agent,kind,generation,created) VALUES(?,?,?,?,?)",
+              ("0" * 64, "lone", "chat", "test-generation", hub.now()))
+        self.status("lone", FIRST)
+        self.assertEqual(self.first_row(), (None, True))
+        self.status("lone", LATER)
+        self.assertEqual(self.first_row(), (None, True))
+
+    def test_only_a_session_on_this_machine_ends_its_keep(self):
+        self.credential("alpha", source=BOX)        # a session on box, which keeps its binding as its first key
+        self.assertEqual((self.first_row("box"), self.first_row()), ((STORE, True), None))
+        self.status("lone", FIRST)
+        self.assertEqual(self.first_row(), (FIRST, False))
+        # A second agent on lone's machine: a session of either one ends the keep for both.
+        hub.TEAM["agents"]["twin"] = {"role": "worker", "runtime": "codex", "machine": "lone", "can": ["shell"],
+                                      "vault": "none"}
+        hub.ins("INSERT INTO agent_keys(agent,sha256,created,source) VALUES('twin',?,?,'owner')", (sha("twin"), hub.now()))
+        self.credential("twin")
+        self.status("lone", LATER)
+        self.assertEqual((self.first_row(), self.offered()), ((FIRST, True), FIRST))
+
+    def test_a_machine_with_its_binding_at_its_first_session_keeps_that_key_when_the_binding_goes(self):
+        # box is bound only by alpha's vault_recipient, the shape of an older team.json: no vault_stores entry.
+        self.assertNotIn("box", hub.TEAM.get("vault_stores", {}))
+        self.credential("alpha", source=BOX)
+        self.assertEqual(self.first_row("box"), (STORE, True))
+        for table, column in hub.REMOVED_OWN:                  # the owner removes alpha, and the binding goes with it
+            hub.q(f"DELETE FROM {table} WHERE {column}=?", ("alpha",))
+        del hub.TEAM["agents"]["alpha"]
+        self.assertIsNone(hub.store_key(hub.TEAM, "box"))
+        self.status("beta", OTHER_STORE, source=BOX)            # what a program that alpha left there can report
+        self.assertEqual((self.first_row("box"), self.offered("box")), ((STORE, True), STORE))
+        self.assertEqual(hub.vault_grant("beta", hub.TEAM), {"ready": False, "missing": ["vault_store_mismatch"]})
+
+    def test_the_end_of_the_keep_comes_before_the_credential(self):
+        self.status("lone", FIRST)
+        # The hub stops in the credential's own step: the end of the keep is there already, and no credential is.
+        with patch.object(hub, "transaction", side_effect=RuntimeError("stopped")):
+            code, _ = self.request("/helper/session/lone", {"kind": "chat", "generation": "test-generation"},
+                                   headers=self.auth("lone"), source=LONE)
+        self.assertNotEqual(code, 200)
+        self.assertIsNone(hub.q1("SELECT 1 AS n FROM session_credentials WHERE agent='lone'"))
+        self.assertEqual(self.first_row(), (FIRST, True))
+
+    def test_a_failure_of_the_keep_stops_neither_the_report_nor_the_session(self):
+        with patch.object(hub, "reported_store", side_effect=RuntimeError("stopped")):
+            self.status("lone", FIRST)                      # stored and answered
+        self.assertIsNone(self.first_row())
+        stored = json.loads(hub.q1("SELECT data FROM machine_status WHERE agent='lone'")["data"])
+        self.assertEqual(stored["security"]["vault"]["broker_recipient"], FIRST)
+        self.assertIsNotNone(hub.q1("SELECT 1 AS n FROM log WHERE what=?",
+                                    ("could not keep the first vault key of lone's machine: RuntimeError",)))
+        with patch.object(hub, "close_first_store", side_effect=RuntimeError("stopped")):
+            self.assertIn("token", self.credential("lone"))     # the session starts
+        self.assertIsNotNone(hub.q1("SELECT 1 AS n FROM log WHERE what=?", (
+            "could not end the keep of the first vault key of lone's machine: RuntimeError",)))
+
+    def test_a_rename_moves_the_row_and_only_the_removal_of_the_server_deletes_it(self):
+        self.status("lone", FIRST)
+        with hub.LOCK, hub.transaction():
+            hub.rename_machine_rows("lone", "lone-box")
+        self.assertEqual((self.first_row("lone-box"), self.first_row()), ((FIRST, False), None))
+        team = self.committed()
+        team["addresses"]["spare"] = "127.0.0.9"            # a server with no agent: one that the owner can remove
+        self.put(team)
+        hub.q("INSERT INTO first_stores(machine, key, at, closed) VALUES('spare', ?, ?, ?)", (FIRST, hub.now(), hub.now()))
+        code, receipt = self.request("/ui/servers/spare/remove", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                                 "base_sha256": self.team()["sha256"]})
+        self.assertEqual(code, 200, receipt)
+        self.assertIsNone(self.first_row("spare"))
 
 
 class BrokerCallers(unittest.TestCase):

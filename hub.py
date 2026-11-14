@@ -236,6 +236,10 @@ CREATE TABLE IF NOT EXISTS agent_limits(id INTEGER PRIMARY KEY, agent TEXT NOT N
 CREATE TABLE IF NOT EXISTS ui_controls(request_id TEXT PRIMARY KEY, route TEXT NOT NULL, body TEXT NOT NULL,
   client TEXT NOT NULL, created REAL NOT NULL, result TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS machine_status(agent TEXT PRIMARY KEY, data TEXT NOT NULL, reported REAL NOT NULL);
+-- C9 (package 6): a machine's first vault key, kept from its reports before the first session of any of its agents
+-- (keep_first_store), and when that keep ended (closed), also with no key when no report came first. Only the
+-- machine's removal deletes the row.
+CREATE TABLE IF NOT EXISTS first_stores(machine TEXT PRIMARY KEY, key TEXT, at REAL, closed REAL);
 CREATE TABLE IF NOT EXISTS machine_updates(agent TEXT PRIMARY KEY, state TEXT NOT NULL, requested REAL NOT NULL,
   desired TEXT, detail TEXT, started REAL, finished REAL);
 CREATE TABLE IF NOT EXISTS goals(id INTEGER PRIMARY KEY, title TEXT NOT NULL, text TEXT NOT NULL, state TEXT NOT NULL,
@@ -14489,6 +14493,7 @@ def conversation_start(agent, cid):
     works = conversation_works(person, agent)
     generation = kv_get("db_id")
     token, t0 = secrets.token_urlsafe(32), now()
+    first_session(agent, t0)        # C9: the end of the keep before the credential, in the caller's hold of the lock
     with transaction():
         if v2 and conversation_mode(read_row("SELECT * FROM people WHERE id=?", (person["id"],)), agent) != mode:
             # person access plan, section 7: the owner's write landed since the mode was read: start nothing the old
@@ -34254,8 +34259,114 @@ def offered_store(team, machine, t0=None):
     itself, so a machine whose broker was just installed could never be granted at all - `no_vault_store`, for
     ever, and the owner's only way out a team.json written by hand. So the first key comes from the machine that
     holds the store, and the owner's own command is what records it. `no_vault_store` then means what it says: this
-    machine has no vault broker."""
-    return store_key(team, machine) or reported_store(team, machine, t0)
+    machine has no vault broker.
+
+    C9 (package 6): the machine's first key comes next (first_store): the key that it reported before the first
+    session of any of its agents, when no agent code had run there yet, or the binding that it had at that session. A
+    report after that session gives the first key only where the hub kept none, as before (VAULT.md, limit 21)."""
+    return store_key(team, machine) or first_store(machine) or reported_store(team, machine, t0)
+
+
+def first_store(machine):
+    """C9 (package 6): the first key of this machine, or None: the store key that its helpers' reports agreed on while
+    none of its agents had had a session (keep_first_store), or the binding that it had at its first session
+    (close_first_store). None when the hub kept neither, because a session came first."""
+    row = q1("SELECT key FROM first_stores WHERE machine=?", (machine,))
+    return row["key"] if row else None
+
+
+def first_machine(team, agent):
+    """C9 (package 6): the machine of this agent, whose first key the hub keeps or whose keep it ends, or None for an
+    agent with no machine. validate_team gives the machine of each agent an address."""
+    machine = (team["agents"].get(agent) or {}).get("machine")
+    return machine if machine and (team.get("addresses") or {}).get(machine) else None
+
+
+def session_seen(team, machine):
+    """True when an agent of this machine has had a session, as far as the hub knows: a session credential, which each
+    session of an agent with an agent key gets before it starts (fleet.py `session_credential`), or a runtime's first
+    MCP call (agents.client), which each session makes, with or without a credential. One address is one machine name
+    (validate_team), so these agents are the ones whose reports reported_store reads."""
+    names = tuple(sorted(n for n, a in team["agents"].items() if a.get("machine") == machine))
+    if not names:
+        return False
+    marks = ",".join("?" * len(names))
+    return q1(f"SELECT 1 AS seen FROM session_credentials WHERE agent IN ({marks}) LIMIT 1", names) is not None or \
+        q1(f"SELECT 1 AS seen FROM agents WHERE name IN ({marks}) AND (client IS NOT NULL OR client_seen IS NOT NULL) "
+           "LIMIT 1", names) is not None
+
+
+def close_first_store(machine, t0, team):
+    """The end of the keep of this machine's first key, written down once: no later report keeps a key for it. A
+    machine that has its binding (store_key) at that moment keeps that key as its first key, over a key that it kept
+    (a binding is the owner's command, or his own edit): so the key stays when the binding goes, as a binding stays
+    until the machine's removal (an older team.json held a machine's key only in its agents' vault_recipient, which
+    leaves with the last of them)."""
+    key = store_key(team, machine)
+    q("INSERT INTO first_stores(machine, key, at, closed) VALUES(?,?,?,?) ON CONFLICT(machine) DO UPDATE SET "
+      "key=COALESCE(excluded.key, first_stores.key), at=COALESCE(excluded.at, first_stores.at), "
+      "closed=COALESCE(first_stores.closed, excluded.closed)", (machine, key, t0 if key else None, t0))
+
+
+def keep_first_store(agent, t0=None):
+    """C9 (package 6), at each status report, after the report is stored: while no agent of this agent's machine has
+    had a session, keep the store key that the machine's fresh reports agree on (reported_store) as its first key. The
+    last one before the first session wins: each one comes from before any agent code ran on that machine, and the last
+    one follows a broker that was set up again. The one exception is a session without a credential (an agent without
+    its agent key), which the hub sees only at its runtime's first MCP call: a report before that call is still kept,
+    also through a whole session whose runtime does not reach the hub (VAULT.md, limit 21).
+
+    The first sign of a session (session_seen) ends the keep, and the hub writes that down (close_first_store), also in
+    a row with no key when no report came first. A sign can go away (an agent that leaves takes its credentials and its
+    name with it), and the end must not: after it, no report keeps a key for that machine. first_session writes the
+    same end before the sign itself. Only the machine's removal (remove_server) deletes the row. A machine that has its
+    binding keeps no reported key. A failure here writes one log line, and the report is stored and answered as before.
+    Called under LOCK."""
+    try:
+        team = TEAM
+        machine = first_machine(team, agent)
+        if machine is None:
+            return
+        row = q1("SELECT key, closed FROM first_stores WHERE machine=?", (machine,))
+        if row and row["closed"] is not None:
+            return
+        t0 = t0 or now()
+        if session_seen(team, machine):
+            close_first_store(machine, t0, team)
+            log("hub", f"{machine} had a session before this report of {agent}: no report gives it a first vault key "
+                       f"from now on")
+            return
+        if store_key(team, machine):
+            return              # its binding is its key
+        key = reported_store(team, machine, t0)
+        if key and (row is None or row["key"] != key):
+            q("INSERT INTO first_stores(machine, key, at) VALUES(?,?,?) ON CONFLICT(machine) DO UPDATE SET "
+              "key=excluded.key, at=excluded.at", (machine, key, t0))
+            log("hub", f"kept {key[:16]} as the first vault key of {machine}: {agent} reported it before any session "
+                       f"there")
+    except Exception as e:
+        with contextlib.suppress(Exception):
+            log("hub", f"could not keep the first vault key of {agent}'s machine: {type(e).__name__}")
+
+
+def first_session(agent, t0=None):
+    """C9 (package 6): a session of this agent gets its credential or makes its first MCP call, so the keep of its
+    machine's first key ends now, and stays ended (close_first_store), also when that sign goes away before the
+    machine's next report. Called before the sign, in the same hold of LOCK: so no stop of the hub and no removal of
+    the agent leaves a sign without its end, and an end with no sign only ends the keep early, which is safe. One read
+    of one row, and one write once for each machine. A failure writes one log line and stops nothing."""
+    try:
+        team = TEAM
+        machine = first_machine(team, agent)
+        if machine is None:
+            return
+        row = q1("SELECT closed FROM first_stores WHERE machine=?", (machine,))
+        if row is None or row["closed"] is None:
+            close_first_store(machine, t0 or now(), team)
+            log("hub", f"{agent} has a session on {machine}: no report gives {machine} a first vault key from now on")
+    except Exception as e:
+        with contextlib.suppress(Exception):
+            log("hub", f"could not end the keep of the first vault key of {agent}'s machine: {type(e).__name__}")
 
 
 def broker_report(name, t0=None):
@@ -35901,6 +36012,7 @@ def remove_server(server, body):
         DB.execute("DELETE FROM server_keys WHERE server=?", (server,))
         DB.execute("DELETE FROM server_status WHERE server=?", (server,))
         DB.execute("DELETE FROM mac_setups WHERE server=?", (server,))
+        DB.execute("DELETE FROM first_stores WHERE machine=?", (server,))      # C9: only this opens its keep again
         DB.execute("UPDATE server_jobs SET state='canceled', prompt=NULL, updated=? WHERE server=? AND state IN "
                    "('queued','running','needs_owner')", (t0, server))
     log("owner", f"removed server {server} in {commit[:12]}")
@@ -36594,8 +36706,10 @@ def agent_first_message_sweep(t0):
 # server by address.
 MACHINE_COLUMNS = (("server_keys", "server"), ("server_status", "server"), ("server_jobs", "server"),
                    ("deposits", "machine"), ("withdrawals", "machine"), ("placements", "machine"),
-                   ("place_codes", "machine"), ("place_hosts", "machine"), ("mac_setups", "server"))
-MACHINE_ROWS = (("server_status", "server"), ("place_hosts", "machine"))    # a key of their own: an old row goes
+                   ("place_codes", "machine"), ("place_hosts", "machine"), ("mac_setups", "server"),
+                   ("first_stores", "machine"))
+MACHINE_ROWS = (("server_status", "server"), ("place_hosts", "machine"),    # a key of their own: an old row goes
+                ("first_stores", "machine"))
 MACHINE_MAPS = ("addresses", "servers", "access", "vault_stores")      # the team.json maps keyed by a machine
 
 
@@ -37955,6 +38069,7 @@ def record_status(agent, data):
         q("INSERT INTO machine_status(agent,data,reported) VALUES(?,?,?) "
           "ON CONFLICT(agent) DO UPDATE SET data=excluded.data, reported=excluded.reported", (agent, json.dumps(data), now()))
     vault_read_missing(agent, data)     # C11: a read key that starts to be missing is told to the manager once
+    keep_first_store(agent)             # C9: a machine's first key comes from its reports before its first session
     end_signed_in_waits(agent)          # a sign-in this report says is made is over, whatever is still waiting for it
     if agent == manager_name():
         manager_flag_update(now())      # the banner follows the manager's own report at once (live_changes)
@@ -48446,6 +48561,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 return self.json(400, {"error": "kind must be task, chat or standing"})
             token, t0 = secrets.token_urlsafe(32), now()
+            # C9: the end of the keep before the credential, in this hold of the lock and in its own try: no stop and no
+            # removal leaves a credential without it, and it can stop no start
+            first_session(agent, t0)
             with transaction():
                 DB.execute("UPDATE session_credentials SET revoked=? WHERE agent=? AND kind=? AND revoked IS NULL AND "
                            "(? IS NULL OR (task=? AND attempt=?))", (t0, agent, kind, task, task, attempt))
@@ -49647,9 +49765,11 @@ def rpc(agent, m, headers, context=None, credential=None):
             headers["Mcp-Session-Id"] = uuid.uuid4().hex
             info = params.get("clientInfo") or {}
             client = " ".join(CONTROL.sub(" ", f"{info.get('name') or 'a client'} {info.get('version') or ''}").split())
-            q("UPDATE agents SET client=? WHERE name=? AND client IS NOT ?", (client[:60], agent, client[:60]))
-            with area("quiet"):
-                q("UPDATE agents SET client_seen=? WHERE name=?", (now(), agent))
+            with LOCK:      # C9: the end of the keep, then the sign of a session, in one hold of the lock
+                first_session(agent)    # a runtime's first MCP call is a session, with or without a credential
+                q("UPDATE agents SET client=? WHERE name=? AND client IS NOT ?", (client[:60], agent, client[:60]))
+                with area("quiet"):
+                    q("UPDATE agents SET client_seen=? WHERE name=?", (now(), agent))
             result = {"protocolVersion": want if want in SUPPORTED_PROTOCOLS else SUPPORTED_PROTOCOLS[1],
                       "capabilities": {"tools": {"listChanged": False}},
                       "serverInfo": {"name": "founderizer-hub", "version": "0.1"},

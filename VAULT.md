@@ -561,16 +561,28 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
     the hub at each use, so the end of the grant stops the next request, also of a session and of a check that
     started before (`vault.py`, `hub.py`; see "The key swap"). Two things stay: what the agent did with the key at
     its site while it had the grant (limit 1), and the value in a session that started before the key swapped.
-21. **The first vault key of a machine.** The hub takes the first vault key of a machine from the report of an
-    agent's helper on that machine, and it keeps that key until the owner removes the machine from the fleet
-    (`hub.py`). The app pins a machine's key by itself when it reads the same key on the machine. On a Linux server,
-    it reads the key as root from the broker's key file. On a Mac, it asks Fleet Vault on its socket, as the OS user
-    of that Mac's agents
-    (`Sources/FleetCore/CentralVaultPlan.swift`, `Sources/Founderizer/CentralVaultSection.swift`,
+21. **The first vault key of a machine.** While no agent of a machine has had a session, the hub keeps the vault key
+    that the reports of that machine's helpers agree on. The last of these keys is the machine's first key. The
+    first grant binds that key, and a machine that then reports another key gets no grant (`vault_store_mismatch`)
+    (`hub.py`). The hub knows a session by its session credential, which each session of an agent with an agent key
+    gets before it starts, and by its runtime's first call to the hub (`hub.py`, `fleet.py`). The hub writes down the
+    end of that keep before the first sign of a session, so the end stays when the sign goes, for example with an
+    agent that the owner removes. A machine that is bound at that moment keeps its bound key the same way. Only the
+    removal of the machine from the fleet opens the keep again (`hub.py`). The app
+    pins a machine's key by itself when it reads on the machine the key that the hub has bound. On a Linux server, it
+    reads the key as root from the broker's key file. On a Mac, it asks Fleet Vault on its socket, as the OS user of
+    that Mac's agents (`Sources/FleetCore/CentralVaultPlan.swift`, `Sources/Founderizer/CentralVaultSection.swift`,
     `Sources/FleetCore/CentralVault.swift`). A program of that OS user can answer on that socket in the vault's
-    place. So on a Mac, the pin shows only what that OS user said. An agent that reports a key of its own before the
-    first grant, and answers with it on the socket, can get that key pinned. The central vault then seals the secrets
-    of that Mac to a key that the agent holds. The hub also locks each handover to an agent of that Mac for that
+    place. So on a Mac, the pin shows only what that OS user said, and the first key from before any session is what
+    makes it true. The case that is left has three ways. In the first two, the machine's helpers named no key in a
+    report before the first session of one of its agents: a broker that first answered after that session, or an
+    agent that had sessions on another machine before it moved here (the hub cannot tell where a session ran). For
+    such a machine the hub takes the first key from the report at the first grant, and keeps it until the owner
+    removes the machine from the fleet. The third is a session of an agent without an agent key, which has no
+    credential: the hub sees it only at its runtime's first call to the hub, so a report that comes before that call
+    is still kept as the first key, also through a whole session whose runtime does not reach the hub. In each way, an agent that reports a key of its own in time, and answers with
+    it on a Mac's socket, can get that key pinned. The central vault then seals the secrets of that Mac to a key that
+    the agent holds. The hub also locks each handover to an agent of that Mac for that
     key, and the owner's pin of it lets a broker that checks pins hand the login over (`hub.py`). On a Linux server,
     an agent that reports a key of its own before the first grant gets no pin: the app reads another key as root,
     so it pins nothing for that server, and the central vault seals nothing to the false key. The hub then hands no

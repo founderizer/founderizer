@@ -187,6 +187,16 @@ class Conversations(Base):
         self.assertEqual(hub.q("SELECT * FROM events WHERE agent='studio' AND kind='say'"), [])
         self.assertEqual(hub.q("SELECT * FROM tasks WHERE owner='manager'"), [])          # no lead task either
 
+    def test_a_conversation_window_ends_the_keep_of_its_machines_first_vault_key(self):
+        """C9 (package 6): the credential of a conversation's window is a sign of a session, so its start writes the end
+        of the keep of its machine's first vault key (hub.first_session), before the credential. Without that line a
+        new agent's report could still be kept after this session, once the owner removed studio."""
+        cid = self.says(PAT, "First question")["conversation"]
+        machine = hub.TEAM["agents"]["studio"]["machine"]
+        self.assertIsNone(hub.q1("SELECT closed FROM first_stores WHERE machine=?", (machine,)))
+        hub.conversation_start("studio", cid)
+        self.assertIsNotNone(hub.q1("SELECT closed FROM first_stores WHERE machine=?", (machine,))["closed"])
+
     def test_a_message_after_the_last_read_opens_the_next_conversation_task(self):
         first = self.says(PAT, "First question")
         cid = first["conversation"]
