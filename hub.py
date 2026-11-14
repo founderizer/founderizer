@@ -60,6 +60,7 @@ import wakeups
 from desktop import Frames
 import google
 import hidden       # hidden characters at the hub's exits (strip_hidden); the helper's hook reads the same rule
+import diagnostics  # the lane "Bug reports": the hub's own faults and refused calls, with no words
 import mcp
 import oauth_server     # the connected apps' own OAuth server: its pure parts (the MCP address build spec)
 import push
@@ -533,6 +534,9 @@ CREATE TABLE IF NOT EXISTS place_codes(id INTEGER PRIMARY KEY, sha256 TEXT NOT N
 CREATE TABLE IF NOT EXISTS place_hosts(machine TEXT NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL,
   user TEXT NOT NULL, line_sha256 TEXT NOT NULL, program_sha256 TEXT, address TEXT, updated REAL NOT NULL,
   PRIMARY KEY(machine, host, port, user));
+CREATE TABLE IF NOT EXISTS faults(sig TEXT PRIMARY KEY, kind TEXT NOT NULL, program TEXT NOT NULL,
+  name TEXT NOT NULL, frames TEXT NOT NULL, errno INTEGER, http INTEGER, count INTEGER NOT NULL,
+  first REAL NOT NULL, last REAL NOT NULL, code TEXT NOT NULL);
 
 """
 TOOL_KINDS = ("read", "edit", "delete", "move", "search", "execute", "think", "fetch", "other")
@@ -1420,9 +1424,11 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "default_models",    # the owner, 9 November 2026: "a default for each [AI provider] somewhere under
                                     # settings, and then each agent can be changed individually"
                "web_hosts",         # the host list of an agent whose Shell box is off (UI-API.md, "the host list")
-               "chat_waits"]        # the owner, 13 November 2026 ("Yes, fix it"): the phone's list of chats says
+               "chat_waits",        # the owner, 13 November 2026 ("Yes, fix it"): the phone's list of chats says
                                     # "Thinking" for every conversation, from agents[].waits_since of GET /ui/mobile
                                     # (UI-API.md 1.142)
+               "diagnostics"]       # the owner, 14 November 2026, to the pictures C0, E1, E2 and E3: GET
+                                    # /ui/diagnostics, the hub's own faults and refused calls (UI-API.md 1.167)
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -1953,7 +1959,7 @@ def ping_sender():
             while send_ping() or badge_look():
                 pass
         except Exception:
-            traceback.print_exc()
+            print_fault()
         PING_WAKE.wait(ping_wait())
         PING_WAKE.clear()
 
@@ -2793,6 +2799,71 @@ def parse_id(value, what):
 
 class ToolError(Exception):
     pass
+
+
+# ---------------------------------------------------------------- the hub's own faults (the lane "Bug reports")
+
+# The owner, 14 November 2026: "Pictures first (Recommended)" and, to the pictures C0, E1, E2 and E3 of Report a
+# problem and System status, "ok yes, make sure we include all relevant inforamtion that is SAFE to send". The
+# plan is ~/dev/founderizer-plans/feedback-diagnostics-plan.md. diagnostics.py keeps a fault as its class, its
+# files and lines in the code tree, numbers and times, and never as its words; the table faults keeps the counts.
+FAULT_DAYS = 30         # a row of faults ends after this many days, or with the code that wrote it
+FAULT_WARN_HOURS = 24   # System status says "The hub hit an error" while a fault of this code is this recent
+
+
+def print_fault():
+    """The journal's traceback of the exception being handled, as before, and its class and its places for
+    diagnostics.py, never its words. It raises nothing: the handler that calls it goes on as it did."""
+    traceback.print_exc()
+    diagnostics.record("hub")
+
+
+def known_tool(name):
+    """A refused call's name as diagnostics.py keeps it: a name of the hub's own tool list, else "other",
+    because an agent writes the name of the tool that it calls."""
+    try:
+        return name if isinstance(name, str) and any(tool[1] == name for tool in TOOLS) else "other"
+    except Exception:       # a refusal must stay a refusal: this name is only a count's
+        return "other"
+
+
+def fault_flush(t0):
+    """Once a pass of the tick: write what diagnostics.py counted since the pass before, and end the rows of other
+    code or older than FAULT_DAYS. A count that a refused write loses is one pass of counts, never a handler."""
+    taken = diagnostics.pending()
+    if not taken:
+        return
+    code = diagnostics.code_id()
+    # Quiet: no app waits for this. System status reads health on its own clock, and a refusal that comes back every
+    # pass must not wake every app and the phone's badge each time (the review of 14 November 2026).
+    try:
+        with area("quiet"), transaction():
+            DB.execute("DELETE FROM faults WHERE code != ? OR last < ?", (code, t0 - FAULT_DAYS * 86400))
+            for f in taken:
+                DB.execute(
+                    "INSERT INTO faults(sig,kind,program,name,frames,errno,http,count,first,last,code) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(sig) DO UPDATE SET count=count+excluded.count, "
+                    "first=MIN(first,excluded.first), last=MAX(last,excluded.last), "
+                    "errno=COALESCE(excluded.errno,errno), http=COALESCE(excluded.http,http)",
+                    (diagnostics.signature(f["kind"], f["program"], f["name"], f["frames"]), f["kind"], f["program"],
+                     f["name"], json.dumps(f["frames"], separators=(",", ":")), f["errno"], f["http"], f["count"],
+                     f["first"], f["last"], code))
+    except sqlite3.Error:       # a database that refuses the write: this pass's counts go, and no new fault comes
+        return
+
+
+def thread_fault(args, default=threading.excepthook):
+    """threading.excepthook of the hub (main): a thread that ends on an error is counted as a fault, then the default
+    prints it as before. A thread that ends with SystemExit is no fault."""
+    if args.exc_type is not SystemExit:
+        diagnostics.record("hub", info=(args.exc_type, args.exc_value, args.exc_traceback))
+    default(args)
+
+
+def fault_rows():
+    """The stored faults and refused calls of the code that runs now, of the last FAULT_DAYS: a row that no write has
+    ended yet is as gone as one that a write ended."""
+    return q("SELECT * FROM faults WHERE code=? AND last>=?", (diagnostics.code_id(), now() - FAULT_DAYS * 86400))
 
 
 # ---------------------------------------------------------------- seatbelt
@@ -11656,7 +11727,7 @@ def central_timer():
         try:
             central_sweep()
         except Exception:
-            traceback.print_exc()
+            print_fault()
 
 
 def vault_view(t0=None):
@@ -17259,7 +17330,7 @@ def settle_kit_push():
         with area("quiet"):
             q("DELETE FROM kv WHERE k=? AND v=?", (KIT_PUSHED, mark))
     except Exception:
-        traceback.print_exc()
+        print_fault()
 
 
 def commit_kit_file(path, data, message, more=None, author=None, allow=None, check=None):
@@ -21086,7 +21157,7 @@ def report_question_sweep(t0):
         except Exception as e:      # noqa: BLE001 -- one question's fault is that question's
             if rq["message"] not in REPORT_QUESTION_FAULTS:     # said once for each run of the hub, with its trace
                 REPORT_QUESTION_FAULTS.add(rq["message"])
-                traceback.print_exc()
+                print_fault()
                 log("hub", f"no session for the question AM-{rq['message']} about {dref(rq['report'])}, and the "
                            f"tick tries again: {type(e).__name__}")
 
@@ -28704,6 +28775,7 @@ def call_tool(agent, name, args, context=None):
                 return text, False
         raise ToolError(f"You have no tool named {name}.")
     except ToolError as e:
+        diagnostics.refused(known_tool(name))     # the lane "Bug reports": its tool and its place, no words
         # A refusal can quote what the agent wrote. The log keeps the text that the answer and calls.detail keep, so
         # it holds no login that was registered when the call came (leak_scan reads log.what as it reads the rest).
         said = mask_secrets(hidden_gone(str(e), agent, name))
@@ -30708,7 +30780,7 @@ def trigger_sweep(t0):
             try:
                 act(row)
             except Exception:
-                traceback.print_exc()           # one broken trigger must not stop the others
+                print_fault()           # one broken trigger must not stop the others
 
     def due(t):
         at = latest_due(json.loads(t["schedule"]), t["anchor"], t["next_due"], t0)
@@ -31458,7 +31530,7 @@ def timers():
                 DESKTOP.prune(now())
             tick()
         except Exception:
-            traceback.print_exc()
+            print_fault()
 
 
 def reminder_sweep(t0):
@@ -31700,7 +31772,7 @@ def ci_watcher():
         try:
             ci_pass()
         except Exception:       # noqa: BLE001
-            traceback.print_exc()
+            print_fault()
 
 
 def ci_reminder(agent, a):
@@ -32309,7 +32381,7 @@ def tick():
         try:
             fn(*args)
         except Exception:
-            traceback.print_exc()
+            print_fault()
             if restarts:
                 held.append(fn)
 
@@ -32354,6 +32426,7 @@ def tick():
         step(report_notices, t0)            # support plan F4: the covered tickets that waited for a place
         step(report_question_sweep, t0)     # and the questions about a report that waited for one
         step(manager_flag_update, t0)
+        step(fault_flush, t0)               # the lane "Bug reports": what diagnostics.py counted in this pass
         step(tick_changes, t0)
         # The last line of the pass, and the only thing that says the pass reached it (tick_heartbeat). It moves
         # unless a step that restarts work raised: the warning it holds up says "no stuck task or session is
@@ -33239,11 +33312,11 @@ def knowledge_refresher():
         try:
             refresh_knowledge(now())
         except Exception:
-            traceback.print_exc()
+            print_fault()
         try:
             ask_for_summaries()
         except Exception:
-            traceback.print_exc()
+            print_fault()
 
 
 def task_artifacts(task):
@@ -35439,7 +35512,7 @@ def mac_setup_sweep(t0):
         except (ToolError, Refusal) as e:
             mac_setup_stop(row, f"{e}.")
         except Exception:
-            traceback.print_exc()       # one setup must not stop the others: the next pass tries it again
+            print_fault()       # one setup must not stop the others: the next pass tries it again
 
 
 # The one screen task that macOS's setup screens let through (setup_click): the owner's yes of 7 November 2026 to the
@@ -39527,7 +39600,7 @@ def door_timer():
             try:
                 step()
             except Exception:
-                traceback.print_exc()
+                print_fault()
 
 
 def history_door(a, days, start, before):
@@ -40735,6 +40808,17 @@ def health_view():
         # and the hub's own log (journalctl --user -u fleet-hub) holds the error for whoever he tells.
         warn("timers_stalled", f"Since {owner_clock(beat, t0)}, no stuck task or session is restarted.",
              "Restart the hub's server, and tell us if this comes back.", agent=on_the_hub)
+    # The lane "Bug reports" (the owner's yes of 14 November 2026 to the picture E1): the hub's own faults of the
+    # code that runs now, while one is recent. The app's title is "The hub hit an error", and its button is Report
+    # a problem, which carries them (GET /ui/diagnostics).
+    try:        # a database that refused the table at the start (build_schema) keeps the rest of this page
+        recent = q1("SELECT SUM(count) AS n, MIN(first) AS since FROM faults WHERE kind='fault' AND code=? "
+                    "AND last>=?", (diagnostics.code_id(), t0 - FAULT_WARN_HOURS * 3600))
+    except sqlite3.Error:
+        recent = None
+    if recent and recent["n"]:
+        since = owner_clock(recent["since"], t0)
+        warn("hub_fault", f"{recent['n']} times since {since}." if recent["n"] > 1 else f"Once at {since}.", None)
     helpers = []
     for name in agents():
         if unplaced(name):          # no server yet, so no helper that could be silent (manager_server)
@@ -41820,7 +41904,7 @@ def release_work(applying, automatic=False, fetch=None):
         with LOCK:
             finish_release(row["id"], result["state"], result["step"], result["says"], automatic, result)
     except Exception:
-        traceback.print_exc()
+        print_fault()
         with LOCK:
             for row in settle_releases("the update ended with an error in the hub; read the hub's own log"):
                 # This process runs the code it started with. When its checkout followed the ref before the error, the
@@ -41855,7 +41939,7 @@ def settle_releases(says="the hub stopped before this update ended; the next upd
                 try:
                     request_update(name, row["reached"])
                 except Exception:
-                    traceback.print_exc()
+                    print_fault()
         q("UPDATE releases SET state=?, step=?, says=?, finished=? WHERE state='updating'",
           (releases.FAILED, "merge", says, now()))
         return cut
@@ -42053,6 +42137,7 @@ class HubServer(ThreadingHTTPServer):
         most of the hub's own output and hid the errors that were its own. Every other error prints as before."""
         if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
             return
+        diagnostics.record("hub")       # the lane "Bug reports": a fault of the hub's, as the 18 handlers count theirs
         super().handle_error(request, client_address)
 
 
@@ -43625,7 +43710,7 @@ class ConnectHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             self.close_connection = True
         except Exception:
-            traceback.print_exc()
+            print_fault()
             try:
                 self.capp_json(500, {"error": "server_error"})
             except OSError:
@@ -45254,6 +45339,25 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             result = dict(health_view(), db=generation, changes=change_counts())
         return self.json(200, scrub(result), {"Cache-Control": "no-store"})
+
+    def ui_diagnostics(self, query):
+        """GET /ui/diagnostics?db= (owner feature diagnostics, UI-API.md 1.167): the hub's own faults and refused
+        calls of the code that runs now, as diagnostics.view gives them: classes, files and lines, numbers and times,
+        and no words. Report a problem shows each line that it makes of them before it sends anything."""
+        if not self.ui_allowed():
+            return
+        generation = kv_get("db_id")
+        if query.get("db") != generation:
+            return self.json(409, {"error": "hub generation changed; refresh state"})
+        try:
+            with LOCK:
+                rows = fault_rows()
+        except sqlite3.Error:       # a database that refused the table at the start: nothing to say
+            rows = []
+        answer = diagnostics.view(rows, tools={tool[1] for tool in TOOLS})
+        if secret_hit(json.dumps(answer)):      # the types leave no room for one; this gate is the last word
+            answer = {"faults": [], "refusals": []}
+        return self.json(200, dict(answer, db=generation), {"Cache-Control": "no-store"})
 
     def ui_wait(self, query):
         """GET /ui/wait?db=&since=&wait= (owner feature live_changes): answers when something the owner sees changed
@@ -47987,7 +48091,10 @@ class Handler(BaseHTTPRequestHandler):
         return {k: v[0] for k, v in urllib.parse.parse_qs(raw.decode("utf-8", "replace")).items()}
 
     def route(self):
-        u = urllib.parse.urlsplit(self.path)
+        try:
+            u = urllib.parse.urlsplit(self.path)
+        except ValueError:          # "http://[x/": the caller's mistake, and no fault of the hub
+            return ["\x00"], {}      # a path that no route takes, so each method ends at its 404 ([] is GET's board)
         parts = [urllib.parse.unquote(x) for x in u.path.split("/") if x]
         query = {k: v[0] for k, v in urllib.parse.parse_qs(u.query, keep_blank_values=True).items()}
         return parts, query
@@ -48012,9 +48119,11 @@ class Handler(BaseHTTPRequestHandler):
             self.get()
         except (BrokenPipeError, ConnectionResetError):
             pass
-        except Exception:
-            if not self.gone():
-                traceback.print_exc()
+        except Exception as e:
+            if getattr(self, "answered", False) and isinstance(e, (ConnectionError, TimeoutError)):
+                self.close_connection = True    # the client stopped reading its answer: no fault of the hub's
+            elif not self.gone():
+                print_fault()
                 self.json(500, {"error": "hub error"})
         finally:
             self.serving, CALL.agent = False, None
@@ -48023,7 +48132,16 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.serving, self.answered = True, False
             # read the whole request first: a refusal must not leave half a request on a kept-alive connection
-            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = -1
+            if n < 0:           # no length to read by: the caller's mistake, and not a fault of the hub
+                self.close_connection = True
+                return self.json(400, {"error": "Content-Length must be a whole number"})
+            if n > max(BACKUP_MAX, GOOGLE_UPLOAD_MAX, OUTPUTS_BODY_MAX, ATTACH_MAX):     # more than any route takes
+                self.close_connection = True
+                return self.json(413, {"error": f"a body is at most {BACKUP_MAX // MIB} MiB"})
             if self.path.startswith("/helper/desktop/") and not 0 <= n <= 1500000:
                 self.close_connection = True
                 return self.json(413, {"error": "desktop frame is too large"})
@@ -48048,9 +48166,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.post()
         except (BrokenPipeError, ConnectionResetError):
             pass
-        except Exception:
-            if not self.gone():
-                traceback.print_exc()
+        except Exception as e:
+            if getattr(self, "answered", False) and isinstance(e, (ConnectionError, TimeoutError)):
+                self.close_connection = True    # the client stopped reading its answer: no fault of the hub's
+            elif not self.gone():
+                print_fault()
                 self.json(500, {"error": "hub error"})
         finally:
             self.serving, CALL.agent = False, None
@@ -48140,6 +48260,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_knowledge(query)
         if parts == ["ui", "health"]:
             return self.ui_health(query)
+        if parts == ["ui", "diagnostics"]:
+            return self.ui_diagnostics(query)
         if parts == ["ui", "team"]:
             return self.ui_team(query)
         if parts == ["ui", "capacity"]:
@@ -50572,11 +50694,13 @@ def binding_matches(row, context):
 def rpc(agent, m, headers, context=None, credential=None):
     """One JSON-RPC call of an MCP session. credential: the SHA-256 of the session credential it came with, if any."""
     mid, method, params = m.get("id"), m.get("method"), m.get("params") or {}
+    if not isinstance(params, dict):        # the caller's mistake, and not a fault of the hub
+        return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "params must be an object"}}
     try:
         if method == "initialize":
             want = params.get("protocolVersion")
             headers["Mcp-Session-Id"] = uuid.uuid4().hex
-            info = params.get("clientInfo") or {}
+            info = params.get("clientInfo") if isinstance(params.get("clientInfo"), dict) else {}
             client = " ".join(CONTROL.sub(" ", f"{info.get('name') or 'a client'} {info.get('version') or ''}").split())
             with LOCK:      # C9: the end of the keep, then the sign of a session, in one hold of the lock
                 first_session(agent)    # a runtime's first MCP call is a session, with or without a credential
@@ -50645,7 +50769,7 @@ def rpc(agent, m, headers, context=None, credential=None):
     except Exception as e:
         if agent not in agents():       # it left the fleet while its call ran: no error of the hub's (Handler.gone)
             raise
-        traceback.print_exc()
+        print_fault()
         return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": f"Hub error: {e}"}}
     return {"jsonrpc": "2.0", "id": mid, "result": result}
 
@@ -50748,6 +50872,8 @@ def main():
     # from every version that has it, whatever options that version's parser has gained or lost.
     if len(sys.argv) == 3 and sys.argv[1] == "--check-schema":
         return check_schema(sys.argv[2])
+    diagnostics.code_id()       # the lane "Bug reports": this code's id, before a thread or a release moves a file
+    threading.excepthook = thread_fault     # and a thread that ends on an error is a fault of the hub too
     sys.setswitchinterval(SWITCH_INTERVAL)      # for every thread of the hub
     ap = argparse.ArgumentParser(description="Founderizer hub")
     ap.add_argument("--host", help="address to listen on; default: the hub machine's address in team.json")

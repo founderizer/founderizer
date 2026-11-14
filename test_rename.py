@@ -402,6 +402,7 @@ class Columns(unittest.TestCase):
         ("place_hosts", "machine"): "a machine", ("placements", "target"): "a target", ("placements", "name"): "a variable",
         ("history_fts", "agent"): "the index's own key for an agent, which a rename keeps (hub.history_key)",
         ("placements", "machine"): "a machine", ("withdrawals", "machine"): "a machine",
+        ("faults", "name"): "an exception class, or a tool of the hub's list (diagnostics.py)",
         ("first_stores", "machine"): "a machine",
         ("door_record", "target"): "a host or a provider account of the door (DevOps plan C4)",
         ("door_record", "caller"): "the door's own record of who called it, kept as the door keeps it (plan C4)",
