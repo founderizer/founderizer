@@ -656,6 +656,43 @@ class Devices(OwnerAPI):
         self.assertEqual([n["text"] for n in after["notes"]], ["Ready"])
         self.assertEqual(self.call("/ui/mobile/task/9999")[0], 404)
 
+    def test_a_task_page_holds_the_permissions_that_the_mac_thread_shows(self):
+        """Owner API 1.161: the task's permission that waits and its refusal, with the six fields of the Mac's row; an
+        allowed one and another task's are not in it, and nothing that GET /ui/state does not give a device already."""
+        task, other = self.task(), self.task(title="Other")
+        t0 = hub.now()
+        rows = [(task, "Bash", '{"command":"curl -s https://help.example.com"}', None, None),
+                (task, "Write", '{"file_path":"replies/1.json"}', "deny", "not that folder"),
+                (task, "Read", '{"file_path":"notes.md"}', "allow", "fine"),
+                (other, "Bash", '{"command":"ls"}', None, None)]
+        for n, (on, tool, given, decision, reason) in enumerate(rows):
+            hub.ins("INSERT INTO prompts(task,agent,tool,input,key,created,decision,reason) VALUES(?,?,?,?,?,?,?,?)",
+                    (on, "manager", tool, given, f"key-{n}", t0 + n, decision, reason))
+        page = self.call(f"/ui/mobile/task/{task}")[1]
+        self.assertEqual([p["tool"] for p in page["permissions"]], ["Bash", "Write"])
+        self.assertEqual(set(page["permissions"][0]), {"id", "tool", "input", "created", "decision", "reason"})
+        self.assertEqual((page["permissions"][1]["decision"], page["permissions"][1]["reason"]), ("deny", "not that folder"))
+        self.assertIn('"curl -s https://help.example.com"', page["permissions"][0]["input"])
+        state = {p["id"]: p for p in self.call("/ui/state")[1]["permissions"]}
+        for p in page["permissions"]:
+            self.assertTrue(set(p.items()) <= set(state[p["id"]].items()), "the state gives a device the same and more")
+
+    def test_a_parked_task_head_says_until_when_as_the_state_does(self):
+        """Owner API 1.161: an open task that its agent parked until a time has parked_until in the device's heads, the
+        same value as GET /ui/state, which a device may read already; a task that is not parked has no such key."""
+        parked, free = self.task(title="Parked"), self.task(title="Free")
+        due = hub.now() + 3600
+        with hub.LOCK:
+            hub.DB.execute("UPDATE tasks SET live_path=? WHERE id=?", (hub.PARKED_PATH + "16:00", parked))
+            hub.commit()
+        hub.ins("INSERT INTO reminders(due,note,done,agent,task,created) VALUES(?,?,0,?,?,?)",
+                (due, "come back", "manager", parked, hub.now()))
+        heads = {t["id"]: t for t in self.call("/ui/mobile")[1]["tasks"]}
+        self.assertEqual(heads[parked]["parked_until"], due)
+        self.assertNotIn("parked_until", heads[free])
+        state = {t["id"]: t for t in self.call("/ui/state")[1]["tasks"]}
+        self.assertEqual(state[parked]["parked_until"], heads[parked]["parked_until"])
+
     def test_a_registered_login_never_leaves_in_a_mobile_read(self):
         password, salt = "SyntheticPassword123", "synthetic-salt"
         hub.ins("INSERT INTO secrets(salt,hash,len) VALUES(?,?,?)",

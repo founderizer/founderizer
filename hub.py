@@ -2459,11 +2459,14 @@ def mobile_state(generation, at=None):
     ended = "('completed','failed','rejected','canceled')"
     tasks = [{k: r[k] for k in MOBILE_HEAD} for r in q(f"SELECT * FROM tasks WHERE state NOT IN {ended} ORDER BY id")]
     turns = task_turns()                    # owner API 1.147, 1.148: whether each working task's session works on it
+    parks = parked_until()                  # owner API 1.161: until when its agent parked it, as GET /ui/state says
     for task in tasks:                      # now, and what its running turn does
         if task["id"] in turns:
             task["works"] = turns[task["id"]]["works"]
             if turns[task["id"]]["doing"]:
                 task["doing"] = turns[task["id"]]["doing"]
+        if task["id"] in parks:
+            task["parked_until"] = parks[task["id"]]
     recent = [{k: r[k] for k in MOBILE_HEAD} for r in q(f"SELECT * FROM tasks WHERE state IN {ended} "
                                                         f"ORDER BY id DESC LIMIT {MOBILE_TASKS}")]
     needs = [need_view(r) for r in q("SELECT * FROM needs WHERE answer IS NULL ORDER BY id")]
@@ -41806,8 +41809,14 @@ def phone_task(task_id, query):
         notes = [dict(r) for r in q("SELECT * FROM notes WHERE task=? AND id>? ORDER BY id", (task_id, since))]
         holds = [dict(r) for r in q("SELECT * FROM holds WHERE task=? ORDER BY id", (task_id,))]
         outcomes = [dict(r) for r in q("SELECT * FROM outcomes WHERE task=? ORDER BY id", (task_id,))]
+        # Owner API 1.161: the permissions that the Mac's task thread shows (FleetPermission.needsReading: one that
+        # waits, and a refusal), with the fields that its row reads and no more. GET /ui/state, which a device may read,
+        # has every permission of the fleet with every field, so a device learns nothing new here.
+        permissions = [dict(r) for r in q("SELECT id,tool,input,created,decision,reason FROM prompts WHERE task=? AND "
+                                          "(decision IS NULL OR decision='deny') ORDER BY id", (task_id,))]
     return 200, scrub({"db": generation, "task": dict(task), "notes": notes, "holds": holds, "outcomes": outcomes,
-                       "cursor": notes[-1]["id"] if notes else since}), {"Cache-Control": "no-store"}
+                       "permissions": permissions, "cursor": notes[-1]["id"] if notes else since}), \
+        {"Cache-Control": "no-store"}
 
 
 def phone_knowledge(query):
