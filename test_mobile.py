@@ -509,7 +509,7 @@ class Devices(OwnerAPI):
         self.assertEqual(status, 200)
         self.assertEqual(set(state), {"schema_version", "db", "time", "manager_flag", "manager_warning", "agents",
                                       "needs", "answered_needs", "tasks", "recent", "holds", "outcomes", "chat_apps",
-                                      "counts", "ui_features", "token"})
+                                      "counts", "ui_features", "token", "ended_mark"})
         self.assertEqual([n["id"] for n in state["needs"]], [need])     # the open item only
         self.assertEqual([(n["id"], n["answer"]) for n in state["answered_needs"]], [(answered, "yes")])
         # a head carries what the Mac's state word reads, so the phone's Tasks row can say "Stalled" as its page does
@@ -715,6 +715,45 @@ class Devices(OwnerAPI):
         child = self.call(f"/ui/mobile/task/{second}")[1]
         self.assertEqual((child["parent_task"]["id"], child["parent_task"]["title"]), (lead, "Lead"))
         self.assertEqual(self.call(f"/ui/mobile/task/{alone}")[1]["subtasks"], [])
+
+    def test_a_device_reads_every_ended_task_with_its_schedule(self):
+        """Owner API 1.166: GET /ui/mobile/ended gives the head of every ended task by id, with its schedule, and the
+        mark of GET /ui/mobile; GET /ui/mobile keeps its 20 newest in recent, and its mark moves when a task ends and
+        when an ended task's check comes."""
+        key = self.enrolled()
+        open_task = self.task(title="Open")
+        ended = [self.task(title=f"Ended {n}", state="failed" if n % 7 == 0 else "completed", details="d") for n in range(25)]
+        hub.q("UPDATE tasks SET trigger_id=3 WHERE id IN (?,?)", (ended[1], ended[2]))
+        mobile = self.call("/ui/mobile", source=PHONE, token=key)[1]
+        self.assertEqual(len(mobile["recent"]), hub.MOBILE_TASKS)
+        self.assertIn("mobile_ended", mobile["ui_features"])
+        status, page = self.call("/ui/mobile/ended?db=test-generation", source=PHONE, token=key)
+        self.assertEqual(status, 200, page)
+        self.assertEqual([t["id"] for t in page["tasks"]], ended)
+        self.assertNotIn(open_task, [t["id"] for t in page["tasks"]])
+        self.assertEqual(set(page["tasks"][0]), set(hub.MOBILE_HEAD) | {"trigger_id"})
+        self.assertEqual([t["trigger_id"] for t in page["tasks"][:3]], [None, 3, 3])
+        self.assertEqual(page["mark"], mobile["ended_mark"])
+        hub.q("UPDATE tasks SET accepted=1 WHERE id=?", (ended[0],))
+        checked = self.call("/ui/mobile", source=PHONE, token=key)[1]["ended_mark"]
+        self.assertNotEqual(checked, page["mark"], "a check of an ended task moves the mark")
+        hub.q("UPDATE tasks SET state='completed' WHERE id=?", (open_task,))
+        self.assertNotEqual(self.call("/ui/mobile", source=PHONE, token=key)[1]["ended_mark"], checked, "a task that ends moves it")
+        self.assertEqual(self.call("/ui/mobile/ended?db=another", source=PHONE, token=key)[0], 409)
+
+    def test_a_device_that_may_not_reads_no_ended_task(self):
+        """Owner API 1.166: the read is a device's under its key, as GET /ui/mobile is: a wrong key, an address that
+        is no device and a removed device are refused, and the Mac reads it."""
+        key = self.enrolled()
+        self.task(title="Ended", state="completed")
+        read = "/ui/mobile/ended?db=test-generation"
+        self.assertEqual(self.call(read, source=PHONE, token=key)[0], 200)
+        self.assertEqual(self.call("/ui/mobile/ended", source=PHONE, token=key)[0], 409, "a read names its generation")
+        self.assertEqual(self.call(read, source=PHONE, token="wrong")[1].get("auth"), "device_key_mismatch")
+        self.assertEqual(self.call(read, source=OTHER, token=key)[0], 403)
+        hub.q("DELETE FROM owner_devices WHERE device='iphone'")
+        self.assertEqual(self.call(read, source=PHONE, token=key)[1].get("auth"), "device_not_enrolled")
+        self.assertEqual(len(self.call(read)[1]["tasks"]), 1, "the owner's Mac")
 
     def test_a_parked_task_head_says_until_when_as_the_state_does(self):
         """Owner API 1.161: an open task that its agent parked until a time has parked_until in the device's heads, the

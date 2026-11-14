@@ -1380,6 +1380,7 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "agent_messages", "google", "mcp", "mcp_check", "mcp_program", "servers", "responsibilities",
                "server_prepare",
                "mobile", "attachments", "resource_grants", "machine_signin",
+               "mobile_ended",      # owner API 1.166: GET /ui/mobile/ended and the ended_mark of GET /ui/mobile
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
                "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
@@ -1432,6 +1433,10 @@ OWNER_DEVICE_LIMIT = 4          # the owner's own devices (MOBILE-APP.md): the p
 DEVICE_CODE_LIFE = 600          # seconds an enrollment code works
 DEVICE_TRIES = 5                # wrong codes from one device in an hour before the hub stops answering it
 MOBILE_TASKS = 20               # task heads that the phone reads beside the open ones
+# Owner API 1.166: a device's read of every ended task (phone_ended), for an Ended lane that counts and opens all ended
+# tasks of its period as the Mac's does (the owner, 14 November 2026: "Yes, as the Mac"). Its heads carry the schedule
+# that a task ran for, so the lane groups a schedule's runs as the Mac does (EndedTasks.groups).
+ENDED_STATES = "('completed','failed','rejected','canceled')"
 MOBILE_CHAT = 30                # chat items in one page for the phone
 MOBILE_PREVIEW = 120            # characters of a chat preview in the phone's agent list
 MOBILE_HEAD = ("id", "title", "state", "owner", "requester", "goal", "needs", "attempt", "accepted", "created",
@@ -2472,6 +2477,7 @@ def mobile_state(generation, at=None):
             task["parked_until"] = parks[task["id"]]
     recent = [{k: r[k] for k in MOBILE_HEAD} for r in q(f"SELECT * FROM tasks WHERE state IN {ended} "
                                                         f"ORDER BY id DESC LIMIT {MOBILE_TASKS}")]
+    mark = ended_mark()                     # owner API 1.166: read GET /ui/mobile/ended again when it changes
     needs = [need_view(r) for r in q("SELECT * FROM needs WHERE answer IS NULL ORDER BY id")]
     # D-7 item 2: an answered request card stays in its chat, folded to two lines, so the phone reads the newest
     # answered items too, oldest first. `needs` stays the open ones, which every phone already reads.
@@ -2481,13 +2487,38 @@ def mobile_state(generation, at=None):
             "manager_flag": kv_get("mgr_flag"), "manager_warning": manager_warning(), "ui_features": ui_features(),
             "agents": [mobile_agent(name, config) for name, config in agents().items()],
             "needs": needs, "answered_needs": list(reversed(answered)), "tasks": tasks,
-            "recent": list(reversed(recent)),
+            "recent": list(reversed(recent)), "ended_mark": mark,
             "holds": [dict(r) for r in q("SELECT * FROM holds WHERE released IS NULL ORDER BY id")],
             "outcomes": [dict(r) for r in q("SELECT * FROM outcomes WHERE resolved IS NULL ORDER BY id")],
             "chat_apps": {"paused": chat_paused()},
             "counts": {"tasks_open": len(tasks), "needs_open": len(needs),
                        "messages": q1("SELECT COUNT(*) n FROM ui_requests")["n"],
                        "reports": q1("SELECT COUNT(*) n FROM owner_reports")["n"]}}
+
+
+def ended_mark():
+    """Owner API 1.166: a short value that changes whenever the answer of GET /ui/mobile/ended would: a task that ends,
+    and a check or an activity of one that ended (its count, its newest id, its accepted marks, its newest check and
+    activity). A client that holds the read of the same mark has every ended head as it is."""
+    r = q1(f"SELECT COUNT(*) n, MAX(id) top, SUM(accepted IS NOT NULL) checked, SUM(COALESCE(accepted, 0)) accepted, "
+           f"MAX(COALESCE(checked_at, 0)) checked_at, MAX(COALESCE(last_activity, 0)) moved, "
+           f"MAX(COALESCE(trigger_id, 0)) schedule FROM tasks WHERE state IN {ENDED_STATES}")
+    return hashlib.sha256(json.dumps([r[k] for k in r.keys()]).encode()).hexdigest()[:16]
+
+
+def phone_ended(query):
+    """GET /ui/mobile/ended after ui_allowed (owner API 1.166): the head of every ended task, by id, with the schedule
+    it ran for, and the mark of GET /ui/mobile that it is of. A device reads it when that mark changes, and its Tasks
+    board counts and opens the ended tasks of each period from it, as the Mac does from GET /ui/state, which has every
+    task. GET /ui/mobile keeps its 20 newest in `recent`, so it does not grow with them."""
+    generation = kv_get("db_id")
+    if query.get("db") != generation:               # a read of a generation that the client holds (its mark)
+        return 409, {"error": "hub generation changed; refresh state"}, None
+    with LOCK:
+        tasks = [{k: r[k] for k in MOBILE_HEAD + ("trigger_id",)}
+                 for r in q(f"SELECT * FROM tasks WHERE state IN {ENDED_STATES} ORDER BY id")]
+        mark = ended_mark()
+    return 200, scrub({"db": generation, "mark": mark, "tasks": tasks}), {"Cache-Control": "no-store"}
 
 
 def mobile_cut(answer):
@@ -44225,6 +44256,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         return self.json(*phone_chat(agent, query))
 
+    def ui_mobile_ended(self, query):
+        """GET /ui/mobile/ended: the head of every ended task (phone_ended)."""
+        if not self.ui_allowed():
+            return
+        return self.json(*phone_ended(query))
+
     def ui_mobile_task(self, task_id, query):
         """GET /ui/mobile/task/<id>: one task in full, with its notes after the cursor, its holds and its outcomes
         (phone_task)."""
@@ -47880,6 +47917,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_mobile_chat(parts[3], query)
         if len(parts) == 4 and parts[:3] == ["ui", "mobile", "task"] and parts[3].isdigit():
             return self.ui_mobile_task(int(parts[3]), query)
+        if parts == ["ui", "mobile", "ended"]:
+            return self.ui_mobile_ended(query)
         if parts == ["ui", "owner", "devices"]:
             return self.ui_owner_devices(query)
         if parts == ["ui", "connect"]:                 # the connected apps (the MCP address build spec, section 3)
