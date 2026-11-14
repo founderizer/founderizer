@@ -4000,7 +4000,7 @@ def allowance_start_text(agent, task_id):
     t = read_row("SELECT needs FROM tasks WHERE id=?", (task_id,)) if task_id else None
     want = "screen" if t and t["needs"] == "screen" else "primary"
     route = next((r for r in usage_routes(agent) if r[0] == want), None)
-    if route is None or (want == "primary" and local_model(agents().get(agent) or {})):
+    if route is None or (want == "primary" and local_model(agents().get(agent) or {}, team_read().get("accounts"))):
         return ""              # a local model has no account allowance to pace against
     _, runtime, reading = route
     lim = read_row("SELECT * FROM agent_limits WHERE agent=? AND ended IS NULL ORDER BY id DESC LIMIT 1", (agent,))
@@ -4128,21 +4128,31 @@ def stable_opening(agent, needs):
     """How a new session of this agent's task gets its per-task block (plan P9.2): "read" for a Claude session, whose
     first read_messages answer is the block, "prompt" for a Codex session, whose first prompt ends with it, and None
     for a start as before, which reads the rules and its profile as files. Only on a helper that starts so
-    (helper feature stable_start), and only in a terminal: a screen or app-server task and an ACP runtime start as
-    before. read_row: admit_task runs this inside the transaction that writes the task."""
+    (helper feature stable_start), and only in a terminal: a screen or app-server task starts as before.
+    read_row: admit_task runs this inside the transaction that writes the task.
+
+    The third opening (the AI providers build, spec 3.5.1): "system" for a task of a runtime of driver acp, on a
+    helper that reports acp_tasks. The runner gives the stable text to the program as its system text and the task's
+    block as its first prompt. Its start event stays unread (task_started marks only "prompt"), so the helper's first
+    signal still comes, which OpenCode's first prompt waits for, and the first read_messages gives START_READ. The two
+    other callers, a conversation with the agent's tools, never reach this for such a runtime: conversation_refusal
+    refuses a conversation with tools to a runtime with no owner_chat, which no ACP runtime has."""
     a = agents().get(agent) or {}
     st = read_row("SELECT data FROM machine_status WHERE agent=?", (agent,))
     try:
         features = (json.loads(st["data"]).get("features") or []) if st else []
     except (TypeError, ValueError):
         features = []
-    if STABLE_START not in features or runtime_fact(a.get("runtime"), "driver") != "terminal" or \
-            app_server_task(a, needs):
+    driver = runtime_fact(a.get("runtime"), "driver")
+    if driver == "acp" and ACP_TASKS in features and runtime_fact(a.get("runtime"), "task_opening") == "system":
+        return "system"
+    if STABLE_START not in features or driver != "terminal" or app_server_task(a, needs):
         return None
     return runtime_fact(a.get("runtime"), "task_opening")
 
 
 STABLE_START = "stable_start"       # the helper feature (lifecycle.FEATURES)
+ACP_TASKS = "acp_tasks"             # the helper feature of a task of driver acp with the third opening (spec 3.10)
 
 
 def task_start_text(agent, task_id, resume=False, note="", row=None, opening=None):
@@ -4716,10 +4726,11 @@ def agent_view(name, config, reads=None):
                 reports_to=None if config["role"] == "manager" else
                 (config["reports_to"] if config.get("reports_to") in agents() else manager_name()),
                 direct_chat=owner_chat(config),
-                local_model=local_model(config),
+                local_model=local_model(config, team_read().get("accounts")),
                 # What its machine last said about its own provider, so the app shows a signed-out agent its sign-in in
                 # place of its chat: null when the reading is old or a local model needs none.
-                signed_in=None if local_model(config) else signed_in_now(name, config["runtime"], reads),
+                signed_in=None if local_model(config, team_read().get("accounts")) else
+                signed_in_now(name, config["runtime"], reads),
                 # Owner feature chat_warm: whether its owner chat can answer now, so the app shows "Setting up" in place
                 # of a chat that cannot yet (chat_ready_now).
                 chat_ready=chat_ready_now(name, seen["alive"] if seen else None, reads),
@@ -5756,7 +5767,8 @@ def spread_limit(agent, route, cause, until, known, t0):
     others = [(name, r) for name, r in g["routes"] if name != agent and name != manager_name()]
     if not others:
         return [], "no other agent spends this allowance"
-    shared, why = one_allowance(g["reading"])
+    # an account with a kind is one allowance (spec 3.1); every other account says so by its reading alone
+    shared, why = (True, None) if g["key"].startswith(ACCOUNT_GROUP) else one_allowance(g["reading"])
     if not shared:
         return [], why
     held = []
@@ -5866,8 +5878,11 @@ def screen_failed(key, seq, error):
     message to the requester. The helper's answer to the pause is the proof that nothing of the session runs. The
     owner's Resume starts a new attempt, as from every hold."""
     t = q1("SELECT * FROM tasks WHERE id=?", (key[0],))
-    if not app_server_task(agents().get(t["owner"]) or {}, t["needs"]) or t["state"] in TERMINAL or \
-            t["attempt"] != key[1] or active_hold(t["id"]):
+    owner = agents().get(t["owner"]) or {}
+    # The AI providers build (spec 3.11 item 7): a task of driver acp too. Its runner ends a failed prompt with the
+    # stop reason error and stays for the next line; a new session would fail in the same way.
+    if not (app_server_task(owner, t["needs"]) or runtime_fact(owner.get("runtime"), "driver") == "acp") or \
+            t["state"] in TERMINAL or t["attempt"] != key[1] or active_hold(t["id"]):
         return
     if error is None:       # the newest record of the turn: its error from an earlier batch, or it has none
         before = q1("SELECT type, data FROM thread_events WHERE task=? AND attempt=? AND session=? AND "
@@ -8045,7 +8060,7 @@ def availability(kind, reason=None, until=None, retry_at=None):
     return {"state": kind, "reason": reason, "until": until, "retry_at": retry_at}
 
 
-def account_state(reading, holds, t0):
+def account_state(reading, holds, t0, model=None):
     """The allowance of one provider account (owner API 1.10), from its newest reading and from the hub's usage-limit
     holds that a session on this account caused. until is the time when every limit that applies has reset, only when
     the provider or the session gave all of them; one unknown reset keeps it null. retry_at is then the hub's own
@@ -8069,6 +8084,8 @@ def account_state(reading, holds, t0):
               ("; it gave no reset time for " + ", ".join(w["label"] for w in open_ended) if open_ended else "") + "."]
              if coming or open_ended else [])
         return availability("limited", " ".join(reasons), until, max(guesses) if until is None and guesses else None)
+    if model:       # the kind of an account with one (the AI providers build): no reading, and with no hold it is open
+        return availability("available", MODEL_ACCOUNT_STATE.get(model))
     if not reading:
         return availability("unknown", "There is no account reading.")
     if not fresh:
@@ -8150,23 +8167,24 @@ def account_groups(t0=None):
     needs. This is the grouping alone, for the places that say something about an allowance before it is spent."""
     t0, out = t0 or now(), {}
     for name in agents():
-        lim, local = active_limit(name), local_model(agents().get(name) or {})
+        lim, local = active_limit(name), local_model(agents().get(name) or {}, team_read().get("accounts"))
+        own = model_group(name)         # the AI providers build: an account with a kind, whatever its reading says
         for route, runtime, reading in usage_routes(name):
-            key = (reading or {}).get("account_key")
-            if not key or (route == "primary" and local):
+            key = own if own and route == "primary" else (reading or {}).get("account_key")
+            if not key or (route == "primary" and local and not own):
                 continue
             g = out.setdefault(key, {"key": key, "runtime": runtime, "reading": None, "agents": set(),
                                      "routes": [], "holds": []})
             g["agents"].add(name)
             g["routes"].append((name, route))       # account_limits: which route of each agent spends from it
-            if (reading.get("collected_at") or 0) > ((g["reading"] or {}).get("collected_at") or -1):
+            if key != own and (reading.get("collected_at") or 0) > ((g["reading"] or {}).get("collected_at") or -1):
                 g["reading"] = reading
             if lim and limit_route(lim) == route:
                 g["holds"].append(lim)
     for g in out.values():
         g["agents"] = sorted(g["agents"])
         g["routes"].sort()
-        g["state"] = account_state(g["reading"], g["holds"], t0)
+        g["state"] = account_state(g["reading"], g["holds"], t0, model=model_group_entry(g["key"]).get("kind"))
     return out
 
 
@@ -8224,7 +8242,7 @@ def account_group(agent, route="primary", groups=None):
     """The provider account that one route of one agent spends from, with the other agents that share it. None for
     a route with no account identity -- a local model, or a reading that has not named one yet."""
     want = next((r for r in usage_routes(agent) if r[0] == route), None)
-    key = (want[2] or {}).get("account_key") if want else None
+    key = (model_group(agent) if route == "primary" else None) or ((want[2] or {}).get("account_key") if want else None)
     g = (groups if groups is not None else account_groups()).get(key) if key else None
     return dict(g, runtime=want[1], sharers=[n for n in g["agents"] if n != agent]) if g else None
 
@@ -8309,9 +8327,10 @@ def capacity_view(names=None, expertise=None, needs=None, login=None):
     t0, team, rev = now(), agents(), kit_revision(fresh=True)
     routes_of, groups = {}, {}
     for name, a in team.items():
-        lim = active_limit(name)
+        lim, own = active_limit(name), model_group(name)       # own: the AI providers build (account_groups)
         for route, runtime, reading in usage_routes(name):
-            group = None if route == "primary" and local_model(a) else \
+            group = own if own and route == "primary" else None if route == "primary" and \
+                local_model(a, team_read().get("accounts")) else \
                 (reading or {}).get("account_key") or f"unknown:{name}:{route}"
             routes_of.setdefault(name, []).append((route, runtime, group, reading or {}))
             if group:
@@ -8319,15 +8338,15 @@ def capacity_view(names=None, expertise=None, needs=None, login=None):
                 g["routes"].append({"agent": name, "route": route})
                 if route == "primary" and a.get("account"):
                     g["labels"].add(a["account"])
-                if reading:
+                if reading and group != own:
                     g["samples"].append((name, route, reading))
                 if lim and limit_route(lim) == route:
                     g["holds"].append(lim)
-    for g in groups.values():
+    for key, g in groups.items():
         newest = max(g["samples"], key=lambda x: x[2].get("collected_at") or 0, default=None)
         g["reading"] = newest[2] if newest else None
         g["routes"].sort(key=lambda r: (r["agent"], r["route"]))
-        g["state"] = account_state(g["reading"], g["holds"], t0)
+        g["state"] = account_state(g["reading"], g["holds"], t0, model=model_group_entry(key).get("kind"))
     stale = lambda r: not r.get("collected_at") or t0 - r["collected_at"] > USAGE_STALE
     out, shown = [], set()
     for name, a in team.items():
@@ -8400,7 +8419,8 @@ def capacity_view(names=None, expertise=None, needs=None, login=None):
         if group not in shown:
             continue
         reading = g["reading"] or {}
-        provider = None if group.startswith("unknown:") else group.split(":", 1)[0]
+        provider = model_group_entry(group).get("provider") or \
+            (None if group.startswith("unknown:") else group.split(":", 1)[0])
         names_ = sorted(g["labels"])
         problems = ([f"Owner labels differ for one provider account: {', '.join(names_)}."] if len(names_) > 1 else []) + \
             [f"The owner label {x} also names {', '.join(sorted(o for o, h in groups.items() if o != group and x in h['labels']))}."
@@ -9284,7 +9304,8 @@ def site_url(value):
 
 
 PROVIDER_SITES = ("claude.ai", "claude.com", "chatgpt.com", "auth.openai.com", "x.ai")   # the providers' sign-in sites
-PROVIDER_KEY_SITES = ("platform.claude.com",)   # an API console under one of them: a key read there stays allowed
+PROVIDER_KEY_SITES = ("platform.claude.com", "api.x.ai")   # an API console or a paid API under one of them: a key
+                                                            # read there stays allowed (api.x.ai: the AI providers build)
 
 
 def provider_site(host):
@@ -14154,6 +14175,8 @@ def conversation_refusal(agent, person=None):
     a = agents().get(agent) or {}
     if not a or not agent_active(agent) or a.get("role") not in ("worker", "lead"):
         return f"{agent_display(agent)} cannot chat now."
+    if model_group(agent):      # the AI providers build (spec 3.11 item 13): its server has no closed runtime
+        return f"{agent_display(agent)} cannot chat now."
     if not contact_reach(agent, person):        # DevOps D5, support plan F1
         return f"{agent_display(agent)} cannot chat now."
     if not contacts_v2():
@@ -16070,7 +16093,7 @@ def record_session_tokens(agent, rows, runtime=None, reading=None):
     if not rows:
         return
     t0 = now()
-    account = reading_account(reading)
+    account = model_group(agent) or reading_account(reading)    # the AI providers build: its account's group key
     with area("activity"), LOCK:
         ids = [r["session_id"] for r in rows]
         known = {r["session_id"]: r for at in range(0, len(ids), 500) for r in read_rows(
@@ -23610,7 +23633,11 @@ def history_view(query):
 # that he reads in the repository's history and reverts in one step.
 # knowledge/services.md says how every agent reaches each service, so it is the owner's too (DevOps plan V1): an agent
 # that rewrote it would steer every other agent's route to a service.
-KNOWLEDGE_WRITE = re.compile(r"(?!.*\.\.)(?!knowledge/owner/)(?!knowledge/services\.md\Z)knowledge/[A-Za-z0-9._/-]+\.md\Z")
+# No file AGENTS.md either, in any case of its letters (the AI providers build, spec 3.11 item 9): OpenCode gives the
+# model an AGENTS.md of a folder below its working folder, which is the agent's checkout, when the agent reads a file
+# there.
+KNOWLEDGE_WRITE = re.compile(r"(?!.*\.\.)(?!knowledge/owner/)(?!knowledge/services\.md\Z)(?!.*/(?i:agents\.md)\Z)"
+                             r"knowledge/[A-Za-z0-9._/-]+\.md\Z")
 
 
 def t_write_knowledge(agent, a):
@@ -26215,6 +26242,12 @@ def t_set_agent_model(agent, a):
                         f"which the next period's costs then show.")
     guard(agent, why)
     old = {k: agents()[target].get(k) for k in ("model", "effort")}
+    # The AI providers build (spec 3.3): at a seller of several makers the owner names the model, and this tool
+    # changes the effort only.
+    if (lifecycle.model_account(team_read(), agents()[target]) or {}).get("makers") == "many":
+        if str(a.get("model") or "").strip() and new["model"] != old["model"]:
+            raise ToolError(SELLER_MODEL)
+        new["model"] = old["model"]
     if new == old:
         return f"{target} already runs {costs_model(new)}. Nothing changed."
     try:
@@ -30582,7 +30615,8 @@ def trigger_sweep(t0):
 MODEL_NAME = re.compile(r"[A-Za-z0-9._:/\[\]-]{1,120}")
 EFFORT_NAME = re.compile(r"[a-z]{1,20}")
 CAPABILITIES = ("shell", "web", "browser", "screen")
-VERIFY_KINDS = ("runtime", "model", "capability", "mac", "login", "access")     # the hub adds "knowledge"
+VERIFY_KINDS = ("runtime", "model", "capability", "mac", "login", "access",
+                "account")      # the hub adds "knowledge"; "account": an account with a kind (the AI providers build)
 LOGIN_REASONS = ("ok", "not_found", "no_access", "bad_format", "no_token", "timeout", "error")
 ACTIVATION_CHECK_AGE = 3600     # seconds: activation needs a machine check at most this old
 MODELS_MAX_AGE = 86400          # seconds: a model or effort is saved only against a reading at most this old
@@ -30626,8 +30660,10 @@ def verify_items(value):
             raise ValueError("each verify item needs kind, ref and state")
         if v["kind"] == "login" and v.get("detail") not in LOGIN_REASONS + ("not probed",):
             raise ValueError("a login item gives one of the fixed probe reasons")
-        items.append({"kind": v["kind"], "ref": v["ref"], "state": v["state"],
-                      "detail": _optional(v.get("detail"), str, 300) or ""})
+        detail = _optional(v.get("detail"), str, 300) or ""
+        if v["kind"] == "account" and not account_detail(detail):
+            detail = ""         # a helper of another release can have another sentence: kept as none, never refused
+        items.append({"kind": v["kind"], "ref": v["ref"], "state": v["state"], "detail": detail})
     return items
 
 
@@ -30677,6 +30713,11 @@ def verify_merge(agent, items, status):
     for login in sorted(granted_logins(agent) - probed):
         out.append({"kind": "login", "ref": login, "state": "not_verified", "detail": "not probed"})
     vault = (status.get("security") or {}).get("vault") or {}
+    # The AI providers build: the check of an account with a kind is the helper's (Lifecycle.verify). A helper that
+    # sent none for this agent's account has not checked it, so the agent does not activate on that check.
+    held = lifecycle.model_account(team_read(), agents().get(agent))
+    if held and not any(i["kind"] == "account" and i["ref"] == held["id"] for i in items):
+        out.append({"kind": "account", "ref": held["id"], "state": "failed", "detail": ""})
     out.append({"kind": "access", "ref": "sandbox", "state": "ok", "detail": start_sandbox(agents().get(agent) or {})})
     out.append({"kind": "access", "ref": "vault", "state": "ok" if vault.get("mode") else "not_verified",
                 "detail": ("The vault token is kept apart from the agent's user." if vault.get("isolated") else
@@ -30689,7 +30730,7 @@ def verify_merge(agent, items, status):
 def item_required(agent, item):
     """The hub's activation rule for one setup check item."""
     a = agents().get(agent) or {}
-    if item["kind"] in ("runtime", "knowledge", "login"):
+    if item["kind"] in ("runtime", "knowledge", "login", "account"):
         return True
     if item["kind"] == "model":
         return bool(a.get("model") or a.get("effort")) and item["state"] != "not_verified"
@@ -30853,6 +30894,8 @@ def save_agent_settings(agent, body):
     model, effort = new.get("model", old["model"]), new.get("effort", old["effort"])
     if ("model" in new or "effort" in new) and (model, effort) != (old["model"], old["effort"]) and (model or effort):
         offered(agent, model, effort)
+    if "account" in new and account_change_refusal(team, old["account"], new["account"]):     # the AI providers build
+        raise Refusal(409, account_change_refusal(team, old["account"], new["account"]))
     if "screen" in new:                     # owner API 1.11: the screen runtime's own model and effort
         if old["screen"] is None:
             raise Refusal(400, f"{shown_role(agent)} has no screen runtime.")
@@ -32065,7 +32108,8 @@ def manager_flag_update(t0):
         # Signed out, it can do nothing, so its silence, a question on its screen, a stopped session or an old limit
         # only show what that looks like, and the sign-in is the step (the owner, 25 October 2026). A switch keeps
         # its own words below.
-        signed_out = not local_model(agents()[mgr]) and signed_in_now(mgr, agents()[mgr].get("runtime")) is False
+        signed_out = not local_model(agents()[mgr], team_read().get("accounts")) and \
+            signed_in_now(mgr, agents()[mgr].get("runtime")) is False
         if signed_out:
             kind, held = "signed_out", False
             flag = "The manager is not signed in."
@@ -33968,6 +34012,7 @@ def validate_team(team):
             raise ValueError(f"agent {name}: expertise must be up to 8 different tags of 1 to 30 characters a-z 0-9 -")
         if a.get("account") is not None and a["account"] not in (team.get("accounts") or {}):
             raise ValueError(f"agent {name}: account must be an ID in accounts")
+        agent_account_rule(team, name, a)       # the AI providers build: its program and its Linux server
         stored = a.get("runtime_policies", {})          # owner feature runtime_switch: the other runtime's policy
         if not isinstance(stored, dict) or set(stored) - set(SWITCH_RUNTIMES) or a["runtime"] in stored or not all(
                 isinstance(p, dict) and not set(p) - {"start", "allow"} and isinstance(p.get("start"), str) and
@@ -34059,11 +34104,12 @@ def validate_team(team):
     if not isinstance(labels, dict) or len(labels) > 64:
         raise ValueError("accounts must map up to 64 account IDs to {provider, title}")
     for aid, acc in labels.items():
-        if not ENTRY_ID.fullmatch(aid) or not isinstance(acc, dict) or set(acc) - {"provider", "title"} or \
+        if not ENTRY_ID.fullmatch(aid) or not isinstance(acc, dict) or set(acc) - set(ACCOUNT_FIELDS) or \
                 not (isinstance(acc.get("provider"), str) and TAG.fullmatch(acc["provider"])) or \
                 not (isinstance(acc.get("title", ""), str) and len(acc.get("title", "")) <= 60 and "\n" not in acc.get("title", "")):
             raise ValueError(f"account {aid!r} needs an ID of 2 to 31 characters a-z 0-9 - that starts with a letter, a "
                              f"provider of 1 to 30 characters a-z 0-9 -, and a title of at most 60 characters")
+        account_rule(team, aid, acc)            # the AI providers build: an account with a key or an address
     catalog = team.get("logins", {})
     if not isinstance(catalog, dict) or len(catalog) > CATALOG_MOST:
         raise ValueError(f"logins must map up to {CATALOG_MOST} bws://<uuid> references to {{title}}")
@@ -34100,6 +34146,7 @@ def validate_team(team):
     # in is read as it is: the key is not checked, not written and not read anywhere. The same holds for "targets"
     # and an agent's "targets" since Targets left the hub (the owner, 24 October 2026).
     validate_resources(team)        # owner feature resource_grants: the grantable pool and the owner's ceiling
+    account_resources_rule(team)    # the AI providers build: no pool holds an account's key
     validate_door(team)             # DevOps plan C4: the door, when this fleet has one
     validate_chat_apps(team)
     check_lines({n: (a["role"], a.get("reports_to")) for n, a in team["agents"].items()})
@@ -37219,13 +37266,271 @@ def save_grant(body, by="owner"):
                 updates_requested=updates)
 
 
+# ---------------------------------------------------------------- model accounts (the AI providers build, lane B)
+#
+# An agent gets its model in one of three ways: a plan (a sign-in in the vendor's own program, as before), a key (an
+# API key in the vault) or the owner's own model server (an address). The two last are an entry of team.json
+# "accounts" with a `kind` (lifecycle.ACCOUNT_KINDS), which the agent names with `account`; the program that runs it
+# is the account's (lifecycle.model_account). The contract is ai-providers-spec.md, version 4, sections 3.1, 3.3 and
+# 3.8, in ~/dev/founderizer-plans. Dormant until the apps offer an account kind: no route of this release makes an
+# agent with one, and no released app writes a `kind`.
+
+ACCOUNT_FIELDS = ("provider", "title", "kind", "secret", "address", "model")     # an entry of team.json "accounts"
+ACCOUNT_ADDRESS_MOST = 200      # characters of a model server's address
+ACCOUNT_PATH = re.compile(r"(?:/[A-Za-z0-9._~-]+)*/?")
+ACCOUNT_HOST = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*")
+ACCOUNT_GROUP = "account:"      # the group key of an account with a kind: account:<its id>
+# The words of the refusals of an account with a kind and of its agents, and of the state of its group. Proposed, not
+# approved: no released app shows them before the apps offer an account kind (spec section 9), and the owner says
+# yes to each one before a release shows it.
+ACCOUNT_WORDS = {
+    "kind": 'account {aid}: kind is "key" or "server", or absent',
+    "labels": "account {aid}: secret, address and model are only for an account with a kind",
+    "key_provider": "account {aid}: the provider of a key account is one of {providers}",
+    "own_provider": 'account {aid}: the provider of a model server is "own"',
+    "secret": "account {aid}: secret is the reference of an API key in logins",
+    "key_secret": "account {aid}: a key account needs secret, the reference of its API key in logins",
+    "model": "account {aid}: model must be 1 to 120 characters of A-Z a-z 0-9 . _ : / - [ ]",
+    "key_model": "account {aid}: {label} sells the models of several makers, so the account names its model",
+    "key_address": "account {aid}: only a model server has an address",
+    "address": f"account {{aid}}: address is http:// or https://, a host, an optional port and an optional path, "
+               f"with no user, query or fragment, at most {ACCOUNT_ADDRESS_MOST} characters",
+    "plain_http": "account {aid}: plain http is only for a loopback or a Tailscale address; use https",
+    "open": "account {aid}: a model server with no key is only for a loopback address that one agent reaches, and "
+            "that agent is alone on its server",
+    "unknown": "agent {name}: the account {aid} is of a provider that this release does not know",
+    "runtime": "agent {name}: an agent on the account {aid} runs {label}",
+    "linux": "agent {name}: an agent on a key or a model server runs on a Linux server",
+    "resource": "resource {rid}: the key of the account {aid} is the owner's alone to give, and no pool holds it",
+    "pooled": "This key is in the pool that the manager gives from. Take it out of the pool first.",
+    "pool_statement": "This key belongs to an account, and only the owner gives it: it goes into no pool.",
+    "change": "An agent on a key or a model server stays on its account. Add a new agent for another account.",
+}
+# The state of its group with no hold, by the account's kind: the owner's words for an account with no allowance (his
+# "Yes, these words" of 14 November 2026 to picture 11 of the AI providers' step 5, ai-providers-step-5-answers.md).
+MODEL_ACCOUNT_STATE = {"key": "Paid per use.", "server": "Local model."}
+SELLER_MODEL = "Only the owner changes the model at a seller of several makers."    # spec 3.3; proposed, not approved
+
+
+def model_group(agent, team=None):
+    """account:<id> for an agent whose account has a kind, else None. Such an account is one allowance, whatever the
+    agent's usage reading says (spec 3.1), so its agents are one group of account_groups, account_group and
+    capacity_view, and a session's tokens count on it (record_session_tokens)."""
+    team = team if team is not None else team_read()
+    acc = lifecycle.model_account(team, (team.get("agents") or {}).get(agent))
+    return ACCOUNT_GROUP + acc["id"] if acc else None
+
+
+def model_group_entry(group, team=None):
+    """The team.json entry of the account of an account:<id> group, or {} for every other group."""
+    if not str(group or "").startswith(ACCOUNT_GROUP):
+        return {}
+    entry = ((team if team is not None else team_read()).get("accounts") or {}).get(group[len(ACCOUNT_GROUP):])
+    return entry if isinstance(entry, dict) else {}
+
+
+def account_address(value, aid):
+    """A model server's address as team.json keeps it (spec 3.8): http or https, a host, an optional port and an
+    optional path, else /v1; no user, no query, no fragment; at most ACCOUNT_ADDRESS_MOST characters; plain http only
+    for a loopback host (127.0.0.0/8, ::1, localhost) or a Tailscale one (100.64.0.0/10, or a name in .ts.net).
+    ValueError with its words for anything else."""
+    import ipaddress
+    words = ACCOUNT_WORDS["address"].format(aid=aid)
+    if not isinstance(value, str) or not 0 < len(value) <= ACCOUNT_ADDRESS_MOST or \
+            any(c in value for c in "?#@\\") or any(not 32 < ord(c) < 127 for c in value):
+        raise ValueError(words)
+    try:
+        parts = urllib.parse.urlsplit(value)
+        port = parts.port
+    except ValueError:
+        raise ValueError(words) from None
+    scheme, host = parts.scheme.lower(), parts.hostname or ""
+    if scheme not in ("http", "https") or not host or port == 0 or not ACCOUNT_PATH.fullmatch(parts.path):
+        raise ValueError(words)
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is None and not ACCOUNT_HOST.fullmatch(host):
+        raise ValueError(words)
+    if scheme == "http" and not (account_loopback(host) or host.endswith(".ts.net") or
+                                 ip is not None and ip.version == 4 and ip in ipaddress.ip_network("100.64.0.0/10")):
+        raise ValueError(ACCOUNT_WORDS["plain_http"].format(aid=aid))
+    where = (f"[{host}]" if ip is not None and ip.version == 6 else host) + (f":{port}" if port is not None else "")
+    return f"{scheme}://{where}{parts.path.rstrip('/') or '/v1'}"
+
+
+def account_loopback(host):
+    """True for a loopback host: 127.0.0.0/8, ::1 or localhost. Only such a model server may have no key, because
+    each agent is inside the owner's Tailscale network, which knows a caller by its machine only (spec 3.8)."""
+    import ipaddress
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def account_rule(team, aid, acc):
+    """ValueError with its words when one entry of team.json "accounts" breaks a rule of its kind (spec 3.1, 3.3,
+    3.8). An entry with no kind keeps the rule of before: a provider and a title, and nothing more. validate_team
+    checks the ID, the fields, the provider's shape and the title first, and the agents before this."""
+    W = ACCOUNT_WORDS
+    if "kind" not in acc:
+        if set(acc) & {"secret", "address", "model"}:
+            raise ValueError(W["labels"].format(aid=aid))
+        return
+    kind = acc["kind"]
+    if kind not in lifecycle.ACCOUNT_KINDS:
+        raise ValueError(W["kind"].format(aid=aid))
+    if "model" in acc and not (isinstance(acc["model"], str) and MODEL_NAME.fullmatch(acc["model"])):
+        raise ValueError(W["model"].format(aid=aid))
+    logins = team.get("logins") if isinstance(team.get("logins"), dict) else {}
+    if "secret" in acc and not (isinstance(acc["secret"], str) and isinstance(logins.get(acc["secret"]), dict)
+                                and logins[acc["secret"]].get("kind") == "api_key"):
+        raise ValueError(W["secret"].format(aid=aid))
+    if kind == "key":
+        known = lifecycle.KEY_PROVIDERS.get(acc["provider"])
+        if not known:
+            raise ValueError(W["key_provider"].format(aid=aid, providers=", ".join(lifecycle.KEY_PROVIDERS)))
+        if "address" in acc:
+            raise ValueError(W["key_address"].format(aid=aid))
+        if "secret" not in acc:
+            raise ValueError(W["key_secret"].format(aid=aid))
+        if known["makers"] == "many" and "model" not in acc:
+            raise ValueError(W["key_model"].format(aid=aid, label=known["label"]))
+        return
+    if acc["provider"] != lifecycle.OWN_SERVER["provider"]:
+        raise ValueError(W["own_provider"].format(aid=aid))
+    if account_address(acc.get("address"), aid) != acc.get("address"):
+        raise ValueError(W["address"].format(aid=aid))
+    if "secret" not in acc:
+        # An open server: at most one agent names it, alone on its server, and the server listens on loopback. An
+        # entry that no agent names yet is taken, so that the owner's writes can come in the order of spec 3.1.
+        users = [a for a in team["agents"].values() if a.get("account") == aid]
+        alone = len(users) <= 1 and all(
+            sum(1 for b in team["agents"].values() if b.get("machine") == a.get("machine")) == 1 for a in users)
+        if not alone or not account_loopback(urllib.parse.urlsplit(acc["address"]).hostname or ""):
+            raise ValueError(W["open"].format(aid=aid))
+
+
+def agent_account_rule(team, name, a):
+    """ValueError with its words when an agent whose account has a kind is not as spec 3.1 says: its runtime is the
+    program of its account, and its machine is a Linux server. The machine's kind is the one that team.json
+    "servers" keeps for it, so that this reads no record and runs outside a hub too (hubsetup, fleet.py verify)."""
+    acc = lifecycle.model_account(team, a)
+    if acc is None:
+        return
+    if acc["runtime"] is None:
+        raise ValueError(ACCOUNT_WORDS["unknown"].format(name=name, aid=acc["id"]))
+    if a.get("runtime") != acc["runtime"]:
+        raise ValueError(ACCOUNT_WORDS["runtime"].format(name=name, aid=acc["id"],
+                                                         label=runtime_label(acc["runtime"])))
+    if ((team.get("servers") or {}).get(a.get("machine")) or {}).get("kind") != "linux":
+        raise ValueError(ACCOUNT_WORDS["linux"].format(name=name))
+
+
+def account_secrets(team):
+    """{secret: the account that names it} of each account with a kind: such a key is the owner's alone to give, and
+    the manager never gives it (spec 3.1)."""
+    accounts = team.get("accounts") if isinstance(team.get("accounts"), dict) else {}
+    return {acc["secret"]: aid for aid, acc in sorted(accounts.items(), reverse=True)
+            if isinstance(acc, dict) and acc.get("kind") and isinstance(acc.get("secret"), str)}
+
+
+def account_resources_rule(team):
+    """ValueError when team.json "resources" holds a secret that an account names: the pool that the manager gives
+    from never holds an account's key (spec 3.1, the second of its three refusals)."""
+    held = account_secrets(team)
+    for rid in team.get("resources") or {}:
+        kind, what = resource_parts(rid)
+        if kind == "secret" and what in held:
+            raise ValueError(ACCOUNT_WORDS["resource"].format(rid=rid, aid=held[what]))
+
+
+def account_fields(data):
+    """The fields of an account with a kind in a write of the owner's route (Handler.ui_team_account), checked for
+    their shape: {kind, secret, address, model} as far as the write has them. The rules of each kind are
+    validate_team's, which the write passes before its commit."""
+    out = {}
+    if "kind" not in data:
+        if set(data) & {"secret", "address", "model"}:
+            raise ValueError("secret, address and model are only for an account with a kind")
+        return out
+    if data["kind"] not in lifecycle.ACCOUNT_KINDS:
+        raise ValueError(f"kind must be {' or '.join(lifecycle.ACCOUNT_KINDS)}, or absent")
+    out["kind"] = data["kind"]
+    if data.get("secret") is not None:
+        if not isinstance(data["secret"], str) or not BWS_REF.fullmatch(data["secret"]):
+            raise ValueError("secret must be a bws://<uuid> reference")
+        out["secret"] = data["secret"].lower()
+    if data.get("address") is not None:
+        out["address"] = account_address(data["address"], data.get("account"))
+    if data.get("model") is not None:
+        if not (isinstance(data["model"], str) and MODEL_NAME.fullmatch(data["model"])):
+            raise ValueError("model must be 1 to 120 characters of A-Z a-z 0-9 . _ : / - [ ]")
+        out["model"] = data["model"]
+    return out
+
+
+def account_entry(body):
+    """The entry that save_account writes from the owner's route: an owner label, {provider, title}, as before, or an
+    account with a kind. A write is the whole entry, and nothing of the entry before it is kept: so a write of another
+    address keeps only the secret and the model that it names itself (spec 3.8, "a write of another address removes
+    the entry's secret and model"), and a key never goes to an address that the owner did not give it with. The
+    other reading, which would drop a secret that the write names, would refuse each new address of a server with a
+    key outside the loopback (account_rule's open server), so that no such address could ever change. A secret that
+    the manager may give is refused (spec 3.1, the first of its three refusals): team.json "resources" holds it, or
+    the central vault's pool."""
+    entry = {k: body[k] for k in ACCOUNT_FIELDS if k in body}
+    secret = entry.get("secret") if entry.get("kind") else None
+    if secret:
+        team, _, _ = team_view(kit_revision(fresh=True))
+        with CENTRAL_LOCK:
+            status = CENTRAL["status"]
+        if f"secret:{secret}" in (team.get("resources") or {}) or secret in central_signatures(status)[1]:
+            raise Refusal(409, ACCOUNT_WORDS["pooled"])
+    return entry
+
+
+def pool_statement_refusal(data):
+    """The words that refuse the owner's signed statement of kind pool for a secret that an account names (spec 3.1,
+    the third of its three refusals), or None. Read before the statement goes to the central vault
+    (Handler.ui_vault_grant); everything else of it is the central vault's to check."""
+    try:
+        said = json.loads(data.get("statement")) if isinstance(data.get("statement"), str) else None
+    except ValueError:
+        return None
+    login = said.get("login") if isinstance(said, dict) and said.get("kind") == "pool" else None
+    return ACCOUNT_WORDS["pool_statement"] if isinstance(login, str) and \
+        login.lower() in account_secrets(team_read()) else None
+
+
+def account_change_refusal(team, old, new):
+    """The words that refuse an owner's change of an agent's `account`, or None (plan K7). An agent whose account has
+    a kind runs that account's program on its own Linux server, and an agent with a plan has its runtime's sign-in, so
+    no change moves an agent into or out of an account with a kind, or between two of them, in version 1."""
+    kinds = [lifecycle.model_account(team, {"account": x}) for x in (old, new) if x]
+    return ACCOUNT_WORDS["change"] if old != new and any(kinds) else None
+
+
+def account_detail(detail):
+    """True for a detail of the setup check's `account` item that the hub keeps: none, one of the six fixed sentences
+    of lifecycle, or a model of the owner's server (own/<name>). No text of a model server reaches the records."""
+    return detail in ("", lifecycle.NO_ANSWER, lifecycle.OPEN_SERVER, lifecycle.NO_TOOL_CALL,
+                      lifecycle.SMALL_CONTEXT, lifecycle.NO_KEY, lifecycle.KEY_REFUSED) or \
+        detail.startswith("own/") and len(detail) > 4 and bool(MODEL_NAME.fullmatch(detail))
+
+
 def save_account(body):
-    """An owner label of one paid account. Counting follows the provider's account identity, not this label."""
+    """An owner label of one paid account. Counting follows the provider's account identity, not this label. Or an
+    account with a key or with a model server's address (the AI providers build), whose agents are its group."""
     def busy(aid):
         users = sorted(n for n, a in agents().items() if a.get("account") == aid)
         if users:
             raise Conflict(f"account {aid} is the label of {', '.join(users)}; change them first", agents=users)
-    entry = None if body.get("delete") else {"provider": body["provider"], "title": body["title"]}
+    entry = None if body.get("delete") else account_entry(body)
     result = save_team_entry(body, "accounts", "account", entry, busy)
     result.pop("done", None)
     return result
@@ -45056,8 +45361,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("provider must be 1 to 30 characters a-z 0-9 -, for example openai")
             if not (isinstance(title, str) and len(title) <= 60 and "\n" not in title):
                 raise ValueError("title must be one line of at most 60 characters")
-            return {"provider": provider, "title": title.strip()}
-        return self.team_entry("team/accounts", "account", ("provider", "title"), check, save_account)
+            # the AI providers build: kind, secret, address and model, of an account with a key or a model server
+            return dict({"provider": provider, "title": title.strip()}, **account_fields(data))
+        return self.team_entry("team/accounts", "account", ACCOUNT_FIELDS, check, save_account)
 
     @staticmethod
     def login_reference(value):
@@ -45958,6 +46264,8 @@ class Handler(BaseHTTPRequestHandler):
             extra = sorted(set(data) - {"request_id", "db", "statement", "signature"})
             if extra:
                 raise ValueError(f"unknown field {extra[0]}")
+            if pool_statement_refusal(data):        # the AI providers build: an account's key goes into no pool
+                raise Refusal(409, pool_statement_refusal(data))
             return self.signed_statement(data, ("grant", "ungrant", "pool", "unpool"))
         return self.ui_command("vault/grant", read, self.signed_receipt, outside=central_statement)
 
@@ -48082,7 +48390,7 @@ class Handler(BaseHTTPRequestHandler):
                         prior, new = old["screen"].get(key), data["screen"][key]
                         if prior and (new is None or (new.get("collected_at") or 0) < (prior.get("collected_at") or 0)):
                             data["screen"][key] = kept_reading(key, prior)
-                if local_model(agents()[agent]):
+                if local_model(agents()[agent], team_read().get("accounts")):
                     data["limits"] = None       # a local model has no vendor account windows; never keep old ones
                 for prior, reading in ((old.get("limits"), data["limits"]),
                                        ((old.get("screen") or {}).get("limits"), (data.get("screen") or {}).get("limits"))):

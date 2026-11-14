@@ -8604,7 +8604,8 @@ def chrome_tab(origin, js, expect, tab_id=0):
 
 
 PROVIDER_SITES = ("claude.ai", "claude.com", "chatgpt.com", "auth.openai.com", "x.ai")   # the providers' sign-in sites
-PROVIDER_KEY_SITES = ("platform.claude.com",)   # an API console under one of them: a key read there stays allowed
+PROVIDER_KEY_SITES = ("platform.claude.com", "api.x.ai")   # an API console or a paid API under one of them: a key
+                                                            # read there stays allowed (api.x.ai: the AI providers build)
 
 
 def provider_site(host):

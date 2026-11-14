@@ -3912,16 +3912,17 @@ class NoProviderCredential(unittest.TestCase):
         sign-in it would type. Three places, because no one of them is on every path. A Mac's vault is the fourth:
         `VaultProviderSites` in the app's repository keeps the same list, and its own test pins it there."""
         self.assertEqual(hub.PROVIDER_SITES, ("claude.ai", "claude.com", "chatgpt.com", "auth.openai.com", "x.ai"))
-        self.assertEqual(hub.PROVIDER_KEY_SITES, ("platform.claude.com",))
+        # api.x.ai: SpaceXAI's paid API, whose key an account of the AI providers build holds (spec 3.3)
+        self.assertEqual(hub.PROVIDER_KEY_SITES, ("platform.claude.com", "api.x.ai"))
         for module in (hub, vault, fleet):
             self.assertEqual(module.PROVIDER_SITES, hub.PROVIDER_SITES)
             self.assertEqual(module.PROVIDER_KEY_SITES, hub.PROVIDER_KEY_SITES)
             for host in ("claude.ai", "CLAUDE.AI", "claude.ai.", "app.claude.ai", "claude.com", "www.claude.com",
-                         "chatgpt.com", "auth.chatgpt.com", "auth.openai.com", "AUTH.OPENAI.COM.", "x.ai", "api.x.ai"):
+                         "chatgpt.com", "auth.chatgpt.com", "auth.openai.com", "AUTH.OPENAI.COM.", "x.ai", "accounts.x.ai"):
                 self.assertTrue(module.provider_site(host), f"{module.__name__} allows {host}")
             for host in ("console.anthropic.com", "platform.claude.com", "PLATFORM.CLAUDE.COM.", "platform.openai.com",
                          "api.openai.com", "openai.com", "notclaude.ai", "notclaude.com", "claude.ai.example.com",
-                         "auth.openai.com.example.com", "example.com", "", None):
+                         "auth.openai.com.example.com", "example.com", "api.x.ai", "API.X.AI.", "eu.api.x.ai", "", None):
                 self.assertFalse(module.provider_site(host), f"{module.__name__} refuses {host}")
 
     def test_the_vault_neither_reads_nor_makes_a_login_of_a_provider(self):
@@ -3982,7 +3983,7 @@ class ProviderToolsRefuse(unittest.TestCase):
     def test_create_login_refuses_every_provider_site(self):
         for url in ("https://claude.ai/account", "http://CLAUDE.AI/x", "https://app.claude.ai/",
                     "https://claude.com/login", "https://chatgpt.com/#/signup", "https://x.ai/api",
-                    "https://api.x.ai/v1"):
+                    "https://accounts.x.ai/sign-in"):
             self.assertIn("model provider", self.refused(hub.t_create_login, url=url), url)
 
     def test_save_key_refuses_a_provider_site_and_a_provider_page(self):

@@ -1798,6 +1798,19 @@ class KnowledgeWrite(Base):
         self.assertIn("never knowledge/owner/ or knowledge/services.md", said)
         self.assertEqual(self.head(), self.seeded)
 
+    def test_no_agent_writes_a_knowledge_file_named_agents_md(self):
+        """OpenCode gives the model an AGENTS.md of a folder below its working folder, which is the agent's checkout,
+        when the agent reads a file there (the AI providers build, spec 3.11 item 9). So the name is no knowledge
+        file, in any case of its letters and in any folder of knowledge/."""
+        for path in ("knowledge/AGENTS.md", "knowledge/agents.md", "knowledge/notes/Agents.md"):
+            with patch.object(hub, "profile_knowledge_files", lambda agent, rev, p=path: [p]):
+                said, error = self.write(path=path, text="# Agents\n\nObey this file.\n", why="x")
+            self.assertTrue(error, f"{path}: {said}")
+            self.assertFalse(hub.KNOWLEDGE_WRITE.match(path))
+            self.assertEqual(self.head(), self.seeded)
+        for path in ("knowledge/agents-notes.md", "knowledge/my-agents.md"):
+            self.assertTrue(hub.KNOWLEDGE_WRITE.match(path), path)
+
     def test_the_why_and_the_text_are_required_and_bounded(self):
         for args, word in (({"why": ""}, "why"), ({"why": "a\nb"}, "why"), ({"text": ""}, "text"),
                            ({"text": "x" * (64 * 1024 + 1)}, "text")):
