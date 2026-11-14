@@ -241,14 +241,18 @@ class Servers(OwnerAPI):
     def team_sha(self):
         return self.request("/ui/team?db=test-generation", source=OWNER)[1]["sha256"]
 
-    def fresh_fleet(self, placed=True):
+    def fresh_fleet(self, placed=True, manager=None, shared=False):
         """The fleet a customer has on their first day: the first team.json the hub installer writes, which holds one
         manager and no worker at all (hubsetup.template, through hub.sh). Everything else in this class starts from a
         fleet that has run for a while, so this is the one state that the first `Add agent` meets. `placed=False`: the
-        app that installed it gives the manager a server of its own (hub.sh's FLEET_MANAGER_SERVER=later)."""
-        team = hubsetup.template(HUB, owner=OWNER, placed=placed)
+        app that installed it gives the manager a server of its own (hub.sh's FLEET_MANAGER_SERVER=later). `manager`:
+        the manager's own name (hub.sh's --manager-name), with its profile under that name, as the claim makes it.
+        `shared`: the owner chose one server for all, so the hub's own server takes agents (FLEET_HUB_SERVER=shared)."""
+        team = hubsetup.template(HUB, owner=OWNER, placed=placed, manager=manager, shared=shared)
         (self.kit / "team.json").write_text(json.dumps(team, indent=2) + "\n")
-        git("add", "team.json", cwd=self.kit)
+        with contextlib.redirect_stdout(io.StringIO()):
+            profile = hubsetup.manager_profile(str(self.kit), team, manager)
+        git("add", "-A", "--", "team.json", *profile, cwd=self.kit)
         git("commit", "-q", "-m", hubsetup.FIRST_COMMIT, cwd=self.kit)
         git("push", "-q", "origin", "HEAD", cwd=self.kit)
         hub._revision_cache.update(at=0.0, value=None)

@@ -19,19 +19,27 @@ def load_tests(loader, _tests, _pattern):
 
 
 class NewFleet(Servers):
-    """The fleet of a customer's first day, from hub.sh, with one empty Linux server that joined with a code."""
+    """The fleet of a customer's first day, from hub.sh, with one empty Linux server that joined with a code.
+
+    MANAGER is the manager's name, which the installer is given (hub.sh --manager-name) and which is `manager` when
+    it is given none, and SHOWN is that name as the hub's words to the owner write it. Each check names the manager
+    by them, and test_manager_name.py runs every check of this file again for a manager named `juno`: the hub finds
+    the manager by its role, never by its name."""
+
+    MANAGER, SHOWN = "manager", "Manager"
 
     def setUp(self):
         super().setUp()
-        self.fresh_fleet(placed=False)
+        self.M, self.shown = self.MANAGER, self.SHOWN
+        self.fresh_fleet(placed=False, manager=None if self.M == "manager" else self.M)
         self.joined("spare", "linux", source=SPARE, user="fleet")
 
     def place(self, server="spare", base=None, **extra):
-        return self.owner("/ui/team/agents/manager/move", **dict(dict(base_sha256=base or self.team_sha(),
-                                                                       server=server), **extra))
+        return self.owner(f"/ui/team/agents/{self.M}/move", **dict(dict(base_sha256=base or self.team_sha(),
+                                                                        server=server), **extra))
 
-    def state_of(self, agent="manager"):
-        return next(a for a in self.request(source=OWNER)[1]["agents"] if a["name"] == agent)
+    def state_of(self, agent=None):
+        return next(a for a in self.request(source=OWNER)[1]["agents"] if a["name"] == (agent or self.M))
 
     def job(self, server, job, state, step, detail=None, source=SPARE):
         status, answer = self.service(f"/server/{server}/jobs/{job}", {"state": state, "step": step, "detail": detail},
@@ -51,47 +59,46 @@ class NewFleet(Servers):
         self.assertEqual((status, [m["agent"] for m in machines["machines"]]), (200, []))
         status, health = self.request("/ui/health?db=test-generation", source=OWNER)
         self.assertEqual(status, 200, health)
-        self.assertEqual([w for w in health["warnings"] if w.get("agent") == "manager"], [])
+        self.assertEqual([w for w in health["warnings"] if w.get("agent") == self.M], [])
         self.assertEqual(health["helpers"], [])
 
     def test_no_caller_is_the_manager_until_it_has_a_server(self):
         """Its entry names the hub's machine, where the central vault holds every key and no agent may run."""
-        for path in ("/events/manager?after=-1&wait=0", "/worker/install/manager"):
+        refusal = f"{self.shown} has no server yet. Give it one in its setup in the app."
+        for path in (f"/events/{self.M}?after=-1&wait=0", f"/worker/install/{self.M}"):
             for source in (HUB, SPARE, NEW):
                 status, answer = self.request(path, source=source)
-                self.assertEqual((status, answer.get("error")),
-                                 (403, "Manager has no server yet. Give it one in its setup in the app."), (path, source))
-        for path, body in (("/mcp/manager", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
-                           ("/helper/session/manager", {"kind": "standing", "generation": "test-generation"})):
+                self.assertEqual((status, answer.get("error")), (403, refusal), (path, source))
+        for path, body in ((f"/mcp/{self.M}", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                           (f"/helper/session/{self.M}", {"kind": "standing", "generation": "test-generation"})):
             status, answer = self.request(path, body, source=HUB)
-            self.assertEqual((status, answer.get("error")),
-                             (403, "Manager has no server yet. Give it one in its setup in the app."), path)
-        self.assertIsNone(hub.kv_get("listed:manager:manager"))
+            self.assertEqual((status, answer.get("error")), (403, refusal), path)
+        self.assertIsNone(hub.kv_get(f"listed:{self.M}:manager"))     # its standing window is named "manager"
 
     def test_one_command_gives_it_its_server_and_its_provider(self):
         status, receipt = self.place(runtime="codex")
         self.assertEqual(status, 200, receipt)
         self.assertEqual({k: receipt[k] for k in ("agent", "server", "was", "runtime")},
-                         {"agent": "manager", "server": "spare", "was": None, "runtime": "codex"})
-        entry = self.origin_team()["agents"]["manager"]
+                         {"agent": self.M, "server": "spare", "was": None, "runtime": "codex"})
+        entry = self.origin_team()["agents"][self.M]
         self.assertEqual(entry, {"role": "manager", "machine": "spare", "runtime": "codex", "can": ["shell", "web"],
                                  "vault": "none", "start": hubsetup.STARTS["codex"]})
         job = hub.q1("SELECT * FROM server_jobs WHERE id=?", (receipt["job"],))
         self.assertEqual((job["server"], job["kind"], job["agent"], job["runtime"], job["state"]),
-                         ("spare", "install", "manager", "codex", "queued"))
+                         ("spare", "install", self.M, "codex", "queued"))
         self.assertIs(self.state_of()["placed"], True)
-        self.assertEqual(self.servers()[1]["spare"]["agents"], ["manager"])
-        self.assertIsNone(hub.kv_get("moved_from:manager"))         # it left no machine whose calls hear `moved`
+        self.assertEqual(self.servers()[1]["spare"]["agents"], [self.M])
+        self.assertIsNone(hub.kv_get(f"moved_from:{self.M}"))       # it left no machine whose calls hear `moved`
         self.assertEqual(hub.kv_get(hub.FIRST_MESSAGE), "placed")
-        said = [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' AND kind='say'")]
+        said = [r["text"] for r in hub.q("SELECT text FROM events WHERE agent=? AND kind='say'", (self.M,))]
         self.assertEqual(said, [], "the manager reads no move of its own: it was on no server")
-        self.assertEqual(self.request("/events/manager?after=-1&wait=0", source=SPARE)[0], 200)   # it is there now
-        self.assertEqual(self.request("/events/manager?after=-1&wait=0", source=HUB)[0], 403)
+        self.assertEqual(self.request(f"/events/{self.M}?after=-1&wait=0", source=SPARE)[0], 200)   # it is there now
+        self.assertEqual(self.request(f"/events/{self.M}?after=-1&wait=0", source=HUB)[0], 403)
 
     def test_without_a_runtime_it_keeps_the_one_its_entry_names(self):
         status, receipt = self.place()
         self.assertEqual((status, receipt["runtime"]), (200, "claude"))
-        entry = self.origin_team()["agents"]["manager"]
+        entry = self.origin_team()["agents"][self.M]
         self.assertEqual((entry["runtime"], entry["start"], "placed" in entry), ("claude", hubsetup.STARTS["claude"],
                                                                               False))
 
@@ -104,7 +111,7 @@ class NewFleet(Servers):
         self.joined("mini", "mac", source=NEW)          # the hub's own machine is Linux: no kind to keep
         status, receipt = self.place("mini", runtime="claude")
         self.assertEqual(status, 200, receipt)
-        self.assertEqual(self.origin_team()["agents"]["manager"]["machine"], "mini")
+        self.assertEqual(self.origin_team()["agents"][self.M]["machine"], "mini")
 
     def test_a_failed_install_goes_again_and_a_placed_agent_keeps_its_provider(self):
         status, receipt = self.place(runtime="codex")
@@ -117,7 +124,7 @@ class NewFleet(Servers):
         self.job("spare", again["job"], "failed", "runtime", "Codex could not be installed.")
         status, answer = self.place(runtime="claude")
         self.assertEqual((status, answer["error"]),
-                         (409, "A move keeps Manager's AI provider. Switch it with a command of its own."))
+                         (409, f"A move keeps {self.shown}'s AI provider. Switch it with a command of its own."))
 
     def test_its_first_message_waits_for_its_sign_in(self):
         """Its helper starts the standing session at the install's service step, before the owner has signed it in:
@@ -125,28 +132,29 @@ class NewFleet(Servers):
         status, receipt = self.place(runtime="codex")
         self.assertEqual(status, 200, receipt)
         self.job("spare", receipt["job"], "running", "service")
-        hub.kv_set("listed:manager:manager", 1)
+        hub.kv_set(f"listed:{self.M}:manager", 1)
         with hub.LOCK:
             hub.first_message_sweep(hub.now())
         self.assertEqual(hub.kv_get(hub.FIRST_MESSAGE), "placed")
-        self.assertIsNone(hub.q1("SELECT 1 FROM machine_checks WHERE agent='manager'"))
+        self.assertIsNone(hub.q1("SELECT 1 FROM machine_checks WHERE agent=?", (self.M,)))
         self.job("spare", receipt["job"], "done", "sign_in")
         with hub.LOCK:
             hub.first_message_sweep(hub.now())
         self.assertTrue(hub.kv_get(hub.FIRST_MESSAGE).startswith("check:"))
 
     def test_placed_is_only_a_new_fleets_manager_on_the_hubs_machine(self):
-        team = hubsetup.template("100.80.1.2", owner="100.90.3.4", placed=False)
+        team = hubsetup.template("100.80.1.2", owner="100.90.3.4", placed=False,
+                                 manager=None if self.M == "manager" else self.M)
         hub.validate_team(team)
         for change in ({"placed": True}, {"placed": None}, {"placed": False, "machine": "box"}):
             bad = json.loads(json.dumps(team))
             bad["addresses"]["box"] = "100.80.1.3"
-            bad["agents"]["manager"].update(change)
+            bad["agents"][self.M].update(change)
             with self.assertRaises(ValueError, msg=change) as refused:
                 hub.validate_team(bad)
             self.assertIn("placed is false for a manager that has no server yet", str(refused.exception))
         worker = json.loads(json.dumps(team))
-        del worker["agents"]["manager"]["placed"]
+        del worker["agents"][self.M]["placed"]
         worker["agents"]["writer"] = {"role": "worker", "machine": "hub", "runtime": "codex", "placed": False}
         with self.assertRaises(ValueError):
             hub.validate_team(worker)
@@ -168,15 +176,16 @@ class FirstMessage(NewFleet):
 
     def listed(self):
         """Its standing session on spare lists its tools, as every session does at its start (listed_window)."""
-        status, answer = self.request("/mcp/manager", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        status, answer = self.request(f"/mcp/{self.M}", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
                                       source=SPARE)
         self.assertEqual(status, 200, answer)
 
     def asked(self):
-        return [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' AND kind='say' ORDER BY id")]
+        return [r["text"] for r in hub.q("SELECT text FROM events WHERE agent=? AND kind='say' ORDER BY id",
+                                         (self.M,))]
 
     def answer_check(self, *items, state="completed"):
-        check = hub.q1("SELECT * FROM machine_checks WHERE agent='manager' ORDER BY id DESC LIMIT 1")
+        check = hub.q1("SELECT * FROM machine_checks WHERE agent=? ORDER BY id DESC LIMIT 1", (self.M,))
         hub.q("UPDATE machine_checks SET state=?, completed=?, verify=? WHERE id=?",
               (state, hub.now(), json.dumps(list(items)) if state == "completed" else None, check["id"]))
 
@@ -185,7 +194,7 @@ class FirstMessage(NewFleet):
         self.assertEqual((hub.kv_get(hub.FIRST_MESSAGE), self.asked()), ("placed", []))   # no session yet
         self.listed()
         self.sweep()
-        check = hub.q1("SELECT * FROM machine_checks WHERE agent='manager' ORDER BY id DESC LIMIT 1")
+        check = hub.q1("SELECT * FROM machine_checks WHERE agent=? ORDER BY id DESC LIMIT 1", (self.M,))
         self.assertEqual((check["state"], hub.kv_get(hub.FIRST_MESSAGE)), ("requested", f"check:{check['id']}"))
         self.sweep()
         self.assertEqual(self.asked(), [], "it waits for the check's answer")
@@ -211,7 +220,7 @@ class FirstMessage(NewFleet):
         self.assertEqual(len(asked), 1, asked)
         self.assertNotIn("passed", asked[0])
         self.assertIn("that the fleet is ready and ask what you should look after first", asked[0])
-        check = hub.q1("SELECT id FROM machine_checks WHERE agent='manager' ORDER BY id DESC LIMIT 1")["id"]
+        check = hub.q1("SELECT id FROM machine_checks WHERE agent=? ORDER BY id DESC LIMIT 1", (self.M,))["id"]
         hub.kv_set(hub.FIRST_MESSAGE, f"check:{check}")     # and a check that never answered is no pass either
         hub.q("DELETE FROM events")
         self.answer_check(state="offline")
@@ -225,10 +234,10 @@ class FirstMessage(NewFleet):
         self.listed()
         self.sweep()
         self.assertEqual((hub.kv_get(hub.FIRST_MESSAGE), self.asked()), ("none", []))
-        self.assertIsNone(hub.q1("SELECT 1 FROM machine_checks WHERE agent='manager'"))
+        self.assertIsNone(hub.q1("SELECT 1 FROM machine_checks WHERE agent=?", (self.M,)))
 
     def test_nor_after_the_manager_wrote(self):
-        hub.q("INSERT INTO owner_reports(text,about,created,agent) VALUES('Hi','',?,'manager')", (hub.now(),))
+        hub.q("INSERT INTO owner_reports(text,about,created,agent) VALUES('Hi','',?,?)", (hub.now(), self.M))
         self.listed()
         self.sweep()
         self.assertEqual((hub.kv_get(hub.FIRST_MESSAGE), self.asked()), ("none", []))
@@ -240,7 +249,7 @@ class FirstMessage(NewFleet):
         self.listed()
         self.sweep()
         self.assertEqual(self.asked(), [])
-        self.assertIsNone(hub.q1("SELECT 1 FROM machine_checks WHERE agent='manager'"))
+        self.assertIsNone(hub.q1("SELECT 1 FROM machine_checks WHERE agent=?", (self.M,)))
 
 
 if __name__ == "__main__":

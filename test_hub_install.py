@@ -190,6 +190,90 @@ class Template(unittest.TestCase):
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertEqual(json.loads(done.stdout)["agents"]["manager"].get("placed"), placed)
 
+    def test_the_manager_has_the_name_that_the_installer_is_given(self):
+        """The manager's name is the owner's own choice, which the installer is given (the app's page "Name your
+        manager" has the owner's yes of 14 November 2026 and is in no flow yet). The name is the agent's key in the
+        first team.json and nothing else changes: the hub finds the manager by its role."""
+        named = hubsetup.template(HUB_IP, owner="100.90.3.4", manager="juno")
+        plain = hubsetup.template(HUB_IP, owner="100.90.3.4")
+        self.assertEqual(list(named["agents"]), ["juno"])
+        self.assertEqual(named["agents"]["juno"], plain["agents"]["manager"])
+        self.assertEqual({k: v for k, v in named.items() if k != "agents"},
+                         {k: v for k, v in plain.items() if k != "agents"})
+        hub.validate_team(named)
+        self.assertEqual(hubsetup.agents_of(named, "hub"), ["juno"])
+        self.assertEqual(hubsetup.agent_user("juno", named["agents"]["juno"]), "fleet-juno")
+        later = hubsetup.template(HUB_IP, owner="100.90.3.4", manager="juno", placed=False)
+        self.assertIs(later["agents"]["juno"]["placed"], False)
+        hub.validate_team(later)
+        self.assertEqual(hubsetup.template(HUB_IP, manager=None), hubsetup.template(HUB_IP))     # none: as before
+
+    def test_one_server_for_all_is_one_word_of_the_first_team_json(self):
+        """`shared` (hub.sh's FLEET_HUB_SERVER=shared): the owner chose one server for all. The file says that the hub's
+        own server takes agents, and names that server as a joined server is named, because its own server service
+        installs the agents that the owner adds there. Nothing else changes, and a template with no word is the
+        template of before. It does not go with a manager that has no server yet."""
+        plain = hubsetup.template(HUB_IP, owner="100.90.3.4", ssh_user="fleet")
+        shared = hubsetup.template(HUB_IP, owner="100.90.3.4", ssh_user="fleet", shared=True)
+        self.assertEqual(shared["hub"], dict(plain["hub"], shared=True))
+        self.assertEqual(shared["servers"], {"hub": {"kind": "linux", "user": "fleet"}})
+        self.assertEqual({k: v for k, v in shared.items() if k not in ("hub", "servers")},
+                         {k: v for k, v in plain.items() if k != "hub"})
+        self.assertNotIn("servers", plain)
+        self.assertNotIn("shared", plain["hub"])
+        hub.validate_team(shared)
+        self.assertIs(hub.hub_shared(shared), True)
+        self.assertIs(hub.hub_shared(plain), False)
+        with self.assertRaisesRegex(hubsetup.Stop, "give --shared or --manager-later, not both"):
+            hubsetup.template(HUB_IP, owner="100.90.3.4", shared=True, placed=False)
+        done = subprocess.run([sys.executable, str(KIT / "hubsetup.py"), "template", "--address", HUB_IP, "--shared"],
+                              capture_output=True, text=True)
+        self.assertEqual((done.returncode, json.loads(done.stdout)["hub"].get("shared")), (0, True), done.stderr)
+        done = subprocess.run([sys.executable, str(KIT / "hubsetup.py"), "template", "--address", HUB_IP, "--shared",
+                               "--manager-later"], capture_output=True, text=True)
+        self.assertEqual((done.returncode, done.stdout), (1, ""), done.stderr)
+
+    def test_a_name_that_the_manager_cannot_have_stops_before_anything_is_written(self):
+        """The hub's own rule for an agent's name, and room for its OS user fleet-<name> in 32 characters: nobody can
+        rename the manager afterwards, so the installer refuses the name and never changes it for the owner."""
+        self.assertEqual(hubsetup.manager_name(), "manager")
+        longest = "a" + "2" * 25
+        self.assertEqual((hubsetup.manager_name(longest), len(hubsetup.AGENT_USER % longest)), (longest, 32))
+        for bad in ("Juno", "j", "owner", "hub", "ju no", "9lives", "-juno", "jüno", "juno\n", "", 7, longest + "x",
+                    *hubsetup.FLEET_OWN_NAMES, "vault-central", "login-scout"):
+            with self.assertRaises(hubsetup.Stop, msg=repr(bad)) as refused:
+                hubsetup.template(HUB_IP, manager=bad)
+            self.assertIn("26 characters", str(refused.exception), repr(bad))
+        for good in ("vaults", "logins", "workx", "a-", "a--b"):       # only the whole name or the whole start counts
+            self.assertEqual(hubsetup.manager_name(good), good)
+        # The names that the fleet uses itself on a server, as fleet-<name>. Each one would stop the manager there,
+        # after the first team.json: the vault broker's user, the group of the agents' users, the services that
+        # `fleet.py service` makes under their names, and the folders that a helper keeps beside its agent's checkout.
+        self.assertIn(hubsetup.AGENT_USER % "vault", hubsetup.RESERVED_USERS)
+        self.assertEqual(hubsetup.AGENT_USER % "agents", hubsetup.AGENT_GROUP)
+        self.assertEqual(hubsetup.AGENT_USER % "vault-central", hubsetup.CENTRAL_SERVICE)
+        self.assertEqual({os.path.basename(folder) for folder in (fleet.WORK, fleet.CHATS)},
+                         {hubsetup.AGENT_USER % "work", hubsetup.AGENT_USER % "chats"})
+        self.assertEqual(hubsetup.lifecycle.CHECK_STORE, hubsetup.AGENT_USER % "checks")
+        self.assertEqual(fleet.LOGIN_SESSION % "scout", hubsetup.AGENT_USER % "login-scout")
+        service = (KIT / "fleet.py").read_text()
+        self.assertIn('if name not in ("hub", "git", "channels") and name not in TEAM["agents"]:', service)
+        self.assertIn('if args.name != "watch" and', service)
+        # hub.sh has the same names, in its check and in its words: the hub's two and this list, then the starts
+        names = (*hub.RESERVED_AGENT_NAMES, *hubsetup.FLEET_OWN_NAMES)
+        starts = [start + "*" for start in hubsetup.FLEET_OWN_STARTS]
+        script = " ".join(SCRIPT.read_text().replace("\\\n", "").split())
+        self.assertIn(f"{'|'.join((*names, *starts))}) stop \"$name_rule\" ;;", script)
+        self.assertIn(f"({', '.join(names)}, and each name that starts with "
+                      f"{' or '.join(hubsetup.FLEET_OWN_STARTS)})", script)
+        done = subprocess.run([sys.executable, str(KIT / "hubsetup.py"), "template", "--address", HUB_IP,
+                               "--manager-name", "juno"], capture_output=True, text=True)
+        self.assertEqual((done.returncode, list(json.loads(done.stdout)["agents"])), (0, ["juno"]), done.stderr)
+        done = subprocess.run([sys.executable, str(KIT / "hubsetup.py"), "template", "--address", HUB_IP,
+                               "--manager-name", "Juno"], capture_output=True, text=True)
+        self.assertEqual((done.returncode, done.stdout), (1, ""))
+        self.assertIn("Founderizer install stopped: 'Juno' is not a name that the manager can have", done.stderr)
+
     def test_the_manager_holds_no_credential(self):
         """"vault": "none" is the line that says it: the manager's runtime is the owner's own subscription, signed in
         by the owner, so Founderizer gives that agent no vault access at all."""
@@ -363,6 +447,186 @@ class Repository(unittest.TestCase):
         self.assertEqual(self.git("log", "-1", "--format=%s", folder=self.kit), hubsetup.FIRST_COMMIT)
         self.assertIsNone(hubsetup.commit_team(self.kit, hubsetup.FIRST_COMMIT))     # again: nothing to commit
         self.assertEqual(self.git("rev-parse", hub.CONFIG_BRANCH, folder=self.bare), commit)
+
+    def named_tree(self):
+        """The installer's copy with the published profile of the manager, as publish.py seeds it."""
+        (self.tree / "profiles" / "manager.md").write_text(
+            "# Profile: manager\n\nWritten by the owner. The manager reads it at every start.\n\n"
+            "**Character.** Calm.\n\n**Responsible for.** Managing Fleet.\n")
+        self.git("add", "-A", folder=self.tree)
+        self.git("commit", "-q", "-m", "the published profile", folder=self.tree)
+        self.commit = self.git("rev-parse", "HEAD", folder=self.tree)
+
+    def first_team(self, name="juno", written=True):
+        """The hub's checkout with the first team.json of a manager named `name`, written and not committed."""
+        self.named_tree()
+        self.make()
+        team = hubsetup.template(HUB_IP, owner="100.90.3.4", manager=name)
+        if written:
+            hubsetup.write_team(os.path.join(self.kit, "team.json"), team)
+        return team, Path(self.kit) / "profiles" / "manager.md", Path(self.kit) / "profiles" / f"{name}.md"
+
+    def test_a_named_managers_profile_goes_with_the_first_commit(self):
+        """The hub and the manager's helper read profiles/<agent>.md. So the first commit moves the published
+        profiles/manager.md to the manager's own name, with that name in its title and every other word as it was."""
+        team, old, new = self.first_team()
+        more = hubsetup.manager_profile(self.kit, team, "juno")
+        self.assertEqual(more, ("profiles/juno.md", "profiles/manager.md"))
+        commit = hubsetup.commit_team(self.kit, hubsetup.FIRST_COMMIT, more=more)
+        self.assertEqual(self.git("rev-parse", hub.CONFIG_BRANCH, folder=self.bare), commit)
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", commit, "--", "profiles", folder=self.kit),
+                         "profiles/juno.md")
+        self.assertEqual(sorted(self.git("diff", "--name-only", "--no-renames", f"{commit}~1", commit,
+                                         folder=self.kit).split()),
+                         ["profiles/juno.md", "profiles/manager.md", "team.json"])
+        profile = self.git("show", f"{commit}:profiles/juno.md", folder=self.kit)
+        self.assertEqual(profile.split("\n")[0], "# Profile: juno")
+        self.assertIn("**Responsible for.** Managing Fleet.", profile)
+        self.assertEqual(list(json.loads(self.git("show", f"{commit}:team.json", folder=self.kit))["agents"]), ["juno"])
+        self.assertEqual(self.git("status", "--porcelain", folder=self.kit), "")
+        # the hub's own reading of it, by the manager's name
+        with patch.dict(hub.CFG, {"team_path": os.path.join(self.kit, "team.json")}):
+            view = hub.profile_view("juno", commit)
+        self.assertEqual([s["key"] for s in view["sections"]][:2], ["character", "responsible_for"], view)
+        # From the first commit on the file is the owner's own. A later run of any line has nothing to commit, and
+        # the owner's later words in that file stay, also when a published profile is there again beside it.
+        new.write_text(profile + "\n\n**Other.** The owner's own words.\n")
+        self.git("commit", "-q", "-am", "the owner's change", folder=self.kit)
+        old.write_text("# Profile: manager\n\n**Character.** Calm.\n")
+        for named, first in (("juno", True), (None, True), ("nova", True), ("juno", False)):
+            self.assertEqual(hubsetup.manager_profile(self.kit, team, named, first=first), (), (named, first))
+        self.assertIn("The owner's own words.", new.read_text())
+        self.assertTrue(old.exists())
+
+    def test_a_manager_named_manager_keeps_the_published_profile_where_it_is(self):
+        team, old, _new = self.first_team("manager", written=False)
+        team["goals"]["review_hour"] = 7
+        hubsetup.write_team(os.path.join(self.kit, "team.json"), team)
+        self.assertEqual(hubsetup.manager_profile(self.kit, team, None), ())
+        self.assertEqual(hubsetup.manager_profile(self.kit, team, "manager"), ())
+        commit = hubsetup.commit_team(self.kit, hubsetup.FIRST_COMMIT)
+        self.assertEqual(self.git("diff", "--name-only", f"{commit}~1", commit, folder=self.kit), "team.json")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", commit, "--", "profiles", folder=self.kit),
+                         "profiles/manager.md")
+
+    def test_a_first_run_that_stopped_is_finished_by_the_next_run_whatever_its_line_names(self):
+        """The write of team.json, the move and the commit are three steps, and a run can stop after each. The next
+        run finishes the work: the same line, a line with no name, a line with another name, and a second owner
+        claim, which moves no file itself. Each leaves a checkout with nothing changed, because the hub refuses each
+        owner write while its checkout has a change (hub.commit_kit_file)."""
+        for stopped in ("after the write", "after the move"):
+            for named, first in (("juno", True), (None, True), ("nova", True), ("juno", False)):
+                with self.subTest(stopped=stopped, named=named, first=first):
+                    shutil.rmtree(self.kit, True)
+                    shutil.rmtree(self.bare, True)
+                    self.git("checkout", "-q", "--", ".", folder=self.tree)
+                    team, old, new = self.first_team() if not (self.tree / "profiles" / "manager.md").exists() \
+                        else (hubsetup.template(HUB_IP, owner="100.90.3.4", manager="juno"), None, None)
+                    if old is None:
+                        self.make()
+                        hubsetup.write_team(os.path.join(self.kit, "team.json"), team)
+                        old, new = (Path(self.kit) / "profiles" / n for n in ("manager.md", "juno.md"))
+                    if stopped == "after the move":
+                        hubsetup.manager_profile(self.kit, team, "juno")        # the first run stopped here
+                    more = hubsetup.manager_profile(self.kit, team, named, first=first)
+                    commit = hubsetup.commit_team(self.kit, hubsetup.FIRST_COMMIT, more=more)
+                    self.assertEqual(self.git("status", "--porcelain", folder=self.kit), "", "a change is left")
+                    # A second owner claim after a stop BEFORE the move moves no file and says that the profile is
+                    # missing: the manager then has the published profile under the name `manager`, and the same
+                    # first line again moves it.
+                    moved = not (stopped == "after the write" and first is False)
+                    self.assertEqual(self.git("ls-tree", "-r", "--name-only", commit, "--", "profiles",
+                                              folder=self.kit),
+                                     "profiles/juno.md" if moved else "profiles/manager.md")
+                    if not moved:
+                        again = hubsetup.manager_profile(self.kit, team, "juno")
+                        self.assertEqual(again, ("profiles/juno.md", "profiles/manager.md"))
+                        hubsetup.commit_team(self.kit, hubsetup.FIRST_COMMIT, more=again)
+                        self.assertEqual(self.git("status", "--porcelain", folder=self.kit), "")
+                        self.assertTrue(new.exists() and not old.exists())
+
+    def test_a_run_that_stopped_between_its_add_and_its_commit_is_finished_too(self):
+        """`git add` and `git commit` are two commands. A run that stopped between them, or whose commit failed, left
+        the two profile paths added and not committed. The next run of any line takes them into its commit: else it
+        would commit team.json alone, and the hub refuses each owner write while its checkout has a change."""
+        team, old, new = self.first_team()
+        more = hubsetup.manager_profile(self.kit, team, "juno")
+        self.git("add", "-A", "--", "team.json", *more, folder=self.kit)       # the first run stopped here
+        self.assertEqual([self.git("status", "--porcelain", "--", path, folder=self.kit) for path in more],
+                         ["A  profiles/juno.md", "D  profiles/manager.md"])
+        for named, first in ((None, True), ("nova", True), ("juno", False)):
+            self.assertEqual(hubsetup.manager_profile(self.kit, team, named, first=first), more, (named, first))
+        commit = hubsetup.commit_team(self.kit, hubsetup.FIRST_COMMIT,
+                                      more=hubsetup.manager_profile(self.kit, team, None, first=False))
+        self.assertEqual(self.git("status", "--porcelain", "--untracked-files=no", folder=self.kit), "")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", commit, "--", "profiles", folder=self.kit),
+                         "profiles/juno.md")
+
+    def test_a_second_owner_claim_says_when_the_named_managers_profile_is_still_missing(self):
+        """A first run that stopped before the move, and then a second owner claim: the claim moves no file, so the
+        manager has no profile under its name. The run says so, with the line that makes it."""
+        team, old, new = self.first_team()
+        said = []
+        with patch.object(hubsetup, "say", said.append):
+            self.assertEqual(hubsetup.manager_profile(self.kit, team, None, first=False), ())
+        self.assertEqual((old.exists(), new.exists()), (True, False))
+        self.assertEqual(said, ["the manager juno has no profile under its name yet: the published profile is still "
+                                "profiles/manager.md. Run the line again with --manager-name juno, and the installer "
+                                "moves it."])
+
+    def test_a_fleet_that_is_there_keeps_its_files_unless_the_same_line_names_its_manager(self):
+        """A team.json in a commit, with a manager that got its name another way and the published profile still
+        there: a run with no name, with another name, or a second owner claim moves nothing. The line that names that
+        manager moves the file, as it does in a first run."""
+        team, old, new = self.first_team()
+        self.git("commit", "-q", "-m", "a fleet that is there", "--", "team.json", folder=self.kit)
+        for named, first in ((None, True), ("nova", True), ("juno", False)):
+            self.assertEqual(hubsetup.manager_profile(self.kit, team, named, first=first), (), (named, first))
+            self.assertEqual((old.exists(), new.exists()), (True, False), (named, first))
+        self.assertEqual(hubsetup.manager_profile(self.kit, team, "juno"), ("profiles/juno.md", "profiles/manager.md"))
+        self.assertEqual((old.exists(), new.exists()), (False, True))
+
+    def test_a_move_that_stopped_half_way_is_finished_and_a_file_that_cannot_move_stops_with_words(self):
+        """The move is a write and a remove. A run that stopped between them left both files, the new one the copy
+        of the old and in no commit: the next run removes the old one and names both paths for the commit. A file
+        system that refuses the move stops the installer with its words, and a terminal that is gone does not."""
+        team, old, new = self.first_team()
+        new.write_bytes(hub.renamed_profile(old.read_bytes(), "manager", "juno"))      # written, and not removed
+        self.assertEqual(hubsetup.manager_profile(self.kit, team, None, first=False),
+                         ("profiles/juno.md", "profiles/manager.md"))
+        self.assertEqual((old.exists(), new.read_text().split("\n")[0]), (False, "# Profile: juno"))
+        self.git("checkout", "-q", "--", "profiles/manager.md", folder=self.kit)
+        new.unlink()
+        with patch.object(hubsetup.os, "remove", side_effect=PermissionError("read-only file system")):
+            with self.assertRaisesRegex(hubsetup.Stop, "could not move from profiles/manager.md to profiles/juno.md "
+                                                       ".*read-only file system"):
+                hubsetup.manager_profile(self.kit, team, "juno")
+        new.unlink()
+
+        def gone(_text):
+            raise BrokenPipeError("the terminal is gone")
+        with patch.object(hubsetup, "say", gone):
+            self.assertEqual(hubsetup.manager_profile(self.kit, team, "juno"),
+                             ("profiles/juno.md", "profiles/manager.md"))
+        self.assertEqual((old.exists(), new.exists()), (False, True))
+
+    def test_with_no_profile_path_the_commit_runs_the_commands_of_before(self):
+        """An install with no name gives commit_team no `more`. It then runs the three git commands that it ran
+        before this option, and no other: the status of team.json, the commit of team.json, and the push."""
+        team, _old, _new = self.first_team("manager", written=False)
+        team["goals"]["review_hour"] = 7
+        hubsetup.write_team(os.path.join(self.kit, "team.json"), team)
+        real, ran = hubsetup.git, []
+
+        def watched(*args, **kw):
+            ran.append(args)
+            return real(*args, **kw)
+        with patch.object(hubsetup, "git", watched):
+            hubsetup.commit_team(self.kit, hubsetup.FIRST_COMMIT)
+        self.assertEqual(ran, [("status", "--porcelain", "--", "team.json"),
+                               ("commit", "-q", "-m", hubsetup.FIRST_COMMIT, "--", "team.json"),
+                               ("push", "-q", "origin", f"HEAD:refs/heads/{hub.CONFIG_BRANCH}"),
+                               ("rev-parse", "HEAD")])
 
     def test_the_code_ref_is_not_moved_by_the_owners_first_write(self):
         """main is the code and config is what the fleet runs: the hub writes only the second one."""
@@ -566,6 +830,55 @@ class Claim(unittest.TestCase):
         written = json.loads(Path(self.out).read_text())
         self.assertEqual(written["addresses"], {"hub": HUB_IP, "owner": "100.90.3.4"})
         self.assertEqual(sorted(written["agents"]), ["manager"])
+
+    def test_the_claim_names_the_manager_and_a_later_run_keeps_that_name(self):
+        """`claim --manager-name juno`, as hub.sh runs it: the first team.json has the manager under that name, and
+        its profile is beside it under the same name. A name that the manager cannot have stops the claim before it
+        makes a code. A later run with another name changes nothing and says so: a hub that is there keeps its fleet,
+        and nobody can rename the manager."""
+        (self.tmp / "profiles").mkdir()
+        (self.tmp / "profiles" / "manager.md").write_text("# Profile: manager\n\n**Character.** Calm.\n")
+
+        def args(**changed):
+            return type("A", (), dict({"address": HUB_IP, "port": 8765, "out": self.out, "reclaim": False,
+                                       "timezone": "UTC", "runtime": "claude", "ssh_user": "fleet", "ssh_port": 22,
+                                       "wait": 1, "commit": False, "manager_later": False, "manager_name": "juno"},
+                                      **changed))()
+        with patch.object(hubsetup, "claim", lambda *a, **k: self.fail("it made a code for a name it refuses")):
+            with self.assertRaisesRegex(hubsetup.Stop, "not a name that the manager can have"):
+                hubsetup.cmd_claim(args(manager_name="Juno"))
+        self.assertFalse(Path(self.out).exists())
+        with patch.object(hubsetup, "claim", lambda *a, **k: "100.90.3.4"):
+            hubsetup.cmd_claim(args())
+        written = json.loads(Path(self.out).read_text())
+        self.assertEqual((list(written["agents"]), written["agents"]["juno"]["role"]), (["juno"], "manager"))
+        self.assertEqual(written["addresses"], {"hub": HUB_IP, "owner": "100.90.3.4"})
+        self.assertEqual(sorted(p.name for p in (self.tmp / "profiles").iterdir()), ["juno.md"])
+        self.assertEqual((self.tmp / "profiles" / "juno.md").read_text(), "# Profile: juno\n\n**Character.** Calm.\n")
+        before = Path(self.out).read_text()
+        self.said.clear()
+        with patch.object(hubsetup, "claim", lambda *a, **k: self.fail("it made a second claim")):
+            hubsetup.cmd_claim(args(manager_name="nova"))
+            hubsetup.cmd_claim(args(manager_name=None))
+        self.assertEqual(Path(self.out).read_text(), before)
+        self.assertEqual(sorted(p.name for p in (self.tmp / "profiles").iterdir()), ["juno.md"])
+        self.assertEqual([line for line in self.said if "nova" in line],
+                         ["this hub's manager has the name juno already, so the name nova is not used."])
+        # A second owner claim changes the owner only: it says the same of another name, and it moves no file, also
+        # in a fleet whose manager got its name another way and has the published profile still there.
+        (self.tmp / "profiles" / "juno.md").unlink()
+        (self.tmp / "profiles" / "manager.md").write_text("# Profile: manager\n\n**Character.** Calm.\n")
+        self.said.clear()
+        with patch.object(hubsetup, "claim", lambda *a, **k: "100.90.9.9"), \
+                patch.object(hubsetup, "HubPause", lambda *a, **k: type("P", (), {
+                    "__enter__": lambda p: p, "__exit__": lambda p, *e: False,
+                    "claim": lambda p, wait: "100.90.9.9"})()):
+            hubsetup.cmd_claim(args(manager_name="nova", reclaim=True))
+            hubsetup.cmd_claim(args(manager_name="juno", reclaim=True))
+        self.assertEqual(json.loads(Path(self.out).read_text())["addresses"]["owner"], "100.90.9.9")
+        self.assertEqual(sorted(p.name for p in (self.tmp / "profiles").iterdir()), ["manager.md"])
+        self.assertEqual([line for line in self.said if "nova" in line],
+                         ["this hub's manager has the name juno already, so the name nova is not used."])
 
     def test_a_second_run_on_this_hub_keeps_what_the_first_wrote(self):
         """The same hub, so the file is this hub's own: a new claim replaces the owner and nothing else."""
@@ -3676,6 +3989,144 @@ class CheckMode(unittest.TestCase):
         out = self.run_check(more_env={"FLEET_MANAGER_SERVER": "later"})
         self.assertIn("one manager with no server yet", out)
         self.assertIn("find none on a new hub", out)
+
+    def test_the_plan_names_the_manager_only_when_a_name_is_given(self):
+        """`--manager-name`: the plan says the name and where the profile goes. Without it the plan has no word of
+        it, as before. A name that the manager cannot have stops the script before its first step."""
+        plain = self.run_check()
+        self.assertNotIn("name the manager", plain)
+        out = self.run_check("--manager-name", "juno")
+        self.assertIn("would name the manager juno: its entry in team.json, and its profile", out)
+        self.assertNotIn("name the manager", self.run_check("--manager-name", "juno", "--reclaim"))   # it names none
+        self.assertIn("/home/fleet/fleet-pilot/profiles/juno.md", out)
+        self.assertEqual([line for line in out.splitlines() if "juno" not in line],
+                         [line for line in plain.splitlines() if "juno" not in line])
+        for bad in ("Juno", "j", "owner", "hub", "ju no", "9lives", "a" * 27, "jüno", "juno;id",
+                    *hubsetup.FLEET_OWN_NAMES, "vault-central", "login-scout"):
+            refused = self.run_check("--manager-name", bad, expect=1)
+            self.assertIn("--manager-name must be a name of 2 to 26 characters a-z 0-9 -", refused, bad)
+            self.assertNotIn("Founderizer step 1", refused, bad)
+        for good in ("vaults", "logins", "git-2", "a" * 26, "x1", "a-"):   # only the whole name or start counts
+            self.run_check("--manager-name", good)
+            self.assertEqual(hubsetup.manager_name(good), good)
+
+    def test_the_plan_has_the_server_service_step_only_on_the_word_for_one_server(self):
+        """FLEET_HUB_SERVER=shared: the plan writes the word into the first team.json and has one more step, the
+        server service of this server, after the hub's records are there. Without the word the plan has neither, as
+        before. The word does not go with the word for a manager with no server yet."""
+        plain = self.run_check()
+        self.assertNotIn("shared", plain)
+        self.assertNotIn("fleet-server", plain)
+        self.assertIn("     on its own server.", plain)
+        out = self.run_check(more_env={"FLEET_HUB_SERVER": "shared"})
+        self.assertIn('would write "hub": {"shared": true} and this server\'s own entry in "servers" there', out)
+        steps = [line.partition(": ")[2] for line in out.splitlines() if line.startswith("Founderizer step ")]
+        before = [line.partition(": ")[2] for line in plain.splitlines() if line.startswith("Founderizer step ")]
+        new = "the server service of this server: it installs the agents that you add here"
+        self.assertEqual([step for step in steps if step != new], before)
+        self.assertEqual(steps[steps.index(new) - 1], "this fleet's own id")
+        self.assertIn("/home/fleet/fleet-server/hubsetup.py hub-server --team", out)
+        self.assertIn("would run no join with a join code: the hub refuses a join from its own address", out)
+        self.assertIn("     on this server or on a server of its own.", out)
+        refused = self.run_check(more_env={"FLEET_HUB_SERVER": "shared", "FLEET_MANAGER_SERVER": "later"}, expect=1)
+        self.assertIn("FLEET_HUB_SERVER=shared puts the manager on this server, so it does not go with "
+                      "FLEET_MANAGER_SERVER=later", refused)
+        self.assertNotIn("Founderizer step 1", refused)
+        self.assertEqual(self.run_check(more_env={"FLEET_HUB_SERVER": "yes"}), plain)       # only the one word counts
+
+    def test_the_server_service_step_clones_its_own_checkout_and_runs_only_on_the_word(self):
+        """The step itself: with the word it clones the service's own checkout as the hub's user and runs
+        hubsetup.py's hub-server from that clone, with the hub's team.json and the fleet's repository address.
+        Without the word it runs nothing and prints no step."""
+        body = shell_function(SCRIPT, "hub_server") + "hub_server\n"
+        tmp = Path(tempfile.mkdtemp(prefix="fleet-hub-server-step-"))
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        team = tmp / "team.json"
+        # as_user: the read of the hub's own word runs for real, on this test's team.json; each other command is named
+        stubs = ("as_user() { case \"$1 $2\" in 'python3 -c') \"$@\" ;; *) printf 'RAN: %s\\n' \"$*\" ;; esac; }\n"
+                 f"home=/home/fleet\naddress=100.80.1.2\nrepo_name=fleet-pilot\nkit={tmp}\n")
+        team.write_text(json.dumps(hubsetup.template(HUB_IP, owner="100.90.3.4", shared=True)))
+        code, out = run_shell(body, extra=stubs + "hub_shared=yes\n")
+        self.assertEqual(code, 0, out)
+        self.assertEqual([line for line in out.splitlines() if line.startswith("RAN: ")],
+                         ["RAN: git clone -q -b config git://100.80.1.2/fleet-pilot.git /home/fleet/fleet-server",
+                          f"RAN: python3 /home/fleet/fleet-server/hubsetup.py hub-server --team {team} --repo "
+                          "git://100.80.1.2/fleet-pilot.git"])
+        self.assertIn("Founderizer step 1: the server service of this server", out)
+        code, out = run_shell(body, extra=stubs + "hub_shared=no\n")
+        self.assertEqual((code, out), (0, ""))
+        # A hub that is there and was installed without the word keeps its rule: the step says so, prints no step
+        # and makes no clone and no service, and the install goes on. The last words then name each agent's own
+        # server, as for every hub without the word.
+        team.write_text(json.dumps(hubsetup.template(HUB_IP, owner="100.90.3.4")))
+        code, out = run_shell(body + 'echo "hub_shared=$hub_shared"\n', extra=stubs + "hub_shared=yes\n")
+        self.assertEqual(code, 0, out)
+        self.assertEqual([line for line in out.splitlines() if line.startswith("RAN: ")], [])
+        self.assertIn("this hub was installed without the word FLEET_HUB_SERVER=shared, so no new agent goes onto its "
+                      "own server, and it gets no server service", out)
+        self.assertNotIn("Founderizer step", out)
+        self.assertTrue(out.strip().endswith("hub_shared=no"), out)
+        self.assertIn('[ "$hub_shared" = no ] || agent_place="on this server or on a server of its own."',
+                      shell_function(SCRIPT, "done_text"))
+        main = shell_function(SCRIPT, "main")
+        self.assertLess(main.index("    fleet_identity\n"), main.index("    hub_server\n"))
+        self.assertLess(main.index("    hub_server\n"), main.index("    verify_step\n"))
+
+    def test_the_claim_gets_the_name_and_an_install_with_none_gets_no_option(self):
+        """The step that writes the first team.json gives hubsetup.py's claim the option, and only when the script
+        was given a name: an install with none runs the command line that it ran before."""
+        body = shell_function(SCRIPT, "sshd_folder") + shell_function(SCRIPT, "first_team") + "first_team\n"
+        stubs = ("sshd() { echo 'port 22'; }\n"
+                 # the hub's own copy of hubsetup.py: its help names the options that it knows ($KNOWS)
+                 "as_user() { case \"$*\" in *' claim --help') printf 'usage: claim %s\\n' \"$KNOWS\" ;; "
+                 "*) printf 'RAN: %s\\n' \"$*\" ;; esac; }\n"
+                 "SSHD_RUN=/nonexistent/run/sshd\naddress=100.80.1.2\nport=8765\nruntime=claude\nclaim_wait=1800\n"
+                 "timezone=\nreclaim=no\nmanager_later=no\nKNOWS='[--manager-later] [--manager-name NAME]'\n")
+        code, out = run_shell(body, extra=stubs + "manager_name=juno\n")
+        self.assertEqual(code, 0, out)
+        ran = [line for line in out.splitlines() if line.startswith("RAN: ")]
+        self.assertEqual(len(ran), 1, out)
+        self.assertTrue(ran[0].endswith("--wait 1800 --commit --manager-name juno"), ran[0])
+        # A checkout that an earlier release left here has a copy from before the option. The step stops with the
+        # reason before any claim, and it never goes on without the name: a manager gets its name once.
+        code, out = run_shell(body, extra=stubs + "manager_name=juno\nKNOWS='[--manager-later]'\n")
+        self.assertEqual(code, 1, out)
+        self.assertIn("is from before the option --manager-name, so this run cannot give the manager that name", out)
+        self.assertIn("A hub that has its owner keeps the name of its manager: run the line again without "
+                      "--manager-name.", " ".join(out.split()))
+        self.assertIn('names the manager "manager" for good: use a new server if you want another name',
+                      " ".join(out.split()))
+        self.assertEqual([line for line in out.splitlines() if line.startswith("RAN: ")], [])
+        # a copy that does not answer at all is said as that, with its own words, and not as an old copy
+        broken = stubs.replace("printf 'usage: claim %s\\n' \"$KNOWS\" ;;",
+                               "echo 'ModuleNotFoundError: hub'; return 1 ;;")
+        self.assertNotEqual(broken, stubs)
+        code, out = run_shell(body, extra=broken + "manager_name=juno\n")
+        self.assertEqual(code, 1, out)
+        self.assertIn("did not answer, so the owner claim cannot start. It said: ModuleNotFoundError: hub",
+                      " ".join(out.split()))
+        self.assertNotIn("is from before", out)
+        code, out = run_shell(body, extra=stubs + "manager_name=\nKNOWS='[--manager-later]'\n")    # no name: as before
+        self.assertEqual((code, len([line for line in out.splitlines() if line.startswith("RAN: ")])), (0, 1), out)
+        # the word for one server goes to the claim the same way, when the hub's own copy knows it
+        code, out = run_shell(body, extra=stubs + "manager_name=juno\nhub_shared=yes\n"
+                                                  "KNOWS='[--manager-later] [--manager-name NAME] [--shared]'\n")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(out.strip().endswith("--wait 1800 --commit --manager-name juno --shared"), out)
+        # A copy from before the word: a hub that is there keeps its rule, so the claim runs without the word, the
+        # step says so, and the step of the server service then finds nothing to do.
+        code, out = run_shell(body + 'echo "hub_shared=$hub_shared"\n',
+                              extra=stubs + "manager_name=\nhub_shared=yes\nKNOWS='[--manager-later]'\n")
+        self.assertEqual(code, 0, out)
+        ran = [line for line in out.splitlines() if line.startswith("RAN: ")]
+        self.assertEqual((len(ran), "--shared" in ran[0]), (1, False), out)
+        self.assertIn("is from before one server for all, so this hub keeps its rule", out)
+        self.assertTrue(out.strip().endswith("hub_shared=no"), out)
+        code, out = run_shell(body, extra=stubs + "manager_name=\n")
+        self.assertEqual(code, 0, out)
+        ran = [line for line in out.splitlines() if line.startswith("RAN: ")]
+        self.assertTrue(ran[0].endswith("--wait 1800 --commit"), ran[0])
+        self.assertNotIn("manager-name", ran[0])
 
     def test_the_plan_leaves_verify_to_the_app_only_on_the_apps_word(self):
         out = self.run_check()

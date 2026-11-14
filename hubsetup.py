@@ -2,15 +2,17 @@
 """The Python half of the Founderizer hub installer (hub.sh): the first team.json, the owner claim and the end checks.
 Standard library only, and it reads no credential of a model provider.
 
-    python3 hubsetup.py template --address IP [--port N] [--timezone Z] [--owner IP]
+    python3 hubsetup.py template --address IP [--port N] [--timezone Z] [--owner IP] [--manager-name NAME]
                                                     print the first team.json; write nothing
     python3 hubsetup.py repository --tree PATH --bare PATH --kit PATH
                                                     this hub's own repository: the bare one that every machine of the
                                                     fleet fetches from, and the hub's checkout on the configuration ref
     python3 hubsetup.py claim --address IP --out PATH [--port N] [--timezone Z] [--wait S] [--reclaim] [--commit]
-                              [--manager-later]
+                              [--manager-later] [--manager-name NAME] [--shared]
                                                     the owner claim, then write team.json, and commit it on the ref;
                                                     --manager-later: the app gives the manager a server of its own;
+                                                    --manager-name: the manager's own name, `manager` without it;
+                                                    --shared: one server for all, so this server takes agents;
                                                     --reclaim: a new owner for a hub that has one; a hub that runs
                                                     is stopped for the time of the claim and started again
     python3 hubsetup.py runtime --runtime claude|codex
@@ -36,6 +38,10 @@ Standard library only, and it reads no credential of a model provider.
                                                     the end checks on this machine: selftest.py and GET /health;
                                                     --no-selftest for a caller that runs verify next
     python3 hubsetup.py fleet-id [--db PATH]        this fleet's own id in the hub's key store, made once
+    python3 hubsetup.py hub-server --team PATH --repo URL [--db PATH]
+                                                    as the hub's user, from the server service's own clone, and only
+                                                    on a hub whose own server takes agents: that server's server
+                                                    service, with its key's SHA-256 in the hub's records
     python3 hubsetup.py kit-clone [--hub-user fleet] [--source URL]
                                                     as root on the hub's machine: root's own clone of the published
                                                     repository at /usr/local/lib/founderizer-kit, at the revision of
@@ -113,6 +119,8 @@ HUB_SERVICE = "fleet-hub.service"   # the hub, as `fleet.py service hub` install
 PORT_TRIES = 20                 # readings of the hub's port, a second apart, after a claim stopped the hub's service
 BACK_TRIES = 60                 # readings of GET /health, a second apart, after a claim started that service again
 START_TRIES = 120               # readings of GET /health, a second apart, after the install started that service (first_health)
+KEY_TRIES = 120                 # readings of the hub's agent keys before a hub server's own service starts (hub_server)
+KEY_WAIT = 1                    # seconds between two of those readings
 CLAIM_ENDS = ("SIGHUP", "SIGTERM")  # what ends a claim from outside: a terminal that closed, and a kill
 # The manager's start policy, as team.json has it on the pilot hub, and a worker's or a lead's for the first one of a
 # fleet, where the hub has no other worker to copy from (hub.py `server_agent_entry`). Both are that runtime's own
@@ -122,6 +130,20 @@ CLAIM_ENDS = ("SIGHUP", "SIGTERM")  # what ends a claim from outside: a terminal
 STARTS = {name: e["manager_access"]["start"] for name, e in lifecycle.RUNTIMES.items() if e["manager_access"]}
 WORKER_STARTS = {name: e["first_worker"] for name, e in lifecycle.RUNTIMES.items() if e["first_worker"]}
 FIRST_COMMIT = "The first team.json of this hub: one manager, and the owner's own Mac"
+# The name of a new hub's manager when its installer is given none, as each hub had it until 14 November 2026. The
+# published repository carries the manager's profile under this name (publish.py SEEDED), and `manager_profile` gives
+# a manager with another name that file under its own.
+MANAGER = "manager"
+# Names that a new hub's manager cannot have, because the fleet uses each one itself on a server, as fleet-<name>:
+# the user of the vault broker (vault), the group of the agents' users (agents), the services that `fleet.py service`
+# makes under these names and not as an agent's helper (git, channels, and watch on a Mac), the folders of the hub's
+# checkout and of a server's service (pilot, server), and the folders that an agent's helper keeps in the agent's own
+# home beside its checkout (work, chats, checks: fleet.py WORK and CHATS, lifecycle.py CHECK_STORE). And each name
+# that starts with one of FLEET_OWN_STARTS: vault- (fleet-vault-central was the central vault's user, and the vault
+# has more parts with such names) and login- (fleet-login-<agent> is the tmux session of an agent's sign-in).
+# hub.sh has the same names in its check, and a test holds the two lists to each other.
+FLEET_OWN_NAMES = ("agents", "channels", "chats", "checks", "git", "pilot", "server", "vault", "watch", "work")
+FLEET_OWN_STARTS = ("login-", "vault-")
 OWNER_COMMIT = "The owner of this hub is another Mac: a second owner claim, made on the hub's own server"
 # One OS user for each agent (PRODUCT.md P2), in this one place: both installers call the command that uses it, so
 # no second copy of the name can drift from it. The agent's name comes from the hub's own pattern.
@@ -245,11 +267,42 @@ def machine_timezone():
     return "UTC"
 
 
+def manager_name(name=None):
+    """The name of a new hub's manager: the one that the installer was given, which is the owner's own choice, or
+    `manager` when it was given none. It is one name by the hub's own rule for an agent's name (hub.AGENT_NAME, and
+    not `owner` or `hub`), it is no name that the fleet uses itself on a server (FLEET_OWN_NAMES, FLEET_OWN_STARTS),
+    and it is short enough for its OS user `fleet-<name>`. The hub lets nobody rename the manager afterwards
+    (hub.rename_agent), so a name that fails stops the install: hub.sh checks it before its first step, and the claim
+    checks it here before it makes a code."""
+    if name is None:
+        return MANAGER
+    if not isinstance(name, str) or not hub.AGENT_NAME.fullmatch(name) or name in hub.RESERVED_AGENT_NAMES \
+            or name in FLEET_OWN_NAMES or name.startswith(FLEET_OWN_STARTS):
+        raise Stop(f"{name!r} is not a name that the manager can have: a name has 2 to {USER_LIMIT - len(AGENT_USER % '')} "
+                   f"characters a-z 0-9 -, starts with a letter, and is none of the names that the fleet uses itself "
+                   f"({', '.join((*hub.RESERVED_AGENT_NAMES, *FLEET_OWN_NAMES))}, and each name that starts with "
+                   f"{' or '.join(FLEET_OWN_STARTS)}).")
+    if len(AGENT_USER % name) > USER_LIMIT:
+        raise Stop(f"the manager's name {name!r} is too long: its OS user {AGENT_USER % name!r} has more than the "
+                   f"{USER_LIMIT} characters that this system allows. Give a name of at most "
+                   f"{USER_LIMIT - len(AGENT_USER % '')} characters.")
+    return name
+
+
 def template(hub_ip, port=8765, timezone=None, owner=None, runtime="claude", ssh_user="fleet", ssh_port=22,
-             placed=True):
+             placed=True, manager=None, shared=False):
     """The first team.json of a new hub: one manager, this machine's address, and the owner's Mac when the claim has
     proved it. Nothing here holds a credential: `"vault": "none"` says that the manager has no vault access, because
     its runtime is the customer's own subscription, signed in by the customer.
+
+    `manager` is the manager's own name (manager_name): the agent's key in "agents", and with it its profile's file,
+    its OS user, its checkout and its service. The hub finds the manager by its role, never by that name.
+
+    `shared` (`claim --shared`; hub.sh's FLEET_HUB_SERVER=shared): the owner chose one server for all, so the hub's
+    own server takes agents (`"hub": {"shared": true}`, hub.hub_shared). The file then names that server as a joined
+    server is named (`servers`: Linux, with `ssh_user`, which hub.sh gives as the user of the hub's services), because
+    its own server service installs each agent that the owner adds there (hub_server). It does not go with
+    `placed=False`: that manager is on no server.
 
     `placed=False` (`claim --manager-later`; hub.sh's FLEET_MANAGER_SERVER=later, which Founderizer 0.1.112 and later
     set): the manager has no server yet (`"placed": false`, hub.unplaced), so no agent runs on the hub's server, and
@@ -266,17 +319,25 @@ def template(hub_ip, port=8765, timezone=None, owner=None, runtime="claude", ssh
     addresses = {"hub": address(hub_ip, "the hub's address")}
     if owner is not None:
         addresses["owner"] = address(owner, "the owner's address")
+    name = manager_name(manager)
+    if shared and not placed:
+        raise Stop("one server for all puts the manager on the hub's server, so it does not go with a manager that "
+                   "has no server yet: give --shared or --manager-later, not both.")
     manager = {"role": "manager", "machine": "hub", "runtime": runtime, "can": ["shell", "web"], "vault": "none",
                "start": STARTS[runtime]}
     if not placed:
         manager["placed"] = False
-    return {
+    team = {
         "hub": {"machine": "hub", "port": int(port)},
         "goals": {"sweep_minutes": 15, "review_hour": 9, "timezone": timezone or "UTC"},
         "addresses": addresses,
         "access": {"hub": {"ssh_user": ssh_user, "ssh_port": int(ssh_port)}},
-        "agents": {"manager": manager},
+        "agents": {name: manager},
     }
+    if shared:
+        team["hub"]["shared"] = True
+        team["servers"] = {"hub": {"kind": "linux", "user": ssh_user}}
+    return team
 
 
 def install_runtime(runtime):
@@ -1545,6 +1606,100 @@ def keep_fleet_id(db=None):
         hub.DB = kept
 
 
+def hub_server(team_path, db=None, repo=None):
+    """The server service of a hub's own server that takes agents (team.json `"hub": {"shared": true}`, owner feature
+    hub_shared), as the hub's own user: the service's key and its settings in that user's ~/.fleet, the SHA-256 of the
+    key in the hub's records, and the service itself, written and started.
+
+    **Why the installer writes the key's record.** A server gets its server service by a join with a join code, and
+    the hub refuses a join from its own address (hub.join_server). That refusal is correct: an agent on the hub's
+    server calls from that address too. So the one that may write the hub's records, the hub's own user, puts the
+    SHA-256 there: the hub then knows the service by its key, as it knows each server's. No agent of this server can
+    read the key (its file has mode 600 and belongs to the hub's user) or write the records.
+
+    **The service starts for the first time only when each agent of this server has its agent key in the hub's
+    records.** hub.sh installs the manager with no key step: its helper registers its own key while it is alone on
+    the server. The hub takes no such key any more from the moment the server's service reports that it gives new
+    agents their keys (hub.py helper_key), so a service that started first would leave the manager with no key, and
+    the server could never take a second agent (`agent_not_ready`). The wait ends at the key, or at KEY_TRIES
+    readings, a second apart: then this stops with the reason, and the same line again goes on from here. A server
+    whose service the hub knows already has no such wait: there the service gives each new agent its key.
+
+    **It runs from the service's own clone, never from the hub's checkout.** The service brings its checkout up to
+    date by itself (server.py `update`), and the hub's checkout is the hub's to move. hub.sh clones
+    /home/fleet/fleet-server for it, as join.sh does on a joined server.
+
+    Safe to run again: the key that is there stays, and its record is written only when it differs. `repo`: the
+    address that this fleet's machines clone from, which the service gives each new agent's checkout."""
+    import server                       # the service's own program; only this command needs it
+    team = read_team(team_path)
+    if team is None:
+        raise Stop(f"{team_path} is not a team.json the hub can run, so this server gets no server service.")
+    conf = team["hub"]
+    name = conf["machine"]
+    if conf.get("shared") is not True:
+        raise Stop(f"this hub's own server takes no agent (\"hub\": {{\"shared\": true}} is not in {team_path}), so "
+                   f"it gets no server service. Only a hub's first install decides that.")
+    if os.path.realpath(server.KIT) == os.path.realpath(os.path.dirname(os.path.abspath(team_path))):
+        raise Stop("run hub-server from the server service's own clone, not from the hub's checkout: the service "
+                   "brings its checkout up to date by itself, and the hub's checkout is the hub's to move.")
+    if not isinstance(repo, str) or not repo.startswith("git://"):
+        raise Stop("--repo must be the git:// address that this fleet's machines clone from.")
+    path = os.path.expanduser(db or DB_PATH)
+    if not os.path.exists(path):
+        raise Stop(f"the hub keeps no records in {path} yet, so its server service cannot be made known there. The "
+                   f"hub writes them when it starts: look at systemctl --user status fleet-hub")
+    waiting = []
+    for reading in range(KEY_TRIES):
+        records = sqlite3.connect(path, timeout=30)
+        try:
+            if records.execute("SELECT 1 FROM server_keys WHERE server=?", (name,)).fetchone():
+                break                   # a second run: the service started before, and the keys are its own work
+            keyed = {row[0] for row in records.execute("SELECT agent FROM agent_keys")}
+        except sqlite3.Error as e:
+            raise Stop(f"the agent keys could not be read in {path}: {e}. The hub writes its records when it "
+                       f"starts: look at systemctl --user status fleet-hub") from None
+        finally:
+            records.close()
+        waiting = [agent for agent in agents_of(team, name) if agent not in keyed]
+        if not waiting:
+            break
+        if not reading:
+            say(f"{', '.join(waiting)} has no agent key in the hub's records yet: its helper registers one at its "
+                f"start, so the records are read up to {KEY_TRIES} times, a second apart")
+        time.sleep(KEY_WAIT)
+    if waiting:
+        raise Stop(f"{', '.join(waiting)} has no agent key in the hub's records, so the server service of {name} "
+                   f"does not start yet: with it, the hub takes no key from an agent's own helper any more. Look at "
+                   f"the agent's service (systemctl --user status fleet-{waiting[0]}, as its own user), then run "
+                   f"the line again.")
+    key = server.server_key(make=True)
+    digest = hashlib.sha256(key.encode()).hexdigest()
+    server.save_conf({"name": name, "hub": f"http://{team['addresses'][name]}:{int(conf.get('port') or 8765)}",
+                      "repo": repo})
+    records = sqlite3.connect(path, timeout=30)
+    try:
+        with records:
+            kept = records.execute("SELECT sha256 FROM server_keys WHERE server=?", (name,)).fetchone()
+            if kept and kept[0] == digest:
+                say(f"the hub knows the server service of {name} by its key already")
+            else:
+                records.execute("INSERT INTO server_keys(server,sha256,created) VALUES(?,?,?) ON CONFLICT(server) DO "
+                                "UPDATE SET sha256=excluded.sha256, created=excluded.created",
+                                (name, digest, time.time()))
+                say(f"the hub knows the server service of {name} by its key: the key stays in this user's ~/.fleet, "
+                    f"and the hub keeps only its SHA-256")
+    except sqlite3.Error as e:
+        raise Stop(f"the server service of {name} could not be made known in {path}: {e}. The hub writes its "
+                   f"records when it starts: look at systemctl --user status fleet-hub") from None
+    finally:
+        records.close()
+    server.install_service()
+    say(f"the server service of {name} runs: it installs each agent that the owner adds on this server, each under "
+        f"its own OS user")
+    return digest
+
+
 # ---------------------------------------------------------------- root's own clone (DevOps plan V2)
 #
 # The central vault is installed and updated as root, so the program that does it must be one that the hub's user
@@ -2455,20 +2610,115 @@ def repository(tree, bare, kit):
     return commit
 
 
-def commit_team(kit, message):
+def manager_of(team):
+    """The name of the manager of this team.json, by its role; None for a file with no manager."""
+    return next((n for n, a in ((team or {}).get("agents") or {}).items()
+                 if isinstance(a, dict) and a.get("role") == "manager"), None)
+
+
+def manager_profile(kit, team, named, first=True):
+    """The profile of a manager whose name is not `manager`, in the hub's checkout: the published profile
+    `profiles/manager.md` under the manager's own name, with that name in its title line, as a rename moves a profile
+    (hub.renamed_profile). The hub and the manager's helper read `profiles/<agent>.md`, so without this file a manager
+    with its own name starts with no profile. Returns the paths that the commit takes with team.json: the two files'
+    paths while the move is in no commit yet, and else none.
+
+    **It moves the file only for the first team.json of a hub**: when this run named the team's manager (`named`,
+    its --manager-name), or when team.json is itself in no commit yet, which is the mark of a first run that stopped
+    before its commit. A fleet that is there keeps its files, and a second owner claim (`first=False`) never moves
+    one: when the profile is then still missing, it says so, with the line that makes it. **It finishes a move that
+    a stopped run left in every case**, whatever this run was given: the new file is in no commit (git calls it
+    untracked, or added when the run stopped between its `git add` and its commit), so the commit takes both paths,
+    and a published file that is still there beside its own copy is removed. Else a run with another line would
+    commit team.json alone and leave the checkout with a change that the hub refuses each owner write for
+    (hub.commit_kit_file).
+
+    A profile that is there under the manager's name and is in a commit is the owner's own file: nothing touches it.
+    A checkout with no published profile gets none. A claim that commits nothing (no --commit) leaves the two files
+    changed and not committed, as it leaves team.json."""
+    name = manager_of(team)
+    if name in (None, MANAGER):
+        return ()
+    paths = (f"profiles/{name}.md", f"profiles/{MANAGER}.md")
+    new, old = (os.path.join(kit, path) for path in paths)
+
+    def pending(path):
+        return git("status", "--porcelain", "--untracked-files=all", "--", path, folder=kit)[1]
+
+    def new_here():
+        """True while the profile under the manager's name is in no commit: untracked (??), or added (A)."""
+        return pending(paths[0]).startswith(("??", "A"))
+    moved = False
+    try:
+        data = None
+        if os.path.isfile(old):
+            with open(old, "rb") as f:
+                data = hub.renamed_profile(f.read(), MANAGER, name)
+        if data is not None and not os.path.exists(new):
+            if first and (named == name or pending("team.json")):
+                with open(new + ".new", "wb") as f:
+                    f.write(data)
+                os.replace(new + ".new", new)
+                os.remove(old)
+                moved = True
+        elif data is not None and new_here():
+            with open(new, "rb") as f:
+                copied = f.read() == data
+            if copied:                  # the run before stopped between its write and its remove
+                os.remove(old)
+    except OSError as e:
+        raise Stop(f"the manager's profile could not move from profiles/{MANAGER}.md to profiles/{name}.md in {kit}: "
+                   f"{e}. Run the line again.") from None
+    try:                                # a terminal that is gone does not undo the move, and the commit comes next
+        if moved:
+            say(f"the manager's profile is profiles/{name}.md: the manager's name is {name}")
+        elif not os.path.exists(new) and os.path.isfile(old):
+            say(f"the manager {name} has no profile under its name yet: the published profile is still "
+                f"profiles/{MANAGER}.md. Run the line again with --manager-name {name}, and the installer moves it.")
+    except OSError:
+        pass
+    return paths if moved or new_here() else ()
+
+
+def commit_team(kit, message, more=()):
     """Commit team.json on the configuration ref and push it to this hub's own bare repository. Nothing to commit is
-    no failure: that is what a second run of the installer finds."""
-    if git("status", "--porcelain", "--", "team.json", folder=kit)[1] == "":
-        say("team.json is as it was; nothing to commit")
-        return None
-    code, _, err = git("commit", "-q", "-m", message, "--", "team.json", folder=kit, identity=True)
-    if code != 0:
-        raise Stop(f"could not commit team.json in {kit}: {err}")
+    no failure: that is what a second run of the installer finds. `more`: the paths of a named manager's profile
+    (manager_profile), each committed with team.json when it changed; with none, this is the body of before 14
+    November 2026, command for command."""
+    if not more:
+        if git("status", "--porcelain", "--", "team.json", folder=kit)[1] == "":
+            say("team.json is as it was; nothing to commit")
+            return None
+        code, _, err = git("commit", "-q", "-m", message, "--", "team.json", folder=kit, identity=True)
+        if code != 0:
+            raise Stop(f"could not commit team.json in {kit}: {err}")
+        what = "team.json"
+    else:
+        # One reading for each path: a new file, a changed one and a removed one all give a line, and a path that is
+        # neither in the checkout nor in its history gives none, where `git add` of it would fail.
+        changed = [path for path in ("team.json", *more)
+                   if git("status", "--porcelain", "--untracked-files=all", "--", path, folder=kit)[1]]
+        if not changed:
+            say("team.json and the manager's profile are as they were; nothing to commit")
+            return None
+        what = " and ".join(changed)
+        # A path that is neither in the checkout nor in git's index is a removal that a stopped run added already:
+        # `git add` of it would fail, and the commit takes it as it is.
+        add = [path for path in changed if os.path.lexists(os.path.join(kit, path))
+               or git("ls-files", "--error-unmatch", "--", path, folder=kit)[0] == 0]
+        code, _, err = git("add", "-A", "--", *add, folder=kit) if add else (0, "", "")
+        if code == 0:
+            code, _, err = git("commit", "-q", "-m", message, "--", *changed, folder=kit, identity=True)
+        if code != 0:
+            raise Stop(f"could not commit {what} in {kit}: {err}")
     code, _, err = git("push", "-q", "origin", f"HEAD:refs/heads/{hub.CONFIG_BRANCH}", folder=kit)
     if code != 0:
-        raise Stop(f"could not push team.json to this hub's own repository: {err}")
+        raise Stop(f"could not push {what} to this hub's own repository: {err}")
     commit = git("rev-parse", "HEAD", folder=kit)[1]
-    say(f"team.json is committed on {hub.CONFIG_BRANCH} as {commit[:7]} and pushed to the hub's own repository")
+    if more:
+        say(f"committed on {hub.CONFIG_BRANCH} as {commit[:7]} and pushed to the hub's own repository: {what}")
+    else:
+        say(f"team.json is committed on {hub.CONFIG_BRANCH} as {commit[:7]} and pushed to the hub's own repository")
     return commit
 
 
@@ -3006,7 +3256,9 @@ def first_health(hub_ip, port, tries=START_TRIES, pause=1):
 
 def cmd_template(args):
     print(json.dumps(template(args.address, args.port, args.timezone or machine_timezone(), args.owner,
-                              args.runtime, args.ssh_user, args.ssh_port, placed=not args.manager_later), indent=2))
+                              args.runtime, args.ssh_user, args.ssh_port, placed=not args.manager_later,
+                              manager=getattr(args, "manager_name", None),
+                              shared=getattr(args, "shared", False)), indent=2))
 
 
 def cmd_repository(args):
@@ -3015,11 +3267,22 @@ def cmd_repository(args):
 
 def cmd_claim(args):
     here = address(args.address, "the hub's address")
+    named = getattr(args, "manager_name", None)     # a caller from before the option gives none: `manager`
+    manager_name(named)                 # a name that the manager cannot have stops the claim before its code
+    if getattr(args, "shared", False) and args.manager_later:       # and so do two layouts at one time (template)
+        raise Stop("one server for all puts the manager on the hub's server, so it does not go with a manager that "
+                   "has no server yet: give --shared or --manager-later, not both.")
     already = claimed_by(args.out, here, args.port)
     if already and not args.reclaim:
         say(f"this hub belongs to the Mac at {already} already, so no code was made and nothing changed.")
+        team, kit = read_team(args.out), os.path.dirname(os.path.abspath(args.out))
+        if named and manager_of(team) not in (None, named):     # a hub that is there keeps its fleet
+            say(f"this hub's manager has the name {manager_of(team)} already, so the name {named} is not used.")
+        # A first run that stopped before its commit left its work for this run, whatever this line names: the
+        # profile of a named manager is finished and committed with team.json (manager_profile).
+        more = manager_profile(kit, team, named)
         if args.commit:
-            commit_team(os.path.dirname(os.path.abspath(args.out)), FIRST_COMMIT)
+            commit_team(kit, FIRST_COMMIT, more=more)
         return
     if args.reclaim and not already:
         # --reclaim is the word for a hub that has an owner. Without this, a claim on a port that is free took the
@@ -3037,9 +3300,12 @@ def cmd_claim(args):
         team = own_team(args.out, here, args.port) or template(args.address, args.port,
                                                                args.timezone or machine_timezone(),
                                                                runtime=args.runtime, ssh_user=args.ssh_user,
-                                                               ssh_port=args.ssh_port, placed=not args.manager_later)
+                                                               ssh_port=args.ssh_port, placed=not args.manager_later,
+                                                               manager=named, shared=getattr(args, "shared", False))
         team.setdefault("addresses", {})["owner"] = owner
         kit = os.path.dirname(os.path.abspath(args.out))
+        if named and manager_of(team) not in (None, named):     # a team.json that is this hub's own keeps its fleet
+            say(f"this hub's manager has the name {manager_of(team)} already, so the name {named} is not used.")
         # A second claim changes the team.json of a fleet. When its write, its commit or its push fails, the checkout
         # goes back to this commit (take_back), and the hub starts on what it ran before.
         head = git("rev-parse", "HEAD", folder=kit)[1] if already and args.commit else ""
@@ -3049,8 +3315,12 @@ def cmd_claim(args):
                 say(f"{args.out} names {owner} as the owner.")
             except OSError:
                 pass            # a terminal that is gone does not undo a claim that the Mac made
+            # The profile of a named manager moves with the first team.json only. A second claim moves no file: it
+            # changes the owner, and take_back puts back team.json alone when it fails. It still takes a move that a
+            # stopped first run left into its commit, so that the checkout is whole after it.
+            more = manager_profile(kit, team, named, first=not already)
             if args.commit:     # the record says which of the two it was: a second claim is not the first team.json
-                commit_team(kit, OWNER_COMMIT if already else FIRST_COMMIT)
+                commit_team(kit, OWNER_COMMIT if already else FIRST_COMMIT, more=more)
         except BaseException:
             if head:
                 take_back(kit, head)
@@ -3108,6 +3378,10 @@ def cmd_agent_list(args):
 
 def cmd_fleet_id(args):
     keep_fleet_id(args.db)
+
+
+def cmd_hub_server(args):
+    hub_server(args.team, args.db, args.repo)
 
 
 def cmd_central_vault(args):
@@ -3237,6 +3511,11 @@ def main(argv=None):
     fid = sub.add_parser("fleet-id")
     fid.add_argument("--db", default=DB_PATH, help="the hub's own records; the default is where hub.py keeps them")
     fid.set_defaults(fn=cmd_fleet_id)
+    hs = sub.add_parser("hub-server")
+    hs.add_argument("--team", required=True, help="the hub's own team.json, which says that its server takes agents")
+    hs.add_argument("--repo", required=True, help="the git:// address that this fleet's machines clone from")
+    hs.add_argument("--db", default=DB_PATH, help="the hub's own records; the default is where hub.py keeps them")
+    hs.set_defaults(fn=cmd_hub_server)
     kc = sub.add_parser("kit-clone")
     kc.add_argument("--hub-user", default="fleet", help="the user the hub runs as: its checkout holds release.json")
     kc.add_argument("--source", help="the published repository; default: " + releases.DEFAULT_UPSTREAM)
@@ -3274,6 +3553,10 @@ def main(argv=None):
         p.add_argument("--ssh-port", type=int, default=22)
         p.add_argument("--manager-later", action="store_true",
                        help="the manager has no server yet: the app that installs this hub gives it one")
+        p.add_argument("--manager-name", help="the manager's own name, by the hub's rule for an agent's name; "
+                                              f"{MANAGER} when it is left out")
+        p.add_argument("--shared", action="store_true",
+                       help="one server for all: this hub's own server takes agents (not with --manager-later)")
         if name == "template":
             p.add_argument("--owner")
         else:

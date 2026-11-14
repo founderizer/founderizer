@@ -1055,6 +1055,23 @@ def unplaced(name, team=None):
     return ((team or team_read()).get("agents") or {}).get(name, {}).get("placed") is False
 
 
+# The names that the hub's own user uses on the hub's server, as fleet-<name>: its git service, its chat bridge, the
+# server service of a hub server that takes agents, and the hub's checkout (hubsetup.py FLEET_OWN_NAMES has them too).
+HUB_OWN_NAMES = ("channels", "git", "pilot", "server")
+
+
+def hub_shared(team=None):
+    """True for a hub whose own server takes agents (owner feature hub_shared, team.json `"hub": {"shared": true}`): the
+    owner chose one server for all at the install (the first step of the slider "Your fleet's servers", which the
+    owner approved on 14 November 2026). The installer writes the word (hubsetup.template) and gives that server a
+    server service (hubsetup.hub_server), so an agent comes onto it as onto a joined server: by an install job, under
+    its own OS user `fleet-<agent>`. Each other hub keeps the rule of 2 November 2026, that no new agent goes onto
+    the hub's server, where the central vault holds every key. No app and no tool gives the installer the word yet:
+    UI-API.md 1.168 lists what is still open (no vault broker there, the door, a restore, the hub's own watch)."""
+    conf = (TEAM if team is None else team).get("hub")
+    return isinstance(conf, dict) and conf.get("shared") is True
+
+
 def runtime_label(runtime):
     """What the owner is shown for a runtime (lifecycle.RUNTIMES), or the name itself for one the fleet does not
     know."""
@@ -1424,6 +1441,10 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "default_models",    # the owner, 9 November 2026: "a default for each [AI provider] somewhere under
                                     # settings, and then each agent can be changed individually"
                "web_hosts",         # the host list of an agent whose Shell box is off (UI-API.md, "the host list")
+               "hub_shared",        # the owner, 14 November 2026 (the slider's first step, "Yes, as shown"): the
+                                    # hub's own server takes agents when team.json says "hub": {"shared": true};
+                                    # GET /ui/servers has hub_shared, and the door's refusals have `why`
+                                    # (UI-API.md 1.168)
                "chat_waits",        # the owner, 13 November 2026 ("Yes, fix it"): the phone's list of chats says
                                     # "Thinking" for every conversation, from agents[].waits_since of GET /ui/mobile
                                     # (UI-API.md 1.142)
@@ -32839,6 +32860,15 @@ class Conflict(Refusal):
         self.extra = extra
 
 
+def refusal_why(message, why, **extra):
+    """A 409 with the words of before and `why`, a list of codes that the app reads in place of the words (owner
+    feature hub_shared). It is a Refusal and not a Conflict: a caller that catches Conflict takes it for a team.json
+    that moved and tries again (mac_setup_add), and this refusal stays true at each try."""
+    refusal = Refusal(409, message)
+    refusal.extra = dict(extra, why=list(why))
+    return refusal
+
+
 KNOWLEDGE_CACHE = (None, [])
 KNOWLEDGE_BLOBS = {}            # (title, source) of a blob by its object id, or None for one that is not text
 OWNER_KNOWLEDGE = "knowledge/owner/"
@@ -34053,6 +34083,8 @@ def validate_team(team):
             raise ValueError("hub.connect is not in this release of the hub")
         if not isinstance(hub_conf["connect"], bool):
             raise ValueError("hub.connect must be true or false")
+    if "shared" in hub_conf and hub_conf["shared"] is not True:        # owner feature hub_shared
+        raise ValueError("hub.shared is true for a hub whose own server takes agents, or absent")
     for machine, ip in addresses.items():
         try:
             ipaddress.ip_address(ip)
@@ -34278,6 +34310,14 @@ def validate_team(team):
             if other[1] != a.get("vault_recipient"):
                 raise ValueError(f"{other[0]} and {name} use the vault broker of one machine, so they pin the same "
                                  f"vault_recipient")
+    # owner feature hub_shared: on a hub's own server that takes agents, the server service runs as the hub's user,
+    # so no agent there has a name that this user uses itself (HUB_OWN_NAMES). One rule for each write: Add agent,
+    # a rename, a move and a reload.
+    if hub_conf.get("shared") is True:
+        for name, a in team["agents"].items():
+            if name in HUB_OWN_NAMES and a["machine"] == hub_conf["machine"] and a.get("placed") is not False:
+                raise ValueError(f"agent {name}: the hub uses the name {name} itself on its own server, which takes "
+                                 f"agents: the agent has another name or another server")
     homes = {}              # owner feature agent_rename: one home, one runtime credential, one agent
     for name, a in team["agents"].items():
         home = (a["machine"], a.get("user") or f"fleet-{name}")
@@ -35902,7 +35942,8 @@ def installing(job, agent):
 
 def servers_view():
     """GET /ui/servers: each server with its kind, address, agents, newest reading, availability (why: the codes of
-    what stops a new agent) and newest job; and the state of the newest join code."""
+    what stops a new agent) and newest job; whether the hub's own server takes agents (hub_shared); and the state of
+    the newest join code."""
     t0, desired = now(), kit_revision()
     expire_server_jobs(t0)
     team, hub_machine = TEAM, (TEAM.get("hub") or {}).get("machine")
@@ -35918,7 +35959,7 @@ def servers_view():
         job = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (name,))
         # An agent there already: a new one needs a service that gives it its key, and a server where nobody else has
         # root (add_server_agent).
-        why = (["hub_machine"] if name == hub_machine else []) + \
+        why = (["hub_machine"] if name == hub_machine and not hub_shared(team) else []) + \
             (["has_agent"] if here and INSTALL_KEY not in server_features(name) else
              ["agent_not_ready"] if [n for n in not_shareable(team, here) if not installing(job, n)] else []) + \
             (["fix_holder"] if fix_holders(team, name) else []) + \
@@ -35936,6 +35977,7 @@ def servers_view():
                     "hub": name == hub_machine, "joined": name in keys, "agents": here, "reading": reading,
                     "load": load, "available": not why, "why": why, "job": job_view(job)})
     return {"desired_revision": desired, "servers": out, "apps": app_servers_view(team),
+            "hub_shared": hub_shared(team),
             "join": join_view(q1("SELECT * FROM join_codes ORDER BY id DESC LIMIT 1"), t0)}
 
 
@@ -36365,6 +36407,11 @@ def add_server_agent(server, body):
             raise Refusal(409, f"An agent named {agent} was in this fleet before, and its records are still here. "
                                f"Choose another name.")
         here = server_agents(server, team)
+        # On the hub's own server the server service runs as the hub's user, whose home has the hub's own services and
+        # folders under these names (fleet-git, fleet-channels, fleet-server, fleet-pilot). An agent of such a name
+        # there would share them: its removal could end the hub's own git service.
+        if server == (team.get("hub") or {}).get("machine") and hub_shared(team) and agent in HUB_OWN_NAMES:
+            raise Refusal(409, f"The hub uses the name {agent} itself on its own server. Choose another name.")
         if here and INSTALL_KEY not in server_features(server):
             raise Refusal(409, f"{server} runs an older Founderizer that cannot add a second agent. Update Founderizer "
                                f"on {server}, then try again.")
@@ -36372,9 +36419,10 @@ def add_server_agent(server, body):
             raise Refusal(409, f"{', '.join(fix_holders(team, server))} holds Fix on {server}: a new agent goes to a "
                                f"server where no other agent has root.")
         if door_callers_at(team, server):   # the door would no longer tell that agent apart by its address
-            raise Refusal(409, f"{', '.join(shown_role(n) for n in door_callers_at(team, server))} holds servers "
-                               f"through the door and runs alone on {server}, by which the door knows it: a new agent "
-                               f"goes to another server.")
+            # why: the code that GET /ui/servers gives this server, so that the app reads the reason and not the words
+            raise refusal_why(f"{', '.join(shown_role(n) for n in door_callers_at(team, server))} holds servers "
+                              f"through the door and runs alone on {server}, by which the door knows it: a new agent "
+                              f"goes to another server.", ["door_caller"])
         if not_shareable(team, here):       # its helper or its vault would stop answering beside a second agent
             raise Refusal(409, f"{', '.join(shown_role(n) for n in not_shareable(team, here))} on {server} cannot share "
                                f"it yet: an agent beside another needs its own agent key and a vault that serves both.")
@@ -36778,7 +36826,7 @@ def move_agent(agent, body):
     if where == server:
         if not last or last["kind"] != "install" or last["agent"] != agent or last["state"] != "failed":
             raise Refusal(409, f"{shown_role(agent)} runs on {server} already.")
-    elif server == (team.get("hub") or {}).get("machine"):
+    elif server == (team.get("hub") or {}).get("machine") and not hub_shared(team):
         raise Refusal(409, "No agent runs on the hub's server.")
     elif server_agents(server, team):
         raise Refusal(409, f"{server} has an agent already: {', '.join(server_agents(server, team))}")
@@ -38998,6 +39046,12 @@ def validate_door(team):
             door["address"] != addresses.get((team.get("hub") or {}).get("machine")):
         raise ValueError("the door runs on a server of its own or on the hub's server, and on no other machine of the "
                          "fleet")
+    # A hub's server that takes agents (hub_shared) has shells beside it, and each agent there calls from the hub's
+    # own address. The hub knows the door's own calls by the door's address alone (door_sealed, door_approvals,
+    # door_release, door_fetched), so in such a fleet the door has a server of its own.
+    if hub_shared(team) and door["address"] == addresses.get((team.get("hub") or {}).get("machine")):
+        raise ValueError("the door runs on a server of its own in a fleet whose hub's server takes agents: an agent "
+                         "on the hub's server calls from the hub's address, by which the hub knows the door")
     port = door.get("port", DOOR_PORT)
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError("door.port is a port number")
@@ -39052,10 +39106,11 @@ def grant_server(body):
     # The reverse of door_callers_at: the door knows a caller by its server's address alone, so an agent beside the
     # holder on one server would be the holder to the door. The app's own check of the box says the same.
     mates = sorted(n for n in machine_agents(agent) if n != agent)
-    if level and mates:
-        raise Refusal(409, f"{shown_role(agent)} shares {a['machine']} with "
-                           f"{', '.join(shown_role(n) for n in mates)}: the door knows a caller by its server's "
-                           f"address, so an agent that holds servers through the door runs alone on its server.")
+    if level and mates:         # why: a code for the app, as the refusal of add_server_agent has one
+        raise refusal_why(f"{shown_role(agent)} shares {a['machine']} with "
+                          f"{', '.join(shown_role(n) for n in mates)}: the door knows a caller by its server's "
+                          f"address, so an agent that holds servers through the door runs alone on its server.",
+                          ["shares_server"], agents=mates)
     rid = f"server:{server}"
     phrase = resource_phrase("server", server)
     result = grant_resource("owner", rid, agent, level, phrase)

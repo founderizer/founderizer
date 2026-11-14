@@ -10,6 +10,7 @@
 #       sh hub.sh --check                   say what it would do, change nothing
 #       sh hub.sh --reclaim                 a hub that has an owner gets a new one: the owner's Mac is lost, or it
 #                                           has a new address (HUB-INSTALL.md, "Run it again, update, remove")
+#       sh hub.sh --manager-name NAME       the manager's own name in a new fleet; without it the name is manager
 #
 # Its steps: base packages, the user fleet with lingering, the private network (Tailscale), the firewall, the bare
 # repository and the hub's checkout on the configuration ref, the first team.json with the owner's own Mac proved by
@@ -25,6 +26,13 @@
 # So the two agent steps find no agent there. Without it the manager runs beside the hub, as it always did: an app
 # from before has no page that gives the manager a server, and this script is the newest release, which reaches a
 # new hub before the app that the download page gives does.
+#
+# With FLEET_HUB_SERVER=shared the owner chose one server for all (a layout that the owner approved on 14 November
+# 2026): the manager runs on this server, and the owner can add each later agent on this server too, each under its
+# own OS user. The first team.json says so ("hub": {"shared": true}), and one more step gives this server its own
+# server service, which installs those agents as a joined server's service does. It is a word of a hub's first
+# install, and it does not go with FLEET_MANAGER_SERVER=later. Without the word no new agent goes onto the hub's
+# server, as before. No app and no tool gives the word yet: HUB-INSTALL.md says what is still open.
 #
 # With FLEET_VERIFY=caller, which the app sets when its own next step is `fleet.py verify`, the last step here runs
 # no verify: the app's step answers for this machine, and the self-test, about a minute, runs one time and not two.
@@ -76,6 +84,7 @@ timezone=""
 runtime=claude
 claim_wait=1800
 reclaim=no
+manager_name=""         # the manager's own name in a new fleet, which its owner chose; none: manager
 hostname=""             # its name in Tailscale, which is its name in Fleet: the name its provider gave it
 root=""                 # --check only: a folder that stands in for / so the plan can be read on any machine
 step=0
@@ -119,7 +128,8 @@ sshd_folder() {
 
 usage() {
     printf '%s\n' "Usage: sh hub.sh [--check] [--source <git url or path>] [--port N] [--timezone Z]" \
-        "              [--runtime claude|codex] [--hostname NAME] [--claim-wait SECONDS] [--reclaim]"
+        "              [--runtime claude|codex] [--hostname NAME] [--claim-wait SECONDS] [--reclaim]" \
+        "              [--manager-name NAME]"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -132,6 +142,7 @@ while [ "$#" -gt 0 ]; do
         --hostname) hostname=${2:?--hostname needs a name}; shift 2 ;;
         --claim-wait) claim_wait=${2:?--claim-wait needs seconds}; shift 2 ;;
         --reclaim) reclaim=yes; shift ;;
+        --manager-name) manager_name=${2:?--manager-name needs a name}; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; stop "unknown option $1" ;;
     esac
@@ -139,8 +150,27 @@ done
 case "$port" in ''|*[!0-9]*) stop "--port must be a number" ;; esac
 case "$claim_wait" in ''|*[!0-9]*) stop "--claim-wait must be seconds" ;; esac
 case "$runtime" in claude|codex) ;; *) stop "--runtime must be claude or codex" ;; esac
+# The manager's name, by the hub's own rule for an agent's name (hub.py AGENT_NAME), and at most 26 characters: its OS
+# user is fleet-<name>, and a user name has at most 32. It is none of the names that the fleet uses itself on a
+# server (hubsetup.py FLEET_OWN_NAMES and FLEET_OWN_STARTS). It is checked here, before the first step, because the
+# hub lets nobody rename the manager afterwards. hubsetup.py's manager_name has the same rule.
+if [ -n "$manager_name" ]; then
+    name_rule="--manager-name must be a name of 2 to 26 characters a-z 0-9 -, which starts with a letter and is none \
+of the names that the fleet uses itself (owner, hub, agents, channels, chats, checks, git, pilot, server, vault, \
+watch, work, and each name that starts with login- or vault-)"
+    case "$manager_name" in
+        owner|hub|agents|channels|chats|checks|git|pilot|server|vault|watch|work|login-*|vault-*) stop "$name_rule" ;;
+        [!a-z]*|*[!a-z0-9-]*) stop "$name_rule" ;;
+    esac
+    if [ "${#manager_name}" -lt 2 ] || [ "${#manager_name}" -gt 26 ]; then stop "$name_rule"; fi
+fi
 manager_later=no        # the app gives the manager a server of its own (see the top of this file)
 if [ "${FLEET_MANAGER_SERVER:-}" = later ]; then manager_later=yes; fi
+hub_shared=no           # the owner chose one server for all: this server takes agents (see the top of this file)
+if [ "${FLEET_HUB_SERVER:-}" = shared ]; then hub_shared=yes; fi
+if [ "$hub_shared" = yes ] && [ "$manager_later" = yes ]; then
+    stop "FLEET_HUB_SERVER=shared puts the manager on this server, so it does not go with FLEET_MANAGER_SERVER=later"
+fi
 caller_verifies=no      # the app that started this install runs verify itself as its next step (see the top)
 if [ "${FLEET_VERIFY:-}" = caller ]; then caller_verifies=yes; fi
 if [ "$check" = yes ]; then
@@ -405,6 +435,13 @@ false), runtime $runtime until its setup in the app chooses one, \"vault\": \"no
             plan "write $kit/team.json: the hub machine at $address, one manager agent on it with runtime $runtime and \
 \"vault\": \"none\", and no credential of any kind"
         fi
+        # a hub that is there keeps its manager's name, and --reclaim is for such a hub
+        if [ -n "${manager_name:-}" ] && [ "$reclaim" = no ]; then
+            plan "name the manager $manager_name: its entry in team.json, and its profile \
+$kit/profiles/$manager_name.md, which is the published profiles/manager.md with that name in its title"
+        fi
+        [ "${hub_shared:-no}" = no ] || plan "write \"hub\": {\"shared\": true} and this server's own entry in \
+\"servers\" there: the owner chose one server for all, so this server takes agents"
         plan "make a one-time claim code, print the line for the owner's Mac, and serve it on $address:$port until \
 that Mac sends the code back; its address becomes addresses.owner"
         [ "$reclaim" = no ] || plan "stop the service fleet-hub of a hub that runs for the time of that claim, because \
@@ -421,6 +458,34 @@ in time; the hub then serves the owner's pages to the new address and refuses th
     more=""
     [ "$reclaim" = no ] || more="--reclaim"
     [ "$manager_later" = no ] || more="$more --manager-later"
+    # The hub's own copy of hubsetup.py runs the claim, and a checkout that an earlier release left on this server has
+    # a copy from before the two options below. So this step asks that copy what it knows, and reads its whole answer.
+    #   --manager-name: the old copy would stop on the option with words that say nothing to the owner, so the step
+    #   stops here with the reason. It never goes on without the name: a manager gets its name once.
+    #   --shared: a hub that is there keeps its rule, so the step goes on without the word and says so, and the step
+    #   of the server service then has nothing to do.
+    if [ -n "${manager_name:-}" ] || [ "${hub_shared:-no}" = yes ]; then
+        known=$(as_user python3 "$kit/hubsetup.py" claim --help 2>&1) \
+            || stop "the hub's own copy of hubsetup.py in $kit did not answer, so the owner claim cannot start. It \
+said: $known"
+        if [ -n "${manager_name:-}" ]; then
+            case "$known" in
+                *--manager-name*) more="$more --manager-name $manager_name" ;;
+                *) stop "the copy of Founderizer in $kit is from before the option --manager-name, so this run \
+cannot give the manager that name. A hub that has its owner keeps the name of its manager: run the line again without \
+--manager-name. Where the install did not reach its owner claim yet, a run without the option names the manager \
+\"manager\" for good: use a new server if you want another name." ;;
+            esac
+        fi
+        if [ "${hub_shared:-no}" = yes ]; then
+            case "$known" in
+                *--shared*) more="$more --shared" ;;
+                *) say "  the copy of Founderizer in $kit is from before one server for all, so this hub keeps its \
+rule: no new agent goes onto its own server"
+                   hub_shared=no ;;
+            esac
+        fi
+    fi
     # The claim listens on this hub's own address and port. On a hub that runs (--reclaim: the owner's Mac is lost, or
     # it has a new address) the claim itself stops fleet-hub for its time and starts it again in every case, so no
     # service is stopped here (hubsetup.py HubPause). It is the hub's own copy of hubsetup.py that runs, so an older
@@ -644,6 +709,45 @@ store: it says nothing about its owner (PRODUCT.md 4.2)"
     as_user python3 "$kit/hubsetup.py" fleet-id || stop "this fleet's own id could not be made."
 }
 
+hub_server() {  # only where the owner chose one server for all (FLEET_HUB_SERVER=shared): this server's own server
+                # service, after the hub has answered, so that its records are there for the SHA-256 of the service's
+                # key. The service installs each agent that the owner adds on this server, as a joined server's does:
+                # under the agent's own OS user, through the root helper that the step agent_helper put in place.
+    [ "$hub_shared" = yes ] || return 0
+    server_kit="$home/fleet-server"
+    # A hub that is there keeps its rule (the word counts at a hub's first install): one that was installed without
+    # the word gets no server service and no step, and the install goes on.
+    # shellcheck disable=SC2016
+    if [ "$check" = no ] && ! as_user python3 -c 'import json, sys
+sys.exit(0 if (json.load(open(sys.argv[1])).get("hub") or {}).get("shared") is True else 1)' "$kit/team.json" \
+            </dev/null; then
+        say "this hub was installed without the word FLEET_HUB_SERVER=shared, so no new agent goes onto its own \
+server, and it gets no server service"
+        hub_shared=no
+        return 0
+    fi
+    heading "the server service of this server: it installs the agents that you add here"
+    if [ "$check" = yes ]; then
+        plan "clone git://$address/$repo_name.git on the configuration ref into $server_kit, the service's own \
+checkout: the service brings it up to date by itself, and the hub's checkout stays the hub's to move"
+        plan "run: python3 $server_kit/hubsetup.py hub-server --team $kit/team.json --repo \
+git://$address/$repo_name.git, as $HUB_USER: make the service's key (mode 600, in that user's ~/.fleet), put its \
+SHA-256 in the hub's records, and write and start fleet-server.service"
+        plan "run no join with a join code: the hub refuses a join from its own address"
+        return 0
+    fi
+    if [ -d "$server_kit/.git" ]; then
+        take "$server_kit" as_user || say "  $server_kit could not update; it stays as it is"
+    else
+        as_user git clone -q -b config "git://$address/$repo_name.git" "$server_kit" </dev/null \
+            || stop "The checkout of the server service could not be cloned from git://$address/$repo_name.git. \
+Check that fleet-git runs: runuser -u $HUB_USER -- systemctl --user status fleet-git"
+    fi
+    as_user python3 "$server_kit/hubsetup.py" hub-server --team "$kit/team.json" \
+        --repo "git://$address/$repo_name.git" </dev/null \
+        || stop "the server service of this server could not be made: the line above says why. Run the line again."
+}
+
 verify_step() {  # the last step: the one health check of the whole product (PRODUCT.md 4.1), in its readable form
     heading "verify: is this machine of the fleet healthy?"
     if [ "$caller_verifies" = yes ]; then
@@ -692,13 +796,15 @@ done_text() {
             "     on its own server." \
             ""
     else
+        agent_place="on its own server."
+        [ "$hub_shared" = no ] || agent_place="on this server or on a server of its own."
         printf '%s\n' \
             "  1. Sign in to your own $runtime account: Settings, Servers, this server, Sign in." \
             "     The app gives you a link, you authenticate in your own browser, and you paste the code it gives you" \
             "     back into the app. The sign-in happens on this server, and nothing of it is stored by Founderizer." \
             "     Nobody can do this for you, and the same button signs you in again when the login expires." \
             "  2. Add your agents: the + at the top of the sidebar, Add agent. Each one is signed in the same way," \
-            "     on its own server." \
+            "     $agent_place" \
             ""
     fi
 }
@@ -717,6 +823,7 @@ main() {
     agents
     checks
     fleet_identity
+    hub_server
     updates
     harden
     tcp_window

@@ -30,6 +30,23 @@ agent, and its own setup page in the app gives it a server of its own (a VPS tha
 with one line, or a Mac), then its AI provider and the sign-in (UI-API.md 1.82). Each
 agent installs only its own AI, on its own server.
 
+**One server for all is one word, and it is not ready for a fleet that does real work.** With
+`FLEET_HUB_SERVER=shared` in the installer's environment, the manager runs on the hub's
+server, and the owner can add each later agent on that server too, each under its own OS
+user. The first `team.json` then says `"hub": {"shared": true}` (UI-API.md 1.168), and one
+more step, after "This fleet's own id", gives this server its own server service:
+`fleet-server.service` of the user `fleet`, from its own clone `/home/fleet/fleet-server`,
+with the SHA-256 of its key in the hub's records (`hubsetup.py hub-server`). That service
+installs each later agent as a joined server's service does. An agent that breaks out of its
+account there can reach every key of the fleet. The word counts at a hub's first install, and
+it does not go with `FLEET_MANAGER_SERVER=later`. Without it the steps are the seventeen
+below, and no new agent goes onto the hub's server. No app and no tool gives the word yet:
+the owner approved this layout on 14 November 2026, and these parts are still open (UI-API.md
+1.168 has the list). The installer puts no vault broker on the hub's server, so an agent that
+is added there can use no saved login and no key. The door cannot run on such a hub's server.
+A restore of the hub's records takes the server service's key record away, and the same line
+again writes it. No real server has run the new step.
+
 ## Before you run it
 
 1. **A server.** Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, with systemd, and
@@ -82,8 +99,15 @@ sh /root/fleet-kit/hub.sh --check
 Other options: `--port N` (default 8765), `--timezone Z` (default the server's own),
 `--runtime claude|codex` for the manager's first AI provider, which its setup page may change, `--hostname NAME` for the Tailscale name
 (default: the name its provider gave the machine, which becomes its name in Fleet), `--claim-wait SECONDS`
-(default 1800) and `--reclaim`, for a hub that has an owner ("The owner's Mac is lost, or it has a new
-address", below).
+(default 1800), `--manager-name NAME` for the manager's own name in a new fleet, and `--reclaim`, for a hub that
+has an owner ("The owner's Mac is lost, or it has a new address", below).
+
+`--manager-name`: without it the manager is named `manager`. A name has 2 to 26 characters a-z 0-9 -, starts
+with a letter, and is none of the names that the fleet uses itself (owner, hub, agents, channels, chats, checks,
+git, pilot, server, vault, watch, work, and each name that starts with login- or vault-). A hub that is there
+keeps the name that its manager has, and nobody can rename the manager afterwards. **Use it only with an app that finds the manager by its role.** The Founderizer apps of
+14 November 2026 (Founderizer for Mac 0.1.227) find the manager by the name `manager` in some places (the
+notification of a Needs-you item, the chat that opens first), so with those apps leave the option out.
 
 ### What the seventeen steps do
 
@@ -130,7 +154,11 @@ address", below).
    server yet (`"placed": false`: its `machine` names this machine only until its setup
    gives it one); this machine's address, `"vault": "none"`, and no credential of any kind.
    Then the claim, below. The file is committed on `config` and pushed to the hub's own
-   repository, so the record starts at the first minute.
+   repository, so the record starts at the first minute. With `--manager-name NAME` the
+   manager's entry has that name, and the same commit moves the published profile
+   `profiles/manager.md` to `profiles/NAME.md` with that name in its title line: the hub
+   and the manager's own helper read an agent's profile by the agent's name. The name is
+   also in the manager's OS user, its checkout and its service (`fleet-NAME`).
 8. **The two root commands of this machine**, below:
    `/usr/local/sbin/fleet-agent-user`, `/usr/local/sbin/fleet-vault-program` and
    `/etc/sudoers.d/fleet-agents`.
@@ -402,7 +430,8 @@ the checkout and the service of an agent that was added since.
   ```
 
   Each agent's service belongs to that agent's own user, so it is stopped there, once for
-  each agent of this machine:
+  each agent of this machine. These lines are for a manager named `manager`; a manager with
+  another name has that name in its place (`fleet-<name>`):
 
   ```sh
   runuser -u fleet-manager -- systemctl --user disable --now fleet-manager
