@@ -365,6 +365,30 @@ class Delivery(OwnerAPI):
         self.assertIsNone(hub.OUTPUTS[token]["answer"])
         self.assertTrue(hub.outputs_allow(self.ref).match(f"outputs/{self.ref}/{'/'.join('d' * 5)}/x.md"))
 
+    def test_an_older_helpers_agents_md_stays_out_with_its_reason(self):
+        """The AI providers build (spec 3.11 item 9; the wave 1 review, R3): the hub takes no file or folder AGENTS.md
+        of an output, in any case of its letters, also from a helper of a release before its own rule. Such a file
+        stays out with the helper's own reason, and the other files of the delivery go in."""
+        token = "t" * 22
+        hub.OUTPUTS[token] = {"agent": "vps", "task": self.task, "answer": None, "gave_up": False, "late": False}
+        self.addCleanup(hub.OUTPUTS.pop, token, None)
+        names = [f"outputs/{self.ref}/{name}" for name in ("AGENTS.md", "notes/agents.md", "Agents.MD/plan.md",
+                                                            "report.md", "agents.md.txt")]
+        code, data = self.request("/helper/outputs/vps", {"outputs": token, "task": self.ref,
+                                                          "files": [{"path": n, "data": "eA=="} for n in names]},
+                                  source=VPS)
+        self.assertEqual((code, data), (200, {"taken": True}))
+        answer = hub.OUTPUTS[token]["answer"]
+        self.assertEqual(sorted(answer["files"]), [f"outputs/{self.ref}/agents.md.txt", f"outputs/{self.ref}/report.md"])
+        self.assertEqual(answer["skipped"], [{"path": n, "why": fleet.OUTPUT_BAD_NAME} for n in names[:3]])
+        allow = hub.outputs_allow(self.ref)
+        self.assertEqual([bool(allow.match(n)) for n in names], [False, False, False, True, True])
+        hub.OUTPUTS[token].update(answer=None)
+        code, data = self.request("/helper/outputs/vps", {"outputs": token, "task": self.ref,
+                                                          "files": [{"path": f"outputs/{self.ref}/../AGENTS.md",
+                                                                     "data": "eA=="}]}, source=VPS)
+        self.assertEqual(code, 400, data)           # a path outside the folder is refused as before
+
     def test_the_same_files_twice_make_one_commit(self):
         t = hub.q1("SELECT * FROM tasks WHERE id=?", (self.task,))
         files = {f"outputs/{self.ref}/report.md": b"# Report\n"}

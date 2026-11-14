@@ -325,6 +325,69 @@ class ModelAccounts(OwnerAPI):
         self.assertEqual(code, 409)                 # the owner's route refuses it first: no change of account (K7)
         self.assertEqual(self.stored()["agents"]["gem-2"]["account"], "gemini")
 
+    def test_a_write_never_takes_the_key_or_the_program_away_from_the_agents_of_an_account(self):
+        """The wave 1 review, R1, and the spec writer's answer of 14 November 2026."""
+        before = self.stored()
+        # 1. A write with no kind of an entry that has one: a client that knows no kind (the owner MCP's save_account
+        # of today sends provider and title) cannot make a key account a label.
+        code, said = self.account("gemini", provider="google", title="Gemini key")
+        self.assertEqual((code, said["error"]), (409, hub.ACCOUNT_WORDS["kind_kept"]))
+        # 2. While agents name it: no change of its kind, its provider or its secret, nor a label made a kind.
+        for account, fields, agents in (
+                ("gemini", dict(provider="openrouter", kind="key", secret=GEMINI_KEY, model="openrouter/kimi-k3"),
+                 ["gem-1", "gem-2"]),
+                ("spark", dict(provider="google", kind="key", secret=SERVER_KEY), ["own-1"]),
+                ("gemini", dict(provider="google", kind="key", secret=FREE_KEY), ["gem-1", "gem-2"]),
+                ("spark", dict(provider="own", kind="server", address="http://127.0.0.1:11434"), ["own-1"]),
+                ("codex-main", dict(provider="google", kind="key", secret=FREE_KEY), ["dev-lead"])):
+            with self.subTest(account=account, fields=fields):
+                code, said = self.account(account, title="T", **fields)
+                self.assertEqual((code, said["error"], said["agents"]), (409, hub.ACCOUNT_WORDS["in_use"], agents))
+        self.assertEqual(self.stored(), before)
+        # Taken: a change of its title, its model or its address, with its secret named again.
+        for account, fields in (("gemini", dict(provider="google", title="Gemini (team)", kind="key",
+                                                secret=GEMINI_KEY)),
+                                ("router", dict(provider="openrouter", title="OpenRouter", kind="key",
+                                                secret=ROUTER_KEY, model="openrouter/kimi-k3")),
+                                ("spark", dict(provider="own", title="Spark", kind="server",
+                                               address="http://100.64.0.8:8000", secret=SERVER_KEY))):
+            with self.subTest(account=account, taken=fields):
+                code, said = self.account(account, **fields)
+                self.assertEqual((code, said["changed"]), (200, True), said)
+        self.assertEqual(self.stored()["accounts"]["spark"]["address"], "http://100.64.0.8:8000/v1")
+        # An owner label as before: its provider changes while an agent names it.
+        self.assertEqual(self.account("codex-main", provider="anthropic", title="Claude Max")[0], 200)
+        # An account that no agent names changes freely, and delete stays the way to remove one.
+        self.assertEqual(self.account("spare", provider="google", title="S", kind="key", secret=FREE_KEY)[0], 200)
+        self.assertEqual(self.account("spare", provider="openrouter", title="S", kind="key", secret=FREE_KEY,
+                                      model="openrouter/kimi-k3")[0], 200)
+        self.assertEqual(self.account("spare", delete=True)[0], 200)
+        code, said = self.account("gemini", delete=True)
+        self.assertEqual((code, said["agents"]), (409, ["gem-1", "gem-2"]))
+
+    def test_an_accounts_model_is_named_as_its_program_names_it(self):
+        """The wave 1 review, R6: a key account's model is <the provider's name in the program>/<model>, a model
+        server's own/<model>; Grok Build, one provider only, names its models with no part before them."""
+        for fields, prefix in ((dict(provider="google", kind="key", secret=FREE_KEY, model="gemini-3.1-pro"), "google"),
+                               (dict(provider="google", kind="key", secret=FREE_KEY, model="google/"), "google"),
+                               (dict(provider="openrouter", kind="key", secret=FREE_KEY, model="qwen/qwen3.8-max"),
+                                "openrouter"),
+                               (dict(provider="own", kind="server", address="https://models.example.com",
+                                     secret=FREE_KEY, model="qwen3.8-max"), "own")):
+            with self.subTest(fields=fields):
+                code, said = self.account("acc-x", title="X", **fields)
+                self.assertEqual((code, said["error"]), (400, hub.ACCOUNT_WORDS["model_prefix"].format(
+                    aid="acc-x", prefix=prefix)))
+        for account, fields in (("acc-g", dict(provider="google", kind="key", secret=FREE_KEY,
+                                               model="google/gemini-3.1-pro")),
+                                ("acc-r", dict(provider="openrouter", kind="key", secret=FREE_KEY,
+                                               model="openrouter/qwen/qwen3.8-max")),
+                                ("acc-o", dict(provider="own", kind="server", address="https://models.example.com",
+                                               secret=FREE_KEY, model="own/qwen3.8-max")),
+                                ("acc-x", dict(provider="xai", kind="key", secret=FREE_KEY, model="grok-4.7"))):
+            with self.subTest(taken=account):
+                self.assertEqual(self.account(account, title="X", **fields)[0], 200)
+
     def test_an_agent_on_an_account_runs_its_program_on_a_linux_server(self):
         W = hub.ACCOUNT_WORDS
         self.assertEqual(self.refused(lambda t: t["agents"]["gem-1"].update(runtime="claude")),

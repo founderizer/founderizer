@@ -6933,7 +6933,15 @@ OUTPUTS_FILE_MAX = 8 * 1024 * 1024      # bytes of one file: the largest image t
 OUTPUTS_TOTAL_MAX = 24 * 1024 * 1024    # bytes of one delivery
 OUTPUTS_BODY_MAX = 34 * 1024 * 1024     # the helper's POST: the files in base64 and the JSON around them
 OUTPUTS_DEPTH = 6                       # names below outputs/T-<id>/, the file's own included
-OUTPUTS_NAME = r"[A-Za-z0-9_][A-Za-z0-9._+-]{0,119}"   # one of them: no dot or dash first, so no ".." and no option
+# One of them: no dot or dash first, so no ".." and no option. And no file or folder AGENTS.md, in any case of its
+# letters (the AI providers build, spec 3.11 item 9; the wave 1 review, R3): OpenCode gives the model an AGENTS.md of a
+# folder below its working folder, which is the agent's checkout, when the agent reads a file there.
+OUTPUTS_NAME = r"(?!(?i:agents\.md)(?:/|\Z))[A-Za-z0-9_][A-Za-z0-9._+-]{0,119}"
+OUTPUTS_AGENTS_MD = re.compile(r"(?i)(?<=/)agents\.md(?=/|\Z)")
+# Why a file named so stays out: fleet.OUTPUT_BAD_NAME's words (lane H; proposed, not approved), for a helper of a
+# release before that rule, which still sends such a file.
+OUTPUTS_BAD_NAME = ("its name has a character other than letters, digits and . _ + -, starts with one of . -, or is "
+                    "AGENTS.md")
 # Only in the hub's memory, as the MCP program checks are: each delivery that waits for its files. A restart ends the
 # call that waited, and the agent's deliver_result, which then failed, sends its files again.
 OUTPUTS = {}
@@ -37354,6 +37362,12 @@ ACCOUNT_WORDS = {
     "pooled": "This key is in the pool that the manager gives from. Take it out of the pool first.",
     "pool_statement": "This key belongs to an account, and only the owner gives it: it goes into no pool.",
     "change": "An agent on a key or a model server stays on its account. Add a new agent for another account.",
+    # the wave 1 review, R1 and R6 (14 November 2026)
+    "kind_kept": "This account has a key or a model server's address, so each write of it names its kind. Delete it "
+                 "to remove it.",
+    "in_use": "Agents use this account, so its kind, its provider and its key stay as they are. To give it a new key, "
+              "replace the key's value in the vault.",
+    "model_prefix": 'account {aid}: model is "{prefix}/" and then the name of the model',
 }
 # The state of its group with no hold, by the account's kind: the owner's words for an account with no allowance (his
 # "Yes, these words" of 14 November 2026 to picture 11 of the AI providers' step 5, ai-providers-step-5-answers.md).
@@ -37449,9 +37463,11 @@ def account_rule(team, aid, acc):
             raise ValueError(W["key_secret"].format(aid=aid))
         if known["makers"] == "many" and "model" not in acc:
             raise ValueError(W["key_model"].format(aid=aid, label=known["label"]))
+        account_model_rule(aid, acc, known["program"])
         return
     if acc["provider"] != lifecycle.OWN_SERVER["provider"]:
         raise ValueError(W["own_provider"].format(aid=aid))
+    account_model_rule(aid, acc, lifecycle.OWN_SERVER["program"])
     if account_address(acc.get("address"), aid) != acc.get("address"):
         raise ValueError(W["address"].format(aid=aid))
     if "secret" not in acc:
@@ -37462,6 +37478,16 @@ def account_rule(team, aid, acc):
             sum(1 for b in team["agents"].values() if b.get("machine") == a.get("machine")) == 1 for a in users)
         if not alone or not account_loopback(urllib.parse.urlsplit(acc["address"]).hostname or ""):
             raise ValueError(W["open"].format(aid=aid))
+
+
+def account_model_rule(aid, acc, program):
+    """ValueError when an account's own model is not named as its program names it (the wave 1 review, R6): a key
+    account's as <the provider's name in the program>/<model> (lifecycle.KEY_PROVIDERS "program"), a model server's
+    as own/<model>. A program with one provider only (program None: Grok Build) names its models with no part before
+    them, and this holds nothing there."""
+    model = acc.get("model")
+    if model is not None and program and not (model.startswith(program + "/") and len(model) > len(program) + 1):
+        raise ValueError(ACCOUNT_WORDS["model_prefix"].format(aid=aid, prefix=program))
 
 
 def agent_account_rule(team, name, a):
@@ -37531,11 +37557,26 @@ def account_entry(body):
     other reading, which would drop a secret that the write names, would refuse each new address of a server with a
     key outside the loopback (account_rule's open server), so that no such address could ever change. A secret that
     the manager may give is refused (spec 3.1, the first of its three refusals): team.json "resources" holds it, or
-    the central vault's pool."""
+    the central vault's pool.
+
+    The wave 1 review (R1) and the spec writer's answer of 14 November 2026: a write with no kind of an entry that has
+    one is refused, so a client that knows no kind cannot make a key account a label (delete stays the way to remove
+    it); and while an agent names the account, a change of its kind, its provider or its secret is refused. Its agents
+    run that program with the grant of that secret; a new key goes into the vault's replace under the same reference
+    (POST /ui/vault/intake with the owner's signed replace), which keeps each grant. An owner label (no kind, before
+    and after) reads and writes as before."""
     entry = {k: body[k] for k in ACCOUNT_FIELDS if k in body}
+    team, _, _ = team_view(kit_revision(fresh=True))
+    old = (team.get("accounts") or {}).get(body["account"])
+    old = old if isinstance(old, dict) else {}
+    if old.get("kind") and not entry.get("kind"):
+        raise Refusal(409, ACCOUNT_WORDS["kind_kept"])
+    users = sorted(n for n, a in team["agents"].items() if a.get("account") == body["account"])
+    if users and (old.get("kind") or entry.get("kind")) and \
+            any(entry.get(k) != old.get(k) for k in ("kind", "provider", "secret")):
+        raise Conflict(ACCOUNT_WORDS["in_use"], agents=users)
     secret = entry.get("secret") if entry.get("kind") else None
     if secret:
-        team, _, _ = team_view(kit_revision(fresh=True))
         with CENTRAL_LOCK:
             status = CENTRAL["status"]
         if f"secret:{secret}" in (team.get("resources") or {}) or secret in central_signatures(status)[1]:
@@ -49370,6 +49411,10 @@ class Handler(BaseHTTPRequestHandler):
         allow, files, skipped, seen, total = outputs_allow(ref), {}, [], set(), 0
         for one in sent:
             path = one.get("path") if isinstance(one, dict) else None
+            if isinstance(path, str) and len(path) <= 400 and OUTPUTS_AGENTS_MD.search(path) and \
+                    allow.match(OUTPUTS_AGENTS_MD.sub("x", path)):      # the AI providers build: no AGENTS.md
+                skipped.append({"path": path, "why": OUTPUTS_BAD_NAME})
+                continue
             if not isinstance(path, str) or len(path) > 400 or not allow.match(path):
                 return self.json(400, {"error": f"{str(path)[:200]} is not a file of outputs/{ref}/"})
             if path.lower() in seen:        # two names that differ only in case are one file on a Mac
