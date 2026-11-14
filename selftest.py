@@ -476,6 +476,19 @@ try:
                  if f not in hub_features or n not in {e["name"] for e in built})
     check("each feature that the app's table names is one that every hub lists, for a tool that the table builds",
           not odd, f"not so: {odd}")
+    # The program's verb `call` takes a tool that the table marks as a read only when its kind is `swift`, a read that
+    # the program's own code wrote; `write` takes each other tool that it has (OwnerTools.verb in
+    # app/Sources/FleetOwnerAPI). So those reads are the plan's four, and no tool that the table builds is marked as a
+    # read: such a tool would get no verb (plan 3.3).
+    call_reads = {e["name"] for e in dumped["tools"] if e["annotations"].get("readOnlyHint") and e["kind"] == "swift"}
+    check("the reads that founderizer-cli call takes are the marked reads that the program wrote",
+          call_reads == set(owner_mcp.SWIFT_READS) and not any(e["annotations"].get("readOnlyHint") for e in built),
+          f"call would take {sorted(call_reads)}")
+    # The media types that both programs give a file with no `mime` (owner_mcp.py MEDIA_TYPES, in the table): only the
+    # hub's own types, each of them.
+    hub_types = set(constants(os.path.join(KIT, "hub.py"), "ATTACH_TYPES") or ())
+    check("the media types of attach_file are the hub's own", set(dumped["MEDIA_TYPES"].values()) == hub_types,
+          f"the table gives {sorted(set(dumped['MEDIA_TYPES'].values()))}, the hub takes {sorted(hub_types)}")
 except Exception as owner_mcp_problem:       # a missing file or a changed shape is a failure, never a silent pass
     check("the owner's MCP server can be checked against the owner API", False, repr(owner_mcp_problem))
 

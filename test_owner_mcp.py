@@ -25,6 +25,7 @@ import time
 import types
 import unittest
 import urllib.error
+import urllib.parse
 import uuid
 from unittest.mock import patch
 
@@ -42,7 +43,8 @@ SHELLS = [sh for sh in ("/bin/sh", "/bin/dash") if os.access(sh, os.X_OK)]     #
 
 def load_tests(loader, _tests, _pattern):
     return unittest.TestSuite(cls(name) for cls in (Admin, Boundary, FromNothing, McpServers, Refusals,
-                                                    Install, Progress, RootThroughSudo, NoSecret, Shape, Table)
+                                                    Install, Progress, RootThroughSudo, NoSecret, Shape, Table,
+                                                    Parity)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -3050,6 +3052,578 @@ class Boundary(WithServer):
         self.assertEqual(hub.agents()["studio"].get("repos") or {}, {})
 
 
+# ---- the parity check of the two programs (plan 3.3): owner_mcp.py and the program inside the Founderizer app
+
+PARITY_FIXTURE = HERE / "app" / "Tests" / "FleetOwnerAPITests" / "Fixtures" / "owner-parity.json"
+PARITY_REMAKE = "python3 test_owner_mcp.py --parity-fixture"
+PARITY_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+PARITY_TEAM = {"sha256": "team-sha-1", "lines": [
+    {"agent": "manager", "repos": {}, "tools": [], "google": {}},
+    {"agent": "worker-1", "repos": {"acme/web": "read"}, "tools": ["github"],
+     "google": {"gmail": {"account": "ada@example.com", "level": "read"}}},
+    {"agent": "worker-2", "repos": {"acme/web": "write", "acme/api": "deploy"}, "tools": ["github", "linear"],
+     "google": {"drive": {"account": "ada@example.com", "level": "write"}}}]}
+PARITY_PROFILES = {"profiles": [{"agent": "worker-1", "sha256": "profile-sha-1", "sections": []},
+                                {"agent": "ops lead", "sha256": "profile-sha-2", "sections": []}]}
+PARITY_FILE = b"hello attachment\n"
+PARITY_COPY = b"PK\x03\x04 a stand-in copy of a fleet\n"
+PARITY_RID = "6F1C2A3B-0000-4000-8000-00000000000A"
+
+
+def parity_state(db):
+    return {"db": db, "time": 1763078400, "ui_features": sorted(set(owner_mcp.FEATURES.values())),
+            "manager_warning": None,
+            "agents": [{"name": "manager", "role": "manager", "runtime": "claude", "active": True, "secret": "x"}],
+            "tasks": [{"id": 1, "title": "Write the page", "state": "working", "owner": "worker-1"},
+                      {"id": 2, "title": "Old", "state": "completed"}],
+            "needs": [{"id": 5, "answered": False}, {"id": 6, "answered": True}],
+            "goals": [{"id": 3, "title": "Launch", "state": "active"}],
+            "responsibilities": [{"id": 4, "title": "Watch the site", "agent": "worker-1"}],
+            "reports": list(range(1, 8))}
+
+
+def parity_json(status, value):
+    return status, {"Content-Type": "application/json"}, json.dumps(value).encode()
+
+
+def parity_answer(state, req):
+    """The stand-in hub's own answer, from the fixed facts above. A case can answer a request itself first."""
+    method, path, query = req["method"], req["path"], urllib.parse.parse_qs(req["query"], keep_blank_values=True)
+    db = state["db"]
+    stale = parity_json(409, {"error": "hub generation changed; refresh state"})
+    if method == "POST":
+        if path == "/ui/attachments":
+            if query.get("db") != [db]:
+                return parity_json(409, {"error": "hub generation changed; refresh state before sending"})
+            rid = req["headers"].get("x-fleet-request-id", "")
+            if not PARITY_UUID.fullmatch(rid):
+                return parity_json(400, {"error": "X-Fleet-Request-Id must be a UUID"})
+            return parity_json(200, {"ok": True, "replayed": False, "id": 11, "name": req["headers"].get("x-fleet-name"),
+                                     "mime": req["headers"].get("content-type"), "size": len(req["body"]),
+                                     "sha256": hashlib.sha256(req["body"]).hexdigest()})
+        body = json.loads(req["body"] or b"{}")
+        if body.get("db") != db:
+            return stale
+        if path == "/ui/backups/confirm":
+            return parity_json(200, {"ok": True, "backup": {"sha256": body.get("sha256"), "bytes": body.get("bytes")}})
+        return parity_json(200, {"ok": True, "route": path})
+    if path == "/ui/state":
+        return parity_json(200, parity_state(db))
+    if query.get("db") != [db]:
+        return stale
+    parts = path.strip("/").split("/")
+    if path == "/ui/team":
+        return parity_json(200, PARITY_TEAM)
+    if path == "/ui/profiles":
+        return parity_json(200, PARITY_PROFILES)
+    if len(parts) == 3 and parts[1] in ("goals", "responsibilities", "triggers"):
+        thing = {"goals": "goal", "responsibilities": "responsibility", "triggers": "trigger"}[parts[1]]
+        return parity_json(200, {thing: {"id": int(parts[2]), "revision": 12}})
+    if path == "/ui/attachments/3":
+        return 200, {"Content-Type": "text/plain; charset=utf-8", "X-Fleet-SHA256": hashlib.sha256(PARITY_FILE).hexdigest(),
+                     "Content-Disposition": 'attachment; filename="notes.txt"'}, PARITY_FILE
+    if path == "/ui/attachments/4":                 # no digest and no name
+        return 200, {"Content-Type": "text/plain"}, PARITY_FILE
+    if path == "/ui/attachments/5":
+        return 200, {"Content-Type": "text/plain", "X-Fleet-SHA256": "0" * 64}, PARITY_FILE
+    if parts[:2] == ["ui", "attachments"]:
+        return parity_json(404, {"error": "no such attachment"})
+    if path == "/ui/backup":
+        return 200, {"Content-Type": "application/zip", "X-Fleet-DB": db,
+                     "X-Fleet-Backup-SHA256": hashlib.sha256(PARITY_COPY).hexdigest(),
+                     "Content-Disposition": 'attachment; filename="founderizer-fleet-20261114T000000Z.zip"'}, PARITY_COPY
+    return parity_json(200, {"page": path})
+
+
+def parity_sample(name, schema):
+    """One value of a property, from its schema alone: the same arguments every time."""
+    if "enum" in schema:
+        return schema["enum"][0]
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        kind = next(k for k in kind if k != "null")
+    if kind == "object":
+        props = schema.get("properties") or {}
+        return {k: parity_sample(k, v) for k, v in sorted(props.items())} if props else {"key": "value"}
+    if kind == "array":
+        return [parity_sample(name, schema.get("items") or {"type": "string"})]
+    return {"string": f"{name}-1", "integer": 7, "boolean": True, "number": 1.5}.get(kind, f"{name}-1")
+
+
+def parity_cases():
+    """The fixed script: each tool that both programs have, once with arguments from its schema, and the cases of the
+    shared part and the nine writes. `answer(state, request)` answers a request before the stand-in hub's own."""
+    cases = []
+
+    def case(name, tool, arguments=None, answer=None, files=None, folders=(), links=None):
+        """`links`: a symbolic link of the work folder, by its path there, to a path there (made absolute)."""
+        cases.append({"name": name, "tool": tool, "arguments": arguments or {}, "answer": answer,
+                      "setup": {"files": files or {}, "folders": list(folders), "links": links or {}}})
+
+    for t in owner_mcp.dump_tools()["tools"]:
+        if t["kind"] in ("plain", "with_base", "with_revision"):
+            props = t["inputSchema"]["properties"]
+            case(f"{t['name']}: every field", t["name"],
+                 {k: parity_sample(k, v) for k, v in sorted(props.items()) if k != "request_id"})
+    case("with_revision: no revision", "goal_state", {"id": 3, "action": "pause"},
+         lambda s, r: parity_json(200, {"goal": {"id": 3}}) if r["path"] == "/ui/goals/3" else None)
+    case("plain: the agent's own request id", "control_task", {"task": 7, "action": "pause", "request_id": PARITY_RID})
+    case("plain: a part that the arguments do not give", "check_machine", {})
+    case("plain: a part that is two dots", "check_machine", {"agent": ".."})
+    case("plain: a part with / ? and %", "check_machine", {"agent": "a/b?c%d"})
+    case("with_revision: no id", "duty_state", {"action": "pause"})
+    case("with_base: a part that the arguments do not give", "activate_agent", {"active": True})
+    # The four reads.
+    case("fleet_overview", "fleet_overview")
+    case("fleet_overview: a page refused", "fleet_overview", None,
+         lambda s, r: parity_json(403, {"error": "is not owner's machine"}) if r["path"] == "/ui/servers" else None)
+    for args in ({"page": "health"}, {"page": "notes", "agent": "a b", "limit": 5},
+                 {"page": "trigger", "id": 2, "after": 9}, {"page": "knowledge", "path": "a/b.md"},
+                 {"page": "chat_link", "name": "wa 1"}, {"page": "goal"}, {"page": "nothing"},
+                 {"page": "notes", "agent": "a/b"}):
+        case(f"fleet_read: {json.dumps(args, sort_keys=True)}", "fleet_read", args)
+    case("search_history", "search_history", {"agent": "worker-1", "query": "a b", "limit": 3})
+    case("see_costs", "see_costs", {"from": "2026-11-01", "minimum": 3})
+    # The shared part of a command.
+    case("send_message", "send_message", {"text": "Launch the site.", "recipient": "manager"})
+    case("send_message: the agent's own request id", "send_message", {"text": "Again.", "request_id": PARITY_RID})
+    case("send_message: a request id that is no UUID", "send_message", {"text": "x", "request_id": "not-one"})
+    case("send_message: with attachments", "send_message",
+         {"text": "See this.", "attachments": [11], "replaces_request_id": PARITY_RID.lower()})
+
+    def moved_once(state, req):
+        if req["method"] == "POST" and state.setdefault("moved", 0) == 0:
+            state["moved"], state["db"] = 1, "g2"
+            return parity_json(409, {"error": "hub generation changed; refresh state"})
+        return None
+    case("send_message: a new generation, read again once", "send_message", {"text": "x"}, moved_once)
+    case("send_message: a second new generation is given back", "send_message", {"text": "x"},
+         lambda s, r: parity_json(409, {"error": "hub generation changed; refresh state"})
+         if r["method"] == "POST" else None)
+    case("send_message: team.json moved", "send_message", {"text": "x"},
+         lambda s, r: parity_json(409, {"error": "team.json changed", "sha256": "team-sha-2"})
+         if r["method"] == "POST" else None)
+    case("send_message: the owner address", "send_message", {"text": "x"},
+         lambda s, r: parity_json(403, {"error": "is not owner's machine"}) if r["method"] == "POST" else None)
+    case("send_message: a hub in trouble", "send_message", {"text": "x"},
+         lambda s, r: (502, {"Content-Type": "text/html"}, b"<html>Bad gateway</html>")
+         if r["method"] == "POST" else None)
+    case("send_message: no text", "send_message", {})
+    case("answer_needs_you: a choice", "answer_needs_you", {"need": 4, "choice": 1})
+    case("answer_needs_you: choices", "answer_needs_you", {"need": 4.0, "choices": [0, 2]})
+    case("answer_needs_you: words", "answer_needs_you", {"need": "5", "answer": "Yes, but later."})
+    case("answer_needs_you: a need that is no number", "answer_needs_you", {"need": "five", "answer": "x"})
+    case("decline_secret_request", "decline_secret_request", {"need": 6, "reason": "Not now."})
+    case("decline_secret_request: no reason", "decline_secret_request", {"need": 6})
+    # save_profile.
+    sections = [{"key": "responsible", "title": "Responsible for", "text": "The site."}]
+    case("save_profile", "save_profile", {"agent": "worker-1", "sections": sections})
+    case("save_profile: a name with a space", "save_profile", {"agent": " ops lead ", "sections": sections})
+    case("save_profile: an agent that does not exist", "save_profile", {"agent": "ghost", "sections": sections})
+    case("save_profile: no agent", "save_profile", {"sections": sections})
+    case("save_profile: a part that is two dots", "save_profile", {"agent": "..", "sections": sections})
+    # grant_access, each kind.
+    for name, args in (("repo", {"resource": "repo:acme/web", "agent": "worker-1", "level": "write"}),
+                       ("repo, null ends a hold", {"resource": "repo:acme/web", "agent": "worker-2", "level": None}),
+                       ("repo, a new holder", {"resource": "repo:acme/new", "agent": "manager", "level": "read"}),
+                       ("tool", {"resource": "tool:github", "agent": "manager", "level": "use"}),
+                       ("tool, null ends a hold", {"resource": "tool:github", "agent": "worker-2", "level": None}),
+                       ("secret", {"resource": "secret:bws://0000-test", "agent": "worker-1", "level": "read"}),
+                       ("secret, null", {"resource": "secret:bws://0000-test", "agent": "worker-1", "level": None}),
+                       ("drive", {"resource": "drive:ada@example.com", "agent": "worker-1", "level": "write"}),
+                       ("gmail", {"resource": "gmail:ada@example.com", "agent": "worker-2", "level": "send"}),
+                       ("gmail, null", {"resource": "gmail:ada@example.com", "agent": "worker-1", "level": None}),
+                       ("server is refused", {"resource": "server:web-1", "agent": "worker-1", "level": "fix"}),
+                       ("a bad kind", {"resource": "disk:one", "agent": "worker-1", "level": "read"}),
+                       ("no what", {"resource": "repo:", "agent": "worker-1", "level": "read"}),
+                       ("no agent", {"resource": "repo:acme/web", "level": "read"}),
+                       ("the agent's own request id", {"resource": "repo:acme/web", "agent": "worker-1",
+                                                       "level": "read", "request_id": PARITY_RID})):
+        case(f"grant_access: {name}", "grant_access", args)
+    case("grant_access: a team read with no lines", "grant_access",
+         {"resource": "repo:acme/web", "agent": "worker-1", "level": "read"},
+         lambda s, r: parity_json(200, {"sha256": "x"}) if r["path"] == "/ui/team" else None)
+    # share_resource.
+    case("share_resource: with max", "share_resource", {"resource": "repo:acme/web", "max": "write"})
+    case("share_resource: with max and to", "share_resource", {"resource": "tool:github", "max": "use", "to": "workers"})
+    case("share_resource: without max", "share_resource", {"resource": "repo:acme/web"})
+    # attach_file.
+    files = {"note.txt": "hello\n", "a.png": "png", "b.PNG": "png", "c.jpg": "jpg", "d.jpeg": "jpeg", "e.gif": "gif",
+             "f.pdf": "pdf", "g.md": "# md\n", "h.csv": "a,b\n", "i.json": "{}", "j.zip": "zip", "k.qqq": "qqq",
+             "noext": "x", ".png": "hidden", "résumé 日本.txt": "name"}
+    for name in files:
+        case(f"attach_file: {name}", "attach_file", {"path": f"<tmp>/{name}"}, files=files)
+    case("attach_file: a media type given", "attach_file", {"path": "<tmp>/k.qqq", "mime": " text/plain "}, files=files)
+    case("attach_file: the agent's own request id", "attach_file", {"path": "<tmp>/note.txt", "request_id": PARITY_RID},
+         files=files)
+    case("attach_file: a request id that is no UUID", "attach_file", {"path": "<tmp>/note.txt", "request_id": "nope"},
+         files=files)
+    case("attach_file: a new generation, read again once", "attach_file", {"path": "<tmp>/note.txt"},
+         lambda s, r: (s.update(db="g2", moved=1), parity_json(409, {"error": "hub generation changed; refresh state "
+                                                                              "before sending"}))[1]
+         if r["method"] == "POST" and not s.get("moved") else None, files=files)
+    case("attach_file: a file that is not there", "attach_file", {"path": "<tmp>/missing.txt"})
+    case("attach_file: a folder", "attach_file", {"path": "<tmp>/dl"}, folders=["dl"])
+    case("attach_file: too large", "attach_file", {"path": "<tmp>/big.bin"},
+         files={"big.bin": {"sparse": owner_mcp.ATTACH_MAX + 1}})
+    case("attach_file: no path", "attach_file", {"path": "  "})
+    case("attach_file: the hub refuses the type", "attach_file", {"path": "<tmp>/k.qqq"},
+         lambda s, r: parity_json(415, {"error": "this type cannot be attached"}) if r["method"] == "POST" else None,
+         files=files)
+    # read_attachment.
+    case("read_attachment: into a file", "read_attachment", {"attachment": 3, "path": "<tmp>/out/a.txt"})
+    case("read_attachment: into a folder", "read_attachment", {"attachment": 3, "path": "<tmp>/dl/"}, folders=["dl"])
+    case("read_attachment: into a folder, no name", "read_attachment", {"attachment": 4, "path": "<tmp>/dl"},
+         folders=["dl"])
+    case("read_attachment: under the home", "read_attachment", {"attachment": 3, "path": "~/dl/./a.txt"})
+    case("read_attachment: a digest that does not match", "read_attachment", {"attachment": 5, "path": "<tmp>/x.txt"})
+    case("read_attachment: not there", "read_attachment", {"attachment": 9, "path": "<tmp>/x.txt"})
+    case("read_attachment: no number", "read_attachment", {"attachment": 0, "path": "<tmp>/x.txt"})
+    case("read_attachment: a number as text", "read_attachment", {"attachment": "3", "path": "<tmp>/x.txt"})
+    case("read_attachment: no path", "read_attachment", {"attachment": 3})
+    case("read_attachment: a place that cannot be written", "read_attachment",
+         {"attachment": 3, "path": "<tmp>/note.txt/sub/a.txt"}, files={"note.txt": "a file, not a folder"})
+    case("read_attachment: a new generation", "read_attachment", {"attachment": 3, "path": "<tmp>/a.txt"},
+         lambda s, r: (s.update(db="g2", moved=1), parity_json(409, {"error": "hub generation changed; refresh "
+                                                                              "state"}))[1]
+         if r["path"] == "/ui/attachments/3" and not s.get("moved") else None)
+    # take_backup.
+    case("take_backup: into a folder", "take_backup", {"path": "<tmp>/copies"}, folders=["copies"])
+    case("take_backup: into a file", "take_backup", {"path": "<tmp>/copies/one.zip", "request_id": PARITY_RID})
+    case("take_backup: a digest that does not match", "take_backup", {"path": "<tmp>/c.zip"},
+         lambda s, r: (200, {"Content-Type": "application/zip", "X-Fleet-Backup-SHA256": "0" * 64}, PARITY_COPY)
+         if r["path"] == "/ui/backup" else None)
+    case("take_backup: copies turned off", "take_backup", {"path": "<tmp>/c.zip"},
+         lambda s, r: parity_json(403, {"error": "owner backups are turned off on this hub"})
+         if r["path"] == "/ui/backup" else None)
+    case("take_backup: the confirmation refused", "take_backup", {"path": "<tmp>/c.zip"},
+         lambda s, r: parity_json(400, {"error": "the copy is not the one this hub served last"})
+         if r["method"] == "POST" else None)
+    case("take_backup: a place that cannot be written", "take_backup", {"path": "<tmp>/note.txt/c.zip"},
+         files={"note.txt": "a file"})
+    case("take_backup: no path", "take_backup", {})
+    # The hub's name of a file counts only as one file name in the folder that the agent named (F1).
+    names = {"a parent's part": "../../.zshrc", "a whole path": "/Library/LaunchAgents/a.plist",
+             "a dot": ".", "two dots": "..", "nothing": "", "a folder in it": "dl2/a.txt",
+             "a control character": "a\x01b.txt", "a NUL": "safe.txt\x00../../x", "a DEL": "a\x7fb.txt",
+             "a plain name": "kept name.txt", "a dot file": ".zshenv",
+             "a composed letter": "été.txt", "a decomposed letter": "été.txt",
+             "a backslash": "a\\b.txt", "a NUL first": "\x00x.txt", "a C1 control character": "\u0085x.txt",
+             "no quotes": None}
+    for what, name in names.items():
+        disposition = {"Content-Disposition": "attachment; filename=plain-name.txt" if name is None
+                       else f'attachment; filename="{name}"'}
+        case(f"read_attachment: the hub names {what}", "read_attachment", {"attachment": 3, "path": "<tmp>/dl"},
+             lambda s, r, d=disposition: (200, dict({"Content-Type": "text/plain"}, **d), PARITY_FILE)
+             if r["path"] == "/ui/attachments/3" else None, folders=["dl"])
+        case(f"take_backup: the hub names {what}", "take_backup", {"path": "<tmp>/copies"},
+             lambda s, r, d=disposition: (200, dict({"Content-Type": "application/zip"}, **d), PARITY_COPY)
+             if r["path"] == "/ui/backup" else None, folders=["copies"])
+    # A file whose name the hub gave is made new and only new, and follows no link (K1).
+    notes = {"Content-Disposition": 'attachment; filename="notes.txt"'}
+    case("read_attachment: the hub's name is there already as a file", "read_attachment",
+         {"attachment": 3, "path": "<tmp>/dl"}, files={"dl/notes.txt": "the owner's own notes"})
+    case("read_attachment: the hub's name is there already as a link to a file outside", "read_attachment",
+         {"attachment": 3, "path": "<tmp>/dl"}, files={"outside/target.txt": "keep me"},
+         folders=["dl"], links={"dl/notes.txt": "outside/target.txt"})
+    case("read_attachment: the hub's name is there already as a folder", "read_attachment",
+         {"attachment": 3, "path": "<tmp>/dl"}, folders=["dl/notes.txt"])
+    case("read_attachment: the agent's own file is replaced", "read_attachment",
+         {"attachment": 3, "path": "<tmp>/dl/notes.txt"}, files={"dl/notes.txt": "the old text"})
+    case("take_backup: the hub's name is there already, so no confirmation", "take_backup",
+         {"path": "<tmp>/copies"},
+         lambda s, r: (200, dict({"Content-Type": "application/zip"}, **notes), PARITY_COPY)
+         if r["path"] == "/ui/backup" else None, files={"copies/notes.txt": "an old copy"})
+    case("take_backup: the agent's own file is replaced", "take_backup", {"path": "<tmp>/copies/one.zip"},
+         files={"copies/one.zip": "an old copy"})
+    # A root as the folder (K3): the name "tmp" is there in "/", so nothing is written into it.
+    for root in ("/", "//", "///"):
+        case(f"read_attachment: the folder {root}", "read_attachment", {"attachment": 3, "path": root},
+             lambda s, r: (200, {"Content-Type": "text/plain", "Content-Disposition": 'attachment; filename="tmp"'},
+                           PARITY_FILE) if r["path"] == "/ui/attachments/3" else None)
+    # int() as Python strips (K4).
+    case("duty_state: an id with U+001C", "duty_state", {"id": "\u001c5", "action": "pause"})
+    case("answer_needs_you: a need with U+001F", "answer_needs_you", {"need": "5\u001f", "answer": "x"})
+    case("answer_needs_you: a need in spaces", "answer_needs_you", {"need": " 5 ", "answer": "x"})
+    case("answer_needs_you: a need in Unicode spaces", "answer_needs_you", {"need": "\u20035\u0085", "answer": "x"})
+    # A NUL in a local path (K5).
+    case("attach_file: a NUL in the path", "attach_file", {"path": "<tmp>/note.txt\u0000x"}, files=files)
+    case("read_attachment: a NUL in the path", "read_attachment", {"attachment": 3, "path": "<tmp>/a\u0000x"})
+    case("take_backup: a NUL in the path", "take_backup", {"path": "<tmp>/a\u0000x"})
+    # A NUL is the first check on a path, before "~" is expanded (L1).
+    case("attach_file: a NUL in a user's home", "attach_file", {"path": "~root\u0000x/y"})
+    case("attach_file: a NUL after ~", "attach_file", {"path": "~\u0000x"})
+    case("read_attachment: a NUL after ~", "read_attachment", {"attachment": 3, "path": "~\u0000x/a.txt"})
+    case("take_backup: a NUL in a user's home", "take_backup", {"path": "~root\u0000x"})
+    # One rule for a whole number in both programs (L2).
+    for what, value in (("300 letters", "a" * 300), ("a lone surrogate", "\ud800"), ("an underscore", "1_000"),
+                        ("an Arabic-Indic digit", "٥"), ("3.0", 3.0), ("3.7", 3.7), ("true", True),
+                        ("30 digits", 123456789012345678901234567890), ("spaces", " 5 "), ("U+001C", "\u001c5"),
+                        ("a plus", "+5"), ("minus zero", "-0"), ("a list", [5]), ("2^63", 9223372036854775808),
+                        ("1e19", 1e19), ("an empty text", ""), ("spaces alone", "  ")):
+        case(f"answer_needs_you: a need of {what}", "answer_needs_you", {"need": value, "answer": "x"})
+    for what, value in (("3.7", 3.7), ("a lone surrogate", "\ud800"), ("an Arabic-Indic digit", "٥"),
+                        ("3.0", 3.0)):
+        case(f"decline_secret_request: a need of {what}", "decline_secret_request", {"need": value})
+        case(f"goal_state: an id of {what}", "goal_state", {"id": value, "action": "pause"})
+    # Text as Python reads it: by code points, not by characters (F5).
+    case("grant_access: a combining mark after the colon", "grant_access",
+         {"resource": "repo:́x", "agent": "worker-1", "level": "read"})
+    case("save_profile: Unicode spaces around the name", "save_profile",
+         {"agent": "\u3000ops lead\u0085", "sections": sections})
+    case("attach_file: a media type with Unicode spaces", "attach_file",
+         {"path": "<tmp>/note.txt", "mime": "\u2003text/plain\u3000"}, files=files)
+    # A read of the team of another shape: nothing is sent (F6).
+    for what, team, kind in (("an element that is no object", {"sha256": "x", "lines": ["worker-1"]}, "repo"),
+                             ("an agent that is no text", {"sha256": "x", "lines": [{"agent": 7}]}, "repo"),
+                             ("repos a list", {"sha256": "x", "lines": [{"agent": "worker-1", "repos": ["acme/web"]}]},
+                              "repo"),
+                             ("tools a text", {"sha256": "x", "lines": [{"agent": "worker-1", "tools": "github"}]},
+                              "tool"),
+                             ("google a list", {"sha256": "x", "lines": [{"agent": "worker-1", "google": ["x"]}]},
+                              "gmail"),
+                             ("a service with no level", {"sha256": "x", "lines": [
+                                 {"agent": "worker-1", "google": {"gmail": {"account": "ada@example.com"}}}]}, "gmail"),
+                             ("lines missing", {"sha256": "x"}, "tool")):
+        resource = {"repo": "repo:acme/web", "tool": "tool:github", "gmail": "gmail:ada@example.com"}[kind]
+        case(f"grant_access: a team read with {what}", "grant_access",
+             {"resource": resource, "agent": "worker-1", "level": "read"},
+             lambda s, r, t=team: parity_json(200, t) if r["path"] == "/ui/team" else None)
+    # The sentence that a hub older than the app gets (G2): only for what hub.py answers to a route or a field that it
+    # does not know, and not for another 404.
+    case("send_message: the hub does not know the route", "send_message", {"text": "x"},
+         lambda s, r: parity_json(404, {"error": "not found"}) if r["method"] == "POST" else None)
+    case("check_machine: the hub does not know a field", "check_machine", {"agent": "worker-1"},
+         lambda s, r: parity_json(400, {"error": "unknown field foo"}) if r["method"] == "POST" else None)
+    case("fleet_overview: the hub does not know a page", "fleet_overview", None,
+         lambda s, r: parity_json(404, {"error": "not found"}) if r["path"] == "/ui/servers" else None)
+    case("take_backup: the hub has no such route", "take_backup", {"path": "<tmp>/c.zip"},
+         lambda s, r: parity_json(404, {"error": "no such route here"}) if r["path"] == "/ui/backup" else None)
+    return cases
+
+
+class ParityHub:
+    """A stand-in hub on 127.0.0.1 that records each request and answers it with `answer(index, request)`."""
+
+    def __init__(self):
+        import http.server
+        hub_self = self
+        self.requests, self.answer = [], None
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def handle_one(self):
+                path, _, query = self.path.partition("?")
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                req = {"method": self.command, "path": path, "query": query, "body": body,
+                       "headers": {k.lower(): v for k, v in self.headers.items()}}
+                hub_self.requests.append(req)
+                status, headers, data = hub_self.answer(len(hub_self.requests) - 1, req)
+                # A header goes out as the UTF-8 bytes of its text, which http.server writes as Latin-1: a header of
+                # the hub can hold any bytes, and a reader reads them as it reads them. The fixture keeps the text
+                # that a reader of Latin-1 gets.
+                headers = {k: v.encode("utf-8").decode("latin-1") for k, v in headers.items()}
+                req["answer"] = (status, headers, data)
+                self.send_response(status)
+                for k, v in headers.items():
+                    self.send_header(k, v)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            do_GET = do_POST = handle_one
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def parity_requests(requests, given):
+    """The requests as the two programs are compared: method, path, the parsed query, the headers that carry meaning,
+    and the parsed body, with each request id that this program made named by its order (`<rid1>`)."""
+    given = str(given).lower() if given else None
+    ids = {}
+
+    def rid(value):
+        if not isinstance(value, str) or value == given or not PARITY_UUID.fullmatch(value):
+            return value
+        return ids.setdefault(value, f"<rid{len(ids) + 1}>")
+    out = []
+    for req in requests:
+        headers = req["headers"]
+        kind = (headers.get("content-type") or "").split(";")[0].strip()
+        body = None
+        if req["body"]:
+            if kind == "application/json":
+                body = json.loads(req["body"])
+                if isinstance(body, dict) and "request_id" in body:
+                    body["request_id"] = rid(body["request_id"])
+            else:
+                body = {"bytes": len(req["body"]), "sha256": hashlib.sha256(req["body"]).hexdigest()}
+        out.append({"method": req["method"], "path": req["path"],
+                    "query": urllib.parse.parse_qs(req["query"], keep_blank_values=True),
+                    "headers": {"content-type": headers.get("content-type"),
+                                "x-fleet-request-id": rid(headers.get("x-fleet-request-id")),
+                                "x-fleet-name": headers.get("x-fleet-name"),
+                                "x-fleet-client": "x-fleet-client" in headers,
+                                "authorization": "authorization" in headers, "origin": "origin" in headers},
+                    "body": body})
+    return out
+
+
+# The clock of both programs in the parity check, so that take_backup's fallback name is the same with no placeholder
+# (the Swift test gives the same time to OwnerContext.now).
+PARITY_NOW = 1763078400
+# The files of a home that the comparison leaves out, each by its name: the lock, and each program's own label.
+PARITY_OWN = (".founderizer/lock", ".founderizer/client", ".founderizer/cli-client")
+
+
+def parity_places(value, places):
+    """Each local folder and the hub's address in a value, as its placeholder."""
+    if isinstance(value, str):
+        for real, mark in places:
+            value = value.replace(real, mark)
+        return value
+    if isinstance(value, list):
+        return [parity_places(v, places) for v in value]
+    if isinstance(value, dict):
+        return {k: parity_places(v, places) for k, v in value.items()}
+    return value
+
+
+def parity_older(answer):
+    """True for an answer that hub.py gives to a route or a field that it does not know (`Parity` holds these words to
+    hub.py): 404 "not found" of its dispatch, and 400 "unknown field ..." of a route's `only`. The program inside the
+    app adds one sentence to such a refusal (`OwnerHub.olderHub`), and only to such a one."""
+    status, _headers, data = answer
+    try:
+        error = (json.loads(data) or {}).get("error") or ""
+    except (ValueError, AttributeError):
+        return False
+    if not isinstance(error, str):                  # an error that is no text is no such answer
+        return False
+    return (status == 404 and error == "not found") or (status == 400 and error.startswith("unknown field "))
+
+
+def parity_after(work, home, places):
+    """Every file (with its SHA-256) and every folder under the two folders after the call, setup ones included, and
+    each own file of a program in the home left out by its name (PARITY_OWN)."""
+    files, folders = {}, []
+    for root, mark in ((work, "<tmp>"), (home, "<home>")):
+        for f in sorted(root.rglob("*")):
+            rel = f.relative_to(root).as_posix()
+            if mark == "<home>" and rel in PARITY_OWN:
+                continue
+            if f.is_dir():
+                folders.append(parity_places(f"{mark}/{rel}", places))
+            elif f.is_file():
+                files[parity_places(f"{mark}/{rel}", places)] = hashlib.sha256(f.read_bytes()).hexdigest()
+    return {"files": files, "folders": sorted(folders)}
+
+
+def parity_fixture():
+    """Run each case on owner_mcp.py against the stand-in hub, and give the fixture that the Swift test replays."""
+    owner_mcp.TOOLS.update({t["name"]: t for t in owner_mcp.tools()})
+    hub_ = ParityHub()
+    out = []
+    try:
+        for c in parity_cases():
+            scratch = pathlib.Path(tempfile.mkdtemp(prefix="fleet-parity-"))
+            work, home = scratch / "work", scratch / "home"
+            work.mkdir()
+            home.mkdir()
+            try:
+                for folder in c["setup"]["folders"]:
+                    (work / folder).mkdir(parents=True, exist_ok=True)
+                for name, content in c["setup"]["files"].items():
+                    (work / name).parent.mkdir(parents=True, exist_ok=True)
+                    if isinstance(content, dict):
+                        with open(work / name, "wb") as f:
+                            f.truncate(content["sparse"])
+                    else:
+                        (work / name).write_text(content, encoding="utf-8")
+                for name, target in c["setup"]["links"].items():
+                    os.symlink(work / target, work / name)
+                state = {"db": "g1"}
+                hub_.requests = []
+                hub_.answer = lambda _i, req, c=c, state=state: (c["answer"] and c["answer"](state, req)) or \
+                    parity_answer(state, req)
+                places = [(str(work), "<tmp>"), (str(home), "<home>"), (hub_.base, "<hub>")]
+                args = json.loads(json.dumps(c["arguments"]).replace("<tmp>", str(work)))
+                owner_mcp.GENERATION["db"] = None
+                with patch.dict(os.environ, {"FOUNDERIZER_HUB": hub_.base, "HOME": str(home)}), \
+                        patch.object(owner_mcp, "HOME", home / ".founderizer"), \
+                        patch.object(owner_mcp, "CLIENT_FILE", home / ".founderizer" / "client"), \
+                        patch.object(owner_mcp, "HUB_FILE", home / ".founderizer" / "hub"), \
+                        patch.object(owner_mcp.time, "time", lambda: float(PARITY_NOW)):
+                    text, bad = owner_mcp.call_tool(c["tool"], args)
+                owner_mcp.GENERATION["db"] = None
+                answers = []
+                for req in hub_.requests:
+                    status, headers, data = req["answer"]
+                    try:
+                        body = {"text": data.decode("utf-8")}
+                    except UnicodeDecodeError:
+                        body = {"base64": __import__("base64").b64encode(data).decode()}
+                    answers.append(dict(body, status=status, headers=headers))
+                out.append({"name": c["name"], "tool": c["tool"], "arguments": c["arguments"], "setup": c["setup"],
+                            "answers": answers,
+                            "requests": parity_requests(hub_.requests, c["arguments"].get("request_id")),
+                            "outcome": {"refusal": parity_places(text, places)} if bad else
+                            {"result": parity_places(json.loads(text), places)},
+                            "older_hub": sum(parity_older(req["answer"]) for req in hub_.requests),
+                            "after": parity_after(work, home, places)})
+            finally:
+                shutil.rmtree(scratch, True)
+    finally:
+        hub_.close()
+    return {"about": "The parity check of owner_mcp.py and the program inside the Founderizer app (OWNER-MCP.md, "
+                     "\"The program inside the app\"): each case's arguments, the stand-in hub's answers in order, "
+                     "the requests that owner_mcp.py made and its outcome. The Swift test OwnerParityTests replays "
+                     "it. Remake it with: " + PARITY_REMAKE,
+            "now": PARITY_NOW, "cases": out}
+
+
+def parity_text():
+    return json.dumps(parity_fixture(), indent=1, sort_keys=True) + "\n"
+
+
+class Parity(unittest.TestCase):
+    """**The parity check** (plan 3.3): the fixture that the Swift tests replay against the program inside the app is
+    what `owner_mcp.py` does now, case by case, and it covers each tool that both programs have."""
+
+    def test_the_committed_parity_fixture_is_what_owner_mcp_does_now(self):
+        made = parity_text()
+        self.assertEqual(PARITY_FIXTURE.read_text() if PARITY_FIXTURE.exists() else "", made,
+                         f"the parity fixture is not what owner_mcp.py does now: remake it with `{PARITY_REMAKE}`, "
+                         f"read its diff, and run the Swift tests (OwnerParityTests)")
+
+    def test_the_script_covers_each_tool_that_both_programs_have(self):
+        named = {c["tool"] for c in parity_cases()}
+        both = {t["name"] for t in owner_mcp.dump_tools()["tools"] if t["kind"] != "absent"}
+        self.assertEqual(both - named, set())
+        self.assertEqual(len(both), 54 + 4 + 9)
+
+    def test_the_older_hub_rule_is_what_hub_py_answers(self):
+        """`parity_older` is read from the hub, not from the program: its dispatch answers an unknown route with 404
+        "not found", and a route's `only` an unknown field with ValueError "unknown field <name>", which ui_command
+        gives as 400."""
+        src = (HERE / "hub.py").read_text()
+        self.assertIn('self.json(404, {"error": "not found"})', src)
+        self.assertIn('raise ValueError(f"unknown field {extra[0]}")', src)
+        self.assertIn('return self.json(400, {"error": str(e)})', src)
+        self.assertTrue(parity_older((404, {}, b'{"error": "not found"}')))
+        self.assertTrue(parity_older((400, {}, b'{"error": "unknown field foo"}')))
+        self.assertFalse(parity_older((404, {}, b'{"error": "no such attachment"}')))
+        self.assertFalse(parity_older((409, {}, b'{"error": "unknown field foo"}')))
+
+
 class Table(unittest.TestCase):
     """The table of the program inside the Founderizer app (`owner_mcp.py --dump-tools`, OWNER-MCP.md "The program
     inside the app"): read from the same objects that `tools()` gives, so it cannot drift from them, and the copy that
@@ -3083,12 +3657,13 @@ class Table(unittest.TestCase):
         kinds = {}
         for entry in table["tools"]:
             kinds.setdefault(entry["kind"], []).append(entry["name"])
-        self.assertEqual(sorted(kinds["swift"]), sorted(owner_mcp.SWIFT_READS))
-        self.assertEqual(sorted(kinds["later"]), sorted(owner_mcp.LATER))
+        self.assertEqual(sorted(kinds["swift"]), sorted(owner_mcp.SWIFT_READS + owner_mcp.SWIFT_WRITES))
+        self.assertNotIn("later", kinds)
         self.assertEqual(sorted(kinds["absent"]), sorted(owner_mcp.ABSENT))
         built = sum(1 for t in owner_mcp.tools() if getattr(t["run"], "kind", None))
         self.assertEqual(sum(len(kinds.get(k, [])) for k in self.TABLE_KINDS), built)
-        self.assertEqual((len(owner_mcp.SWIFT_READS), len(owner_mcp.LATER), len(owner_mcp.ABSENT)), (4, 9, 6))
+        self.assertEqual((len(owner_mcp.SWIFT_READS), len(owner_mcp.SWIFT_WRITES), len(owner_mcp.ABSENT), built),
+                         (4, 9, 6, 54))
         # A tool of no kind stops the dump: somebody decides which it is.
         stray = owner_mcp.tool("stray", "A tool of no kind.", {}, (), lambda _args: {})
         with self.assertRaises(ValueError) as caught:
@@ -3105,6 +3680,97 @@ class Table(unittest.TestCase):
     def test_the_marked_reads_are_the_reads(self):
         for t in owner_mcp.dump_tools()["tools"]:
             self.assertEqual(t["annotations"], {"readOnlyHint": t["name"] in owner_mcp.READ_ONLY}, t["name"])
+
+    def test_the_reads_of_the_programs_call_are_the_marked_reads_that_it_has(self):
+        """`founderizer-cli call` takes each tool of the table that is marked as a read and that the program has (not
+        `absent`), and `write` each other tool that it has (OwnerTools.verb): the plan's four reads, and no tool that
+        the table builds or that writes."""
+        table = owner_mcp.dump_tools()["tools"]
+        # The program's rule (OwnerTools.verb): call takes a marked read whose kind is swift, write each unmarked tool
+        # that it has, and a table tool marked as a read gets no verb, so none may exist.
+        reads = {t["name"] for t in table if t["annotations"]["readOnlyHint"] and t["kind"] == "swift"}
+        self.assertEqual(reads, set(owner_mcp.SWIFT_READS))
+        self.assertEqual([t["name"] for t in table if t["annotations"]["readOnlyHint"] and t["kind"] in self.TABLE_KINDS],
+                         [])
+        writes = {t["name"] for t in table if not t["annotations"]["readOnlyHint"] and t["kind"] != "absent"}
+        self.assertEqual(len(writes), 54 + 9)
+        self.assertTrue(set(owner_mcp.SWIFT_WRITES) <= writes)
+
+    def test_a_lost_error_answer_says_that_the_request_can_have_arrived(self):
+        """The read of an error answer's body is inside `except HTTPError`, outside the `except OSError` of the same
+        `try`: an OSError there (a wait that took too long, the total time) must give the same words as the other
+        path, and not an error of the protocol."""
+        scratch = pathlib.Path(tempfile.mkdtemp(prefix="fleet-lost-"))
+        self.addCleanup(shutil.rmtree, str(scratch), True)
+
+        import http.client
+
+        class Broken:
+            """A body whose read breaks as `raised` says: an OSError, http.client's IncompleteRead (a chunked answer
+            that closes inside a chunk) or a ValueError (a bad chunk size)."""
+            closed, status, headers = False, 200, {"Content-Type": "application/json"}
+
+            def __init__(self, raised):
+                self.raised = raised
+
+            def read(self, *_args):
+                raise self.raised
+
+            def close(self):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+        lost = "The call to the hub at http://127.0.0.1:9 was lost: {}. The request can have arrived: read the fleet " \
+               "before you send it again."
+        for raised, said in ((TimeoutError("timed out"), "timed out"),
+                             (http.client.IncompleteRead(b"x", 5), "the answer broke off (IncompleteRead)"),
+                             (ValueError("invalid literal for int() with base 16: b'zz'"),
+                              "the answer broke off (ValueError)")):
+            def failing(request, timeout=None, raised=raised):     # an error answer whose body breaks
+                raise urllib.error.HTTPError(request.full_url, 500, "broken", {"Content-Type": "text/plain"},
+                                             Broken(raised))
+
+            def broken(request, timeout=None, raised=raised):      # a success whose body breaks
+                return Broken(raised)
+            for opener in (failing, broken):
+                for total in (None, owner_mcp.FILE_TOTAL):
+                    with patch.object(owner_mcp.OPENER, "open", opener), patch.object(owner_mcp, "HOME", scratch), \
+                            patch.object(owner_mcp, "CLIENT_FILE", scratch / "client"):
+                        with self.assertRaises(owner_mcp.Refused) as caught:
+                            owner_mcp.call("POST", "/ui/messages", body={"text": "x"}, base="http://127.0.0.1:9",
+                                           total=total)
+                    self.assertEqual(str(caught.exception), lost.format(said), (said, opener.__name__, total))
+
+    def test_a_file_from_the_hub_is_new_and_follows_no_link(self):
+        """write_here with the agent's folder: an exclusive create, which leaves a file, a link and its target as they
+        are; with the agent's own file path it replaces that file."""
+        scratch = pathlib.Path(tempfile.mkdtemp(prefix="fleet-new-"))
+        self.addCleanup(shutil.rmtree, str(scratch), True)
+        (scratch / "target").write_text("keep me")
+        (scratch / "dl").mkdir()
+        os.symlink(scratch / "target", scratch / "dl" / "a.txt")
+        with self.assertRaises(owner_mcp.Refused) as caught:
+            owner_mcp.write_here(scratch / "dl" / "a.txt", b"new", scratch / "dl")
+        self.assertEqual(str(caught.exception), f"a.txt is there already in {scratch / 'dl'}, so nothing was written. "
+                         "Name the file itself in path to replace it, or name another folder.")
+        self.assertEqual((scratch / "target").read_text(), "keep me")
+        owner_mcp.write_here(scratch / "target", b"replaced")
+        self.assertEqual((scratch / "target").read_text(), "replaced")
+
+    def test_the_media_types_are_the_hubs_own(self):
+        """MEDIA_TYPES, which both programs read, gives only types that the hub takes, each of them, and each with the
+        ending that the hub gives it."""
+        self.assertEqual(set(owner_mcp.MEDIA_TYPES.values()), set(hub.ATTACH_TYPES))
+        for mime, (ending, _magic) in hub.ATTACH_TYPES.items():
+            self.assertEqual(owner_mcp.MEDIA_TYPES[ending.lstrip(".")], mime)
+        self.assertEqual(owner_mcp.dump_tools()["MEDIA_TYPES"], owner_mcp.MEDIA_TYPES)
+        for name, mime in (("a.PNG", "image/png"), (".png", "application/octet-stream"), ("a..jpg", "image/jpeg"),
+                           ("noext", "application/octet-stream"), ("a.docx", "application/octet-stream")):
+            self.assertEqual(owner_mcp.media_type(name), mime, name)
 
     def test_the_dump_prints_the_table_and_the_apps_copy_is_that_print(self):
         """`--dump-tools` is what release.sh and run.sh put in the app, and the Swift tests read a committed copy of
@@ -3232,4 +3898,8 @@ class Table(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    if sys.argv[1:] == ["--parity-fixture"]:
+        PARITY_FIXTURE.write_text(parity_text())
+        print(f"wrote {PARITY_FIXTURE.relative_to(HERE)}")
+    else:
+        unittest.main()

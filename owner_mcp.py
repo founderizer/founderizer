@@ -37,9 +37,9 @@ import collections
 import contextlib
 import fcntl
 import hashlib
+import http.client
 import ipaddress
 import json
-import mimetypes
 import os
 import pathlib
 import re
@@ -67,6 +67,25 @@ TIMEOUT = 30                            # seconds for one owner-API call
 READ_MAX = 8 * 1024 * 1024              # the largest answer this server reads from the hub
 BACKUP_MAX = 256 * 1024 * 1024          # hub.py BACKUP_MAX: the largest copy the hub serves
 ATTACH_MAX = 25 * 1024 * 1024           # hub.py ATTACH_MAX: the largest file the owner attaches
+# The three tools that move a file (attach_file, read_attachment, take_backup) read up to the hub's own limit of that
+# file (ATTACH_MAX, BACKUP_MAX) and not READ_MAX, and they wait longer: FILE_WAIT seconds for each part of the transfer
+# and FILE_TOTAL for the whole read, as the Mac app reads a copy (FleetCopy.takeCopy: 60 and 900). The program inside
+# the Founderizer app has the same limits (`Transfer` in OwnerHub.swift).
+FILE_WAIT = 60
+FILE_TOTAL = 900
+# The media type of a file that the agent attaches with no `mime`, by its ending in lower case: the hub's own ten types
+# (hub.py ATTACH_TYPES, which takes no other) and the other endings of the same types. Every other file is
+# application/octet-stream, which the hub refuses. One table for both programs: `--dump-tools` carries it, and the
+# program inside the Founderizer app reads it from there. Until 14 November 2026 this server asked Python's
+# `mimetypes`, whose answer hangs on the Python version and the Mac's own files.
+MEDIA_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "jpe": "image/jpeg", "gif": "image/gif",
+               "webp": "image/webp", "pdf": "application/pdf", "zip": "application/zip", "txt": "text/plain",
+               "md": "text/markdown", "markdown": "text/markdown", "csv": "text/csv", "json": "application/json"}
+
+
+def media_type(name):
+    """The media type of a file's name: its ending as `os.path.splitext` finds it (".png" has none), in lower case."""
+    return MEDIA_TYPES.get(os.path.splitext(name)[1][1:].lower(), "application/octet-stream")
 SSH_HOST = re.compile(r"[A-Za-z0-9._:-]{1,255}")        # a host name or an address, as it goes in a command line
 SSH_USER = re.compile(r"[A-Za-z_][A-Za-z0-9._-]{0,31}")  # hub.py SSH_USER
 CLAIM_CODE = re.compile(r"[A-Z2-9-]{12,20}")            # hubsetup.py: 12 characters of LINK_ALPHABET, in three groups
@@ -347,13 +366,43 @@ class Answer:
         return (self.data or {}).get("error") if isinstance(self.data, dict) else None
 
 
-def call(method, path, body=None, base=None, timeout=TIMEOUT, limit=READ_MAX, mime=None, extra=None):
+def one_read(answer, size):
+    """One read of a body; a body that breaks off is an OSError with words for the agent, at this read only."""
+    try:
+        return answer.read(size)
+    except (http.client.HTTPException, ValueError) as e:
+        raise OSError(f"the answer broke off ({type(e).__name__})") from None
+
+
+def read_whole(answer, limit, total, started):
+    """The body of an answer, at most `limit` + 1 bytes. With `total`, the read stops with an OSError when the whole
+    transfer took longer than that many seconds since `started`, so a hub that sends a file slowly cannot hold a call
+    for ever (each wait has its own `timeout` too). A body that breaks off is an OSError too, so `call` says that the
+    request can have arrived: `http.client.IncompleteRead` when a chunked answer closes inside a chunk, and a ValueError
+    for a bad chunk size (`one_read`)."""
+    if total is None:
+        return one_read(answer, limit + 1)
+    parts, size = [], 0
+    while size <= limit:
+        part = one_read(answer, min(1024 * 1024, limit + 1 - size))
+        if not part:
+            break
+        parts.append(part)
+        size += len(part)
+        if time.monotonic() - started > total:
+            raise OSError(f"the transfer took longer than {total} seconds")
+    return b"".join(parts)
+
+
+def call(method, path, body=None, base=None, timeout=TIMEOUT, limit=READ_MAX, mime=None, extra=None, total=None):
     """One call to the owner API from this Mac. No Authorization header and no Origin, because `ui_allowed` refuses
     both on an owner route: this Mac's own address is the whole credential.
 
     `mime`: the body is those bytes under that media type, instead of JSON — the one route whose body is a file
-    (`POST /ui/attachments`). `extra`: that route's own headers, which carry what a JSON body would carry as fields."""
+    (`POST /ui/attachments`). `extra`: that route's own headers, which carry what a JSON body would carry as fields.
+    `total`: the seconds that the read of the whole answer may take (the file tools, FILE_TOTAL)."""
     next_step(f"the call {method} {path}")
+    started = time.monotonic()
     base = base or hub_base()
     headers = {"Accept": "application/json", "User-Agent": f"{NAME}/{VERSION}"}
     data = None
@@ -365,10 +414,17 @@ def call(method, path, body=None, base=None, timeout=TIMEOUT, limit=READ_MAX, mi
     request = urllib.request.Request(base + path, data=data, method=method, headers=headers)
     try:
         with OPENER.open(request, timeout=timeout) as answer:
-            raw, got, status = answer.read(limit + 1), answer.headers, answer.status
+            raw, got, status = read_whole(answer, limit, total, started), answer.headers, answer.status
     except urllib.error.HTTPError as e:
-        with e:
-            raw, got, status = e.read(limit + 1), e.headers, e.code
+        # A refusal's body is words, never a file: at most READ_MAX, under the same total as the answer it stands for,
+        # so a file route that answers 500 and then one byte a minute cannot hold the call.
+        limit = min(limit, READ_MAX)
+        try:
+            with e:
+                raw, got, status = read_whole(e, limit, total, started), e.headers, e.code
+        except OSError as lost:             # this handler is outside the `except OSError` below: the same words here
+            raise Refused(f"The call to the hub at {base} was lost: {lost}. The request can have arrived: read the "
+                          f"fleet before you send it again.") from None
     except urllib.error.URLError as e:
         raise Refused(f"The hub at {base} did not answer ({e.reason}). Check that it runs and that this Mac is on "
                       f"the fleet's private network.") from None
@@ -447,13 +503,18 @@ def stale(answer):
     return answer.status == 409 and "generation" in (answer.error or "")
 
 
-def get(route, what, **query):
+def get(route, what, transfer=None, **query):
     """One owner read route, with the generation it asks for. `/ui/state` takes none. The query words are the route's
-    own (`path`, `agent`, `after`, ...), so they are passed in and never named as parameters of this function."""
+    own (`path`, `agent`, `after`, ...), so they are passed in and never named as parameters of this function, except
+    `transfer`, which no route takes: the largest answer of a file route, which then has the time of a file (FILE_WAIT,
+    FILE_TOTAL)."""
     def once():
         q = dict({"db": generation()} if route != "/ui/state" else {},
                  **{k: v for k, v in query.items() if v is not None})
-        return call("GET", route + ("?" + urllib.parse.urlencode(q) if q else ""))
+        path = route + ("?" + urllib.parse.urlencode(q) if q else "")
+        if transfer is None:
+            return call("GET", path)
+        return call("GET", path, timeout=FILE_WAIT, limit=transfer, total=FILE_TOTAL)
     answer = once()
     if stale(answer):
         generation(fresh=True)
@@ -622,15 +683,49 @@ def write_message(args):
     return command("/ui/messages", body, "the message", args.get("request_id"))
 
 
+# The characters that Python's int() takes off a text (Python 3.12, measured over every code point): str.strip()'s
+# without U+001C to U+001F. The program inside the app has the same set (PyText.intSpace).
+INT_SPACE = ("\t\n\x0b\x0c\r \x85\xa0\u1680" + "".join(map(chr, range(0x2000, 0x200B)))
+             + "\u2028\u2029\u202f\u205f\u3000")
+WHOLE = re.compile(r"[+-]?[0-9]+")
+
+
+def whole_number(args, field):
+    """**One whole number from an argument, by one rule that the program inside the app has too** (`wholeNumber`):
+    absent, null or an empty text is 0; a JSON integer is itself, and a boolean is refused; a JSON number with no
+    fraction part (3.0) is that integer, and one with a fraction is refused (until 14 November 2026 int() cut 3.7 to 3
+    in silence); a text is taken when, after the spaces that int() takes off, it is an optional + or - and ASCII digits
+    alone; and the value fits 64 bits. Anything else is refused with one sentence that names the field and does not
+    quote the value (before, the words were int()'s own, which the program could not copy exactly)."""
+    value, refused = args.get(field), Refused(f"{field} must be a whole number.")
+    if value is None or value == "":
+        return 0
+    if isinstance(value, bool):
+        raise refused
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, float):
+        if not value.is_integer():
+            raise refused
+        number = int(value)
+    elif isinstance(value, str) and WHOLE.fullmatch(value.strip(INT_SPACE)):
+        number = int(value.strip(INT_SPACE))
+    else:
+        raise refused
+    if not -2 ** 63 <= number < 2 ** 63:
+        raise refused
+    return number
+
+
 def answer_need(args):
     body = {k: args[k] for k in ("answer", "choice", "choices") if args.get(k) is not None}
-    return command(f"/ui/needs/{int(args.get('need') or 0)}", body, "the answer", args.get("request_id"))
+    return command(f"/ui/needs/{whole_number(args, 'need')}", body, "the answer", args.get("request_id"))
 
 
 def decline_secret(args):
     """The decline half of a secret request's answer (POST /ui/needs/<id>/secret): no value comes in or goes out, so
     it is a tool here. The answer with a login stays the app's secure form, which puts the value into a vault first."""
-    return command(f"/ui/needs/{int(args.get('need') or 0)}/secret", {"decline": args.get("reason") or ""},
+    return command(f"/ui/needs/{whole_number(args, 'need')}/secret", {"decline": args.get("reason") or ""},
                    "the decline", args.get("request_id"))
 
 
@@ -704,22 +799,90 @@ def attach_file(args):
     where = args.get("path")
     if not isinstance(where, str) or not where.strip():
         raise Refused("path must be the file on this Mac to send.")
-    place = pathlib.Path(os.path.expanduser(where.strip()))
+    place = local_place(where)              # a NUL first, before "~" is expanded
     if not place.is_file():
         raise Refused(f"{place} is not a file on this Mac.")
-    data = place.read_bytes()
-    if len(data) > ATTACH_MAX:
+    try:                                    # the size first: a file far above the limit is never read whole
+        size = place.stat().st_size
+        if size > ATTACH_MAX:
+            raise Refused(f"{place} is {size} bytes; an attachment is at most {ATTACH_MAX // (1024 * 1024)} MiB.")
+        data = place.read_bytes()
+    except OSError as e:
+        raise Refused(f"{place} could not be read on this Mac: {e.strerror or e}.") from None
+    if len(data) > ATTACH_MAX:              # it grew between the two reads
         raise Refused(f"{place} is {len(data)} bytes; an attachment is at most {ATTACH_MAX // (1024 * 1024)} MiB.")
     rid = str(args.get("request_id") or uuid.uuid4()).lower()
-    mime = str(args.get("mime") or "").strip() or \
-        (mimetypes.guess_type(place.name)[0] or "application/octet-stream")
-    db = generation()
-    with command_lock():                    # an upload is a command too: one request under the lock
-        answer = call("POST", f"/ui/attachments?db={urllib.parse.quote(db)}", body=data, mime=mime,
-                      extra={"X-Fleet-Request-Id": rid, "X-Fleet-Name": place.name})
+    mime = str(args.get("mime") or "").strip() or media_type(place.name)
+    # A header carries Latin-1 only, and a character outside it stopped the upload before 14 November 2026. The hub
+    # keeps letters, digits, ". _ -" and spaces of the name and makes every other character "_" (hub.py
+    # attachment_name), so "_" here for each character outside printable ASCII gives the hub the same name.
+    name = "".join(c if " " <= c <= "~" else "_" for c in place.name)
+
+    def once(db):
+        with command_lock():                # an upload is a command too: one request under the lock
+            return call("POST", f"/ui/attachments?db={urllib.parse.quote(db)}", body=data, mime=mime,
+                        extra={"X-Fleet-Request-Id": rid, "X-Fleet-Name": name}, timeout=FILE_WAIT,
+                        total=FILE_TOTAL)
+    answer = once(generation())
+    if stale(answer):                       # the same request id: the hub keeps one file for it
+        answer = once(generation(fresh=True))
     if answer.status != 200:
         raise refusal(answer, f"the upload of {place.name}")
     return dict(answer.data or {}, path=str(place))
+
+
+def hub_file_name(answer, fallback):
+    """**The hub's name of a file counts only as one new, plain file name** in the folder that the agent named. The
+    part of `Content-Disposition` after `filename=`, without its quotes and cut at its first NUL (the program inside
+    the app cannot see what follows a NUL in a header, so neither does this). A name that is empty, that starts with
+    "." (".", "..", a dot file such as ".zshenv"), that holds "/", or that holds a character outside printable ASCII (a
+    control character, or a letter whose bytes the two programs read from a header in different ways) is not used, and
+    the fallback is. The hub's own names are printable ASCII (hub.py attachment_name). Before 14 November 2026 a name
+    such as "../../.zshrc" or "/Library/LaunchAgents/a.plist" put the file outside the folder."""
+    name = answer.headers.get("Content-Disposition", "").partition("filename=")[2].strip('"').partition("\0")[0]
+    if not name or name.startswith(".") or "/" in name or any(not " " <= c <= "~" for c in name):
+        return fallback
+    return name
+
+
+def into_folder(folder, name):
+    """`folder / name`, refused unless the file's own folder is `folder`."""
+    place = folder / name
+    if place.parent != folder:
+        raise Refused(f"the hub's name of the file would put it outside {folder}, so nothing was written.")
+    return place
+
+
+def local_place(where):
+    """The path that the agent named, as a path of this Mac. A NUL is refused: no system call can take it, and the
+    program inside the app would cut the path there."""
+    if "\0" in where:
+        raise Refused("path cannot hold a NUL character: name a file or a folder of this Mac.")
+    return pathlib.Path(os.path.expanduser(where.strip()))
+
+
+def write_here(place, data, folder=None):
+    """The bytes into a file on this Mac, its folders made. A file that cannot be written is the agent's to read in
+    words, with the reason of the system (before 14 November 2026 it was an error of the protocol).
+
+    `folder`: the agent named that folder, and the file's name is the hub's or the fallback. Then the file is made new
+    and only new (`open(..., "xb")`, which is O_CREAT|O_EXCL and so follows no link at its last part): a file, a link or
+    a folder of that name stays as it is, and nothing is written. When the agent named the file itself, it replaces
+    that file, as it did before."""
+    try:
+        place.parent.mkdir(parents=True, exist_ok=True)
+        if folder is None:
+            place.write_bytes(data)
+            return
+        try:
+            made = open(place, "xb")
+        except FileExistsError:             # only the create's own: a folder in the way above is the words below
+            raise Refused(f"{place.name} is there already in {folder}, so nothing was written. Name the file itself "
+                          f"in path to replace it, or name another folder.") from None
+        with made:
+            made.write(data)
+    except OSError as e:
+        raise Refused(f"{place} could not be written on this Mac: {e.strerror or e}.") from None
 
 
 def read_attachment(args):
@@ -731,17 +894,16 @@ def read_attachment(args):
         raise Refused("attachment must be the number of an attachment (A-<id> without the A-).")
     if not isinstance(where, str) or not where.strip():
         raise Refused("path must be where on this Mac the file is written.")
-    answer = get(f"/ui/attachments/{number}", f"attachment A-{number}")
+    place = local_place(where)
+    answer = get(f"/ui/attachments/{number}", f"attachment A-{number}", transfer=ATTACH_MAX)
     digest = hashlib.sha256(answer.raw).hexdigest()
     said = answer.headers.get("X-Fleet-SHA256")
     if said and said != digest:
         raise Refused("the file did not arrive whole: the hub's SHA-256 is not the one of the bytes received.")
-    place = pathlib.Path(os.path.expanduser(where.strip()))
+    folder = None
     if place.is_dir():
-        place = place / ((answer.headers.get("Content-Disposition", "").partition("filename=")[2].strip('"'))
-                         or f"attachment-{number}")
-    place.parent.mkdir(parents=True, exist_ok=True)
-    place.write_bytes(answer.raw)
+        folder, place = place, into_folder(place, hub_file_name(answer, f"attachment-{number}"))
+    write_here(place, answer.raw, folder)
     return {"attachment": number, "path": str(place), "bytes": len(answer.raw), "sha256": digest,
             "mime": (answer.headers.get("Content-Type") or "").split(";")[0].strip()}
 
@@ -750,13 +912,15 @@ def with_revision(route, read, fields, what):
     """A goal, duty or wake-up rule state change: `base_revision` is the revision of the thing itself, which its own
     read gives, so two changes at once cannot undo each other."""
     def run(args):
-        page = read_page({"page": read, "id": int(args.get("id") or 0)})
+        number = whole_number(args, "id")
+        page = read_page({"page": read, "id": number})
         thing = page.get({"goal": "goal", "responsibility": "responsibility", "trigger": "trigger"}[read])
         body = {name: args[name] for name in fields if args.get(name) is not None}
         body["base_revision"] = (thing or {}).get("revision")
         if not isinstance(body["base_revision"], int):
-            raise Refused(f"the hub gave no revision for {read} {args.get('id')}, so this change cannot be bound to it.")
-        return command(route_for(route, args), body, what, args.get("request_id"))
+            raise Refused(f"the hub gave no revision for {read} {number}, so this change cannot be bound to it.")
+        # The route takes the number that was read, so an id of 3.0 or " 3" is the thing 3 there too.
+        return command(route_for(route, dict(args, id=number)), body, what, args.get("request_id"))
     return table_tool(run, "with_revision", route, fields, what, revision_page=read)
 
 
@@ -782,21 +946,52 @@ def grant_access(args):
     if kind == "secret":
         return command("/ui/secrets/grant", {"login": what, "agent": agent, "grant": level},
                        f"the grant of {rid} to {agent}", args.get("request_id"))
-    held = team()
+    lines = team_lines(team())
     what_for = f"the grant of {rid} to {agent}"
     if kind == "repo":
-        access = {line["agent"]: (line.get("repos") or {})[what]
-                  for line in held["lines"] if what in (line.get("repos") or {})}
+        access = {line["agent"]: team_part(line, "repos", dict)[what]
+                  for line in lines if what in team_part(line, "repos", dict)}
         return _one_moved(access, agent, level, "/ui/team/repos", {"repo": what}, "access", what_for, args)
     if kind == "tool":
-        names = {line["agent"]: "use" for line in held["lines"] if what in (line.get("tools") or [])}
+        names = {line["agent"]: "use" for line in lines if what in team_part(line, "tools", list)}
         held_now = _one_moved_map(names, agent, level)
         return _team_command("/ui/team/tools", {"tool": what, "agents": sorted(held_now)}, what_for, args)
-    access = {line["agent"]: (line.get("google") or {})[kind]["level"]
-              for line in held["lines"]
-              if ((line.get("google") or {}).get(kind) or {}).get("account") == what}
+    access = {}
+    for line in lines:
+        service = team_part(team_part(line, "google", dict), kind, dict)
+        if service.get("account") == what:
+            if "level" not in service:
+                raise Refused(TEAM_SHAPE)
+            access[line["agent"]] = service["level"]
     return _one_moved(access, agent, level, "/ui/team/google", {"account": what, "service": kind}, "access",
                       what_for, args)
+
+
+# The words when GET /ui/team does not have the shape that grant_access reads. Nothing is sent then: before
+# 14 November 2026 a line of another shape stopped this server with an error of Python, and the program inside the app
+# left that line out and sent the map without it, so that agent could lose its hold.
+TEAM_SHAPE = ("The hub's answer to the read of the team does not have the shape that grant_access reads, so nothing "
+              "was sent. Read fleet_read(page=\"team\") and tell the owner.")
+
+
+def team_lines(held):
+    """`lines` of GET /ui/team: a list of objects, each with its agent's name as a text."""
+    lines = held.get("lines") if isinstance(held, dict) else None
+    if not isinstance(lines, list) or not all(isinstance(line, dict) and isinstance(line.get("agent"), str)
+                                              for line in lines):
+        raise Refused(TEAM_SHAPE)
+    return lines
+
+
+def team_part(line, key, kind):
+    """One part of a line (`repos`, `tools`, `google`, a service of `google`): empty when it is absent or empty, and a
+    refusal when it is of another kind."""
+    value = line.get(key)
+    if not value:
+        return kind()
+    if not isinstance(value, kind):
+        raise Refused(TEAM_SHAPE)
+    return value
 
 
 def _one_moved_map(held_now, agent, level):
@@ -831,17 +1026,16 @@ def take_backup(args):
     where = args.get("path")
     if not isinstance(where, str) or not where.strip():
         raise Refused("path must be where on this Mac the copy is written.")
-    answer = get("/ui/backup", "a copy of this fleet")
+    place = local_place(where)
+    answer = get("/ui/backup", "a copy of this fleet", transfer=BACKUP_MAX)
     digest = hashlib.sha256(answer.raw).hexdigest()
     said = answer.headers.get("X-Fleet-Backup-SHA256")
     if said and said != digest:
         raise Refused("the copy did not arrive whole: the hub's SHA-256 is not the one of the bytes received.")
-    place = pathlib.Path(os.path.expanduser(where.strip()))
+    folder = None
     if place.is_dir():
-        place = place / (answer.headers.get("Content-Disposition", "").partition("filename=")[2].strip('"')
-                         or f"founderizer-{int(time.time())}.zip")
-    place.parent.mkdir(parents=True, exist_ok=True)
-    place.write_bytes(answer.raw)
+        folder, place = place, into_folder(place, hub_file_name(answer, f"founderizer-{int(time.time())}.zip"))
+    write_here(place, answer.raw, folder)          # before the confirmation: a write refused confirms nothing
     receipt = command("/ui/backups/confirm", {"sha256": digest, "bytes": len(answer.raw)},
                       "the confirmation of the copy", args.get("request_id"))
     return dict(receipt, path=str(place), bytes=len(answer.raw), sha256=digest)
@@ -2150,12 +2344,15 @@ INSTRUCTIONS = ("You run the owner's own Founderizer fleet. Every tool here is o
 
 # ---- the table: what the program inside the Founderizer app reads (`founderizer-cli`, OWNER-MCP.md)
 
-# The tools that the program writes in Swift because each has logic of its own: the four reads now, and the nine that
-# write in a later slice of the app (A2). The six of ABSENT the program never has: the app's own pages do that work
-# (the install, the claim, a new machine), and the app's own setting says which hub it reads.
+# The tools that the program writes in Swift because each has logic of its own (kind `swift` in the table): the four
+# reads, which its verb `call` takes, and the nine that write (slice A2, 14 November 2026), which its verb `write`
+# takes. The parity check holds each of them to the function here (test_owner_mcp.Parity). The six of ABSENT the
+# program never has: the app's own pages do that work (the install, the claim, a new machine), and the app's own
+# setting says which hub it reads. A program that reads a table with a `swift` tool that its own code does not have
+# refuses that tool in words (an app older than the table).
 SWIFT_READS = ("fleet_overview", "fleet_read", "search_history", "see_costs")
-LATER = ("save_profile", "attach_file", "read_attachment", "take_backup", "grant_access", "share_resource",
-         "send_message", "answer_needs_you", "decline_secret_request")
+SWIFT_WRITES = ("save_profile", "attach_file", "read_attachment", "take_backup", "grant_access", "share_resource",
+                "send_message", "answer_needs_you", "decline_secret_request")
 ABSENT = ("install_hub", "install_log", "claim_hub", "add_machine", "use_hub", "which_hub")
 # The name in the hub's `ui_features` that gates a tool of the table, where the hub has one. The program refuses such a
 # tool on a hub whose `ui_features` lacks the name (that hub is older than the app). Only names of hub.UI_FEATURES,
@@ -2186,7 +2383,7 @@ def dump_tools(listed=None):
     gives, so that it cannot drift from them: every tool with its name, words, input schema and annotations, and its
     kind. A tool that `plain`, `with_base` or `with_revision` builds carries its route, its fields, its words for a
     refusal, whether the request id comes from the arguments, the page of its revision (`with_revision`) and the hub's
-    feature that gates it. Each other tool is `swift`, `later` or `absent`, and a tool of none of these kinds stops
+    feature that gates it. Each other tool is `swift` or `absent`, and a tool of none of these kinds stops
     the dump: somebody decides which it is. Beside the tools: the facts that the program's own reads take from this
     file, its first words to a client, and a `version`, a SHA-256 of all the rest (this file does not know the
     repository's revision)."""
@@ -2199,20 +2396,18 @@ def dump_tools(listed=None):
             entry.update(kind=kind, route=run.route, fields=list(run.fields), what=run.what,
                          revision_page=run.revision_page, request_id_from_args=run.rid_from_args,
                          feature=FEATURES.get(name))
-        elif name in SWIFT_READS:
+        elif name in SWIFT_READS or name in SWIFT_WRITES:
             entry["kind"] = "swift"
-        elif name in LATER:
-            entry["kind"] = "later"
         elif name in ABSENT:
             entry["kind"] = "absent"
         else:
-            raise ValueError(f"the tool {name} has no kind for the app's table: put it in SWIFT_READS, LATER or ABSENT, "
-                             f"or build it with plain, with_base or with_revision")
+            raise ValueError(f"the tool {name} has no kind for the app's table: put it in SWIFT_READS, SWIFT_WRITES or "
+                             f"ABSENT, or build it with plain, with_base or with_revision")
         entries.append(entry)
     table = {"tools": entries, "instructions": INSTRUCTIONS, "protocol": PROTOCOL, "supported": list(SUPPORTED),
              "PAGES": {page: list(found) for page, found in PAGES.items()}, "PAGE_QUERY": list(PAGE_QUERY),
              "PAGE_WORDS": list(PAGE_WORDS), "PAGE_IN_PATH": list(PAGE_IN_PATH), "HISTORY_WORDS": list(HISTORY_WORDS),
-             "COSTS_WORDS": list(COSTS_WORDS)}
+             "COSTS_WORDS": list(COSTS_WORDS), "MEDIA_TYPES": dict(MEDIA_TYPES)}
     table["version"] = hashlib.sha256(json.dumps(table, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return table
 
