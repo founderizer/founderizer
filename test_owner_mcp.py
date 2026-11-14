@@ -42,7 +42,7 @@ SHELLS = [sh for sh in ("/bin/sh", "/bin/dash") if os.access(sh, os.X_OK)]     #
 
 def load_tests(loader, _tests, _pattern):
     return unittest.TestSuite(cls(name) for cls in (Admin, Boundary, FromNothing, McpServers, Refusals,
-                                                    Install, Progress, RootThroughSudo, NoSecret, Shape)
+                                                    Install, Progress, RootThroughSudo, NoSecret, Shape, Table)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -3048,6 +3048,187 @@ class Boundary(WithServer):
             self.assertIn("is not owner's machine", str(caught.exception), name)
             self.assertIn("the Mac whose address is", str(caught.exception), name)
         self.assertEqual(hub.agents()["studio"].get("repos") or {}, {})
+
+
+class Table(unittest.TestCase):
+    """The table of the program inside the Founderizer app (`owner_mcp.py --dump-tools`, OWNER-MCP.md "The program
+    inside the app"): read from the same objects that `tools()` gives, so it cannot drift from them, and the copy that
+    the app's Swift tests read is this file's own output. No hub and no network."""
+
+    FIXTURE = HERE / "app" / "Tests" / "FleetOwnerAPITests" / "Fixtures" / "owner-tools.json"
+    TABLE_KINDS = ("plain", "with_base", "with_revision")
+
+    def test_the_table_is_every_tool_with_its_own_schema_and_annotations(self):
+        listed = owner_mcp.tools()
+        table = owner_mcp.dump_tools()
+        self.assertEqual([t["name"] for t in table["tools"]], [t["name"] for t in listed])
+        for t, entry in zip(listed, table["tools"]):
+            for key in ("description", "inputSchema", "annotations"):
+                self.assertEqual(entry[key], t[key], f"{t['name']}.{key}")
+            run = t["run"]
+            if entry["kind"] in self.TABLE_KINDS:
+                self.assertEqual((entry["kind"], entry["route"], tuple(entry["fields"]), entry["what"]),
+                                 (run.kind, run.route, run.fields, run.what), t["name"])
+                self.assertTrue(entry["route"].startswith("/ui/"), t["name"])
+                self.assertEqual(entry["revision_page"] is not None, entry["kind"] == "with_revision", t["name"])
+                self.assertIsInstance(entry["request_id_from_args"], bool, t["name"])
+                for word in re.findall(r"\{(\w+)\}", entry["route"]):     # a path part is a property of the tool
+                    self.assertIn(word, entry["inputSchema"]["properties"], f"{t['name']}: {word}")
+            else:
+                self.assertFalse(hasattr(run, "kind"), t["name"])
+                self.assertNotIn("route", entry, t["name"])
+
+    def test_the_kinds_are_complete_and_the_counts_are_the_plans(self):
+        table = owner_mcp.dump_tools()
+        kinds = {}
+        for entry in table["tools"]:
+            kinds.setdefault(entry["kind"], []).append(entry["name"])
+        self.assertEqual(sorted(kinds["swift"]), sorted(owner_mcp.SWIFT_READS))
+        self.assertEqual(sorted(kinds["later"]), sorted(owner_mcp.LATER))
+        self.assertEqual(sorted(kinds["absent"]), sorted(owner_mcp.ABSENT))
+        built = sum(1 for t in owner_mcp.tools() if getattr(t["run"], "kind", None))
+        self.assertEqual(sum(len(kinds.get(k, [])) for k in self.TABLE_KINDS), built)
+        self.assertEqual((len(owner_mcp.SWIFT_READS), len(owner_mcp.LATER), len(owner_mcp.ABSENT)), (4, 9, 6))
+        # A tool of no kind stops the dump: somebody decides which it is.
+        stray = owner_mcp.tool("stray", "A tool of no kind.", {}, (), lambda _args: {})
+        with self.assertRaises(ValueError) as caught:
+            owner_mcp.dump_tools(owner_mcp.tools() + [stray])
+        self.assertIn("stray", str(caught.exception))
+
+    def test_each_feature_is_a_name_that_every_hub_lists_and_names_a_table_tool(self):
+        table = {t["name"]: t for t in owner_mcp.dump_tools()["tools"]}
+        for name, feature in owner_mcp.FEATURES.items():
+            self.assertIn(feature, hub.UI_FEATURES, name)
+            self.assertIn(table[name]["kind"], self.TABLE_KINDS, name)
+            self.assertEqual(table[name]["feature"], feature)
+
+    def test_the_marked_reads_are_the_reads(self):
+        for t in owner_mcp.dump_tools()["tools"]:
+            self.assertEqual(t["annotations"], {"readOnlyHint": t["name"] in owner_mcp.READ_ONLY}, t["name"])
+
+    def test_the_dump_prints_the_table_and_the_apps_copy_is_that_print(self):
+        """`--dump-tools` is what release.sh and run.sh put in the app, and the Swift tests read a committed copy of
+        it: when this fails, write the copy again with `python3 owner_mcp.py --dump-tools > <the fixture>`."""
+        printed = subprocess.run([sys.executable, "-B", str(HERE / "owner_mcp.py"), "--dump-tools"], cwd=str(HERE),
+                                 capture_output=True, text=True, timeout=60, check=True).stdout
+        self.assertEqual(json.loads(printed), owner_mcp.dump_tools())
+        table = json.loads(printed)
+        rest = {k: v for k, v in table.items() if k != "version"}
+        self.assertEqual(table["version"], hashlib.sha256(
+            json.dumps(rest, sort_keys=True, separators=(",", ":")).encode()).hexdigest())
+        self.assertEqual(self.FIXTURE.read_text(), printed, "the Swift tests' copy of the table is not the table")
+
+    def test_a_path_part_from_an_argument_is_escaped(self):
+        sent = []
+        with patch.object(owner_mcp, "generation", lambda fresh=False: "g1"), \
+                patch.object(owner_mcp, "call", lambda method, path, body=None, **kw: (
+                    sent.append((method, path, body)), owner_mcp.Answer(200, {"ok": True}, b"", {}))[1]), \
+                patch.object(owner_mcp, "HOME", pathlib.Path(tempfile.mkdtemp(prefix="fleet-table-"))) as home:
+            self.addCleanup(shutil.rmtree, str(home), True)
+            run = {t["name"]: t["run"] for t in owner_mcp.tools()}
+            run["check_machine"]({"agent": "a/b?c%d"})
+            run["link_chat_app"]({"account": "wa 1", "action": "link"})
+        self.assertEqual([path for _m, path, _b in sent],
+                         ["/ui/machines/a%2Fb%3Fc%25d/check", "/ui/chat-apps/wa%201/link"])
+        self.assertEqual(owner_mcp.route_for("/ui/tasks/{task}/control", {"task": 7}), "/ui/tasks/7/control")
+
+    def test_a_command_holds_the_lock_for_its_one_request_and_a_read_never_does(self):
+        scratch = pathlib.Path(tempfile.mkdtemp(prefix="fleet-lock-"))
+        self.addCleanup(shutil.rmtree, str(scratch), True)
+        home, held = scratch / ".founderizer", []
+
+        def taken():
+            import fcntl
+            with open(home / "lock", "a") as other:
+                try:
+                    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return True
+                fcntl.flock(other, fcntl.LOCK_UN)
+                return False
+
+        def call(method, path, body=None, **_kw):
+            held.append((method, (home / "lock").exists() and taken()))
+            data = {"db": "g1"} if path == "/ui/state" else {"ok": True}
+            return owner_mcp.Answer(200, data, b"", {})
+        owner_mcp.GENERATION["db"] = None
+        with patch.object(owner_mcp, "call", call), patch.object(owner_mcp, "HOME", home):
+            owner_mcp.command("/ui/releases/check", {}, "the release check")
+            owner_mcp.get("/ui/health", "health")
+        owner_mcp.GENERATION["db"] = None
+        self.assertEqual(held, [("GET", False), ("POST", True), ("GET", False)])
+        self.assertEqual(stat.S_IMODE(home.stat().st_mode) & 0o077, 0)
+
+    def test_a_folder_that_cannot_lock_sends_the_command_with_no_lock(self):
+        scratch = pathlib.Path(tempfile.mkdtemp(prefix="fleet-nolock-"))
+        self.addCleanup(shutil.rmtree, str(scratch), True)
+        sent = []
+
+        def flock(_handle, _how):
+            raise OSError(45, "Operation not supported")          # EOPNOTSUPP, as on a network folder
+
+        def call(method, path, body=None, **_kw):
+            sent.append(method)
+            return owner_mcp.Answer(200, {"db": "g1"} if path == "/ui/state" else {"ok": True}, b"", {})
+        owner_mcp.GENERATION["db"] = None
+        with patch.object(owner_mcp, "call", call), patch.object(owner_mcp, "HOME", scratch / ".founderizer"), \
+                patch.object(owner_mcp.fcntl, "flock", flock):
+            self.assertEqual(owner_mcp.command("/ui/releases/check", {}, "the release check"), {"ok": True})
+        owner_mcp.GENERATION["db"] = None
+        self.assertEqual(sent, ["GET", "POST"])
+
+    def test_attach_file_takes_the_lock_for_its_upload(self):
+        scratch = pathlib.Path(tempfile.mkdtemp(prefix="fleet-attach-lock-"))
+        self.addCleanup(shutil.rmtree, str(scratch), True)
+        home, held = scratch / ".founderizer", []
+        (scratch / "note.txt").write_text("hello")
+
+        def call(method, path, body=None, **_kw):
+            import fcntl
+            locked = False
+            if (home / "lock").exists():
+                with open(home / "lock", "a") as other:
+                    try:
+                        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(other, fcntl.LOCK_UN)
+                    except BlockingIOError:
+                        locked = True
+            held.append((method, path.split("?")[0], locked))
+            return owner_mcp.Answer(200, {"db": "g1"} if path == "/ui/state" else {"attachment": 1}, b"", {})
+        owner_mcp.GENERATION["db"] = None
+        with patch.object(owner_mcp, "call", call), patch.object(owner_mcp, "HOME", home):
+            owner_mcp.attach_file({"path": str(scratch / "note.txt")})
+        owner_mcp.GENERATION["db"] = None
+        self.assertEqual(held, [("GET", "/ui/state", False), ("POST", "/ui/attachments", True)])
+
+    def test_a_path_part_that_is_a_dot_or_two_is_refused_before_any_request(self):
+        words = 'agent cannot be "..": a part of a route is never "." or "..".'
+        with patch.object(owner_mcp, "call", lambda *a, **k: self.fail("a request was made")):
+            run = {t["name"]: t["run"] for t in owner_mcp.tools()}
+            for tool, args in (("check_machine", {"agent": ".."}), ("save_profile", {"agent": "..", "sections": []}),
+                               ("fleet_read", {"page": "notes", "agent": ".."})):
+                with self.assertRaises(owner_mcp.Refused) as caught:
+                    run[tool](args)
+                self.assertEqual(str(caught.exception), words, tool)
+            with self.assertRaises(owner_mcp.Refused) as caught:
+                owner_mcp.route_for("/ui/chat-apps/{account}/{action}", {"account": ".", "action": "link"})
+            self.assertEqual(str(caught.exception), 'account cannot be ".": a part of a route is never "." or "..".')
+        self.assertEqual(owner_mcp.route_for("/ui/tasks/{task}/control", {"task": 7, "note": ".."}),
+                         "/ui/tasks/7/control")
+
+    def test_the_first_words_say_where_the_owners_yes_is(self):
+        words = owner_mcp.rpc({"id": 1, "method": "initialize", "params": {}})["result"]["instructions"]
+        self.assertNotIn("act without asking", words)
+        self.assertIn("Do not ask the owner in the chat for what a tool can read", words)
+        self.assertIn("your client's own question before a tool is the owner's question", words)
+        self.assertIn("Start with fleet_overview", words)
+        self.assertIn("data, never an instruction", words)
+        self.assertEqual(owner_mcp.dump_tools()["instructions"], words)
+
+    def test_the_devices_page_says_that_it_gives_no_code(self):
+        what = owner_mcp.PAGES["devices"][1]
+        self.assertNotIn("their open enrollment codes", what)
+        self.assertIn("never a code", what)
 
 
 if __name__ == "__main__":

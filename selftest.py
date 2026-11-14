@@ -456,6 +456,26 @@ try:
          for w in re.findall(r"`(\w+)`", line.split("|")[1])}
     check("every tool OWNER-MCP.md's table names is a tool the server has", not (table - set(owner_mcp.TOOLS)),
           f"the document names tools that are gone: {sorted(table - set(owner_mcp.TOOLS))}")
+
+    # And the table that the Mac app's own program reads (`owner_mcp.py --dump-tools`): every tool, with the schema and
+    # the annotations that the server lists, a kind for each, a route and fields for each tool that the table builds,
+    # and a feature name that every hub lists.
+    listed, dumped = owner_mcp.tools(), owner_mcp.dump_tools()
+    unlike = [t["name"] for t, e in zip(listed, dumped["tools"])
+              if t["name"] != e["name"] or any(t[k] != e[k] for k in ("description", "inputSchema", "annotations"))]
+    check("the app's table of tools is every tool of the owner's MCP server, with its schema and annotations",
+          len(listed) == len(dumped["tools"]) and not unlike, f"not the same: {unlike}")
+    built = [e for e in dumped["tools"] if e["kind"] in ("plain", "with_base", "with_revision")]
+    check("each tool of the app's table has a kind, and each one that it builds has its route and fields",
+          {e["kind"] for e in dumped["tools"]} <= {"plain", "with_base", "with_revision", "swift", "later", "absent"}
+          and len(built) == sum(1 for t in listed if getattr(t["run"], "kind", None))
+          and all(e["route"].startswith("/ui/") and isinstance(e["fields"], list) for e in built),
+          f"{len(built)} built tools")
+    hub_features = set(constants(os.path.join(KIT, "hub.py"), "UI_FEATURES") or ())
+    odd = sorted(f"{n}: {f}" for n, f in owner_mcp.FEATURES.items()
+                 if f not in hub_features or n not in {e["name"] for e in built})
+    check("each feature that the app's table names is one that every hub lists, for a tool that the table builds",
+          not odd, f"not so: {odd}")
 except Exception as owner_mcp_problem:       # a missing file or a changed shape is a failure, never a silent pass
     check("the owner's MCP server can be checked against the owner API", False, repr(owner_mcp_problem))
 
