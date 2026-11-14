@@ -106,6 +106,7 @@ RENDERED_FILE = STATE + "/rendered.json"    # the GitOps repositories whose comm
 APPROVALS_FILE = STATE + "/approvals.json"  # the owner's signed yeses for exact calls that are his, from the hub
 APPROVED_FILE = STATE + "/approved.json"    # the yeses that were used: each lets its one call through once
 APPROVAL_DAYS = 7                           # a signed yes older than this lets nothing through
+TASK = re.compile(r"T-[1-9][0-9]{0,17}")    # a task's code, as a caller names the task that it works in
 YES_READ_EVERY = 2                          # seconds between two reads of the hub's signed statements that a call
                                             # asks for (Door.yes_read): a caller that repeats a refused call asks the
                                             # hub no more often than this
@@ -982,8 +983,12 @@ class Door:
             raise door_providers.Stop(f"the door holds no value of {key_id}") from None
 
     # ---- one call
-    def call(self, address, target, op, args, content=None):
-        """{ok, kind, out, why, n}: what the agent at this address reads."""
+    def call(self, address, target, op, args, content=None, task=None):
+        """{ok, kind, out, why, n}: what the agent at this address reads. task: the task that the caller says it works
+        in (ops sends it), which the record keeps beside the call, as the caller's own word and nothing more: it
+        decides nothing."""
+        task = task if isinstance(task, str) and TASK.fullmatch(task) else None
+        noted = {"task": task} if task else {}
         agent = self.caller(address)
         if agent is None:
             n = self.record.add(caller=address, target=target, action=op, kind="refused", outcome="refused",
@@ -1038,7 +1043,7 @@ class Door:
                 d.why = f"{agent}'s own call, which it answers for: {d.why}"
         if d.kind == "refused":
             n = self.record.add(caller=agent, target=target, action=op, kind="refused", outcome="refused",
-                                why=d.why[:300], sha256=sha)
+                                why=d.why[:300], sha256=sha, **noted)
             answer = {"ok": False, "kind": "refused", "why": d.why, "n": n, "route": "yes" if hashed else
                       d.route if d.route in ROUTES else "none"}
             if hashed:
@@ -1056,8 +1061,11 @@ class Door:
             ok, outcome, out = False, "failed", str(e)
             ran = str(e) if isinstance(e, RunFailed) else None
         made = ((d.plan or {}).get("repo_new") or {}).get("name") if ok else None     # N3: what the call made
+        if ok and d.form == "look":     # how much of the host went back to the caller: the count, never the bytes
+            noted = dict(noted, bytes=len(out.encode("utf-8", "replace")))
         n = self.record.add(caller=agent, target=target, action=op, kind=d.kind, outcome=outcome,
-                            why=(f"{ran}. {d.why}" if ran else d.why)[:300], sha256=sha, **({"made": made} if made else {}))
+                            why=(f"{ran}. {d.why}" if ran else d.why)[:300], sha256=sha, **({"made": made} if made else {}),
+                            **noted)
         return {"ok": ok, "kind": d.kind, "out" if ok else "why": out, "n": n}
 
     def run(self, agent, access, d, op, args, content):
@@ -2256,7 +2264,7 @@ class Handler(BaseHTTPRequestHandler):
                     content = base64.b64decode(data["content"], validate=True)
                 except (ValueError, TypeError):
                     return self.answer(400, {"error": "content is base64"})
-            result = self.door.call(self.source(), target, op, args, content)
+            result = self.door.call(self.source(), target, op, args, content, data.get("task"))
             return self.answer(200 if result["ok"] else 403 if result["kind"] == "refused" else 502, result)
         if self.path == "/github/token":
             if not self.door.hub_allowed(self.source(), self.bearer(), "token_sha256"):

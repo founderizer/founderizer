@@ -162,6 +162,13 @@ class ServerKind(Access):
         text = hub.holdings_start_text("vps")
         self.assertIn("servers through the door, each with `ops <server> <action>`", text)
         self.assertIn("web-1 (fix)", text)
+        # incident intake, part 3: the holder at Fix reads the server's files itself, and its start says so
+        self.assertIn("at fix, `ops <server> look --content <script>` reads its files and its apps' logs", text)
+        self.grant(level="read")
+        text = hub.holdings_start_text("vps")
+        self.assertIn("web-1 (read)", text)
+        self.assertNotIn("look --content", text)
+        self.grant(level="fix")
         # and its colleagues read who holds the server, so that server work goes to it (RULES.md, "Find a colleague")
         self.assertIn("servers through the door web-1 (fix)", hub.colleague_line("vps"))
         self.assertNotIn("servers through the door", hub.colleague_line("studio"))

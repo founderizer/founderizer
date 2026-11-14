@@ -52,7 +52,7 @@ VENDOR_REPOS = ("founderizer/founderizer", "founderizer/founderizer-apps", "migu
 DOOR_ONLY = {"self-update", "place", "pro-attach", "runner-register"}
 # Host forms whose content goes to the host on stdin, with its sha256, and the forms whose value the door itself sends
 # there (new-projects plan N4): never the caller's.
-HOST_CONTENT = ("file", "unit-new", "vhost-new", "script", "run")
+HOST_CONTENT = ("file", "unit-new", "vhost-new", "script", "run", "look")
 DOOR_VALUE = ("env-new", "env-add")
 # Host forms that arm the rollback timer before they run, whatever they do: a host that answers the door after one of
 # them did not lock the door out, so the door ends the countdown then (door.py, Door.timer_off).
@@ -242,6 +242,9 @@ def decide_host(access, agent, me, host, op, args, never, content=None, lookups=
     if op not in OPS_ROOT.FORMS:
         return refused(f"{op} is not listed for a host: `help` lists the forms", **common)
     if level != "fix":
+        if op == "look":            # incident intake, part 3: the wide read is the Fix holder's, who can write there
+            return refused(f"{agent} holds Read on {host}: look reads a host's files for the agent that holds it at "
+                           f"Fix", **dict(common, **lacks))
         return refused(f"{agent} holds Read on {host}: no write", **dict(common, **lacks))
     try:
         checked = OPS_ROOT.check_args(op, list(args))
@@ -271,6 +274,15 @@ def decide_host(access, agent, me, host, op, args, never, content=None, lookups=
         return refused(f"{op} takes its bytes as the call's content", **common)
     f = OPS_ROOT.FORMS[op]
     more = dict(common, form=op, args=checked, window=f["window"], reboot=f["reboot"], write=f["write"], value=value)
+    if f["kind"] == "look":
+        # The holder's wide read (incident intake, part 3): a script that reads the host's files in a box with no
+        # write and no network, which the host builds and proves itself (ops-root, look_box and look_proved). It is
+        # a read: no yes of the owner, no hash for one, no window, no host lock and no rollback timer.
+        if h.get("mode") != "fix":
+            return refused(f"{host} is rule-only: it holds the fleet's own keys, and no look runs there", **more)
+        if me.get("business") != h.get("business"):     # as Full access asks it (door.Door.full_access)
+            return refused(f"{host} is a server of another business than {agent}'s: no look there", **more)
+        return Decision("read", "the holder's wide read: a script in a box with no write and no network", **more)
     if f["kind"] in ("own", "full"):
         if h.get("mode") != "fix":          # Patch only is code's: no yes of the owner lifts it, so no hash asks for it
             return refused(f"{host} is rule-only: only rule forms run there, and no file install", **more)

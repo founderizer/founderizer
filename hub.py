@@ -3768,8 +3768,11 @@ def holdings_parts(agent):
         parts.append("MCP servers " + named_few(sorted(a["tools"])))
     if a.get("servers"):        # DevOps plan C4: through the door, with the one command that reaches it
         parts.append("servers through the door, each with `ops <server> <action>` (`ops <server> help` lists its "
-                     "forms, `ops status` what the door gives you): " +
-                     named_few(f"{h} ({v})" for h, v in sorted(a["servers"].items())))
+                     "forms, `ops status` what the door gives you" +
+                     # incident intake, part 3: the holder at Fix reads a server's files itself, with no item
+                     ("; at fix, `ops <server> look --content <script>` reads its files and its apps' logs with a "
+                      "bash script that changes nothing, with nobody's yes" if "fix" in a["servers"].values() else "") +
+                     "): " + named_few(f"{h} ({v})" for h, v in sorted(a["servers"].items())))
     keys = [name for _, name in session_variables(agent)]       # none for an agent with no vault broker
     gone = [k for k in keys if k in vault_missing(agent)]        # C11: not given at its vault's last session read
     if len(gone) < len(keys):

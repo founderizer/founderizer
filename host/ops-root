@@ -40,11 +40,12 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 
-VERSION = 2                 # the floor: self-update takes only a file whose VERSION is not lower
+VERSION = 3                 # the floor: self-update takes only a file whose VERSION is not lower
 ROOT = ""                   # a prefix for every path below, which only the tests set
 ETC = "/etc/ops-root"
 MODE_FILE = ETC + "/mode"                   # fix | rule-only
@@ -511,6 +512,7 @@ CHECKS = {
     "env-add": lambda a: check_env(a, "env-add"),
     "runner-new": lambda a: [check_app_name(one(a, "runner-new", "the app's name"))],
     "vhost-new": lambda a: [check_app_name(one(a, "vhost-new", "the app's name"))],
+    "hide": lambda a: check_hide(a),
 }
 
 
@@ -889,16 +891,17 @@ def do_place(req, data):
     if len(hits) != 1:
         raise Refused(f"{path} has no one line {name}= whose value has that hash: nothing was placed")
     lines[hits[0]] = f"{name}={value}"
-    fd, temp = tempfile.mkstemp(dir=os.path.dirname(P(path)), prefix=".ops-root-")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-        os.chown(temp, st.st_uid, st.st_gid)
-        os.chmod(temp, stat.S_IMODE(st.st_mode))
-        os.replace(temp, P(path))
-    finally:
-        with contextlib.suppress(OSError):
-            os.remove(temp)
+    with look_writes():         # the key's new value is in a temporary file, then in a file that a look hides by itself
+        fd, temp = tempfile.mkstemp(dir=os.path.dirname(P(path)), prefix=".ops-root-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            os.chown(temp, st.st_uid, st.st_gid)
+            os.chmod(temp, stat.S_IMODE(st.st_mode))
+            os.replace(temp, P(path))
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(temp)
     return f"{name} in {path} has its new value"
 
 
@@ -1001,6 +1004,682 @@ def do_run(req, data):
     return run_script("run", req, data, boxed=False)
 
 
+# ---- look: the holder's wide read (incident intake, part 3)
+#
+# A bash script that reads this host's files and can change nothing and reach nothing: the call of the agent that holds
+# the host at Fix, alone, with no yes of the owner, no rollback timer, no host lock and no window. It runs in a
+# transient service as a user of its own, whose one right is to read the files of every owner, in a box with no
+# network, no socket and no write. What it never reads (look_deny): the key stores, the stores of databases and
+# containers, the settings files with secrets by what a unit says and by their names, the dot entries of each home,
+# and this host's own list. A name is a list, and a list can miss a file: SECURITY.md says what that leaves open.
+
+LOOK_SECONDS = 120          # the unit's own limit (RuntimeMaxSec): a look that its ops-root lost ends by it too
+LOOK_OUT = 256 * 1024       # characters of a look's answer, the end kept
+LOOK_PATHS = 4000           # paths that one unit hides; over it, the deepest folders with the most of them go whole
+LOOK_WALK = 400000          # entries that the walk of one look reads; what it did not reach is hidden whole
+LOOK_WAIT = 30              # seconds that a look waits for a write of this file that runs, before it is refused
+LOOK_LIST_SECONDS = 20      # and the seconds of that walk: a write of this file waits while a look makes its list
+LOOK_MATCHES = 50           # secret names right in one folder; over it, the folder is hidden whole
+LOOK_HOME = 400             # dot entries of one home
+LOOK_CONTAINERS = 200       # containers whose logs one look reads
+LOOK_LOCK = "/run/ops-root.look.lock"       # a look holds it shared; a write of a file here (replace) takes it alone
+LOOK_GATE = "/run/ops-root.look.gate"       # a write takes it before it waits, so looks that overlap do not hold it up
+LOOK_RUN = "/run/ops-root-look"             # each running look's script, and its mark
+LOOK_UNIT = "ops-root-look-"
+LOOK_STATE = "look"                         # under STATE: what the box's own test said, for this version and boot
+LOOK_CHECK = "/var/lib/ops-root-look-check" # the test's own folder outside the hidden ones, for the time of the test
+# The key stores of every host, and this file's own folders: every entry of HIDDEN that is no app tree, and more.
+LOOK_KEYS = tuple(p for p in HIDDEN if p not in ("/var/www", "/srv", "/opt", "/home")) + (
+    "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-", "/etc/security/opasswd", "/etc/sudoers",
+    "/etc/sudoers.d", "/etc/ssh", "/etc/wireguard", "/etc/netplan", "/run/netplan", "/run/systemd/network",
+    "/etc/openvpn", "/etc/ipsec.secrets", "/etc/ipsec.d", "/etc/krb5.keytab", "/run/secrets", "/run/credentials",
+    "/run/user", "/run/systemd/transient", "/var/lib/systemd/credential.secret", "/var/lib/systemd/coredump",
+    "/var/crash", "/var/lib/cloud", "/run/cloud-init", "/etc/apt/auth.conf", "/etc/apt/auth.conf.d",
+    "/var/lib/ubuntu-advantage", "/etc/postfix/sasl_passwd", "/etc/postfix/sasl_passwd.db", "/etc/mysql/debian.cnf",
+    "/etc/redis", "/etc/gitlab-runner", "/etc/rclone", "/etc/borgmatic", "/etc/borgmatic.d", "/etc/pgbackrest",
+    "/etc/pgbackrest.conf",
+    ETC, STATE, BACKUPS, "/var/lib/ops-agent", CI_STATE, LOCK_FILE, LOOK_LOCK, LOOK_GATE,
+    "/var/lib/mongodb", "/var/lib/clickhouse", "/var/lib/elasticsearch", "/var/lib/opensearch", "/var/lib/rabbitmq",
+    "/var/lib/grafana", "/var/lib/influxdb", "/var/lib/cassandra", "/var/lib/pgsql", "/var/lib/etcd",
+    "/run/docker", "/var/lib/containers", "/var/snap/docker", "/var/lib/rancher", "/etc/rancher", "/var/lib/kubelet",
+    "/etc/kubernetes", "/var/lib/lxd", "/var/lib/libvirt",
+    "/dev/shm", "/dev/mqueue", "/dev/pts", "/dev/hugepages",
+    # root's own views into the kernel and into other processes, which the right to read every file opens
+    "/sys/kernel/debug", "/sys/kernel/tracing", "/sys/kernel/security", "/sys/firmware/efi/efivars", "/sys/fs/bpf",
+    "/sys/fs/pstore")
+# A file with one of these names holds a secret more often than not, wherever it is: the name in lower case.
+LOOK_NAMES = (
+    ".env", ".env.*", ".env-*", "env.*", "*.env", ".envrc", "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "*.keystore",
+    "*.ppk", "id_rsa*", "id_ed25519*", "id_ecdsa*", "id_dsa*", ".npmrc", ".netrc", ".pgpass", ".my.cnf",
+    ".git-credentials", ".htpasswd", ".dockercfg", "auth.json", "credentials*", ".credentials*", "*-credentials.json",
+    "service-account*.json", "secrets.*", "kubeconfig", "*.kubeconfig", "terraform.tfstate*", "*.tfvars",
+    "wp-config.php", "appsettings*.json", "web.config", "database.yml", "application.properties", "application*.yml",
+    "application*.yaml", "parameters.yml", "local_settings.py", "acme.json", "alertmanager.yml", "alertmanager.yaml",
+    "grafana.ini", "*.sqlite", "*.sqlite3", "*.db", "*.sql", "*.sql.gz", "*.dump")
+# A folder with one of these names is hidden whole and not walked: a store of keys, or a mass of files that the
+# agent has in its repository, whose test keys would fill the list.
+LOOK_DIRS = frozenset(("secrets", ".ssh", ".aws", ".gnupg", ".docker", ".kube", ".azure", ".terraform",
+                       "actions-runner", "node_modules", "vendor", ".venv", "venv", "site-packages", "dist-packages",
+                       ".git", "__pycache__"))
+LOOK_DATA = frozenset(("PG_VERSION", "ibdata1"))        # a file of a database's own folder, wherever that folder is
+# Not walked: what the system's packages installed, and what is no file on a disk.
+LOOK_SKIP = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/boot", "/snap", "/proc", "/sys",
+             "/dev", "/lost+found")
+LOOK_NOT_SKIPPED = ("/usr/local", "/usr/src", "/usr/share/nginx")       # where an app can be under /usr
+LOOK_PSEUDO = frozenset(("proc", "sysfs", "devtmpfs", "devpts", "cgroup", "cgroup2", "securityfs", "debugfs",
+                         "tracefs", "configfs", "pstore", "bpf", "mqueue", "hugetlbfs", "autofs", "binfmt_misc",
+                         "fusectl", "efivarfs", "nsfs", "squashfs", "rpc_pipefs", "selinuxfs"))
+LOOK_NETWORK = re.compile(r"nfs[0-9]?|cifs|smb[0-9]?|smbfs|ceph|glusterfs|9p|afs|ocfs2|lustre|davfs|ncpfs|"
+                          r"fuse\.(sshfs|s3fs|rclone|gcsfuse|glusterfs|ceph|davfs2?|goofys|blobfuse2?)")
+LOOK_UNITS = ("/etc/systemd/system", "/run/systemd/system", "/usr/local/lib/systemd/system", "/usr/lib/systemd/system",
+              "/lib/systemd/system")
+LOOK_OWN_UNITS = LOOK_UNITS[:3]         # written on this host: one that holds a value itself is hidden
+LOOK_UNIT_ENDS = (".service", ".socket", ".timer", ".mount", ".path", ".conf")
+LOOK_NO_HOME = frozenset(("/", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/sbin", "/usr/games", "/dev", "/proc",
+                          "/sys", "/etc", "/var", "/run", "/tmp", "/nonexistent", "/var/empty"))
+LOOK_SAFE = re.compile(r"(?:/[\w.@+,:=~^#-]+)+")       # a path that goes into a unit's property as it is
+LOOK_NEVER = re.compile(r"[\x00-\x1f\x7f]")             # what no property takes, quoted or not: its folder is hidden
+HIDE_MAX = 500                                          # lines of this host's own list
+# hide takes no path that a box runs from or that this host's own programs read: a hidden one would stop every look,
+# script and command of the door here, and no form takes a path out of the list again
+HIDE_NEVER = ("/etc/systemd", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf", "/etc/ld.so.cache", "/etc/ld.so.conf",
+              "/etc/ld.so.conf.d", "/etc/alternatives", "/etc/ssl/certs", "/var/lib/dpkg", "/var/lib/apt", "/var/log",
+              "/var/lib/systemd", "/run/systemd", "/run/dbus", "/run/ops-root-look", "/etc/hosts", "/etc/resolv.conf",
+              "/etc/host.conf", "/etc/gai.conf", "/etc/machine-id", "/etc/dbus-1", "/var/lib/dbus", "/etc/localtime",
+              "/etc/os-release")
+
+
+def look_mounts():
+    """{mount point: file system} of this host, from its own table."""
+    out = {}
+    for line in read("/proc/self/mounts").splitlines():
+        parts = line.split(" ")
+        if len(parts) >= 3 and parts[1].startswith("/"):
+            out[parts[1].replace("\\040", " ")] = parts[2]
+    return out
+
+
+LOOK_SPECIFIERS = {"%E": "/etc", "%t": "/run", "%S": "/var/lib", "%C": "/var/cache", "%L": "/var/log", "%h": "/root",
+                   "%%": "%"}
+
+
+def look_units():
+    """(paths, unit files): the files that a unit of this host names as its settings or its credentials
+    (EnvironmentFile=, LoadCredential=), and the unit files written on this host that hold a value themselves
+    (Environment=, SetCredential=), which are hidden too. A unit file that is a link (systemctl link) is read where
+    it leads, and that file is the one that is hidden."""
+    paths, own = [], []
+    for top in LOOK_UNITS:
+        for folder, _folders, files in os.walk(P(top)):
+            for name in sorted(files):
+                full = os.path.join(folder, name)
+                if not name.endswith(LOOK_UNIT_ENDS) or not os.path.isfile(full):
+                    continue
+                try:
+                    with open(full, encoding="utf-8", errors="replace") as f:
+                        text = f.read(256 * 1024)
+                except OSError:
+                    continue
+                holds = False
+                for line in text.replace("\\\n", " ").splitlines():      # a line that goes on after a backslash
+                    key, _, value = line.strip().partition("=")
+                    key, value = key.strip(), value.strip()
+                    if key == "EnvironmentFile":
+                        paths += look_named(value.lstrip("-"))
+                    elif key in ("LoadCredential", "LoadCredentialEncrypted"):
+                        paths += look_named(value.partition(":")[2])
+                    elif key in ("Environment", "SetCredential", "SetCredentialEncrypted") and value:
+                        holds = True
+                listed = full[len(ROOT):] if ROOT else full
+                shown = real(listed) if os.path.islink(full) else listed       # where a link really leads
+                if holds and listed.startswith(tuple(t + "/" for t in LOOK_OWN_UNITS)):
+                    paths.append(shown)
+                    own.append(shown)
+    return paths, own
+
+
+def look_named(path):
+    """The files that a unit's path names: the path itself, without its quotes, or what it matches when it has a
+    specifier that this file does not know (%i, %p)."""
+    path = path.strip()
+    if len(path) > 1 and path[0] == path[-1] and path[0] in "\"'":
+        path = path[1:-1]
+    for sign, folder in LOOK_SPECIFIERS.items():
+        path = path.replace(sign, folder if sign != "%%" else "\0")
+    if not path.startswith("/"):
+        return []
+    path = os.path.normpath(path)
+    if "%" not in path:
+        return [path.replace("\0", "%")]
+    import glob
+    pattern = re.sub(r"%.", "*", glob.escape(P(path)).replace("[%]", "%")).replace("\0", "[%]")
+    return [(p[len(ROOT):] if ROOT else p) for p in sorted(glob.glob(pattern))[:LOOK_MATCHES]]
+
+
+def look_homes():
+    """The dot entries of the home of each account of this host: its keys, its histories and its tools' logins."""
+    paths = []
+    for line in read("/etc/passwd").splitlines():
+        parts = line.split(":")
+        home = os.path.normpath(parts[5]) if len(parts) > 5 and parts[5].startswith("/") else None
+        if not home or home in LOOK_NO_HOME:
+            continue
+        try:
+            with os.scandir(P(home)) as entries:
+                dots = sorted(e.name for e in entries if e.name.startswith(".") and not e.is_symlink())
+        except OSError:
+            continue
+        paths += [home + "/" + name for name in dots[:LOOK_HOME]]
+        if len(dots) > LOOK_HOME:
+            paths.append(home)
+    return paths
+
+
+def look_names(known):
+    """(paths, whole): the files with a secret's name and the folders with a store's name, on each file system of this
+    host that is a disk of its own, found by one walk that follows no link. `known`: what is hidden already, which is
+    not walked. A file system of another machine is hidden and not walked. whole: the folders that are hidden whole
+    because they hold more such names than LOOK_MATCHES, or because the walk's count of entries was spent before it
+    reached them: the answer of a look names them."""
+    mounts, found, whole, left = look_mounts(), [], [], LOOK_WALK
+    stack = [p for p in LOOK_NOT_SKIPPED if p not in known] + ["/"]
+    skip = (set(LOOK_SKIP) | set(known)) - set(LOOK_NOT_SKIPPED)
+    end = time.monotonic() + LOOK_LIST_SECONDS
+    while stack:
+        folder = stack.pop()
+        try:
+            with os.scandir(P(folder)) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError:
+            continue
+        left -= len(entries) + 1
+        if left < 0 or time.monotonic() > end:      # the count or the time is spent: this folder and each one that
+            #                                         still waits go whole
+            rest = [folder] + stack
+            if "/" in rest:             # before the walk read anything: there is no list, so there is no look
+                raise Refused("this host's files could not be read in time to know what a look must not read")
+            return found + rest, whole + rest
+        if folder != "/" and any(e.name in LOOK_DATA for e in entries):
+            found.append(folder)        # a database's own folder
+            continue
+        matches, later = [], []
+        for e in entries:
+            path = folder.rstrip("/") + "/" + e.name
+            if e.is_symlink() or path in skip:
+                continue
+            low = e.name.lower()
+            if e.is_dir(follow_symlinks=False):
+                kind = mounts.get(path, "")
+                if LOOK_NETWORK.fullmatch(kind) or low in LOOK_DIRS:
+                    matches.append(path)
+                elif kind not in LOOK_PSEUDO or path in LOOK_NOT_SKIPPED:
+                    later.append(path)
+            elif any(fnmatch.fnmatchcase(low, pattern) for pattern in LOOK_NAMES) or \
+                    (low == "config.php" and folder.endswith("/bootstrap/cache")):
+                matches.append(path)
+        if len(matches) > LOOK_MATCHES and folder.count("/") >= 2:
+            found.append(folder)
+            whole.append(folder)
+        else:
+            found += matches
+            stack += reversed(later)
+    return found, whole
+
+
+def look_docker():
+    """(Docker's folder, its containers' log files, "<id>=<name>" of each): the folder is hidden whole behind an empty
+    one, and each container's log is bound back at its own path, so that a container that starts during a look shows
+    nothing of its settings."""
+    root = "/var/lib/docker"
+    try:
+        conf = json.loads(read("/etc/docker/daemon.json") or "{}")
+        named = conf.get("data-root") or conf.get("graph") if isinstance(conf, dict) else None
+    except ValueError:
+        named = None
+    if isinstance(named, str) and LOOK_SAFE.fullmatch(named) and ".." not in named:
+        root = os.path.normpath(named)
+    logs, names = [], []
+    try:
+        ids = sorted(os.listdir(P(root + "/containers")))
+    except OSError:
+        return (root if os.path.isdir(P(root)) else None), [], []
+    for cid in [c for c in ids if SHA256.fullmatch(c)][:LOOK_CONTAINERS]:
+        log = f"{root}/containers/{cid}/{cid}-json.log"
+        if not plain(log):
+            continue
+        logs.append(log)
+        try:
+            name = json.loads(read(f"{root}/containers/{cid}/config.v2.json") or "{}").get("Name")
+        except (ValueError, AttributeError):
+            name = None
+        names.append(f"{cid[:12]}={re.sub(r'[^A-Za-z0-9_.-]', '', str(name or ''))[:60]}")
+    return root, logs, names
+
+
+def look_fewer(paths, limit):
+    """(paths, whole): at most `limit` of them, by hiding whole the folders that hold the most of them, the deepest
+    ones first, one pass for each depth. The list never fails for its size: a host with more secret names than a
+    unit can hide loses the sight of the folders that hold them."""
+    paths, whole = set(paths), []
+    if len(paths) <= limit:
+        return sorted(paths), whole
+    cuts = {p: [i for i, c in enumerate(p) if c == "/"] for p in paths}
+    depth = max(len(c) for c in cuts.values()) - 1
+    while len(paths) > limit and depth >= 1:
+        groups = {}
+        for p in paths:
+            if len(cuts[p]) > depth:            # a path below a folder of this depth
+                groups.setdefault(p[:cuts[p][depth]], []).append(p)
+        for folder, members in sorted(groups.items(), key=lambda g: (-len(g[1]), g[0])):
+            if len(paths) <= limit or len(members) < 2:
+                break
+            paths.difference_update(members)
+            paths.add(folder)
+            cuts[folder] = cuts[members[0]][:depth]
+            whole.append(folder)
+        depth -= 1
+    if len(paths) > limit:      # more secret names right under / than a unit hides: no real host, and no box for it
+        raise Refused(f"this host has more than {limit} paths to hide at the top of its folders: no look runs here")
+    return sorted(paths), whole
+
+
+def look_deny():
+    """{"paths", "whole", "units", "docker", "logs", "containers"}: what one look does not read, made for that look."""
+    docker, logs, containers = look_docker()
+    fixed = [p for p in tuple(LOOK_KEYS) + tuple(hidden_paths()) if p not in ("/var/www", "/srv", "/opt", "/home")]
+    declared, units = look_units()
+    names, whole = look_names(set(fixed) | ({docker} if docker else set()))
+    safe = set()
+    for path in fixed + declared + look_homes() + names:
+        path = os.path.normpath(path)
+        named = path
+        while path != "/" and LOOK_NEVER.search(path):      # a name that no property of a unit takes: its folder
+            path = os.path.dirname(path)
+        if path != "/" and path != docker and not (docker and path.startswith(docker + "/")):
+            safe.add(path)
+            if path != named:
+                whole.append(path)
+    # a path under a folder that is hidden already says nothing more
+    paths = [p for p in safe if not any(p[:i] in safe for i in range(1, len(p)) if p[i] == "/")]
+    paths, more = look_fewer(paths, LOOK_PATHS)
+    return {"paths": paths, "whole": sorted(set(whole + more) & set(paths)), "units": units, "docker": docker,
+            "logs": logs, "containers": containers}
+
+
+def look_word(path):
+    """One path as one word of a unit's property. systemd reads a property's value as words, with quotes: a name
+    with a space, a quote or a backslash goes in double quotes, with its quotes and backslashes escaped, so that it
+    stays one path and hides what it names, and never another path."""
+    if LOOK_SAFE.fullmatch(path.removeprefix("-")):
+        return path
+    return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def look_box(unit, deny):
+    """systemd-run's argv for the transient service of one look. Each property closes one way out of the box or
+    back to a hidden path; look_check tries each of them on this host before the first look runs here."""
+    props = [
+        "DynamicUser=yes",                      # a user of its own, which owns nothing on this host
+        "AmbientCapabilities=CAP_DAC_READ_SEARCH", "CapabilityBoundingSet=CAP_DAC_READ_SEARCH",    # it reads, no more
+        "NoNewPrivileges=yes", "RestrictSUIDSGID=yes", "RestrictNamespaces=yes", "LockPersonality=yes",
+        "ProtectSystem=strict", "ProtectHome=read-only",        # strict alone leaves /home open to a write
+        # a user of its own brings a /tmp of its own on this host's disk, which a script could fill: both are closed,
+        # and the script's room for its own files is 64 MiB of memory, which the unit's limit of memory counts
+        "ReadOnlyPaths=/ /tmp /var/tmp", f"TemporaryFileSystem={LOOK_RUN}/tmp:size=64M,mode=1777",
+        # no network, and no socket of any family: systemd-run takes no "none" for the families (systemd 255), so the
+        # usual ones are refused by name and the calls that make or use a socket are refused all (@network-io)
+        "PrivateNetwork=yes", "RestrictAddressFamilies=~AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET",
+        "PrivateIPC=yes", "PrivateDevices=yes",
+        "ProtectProc=invisible", "ProcSubset=pid", "ProtectKernelTunables=yes", "ProtectKernelModules=yes",
+        "ProtectKernelLogs=yes", "ProtectControlGroups=yes", "ProtectClock=yes", "ProtectHostname=yes",
+        "RestrictRealtime=yes", "KeyringMode=private", "UMask=0077",
+        "SystemCallArchitectures=native", "SystemCallErrorNumber=EPERM",
+        # with the right to read every file, a file's handle opens a hidden path again; io_uring makes a socket with
+        # no socket call; the others are the ways into another process or another view of the files
+        "SystemCallFilter=~@network-io open_by_handle_at name_to_handle_at io_uring_setup io_uring_enter io_uring_register "
+        "ptrace process_vm_readv process_vm_writev mount umount2 pivot_root chroot setns unshare bpf perf_event_open "
+        "keyctl add_key request_key kexec_load kexec_file_load init_module finit_module delete_module swapon swapoff "
+        "reboot",
+        "MemoryMax=512M", "MemorySwapMax=0", "TasksMax=64", "CPUWeight=20", "IOWeight=20",
+        f"RuntimeMaxSec={LOOK_SECONDS}", "TimeoutStopSec=5", "KillMode=control-group", "SendSIGKILL=yes"]
+    if deny["docker"]:
+        props.append(f"TemporaryFileSystem={deny['docker']}:ro")
+        props += [f"BindReadOnlyPaths=-{log}" for log in deny["logs"]]
+    props += ["InaccessiblePaths=" + look_word("-" + p) for p in deny["paths"]]
+    argv = ["systemd-run", "--pipe", "--wait", "--collect", "--quiet", "--unit", unit]
+    for p in props:
+        argv += ["--property", p]
+    return argv + [f"--setenv={k}={v}" for k, v in ENV.items() if k != "DEBIAN_FRONTEND"] + \
+        [f"--setenv=TMPDIR={LOOK_RUN}/tmp", "--setenv=LOOK_CONTAINERS=" + " ".join(deny["containers"])]
+
+
+@contextlib.contextmanager
+def look_lock(shared, wait=None):
+    """A look's lock, shared, or a write's, alone. A file that is hidden by itself opens again when a program puts a
+    new file in its place by a rename. Each form of this file that writes does it, or runs a program that can: so a
+    write waits for the looks that run, and no look runs beside a write. A write takes the gate first and keeps it
+    while it waits and while it runs, so that looks that overlap cannot keep it waiting for longer than one of them
+    runs; a look only passes the gate. wait: the seconds that a look waits for a write that runs before it is
+    refused, so that a long write leaves no look hanging with no word."""
+    os.makedirs(os.path.dirname(P(LOOK_LOCK)) or "/", exist_ok=True)
+    with open(P(LOOK_GATE), "a") as gate, open(P(LOOK_LOCK), "a") as lock:
+        if shared and wait is not None:
+            end = time.monotonic() + wait
+            for held in (gate, lock):
+                while True:
+                    try:
+                        fcntl.flock(held, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                        break
+                    except OSError:
+                        if time.monotonic() > end:
+                            raise Refused("a form of the door writes on this host now, and no look runs beside a "
+                                          "write: send the same look again when that call has ended") from None
+                        time.sleep(0.2)
+        else:
+            fcntl.flock(gate, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+            fcntl.flock(lock, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        if shared:
+            fcntl.flock(gate, fcntl.LOCK_UN)
+        yield
+
+
+LOOK_HELD = threading.local()       # how deep this thread is inside look_writes: the lock is taken once
+# The forms that hold the looks' lock for all of their run, and not only for a rename of this file's own: each runs
+# a program that this file did not write and that can put a new file in the place of one that a look hides by
+# itself. passwd and useradd do it with /etc/shadow, a package's install with a file of /etc, and the agent's own
+# command or script with any file. The other forms put a file in its place only through replace, place and file,
+# which take the lock themselves, and the fixed commands that they run (a restart, a certificate's renewal, a log's
+# rotation, a prune) replace no file that a look hides by itself. So a look delays none of them longer than its own
+# rename: the timer's cancel, which the door sends after a script, waits for no look.
+LOOK_WRITERS = frozenset(("exec", "script", "run", "passwd-lock", "app-new", "install", "purge", "upgrade",
+                          "tailscale-upgrade", "pro-attach"))
+
+
+@contextlib.contextmanager
+def look_writes():
+    """Around each write of this file that puts a file in its place by a rename, and around the temporary file that
+    it makes for it: alone, when no look runs (look_lock, look_quiet). A write inside another one takes the lock no
+    second time, so that self-update waits one time for all of its files."""
+    depth = getattr(LOOK_HELD, "depth", 0)
+    if depth:
+        LOOK_HELD.depth = depth + 1
+        try:
+            yield
+        finally:
+            LOOK_HELD.depth = depth
+        return
+    with look_lock(shared=False):
+        look_quiet()
+        LOOK_HELD.depth = 1
+        try:
+            yield
+        finally:
+            LOOK_HELD.depth = 0
+
+
+@contextlib.contextmanager
+def look_away(seconds):
+    """For the rollback timer's restore, which puts files back as new files: the looks' lock, alone, when it comes
+    within `seconds`, and no lock after that. The restore never waits for a form that writes, which can be the very
+    script that the countdown guards and which keeps looks out by itself; a look ends within its own limit."""
+    os.makedirs(os.path.dirname(P(LOOK_LOCK)) or "/", exist_ok=True)
+    with open(P(LOOK_GATE), "a") as gate, open(P(LOOK_LOCK), "a") as lock:
+        end = time.monotonic() + seconds
+        for held in (gate, lock):
+            while True:
+                try:
+                    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() > end:
+                        break
+                    time.sleep(0.5)
+        look_quiet()            # a look that lost its ops-root: to its unit's own limit at the most
+        yield
+
+
+def look_quiet():
+    """Under a write's lock: wait until no look can still run. A look whose ops-root ended (the door's session went
+    away) lost its lock and runs on, to its unit's own limit at the most: its mark says since when."""
+    while True:
+        try:
+            marks = [os.path.join(P(LOOK_RUN), n) for n in os.listdir(P(LOOK_RUN)) if n.endswith(".run")]
+        except OSError:
+            return
+        ages = []
+        for mark in marks:
+            with contextlib.suppress(OSError):
+                ages.append(time.time() - os.stat(mark).st_mtime)
+        # a mark from before a look can still run, by this host's clock; one far in the future is a clock that
+        # went back, and it holds no write
+        if not any(abs(age) < LOOK_SECONDS + 10 for age in ages):
+            return
+        time.sleep(1)
+
+
+def look_clear():
+    """Refused while a program that this file started still runs with no ops-root of its own: a script or a command
+    whose call ended before it (the door's session went away, or its time was over), a package's install that goes
+    on, the rollback timer's restore. Such a unit holds no lock, and it can put a new file in the place of one that
+    a look hides by itself."""
+    _, said = run(["systemctl", "list-units", "--type=service", "--no-legend", "--plain",
+                   "--state=active,activating,deactivating", "ops-root-*"], timeout=30)
+    units = [line.split()[0] for line in said.splitlines() if line.split()[:1] and
+             line.split()[0].startswith("ops-root-") and line.split()[0].endswith(".service")]
+    units = [u for u in units if not u.startswith(LOOK_UNIT) and u != BOOT_UNIT]
+    if units:
+        raise Refused(f"a program that the door started still runs on this host ({units[0]}), and no look runs "
+                      f"beside it: send the same look again when it has ended")
+
+
+def look_run(script, deny=None):
+    """(status, output, deny) of one script in the box, under a look's lock."""
+    with look_lock(shared=True, wait=LOOK_WAIT):
+        look_clear()
+        deny = deny or look_deny()
+        unit = f"{LOOK_UNIT}{os.getpid()}"
+        os.makedirs(P(LOOK_RUN) + "/tmp", mode=0o755, exist_ok=True)      # where the box puts the script's own room
+        os.chmod(P(LOOK_RUN), 0o711)
+        for name in os.listdir(P(LOOK_RUN)):        # what a look left whose ops-root ended before it: long over now
+            old = os.path.join(P(LOOK_RUN), name)
+            with contextlib.suppress(OSError):
+                if name.endswith((".sh", ".run")) and time.time() - os.lstat(old).st_mtime > 4 * LOOK_SECONDS:
+                    os.remove(old)
+        path, mark = f"{LOOK_RUN}/{unit}.sh", f"{LOOK_RUN}/{unit}.run"
+        try:
+            for name, data in ((path, script), (mark, b"")):
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(P(name))
+                with open(os.open(P(name), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644), "wb") as f:
+                    f.write(data)
+            try:
+                r = subprocess.run(look_box(unit, deny) + ["--", "/bin/bash", path], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=LOOK_SECONDS + 60,
+                                   env=dict(ENV))
+                status, out = r.returncode, r.stdout
+            except FileNotFoundError:
+                status, out = 127, b"systemd-run is not on this host"
+            except subprocess.TimeoutExpired as e:
+                status, out = 124, e.stdout or b""
+            return status, out[-LOOK_OUT * 4:].decode("utf-8", "replace")[-LOOK_OUT:], deny
+        finally:
+            for name in (path, mark):
+                with contextlib.suppress(OSError):
+                    os.remove(P(name))
+
+
+# What stands in the place of a hidden file is an empty file, which the box's one right opens: a read is a fault
+# only when it gives a byte of the real file.
+LOOK_TEST = r"""r() { if [ -n "$(head -c 1 "$1" 2>/dev/null)" ]; then echo "FAULT read $2"; fi; }
+w() { if ( : > "$1" ) 2>/dev/null; then echo "FAULT write $2"; rm -f "$1" 2>/dev/null; fi; }
+r '{folder}/secret' a-hidden-folder
+r '{named}' a-secret-name
+r '{odd}' a-secret-name-in-a-folder-with-an-odd-name
+r /etc/shadow shadow
+r /run/ops-root.lock the-host-lock
+w /home/.ops-root-look-check home
+w /dev/shm/.ops-root-look-check shm
+w /var/lib/.ops-root-look-check var-lib
+w /etc/.ops-root-look-check etc
+w /run/.ops-root-look-check run
+w /tmp/.ops-root-look-check tmp-on-the-disk
+w /var/tmp/.ops-root-look-check var-tmp-on-the-disk
+if ( echo x >> /etc/hostname ) 2>/dev/null; then echo "FAULT write more-to-a-file"; fi
+if chmod u+w /etc/hostname 2>/dev/null; then echo "FAULT write a-file-s-mode"; fi
+if mkfifo /var/lib/.ops-root-look-fifo 2>/dev/null; then echo "FAULT write a-pipe-s-name"; fi
+if ln /etc/hostname /var/lib/.ops-root-look-link 2>/dev/null; then echo "FAULT write a-second-name"; fi
+if [ -n "$(ls /sys/kernel/debug 2>/dev/null | head -c 1)" ]; then echo "FAULT read the-kernel-s-debug-folder"; fi
+if ! ( : > "$TMPDIR/.ops-root-look-check" ) 2>/dev/null; then echo "FAULT no room of its own"; fi
+if ( exec 3<>/dev/tcp/127.0.0.1/22 ) 2>/dev/null; then echo "FAULT socket tcp"; fi
+python3 -IS - <<'PY'
+import ctypes, os, socket
+if os.geteuid() == 0:
+    print("FAULT root")
+for family, kind, name in ((socket.AF_UNIX, socket.SOCK_STREAM, "unix"), (socket.AF_INET, socket.SOCK_STREAM, "inet"),
+                           (socket.AF_INET6, socket.SOCK_DGRAM, "inet6"), (socket.AF_NETLINK, socket.SOCK_RAW, "netlink")):
+    try:
+        socket.socket(family, kind).close()
+        print("FAULT socket " + name)
+    except OSError:
+        pass
+try:
+    socket.socketpair()
+    print("FAULT socket pair")
+except OSError:
+    pass
+numbers = {"x86_64": (425, 426, 303, 304), "aarch64": (425, 426, 264, 265)}.get(os.uname().machine)
+if numbers is None:
+    print("FAULT machine " + os.uname().machine)
+else:
+    libc = ctypes.CDLL(None, use_errno=True)
+    for number, name in zip(numbers, ("io_uring_setup", "io_uring_enter", "name_to_handle_at", "open_by_handle_at")):
+        ctypes.set_errno(0)
+        if not (libc.syscall(number, 0, 0, 0, 0, 0, 0) == -1 and ctypes.get_errno() == 1):
+            print("FAULT call " + name + " " + str(ctypes.get_errno()))
+try:
+    os.listdir("/proc/1/fd")
+    print("FAULT proc")
+except OSError:
+    pass
+PY
+echo "DONE $?"
+"""
+
+
+def look_check():
+    """Why this host's box does not hold, or None: one script in the box of a look that tries each way that the box
+    closes, with three files of the test's own as what it must not read: one in a hidden folder, and two with a
+    secret's name in folders that are not hidden, one of them a folder whose name systemd must take as one word."""
+    folder, named = f"{STATE}/{LOOK_STATE}/canary", f"{LOOK_CHECK}/.env"
+    odd = LOOK_CHECK + '/a b%c"d\\e/.env'        # a space, a specifier's sign, a quote and a backslash in a name
+    try:
+        for path, text in ((folder + "/secret", "x"), (named, "x"), (odd, "x")):
+            os.makedirs(os.path.dirname(P(path)), mode=0o755, exist_ok=True)
+            with open(P(path), "w") as f:
+                f.write(text)
+            os.chmod(P(path), 0o644)        # open to every reader: only the box keeps the look out
+        status, out, _ = look_run(LOOK_TEST.replace("{folder}", folder).replace("{named}", named)
+                                  .replace("{odd}", odd).encode())
+    finally:
+        shutil.rmtree(P(LOOK_CHECK), ignore_errors=True)
+        shutil.rmtree(P(folder), ignore_errors=True)
+    lines = [line.strip() for line in out.splitlines() if line.strip()]
+    faults = [line for line in lines if line.startswith("FAULT")]
+    if faults:
+        return "; ".join(faults)[:400]
+    if status != 0 or not lines or lines[-1] != "DONE 0":
+        return ("the test did not run to its end: " + (" ".join(lines[-3:]) or f"status {status}"))[:400]
+    return None
+
+
+def look_proved():
+    """None when this host's box passed its own test, for this version of this file, this boot and this systemd;
+    otherwise why not. The test runs at the first look after any of the three changed, one at a time, and a pass is
+    kept: a look never runs before the test passed. A test that did not pass is not kept: the next look tries the
+    box again, so that one bad moment of the host does not close its looks until the next boot."""
+    _, said = run(["systemctl", "--version"], timeout=30)
+    key = f"{VERSION} {read(BOOT_ID).strip()} {said.splitlines()[0].strip()[:80] if said.strip() else ''}"
+    os.makedirs(P(f"{STATE}/{LOOK_STATE}"), mode=0o700, exist_ok=True)
+    with open(P(f"{STATE}/{LOOK_STATE}/check.lock"), "a") as lock:
+        end = time.monotonic() + LOOK_WAIT
+        while True:             # another first look tests the box now: a short wait, and no line of looks behind it
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() > end:
+                    raise Refused("another look tests this host's box now: send the same look again") from None
+                time.sleep(0.2)
+        try:
+            kept = json.loads(read(f"{STATE}/{LOOK_STATE}/checked") or "{}")
+        except ValueError:
+            kept = {}
+        if isinstance(kept, dict) and kept.get("key") == key and kept.get("passed") is True:
+            return None
+        why = look_check()
+        if why is None:
+            # this file's own folder is hidden whole, so a new file there opens nothing: no wait for a write's lock
+            kept = P(f"{STATE}/{LOOK_STATE}/checked")
+            with open(kept + ".new", "w") as f:
+                f.write(json.dumps({"key": key, "passed": True}))
+            os.replace(kept + ".new", kept)
+        return why
+
+
+@form("look", kind="look", write=False,
+      help="a bash script that reads this host's files, in a box with no write and no network: the script on stdin "
+           "with its sha256; key stores and files with a secret's name are not there; $TMPDIR is 64 MiB of room "
+           "for its own files; $LOOK_CONTAINERS names the containers whose logs are at their own paths")
+def do_look(req, data):
+    script = script_bytes(req, data, "look")
+    why = look_proved()
+    if why:
+        raise Refused(f"look does not run on this host: its box did not pass its own test here ({why})")
+    status, out, deny = look_run(script)
+    notes = []
+    if status == 124 or (status != 0 and not out.strip()):
+        notes.append(f"the look ended with status {status}" + (f", at its limit of {LOOK_SECONDS} seconds"
+                                                               if status == 124 else ""))
+    elif status != 0:
+        notes.append(f"the script ended with status {status}")
+    if deny["whole"]:
+        notes.append("hidden whole, for the count of secret names in them or for a name that no rule can write: " +
+                     ", ".join(deny["whole"][:10]) +
+                     (f" and {len(deny['whole']) - 10} more" if len(deny["whole"]) > 10 else ""))
+    if deny["units"]:
+        notes.append("unit files that hold a value themselves are hidden: " + ", ".join(deny["units"][:10]) +
+                     (f" and {len(deny['units']) - 10} more" if len(deny["units"]) > 10 else ""))
+    return (out if out.strip() else "(no output)\n").rstrip("\n") + "".join(f"\n({note})" for note in notes)
+
+
+@form("hide", kind="own", help="one more path that no box of this host reads, a look's and a script's: an absolute "
+                               "path, added to this host's own list")
+def do_hide(req, data):
+    path = req["args"][0]
+    lines = [line.strip() for line in read(HIDDEN_FILE).splitlines() if line.strip()]
+    if path in lines or path in HIDDEN:
+        return f"{path} is hidden already"
+    if len(lines) >= HIDE_MAX:
+        raise Refused(f"this host's own list has {HIDE_MAX} paths already")
+    os.makedirs(P(ETC), mode=0o755, exist_ok=True)
+    replace(HIDDEN_FILE, ("\n".join(lines + [path]) + "\n").encode(), 0o644)
+    return f"{path} is hidden from now on"
+
+
+def check_hide(args):
+    path = one(args, "hide", "an absolute path")
+    if not LOOK_SAFE.fullmatch(path) or os.path.normpath(path) != path or path.count("/") < 2 or ".." in path:
+        raise Refused("hide takes one absolute path of at least two parts, of letters, digits and . _ - @ + , : = ~")
+    if protected(path):
+        raise Refused(f"{path} is protected on this host, and its boxes need it")
+    for found in {path, real(path)}:        # the path, and where it really leads: /var/run is a link to /run
+        if any(found == top or found.startswith(top + "/") or top.startswith(found + "/")
+               for top in LOOK_SKIP + HIDE_NEVER + (ETC, STATE, LIB, LOOK_RUN)):
+            raise Refused(f"{path} is a part of the system that every box of this host runs from, or a folder "
+                          f"above one: hide takes a path of an app or of its data")
+    return [path]
+
+
 @form("install", kind="own", help="apt-get install of packages by name, which goes on if the session ends")
 def do_install(req, data):
     return detached("install", ["apt-get", "install", "-y", "--no-install-recommends", "-o", "DPkg::Lock::Timeout=600",
@@ -1057,20 +1736,21 @@ def do_file(req, data):
         gid = pwd.getpwnam(user).pw_gid if not group else grp.getgrnam(group).gr_gid
     except KeyError:
         raise Refused(f"{owner} is no user or group here") from None
-    fd, temp = tempfile.mkstemp(dir=P(parent), prefix=".ops-root-")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        os.chown(temp, uid, gid)
-        os.chmod(temp, int(mode_text, 8))
-        if parent.rstrip("/") == "/etc/sudoers.d":
-            status, out = run(["visudo", "-c", "-q", "-f", temp])
-            if status != 0:
-                raise Refused("visudo refused this sudoers file:\n" + out)
-        os.replace(temp, P(path))
-    finally:
-        with contextlib.suppress(OSError):
-            os.remove(temp)
+    with look_writes():         # the file can be one that a look hides by itself
+        fd, temp = tempfile.mkstemp(dir=P(parent), prefix=".ops-root-")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.chown(temp, uid, gid)
+            os.chmod(temp, int(mode_text, 8))
+            if parent.rstrip("/") == "/etc/sudoers.d":
+                status, out = run(["visudo", "-c", "-q", "-f", temp])
+                if status != 0:
+                    raise Refused("visudo refused this sudoers file:\n" + out)
+            os.replace(temp, P(path))
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(temp)
     return said + f"{path} installed ({len(data)} bytes)"
 
 
@@ -1096,11 +1776,12 @@ def do_self_update(req, data):
     if floor and not descends(bundle, floor):
         raise Refused(f"release {m['version']} does not descend from {floor}, the release this ops-root came from: "
                       f"never an older one")
-    for name, target, mode_bits in (("ops-root", SELF, 0o755), ("ops-read", READER, 0o755),
-                                    ("inventory", INVENTORY, 0o755), ("app-release", RELEASE_HELPER, 0o755)):
-        if name in files:
-            replace(target, files[name], mode_bits)
-    replace(RELEASE_FILE, (bundle["manifest"]["revision"] + "\n").encode(), 0o644)
+    with look_writes():         # one wait for the looks that run, not one for each file
+        for name, target, mode_bits in (("ops-root", SELF, 0o755), ("ops-read", READER, 0o755),
+                                        ("inventory", INVENTORY, 0o755), ("app-release", RELEASE_HELPER, 0o755)):
+            if name in files:
+                replace(target, files[name], mode_bits)
+        replace(RELEASE_FILE, (bundle["manifest"]["revision"] + "\n").encode(), 0o644)
     return f"ops-root {int(found.group(1))} from release {bundle['manifest']['version']}"
 
 
@@ -1920,15 +2601,18 @@ def write_state(name, text):
 
 
 def replace(path, data, mode_bits):
-    fd, temp = tempfile.mkstemp(dir=os.path.dirname(P(path)), prefix=".ops-root-")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        os.chmod(temp, mode_bits)
-        os.replace(temp, P(path))
-    finally:
-        with contextlib.suppress(OSError):
-            os.remove(temp)
+    """A file's new bytes, put in its place by a rename, when no look runs (look_writes): a rename opens a file again
+    that a look's box hides by itself."""
+    with look_writes():
+        fd, temp = tempfile.mkstemp(dir=os.path.dirname(P(path)), prefix=".ops-root-")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.chmod(temp, mode_bits)
+            os.replace(temp, P(path))
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(temp)
 
 
 def runners():
@@ -2202,25 +2886,27 @@ def fire():
     run(["systemctl", "reset-failed"])
     applied = ("/etc/netplan", "/etc/ufw/ufw.conf", "/etc/iptables")
     before = [tree_state(p) for p in applied]
-    whole = restore(snapshot) if os.path.isfile(snapshot) else True
-    netplan, ufw, iptables = (tree_state(p) != b for p, b in zip(applied, before))
-    systemctl("daemon-reload")
-    if netplan:
-        with contextlib.suppress(OSError):
-            run(["netplan", "apply"])
-    restart("ssh.service", "ssh.socket", "nftables.service")
-    if ufw:
-        with contextlib.suppress(OSError):
-            run([UFW_INIT, "force-stop"])
-    restart("ufw.service")
-    if iptables:
-        restart("netfilter-persistent.service")
-    version = read(STATE + "/rollback/tailscale").strip()
-    if version:
-        _, now = run(["dpkg-query", "-W", "-f=${Version}", "tailscale"])
-        if now.strip() != version:
-            run(["apt-get", "install", "-y", "--allow-downgrades", "-o", "DPkg::Lock::Timeout=600",
-                 f"tailscale={version}"], timeout=1800)
+    with look_away(LOOK_SECONDS + 10):      # tar and a package's downgrade put files back as new files: no look
+        #                                    runs beside them, by a wait that never waits for a form that writes
+        whole = restore(snapshot) if os.path.isfile(snapshot) else True
+        netplan, ufw, iptables = (tree_state(p) != b for p, b in zip(applied, before))
+        systemctl("daemon-reload")
+        if netplan:
+            with contextlib.suppress(OSError):
+                run(["netplan", "apply"])
+        restart("ssh.service", "ssh.socket", "nftables.service")
+        if ufw:
+            with contextlib.suppress(OSError):
+                run([UFW_INIT, "force-stop"])
+        restart("ufw.service")
+        if iptables:
+            restart("netfilter-persistent.service")
+        version = read(STATE + "/rollback/tailscale").strip()
+        if version:
+            _, now = run(["dpkg-query", "-W", "-f=${Version}", "tailscale"])
+            if now.strip() != version:
+                run(["apt-get", "install", "-y", "--allow-downgrades", "-o", "DPkg::Lock::Timeout=600",
+                     f"tailscale={version}"], timeout=1800)
     restart("tailscaled.service", SSHD_UNIT)
     with contextlib.suppress(OSError):
         run(["ufw", "reload"])
@@ -2505,18 +3191,21 @@ def call(req, data=None):
     op = req["op"]
     req["args"] = check_args(op, req["args"])
     f = FORMS[op]
-    if f["kind"] in ("own", "full") and mode() != "fix":
+    if f["kind"] in ("own", "full", "look") and mode() != "fix":
         raise Refused("this host is rule-only: only rule forms run here, and no file install")
     if op in PLAN_WRITES and mode() != "fix":        # new-projects plan N4: a new app lives on a fix host only
         raise Refused("this host is rule-only: no form of a new app writes here")
     if data is not None and op not in ("file", "self-update", "pro-attach", "runner-register", "place", "unit-new",
-                                       "env-new", "env-add", "runner-new", "vhost-new", "script", "run"):
+                                       "env-new", "env-add", "runner-new", "vhost-new", "script", "run", "look"):
         raise Refused(f"{op} takes nothing on stdin")
     if not f["write"]:
         return f["run"](req, data)
     os.makedirs(os.path.dirname(P(LOCK_FILE)) or "/", exist_ok=True)
     with open(P(LOCK_FILE), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)         # a second write on this host waits here
+        if op in LOOK_WRITERS:      # no look runs beside a form that runs a program of another's making
+            with look_writes():
+                return f["run"](req, data)
         return f["run"](req, data)
 
 
@@ -2535,7 +3224,7 @@ def main(argv):
             raise Refused("ops-root takes one argument: the request")
         req = decode(argv[1])
         data = None if sys.stdin is None or sys.stdin.isatty() else sys.stdin.buffer.read(FILE_MAX * 2 + 1) or None
-        print(call(req, data)[-OUT_MAX:])
+        print(call(req, data)[-(LOOK_OUT if req.get("op") == "look" else OUT_MAX):])
         return 0
     except Refused as e:
         print(f"refused: {e}"[:2000])

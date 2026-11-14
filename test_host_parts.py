@@ -10,9 +10,11 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -31,7 +33,7 @@ def load_tests(loader, _tests, _pattern):
     return unittest.TestSuite(cls(name) for cls in (Files, ModeAndLock, ScriptForms, Runners, PristineRunners,
                                                     Accounts, SelfUpdate,
                                                     Reader, Scripts, NewApp, AppUnitAndSettings, AppRunner, AppVhost,
-                                                    ReleaseHelper)
+                                                    ReleaseHelper, Look, LookBoxLive)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -255,16 +257,17 @@ class ModeAndLock(HostCase):
     def test_a_rule_only_host_refuses_the_agent_s_own_forms_and_file_installs_by_itself(self):
         self.put("/etc/ops-root/mode", "rule-only\n")
         own = sorted(name for name, f in ROOT.FORMS.items() if f["kind"] == "own")
-        self.assertEqual(own, ["env-add", "exec", "file", "install", "passwd-lock", "purge", "script", "unit-new",
-                               "vhost-new"])
+        self.assertEqual(own, ["env-add", "exec", "file", "hide", "install", "passwd-lock", "purge", "script",
+                               "unit-new", "vhost-new"])
         self.assertEqual([name for name, f in ROOT.FORMS.items() if f["kind"] == "full"], ["run"])
-        self.assertEqual({f["kind"] for f in ROOT.FORMS.values()}, {"rule", "own", "full"})
+        self.assertEqual([name for name, f in ROOT.FORMS.items() if f["kind"] == "look"], ["look"])
+        self.assertEqual({f["kind"] for f in ROOT.FORMS.values()}, {"rule", "own", "full", "look"})
         for op, args in (("exec", ["ls", "/etc"]), ("install", ["htop"]), ("purge", ["telnetd"]),
                          ("passwd-lock", ["olduser"]), ("file", ["/etc/nginx/x.conf", "0644", "root"]),
-                         ("script", []), ("run", [])):
+                         ("script", []), ("run", []), ("look", []), ("hide", ["/srv/app/x"])):
             with self.subTest(op=op), self.assertRaisesRegex(
                     ROOT.Refused, "this host is rule-only: only rule forms run here, and no file install"):
-                self.call(op, *args, data=b"x" if op in ("file", "script", "run") else None)
+                self.call(op, *args, data=b"x" if op in ("file", "script", "run", "look") else None)
 
     def test_no_form_starts_a_unit_that_powers_the_host_off_or_is_ops_root_s_own(self):
         """`restart systemd-poweroff` powered a rule-only host off, outside the reboot form and its rules."""
@@ -700,7 +703,8 @@ class ScriptForms(HostCase):
         self.assertEqual(said.split("\n")[0], f"ops-root {ROOT.VERSION}, mode fix, release none")
         self.assertRegex(said, r"\nscript +own +a bash script in the box of exec, under the rollback timer")
         self.assertRegex(said, r"\nrun +full +a bash script as root with no box, under the rollback timer")
-        self.assertEqual(ROOT.VERSION, 2)
+        self.assertRegex(said, r"\nlook +look +a bash script that reads this host's files, in a box with no write")
+        self.assertEqual(ROOT.VERSION, 3)
 
 
 def git(*args, cwd=None):
@@ -1072,6 +1076,873 @@ class Reader(HostCase):
         argv = calls[0][0]
         self.assertEqual(argv[:3], ["sudo", "-n", "/usr/local/sbin/ops-root"])
         self.assertEqual(json.loads(base64.b64decode(argv[3])), req)
+
+
+class Look(HostCase):
+    """look, the holder's wide read (incident intake, part 3): what one look does not read, on a host made of files
+    under a temporary folder. The box itself, a transient service, runs on a real Ubuntu host: LookBoxLive."""
+    CONTAINER = "ab" * 32
+
+    def tree(self, files, links=()):
+        for path, text in files.items():
+            os.makedirs(os.path.dirname(self.tmp + path), exist_ok=True)
+            with open(self.tmp + path, "w") as f:
+                f.write(text)
+        for path, target in links:
+            os.makedirs(os.path.dirname(self.tmp + path), exist_ok=True)
+            os.symlink(target, self.tmp + path)
+
+    def host(self):
+        """A host with two apps, a database of its own, a Docker container, units, homes and a shared disk."""
+        self.tree({
+            "/proc/self/mounts": "/dev/sda1 / ext4 rw 0 0\nproc /proc proc rw 0 0\n"
+                                 "10.0.0.9:/export /mnt/share nfs4 rw 0 0\n/dev/loop3 /snap/core squashfs ro 0 0\n"
+                                 "/dev/sdb1 /mnt/volume ext4 rw 0 0\n",
+            "/etc/passwd": "root:x:0:0:root:/root:/bin/bash\nwww-data:x:33:33::/var/www:/usr/sbin/nologin\n"
+                           "deploy:x:1001:1001::/home/deploy:/bin/bash\nnobody:x:65534:65534::/nonexistent:/bin/false\n"
+                           "daemon:x:1:1::/usr/sbin:/usr/sbin/nologin\n",
+            "/var/www/shop/shared/.env": "KEY=1", "/var/www/shop/shared/log/app.log": "line",
+            "/var/www/shop/current/server.js": "code", "/var/www/shop/current/config/Database.YML": "password: x",
+            "/var/www/shop/current/node_modules/tls/test/key.pem": "test key",
+            "/var/www/.bash_history": "mysql -psecret", "/var/www/index.html": "page",
+            "/home/deploy/.ssh/id_ed25519": "key", "/home/deploy/.npmrc": "token", "/home/deploy/notes.txt": "notes",
+            "/srv/api/app.py": "code", "/srv/api/local_settings.py": "SECRET", "/srv/api/data/app.sqlite3": "rows",
+            "/srv/api/bootstrap/cache/config.php": "<?php", "/srv/api/web/config.php": "<?php // no secret by name",
+            "/opt/pg/data/PG_VERSION": "16", "/opt/pg/data/base/1/123": "rows", "/opt/pg/readme.txt": "text",
+            "/etc/systemd/system/shop.service": "[Service]\nEnvironmentFile=-/etc/shop/settings\nExecStart=/bin/true\n",
+            "/etc/systemd/system/api@.service": "[Service]\nEnvironmentFile=/etc/api/%i.conf\n",
+            "/etc/systemd/system/worker.service.d/override.conf": "[Service]\nEnvironment=TOKEN=abc\n",
+            "/etc/systemd/system/plain.service": "[Service]\nExecStart=/bin/true\n",
+            "/usr/lib/systemd/system/cron.service": "[Service]\nEnvironment=LANG=C\nLoadCredential=cron:/etc/cron.key2\n",
+            "/etc/shop/settings": "A=1", "/etc/shop/readme": "text", "/etc/api/eu.conf": "A=1", "/etc/api/us.conf": "A=2",
+            "/etc/cron.key2": "k", "/etc/nginx/ssl/site.key": "key", "/etc/nginx/nginx.conf": "conf",
+            "/etc/ssh/ssh_host_ed25519_key": "host key", "/etc/shadow": "root:hash",
+            "/mnt/share/backup/.env": "copy", "/mnt/volume/app/.env.production": "A=1", "/mnt/volume/app/run.log": "l",
+            "/usr/share/doc/x/example.pem": "a package's file", "/usr/local/etc/tool/secrets.yaml": "s",
+            "/var/www/My Site/.env": "A=1", "/var/www/My Site/page.html": "page",
+            "/etc/docker/daemon.json": "{}",
+            f"/var/lib/docker/containers/{self.CONTAINER}/{self.CONTAINER}-json.log": "{}",
+            f"/var/lib/docker/containers/{self.CONTAINER}/config.v2.json": json.dumps({"Name": "/web 1;x"}),
+            "/var/lib/docker/overlay2/x/diff/app/.env": "A=1",
+        }, links=(("/var/www/shop/current/.env", "../shared/.env"), ("/etc/ssl/certs/ca.pem", "/usr/share/doc/x/example.pem")))
+
+    def test_what_a_look_does_not_read_on_a_host_with_apps(self):
+        self.host()
+        deny = ROOT.look_deny()
+        paths = set(deny["paths"])
+        # by name, wherever the file is, in whatever case; a folder of keys or of a mass of files goes whole
+        for hidden in ("/var/www/shop/shared/.env", "/var/www/shop/current/config/Database.YML",
+                       "/var/www/shop/current/node_modules", "/srv/api/local_settings.py", "/srv/api/data/app.sqlite3",
+                       "/srv/api/bootstrap/cache/config.php", "/etc/nginx/ssl/site.key", "/mnt/volume/app/.env.production",
+                       "/usr/local/etc/tool/secrets.yaml"):
+            self.assertIn(hidden, paths)
+        # the dot entries of each account's home, the home of the web server's account too
+        for hidden in ("/home/deploy/.ssh", "/home/deploy/.npmrc", "/var/www/.bash_history"):
+            self.assertIn(hidden, paths)
+        # a database's own folder, by the file that only such a folder has; a disk of another machine, not walked
+        self.assertIn("/opt/pg/data", paths)
+        self.assertIn("/mnt/share", paths)
+        self.assertNotIn("/mnt/share/backup/.env", paths)
+        # what a unit names as its settings or its credentials, with a specifier too; and a unit file of this host
+        # that holds a value itself, which the answer names
+        for hidden in ("/etc/shop/settings", "/etc/api/eu.conf", "/etc/api/us.conf", "/etc/cron.key2",
+                       "/etc/systemd/system/worker.service.d/override.conf"):
+            self.assertIn(hidden, paths)
+        self.assertEqual(deny["units"], ["/etc/systemd/system/worker.service.d/override.conf"])
+        self.assertNotIn("/usr/lib/systemd/system/cron.service", paths)       # a package's unit holds no secret
+        # the key stores of every host, and this file's own folders
+        for hidden in ("/etc/ssh", "/etc/shadow", "/root", "/etc/ops-root", "/var/lib/ops-root", "/run/ops-root.lock",
+                       "/dev/shm", "/dev/pts"):
+            self.assertIn(hidden, paths)
+        # a name with a space is hidden as itself, and the folder above it stays in sight
+        self.assertIn("/var/www/My Site/.env", paths)
+        self.assertNotIn("/var/www", paths)
+        self.assertNotIn("/var/www/My Site", paths)
+        # no path is under a folder that is hidden already
+        for path in paths:
+            self.assertFalse(any(path.startswith(other + "/") for other in paths), path)
+        # Docker's folder is not in the list: an empty folder stands in its place, with each container's log
+        self.assertEqual(deny["docker"], "/var/lib/docker")
+        self.assertEqual(deny["logs"], [f"/var/lib/docker/containers/{self.CONTAINER}/{self.CONTAINER}-json.log"])
+        self.assertEqual(deny["containers"], [f"{self.CONTAINER[:12]}=web1x"])
+        self.assertFalse(any(p.startswith("/var/lib/docker") for p in paths))
+
+    def test_what_a_look_still_reads(self):
+        self.host()
+        paths = set(ROOT.look_deny()["paths"])
+
+        def hidden(path):
+            return any(path == p or path.startswith(p + "/") for p in paths)
+        for seen in ("/var/www/shop/shared/log/app.log", "/var/www/shop/current/server.js", "/var/www/index.html",
+                     "/home/deploy/notes.txt", "/srv/api/app.py", "/srv/api/web/config.php", "/opt/pg/readme.txt",
+                     "/etc/systemd/system/shop.service", "/etc/systemd/system/plain.service", "/etc/shop/readme",
+                     "/etc/nginx/nginx.conf", "/mnt/volume/app/run.log", "/usr/share/doc/x/example.pem", "/var/log",
+                     "/usr/lib/systemd/system/cron.service", "/var/www/My Site/page.html"):
+            self.assertFalse(hidden(seen), seen)
+        # a link is not hidden by its name: what it leads to is hidden where it is
+        self.assertFalse(hidden("/var/www/shop/current/.env") and "/var/www/shop/current/.env" in paths)
+        self.assertNotIn("/etc/ssl/certs/ca.pem", paths)
+
+    def test_a_folder_with_many_secret_names_and_a_walk_that_is_too_long_hide_whole_folders(self):
+        self.tree({"/proc/self/mounts": "/dev/sda1 / ext4 rw 0 0\n", "/etc/passwd": ""})
+        self.tree({f"/srv/certs/site{i}.pem": "k" for i in range(ROOT.LOOK_MATCHES + 1)})
+        self.tree({"/srv/certs/readme": "text", "/srv/app/.env": "A", "/srv/app/log/app.log": "l"})
+        deny = ROOT.look_deny()
+        self.assertIn("/srv/certs", deny["paths"])
+        self.assertEqual(deny["whole"], ["/srv/certs"])
+        self.assertIn("/srv/app/.env", deny["paths"])
+        self.assertFalse(any(p.startswith("/srv/certs/") for p in deny["paths"]))
+        # the walk's count of entries is spent: what it did not reach is hidden, never left open
+        self.tree({f"/srv/big/d{i}/f{j}": "x" for i in range(6) for j in range(6)})
+        self.tree({"/srv/big/d5/.env": "A"})
+        with patch.object(ROOT, "LOOK_WALK", 40):
+            deny = ROOT.look_deny()
+
+        def hidden(path):
+            return any(path == p or path.startswith(p + "/") for p in deny["paths"])
+        self.assertTrue(hidden("/srv/big/d5/.env"))
+        self.assertTrue(deny["whole"])
+        self.assertTrue(set(deny["whole"]) <= set(deny["paths"]))
+        # more paths than one unit hides: the deepest folders with the most of them go whole, and the list is never
+        # longer than the limit
+        many = [f"/srv/a/b{i}/k{j}.key" for i in range(5) for j in range(4)] + ["/etc/one.key", "/srv/a/top.key"]
+        kept, whole = ROOT.look_fewer(many, 8)
+        self.assertLessEqual(len(kept), 8)
+        self.assertTrue(all(any(m == k or m.startswith(k + "/") for k in kept) for m in many))
+        self.assertTrue(whole and all(w in kept or any(w.startswith(k + "/") for k in kept) for w in whole))
+        self.assertEqual(ROOT.look_fewer(many, 100), (sorted(many), []))
+
+    def test_a_unit_s_settings_file_is_found_through_a_link_quotes_a_line_that_goes_on_and_a_specifier(self):
+        self.tree({
+            "/proc/self/mounts": "/dev/sda1 / ext4 rw 0 0\n", "/etc/passwd": "",
+            # systemctl link: the unit file is a link to the app's own file, which holds a value itself
+            "/opt/shop/shop.service": "[Service]\nEnvironment=TOKEN=abc\nEnvironmentFile=/opt/shop/conf/live\n",
+            "/opt/shop/conf/live": "A=1", "/opt/shop/readme": "text",
+            "/etc/systemd/system/quoted.service": '[Service]\nEnvironmentFile="/etc/app/my settings"\n',
+            "/etc/systemd/system/long.service": "[Service]\nExecStart=/bin/true \\\n  --flag\n"
+                                                "EnvironmentFile = -/etc/app/spaced\n",
+            "/etc/systemd/system/sign.service": "[Service]\nEnvironmentFile=%E/app/by-sign\nLoadCredential=k:%S/app/cred\n",
+            "/etc/systemd/system/drop.service.d/10-env.conf": "[Service]\nSetCredential=k:value\n",
+            "/etc/app/my settings": "A=1", "/etc/app/spaced": "A=1", "/etc/app/by-sign": "A=1", "/etc/app/plain": "text",
+            "/var/lib/app/cred": "k",
+        }, links=(("/etc/systemd/system/shop.service", self.tmp + "/opt/shop/shop.service"),))
+        deny = ROOT.look_deny()
+        for hidden in ("/opt/shop/shop.service", "/opt/shop/conf/live", "/etc/app/my settings", "/etc/app/spaced",
+                       "/etc/app/by-sign", "/var/lib/app/cred", "/etc/systemd/system/drop.service.d/10-env.conf"):
+            self.assertIn(hidden, deny["paths"])
+        self.assertEqual(sorted(deny["units"]),
+                         ["/etc/systemd/system/drop.service.d/10-env.conf", "/opt/shop/shop.service"])
+        for seen in ("/opt/shop/readme", "/etc/app/plain", "/etc/systemd/system/long.service"):
+            self.assertNotIn(seen, deny["paths"])
+
+    def test_the_kernel_s_own_folders_are_hidden_and_the_walk_ends_by_its_clock_too(self):
+        self.tree({"/proc/self/mounts": "/dev/sda1 / ext4 rw 0 0\n", "/etc/passwd": "", "/srv/app/.env": "A",
+                   "/srv/app/log/app.log": "l", "/usr/src/app/.env": "A", "/usr/share/nginx/html/.env": "A",
+                   "/usr/share/doc/pkg/example.key": "a package's file"})
+        deny = ROOT.look_deny()
+        for hidden in ("/sys/kernel/debug", "/sys/kernel/tracing", "/sys/kernel/security", "/sys/firmware/efi/efivars",
+                       "/srv/app/.env", "/usr/src/app/.env", "/usr/share/nginx/html/.env"):
+            self.assertIn(hidden, deny["paths"])
+        self.assertNotIn("/usr/share/doc/pkg/example.key", deny["paths"])       # what a package installed: not searched
+        # the walk's time is spent after its first folders: each folder that still waits is hidden whole
+        ticks = iter([0.0] + [0.0] * 3 + [10 ** 9] * 10 ** 6)
+        with patch.object(ROOT.time, "monotonic", lambda: next(ticks)):
+            deny = ROOT.look_deny()
+
+        def hidden(path):
+            return any(path == p or path.startswith(p + "/") for p in deny["paths"])
+        self.assertTrue(hidden("/srv/app/.env") and hidden("/srv/app/log/app.log"))
+        self.assertTrue(deny["whole"])
+        # and a walk whose time is spent before it read anything makes no list: no look runs on a guess
+        with patch.object(ROOT, "LOOK_LIST_SECONDS", -1), self.assertRaisesRegex(ROOT.Refused, "could not be read in time"):
+            ROOT.look_deny()
+        # more paths right under / than a unit hides: no box is made, the look is refused
+        with self.assertRaisesRegex(ROOT.Refused, "more than 3 paths to hide at the top"):
+            ROOT.look_fewer(["/a", "/b", "/c", "/d"], 3)
+
+    def test_what_a_look_left_whose_ops_root_ended_goes_at_a_later_look(self):
+        os.makedirs(self.tmp + ROOT.LOOK_RUN, exist_ok=True)
+        old, new = time.time() - 4 * ROOT.LOOK_SECONDS - 5, time.time() - 30
+        for name, when in (("ops-root-look-1.sh", old), ("ops-root-look-1.run", old), ("ops-root-look-2.run", new)):
+            with open(f"{self.tmp}{ROOT.LOOK_RUN}/{name}", "w"):
+                pass
+            os.utime(f"{self.tmp}{ROOT.LOOK_RUN}/{name}", (when, when))
+        ran = []
+
+        def run(argv, **kw):
+            ran.append(argv)
+            return subprocess.CompletedProcess(argv, 0, b"out\n", b"")
+        with patch.object(ROOT.subprocess, "run", run):
+            status, out, _ = ROOT.look_run(b"ls\n", deny={"paths": [], "whole": [], "units": [], "docker": None,
+                                                         "logs": [], "containers": []})
+        self.assertEqual((status, out), (0, "out\n"))
+        self.assertEqual(ran[0][:2], ["systemctl", "list-units"])           # first: does a program of the door run on?
+        self.assertEqual(ran[1][0], "systemd-run")
+        self.assertEqual(ran[1][-2:], ["/bin/bash", f"{ROOT.LOOK_RUN}/ops-root-look-{os.getpid()}.sh"])
+        self.assertEqual(sorted(n for n in os.listdir(self.tmp + ROOT.LOOK_RUN) if n != "tmp"), ["ops-root-look-2.run"])
+
+    def test_a_look_is_no_form_of_a_rule_only_host_and_takes_its_script_with_its_sha256(self):
+        script = b"ls /var/www\n"
+        sha = hashlib.sha256(script).hexdigest()
+        self.put("/etc/ops-root/mode", "rule-only\n")
+        with self.assertRaisesRegex(ROOT.Refused, "rule-only"):
+            self.call("look", data=script, sha256=sha)
+        self.put("/etc/ops-root/mode", "fix\n")
+        with self.assertRaisesRegex(ROOT.Refused, "sha256"):
+            self.call("look", data=script, sha256="0" * 64)
+        with self.assertRaisesRegex(ROOT.Refused, "takes the script on stdin"):
+            self.call("look")
+        with self.assertRaisesRegex(ROOT.Refused, "takes no arguments"):
+            self.call("look", "/etc", data=script, sha256=sha)
+        self.assertEqual((ROOT.FORMS["look"]["kind"], ROOT.FORMS["look"]["write"], ROOT.FORMS["look"]["window"]),
+                         ("look", False, None))
+
+    def look(self, script=b"ls\n", proved=None, ran=(0, "out\n"), deny=None):
+        """One look on a fix host whose box is not built here: what the test of the box said, and what the box
+        printed."""
+        self.put("/etc/ops-root/mode", "fix\n")
+        deny = deny or {"paths": [], "whole": [], "units": [], "docker": None, "logs": [], "containers": []}
+        seen = []
+
+        def run(data, given=None):
+            seen.append(data)
+            return ran[0], ran[1], deny
+        with patch.object(ROOT, "look_proved", lambda: proved), patch.object(ROOT, "look_run", run):
+            return self.call("look", data=script, sha256=hashlib.sha256(script).hexdigest()), seen
+
+    def test_a_look_answers_what_the_script_printed_and_says_what_it_hid_whole(self):
+        self.assertEqual(self.look(), ("out", [b"ls\n"]))
+        self.assertEqual(self.look(ran=(0, ""))[0], "(no output)")
+        self.assertEqual(self.look(ran=(1, "grep found nothing\n"))[0], "grep found nothing\n(the script ended with status 1)")
+        self.assertEqual(self.look(ran=(124, "part\n"))[0],
+                         "part\n(the look ended with status 124, at its limit of 120 seconds)")
+        deny = {"paths": ["/srv/certs"], "whole": ["/srv/certs"], "units": ["/etc/systemd/system/a.service"],
+                "docker": None, "logs": [], "containers": []}
+        self.assertEqual(self.look(deny=deny)[0],
+                         "out\n(hidden whole, for the count of secret names in them or for a name that no rule can "
+                         "write: /srv/certs)\n"
+                         "(unit files that hold a value themselves are hidden: /etc/systemd/system/a.service)")
+        # a host whose box did not pass its own test runs no look at all
+        with self.assertRaisesRegex(ROOT.Refused, r"did not pass its own test here \(FAULT read a-secret-name\)"):
+            self.look(proved="FAULT read a-secret-name")
+
+    def test_the_box_s_own_test_runs_once_for_a_version_a_boot_and_a_systemd_and_only_a_pass_is_kept(self):
+        self.put("/etc/ops-root/mode", "fix\n")
+        ran, said = [], ["DONE 0\n"]
+
+        def run(script, deny=None):
+            ran.append(script.decode())
+            return 0, said[0], {}
+
+        def version(argv, **kw):
+            return 0, "systemd 255 (255.4-1ubuntu8)\n+PAM"
+        with patch.object(ROOT, "look_run", run), patch.object(ROOT, "run", version), \
+                patch.object(ROOT, "BOOT_ID", "/etc/boot_id"):
+            self.put("/etc/boot_id", "boot-1\n")
+            self.assertIsNone(ROOT.look_proved())
+            self.assertIsNone(ROOT.look_proved())
+            self.assertEqual(len(ran), 1)                       # once
+            self.assertIn(f"{ROOT.STATE}/look/canary/secret", ran[0])
+            self.assertIn(f"{ROOT.LOOK_CHECK}/.env", ran[0])
+            self.assertIn(ROOT.LOOK_CHECK + '/a b%c"d\\e/.env', ran[0])
+            self.assertFalse(os.path.exists(self.tmp + ROOT.LOOK_CHECK))          # the test's own files are gone
+            self.assertFalse(os.path.exists(self.tmp + ROOT.STATE + "/look/canary"))
+            self.put("/etc/boot_id", "boot-2\n")              # a new boot: the box is tried again
+            said[0] = "FAULT read a-secret-name\nFAULT socket unix\nDONE 0\n"
+            self.assertEqual(ROOT.look_proved(), "FAULT read a-secret-name; FAULT socket unix")
+            self.assertEqual(ROOT.look_proved(), "FAULT read a-secret-name; FAULT socket unix")
+            self.assertEqual(len(ran), 3)                       # a fault is not kept: each look tries the box again
+            said[0] = "DONE 0\n"                                # and a box that holds now is a pass from then on
+            self.assertIsNone(ROOT.look_proved())
+            self.assertIsNone(ROOT.look_proved())
+            self.assertEqual(len(ran), 4)
+            for bad in ("", "FINE\n", "DONE 127\n"):          # a test that did not run to its end is no pass
+                self.put("/etc/boot_id", f"boot-{bad!r}\n")
+                said[0] = bad
+                self.assertIn("did not run to its end", ROOT.look_proved())
+            with patch.object(ROOT, "VERSION", ROOT.VERSION + 1):      # a new version of this file: tried again
+                said[0] = "DONE 0\n"
+                self.assertIsNone(ROOT.look_proved())
+
+    def test_the_box_of_a_look_names_each_way_that_it_closes(self):
+        deny = {"paths": ["/etc/ssh", "/srv/app/.env"], "whole": [], "units": [], "docker": "/var/lib/docker",
+                "logs": ["/var/lib/docker/containers/a/a-json.log"], "containers": ["abc=web"]}
+        argv = ROOT.look_box("ops-root-look-7", deny)
+        self.assertEqual(argv[:7], ["systemd-run", "--pipe", "--wait", "--collect", "--quiet", "--unit", "ops-root-look-7"])
+        props = [argv[i + 1] for i, word in enumerate(argv) if word == "--property"]
+        for needed in ("DynamicUser=yes", "AmbientCapabilities=CAP_DAC_READ_SEARCH",
+                       "CapabilityBoundingSet=CAP_DAC_READ_SEARCH", "NoNewPrivileges=yes", "ProtectSystem=strict",
+                       "ProtectHome=read-only", "PrivateNetwork=yes",
+                       "RestrictAddressFamilies=~AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET", "PrivateIPC=yes",
+                       "PrivateDevices=yes", "ProtectProc=invisible", "RestrictNamespaces=yes",
+                       "SystemCallArchitectures=native", "SystemCallErrorNumber=EPERM", "MemoryMax=512M",
+                       "TasksMax=64", "RuntimeMaxSec=120", "TimeoutStopSec=5",
+                       "ReadOnlyPaths=/ /tmp /var/tmp", "TemporaryFileSystem=/run/ops-root-look/tmp:size=64M,mode=1777",
+                       "TemporaryFileSystem=/var/lib/docker:ro",
+                       "BindReadOnlyPaths=-/var/lib/docker/containers/a/a-json.log",
+                       "InaccessiblePaths=-/etc/ssh", "InaccessiblePaths=-/srv/app/.env"):
+            self.assertIn(needed, props)
+        calls = next(p for p in props if p.startswith("SystemCallFilter=~")).removeprefix("SystemCallFilter=~")
+        for refused in ("@network-io", "open_by_handle_at", "name_to_handle_at", "io_uring_setup", "io_uring_enter",
+                        "ptrace", "mount"):
+            self.assertIn(refused, calls.split())
+        self.assertIn("--setenv=LOOK_CONTAINERS=abc=web", argv)
+        self.assertIn("--setenv=TMPDIR=/run/ops-root-look/tmp", argv)
+        self.assertFalse(any(p.startswith(("PrivateTmp", "User=")) for p in props))
+
+    def test_a_name_with_a_space_or_a_quote_is_one_word_of_the_box_and_one_that_no_word_takes_hides_its_folder(self):
+        self.assertEqual(ROOT.look_word("-/srv/app/.env"), "-/srv/app/.env")
+        self.assertEqual(ROOT.look_word("-/srv/caf\u00e9/.env"), "-/srv/caf\u00e9/.env")
+        self.assertEqual(ROOT.look_word("-/var/www/My Site/.env"), '"-/var/www/My Site/.env"')
+        self.assertEqual(ROOT.look_word('-/srv/a"b\\c d/x.key'), '"-/srv/a\\"b\\\\c d/x.key"')
+        self.assertEqual(ROOT.look_word("-/srv/$HOME *?/x.key"), '"-/srv/$HOME *?/x.key"')
+        # systemd reads a quoted word as shlex does for these: the word is the path, whatever a stranger named it
+        for path in ("/var/www/My Site/.env", '/srv/a"b\\c d/x.key', "/srv/it's/x.key", "/srv/a  b/-x/.env"):
+            self.assertEqual(shlex.split(ROOT.look_word("-" + path)), ["-" + path])
+        self.tree({"/proc/self/mounts": "/dev/sda1 / ext4 rw 0 0\n", "/etc/passwd": "",
+                   "/srv/shop/up loads/x y.env": "A", "/srv/shop/up loads/photo.jpg": "p",
+                   "/srv/shop/odd%name/.env": "A", "/srv/shop/odd%name/readme": "r",
+                   "/srv/other/line\nend/id_rsa": "k", "/srv/shop/log/app.log": "l"})
+        deny = ROOT.look_deny()
+        self.assertIn("/srv/shop/up loads/x y.env", deny["paths"])
+        self.assertIn("/srv/shop/odd%name/.env", deny["paths"])
+        self.assertIn("/srv/other", deny["paths"])                        # a line end in a name: the folder above it
+        self.assertIn("/srv/other", deny["whole"])                        # and the answer of the look says so
+        self.assertNotIn("/srv/shop", deny["paths"])
+        props = ROOT.look_box("u", dict(deny, paths=["/srv/shop/up loads/x y.env"]))
+        self.assertIn('InaccessiblePaths="-/srv/shop/up loads/x y.env"', props)
+
+    def gate_taken(self):
+        """True when a write holds the gate: a look cannot pass it now."""
+        with open(self.tmp + ROOT.LOOK_GATE, "a") as gate:
+            try:
+                fcntl.flock(gate, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(gate, fcntl.LOCK_UN)
+            return False
+
+    def beside_a_look(self, write):
+        """The order of what happened when `write` runs while a look runs, with a second look that comes while the
+        write waits: the write's rename comes only after the first look, and the second look only after the rename."""
+        order, started, release, rename = [], threading.Event(), threading.Event(), os.replace
+
+        def renamed(source, target):
+            order.append("renamed")
+            return rename(source, target)
+
+        def looks():
+            with ROOT.look_lock(shared=True):
+                order.append("look runs")
+                started.set()
+                release.wait(20)
+                order.append("look ends")
+
+        def writes():
+            with patch.object(ROOT.os, "replace", renamed):
+                write()
+
+        def late():
+            with ROOT.look_lock(shared=True):
+                order.append("late look")
+        reader = threading.Thread(target=looks)
+        reader.start()
+        self.assertTrue(started.wait(10))
+        writer = threading.Thread(target=writes)
+        writer.start()
+        for _ in range(200):                # until the write holds the gate, where it waits for the look
+            if self.gate_taken():
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("the write took no lock of the looks")
+        self.assertEqual(order, ["look runs"])          # the write waits
+        second = threading.Thread(target=late)
+        second.start()
+        time.sleep(0.3)                     # room for a second look that passed the waiting write to say so
+        self.assertEqual(order, ["look runs"])
+        release.set()
+        for thread in (writer, second, reader):
+            thread.join(20)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(order, ["look runs", "look ends", "renamed", "late look"])
+        return order
+
+    def test_a_write_of_a_file_waits_for_the_looks_that_run_and_a_look_for_a_write(self):
+        self.tree({"/etc/app/settings": "old"})
+        self.beside_a_look(lambda: ROOT.replace("/etc/app/settings", b"new", 0o600))
+        self.assertEqual(self.get("/etc/app/settings"), "new")
+
+    def test_each_form_that_puts_a_file_in_its_place_waits_for_the_looks_that_run(self):
+        # place puts a key's new value into a settings file, which a look hides by itself: a rename there during a
+        # look would show the new key, and so would the temporary file beside it
+        old = "OLD-KEY-VALUE"
+        self.put("/etc/ops-root/mode", "fix\n")
+        self.put("/etc/restic/b2.env", f"B2_ACCOUNT_KEY={old}\n", 0o600)
+        digest = hashlib.sha256(old.encode()).hexdigest()
+        self.beside_a_look(lambda: self.call("place", "/etc/restic/b2.env", "B2_ACCOUNT_KEY", digest,
+                                             data=b"NEW-KEY-VALUE\n"))
+        self.assertEqual(self.get("/etc/restic/b2.env"), "B2_ACCOUNT_KEY=NEW-KEY-VALUE\n")
+        self.assertEqual([n for n in os.listdir(self.tmp + "/etc/restic") if n.startswith(".ops-root-")], [])
+        # a file install
+        data = b"A=1\n"
+        me = __import__("pwd").getpwuid(os.getuid()).pw_name
+        self.beside_a_look(lambda: self.call("file", "/etc/nginx/app.env", "0600", me, data=data,
+                                             sha256=hashlib.sha256(data).hexdigest()))
+        self.assertEqual(self.get("/etc/nginx/app.env"), "A=1\n")
+        # hide, which writes this host's own list
+        self.beside_a_look(lambda: self.call("hide", "/srv/app/private"))
+
+    def test_a_form_that_writes_runs_no_program_beside_a_look_and_no_look_runs_beside_it(self):
+        # passwd puts a new /etc/shadow in the old one's place, a script can do it with a settings file, a package's
+        # install with a file of /etc: each form that writes waits for the looks that run, whatever it runs
+        self.put("/etc/ops-root/mode", "fix\n")
+        order, started, release = [], threading.Event(), threading.Event()
+
+        def looks():
+            with ROOT.look_lock(shared=True):
+                order.append("look runs")
+                started.set()
+                release.wait(20)
+                order.append("look ends")
+
+        running, finish = threading.Event(), threading.Event()
+
+        def program(argv, **kw):
+            order.append("the form's program runs")
+            running.set()
+            finish.wait(20)
+            return 0, "done"
+        nothing = {"paths": [], "whole": [], "units": [], "docker": None, "logs": [], "containers": []}
+        reader = threading.Thread(target=looks)
+        reader.start()
+        self.assertTrue(started.wait(10))
+        with patch.object(ROOT, "run", program), patch.object(ROOT, "systemctl", lambda *words: (0, "")):
+            # a form that writes only this file's own state waits for no look: the door's cancel of the countdown
+            # after a script must not come late
+            self.assertEqual(self.call("timer", "cancel")[:25], "the rollback timer is off")
+            self.assertEqual(self.call("restart", "nginx"), "nginx.service restarted")
+            self.assertEqual(order, ["look runs"])      # both answered while the look still runs
+            writer = threading.Thread(target=lambda: self.call("exec", "ls", "/etc"))
+            writer.start()
+            for _ in range(200):
+                if self.gate_taken():
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("the form took no lock of the looks")
+            self.assertEqual(order, ["look runs"])
+            # a look that comes while the form waits, or while it runs, waits a short time and is then refused
+            with patch.object(ROOT, "LOOK_WAIT", 0.5), \
+                    self.assertRaisesRegex(ROOT.Refused, "a form of the door writes on this host now"):
+                ROOT.look_run(b"ls\n", deny=nothing)
+            release.set()
+            self.assertTrue(running.wait(20))           # the look ended, and the form's program runs now
+            with patch.object(ROOT, "LOOK_WAIT", 0.5), \
+                    self.assertRaisesRegex(ROOT.Refused, "a form of the door writes on this host now"):
+                ROOT.look_run(b"ls\n", deny=nothing)    # and while it runs, too
+            finish.set()
+            writer.join(20)
+            reader.join(20)
+        self.assertEqual(order[:3], ["look runs", "look ends", "the form's program runs"])
+        self.assertFalse(self.gate_taken())             # and the form let go of it
+        # a read of the fixed kind, and a look, take no lock of the host's writes
+        self.assertFalse(ROOT.FORMS["look"]["write"])
+        # each form of the list is a form, and each one that runs the agent's own program or an account's or a
+        # package's tool is in it
+        self.assertTrue(ROOT.LOOK_WRITERS <= set(ROOT.FORMS), ROOT.LOOK_WRITERS - set(ROOT.FORMS))
+        self.assertTrue({"exec", "script", "run", "passwd-lock", "app-new", "install", "purge"} <= ROOT.LOOK_WRITERS)
+
+    def test_the_box_s_own_test_keeps_its_pass_while_a_write_runs_and_the_timer_s_restore_is_a_write(self):
+        self.put("/etc/ops-root/mode", "fix\n")
+        self.put("/etc/boot_id", "boot-1\n")
+        with patch.object(ROOT, "look_run", lambda script, deny=None: (0, "DONE 0\n", {})), \
+                patch.object(ROOT, "run", lambda argv, **kw: (0, "systemd 255")), \
+                patch.object(ROOT, "BOOT_ID", "/etc/boot_id"):
+            with ROOT.look_writes():                    # a long write holds the looks' lock
+                done = []
+                proves = threading.Thread(target=lambda: done.append(ROOT.look_proved()))
+                proves.start()
+                proves.join(10)
+                self.assertEqual(done, [None])          # the pass is kept with no wait for that lock
+        self.assertTrue(json.loads(self.get(ROOT.STATE + "/look/checked"))["passed"])
+        # the rollback timer's restore puts files back as new files: it is a write
+        folder = self.tmp + ROOT.STATE + "/rollback"
+        os.makedirs(folder, exist_ok=True)
+        with open(folder + "/snapshot.tar", "w"):
+            pass
+        seen = []
+        with patch.object(ROOT, "restore", lambda snapshot: seen.append(self.gate_taken()) or True), \
+                patch.object(ROOT, "run", lambda argv, **kw: (0, "")), \
+                patch.object(ROOT, "systemctl", lambda *words: (0, "")), \
+                patch.object(ROOT, "restart", lambda *units: None), \
+                patch.object(ROOT, "tree_state", lambda path: None):
+            self.assertTrue(ROOT.fire())
+            self.assertEqual(seen, [True])
+            self.assertFalse(self.gate_taken())
+            # and it never waits for a form that writes, which can be the script that the countdown guards: after
+            # its short wait it puts the files back with no lock
+            held, release = threading.Event(), threading.Event()
+
+            def long_write():
+                with ROOT.look_lock(shared=False):
+                    held.set()
+                    release.wait(20)
+            writer = threading.Thread(target=long_write)
+            writer.start()
+            self.assertTrue(held.wait(10))
+            os.makedirs(folder, exist_ok=True)
+            with open(folder + "/snapshot.tar", "w"):
+                pass
+            started = time.monotonic()
+            with patch.object(ROOT, "LOOK_SECONDS", -9):        # the wait of fire: one second
+                self.assertTrue(ROOT.fire())
+            self.assertLess(time.monotonic() - started, 15)
+            self.assertEqual(len(seen), 2)
+            release.set()
+            writer.join(20)
+
+    def test_no_look_starts_beside_a_program_of_the_door_that_runs_on_after_its_call(self):
+        # a script whose call ended before it (the door's session went away), a package's install that goes on, the
+        # rollback timer's restore: each is a unit of this file's own that holds no lock
+        nothing = {"paths": [], "whole": [], "units": [], "docker": None, "logs": [], "containers": []}
+        listed, ran = [""], []
+
+        def run(argv, **kw):
+            ran.append(argv[0])
+            return (0, listed[0]) if argv[0] == "systemctl" else (0, "")
+
+        def box(argv, **kw):
+            ran.append(argv[0])
+            return subprocess.CompletedProcess(argv, 0, b"out\n", b"")
+        with patch.object(ROOT, "run", run), patch.object(ROOT.subprocess, "run", box):
+            for unit in ("ops-root-script-4711.service", "ops-root-run-12.service", "ops-root-exec-9.service",
+                         "ops-root-upgrade-1794600000.service", "ops-root-rollback.service"):
+                listed[0] = f"{unit} loaded active running a unit\nops-root-look-5.service loaded active running x\n"
+                with self.subTest(unit=unit), self.assertRaisesRegex(
+                        ROOT.Refused, f"a program that the door started still runs on this host .{unit}."):
+                    ROOT.look_run(b"ls\n", deny=nothing)
+            self.assertNotIn("systemd-run", ran)
+            # another look, the unit of a boot, and what is no unit of this file: none of them holds a look back
+            listed[0] = (f"ops-root-look-5.service loaded active running x\n{ROOT.BOOT_UNIT} loaded active exited y\n"
+                         "nginx.service loaded active running z\nout\n")
+            self.assertEqual(ROOT.look_run(b"ls\n", deny=nothing)[:2], (0, "out\n"))
+        self.assertFalse(self.gate_taken())
+
+    def test_a_look_waits_a_short_time_for_another_look_s_test_of_the_box_and_is_then_refused(self):
+        self.put("/etc/boot_id", "boot-1\n")
+        os.makedirs(self.tmp + ROOT.STATE + "/look", exist_ok=True)
+        held, release = threading.Event(), threading.Event()
+
+        def tests():
+            with open(self.tmp + ROOT.STATE + "/look/check.lock", "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                held.set()
+                release.wait(20)
+        other = threading.Thread(target=tests)
+        other.start()
+        self.assertTrue(held.wait(10))
+        with patch.object(ROOT, "run", lambda argv, **kw: (0, "systemd 255")), \
+                patch.object(ROOT, "BOOT_ID", "/etc/boot_id"), patch.object(ROOT, "LOOK_WAIT", 0.5), \
+                patch.object(ROOT, "look_run", lambda script, deny=None: (0, "DONE 0\n", {})):
+            started = time.monotonic()
+            with self.assertRaisesRegex(ROOT.Refused, "another look tests this host's box now"):
+                ROOT.look_proved()
+            self.assertLess(time.monotonic() - started, 15)
+            release.set()
+            other.join(20)
+            self.assertIsNone(ROOT.look_proved())       # and when that test has ended, this one runs its own
+
+    def test_a_write_inside_a_write_takes_the_lock_one_time(self):
+        # self-update puts five files in place: one wait for the looks that run, and no wait for itself
+        self.tree({"/etc/app/a": "old", "/etc/app/b": "old"})
+        taken = []
+        real = ROOT.look_lock
+
+        @contextlib.contextmanager
+        def counted(shared):
+            taken.append(shared)
+            with real(shared):
+                yield
+        with patch.object(ROOT, "look_lock", counted):
+            with ROOT.look_writes():
+                ROOT.replace("/etc/app/a", b"new", 0o600)
+                ROOT.replace("/etc/app/b", b"new", 0o600)
+            self.assertEqual(taken, [False])
+            ROOT.replace("/etc/app/a", b"newer", 0o600)         # and afterwards each write takes it again
+            self.assertEqual(taken, [False, False])
+        self.assertEqual((self.get("/etc/app/a"), self.get("/etc/app/b")), ("newer", "new"))
+        self.assertFalse(self.gate_taken())
+
+    def test_a_write_waits_for_a_look_that_lost_its_ops_root_but_not_for_an_old_mark(self):
+        os.makedirs(self.tmp + ROOT.LOOK_RUN, exist_ok=True)
+        mark = self.tmp + ROOT.LOOK_RUN + "/ops-root-look-9.run"
+        with open(mark, "w"):
+            pass
+        old = time.time() - ROOT.LOOK_SECONDS - 11
+        os.utime(mark, (old, old))
+        started = time.monotonic()
+        ROOT.look_quiet()                                   # a mark older than a look can run: no wait
+        self.assertLess(time.monotonic() - started, 10)
+        ahead = time.time() + 3600
+        os.utime(mark, (ahead, ahead))                      # a mark from far in the future: a clock that went back
+        started = time.monotonic()
+        ROOT.look_quiet()
+        self.assertLess(time.monotonic() - started, 10)
+        os.utime(mark, None)                                # a look that can still run
+        done = []
+        waiter = threading.Thread(target=lambda: (ROOT.look_quiet(), done.append(1)))
+        waiter.start()
+        time.sleep(1.3)
+        self.assertEqual(done, [])
+        os.remove(mark)                                     # it ended
+        waiter.join(5)
+        self.assertEqual(done, [1])
+
+    def test_hide_adds_one_path_to_the_host_s_own_list_and_no_path_that_a_box_needs(self):
+        self.put("/etc/ops-root/mode", "fix\n")
+        self.assertEqual(self.call("hide", "/srv/app/private"), "/srv/app/private is hidden from now on")
+        self.assertEqual(self.call("hide", "/srv/app/private"), "/srv/app/private is hidden already")
+        self.assertEqual(self.call("hide", "/var/www"), "/var/www is hidden already")
+        self.assertEqual(self.get("/etc/ops-root/hidden"), "/srv/app/private\n")
+        self.assertIn("/srv/app/private", ROOT.hidden_paths())
+        self.tree({"/proc/self/mounts": "/dev/sda1 / ext4 rw 0 0\n", "/etc/passwd": ""})
+        self.assertIn("/srv/app/private", ROOT.look_deny()["paths"])
+        # a link to a part of the system is that part: /var/run is a link to /run on a real host
+        os.makedirs(self.tmp + "/run/systemd", exist_ok=True)
+        os.makedirs(self.tmp + "/var", exist_ok=True)
+        os.symlink(self.tmp + "/run", self.tmp + "/var/run")
+        for bad in ("/etc", "relative/path", "/srv/app/../x", "/srv/my app", "/srv/app/", "/etc/ops-root/mode",
+                    "/srv/a\nb", "/usr/bin", "/usr/local/bin/tool", "/bin/bash", "/lib/x86_64-linux-gnu",
+                    "/etc/systemd/system", "/etc/passwd", "/var/log/nginx", "/run/systemd/x", "/proc/1",
+                    # a folder above a part that the boxes run from, and a link to one
+                    "/var/lib", "/etc/ssl", "/var/log", "/run/systemd", "/var/run/systemd", "/var/lib/ops-root/look",
+                    "/usr/local/lib", "/etc/hosts", "/etc/resolv.conf", "/etc/machine-id", "/etc/dbus-1/system.d"):
+            with self.subTest(bad=bad), self.assertRaises(ROOT.Refused):
+                self.call("hide", bad)
+        self.put("/etc/ops-root/mode", "rule-only\n")
+        with self.assertRaisesRegex(ROOT.Refused, "rule-only"):
+            self.call("hide", "/srv/app/other")
+
+
+@unittest.skipUnless(sys.platform == "linux" and os.geteuid() == 0 and shutil.which("systemd-run") and
+                     os.environ.get("FLEET_LOOK_BOX_TEST") == "1",
+                     "the box of a look is a transient service: a Linux with systemd, as root, on a machine that is "
+                     "thrown away after it (FLEET_LOOK_BOX_TEST=1): the test writes files of its own under /srv, "
+                     "/home, /etc and /var/lib/docker")
+class LookBoxLive(unittest.TestCase):
+    """The box of a look on a real system (incident intake, part 3): each line of "what stops" and of "what is not
+    stopped" in SECURITY.md, as this file sees it happen. Run in a container with systemd, one release of Ubuntu at a
+    time; the machine is thrown away after the run."""
+    CONTAINER = "cd" * 32
+    SECRETS = {
+        "/srv/iil/app/.env": "ENV-SECRET",
+        "/srv/iil/My Site/.env": "SPACE-SECRET",
+        '/srv/iil/odd%n"a\\me/.env': "ODD-SECRET",
+        "/srv/iil/app/config/wp-config.php": "FRAMEWORK-SECRET",
+        "/home/iiluser/.ssh/id_ed25519": "HOME-SECRET",
+        "/etc/iil/settings": "UNIT-FILE-SECRET",
+        "/etc/systemd/system/iil-env.service": "[Service]\nEnvironment=TOKEN=UNIT-VALUE-SECRET\nExecStart=/bin/true\n",
+        "/srv/iil/data/PG_VERSION": "16", "/srv/iil/data/base/rows": "ROW-SECRET",
+        "/srv/iil/app/node_modules/pkg/key.pem": "BULK-SECRET",
+        "/var/lib/docker/containers/" + "cd" * 32 + "/config.v2.json":
+            json.dumps({"Name": "/web", "Config": {"Env": ["A=CONTAINER-SECRET"]}}),
+        "/var/lib/docker/overlay2/layer/app/.env": "LAYER-SECRET",
+    }
+    SEEN = {
+        "/srv/iil/app/log/app.log": "APP-LOG-LINE", "/srv/iil/app/server.js": "APP-CODE",
+        "/srv/iil/My Site/page.html": "SPACE-PAGE", "/home/iiluser/notes.txt": "HOME-NOTES",
+        "/etc/iil/readme": "ETC-README",
+        "/etc/systemd/system/iil.service": "[Service]\nEnvironmentFile=/etc/iil/settings\nExecStart=/bin/true\n",
+        "/var/lib/docker/containers/" + "cd" * 32 + "/" + "cd" * 32 + "-json.log": "CONTAINER-LOG-LINE\n",
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        with open("/etc/passwd") as f:
+            known = any(line.startswith("iiluser:") for line in f)
+        if not known:
+            subprocess.run(["useradd", "--create-home", "iiluser"], check=True)
+        for path, text in list(cls.SECRETS.items()) + list(cls.SEEN.items()):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(text)
+            os.chmod(path, 0o600 if path in cls.SECRETS else 0o640)      # root's own: the box's one right reads them
+        os.makedirs("/home/iiluser/uploads", exist_ok=True)
+        os.chmod("/home/iiluser/uploads", 0o777)                # a folder that every user of the host may write
+        os.makedirs("/etc/ops-root", exist_ok=True)
+        with open("/etc/ops-root/mode", "w") as f:
+            f.write("fix\n")
+        shutil.rmtree(ROOT.STATE + "/look", ignore_errors=True)
+
+    def look(self, script):
+        data = script.encode()
+        return ROOT.call({"v": 1, "op": "look", "args": [], "sha256": hashlib.sha256(data).hexdigest()}, data)
+
+    def look_beside(self, script):
+        """A look in a thread of its own, and its answer's list: this returns when the look's unit runs, so that
+        what the test does next happens during the look and not before its box is there."""
+        outs = []
+        runs = threading.Thread(target=lambda: outs.append(self.look(script)))
+        runs.start()
+        for _ in range(300):
+            r = subprocess.run(["systemctl", "list-units", "--no-legend", "--plain", "--state=active",
+                                ROOT.LOOK_UNIT + "*"], capture_output=True, text=True)
+            if r.stdout.strip():
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("the look's unit did not start")
+        time.sleep(0.5)                                 # the script's first lines
+        return runs, outs
+
+    def test_1_the_box_passes_its_own_test_on_this_system(self):
+        self.assertIsNone(ROOT.look_proved())
+        with open(ROOT.STATE + "/look/checked") as f:
+            kept = json.load(f)
+        self.assertIs(kept["passed"], True)
+        self.assertIn("systemd", kept["key"])
+        self.assertIsNone(ROOT.look_proved())           # kept: no second run of the test
+        self.assertFalse(os.path.exists(ROOT.LOOK_CHECK))
+
+    def test_2_a_look_reads_the_apps_files_and_logs_as_a_user_that_is_not_root(self):
+        out = self.look("id -u; echo \"containers: $LOOK_CONTAINERS\"\n" +
+                        "".join(f"cat {shlex.quote(p)}; echo\n" for p in self.SEEN) +
+                        "ls /srv/iil/app; grep -c . /etc/passwd; echo scratch > \"$TMPDIR/f\" && cat \"$TMPDIR/f\"\n")
+        for words in ("APP-LOG-LINE", "APP-CODE", "SPACE-PAGE", "HOME-NOTES", "ETC-README", "EnvironmentFile=/etc/iil/settings",
+                      "CONTAINER-LOG-LINE", f"containers: {self.CONTAINER[:12]}=web", "server.js", "scratch"):
+            self.assertIn(words, out)
+        self.assertNotEqual(out.splitlines()[0], "0")
+        self.assertRegex(out.splitlines()[0], r"^[0-9]+$")
+
+    def test_3_no_script_reads_a_hidden_path_whatever_its_name_is(self):
+        tries = "".join(f"cat {shlex.quote(p)} 2>&1; ls -la {shlex.quote(p)} 2>&1; head -c 64 < {shlex.quote(p)} 2>&1\n"
+                        for p in list(self.SECRETS) + ["/etc/shadow", "/etc/ssh/sshd_config", "/root/.bashrc",
+                                                        "/var/lib/ops-root/look/checked", "/run/ops-root.lock"])
+        out = self.look(tries + "find /srv/iil /home/iiluser /etc/iil /var/lib/docker -type f 2>/dev/null | xargs -d '\\n' cat 2>/dev/null\n"
+                        "wc -c < /srv/iil/app/.env; ls /srv/iil/data | wc -l\n")
+        for secret in ("ENV-SECRET", "SPACE-SECRET", "ODD-SECRET", "FRAMEWORK-SECRET", "HOME-SECRET", "UNIT-FILE-SECRET",
+                       "UNIT-VALUE-SECRET", "ROW-SECRET", "BULK-SECRET", "CONTAINER-SECRET", "LAYER-SECRET", "root:"):
+            self.assertNotIn(secret, out)
+        self.assertIn("APP-LOG-LINE", out)              # the same find and cat did read what is not hidden
+        # what stands in a hidden path's place is an empty file or an empty folder, which the box's one right opens
+        said = [line for line in out.splitlines() if not line.startswith("(")]
+        self.assertEqual(said[-2:], ["0", "0"], out[-300:])
+        self.assertIn("unit files that hold a value themselves are hidden: /etc/systemd/system/iil-env.service", out)
+
+    def test_4_a_look_changes_nothing_on_the_host_and_reaches_nothing(self):
+        out = self.look("""
+for p in /home/iiluser/uploads/x /srv/iil/app/log/x /etc/iil/x /var/lib/x /run/x /tmp/x /var/tmp/x /dev/shm/x /srv/iil/x; do
+  ( : > "$p" ) 2>/dev/null && echo "WROTE $p"
+done
+rm -f /srv/iil/app/log/app.log 2>/dev/null && echo "REMOVED"
+( exec 3<>/dev/tcp/127.0.0.1/22 ) 2>/dev/null && echo "NET tcp"
+python3 -IS - <<'PY'
+import socket
+for family in (socket.AF_UNIX, socket.AF_INET, socket.AF_INET6, socket.AF_NETLINK, socket.AF_PACKET):
+    try:
+        socket.socket(family, socket.SOCK_DGRAM).close()
+        print("SOCKET", family)
+    except OSError:
+        pass
+PY
+ip -o link 2>/dev/null | grep -v ' lo:' && echo "LINK"
+flock -n /run/ops-root.lock true 2>/dev/null && echo "LOCKED the host's lock"
+echo end
+""")
+        for bad in ("WROTE", "REMOVED", "NET", "SOCKET", "LINK", "LOCKED"):
+            self.assertNotIn(bad, out)
+        self.assertEqual([line for line in out.splitlines() if not line.startswith("(")][-1], "end", out[-300:])
+        for path in ("/home/iiluser/uploads/x", "/srv/iil/app/log/x", "/tmp/x", "/dev/shm/x"):
+            self.assertFalse(os.path.exists(path), path)
+        self.assertTrue(os.path.exists("/srv/iil/app/log/app.log"))
+
+    def test_5_a_look_sees_no_other_process_and_none_of_its_environment(self):
+        other = subprocess.Popen(["sleep", "120"], env={"PATH": "/usr/bin:/bin", "TOKEN": "PROCESS-SECRET"})
+        try:
+            out = self.look("cat /proc/[0-9]*/environ 2>/dev/null | tr '\\0' '\\n' | grep -c PROCESS-SECRET\n"
+                            "ls /proc | grep -c '^[0-9]'; ls /proc/1 2>&1 | head -1; "
+                            f"cat /proc/{other.pid}/cmdline 2>&1 | head -c 80; echo; echo end\n")
+        finally:
+            other.kill()
+            other.wait()
+        self.assertNotIn("PROCESS-SECRET", out)
+        self.assertEqual(out.splitlines()[0], "0")
+        self.assertLess(int(out.splitlines()[1]), 12)           # its own few processes, not the host's
+        self.assertIn("No such file or directory", out)
+
+    def test_6_a_look_ends_at_its_limits_of_time_and_memory(self):
+        with patch.object(ROOT, "LOOK_SECONDS", 4):
+            started = time.monotonic()
+            out = self.look("echo before; sleep 60; echo after\n")
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertIn("before", out)
+        self.assertNotIn("after\n", out + "\n")
+        self.assertRegex(out, r"\((the script|the look) ended with status [0-9]+")
+        out = self.look("python3 -IS -c 'x = bytearray(900 * 1024 * 1024); print(len(x))'; echo \"status $?\"\n")
+        self.assertNotIn(str(900 * 1024 * 1024), out)
+        out = self.look("head -c 100000000 /dev/zero > \"$TMPDIR/big\" 2>&1; ls -la \"$TMPDIR/big\" | awk '{print $5}'\n")
+        self.assertLessEqual(int(out.split()[-1]) if out.split()[-1].isdigit() else 0, 64 * 1024 * 1024)
+
+    def test_7_a_write_of_this_file_s_own_waits_for_a_look_and_a_rename_by_another_program_opens_the_file(self):
+        with open("/etc/iil/settings", "w") as f:
+            f.write("UNIT-FILE-SECRET")
+        loop = "for i in $(seq 1 40); do cat /etc/iil/settings 2>/dev/null; sleep 0.1; done; echo end\n"
+        reader, outs = self.look_beside(loop)
+        started = time.monotonic()
+        ROOT.replace("/etc/iil/settings", b"NEW-UNIT-FILE-SECRET", 0o600)       # as env-add writes it
+        waited = time.monotonic() - started
+        reader.join(60)
+        self.assertGreater(waited, 1.0)                 # it waited for the look to end
+        self.assertNotIn("UNIT-FILE-SECRET", outs[0])
+        self.assertIn("end", outs[0])
+        with open("/etc/iil/settings") as f:
+            self.assertEqual(f.read(), "NEW-UNIT-FILE-SECRET")
+        # what SECURITY.md says is not stopped: another program, which takes no lock, puts a new file in the place of
+        # one that is hidden by itself, and the look that runs reads the new file
+        reader, outs = self.look_beside(loop)
+        with open("/etc/iil/settings.new", "w") as f:
+            f.write("RENAMED-SECRET")
+        os.replace("/etc/iil/settings.new", "/etc/iil/settings")
+        reader.join(60)
+        type(self).rename_opens = "RENAMED-SECRET" in outs[0]
+        self.assertTrue(self.rename_opens, "SECURITY.md says that a rename by another program opens a file that is "
+                                           "hidden by itself: on this system it did not, so its words are too wide")
+
+    def test_8_a_container_that_starts_during_a_look_shows_nothing_of_its_settings(self):
+        new = "/var/lib/docker/containers/" + "ef" * 32
+        reader, outs = self.look_beside(
+            "for i in $(seq 1 30); do cat /var/lib/docker/containers/*/config.v2.json 2>/dev/null; sleep 0.1; done; "
+            "ls /var/lib/docker/containers | wc -l; echo end\n")
+        os.makedirs(new, exist_ok=True)
+        with open(new + "/config.v2.json", "w") as f:
+            f.write(json.dumps({"Name": "/late", "Config": {"Env": ["A=LATE-CONTAINER-SECRET"]}}))
+        reader.join(60)
+        shutil.rmtree(new, ignore_errors=True)
+        self.assertNotIn("LATE-CONTAINER-SECRET", outs[0])
+        self.assertNotIn("CONTAINER-SECRET", outs[0])
+        self.assertIn("end", outs[0])
+
+    def test_9_a_host_with_very_many_files_still_gets_its_list_in_seconds(self):
+        count = int(os.environ.get("FLEET_LOOK_BOX_FILES", "100000"))
+        for d in range(count // 1000):
+            os.makedirs(f"/srv/iil/big/d{d}", exist_ok=True)
+            for n in range(1000):
+                with open(f"/srv/iil/big/d{d}/f{n}", "w"):
+                    pass
+        with open("/srv/iil/big/d0/.env", "w") as f:
+            f.write("BIG-TREE-SECRET")
+        started = time.monotonic()
+        deny = ROOT.look_deny()
+        took = time.monotonic() - started
+        type(self).walk_seconds = round(took, 1)
+        self.assertLess(took, 60, f"the walk of {count} files took {took:.0f} seconds")
+        self.assertTrue(any(p == "/srv/iil/big/d0/.env" or "/srv/iil/big/d0/.env".startswith(p + "/")
+                            for p in deny["paths"]))
+        out = self.look("cat /srv/iil/big/d0/.env 2>&1; ls /srv/iil/big | wc -l\n")
+        self.assertNotIn("BIG-TREE-SECRET", out)
+        print(f"\n[look] the list for {count} more files took {took:.1f} s; paths hidden: {len(deny['paths'])}; "
+              f"a rename by another program opens a hidden file: {getattr(self, 'rename_opens', None)}", file=sys.stderr)
 
 
 class Runners(HostCase):
