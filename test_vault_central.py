@@ -765,7 +765,8 @@ class CentralVault(unittest.TestCase):
     def test_a_replace_keeps_the_address_of_the_key_when_the_new_value_names_none(self):
         """The owner saved a key with the address of its service, and an agent's vault sends the key there for it
         (call_api). In Add secret the address is optional, so the new value of a replace often names none. The key
-        changes; its address stays, or the agent that uses the key would have no place to send it to."""
+        changes; its address stays, or the agent that uses the key would have no place to send it to. The user name
+        comes from the new value only (C11), so a replace by Add secret repairs a key that held a login's user name."""
         key = {"password": API_KEY, "url": "https://api.example.org", "username": "api-user"}
         self.intake(value=key, ref=KEY_REF, title="OPENAI_API_KEY", item="api_key")
         # only a replace keeps an address: the same key with no address and no statement is another value, refused
@@ -775,8 +776,9 @@ class CentralVault(unittest.TestCase):
         new = {"password": "sk-fake-only-the-new-20261113"}             # the form's address field was empty
         fields = self.replace_fields(new, T2, ref=KEY_REF, title="OPENAI_API_KEY", item="api_key")
         self.assertEqual(self.ask("intake", **fields)["saved"], "replaced")
-        kept = {"password": new["password"], "url": "https://api.example.org", "username": "api-user"}
+        kept = {"password": new["password"], "url": "https://api.example.org", "username": ""}
         self.assertEqual(json.loads(self.items()[KEY_SID]["value"]), kept)
+        self.assertFalse(vault.login_shaped(self.items()[KEY_SID]["value"]))   # a session can read this key again
         self.assertEqual(vault.check_login(self.items()[KEY_SID]["value"])["url"], "https://api.example.org")
         self.assertEqual(self.ask("intake", **fields)["saved"], "same")     # the same statement again: the same save
         self.assertEqual(json.loads(self.items()[KEY_SID]["value"]), kept)

@@ -86,6 +86,25 @@ class SessionEnv(Checkout):
         self.assertIn("chat: the session starts without its read variables: the vault broker refused: no",
                       printed.getvalue())
 
+    def test_the_helper_keeps_what_the_last_read_did_not_give_for_its_status(self):
+        """C11: the vault's answer names the variables that it left out because their value has the shape of a login.
+        The helper keeps both lists of its last read and sends them in its status (vault_status), and its log says why."""
+        self.addCleanup(fleet.READ_MISSING.pop, "alpha", None)
+        given = {"ok": True, "v": 2, "env": {"OPENAI_API_KEY": VALUE}, "missing": ["SHOP_KEY", "GONE_KEY"],
+                 "logins": ["SHOP_KEY", "NOT_MISSING"]}
+        printed = io.StringIO()
+        with patch.object(fleet, "broker_job_request", return_value=given), patch("sys.stdout", printed):
+            self.assertEqual(fleet.session_env("alpha", CLAUDE, "task"), {"OPENAI_API_KEY": VALUE})
+        self.assertEqual(fleet.READ_MISSING["alpha"], {"missing": ["GONE_KEY", "SHOP_KEY"], "logins": ["SHOP_KEY"]})
+        self.assertIn("task: the vault did not give SHOP_KEY, GONE_KEY (SHOP_KEY: a value with the shape of a login)",
+                      printed.getvalue())
+        with patch.object(fleet, "broker_status", return_value=None):
+            self.assertEqual(fleet.vault_status("alpha")["read_missing"], fleet.READ_MISSING["alpha"])
+        # an answer with no `logins` (an older vault) is a read with none
+        with patch.object(fleet, "broker_job_request", return_value=dict(given, logins=None)), patch("sys.stdout", printed):
+            fleet.session_env("alpha", CLAUDE, "task")
+        self.assertEqual(fleet.READ_MISSING["alpha"], {"missing": ["GONE_KEY", "SHOP_KEY"], "logins": []})
+
     def test_an_agent_that_still_says_file_reads_nothing_and_asks_nothing(self):
         """File mode read the value with this helper's own Bitwarden token. It is gone: such an agent has no
         credential access, so its sessions start with no key, also with a read grant, and nothing is asked."""

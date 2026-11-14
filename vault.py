@@ -620,13 +620,15 @@ def check_value(value):
 
 
 def login_shaped(value):
-    """True for a stored item with a user name or an authenticator seed: the shape of a login. The owner's choice C11 of
-    13 November 2026 keeps such an item out of a session; its first step only counts them at each read (`read`)."""
+    """True for a stored item with a user name or an authenticator seed, of any type: the shape of a login. The owner's
+    choice C11 of 13 November 2026 keeps such an item out of a session (`read`, and the proxy's `swap_value`). A field
+    that is there and not empty counts, whatever its type, so that no later writer opens a gap with a user name that is
+    not a string. A login that was saved with no user name and no seed has the shape of a key, and this cannot tell."""
     try:
         item = json.loads(value)
     except (ValueError, TypeError):
         return False
-    return isinstance(item, dict) and any(isinstance(item.get(k), str) and item[k] for k in ("username", "totp"))
+    return isinstance(item, dict) and any(item.get(k) not in (None, "") for k in ("username", "totp"))
 
 
 def provenance(text, data, sid):
@@ -707,7 +709,7 @@ def read(conf, purpose=None, uid=None):
         reason = data.get("error") if isinstance(data, dict) else None
         raise Refused("the hub did not name the secrets to read" + (f": {reason}" if isinstance(reason, str) else ""))
     env, missing, swapped, named = {}, [], {}, set()
-    shaped = []             # C11, its first step: the references of the values given that have the shape of a login
+    logins = []             # C11: (variable, reference) of each value that has the shape of a login: none is given
     for x in found:
         name, ref = x.get("env") if isinstance(x, dict) else None, x.get("login") if isinstance(x, dict) else None
         salts = x.get("fingerprint_salts") if isinstance(x, dict) else None
@@ -726,6 +728,15 @@ def read(conf, purpose=None, uid=None):
                 continue
         try:
             stored = store.item(SECRET_REF.fullmatch(ref).group(1))["value"]
+            if login_shaped(stored):
+                # C11: a login's value never reaches a session, as itself or as a placeholder. Its reference leaves
+                # `named`, so `Swaps.only` drops a placeholder that an earlier read made. This rule is for a session's
+                # read and the swap way only: a login that an agent holds as "Uses it" goes through `send` (call_api)
+                # as before.
+                named.discard(ref.lower())
+                logins.append((name, ref.lower()))
+                missing.append(name)
+                continue
             value = check_value(stored)
             protect(conf, {"fingerprint_salts": salts}, value, read=ref.lower())
             if site:
@@ -734,8 +745,6 @@ def read(conf, purpose=None, uid=None):
         except Refused:
             missing.append(name)
             continue
-        if login_shaped(stored):
-            shaped.append(ref.lower())
         env[name] = value["password"]
     if conf.get("_swaps") is not None and type(uid) is int:
         try:                    # the placeholders of keys that the hub names with a site no more
@@ -744,9 +753,13 @@ def read(conf, purpose=None, uid=None):
             pass                # the list stays as it is: each use of an entry still asks the hub
     log(f"read {len(env)} of {len(found)} value(s) for a session of {conf['agent']}"
         + (f", {len(swapped)} of them as a placeholder" if swapped else ""))
-    log(f"a session read of {conf['agent']} gave {len(shaped)} value(s) with a user name or an authenticator seed"
-        + (f": {', '.join(shaped)}" if shaped else ""))     # a reference opens nothing; it names what root checks
+    log(f"a session read of {conf['agent']} left out {len(logins)} value(s) with a user name or an authenticator seed"
+        + (f": {', '.join(ref for _, ref in logins)}" if logins else ""))   # a reference opens nothing
+    # `missing` names each variable that the session does not get, as before; `logins`, only when there is one, names
+    # those of them that C11 left out, so an answer with no login keeps its shape for an older helper
     reply = {"ok": True, "v": PROTOCOL, "env": env, "missing": missing}
+    if logins:
+        reply["logins"] = [name for name, _ in logins]
     if swapped:
         reply["swap"] = {"proxy": f"http://127.0.0.1:{conf['_swap']['port']}", "ca": SWAP_RUN, "names": swapped}
     return reply
@@ -2026,11 +2039,13 @@ def intake(conf, req):
 
 
 def kept_address(value, held):
-    """The value that a replace saves: the new one, with the address and the user name of the stored one when the new
-    one names no address. A replace puts a new key in the place of the old one, and the address of the key's
-    service is no part of the key: an API key that the owner saved with an address keeps it when his new save names
-    none, so that an agent whose vault sends the key for it (call_api) still has the place to send it to. An address
-    in the new value takes the place of the old one. held: the stored item, or None."""
+    """The value that a replace saves: the new one, with the address of the stored one when the new one names no
+    address. A replace puts a new key in the place of the old one, and the address of the key's service is no part of
+    the key: an API key that the owner saved with an address keeps it when his new save names none, so that an agent
+    whose vault sends the key for it (call_api) still has the place to send it to. An address in the new value takes
+    the place of the old one. The user name and the seed come from the new value only (C11): a replace by Add secret,
+    which saves an API key with no user name and no seed, so repairs a key whose stored item had a login's user name,
+    and that key reaches a session again. held: the stored item, or None."""
     try:
         old = json.loads(held["value"]) if held else None
     except ValueError:
@@ -2038,7 +2053,7 @@ def kept_address(value, held):
     if "url" in value or not isinstance(old, dict) or not isinstance(old.get("url"), str):
         return value
     try:
-        return check_login(dict(value, url=old["url"], username=old.get("username", "")))
+        return check_login(dict(value, url=old["url"]))
     except Refused:
         return value                    # an address that is no address any more: the new value as it came
 
@@ -2912,7 +2927,12 @@ def swap_value(conf, uid, host, port, name, form):
                 pass                    # the list could not be written: each use still asks the hub
         return {"ok": False, "code": "refused" if code in (403, 404, 409) else "hub"}
     try:
-        value = check_value(LocalStore(conf).item(SECRET_REF.fullmatch(entry["login"]).group(1))["value"])["password"]
+        stored = LocalStore(conf).item(SECRET_REF.fullmatch(entry["login"]).group(1))["value"]
+        if login_shaped(stored):
+            # C11, the second wall of `read`: the proxy puts no login's value into a request. This is the swap way of
+            # a session only; call_api with a login ("Uses it") goes through `send` as before.
+            return {"ok": False, "code": "refused"}
+        value = check_value(stored)["password"]
     except Refused:
         # Also when the store has the item no more: at the end of the last grant of a machine the hub takes the value
         # back (withdraw), and a grant that is given again brings it back (deposit). In between, there is no key.

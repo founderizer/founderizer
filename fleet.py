@@ -354,6 +354,9 @@ def shell_off(conf):
     return conf.get("role") in ("worker", "lead") and isinstance(conf.get("can"), list) and "shell" not in conf["can"]
 
 
+READ_MISSING = {}       # C11: {agent: {"missing": [...], "logins": [...]}} of its last read, for the hub (vault_status)
+
+
 def read_env(agent, conf, kind):
     """The API keys that the owner lets this agent read (Secrets: read), for session_env: the machine's vault broker
     gives the values, and the hub has their fingerprints before a value comes here, so it masks each one in texts.
@@ -378,8 +381,13 @@ def read_env(agent, conf, kind):
     given = done.get("env") if isinstance(done.get("env"), dict) else {}
     env = {k: v for k, v in given.items() if key_env(k) and isinstance(v, str) and v and "\0" not in v}   # plan 0.2
     missing = [x for x in done.get("missing") or [] if isinstance(x, str) and ENV_NAME.fullmatch(x)]
+    # C11: the names that the vault left out because their value has the shape of a login. Both lists go to the hub in
+    # this helper's status (vault_status), and the hub tells the agent's manager once when a name starts to be missing.
+    logins = sorted(x for x in done.get("logins") or [] if isinstance(x, str) and x in missing)
+    READ_MISSING[agent] = {"missing": sorted(missing), "logins": logins}
     if missing:
-        print(time.strftime("%H:%M:%S"), f"{kind}: the vault did not give {', '.join(missing)}", flush=True)
+        print(time.strftime("%H:%M:%S"), f"{kind}: the vault did not give {', '.join(missing)}"
+              + (f" ({', '.join(logins)}: a value with the shape of a login)" if logins else ""), flush=True)
     # The key swap (VAULT.md): a key can come as a placeholder, which works only through the vault's proxy. Then the
     # session gets the proxy's variables too. When they cannot be made, it starts without each placeholder and
     # without them, so that its other HTTPS programs work.
@@ -8396,7 +8404,9 @@ def vault_status(agent):
               "broker_read_at": time.time() if status else None,
               # package 7: the key generation of a Mac's Fleet Vault (None for a Linux broker, or a vault before it)
               "key_generation": status.get("key_generation") if status and type(status.get("key_generation")) is int
-              and 0 < status["key_generation"] < 1000 else None}
+              and 0 < status["key_generation"] < 1000 else None,
+              # C11: what the agent's last read did not give (read_env), or None before its first read
+              "read_missing": READ_MISSING.get(agent)}
     if vault_mode(agent) == "none":
         return dict(broker, mode="none", isolated=None)
     return dict(broker, mode="broker", isolated=status is not None and not vault_readable())

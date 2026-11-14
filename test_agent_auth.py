@@ -903,7 +903,8 @@ class HelperSide(unittest.TestCase):
                     "withdrawals": None,    # owner feature central_vault
                     "replaces": None,       # owner feature secret_replace
                     "places": None, "place_key": None,      # secret_targets
-                    "key_generation": None})                # package 7: a Mac's vault only
+                    "key_generation": None,                 # package 7: a Mac's vault only
+                    "read_missing": None})                  # C11: before the first read
                 self.assertEqual(fleet.probe_logins(agent, 4), {"ok": True, "results": []})
                 for call in (lambda: fleet.read_login(LOGIN, agent), lambda: fleet.do_signin(LOGIN, agent, "T-1", 3),
                              lambda: fleet.do_handover(LOGIN, agent, "b", "T-1", 3)):

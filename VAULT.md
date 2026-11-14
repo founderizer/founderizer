@@ -155,11 +155,13 @@ The vault protects the value of each secret. The design gives these results:
 - Each build of Fleet Vault has that signature, an older one too, and an agent of the Mac can stop Fleet Vault and
   start an older signed build. So the keys are under the Keychain names of a key generation: `local.agent-fleet.vault`
   for generation 1, and that name with the generation's number for each later one. A build reads only the names of
-  its own generation: builds 1 to 14 generation 1, and build 15 and later generation 2.
+  its own generation: builds 1 to 14 generation 1, build 15 generation 2, and build 16 and later generation 3, which
+  keeps a value with the shape of a login out of each session (see "Never a login's password in a session").
   The name of each generation is a constant of each build's code, so no older build can be told to read another
   (`Sources/FleetVaultCore/VaultKeychain.swift`).
-- The first start of a build of a newer generation moves the keys. It copies the four items, proves each copy by its
-  bytes, writes a marker, and only then deletes the old items. Each process moves under a lock of the vault's own
+- The first start of a build of a newer generation moves the keys. It copies the four items of the newest lower
+  generation that has its marker, or else of generation 1, so a copy that an earlier move left unfinished is never its
+  source. A marked generation ends that search, also with no item in it: after a marker, nothing lower is read. It proves each copy by its bytes, writes a marker, and only then deletes the old items. Each process moves under a lock of the vault's own
   folder and reads the marker again inside it, so two processes never move at once. A move that stops goes on at the
   next start, and loses no key. Until the move is done, the build reads and makes no key of its own generation
   (`VaultKeyMove.swift`).
@@ -296,12 +298,18 @@ The vault protects the value of each secret. The design gives these results:
   agent, the owner chat included, and in the agent's checks, because each of them gets its keys by the same read
   (`fleet.py`). The swap proxy puts the key into requests to the key's site (`vault.py`).
 - **Never a login's password in a session.** The hub names only API keys with a read grant for a session (`hub.py`).
-  But the hub knows a key by its kind in the catalog, and nothing ties that kind to the value under its reference. So
-  a change of the kind, by the owner's API or by a `team.json` of the configuration ref, can make a login's password a
-  key that sessions read (`hub.py`). At each read, a Linux broker writes into its own log how many of the values that
-  it gives have a user name or an authenticator seed, with their references, and it leaves none of them out yet
-  (`vault.py`). A login that was saved with no user name and no seed has the shape of a key, so no count tells it
-  apart.
+  The hub knows a key by its kind in the catalog, and nothing ties that kind to the value under its reference, so the
+  broker checks the value itself. It gives a session no value that has a user name or an authenticator seed: not as
+  itself, and not as a placeholder of the key swap. The swap proxy gives none of it either (`vault.py`,
+  `Sources/FleetVaultCore/VaultBroker.swift`). A login that an agent holds as "Uses it" still goes out in `call_api`.
+  - **The manager hears of it.** The broker's answer names each key that this rule left out. The helper reports what
+    its agent's last read did not give, and the hub tells the manager in a quiet message when a key starts to be
+    missing, with the reason and the repair, at most once a day for each key (`fleet.py`, `hub.py`). The start texts name such a key apart, from
+    the last read, so the first session after a key goes missing still lists it.
+  - **The repair** is to save the key again under the same name in Settings › Secrets. A replace keeps the stored
+    address when the new value names none, and it takes the user name and the seed from the new value only (`vault.py`).
+  - **What this rule cannot see:** a login that was saved with no user name and no seed has the shape of a key
+    (limit 5).
 
 ## The key swap
 
@@ -456,7 +464,9 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
    broker's store to the agent users of its machine, or send it to the saved site of that value. It can also put a
    value of its own into a broker's store (`vault.py`). On a server that swaps keys, the hub's word also says which
    key swaps and what its site is. When the hub names no site for a key, the broker gives the key itself to the
-   session (`vault.py`, `hub.py`).
+   session (`vault.py`, `hub.py`). A broker gives a session no value with a user name or an authenticator seed. But a
+   login that was saved with no user name and no seed has the shape of a key, so the hub's word can still bring such a
+   login's password into a session, and an older Fleet Vault build on a Mac has no such check (limit 6).
 6. **A Mac that does not have the owner's keys.** Fleet Vault on a Mac checks the owner's pin of the receiving key
    with the owner's public keys and the id of the fleet that root gave its configuration. No install gives them
    (`Sources/FleetVaultCore/VaultOwnerPin.swift`, `Vault/install.py`). Without them, Fleet Vault refuses each handover,

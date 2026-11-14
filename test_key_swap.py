@@ -1524,6 +1524,18 @@ class BrokerPart(test_vault.VaultBroker):
         self.assertFalse(self.proxy_asks(op="read")["ok"])                  # no other operation on this socket
         self.assertFalse(self.proxy_asks(op="swap", uid="1", host=HOST, port=443, name=name, form="bearer")["ok"])
 
+    def test_a_value_with_a_login_s_shape_gets_no_placeholder_and_the_proxy_gives_none_of_it(self):
+        """C11 on the swap way: a value with a user name gets no placeholder, the read switches off the placeholder
+        that an earlier read made, and the proxy's own value path refuses that value too (the second wall)."""
+        self.started()
+        name = fleet.vault_call({"op": "read"})["env"]["SHOP_API_KEY"]        # a key: its placeholder, which works
+        self.assertEqual(self.swap(name), {"ok": True, "value": self.VALUE})
+        self.item(test_vault.SECRET_ID, {"username": "pilot-b", "password": self.VALUE}, key="SHOP_API_KEY")
+        self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})    # the second wall, before any new read
+        raw = fleet.vault_call({"op": "read"})
+        self.assertEqual(raw, {"ok": True, "v": 2, "env": {}, "missing": ["SHOP_API_KEY"], "logins": ["SHOP_API_KEY"]})
+        self.assertIn(name, self.off())                                         # the earlier placeholder is off
+
     def off(self):
         """The placeholders of the broker's list that are switched off. The list has one form of off, true, and it is
         a list that a broker reads at its start: a vault.py of the first version takes the same form and no other."""

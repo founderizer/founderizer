@@ -1298,7 +1298,8 @@ def key_words(agent, short=False):
     keep the prefix, so a session sees a wrong word of the owner's itself. Elsewhere the hub does not know whether
     the agent's machine swaps keys, so the words say how the session sees it: the value begins with vaultswap_. From
     team.json only: a start text reads nothing else."""
-    held = [(name, key_swap(agent, ref)) for ref, name in read_secrets(agent)]
+    gone = vault_missing(agent)         # C11: a key that the last read did not give has no placeholder to speak of
+    held = [(name, key_swap(agent, ref)) for ref, name in read_secrets(agent) if name not in gone]
     held = [(name, found[0].split("://", 1)[1]) for name, found in held if found]
     if not held:
         return ""
@@ -3770,8 +3771,11 @@ def holdings_parts(agent):
                      "forms, `ops status` what the door gives you): " +
                      named_few(f"{h} ({v})" for h, v in sorted(a["servers"].items())))
     keys = [name for _, name in session_variables(agent)]       # none for an agent with no vault broker
-    if keys:
-        parts.append("API keys in this session: " + named_few(keys) + key_words(agent))
+    gone = [k for k in keys if k in vault_missing(agent)]        # C11: not given at its vault's last session read
+    if len(gone) < len(keys):
+        parts.append("API keys in this session: " + named_few(k for k in keys if k not in gone) + key_words(agent))
+    if gone:
+        parts.append("API keys that the vault did not give at its last read: " + named_few(gone))
     refs = sorted(secret_grants(agent)) if a.get("vault") != "none" else []
     if refs:
         # secret_words is see_capacity's, so the clause names it as the catalog's own words and not as a sentence
@@ -11692,6 +11696,83 @@ def machine_pin(machine):
     return pin if isinstance(pin, dict) else None
 
 
+READ_TOLD_FOR = 86400       # C11: at most one message a day for each read key of an agent (vault_read_missing)
+
+
+def vault_missing(agent):
+    """C11: {variable: "login" or "other"} for each read key that this agent's vault did not give at its last session
+    read, as the agent's helper reported it: "login" for a value with the shape of a login, "other" for each other
+    reason. {} when none, before such a report, or for a damaged row.
+
+    A start text reads it, and the hub writes a task's start text and a duty's watch task inside a transaction
+    (admit_task, duty_save), so it reads with read_row: kv_get commits, and the hub's guard refuses a commit there."""
+    row = read_row("SELECT v FROM kv WHERE k=?", (f"read_missing:{agent}",))
+    try:
+        kept = json.loads((row["v"] if row else None) or "{}")
+    except ValueError:
+        return {}
+    return {k: v for k, v in kept.items() if isinstance(k, str) and v in ("login", "other")} \
+        if isinstance(kept, dict) else {}
+
+
+def vault_told(agent):
+    """C11: {variable: {"why", "at"}}: when the manager was told last that this read key was missing. A key that came
+    back keeps its entry for READ_TOLD_FOR, so an agent's own reports bring at most one message a day for each key.
+    It reads with read_row, as vault_missing does, so that no read of these records commits."""
+    row = read_row("SELECT v FROM kv WHERE k=?", (f"read_told:{agent}",))
+    try:
+        kept = json.loads((row["v"] if row else None) or "{}")
+    except ValueError:
+        return {}
+    return {k: v for k, v in kept.items() if isinstance(k, str) and isinstance(v, dict) and v.get("why") in
+            ("login", "other") and isinstance(v.get("at"), (int, float)) and not isinstance(v.get("at"), bool)} \
+        if isinstance(kept, dict) else {}
+
+
+def missing_words(name, why, machine, who):
+    """The quiet message to the manager when a read key starts to be missing from an agent's sessions (C11)."""
+    if why == "login":
+        return (f"[hub] The vault of {machine} left {name} out of the sessions of {who}: the value under that key has a "
+                f"user name or an authenticator seed, so it is a login's value and not a key. If it is a login, or its "
+                f"service needs the user name, the owner takes \"Reads it\" back and gives \"Uses it\". Only if it is "
+                f"a key that was saved with a user name by mistake, the owner saves it again under the same name in "
+                f"Settings › Secrets (Add secret), which replaces it with a key that has no user name.")
+    return (f"[hub] The vault of {machine} did not give {name} to the sessions of {who}: it could not read or protect "
+            f"that key there. Look at the key's delivery to {machine} in Settings › Secrets.")
+
+
+def vault_read_missing(agent, data, t0=None):
+    """C11: the hub keeps what the last session read of this agent did not give (security.vault.read_missing of its
+    helper's report), and it tells the manager in a quiet message when a key starts to be missing, as for a failed
+    delivery. Only the names of the agent's own read grants count, so a report can make no other message. A key is
+    told at most once a day (READ_TOLD_FOR), whatever its reason, so an agent's own reports cannot make many messages.
+    A key whose delivery to that machine is still on its way is not told: the delivery's own message follows. A report
+    without the field (an older helper, or a helper before its first read) changes nothing."""
+    report = ((data.get("security") or {}).get("vault") or {}).get("read_missing")
+    if not isinstance(report, dict):
+        return
+    t0 = t0 or now()
+    granted = {env: ref for ref, env in read_secrets(agent)}
+    missing = [n for n in report.get("missing") or [] if isinstance(n, str) and n in granted]
+    logins = {n for n in report.get("logins") or [] if isinstance(n, str) and n in missing}
+    now_missing = {n: "login" if n in logins else "other" for n in missing}
+    told = vault_told(agent)
+    told_now = {n: e for n, e in told.items() if n in now_missing or t0 - e["at"] < READ_TOLD_FOR}
+    machine = (agents().get(agent) or {}).get("machine") or "its server"
+    for name, why in sorted(now_missing.items()):
+        if name in told_now:
+            continue
+        row = latest_deposits(granted[name]).get(machine)
+        if row and not row["finished"]:
+            continue
+        emit(manager_name(), "say", missing_words(name, why, machine, shown_role(agent)), extra={"quiet": True})
+        told_now[name] = {"why": why, "at": t0}
+    if now_missing != vault_missing(agent):
+        kv_set(f"read_missing:{agent}", json.dumps(now_missing) if now_missing else None)
+    if told_now != told:
+        kv_set(f"read_told:{agent}", json.dumps(told_now) if told_now else None)
+
+
 def owner_pin(agent):
     """The owner's signed pin of the machine of this agent, {statement, signature} as the app sent it and the central
     vault took it, or None: what a giving broker checks a handover's recipient with (vault.owner_pinned)."""
@@ -18400,8 +18481,12 @@ def duty_toolbox(agent):
     if a.get("tools"):
         parts.append("tools " + ", ".join(sorted(a["tools"])))
     keys = [name for _, name in session_variables(agent)]       # none for an agent with no vault broker
-    if keys:
-        parts.append("API keys in your session: " + ", ".join(keys) + key_words(agent, short=True))
+    gone = [k for k in keys if k in vault_missing(agent)]        # C11: not given at its vault's last session read
+    if len(gone) < len(keys):
+        parts.append("API keys in your session: " + ", ".join(k for k in keys if k not in gone) +
+                     key_words(agent, short=True))
+    if gone:
+        parts.append("not given by the vault at its last read: " + ", ".join(gone))
     logins = granted_logins(agent)
     if logins:
         parts.append(f"{len(logins)} saved logins by name (sign_in, call_api)")
@@ -33163,6 +33248,14 @@ def validate_status(data):
         place_key = vault.get("place_key")              # its own SSH key for a server (PLACE_PUBLIC): unused here
         if place_key is not None and not (isinstance(place_key, str) and PLACE_PUBLIC.fullmatch(place_key)):
             raise ValueError("place_key must be an ssh-ed25519 public key or null")
+        # C11: what the agent's last read did not give (vault_read_missing). A damaged one is null, never a refusal of
+        # the whole report, which would take the machine's broker and its deliveries with it.
+        read_missing, names = vault.get("read_missing"), lambda v: isinstance(v, list) and len(v) <= 256 and all(
+            isinstance(n, str) and ENV_NAME.fullmatch(n) for n in v)
+        read_missing = {"missing": list(read_missing["missing"]),
+                        "logins": [n for n in read_missing.get("logins") or [] if n in read_missing["missing"]]} \
+            if isinstance(read_missing, dict) and names(read_missing.get("missing")) \
+            and names(read_missing.get("logins") or []) else None
         vault = {"mode": mode, "isolated": _optional(vault.get("isolated"), bool),       # shared broker callers:
                  "callers": _optional(vault.get("callers"), bool), "broker_recipient": recipient,
                  "broker_read_at": read_at, "creates": _optional(vault.get("creates"), bool),      # create_login
@@ -33172,7 +33265,7 @@ def validate_status(data):
                  "withdrawals": _optional(vault.get("withdrawals"), bool),  # owner feature central_vault
                  "replaces": _optional(vault.get("replaces"), bool),        # owner feature secret_replace
                  "places": _optional(vault.get("places"), bool),            # vault.py `place`: unused here
-                 "place_key": place_key, "broker_source": source,
+                 "place_key": place_key, "broker_source": source, "read_missing": read_missing,
                  # package 7: a Mac vault's key generation; another value is null, never a refusal of the report
                  "key_generation": vault.get("key_generation") if type(vault.get("key_generation")) is int
                  and 0 < vault["key_generation"] < 1000 else None}
@@ -35884,7 +35977,7 @@ AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent"
 # kv key the code builds from a value, so a new prefix is placed here or named there with what it holds.
 AGENT_KV = ("tools:", "offline_told:", "runtime_since:", "switched:", "switching:", "history_agent:", "default_vault:",
             "default_desktop:", "checks_brief:", "chat_team:", "duty_review:", "presence:", "turn_ended:",
-            "first_message:", "settings_finding:", "chat_undelivered:")
+            "first_message:", "settings_finding:", "chat_undelivered:", "read_missing:", "read_told:")
 # The same, with more after the name: `<prefix><agent>:<window, task or item>`.
 AGENT_KV_SCOPED = ("listed:", "untaken:", "chased:")
 # Columns that hold a JSON list of agents' names: the agents that passed a question up (question_passers).
@@ -37858,6 +37951,7 @@ def record_status(agent, data):
     with area("state" if not old or said(json.loads(old["data"])) != said(data) else "activity"):
         q("INSERT INTO machine_status(agent,data,reported) VALUES(?,?,?) "
           "ON CONFLICT(agent) DO UPDATE SET data=excluded.data, reported=excluded.reported", (agent, json.dumps(data), now()))
+    vault_read_missing(agent, data)     # C11: a read key that starts to be missing is told to the manager once
     end_signed_in_waits(agent)          # a sign-in this report says is made is over, whatever is still waiting for it
     if agent == manager_name():
         manager_flag_update(now())      # the banner follows the manager's own report at once (live_changes)

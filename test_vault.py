@@ -300,9 +300,9 @@ class VaultBroker(OwnerAPI):
             fleet.vault_call({"op": "read"})
         self.assertIn("vps has no credential access", str(refused.exception))
 
-    def test_a_read_counts_the_values_with_a_user_name_or_a_seed_and_still_gives_them(self):
-        """C11, its first step: the broker writes into its own log how many of the values that it gives have the shape
-        of a login (a user name or an authenticator seed), and it leaves none of them out yet."""
+    def test_a_read_leaves_out_each_value_with_a_user_name_or_a_seed(self):
+        """C11: a session read gives no value that has the shape of a login (a user name or an authenticator seed). It
+        names such a variable in `missing` and in `logins`, and the broker's log names its reference, never a value."""
         named, seeded, plain = "sk-fake-named-20261113", "sk-fake-seeded-20261113", "sk-fake-plain-20261113"
         seed = "JBSWY3DPEHPK3PXP"
         refs = {"SHOP_API_KEY": self.item(SECRET_ID, {"username": "pilot-b", "password": named}),
@@ -315,15 +315,116 @@ class VaultBroker(OwnerAPI):
         logged = []
         with patch.object(vault, "log", side_effect=logged.append):
             raw = fleet.vault_call({"op": "read"})
-        self.assertEqual(raw["env"], {"SHOP_API_KEY": named, "SEED_KEY": seeded, "PLAIN_KEY": plain})
-        self.assertEqual(raw["missing"], [])
-        head = "a session read of vps gave 2 value(s) with a user name or an authenticator seed: "
+        self.assertEqual(raw["env"], {"PLAIN_KEY": plain})
+        self.assertEqual((sorted(raw["missing"]), sorted(raw["logins"])), (["SEED_KEY", "SHOP_API_KEY"],) * 2)
+        head = "a session read of vps left out 2 value(s) with a user name or an authenticator seed: "
         line = next(line for line in logged if line.startswith(head))
         self.assertEqual(sorted(line[len(head):].split(", ")), sorted([refs["SHOP_API_KEY"], refs["SEED_KEY"]]))
         self.assertFalse([line for line in logged if any(v in line for v in (named, seeded, plain, seed, "pilot-b"))])
-        self.assertEqual([vault.login_shaped(text) for text in ('{"username": "", "password": "x"}', "not json", "[1]",
-                                                                 '{"username": 7, "password": "x"}')],
-                         [False, False, False, False])
+        # a field that is there and not empty counts, whatever its type
+        shapes = {'{"username": "", "password": "x"}': False, "not json": False, "[1]": False,
+                  '{"username": null, "totp": "", "password": "x"}': False, '{"username": 7, "password": "x"}': True,
+                  '{"username": " ", "password": "x"}': True, '{"totp": ["x"], "password": "x"}': True}
+        self.assertEqual({text: vault.login_shaped(text) for text in shapes}, shapes)
+        # a read with no such value answers in the shape of before: no `logins`
+        self.item(SECRET_ID, {"username": "", "password": named})
+        self.item(OTHER_ID, {"username": "", "password": seeded})
+        self.assertNotIn("logins", fleet.vault_call({"op": "read"}))
+
+    def test_a_task_and_a_duty_of_an_agent_with_read_keys_start_through_their_real_paths(self):
+        """C11 through the paths that write a start text inside a transaction: a task that the manager makes
+        (create_task, admit_task) and a duty with a watch (duty_save, its watch task). The start text reads what the
+        agent's last read left out (vault_missing); a read that commits there was refused by the hub's own guard, so no
+        task of an agent with read keys and a shell could be made, started or given a duty. Once with no missing key,
+        once with one."""
+        refs = {"SHOP_API_KEY": REF, "PLAIN_KEY": "bws://" + THIRD_ID}
+        hub.TEAM["logins"] = {ref: {"title": env, "kind": "api_key", "env": env} for env, ref in refs.items()}
+        self.addCleanup(hub.TEAM.pop, "logins", None)
+        hub.TEAM["agents"]["vps"]["secrets"] = {ref: "read" for ref in refs.values()}
+        self.addCleanup(hub.TEAM["agents"]["vps"].pop, "secrets", None)
+        clock = {"kind": "clock", "schedule": {"kind": "every", "minutes": 10}}
+        for missing, here, apart in (([], "PLAIN_KEY, SHOP_API_KEY", None), (["SHOP_API_KEY"], "PLAIN_KEY", "SHOP_API_KEY")):
+            hub.vault_read_missing("vps", {"security": {"vault": {"read_missing": {"missing": missing, "logins": missing}}}})
+            text, error = hub.call_tool("manager", "create_task", {"owner": "vps", "title": f"Count the orders {here}",
+                                                                   "done_when": "The count is in the result."})
+            self.assertFalse(error, text)
+            start = hub.q1("SELECT text FROM events WHERE agent='vps' AND kind='task' ORDER BY id DESC LIMIT 1")["text"]
+            self.assertIn(f"API keys in this session: {here}", start)
+            with hub.LOCK:
+                duty = hub.duty_save(hub.duty_fields({"agent": "vps", "text": f"Watch the shop's orders ({here}).",
+                                                      "watch": [clock]}, True), "manager", hub.now())
+            details = json.loads(hub.q1("SELECT task FROM triggers WHERE responsibility=?", (duty["id"],))["task"])["details"]
+            self.assertIn(f"API keys in your session: {here}", details)
+            if apart:
+                self.assertIn(f"API keys that the vault did not give at its last read: {apart}", start)
+                self.assertIn(f"not given by the vault at its last read: {apart}", details)
+            else:
+                self.assertNotIn("did not give at its last read", start)
+                self.assertNotIn("not given by the vault", details)
+
+    def test_a_key_that_starts_to_be_missing_is_told_to_the_manager_once(self):
+        """C11: the hub keeps what an agent's last session read did not give (its helper's report), tells the manager in
+        a quiet message with the reason and the repair, at most once a day for each key, counts only the agent's own
+        read grants, waits for a delivery on its way, and its start texts name such a key apart."""
+        refs = {"SHOP_API_KEY": REF, "PLAIN_KEY": "bws://" + THIRD_ID}
+        hub.TEAM["logins"] = {ref: {"title": env, "kind": "api_key", "env": env} for env, ref in refs.items()}
+        self.addCleanup(hub.TEAM.pop, "logins", None)
+        hub.TEAM["agents"]["vps"]["secrets"] = {ref: "read" for ref in refs.values()}
+        self.addCleanup(hub.TEAM["agents"]["vps"].pop, "secrets", None)
+
+        def said():
+            return [r["text"] for r in hub.q("SELECT text FROM events WHERE agent=? AND kind='say' ORDER BY id",
+                                             (hub.manager_name(),))]
+
+        def report(missing, logins=(), t0=None):
+            hub.vault_read_missing("vps", {"security": {"vault": {"read_missing": {"missing": list(missing),
+                                                                                    "logins": list(logins)}}}}, t0)
+        before, day = len(said()), hub.READ_TOLD_FOR
+        report(["SHOP_API_KEY", "PLAIN_KEY", "NOT_GRANTED"], ["SHOP_API_KEY"])
+        new = said()[before:]
+        self.assertEqual(len(new), 2)
+        login = next(text for text in new if "SHOP_API_KEY" in text)
+        self.assertIn("left SHOP_API_KEY out of the sessions of", login)
+        self.assertIn("If it is a login, or its service needs the user name, the owner takes \"Reads it\" back", login)
+        self.assertIn("Only if it is a key that was saved with a user name by mistake", login)
+        self.assertIn("did not give PLAIN_KEY to the sessions of", next(text for text in new if "PLAIN_KEY" in text))
+        self.assertEqual(hub.vault_missing("vps"), {"SHOP_API_KEY": "login", "PLAIN_KEY": "other"})
+        # the start texts name what the vault did not give apart, and not as a key of the session
+        parts = "; ".join(hub.holdings_parts("vps"))
+        self.assertIn("API keys that the vault did not give at its last read: PLAIN_KEY, SHOP_API_KEY", parts)
+        self.assertNotIn("API keys in this session:", parts)
+        self.assertIn("not given by the vault at its last read: PLAIN_KEY, SHOP_API_KEY", hub.duty_toolbox("vps"))
+        self.assertNotIn("API keys in your session:", hub.duty_toolbox("vps"))
+        report(["SHOP_API_KEY", "PLAIN_KEY"], ["SHOP_API_KEY"])               # the same again: told already
+        self.assertEqual(len(said()), before + 2)
+        report(["SHOP_API_KEY"], ["SHOP_API_KEY"])                            # PLAIN_KEY came back
+        self.assertEqual(hub.vault_missing("vps"), {"SHOP_API_KEY": "login"})
+        self.assertIn("API keys in this session: PLAIN_KEY", "; ".join(hub.holdings_parts("vps")))
+        report(["SHOP_API_KEY", "PLAIN_KEY"], ["SHOP_API_KEY"])               # and goes again: not in the same day
+        report(["SHOP_API_KEY", "PLAIN_KEY"], ["SHOP_API_KEY", "PLAIN_KEY"])  # nor with another reason
+        self.assertEqual(len(said()), before + 2)
+        report(["SHOP_API_KEY"], ["SHOP_API_KEY"], t0=hub.now() + day + 60)   # back for more than a day
+        report(["SHOP_API_KEY", "PLAIN_KEY"], ["SHOP_API_KEY"], t0=hub.now() + day + 120)   # then a new loss is told
+        self.assertEqual(len(said()), before + 3)
+        hub.vault_read_missing("vps", {"security": {"vault": {}}})            # an older helper: nothing changes
+        self.assertEqual(hub.vault_missing("vps"), {"SHOP_API_KEY": "login", "PLAIN_KEY": "other"})
+        report([])
+        self.assertEqual(hub.vault_missing("vps"), {})
+        self.assertEqual(set(hub.vault_told("vps")), {"SHOP_API_KEY", "PLAIN_KEY"})     # kept for a day after
+        report([], t0=hub.now() + 3 * day)
+        self.assertEqual(hub.kv_get("read_told:vps"), None)
+        # a key whose delivery to that machine is on its way, for either reason: its delivery's own message follows
+        for ref in refs.values():
+            hub.ins("INSERT INTO deposits(login,machine,agent,recipient,sha256,request_id,created) VALUES(?,?,?,?,?,?,?)",
+                    (ref, hub.TEAM["agents"]["vps"]["machine"], "vps", "age1x", "0" * 64, "r-" + ref[-4:], hub.now()))
+        report(["PLAIN_KEY", "SHOP_API_KEY"], ["SHOP_API_KEY"], t0=hub.now() + 4 * day)
+        self.assertEqual(len(said()), before + 3)
+        self.assertEqual(hub.vault_missing("vps"), {"PLAIN_KEY": "other", "SHOP_API_KEY": "login"})
+        # the real way: the helper's report through the hub's check of it (validate_status), then record_status
+        hub.q("UPDATE deposits SET finished=?, ok=1", (hub.now(),))
+        hub.record_status("vps", hub.validate_status({"security": {"vault": {"mode": "broker", "read_missing": {
+            "missing": ["SHOP_API_KEY"], "logins": ["SHOP_API_KEY"]}}}}))
+        self.assertEqual((hub.vault_missing("vps"), len(said())), ({"SHOP_API_KEY": "login"}, before + 4))
 
     def test_a_sealed_handover_is_opened_only_inside_the_broker(self):
         # A copy names its source login (owner API 1.10), and a handover needs its receiver to hold that login
@@ -717,6 +818,7 @@ class VaultBroker(OwnerAPI):
                   "withdrawals": None,                                                 # withdrawals: central_vault
                   "replaces": None,                                                    # replaces: secret_replace
                   "key_generation": None,                                              # package 7: a Mac's vault only
+                  "read_missing": None,                                                # C11: before the first read
                   "places": None, "place_key": None}                                   # places: secret_targets
         self.assertEqual(fleet.vault_status("vps"), dict(unread, mode="broker", isolated=False))
         report = hub.validate_status({"security": {"vault": {"mode": "broker", "isolated": True, "token": "x"}}})
@@ -727,6 +829,13 @@ class VaultBroker(OwnerAPI):
                              ["security"]["vault"]["key_generation"], kept, said)
         with patch.object(fleet, "broker_status", return_value={"recipient": None, "key_generation": 2}):
             self.assertEqual(fleet.vault_status("vps")["key_generation"], 2)
+        # C11: a report's read_missing passes when it is lists of variable names, and a damaged one is null, never a refusal
+        said = {"missing": ["SHOP_API_KEY", "GONE_KEY"], "logins": ["SHOP_API_KEY", "NOT_MISSING"]}
+        self.assertEqual(hub.validate_status({"security": {"vault": {"mode": "broker", "read_missing": said}}})
+                         ["security"]["vault"]["read_missing"], {"missing": ["SHOP_API_KEY", "GONE_KEY"], "logins": ["SHOP_API_KEY"]})
+        for damaged in ({"missing": "SHOP_API_KEY"}, {"missing": ["lower"]}, {"missing": ["A"] * 257}, ["A"], "A"):
+            self.assertIsNone(hub.validate_status({"security": {"vault": {"mode": "broker", "read_missing": damaged}}})
+                              ["security"]["vault"]["read_missing"], damaged)
         for wrong in ({"broker_recipient": "age1short"}, {"callers": "yes"}, {"broker_read_at": "now"}, {"creates": 1},
                       {"captures": "yes"}, {"requests": 1}):
             with self.assertRaises(ValueError):

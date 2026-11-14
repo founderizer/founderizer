@@ -237,6 +237,15 @@ class BrokerRequests(VaultBroker):
         self.assertEqual(self.answered('{"error": "none"}')[1]["status"], 404)
         self.assertEqual(len(self.service.seen), 6)
 
+    def test_a_login_with_a_user_name_still_goes_out_in_a_request(self):
+        """C11 keeps a login's value out of a session's read and out of the swap proxy. A login that the agent holds
+        as "Uses it" still goes out in call_api as before (`send`), its user name included."""
+        self.assertTrue(vault.login_shaped(json.dumps(self.login)))
+        job = self.request_job(path="/v1/orders", auth="basic")
+        self.assertEqual(self.ask(job)["status"], 200)
+        basic = base64.b64encode(f"{LOGIN['username']}:{LOGIN['password']}".encode()).decode()
+        self.assertEqual(self.service.seen[-1]["headers"].get_all("Authorization"), ["Basic " + basic])
+
     def test_the_key_is_in_no_argument_no_environment_and_no_log_line(self):
         sent, started, real = '{"note": "body-marker-13579"}', [], subprocess.Popen
 
