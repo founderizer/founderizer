@@ -37882,6 +37882,20 @@ def record_status(agent, data):
                 event_rows(notices, t0)
         released = True                             # the helper forgets the hand-over (handover_done)
         log(agent, "the manager session of its new runtime runs; its messages are delivered again")
+    # **A machine's first report that is behind the hub is asked to follow.** apply_team asks the machines that have
+    # reported, so a helper that loaded team.json before a change of it, and reports for the first time after it, was
+    # asked by nobody: it kept the settings that it loaded, the hub waited for the new ones (settings_pending), and no
+    # session of its agent started until the file changed again. The fourth agent of a new fleet stood so for ten
+    # minutes on 13 November 2026, with the owner's message unread: the hub gave it the desktop of its Mac by default
+    # one second before its first report. Only a first report, and only a commit that the hub's own revision has in
+    # its history: a later report meets the request that apply_team made, and a commit that the hub does not know can
+    # be a later one (contains_revision).
+    first = data.get("revision")
+    if not old and desired and isinstance(first, str) and REVISION.match(first) and first != desired and \
+            git_kit("cat-file", "-e", f"{first}^{{commit}}")[0] == 0 and not same_code(first, desired) and \
+            git_kit("merge-base", "--is-ancestor", first, desired)[0] == 0:
+        request_update(agent, desired)
+        log(agent, f"its first report is behind the hub at {first[:12]}; it is asked to follow to {desired[:12]}")
     up = q1("SELECT * FROM machine_updates WHERE agent=?", (agent,))
     if up and up["state"] in ("requested", "waiting_idle", "updating", "failed"):
         target, rev = up["desired"] or desired, data.get("revision")

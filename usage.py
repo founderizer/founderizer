@@ -69,6 +69,12 @@ class SignedOut(ValueError):
     then no longer the runtime's identity."""
 
 
+class SignInAgain(SignedOut):
+    """The runtime keeps a sign-in, and the provider ended it: its status command still says "signed in", and no turn
+    of a session can run (codex_limits). The other SignedOut, a runtime that keeps no account, is what its status
+    command says too."""
+
+
 class Unrefreshed(ValueError):
     """The limits could not be read, but the runtime itself named its account before that: email is that account's
     email, "" for an account without one (for example an API key)."""
@@ -557,7 +563,37 @@ def run_json(args, cwd, timeout=25, ok=(0,)):
         return json.load(output)
 
 
+# What Codex answers when its stored sign-in is over at the provider: the refresh token was revoked, has expired or was
+# used a second time, or the account signed in again somewhere else. `codex login status` still says "Logged in" then,
+# because it reads only the file of the sign-in, and each turn of a session fails. The first form is from the owner's
+# own Mac Studio on 13 November 2026 (Codex 0.166.0), in the answer to account/read: "Your access token could not be
+# refreshed because your refresh token was revoked. Please log out and sign in again." The same machine's
+# account/rateLimits/read named the provider's own code, token_revoked.
+SIGN_IN_AGAIN = re.compile(r"sign in again|token_revoked|refresh_token_(?:expired|reused|invalidated)", re.I)
+SIGN_IN_AGAIN_WAIT = 3      # seconds from such an answer to the read that confirms it
+ACCOUNT_AGAIN = 15          # seconds from one early account read to the next one (Collector.sign_in_ended)
+NO_ANSWER_READS = 3         # account reads in a row with no answer, after which "the provider ended it" says nothing
+
+
 def codex_limits(kit, command="codex"):
+    """This account's allowance, by Codex's own app-server (codex_account). SignedOut when the runtime says that it
+    keeps no account; SignInAgain when it says, two times in a row, that its sign-in is over at the provider
+    (SIGN_IN_AGAIN); Unrefreshed when the account is known and only its limits are not.
+
+    **One such answer can be a lost race.** Each Codex process of this user renews the same stored sign-in when its
+    access token ends, and the provider takes a renewal token one time: a read that came with the token from before
+    is told that it "was already used", with the same words as a sign-in that is over. So the answer is asked for
+    again a moment later, when the other process has written the new sign-in, and only the same answer again is the
+    provider's word: one that is wrong would show a working agent as signed out and hold its sessions."""
+    try:
+        return codex_account(kit, command)
+    except SignInAgain:
+        time.sleep(SIGN_IN_AGAIN_WAIT)
+        return codex_account(kit, command)
+
+
+def codex_account(kit, command="codex"):
+    """One read of codex_limits: one start of the app-server, the account and its limits."""
     process = subprocess.Popen([command, "app-server", "--listen", "stdio://"], cwd=kit,
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                bufsize=0, start_new_session=True)
@@ -576,6 +612,9 @@ def codex_limits(kit, command="codex"):
                 data = json.loads(line)
                 if data.get("id") == identifier:
                     if "result" not in data:
+                        error = data.get("error") if isinstance(data.get("error"), dict) else {}
+                        if SIGN_IN_AGAIN.search(str(error.get("message") or "")):
+                            raise SignInAgain("the runtime asks for a new sign-in")
                         raise ValueError("account read failed")
                     return data["result"]
             if not reader.select(0.2):
@@ -599,6 +638,8 @@ def codex_limits(kit, command="codex"):
             send({"id": 3, "method": "account/rateLimits/read"})
             result = response(3)
             return normalize_codex_limits(result, account, time.time())
+        except SignedOut:
+            raise                               # the provider ended this sign-in: no failed refresh of a known account
         except (OSError, ValueError, KeyError, TypeError):
             if isinstance(answer.get("account"), dict):         # the account is known; only its limits are not
                 raise Unrefreshed(str(account.get("email") or "")) from None
@@ -961,6 +1002,12 @@ class Collector:
         self.path = self.home / ".fleet" / ("usage-" + agent + ".json")
         self.data, self.last_poll = {"tokens": None, "limits": None}, 0
         self.wake = threading.Event()   # account_again: scan now, not at the end of this wait
+        # {"limits" (the agent's own runtime), "screen" (Codex for its screen tasks): True} while the newest account
+        # read that gave an answer said that the provider ended the sign-in that this machine keeps (SignInAgain). It
+        # is apart from the reading, because a machine can have no reading yet: a new agent, one that moved here, or
+        # one whose runtime the owner switched (heard, sign_in_ended).
+        self.over, self.silent, self.over_asked = {}, {}, float("-inf")
+        self.over_changed = None        # () -> None, called when that word changes: the machine's report is due
         self.takes = 0                  # the hub's last answer took each session's four kinds (1), and its models (2)
         self.scans = {}                 # runtime -> its Scan: each scan reads only what its transcripts gained
         try:
@@ -969,14 +1016,67 @@ class Collector:
                 raise ValueError("another runtime")
             self.data = validate_usage(cache["data"], runtime)
             self.last_poll = number(cache["last_poll"])
+            said = cache.get("over") if isinstance(cache.get("over"), dict) else {}
+            self.over = {route: True for route in ("limits", "screen") if said.get(route) is True}
+            if self.over:
+                # The owner can have signed this machine in while its helper was down, and the machine's reading
+                # takes this word over the status command's: the first scan reads the account, whatever the clock.
+                self.last_poll = 0
         except (OSError, ValueError, KeyError, TypeError):
             pass
         if local:
             self.data["limits"] = None          # a cached account window would belong to a vendor login, not this model
+        if local or runtime not in LIMIT_SOURCES:
+            self.over = {}                      # nothing reads an account here, so no read could ever end that word
         if not self.previous or (self.data.get("previous") or {}).get("runtime") != self.previous:
             self.data.pop("previous", None)
         if screen_command:
             self.data.setdefault("screen", {"tokens": None, "limits": None})
+
+    def heard(self, route, word):
+        """What one account read said about the sign-in that this machine keeps for a route: True, the provider ended
+        it (SignInAgain); False, the account answered, or the runtime keeps none, which its status command says
+        too; None, the read gave no answer (a time-out, a network fault, a program that does not start). No answer
+        leaves the word as it is, and NO_ANSWER_READS of them in a row end it: the read says nothing any more, and
+        the status command's word stands again, as before this word existed. Without that end, a sign-in that the
+        owner made again would read "signed out" for as long as the account read fails for another reason. The reads
+        are the poll clock's, 15 minutes for three, and the early ones of sign_in_ended while a sign-in job looks:
+        then a network fault of under a minute ends the word, until the next read that gets an answer."""
+        before = bool(self.over.get(route))
+        if word is None:
+            self.silent[route] = self.silent.get(route, 0) + 1
+            if self.silent[route] >= NO_ANSWER_READS:
+                self.over.pop(route, None)
+        else:
+            self.silent[route] = 0
+            if word:
+                self.over[route] = True
+            else:
+                self.over.pop(route, None)
+        if bool(self.over.get(route)) != before and self.over_changed:
+            try:
+                self.over_changed()
+            except Exception:
+                pass                    # a report that is not asked for now comes at the report clock
+
+    def sign_in_ended(self, runtime):
+        """True while the newest account read says that the provider ended the sign-in that this machine keeps for
+        that runtime (heard): the agent's own runtime, or Codex as the runtime of its screen tasks. The runtime's
+        status command still says "Logged in" then (codex_limits), so the machine's reading takes this word over that
+        one (lifecycle.Lifecycle.runtime), and it is asked only when the status command says signed in.
+
+        **That read can be older than a sign-in.** After the owner signs the machine in again, the status command and
+        this word disagree until the account is read again. So each True also asks for that read now, at most each
+        ACCOUNT_AGAIN seconds (account_again), and the read's new word asks for the machine's report (over_changed):
+        a sign-in that worked reads so within seconds, and not at the end of the poll clock."""
+        route = "limits" if runtime == self.runtime else \
+            "screen" if runtime == "codex" and self.screen_command else None
+        if not route or not self.over.get(route):
+            return False
+        if time.monotonic() - self.over_asked >= ACCOUNT_AGAIN:
+            self.over_asked = time.monotonic()
+            self.account_again()
+        return True
 
     def account_again(self):
         """Read the account at the next scan, whatever the poll clock says. This machine signed in to another
@@ -1021,17 +1121,24 @@ class Collector:
                 try:
                     self.data["screen"]["limits"] = keep_windows(self.data["screen"]["limits"],
                                                                  codex_limits(self.kit, self.screen_command))
-                except SignedOut:
+                    self.heard("screen", False)
+                except SignedOut as said:
+                    self.heard("screen", isinstance(said, SignInAgain))
                     signed_out(self.data["screen"]["limits"])
                 except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as failure:
+                    self.heard("screen", False if isinstance(failure, Unrefreshed) else None)
                     if self.data["screen"]["limits"]:
                         refresh_failed(self.data["screen"]["limits"], failure)
             try:
                 self.data["limits"] = keep_windows(self.data["limits"], codex_limits(self.kit) if self.runtime == "codex"
                                                    else claude_limits(self.kit, self.home))
-            except SignedOut:               # confirmed by the runtime: no old cache stands in, and no email stays
+                self.heard("limits", False)
+            except SignedOut as said:       # confirmed by the runtime: no old cache stands in, and no email stays
+                self.heard("limits", isinstance(said, SignInAgain))
                 signed_out(self.data["limits"])
             except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as failure:
+                # the runtime named its account before the limits failed (Unrefreshed): its sign-in works
+                self.heard("limits", False if isinstance(failure, Unrefreshed) else None)
                 if self.data["limits"] is None and self.runtime == "claude":
                     try:
                         self.data["limits"] = claude_cache(self.home)
@@ -1043,7 +1150,8 @@ class Collector:
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         # Numbers, labels, the account key and the account email only. A failed write cannot change task handling.
         with open(self.path, "w", opener=lambda path, flags: os.open(path, flags, 0o600)) as stream:
-            json.dump({"runtime": self.runtime, "data": self.data, "last_poll": self.last_poll}, stream)
+            json.dump({"runtime": self.runtime, "data": self.data, "last_poll": self.last_poll,
+                       "over": self.over}, stream)
         self.send(self.data)
 
     def tokens(self, runtime):

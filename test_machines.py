@@ -262,6 +262,53 @@ class Machines(OwnerAPI):
         self.assertEqual(vps["update"]["state"], "current")
         self.assertIsNotNone(vps["update"]["finished_at"])
 
+    def test_a_machine_whose_first_report_is_behind_is_asked_to_follow(self):
+        """The hub asks the machines that have reported when team.json changes (apply_team). A helper that loaded
+        the file before a change of it, and reports for the first time after it, was asked by nobody, so its agent
+        got no session until the next change. Its first report is asked now."""
+        old = self.rev
+        new = self.push_team(lambda team: team["agents"]["vps"].update(can=["shell", "web", "screen"]))
+        self.move_kit(new)                          # the change is the hub's before this machine ever reported
+        code, answer = self.status(revision=old)
+        self.assertEqual((code, answer["update_requested"], answer["desired_revision"]), (200, True, new))
+        asked = lambda: [json.loads(e["extra"])["desired_revision"]
+                         for e in hub.q("SELECT * FROM events WHERE agent='vps' AND kind='update'")]
+        self.assertEqual(asked(), [new])
+        self.assertEqual(self.row("vps")["update"]["state"], "requested")
+        code, answer = self.status(revision=old)    # the same report again asks no second time
+        self.assertTrue(answer["update_requested"])
+        self.assertEqual(asked(), [new])
+        code, answer = self.status(revision=new)    # and the helper that followed ends the request
+        self.assertFalse(answer["update_requested"])
+        self.assertEqual(self.row("vps")["update"]["state"], "current")
+
+    def test_a_machine_whose_reading_went_is_asked_again_at_its_next_report(self):
+        """A move to another server and a removal take the agent's machine reading away, so its next report is a
+        first one again, and a helper that still runs older settings is asked to follow."""
+        old = self.rev
+        self.assertFalse(self.status(revision=old)[1]["update_requested"])      # current: its reading is there
+        hub.q("DELETE FROM machine_status WHERE agent='vps'")                   # as a move does
+        self.move_kit(self.push_team(lambda team: team["agents"]["vps"].update(can=["shell"])))
+        code, answer = self.status(revision=old)
+        self.assertEqual((code, answer["update_requested"], answer["desired_revision"]), (200, True, self.rev))
+        self.assertEqual(len(hub.q("SELECT 1 FROM events WHERE agent='vps' AND kind='update'")), 1)
+
+    def test_a_first_report_that_is_not_behind_is_asked_nothing(self):
+        """Current, of a commit that the hub does not know, and different in no Fleet file: none is asked. And a
+        report after the first is not this rule's: the change's own request is (apply_team)."""
+        events = lambda agent: hub.q("SELECT * FROM events WHERE agent=? AND kind='update'", (agent,))
+        self.assertFalse(self.report("manager", revision=self.rev)[1]["update_requested"])
+        self.assertFalse(self.status(revision="a" * 40)[1]["update_requested"])         # unknown: maybe a later one
+        self.assertEqual((events("manager"), events("vps")), ([], []))
+        hub.q("DELETE FROM machine_status")
+        old = self.rev
+        self.move_kit(self.push_file("outputs/T-1/notes.md", "A task's output.\n", "the output of a task"))
+        self.assertFalse(self.status(revision=old)[1]["update_requested"])              # no Fleet file changed
+        self.assertEqual(events("vps"), [])
+        self.move_kit(self.push_team(lambda team: team["agents"]["vps"].update(can=["shell"])))
+        self.assertFalse(self.status(revision=old)[1]["update_requested"])              # not its first report
+        self.assertEqual(events("vps"), [])
+
     def test_each_row_says_what_the_agent_s_own_processes_use(self):
         """The owner's yes of 4 November 2026 to each agent's own use on Agents (lifecycle.agent_use): as its helper
         reported it, a figure of another shape as null, and null from a helper older than that."""

@@ -866,7 +866,7 @@ class HelperSide(unittest.TestCase):
         self.assertEqual(order, ["needs_owner", "status", "done", "soon"])     # the model options, after it
 
     def run_login(self, extra, signed_in, typed, done_wait=None, posts=None,
-                  screen=f"Use the url below to sign in:\n  {CLAUDE_URL}\n", look=None):
+                  screen=f"Use the url below to sign in:\n  {CLAUDE_URL}\n", look=None, collector=None):
         """The helper's sign-in against stand-ins, recording the order of its status reports and its sign-in posts.
         posts: a list that gets the body of each sign-in post. look: what the hub says of the sign-in (login_look)."""
         order, seq = [], list(signed_in)
@@ -880,6 +880,8 @@ class HelperSide(unittest.TestCase):
         helper.signed_in = lambda _runtime: seq.pop(0) if seq else False
         if look is not None:
             helper.login_look = look
+        if collector is not None:
+            helper.collector = collector
 
         def post(method, path, data=None, timeout=40):
             order.append(data["state"])
@@ -905,6 +907,46 @@ class HelperSide(unittest.TestCase):
             for one in patches:
                 one.stop()
         return order
+
+    def test_a_sign_in_waits_for_an_account_read_that_came_after_it(self):
+        """The machine's last account read said that the provider ended its sign-in. After the owner's new sign-in
+        the status command says signed in, and that read is from before: the job is done only when a new read has
+        said so, and each look asks for that read (usage.Collector.sign_in_ended), so it waits seconds and not the
+        five minutes of the poll clock. A sign-in that the provider still refuses is never reported as made."""
+        class Collector:
+            def __init__(self, words):
+                self.words, self.asked, self.again = list(words), [], 0
+
+            def sign_in_ended(self, runtime):
+                self.asked.append(runtime)
+                return self.words.pop(0) if self.words else True
+
+            def account_again(self):
+                self.again += 1
+
+        collector = Collector([True, True, False])
+        order = self.run_login({"login": 7, "runtime": "claude"}, [False, True, True, True], typed=True,
+                               collector=collector)
+        self.assertEqual(order, ["needs_owner", "status", "done", "soon"])
+        self.assertEqual((collector.asked, collector.again), (["claude"] * 3, 1))   # asked only once it is kept
+        dead = Collector([])                        # each account read still says that the provider ended it
+        order = self.run_login({"login": 8, "runtime": "claude"}, [True] * 50, typed=True, done_wait=0,
+                               collector=dead)
+        self.assertEqual(order, ["needs_owner", "status", "failed"])
+        self.assertEqual(dead.again, 0)
+
+    def test_the_helper_asks_what_the_machine_keeps_and_the_account_read_s_word_apart(self):
+        """signed_in is the status command's own word, which a sign-out removes; sign_in_ended is the account read's
+        word on it, and a helper with no collector yet has none."""
+        asked = []
+        helper = fleet.Helper.__new__(fleet.Helper)
+        helper.lifecycle = type("Lifecycle", (), {
+            "runtime": lambda _self, name, stored=False: asked.append((name, stored)) or {"signed_in": True}})()
+        self.assertIs(fleet.Helper.signed_in(helper, "codex"), True)
+        self.assertEqual(asked, [("codex", True)])
+        self.assertIs(helper.sign_in_ended("codex"), False)
+        helper.collector = type("Collector", (), {"sign_in_ended": lambda _self, runtime: runtime == "codex"})()
+        self.assertEqual((helper.sign_in_ended("codex"), helper.sign_in_ended("claude")), (True, False))
 
     def test_another_account_reports_the_sign_out_before_its_sign_in_starts(self):
         """A reading taken during the sign-out, still signed in, must not arrive after `starting` and close the new
@@ -1186,7 +1228,8 @@ class HelperSide(unittest.TestCase):
         helper.say = lambda *_: None
         helper.signed_in = lambda _runtime: True
         helper.await_login_code = lambda *_: True           # the owner pasted the code
-        helper.collector = type("Stand", (), {"account_again": lambda _self: again.append(True)})()
+        helper.collector = type("Stand", (), {"account_again": lambda _self: again.append(True),
+                                              "sign_in_ended": lambda _self, _runtime: False})()
 
         with patch.object(fleet, "http", lambda m, p, d=None, timeout=40: posts.append(d) or (200, {})), \
              patch.object(fleet, "exe", lambda *a, **k: "/home/solo/.local/bin/claude"), \

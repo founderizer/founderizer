@@ -13,6 +13,9 @@ import usage
 from test_ui_api import OwnerAPI
 
 
+real_codex_limits = usage.codex_limits     # the reader itself, for a test that patches the name
+
+
 def tokens(runtime="claude"):
     return dict(input=10, output=20, cache_read=30, cache_write=40, total=100,
                 sessions=2, since=1000, last_activity=2000, collected_at=3000,
@@ -577,6 +580,163 @@ class TokenRecords(unittest.TestCase):
         with self.assertRaises(ValueError) as failed:
             usage.codex_limits(str(self.home), str(fake))
         self.assertNotIsInstance(failed.exception, (usage.SignedOut, usage.Unrefreshed))
+
+    REVOKED = {"code": -32603, "message": "Your access token could not be refreshed because your refresh token was "
+                                         "revoked. Please log out and sign in again."}
+
+    def fake_codex(self, account, limits, later=None):
+        """An app-server stand-in: what it answers to account/read and to account/rateLimits/read, as whole JSON-RPC
+        answers with no id. later: (account, limits) of each start after the first. It counts its starts in a file."""
+        fake, starts = self.home / "fake-codex", self.home / "fake-codex-starts"
+        starts.write_text("")
+        fake.write_text("#!/usr/bin/env python3\nimport json, sys\n"
+                        f"open({str(starts)!r}, 'a').write('x')\n"
+                        f"first = len(open({str(starts)!r}).read()) == 1\n"
+                        f"account, limits = {(account, limits)!r} if first else {(later or (account, limits))!r}\n"
+                        "for line in sys.stdin:\n    m = json.loads(line)\n"
+                        "    if m.get('id') == 1:\n        print(json.dumps({'id': 1, 'result': {}}), flush=True)\n"
+                        "    if m.get('id') == 2:\n        print(json.dumps(dict(account, id=2)), flush=True)\n"
+                        "    if m.get('id') == 3:\n        print(json.dumps(dict(limits, id=3)), flush=True)\n")
+        fake.chmod(0o755)
+        return str(fake), lambda: len(starts.read_text())
+
+    def test_a_codex_sign_in_that_the_provider_ended_is_its_own_answer_and_is_asked_for_two_times(self):
+        """Codex 0.166.0 on the owner's Mac Studio, 13 November 2026: the provider had revoked the stored sign-in.
+        `codex login status` said "Logged in", account/read answered with an error and no account, and the reading
+        said "Account limits could not be refreshed." for a day, with the earlier email, while no turn could run."""
+        known = {"result": {"account": {"type": "chatgpt", "email": "owner@example.com", "planType": "plus"}}}
+        revoked = {"error": self.REVOKED}
+        refused = {"error": {"code": -32603, "message": "failed to fetch codex rate limits: GET "
+                             "https://chatgpt.com/backend-api/wham/usage failed: 401 Unauthorized; body={\"error\": "
+                             "{\"message\": \"Encountered invalidated oauth token for user, failing request\", "
+                             "\"code\": \"token_revoked\"}}"}}
+        other = {"error": {"code": -32603, "message": "failed to fetch codex rate limits: 503"}}
+        good = {"result": {"rateLimits": {"limitId": "codex", "primary": {
+            "usedPercent": 10, "windowDurationMins": 300, "resetsAt": 20000}}}}
+        with patch("usage.SIGN_IN_AGAIN_WAIT", 0):
+            for account, limits, want, reads in (
+                    (revoked, other, usage.SignInAgain, 2),         # the account read itself says so, two times
+                    (known, refused, usage.SignInAgain, 2),         # or the provider's code at the limits
+                    (known, other, usage.Unrefreshed, 1),           # another failure is a failed refresh
+                    ({"error": {"message": "internal error"}}, other, ValueError, 1)):
+                with self.subTest(account=account.get("error"), limits=limits["error"]["message"][-40:]):
+                    fake, starts = self.fake_codex(account, limits)
+                    with self.assertRaises(want) as failed:
+                        usage.codex_limits(str(self.home), fake)
+                    self.assertIs(type(failed.exception), want)
+                    self.assertEqual(starts(), reads)
+            self.assertTrue(issubclass(usage.SignInAgain, usage.SignedOut))
+            # One such answer can be a lost race with another Codex process that renewed the sign-in at that moment
+            # ("was already used"): the read a moment later answers, and nothing says signed out.
+            reused = {"error": {"code": -32603, "message": "Your access token could not be refreshed because your "
+                                "refresh token was already used. Please log out and sign in again."}}
+            fake, starts = self.fake_codex(reused, other, later=(known, good))
+            reading = usage.codex_limits(str(self.home), fake)
+            self.assertEqual((reading["account_email"], reading["error"], starts()),
+                             ("owner@example.com", None, 2))
+        fake, starts = self.fake_codex({"result": {"account": None}}, other)     # no account: its own answer, one read
+        with self.assertRaises(usage.SignedOut) as failed:
+            usage.codex_limits(str(self.home), fake)
+        self.assertEqual((type(failed.exception), starts()), (usage.SignedOut, 1))
+
+    def collector(self, runtime="codex", **more):
+        os.makedirs(self.kit, exist_ok=True)
+        return usage.Collector(self.kit, "seo", runtime, lambda data: None, self.home, **more)
+
+    def poll(self, collector, *answers):
+        """One account read of the collector for each answer: a reading, or the exception that the read raises."""
+        for answer in answers:
+            collector.last_poll = 0
+            read = {"side_effect": answer} if isinstance(answer, BaseException) else {"return_value": answer}
+            with patch("usage.transcript_tokens", return_value=tokens(collector.runtime)), \
+                    patch("usage.codex_limits", **read), patch("usage.claude_limits", **read), \
+                    patch("usage.time.time", return_value=3000):
+                collector.collect()
+
+    def test_the_collector_says_when_the_provider_ended_the_sign_in_also_with_no_earlier_reading(self):
+        """The machine's reading takes this word over the status command's (lifecycle.Lifecycle.runtime). It needs no
+        earlier reading: a new agent, one that moved here and one whose runtime the owner switched have none."""
+        changes = []
+        codex = self.collector()
+        codex.over_changed = lambda: changes.append(codex.sign_in_ended("codex"))
+        self.assertIs(codex.sign_in_ended("codex"), False)             # no read yet says nothing
+        self.poll(codex, usage.SignInAgain("the runtime asks for a new sign-in"))
+        self.assertEqual((codex.data["limits"], codex.sign_in_ended("codex"), codex.sign_in_ended("claude")),
+                         (None, True, False))
+        self.poll(codex, usage.SignedOut("no account"))                 # the runtime keeps none: its status says so too
+        self.assertIs(codex.sign_in_ended("codex"), False)
+        self.poll(codex, limits("codex"), usage.SignInAgain("again"))   # with a reading: the windows stay, no email
+        reading = codex.data["limits"]
+        self.assertEqual((reading["error"], reading["account_email"], bool(reading["windows"])),
+                         (usage.SIGN_IN_REQUIRED, None, True))
+        self.assertIs(codex.sign_in_ended("codex"), True)
+        self.poll(codex, usage.Unrefreshed("owner@example.com"))        # the runtime named its account: it works
+        self.assertIs(codex.sign_in_ended("codex"), False)
+        self.assertEqual(changes, [True, False, True, False])           # each change asks for the machine's report
+
+    def test_reads_with_no_answer_end_that_word_only_after_three_in_a_row(self):
+        """A time-out or a program that does not start says nothing about the sign-in. One such read leaves the word,
+        so that a revoked sign-in does not read "signed in" at each network fault; three in a row end it, so that a
+        machine that the owner signed in again is not held while its account read fails for another reason."""
+        codex = self.collector()
+        over = usage.SignInAgain("again")
+        self.poll(codex, over, ValueError("account read timed out"), OSError("no such program"))
+        self.assertIs(codex.sign_in_ended("codex"), True)
+        self.poll(codex, over, ValueError("timed out"), ValueError("timed out"))    # an answer starts the count again
+        self.assertIs(codex.sign_in_ended("codex"), True)
+        self.poll(codex, ValueError("timed out"))
+        self.assertEqual(usage.NO_ANSWER_READS, 3)
+        self.assertIs(codex.sign_in_ended("codex"), False)
+
+    def test_that_word_outlives_a_restart_and_the_first_scan_reads_the_account_again(self):
+        codex = self.collector()
+        self.poll(codex, limits("codex"), usage.SignInAgain("again"))
+        again = self.collector()                    # the helper started again, on the same cache file
+        self.assertEqual((again.sign_in_ended("codex"), again.last_poll), (True, 0))
+        self.poll(again, limits("codex"))           # the owner had signed the machine in meanwhile
+        self.assertIs(again.sign_in_ended("codex"), False)
+        self.assertNotEqual(self.collector().last_poll, 0)      # and a cache with no such word keeps its poll clock
+        # An agent that reads no account takes no such word from a cache: no read of it could ever end it.
+        self.poll(again, usage.SignInAgain("again"))
+        self.assertIs(self.collector().sign_in_ended("codex"), True)
+        self.assertIs(self.collector(local=True).sign_in_ended("codex"), False)         # on a model server now
+        self.assertIs(self.collector("claude").sign_in_ended("claude"), False)          # another runtime's cache
+
+    def test_a_word_that_stands_asks_for_an_early_account_read_and_not_at_each_look(self):
+        """After the owner signs the machine in again, the status command and this word disagree until the account
+        is read again: each look that finds the word asks for that read now, at most each ACCOUNT_AGAIN seconds."""
+        codex, clock, asked = self.collector(), [1000.0], []
+        self.poll(codex, usage.SignInAgain("again"))
+        codex.account_again = lambda: asked.append(clock[0])
+        with patch("usage.time.monotonic", lambda: clock[0]):
+            for step in (0, 5, usage.ACCOUNT_AGAIN - 1, usage.ACCOUNT_AGAIN, usage.ACCOUNT_AGAIN + 1):
+                clock[0] = 1000.0 + step
+                self.assertIs(codex.sign_in_ended("codex"), True)
+            self.assertEqual(asked, [1000.0, 1000.0 + usage.ACCOUNT_AGAIN])
+            self.poll(codex, limits("codex"))
+            clock[0] += 100
+            self.assertIs(codex.sign_in_ended("codex"), False)         # no word: nothing is asked
+        self.assertEqual(len(asked), 2)
+
+    def test_the_screen_route_has_its_own_word(self):
+        """Codex as the runtime of a Claude agent's screen tasks, and a Codex agent that also has a screen route:
+        its two routes are one sign-in, and its own reading says it."""
+        ivy = self.collector("claude", screen_command="codex")
+        for collector, run in ((ivy, ("usage.codex_limits", "usage.claude_limits")),):
+            collector.last_poll = 0
+            with patch("usage.transcript_tokens", return_value=tokens("claude")), \
+                    patch("usage.screen_tokens", return_value=None), \
+                    patch(run[0], side_effect=usage.SignInAgain("again")), \
+                    patch(run[1], return_value=limits("claude")), patch("usage.time.time", return_value=3000):
+                collector.collect()
+        self.assertEqual((ivy.sign_in_ended("codex"), ivy.sign_in_ended("claude")), (True, False))
+        both = self.collector("codex", screen_command="codex")
+        both.heard("limits", True)
+        self.assertIs(both.sign_in_ended("codex"), True)
+        both.heard("limits", False)
+        both.heard("screen", True)                  # never alone: both reads are of one sign-in
+        self.assertIs(both.sign_in_ended("codex"), False)
+        self.assertIs(self.collector("claude").sign_in_ended("codex"), False)   # an agent with no Codex route
 
     def test_provider_timeout_retains_prior_numbers_and_original_time(self):
         collector = usage.Collector(self.kit, "manager", "claude", lambda data: None, self.home)

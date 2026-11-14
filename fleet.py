@@ -5778,7 +5778,11 @@ class Helper:
                 return
             deadline = time.monotonic() + LOGIN_DONE_WAIT
             while True:                 # asked once more at the deadline, after a look that waited that long
-                if self.signed_in(runtime):
+                # Signed in: the machine keeps a sign-in, and no account read says that the provider ended it. Such
+                # a read is from before this sign-in, or the stored sign-in is still the dead one (a runtime that
+                # keeps it while a new sign-in waits): sign_in_ended reads the account again each time it says so,
+                # so the next look here has the word of a read that came after the owner's step.
+                if self.signed_in(runtime) and not self.sign_in_ended(runtime):
                     self.account_changed()
                     self.restart_after_login()
                     self.send_status()      # the machine's status first, then the end of the sign-in
@@ -6181,8 +6185,16 @@ class Helper:
         return status, answer
 
     def signed_in(self, runtime):
-        """What this machine's runtime says about itself now: the runtime's own status command, no AI turn."""
-        return self.lifecycle.runtime(runtime).get("signed_in") is True
+        """What this machine's runtime says about itself now: the runtime's own status command, no AI turn. It is what
+        the machine keeps: the account read's word on it is sign_in_ended."""
+        return self.lifecycle.runtime(runtime, stored=True).get("signed_in") is True
+
+    def sign_in_ended(self, runtime):
+        """True while this machine's newest account read says that the provider ended the sign-in that the machine
+        keeps for this runtime (usage.Collector.sign_in_ended, which then also reads the account again now). A helper
+        with no collector yet has no such word."""
+        collector = getattr(self, "collector", None)
+        return collector is not None and collector.sign_in_ended(runtime) is True
 
     def trigger_check(self, extra):
         """A check run from the hub (owner API 1.8), in its own thread and outside every AI session. No claim expires
@@ -7721,7 +7733,9 @@ def cmd_run(args):
                             runtimes_busy=h.runtimes_busy, say=h.say,       # it updates this user's runtimes
                             slow_file=os.path.join(HOME, "slow-%s.json" % agent),
                             floor=os.path.join(HOME, FLOOR_FILE),     # DevOps plan 0.1: every move under may_take
-                            read_key=lambda: account_key(agent, conf))    # the key of a model account, for its check
+                            read_key=lambda: account_key(agent, conf),    # the key of a model account, for its check
+                            ended=collector.sign_in_ended)      # a sign-in that the provider ended is none
+    collector.over_changed = h.lifecycle.report_soon    # and the account read's new word on it is reported at once
     threading.Thread(target=h.lifecycle.run_forever, name="machine-status", daemon=True).start()
     threading.Thread(target=h.tailer.run, name="thread-records", daemon=True).start()
     threading.Thread(target=h.presence, name="presence", daemon=True).start()      # plan C2

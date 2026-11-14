@@ -2316,8 +2316,11 @@ class Lifecycle:
     def __init__(self, kit, agent, conf, post, busy, restart=None, run=_run, clock=time.time,
                  platform_name=sys.platform, home=None, vault=None, probe=None, models=codex_model_list, legacy=None,
                  switch=None, which=None, monotonic=time.monotonic, runtimes_busy=None, say=print, slow_file=None,
-                 floor=None, read_key=None):
+                 floor=None, read_key=None, ended=None):
         self.kit, self.agent, self.conf, self.post, self.busy = kit, agent, conf, post, busy
+        # (runtime) -> True when that runtime's own account read said that its sign-in is over at the provider
+        # (usage.Collector.sign_in_ended). None: nothing reads the account here, as for the server service's readings.
+        self.ended = ended
         # () -> the key of the agent's model account from this machine's vault, or None (fleet.account_key): the
         # setup check proves the key with it, and a reading of the program's model list starts the program with it
         self.read_key = read_key
@@ -2576,8 +2579,10 @@ class Lifecycle:
         """
         return self.which(name) if self.which else exe(name, self.home)
 
-    def runtime(self, name=None):
-        """{name, version, signed_in} of the agent's runtime, or of another one: status commands only, no model."""
+    def runtime(self, name=None, stored=False):
+        """{name, version, signed_in} of the agent's runtime, or of another one: status commands only, no model.
+        stored: only what the machine keeps, without the account read's word on it (`ended`): the question of a
+        sign-out, which removes what is kept, and of a sign-in job, which asks the account read itself."""
         name = name or self.conf.get("runtime")
         result = {"name": name, "version": None, "signed_in": None}
         exe = self.exe(name)
@@ -2597,6 +2602,12 @@ class Lifecycle:
                 result["signed_in"] = bool(json.loads(out).get("loggedIn"))
             except ValueError:
                 pass
+        # A status command reads what the machine keeps, and Codex's keeps saying "Logged in" after the provider
+        # ended the sign-in: the refresh token was revoked, has expired, or the account signed in again somewhere
+        # else. Each turn fails then, and the owner's Sign in was refused with "is signed in on this machine" (the
+        # owner's Mac Studio, 13 November 2026, for a day). The account read asks the provider, so its word decides.
+        if result["signed_in"] and not stored and self.ended and self.ended(name):
+            result["signed_in"] = False
         return result
 
     def collect(self, fast=False):
