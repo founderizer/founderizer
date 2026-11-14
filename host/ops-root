@@ -1018,16 +1018,23 @@ def do_run(req, data):
 
 LOOK_SECONDS = 120          # the unit's own limit (RuntimeMaxSec): a look that its ops-root lost ends by it too
 LOOK_OUT = 256 * 1024       # characters of a look's answer, the end kept
-# Paths that one unit hides; over it, look_fewer hides whole the folders that hold the most of them. systemd's time to start a
-# unit grows with the square of this count: 300 paths 0.6 seconds, 600 paths 2.1, 1,200 paths 8.3, 3,650 paths 91
-# (measured on systemd 255 and 259, 14 November 2026). At 1,500 a box starts in about 13 seconds.
-LOOK_PATHS = 1500
+# Paths that are there and that one unit hides; over it, look_fewer hides whole the folders that hold the most of
+# them. systemd's time to start a unit grows with the square of the count of hidden paths that are there (one that
+# is not there costs nothing: 600 of them 0.1 seconds). On a fast test machine: 300 paths 0.6 seconds, 600 paths
+# 2.1, 1,200 paths 8.3, 3,650 paths 91 (systemd 255 and 259). On real servers with 2 to 16 shared processors it is
+# 4 to 10 times that: 176 paths 0.7 seconds, 276 paths 4.2, 377 paths 2.9, 496 paths 8.1 (14 November 2026). At
+# 600 the slowest of them starts a box in about 20 seconds.
+LOOK_PATHS = 600
 # Entries that the walk of one look reads; what it did not reach is hidden whole. The largest of nine real servers
 # spent 195,187 (14 November 2026), and the whole list took 0.6 seconds there.
 LOOK_WALK = 1000000
 LOOK_WAIT = 30              # seconds that a look waits for a write of this file that runs, before it is refused
 LOOK_LIST_SECONDS = 20      # and the seconds of that walk: a write of this file waits while a look makes its list
 LOOK_MATCHES = 50           # secret names right in one folder; over it, the folder is hidden whole
+# And files with a secret's name and one ending right in one folder: a folder of migrations (*.sql) or of
+# certificates (*.pem), which cost one real server 70 paths, one for each file. Not names of any kind: the top
+# folder of an app has 7 to 13 of them (.env and its variants, the folders of libraries), and it stays in sight.
+LOOK_ALIKE = 12
 # A mass of files is hidden whole, and the walk goes on beside it: a folder with more folders right in it than
 # LOOK_FOLDERS, none of which is read (one work folder for each job), and a folder with more entries than
 # LOOK_ENTRIES, whose names are not all read (a cache, a queue). On the first real server (14 November 2026) one
@@ -1220,9 +1227,9 @@ def look_names(known):
     """(paths, whole): the files with a secret's name and the folders with a store's name, on each file system of this
     host that is a disk of its own, found by one walk that follows no link. `known`: what is hidden already, which is
     not walked. A file system of another machine is hidden and not walked. whole: the folders that are hidden whole
-    because they hold more such names than LOOK_MATCHES, more folders than LOOK_FOLDERS or more entries than
-    LOOK_ENTRIES, because they are too deep or could not be read, or because the walk ended before it read them:
-    the answer of a look names them.
+    because they hold more such names than LOOK_MATCHES (or more than LOOK_ALIKE with one ending), more folders
+    than LOOK_FOLDERS or more entries than LOOK_ENTRIES, because they are too deep or could not be read, or because
+    the walk ended before it read them: the answer of a look names them.
 
     A folder that the walk does not read to its end is in the paths, each one: only what LOOK_SKIP and
     LOOK_UNSEARCHED name, a file system that is no disk, and a link are left unread and open.
@@ -1272,7 +1279,7 @@ def look_names(known):
                               any(engine <= folders for engine in LOOK_ENGINES)):
             found.append(folder)        # a database's own folder, or a container engine's
             continue
-        matches, later = [], []
+        matches, later, endings = [], [], collections.Counter()
         for e in entries:
             path = folder.rstrip("/") + "/" + e.name
             if e.is_symlink() or path in skip:
@@ -1286,7 +1293,9 @@ def look_names(known):
                     later.append(path)
             elif LOOK_NAME.match(low) or (low == "config.php" and folder.endswith("/bootstrap/cache")):
                 matches.append(path)
-        if (len(later) > LOOK_FOLDERS and folder != "/") or (len(matches) > LOOK_MATCHES and folder.count("/") >= 2):
+                endings[low.rpartition(".")[2]] += 1
+        store = len(matches) > LOOK_MATCHES or max(endings.values(), default=0) > LOOK_ALIKE
+        if (len(later) > LOOK_FOLDERS and folder != "/") or (store and folder.count("/") >= 2):
             found.append(folder)        # a mass of folders, none of which is read; or a store of keys
             whole.append(folder)
         else:
@@ -1336,11 +1345,14 @@ def look_fewer(paths, limit, never=()):
     /var/lib/<app> are each level 0, and an app's folder in /srv or /var/www is level 1. Hiding every folder of
     level 0 leaves the fewest paths that any choice can, so when that is too many, nothing fits. Else the rule takes
     the level nearest to the files at which hiding every folder with paths under it would be enough, and hides at
-    that level the folders with the most paths first, only as many as it takes; of such a folder it hides the
-    narrowest folder that holds the same paths. After each one the level is looked for again, because with a mass
-    gone a level nearer to the files can be enough: it never goes back up. So one folder with thousands of names
-    goes whole alone, and no small app beside it goes with it (on 14 November 2026 a pass for each depth, the
-    deepest first, hid an app's folder for its three names before it came to the mass)."""
+    that level the folders with the most paths first, only as many as it takes. In such a folder it goes down to
+    the folder that holds the mass: while one folder right in it holds half of its paths or more, that one goes in
+    its place, and the folder's other paths stay as they are. After each one the level is looked for again, because
+    with a mass gone a level nearer to the files can be enough: it never goes back up. So one folder with thousands
+    of names goes whole alone, and no small app beside it goes with it (on 14 November 2026 a pass for each depth,
+    the deepest first, hid an app's folder for its three names before it came to the mass; and a rule that hid the
+    folder of the level hid an app with it when a second mass elsewhere made a shallow level the only one that was
+    enough)."""
     paths, whole = set(paths), []
     if len(paths) <= limit:
         return sorted(paths), whole
@@ -1393,7 +1405,16 @@ def look_fewer(paths, limit, never=()):
         for folder, members in sorted(groups.items(), key=lambda g: (-len(g[1]), g[0])):
             if len(members) < 2:
                 break
-            folder = os.path.commonpath(members)        # the narrowest folder that holds them all: at it or below
+            inner = level + 1   # down to the mass: a folder right in this one with half of its paths or more
+            while True:
+                inside = collections.Counter(p[:above(p)[inner]] for p in members if len(above(p)) > inner)
+                if not inside:
+                    break
+                most = min(inside, key=lambda name: (-inside[name], name))
+                if inside[most] < 2 or inside[most] * 2 < len(members):
+                    break
+                folder, inner = most, inner + 1
+                members = [p for p in members if p.startswith(most + "/")]
             for path in members:
                 count(path, -1)
             paths.difference_update(members)
@@ -1436,7 +1457,14 @@ def look_deny():
                 whole.append(path)
     # a path under a folder that is hidden already says nothing more
     paths = [p for p in safe if not any(p[:i] in safe for i in range(1, len(p)) if p[i] == "/")]
-    paths, more = look_fewer(paths, LOOK_PATHS, LOOK_SKIP + HIDE_NEVER + (LOOK_RUN,))
+    # Only a path that is there costs the unit's start anything, so only those count against the limit. The ones
+    # that are not there (most of the key stores of LOOK_KEYS, on any one host) stay in the list: a path that comes
+    # between this list and the unit's start is hidden then.
+    there = [p for p in paths if os.path.lexists(P(p))]
+    fewer, more = look_fewer(there, LOOK_PATHS, LOOK_SKIP + HIDE_NEVER + (LOOK_RUN,))
+    kept = set(fewer)
+    paths = sorted(kept | {p for p in set(paths) - set(there)
+                           if not any(p[:i] in kept for i in range(1, len(p)) if p[i] == "/")})
     return {"paths": paths, "whole": sorted(set(whole + more) & set(paths)), "units": units, "docker": docker,
             "logs": logs, "containers": containers}
 

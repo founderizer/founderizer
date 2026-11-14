@@ -1915,7 +1915,7 @@ def ping_payload(need, generation, seal=None, badge=None):
         payload["aps"]["badge"] = badge
     if not seal:
         return payload
-    title = scrub(need["title"] or "")
+    title = scrub(need_title(need))
     if len(title) > PUSH_TEXT:
         title = title[:PUSH_TEXT - 1].rstrip() + "…"
     said = {"need": need["id"], "db": generation, "title": shown_role(need["by"]) or PUSH_BANNER, "body": title}
@@ -2233,6 +2233,52 @@ def door_call_run(call):
     """The server whose root script (a host's run) this call hash is of, by the door's record, or None."""
     known = door_call_known(call)
     return known[0] if known and known[1] == "run" and ":" not in known[0] else None
+
+
+DOOR_TASK = re.compile(r"T-[1-9][0-9]{0,17}")       # a task's code on a line of the door's record (door.TASK)
+DOOR_TASK_CHARS = 60            # characters of the second half of a door card's title
+
+
+# Characters that draw nothing or a blank and that Python calls printable: the Hangul and Khmer fillers, the braille
+# blank, the joiner of graphemes and the variation selectors. No list of them is whole (the reviews of 12 November
+# 2026 found 263), so the second half of a title is words to read and never a thing to trust.
+DOOR_TASK_BLANK = re.compile("[\u034f\u115f\u1160\u17b4\u17b5\u2800\u3164\uffa0\ufe00-\ufe0f\U000e0100-\U000e01ef]")
+
+
+def door_task_words(title):
+    """The second half of a door card's title: a task's title as one line of plain words, or None. The card's other
+    words hold no backtick (door_script_card), and a control or format character, or one of the known characters
+    that draw nothing, has no place beside the words that the owner's Mac signs under. A task's title can be the
+    words of the agent that asks (a worker names the tasks that it starts itself), so these are that agent's words
+    on the owner's card: 60 characters of them, after the title, which they cannot change."""
+    words = " ".join("".join(" " if ch.isspace() else ch for ch in DOOR_TASK_BLANK.sub("", str(title or ""))
+                             if ch.isspace() or (ch.isprintable() and ch != "`")).split())
+    if len(words) > DOOR_TASK_CHARS:
+        words = words[:DOOR_TASK_CHARS - 1].rstrip() + "…"
+    return words or None
+
+
+def door_asking_task(call, question=None):
+    """The task that asked for the call of this hash, as its row, or None. It is the one that the caller named with
+    its call, as the door wrote it on the line of its refusal, when it is a task of that caller's own; else the task
+    of the question that the item carries to the owner. An agent names its task itself, so this says where to
+    write and what to show, and nothing else: no check and no signature reads it."""
+    if question:        # two agents can send one script to one server: only the line of the asker itself
+        line = q1("SELECT caller, task FROM door_record WHERE call=? AND caller=? ORDER BY n DESC LIMIT 1",
+                  (call, question["asker"]))
+    else:
+        line = q1("SELECT caller, task FROM door_record WHERE call=? ORDER BY n DESC LIMIT 1", (call,))
+    task = q1("SELECT * FROM tasks WHERE id=?", (int(line["task"][2:]),)) if line and line["task"] else None
+    if not task or task["owner"] != line["caller"]:
+        task = q1("SELECT * FROM tasks WHERE id=?", (question["task"],)) if question else None
+    return task
+
+
+def need_title(need):
+    """A Needs-you item's title as the owner reads it: on the door's card of a run, the title that the Mac signs
+    under, then " · " and the title of the task that asked (two cards on one server read as two things)."""
+    task = need["door_task"] if "door_task" in need.keys() else None
+    return (need["title"] or "") + (" · " + task if task else "")
 
 
 def door_card_fits(call, host):
@@ -3327,6 +3373,10 @@ def migrate():
                   # review point 5.6 of 11 November 2026: the script of the run that a door card asks for, byte for
                   # byte, which the owner's Mac hashes itself before it signs Run it once (door_script_card)
                   "door_script": "TEXT",
+                  # incident intake, part 3 (the owner's "Yes, as shown", 14 November 2026): the title of the task
+                  # that asked for the run, which the apps show after the door card's title, " · " between them
+                  "door_task": "TEXT",
+                  "door_task_id": "INTEGER",  # that task, which hears when the door has taken Full access (door_mode_news)
                   "github_app": "TEXT",       # plan 13, item 4: the account that the item's first option makes an App in
                   "add_device": "INTEGER",    # plan V12 and 8.3: the item's first option opens the Add device picture
                   "github_key": "TEXT",       # plan 13, item 4: the App owner whose key the item renews (door_renew)
@@ -3344,7 +3394,9 @@ def migrate():
         # plan V12: the phone's own key that the recovery code is sealed to, and its HMAC of the QR's one-time value
         "owner_device_signing": {"recovery_key": "TEXT", "recovery_binding": "TEXT"},
         # call: the hash of a refused call, which the door writes on its line (door_card_fits)
-        "door_record": {"made": "TEXT", "call": "TEXT"},     # new-projects plan N3: what the door's call made, a repository by name
+        # task: the task that the caller named with its call, as the door wrote it (T-<id>): the second half of a
+        # door card's title is that task's title (door_asking_task)
+        "door_record": {"made": "TEXT", "call": "TEXT", "task": "TEXT"},     # new-projects plan N3: what the door's call made, a repository by name
         "triggers": {"failures": "INTEGER NOT NULL DEFAULT 0", "created_by": "TEXT NOT NULL DEFAULT 'owner'",
                      "responsibility": "INTEGER", "watch": "TEXT"},         # owner API 1.13: a duty's watch
         # the connected app that sent the steer (capp_connections.id), as ui_requests.connection: the history's mark
@@ -9904,16 +9956,19 @@ def t_raise_needs_you(agent, a):
         if qu and door_script is None:  # the asker's own words, which the owner answers: behind Details, with no code
             details = (details + "\n\n" if details else "") + \
                 f"{shown_role(qu['asker'])}'s question, in its own words: \"{clip(qu['text'], 1000)}\""
+        asking = door_asking_task(door_call, qu) if door_host else None
+        door_task = door_task_words(asking["title"]) if asking else None
         nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,door_host,github_app,"
-                  "add_device,github_key,details,multi,door_script) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  "add_device,github_key,details,multi,door_script,door_task,door_task_id) "
+                  "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (unused_id("needs"), title, why, todo, now(), agent, options, qu["id"] if qu else None, door_call,
                    door_host, github_app, 1 if add_device else None, github_key, details or None,
-                   1 if multi else None, door_script))
+                   1 if multi else None, door_script, door_task, asking["id"] if asking else None))
         if old:                 # the old item leaves Needs you, and the record of an earlier discussion moves along
             q("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
               (f"Replaced by {agent} with a new item: {title}", now(), agent, old["id"]))
             q("UPDATE need_talk SET need=? WHERE need=?", (nid, old["id"]))
-    emit("owner", "notify", f"Needs you: {title}")
+    emit("owner", "notify", f"Needs you: {title}" + (f" · {door_task}" if door_task else ""))
     ping_need(nid)                                      # owner feature push: the phone rings, also when it is closed
     picks = (" The owner sees your options and presses one: " + ", ".join(json.loads(options)) +
              ". The owner's answer is the words of the one they press, or anything else they write "
@@ -27041,7 +27096,9 @@ TOOLS = [
                       "full_access): that server, with the run's door_call. The card is then the door's card, which "
                       "the owner approved: the title \"Run one root script on <server>?\", one or two sentences, the "
                       "script in details, and the three answers Run it once, Full access on <server>, and No, which "
-                      "the hub writes itself. Leave options out. The door's record says which call a hash is "
+                      "the hub writes itself. Leave options out. The owner reads the title of the task that asked "
+                      "after the card's title, and the hub adds it itself: give the title word for word, with nothing "
+                      "after it. The door's record says which call a hash is "
                       "of: the hash of a host's run needs door_host, that host, and no other hash takes one."},
         "door_script": {"type": "string", "description": f"With door_host, always: the script of that run, character for "
                         f"character as the agent sent it to the door, at most {DOOR_SCRIPT_CHARS} characters of "
@@ -28562,19 +28619,19 @@ def board_html():
     for r in rows:
         if r["answer"] is None and r["kind"] == "secret":
             # owner feature secret_requests: a page of the hub is no place to type a key
-            p.append(f"<div><b>N-{r['id']} {esc(r['title'])}</b><br>Why: {esc(r['why'])}<br>"
+            p.append(f"<div><b>N-{r['id']} {esc(need_title(r))}</b><br>Why: {esc(r['why'])}<br>"
                      f"<span class='muted'>Answer it in Founderizer on your Mac: its secure form puts the value into "
                      f"the vault. This page takes no secret.</span></div><br>")
         elif r["answer"] is None:
             # owner feature need_options: one row for each option the agent offered, and the text box under them
             picks = "".join(f"<div><button name='choice' value='{i}'>{esc(x)}</button></div>"
                             for i, x in enumerate(need_options(r)))
-            p.append(f"<form method='post' action='/needs/{r['id']}'><b>N-{r['id']} {esc(r['title'])}</b><br>"
+            p.append(f"<form method='post' action='/needs/{r['id']}'><b>N-{r['id']} {esc(need_title(r))}</b><br>"
                      f"Why: {esc(r['why'])}<br>What to do: {esc(r['todo'])}<br>"
                      + (picks + "<br>" if picks else "") +
                      f"<input type='text' name='answer' placeholder='Your answer'> <button>Answer</button></form><br>")
         else:
-            p.append(f"<div class='muted'>N-{r['id']} {esc(r['title'])}: answered \"{esc(r['answer'])}\"</div>")
+            p.append(f"<div class='muted'>N-{r['id']} {esc(need_title(r))}: answered \"{esc(r['answer'])}\"</div>")
     p.append("<h2>Message the manager</h2><form method='post' action='/say'>"
              "<input type='text' name='text' placeholder='Type a goal or a question for the manager'> "
              "<button>Send</button></form>")
@@ -38795,14 +38852,15 @@ def door_sweep(t0=None):
                 str(e.get("made")).lower()) else None
             call = e.get("sha256") if isinstance(e.get("sha256"), str) and e.get("kind") == "refused" and \
                 re.fullmatch(r"[0-9a-f]{64}", e["sha256"]) else None
+            task = e.get("task") if isinstance(e.get("task"), str) and DOOR_TASK.fullmatch(e["task"]) else None
             if call:            # a line that the hub read before it kept hashes, and reads again (its last one)
                 DB.execute("UPDATE door_record SET call=? WHERE n=? AND call IS NULL AND abs(ts-?)<0.001",
                            (call, base + e["n"], float(e.get("ts") or t0)))
-            DB.execute("INSERT OR IGNORE INTO door_record(n,ts,caller,target,action,kind,outcome,why,made,call) "
-                       "VALUES(?,?,?,?,?,?,?,?,?,?)", (base + e["n"], float(e.get("ts") or t0), str(e.get("caller"))[:64],
-                                                       str(e.get("target"))[:120], str(e.get("action"))[:40],
-                                                       str(e.get("kind"))[:16], str(e.get("outcome"))[:16],
-                                                       str(e.get("why") or "")[:300], made, call))
+            DB.execute("INSERT OR IGNORE INTO door_record(n,ts,caller,target,action,kind,outcome,why,made,call,task) "
+                       "VALUES(?,?,?,?,?,?,?,?,?,?,?)", (base + e["n"], float(e.get("ts") or t0), str(e.get("caller"))[:64],
+                                                         str(e.get("target"))[:120], str(e.get("action"))[:40],
+                                                         str(e.get("kind"))[:16], str(e.get("outcome"))[:16],
+                                                         str(e.get("why") or "")[:300], made, call, task))
     return len(rows)
 
 
@@ -39158,6 +39216,78 @@ def door_modes_said(answer, t0):
     old = door_modes_word()
     if old is None or old != modes:
         kv_set("door_modes_said", json.dumps({"at": round(t0), "modes": modes}, sort_keys=True))
+        if old is not None:
+            door_mode_news(old, modes, t0)
+    door_modes_untaken(modes, t0)
+
+
+def door_mode_news(old, modes, t0):
+    """The door's word about a server changed to Full access: one message into the open task of the door card that
+    the owner answered with the signed Full access that stands now (incident intake, part 3). On 13 November 2026 the
+    door took the owner's Full access 80 seconds after his press, and nothing told the agent: it had been refused
+    three times in that minute, and its work waited for a second card all night. The door asks the hub before it
+    refuses now (Door.yes_read), so the agent's call has often run when this comes: the words say what to do only
+    for a call that the door refused. One time for one statement: a read in which the door names no server, and the
+    next one that names it again, are no news."""
+    held = door_modes_held()
+    for host, word in sorted(modes.items()):
+        if word["mode"] != "full" or (old.get(host) or {}).get("mode") == "full" or host not in held:
+            continue
+        key, signed = f"door_news:{host}", str(held[host]["at"])
+        if kv_get(key) == signed:
+            continue
+        kv_set(key, signed)
+        told = set()
+        for need in q("SELECT approval, door_task_id FROM needs WHERE door_host=? AND door_task_id IS NOT NULL AND "
+                      "approval IS NOT NULL AND answered > ? ORDER BY id DESC", (host, t0 - DOOR_APPROVAL_DAYS * 86400)):
+            task = q1("SELECT id, owner, state FROM tasks WHERE id=?", (need["door_task_id"],))
+            try:            # only the card of this very statement: an older Full access of the server is no news
+                signed = json.loads(need["approval"])["statement"] == held[host]["statement"]
+            except (ValueError, TypeError, KeyError, RecursionError):
+                signed = False
+            if not signed or approval_kind(need["approval"]) != "door-mode" or not task \
+                    or task["state"] in TERMINAL or task["id"] in told:
+                continue
+            told.add(task["id"])
+            emit(task["owner"], "say", f"[hub] The door has the owner's Full access on {host} now: a root script "
+                                       f"with no box runs there with no card. If the door refused your call, send "
+                                       f"it again; a call that ran needs nothing more.", task=task["id"])
+
+
+DOOR_UNTAKEN_FRESH = 3600       # seconds after its arrival in which a statement that the door did not take is news
+
+
+def door_modes_untaken(modes, t0):
+    """A fresh signed mode of the owner that the hub carries and that is not in effect at the door, said one time
+    to the manager. The door takes a statement only when the owner's key signed it and its time fits, and it
+    honours Full access only for a server at Fix with an agent that holds it at Fix; the hub checks the form of a
+    statement and the signature of none. So the test is the door's own word after it read what the hub carries:
+    its mode for the server is not the statement's. That word cannot say why. This judges only a statement of the
+    last hour, for a server that an agent holds at Fix, and only at the second read in a row that shows it: the
+    first one can be the read of the very second in which the door fetched."""
+    fetched = DOOR.get("approvals_at") or 0.0
+    fix = door_mode_servers(TEAM)
+    for host, held in sorted(door_modes_held().items()):
+        seen = f"door_untaken_seen:{host}"
+        says = (modes.get(host) or {}).get("mode") or "auto"
+        if host not in fix or held["received"] < t0 - DOOR_UNTAKEN_FRESH or held["received"] >= fetched \
+                or fetched >= t0 or says == held["mode"]:
+            if kv_get(seen):
+                kv_set(seen, "")
+            continue                # an old statement, one that the door has not read yet, or one in effect
+        if kv_get(seen) != str(held["at"]):
+            kv_set(seen, str(held["at"]))       # the first read that shows it
+            continue
+        key = f"door_untaken:{host}"
+        if kv_get(key) == str(held["at"]):
+            continue
+        kv_set(key, str(held["at"]))
+        name = {"full": "Full access", "auto": "Auto"}
+        emit(manager_name(), "say",
+             f"[hub] The owner's {name[held['mode']]} on {host} is not in effect at the door: it read the "
+             f"statements that the hub carries two times, and it still says {name[says]} for that server. The "
+             f"door's own log says why. Tell the owner in a Needs-you item that their answer for {host} did not "
+             f"take effect.")
 
 
 def door_approvals(src):
@@ -39171,6 +39301,7 @@ def door_approvals(src):
         raise Refusal(403, "this is the door's route")
     rows = q("SELECT id, approval FROM needs WHERE approval IS NOT NULL AND answered > ? ORDER BY id",
              (now() - DOOR_APPROVAL_DAYS * 86400,))
+    DOOR["approvals_at"] = now()        # the door has what the hub carries as of now (door_modes_untaken)
     phones, devices = q("SELECT device, statement, signature FROM owner_device_signing WHERE statement IS NOT NULL "
                         "ORDER BY device"), owner_devices()
     return {"approvals": [dict(json.loads(r["approval"]), need=r["id"]) for r in rows

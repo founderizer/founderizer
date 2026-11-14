@@ -130,7 +130,8 @@ Say in each part's `why` why that agent suits that part.
   made, an AWS delete, or a host's `run`, a root script with no box). For that last one, raise one Needs-you item with
   `door_call` set to that hash and the exact command in `what_to_do`; the owner's yes lets that exact call through once. For a
   `run`, give `door_host`, its server, too: the item is then the door's card, "Run one root script on <server>?", with
-  the script in `details`, and the hub gives it the three answers Run it once, Full access on <server>, and No. Full
+  the script in `details`, and the hub gives it the three answers Run it once, Full access on <server>, and No. The
+  owner reads the asking task's title after that title; the hub adds it. Full
   access lets every later root script on that server through, so no later run there needs an item. A script
   that only reads files needs no item at all: the holder runs it with `ops <server> look`. The owner's
   app signs the first two answers, and the door asks the hub for a signed answer before it refuses a call: so when

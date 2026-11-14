@@ -5,6 +5,7 @@ central vault, whose sealed copies wait for the door at its own address."""
 import base64
 import json
 import threading
+import time
 import unittest
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -449,13 +450,16 @@ class DoorTokens(Access):
     def test_the_record_each_minute_and_one_word_when_the_door_stops_and_comes_back(self):
         StubDoor.answers["/record"] = (200, {"entries": [
             {"n": 1, "ts": 1.0, "caller": "vps", "target": "web-1", "action": "restart", "kind": "rule",
-             "outcome": "done", "why": "a rule call"},
+             "outcome": "done", "why": "a rule call", "task": "T-41"},
             {"n": 2, "ts": 2.0, "caller": "vps", "target": "web-1", "action": "install", "kind": "own",
-             "outcome": "done", "why": "vps's own call, which it answers for: the host form install"}], "last": 2})
+             "outcome": "done", "why": "vps's own call, which it answers for: the host form install",
+             "task": "T-41; and words that are no task's code"}], "last": 2})
         hub.DOOR.update(read_at=0.0, error=None)
         self.assertEqual(hub.door_sweep(t0=100.0), 2)
         self.assertEqual(StubDoor.calls[-1][1:3], ("/record?after=0", "Bearer record-secret"))
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM door_record")["n"], 2)
+        # the task that the caller named with its call, as the door wrote it: only a task's code is kept
+        self.assertEqual([r["task"] for r in hub.q("SELECT task FROM door_record ORDER BY n")], ["T-41", None])
         self.assertIsNone(hub.door_sweep(t0=120.0))         # once a minute
         StubDoor.answers["/record"] = (503, {})
         hub.door_sweep(t0=200.0)
@@ -982,6 +986,171 @@ class DoorCalls(Access):
             with self.assertRaises(hub.ToolError):
                 hub.t_raise_needs_you("manager", dict({"title": "Start it", "why": "It adds cost",
                                                        "what_to_do": "Say yes"}, **bad))
+
+    def test_the_door_s_card_names_the_task_that_asked_after_its_title(self):
+        """Incident intake, part 3 (the owner, 14 November 2026, "Yes, as shown", to that title with the name of
+        a server of his and of one of his tasks). On 13 November two cards for one server had one title. The title that the Mac
+        signs under stays word for word, and the task's title is a field of its own beside it."""
+        self.grant(agent="vps", server="web-1", level="fix")
+        logs = hub.ins("INSERT INTO tasks(title,owner,state) VALUES('Read the checkout logs','vps','working')")
+        long = hub.ins("INSERT INTO tasks(title,owner,state) VALUES(?,'vps','working')",
+                       ("Move `uploads`\u202e to the  new\tdisk\nand check each one of the 4,000 files against its old copy",))
+        other = hub.ins("INSERT INTO tasks(title,owner,state) VALUES('A task of another agent','manager','working')")
+
+        def raised(script, task=None, **more):
+            card = run_card(script=script, **more)
+            if task:
+                hub.q("UPDATE door_record SET task=? WHERE call=?", (task, card["door_call"]))
+            nid = int(hub.t_raise_needs_you("manager", card).split("N-")[1].split(".")[0])
+            return hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))
+        first, second = raised("journalctl -u app\n", f"T-{logs}"), raised("mv /srv/a /srv/b\n", f"T-{long}")
+        self.assertEqual((first["title"], first["door_task"]), ("Run one root script on web-1?", "Read the checkout logs"))
+        # one line of plain words, at most 60 characters: no backtick, no mark that turns the line, no line feed
+        self.assertEqual(second["title"], first["title"])
+        self.assertEqual(second["door_task"], "Move uploads to the new disk and check each one of the 4,00…")
+        self.assertEqual(len(second["door_task"]), 60)
+        self.assertEqual(hub.need_title(second), "Run one root script on web-1? · " + second["door_task"])
+        # the owner's notice, the phone's ping and the hub's own page say both halves
+        said = [e["text"] for e in hub.q("SELECT text FROM events WHERE agent='owner' AND kind='notify' ORDER BY id")]
+        self.assertIn("Needs you: Run one root script on web-1? · Read the checkout logs", said)
+        self.assertIn("Run one root script on web-1? · Read the checkout logs", hub.board_html())
+        # a task of another agent that the caller named is not the task that asked: no second half
+        self.assertIsNone(raised("ls /root\n", f"T-{other}")["door_task"])
+        self.assertIsNone(raised("ls /srv\n")["door_task"])                # the call named no task
+        self.assertIsNone(raised("ls /opt\n", "T-999999")["door_task"])     # and no task that is not there
+        # a card that is not the door's card of a run has none
+        plain = hub.t_raise_needs_you("manager", {"title": "Choose the plan", "why": "Two plans fit.",
+                                                  "what_to_do": "Say which one"})
+        self.assertIsNone(hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?",
+                                               (int(plain.split("N-")[1].split(".")[0]),)))["door_task"])
+        self.assertEqual(hub.need_title({"title": "Choose the plan"}), "Choose the plan")
+        # two agents sent one script to one server, and the item carries the question of one of them: its own line
+        # says its task, also when the other agent's line is the newer one; with no line of its own, the task of
+        # the question
+        self.grant(agent="dev", server="web-1", level="fix")
+        mine = hub.ins("INSERT INTO tasks(title,owner,state,requester) VALUES('Check the disk','vps','working','manager')")
+        theirs = hub.ins("INSERT INTO tasks(title,owner,state) VALUES('Another agent looks too','dev','working')")
+        asked = hub.ins("INSERT INTO questions(task,asker,requester,text,asked) VALUES(?,?,?,?,?)",
+                        (mine, "vps", "manager", "The door refused my script.", 1.0))
+        card = run_card(script="df -h\n")
+        hub.q("UPDATE door_record SET task=? WHERE call=?", (f"T-{mine}", card["door_call"]))
+        n = hub.q1("SELECT MAX(n) n FROM door_record")["n"] + 1
+        hub.q("INSERT INTO door_record(n,ts,caller,target,action,kind,outcome,why,call,task) VALUES(?,?,?,?,?,?,?,?,?,?)",
+              (n, float(n), "dev", "web-1", "run", "refused", "refused", "the door's words", card["door_call"],
+               f"T-{theirs}"))
+        nid = int(hub.t_raise_needs_you("manager", dict(card, question_id=f"Q-{asked}")).split("N-")[1].split(".")[0])
+        row = hub.q1("SELECT * FROM needs WHERE id=?", (nid,))
+        self.assertEqual((row["door_task"], row["door_task_id"]), ("Check the disk", mine))
+        hub.q("UPDATE needs SET answer='No', answered=1 WHERE id=?", (nid,))
+        hub.q("UPDATE door_record SET task=NULL WHERE call=? AND caller='vps'", (card["door_call"],))
+        nid = int(hub.t_raise_needs_you("manager", dict(card, question_id=f"Q-{asked}")).split("N-")[1].split(".")[0])
+        self.assertEqual(hub.q1("SELECT door_task FROM needs WHERE id=?", (nid,))["door_task"], "Check the disk")
+        hub.q("UPDATE needs SET answer='No', answered=1 WHERE id=?", (nid,))
+        hub.q("DELETE FROM door_record WHERE call=? AND caller='vps'", (card["door_call"],))    # only the other's line
+        refusal(hub.door_call_hash("web-1", "run", [], b"true\n"), "web-1", "run")              # (the record is read)
+        nid = int(hub.t_raise_needs_you("manager", dict(card, question_id=f"Q-{asked}")).split("N-")[1].split(".")[0])
+        self.assertEqual(hub.q1("SELECT door_task FROM needs WHERE id=?", (nid,))["door_task"], "Check the disk")
+        # the door's line gives the task: the hub keeps it with the line, and only a task's code. The words are one
+        # line with no character that is known to draw nothing
+        self.assertEqual([hub.door_task_words(x) for x in ("", None, " \n ", "`", "a  b")], [None, None, None, None, "a b"])
+        self.assertEqual(hub.door_task_words("Read\u3164 the\u2800 l\u034fo\ufe0fgs\u115f"), "Read the logs")
+        self.assertTrue(hub.DOOR_TASK.fullmatch("T-12") and not hub.DOOR_TASK.fullmatch("T-0") and
+                        not hub.DOOR_TASK.fullmatch("T-12; x"))
+
+    def test_the_hub_says_when_the_door_took_full_access_and_when_it_did_not(self):
+        """Incident intake, part 3. On 13 November 2026 the owner's signed Full access was at the door 80 seconds
+        after his press, and nothing told the agent that had asked, or the manager. The door's own word comes with
+        each read of its record: when it turns to Full access, the task of the card hears it one time; and when the
+        door has read a fresh statement of the hub two times and keeps none of that time, the manager hears that
+        one time."""
+        self.grant(agent="vps", server="web-1", level="fix")
+        task = hub.ins("INSERT INTO tasks(title,owner,state) VALUES('Read the checkout logs','vps','working')")
+        once = hub.ins("INSERT INTO tasks(title,owner,state) VALUES('Rotate the logs','vps','working')")
+        ended = hub.ins("INSERT INTO tasks(title,owner,state) VALUES('An older task','vps','completed')")
+        fleet, t = hub.fleet_id(), time.time()
+
+        def answered(script, of, statement, received):
+            card = run_card(script=script)
+            hub.q("UPDATE door_record SET task=? WHERE call=?", (f"T-{of}", card["door_call"]))
+            nid = int(hub.t_raise_needs_you("manager", card).split("N-")[1].split(".")[0])
+            hub.q("UPDATE needs SET approval=?, answer='answered', chosen=1, answered=? WHERE id=?",
+                  (json.dumps({"statement": json.dumps(statement, sort_keys=True, separators=(",", ":")),
+                               "signature": "c2ln"}), received, nid))
+            return nid
+
+        def mode(at):
+            return {"v": 1, "kind": "door-mode", "fleet": fleet, "host": "web-1", "mode": "full", "at": at}
+        first = int(t) - 200
+        full = answered("journalctl -u app\n", task, mode(first), t - 190)
+        answered("ls /srv\n", ended, mode(first - 50), t - 195)
+        # a signed Run it once is no Full access: its task hears nothing, or its script would run two times
+        answered("logrotate -f /etc/logrotate.conf\n", once,
+                 {"v": 1, "kind": "door-call", "fleet": fleet, "need": 0, "call": "ab" * 32, "at": first}, t - 185)
+
+        def said(agent):
+            return [(r["task"], r["text"]) for r in hub.q("SELECT task, text FROM events WHERE agent=? AND kind='say' "
+                                                          "AND text LIKE '%door%' ORDER BY id", (agent,))]
+
+        def word(at, t0, mode="full"):
+            hub.door_modes_said({"modes": {"web-1": {"mode": mode, "at": at}} if mode else {}}, t0)
+        word(None, t - 180, "auto")                                     # the door's first word: no news
+        self.assertEqual((said("vps"), said("manager")), ([], []))
+        hub.DOOR.pop("approvals_at", None)
+        self.assertEqual(self.request("/door/approvals", source=DOOR)[0], 200)      # the door reads the statements
+        self.assertGreaterEqual(hub.DOOR["approvals_at"], t)
+        word(first, t + 5)
+        word(first, t + 65)
+        self.assertEqual(said("vps"), [(task, "[hub] The door has the owner's Full access on web-1 now: a root script "
+                                              "with no box runs there with no card. If the door refused your call, "
+                                              "send it again; a call that ran needs nothing more.")])
+        # a read in which the door names no server, and the next one: no news a second time
+        word(None, t + 70, None)
+        word(first, t + 75)
+        self.assertEqual(len(said("vps")), 1)
+        self.assertEqual(said("manager"), [])                           # an old statement that the door keeps
+        # a fresh statement that is not in effect at the door: the owner set Auto, and the door still says Full access
+        def kept(statement, received):
+            hub.q("UPDATE needs SET approval=?, answered=? WHERE id=?",
+                  (json.dumps({"statement": json.dumps(statement, sort_keys=True, separators=(",", ":")),
+                               "signature": "c2ln"}), received, full))
+        second = int(t) - 20
+        kept(dict(mode(second), mode="auto"), t - 10)
+        self.assertEqual(hub.door_modes_held()["web-1"]["mode"], "auto")
+        hub.DOOR["approvals_at"] = t - 15                               # the door's last read was before it came
+        word(first, t + 80)
+        word(first, t + 140)
+        self.assertEqual(said("manager"), [])
+        hub.DOOR["approvals_at"] = t + 141
+        word(first, t + 145)                                            # the first read that shows it: not yet
+        self.assertEqual(said("manager"), [])
+        word(first, t + 205)
+        word(first, t + 265)
+        told = said("manager")
+        self.assertEqual(len(told), 1)
+        self.assertIn("[hub] The owner's Auto on web-1 is not in effect at the door", told[0][1])
+        self.assertIn("it still says Full access for that server. The door's own log says why", told[0][1])
+        # the door says Auto: nothing more
+        word(second, t + 325, "auto")
+        self.assertEqual((len(said("manager")), len(said("vps"))), (1, 1))
+        # a newer Full access that the door honours with the statement before it is in effect: no word to the
+        # manager, and the task of that very card hears of it one time
+        kept(mode(int(t) - 5), t - 3)
+        hub.DOOR["approvals_at"] = t + 330
+        word(first, t + 385)
+        word(first, t + 445)
+        self.assertEqual((len(said("manager")), len(said("vps"))), (1, 2))
+        # a statement that is not fresh, or of a server that no agent holds at Fix, is no news: the door says the
+        # same of a statement that it took and does not honour
+        hub.kv_set("door_untaken:web-1", "")
+        kept(dict(mode(int(t) - 1), mode="auto"), t - 2 * hub.DOOR_UNTAKEN_FRESH)
+        word(first, t + 505)
+        word(first, t + 565)
+        self.assertEqual(len(said("manager")), 1)
+        kept(dict(mode(int(t) - 1), mode="auto"), t - 2)
+        self.grant(agent="vps", server="web-1", level="read")
+        word(first, t + 625)
+        word(first, t + 685)
+        self.assertEqual(len(said("manager")), 1)
 
     def test_the_words_of_a_signed_answer_do_not_close_the_door_s_card(self):
         """Words are no signature. An answer in words closes an item as a press does, so the words of Run it once or

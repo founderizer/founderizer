@@ -282,6 +282,9 @@ class Sender(PushCase):
         self.assertEqual({k: v for k, v in self.opened(hub.ping_payload(need, "g", SEAL)).items()
                           if k in ("title", "body")}, {"title": "Atlas", "body": need["title"]})
         self.assertEqual(self.opened(hub.ping_payload(dict(need, by=None), "g", SEAL))["title"], "Needs you")
+        # the door's card says the task that asked after its title (owner API 1.160)
+        card = dict(need, title="Run one root script on web-1?", door_task="Read the logs")
+        self.assertEqual(self.opened(hub.ping_payload(card, "g", SEAL))["body"], "Run one root script on web-1? · Read the logs")
         # as the apps write it (Swift's capitalized), not Python's capitalize() (review A9)
         self.assertEqual(self.opened(hub.ping_payload(dict(need, by="acme-dev"), "g", SEAL))["title"], "Acme-Dev")
 

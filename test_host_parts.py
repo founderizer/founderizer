@@ -1388,17 +1388,34 @@ class Look(HostCase):
         self.assertIn("/srv/a", deny["whole"])              # a folder under the top one with more folders than that
         all_hidden(deny, "the top folder's own folders")
 
+    def test_only_a_path_that_is_there_counts_against_the_limit_of_one_unit(self):
+        """A hidden path that is not on the host costs the unit's start nothing, and most of the key stores of the
+        fixed list are on no one host: on five real servers 51 to 55 of 230 to 550 paths were not there."""
+        self.tree({"/proc/self/mounts": "/dev/sda1 / ext4 rw 0 0\n", "/etc/passwd": "", "/etc/shadow": "x",
+                   "/srv/a/.env": "A", "/srv/a/x.key": "k", "/srv/a/log/app.log": "l", "/srv/b/.env": "A"})
+        free = ROOT.look_deny()
+        there = [p for p in free["paths"] if os.path.lexists(self.tmp + p)]
+        self.assertGreater(len(free["paths"]) - len(there), 50)
+        with patch.object(ROOT, "LOOK_PATHS", len(there)):          # as many as are there: nothing goes whole
+            self.assertEqual(ROOT.look_deny(), free)
+        with patch.object(ROOT, "LOOK_PATHS", len(there) - 1):      # one less: the folder with two names goes
+            fewer = ROOT.look_deny()
+        self.assertEqual(fewer["whole"], ["/srv/a"])
+        self.assertEqual(set(free["paths"]) - set(fewer["paths"]), {"/srv/a/.env", "/srv/a/x.key"})
+        self.assertIn("/etc/kubernetes", fewer["paths"])            # not there, and still in the list
+
     def test_the_names_that_the_walk_found_count_as_paths_that_it_holds(self):
         """The steps after the walk work on what it found and on what still waited. Both are bounded by one number
         (LOOK_QUEUE), so a server with a million secret names costs those steps seconds and not minutes."""
         self.tree({"/proc/self/mounts": "/dev/sda1 / ext4 rw 0 0\n", "/etc/passwd": "", "/srv/z/.env": "A"})
-        self.tree({f"/srv/keys/site{i}.key": "k" for i in range(30)})
+        keys = [f"/srv/keys{g}/site{i}.key" for g in range(3) for i in range(ROOT.LOOK_ALIKE - 2)]
+        self.tree({path: "k" for path in keys})
         self.assertEqual(ROOT.look_deny()["whole"], [])
         with patch.object(ROOT, "LOOK_QUEUE", 20):          # few folders wait, and 30 names were found
             deny = ROOT.look_deny()
         self.assertTrue(deny["whole"])
         self.assertTrue(any(p == "/srv/z" or p == "/srv/z/.env" for p in deny["paths"]), deny["whole"])
-        self.assertTrue(all(f"/srv/keys/site{i}.key" in deny["paths"] or "/srv/keys" in deny["paths"] for i in range(30)))
+        self.assertTrue(all(path in deny["paths"] or os.path.dirname(path) in deny["paths"] for path in keys))
 
     def test_the_names_as_one_pattern_are_the_names_one_by_one(self):
         """The walk matches a name one time against all names (LOOK_NAME), where it matched it against each one."""
@@ -1507,11 +1524,22 @@ class Look(HostCase):
         deep = [f"/var/www/big/storage/cache/d{i}/.env" for i in range(400)] + ["/var/www/big/shared/.env"]
         self.assertEqual(ROOT.look_fewer(deep + apps + app, 150, never)[1][0], "/var/www/big/storage/cache")
         self.assertEqual(ROOT.look_fewer(deep + app, 150, never)[1], ["/var/www/big/storage/cache"])
+        # two masses in two places, where only a level near the top is enough: each one gives the folder that holds
+        # it, and the app beside the first one stays in sight (a test server, 14 November 2026: /srv/iil went whole)
+        beside = ["/srv/iil/app/.env", "/srv/iil/app/config/wp-config.php", "/srv/iil/app/node_modules"]
+        first = [f"/srv/iil/many/d{i}/.env" for i in range(100)]
+        other = [f"/srv/curve/d{i}/.env" for i in range(60)]
+        self.assertEqual(ROOT.look_fewer(first + other + beside, 60, never),
+                         (sorted(beside + ["/srv/curve", "/srv/iil/many"]), ["/srv/iil/many", "/srv/curve"]))
+        # a folder whose paths are spread, with no folder in it that holds half of them, goes whole itself
+        spread = [f"/srv/mix/{part}/d{i}/.env" for part, count in (("a", 40), ("b", 30), ("c", 30)) for i in range(count)] + \
+                 [f"/srv/mix/s{i}/.env" for i in range(60)]
+        self.assertEqual(ROOT.look_fewer(spread + beside, 50, never)[1], ["/srv/mix"])
         self.assertEqual(ROOT.look_fewer(system + ["/var/www/a/.env", "/var/www/a/x.key", "/var/www/b/.env"], 46, never)[1],
                          ["/var/www/a"])
-        # the limit itself: a unit's start time grows with the square of it (1,200 paths 8.3 seconds, 3,650 paths
-        # 91 seconds), and LookBoxLive runs a box at the limit
-        self.assertLessEqual(ROOT.LOOK_PATHS, 1500)
+        # the limit itself: a unit's start time grows with the square of it (on a real server with two shared
+        # processors, 276 paths 4.2 seconds), and LookBoxLive runs a box at the limit
+        self.assertLessEqual(ROOT.LOOK_PATHS, 600)
         # every list: at most the limit, each path in it or under a folder of it, no path under another one
         import random
         rng = random.Random(14)
@@ -1544,6 +1572,28 @@ class Look(HostCase):
             self.assertFalse(any(held(w) for w in whole), (whole, never))
             if len(paths) <= limit:
                 self.assertEqual((kept, whole), (sorted(paths), []))
+
+    def test_a_folder_of_files_with_one_ending_goes_whole_and_an_app_s_own_folder_does_not(self):
+        """A folder of migrations or of certificates cost one path for each file: 70 paths on one real server. An
+        app's own top folder has as many names of secrets and of stores, of several kinds, and it stays in sight:
+        a look that hides it sees none of the app."""
+        self.tree({"/proc/self/mounts": "/dev/sda1 / ext4 rw 0 0\n", "/etc/passwd": ""})
+        self.tree({f"/srv/shop/db/migrations/{i:03d}_step.sql": "sql" for i in range(ROOT.LOOK_ALIKE + 1)})
+        self.tree({f"/srv/shop/db/seeds/{i:03d}_seed.sql": "sql" for i in range(ROOT.LOOK_ALIKE)})
+        root = [".env", ".env.local", ".env.dev", ".env.test", ".env.prod", ".env.dist", ".env.local.php",
+                ".env.dev.local", ".env.test.local", ".env.prod.local", "auth.json", ".npmrc", ".env.staging",
+                "database.yml"]
+        self.assertGreater(len(root), ROOT.LOOK_ALIKE)
+        self.tree({f"/srv/shop/{name}": "A" for name in root})
+        self.tree({"/srv/shop/.git/config": "c", "/srv/shop/vendor/a/b.php": "p", "/srv/shop/node_modules/a/b.js": "j",
+                   "/srv/shop/src/Kernel.php": "code", "/srv/shop/db/migrations/README": "text"})
+        deny = ROOT.look_deny()
+        self.assertEqual(deny["whole"], ["/srv/shop/db/migrations"])
+        self.assertIn("/srv/shop/db/seeds/000_seed.sql", deny["paths"])     # as many as the number: each by itself
+        for name in root + [".git", "vendor", "node_modules"]:              # 17 names of several kinds
+            self.assertIn(f"/srv/shop/{name}", deny["paths"])
+        self.assertFalse(any("/srv/shop/src/Kernel.php".startswith(p + "/") for p in deny["paths"]))
+        self.assertNotIn("/srv/shop", deny["paths"])
 
     def test_a_python_cache_folder_costs_no_path_and_the_compiled_copy_of_a_hidden_file_is_hidden(self):
         """One real server had 803 Python cache folders among its 1,180 hidden paths, and a unit's start time grows
@@ -2346,8 +2396,11 @@ echo end
         """The largest list that a look can have: LOOK_PATHS paths, each one a property of the unit, whose start
         time grows with the square of their count. With more names than that, folders go whole."""
         shutil.rmtree("/srv/iil/many", ignore_errors=True)
-        many = ROOT.LOOK_PATHS - len(ROOT.look_deny()["paths"]) - 60       # with this host's own: 60 under the limit
-        self.assertGreater(many, 1000, "this host has too many paths of its own for this test")
+
+        def there(deny):
+            return sum(1 for p in deny["paths"] if os.path.lexists(p))
+        many = ROOT.LOOK_PATHS - there(ROOT.look_deny()) - 60       # with this host's own: 60 under the limit
+        self.assertGreater(many, 250, "this host has too many paths of its own for this test")
         for d in range(many):
             os.makedirs(f"/srv/iil/many/d{d}", exist_ok=True)
             with open(f"/srv/iil/many/d{d}/.env", "w") as f:
@@ -2356,9 +2409,9 @@ echo end
                 f.write(f"MANY-PAGE-{d}")
         last = many - 1
         deny = ROOT.look_deny()
-        self.assertEqual(len(deny["paths"]), ROOT.LOOK_PATHS - 60)
+        self.assertEqual(there(deny), ROOT.LOOK_PATHS - 60)
         self.assertIn(f"/srv/iil/many/d{last}/.env", deny["paths"])
-        script = (f"cat /srv/iil/many/d0/.env /srv/iil/many/d700/.env /srv/iil/many/d{last}/.env 2>&1\n"
+        script = (f"cat /srv/iil/many/d0/.env /srv/iil/many/d{many // 2}/.env /srv/iil/many/d{last}/.env 2>&1\n"
                   f"cat /srv/iil/many/d{last}/page.txt /srv/iil/app/log/app.log\n"
                   f"echo \"bytes of all of them: $(cat /srv/iil/many/*/.env 2>/dev/null | wc -c)\"\n")
         started = time.monotonic()
@@ -2369,7 +2422,7 @@ echo end
         self.assertIn(f"MANY-PAGE-{last}", out)
         self.assertIn("APP-LOG-LINE", out)
         self.assertLess(took, 40, f"a look with {len(deny['paths'])} hidden paths took {took:.0f} seconds")
-        print(f"\n[look] a look with {len(deny['paths'])} hidden paths took {took:.1f} s", file=sys.stderr)
+        print(f"\n[look] a look with {there(deny)} hidden paths that are there took {took:.1f} s", file=sys.stderr)
         # more names than one unit hides: the folder that holds the most of them goes whole, each secret stays
         # hidden, and the box starts sooner
         for d in range(many, ROOT.LOOK_PATHS + 400):
@@ -2377,7 +2430,7 @@ echo end
             with open(f"/srv/iil/many/d{d}/.env", "w") as f:
                 f.write(f"MANY-SECRET-{d}")
         deny = ROOT.look_deny()
-        self.assertLessEqual(len(deny["paths"]), ROOT.LOOK_PATHS)
+        self.assertLessEqual(there(deny), ROOT.LOOK_PATHS)
         self.assertIn("/srv/iil/many", deny["whole"])
         started = time.monotonic()
         out = self.look(script + f"cat /srv/iil/many/d{ROOT.LOOK_PATHS + 399}/.env 2>&1\n")
