@@ -119,6 +119,20 @@ finally:
 if error:
     sys.exit(error)
 """
+# The name of the AI in the install lines of an agent whose model account has a kind: the provider that the owner
+# picked, never the program (his answer 12 to the AI providers' pictures, 14 November 2026: "The name I picked").
+# A key's provider has its label in lifecycle.KEY_PROVIDERS; his own model server is this one.
+MODEL_SERVER_LABEL = "Model server"
+
+
+def provider_label(job, runtime):
+    """The name of the AI in an install job's lines: the job's `provider_label`, which the hub writes for an agent of
+    a model account, when it is the label of a provider whose program is this runtime (a key's provider, or the
+    owner's own model server); else the runtime's own word (LABELS), as for every other job."""
+    named = job.get("provider_label")
+    programs = {p["label"]: p["runtime"] for p in lifecycle.KEY_PROVIDERS.values()}
+    programs[MODEL_SERVER_LABEL] = lifecycle.OWN_SERVER["runtime"]
+    return named if isinstance(named, str) and programs.get(named) == runtime else LABELS[runtime]
 
 
 class StepFailed(Exception):
@@ -658,11 +672,11 @@ class Service:
         if not NAME.fullmatch(str(agent)) or runtime not in LABELS:
             raise StepFailed(None, f"{self.name} runs an older Founderizer that cannot do this. Update Founderizer, "
                                    f"then try again.")      # a newer hub's provider or name (review, 30 October)
-        pinned = lifecycle.runtime_fact(runtime, "pinned")
+        pinned, label = lifecycle.runtime_fact(runtime, "pinned"), provider_label(job, runtime)
         if pinned and self.platform == "darwin":
             # The pins are Linux programs (onboard.PINNED), and the hub gives such a job to a Linux server only: a Mac
             # makes nothing for it.
-            raise failed("runtime", f"{LABELS[runtime]} did not install. Try again.",
+            raise failed("runtime", f"{label} did not install. Try again.",
                          f"{LABELS[runtime]} has no pinned program for a Mac")
         user = self.user_step(job, agent)
         if pinned:
@@ -674,7 +688,7 @@ class Service:
         self.key_step(job, agent, folder, user)
         self.service_step(job, agent, runtime, folder, user)
         if pinned:
-            self.program_answers(runtime, exe, folder, user)
+            self.program_answers(label, runtime, exe, folder, user)
         if job.get("sign_in") not in ("at_the_mac", "none") and lifecycle.runtime_fact(runtime, "sign_in"):
             self.sign_in_step(job, agent, runtime, exe, user)
         self.post(job, "done", "sign_in", f"{shown_name(agent)} runs on {self.name}. Open it to finish its setup.")
@@ -841,7 +855,7 @@ class Service:
         the digest that the checkout carries. Its program is taken only at the path of its pin
         (lifecycle.pinned_path), never from a PATH, and a download that could not reach an address is tried again in
         the same way."""
-        label = LABELS[runtime]
+        label = provider_label(job, runtime)
         self.post(job, "running", "runtime", f"Looking for {label}.")
         exe = self.agent_exe(runtime, user)
         if exe:
@@ -877,7 +891,7 @@ class Service:
             if code == 0 and exe:
                 break
             offline = bool(offline_in(f"{err}\n{out}"))
-            print(f"job {job.get('id')}: {label} {pin} did not install (try {again + 1} of "
+            print(f"job {job.get('id')}: {LABELS[runtime]} {pin} did not install (try {again + 1} of "
                   f"{onboard.NETWORK_RETRIES + 1}{', a network error' if offline else ''}): "
                   f"{' '.join(tail(err or out, 500).split())}", flush=True)
             if not offline or again == onboard.NETWORK_RETRIES:
@@ -915,7 +929,7 @@ class Service:
             "sh", runtime]))
         return (out.strip() or None) if code == 0 else None
 
-    def program_answers(self, runtime, exe, folder, user=None):
+    def program_answers(self, label, runtime, exe, folder, user=None):
         """The proof that the agent's pinned program runs (PINNED_ANSWERS): it starts once, as the agent's own user
         in the agent's checkout, with a folder of its own as a session has it, and answers ACP's `initialize`. A
         program that does not answer fails the job at its runtime step: a file of the right bytes can still need what
@@ -923,7 +937,7 @@ class Service:
         argv, cwd = self.in_folder(user, folder, [sys.executable, "-c", PINNED_ANSWERS, runtime, exe])
         code, out, err = self.run(argv, cwd=cwd, timeout=120)
         if code != 0:
-            raise failed("runtime", f"{LABELS[runtime]} did not install. Try again.",
+            raise failed("runtime", f"{label} did not install. Try again.",
                          f"{LABELS[runtime]} at {exe} did not answer initialize: {err or out or f'exit {code}'}")
 
     def checkout_step(self, job, agent, user=None):

@@ -2192,6 +2192,56 @@ class ServerService(Servers):
         self.assertIn("model_accounts", reported["features"])
         self.assertIn(self.mod.MODEL_ACCOUNTS, self.mod.lifecycle.FEATURES)      # the helper's word is the same
 
+    def test_the_install_lines_name_the_provider_that_the_owner_picked_and_never_the_program(self):
+        """His answer 12 to the AI providers' pictures (14 November 2026): the AI of such an agent is the provider
+        he picked, "Gemini" or "Model server", never "OpenCode". The hub writes it into the job (`provider_label`);
+        a label of another program's provider, or of none, keeps the runtime's own word."""
+        self.join_by_script(self.code()["code"])
+        svc = self.service(answers={" ".join([sys.executable, "-c", self.mod.PINNED_ANSWERS]):
+                                    (1, "", "the program gave no model list: TimeoutError\n")})
+        posted = self.pinned_machine(svc)
+        job = self.pinned_job(svc)
+        self.agent_user_made("fleet-scout")
+        refused = (1, "", "fleet: the download of OpenCode 2.2.5 does not match the digest of its pin\n")
+        for runtime, named, label in (("opencode", "Gemini", "Gemini"), ("opencode", "OpenRouter", "OpenRouter"),
+                                      ("opencode", "Model server", "Model server"),
+                                      ("opencode", "Grok", "OpenCode"),         # the provider of another program
+                                      ("opencode", "Claude Code", "OpenCode"), ("opencode", 7, "OpenCode"),
+                                      ("opencode", None, "OpenCode"), ("grok", "Grok", "Grok"),
+                                      ("grok", "Gemini", "Grok")):
+            posted.clear()
+            self.downloads[:] = [refused]
+            one = dict(job, runtime=runtime, **({"provider_label": named} if named is not None else {}))
+            with contextlib.redirect_stdout(io.StringIO()) as log, self.assertRaises(self.mod.StepFailed) as said:
+                svc.runtime_step(one, runtime, "fleet-scout")
+            self.assertEqual([detail for _state, _step, detail in posted],
+                             [f"Looking for {label}.", f"Installing {label}."], named)
+            self.assertEqual(str(said.exception), f"{label} did not install. Try again.", named)
+            self.assertIn(f"job {job['id']}: {self.mod.LABELS[runtime]} ", log.getvalue())    # its log: the program
+        # the whole job, to a program that does not answer: the line on the hub names the provider too
+        posted.clear()
+        with contextlib.redirect_stderr(io.StringIO()):
+            svc.work(dict(job, provider_label="Gemini"))
+        shown = self.servers()[1]["mini"]["job"]
+        self.assertEqual((shown["state"], shown["step"], shown["detail"]),
+                         ("failed", "runtime", "Gemini did not install. Try again."))
+        self.assertEqual([detail for _state, step, detail in posted if step == "runtime"],
+                         ["Looking for Gemini.", "Installing Gemini.", "Gemini did not install. Try again."])
+
+    def test_a_job_with_no_sign_in_runs_no_sign_in_step_for_a_runtime_that_has_one(self):
+        """`"sign_in": "none"` alone keeps an agent of a key from the sign-in step of a runtime that has one: Claude
+        Code here, and Grok Build once it has its own sign-in (step 4)."""
+        self.join_by_script(self.code()["code"])
+        svc = self.service(life=FakeLife(signed_in=False, after=10 ** 6))      # a sign-in would be needed
+        posted = self.pinned_machine(svc)
+        self.assertTrue(self.mod.lifecycle.runtime_fact("claude", "sign_in"))
+        svc.work(self.pinned_job(svc, "claude"))
+        shown = self.servers()[1]["mini"]["job"]
+        self.assertEqual((shown["state"], shown["step"], shown["detail"]),
+                         ("done", "sign_in", "Scout runs on mini. Open it to finish its setup."))
+        self.assertEqual([step for _state, step, _detail in posted], ["user", "runtime", "checkout", "service", "sign_in"])
+        self.assertIsNone(hub.q1("SELECT id FROM signin_jobs WHERE agent='scout'"))
+
 
 class InstallRetries(unittest.TestCase):
     """T-35: an install that could not reach the internet. The owner saw "Codex did not install: npm could not reach
