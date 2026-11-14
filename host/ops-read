@@ -11,11 +11,15 @@ goes to `sudo -n /usr/local/sbin/ops-root` with the same request and this sessio
 door reads only there is no sudoers line, and sudo refuses. No shell, no pager, no option of the caller's own.
 """
 import base64
+import http.client
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import time
+import unicodedata
 import urllib.request
 
 ROOT = ""                           # a prefix for the log folder, which only the tests set
@@ -26,6 +30,20 @@ ENV = {"PATH": PATH, "LANG": "C.UTF-8", "SYSTEMD_PAGER": "", "PAGER": "cat", "SY
 OUT_MAX = 256 * 1024
 LINES_MAX = 5000
 ALERTS = "http://127.0.0.1:9093/api/v2/alerts"
+ALERT_LABELS = 20                   # labels of one alert that its line gives besides its name and its severity
+ALERT_NAME = 60                     # characters of a label's name
+ALERT_VALUE = 120                   # characters of a label's value
+ALERT_SUMMARY = 200                 # characters of an alert's summary
+ALERTS_MAX = 8 * 1024 * 1024        # bytes of the Alertmanager's answer that the read takes
+ALERTS_WAIT = 20                    # seconds for all of that answer, whatever the pace of its parts
+ALERTS_OUT = 200 * 1000             # characters of alert lines in one answer: under OUT_MAX, so no line is cut
+FINGERPRINT = re.compile(r"[0-9a-f]{1,64}")
+STARTED = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d{1,9})?(Z|[+-]\d\d:\d\d)")     # RFC 3339, as Go writes it
+# What never goes into a column as it is: a control character, a line or a paragraph separator, half of a surrogate
+# pair (UNSEEN), and the marks that turn the reading order of a line or that are a gap with no width (TURNS). The
+# joiners that a script and an emoji need (U+200C, U+200D), and every letter, stay as they are.
+UNSEEN = ("Cc", "Zl", "Zp", "Cs")
+TURNS = frozenset("\u061c\u200b\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2060\u2066\u2067\u2068\u2069\ufeff")
 UNIT = re.compile(r"[A-Za-z0-9][A-Za-z0-9@_.:-]{0,99}")
 SINCE = re.compile(r"\d{4}-\d\d-\d\d( \d\d:\d\d(:\d\d)?)?|-?[1-9][0-9]{0,3} ?(s|sec|min|m|h|hours?|d|days?)( ago)?|"
                    r"today|yesterday|now")
@@ -126,16 +144,110 @@ def none(name):
     return check
 
 
+def plain(value, limit):
+    """One value of an alert as it goes into a column: text on one line, with no tab, no line end of any kind and no
+    character that a reader does not see (UNSEEN), because a label and an annotation hold what the alert's source
+    wrote, and cut to `limit` characters. What is left can always be printed."""
+    text = "".join(" " if c in TURNS or unicodedata.category(c) in UNSEEN else c for c in str(value))
+    return text.strip()[:limit]
+
+
+def alert_line(a):
+    """One alert of the Alertmanager as one line of columns with a tab between them. The first three are the ones
+    that this read always gave: name, severity, state. Then the fingerprint, which is the alert's key for as long as
+    its labels stay the same, the time it started, its summary, and each other label as name=value, by name: the
+    first ALERT_LABELS of them, and then how many more there are. The summary's column is always there, so every
+    column after the sixth is a label, with the first = after its name (an = in a name is written _), or the count
+    of the labels that are left out, which has no =."""
+    labels = a.get("labels") if isinstance(a.get("labels"), dict) else {}
+    status = a.get("status") if isinstance(a.get("status"), dict) else {}
+    notes = a.get("annotations") if isinstance(a.get("annotations"), dict) else {}
+    fingerprint, started = a.get("fingerprint"), a.get("startsAt")
+    columns = [plain(labels.get("alertname"), ALERT_VALUE), plain(labels.get("severity"), ALERT_VALUE),
+               plain(status.get("state"), ALERT_VALUE),
+               fingerprint if isinstance(fingerprint, str) and FINGERPRINT.fullmatch(fingerprint) else "-",
+               started if isinstance(started, str) and STARTED.fullmatch(started) else "-",
+               plain(notes.get("summary") or "", ALERT_SUMMARY)]
+    others = sorted((str(k), v) for k, v in labels.items() if k not in ("alertname", "severity"))
+    columns += [f"{plain(k, ALERT_NAME).replace('=', '_') or '_'}={plain(v, ALERT_VALUE)}"
+                for k, v in others[:ALERT_LABELS]]
+    if len(others) > ALERT_LABELS:
+        columns.append(f"(+{len(others) - ALERT_LABELS} labels)")
+    return "\t".join(columns)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None             # the alerts are this host's own: an answer that sends the read elsewhere is none
+
+
+class Slow(Exception):
+    pass
+
+
+def alert_opener():
+    """What asks the Alertmanager: this host itself, through no proxy, and it follows no redirect."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+
+
+def alerts_answer():
+    """The bytes of the local Alertmanager's answer, or the fixed words for why there are none. Port 9093 is no
+    privileged port, so whatever answers there can be any program of this host: the read takes ALERTS_MAX bytes and
+    ALERTS_WAIT seconds for all of it, the answer's first line and each part of a chunked one included, which a
+    time for each part of the socket's work does not bound."""
+    def late(signum, frame):
+        raise Slow()
+    try:
+        before = signal.signal(signal.SIGALRM, late)
+    except ValueError:              # not the program's main thread: the count of bytes and the pace of the parts bound it
+        before = None
+    try:
+        if before is not None:
+            signal.alarm(max(1, ALERTS_WAIT))
+        data, end = b"", time.monotonic() + ALERTS_WAIT
+        with alert_opener().open(ALERTS, timeout=10) as r:
+            while True:
+                part = r.read1(65536)
+                if not part:
+                    return data
+                data += part
+                if len(data) > ALERTS_MAX or time.monotonic() > end:
+                    return "the Alertmanager's answer on this host is too large or too slow to read"
+    except Slow:
+        return "the Alertmanager's answer on this host is too large or too slow to read"
+    except (OSError, ValueError, http.client.HTTPException):
+        return "no Alertmanager answers on this host"
+    finally:
+        if before is not None:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, before)
+
+
 def alerts(args):
     if args:
         raise Refused("alerts takes no arguments")
     try:
-        with urllib.request.urlopen(ALERTS, timeout=10) as r:
-            found = json.loads(r.read())
-    except (OSError, ValueError):
+        data = alerts_answer()
+    except Slow:                    # the alarm at the very moment that the answer's reading ended
+        data = "the Alertmanager's answer on this host is too large or too slow to read"
+    if isinstance(data, str):
+        return data
+    try:
+        found = json.loads(data)
+    except (ValueError, RecursionError):
         return "no Alertmanager answers on this host"
-    return "\n".join(f"{a.get('labels', {}).get('alertname')}\t{a.get('labels', {}).get('severity')}\t"
-                     f"{a.get('status', {}).get('state')}" for a in found if isinstance(a, dict)) or "no alert"
+    if not isinstance(found, list):
+        return "no Alertmanager answers on this host"
+    found = [a for a in found if isinstance(a, dict)]
+    lines, size = [], 0
+    for a in found:
+        line = alert_line(a)
+        size += len(line) + 1
+        if size > ALERTS_OUT:       # whole lines only: the answer's own cut keeps its end, and would cut one in two
+            lines.append(f"(+{len(found) - len(lines)} alerts)")
+            break
+        lines.append(line)
+    return "\n".join(lines) or "no alert"
 
 
 READS = {
@@ -157,7 +269,9 @@ READS = {
     "lsblk": {"argv": ["lsblk"], "help": "lsblk"},
     "findmnt": {"argv": ["findmnt"], "help": "findmnt"},
     "swap": {"argv": ["swapon", "--show"], "help": "swapon --show"},
-    "alerts": {"text": alerts, "check": lambda a: none_given(a, "alerts"), "help": "the local Alertmanager's alerts"},
+    "alerts": {"text": alerts, "check": lambda a: none_given(a, "alerts"),
+               "help": "the local Alertmanager's alerts, a line each: name, severity, state, fingerprint, start, "
+                       "summary, then each other label as name=value, with a tab between them"},
 }
 for _name, _read in READS.items():
     if "argv" in _read:

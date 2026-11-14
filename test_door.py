@@ -2456,6 +2456,19 @@ class OwnerYes(DoorCase):
         self.assertIn(got["call"], got["why"])
         return got["call"]
 
+    def test_a_signed_yes_of_a_moment_ago_counts_for_the_very_next_call(self):
+        # the yes is at the hub and the door's sweep has not run since: the door asks the hub before it refuses
+        call = self.refused_once()
+        said = self.statement(call)
+        self.answers = [{"need": 7, "statement": said, "signature": self.sign(said)}]
+        self.door.yes_read_next = 0.0           # the first refusal asked a moment ago: this call may ask again
+        got = self.delete()
+        self.assertEqual((got["ok"], got["kind"]), (True, "approved"), got)
+        self.assertEqual(len(self.deleted()), 1)
+        self.door.yes_read_next = 0.0
+        self.assertEqual(self.delete()["kind"], "refused")             # once: the hub still serves it, and it is used
+        self.assertEqual(len(self.deleted()), 1)
+
     def test_the_owners_signed_yes_lets_that_exact_call_through_once(self):
         call = self.refused_once()
         said = self.statement(call)
@@ -2949,6 +2962,117 @@ class FullAccess(Signed, DoorCase):
                                                               "Full access"))
         self.assertEqual([c[1] for c in self.stubs.ssh_calls], ["run", "timer", "run", "timer"])
         self.assertEqual(self.run_on("db-1")["kind"], "refused")         # the mode of one host only
+
+    def hub_calls(self):
+        """The door's reads of the hub's signed statements, counted, on top of the fixture's stand-in hub."""
+        asked, hub = [], self.door.http
+
+        def http(method, url, headers, body):
+            if url.endswith("/door/approvals"):
+                asked.append(time.monotonic())
+            return hub(method, url, headers, body)
+        self.door.http = http
+        return asked
+
+    def test_full_access_of_a_moment_ago_counts_for_the_very_next_call(self):
+        # 13 November 2026: the owner's signed Full access was at the hub, the agent called before the door's next
+        # sweep, the door refused, and the owner was told that the answer had not arrived. The door asks the hub
+        # before it refuses a call that only the owner's word lets through.
+        asked = self.hub_calls()
+        said = self.statement("web-1")
+        self.modes.append({"statement": said, "signature": self.sign(said)})       # at the hub; no sweep ran since
+        got = self.run_on()
+        self.assertEqual((got["ok"], got["kind"]), (True, "own"), got)
+        self.assertEqual(len(asked), 1)
+        self.assertIn("which the owner set to Full access", self.door.record.after(0)[-1]["why"])
+        # the next run needs no question to the hub: the door holds the mode now
+        self.assertEqual(self.run_on(content=SCRIPT + b"id\n")["kind"], "own")
+        self.assertEqual(len(asked), 1)
+
+    def test_a_call_that_no_word_of_the_owner_lifts_asks_the_hub_nothing(self):
+        asked = self.hub_calls()
+        self.assertTrue(self.call(ONE, "web-1", "journal", "unit=nginx")["ok"])              # a read
+        self.assertTrue(self.call(ONE, "web-1", "restart", "nginx")["ok"])                   # a rule call
+        self.assertTrue(self.call(ONE, "web-1", "script", content=SCRIPT)["ok"])            # the agent's own call
+        self.assertEqual(self.call(TWO, "web-1", "run", content=SCRIPT)["kind"], "refused")  # no grant: no yes lifts it
+        self.assertEqual(self.call(ONE, "web-1", "nonsense")["kind"], "refused")
+        self.assertEqual(asked, [])
+
+    def test_a_refused_run_that_is_repeated_asks_the_hub_once_in_a_while_and_a_silent_hub_changes_nothing(self):
+        asked = self.hub_calls()
+        for _ in range(5):
+            self.assertEqual(self.run_on()["kind"], "refused")
+        self.assertEqual(len(asked), 1)                 # YES_READ_EVERY: the same refused call again asks no more
+        self.door.yes_read_next = 0.0
+        self.assertEqual(self.run_on()["kind"], "refused")
+        self.assertEqual(len(asked), 2)
+        # a hub that fails: the call is decided on what the door holds, with the same refusal and its hash
+
+        def broken(method, url, headers, body):
+            raise OSError("no route to the hub")
+        self.door.http, self.door.yes_read_next = broken, 0.0
+        got = self.run_on()
+        self.assertEqual((got["kind"], got["route"], got["full_access"]), ("refused", "yes", "web-1"))
+        self.assertIn(got["call"], got["why"])
+        # and a hub that hardly answers is not asked again by a call before the sweep's own next read
+        with patch.object(door, "YES_READ_SLOW", -1):
+            self.door.yes_read_next = 0.0
+            self.assertEqual(self.run_on()["kind"], "refused")
+        self.assertGreater(self.door.yes_read_next, time.monotonic() + door.YES_READ_LATER - 5)
+
+    def test_one_read_for_a_call_runs_at_a_time_and_a_hub_that_hangs_holds_one_call_only(self):
+        entered, release, hub, asked = threading.Event(), threading.Event(), self.door.http, []
+
+        def hangs(method, url, headers, body):
+            if url.endswith("/door/approvals"):
+                asked.append(1)
+                entered.set()
+                release.wait(20)
+            return hub(method, url, headers, body)
+        self.door.http = hangs
+        first = threading.Thread(target=self.run_on)
+        first.start()
+        self.assertTrue(entered.wait(10))
+        started = time.monotonic()
+        for _ in range(3):                      # while that read hangs, other refused calls answer at once
+            self.assertEqual(self.run_on()["kind"], "refused")
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(len(asked), 1)
+        release.set()
+        first.join(10)
+        self.assertFalse(first.is_alive())
+
+    def test_an_answer_of_the_hub_that_was_asked_for_earlier_never_replaces_a_later_one(self):
+        # the sweep asks, the hub answers it late; meanwhile a call asks and gets the owner's yes of a moment ago.
+        # The sweep's older answer, which has no such yes, must not take its place.
+        said = self.statement("web-1")
+        fresh = {"approvals": [], "devices": [], "modes": [{"statement": said, "signature": self.sign(said)}]}
+        entered, release = threading.Event(), threading.Event()
+        answers = iter(["old", "new"])
+
+        def http(method, url, headers, body):
+            if not url.endswith("/door/approvals"):
+                return 404, {}
+            if next(answers) == "old":
+                entered.set()
+                release.wait(20)
+                return 200, {"approvals": [{"statement": "x", "signature": "y"}], "devices": [], "modes": []}
+            return 200, fresh
+        self.door.http = http
+        door.write_json(door.APPROVALS_FILE, {"kept": {"need": 1, "statement": "s", "signature": "g"}})
+        sweep = threading.Thread(target=door.fetch_approvals, args=(self.door,))
+        sweep.start()
+        self.assertTrue(entered.wait(10))
+        door.fetch_approvals(self.door)                         # the later asking: it is kept
+        self.assertEqual(door.read_json(door.MODES_FILE, {})["web-1"]["mode"], "full")
+        kept = door.read_json(door.APPROVALS_FILE, None)
+        self.assertEqual(kept, {})
+        door.write_json(door.APPROVALS_FILE, {"marker": {"need": 2, "statement": "s", "signature": "g"}})
+        release.set()
+        sweep.join(10)
+        self.assertFalse(sweep.is_alive())
+        self.assertIn("marker", door.read_json(door.APPROVALS_FILE, {}))    # the earlier asking wrote nothing
+        self.assertEqual(self.run_on()["kind"], "own")
 
     def test_a_newer_statement_wins_and_an_older_one_never_comes_back(self):
         t = round(time.time())

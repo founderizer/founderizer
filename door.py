@@ -106,6 +106,11 @@ RENDERED_FILE = STATE + "/rendered.json"    # the GitOps repositories whose comm
 APPROVALS_FILE = STATE + "/approvals.json"  # the owner's signed yeses for exact calls that are his, from the hub
 APPROVED_FILE = STATE + "/approved.json"    # the yeses that were used: each lets its one call through once
 APPROVAL_DAYS = 7                           # a signed yes older than this lets nothing through
+YES_READ_EVERY = 2                          # seconds between two reads of the hub's signed statements that a call
+                                            # asks for (Door.yes_read): a caller that repeats a refused call asks the
+                                            # hub no more often than this
+YES_READ_SLOW = 5                           # a read that took longer than this found a hub that hardly answers:
+YES_READ_LATER = 60                         # then, and while a read runs, no call asks before the sweep's next read
 DEVICES_FILE = STATE + "/devices.json"      # the owner's phones whose signing key his owner key certified
 MODES_FILE = STATE + "/modes.json"          # the owner's signed mode of each host: the newest statement of each
 MODES = ("auto", "full")                    # door-modes proposal, step 4: Auto, the default, and Full access
@@ -689,6 +694,8 @@ class Door:
         self.host_locks, self.business_locks, self.repo_locks, self.tunnel_locks = {}, {}, {}, {}
         self.key_locks, self.key_failures = {}, {}      # one call of an account makes its work key; what failed last
         self.access_cache = (None, None)
+        self.yes_read_next = 0.0        # the time.monotonic() from which a call may ask the hub again (yes_read)
+        self.asked, self.asked_kept = 0, 0      # the askings of the hub's signed statements (fetch_approvals)
         self.aws_sessions = {}          # each AWS role's session of an hour, in memory only (door_providers.aws_session)
 
     # ---- the files
@@ -878,6 +885,28 @@ class Door:
             write_json(APPROVED_FILE, used)
         return entry
 
+    def yes_read(self):
+        """Before a call is refused for want of the owner's word: one read of the signed statements that the hub
+        carries, so that a yes or a Full access of a moment ago counts for the very next call. True when the door
+        asked. The sweep reads them each minute, and the hub tells the agent of the owner's answer at once: on
+        13 November 2026 the owner's signed Full access was at the door 80 seconds later, the agent's call came
+        before that and was refused, and the owner was told that the answer had not arrived. A hub that does not
+        answer changes nothing: the call is decided on what the door holds, as before. One such read runs at a
+        time: while it runs, and for YES_READ_LATER seconds after one that the hub hardly answered, a call does not
+        ask, so a hub that hangs holds one call and not each of them."""
+        with self.lock:
+            started = time.monotonic()
+            if started < self.yes_read_next:
+                return False
+            self.yes_read_next = started + YES_READ_LATER
+        with contextlib.suppress(Exception):
+            fetch_approvals(self)
+        ended = time.monotonic()
+        if ended - started <= YES_READ_SLOW:
+            with self.lock:
+                self.yes_read_next = ended + YES_READ_EVERY
+        return True
+
     def update_host(self, host, name, manifest, code):
         """(outcome, words) of one host's update to the host parts of the release that the door runs: current, done,
         refused, failed or unreachable. Its help says its version and its release (an ops-root of version 1 names no
@@ -981,8 +1010,18 @@ class Door:
         sha = call_hash(target, op, args, content)
         hashed = d.kind in ("own", "full")      # a refusal of these two kinds is the owner's to lift: it gives the hash
         full_host = d.host if d.kind == "full" else None
-        full = full_host is not None and self.full_access(access, full_host, agent)
-        yes = self.approved(access, sha) if hashed and not full else None
+
+        def owners_word():
+            """(Full access on the call's host, the owner's signed yes to this call, now used, and what of this call
+            only that yes lets through: D25, a delete of what no agent made through the door, and every AWS delete)."""
+            full = full_host is not None and self.full_access(access, full_host, agent)
+            yes = self.approved(access, sha) if hashed and not full else None
+            unmade = [key for key in door_providers.deletes(d.plan, self.credential(access, d.target))
+                      if not self.made(d.target, key)] if d.kind == "own" and not yes else []
+            return full, yes, unmade
+        full, yes, unmade = owners_word()
+        if (unmade or (d.kind == "full" and not full and not yes)) and self.yes_read():
+            full, yes, unmade = owners_word()   # the owner's word of a moment ago: the door asked the hub for it now
         if full:                # door-modes proposal, step 4: the owner set this server to Full access
             d.kind, d.why = "own", f"{agent}'s own call, which it answers for: a root script with no box on " \
                                    f"{full_host}, which the owner set to Full access"
@@ -992,10 +1031,7 @@ class Door:
             d = door_targets.refused(d.why + "." + APPROVAL_NOTE.format(sha=sha) +
                                      (FULL_NOTE.format(host=full_host) if full_host else ""), target=d.target)
         elif d.kind == "own":
-            # D25: a delete of what no agent made through the door, and every AWS delete, is the owner's, by code
-            unmade = [key for key in door_providers.deletes(d.plan, self.credential(access, d.target))
-                      if not self.made(d.target, key)]
-            if unmade:
+            if unmade:          # D25: the owner's, by code
                 d = door_targets.refused(door_providers.delete_refusal(unmade[0]) + APPROVAL_NOTE.format(sha=sha),
                                          target=d.target)
             else:               # the owner, 11 November 2026: no model decides, "it needs to be the agent itself"
@@ -2484,6 +2520,11 @@ def fetch_approvals(door):
     hub = access.get("hub") or {}
     if not hub.get("address") or not access.get("owner_keys"):
         return 0
+    # The sweep's thread and a call's thread (Door.yes_read) can both ask. Each asking takes a number before it asks,
+    # and an answer is kept only when no later asking was kept already: so an answer that the hub gave earlier never
+    # takes the place of a later one, with a yes that it does not have or a phone's key that the owner took away.
+    with door.lock:
+        door.asked = asking = getattr(door, "asked", 0) + 1
     status, answer = door.http("GET", hub_url(hub) + "/door/approvals", {"X-Fleet-Client": "door"}, None)
     if status != 200 or not isinstance(answer, dict) or not isinstance(answer.get("approvals"), list):
         return 0
@@ -2518,6 +2559,9 @@ def fetch_approvals(door):
         if mode_statement(access, item.get("statement"), item.get("signature")) == form:
             signed.append((form, item))
     with door.lock:
+        if asking < getattr(door, "asked_kept", 0):
+            return 0                # nothing of this answer is kept
+        door.asked_kept = asking
         write_json(DEVICES_FILE, devices)
         write_json(APPROVALS_FILE, kept)
         modes = read_json(MODES_FILE, {})

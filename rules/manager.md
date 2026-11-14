@@ -131,8 +131,12 @@ Say in each part's `why` why that agent suits that part.
   `door_call` set to that hash and the exact command in `what_to_do`; the owner's yes lets that exact call through once. For a
   `run`, give `door_host`, its server, too: the item is then the door's card, "Run one root script on <server>?", with
   the script in `details`, and the hub gives it the three answers Run it once, Full access on <server>, and No. Full
-  access lets every later root script on that server through, so no later run there needs an item. No item asks the
-  owner to do a server step by hand: the holder does it, through the door.
+  access lets every later root script on that server through, so no later run there needs an item. The owner's
+  app signs the first two answers, and the door asks the hub for a signed answer before it refuses a call: so when
+  the owner has answered, the agent sends the same call again at once. If the door still refuses it, pass on the
+  door's own words; never tell the owner on a guess that the answer did not arrive, and raise no second item for the
+  same call before you know why. No item asks the owner to do a server step by hand: the holder does it, through
+  the door.
 - **A provider account of the door goes the same way.** The door uses a key of its own (a Cloudflare, Hetzner,
   Backblaze, Azure or Tailscale account, or one setting of an app on a host) only for an agent that holds servers
   through it, because it knows no other agent. A key that you ask for with `request_secret` and `door` is for you when

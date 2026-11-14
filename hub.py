@@ -41595,6 +41595,25 @@ def need_words_note(need, choice, ticked):
             "reply with a new item (raise_needs_you) whose why answers what they asked.")
 
 
+def door_answer_words(text):
+    """An answer in words as it is compared with the words of an item's signed answers: its letters and digits in
+    one case, with one space where marks, quotes or spaces stood between them."""
+    return " ".join(re.sub(r"[\W_]+", " ", str(text).casefold()).split())
+
+
+def door_signed_answer(need, text):
+    """(index, words) of the answer of the door's card that this text is and that only a signed press gives, or None:
+    the first answer of an item with a door call (Run it once), the second of an item with a door's server (Full
+    access on <server>). Words are no signature. An answer in words closes an item as a press does, so these words
+    as text would close the card and give the door nothing: the agent's next call is refused, and nobody is told
+    why. No needs no signature, and every other text is the owner's own reply, which the manager reads."""
+    keys, said, picks = need.keys(), door_answer_words(text), need_options(need)
+    signed = ([0] if "door_call" in keys and need["door_call"] else []) + \
+        ([1] if "door_host" in keys and need["door_host"] else [])
+    return next(((i, picks[i]) for i in signed if i < len(picks) and said and said == door_answer_words(picks[i])),
+                None)
+
+
 def phone_submit(data, client, need_id=None, address=None, connection=None):
     """POST /ui/messages and /ui/needs/<id> after the route's checks (ui_allowed, the body's type and size):
     (status, answer). data: the JSON body; client: its X-Fleet-Client, stripped; address: the source address of
@@ -41755,6 +41774,12 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
        chosen=need["chosen"] if need is not None else None))
         if need is not None and need["answer"] is not None:
             return (409, {"error": "owner request is already answered"})
+        if need is not None and choice is None and ticked is None and isinstance(value, str):
+            unsigned = door_signed_answer(need, value)
+            if unsigned:        # the refusal of the unsigned press, and the item stays open
+                return (409, {"error": f"\"{unsigned[1]}\" needs the signature of the owner's key, and words carry "
+                                       f"none. Press that answer in Founderizer"
+                                       + (" on the Mac." if unsigned[0] == 1 else ".")})
         previous = None
         if replaces is not None:
             previous = DB.execute("SELECT * FROM ui_requests WHERE request_id=?", (replaces,)).fetchone()
@@ -47884,6 +47909,10 @@ class Handler(BaseHTTPRequestHandler):
                     log("owner", "BLOCKED an answer that contained a login")
                 elif row and answer and row["answer"] is None and row["kind"] == "secret":
                     log("owner", f"REFUSED an answer in words to the secret request N-{nid}")      # never the words
+                elif row and answer and row["answer"] is None and door_signed_answer(row, answer):
+                    # the board signs nothing: a press of Run it once or of Full access on <server> here, and their
+                    # words, would close the door's card and give the door no statement of the owner's key
+                    log("owner", f"REFUSED an answer on the board to N-{nid} that only the owner's app signs")
                 elif row and answer and row["answer"] is None and row["conversation"] and \
                         q1("SELECT 1 FROM conversations WHERE id=?", (row["conversation"],)):
                     # A question of a person's conversation: the answer goes back there, as owner_message_rows sends it.

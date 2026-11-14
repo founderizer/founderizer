@@ -861,6 +861,211 @@ class Reader(HostCase):
         code, out, _ = self.run_read({"v": 1, "op": "log", "args": ["/var/log/nginx/passwd.log"]})
         self.assertEqual(code, 3)
 
+    def alerts_of(self, answer, parts=None, asked=None):
+        """What the read `alerts` prints when the local Alertmanager gives this answer: bytes, or an error to raise.
+        parts: the answer comes in pieces of this many bytes, one for each read, and `asked` counts the reads; an
+        error in `parts` is raised by that read."""
+        test = self
+
+        class Answer:
+            def __init__(self, data):
+                self.left = list(parts) if isinstance(parts, list) else None
+                self.data, self.size = data, parts if isinstance(parts, int) else len(data) or 1
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read1(self, n):
+                if asked is not None:
+                    asked.append(n)
+                if self.left is not None:
+                    part = self.left.pop(0) if self.left else b""
+                    if isinstance(part, Exception):
+                        raise part
+                    if callable(part):
+                        return part()
+                    return part
+                part, self.data = self.data[:self.size], self.data[self.size:]
+                return part
+
+        class Opener:
+            def open(self, url, timeout=None):
+                test.assertEqual((url, timeout), ("http://127.0.0.1:9093/api/v2/alerts", 10))
+                if isinstance(answer, Exception):
+                    raise answer
+                return Answer(answer if isinstance(answer, bytes) else json.dumps(answer).encode())
+        with patch.object(READ, "alert_opener", Opener):
+            code, out, calls = self.run_read({"v": 1, "op": "alerts", "args": []})
+        self.assertEqual((code, calls), (0, []))
+        return out
+
+    def test_an_alert_is_one_line_with_its_key_and_its_labels_after_the_three_columns(self):
+        out = self.alerts_of([
+            {"fingerprint": "a1b2c3d4e5f60718", "startsAt": "2026-11-13T09:31:02.123Z",
+             "status": {"state": "active", "silencedBy": [], "inhibitedBy": []},
+             "labels": {"alertname": "ApiLatencyHigh", "severity": "critical", "service": "api", "instance": "web-1:9100",
+                        "job": "node"},
+             "annotations": {"summary": "p95 latency over 8 s for 10 minutes", "description": "long words"}},
+            {"fingerprint": "00ff", "startsAt": "2026-11-13T10:00:00Z", "status": {"state": "suppressed"},
+             "labels": {"alertname": "DiskFull", "severity": "warning"}, "annotations": {}}])
+        first, second = out.rstrip("\n").split("\n")
+        self.assertEqual(first.split("\t"), ["ApiLatencyHigh", "critical", "active", "a1b2c3d4e5f60718",
+                                             "2026-11-13T09:31:02.123Z", "p95 latency over 8 s for 10 minutes",
+                                             "instance=web-1:9100", "job=node", "service=api"])
+        # an alert with no other label and no summary keeps its six columns, the last one empty
+        self.assertEqual(second.split("\t"), ["DiskFull", "warning", "suppressed", "00ff", "2026-11-13T10:00:00Z", ""])
+
+    def test_the_first_three_columns_of_an_alert_are_the_ones_that_the_read_always_gave(self):
+        # a saved check that reads name, severity and state by their place reads the same values as before
+        alert = {"labels": {"alertname": "Down", "severity": "page", "zone": "a"}, "status": {"state": "active"}}
+        line = self.alerts_of([alert]).rstrip("\n")
+        self.assertEqual(line.split("\t")[:3], ["Down", "page", "active"])
+        self.assertTrue(line.startswith("Down\tpage\tactive\t"))
+        # an alert that names none of them gave the word None for each, and still does
+        self.assertEqual(self.alerts_of([{}]).rstrip("\n").split("\t"), ["None", "None", "None", "-", "-", ""])
+
+    def test_what_an_alert_s_source_wrote_stays_in_its_own_column_and_is_cut(self):
+        labels = {"alertname": "A\tB\nC", "severity": "s\x1bev", "note": "x" * 500, "n" * 100: "v",
+                  "tab": "one\ttwo", "line": "one\r\ntwo\x85three"}
+        out = self.alerts_of([{"fingerprint": "not hex!", "startsAt": "now\tor never", "labels": labels,
+                               "status": {"state": "active\nfake\tline"},
+                               "annotations": {"summary": "s" * 300 + "\ttail"}}])
+        lines = out.rstrip("\n").split("\n")
+        self.assertEqual(len(lines), 1)                      # no value starts a line of its own
+        columns = lines[0].split("\t")
+        self.assertEqual(columns[:5], ["A B C", "s ev", "active fake line", "-", "-"])
+        self.assertEqual(columns[5], "s" * 200)
+        self.assertEqual(columns[6:], ["line=one  two three", "n" * 60 + "=v", "note=" + "x" * 120, "tab=one two"])
+        # a fingerprint and a start time that are not text in their form give a dash, never a column that a reader
+        # takes for a key or for a time
+        for bad in ({"fingerprint": "A1B2"}, {"fingerprint": "ab" * 33}, {"fingerprint": 12}, {"fingerprint": ""},
+                    {"startsAt": "2026 11 13"}, {"startsAt": "----"}, {"startsAt": 12345},
+                    {"startsAt": "2026-11-13T09:31:02"}):
+            self.assertEqual(self.alerts_of([dict(bad, labels={"alertname": "x"})]).split("\t")[3:5], ["-", "-"], bad)
+        for good in ("2026-11-13T09:31:02Z", "2026-11-13T09:31:02.123456789+01:00", "0001-01-01T00:00:00.000Z"):
+            self.assertEqual(self.alerts_of([{"startsAt": good, "fingerprint": "0a"}]).split("\t")[3:5], ["0a", good])
+
+    def test_no_value_of_an_alert_ends_a_line_turns_its_reading_order_or_stops_the_answer(self):
+        # every line end that a reader may know, not only \\n: U+2028 and U+2029 split a line for str.splitlines();
+        # the marks that turn the reading order of a line; a gap with no width; half of a surrogate pair, which
+        # cannot be printed at all
+        labels = {"alertname": "a\u2028b\u2029c\x0bd\x1ce", "severity": "\u202elacitirc\u202c", "zone": "eu\u200b\ufeff",
+                  "half": "x\ud800y", "team": "caf\u00e9 \u65e5\u672c"}
+        out = self.alerts_of([{"labels": labels, "annotations": {"summary": "one\u2029two\u2066three\udfff"}}])
+        self.assertEqual(len(out.rstrip("\n").splitlines()), 1)
+        out.encode("utf-8")                     # it can be printed: no half of a pair is left
+        columns = out.rstrip("\n").split("\t")
+        self.assertEqual(columns[:3], ["a b c d e", "lacitirc", "None"])
+        self.assertEqual(columns[5], "one two three")
+        self.assertEqual(columns[6:], ["half=x y", "team=caf\u00e9 \u65e5\u672c", "zone=eu"])
+        # by the rule and not by a list of the test's own: no character at all ends a line, is a tab, or is one of
+        # the marks, and what a reader's own split gives is one line
+        every = "".join(chr(c) for c in range(0x3000)) + "".join(map(chr, (0xD800, 0xDFFF, 0xFEFF, 0xE0001, 0x1F468)))
+        cleaned = READ.plain(every, len(every))
+        self.assertEqual(len(cleaned.splitlines()), 1)
+        self.assertFalse(set(cleaned) & (set("\t\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029") | READ.TURNS))
+        cleaned.encode("utf-8")
+        # the joiners that a script and an emoji need stay: a word of Persian, a family of three
+        for kept in ("\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645", "\U0001f468\u200d\U0001f469\u200d\U0001f467", "na\u00efve co\u00adop"):
+            self.assertEqual(READ.plain(kept, 100), kept)
+
+    def test_a_label_s_name_has_no_equal_sign_so_the_first_one_of_a_column_ends_the_name(self):
+        columns = self.alerts_of([{"labels": {"a=b": "c=d", "plain": "v", " ": "blank"}}]).rstrip("\n").split("\t")
+        self.assertEqual(columns[6:], ["_=blank", "a_b=c=d", "plain=v"])        # a name with no letter is _
+        self.assertEqual([c.partition("=")[::2] for c in columns[6:]], [("_", "blank"), ("a_b", "c=d"), ("plain", "v")])
+
+    def test_a_long_list_of_alerts_ends_with_whole_lines_and_the_count_of_the_rest(self):
+        alerts = [{"fingerprint": f"{i:016x}", "labels": dict({f"l{n:02d}": "v" * 120 for n in range(20)},
+                                                              alertname=f"Alert{i}")} for i in range(200)]
+        out = self.alerts_of(alerts)
+        lines = out.rstrip("\n").split("\n")
+        self.assertLessEqual(len(out), READ.ALERTS_OUT + 40)
+        self.assertLess(READ.ALERTS_OUT + 40, READ.OUT_MAX)          # so the answer's own cut never takes a part
+        self.assertRegex(lines[-1], r"^\(\+[0-9]+ alerts\)$")
+        self.assertEqual(int(lines[-1][2:].split()[0]) + len(lines) - 1, 200)
+        # every line before it is a whole alert, the first ones first
+        self.assertEqual([line.split("\t")[0] for line in lines[:-1]], [f"Alert{i}" for i in range(len(lines) - 1)])
+        self.assertTrue(all(len(line.split("\t")) == 26 for line in lines[:-1]))
+        # a list that fits has no such line
+        self.assertNotIn("alerts)", self.alerts_of(alerts[:3]))
+
+    def test_an_answer_that_cannot_be_read_gives_fixed_words_and_never_an_error(self):
+        import http.client
+        import urllib.error
+        none = "no Alertmanager answers on this host\n"
+        for answer in (b"[" * 100000, http.client.IncompleteRead(b"half"), http.client.LineTooLong("header"),
+                       ValueError("bad"), b"\xff\xfe", urllib.error.URLError("refused"),
+                       urllib.error.HTTPError("http://127.0.0.1:9093/api/v2/alerts", 302, "Found", {}, None)):
+            self.assertEqual(self.alerts_of(answer), none)
+        # an error in the middle of the answer's parts, as a chunked answer that is cut gives it
+        for broken in (http.client.IncompleteRead(b"x"), ConnectionResetError("reset"), TimeoutError("slow part")):
+            self.assertEqual(self.alerts_of(b"", parts=[b'[{"labels":', broken]), none)
+
+    def test_the_read_takes_a_bounded_answer_in_bytes_and_in_time(self):
+        large = "the Alertmanager's answer on this host is too large or too slow to read\n"
+        alert = [{"labels": {"alertname": "x" * 100}}]
+        # in bytes: the read stops in the middle of the answer's parts, and asks for no part after the one over the cap
+        asked = []
+        with patch.object(READ, "ALERTS_MAX", 25):
+            self.assertEqual(self.alerts_of(alert, parts=10, asked=asked), large)
+        self.assertEqual(len(asked), 3)
+        # an answer that comes in many parts and fits is read whole
+        self.assertTrue(self.alerts_of(alert, parts=7).startswith("x" * 100 + "\t"))
+        # in time: a part that comes after the time for the whole answer ends the read
+        with patch.object(READ, "ALERTS_WAIT", -1):
+            self.assertEqual(self.alerts_of(alert), large)
+        # and a part that never comes: the read's own clock ends it, whatever the socket's time for one part is
+        started, waited = time.monotonic(), []
+
+        def never():
+            waited.append(1)
+            time.sleep(30)
+            return b"]"
+        with patch.object(READ, "ALERTS_WAIT", 1):
+            self.assertEqual(self.alerts_of(b"", parts=[b"[", never]), large)
+        self.assertEqual(waited, [1])
+        self.assertLess(time.monotonic() - started, 10)
+        import signal
+        self.assertEqual(signal.alarm(0), 0)            # no alarm is left for the program's later work
+        # the alarm at the moment that the reading ended, after its own handling of it: fixed words still
+        with patch.object(READ, "alerts_answer", side_effect=READ.Slow()):
+            code, out, _ = self.run_read({"v": 1, "op": "alerts", "args": []})
+        self.assertEqual((code, out), (0, large))
+
+    def test_the_read_asks_this_host_only_through_no_proxy_and_follows_no_redirect(self):
+        import urllib.request
+        with patch.dict(os.environ, {"http_proxy": "http://203.0.113.9:8080", "HTTP_PROXY": "http://203.0.113.9:8080"}):
+            opener = READ.alert_opener()
+        kinds = [type(h).__name__ for h in opener.handlers]
+        self.assertIn("NoRedirect", kinds)
+        self.assertNotIn("HTTPRedirectHandler", kinds)
+        proxies = [h for h in opener.handlers if isinstance(h, urllib.request.ProxyHandler)]
+        self.assertTrue(all(not h.proxies for h in proxies), proxies)
+        request = urllib.request.Request(READ.ALERTS)
+        self.assertIsNone(READ.NoRedirect().redirect_request(request, None, 302, "Found", {}, "http://203.0.113.9/"))
+
+    def test_an_alert_gives_twenty_other_labels_by_name_and_says_how_many_more(self):
+        labels = dict({f"l{i:02d}": str(i) for i in range(25)}, alertname="Many", severity="info")
+        columns = self.alerts_of([{"labels": labels, "status": {"state": "active"}}]).rstrip("\n").split("\t")
+        self.assertEqual(columns[6:26], [f"l{i:02d}={i}" for i in range(20)])
+        self.assertEqual(columns[26:], ["(+5 labels)"])
+        exact = dict({f"l{i:02d}": "v" for i in range(20)}, alertname="Twenty")
+        self.assertEqual(len(self.alerts_of([{"labels": exact}]).rstrip("\n").split("\t")), 26)
+
+    def test_no_alert_no_alertmanager_and_an_answer_that_is_no_list(self):
+        self.assertEqual(self.alerts_of([]), "no alert\n")
+        self.assertEqual(self.alerts_of(["text", 3, None]), "no alert\n")
+        for answer in (OSError("refused"), b"<html>not json", {"status": "error"}, "text"):
+            self.assertEqual(self.alerts_of(answer), "no Alertmanager answers on this host\n")
+        # fields of another type than the Alertmanager gives are read as missing, and the read still answers
+        odd = self.alerts_of([{"labels": ["a"], "status": "active", "annotations": 3, "fingerprint": None}])
+        self.assertEqual(odd.rstrip("\n").split("\t"), ["None", "None", "None", "-", "-", ""])
+        code, out, _ = self.run_read({"v": 1, "op": "alerts", "args": ["x"]})
+        self.assertEqual((code, out), (3, "refused: alerts takes no arguments\n"))
+
     def test_every_other_form_goes_to_ops_root_through_sudo(self):
         req = {"v": 1, "op": "restart", "args": ["nginx"]}
         code, _, calls = self.run_read(req)

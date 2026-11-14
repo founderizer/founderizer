@@ -976,6 +976,79 @@ class DoorCalls(Access):
                 hub.t_raise_needs_you("manager", dict({"title": "Start it", "why": "It adds cost",
                                                        "what_to_do": "Say yes"}, **bad))
 
+    def test_the_words_of_a_signed_answer_do_not_close_the_door_s_card(self):
+        """Words are no signature. An answer in words closes an item as a press does, so the words of Run it once or
+        of Full access on <server>, sent as text, would close the door's card and give the door nothing. They get the
+        refusal of the unsigned press, and the card stays open."""
+        self.grant(agent="vps", server="web-1", level="fix")
+        nid = int(hub.t_raise_needs_you("manager", run_card()).split("N-")[1].split(".")[0])
+        for words, where in (("Full access on web-1", "on the Mac."), ("full access on WEB-1.", "on the Mac."),
+                             ("  Full   access\ton web-1 ", "on the Mac."), ('"Full access on web-1"', "on the Mac."),
+                             ("Full access on web_1!", "on the Mac."), ("Run it once", "Founderizer."),
+                             ("run it once!", "Founderizer."), ("RUN IT ONCE", "Founderizer.")):
+            with self.subTest(words=words):
+                status, answer = self.owner(f"/ui/needs/{nid}", answer=words)
+                self.assertEqual(status, 409, answer)
+                self.assertIn("needs the signature of the owner's key, and words carry none", answer["error"])
+                self.assertTrue(answer["error"].endswith("Press that answer in Founderizer " + where
+                                                         if where == "on the Mac." else
+                                                         "Press that answer in Founderizer."), answer)
+                row = hub.q1("SELECT answer, approval FROM needs WHERE id=?", (nid,))
+                self.assertEqual((row["answer"], row["approval"]), (None, None))
+        # the old board of the hub's own pages signs nothing: neither a press nor the words close the card there
+        def board(item, **form):
+            """One press or one written answer on the hub's own page, with no redirect back to the page followed."""
+            import urllib.error
+            import urllib.parse
+            import urllib.request
+
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *_args):
+                    return None
+            req = urllib.request.Request(self.base + f"/needs/{item}", data=urllib.parse.urlencode(form).encode(),
+                                         headers={"Content-Type": "application/x-www-form-urlencoded",
+                                                  "X-Test-Source": OWNER})
+            try:
+                with urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect).open(req, timeout=5) as r:
+                    return r.status
+            except urllib.error.HTTPError as r:
+                with r:
+                    return r.code
+        for form in ({"choice": "0"}, {"choice": "1"}, {"answer": "Run it once"}, {"answer": "full access on web-1"}):
+            self.assertEqual(board(nid, **form), 303)
+            self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"], form)
+        # words that are no signed answer close the card, as they close every item: the manager reads them
+        status, answer = self.owner(f"/ui/needs/{nid}", answer="Full access on web-1 for today only, then Auto")
+        self.assertEqual(status, 200, answer)
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"],
+                         "Full access on web-1 for today only, then Auto")
+        # a card that is answered says so, also to the words of a signed answer
+        status, answer = self.owner(f"/ui/needs/{nid}", answer="Run it once")
+        self.assertEqual((status, answer["error"]), (409, "owner request is already answered"))
+        # No needs no signature: its word closes the card, as its button does, on the board too
+        no = int(hub.t_raise_needs_you("manager", run_card(script="id\n")).split("N-")[1].split(".")[0])
+        self.assertEqual(self.owner(f"/ui/needs/{no}", answer="no")[0], 200)
+        third = int(hub.t_raise_needs_you("manager", run_card(script="uptime\n")).split("N-")[1].split(".")[0])
+        self.assertEqual(board(third, choice="2"), 303)
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (third,))["answer"], "No")
+        # an item with a door call and no server (a delete that is the owner's): its first answer is the signed one,
+        # whatever its words are, and its second one is free
+        call = refusal("b" * 64, "hetzner:acme", "change")
+        free = int(hub.t_raise_needs_you("manager", {"title": "Delete the old server?", "why": "It is not used.",
+                                                     "what_to_do": "Say yes or no", "door_call": call,
+                                                     "options": ["Yes, delete it", "Keep it"]}
+                                         ).split("N-")[1].split(".")[0])
+        status, answer = self.owner(f"/ui/needs/{free}", answer="yes delete it")
+        self.assertEqual(status, 409, answer)
+        self.assertTrue(answer["error"].startswith('"Yes, delete it" needs the signature of the owner\'s key'), answer)
+        self.assertEqual(self.owner(f"/ui/needs/{free}", answer="Keep it")[0], 200)
+        # an item that is no door card takes the same words as any answer
+        plain = int(hub.t_raise_needs_you("manager", {"title": "Which mode?", "why": "One of two.",
+                                                      "what_to_do": "Pick one",
+                                                      "options": ["Run it once", "Full access on web-1"]}
+                                          ).split("N-")[1].split(".")[0])
+        self.assertEqual(self.owner(f"/ui/needs/{plain}", answer="Run it once")[0], 200)
+
     def test_full_access_on_a_server_is_the_second_answer_of_the_door_s_card(self):
         """The door-modes proposal, step 4 (the owner's "Yes, as shown", 11 November 2026): a door card names the
         run's call hash and its server, and the hub writes its three answers. The Mac signs Full access on <server> as
