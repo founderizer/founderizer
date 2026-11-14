@@ -385,6 +385,80 @@ class Central(WithCentral, OwnerAPI):
             self.assertIsNone({m["machine"]: m for m in self.view()["machines"]}["vps"]["kept_pin_at"])
         self.assertIn("kept_pins", hub.ui_features())
 
+    def test_the_hub_warns_30_days_before_the_trust_in_a_vault_ends(self):
+        """Package 4 of the vault's gates (C5): a warning for each machine of the vault page whose kept pin ends within 30
+        days, or has ended, while its vault takes copies, named by the agent of its carrier; and a quiet message to the
+        fleet manager when it starts, again each 7 days while it holds, and at once when the trust has ended. A machine
+        whose vault does not report now has no warning, a vault that is silent for a while makes no second message, and a
+        pin that the owner's app signed again ends the record."""
+        t0, day, fleet = hub.now(), 86400, hub.fleet_id()
+        self.addCleanup(hub.PIN_SWEPT.update, at=0.0)
+
+        def kept(machine, age):
+            hub.kv_set(f"owner_pin:{machine}", json.dumps({"statement": statement(
+                kind="pin", fleet=fleet, machine=machine, recipient=STORE_A, at=int(t0 - age)), "signature": SIGNATURE}))
+
+        def warned():
+            return [(w["kind"], w.get("agent"), w["detail"]) for w in hub.health_view()["warnings"]
+                    if w["kind"].startswith("vault_pin")]
+
+        def said():
+            return [r["text"] for r in hub.q("SELECT text FROM events WHERE agent=? AND kind='say' ORDER BY id",
+                                             (hub.manager_name(),)) if "trust in the vault of" in r["text"]]
+
+        def sweep():
+            hub.PIN_SWEPT["at"] = 0.0
+            hub.pin_end_sweep(hub.now())
+
+        kept("vps", 59 * day)
+        self.assertEqual(warned(), [])
+        sweep()
+        self.assertEqual(said(), [])
+        kept("vps", 61 * day)
+        signed, ends = hub.owner_day(int(t0 - 61 * day)), hub.owner_day(int(t0 - 61 * day) + 90 * day)
+        self.assertEqual(warned(), [("vault_pin_ends", "vps", f"It ends on {ends}. From that day, no agent can hand a "
+                                                              f"login over to an agent on vps.")])
+        [warning] = [w for w in hub.health_view()["warnings"] if w["kind"] == "vault_pin_ends"]
+        self.assertEqual(warning["fix"], "Open Founderizer on your Mac. It signs the trust again by itself. If this "
+                                         "warning stays, look at the server's row in Settings › Secrets.")
+        sweep()
+        self.assertEqual(said(), [f"[hub] The owner's trust in the vault of vps ends on {ends}: Founderizer on the "
+                                  f"owner's Mac has not signed it again since {signed}. From that day, no login can be "
+                                  f"handed over to the agents of vps. Raise a Needs-you item: the owner must open "
+                                  f"Founderizer on the Mac."])
+        sweep()
+        self.assertEqual(len(said()), 1)                        # told once in each 7 days
+        hub.q("UPDATE machine_status SET reported=? WHERE agent='vps'", (hub.now() - 3600,))   # its vault is silent a while
+        self.assertEqual(warned(), [])
+        sweep()
+        self.report("vps")                                      # and reports again: no second message
+        sweep()
+        self.assertEqual(len(said()), 1)
+        for told_ago, count in ((6 * day, 1), (7 * day, 2)):
+            hub.kv_set("pin_told", json.dumps({"vps": {"at": hub.now() - told_ago, "ended": False,
+                                                       "pin": int(t0 - 61 * day)}}))
+            sweep()
+            self.assertEqual(len(said()), count)
+        kept("vps", 91 * day)                                   # the trust has ended: told at once, in its own words
+        ended = hub.owner_day(int(t0 - 91 * day) + 90 * day)
+        self.assertEqual(warned(), [("vault_pin_ended", "vps", f"It ended on {ended}. Since that day, no agent can hand "
+                                                               f"a login over to an agent on vps.")])
+        sweep()
+        self.assertEqual(len(said()), 3)
+        self.assertIn(f"the vault of vps ended on {ended}", said()[-1])
+        self.assertIn("Since that day, no login can be handed over to the agents of vps.", said()[-1])
+        kept("vps", day)                                        # the owner's app signed it again
+        self.assertEqual(warned(), [])
+        sweep()
+        self.assertIsNone(hub.kv_get("pin_told"))
+        kept("studio", 70 * day)
+        self.assertEqual([w[:2] for w in warned()], [("vault_pin_ends", "studio")])
+        hub.q("UPDATE machine_status SET reported=? WHERE agent='studio'", (hub.now() - 3600,))   # its vault is silent
+        self.assertEqual(warned(), [])
+        sweep()
+        self.assertEqual(len(said()), 3)
+        self.assertIsNone(hub.kv_get("pin_told"))
+
     def test_the_vault_page_says_which_machine_is_pinned_and_which_is_not(self):
         self.vault.pins = {"vps": STORE_A, "studio": OTHER}
         hub.central_read()

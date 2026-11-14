@@ -4372,6 +4372,14 @@ def owner_clock(ts, t0=None):
             f"{at.day} {at.strftime('%B')}")
 
 
+def owner_day(ts):
+    """A day as the owner reads it, with its year ("12 February 2027"), in the fleet's own time zone (team.json
+    goals.timezone): for a date that can be months away."""
+    import datetime
+    at = datetime.datetime.fromtimestamp(ts, goal_settings()[2])
+    return f"{at.day} {at.strftime('%B')} {at.year}"
+
+
 def silent_words(agent, last_seen, t0=None):
     """Why an open task of an agent that does not answer has no live path, as the owner reads it in its task: the
     agent by the name he knows ("Mini") and how long it has been silent, never "helper" or "UTC"."""
@@ -11707,15 +11715,17 @@ def central_statement(body):
     return answer
 
 
-def handover_unpinned(name):
+def handover_unpinned(name, t0=None):
     """Why nothing may be locked for this broker agent now, in one sentence for its `hand_over` refusal, or None: it
-    has a vault key with the hub, and the owner's kept pin of its machine names that key."""
+    has a vault key with the hub, the owner's kept pin of its machine names that key, and that pin is not older than
+    PIN_LIFE or dated more than PIN_AHEAD after now, as each broker checks it (vault.py `owner_pinned`, package 4 of the
+    vault's gates)."""
     conf = agents().get(name) or {}
     recipient, pin = conf.get("vault_recipient"), owner_pin(name)
     who = f"{shown_role(name)}'s server"
     if not recipient:
         return f"The vault of {who} has no key with the hub yet, so nothing can be locked for it."
-    if pin_said(pin) is None:
+    if pin_said(pin) is None or pin_at(pin) is None:
         entry = deposit_machines(None).get(conf.get("machine"))     # the machines of the vault page, which the app pins
         if entry is None:
             return (f"The owner has not pinned the vault key of {who}, so nothing can be locked for it. The owner's "
@@ -11728,6 +11738,13 @@ def handover_unpinned(name):
     if pin_recipient(pin) != recipient:
         return (f"The owner's pin of {who} names another key than its vault's, so nothing is locked for it. The owner "
                 f"looks at that server first.")
+    age = (t0 or now()) - pin_at(pin)
+    if age > PIN_LIFE:
+        return (f"The owner's pin of the vault key of {who} is more than 90 days old, so nothing can be locked for it. "
+                f"The owner's Founderizer app signs it again by itself while it runs on the owner's Mac.")
+    if age < -PIN_AHEAD:
+        return (f"The owner's pin of the vault key of {who} is dated after now, so nothing can be locked for it. The "
+                f"owner looks at that server first.")
     return None
 
 
@@ -11762,6 +11779,86 @@ def machine_pin(machine):
     except ValueError:
         return None
     return pin if isinstance(pin, dict) else None
+
+
+# The lifetime of the owner's kept pin of a machine (package 4 of the vault's gates, C2 and C5), with the numbers of each
+# broker (vault.py PIN_LIFE and PIN_AHEAD): a kept pin locks a handover for 90 days from the time that it names, and not
+# when it is dated more than a day after now. The owner's app signs the pin of each trusted machine again after 7 days
+# (its VaultPlan), so a pin is that old only when the owner's Mac has not done so for 83 days. The hub warns 30 days
+# before the end (PIN_WARN), and tells the fleet manager once each PIN_TOLD_EVERY while that holds (pin_end_sweep).
+PIN_LIFE = 90 * 86400
+PIN_AHEAD = 86400
+PIN_WARN = 30 * 86400
+PIN_TOLD_EVERY = 7 * 86400
+PIN_SWEEP_EVERY = 600       # pin_end_sweep reads the vault page's machines at most this often
+PIN_SWEPT = {"at": 0.0}
+
+
+def pin_ends(t0=None, machines=None):
+    """C5: each machine of the vault page whose kept pin ends within PIN_WARN, or has ended, while its vault takes copies
+    (it has a carrier): [{machine, carrier, at, ends}], by machine. The owner's app signs a pin again only for such a
+    machine, so only there do the words "Open Founderizer on your Mac" help. A machine whose vault does not report now,
+    or takes no copy, has its own reason on the vault page and its own warning (the manager's answer b). machines: the
+    vault page's machines (deposit_machines), when the caller has read them."""
+    t0 = t0 or now()
+    out = []
+    for name, m in sorted((deposit_machines(None, t0) if machines is None else machines).items()):
+        at = pin_at(machine_pin(name)) if m["carrier"] else None
+        if at is not None and at + PIN_LIFE - t0 <= PIN_WARN:
+            out.append({"machine": name, "carrier": m["carrier"], "at": at, "ends": at + PIN_LIFE})
+    return out
+
+
+def pin_end_words(entry, t0=None):
+    """The health warning of one entry of pin_ends: its kind, its fact and its way out, in the owner's words (the
+    manager's words of 13 November 2026, with "trust" as the Secrets page says it)."""
+    ended, day = entry["ends"] <= (t0 or now()), owner_day(entry["ends"])
+    detail = (f"It ended on {day}. Since that day, no agent can hand a login over to an agent on {entry['machine']}."
+              if ended else
+              f"It ends on {day}. From that day, no agent can hand a login over to an agent on {entry['machine']}.")
+    return ("vault_pin_ended" if ended else "vault_pin_ends", detail,
+            "Open Founderizer on your Mac. It signs the trust again by itself. If this warning stays, look at the "
+            "server's row in Settings › Secrets.")
+
+
+def pin_end_sweep(t0):
+    """C5 on the owner's phone: the hub tells the fleet manager in a quiet message when the owner's trust in a server's
+    vault starts to end (pin_ends), when it has ended, and again each PIN_TOLD_EVERY while it holds. The iPhone app shows
+    no list of the hub's warnings, and the manager raises the Needs-you item, which is the phone's place (the manager's
+    answer 1). The record keeps the time of the kept pin that it told of: a machine leaves it only when the owner's app
+    signed its pin again or it leaves the vault page, so a later end is told at once, and a vault that is silent for a
+    while (a Mac that sleeps, a restart) makes no second message when it reports again."""
+    if t0 - PIN_SWEPT["at"] < PIN_SWEEP_EVERY:
+        return
+    PIN_SWEPT["at"] = t0
+    try:
+        told = json.loads(kv_get("pin_told") or "{}")
+    except ValueError:
+        told = {}
+    told = {m: x for m, x in told.items() if isinstance(x, dict) and isinstance(x.get("at"), (int, float))} \
+        if isinstance(told, dict) else {}
+    machines = deposit_machines(None, t0)
+    ending = {e["machine"]: e for e in pin_ends(t0, machines)}
+    kept, manager = {}, manager_name()
+    for machine, last in told.items():          # silent now, with the same kept pin: its record stays
+        if machine not in ending and machine in machines and last.get("pin") == pin_at(machine_pin(machine)):
+            kept[machine] = last
+    for e in ending.values():
+        ended, last = e["ends"] <= t0, told.get(e["machine"])
+        if last and last.get("pin") == e["at"] and t0 - last["at"] < PIN_TOLD_EVERY and last.get("ended") == ended:
+            kept[e["machine"]] = last
+            continue
+        if not manager:
+            continue
+        day, since, machine = owner_day(e["ends"]), owner_day(e["at"]), e["machine"]
+        emit(manager, "say",
+             f"[hub] The owner's trust in the vault of {machine} {'ended' if ended else 'ends'} on {day}: Founderizer on "
+             f"the owner's Mac has not signed it again since {since}. {'Since' if ended else 'From'} that day, no login "
+             f"can be handed over to the agents of {machine}. Raise a Needs-you item: the owner must open Founderizer "
+             f"on the Mac.", extra={"quiet": True})
+        kept[machine] = {"at": t0, "ended": ended, "pin": e["at"]}
+    if kept != told:
+        kv_set("pin_told", json.dumps(kept) if kept else None)
 
 
 READ_TOLD_FOR = 86400       # C11: at most one message a day for each read key of an agent (vault_read_missing)
@@ -32075,6 +32172,7 @@ def tick():
         step(expire_handovers, t0)
         step(expire_deposits, t0)           # owner feature central_vault: a copy no vault may take any more
         step(expire_withdrawals, t0)        # owner feature central_vault: a withdrawal no vault can take any more
+        step(pin_end_sweep, t0)             # package 4 of the vault's gates: the owner's trust in a vault that ends
         step(settle_checks, t0)
         step(attachment_sweep, t0)          # owner feature attachments: the files that the hub may let go
         step(release_sweep, t0)             # owner feature releases: the automatic poll, when the owner opted in
@@ -40197,6 +40295,13 @@ def health_view():
             continue
         warn("vault_behind", f"The vault on {machine} has not taken the last update.",
              "It updates itself within ten minutes; tell us if it does not.", agent=broker["agent"])
+    # Package 4 of the vault's gates (C5): the owner's trust in a server's vault, the kept pin that each handover to it
+    # needs, ends 90 days after the owner's app signed it, and the app signs it again after 7 days while it runs. So a
+    # warning 30 days before the end, for each machine whose vault takes copies (pin_ends): the app's title names the
+    # agent's server, and its button opens it.
+    for entry in pin_ends(t0):
+        kind, detail, fix = pin_end_words(entry, t0)
+        warn(kind, detail, fix, agent=entry["carrier"])
     flag = manager_warning()
     if flag:
         # A session that is not running is the one manager warning that a button settles: the app asks that

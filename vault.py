@@ -222,6 +222,13 @@ CENTRAL_KEYS = {"central", "hub_uid", "fleet", "owner_keys", "age", "age_key", "
 FLEET_ID = re.compile(r"[0-9a-f]{16}")              # the hub's fleet_id()
 OWNER_KEYS = 8                                      # the most owner keys that may sign
 MACHINE = re.compile(r"[a-z][a-z0-9-]{0,62}")       # a machine of a pin
+# The lifetime of the owner's pin of a handover's recipient (package 4 of the vault's gates, C2): a pin locks a handover
+# for 90 days from the time that it names, by this machine's clock. This broker keeps no record of an unpin, so an old pin
+# of a key that the owner took back ends here within that time, and the owner's app signs each pin again after 7 days.
+# A pin dated more than a day after this machine's clock is not taken either, so a clock ahead on the owner's Mac cannot
+# make a pin live longer.
+PIN_LIFE = 90 * 86400
+PIN_AHEAD = 86400
 STATE = 1                                           # the format of the central vault's state file
 # The fields of each statement that the owner signs: all of them, and no other.
 # grant: the owner gives this secret to this agent, whose vault is on this machine, so the vault may seal it to that
@@ -469,7 +476,9 @@ def owner_pinned(conf, confirmed):
     """Refused unless the owner signed a pin of the recipient that the hub named for this handover: the pin statement
     that the hub carries beside the job, checked here with the owner's keys of this broker's own configuration. The hub
     names the receiving agent and its key, and a hub that is broken into could name a key of its own; it cannot sign
-    for the owner (DevOps plan 0.3)."""
+    for the owner (DevOps plan 0.3). The pin must also be from the last PIN_LIFE, and not from more than PIN_AHEAD after
+    now: this broker keeps no record of an unpin, so an old pin of a key that the owner took back would otherwise lock a
+    login for it for ever (C2)."""
     owner_keys_held(conf)
     pin = confirmed.get("pin")
     if not isinstance(pin, dict):
@@ -478,6 +487,13 @@ def owner_pinned(conf, confirmed):
     if said["recipient"] != confirmed["recipient"]:
         raise Refused("the owner's pin names another key than the one the login would be locked for, so it is not "
                       "handed over")
+    age = time.time() - said["at"]
+    if age > PIN_LIFE:
+        raise Refused("the owner's pin of the receiving machine's key is more than 90 days old, so the login is not "
+                      "handed over")
+    if age < -PIN_AHEAD:
+        raise Refused("the owner's pin of the receiving machine's key is dated after now, so the login is not handed "
+                      "over")
 
 
 def confirm_job(conf, job, kind):
@@ -2065,6 +2081,8 @@ def central_signed(conf, req, kind):
     so a retry is no error. A pin's key is what seal locks a copy to, a grant or the pool is what lets seal lock that
     secret at all, and the recovery key is what export locks the store's key to."""
     said = owner_statement(conf, req, kind)
+    if kind in ("pin", "unpin") and said["at"] - time.time() > PIN_AHEAD:     # package 4: never kept from the future
+        raise Refused(f"the owner's {kind} is dated more than a day after this vault's clock, so it is not kept")
     state = central_state(conf)
     if kind in ("grant", "ungrant"):
         held = state["grants"].setdefault(said["login"], {})

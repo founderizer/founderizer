@@ -53,7 +53,7 @@ class CreateLogin(Capacity):
         # Package 1 of the vault's gates (C3, C8): the hub locks a handover only for a machine whose kept pin of the
         # owner names its vault's key (hub.handover_unpinned). deva's machine has one here, so that these handovers
         # reach the refusals that the tests check. The hub reads the statement, and a broker checks the signature.
-        statement = json.dumps({"v": 1, "kind": "pin", "machine": "w2", "at": 1793600000,
+        statement = json.dumps({"v": 1, "kind": "pin", "machine": "w2", "at": int(hub.now()),      # a pin lives 90 days
                                 "recipient": hub.TEAM["agents"]["deva"]["vault_recipient"]})
         hub.kv_set("owner_pin:w2", json.dumps({"statement": statement, "signature": "AAAA"}))
 

@@ -719,6 +719,35 @@ class HandoverRecipients(VaultBroker):
         hub.TEAM["agents"]["studio"].pop("vault_recipient")
         self.assertIn("has no key with the hub yet", says())
 
+    def test_a_pin_lives_90_days_and_is_not_taken_from_more_than_a_day_ahead(self):
+        """Package 4 of the vault's gates (C2): the broker and the hub each check a pin's time with their own clock. A pin
+        of 89 days and a pin dated one day ahead lock a handover; a pin of 91 days and a pin dated two days ahead do not,
+        each with its own sentence on both sides. The broker's check holds also when a hub that is broken into names the
+        key anyway."""
+        machine, day = hub.TEAM["agents"]["studio"]["machine"], 86400
+
+        def kept(age):
+            hub.kv_set(f"owner_pin:{machine}", json.dumps(owner_pin(machine, STUDIO_KEY, at=int(time.time() - age))))
+        for age in (89 * day, -day):
+            kept(age)
+            self.assertIsNone(hub.handover_unpinned("studio"))
+            raw = fleet.vault_call({"op": "handover", "job": self.job()})
+            self.assertEqual(self.opens(raw["ciphertext"], "studio")["password"], "FakeOnlyPassword-987654321")
+        self.store_reads.clear()
+        kept(91 * day)
+        self.assertIn("is more than 90 days old, so nothing can be locked for it", hub.handover_unpinned("studio"))
+        self.refused("has no vault broker with a pinned handover key")        # the hub's own rule refuses it first
+        with self.broken_in_hub():
+            self.refused("the owner's pin of the receiving machine's key is more than 90 days old, so the login is not "
+                         "handed over")
+        kept(-2 * day)
+        self.assertIn("is dated after now, so nothing can be locked for it", hub.handover_unpinned("studio"))
+        self.refused("has no vault broker with a pinned handover key")
+        with self.broken_in_hub():
+            self.refused("the owner's pin of the receiving machine's key is dated after now, so the login is not handed "
+                         "over")
+        self.assertEqual((vault.PIN_LIFE, vault.PIN_AHEAD), (hub.PIN_LIFE, hub.PIN_AHEAD))
+
     def test_a_pin_that_another_key_signed_is_refused(self):
         stranger = owner_pin("studio", STUDIO_KEY, d=12345678901234567890)
         hub.kv_set("owner_pin:studio", json.dumps(stranger))

@@ -260,6 +260,20 @@ The vault protects the value of each secret. The design gives these results:
   (`hub.py`). The app signs the pin of each trusted machine again when the pin that the hub keeps is 7 days old, or
   when the hub keeps none (`Sources/FleetCore/CentralVaultPlan.swift`). It signs the pins of the machines that have a
   worker or a lead, so the hub hands no login over to an agent on another machine.
+- **A pin lives 90 days.** A broker, on Linux or on a Mac, and the hub each lock a handover only with a pin whose time
+  is not more than 90 days before their own clock, and not more than one day after it (`vault.py`,
+  `Sources/FleetVaultCore/VaultOwnerPin.swift`, `hub.py`). The central vault keeps no pin and no unpin dated more than
+  one day after its own clock (`vault.py`), and the app signs no pin while the Mac's clock and the hub's clock differ by more
+  than an hour (`Sources/FleetCore/CentralVaultPlan.swift`). The hub warns on the System status
+  page 30 days before the trust in a server's vault ends, for a server whose vault takes copies, and it tells the fleet
+  manager each 7 days, so that the manager asks the owner to open Founderizer on the Mac (`hub.py`). So when the
+  owner's Mac stops, the fleet still hands logins over for at least 83 days: a pin lives 90 days, and the app signed
+  each one again at most 7 days before.
+- **A server that the owner removes on the Mac gets no pin again.** Remove server writes the machine into a record of
+  that Mac, and the app then signs an unpin of it and sends it until the central vault takes it. The app signs no pin
+  of a machine in that record, by a re-sign or by a first trust, until Add server for that machine on the same Mac
+  (`Sources/FleetCore/VaultRemovals.swift`, `Sources/Founderizer/CentralVaultSection.swift`). The record holds no key,
+  so a lost record, or the empty record of a new Mac, ends no pin: each trusted machine gets the trust step again.
 - Fleet Vault on a Mac makes the same check, with the owner's public keys and the id of the fleet in its
   configuration. Only root writes that configuration, and no install adds the keys: a root step of its own does
   (`Sources/FleetVaultCore/VaultOwnerPin.swift`, `Sources/FleetVaultCore/VaultHub.swift`, `Vault/install.py`,
@@ -483,9 +497,31 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
    - **A check that comes with no new generation.** An older build of the same generation can undo it
      (`Sources/FleetVaultCore/VaultKeychain.swift`, `Vault/update.zsh`).
 7. **An old pin, and an old owner key.** A broker that checks the owner's pin of the receiving key, on Linux or on a
-   Mac, keeps no record of an unpin. So a hub that is broken into can send an old pin of a key that the owner removed
-   (`vault.py`, `Sources/FleetVaultCore/VaultOwnerPin.swift`). Such a broker also keeps the owner keys of its root
-   step after the owner changes Macs, until a root step on that machine changes them (`hubsetup.py`,
+   Mac, keeps no record of an unpin. So a hub that is broken into can hold an unpin back, and send the last pin of a
+   key that the owner removed, until that pin is 90 days old (`vault.py`, `Sources/FleetVaultCore/VaultOwnerPin.swift`).
+   Each broker reads that age with its own clock. A broker whose clock is days behind takes an old pin for that much
+   longer, and it refuses a new pin as dated after now until the pin is less than a day ahead of its clock. A broker
+   more than 8 days behind refuses each handover, because the app signs each pin again after 7 days. On 14 November
+   2026 the clock of each machine of the fleet was within a second of the hub's. While the owner adds a server on a
+   Mac, a hub that is broken into can name a removed machine as the server that joined with that Mac's join code, and
+   that clears its mark (`Sources/Founderizer/AddMachineView.swift`, `Sources/Founderizer/MachineInstallView.swift`).
+   The record of removed servers is only on the Mac that removed them: a removal by another Mac, or
+   by the owner's MCP tool `remove_machine`, signs no unpin and writes no record, and a new Mac does not know a removal
+   of the old one. The app of such a Mac signs the pin of that machine again while the hub's reading names it as
+   trusted (`Sources/FleetCore/VaultRemovals.swift`). The other way round, a server that the owner removed on a Mac and
+   then adds again by another way (another Mac, or the MCP tool `add_machine`) keeps its mark on that Mac. That Mac
+   then signs no pin of it by itself: the server's row on the Secrets page says that the owner removed it on this Mac,
+   and Try again on that row clears the mark and runs the trust step (`Sources/FleetCore/CentralVaultPlan.swift`).
+   Until then the central vault seals nothing to it, and its agents get no login by handover. A hub that is broken
+   into can make that row show, but only the owner's Try again clears the mark. An agent of a Mac whose agents run as the SSH user can make each
+   re-sign of that Mac fail: then its server row shows after six tries, the warning shows at day 60, and at day 90 that
+   Mac's agents get no login by handover (`Sources/FleetCore/CentralVaultPlan.swift`). On a Mac, Fleet Vault before
+   build 17 checks no age of a pin. Build 17 keeps key generation 3, so an agent of a Mac can start build 16 in its
+   place, which opens the same store and checks no age (limit 6, "A check that comes with no new generation"), until
+   a later build raises the generation (`Sources/FleetVaultCore/VaultKeychain.swift`). A pin that the central vault
+   took with a time more than a day ahead, before it refused such a pin, cannot be put right before its time: each
+   broker refuses it until it is less than a day ahead, and a new pin is not newer than it (`vault.py`). The live fleet had none on 14 November 2026. A broker also keeps the owner keys that its root step gave it after the owner changes
+   Macs, until a root step on that machine changes them, and it refuses a pin that another key signed (`hubsetup.py`,
    `Vault/install.py`). The app signs each kept pin again with the new Mac's owner key, so such a broker then refuses
    handovers until that root step (`Sources/FleetCore/CentralVaultPlan.swift`).
 8. **The end of a grant.** The end of a grant, of a pin and of a pool entry reaches the central vault only through
@@ -637,7 +673,12 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
    keep the old owner key until a root step on that machine changes it (`hubsetup.py`, `Vault/install.py`). Do that
    root step on each such machine soon. Within 7 days the new Mac signs the pin of each machine again with its own
    key, and such a broker refuses each pin that the new key signed. So that machine's broker hands no login over
-   until its root step (`Sources/FleetCore/CentralVaultPlan.swift`, `vault.py`).
+   until its root step (`Sources/FleetCore/CentralVaultPlan.swift`, `vault.py`). Keep Founderizer running on a Mac:
+   it signs each pin again after 7 days, and a pin lives 90 days. When the Mac stops, handovers go on for at least 83
+   more days, and the System status page warns 30 days before the end (`hub.py`). A server that
+   you removed on another Mac, or with `remove_machine`, is not in this Mac's record of removed servers. A server that
+   you removed on this Mac and add again another way has a row on the Secrets page: select Try again there to trust it
+   (limit 7).
 8. **Replace a key after the end of "Reads it".** When you take "Reads it" from an agent, replace the key at its
    service. A session of the agent that runs keeps the old value until it ends, and the agent could copy the value
    while it had the grant (`fleet.py`, `hub.py`). A key that swaps is different: the agent had only a placeholder,

@@ -67,10 +67,16 @@ OWNER_D = secrets.randbelow(vault.P256_N - 1) + 1
 OWNER = owner_key(OWNER_D)
 
 
-def owner_pin(machine, recipient, d=OWNER_D, fleet_id=FLEET):
+# The time of the tests' pins: a pin lives 90 days at a broker and at the hub (package 4 of the vault's gates), so a pin
+# of a fixed date would stop each handover of these tests some day. One time for the whole run, so that one pin made
+# twice is the same statement.
+PIN_AT = int(time.time())
+
+
+def owner_pin(machine, recipient, d=OWNER_D, fleet_id=FLEET, at=None):
     """The owner's signed pin of one machine's key: what the app sends to POST /ui/vault/pin."""
     statement = vault.canonical({"v": 1, "kind": "pin", "fleet": fleet_id, "machine": machine, "recipient": recipient,
-                                 "at": 1793600000})
+                                 "at": PIN_AT if at is None else at})
     return {"statement": statement, "signature": owner_sign(d, statement)}
 
 

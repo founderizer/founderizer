@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -502,6 +503,33 @@ class CentralVault(unittest.TestCase):
         self.assertEqual(self.items(), {})
 
     # ---- the owner's statements
+    def test_a_pin_dated_more_than_a_day_ahead_is_not_kept(self):
+        """Package 4 of the vault's gates: the central vault refuses a pin or an unpin whose `at` is more than a day after
+        its own clock, so no pin from the future is recorded or kept, and the record before it stays. A statement is kept
+        only when it is newer than the record, so a pin that the app signs now could not take the place of one from the
+        future (the manager's reading of central_signed). A grant from ahead is kept as before: its time comes from the
+        app's GrantClock."""
+        now = int(time.time())
+
+        def pinned(recipient, at):
+            statement = pin(recipient, at)
+            return {"statement": statement, "signature": owner_sign(statement)}
+        self.assertEqual(self.refused("pin", **pinned(R2, now + 2 * 86400)),
+                         "the owner's pin is dated more than a day after this vault's clock, so it is not kept")
+        self.assertEqual(self.ask("status")["pins"], {})
+        self.assertEqual(self.ask("pin", **pinned(R1, now + 86400 - 60))["saved"], "new")       # within a day: kept
+        self.assertIn("as new or newer", self.refused("pin", **pinned(R2, now)))
+        self.assertIn("as new or newer", self.refused("pin", **pinned(R2, now + 86400 - 60)))
+        self.assertEqual(self.ask("status")["pins"], {"vps": {"recipient": R1, "at": now + 86400 - 60}})
+        def unpinned(at):
+            statement = canon({"v": 1, "kind": "unpin", "fleet": FLEET, "machine": "vps", "at": at})
+            return {"statement": statement, "signature": owner_sign(statement)}
+        self.assertEqual(self.refused("unpin", **unpinned(now + 3 * 86400)),
+                         "the owner's unpin is dated more than a day after this vault's clock, so it is not kept")
+        self.assertEqual(self.ask("status")["pins"], {"vps": {"recipient": R1, "at": now + 86400 - 60}})
+        self.assertEqual(self.ask("unpin", **unpinned(now + 86400 - 30))["saved"], "removed")
+        self.assertEqual(self.ask("status")["pins"], {})
+
     def test_a_pin_is_kept_until_a_newer_statement_of_the_owner(self):
         self.assertEqual(self.signed("pin", PIN_1, SIG_PIN_1),
                          {"ok": True, "kind": "pin", "machine": "vps", "recipient": R1, "saved": "new"})
