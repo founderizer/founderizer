@@ -78,6 +78,18 @@ boundary, so this section says what it stops and what it does not.
   private keys, VPN and backup settings, the vault's and the door's own folders), the stores of databases and of
   containers, the folders of code libraries, and each folder that the server's own list names. A hidden folder is
   an empty folder for the script.
+- **A folder that a look cannot search,** with all that is in it. A look makes its list of hidden files for each
+  call, and a folder whose names it does not read to the end is hidden whole: a folder with more than 4,000
+  folders or 250,000 entries right in it, a folder more than 48 levels down or with a path of more than 1,024
+  characters, and a folder that the server could not read. A folder at least two levels down with more than 50
+  names of secrets or of stores right in it is hidden whole too. On a server with more than 1,500 paths to hide,
+  the folders that hold the most of them are hidden whole, because a box starts more slowly with each path; no
+  folder that the box itself runs from is one of them. And the list ends at 1,000,000 entries read, at about
+  100,000 paths held or after 20 seconds: then each folder that it did not reach is hidden whole, which is the
+  level of the server's folders that the list was at and all below it, and that can be an app's own folders. The
+  look's answer names the first ten of the folders that it hid whole, and says how many more there are. No look
+  runs on a server whose top folder cannot be read or holds more than 250,000 entries, or whose paths to hide
+  are more than 1,500 with no folders of its apps that can be hidden whole in their place.
 - **A hidden file,** while no program puts a new file in its place: a file that a systemd unit names as its
   settings or its credentials, a unit file written on the server that holds a value itself, a file with one of the
   usual names of a file with secrets (`.env`, a private key, a database's settings file of a common framework),
@@ -104,6 +116,10 @@ entries, Docker's folder, other processes' environments, the limits) on a real U
   `/usr/src` and `/usr/share/nginx`; `/boot`; `/snap`), and `/lost+found`, are not searched for names. The names are a list, and a list
   can miss a file. The agent that holds the server adds a path to the server's own list with
   `ops <server> hide <path>`.
+- **A compiled copy of a hidden Python file in another place.** Beside a hidden `.py` file, a look hides its
+  folder's cache (`__pycache__`) and an old `.pyc` or `.pyo`. It does not find the cache beside a link to that
+  file, a cache folder that Python's own settings name (`PYTHONPYCACHEPREFIX`), or a copy that Python writes
+  during the look.
 - **A hidden file that another program writes during a look:** an app's own deploy, a package's own timer, a
   command of a person on the server, and the door's rollback timer when a look still runs after the timer's wait
   of about two minutes. A rename puts a new file in the place of the hidden one, and the look that runs can read

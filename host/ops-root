@@ -24,11 +24,14 @@ one, and never one before the release it came from.
 Exit status: 0 done, 3 refused (the one line says why), 1 failed.
 """
 import base64
+import collections
 import contextlib
+import errno
 import fcntl
 import fnmatch
 import grp
 import hashlib
+import itertools
 import json
 import os
 import pwd
@@ -1015,11 +1018,33 @@ def do_run(req, data):
 
 LOOK_SECONDS = 120          # the unit's own limit (RuntimeMaxSec): a look that its ops-root lost ends by it too
 LOOK_OUT = 256 * 1024       # characters of a look's answer, the end kept
-LOOK_PATHS = 4000           # paths that one unit hides; over it, the deepest folders with the most of them go whole
-LOOK_WALK = 400000          # entries that the walk of one look reads; what it did not reach is hidden whole
+# Paths that one unit hides; over it, look_fewer hides whole the folders that hold the most of them. systemd's time to start a
+# unit grows with the square of this count: 300 paths 0.6 seconds, 600 paths 2.1, 1,200 paths 8.3, 3,650 paths 91
+# (measured on systemd 255 and 259, 14 November 2026). At 1,500 a box starts in about 13 seconds.
+LOOK_PATHS = 1500
+# Entries that the walk of one look reads; what it did not reach is hidden whole. The largest of nine real servers
+# spent 195,187 (14 November 2026), and the whole list took 0.6 seconds there.
+LOOK_WALK = 1000000
 LOOK_WAIT = 30              # seconds that a look waits for a write of this file that runs, before it is refused
 LOOK_LIST_SECONDS = 20      # and the seconds of that walk: a write of this file waits while a look makes its list
 LOOK_MATCHES = 50           # secret names right in one folder; over it, the folder is hidden whole
+# A mass of files is hidden whole, and the walk goes on beside it: a folder with more folders right in it than
+# LOOK_FOLDERS, none of which is read (one work folder for each job), and a folder with more entries than
+# LOOK_ENTRIES, whose names are not all read (a cache, a queue). On the first real server (14 November 2026) one
+# folder held 136,812 folders with 1.3 million files: the walk spent its whole count in it, and a second app's
+# folder was hidden for it.
+LOOK_FOLDERS = 4000
+LOOK_ENTRIES = 250000
+# Paths that the walk holds at one time: the folders that wait, and what it found; over it, the walk ends as with a
+# spent count. The walk reads each level before the next one, so the folders of one level wait together. This bounds
+# the list's memory, and the time of the steps after the walk, on a server with a million folders or a million
+# secret names: the walk looks at the number at each folder that it reads, so one folder's 4,000 folders and 50
+# names can come on top of it. The widest level of nine real servers was under 30,000 folders.
+LOOK_QUEUE = 100000
+# A folder deeper than this, or with a longer path, is hidden whole and not read: a unit's property takes no path
+# of any length, and a chain of folders 2,000 deep would cost the steps after the walk minutes.
+LOOK_DEPTH = 48
+LOOK_LONG = 1024
 LOOK_HOME = 400             # dot entries of one home
 LOOK_CONTAINERS = 200       # containers whose logs one look reads
 LOOK_LOCK = "/run/ops-root.look.lock"       # a look holds it shared; a write of a file here (replace) takes it alone
@@ -1037,7 +1062,7 @@ LOOK_KEYS = tuple(p for p in HIDDEN if p not in ("/var/www", "/srv", "/opt", "/h
     "/var/crash", "/var/lib/cloud", "/run/cloud-init", "/etc/apt/auth.conf", "/etc/apt/auth.conf.d",
     "/var/lib/ubuntu-advantage", "/etc/postfix/sasl_passwd", "/etc/postfix/sasl_passwd.db", "/etc/mysql/debian.cnf",
     "/etc/redis", "/etc/gitlab-runner", "/etc/rclone", "/etc/borgmatic", "/etc/borgmatic.d", "/etc/pgbackrest",
-    "/etc/pgbackrest.conf",
+    "/etc/pgbackrest.conf", "/var/lib/letsencrypt",
     ETC, STATE, BACKUPS, "/var/lib/ops-agent", CI_STATE, LOCK_FILE, LOOK_LOCK, LOOK_GATE,
     "/var/lib/mongodb", "/var/lib/clickhouse", "/var/lib/elasticsearch", "/var/lib/opensearch", "/var/lib/rabbitmq",
     "/var/lib/grafana", "/var/lib/influxdb", "/var/lib/cassandra", "/var/lib/pgsql", "/var/lib/etcd",
@@ -1054,17 +1079,33 @@ LOOK_NAMES = (
     ".git-credentials", ".htpasswd", ".dockercfg", "auth.json", "credentials*", ".credentials*", "*-credentials.json",
     "service-account*.json", "secrets.*", "kubeconfig", "*.kubeconfig", "terraform.tfstate*", "*.tfvars",
     "wp-config.php", "appsettings*.json", "web.config", "database.yml", "application.properties", "application*.yml",
-    "application*.yaml", "parameters.yml", "local_settings.py", "acme.json", "alertmanager.yml", "alertmanager.yaml",
+    "application*.yaml", "parameters.yml", "local_settings*", "acme.json", "alertmanager.yml", "alertmanager.yaml",
     "grafana.ini", "*.sqlite", "*.sqlite3", "*.db", "*.sql", "*.sql.gz", "*.dump")
 # A folder with one of these names is hidden whole and not walked: a store of keys, or a mass of files that the
-# agent has in its repository, whose test keys would fill the list.
+# agent has in its repository, whose test keys would fill the list. A Python cache folder is not one of them: it
+# holds no key file, each one costs the unit a path (803 of the 1,180 paths of one real server), and the compiled
+# file of a file with a secret's name has a name of the list too (local_settings*, secrets.*, env.*).
 LOOK_DIRS = frozenset(("secrets", ".ssh", ".aws", ".gnupg", ".docker", ".kube", ".azure", ".terraform",
                        "actions-runner", "node_modules", "vendor", ".venv", "venv", "site-packages", "dist-packages",
-                       ".git", "__pycache__"))
+                       ".git"))
+# The names as one pattern: a walk matches each entry's name one time. With one match for each of the names above,
+# the walk of a server with 118,000 entries took 6 to 13 seconds for each look, and under 1 second without them
+# (14 November 2026).
+LOOK_NAME = re.compile("|".join(fnmatch.translate(pattern) for pattern in LOOK_NAMES))
+# A folder whose name starts so is hidden whole too: a runner's folder is named after its repository.
+LOOK_DIR_STARTS = ("actions-runner",)
 LOOK_DATA = frozenset(("PG_VERSION", "ibdata1"))        # a file of a database's own folder, wherever that folder is
+# A folder that holds a folder of each name of one of these is a container engine's own store, wherever it is: a
+# second Docker daemon with a data folder of its own, or containerd's. It is hidden whole, as a database's folder is: it holds each
+# container's files and volumes, an app's keys among them. Docker's own folder by its settings is look_docker's.
+LOOK_ENGINES = (frozenset(("containers", "image", "network", "volumes", "plugins", "runtimes")),
+                frozenset(("io.containerd.content.v1.content",)))
 # Not walked: what the system's packages installed, and what is no file on a disk.
 LOOK_SKIP = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/boot", "/snap", "/proc", "/sys",
              "/dev", "/lost+found")
+# Not searched for names either, and no part of the system that a box runs from: the index files of the man pages
+# (*.db), 26 paths on each real server.
+LOOK_UNSEARCHED = ("/var/cache/man",)
 LOOK_NOT_SKIPPED = ("/usr/local", "/usr/src", "/usr/share/nginx")       # where an app can be under /usr
 LOOK_PSEUDO = frozenset(("proc", "sysfs", "devtmpfs", "devpts", "cgroup", "cgroup2", "securityfs", "debugfs",
                          "tracefs", "configfs", "pstore", "bpf", "mqueue", "hugetlbfs", "autofs", "binfmt_misc",
@@ -1179,28 +1220,57 @@ def look_names(known):
     """(paths, whole): the files with a secret's name and the folders with a store's name, on each file system of this
     host that is a disk of its own, found by one walk that follows no link. `known`: what is hidden already, which is
     not walked. A file system of another machine is hidden and not walked. whole: the folders that are hidden whole
-    because they hold more such names than LOOK_MATCHES, or because the walk's count of entries was spent before it
-    reached them: the answer of a look names them."""
+    because they hold more such names than LOOK_MATCHES, more folders than LOOK_FOLDERS or more entries than
+    LOOK_ENTRIES, because they are too deep or could not be read, or because the walk ended before it read them:
+    the answer of a look names them.
+
+    A folder that the walk does not read to its end is in the paths, each one: only what LOOK_SKIP and
+    LOOK_UNSEARCHED name, a file system that is no disk, and a link are left unread and open.
+
+    The walk reads the folders nearest to the top first, each level before the next one. When its count, its time or
+    the paths that it holds end it, the folders that it had not read are hidden: those of the level that it was at,
+    and the ones below. That can be an app's own folders of that level, on a server with more files than one look
+    lists. It is never the top of the server for one mass of files in one folder."""
     mounts, found, whole, left = look_mounts(), [], [], LOOK_WALK
-    stack = [p for p in LOOK_NOT_SKIPPED if p not in known] + ["/"]
-    skip = (set(LOOK_SKIP) | set(known)) - set(LOOK_NOT_SKIPPED)
+    queue = collections.deque(["/"] + [p for p in LOOK_NOT_SKIPPED if p not in known])
+    skip = (set(LOOK_SKIP) | set(LOOK_UNSEARCHED) | set(known)) - set(LOOK_NOT_SKIPPED)
     end = time.monotonic() + LOOK_LIST_SECONDS
-    while stack:
-        folder = stack.pop()
+    while queue:
+        folder = queue.popleft()
+        if folder.count("/") > LOOK_DEPTH or len(folder) > LOOK_LONG:
+            found.append(folder)        # too deep, or a path that is too long: hidden, and not read
+            whole.append(folder)
+            continue
         try:
-            with os.scandir(P(folder)) as it:
-                entries = sorted(it, key=lambda e: e.name)
-        except OSError:
+            with os.scandir(P(folder)) as it:       # at most one entry more than a folder may have: no list of a
+                entries = list(itertools.islice(it, LOOK_ENTRIES + 1))      # million names is ever made
+        except OSError as e:
+            if folder == "/":
+                raise Refused("this host's top folder could not be read to know what a look must not read") from None
+            if e.errno not in (errno.ENOENT, errno.ENOTDIR):    # it is there, and it could not be read: hidden
+                found.append(folder)
+                whole.append(folder)
             continue
         left -= len(entries) + 1
-        if left < 0 or time.monotonic() > end:      # the count or the time is spent: this folder and each one that
-            #                                         still waits go whole
-            rest = [folder] + stack
+        if left < 0 or len(queue) + len(found) > LOOK_QUEUE or time.monotonic() > end:
+            # the count or the time is spent, or the walk holds too many paths: this folder and each one that
+            # still waits go whole
+            rest = [folder] + list(queue)
             if "/" in rest:             # before the walk read anything: there is no list, so there is no look
                 raise Refused("this host's files could not be read in time to know what a look must not read")
             return found + rest, whole + rest
-        if folder != "/" and any(e.name in LOOK_DATA for e in entries):
-            found.append(folder)        # a database's own folder
+        if len(entries) > LOOK_ENTRIES:     # a mass of files, whose names were not all read
+            if folder == "/":           # the names after the cut are folders that nothing would hide
+                raise Refused("this host's top folder has more entries than a look reads the names of: no look "
+                              "runs here")
+            found.append(folder)
+            whole.append(folder)
+            continue
+        entries.sort(key=lambda e: e.name)
+        folders = {e.name for e in entries if e.is_dir(follow_symlinks=False)}
+        if folder != "/" and (any(e.name in LOOK_DATA for e in entries) or
+                              any(engine <= folders for engine in LOOK_ENGINES)):
+            found.append(folder)        # a database's own folder, or a container engine's
             continue
         matches, later = [], []
         for e in entries:
@@ -1208,21 +1278,20 @@ def look_names(known):
             if e.is_symlink() or path in skip:
                 continue
             low = e.name.lower()
-            if e.is_dir(follow_symlinks=False):
+            if e.name in folders:
                 kind = mounts.get(path, "")
-                if LOOK_NETWORK.fullmatch(kind) or low in LOOK_DIRS:
+                if LOOK_NETWORK.fullmatch(kind) or low in LOOK_DIRS or low.startswith(LOOK_DIR_STARTS):
                     matches.append(path)
                 elif kind not in LOOK_PSEUDO or path in LOOK_NOT_SKIPPED:
                     later.append(path)
-            elif any(fnmatch.fnmatchcase(low, pattern) for pattern in LOOK_NAMES) or \
-                    (low == "config.php" and folder.endswith("/bootstrap/cache")):
+            elif LOOK_NAME.match(low) or (low == "config.php" and folder.endswith("/bootstrap/cache")):
                 matches.append(path)
-        if len(matches) > LOOK_MATCHES and folder.count("/") >= 2:
-            found.append(folder)
+        if (len(later) > LOOK_FOLDERS and folder != "/") or (len(matches) > LOOK_MATCHES and folder.count("/") >= 2):
+            found.append(folder)        # a mass of folders, none of which is read; or a store of keys
             whole.append(folder)
         else:
             found += matches
-            stack += reversed(later)
+            queue.extend(later)
     return found, whole
 
 
@@ -1256,31 +1325,87 @@ def look_docker():
     return root, logs, names
 
 
-def look_fewer(paths, limit):
-    """(paths, whole): at most `limit` of them, by hiding whole the folders that hold the most of them, the deepest
-    ones first, one pass for each depth. The list never fails for its size: a host with more secret names than a
-    unit can hide loses the sight of the folders that hold them."""
+def look_fewer(paths, limit, never=()):
+    """(paths, whole): at most `limit` of them, by hiding whole folders in place of the paths under them. No path of
+    `paths` is under another one. The list never fails for its size: a host with more secret names than a unit can
+    hide loses the sight of the folders that hold them. `never`: the parts of the system that a box runs from. No
+    folder at one of them or above one goes whole (/etc, /var, /run, /dev), because the box would not start or
+    would see no system: a host whose paths fit in no other way gets no look.
+
+    Which folders. A path's levels are counted from the first folder above it that may go whole: /srv, /var/www and
+    /var/lib/<app> are each level 0, and an app's folder in /srv or /var/www is level 1. Hiding every folder of
+    level 0 leaves the fewest paths that any choice can, so when that is too many, nothing fits. Else the rule takes
+    the level nearest to the files at which hiding every folder with paths under it would be enough, and hides at
+    that level the folders with the most paths first, only as many as it takes; of such a folder it hides the
+    narrowest folder that holds the same paths. After each one the level is looked for again, because with a mass
+    gone a level nearer to the files can be enough: it never goes back up. So one folder with thousands of names
+    goes whole alone, and no small app beside it goes with it (on 14 November 2026 a pass for each depth, the
+    deepest first, hid an app's folder for its three names before it came to the mass)."""
     paths, whole = set(paths), []
     if len(paths) <= limit:
         return sorted(paths), whole
-    cuts = {p: [i for i, c in enumerate(p) if c == "/"] for p in paths}
-    depth = max(len(c) for c in cuts.values()) - 1
-    while len(paths) > limit and depth >= 1:
+    held = set(never) | {top[:i] for top in never for i, c in enumerate(top) if c == "/" and i}
+    ends = {}           # of a path: where each folder that may go whole in its place ends, the top one first
+
+    def above(path):
+        if path not in ends:
+            cuts = [i for i, c in enumerate(path) if c == "/"][1:]
+            first = next((n for n, i in enumerate(cuts) if path[:i] not in held), len(cuts))
+            ends[path] = cuts[first:]
+        return ends[path]
+    # under: the paths below a folder. folders: for each level, the folders with a path below them. at: for each
+    # level, the paths whose own place is that level; at[0] is the paths that no folder can stand for.
+    under, folders, at = {}, collections.Counter(), collections.Counter()
+
+    def count(path, by):
+        at[len(above(path))] += by
+        for level, cut in enumerate(above(path)):
+            folder = path[:cut]
+            had = under.get(folder, 0)
+            under[folder] = had + by
+            if (had == 0) != (had + by == 0):
+                folders[level] += 1 if had == 0 else -1
+
+    for path in paths:
+        count(path, 1)
+    deepest = max(at)
+
+    def enough():
+        """The deepest level at which hiding each folder with paths under it leaves at most `limit` paths, or
+        None: a path at that level or above it stays as it is, and each deeper one is under a folder of the level."""
+        found, stay = None, 0
+        for level in range(deepest + 1):
+            stay += at[level]
+            if folders[level] + stay <= limit:
+                found = level
+        return found
+
+    while len(paths) > limit:
+        level = enough()
+        if level is None:       # more paths right under / than a unit hides, or in folders that a box runs from
+            raise Refused(f"this host has more than {limit} paths to hide, and no folders of its apps that could "
+                          f"be hidden whole in their place: no look runs here")
         groups = {}
-        for p in paths:
-            if len(cuts[p]) > depth:            # a path below a folder of this depth
-                groups.setdefault(p[:cuts[p][depth]], []).append(p)
+        for path in paths:
+            if len(above(path)) > level:
+                groups.setdefault(path[:above(path)[level]], []).append(path)
+        before = len(paths)
         for folder, members in sorted(groups.items(), key=lambda g: (-len(g[1]), g[0])):
-            if len(paths) <= limit or len(members) < 2:
+            if len(members) < 2:
                 break
+            folder = os.path.commonpath(members)        # the narrowest folder that holds them all: at it or below
+            for path in members:
+                count(path, -1)
             paths.difference_update(members)
             paths.add(folder)
-            cuts[folder] = cuts[members[0]][:depth]
+            count(folder, 1)
             whole.append(folder)
-        depth -= 1
-    if len(paths) > limit:      # more secret names right under / than a unit hides: no real host, and no box for it
-        raise Refused(f"this host has more than {limit} paths to hide at the top of its folders: no look runs here")
-    return sorted(paths), whole
+            if len(paths) <= limit or enough() != level:
+                break
+        if len(paths) == before:    # no folder of that level holds two paths: cannot be, and never a loop
+            raise Refused(f"this host has more than {limit} paths to hide, and no folders of its apps that could "
+                          f"be hidden whole in their place: no look runs here")
+    return sorted(paths), [folder for folder in whole if folder in paths]
 
 
 def look_deny():
@@ -1288,9 +1413,19 @@ def look_deny():
     docker, logs, containers = look_docker()
     fixed = [p for p in tuple(LOOK_KEYS) + tuple(hidden_paths()) if p not in ("/var/www", "/srv", "/opt", "/home")]
     declared, units = look_units()
-    names, whole = look_names(set(fixed) | ({docker} if docker else set()))
+    homes = look_homes()                # hidden here, so the walk does not read them: a tool's cache in a home
+    #                                     holds 65,536 folders at one level
+    names, whole = look_names(set(fixed) | set(homes) | ({docker} if docker else set()))
+    hidden = fixed + declared + homes + names
+    # A Python file's compiled copy holds what the file holds, and the walk hides no cache folder by its name:
+    # beside a hidden .py file, its folder's cache and an old .pyc or .pyo are hidden too. That covers a file that
+    # only this host's own list or a unit names. It does not cover the cache beside a link to the file, or a cache
+    # folder that Python's own settings name (SECURITY.md).
+    for path in [p for p in hidden if p.endswith(".py")]:
+        hidden += [copy for copy in (os.path.dirname(path) + "/__pycache__", path + "c", path + "o")
+                   if os.path.lexists(P(copy))]
     safe = set()
-    for path in fixed + declared + look_homes() + names:
+    for path in hidden:
         path = os.path.normpath(path)
         named = path
         while path != "/" and LOOK_NEVER.search(path):      # a name that no property of a unit takes: its folder
@@ -1301,7 +1436,7 @@ def look_deny():
                 whole.append(path)
     # a path under a folder that is hidden already says nothing more
     paths = [p for p in safe if not any(p[:i] in safe for i in range(1, len(p)) if p[i] == "/")]
-    paths, more = look_fewer(paths, LOOK_PATHS)
+    paths, more = look_fewer(paths, LOOK_PATHS, LOOK_SKIP + HIDE_NEVER + (LOOK_RUN,))
     return {"paths": paths, "whole": sorted(set(whole + more) & set(paths)), "units": units, "docker": docker,
             "logs": logs, "containers": containers}
 
@@ -1643,7 +1778,9 @@ def do_look(req, data):
     elif status != 0:
         notes.append(f"the script ended with status {status}")
     if deny["whole"]:
-        notes.append("hidden whole, for the count of secret names in them or for a name that no rule can write: " +
+        notes.append("hidden whole, with all that is in them: too many files, folders or secret names, more paths to "
+                     "hide than one box takes, too deep or too long a path, not readable, not reached by the list of "
+                     "this host's files, or a name that no rule can write: " +
                      ", ".join(deny["whole"][:10]) +
                      (f" and {len(deny['whole']) - 10} more" if len(deny["whole"]) > 10 else ""))
     if deny["units"]:
