@@ -209,7 +209,8 @@ link, which the app listens on while it runs (`OwnerChannel.swift` in `FleetOwne
   link's version (`"v": 1`). The request names the program's set (`"set": "owner"`), one tool of the
   link and its fields; the answer is `"result"` or `"refused"` with words. A request of another
   version, set or tool is refused in words, and a later tool is one more entry of the same link. A
-  tool that takes a value (`save_bot_token`) gets it as a value part, never in the line: the line's
+  tool that takes a value (`save_bot_token`, except from the clipboard, which the app reads itself)
+  gets it as a value part, never in the line: the line's
   envelope says `"value_bytes": N`, and exactly N bytes, at most 64 KiB, follow its line end.
 - **Each side checks the other by its code signature**, from the socket's peer: the peer's audit
   token (`LOCAL_PEERTOKEN`), the Security framework's guest lookup by that token, and a requirement.
@@ -310,14 +311,18 @@ the app to the front 3 times of 3.
 **`save_bot_token`** (a write, so `founderizer-cli write` and the MCP form take it, and `call` does
 not): a Discord bot's token to the hub, as the app's own Discord page sends it, or its delete. Its
 fields are `account` (a Discord chat account that the fleet has already: the tool makes none),
-`from` (`file` with `path`, or `stdin`), `replace` and `delete`. A save for a bot that the
+`from` (`file` with `path`, `stdin`, or `clipboard`), `replace` and `delete`. A save for a bot that the
 bridge reports as connected now needs `replace` true; in every other state a save replaces what is
 there, and `replaced` says so. The token is never a field and never a word of
 the command line: the program reads it from the file, or from its standard input as a pipe of a
 program (only with `write`; the MCP form refuses `stdin`, because its standard input is the
 protocol), and sends it to the app as a value part after the request line, 64 KiB at most, with no
-`path`. The app checks the token itself and sends it only while its reading of the fleet is current.
-It answers `account`, `set` and `replaced` (null when the hub does not say), never the token. No command lock: the app does the
+`path`. With `from` `clipboard` (with `write` and in the MCP form) the program reads nothing and
+sends only the fields: the app reads the clipboard itself, last, only for a call that passed every
+other check, and after a save that the hub confirmed clears it when nothing else changed it since
+the read. The app checks the token itself and sends it only while its reading of the fleet is current.
+It answers `account`, `set` and `replaced` (null when the hub does not say), and for the clipboard
+`clipboard` (`cleared` or `kept`), never the token. No command lock: the app does the
 write, as its page does. The value part and what any process of the owner's user can do with the
 tool: OWNER-MCP-BOUNDARY.md section 7b.
 
