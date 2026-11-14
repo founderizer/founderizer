@@ -73,7 +73,8 @@ class ServerWatch(Servers):
         self.sweep()
         self.assertEqual(self.said(), [])
         self.sweep(self.t0 + hub.JOIN_GRACE)
-        self.assertIn("box needs care: its firewall is off; its SSH lets passwords in.", self.said()[-1])
+        self.assertIn("box needs care: its firewall is off.", self.said()[-2])
+        self.assertIn("box needs care: its SSH lets passwords in.", self.said()[-1])
 
     def test_a_server_that_holds_its_baseline_says_nothing(self):
         self.report()
@@ -86,14 +87,14 @@ class ServerWatch(Servers):
         self.sweep()
         self.sweep(self.t0 + 120)
         self.assertEqual(self.said(), [
-            "[hub] The server box needs care: its firewall is off; its SSH lets passwords in. Give it to the agent "
-            "whose duty covers this server; fix it yourself when no duty covers it; raise Needs-you only for a step "
-            "that no agent can take."])
+            "[hub] The server box needs care: its firewall is off. Give it to the agent whose duty covers this server; "
+            "fix it yourself when no duty covers it; raise Needs-you only for a step that no agent can take.",
+            "[hub] The server box needs care: its SSH lets passwords in. " + hub.MENDED_WORDS])
         self.report(ssh_keys_only=False)
         self.sweep(self.t0 + 180)
         self.report()
         self.sweep(self.t0 + 240)
-        self.assertEqual(self.said()[1:], ["[hub] The server box is in order again: its firewall is on.",
+        self.assertEqual(self.said()[2:], ["[hub] The server box is in order again: its firewall is on.",
                                           "[hub] The server box is in order again: its SSH takes keys only."])
         self.assertIsNone(hub.kv_get("server_watch"), "a server in order keeps no record")
 
@@ -131,6 +132,55 @@ class ServerWatch(Servers):
         self.report(npm_rule=False)
         self.sweep()
         self.assertIn("box needs care: npm has no seven-day rule.", self.said()[-1])
+
+    def test_ssh_and_npm_are_put_right_by_the_owners_mac_with_no_step_and_no_needs_you(self):
+        """The owner, 14 November 2026 ("Yes, all of it"): a join kept password login, and the manager asked the owner
+        for a root command. The owner's Mac runs the join's hardening again by itself, so the words ask for nothing."""
+        self.report(ssh_keys_only=False, npm_rule=False)
+        self.sweep()
+        self.assertEqual(self.said(), ["[hub] The server box needs care: npm has no seven-day rule; its SSH lets "
+                                       "passwords in. The owner's Mac puts this right by itself: while the Founderizer "
+                                       "app runs there, it runs the join's hardening again on this server, as root. "
+                                       "Take no step for it and raise no Needs-you item: if it still stands in 3 days, "
+                                       "the hub tells you again."])
+        self.report()
+        self.sweep(self.t0 + 600)
+        self.assertEqual(self.said()[-1], "[hub] The server box is in order again: npm has its seven-day rule; its SSH "
+                                          "takes keys only.")
+        self.assertIsNone(hub.kv_get("server_watch"), "a server in order keeps no record")
+
+    def test_what_the_mac_has_not_put_right_in_3_days_is_said_once_more_and_then_a_needs_you_item_is_asked(self):
+        """A Mac that stayed shut over a weekend puts it right on the Monday, before 3 days; after that, or after the
+        app's six tries, the manager hears once more and raises one Needs-you item, with no step by hand."""
+        fresh = self.t0 + 20 * DAY       # the daily run keeps its stamp fresh
+        self.report(ssh_keys_only=False, upgraded_at=fresh)
+        self.sweep()
+        # What else stops holding keeps its own count.
+        self.report(ssh_keys_only=False, firewall="inactive", upgraded_at=fresh)
+        self.sweep(self.t0 + DAY)
+        self.sweep(self.t0 + hub.MENDED_WAIT - 60)
+        self.assertEqual(len(self.said()), 2)
+        self.sweep(self.t0 + hub.MENDED_WAIT)
+        late = ("[hub] The server box still needs care after 3 days: its SSH lets passwords in. The owner's Mac has "
+                "not put it right: it does so only while the Founderizer app runs there, and it stops after six tries. "
+                "Raise one Needs-you item that says this in plain words, with no step by hand in it: this server is a "
+                "fleet machine, where agents run, and no agent holds it through the door.")
+        self.assertEqual(self.said()[-1], late)
+        for days in (4, 10):                                    # once
+            self.sweep(self.t0 + days * DAY)
+        self.assertEqual(self.said()[-1], late)
+        self.assertEqual(len(self.said()), 3)
+        # In order: a later fault counts again from its own start.
+        self.report(firewall="inactive", upgraded_at=fresh)
+        self.sweep(self.t0 + 11 * DAY)
+        self.assertEqual(self.said()[-1], "[hub] The server box is in order again: its SSH takes keys only.")
+        self.report(ssh_keys_only=False, firewall="inactive", upgraded_at=fresh)
+        self.sweep(self.t0 + 12 * DAY)
+        self.sweep(self.t0 + 14 * DAY)
+        self.assertEqual(len(self.said()), 5)
+        self.assertTrue(self.said()[-1].endswith(hub.MENDED_WORDS))
+        self.sweep(self.t0 + 15 * DAY)
+        self.assertEqual(self.said()[-1], late)
 
     def test_a_restart_that_waits_seven_days_is_said(self):
         self.report(reboot_required=True, upgraded_at=self.t0 + 8 * DAY)      # the daily run keeps its stamp fresh

@@ -35364,6 +35364,23 @@ MACOS_UPDATE_WAIT = 14 * 86400  # seconds that a Mac's macOS update may wait bef
 # Seconds after its join in which a server is still being set up: its service reads it as soon as it starts, which is
 # before the join's updates, firewall and hardening (join.sh), so a reading of that time is no news.
 JOIN_GRACE = 3600
+# What the owner's Mac puts right by itself on a joined Linux server that is not the hub's own machine (the owner, 14
+# November 2026: "Yes, all of it", after a join kept password login and the manager asked the owner for a root
+# command): the Mac app runs the join's hardening again there as root, over the SSH connection that it has to each
+# server, in its first rounds after JOIN_GRACE, and tries six times at most (ServerHardening in the app). So the
+# manager takes no step and raises no Needs-you item for these, and hears of them once more only when one still stands
+# MENDED_WAIT after it was said.
+MENDED_BY_MAC = ("ssh", "npm")
+# Three days: the app puts it right only while it runs on the owner's Mac, and a Mac can stay shut over a weekend
+# (Friday evening to Monday morning is about 64 hours); and 3 days is UPDATES_STALLED, the hub's measure of a fact that
+# should heal by itself and has not. On a Mac that runs, the app has done its six tries within about an hour.
+MENDED_WAIT = 3 * 86400
+MENDED_WORDS = ("The owner's Mac puts this right by itself: while the Founderizer app runs there, it runs the join's "
+                "hardening again on this server, as root. Take no step for it and raise no Needs-you item: if it still "
+                "stands in 3 days, the hub tells you again.")
+MENDED_LATE = ("The owner's Mac has not put it right: it does so only while the Founderizer app runs there, and it "
+               "stops after six tries. Raise one Needs-you item that says this in plain words, with no step by hand in "
+               "it: this server is a fleet machine, where agents run, and no agent holds it through the door.")
 WATCH = {"at": 0.0}
 WATCH_WORDS = {                 # what stopped holding, and what holds again
     "quiet": ("it has sent no reading for 30 minutes", "it sends its readings again"),
@@ -35471,21 +35488,38 @@ def server_watch_sweep(t0):
             since = (since or t0) if sec.get("reboot_required") else None
             now_found = set(server_troubles(reading, joined[name], since, t0) + load_troubles(load, told))
         new, ended = sorted(now_found - told), sorted(told - now_found)
-        if new:
-            names = [shown_role(a) for a in here] if {"disk", "memory"} & set(new) else []    # what runs there
+        mended = [] if own else [k for k in new if k in MENDED_BY_MAC]      # the owner's Mac puts these right
+        other = [k for k in new if k not in mended]
+        if other:
+            names = [shown_role(a) for a in here] if {"disk", "memory"} & set(other) else []    # what runs there
             runs = f" It runs {', '.join(names[:-1])} and {names[-1]}." if len(names) > 1 else \
                 f" It runs {names[0]}." if names else ""
             emit(manager_name(), "say", f"[hub] The server {name} needs care: "
-                                        f"{'; '.join(watch_words(k, load) for k in new)}.{runs} Give it to the agent "
+                                        f"{'; '.join(watch_words(k, load) for k in other)}.{runs} Give it to the agent "
                                         f"whose duty covers this server; fix it yourself when no duty covers it; raise "
                                         f"Needs-you only for a step that no agent can take.")
-            log("hub", f"the server {name} needs care ({', '.join(new)}); the manager was told")
+            log("hub", f"the server {name} needs care ({', '.join(other)}); the manager was told")
+        if mended:
+            emit(manager_name(), "say", f"[hub] The server {name} needs care: "
+                                        f"{'; '.join(watch_words(k, load) for k in mended)}. {MENDED_WORDS}")
+            log("hub", f"the server {name} needs care ({', '.join(mended)}), which the owner's Mac puts right; the "
+                       f"manager was told")
+        # Since when what the owner's Mac puts right stands, and whether the manager heard that it still does.
+        standing = [] if own else [k for k in sorted(now_found) if k in MENDED_BY_MAC]
+        mend = (was.get("mend") or t0) if standing else None
+        late = bool(standing and was.get("late"))
+        if standing and not late and t0 - mend >= MENDED_WAIT:
+            emit(manager_name(), "say", f"[hub] The server {name} still needs care after 3 days: "
+                                        f"{'; '.join(watch_words(k, load) for k in standing)}. {MENDED_LATE}")
+            log("hub", f"the server {name} still needs care after 3 days ({', '.join(standing)}); the manager was told")
+            late = True
         if ended:
             emit(manager_name(), "say", f"[hub] The server {name} is in order again: "
                                         f"{'; '.join(watch_words(k, None, ended=True) for k in ended)}.")
             log("hub", f"the server {name} is in order again ({', '.join(ended)})")
         if now_found or since or macos:
-            kept[name] = dict({"told": sorted(now_found), "restart": since}, **({"macos": macos} if macos else {}))
+            kept[name] = dict({"told": sorted(now_found), "restart": since}, **({"macos": macos} if macos else {}),
+                              **({"mend": mend} if mend else {}), **({"late": True} if late else {}))
     if kept != state:
         kv_set("server_watch", json.dumps(kept, sort_keys=True) if kept else None)
 
