@@ -97,5 +97,74 @@ class AnEndedRun(unittest.TestCase):
         self.assertEqual(self.ended(signal.SIGINT, hold_the_guard=True), (([], False), ([], [])))
 
 
+# What a run's first hub does at its start, before a line of hub.py runs: Python reads sitecustomize.py at each start,
+# and the run gives its hubs its own environment. The mark makes it the first hub only.
+FIRST_HUB = """import os, sys, time
+mark = os.environ.get("SELFTEST_FIRST_HUB")
+if mark and os.path.basename(sys.argv[0]) == "hub.py" and not os.path.exists(mark):
+    open(mark, "w").close()
+    %s
+"""
+LATE = 12           # seconds before that hub goes on: more than the 80 readings, about 8 seconds, of before
+
+
+class AHubThatStartsLate(unittest.TestCase):
+    """A hub's start makes its database, and on a slow disk that took 8 to 9 seconds (a test server of 13 November
+    2026). Until 14 November 2026 the run gave a hub 80 readings, a tenth of a second apart, and then said "the hub
+    did not start" over a server that was in order. The wait now ends at the hub's answer or at the end of the hub's
+    process."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="selftest-late-hub-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def run_with(self, first_hub):
+        """A run whose first hub does `first_hub` at its start: what the run printed until its first check or its end,
+        and its status, or None when it still ran then. The run is ended here, and it leaves nothing."""
+        site, out = os.path.join(self.tmp, "site"), os.path.join(self.tmp, "out")
+        os.mkdir(site)
+        with open(os.path.join(site, "sitecustomize.py"), "w") as f:
+            f.write(FIRST_HUB % first_hub)
+        with open(out, "w") as printed:
+            run = subprocess.Popen([sys.executable, os.path.join(KIT, "selftest.py"), "-v"], cwd=KIT,
+                                   env=dict(os.environ, TMPDIR=self.tmp, PYTHONPATH=site, PYTHONUNBUFFERED="1",
+                                            SELFTEST_FIRST_HUB=os.path.join(self.tmp, "first-hub")),
+                                   stdin=subprocess.DEVNULL, stdout=printed, stderr=subprocess.DEVNULL)
+
+        def stop():
+            if run.poll() is None:
+                run.kill()
+                run.wait()
+        self.addCleanup(stop)
+        deadline = time.time() + WAIT + LATE
+        while time.time() < deadline and run.poll() is None and not os.path.getsize(out):
+            time.sleep(0.1)
+        for _ in range(100):            # a run that printed why it stops ends a moment after its line
+            if run.poll() is not None:
+                break
+            time.sleep(0.1)
+        status = run.poll()
+        if status is None:
+            run.send_signal(signal.SIGTERM)
+            run.wait(timeout=GONE_WAIT)
+        deadline = time.time() + GONE_WAIT
+        while time.time() < deadline and naming(self.tmp):
+            time.sleep(0.1)
+        with open(out) as printed:
+            return printed.read(), status
+
+    def test_a_hub_that_listens_after_twelve_seconds_is_waited_for(self):
+        said, status = self.run_with(f"time.sleep({LATE})")
+        self.assertNotIn("the hub did not start", said)
+        self.assertEqual(status, None, said)                    # the run went on to its checks
+        self.assertTrue(said.startswith(("PASS ", "FAIL ")), said)
+        self.assertEqual(naming(self.tmp), [])
+
+    def test_a_hub_whose_process_ended_stops_the_run_at_once_with_its_status(self):
+        said, status = self.run_with("os._exit(3)")
+        self.assertEqual((said, status), ("the hub did not start: its process ended with status 3\n", 1))
+        self.assertEqual(naming(self.tmp), [])
+
+
 if __name__ == "__main__":
     unittest.main()

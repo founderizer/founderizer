@@ -861,7 +861,7 @@ class Install(unittest.TestCase):
         step with the key on standard input, a read at the server's address on the private network, and the start
         there, which the server's own SSH keys check."""
         client = self.client()
-        done = client.call("install_hub", host="203.0.113.9", ssh_user="root",
+        done = client.call("install_hub", host="203.0.113.9", ssh_user="root", servers=2,
                            source="https://example.invalid/founderizer.git", authkey_file=str(self.key))
         self.assertEqual((done["host"], done["address"]), ("203.0.113.9", "100.64.0.1"))
         self.assertIn("step 15 of 15: verify", done["plan"])
@@ -901,7 +901,7 @@ class Install(unittest.TestCase):
         client = Client(self, path=str(self.calls), every=0.1)
         client.start()
         install = {"host": "203.0.113.9", "ssh_user": "root", "source": "https://example.invalid/f.git",
-                   "authkey_file": str(self.key)}
+                   "authkey_file": str(self.key), "servers": 2}
         done = client.call("install_hub", _progress=True, **install)
         token, heard = client.number, list(client.notices)          # the token is the id of the request
         self.assertIn("step 15 of 15: verify", done["plan"])
@@ -996,17 +996,73 @@ class Install(unittest.TestCase):
         self.assertEqual((self.ran("id -un"), self.ran("tail -n")), (2, 1), "the cancelled call started a step")
         self.assertEqual(self.ended(), 3, "the command of the call that the client cancelled stopped part way")
 
+    def test_it_takes_the_owners_choice_of_servers_and_gives_hub_sh_its_word(self):
+        """**How many servers a fleet starts with is the owner's choice, and install_hub takes no default.** Until 14
+        November 2026 it gave hub.sh no word, so the manager ran on the hub's own server with no question. Without
+        `servers` it sends no command, and its refusal has both layouts and tells the agent to ask. With 2, both runs
+        of hub.sh (the plan and the install) have the word FLEET_MANAGER_SERVER=later in front, which the Mac app sets
+        too: the hub then has a manager with no server yet. With 1 neither has it, and `runtime` gives hub.sh the
+        manager's provider."""
+        client, reach = self.client(), {"host": "203.0.113.9", "ssh_user": "root",
+                                        "source": "https://example.invalid/f.git", "authkey_file": str(self.key)}
+        for bad in ({}, {"servers": 3}, {"servers": "2"}, {"servers": True}):
+            with self.assertRaises(Refused) as caught:
+                client.call("install_hub", **reach, **bad)
+            said = str(caught.exception)
+            self.assertEqual([part for part in ("servers must be 1 or 2", "1 server: the hub and the manager run on "
+                                                "this one server", "2 servers: this server runs the hub and no agent",
+                                                "Ask the owner which one", "Never choose for them",
+                                                "Nothing on 203.0.113.9 was changed") if part not in said], [], said)
+        for bad in ({"servers": 2, "runtime": "codex"}, {"servers": 1, "runtime": "grok"}):
+            with self.assertRaises(Refused) as caught:
+                client.call("install_hub", **reach, **bad)
+            self.assertIn("only with servers 1", str(caught.exception))
+        self.assertEqual(self.sent(), [])
+
+        def hub_sh():
+            return [" ".join(c["args"]).rpartition("root@203.0.113.9 ")[2] for c in self.sent()
+                    if "sh /root/fleet-kit/hub.sh" in " ".join(c["args"]) and "ps -A" not in " ".join(c["args"])]
+        done = client.call("install_hub", **reach, servers=2)
+        ran = hub_sh()
+        self.assertEqual(len(ran), 2, ran)
+        self.assertIn("FLEET_MANAGER_SERVER=later sh /root/fleet-kit/hub.sh --check", ran[0])
+        self.assertIn('setsid sh -c "FLEET_MANAGER_SERVER=later sh /root/fleet-kit/hub.sh < /dev/null', ran[1])
+        self.assertEqual(done["servers"], 2)
+        self.assertIn("move_agent", done["next"])
+        plan = self.MACHINE["hub.sh --check"]           # the stand-in's plan, for the plan with an option too
+        (self.calls / "table.json").write_text(json.dumps(dict(
+            self.MACHINE, **{"hub.sh --runtime codex --check": plan, "hub.sh --port 9000 --check": plan})))
+        done = client.call("install_hub", **reach, servers=1, runtime="codex")
+        ran = hub_sh()[2:]
+        self.assertEqual(len(ran), 2, ran)
+        self.assertEqual([one for one in ran if "FLEET_MANAGER_SERVER" in one], [])
+        self.assertIn("sh /root/fleet-kit/hub.sh --runtime codex --check", ran[0])     # the plan says the same provider
+        self.assertIn('setsid sh -c "sh /root/fleet-kit/hub.sh --runtime codex < /dev/null', ran[1])
+        self.assertEqual(done["servers"], 1)
+        self.assertIn("NOT READY: runtime_signed_in", done["next"])
+        self.assertIn("counts at a hub's first install", done["next"])
+        client.call("install_hub", **reach, servers=1, port=9000)
+        self.assertIn("sh /root/fleet-kit/hub.sh --port 9000 --check", hub_sh()[4])
+        self.assertIn('setsid sh -c "sh /root/fleet-kit/hub.sh --port 9000 < /dev/null', hub_sh()[5])
+        # The providers of `runtime` are hub.sh's own list, and no other.
+        self.assertIn('case "$runtime" in ' + "|".join(owner_mcp.HUB_SH_RUNTIMES) + ") ;;",
+                      (HERE / "hub.sh").read_text())
+        listed = {one["name"]: one for one in owner_mcp.tools()}["install_hub"]
+        self.assertIn("servers", listed["inputSchema"]["required"])
+        self.assertEqual(listed["inputSchema"]["properties"]["servers"]["enum"], [1, 2])
+        self.assertIn("Never choose for them", listed["description"])
+
     def test_it_refuses_an_auth_key_file_that_other_users_can_read_and_never_opens_it(self):
         client = self.client()
         self.key.chmod(0o644)
         with self.assertRaises(Refused) as caught:
-            client.call("install_hub", host="203.0.113.9", ssh_user="root",
+            client.call("install_hub", host="203.0.113.9", ssh_user="root", servers=2,
                         source="https://example.invalid/f.git", authkey_file=str(self.key))
         self.assertIn("chmod 600", str(caught.exception))
         self.assertEqual(self.sent(), [])
         self.key.unlink()
         with self.assertRaises(Refused) as caught:
-            client.call("install_hub", host="203.0.113.9", ssh_user="root",
+            client.call("install_hub", host="203.0.113.9", ssh_user="root", servers=2,
                         source="https://example.invalid/f.git", authkey_file=str(self.key))
         self.assertIn("cannot read", str(caught.exception))
         self.assertEqual(self.sent(), [])
@@ -1041,7 +1097,7 @@ class Install(unittest.TestCase):
         self.MACHINE["id -un; id -u; sed"] = "root\n0\nPRETTY_NAME=\"Alpine Linux\"\nNAME=\"Alpine\""
         (self.calls / "table.json").write_text(json.dumps(self.MACHINE))
         with self.assertRaises(Refused) as caught:
-            self.client().call("install_hub", host="203.0.113.9", ssh_user="root",
+            self.client().call("install_hub", host="203.0.113.9", ssh_user="root", servers=2,
                                source="https://example.invalid/f.git", authkey_file=str(self.key))
         self.assertIn("no systemctl", str(caught.exception))
         self.assertEqual(len(self.sent()), 1)
@@ -1467,7 +1523,7 @@ echo READY
         `user` reaches `server` (`reached`): the remote command of each step with what `run` gave, and the tools'
         answers."""
         install = {"host": self.HOST, "ssh_user": user, "source": StandInServer.SOURCE,
-                   "authkey_file": str(server.keyfile)}
+                   "authkey_file": str(server.keyfile), "servers": 2}
         reach = {"host": self.HOST, "ssh_user": user}
         with self.reached(server, user, run) as (sent, _made):
             answers = {"new": owner_mcp.install_hub(install), "again": owner_mcp.install_hub(install),
@@ -1490,7 +1546,7 @@ echo READY
 
     def install(self, server):
         """The arguments of install_hub on `server`, beside the host and the user."""
-        return {"source": StandInServer.SOURCE, "authkey_file": str(server.keyfile)}
+        return {"source": StandInServer.SOURCE, "authkey_file": str(server.keyfile), "servers": 2}
 
     @staticmethod
     def as_root(server, remote, stdin):
@@ -1794,7 +1850,7 @@ echo READY
         cases = []
         for user in ("root", "deploy"):
             reach = {"host": self.HOST, "ssh_user": user}
-            install = dict(reach, source=StandInServer.SOURCE, authkey_file=str(key))
+            install = dict(reach, source=StandInServer.SOURCE, authkey_file=str(key), servers=2)
             become = ["'id -u'"] if user != "root" else []      # become_root's step, for a user who is not root
             cases += [("install_hub", install, stop, step, ("install_log",)) for stop in
                       ["; sed", *become, "ps -A", "apt-get", "if test -d", "rev-parse --short HEAD",
@@ -1866,7 +1922,7 @@ echo READY
         cases = []
         for user in ("root", "deploy"):
             reach = {"host": self.HOST, "ssh_user": user}
-            install = dict(reach, source=StandInServer.SOURCE, authkey_file=str(key))
+            install = dict(reach, source=StandInServer.SOURCE, authkey_file=str(key), servers=2)
             cases += [("install_hub", install, stop, step) for stop in
                       ["apt-get", "if test -d", "rev-parse --short HEAD", "hub.sh --check", "tailscale status"]]
             cases.append(("install_hub", install, "cat > ", (*step, "fleet-authkey")))
@@ -2472,6 +2528,40 @@ exec /bin/cat "$FILES/install.log"
         self.assertEqual(owner_mcp.KNOWN_HOSTS.read_bytes(), b"\xff\xfe not text\n")
         self.assertEqual(sorted(path.name for path in owner_mcp.KNOWN_HOSTS.parent.iterdir()),
                          ["known_hosts", "known_hosts.lock"])
+
+    # hub.sh, as far as the owner's choice of servers reaches it: what it reads in FLEET_MANAGER_SERVER and its
+    # arguments, for the plan and for the install (STATE/hub-sh).
+    WORD_HUB = r'''#!/bin/sh
+echo "${FLEET_MANAGER_SERVER:-no word} [$*]" >> "$STATE/hub-sh"
+case " $* " in *" --check "*) echo "Founderizer: check only: nothing on this machine changes"; exit 0 ;; esac
+exec /bin/cat "$FILES/install.log"
+'''
+
+    def test_the_word_of_the_owners_choice_reaches_hub_sh_as_root_and_through_sudo(self):
+        """**FLEET_MANAGER_SERVER=later stands in front of `sh <kit>/hub.sh` inside the one `/bin/sh -c` of a root
+        step, so hub.sh reads it in its own environment**, for root and for a user who becomes root through `sudo -n
+        -i`, with each shell that root can have. With servers 1 it reads no word, and it gets the manager's provider
+        as an argument."""
+        issues = []
+        for user, sh in [("root", "/bin/sh")] + [("deploy", sh) for sh in SHELLS]:
+            for more, want in (({"servers": 2}, ["later [--check]", "later []"]),
+                               ({"servers": 1, "runtime": "codex"},
+                                ["no word [--runtime codex --check]", "no word [--runtime codex]"])):
+                who, server = f"{user}, with {sh}, {more}", self.server()
+                (server.files / "hub.sh").write_text(self.WORD_HUB)
+                run = (lambda remote, stdin: self.as_root(server, remote, stdin)) if user == "root" else (
+                    lambda remote, stdin: self.through_sudo(server, remote, sh, stdin))
+                _sent, _made, answer = self.one(server, user, run, "install_hub", dict(self.install(server), **more))
+                read, tries = [], 0
+                while len(read) < 2 and tries < 1200:       # the start step runs the install in the background
+                    read = (server.state / "hub-sh").read_text().splitlines() \
+                        if (server.state / "hub-sh").exists() else []
+                    tries += 1
+                    time.sleep(0.05)
+                if isinstance(answer, owner_mcp.Refused) or read != want:
+                    issues.append(f"{who}: install_hub said {answer if isinstance(answer, owner_mcp.Refused) else 'yes'}"
+                                  f", and hub.sh read {read}, not {want}")
+        self.assertNoIssues(issues)
 
     def test_install_hub_changes_nothing_on_a_server_where_an_install_runs(self):
         """**install_hub stops before it changes anything when an install runs on the server already** (`sh

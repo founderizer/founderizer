@@ -46,6 +46,7 @@ subprocess.Popen([sys.executable, os.path.abspath(__file__), "--guard", TMP, str
                  start_new_session=True)
 os.close(GONE)
 HUBS = []           # every hub this run started
+HUB_START_TRIES = 600       # readings of a new hub's /health, a tenth of a second apart, while its process lives
 
 
 def finish():
@@ -113,11 +114,19 @@ def start_hub(name, addresses, *flags, agents=None, extra=None):
                             env=dict(os.environ, HOME=TMP))
     HUBS.append(proc)
     base = f"http://127.0.0.1:{port}"
-    for _ in range(80):
+    # The wait for the hub's first answer ends when the hub answers or when its process ended, and at HUB_START_TRIES
+    # readings at the latest. Until 14 November 2026 it ended after 80 readings, about 8 seconds. A hub's start makes
+    # its database, and on a slow disk that alone took 8 to 9 seconds (a test server of 13 November 2026, measured
+    # there; 0.6 seconds with the database in memory). So this self-test said "the hub did not start" on a server that
+    # was in order, and its verify said NOT READY: selftest.
+    for _ in range(HUB_START_TRIES):
         try:
             urllib.request.build_opener(urllib.request.ProxyHandler({})).open(base + "/health", timeout=1).read()
             return proc, base
         except (urllib.error.URLError, OSError):
+            if proc.poll() is not None:
+                print(f"the hub did not start: its process ended with status {proc.returncode}")
+                sys.exit(1)
             time.sleep(0.1)
     print("the hub did not start")
     sys.exit(1)

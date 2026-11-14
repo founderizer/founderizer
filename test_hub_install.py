@@ -1430,6 +1430,72 @@ class VerifyStep(unittest.TestCase):
         self.assertEqual(ran.call_count, 1)
         self.assertIn("selftest.py: passed 3 of 3", said.getvalue())
 
+    def test_the_check_reads_health_until_a_hub_that_just_started_answers(self):
+        """hub.sh's `services` ends when systemd calls the hub's service active, which is before the hub listens, and
+        with FLEET_MANAGER_SERVER=later no agent is installed between that step and `check`. On 13 November 2026 the
+        one reading of `check` came 8 seconds before a new hub listened, and a first install stopped over a hub that
+        was in order. Here a real listener opens at the port only after the first reading: `check` reads again."""
+        class Health(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps({"ok": True, "agents": ["manager"]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        # The port is the hub's from the start, and nothing listens there: a connection is refused, as at a hub that
+        # has not come to the end of its start.
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Health, bind_and_activate=False)
+        server.server_bind()
+        port, pauses, serving = server.server_address[1], [], []
+        self.addCleanup(server.server_close)
+
+        def the_hub_starts_to_listen(seconds):        # the pause after the first reading: the hub's start ends in it
+            pauses.append(seconds)
+            if not serving:
+                server.server_activate()
+                serving.append(threading.Thread(target=server.serve_forever, daemon=True))
+                serving[0].start()
+                self.addCleanup(server.shutdown)
+        with patch.object(hubsetup.time, "sleep", the_hub_starts_to_listen), \
+                contextlib.redirect_stdout(io.StringIO()) as said, contextlib.redirect_stderr(io.StringIO()) as stopped:
+            code = hubsetup.main(["check", "--address", "127.0.0.1", "--port", str(port), "--no-selftest"])
+        self.assertEqual(code, 0, said.getvalue() + stopped.getvalue())
+        self.assertEqual(pauses, [1])
+        self.assertEqual(said.getvalue().count("the hub does not answer yet"), 1, said.getvalue())
+        self.assertIn(f"/health is read up to {hubsetup.START_TRIES} times, a second apart", said.getvalue())
+        self.assertIn("the hub answers /health: manager", said.getvalue())
+
+    def test_the_check_stops_at_its_count_of_readings_and_a_hub_that_answers_is_read_once(self):
+        """No time ends the wait for the hub's first answer: a hub that never answers stops `check` after START_TRIES
+        readings, a second apart, with the words of the last reading, and one line said that it waits. A hub that
+        answers at the first reading gets one reading, no pause and no such line."""
+        readings, pauses = [], []
+
+        def silent(hub_ip, port, timeout=10):
+            readings.append((hub_ip, port, timeout))
+            return False, "<urlopen error [Errno 111] Connection refused>"
+        with patch.object(hubsetup, "health", silent), patch.object(hubsetup.time, "sleep", pauses.append), \
+                contextlib.redirect_stdout(io.StringIO()) as said, contextlib.redirect_stderr(io.StringIO()) as stopped:
+            code = hubsetup.main(["check", "--address", "100.64.0.1", "--no-selftest"])
+        self.assertEqual(code, 1)
+        self.assertEqual(readings, [("100.64.0.1", 8765, 3)] * hubsetup.START_TRIES)     # 3 seconds a reading
+        self.assertEqual(pauses, [1] * (hubsetup.START_TRIES - 1))
+        self.assertEqual(said.getvalue().count("the hub does not answer yet"), 1, said.getvalue())
+        self.assertIn("the hub does not answer /health: <urlopen error [Errno 111] Connection refused>",
+                      said.getvalue())
+        self.assertIn("the hub is not serving", stopped.getvalue())
+        pauses.clear()
+        with patch.object(hubsetup, "health", return_value=(True, "manager")) as read, \
+                patch.object(hubsetup.time, "sleep", pauses.append), \
+                contextlib.redirect_stdout(io.StringIO()) as said:
+            self.assertEqual(hubsetup.first_health("100.64.0.1", 8765), (True, "manager"))
+        self.assertEqual((read.call_count, pauses, said.getvalue()), (1, [], ""))
+
     def test_verify_is_the_last_step_of_the_hub_installer(self):
         main = shell_function(SCRIPT, "main")
         steps = [line.strip() for line in main.splitlines() if re.fullmatch(r" {4}[a-z_]+", line)]

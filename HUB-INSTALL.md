@@ -263,7 +263,8 @@ owner's Mac is lost, or it has a new address", below.
   check; what counts is that nothing failed). Since 18 October 2026 the suite carries no
   standing failures, so **any** failure is real: send the line to the operator.
 - **`GET /health`** from the server, which the installer makes: it names the agents the
-  hub runs.
+  hub runs. A hub listens only at the end of its start, so the installer reads it until the
+  hub's first answer: up to 120 times, a second apart.
 - **`GET /ui/state`** from the owner's Mac, which the claim line makes on that Mac. 200
   there is the real proof: that route answers the owner's address and no other.
 - **The address line**, printed last. Paste it into the Founderizer window that waits for it: the app

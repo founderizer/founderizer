@@ -169,7 +169,7 @@ would read as an empty fleet instead of as a mistake.
 | `search_history` | `/ui/history` | Search what one agent, or every agent, took part in, by words, dates, person, task and kind; with `ref`, one record in full. |
 | `see_costs` | `/ui/costs` | What every agent's work cost, against the period before: list dollars, the four kinds of tokens, results without rework by kind of work, checks, each account's window and the model changes. |
 | `which_hub` / `use_hub` | `/ui/state` | Which hub, on what authority; and point at one. |
-| `install_hub` | SSH, `hub.sh` (INSTALL-PROMPT.md A1–A5) | Install a hub on a server the owner names. It puts the server on the private network first (A2), with `authkey_file`, and starts the install at the server's address there. It changes nothing on a server where an install runs. |
+| `install_hub` | SSH, `hub.sh` (INSTALL-PROMPT.md A1–A5) | Install a hub on a server the owner names. It puts the server on the private network first (A2), with `authkey_file`, and starts the install at the server's address there. It changes nothing on a server where an install runs. `servers` is the owner's own choice, 1 or 2, and the tool takes no default ("How many servers a fleet starts with", below). |
 | `install_log` | SSH, `tail` | The install's own log, with the claim code read out of it. When SSH gets no connection to the host, because of the install's firewall, it reads the log at the server's address on the private network. |
 | `claim_hub` | `POST /claim` | Prove this Mac's address. This is what grants the authority. |
 | `add_machine` | `/ui/servers/join` | The one-time join line, and with `host` it runs it over SSH: as root on Linux, as the Mac user on a Mac. A Linux server that is not on the private network goes on it first, with `authkey_file` (B2); without that file, it stops before the hub makes a code. |
@@ -188,7 +188,7 @@ would read as an empty fleet instead of as a mistake.
 | `save_profile` | `/ui/profiles/<a>` | Write one agent's profile — the owner's own words, which the agent cannot change. |
 | `prepare_runtime` | `/ui/servers/<s>/prepare` | Prepare an agent's other runtime before its switch. |
 | `start_manager_session` | `/ui/machines/<a>/manager` | Ask the manager's machine to start the standing session. |
-| `sign_in_machine` / `sign_in_code` | `/ui/machines/<a>/signin[/code]` | Start a machine's own provider sign-in, and carry the code back. |
+| `sign_in_machine` / `sign_in_code` | `/ui/machines/<a>/signin[/code]` | Start a machine's own provider sign-in, and carry the code back. The install job of a new or moved agent opens its sign-in by itself: the job's prompt on the page `servers` has the link and the code (Codex), or names a login of the page `machines` (Claude Code). |
 | `check_machine` / `update_machine` | `/ui/machines/<a>/check`, `/update` | Take a reading now; update Fleet when idle. |
 | `check_mcp_server` | `/ui/mcp/check` | Does this MCP server answer? Asked before it is saved, and of a machine for a `command` server. Writes nothing. |
 | `save_mcp_server` | `/ui/team/mcp` | Add one of the owner's own MCP servers, change it, or remove it. An agent loads it only once it also holds `tool:<name>`. |
@@ -227,6 +227,26 @@ hub on the owner's direction: they say in chat what they want the fleet to reach
 writes it down with `update_goal`, or a duty with `set_duty`. So this server sets a goal with
 `send_message` and nothing else, and `goal_state` and `duty_state` are the state changes that
 stayed.
+
+## How many servers a fleet starts with
+
+It is the owner's choice, because it is the owner's money and the owner's risk. So `install_hub` takes it as
+`servers`, with no default, and its refusal and its description give the agent both layouts in the words to ask with:
+
+- **1**: the hub and the manager run on the one server, each as its own OS user. It costs the least. The fleet's vault
+  is on that server, so a manager that breaks out of its OS user reaches every key of the fleet. `runtime` gives the
+  manager's AI provider, one of those that `hub.sh` takes. The install then ends `NOT READY: runtime_signed_in` until
+  the owner signs the manager in.
+- **2**: the hub's server runs no agent. `install_hub` puts the word `FLEET_MANAGER_SERVER=later` in front of both runs
+  of `hub.sh`, which the Mac app sets for each hub that it installs, so the first `team.json` has a manager with no
+  server yet. After the install,
+  `add_machine` adds the manager's server and `move_agent` gives it to the manager, with its AI provider.
+
+The choice counts at a hub's first install: a later `install_hub` on that server keeps the fleet that is there.
+Until 14 November 2026 `install_hub` gave `hub.sh` no word, so each hub that this server installed ran its manager on
+the hub's own server, and the owner was not asked. A manager that started on the hub's server and moves later
+(`move_agent`) leaves its OS user and its home on the hub's server: the hub's machine runs no server service that
+could remove them. Nothing removes them yet.
 
 ## The three things it cannot do without the owner
 

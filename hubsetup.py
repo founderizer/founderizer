@@ -112,6 +112,7 @@ CLAIM_LIFE = hub.JOIN_LIFE      # seconds the claim waits for the owner's Mac
 HUB_SERVICE = "fleet-hub.service"   # the hub, as `fleet.py service hub` installs it: a user service of the hub's user
 PORT_TRIES = 20                 # readings of the hub's port, a second apart, after a claim stopped the hub's service
 BACK_TRIES = 60                 # readings of GET /health, a second apart, after a claim started that service again
+START_TRIES = 120               # readings of GET /health, a second apart, after the install started that service (first_health)
 CLAIM_ENDS = ("SIGHUP", "SIGTERM")  # what ends a claim from outside: a terminal that closed, and a kill
 # The manager's start policy, as team.json has it on the pilot hub, and a worker's or a lead's for the first one of a
 # fleet, where the hub has no other worker to copy from (hub.py `server_agent_entry`). Both are that runtime's own
@@ -2928,6 +2929,37 @@ def health(hub_ip, port, timeout=10):
         return False, str(e)
 
 
+def first_health(hub_ip, port, tries=START_TRIES, pause=1):
+    """**GET /health of a hub whose service the install started a moment before: its first answer that is in order,
+    within `tries` readings, `pause` seconds apart; else the last reading.** A hub listens only at the end of its
+    start, and its first start makes its database. hub.sh's `services` step ends when systemd calls the service
+    active, which is when its process started, not when it listens.
+
+    Until 14 November 2026 `check` read /health one time. A hub that also installs the manager spends minutes on that
+    step between the two, so the one reading came late enough. With FLEET_MANAGER_SERVER=later, which the app sets, no
+    agent is installed there, and since 12 November 2026 the step runs no self-test before the reading
+    (`--no-selftest`). So the reading came some tenths of a second after the start of the service. On a test server
+    with a slow disk (13 November 2026) the new hub listened 8 seconds after its start: the first install stopped with
+    "the hub is installed but it does not answer", over a hub that answered some seconds later, and the same install
+    run again passed, because the database was there.
+
+    The wait ends at the hub's answer, or at the count: no time ends it. One line says that it waits, at the first
+    reading with no answer. A reading waits 3 seconds for the hub, as the claim's readings do (BACK_TRIES), so a hub
+    that takes a connection and says nothing holds the step for 8 minutes at most."""
+    live, agents = False, "no reading"
+    for reading in range(max(1, tries)):
+        if reading:
+            time.sleep(pause)
+        live, agents = health(hub_ip, port, timeout=3)
+        if live:
+            break
+        if not reading and tries > 1:
+            apart = "a second" if pause == 1 else f"{pause} seconds"
+            say(f"the hub does not answer yet ({agents}): a hub listens only at the end of its start, so /health is "
+                f"read up to {tries} times, {apart} apart")
+    return live, agents
+
+
 def cmd_template(args):
     print(json.dumps(template(args.address, args.port, args.timezone or machine_timezone(), args.owner,
                               args.runtime, args.ssh_user, args.ssh_port, placed=not args.manager_later), indent=2))
@@ -3098,11 +3130,12 @@ def cmd_kit_clone(args):
 
 def cmd_check(args):
     """check: selftest.py and GET /health. With --no-selftest only GET /health, for a caller whose own last step is
-    `fleet.py verify` (hub.sh): verify runs the self-test itself, so the install ran the same minute two times."""
+    `fleet.py verify` (hub.sh): verify runs the self-test itself, so the install ran the same minute two times. The
+    hub's service can have started a moment before, so /health is read until the hub's first answer (first_health)."""
     ok, last = (True, None) if args.no_selftest else selftest(args.kit)
     if last is not None:
         say(f"selftest.py: {last}")
-    live, agents = health(address(args.address, "the hub's address"), args.port)
+    live, agents = first_health(address(args.address, "the hub's address"), args.port)
     say(f"the hub answers /health: {agents}" if live else f"the hub does not answer /health: {agents}")
     if not live:
         raise Stop("the hub is not serving. Look at: systemctl --user status fleet-hub")
