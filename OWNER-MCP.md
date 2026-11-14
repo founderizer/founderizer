@@ -137,8 +137,9 @@ founderizer-cli write <tool> ['<json object>']
 kind is `swift`, a read that the program's own code wrote: `fleet_overview`, `fleet_read`,
 `search_history` and `see_costs`. A tool that the table builds and that a table marked as a read by
 mistake is sent by neither verb. `call` leaves out one page of `fleet_read`, `chat_link`, whose QR
-links a WhatsApp account to the fleet: the owner reads that QR in the app, and `call` says so. (The
-setup tools of a later slice will join `call` by name.) `write` takes each other tool that the
+links a WhatsApp account to the fleet: the owner reads that QR in the app, and `call` says so.
+Since 14 November 2026 `call` also takes the two setup tools, `setup_state` and `setup_show`, by
+name (below, "The link to the running app"). `write` takes each other tool that the
 program has: the nine below and the 54 of the table. A read through `write` is refused, and a write
 through `call` is refused, each with words that name the right verb; a tool that the program does
 not have gets the words of the MCP form. The JSON is one word of the shell, an object of the tool's
@@ -184,7 +185,119 @@ in the same order, with the same refusals and the same result. A table of a newe
 file can name a `swift` tool that an older program does not have: that program refuses it with
 "not in this version of the app yet" and does not list it. Never in the program, because the app's
 own pages do that work and its own setting says which hub it reads: `install_hub`, `install_log`,
-`claim_hub`, `add_machine`, `use_hub` and `which_hub`.
+`claim_hub`, `add_machine`, `use_hub` and `which_hub`. Two more are the program's own and are not
+in the table or in this server: `setup_state` and `setup_show`, on the link to the running app
+(below). So `tools/list` gives 69 tools: the 54 of the table, the thirteen and the two.
+
+**The link to the running app.** Some work only the running app can do: its first run, its pages,
+and in later slices its keys and its engine. So the program asks the app on a local socket, the
+link, which the app listens on while it runs (`OwnerChannel.swift` in `FleetOwnerAPI`, and
+`SetupChannel.swift` in the app):
+
+- **The place:** `~/Library/Application Support/Founderizer/app.sock`, in the app's own folder with
+  mode 700, the socket with mode 600. A local socket's path takes at most 104 bytes, and the link
+  keeps under 100: with a home folder whose name makes it longer, the app does not listen and says
+  so in its log, and the program refuses in words. Both read the home folder from the user database,
+  not from `HOME`.
+- **The wire:** one request and one answer for each connection, each one line of JSON with the
+  link's version (`"v": 1`). The request names the program's set (`"set": "owner"`), one tool of the
+  link and its fields; the answer is `"result"` or `"refused"` with words. A request of another
+  version, set or tool is refused in words, and a later tool is one more entry of the same link.
+- **Each side checks the other by its code signature**, from the socket's peer: the peer's audit
+  token (`LOCAL_PEERTOKEN`), the Security framework's guest lookup by that token, and a requirement.
+  In a release build that requirement is a Developer ID of the same team as the checking side's own
+  signature, and the other side's identifier, which each side knows as its own constant and never
+  reads from a file: `com.founderizer.cli` for the program, `com.founderizer.app` for the app (a test
+  holds both to `Info.plist`, `release.sh` and `run.sh`). This check has not run with a Developer ID
+  signed build yet. A build whose own signature has no team (an ad hoc test build, or none) takes
+  only the exact code of its own bundle, by its code directory hash and the real path of its main
+  executable: the app takes only `Contents/MacOS/founderizer-cli` of its own bundle, and the program
+  only the app's own executable. So a test build works with itself and with no other build. A
+  signature with a team that does not meet the Developer ID requirement takes no peer at all. A
+  peer that fails the check gets one refusal line and nothing of its request is read; the program
+  sends nothing to a listener that fails its check. What the check is worth: OWNER-MCP-BOUNDARY.md
+  section 7b.
+- **Bounds:** a request line of 64 KiB at most (the app reads no byte past it), an answer of 1
+  MiB, and 8 open connections; one more ends the oldest. So a client that sends nothing, half a
+  line or 10 MB with no line end, or that never reads its answer, holds one place and never the
+  app's main thread: each connection ends by an event (its answer is written, its line is too long,
+  it closes, also after its line while its answer is made) or by that count, and never by a clock.
+  A client keeps its side open until the answer: one that closes it has gone. When a connection
+  ends, the work of its answer is cancelled, and a wait of `setup_state` in it ends at once. At
+  most 4 calls of `setup_state` wait at one time; one more answers "no change" at once. The
+  listener runs on a queue of its own; only the answers are made on the main thread, from the app's
+  store. A request that comes while the app starts waits for the app's store 100 times a tenth of
+  a second, then is refused in words. With no file descriptor left, the listener stops taking
+  connections and ends its oldest one, and goes on when that one closes (or after half a second when
+  none is open). A folder that
+  cannot get mode 700 is no place to listen: the app says so in its log.
+- **The program's own bound:** it reads the app's answer with 60 reads of one second each with
+  nothing new, a little above the 50 seconds of `setup_state`'s wait, then says that the app did
+  not answer.
+- **One listener for one user.** The listener holds a lock on `app.sock.lock` beside the socket. A
+  second copy of the app finds the lock held or a live listener at the place, and does not take it;
+  a socket file that nothing listens on (the app crashed) is replaced, and a file that is no socket
+  is never touched.
+- **When the app does not run,** the program starts the app of its own bundle (`open` on the
+  bundle) and tries again, 40 times at most, a quarter of a second apart: about 10 seconds. Nothing
+  was sent before, so nothing is done twice. With no answer, it refuses with words that say what the
+  owner can do (open Founderizer from Applications). "Does not run" means that no socket file is
+  there, or that the socket file refuses and no copy of the app holds the link's lock: a running app
+  whose queue of connections is full gets "busy, call again", and the program starts nothing. The
+  program looks at the lock only when a socket file refuses, so it never takes it while an app
+  starts; and an app whose try of the lock fails while no live listener answers tries again, 20
+  times a tenth of a second apart, before it says that another copy listens. Another copy of the app that answers is asked
+  nothing, and the program says so.
+- The setup tools take no command lock (`~/.founderizer/lock`) and need no hub. Their answers are
+  the app's typed facts, so they carry no sentence that marks the hub's data: through `call` the
+  JSON alone is on standard output.
+
+**`setup_state`** (a read): where the setup stands, from the app, as typed facts and fixed names,
+never a value of a field (no token, key, password, code, address of an account or server, and no
+free text of an agent or a person). Its one field, `after`, is optional. The answer:
+
+- `change`: a number that goes up at each change of any fact below. With `after` set to the
+  number of an earlier answer, the call waits for the next change; any other number answers at
+  once (the facts changed since, or the app started again and counts from 1). It waits 50 seconds
+  at most and then answers with `"no_change": true`. The wait ends no work and judges none: it
+  only stays under a client's own time limit, as the hub's `/ui/wait` does.
+- `app`: `version` and `build`.
+- `hub`: `none` (no hub's address), `set` (an address, and its last read did not answer), or
+  `answers`. It is what the app's store knows; the call makes no request of its own.
+- `first_run`: `shows`; `page`, by a fixed name: `welcome`, `paste`, `vps` ("A VPS for your
+  fleet"), `tailscale`, `tailscale_key`, `token`, `building` (a provider's server is made),
+  `other_vps` (a server by its address), `machine`, `installing`, `address`, `done`, `restore`;
+  `title`, the page's title in English as the app's string table has it, and a title with a
+  placeholder as its key ("Your %@ token"; a title that is a server's address is none); `works`,
+  whether work of the first run runs now (a check, a build, an install, a connection, Tailscale's
+  sign-in, the key); `began`, whether an install of this first run began; `holds_window`; and
+  `provider`, on a provider's page (`hetzner`, `digitalocean`, `vultr`, `akamai`). With no first
+  run, `shows` is false and the rest is empty.
+- `programs`: the programs of the owner's own agent that the app found on this Mac (`claude_code`,
+  `codex`).
+
+Each value is a fixed name, a boolean, a number or a text from a fixed list, and a value that is
+not on its list is left out; `OwnerSetupToolsTests` fails when a key is added to the answer.
+
+**`setup_show`** (marked as a read: it changes no fleet, no server and no file): asks macOS to
+bring the app to the front, on one of its own pages. Fields: `page`, which is `front` (the app as
+it is, with no change of page, from any page), or for a first run `welcome` or `vps`; and `seen`,
+the page that `setup_state` gave last (`first_run.page`, or `none` with no first run). It refuses,
+and says which, when `seen` is not the page that shows now; and for `welcome` and `vps`, when no
+first run shows, when the page that shows is not one of the first run's start pages (`welcome`,
+`paste`, `vps`: on every other page the owner may be typing a token, a key or a password that a
+change of page would erase), when the first run holds the window, when its work runs, or when an
+install of it began. The first run's window checks the ask again when it takes it, so a change in
+between counts; the wait for the window has no clock, and ends on its answer, on another ask, on
+the window's going or on the end of the call. An ask for the page that shows already changes
+nothing in the wizard (not even a failure line on it). It never presses anything, and it gives back the
+state as `setup_state` does, with `"front": "asked"`: macOS was asked, which says nothing of
+whether another app stays in front. **Who asks macOS:** the app asks first, with its own
+activate, and then the program runs `/usr/bin/open` on its own bundle, with no shell and no word
+of the request, after each `setup_show` that the app took, and `founderizer-cli guide` does the
+same after its sign to the app. On a test Mac on 14 November 2026 (macOS 26.6, Terminal in front)
+the app's own activate left Terminal in front 5 times of 5, and `open` from another process brought
+the app to the front 3 times of 3.
 
 **The file tools, in both programs.** `attach_file` sends at most 25 MiB (the hub's
 `ATTACH_MAX`), with its request id and the file's name as headers (`X-Fleet-Request-Id`,
@@ -329,7 +442,10 @@ not by the program's code.
 section 0 holds the table to `tools()` too, the reads that `call` takes to the marked reads that the
 program wrote, and the media types to the hub's own. The Swift tests (`swift test --filter FleetOwnerAPITests` in `app/`) run each
 kind of tool, the thirteen written in Swift, the two verbs, the refusals, the MCP exchange and the
-link's rules on a stand-in hub that opens no port.
+link's rules on a stand-in hub that opens no port. `OwnerChannelTests` runs the link to the app on a
+real socket in a temporary folder, with a stand-in check of the peer (and the real check against
+the test process itself), and `OwnerSetupToolsTests` the two setup tools, with a stand-in for the
+app's start: no test starts the real app.
 
 ## How it authenticates to the hub, and why that is the whole of it
 
