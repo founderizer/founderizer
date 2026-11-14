@@ -292,6 +292,10 @@ class OpenCode(Program):
     RETRY = "opencode/retry"
     LIMITS = ("provider.rate-limit", "provider.free-limit", "provider.go-limit")
     NO_CREDITS = ("provider.quota", "provider.budget-limit", "provider.model-budget-limit")
+    # A 5xx after the program's own tries, and an address that refuses or drops each connection (a model server that
+    # stopped: at 2.2.5, after about 89 seconds of its own tries, `ECONNREFUSED` with this kind; measured by lane S3
+    # on 14 November 2026 with a real model server)
+    NO_ANSWERS = ("provider.internal", "provider.transport")
     CONTEXT, OUTPUT = 64000, 8000       # a model of the owner's own server, where the server names no size
 
     def session_env(self, session):
@@ -379,7 +383,7 @@ class OpenCode(Program):
             return record(LIMIT, error.get("message"))
         if kind in self.NO_CREDITS:
             return record(NO_CREDIT, error.get("message"))
-        if kind == "provider.internal":
+        if kind in self.NO_ANSWERS:
             return record(NO_ANSWER, error.get("message"))
         return record(ERROR, error.get("message"))
 

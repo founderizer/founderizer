@@ -2006,8 +2006,21 @@ NO_TOOL_CALL = "No model here passed a tool call."
 SMALL_CONTEXT = f"Its context is smaller than {REQUIRED_CONTEXT:,} tokens."
 NO_KEY = "The vault gave no key for this account."
 KEY_REFUSED = "The provider refused the key."
+# The model that an account or its agent names is not in the program's list, or not in the model server's (the wave 1
+# review, R6 part 2). Proposed, not approved, for the account item: the words of model_item's own refusal, which live
+# fleets show today for an agent's model. The item's own sentence is 5D's question (R6 part 3).
+NOT_OFFERED = "%s is not offered here."
 CHECK_CLIENT = "Founderizer-Fleet/1 (helper)"       # fleet.OUTSIDE_AGENT: an edge can refuse Python's default name
 CHECK_MODELS = 8                # the models of a server's list that the check tries, in the list's order
+# Step 4 measures a word's tokens and the chat template's own tokens with two short prompts of the word "seven", then
+# sends a prompt that makes CONTEXT_AIM of REQUIRED_CONTEXT under that template. Measured on 14 November 2026: the
+# template of gpt-oss-20b adds 67 tokens to a prompt of one message in llama.cpp, Ollama and LM Studio. A long prompt
+# sized from one prompt alone falls short by about 31 tokens for each of the template's own, so a template of 108 or
+# more failed the step on any server. CHECK_RATE bounds a word's tokens: a server that counts only the tokens that its
+# cache did not hold gives far fewer, and no size of a long prompt follows from such a count.
+CHECK_WORDS = (1000, 2000)
+CONTEXT_AIM = 0.97
+CHECK_RATE = (0.5, 4.0)
 CHECK_BODY = 4 * 1024 * 1024    # the most of an answer that the check reads
 PING = "Call the tool ping with the value 7."
 PING_TOOL = {"type": "function", "function": {
@@ -2050,18 +2063,46 @@ def account_path(home, agent):
 def kept_account(home, agent, account):
     """What the setup check kept for this agent's model server, {account, address, key, models, model, at}, when it
     is of this account as team.json has it now: the same id, address and key or no key. Else None. The hub writes
-    no team.json for the model that passed, because a write of an account would make the check of each agent old."""
-    try:
-        with open(account_path(home, agent), "rb") as f:
-            kept = json.loads(f.read(1 << 20))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(kept, dict) or not account or kept.get("account") != account["id"] or \
-            kept.get("address") != account["address"] or kept.get("key") is not bool(account["secret"]) or \
-            not isinstance(kept.get("model"), str) or not MODEL_NAME.fullmatch(kept["model"]) or \
-            not isinstance(kept.get("models"), list):
-        return None
-    return kept
+    no team.json for the model that passed, because a write of an account would make the check of each agent old.
+
+    Without a file of this agent's own name, the newest file of another name in the same ~/.fleet that is of this
+    account stands: a result is the server's, not the agent's, and so the kept model follows a rename of the agent
+    (the build plan, section 3.6, part b), and an agent of the same OS user on the same account starts with it."""
+    own = account_path(home, agent)
+
+    def changed(path):
+        try:
+            return os.stat(path).st_mtime
+        except OSError:
+            return 0
+    others = glob.glob(os.path.join(glob.escape(os.path.dirname(own)), ACCOUNT_FILE % "*"))
+    paths = [own] + sorted((p for p in others if p != own), key=changed, reverse=True)
+    for path in paths[:64]:
+        try:
+            with open(path, "rb") as f:
+                kept = json.loads(f.read(1 << 20))
+        except (OSError, ValueError):
+            continue
+        if isinstance(kept, dict) and account and kept.get("account") == account["id"] and \
+                kept.get("address") == account["address"] and kept.get("key") is bool(account["secret"]) and \
+                isinstance(kept.get("model"), str) and MODEL_NAME.fullmatch(kept["model"]) and \
+                isinstance(kept.get("models"), list):
+            return kept
+    return None
+
+
+def forget_account(home, account):
+    """Remove each kept result of this account in this ~/.fleet, of any agent's name (kept_account)."""
+    folder = os.path.dirname(account_path(home, "x"))
+    for path in glob.glob(os.path.join(glob.escape(folder), ACCOUNT_FILE % "*")):
+        try:
+            with open(path, "rb") as f:
+                kept = json.loads(f.read(1 << 20))
+        except (OSError, ValueError):
+            continue
+        if isinstance(kept, dict) and kept.get("account") == account["id"]:
+            with contextlib.suppress(OSError):
+                os.remove(path)
 
 
 def program_account(account, runtime, model=None, models=()):
@@ -2129,25 +2170,31 @@ def prompt_tokens(answer):
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
-def check_server(account, key, kept=None, call=model_call, clock=time.time):
+def check_server(account, key, kept=None, call=model_call, clock=time.time, wanted=None):
     """The setup check of the owner's own model server, in its order; the first failure ends it. Returns (state,
     detail, what to keep or None). The helper sends only fixed prompts and reports only the fixed words and a model's
     name.
 
-      1. GET <address>/models, with the key if the account has one: the server answers with its models.
+      1. GET <address>/models, with the key if the account has one: the server answers with its models. A model that
+         the agent or the account names (wanted, own/<name>) must be one of them (the wave 1 review, R6 part 2).
       2. With a key: the same call with no key must answer 401 or 403, and the server's own routes at its host and
          port (Ollama's /api/tags and /api/version) must not answer with their JSON: a proxy that guards /v1 only
          would leave them open to each agent that can reach the address.
-      3. One tool call for each model of the list, 8 at most, until one passes.
-      4. For that model: its context takes REQUIRED_CONTEXT tokens. A server that cuts a long prompt fails here.
+      3. One tool call for each model of the list, 8 at most, until one passes; for the named model only, when there
+         is one, because the sessions start with it.
+      4. For that model: its context takes REQUIRED_CONTEXT tokens (CHECK_WORDS, CONTEXT_AIM). A server that cuts a
+         long prompt fails here.
 
-    Steps 3 and 4 run again only when the account, the address, the key or the model list differ from what was kept
-    (kept_account); else the kept result stands."""
+    Steps 3 and 4 run again only when the account, the address, the key, the model list or the named model differ
+    from what was kept (kept_account); else the kept result stands."""
     address = account["address"]
     status, answer = call("GET", f"{address}/models", key=key, timeout=30)
     models = server_models(answer) if status == 200 else []
     if status != 200 or not isinstance(answer, dict):
         return "failed", NO_ANSWER, None
+    named = (wanted[len("own/"):] if wanted.startswith("own/") else wanted) if wanted else None
+    if named is not None and named not in models:
+        return "failed", NOT_OFFERED % wanted, None
     if key:
         status, _ = call("GET", f"{address}/models", timeout=30)
         if status not in (401, 403):
@@ -2157,10 +2204,10 @@ def check_server(account, key, kept=None, call=model_call, clock=time.time):
             status, said = call("GET", f"{parts.scheme}://{parts.netloc}{route}", timeout=30)
             if status == 200 and isinstance(said, dict) and field in said:
                 return "failed", OPEN_SERVER, None
-    if kept and kept.get("models") == models:
+    if kept and kept.get("models") == models and (named is None or kept.get("model") == "own/" + named):
         return "ok", kept["model"], None
     passed = None
-    for name in models[:CHECK_MODELS]:
+    for name in [named] if named is not None else models[:CHECK_MODELS]:
         status, answer = call("POST", f"{address}/chat/completions", key=key, timeout=120, body={
             "model": name, "messages": [{"role": "user", "content": PING}], "tools": [PING_TOOL], "stream": False})
         if status == 200 and pinged(answer):
@@ -2171,11 +2218,17 @@ def check_server(account, key, kept=None, call=model_call, clock=time.time):
     ask = lambda words: call("POST", f"{address}/chat/completions", key=key, timeout=600, body={
         "model": passed, "messages": [{"role": "user", "content": " ".join(["seven"] * words)}], "max_tokens": 1,
         "stream": False})
-    status, answer = ask(2000)
-    measured = prompt_tokens(answer) if status == 200 else None
-    if not measured:
+    counts = []
+    for words in CHECK_WORDS:
+        status, answer = ask(words)
+        counts.append(prompt_tokens(answer) if status == 200 else None)
+    if not all(counts):
         return "failed", SMALL_CONTEXT, None
-    status, answer = ask(math.ceil(REQUIRED_CONTEXT * 2000 / measured))
+    rate = (counts[1] - counts[0]) / (CHECK_WORDS[1] - CHECK_WORDS[0])
+    if not CHECK_RATE[0] <= rate <= CHECK_RATE[1]:
+        return "failed", SMALL_CONTEXT, None
+    template = max(0, counts[0] - rate * CHECK_WORDS[0])
+    status, answer = ask(math.ceil((CONTEXT_AIM * REQUIRED_CONTEXT - template) / rate))
     taken = prompt_tokens(answer) if status == 200 else None
     if not taken or taken < 0.95 * REQUIRED_CONTEXT:
         return "failed", SMALL_CONTEXT, None
@@ -2757,7 +2810,7 @@ class Lifecycle:
             listed, error = None, f"{label} could not be started for its model list: {type(e).__name__}"
         finally:
             adapter.remove(session)
-        options = []
+        options, starts = [], model         # starts: the model that a session of this agent starts with
         for model, efforts, effort, current in listed or []:
             if isinstance(model, str) and MODEL_NAME.fullmatch(model) and all(o["model"] != model for o in options):
                 options.append({"model": model, "display_name": model, "default": current is True,
@@ -2766,7 +2819,10 @@ class Lifecycle:
                                 else None})
         if not options:
             return None, error or f"{label} listed no models", source
-        return options[:64], None, source
+        # a seller lists hundreds: the model that this agent starts with stays in the 64 that the reading keeps, so
+        # that model_item and the account item (R6 part 2) find it where the program offers it
+        chosen = [o for o in options[64:] if o["model"] == starts]
+        return (options[:64 - len(chosen)] + chosen), None, source
 
     def model_options(self, name, exe):
         """(options, error, source): one runtime's own model options, read with its executable exe (None when it is
@@ -2839,11 +2895,21 @@ class Lifecycle:
         key = self.account_key(account)
         if account["kind"] == "key" or (account["secret"] and not key):
             state, detail = check_key(account, key) if account["kind"] == "key" else ("failed", NO_KEY)
+            # the account's model is in the program's own list (R6 part 2); the agent's own model is model_item's
+            if state == "ok" and account["kind"] == "key" and account["model"] and not self.conf.get("model"):
+                offered = self.offered_models()
+                if offered is not None and account["model"] not in offered:
+                    state, detail = "failed", NOT_OFFERED % account["model"]
             return ("account", account["id"], state, detail)
         if not account["address"]:
             return ("account", account["id"], "failed", NO_ANSWER)
-        state, detail, keep = check_server(account, key, kept_account(self.home, self.agent, account),
-                                           clock=self.clock)
+        # the program's list of a model server is made from its configuration, which names the model: so the server's
+        # own list is the one that the named model must be in (check_server)
+        kept = kept_account(self.home, self.agent, account)
+        state, detail, keep = check_server(account, key, kept, clock=self.clock,
+                                           wanted=self.conf.get("model") or account["model"])
+        if keep is None and state == "ok" and kept and not os.path.exists(account_path(self.home, self.agent)):
+            keep = kept         # the result of another name, as after a rename: this agent's own file from now on
         if keep:
             path = account_path(self.home, self.agent)
             try:
@@ -2855,10 +2921,21 @@ class Lifecycle:
                 return ("account", account["id"], "failed", NO_ANSWER)     # without the file no session could start
         elif state != "ok" and detail != NO_ANSWER:
             # a server that is open, or that no model of passes, keeps no model; one that only does not answer now
-            # keeps what its last check proved, for when it answers again
+            # keeps what its last check proved, for when it answers again. An open server is the server's own fault,
+            # so no file of another name may start a session on it either (kept_account reads them)
             with contextlib.suppress(OSError):
                 os.remove(account_path(self.home, self.agent))
+            if detail == OPEN_SERVER:
+                forget_account(self.home, account)
         return ("account", account["id"], state, detail)
+
+    def offered_models(self):
+        """The model names of the program's own list, as the last reading has it (read_models), or None when there is
+        no list of this agent's runtime."""
+        reading = self.models
+        if not isinstance(reading, dict) or not reading.get("ok") or reading.get("runtime") != self.conf.get("runtime"):
+            return None
+        return {o.get("model") for o in reading.get("options") or [] if isinstance(o, dict)}
 
     def owner_default(self):
         """The owner's default model and effort of this agent's runtime (owner feature default_models), from this
