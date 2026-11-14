@@ -677,6 +677,31 @@ class Devices(OwnerAPI):
         for p in page["permissions"]:
             self.assertTrue(set(p.items()) <= set(state[p["id"]].items()), "the state gives a device the same and more")
 
+    def test_a_task_page_holds_its_guidance_as_the_state_does(self):
+        """Owner API 1.162: the task's guidance, with the fields and values of GET /ui/state's steers; another task's is
+        not in it."""
+        task, other = self.task(), self.task(title="Other")
+        for on, text in ((task, "Look at the logs first."), (other, "Not this one."), (task, "Then the config.")):
+            status, body = self.call(f"/ui/tasks/{on}/steer", {"request_id": str(uuid.uuid4()), "db": hub.kv_get("db_id"),
+                                                              "expected_attempt": 1, "text": text})
+            self.assertEqual(status, 200, body)
+        page = self.call(f"/ui/mobile/task/{task}")[1]
+        self.assertEqual([s["text"] for s in page["steers"]], ["Look at the logs first.", "Then the config."])
+        state = {s["id"]: s for s in self.call("/ui/state")[1]["steers"]}
+        for steer in page["steers"]:
+            self.assertEqual(steer, state[steer["id"]])
+
+    def test_a_task_head_names_its_parent_as_the_state_does(self):
+        """Owner API 1.162: each head carries parent, the value of GET /ui/state, so a device can see that a task waits
+        for its open subtasks."""
+        lead = self.task(title="Lead")
+        child = self.task(title="Child")
+        hub.q("UPDATE tasks SET parent=? WHERE id=?", (lead, child))
+        heads = {t["id"]: t for t in self.call("/ui/mobile")[1]["tasks"]}
+        state = {t["id"]: t for t in self.call("/ui/state")[1]["tasks"]}
+        self.assertEqual((heads[child]["parent"], heads[lead]["parent"]), (lead, None))
+        self.assertEqual(heads[child]["parent"], state[child]["parent"])
+
     def test_a_parked_task_head_says_until_when_as_the_state_does(self):
         """Owner API 1.161: an open task that its agent parked until a time has parked_until in the device's heads, the
         same value as GET /ui/state, which a device may read already; a task that is not parked has no such key."""

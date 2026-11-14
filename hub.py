@@ -1437,7 +1437,10 @@ MOBILE_PREVIEW = 120            # characters of a chat preview in the phone's ag
 MOBILE_HEAD = ("id", "title", "state", "owner", "requester", "goal", "needs", "attempt", "accepted", "created",
                "started", "last_activity", "delivered", "checked_at", "waiting_on", "follows",
                # what the Mac's own state word reads, so that the phone's Tasks row says "Stalled" as its page does
-               "stalled_since", "nudge_level", "missing_since")
+               "stalled_since", "nudge_level", "missing_since",
+               # owner API 1.162: the task it is a subtask of, so a device's board puts a task that waits for its open
+               # subtasks in Waiting, as the Mac's (HubState.subtaskWaits)
+               "parent")
 MOBILE_ANSWERED = 50            # answered Needs-you items that the phone reads, for the folded cards of its chats
 MOBILE_SEEN = 60                # seconds: a helper seen this recently is online in both apps (helperIsRecent)
 DEVICE_PATHS = (("/ui/mobile", ("GET",)), ("/ui/state", ("GET",)), ("/ui/knowledge", ("GET",)),
@@ -41814,8 +41817,12 @@ def phone_task(task_id, query):
         # has every permission of the fleet with every field, so a device learns nothing new here.
         permissions = [dict(r) for r in q("SELECT id,tool,input,created,decision,reason FROM prompts WHERE task=? AND "
                                           "(decision IS NULL OR decision='deny') ORDER BY id", (task_id,))]
+        # Owner API 1.162: the owner's guidance of the task, as GET /ui/state gives it (steer_view), for the Mac's
+        # "Guidance · Attempt 1 · Read" row in the thread.
+        steers = [steer_view(r) for r in q("SELECT s.*, e.read_at FROM steers s JOIN events e ON e.id=s.event_id "
+                                           "WHERE s.task=? ORDER BY s.id", (task_id,))]
     return 200, scrub({"db": generation, "task": dict(task), "notes": notes, "holds": holds, "outcomes": outcomes,
-                       "permissions": permissions, "cursor": notes[-1]["id"] if notes else since}), \
+                       "permissions": permissions, "steers": steers, "cursor": notes[-1]["id"] if notes else since}), \
         {"Cache-Control": "no-store"}
 
 
