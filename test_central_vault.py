@@ -459,6 +459,45 @@ class Central(WithCentral, OwnerAPI):
         self.assertEqual(len(said()), 3)
         self.assertIsNone(hub.kv_get("pin_told"))
 
+    def test_one_message_of_a_sweep_names_each_machine_whose_trust_ends(self):
+        """The manager's follow-up of package 4: when the trust ends in several vaults at once (the owner's Mac is off, so
+        all pins age together), one quiet message names each machine with its day, so the manager raises one Needs-you
+        item. A machine that is due again makes one message that names each of them again, on one schedule."""
+        t0, day, fleet = hub.now(), 86400, hub.fleet_id()
+        self.addCleanup(hub.PIN_SWEPT.update, at=0.0)
+
+        def kept(machine, age):
+            hub.kv_set(f"owner_pin:{machine}", json.dumps({"statement": statement(
+                kind="pin", fleet=fleet, machine=machine, recipient=STORE_A, at=int(t0 - age)), "signature": SIGNATURE}))
+
+        def said():
+            return [r["text"] for r in hub.q("SELECT text FROM events WHERE agent=? AND kind='say' ORDER BY id",
+                                             (hub.manager_name(),)) if "[hub] The owner's trust" in r["text"]]
+
+        def sweep():
+            hub.PIN_SWEPT["at"] = 0.0
+            hub.pin_end_sweep(hub.now())
+
+        def ends(age):
+            return hub.owner_day(int(t0 - age) + 90 * day)
+        kept("vps", 61 * day)
+        kept("studio", 65 * day)
+        sweep()
+        self.assertEqual(said(), [f"[hub] The owner's trust ends in the vaults of 2 servers: studio (it ends on "
+                                  f"{ends(65 * day)}) and vps (it ends on {ends(61 * day)}). Founderizer on the owner's "
+                                  f"Mac has signed none of them again since {hub.owner_day(int(t0 - 61 * day))}. From each "
+                                  f"of those days, no login can be handed over to the agents of that server. Raise one "
+                                  f"Needs-you item for all of them: the owner must open Founderizer on the Mac."])
+        sweep()
+        self.assertEqual(len(said()), 1)
+        kept("studio", 91 * day)                                # studio's trust has ended: one message names both
+        sweep()
+        self.assertEqual(len(said()), 2)
+        self.assertIn(f"2 servers: studio (it ended on {ends(91 * day)}) and vps (it ends on {ends(61 * day)}).",
+                      said()[-1])
+        told = json.loads(hub.kv_get("pin_told"))
+        self.assertEqual((sorted(told), told["studio"]["at"]), (["studio", "vps"], told["vps"]["at"]))
+
     def test_the_vault_page_says_which_machine_is_pinned_and_which_is_not(self):
         self.vault.pins = {"vps": STORE_A, "studio": OTHER}
         hub.central_read()

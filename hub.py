@@ -11873,13 +11873,34 @@ def pin_end_words(entry, t0=None):
             "server's row in Settings › Secrets.")
 
 
+def pin_end_message(entries, t0):
+    """The quiet message to the fleet manager about the trust that ends in these machines' vaults (entries of pin_ends):
+    one message for all of them, so that one act of the owner gets one Needs-you item. With one machine, the manager's
+    words of 13 November 2026; with more, each machine with its day, and the newest of their signatures."""
+    entries = sorted(entries, key=lambda e: (e["ends"], e["machine"]))
+    if len(entries) == 1:
+        e = entries[0]
+        ended = e["ends"] <= t0
+        return (f"[hub] The owner's trust in the vault of {e['machine']} {'ended' if ended else 'ends'} on "
+                f"{owner_day(e['ends'])}: Founderizer on the owner's Mac has not signed it again since {owner_day(e['at'])}. "
+                f"{'Since' if ended else 'From'} that day, no login can be handed over to the agents of {e['machine']}. "
+                f"Raise a Needs-you item: the owner must open Founderizer on the Mac.")
+    named = [f"{e['machine']} (it {'ended' if e['ends'] <= t0 else 'ends'} on {owner_day(e['ends'])})" for e in entries]
+    return (f"[hub] The owner's trust ends in the vaults of {len(entries)} servers: {', '.join(named[:-1])} and "
+            f"{named[-1]}. Founderizer on the owner's Mac has signed none of them again since "
+            f"{owner_day(max(e['at'] for e in entries))}. From each of those days, no login can be handed over to the agents "
+            f"of that server. Raise one Needs-you item for all of them: the owner must open Founderizer on the Mac.")
+
+
 def pin_end_sweep(t0):
     """C5 on the owner's phone: the hub tells the fleet manager in a quiet message when the owner's trust in a server's
     vault starts to end (pin_ends), when it has ended, and again each PIN_TOLD_EVERY while it holds. The iPhone app shows
     no list of the hub's warnings, and the manager raises the Needs-you item, which is the phone's place (the manager's
-    answer 1). The record keeps the time of the kept pin that it told of: a machine leaves it only when the owner's app
-    signed its pin again or it leaves the vault page, so a later end is told at once, and a vault that is silent for a
-    while (a Mac that sleeps, a restart) makes no second message when it reports again."""
+    answer 1). One message in a sweep names each machine whose trust ends, with its day (pin_end_message): when the
+    owner's Mac is off, all pins reach their warning together, and one act of the owner settles them all. The record
+    keeps the time of the kept pin that it told of: a machine leaves it only when the owner's app signed its pin again or
+    it leaves the vault page, so a later end is told at once, and a vault that is silent for a while (a Mac that sleeps,
+    a restart) makes no second message when it reports again."""
     if t0 - PIN_SWEPT["at"] < PIN_SWEEP_EVERY:
         return
     PIN_SWEPT["at"] = t0
@@ -11895,20 +11916,17 @@ def pin_end_sweep(t0):
     for machine, last in told.items():          # silent now, with the same kept pin: its record stays
         if machine not in ending and machine in machines and last.get("pin") == pin_at(machine_pin(machine)):
             kept[machine] = last
-    for e in ending.values():
-        ended, last = e["ends"] <= t0, told.get(e["machine"])
-        if last and last.get("pin") == e["at"] and t0 - last["at"] < PIN_TOLD_EVERY and last.get("ended") == ended:
-            kept[e["machine"]] = last
-            continue
-        if not manager:
-            continue
-        day, since, machine = owner_day(e["ends"]), owner_day(e["at"]), e["machine"]
-        emit(manager, "say",
-             f"[hub] The owner's trust in the vault of {machine} {'ended' if ended else 'ends'} on {day}: Founderizer on "
-             f"the owner's Mac has not signed it again since {since}. {'Since' if ended else 'From'} that day, no login "
-             f"can be handed over to the agents of {machine}. Raise a Needs-you item: the owner must open Founderizer "
-             f"on the Mac.", extra={"quiet": True})
-        kept[machine] = {"at": t0, "ended": ended, "pin": e["at"]}
+    fresh = {}
+    for machine, e in ending.items():           # told of this very pin and state in the last PIN_TOLD_EVERY
+        last = told.get(machine)
+        if last and last.get("pin") == e["at"] and t0 - last["at"] < PIN_TOLD_EVERY and \
+                last.get("ended") == (e["ends"] <= t0):
+            fresh[machine] = last
+    kept.update(fresh)
+    if len(fresh) < len(ending) and manager:    # one machine is due: one message names each of them again
+        emit(manager, "say", pin_end_message(list(ending.values()), t0), extra={"quiet": True})
+        for machine, e in ending.items():
+            kept[machine] = {"at": t0, "ended": e["ends"] <= t0, "pin": e["at"]}
     if kept != told:
         kv_set("pin_told", json.dumps(kept) if kept else None)
 
