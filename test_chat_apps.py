@@ -1066,7 +1066,8 @@ class ChatApps(OwnerAPI):
         config = self.bridge("/bridge/config")[1]
         self.assertNotEqual(config["version"], version)
         self.assertEqual(config["version"], hub.chat_version())
-        self.assertIn({"id": "discord-vps", "app": "discord", "label": "VPS bot", "enabled": True}, config["accounts"])
+        self.assertIn({"id": "discord-vps", "app": "discord", "label": "VPS bot", "enabled": True, "removed": None},
+                      config["accounts"])
         self.assertEqual(save(id="discord-vps", account=dict(account, label="VPS bot"))[1]["changed"], False)
         for fields, status, words in (({"id": "Bad", "account": None}, 400, "id must be"),
                                       ({"id": "x", "account": "no"}, 400, "account must be"),
@@ -1090,6 +1091,138 @@ class ChatApps(OwnerAPI):
         for aid in ("discord-studio", "whatsapp-main"):
             self.assertEqual(save(id=aid, account=None)[0], 200)
         self.assertNotIn("chat_apps", origin_team())
+
+    def test_a_removed_account_leaves_nothing_for_an_account_added_again_under_its_id(self):
+        """CHAT-APPS.md 18.4: a number that the owner removed and connected again read the old account's report, its
+        link and its last message until the bridge reported the new one."""
+        def sha():
+            return self.request("/ui/team?db=test-generation")[1]["sha256"]
+
+        def save(**fields):
+            return self.post("/ui/team/chat-apps", base_sha256=sha(), **fields)
+
+        def view(aid):
+            return next((a for a in self.request("/ui/chat-apps?db=test-generation")[1]["accounts"] if a["id"] == aid), None)
+
+        def config():
+            return self.bridge("/bridge/config")[1]
+        account = dict(TEAM["chat_apps"]["whatsapp-main"])
+        self.bridge("/bridge/status", {"accounts": [{"id": "whatsapp-main", "state": "connected", "name": "34911222333",
+                                                     "user": "34911222333:4@s.whatsapp.net"}]})
+        self.bridge("/bridge/link", {"account": "whatsapp-main", "state": "linked", "qr": None, "expires": None})
+        hub.q("INSERT INTO chat_in(account,msg_id,chat,sender,result,request_id,created) VALUES(?,?,?,?,?,NULL,?)",
+              ("whatsapp-main", "old-1", "34600111222@s.whatsapp.net", "34600111222@s.whatsapp.net", "ignored", hub.now() - 60))
+        hub.q("INSERT INTO chat_ignored(account,sender,name,preview,ts) VALUES('whatsapp-main','34699000000@s.whatsapp.net',"
+              "'Unknown','Hello',?)", (hub.now() - 30,))
+        with hub.LOCK, hub.transaction():
+            waiting = hub.chat_queue("message", "whatsapp-main", hub.now(), chat="34600111222@s.whatsapp.net", text="soon")
+            typing = hub.chat_queue("typing", "whatsapp-main", hub.now(), chat="34600111222@s.whatsapp.net", seconds=600)
+            other = hub.chat_queue("message", "discord-studio", hub.now(), chat="700", text="stays")
+        before = view("whatsapp-main")
+        self.assertEqual((before["state"], before["user"], before["link"]["state"]),
+                         ("connected", "34911222333:4@s.whatsapp.net", "linked"))
+        self.assertIsNotNone(before["last_event"])
+        self.assertEqual((config()["removed"], [a["removed"] for a in config()["accounts"]]), ([], [None, None]))
+        version = hub.chat_version()
+        started = hub.now()
+
+        self.assertEqual(save(id="whatsapp-main", account=None)[0], 200)
+        for table in ("chat_status", "chat_link", "chat_ignored"):
+            self.assertIsNone(hub.q1(f"SELECT 1 FROM {table} WHERE account='whatsapp-main'"), table)
+        # The bridge reads the configuration again for the hub's word of the account that left: the version counts it.
+        plain = hashlib.sha256(json.dumps(hub.chat_apps(), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        self.assertNotEqual(hub.chat_version(), plain)
+        self.assertEqual(hub.q1("SELECT state, error FROM chat_out WHERE id=?", (waiting,))["state"], "failed")
+        self.assertEqual(hub.q1("SELECT error FROM chat_out WHERE id=?", (waiting,))["error"], hub.REMOVED_ACCOUNT)
+        self.assertEqual(hub.q1("SELECT state FROM chat_out WHERE id=?", (typing,))["state"], "expired")
+        self.assertEqual(hub.q1("SELECT state FROM chat_out WHERE id=?", (other,))["state"], "queued")   # another account's
+        self.assertIsNotNone(hub.q1("SELECT 1 FROM chat_in WHERE account='whatsapp-main'"), "the messages are history")
+        gone = config()
+        self.assertEqual((gone["removed"], [a["id"] for a in gone["accounts"]]), (["whatsapp-main"], ["discord-studio"]))
+        self.assertGreaterEqual(hub.chat_removed()["whatsapp-main"], started)
+
+        self.assertEqual(save(id="whatsapp-main", account=account)[0], 200)          # the same fields, a new account
+        again = view("whatsapp-main")
+        self.assertEqual((again["state"], again["user"], again["name"], again["link"], again["status_at"], again["last_event"]),
+                         (None, None, None, None, None, None))
+        new = config()
+        self.assertEqual(new["removed"], [])
+        self.assertEqual({a["id"]: a["removed"] for a in new["accounts"]},
+                         {"discord-studio": None, "whatsapp-main": hub.chat_removed()["whatsapp-main"]})
+        self.assertNotEqual(hub.chat_version(), version, "the bridge must read the configuration again")
+        self.assertEqual(new["version"], hub.chat_version())
+        hub.q("INSERT INTO chat_in(account,msg_id,chat,sender,result,request_id,created) VALUES(?,?,?,?,?,NULL,?)",
+              ("whatsapp-main", "new-1", "34600111222@s.whatsapp.net", "34600111222@s.whatsapp.net", "ignored", hub.now() + 1))
+        self.assertIsNotNone(view("whatsapp-main")["last_event"])
+        # Only the owner's own removal forgets an account. A team that only does not name one (a reload of another
+        # revision of team.json) ends no phone's link and deletes nothing, and a team that names the same accounts
+        # (a rename of an agent keeps the IDs of its accounts) removes nothing.
+        marks, team = hub.chat_removed(), json.loads(json.dumps(hub.TEAM))
+        self.bridge("/bridge/status", {"accounts": [{"id": "discord-studio", "state": "connected", "user": "4444"}]})
+        hub.apply_team(json.loads(json.dumps(team)))
+        without = json.loads(json.dumps(team))
+        del without["chat_apps"]["discord-studio"]
+        hub.apply_team(without)
+        self.assertEqual(hub.chat_removed(), marks)
+        self.assertIsNotNone(hub.q1("SELECT 1 FROM chat_status WHERE account='discord-studio'"))
+        self.assertEqual(self.bridge("/bridge/config")[1]["removed"], [])
+        hub.apply_team(team)
+
+    def test_a_removed_bot_leaves_no_token_on_the_hubs_disk(self):
+        def sha():
+            return self.request("/ui/team?db=test-generation")[1]["sha256"]
+        token = os.path.join(hub.CFG["chat_apps_dir"], "discord-studio.json")
+        kept = os.path.join(hub.CFG["chat_apps_dir"], "discord-other.json")
+        os.makedirs(hub.CFG["chat_apps_dir"], exist_ok=True)
+        for path in (token, kept):
+            with open(path, "w") as f:
+                json.dump({"token": "x" * 60}, f)
+        self.bridge("/bridge/status", {"accounts": [{"id": "discord-studio", "state": "connected", "user": "4444",
+                                                     "name": "Fleet Studio", "application_id": "5555"}]})
+        code, data = self.post("/ui/team/chat-apps", base_sha256=sha(), id="discord-studio", account=None)
+        self.assertEqual(code, 200, data)
+        self.assertFalse(os.path.exists(token))
+        self.assertTrue(os.path.exists(kept), "only the removed account's file goes")
+        self.assertIsNone(hub.q1("SELECT 1 FROM chat_status WHERE account='discord-studio'"))
+        self.assertIn("removed the Discord token file of discord-studio",
+                      hub.q1("SELECT what FROM log WHERE what LIKE 'forgot the bridge%' ORDER BY id DESC LIMIT 1")["what"])
+
+    def test_a_new_bot_under_a_removed_bots_id_does_not_catch_up_on_its_chats(self):
+        """The catch-up after a restart reads the Discord messages after each chat's last one (`chats`). A chat of the
+        bot that left is not the new bot's."""
+        def sha():
+            return self.request("/ui/team?db=test-generation")[1]["sha256"]
+        account = dict(TEAM["chat_apps"]["discord-studio"])
+        self.own()
+        self.inbound()
+        self.assertEqual([c["chat"] for c in self.bridge("/bridge/config")[1]["chats"]], ["dm-1"])
+        for new in (None, account):
+            self.assertEqual(self.post("/ui/team/chat-apps", base_sha256=sha(), id="discord-studio", account=new)[0], 200)
+        config = self.bridge("/bridge/config")[1]
+        self.assertEqual(config["chats"], [])
+        self.assertIsNotNone(next(a for a in config["accounts"] if a["id"] == "discord-studio")["removed"])
+
+    def test_an_account_of_the_other_app_under_the_same_id_is_a_new_account(self):
+        def sha():
+            return self.request("/ui/team?db=test-generation")[1]["sha256"]
+        os.makedirs(hub.CFG["chat_apps_dir"], exist_ok=True)
+        token = os.path.join(hub.CFG["chat_apps_dir"], "discord-studio.json")
+        with open(token, "w") as f:
+            json.dump({"token": "x" * 60}, f)
+        self.bridge("/bridge/status", {"accounts": [{"id": "discord-studio", "state": "connected", "user": "4444",
+                                                     "name": "Fleet Studio", "application_id": "5555"}]})
+        number = {"app": "whatsapp", "label": "Studio", "agents": ["studio"], "unknown": "ignore"}
+        code, data = self.post("/ui/team/chat-apps", base_sha256=sha(), id="discord-studio", account=number)
+        self.assertEqual(code, 200, data)
+        self.assertFalse(os.path.exists(token))
+        self.assertIsNone(hub.q1("SELECT 1 FROM chat_status WHERE account='discord-studio'"),
+                          "the bot's report would read as a connected number")
+        entry = next(a for a in self.bridge("/bridge/config")[1]["accounts"] if a["id"] == "discord-studio")
+        self.assertEqual((entry["app"], entry["removed"]), ("whatsapp", hub.chat_removed()["discord-studio"]))
+        # A change that keeps the app (its label) is the same account.
+        before = hub.chat_removed()
+        code, data = self.post("/ui/team/chat-apps", base_sha256=sha(), id="discord-studio", account=dict(number, label="S"))
+        self.assertEqual((code, hub.chat_removed()), (200, before), data)
 
     def test_owner_views_of_the_accounts_and_the_whatsapp_link(self):
         self.own()
@@ -1178,8 +1311,11 @@ class ChatApps(OwnerAPI):
         hub.q("INSERT INTO chat_in(account,msg_id,chat,sender,result,created) VALUES('discord-studio','old','dm-old',"
               "'x','stored',?)", (hub.now() - 8 * 86400,))
         config = self.bridge("/bridge/config")[1]
-        self.assertEqual(config["accounts"], [{"id": "discord-studio", "app": "discord", "label": "Studio", "enabled": True},
-                                              {"id": "whatsapp-main", "app": "whatsapp", "label": "Fleet", "enabled": True}])
+        self.assertEqual(config["accounts"], [{"id": "discord-studio", "app": "discord", "label": "Studio", "enabled": True,
+                                               "removed": None},
+                                              {"id": "whatsapp-main", "app": "whatsapp", "label": "Fleet", "enabled": True,
+                                               "removed": None}])
+        self.assertEqual(config["removed"], [])         # no account ever left this fleet (CHAT-APPS.md 18.4)
         self.assertEqual(config["chats"], [{"account": "discord-studio", "chat": "dm-1", "last": "m2"}])
         self.assertEqual((config["db"], config["paused"]), ("test-generation", False))
 

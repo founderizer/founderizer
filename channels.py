@@ -56,6 +56,7 @@ INVALID_WAIT = (1.0, 5.0)   # Discord: wait this long after INVALID_SESSION
 SEND_TRIES = 3              # Discord: tries of one part with the same nonce when no answer comes
 WA_SEND_TIMEOUT = 25        # WhatsApp: wait this long for wa-link's "sent" event (4 parts stay under the hub's 120)
 WA_STABLE = 60              # a wa-link that ran this long starts its backoff again
+WA_LOGOUT_WAIT = 5          # WhatsApp: wait this long for wa-link to end the phone's link of a number that left the fleet
 CODE_CHECK = 60             # how often the bridge looks whether a release changed its own code
 
 # wa-link on the hub machine. The bridge builds it itself, so that no hub needs a step by hand: the first time a
@@ -557,6 +558,9 @@ class Account:
 
     def __init__(self, bridge, conf):
         self.bridge, self.id = bridge, conf["id"]
+        # When an account of this ID last left the fleet, as the hub gave it when this one started: another time later
+        # means that this account was removed and one was added again under its ID (Bridge.refresh).
+        self.removed = conf.get("removed")
         self.stopping = threading.Event()
         self.outbox = queue.Queue()
         self.user = self.name = self.application_id = None
@@ -571,6 +575,12 @@ class Account:
         self.outbox.put(None)
         self.typing.stop()
         self.halt()
+
+    def leave(self):
+        """The account left the fleet: what it does about that while it still runs, before its stop."""
+
+    def claim(self):
+        """Before its start: what an account of this ID left on the disk is not this account's."""
 
     def set_state(self, state, error=None):
         self.bridge.set_state(self, {"id": self.id, "state": state, "user": self.user, "name": self.name,
@@ -1130,6 +1140,31 @@ def own_code():
     return digest.hexdigest()
 
 
+STORE_MARK = ".account"     # beside a session <ID>.db: the removal time of its ID that the session was made under
+
+
+def removed_later(new, old):
+    """Whether the hub's time of an ID's last removal is later than the one that a session or an account was made
+    under. The hub's times only grow. An earlier time or none (a hub of an older release, a hub from a backup) is no
+    word that the account left, so nothing is deleted on it."""
+    return isinstance(new, (int, float)) and not isinstance(new, bool) and (old is None or new > old)
+
+
+def forget_store(folder, aid):
+    """Deletes the WhatsApp session of an account that left the fleet: wa-link's database <ID>.db, SQLite's files
+    beside it and the session's mark. True when a session file went."""
+    went = False
+    for suffix in ("", "-wal", "-shm", "-journal", STORE_MARK, STORE_MARK + ".tmp"):
+        try:
+            os.remove(os.path.join(folder, aid + ".db" + suffix))
+            went = went or not suffix.startswith(STORE_MARK)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log(f"account {aid}: its session file could not be removed ({type(e).__name__})")
+    return went
+
+
 class WhatsApp(Account):
     """One linked number: a wa-link child process that speaks JSON lines (CHAT-APPS.md 15.12)."""
     app = "whatsapp"
@@ -1151,6 +1186,55 @@ class WhatsApp(Account):
     def stop(self):
         super().stop()
         self.wake.set()
+
+    def leave(self):
+        """The number left the fleet: wa-link ends the phone's link (its logout also deletes its session). The bridge
+        deletes the session file after the stop in any case (forget_store), so a number that is added again under this
+        ID is linked by a new scan and never comes back by itself."""
+        if self.wa_state == "logged_out" or not self.command({"op": "logout"}):
+            return                  # no phone holds it, or no wa-link runs: there is no link to end
+        end = time.monotonic() + WA_LOGOUT_WAIT
+        while self.wa_state != "logged_out" and time.monotonic() < end:
+            time.sleep(0.05)
+        log(f"whatsapp {self.id}: " + ("the phone's link ended" if self.wa_state == "logged_out"
+                                       else "wa-link did not confirm the end of the phone's link"))
+
+    def claim(self):
+        """Before its start. A session file is of the account that made it: a file beside it keeps the hub's time of
+        the last removal of this ID as it was then (`removed`, null for none). A later time now means that the number
+        was removed and one was added again under its ID while no account of it ran here (the bridge was down, or the
+        number was off), so the session goes and the new number is linked by a new scan. Only a later time is the
+        hub's word (removed_later): on an earlier one, or on none, the session and its mark stay, and the account
+        counts from the mark's time. A session with no mark, or with a mark that is no time, is kept and marked."""
+        mark = self.db_path + STORE_MARK
+        try:
+            with open(mark, encoding="utf-8") as f:
+                text = f.read().strip()
+        except FileNotFoundError:
+            text = None
+        except OSError as e:
+            log(f"whatsapp {self.id}: its session's mark could not be read ({type(e).__name__})")
+            return
+        have, timed = None, False               # timed: the mark holds a time, or null for "no removal yet"
+        if text is not None:
+            try:
+                have = json.loads(text)
+                timed = have is None or (isinstance(have, (int, float)) and not isinstance(have, bool))
+            except ValueError:
+                pass
+        if timed:
+            if not removed_later(self.removed, have):
+                if have is not None:
+                    self.removed = have         # the session is of this time
+                return
+            if forget_store(self.bridge.folder, self.id):
+                log(f"whatsapp {self.id}: the session of the number that left the fleet is removed")
+        try:
+            with open(mark + ".tmp", "w", encoding="utf-8") as f:
+                f.write(json.dumps(self.removed) + "\n")
+            os.replace(mark + ".tmp", mark)
+        except OSError as e:
+            log(f"whatsapp {self.id}: its session's mark could not be written ({type(e).__name__})")
 
     def pause(self, seconds):
         """The wait between two tries to start wa-link. A link request or the stop ends it."""
@@ -1460,8 +1544,17 @@ class Bridge:
                 continue
             if conf.get("enabled", True) is not False:
                 want[aid] = conf
+        # The accounts that the hub saw leave the fleet (CHAT-APPS.md 18.4). Only its word ends a phone's link and
+        # deletes a session: an account that is turned off, or that a configuration only does not name, keeps both.
+        known = {str(conf.get("id") or "") for conf in config["accounts"] if isinstance(conf, dict)}
+        left = {aid for aid in config.get("removed") or [] if isinstance(aid, str) and ACCOUNT_ID.match(aid)} - known
         with self.lock:
-            stopped = [a for aid, a in self.accounts.items() if aid not in want or a.app != want[aid]["app"]]
+                # Removed and added again between two readings (also as an account of the other app): the hub's time of
+            # the removal is a later one now.
+            again = {aid for aid, a in self.accounts.items()
+                     if aid in want and removed_later(want[aid].get("removed"), a.removed)}
+            stopped = [a for aid, a in self.accounts.items()
+                       if aid not in want or a.app != want[aid]["app"] or aid in again]
             for account in stopped:
                 del self.accounts[account.id]
                 self.states.pop(account.id, None)
@@ -1470,9 +1563,19 @@ class Bridge:
                 self.accounts[account.id] = account
             self.configured, self.version = True, config.get("version")
         for account in stopped:
+            leaves = account.id in left or account.id in again
+            if leaves:
+                account.leave()
             account.stop()
             log(f"account {account.id}: stopped")
+            if leaves and forget_store(self.folder, account.id):
+                log(f"account {account.id}: its session file is removed")
+        # A session of an account that left while no account of it ran here (the bridge was down, or it was off).
+        for aid in sorted(left):
+            if forget_store(self.folder, aid):
+                log(f"account {aid}: its session file is removed")
         for account in started:
+            account.claim()
             account.start()
             log(f"account {account.id}: started ({account.app})")
         if stopped:

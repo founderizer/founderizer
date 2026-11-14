@@ -12471,10 +12471,22 @@ def chat_enabled(acc):
     return acc.get("enabled", True) is not False
 
 
+def chat_removed():
+    """{account ID: when the hub last saw that account leave team.json} (forget_removed_chat_accounts). An ID that
+    was added again keeps its time: the account that has it now is a new one since then."""
+    return {r["k"][len(CHAT_REMOVED):]: float(r["v"])
+            for r in read_rows("SELECT k, v FROM kv WHERE substr(k,1,?)=?", (len(CHAT_REMOVED), CHAT_REMOVED))}
+
+
 def chat_version(conf=None):
-    """The SHA-256 of the canonical chat_apps JSON (sorted keys, no spaces): the bridge reloads when it changes."""
+    """The SHA-256 of the canonical chat_apps JSON (sorted keys, no spaces): the bridge reloads when it changes. Each
+    removal's time counts too: an account that was removed and added again with the same fields is a new account, and
+    the bridge must read the hub's word of every account that left. The version of a fleet that never removed an
+    account stays what it was."""
     conf = chat_apps() if conf is None else conf
-    return hashlib.sha256(json.dumps(conf, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    marks = chat_removed()
+    return hashlib.sha256(json.dumps([conf, marks] if marks else conf, sort_keys=True,
+                                     separators=(",", ":")).encode()).hexdigest()
 
 
 def chat_paused():
@@ -13019,7 +13031,7 @@ def hide_code(result):
 
 def chat_accounts_view(t0):
     """GET /ui/chat-apps: each account with the bridge's last reading and today's counters."""
-    out = []
+    out, removed = [], chat_removed()
     for aid, acc in sorted(chat_apps().items()):
         st = q1("SELECT * FROM chat_status WHERE account=?", (aid,))
         link = q1("SELECT * FROM chat_link WHERE account=?", (aid,)) if acc["app"] == "whatsapp" else None
@@ -13035,20 +13047,70 @@ def chat_accounts_view(t0):
             "invite_url": f"https://discord.com/oauth2/authorize?client_id={app_id}&scope=bot&permissions=0"
             if discord and app_id else None,
             "status_at": st["at"] if st else None,
-            "last_event": q1("SELECT MAX(created) m FROM chat_in WHERE account=?", (aid,))["m"],
+            "last_event": q1("SELECT MAX(created) m FROM chat_in WHERE account=? AND created>?",
+                             (aid, removed.get(aid, 0)))["m"],
             "sent_today": chat_count(aid, "parts", t0), "ignored_today": chat_count(aid, "ignored", t0),
             "link": {"state": link["state"], "expires": link["expires"], "error": link["error"]} if link else None})
     return out
 
 
+CHAT_REMOVED = "chat_removed:"          # kv: when an account of this ID left team.json
+REMOVED_ACCOUNT = "The account was removed."
+
+
+def forget_removed_chat_accounts(ids, t0):
+    """Inside a transaction: what the hub holds of a chat app account that left team.json, and that an account added
+    again under its ID must not inherit (CHAT-APPS.md 18.4; the owner's "Yes, fix it" of 14 November 2026). A number
+    that the owner removed and connected again read the old account's "connected", its number and its link until the
+    bridge reported the new one. So the bridge's last report, the WhatsApp link and the list of who wrote and was not
+    answered go, each item that still waits for the bridge ends (it would go out through the new account), and the
+    time goes into kv: `last_event` and the Discord catch-up count no message before it, and the bridge reads it
+    (bridge_config), ends the phone's link and deletes the number's session. The messages stay: they are the history,
+    and they keep a message that the app delivers again from being taken a second time (chat_in). The counters of the
+    day stay too. Only a caller whose own change removed the account names it (apply_team)."""
+    in_transaction("forget_removed_chat_accounts")
+    for aid in ids:
+        DB.execute("DELETE FROM chat_status WHERE account=?", (aid,))
+        DB.execute("DELETE FROM chat_link WHERE account=?", (aid,))
+        DB.execute("DELETE FROM chat_ignored WHERE account=?", (aid,))
+        DB.execute("UPDATE chat_out SET state='failed', error=?, updated=? WHERE account=? AND state='queued' AND "
+                   "kind='message'", (REMOVED_ACCOUNT, t0, aid))
+        DB.execute("UPDATE chat_out SET state='expired', updated=? WHERE account=? AND state='queued'", (t0, aid))
+        DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                   (CHAT_REMOVED + aid, repr(t0)))
+
+
+def forget_chat_token(aid):
+    """The Discord token file of an account that left team.json (ui_chat_token writes it): the token of a bot that
+    the owner removed does not stay on the hub's disk, and a bot added again under that ID asks for its token. The
+    token's fingerprint stays, so guard still refuses it in every text. True when a file went."""
+    folder = CFG.get("chat_apps_dir")
+    if not folder:              # a hub with no chat apps folder keeps no token
+        return False
+    try:
+        os.remove(os.path.join(folder, aid + ".json"))
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        log("hub", f"could not remove the Discord token file of the removed account {aid} ({type(e).__name__})")
+        return False
+    return True
+
+
 def save_chat_app(body):
     """POST /ui/team/chat-apps: create, replace or remove (account null) one chat app account in team.json."""
     aid, account = body["id"], body["account"]
+    left = []
 
     def change(team):
         conf = dict(team.get("chat_apps") or {})
         if conf.get(aid) == account:
             return False
+        was = conf.get(aid)
+        # The account leaves the fleet, or an account of the other app takes its ID: what the hub and the bridge hold
+        # of it is not the new account's (apply_team).
+        if isinstance(was, dict) and (account is None or account.get("app") != was.get("app")):
+            left.append(aid)
         if account is None:
             conf.pop(aid)
         else:
@@ -13059,7 +13121,7 @@ def save_chat_app(body):
             team.pop("chat_apps", None)
         return True
     done = "removed" if account is None else "changed"
-    result = save_integration(body["base_sha256"], change, f"Owner {done} the chat app account {aid}")
+    result = save_integration(body["base_sha256"], change, f"Owner {done} the chat app account {aid}", left=left)
     return dict(result, id=aid, account=account)
 
 
@@ -34374,12 +34436,28 @@ def forget_removed_agents(names, t0):
     return forgot
 
 
-def apply_team(new):
+def apply_team(new, left=()):
+    """The team that the hub runs from now on. left: the chat app account IDs that the caller's own change took out of
+    the fleet (save_chat_app, remove_agent), which the hub then forgets (forget_removed_chat_accounts, CHAT-APPS.md
+    18.4). Only the owner's own removal names one: a team that only does not name an account that the hub ran (a reload
+    of another revision of team.json) ends no phone's link and deletes no token."""
     was_v2 = contacts_v2()
     gone = [name for name in agents() if name not in new["agents"]]
-    TEAM.update(new)                                 # one key at a time: readers never see an empty team
-    for key in [k for k in TEAM if k not in new]:
-        del TEAM[key]
+    left = sorted(set(left))
+    # Under LOCK, with which the bridge reads its configuration: it never reads an account gone without the hub's word
+    # that it left. A fault of the forgetting does not stop the rest: the team is applied in any case.
+    with LOCK:
+        TEAM.update(new)                             # one key at a time: readers never see an empty team
+        for key in [k for k in TEAM if k not in new]:
+            del TEAM[key]
+        if left:
+            try:
+                with transaction():
+                    forget_removed_chat_accounts(left, now())
+            except Exception as e:
+                log("hub", f"could not forget the chat app account(s) {', '.join(left)}, which left the team "
+                           f"({type(e).__name__})")
+                left = []
     CFG["team_problem"] = team_problem(TEAM)    # a write that validates takes the startup reading off the board
     for name in new["agents"]:
         know(name)
@@ -34389,6 +34467,11 @@ def apply_team(new):
         if forgot:
             log("hub", f"forgot the key, the machine reading and the default-access marks of {', '.join(forgot)}, which "
                        f"left the team")
+    if left:
+        tokens = [aid for aid in left if forget_chat_token(aid)]
+        log("hub", f"forgot the bridge's report, the link and the waiting items of the chat app account(s) "
+                   f"{', '.join(left)}, which left the team" +
+                   (f", and removed the Discord token file of {', '.join(tokens)}" if tokens else ""))
     rev = kit_revision(fresh=True)
     # Every machine runs team.json from its own checkout and same_code counts it, so a write about one agent changes
     # what each machine should run: each one that reports is asked to follow, or it stands "behind" (Update available)
@@ -36856,7 +36939,8 @@ def remove_agent(agent, body):
                                                   f"still needed.", None)], t0)
         log_row("owner", f"deleted agent {agent} in {commit[:12]}" + (f": server {server} removes it, job {job}"
                                                                        if job else ""))
-    apply_team(new)
+    # its own chat app accounts left the fleet with it (removed_team): the hub and the bridge forget them
+    apply_team(new, left=[aid for aid in (team.get("chat_apps") or {}) if aid not in (new.get("chat_apps") or {})])
     if job is None:
         with transaction():
             free_name(agent)            # no server holds anything of it
@@ -38470,11 +38554,12 @@ def save_mcp(body):
     return dict(result, name=name, deleted=deleting, server=None if deleting else entry)
 
 
-def save_integration(base, change, message, by="owner"):
+def save_integration(base, change, message, by="owner", left=()):
     """One owner change of the agents' repos or tools: change(team) edits team.json at the hub revision and says
     whether anything changed. Checked, committed through the hub and applied at once: each next task session of an
     agent gets it from the hub at its start. base None: the revision that the hub has now, for a write that changes one
-    entry and can never undo another one (the manager's grant_access). by: who the hub logs it under."""
+    entry and can never undo another one (the manager's grant_access). by: who the hub logs it under. left: the chat
+    app account IDs that change() takes out of the fleet, read after it ran (apply_team)."""
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     if base is not None and base != current:
@@ -38487,7 +38572,7 @@ def save_integration(base, change, message, by="owner"):
         raise Refusal(400, str(e)) from None
     data = (json.dumps(team, indent=2) + "\n").encode()
     commit = commit_kit_file("team.json", data, message)
-    apply_team(team)
+    apply_team(team, left=left)
     log(by, f"{message} in {commit[:12]}")
     return {"revision": commit, "sha256": hashlib.sha256(data).hexdigest(), "changed": True}
 
@@ -46992,18 +47077,28 @@ class Handler(BaseHTTPRequestHandler):
         return data
 
     def bridge_config(self):
-        """GET /bridge/config: the accounts, Pause all, the version, and the Discord chats of the last 7 days."""
+        """GET /bridge/config: the accounts, the IDs that left the fleet, Pause all, the version, and the Discord chats
+        of the last 7 days."""
         if not self.bridge_allowed():
             return
         with LOCK:
             conf = chat_apps()
             discord = sorted(aid for aid, acc in conf.items() if acc["app"] == "discord")
-            rows = q(f"SELECT account, chat, msg_id FROM chat_in WHERE id IN (SELECT MAX(id) FROM chat_in WHERE created>? AND "
-                     f"account IN ({','.join('?' * len(discord))}) GROUP BY account, chat) ORDER BY id",
+            rows = q(f"SELECT account, chat, msg_id, created FROM chat_in WHERE id IN (SELECT MAX(id) FROM chat_in WHERE "
+                     f"created>? AND account IN ({','.join('?' * len(discord))}) GROUP BY account, chat) ORDER BY id",
                      (now() - 7 * 86400, *discord)) if discord else []
+            removed = chat_removed()
+            # A chat whose last message is from before an account of this ID left is the old bot's: the new bot does
+            # not catch up on it.
+            rows = [r for r in rows if r["created"] > removed.get(r["account"], 0)]
+            # `removed` of an account: when an account of its ID last left the fleet (null: never). The list `removed`:
+            # the IDs that left and that no account has now. The bridge ends the phone's link and deletes the session
+            # of each one, and of an account whose `removed` changed under it (CHAT-APPS.md 18.4).
             result = {"db": kv_get("db_id"), "paused": chat_paused(), "version": chat_version(conf),
-                      "accounts": [{"id": aid, "app": acc["app"], "label": acc["label"], "enabled": chat_enabled(acc)}
+                      "accounts": [{"id": aid, "app": acc["app"], "label": acc["label"], "enabled": chat_enabled(acc),
+                                    "removed": removed.get(aid)}
                                    for aid, acc in sorted(conf.items())],
+                      "removed": sorted(aid for aid in removed if aid not in conf),
                       "chats": [{"account": r["account"], "chat": r["chat"], "last": r["msg_id"]} for r in rows]}
         return self.json(200, result, {"Cache-Control": "no-store"})
 

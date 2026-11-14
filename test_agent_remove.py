@@ -110,6 +110,8 @@ class Remove(Servers):
         after = self.origin_team()
         self.assertNotIn("scout", after["agents"])
         self.assertEqual(list(after["chat_apps"]), ["wa2"])            # its own account goes, vps's stays
+        # ... and the hub forgets what it held of that account, and tells the bridge (CHAT-APPS.md 18.4)
+        self.assertEqual(list(hub.chat_removed()), ["wa1"])
         self.assertEqual(after["agents"]["vps"], team["agents"]["vps"])
         files = git("--git-dir", str(self.root / "origin.git"), "ls-tree", "-r", "--name-only", "main").split()
         self.assertNotIn("profiles/scout.md", files)

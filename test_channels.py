@@ -496,7 +496,7 @@ def wait_for(test, check, what, timeout=5.0):
 
 
 TIMINGS = dict(OUT_WAIT=1, STATUS_EVERY=0.5, TYPING_EVERY=0.1, BACKOFF_FIRST=0.02, BACKOFF_MAX=0.1, TOKEN_POLL=0.05,
-               INVALID_WAIT=(0.01, 0.02), WA_SEND_TIMEOUT=1.0)
+               INVALID_WAIT=(0.01, 0.02), WA_SEND_TIMEOUT=1.0, WA_LOGOUT_WAIT=1.0)
 
 
 # ---------------------------------------------------------------- the test base
@@ -1014,6 +1014,130 @@ class WhatsAppTests(Base):
         self.wait_for(lambda: self.has_state("whatsapp-main", "logged_out"), "logged_out")
         self.wait_for(lambda: self.hub.links and self.hub.links[-1]["state"] == "logged_out", "the link report")
         self.assertEqual(self.has_state("whatsapp-main", "logged_out")[-1]["user"], None)
+
+    # CHAT-APPS.md 18.4: a number that left the fleet takes its phone's link and its session with it.
+
+    def session(self, aid="whatsapp-main"):
+        return os.path.join(self.folder, aid + ".db")
+
+    def stops(self):
+        return self.log.getvalue().count("account whatsapp-main: stopped")
+
+    def test_a_number_that_left_the_fleet_is_logged_out_and_its_session_goes(self):
+        self.linked()
+        self.hub.config.update(accounts=[], removed=["whatsapp-main"], version="v2")
+        self.wait_for(lambda: self.commands("logout"), "wa-link's logout")
+        self.wait_for(self.stops, "the stop")
+        self.wait_for(lambda: not os.path.exists(self.session()), "the session file gone")
+        self.assertIn("whatsapp whatsapp-main: the phone's link ended", self.log.getvalue())
+        self.assertEqual(len(self.commands("start")), 1, "nothing starts it again")
+
+    def test_a_number_that_is_turned_off_or_that_a_configuration_only_does_not_name_keeps_its_session(self):
+        self.linked()
+        self.hub.config.update(accounts=[dict(WHATSAPP, enabled=False)], version="v2")
+        self.wait_for(self.stops, "the stop of a number that is turned off")
+        self.assertTrue(os.path.exists(self.session()))
+        self.hub.config.update(accounts=[WHATSAPP], version="v3")
+        self.wait_for(lambda: len(self.commands("start")) == 2, "wa-link of the number that is on again")
+        # No word of the hub that it left the fleet (an older hub, or a fault): the bridge only stops it.
+        self.hub.config.update(accounts=[], version="v4")
+        self.wait_for(lambda: self.stops() == 2, "the second stop")
+        self.assertTrue(os.path.exists(self.session()))
+        self.assertEqual(self.commands("logout"), [])
+
+    def test_a_number_removed_and_added_again_between_two_readings_starts_with_no_session(self):
+        self.linked()
+        self.hub.config.update(accounts=[dict(WHATSAPP, removed=1700000000.5)], version="v2")
+        self.wait_for(lambda: self.commands("logout"), "the logout of the number that was removed")
+        self.wait_for(lambda: len(self.commands("start")) == 2, "wa-link of the new account")
+        self.wait_for(lambda: self.has_state("whatsapp-main", "logged_out"), "the new account has no phone")
+        self.assertFalse(os.path.exists(self.session()))
+        # The same time at the next reading is the same account: it runs on.
+        reads = self.config_reads()
+        self.hub.config.update(version="v3")
+        self.wait_for(lambda: self.config_reads() > reads, "one more reading of the configuration")
+        self.assertEqual((len(self.commands("start")), len(self.commands("logout")), self.stops()), (2, 1, 1))
+
+    def test_a_session_of_a_number_that_left_while_no_bridge_ran_goes_at_the_first_reading(self):
+        for name in ("whatsapp-old.db", "whatsapp-old.db-wal", "whatsapp-kept.db"):
+            open(os.path.join(self.folder, name), "w").close()
+        outside = os.path.join(self.tmp.name, "outside.db")
+        open(outside, "w").close()
+        self.hub.config["removed"] = ["whatsapp-old", "../outside", 7, "whatsapp-main"]
+        self.linked()               # it is in the accounts, so the hub's list cannot remove it
+        self.wait_for(lambda: not os.path.exists(self.session("whatsapp-old")), "the old session gone")
+        self.assertFalse(os.path.exists(self.session("whatsapp-old") + "-wal"))
+        self.assertTrue(os.path.exists(self.session("whatsapp-kept")), "the hub said nothing of this one")
+        self.assertTrue(os.path.exists(outside), "an ID is never a path")
+        self.assertTrue(os.path.exists(self.session()))
+        self.assertEqual(self.commands("logout"), [])
+
+    def mark(self, text=None):
+        """The mark beside the number's session: written with `text`, or read."""
+        path = self.session() + channels.STORE_MARK
+        if text is None:
+            with open(path) as f:
+                return f.read().strip()
+        with open(path, "w") as f:
+            f.write(text + "\n")
+
+    def test_a_number_removed_and_added_again_while_no_bridge_ran_starts_with_no_session(self):
+        self.link_db()
+        self.mark("null")                       # the session was made before any account of this ID left
+        self.hub.config["accounts"] = [dict(WHATSAPP, removed=1700000000.5)]
+        self.start()
+        self.wait_for(lambda: self.has_state("whatsapp-main", "logged_out"), "the new number has no phone")
+        self.assertFalse(os.path.exists(self.session()))
+        self.assertEqual((self.mark(), self.commands("logout")), ("1700000000.5", []))
+        self.assertIn("the session of the number that left the fleet is removed", self.log.getvalue())
+
+    def test_a_session_whose_mark_agrees_or_that_has_none_stays(self):
+        self.link_db()                          # a session from before the marks: it is this account's
+        self.hub.config["accounts"] = [dict(WHATSAPP, removed=1700000000.5)]
+        self.start()
+        self.wait_for(lambda: self.has_state("whatsapp-main", "connected"), "the linked state")
+        self.assertTrue(os.path.exists(self.session()))
+        self.assertEqual(self.mark(), "1700000000.5")
+        # Turned off and on again: the mark agrees now, and the session stays.
+        self.hub.config.update(accounts=[dict(WHATSAPP, removed=1700000000.5, enabled=False)], version="v2")
+        self.wait_for(self.stops, "the stop")
+        self.hub.config.update(accounts=[dict(WHATSAPP, removed=1700000000.5)], version="v3")
+        self.wait_for(lambda: len(self.commands("start")) == 2, "wa-link started again")
+        self.assertTrue(os.path.exists(self.session()))
+        self.assertEqual(self.commands("logout"), [])
+
+    def keeps(self, told):
+        """A session of the time 1700000000.5 with what the hub tells now: it stays. Then a later time is the hub's
+        word, and the account counted from its session's time."""
+        self.link_db()
+        self.mark("1700000000.5")
+        self.hub.config["accounts"] = [dict(WHATSAPP) if told is None else dict(WHATSAPP, removed=told)]
+        self.start()
+        self.wait_for(lambda: self.has_state("whatsapp-main", "connected"), "the linked state")
+        self.assertTrue(os.path.exists(self.session()))
+        self.assertEqual((self.mark(), self.commands("logout")), ("1700000000.5", []))
+        self.hub.config.update(accounts=[dict(WHATSAPP, removed=1800000000.25)], version="v2")
+        self.wait_for(lambda: self.commands("logout"), "the logout at a later time")
+        self.wait_for(lambda: len(self.commands("start")) == 2, "wa-link of the new account")
+        self.wait_for(lambda: self.has_state("whatsapp-main", "logged_out"), "the new account has no phone")
+        self.assertEqual(self.mark(), "1800000000.25")
+
+    def test_no_time_from_the_hub_deletes_no_session(self):
+        """A hub of the release before this rule names no time."""
+        self.keeps(None)
+
+    def test_an_earlier_time_from_the_hub_deletes_no_session(self):
+        """A hub from a backup can name an earlier time than the session's."""
+        self.keeps(1600000000.0)
+
+    def test_a_mark_that_is_no_time_keeps_the_session_and_is_written_again(self):
+        self.link_db()
+        self.mark("not a time")
+        self.hub.config["accounts"] = [dict(WHATSAPP, removed=1700000000.5)]
+        self.start()
+        self.wait_for(lambda: self.has_state("whatsapp-main", "connected"), "the linked state")
+        self.assertTrue(os.path.exists(self.session()))
+        self.assertEqual((self.mark(), self.commands("logout")), ("1700000000.5", []))
 
     def test_wa_link_restarts_after_a_crash(self):
         self.linked()
