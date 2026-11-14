@@ -230,7 +230,8 @@ NOT_TOOLS = {
     "/ui/door/github-app": "the ID of a GitHub App that the app made with GitHub's manifest flow, whose key the door "
                            "holds",
     "/ui/door/host": "the app's own word about the door's parts on one server, which its round writes by itself",
-    "/ui/chat-apps/{}/token": "a Discord bot token",
+    "/ui/chat-apps/{}/token": "a Discord bot token; the app's program has save_bot_token, which reads the token "
+                              "from a file or a pipe on this Mac and never as a field",
     "/ui/google/connect": "Google's client secret, and a browser flow of the owner's own",
     "/ui/google/finish": "the authorization code of that flow",
     "/ui/mcp/connect": "an MCP server's OAuth client, and a browser flow of the owner's own",
@@ -2063,7 +2064,8 @@ def tools():
              plain("/ui/mcp/disconnect", ("name",), "the disconnection of this MCP server")),
         tool("save_chat_account", "One chat app account of the fleet: {app, label, agents, unknown, enabled}, or "
                                   "account null to remove it. This is the account and not its sign-in: a Discord "
-                                  "bot token is the owner's own, in the app.",
+                                  "bot token is never a field; the app's program takes it from a file or a pipe on "
+                                  "this Mac (save_bot_token), or the owner pastes it in the app.",
              {"id": S["text"], "account": {"type": ["object", "null"]}, **rid}, ("id", "account"),
              with_base("/ui/team/chat-apps", ("id", "account"), "this chat app account")),
         tool("attach_file", "Send one file of this Mac to the hub, so a message can carry it. Give the id it "

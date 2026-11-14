@@ -140,7 +140,7 @@ mistake is sent by neither verb. `call` leaves out one page of `fleet_read`, `ch
 links a WhatsApp account to the fleet: the owner reads that QR in the app, and `call` says so.
 Since 14 November 2026 `call` also takes the two setup tools, `setup_state` and `setup_show`, by
 name (below, "The link to the running app"). `write` takes each other tool that the
-program has: the nine below and the 54 of the table. A read through `write` is refused, and a write
+program has: the nine below, the 54 of the table, and `save_bot_token` on the link. A read through `write` is refused, and a write
 through `call` is refused, each with words that name the right verb; a tool that the program does
 not have gets the words of the MCP form. The JSON is one word of the shell, an object of the tool's
 fields; none means `{}`.
@@ -187,7 +187,8 @@ file can name a `swift` tool that an older program does not have: that program r
 own pages do that work and its own setting says which hub it reads: `install_hub`, `install_log`,
 `claim_hub`, `add_machine`, `use_hub` and `which_hub`. Two more are the program's own and are not
 in the table or in this server: `setup_state` and `setup_show`, on the link to the running app
-(below). So `tools/list` gives 69 tools: the 54 of the table, the thirteen and the two.
+(below). A third, `save_bot_token`, writes on the same link (below). So `tools/list` gives 70
+tools: the 54 of the table, the thirteen, the two and the one.
 
 **The link to the running app.** Some work only the running app can do: its first run, its pages,
 and in later slices its keys and its engine. So the program asks the app on a local socket, the
@@ -202,7 +203,9 @@ link, which the app listens on while it runs (`OwnerChannel.swift` in `FleetOwne
 - **The wire:** one request and one answer for each connection, each one line of JSON with the
   link's version (`"v": 1`). The request names the program's set (`"set": "owner"`), one tool of the
   link and its fields; the answer is `"result"` or `"refused"` with words. A request of another
-  version, set or tool is refused in words, and a later tool is one more entry of the same link.
+  version, set or tool is refused in words, and a later tool is one more entry of the same link. A
+  tool that takes a value (`save_bot_token`) gets it as a value part, never in the line: the line's
+  envelope says `"value_bytes": N`, and exactly N bytes, at most 64 KiB, follow its line end.
 - **Each side checks the other by its code signature**, from the socket's peer: the peer's audit
   token (`LOCAL_PEERTOKEN`), the Security framework's guest lookup by that token, and a requirement.
   In a release build that requirement is a Developer ID of the same team as the checking side's own
@@ -298,6 +301,20 @@ of the request, after each `setup_show` that the app took, and `founderizer-cli 
 same after its sign to the app. On a test Mac on 14 November 2026 (macOS 26.6, Terminal in front)
 the app's own activate left Terminal in front 5 times of 5, and `open` from another process brought
 the app to the front 3 times of 3.
+
+**`save_bot_token`** (a write, so `founderizer-cli write` and the MCP form take it, and `call` does
+not): a Discord bot's token to the hub, as the app's own Discord page sends it, or its delete. Its
+fields are `account` (a Discord chat account that the fleet has already: the tool makes none),
+`from` (`file` with `path`, or `stdin`), `replace` and `delete`. A save for a bot that the
+bridge reports as connected now needs `replace` true; in every other state a save replaces what is
+there, and `replaced` says so. The token is never a field and never a word of
+the command line: the program reads it from the file, or from its standard input as a pipe of a
+program (only with `write`; the MCP form refuses `stdin`, because its standard input is the
+protocol), and sends it to the app as a value part after the request line, 64 KiB at most, with no
+`path`. The app checks the token itself and sends it only while its reading of the fleet is current.
+It answers `account`, `set` and `replaced` (null when the hub does not say), never the token. No command lock: the app does the
+write, as its page does. The value part and what any process of the owner's user can do with the
+tool: OWNER-MCP-BOUNDARY.md section 7b.
 
 **The file tools, in both programs.** `attach_file` sends at most 25 MiB (the hub's
 `ATTACH_MAX`), with its request id and the file's name as headers (`X-Fleet-Request-Id`,
