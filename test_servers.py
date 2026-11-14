@@ -2015,6 +2015,183 @@ class ServerService(Servers):
         svc.loop(rounds=1)
         self.assertEqual(slept, [600])
 
+    # ---- a program that the fleet downloads at its pin: Grok Build, OpenCode (the AI providers build, lane C)
+    def pinned_job(self, svc, runtime="opencode", sign_in="none"):
+        """The job of an agent whose program the fleet downloads at its pin. Today's hub gives none (lane B2 of the
+        AI providers build makes it), so the job of a Claude agent stands in for it, with the runtime and the sign_in
+        field that such a job has."""
+        job = self.add_agent()[1]["job"]
+        hub.q("UPDATE server_jobs SET runtime=? WHERE id=?", (runtime, job))
+        status, answer = svc.hub.call("GET", "/server/mini/jobs")
+        self.assertEqual((status, [j["id"] for j in answer.get("jobs") or []]), (200, [job]), answer)
+        return dict(answer["jobs"][0], **({"sign_in": sign_in} if sign_in else {}))
+
+    def pinned_machine(self, svc, to_hub=True):
+        """The machine of a pinned program: `fleet.py install-pinned`, as the agent in its checkout, takes the next
+        answer of self.downloads, (code, out, err), and with none left it puts a program at the pin's path in the
+        agent's real home of this test, mode 755, and prints that path. The look for that program runs for real.
+        Returns each post of the job, (state, step, detail), in its order; they reach the hub only with to_hub."""
+        self.downloads, run, posted, post = [], svc.run, [], svc.post
+
+        def machine(argv, cwd=None, timeout=120, env=None):
+            user, folder, inner = self.becomes(argv)
+            if inner[:3] == ["/bin/sh", "-c", '[ -f "$1" ] && [ -x "$1" ]'] or inner[:4] == ["mkdir", "-p", "-m", "700"]:
+                return self.mod.Service.command(inner, timeout=timeout)
+            if inner[1:3] == ["fleet.py", "install-pinned"]:
+                self.commands.append((inner, folder or cwd, user))
+                self.assertEqual(timeout, 900)
+                if self.downloads:
+                    return self.downloads.pop(0)
+                program = Path(self.mod.lifecycle.pinned_path(inner[3], self.made[user]))
+                program.parent.mkdir(parents=True, exist_ok=True)
+                program.write_text("#!/bin/sh\n")
+                program.chmod(0o755)
+                return 0, f"{program}\n", ""
+            return run(argv, cwd=cwd, timeout=timeout, env=env)
+
+        def record(job, state, step, detail, **kwargs):
+            posted.append((state, step, detail))
+            return post(job, state, step, detail, **kwargs) if to_hub else 200
+        svc.run, svc.post = machine, record
+        return posted
+
+    def test_a_pinned_program_comes_from_the_agents_own_checkout_and_needs_no_sign_in(self):
+        self.join_by_script(self.code()["code"])
+        svc = self.service()
+        posted = self.pinned_machine(svc)
+        job = self.pinned_job(svc)
+        svc.work(job)
+        shown = self.servers()[1]["mini"]["job"]
+        self.assertEqual((shown["state"], shown["step"], shown["detail"]),
+                         ("done", "sign_in", "Scout runs on mini. Open it to finish its setup."))
+        # the checkout comes before the runtime, because fleet.py of that checkout downloads it; no sign-in step
+        self.assertEqual([step for _state, step, _detail in posted],
+                         ["user", "checkout", "runtime", "runtime", "service", "sign_in"])
+        self.assertEqual([detail for _state, step, detail in posted if step == "runtime"],
+                         ["Looking for OpenCode.", "Installing OpenCode."])
+        folder, program = str(self.checkout_of()), self.mod.lifecycle.pinned_path("opencode", self.made["fleet-scout"])
+        self.assertEqual(program, f"{self.homes}/fleet-scout/.fleet/runtimes/opencode-"
+                                  f"{self.mod.onboard.PINNED['opencode']['version']}/opencode")
+        ran = [(argv[1:] if argv[0] == sys.executable else argv, cwd, user) for argv, cwd, user in self.commands]
+        self.assertEqual(ran, [(["fleet.py", "install-pinned", "opencode"], folder, "fleet-scout"),
+                               (["fleet.py", "key", "scout"], folder, "fleet-scout"),
+                               (["fleet.py", "service", "scout"], folder, "fleet-scout"),
+                               (["systemctl", "--user", "enable", "--now", "fleet-scout.service"], None, "fleet-scout"),
+                               (["-c", self.mod.PINNED_ANSWERS, "opencode", program], folder, "fleet-scout")])
+        self.assertEqual(oct(os.stat(program).st_mode & 0o777), "0o755")
+        self.assertEqual(oct(os.stat(Path(self.made["fleet-scout"]) / ".fleet").st_mode & 0o777), "0o700")
+        # the same job again with no sign_in field: the program that is there is taken with no download, and a
+        # runtime with no sign-in of its own has no such step either
+        self.commands.clear()
+        posted.clear()
+        hub.q("UPDATE server_jobs SET state='running' WHERE id=?", (job["id"],))
+        svc.work({k: v for k, v in job.items() if k != "sign_in"})
+        self.assertEqual(self.servers()[1]["mini"]["job"]["state"], "done")
+        self.assertEqual([step for _state, step, _detail in posted], ["user", "checkout", "runtime", "service", "sign_in"])
+        self.assertEqual([argv[1:3] for argv, _cwd, _user in self.commands if argv[0] == sys.executable],
+                         [["fleet.py", "key"], ["fleet.py", "service"], ["-c", self.mod.PINNED_ANSWERS]])
+
+    def test_a_program_of_that_name_on_a_path_is_never_taken(self):
+        self.join_by_script(self.code()["code"])
+        self.present = {"claude", "codex", "grok", "opencode"}      # each one answers `command -v`, in ~/.local/bin
+        svc = self.service()
+        self.pinned_machine(svc)
+        self.agent_user_made("fleet-scout")
+        home = self.made["fleet-scout"]
+        self.assertIsNone(svc.agent_exe("opencode", "fleet-scout"))
+        self.assertIsNone(svc.agent_exe("grok", "fleet-scout"))
+        self.assertEqual(svc.agent_exe("codex", "fleet-scout"), f"{home}/.local/bin/codex")       # as before
+        program = Path(self.mod.lifecycle.pinned_path("grok", home))
+        program.parent.mkdir(parents=True)
+        program.write_text("#!/bin/sh\n")
+        program.chmod(0o644)
+        self.assertIsNone(svc.agent_exe("grok", "fleet-scout"))             # there, but it cannot run
+        program.chmod(0o755)
+        self.assertEqual(svc.agent_exe("grok", "fleet-scout"), str(program))
+        # this service's own user (an agent from before the move): its own ~/.local/bin is no pin either
+        (self.home / ".local" / "bin").mkdir(parents=True)
+        (self.home / ".local" / "bin" / "opencode").write_text("#!/bin/sh\n")
+        (self.home / ".local" / "bin" / "opencode").chmod(0o755)
+        self.assertIsNone(svc.agent_exe("opencode"))
+        # and the install downloads the pinned program although the agent's PATH has one of that name
+        svc.work(self.pinned_job(svc))
+        self.assertEqual(self.servers()[1]["mini"]["job"]["state"], "done")
+        self.assertEqual([argv[1:] for argv, _cwd, _user in self.commands if argv[1:3] == ["fleet.py", "install-pinned"]],
+                         [["fleet.py", "install-pinned", "opencode"]])
+
+    def test_a_download_that_could_not_reach_the_internet_is_tried_again_and_no_other_failure_is(self):
+        self.join_by_script(self.code()["code"])
+        svc = self.service()
+        posted = self.pinned_machine(svc, to_hub=False)
+        self.agent_user_made("fleet-scout")
+        offline = (1, "", "fleet: OpenCode 2.2.5 could not be downloaded (registry.npmjs.org: URLError)\n")
+        job = {"id": 7, "kind": "install", "agent": "scout", "runtime": "opencode", "sign_in": "none"}
+        again = "OpenCode did not install. Try again."
+        for downloads, tries, words in (
+                ([offline], 2, None),
+                ([offline] * 4, 4, "OpenCode did not install: mini could not reach the internet. Try again when it can."),
+                ([(1, "", "fleet: OpenCode 2.2.5 could not be downloaded (registry.npmjs.org: HTTPError; "
+                          "registry.npmjs.org: TimeoutError)\n")] * 4, 4,
+                 "OpenCode did not install: mini could not reach the internet. Try again when it can."),
+                ([(1, "", "fleet: the download of OpenCode 2.2.5 does not match the digest of its pin\n")], 1, again),
+                ([(1, "", "fleet: OpenCode 2.2.5 could not be downloaded (registry.npmjs.org: HTTPError)\n")], 1, again),
+                ([(1, "", "fleet: OpenCode was not installed: OSError\n")], 1, again),
+                ([(0, "/usr/local/bin/opencode\n", "")], 1, again)):        # a path that is not the pin's
+            shutil.rmtree(Path(self.made["fleet-scout"]) / ".fleet", ignore_errors=True)
+            self.commands.clear()
+            posted.clear()
+            self.downloads[:] = downloads
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                try:
+                    said, exe = None, svc.runtime_step(job, "opencode", "fleet-scout")
+                except self.mod.StepFailed as e:
+                    said, exe = (e.step, str(e)), None
+            self.assertEqual(len(self.commands), tries, downloads)
+            self.assertEqual(said, words and ("runtime", words), downloads)
+            self.assertEqual(exe, None if words else self.mod.lifecycle.pinned_path("opencode", self.made["fleet-scout"]))
+            self.assertEqual(posted, [("running", "runtime", "Looking for OpenCode.")] +
+                             [("running", "runtime", "Installing OpenCode.")] * tries)
+            # the program's own words are in this service's log, once for each try, and never in the job's line
+            self.assertEqual(log.getvalue().count("job 7: OpenCode 2.2.5 did not install (try "), len(downloads[:tries]))
+            self.assertIn(downloads[0][2].strip() or downloads[0][1].strip(), log.getvalue())
+
+    def test_a_program_that_does_not_answer_initialize_fails_the_job_at_its_runtime_step(self):
+        self.join_by_script(self.code()["code"])
+        svc = self.service(answers={" ".join([sys.executable, "-c", self.mod.PINNED_ANSWERS]):
+                                    (1, "", "the program gave no model list: TimeoutError\n")})
+        posted = self.pinned_machine(svc)
+        with contextlib.redirect_stderr(io.StringIO()) as log:
+            svc.work(self.pinned_job(svc, "grok"))
+        shown = self.servers()[1]["mini"]["job"]
+        self.assertEqual((shown["state"], shown["step"], shown["detail"]),
+                         ("failed", "runtime", "Grok did not install. Try again."))
+        program = self.mod.lifecycle.pinned_path("grok", self.made["fleet-scout"])
+        self.assertIn(f"runtime: Grok at {program} did not answer initialize: the program gave no model list: "
+                      f"TimeoutError", log.getvalue())
+        self.assertEqual([step for _state, step, _detail in posted],
+                         ["user", "checkout", "runtime", "runtime", "service", "runtime"])
+
+    def test_a_mac_makes_nothing_for_a_pinned_program(self):
+        """The pins are Linux programs: the hub gives such a job to a Linux server only, and a Mac fails it before
+        any step."""
+        self.join_by_script(self.code()["code"])
+        svc = self.service(platform="darwin")
+        posted = self.pinned_machine(svc)
+        with contextlib.redirect_stderr(io.StringIO()):
+            svc.work(self.pinned_job(svc))
+        self.assertEqual(posted, [("failed", "runtime", "OpenCode did not install. Try again.")])
+        self.assertEqual((self.commands, self.made), ([], {}))
+        self.assertFalse((self.home / "fleet-scout").exists())
+
+    def test_the_reading_says_that_this_service_installs_an_agent_of_a_model_account(self):
+        """The hub refuses an agent of a model account on a server whose reading lacks the word (spec 3.10): its
+        service would run that agent's sign-in, and it knows no pinned program."""
+        self.join_by_script(self.code()["code"])
+        self.service()
+        reported = json.loads(hub.q1("SELECT data FROM server_status WHERE server='mini'")["data"])
+        self.assertIn("model_accounts", reported["features"])
+        self.assertIn(self.mod.MODEL_ACCOUNTS, self.mod.lifecycle.FEATURES)      # the helper's word is the same
+
 
 class InstallRetries(unittest.TestCase):
     """T-35: an install that could not reach the internet. The owner saw "Codex did not install: npm could not reach

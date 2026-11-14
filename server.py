@@ -65,6 +65,8 @@ JOB_HEARTBEAT = "job_heartbeat"
 NAMES_FEATURE = "server_names"  # it takes a new name from the hub (adopt): hub.NAMES_FEATURE
 KEY_FEATURE = "rename_key"      # its rename job moves the agent's key file (carry_key): hub.KEY_FEATURE
 INSTALL_KEY = "install_key"     # its install job registers the new agent's key (key_step): hub.INSTALL_KEY
+MODEL_ACCOUNTS = "model_accounts"  # its install job takes an agent of a model account with no sign-in and a pinned
+                                  # program (install): lifecycle.FEATURES has the same name for the helper
 POLL = 5                        # seconds between looks for a job
 CHROME_SETTLES = 30             # seconds from Chrome's start to the reading that says whether it answers
 SIGN_IN_WAIT = 900              # seconds a sign-in may take
@@ -89,6 +91,34 @@ VAULT_PROGRAM = "/usr/local/lib/fleet-vault/vault.py"
 VAULT_HELPER = "/usr/local/sbin/fleet-vault-program"
 VAULT_EVERY = 600               # seconds before a try that did not settle it is made again
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# The words of `fleet.py install-pinned` when an address of the pin could not be reached: fleet.install_pinned names
+# the failure of each address by its exception ("could not be downloaded (x.ai: URLError; …)"). A refused address
+# (HTTPError), a file with other bytes and a full disk are no network failure, and are not tried again.
+PINNED_OFFLINE = re.compile(r"could not be downloaded \([^)]*\b(?:URLError|TimeoutError|timeout|gaierror|"
+                            r"ConnectionError|ConnectionResetError|ConnectionRefusedError|ConnectionAbortedError|"
+                            r"BrokenPipeError|RemoteDisconnected|IncompleteRead|SSLEOFError)\b")
+# The proof that a pinned program runs (Service.program_answers), as one script in the way of onboard.CLAUDE_CHANNEL:
+# the program starts once as a session of the agent starts it, in a folder of its own that goes again at the end
+# (Lifecycle.acp_model_options), and answers ACP's `initialize` (acp_runner.read_models), with no account, no key and
+# no prompt. It runs as the agent's own user in the agent's checkout, whose acp_programs, acp_runner and lifecycle it
+# imports. Arguments: the runtime and the program's path. It ends 0 when the program answered, else 1 with the reason.
+PINNED_ANSWERS = r"""
+import os, shlex, sys, uuid
+import acp_programs, acp_runner, lifecycle
+
+name, program = sys.argv[1], sys.argv[2]
+adapter = acp_programs.adapter(lifecycle.runtime_fact(name, "acp_adapter"), os.path.expanduser("~"))
+session = str(uuid.uuid4())
+try:
+    adapter.prepare(session)
+    argv = [program] + shlex.split(lifecycle.runtime_fact(name, "acp_command") or "")[1:]
+    _options, error = acp_runner.read_models(argv, os.getcwd(), acp_runner.started_env(name, adapter, session, None),
+                                             adapter, "initialize")
+finally:
+    adapter.remove(session)
+if error:
+    sys.exit(error)
+"""
 
 
 class StepFailed(Exception):
@@ -476,7 +506,7 @@ class Service:
         return {"revision": self.loaded, "os": life.os_info(), "security": life.security(),
                 "runtimes": self.runtimes(), "load": lifecycle.machine_load(self.platform),
                 "access": dict(life.access(), user=pwd.getpwuid(os.getuid()).pw_name),
-                "features": [JOB_HEARTBEAT, NAMES_FEATURE, KEY_FEATURE, INSTALL_KEY]}
+                "features": [JOB_HEARTBEAT, NAMES_FEATURE, KEY_FEATURE, INSTALL_KEY, MODEL_ACCOUNTS]}
 
     def runtimes(self):
         """Codex and Claude Code as this server's agent reads them: as its own OS user, in its own home and on its own
@@ -618,16 +648,34 @@ class Service:
 
     # ---- install an agent
     def install(self, job):
+        """The agent's steps in their order: its user, its runtime, its checkout, its key, its service and its
+        sign-in. A program that the fleet downloads at its pin (the runtime's fact `pinned`: Grok Build, OpenCode)
+        comes from fleet.py of the agent's own checkout, so there the checkout comes before the runtime, and after the
+        service the program shows that it answers (program_answers). The sign-in step does not run for a job that says
+        it has none ("at_the_mac": the installer leads it at this Mac's own screen; "none": the agent's model account
+        is a key or an address), nor for a runtime with no sign-in of its own."""
         agent, runtime = job.get("agent"), job.get("runtime")
         if not NAME.fullmatch(str(agent)) or runtime not in LABELS:
             raise StepFailed(None, f"{self.name} runs an older Founderizer that cannot do this. Update Founderizer, "
                                    f"then try again.")      # a newer hub's provider or name (review, 30 October)
+        pinned = lifecycle.runtime_fact(runtime, "pinned")
+        if pinned and self.platform == "darwin":
+            # The pins are Linux programs (onboard.PINNED), and the hub gives such a job to a Linux server only: a Mac
+            # makes nothing for it.
+            raise failed("runtime", f"{LABELS[runtime]} did not install. Try again.",
+                         f"{LABELS[runtime]} has no pinned program for a Mac")
         user = self.user_step(job, agent)
-        exe = self.runtime_step(job, runtime, user)
-        folder = self.checkout_step(job, agent, user)
+        if pinned:
+            folder = self.checkout_step(job, agent, user)
+            exe = self.runtime_step(job, runtime, user)
+        else:
+            exe = self.runtime_step(job, runtime, user)
+            folder = self.checkout_step(job, agent, user)
         self.key_step(job, agent, folder, user)
         self.service_step(job, agent, runtime, folder, user)
-        if job.get("sign_in") != "at_the_mac":      # the installer leads this sign-in, at this Mac's own screen
+        if pinned:
+            self.program_answers(runtime, exe, folder, user)
+        if job.get("sign_in") not in ("at_the_mac", "none") and lifecycle.runtime_fact(runtime, "sign_in"):
             self.sign_in_step(job, agent, runtime, exe, user)
         self.post(job, "done", "sign_in", f"{shown_name(agent)} runs on {self.name}. Open it to finish its setup.")
 
@@ -786,23 +834,49 @@ class Service:
         times, while the owner's page stays on its moving words and the job's line stays "Installing Codex.". Its own
         words go to this service's log, one line for each try with the job's id, and the job's line says what failed
         in plain words: the owner can act on "could not reach the internet", and on no installer's error text
-        (T-35)."""
+        (T-35).
+
+        A program that the fleet downloads at its pin (the runtime's fact `pinned`) has no vendor installer: `fleet.py
+        install-pinned` of the agent's own checkout, run as the agent's user, downloads the pin's file and holds it to
+        the digest that the checkout carries. Its program is taken only at the path of its pin
+        (lifecycle.pinned_path), never from a PATH, and a download that could not reach an address is tried again in
+        the same way."""
         label = LABELS[runtime]
         self.post(job, "running", "runtime", f"Looking for {label}.")
         exe = self.agent_exe(runtime, user)
         if exe:
             return exe
-        pin = onboard.RUNTIME_PINS[runtime]
-        script = 'mkdir -p "$HOME/.local/bin" && ' + onboard.runtime_install(runtime, pin)
+        if lifecycle.runtime_fact(runtime, "pinned"):
+            pin = (onboard.PINNED.get(runtime) or {}).get("version")
+            home = self.home_of(user)
+            want = lifecycle.pinned_path(runtime, home)
+            argv, cwd = self.in_folder(user, os.path.join(home, f"fleet-{job.get('agent')}"),
+                                       [sys.executable, "fleet.py", "install-pinned", runtime])
+            # ~/.fleet of mode 700, as each other part of the fleet makes it: install-pinned makes only its folder of
+            # runtimes, and in a new agent's home it is the first to write in ~/.fleet
+            self.run(self.as_agent(user, ["mkdir", "-p", "-m", "700", os.path.join(home, ".fleet")]))
+
+            def attempt():
+                code, out, err = self.run(argv, cwd=cwd, timeout=900)
+                printed = (out.strip().splitlines() or [""])[-1].strip()
+                return code, out, err, want if code == 0 and want and printed == want else None
+            offline_in = PINNED_OFFLINE.search
+        else:
+            pin = onboard.RUNTIME_PINS[runtime]
+            script = 'mkdir -p "$HOME/.local/bin" && ' + onboard.runtime_install(runtime, pin)
+
+            def attempt():
+                code, out, err = self.agent_sh(user, script, timeout=900)
+                return code, out, err, self.agent_exe(runtime, user)
+            offline_in = onboard.network_failure
         for again in range(onboard.NETWORK_RETRIES + 1):
             # One line for every try, without the version: the tries are the log's (T-35). Each try still posts it,
             # so a job cancelled between two tries stops here (Gone).
             self.post(job, "running", "runtime", f"Installing {label}.")
-            code, out, err = self.agent_sh(user, script, timeout=900)
-            exe = self.agent_exe(runtime, user)
+            code, out, err, exe = attempt()
             if code == 0 and exe:
                 break
-            offline = onboard.network_failure(f"{err}\n{out}")
+            offline = bool(offline_in(f"{err}\n{out}"))
             print(f"job {job.get('id')}: {label} {pin} did not install (try {again + 1} of "
                   f"{onboard.NETWORK_RETRIES + 1}{', a network error' if offline else ''}): "
                   f"{' '.join(tail(err or out, 500).split())}", flush=True)
@@ -822,13 +896,35 @@ class Service:
 
     def agent_exe(self, runtime, user=None):
         """This agent's runtime binary: lifecycle.exe for this service's own user, and the same two places read as
-        the agent's user, because its home cannot be read from outside."""
+        the agent's user, because its home cannot be read from outside. A program that the fleet downloads at its pin
+        is the file of its pin (lifecycle.pinned_path) when that file is there and can run, and nothing else: a
+        program of that name on a PATH or in ~/.local/bin is never taken."""
+        if lifecycle.runtime_fact(runtime, "pinned"):
+            path = lifecycle.pinned_path(runtime, self.home_of(user))
+            if not path:
+                return None
+            if not user:
+                return path if os.path.isfile(path) and os.access(path, os.X_OK) else None
+            code, _out, _err = self.run(self.as_agent(user, ["/bin/sh", "-c", '[ -f "$1" ] && [ -x "$1" ]', "sh",
+                                                             path]))
+            return path if code == 0 else None
         if not user:
             return lifecycle.exe(runtime, self.home)
         code, out, _err = self.run(self.as_agent(user, [
             "/bin/sh", "-c", 'command -v "$1" || { [ -x "$HOME/.local/bin/$1" ] && printf %s "$HOME/.local/bin/$1"; }',
             "sh", runtime]))
         return (out.strip() or None) if code == 0 else None
+
+    def program_answers(self, runtime, exe, folder, user=None):
+        """The proof that the agent's pinned program runs (PINNED_ANSWERS): it starts once, as the agent's own user
+        in the agent's checkout, with a folder of its own as a session has it, and answers ACP's `initialize`. A
+        program that does not answer fails the job at its runtime step: a file of the right bytes can still need what
+        this machine does not have. Its own words go to this service's log."""
+        argv, cwd = self.in_folder(user, folder, [sys.executable, "-c", PINNED_ANSWERS, runtime, exe])
+        code, out, err = self.run(argv, cwd=cwd, timeout=120)
+        if code != 0:
+            raise failed("runtime", f"{LABELS[runtime]} did not install. Try again.",
+                         f"{LABELS[runtime]} at {exe} did not answer initialize: {err or out or f'exit {code}'}")
 
     def checkout_step(self, job, agent, user=None):
         """The agent's own checkout fleet-<agent> in the home of its own OS user, on the fleet's configuration ref:
