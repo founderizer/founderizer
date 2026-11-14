@@ -33,6 +33,15 @@ NO_CREDIT, REFUSED, NO_ANSWER, ERROR = "no_credit", "refused", "no_answer", "err
 # next try is right (the AI providers spec, section 3.11 item 2).
 LIMIT_WAIT = 60
 SESSION = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"      # a Fleet session's id, a folder's name
+# **A start with no listing sends no prompt** (the AI providers spec, section 6 item 6). The first prompt of a program
+# whose adapter has first_prompt_waits goes at the helper's first signal, which comes when the hub saw the session list
+# the fleet's tools. A session that never lists them never has them, so the helper counts its polls of the hub
+# (fleet.NO_LISTING_POLLS) and then types this word into the window in place of that signal, one time. The word is no
+# prompt: the runner ends the start with NO_LISTING_CAUSE, as a failed turn ends (an error record and the result
+# `error`), and exits with 1. The hub's intake pauses the task once, with that cause, for its requester.
+NO_LISTING = "fleet:no-listing"
+# Proposed, not approved: the words of that error record, which the hub's pause gives the task's requester.
+NO_LISTING_CAUSE = "the program did not list the fleet's tools, so no prompt was sent"
 
 
 def record(code, message, resets_at=None):
@@ -60,7 +69,9 @@ class Program:
     """A program that does nothing in a way of its own: standard ACP. It is the adapter of a runtime that names none,
     and each other adapter changes only what its program does differently."""
     folder_name = None              # the folder of its sessions' folders in ~/.fleet; None for a program with none
-    first_prompt_waits = False      # the first prompt goes at the helper's first signal, not at once (tools_ready)
+    # the first prompt goes at the helper's first signal, not at once (tools_ready), and the helper gives that signal
+    # only when the session listed the fleet's tools (fleet.Helper.first_line_due), else it gives NO_LISTING
+    first_prompt_waits = False
     settle = 0                      # seconds between that signal and the first prompt
     needs_account = False           # no session of it starts for an agent with no model account
 

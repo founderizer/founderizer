@@ -95,6 +95,22 @@ class HelperFiles(unittest.TestCase):
                                    "outputs/T-7/link.md": "not a regular file", "outputs/T-7/linked/": "a symbolic link",
                                    "outputs/T-7/1/2/3/4/5/6/": "deeper than 6 names"})
 
+    def test_no_name_is_agents_md_in_any_case_of_its_letters(self):
+        """The AI providers spec, section 3.11 item 9: OpenCode gives the model an AGENTS.md of a folder below its
+        working folder as instructions, and the outputs reach every agent's checkout. Each folder holds one of the
+        names, as a disk that ignores the case of letters can keep them; the names that only look like it go."""
+        write(self.kit, {"outputs/T-7/AGENTS.md": "x", "outputs/T-7/sub/agents.md": "x", "outputs/T-7/doc/Agents.Md": "x",
+                         "outputs/T-7/AGENTS.md.txt": "x", "outputs/T-7/my-agents.md": "x", "outputs/T-7/agents.mdx": "x",
+                         "outputs/T-7/sub/report.md": "x", "outputs/T-7/deep/AGENTS.MD/inside.md": "x"})
+        files, skipped = self.collect()
+        self.assertEqual(files, ["outputs/T-7/AGENTS.md.txt", "outputs/T-7/agents.mdx", "outputs/T-7/my-agents.md",
+                                 "outputs/T-7/sub/report.md"])
+        self.assertEqual(skipped, {"outputs/T-7/AGENTS.md": fleet.OUTPUT_BAD_NAME,
+                                   "outputs/T-7/deep/AGENTS.MD/": fleet.OUTPUT_BAD_NAME,
+                                   "outputs/T-7/doc/Agents.Md": fleet.OUTPUT_BAD_NAME,
+                                   "outputs/T-7/sub/agents.md": fleet.OUTPUT_BAD_NAME})
+        self.assertIn("AGENTS.md", fleet.OUTPUT_BAD_NAME)       # the reason says it
+
     def test_the_hubs_limits_of_count_size_and_sum(self):
         write(self.kit, {"outputs/T-7/a.md": "1234", "outputs/T-7/b.md": "12345678", "outputs/T-7/c.md": "12",
                          "outputs/T-7/d.md": "12"})

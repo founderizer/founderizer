@@ -15,7 +15,9 @@ can confirm the hold.
 A prompt that fails ends its turn and not the runner: the failure is a thread record with its cause (a limit, no
 credit, a refused call, no answer), the turn's result is `error`, and the runner waits for the next line. So the hub's
 message after a limit is the next prompt of the same session. Only a start that fails before the first prompt ends
-the runner with 1.
+the runner with 1. One such failure has a result too: the helper's word that the program did not list the fleet's
+tools (acp_programs.NO_LISTING), a line that is never a prompt. It ends the start wherever the start waits, and no
+prompt goes to a session that would never have the fleet's tools.
 
 What one program does in its own way is in its adapter (acp_programs.py), and nothing here compares a runtime to a
 name. The program gets none of the variables of its own names (lifecycle.RUNTIMES `own_env`) but the ones that the
@@ -55,6 +57,10 @@ class Ended(RuntimeError):
 
 class Refused(RuntimeError):
     """A start that the runner refuses, in the words of its error record."""
+
+
+class Unlisted(RuntimeError):
+    """The helper's word came before the first prompt: the program did not list the fleet's tools."""
 
 
 def text_of(content):
@@ -328,13 +334,14 @@ def options_of(answer):
 class Runner:
     def __init__(self, argv, prompt, mcp_url, cwd, runtime, records, permission, lines, token=None, *, system=None,
                  model=None, effort=None, auth=None, stored=None, label=None, servers=(), usage=None, policy="ask",
-                 adapter=None, env=None, session=None):
+                 adapter=None, env=None, session=None, unlisted=None):
         """system: the session's stable text, which goes on the program's own road to its system message (the
         adapter's), else at the head of the first prompt. auth: the ACP sign-in method of this start, and stored: the
         method that the program names while it holds a sign-in of its own, where `auth` is the account's key.
         servers: the agent's own MCP servers, in the shapes of ACP. usage: the session's Usage, or None. policy:
         "full" allows each permission request here; "ask" asks the hub. env: the program's environment. session: the
-        Fleet session's id, whose folder the adapter removes at the end."""
+        Fleet session's id, whose folder the adapter removes at the end. unlisted: the threading.Event that the reader
+        of the typed lines sets at the helper's word acp_programs.NO_LISTING (stdin_lines)."""
         self.argv, self.prompt, self.mcp_url, self.cwd, self.runtime = argv, prompt, mcp_url, cwd, runtime
         self.headers = [{"name": "Authorization", "value": f"Bearer {token}"}] if token else []     # owner API 1.12
         self.records, self.permission, self.lines = records, permission, lines
@@ -344,6 +351,7 @@ class Runner:
         self.adapter = adapter or acp_programs.Program()
         self.env, self.session = env, session
         self.stopping = threading.Event()
+        self.unlisted = unlisted if unlisted is not None else threading.Event()
         self.cancelled_at = None
         self.client = self.sid = None
         self.current = None             # the session's model now
@@ -480,7 +488,8 @@ class Runner:
         # plan C7: no clock on the start. The screen says that it waits, so the helper's screen watch sees a start
         # that hangs; a stop or the agent's own exit ends the wait.
         print("Fleet: waiting for the agent to start", flush=True)
-        gone = lambda: self.stopping.is_set() or self.client.proc.poll() is not None
+        # the helper's word that no listing came ends a start that still waits for the program, too
+        gone = lambda: self.stopping.is_set() or self.unlisted.is_set() or self.client.proc.poll() is not None
         try:
             try:
                 head, effort = self.start(gone)
@@ -500,11 +509,21 @@ class Runner:
                     # saw the session list the fleet's tools: that line is the event, and the task's prompt goes then.
                     self.records.send()
                     print("Fleet: waiting for the helper's signal that the agent's tools are there", flush=True)
-                    if self.next_line() is None:
+                    if self.next_line(until=self.unlisted) is None:
                         text = None
                     elif self.adapter.settle:
                         self.stopping.wait(self.adapter.settle)     # the program's own last step has no sign
-            except (Refused, Failed, Ended, TimeoutError, KeyError, OSError, ValueError) as e:
+                if self.unlisted.is_set():
+                    raise Unlisted(acp_programs.NO_LISTING_CAUSE)
+            except (Refused, Failed, Ended, TimeoutError, Unlisted, KeyError, OSError, ValueError) as e:
+                if self.unlisted.is_set() and not isinstance(e, (Refused, Failed)):
+                    # The helper counted its polls and the hub saw no listing: no prompt goes, and the start ends as a
+                    # failed turn ends, with its cause and the result `error`, so the hub pauses the task once. A
+                    # refusal or the program's own error came first and keeps its own words.
+                    self.records.add(acp_programs.record(acp_programs.ERROR, acp_programs.NO_LISTING_CAUSE))
+                    self.records.add({"type": "result", "stop_reason": "error"})
+                    print(f"Fleet: {acp_programs.NO_LISTING_CAUSE}", flush=True)
+                    return 1
                 words = str(e)
                 if isinstance(e, Failed):       # a refused value of a start: the program's own words
                     words = f"{e}: {acp_programs.words_of(e.error)}" if e.error.get("data") else words
@@ -533,10 +552,11 @@ class Runner:
             if self.session:
                 self.adapter.remove(self.session)       # the session's own folder goes with its window
 
-    def next_line(self):
+    def next_line(self, until=None):
         """The next prompt: the next typed line, and every line already queued behind it, as one prompt (plan C5).
-        Lines that waited while a turn ran each asked for a read, so one turn reads them all."""
-        while not self.stopping.is_set():
+        Lines that waited while a turn ran each asked for a read, so one turn reads them all. until: a
+        threading.Event that ends the wait with None, as a stop does."""
+        while not self.stopping.is_set() and not (until is not None and until.is_set()):
             try:
                 line = self.lines.get(timeout=0.5)
             except queue.Empty:
@@ -621,11 +641,18 @@ def read_models(argv, cwd, env, adapter, how, auth=None, timeout=60):
         client.stop()
 
 
-def stdin_lines():
+def stdin_lines(unlisted=None, stream=None):
+    """A queue of the lines typed into the window, None at their end. The helper's word acp_programs.NO_LISTING is no
+    line of it: it sets `unlisted`, a threading.Event, at once, also while the runner's start still waits for the
+    program. stream: sys.stdin, or a test's own."""
     lines = queue.Queue()
 
     def read():
-        for line in sys.stdin:
+        for line in stream or sys.stdin:
+            if line.strip() == acp_programs.NO_LISTING:
+                if unlisted is not None:
+                    unlisted.set()
+                continue                # never a prompt
             lines.put(line)
         lines.put(None)
     threading.Thread(target=read, daemon=True, name="typed-lines").start()
@@ -685,12 +712,13 @@ def main(argv=None):
     servers = (json.loads(taken(args.mcp_file)).get("servers") or []) if args.mcp_file else []
     usage = Usage(args.usage_file, args.session, os.path.realpath(fleet.KIT), args.runtime) if args.usage_file else None
     methods = lifecycle.runtime_fact(args.runtime, "acp_auth") or {}
+    unlisted = threading.Event()        # the helper's word that the program did not list the fleet's tools
     runner = Runner(shlex.split(args.agent_command), prompt, args.mcp_url, fleet.KIT, args.runtime, records,
-                    permission, stdin_lines(), token=token, system=system, model=args.model, effort=args.effort,
+                    permission, stdin_lines(unlisted), token=token, system=system, model=args.model, effort=args.effort,
                     auth=args.auth, stored=methods.get("plan"),
                     label=lifecycle.runtime_fact(args.runtime, "label", args.runtime), servers=servers, usage=usage,
                     policy=args.policy, adapter=adapter, session=args.session,
-                    env=started_env(args.runtime, adapter, args.session, args.auth))
+                    env=started_env(args.runtime, adapter, args.session, args.auth), unlisted=unlisted)
     for one in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):      # a window that is closed ends as Ctrl-C does
         signal.signal(one, runner.cancel)
     return runner.run()

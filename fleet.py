@@ -575,6 +575,16 @@ FROZEN_GAP = 2
 # at the soonest when its tools are not listed, and a line it left unread told again after RESIGNAL_FIRST seconds,
 # doubling up to RESIGNAL_MAX.
 SIGNAL_GAP = 20
+# A task window whose program's first prompt waits for the fleet's tools (acp_programs, first_prompt_waits) takes its
+# first line at the hub's listing only, never after SIGNAL_GAP: OpenCode 2.2.5 fixes a session's tool list at its
+# first prompt, so a prompt before the listing gives a session that never has the fleet's tools. When the hub's polls
+# with a message waiting for that window reach NO_LISTING_POLLS and still bring no listing, the helper types
+# acp_programs.NO_LISTING into it, one time, and its runner ends the start with that cause (the AI providers spec,
+# section 6 item 6). A count of polls, not a clock (plan C5). A poll took 2.35 seconds while a message waited
+# (CHAT_PROOF_POLLS), so this is about two minutes, and OpenCode listed 0.3 to 0.5 seconds after its session/new in a
+# container (step 1, lane A). Not measured on a live server: the live proof of step 2 measures a window's start to its
+# listing under load, and this count must leave the slowest one much more.
+NO_LISTING_POLLS = 50
 HOOK_TIMEOUT = 2_000_000    # seconds: Claude Code's limit for the permission hook, which asks until a decision (C7)
 # The tools whose results the clean hook reads (hook_clean.py): the built-in tools that read outside text, and every MCP
 # tool but the fleet server's, whose answers the hub cleans itself (hub.call_tool). Claude Code reads a matcher with
@@ -4019,9 +4029,15 @@ OUTPUT_FILES = 100
 OUTPUT_FILE_MAX = 8 * 1024 * 1024
 OUTPUT_TOTAL_MAX = 24 * 1024 * 1024
 OUTPUT_DEPTH = 6                        # names below outputs/T-<id>/, the file's own included
-OUTPUT_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._+-]{0,119}")
+# Never AGENTS.md, in any case of its letters (the AI providers spec, section 3.11 item 9): OpenCode gives the model an
+# AGENTS.md of a folder below its working folder as instructions when the agent reads a file there. That folder is the
+# agent's checkout, which follows the configuration ref that the outputs are committed to: so a task's output would
+# give each later session there an instruction. A folder of that name is left out too: the rule is one for each name.
+OUTPUT_NAME = re.compile(r"(?!(?i:agents\.md)\Z)[A-Za-z0-9_][A-Za-z0-9._+-]{0,119}")
 OUTPUT_CAPTURES = "computer-use"
-OUTPUT_BAD_NAME = "its name has a character other than letters, digits and . _ + -, or starts with one of . -"
+# Its last part ("or is AGENTS.md") is proposed, not approved: the result of a delivery names each file left out
+OUTPUT_BAD_NAME = ("its name has a character other than letters, digits and . _ + -, starts with one of . -, or is "
+                   "AGENTS.md")
 
 
 def collect_outputs(kit, ref):
@@ -5013,10 +5029,37 @@ class Helper:
         chat take their first line SIGNAL_GAP seconds after their start at the latest, as a runtime with no readable
         screen does: on 5 November 2026 a new version of Claude Code drew its empty input line in another way, no
         screen read idle any more, and the first line of every new session waited without an end. A line typed
-        before the input box is up gets its Enter again (ENTER_LATER), and none is typed over a question."""
+        before the input box is up gets its Enter again (ENTER_LATER), and none is typed over a question.
+
+        **A program that needs the fleet's tools at its first prompt gets its first line at the listing only** (the
+        AI providers spec, section 6 item 6): a task window of a runtime whose ACP adapter has first_prompt_waits.
+        Neither SIGNAL_GAP nor idle readings make it due, because such a session would never have the fleet's tools.
+        Each call is one poll at which a message waits for the window (signal); at NO_LISTING_POLLS of them with no
+        listing since its start, the helper types acp_programs.NO_LISTING into it once, and it never gets a first
+        line after that: its runner ends the start with the cause, and the next start counts anew."""
         if window not in self.ready_base:
             return True
         listed = self.listed.get(window, 0) > self.ready_base[window]
+        runtime = self.conf.get("runtime")
+        if re.fullmatch(r"T-\d+", window) and \
+                acp_programs.adapter(runtime_fact(runtime, "acp_adapter")).first_prompt_waits:
+            counts = self.__dict__.setdefault("unlisted", {})       # {window: (its start, polls, word typed)}
+            start, polls, told = counts.get(window) or (None, 0, False)
+            if start != self.signalled.get(window):                 # Helper.start marks each start of the window
+                start, polls, told = self.signalled.get(window), 0, False
+            if listed and not told:
+                counts.pop(window, None)
+                self.ready_base.pop(window)
+                return True
+            polls += 1
+            if polls >= NO_LISTING_POLLS and not told:
+                # a window that tmux did not type into (gone, or scrolled back) gets the word at the next poll
+                told = type_into(self.session, window, acp_programs.NO_LISTING, asks=False) == "typed"
+                if told:
+                    self.say(f"{window}: its program did not list the fleet's tools at {polls} polls; its runner ends "
+                             f"the start with that cause, and no prompt goes")
+            counts[window] = (start, polls, told)
+            return False
         idle = (self.screens.get(window) or {}).get("idle_run", 0)
         if reads_its_screen(self.conf.get("runtime")):
             due = idle >= (1 if listed else IDLE_READINGS) or \
