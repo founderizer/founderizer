@@ -32,6 +32,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ETC=/etc/ops-root LIB=/usr/local/lib/ops-root SBIN=/usr/local/sbin/ops-root STATE=/var/lib/ops-root
 UNIT=/etc/systemd/system/ops-sshd.service SUDOERS=/etc/sudoers.d/ops-agent
 BOOT_UNIT=/etc/systemd/system/ops-root-rollback-at-boot.service      # ops-root's own: each arm puts it in place
+KEEP=/etc/systemd/system/ssh.service.d/ops-sshd-folder.conf          # /run/sshd stays at a stop of ssh.service
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 
@@ -58,7 +59,8 @@ done
 remove() {
     systemctl disable --now ops-sshd.service 2>/dev/null || true
     systemctl disable "${BOOT_UNIT##*/}" 2>/dev/null || true
-    rm -f "$UNIT" "$BOOT_UNIT" "$SUDOERS"
+    rm -f "$UNIT" "$BOOT_UNIT" "$SUDOERS" "$KEEP"
+    rmdir "${KEEP%/*}" 2>/dev/null || true          # only when no other drop-in of ssh.service is there
     rm -rf /etc/systemd/system/ops-sshd.service.d
     systemctl daemon-reload
     if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
@@ -187,6 +189,19 @@ chmod 0644 "$ETC/sshd_config"
 # SSH serves, OpenSSH is masked and the folder is not there (7 November 2026). The unit below makes it at each start.
 install -d -m 0755 -o root -g root /run/sshd
 /usr/sbin/sshd -t -f "$ETC/sshd_config"
+# That folder is the RuntimeDirectory of the host's own ssh.service, and systemd removed it at each stop of that unit:
+# an update of openssh-server stops it. Then the second sshd refused every new connection while its unit still said
+# active, until a connection to port 22 started ssh.service again (measured on Ubuntu 24.04, 14 November 2026). This
+# drop-in keeps the folder; ops-root writes the same bytes again where they are not (keep_sshd_folder).
+mkdir -p "${KEEP%/*}"
+cat > "$KEEP.new" <<'EOF'
+# The door's second sshd (ops-sshd.service) needs /run/sshd for each new connection:
+# systemd keeps the folder at a stop of this unit (written by the door: install.sh, ops-root)
+[Service]
+RuntimeDirectoryPreserve=yes
+EOF
+chmod 0644 "$KEEP.new"
+mv -f "$KEEP.new" "$KEEP"
 
 cat > "$UNIT" <<EOF
 [Unit]

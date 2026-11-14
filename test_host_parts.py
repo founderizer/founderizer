@@ -31,7 +31,7 @@ SEED = bytes(range(32))         # the test's own release key; never the product'
 
 def load_tests(loader, _tests, _pattern):
     return unittest.TestSuite(cls(name) for cls in (Files, ModeAndLock, ScriptForms, Runners, PristineRunners,
-                                                    Accounts, SelfUpdate,
+                                                    Accounts, SshdFolder, SelfUpdate,
                                                     Reader, Scripts, NewApp, AppUnitAndSettings, AppRunner, AppVhost,
                                                     ReleaseHelper, Look, LookBoxLive)
                               for name in cls.__dict__ if name.startswith("test_"))
@@ -710,6 +710,72 @@ class ScriptForms(HostCase):
 def git(*args, cwd=None):
     return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main", *args],
                           cwd=cwd, check=True, capture_output=True).stdout
+
+
+class SshdFolder(HostCase):
+    """/run/sshd is the RuntimeDirectory of the host's own ssh.service, and systemd removed it at each stop of that
+    unit: an update of openssh-server stops it. Then the second sshd refused every new connection while its unit still
+    said active, until a connection to port 22 started ssh.service again (measured on a temporary Ubuntu 24.04 server,
+    14 November 2026). A drop-in keeps the folder: install.sh writes it, and each call of ops-root writes it again on a
+    host that an older install left without it."""
+
+    def setUp(self):
+        super().setUp()
+        self.reloads = []
+        patcher = patch.object(ROOT, "systemctl", lambda *words: self.reloads.append(words) or (0, ""))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def help(self):
+        req = base64.b64encode(json.dumps({"v": 1, "op": "help", "args": []}).encode()).decode()
+        with contextlib.redirect_stdout(io.StringIO()) as out, patch("sys.stdin", None):
+            self.assertEqual(ROOT.main(["ops-root", req]), 0)
+        self.assertTrue(out.getvalue().startswith("ops-root "), out.getvalue())
+
+    def unit(self, path="/usr/lib/systemd/system/ssh.service", to=None):
+        os.makedirs(os.path.dirname(self.tmp + path), exist_ok=True)
+        if to:
+            os.symlink(to, self.tmp + path)
+        else:
+            self.put(path, "[Service]\nRuntimeDirectory=sshd\n")
+
+    def test_a_host_with_ssh_service_gets_the_drop_in_at_its_first_call_and_only_then(self):
+        self.unit()
+        self.help()
+        self.assertEqual(self.get(ROOT.SSHD_FOLDER_KEEP), ROOT.SSHD_FOLDER_TEXT)
+        self.assertEqual(os.stat(self.tmp + ROOT.SSHD_FOLDER_KEEP).st_mode & 0o777, 0o644)
+        self.assertEqual(self.reloads, [("daemon-reload",)])
+        self.help()
+        self.assertEqual(self.reloads, [("daemon-reload",)])         # the same bytes: no write, no reload
+
+    def test_a_masked_ssh_service_gets_it_too_and_other_bytes_are_written_again(self):
+        """A host where install.sh put OpenSSH in with its own units masked: the drop-in keeps the folder if a person
+        unmasks them later. Other bytes in its place are the door's no more."""
+        self.unit("/etc/systemd/system/ssh.service", to="/dev/null")
+        self.help()
+        self.assertEqual(self.get(ROOT.SSHD_FOLDER_KEEP), ROOT.SSHD_FOLDER_TEXT)
+        self.put(ROOT.SSHD_FOLDER_KEEP, "[Service]\nRuntimeDirectoryPreserve=no\n")
+        self.help()
+        self.assertEqual(self.get(ROOT.SSHD_FOLDER_KEEP), ROOT.SSHD_FOLDER_TEXT)
+        self.assertEqual(self.reloads, [("daemon-reload",)] * 2)
+
+    def test_a_host_with_no_ssh_service_gets_nothing(self):
+        self.help()
+        self.assertFalse(os.path.exists(self.tmp + os.path.dirname(ROOT.SSHD_FOLDER_KEEP)))
+        self.assertEqual(self.reloads, [])
+
+    def test_a_drop_in_that_cannot_be_written_stops_no_call(self):
+        self.unit()
+        os.makedirs(self.tmp + "/etc/systemd/system")
+        self.put("/etc/systemd/system/ssh.service.d", "a file where the folder goes\n")
+        self.help()
+        self.assertEqual(self.reloads, [])
+
+    def test_no_file_install_and_no_exec_command_writes_the_drop_in(self):
+        """PROTECTED: a file install refuses the path, and an exec command's box sees it read-only."""
+        self.assertIn(ROOT.SSHD_FOLDER_KEEP, ROOT.PROTECTED)
+        self.assertTrue(ROOT.protected(ROOT.SSHD_FOLDER_KEEP))
+        self.assertFalse(ROOT.protected("/etc/systemd/system/ssh.service.d/other.conf"))
 
 
 class SelfUpdate(HostCase):
@@ -2867,6 +2933,29 @@ class Scripts(unittest.TestCase):
             text = f.read()
         folder = text.index("install -d -m 0755 -o root -g root /run/sshd")
         self.assertLess(folder, text.index('/usr/sbin/sshd -t -f "$ETC/sshd_config"'))
+
+    def test_install_keeps_the_folder_with_the_bytes_of_ops_root_and_a_remove_takes_it_away(self):
+        """The drop-in that keeps /run/sshd at a stop of ssh.service (SshdFolder): install.sh's own block, run with its
+        path in a temporary folder, writes ops-root's exact bytes, so that ops-root does not write it once more; it is
+        in place before systemd reads the units and starts the second sshd; a remove takes it away."""
+        with open("host/install.sh") as f:
+            text = f.read()
+        self.assertIn(f"\nKEEP={ROOT.SSHD_FOLDER_KEEP} ", text)
+        start = text.index('mkdir -p "${KEEP%/*}"\n')
+        block = text[start:text.index('mv -f "$KEEP.new" "$KEEP"\n', start) + len('mv -f "$KEEP.new" "$KEEP"\n')]
+        self.assertLess(text.index(block), text.index("systemctl daemon-reload\nsystemctl enable ops-sshd.service"))
+        with tempfile.TemporaryDirectory() as tmp:
+            keep = os.path.join(tmp, "system", "ssh.service.d", "ops-sshd-folder.conf")
+            for _ in range(2):          # a second install writes the same file again
+                subprocess.run(["bash", "-c", "set -euo pipefail\n" + block], check=True, capture_output=True,
+                               env={"PATH": os.environ["PATH"], "KEEP": keep})
+            with open(keep) as f:
+                self.assertEqual(f.read(), ROOT.SSHD_FOLDER_TEXT)
+            self.assertEqual(os.stat(keep).st_mode & 0o777, 0o644)
+            self.assertEqual(os.listdir(os.path.dirname(keep)), ["ops-sshd-folder.conf"])
+        remove = text[text.index("remove() {"):text.index("\n}\n", text.index("remove() {"))]
+        self.assertIn('rm -f "$UNIT" "$BOOT_UNIT" "$SUDOERS" "$KEEP"\n', remove)
+        self.assertLess(remove.index('"$KEEP"'), remove.index("systemctl daemon-reload"))
 
     def test_read_takes_away_the_files_that_only_ops_root_reads(self):
         """From Fix down to Read, ops-root's own files go with it, so a later Fix without one of their options finds

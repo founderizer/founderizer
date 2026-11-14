@@ -123,6 +123,19 @@ class ModelAccounts(OwnerAPI):
             hub.validate_team(team)
         return str(said.exception)
 
+    def service(self, server, os_name="Ubuntu 24.04.1 LTS", features=("install_key", "model_accounts")):
+        """A server that joined: its service's key and a fresh reading with these features (server.py reading)."""
+        hub.q("INSERT OR REPLACE INTO server_keys(server,sha256,created) VALUES(?,?,?)", (server, "0" * 64, hub.now()))
+        hub.q("INSERT OR REPLACE INTO server_status(server,data,reported) VALUES(?,?,?)",
+              (server, json.dumps({"revision": hub.kit_revision(fresh=True), "os": {"name": os_name},
+                                   "access": {"user": "fleet"}, "features": list(features)}), hub.now()))
+
+    def put(self, team):
+        """team.json as the owner's routes write it: committed through the hub and applied."""
+        hub.validate_team(team)
+        hub.commit_kit_file("team.json", (json.dumps(team, indent=2) + "\n").encode(), "Owner changed the team")
+        hub.apply_team(team)
+
     def task(self, owner):
         text = hub.t_create_task("manager", {"owner": owner, "title": "Write the release notes",
                                              "done_when": "The notes are in the repository.", "needs": "none"})
@@ -250,6 +263,67 @@ class ModelAccounts(OwnerAPI):
         self.assertEqual(self.account("local", provider="own", title="Local", kind="server",
                                       address="https://models.example.com")[1]["error"],
                          hub.ACCOUNT_WORDS["open"].format(aid="local"))
+
+    def test_an_owner_label_reads_and_writes_exactly_as_before(self):
+        """The spec writer's answer of 14 November 2026, rule 2: a write replaces the whole entry and carries nothing
+        over only for an entry with a kind; an entry of today's shape (no kind) reads and writes exactly as before."""
+        team = self.stored()
+        self.assertEqual(self.account("codex-team", provider="openai", title=" Codex Team ")[1]["changed"], True)
+        self.assertEqual(self.stored()["accounts"]["codex-team"], {"provider": "openai", "title": "Codex Team"})
+        self.assertEqual(self.account("codex-team", provider="openai", title="Codex Team")[1]["changed"], False)
+        code, receipt = self.account("codex-main", provider="openai", title="Codex Pro (owner)")
+        self.assertEqual(code, 200, receipt)
+        after = self.stored()
+        self.assertEqual(after["accounts"]["codex-main"], {"provider": "openai", "title": "Codex Pro (owner)"})
+        self.assertEqual(after["agents"]["dev-lead"], team["agents"]["dev-lead"])         # its agent stays on it
+        self.assertEqual({k: v for k, v in after["accounts"].items() if k not in ("codex-main", "codex-team")},
+                         {k: v for k, v in team["accounts"].items() if k != "codex-main"})   # no other entry moved
+        self.assertEqual(self.request("/ui/team?db=test-generation")[1]["accounts"]["codex-main"],
+                         {"provider": "openai", "title": "Codex Pro (owner)"})
+        code, said = self.account("codex-main", delete=True)
+        self.assertEqual((code, said["agents"]), (409, ["dev-lead"]))                   # in use: as before
+
+    def test_an_open_model_server_refuses_a_second_agent_on_its_machine(self):
+        """The spec writer's answer, rule 3: validate_team runs on every write, so a later add of a second agent to
+        the machine of an open model server's one agent is refused."""
+        team = copy.deepcopy(TEAM)
+        team["accounts"]["spark"] = {"provider": "own", "title": "Spark", "kind": "server",
+                                     "address": "http://127.0.0.1:11434/v1"}
+        team["agents"]["own-1"].pop("secrets")
+        self.put(team)
+        self.service("app-3")
+        with patch.object(hub, "not_shareable", lambda team, here: []):     # its own agent key: not this test's
+            code, said = self.request("/ui/servers/app-3/agents", dict(
+                request_id=str(uuid.uuid4()), db="test-generation", base_sha256=self.sha(), agent="beside",
+                runtime="claude", role="worker", reports_to=None))
+        self.assertEqual((code, said["error"]), (400, hub.ACCOUNT_WORDS["open"].format(aid="spark")))
+        self.assertNotIn("beside", self.stored()["agents"])
+        self.assertEqual(hub.q("SELECT * FROM server_jobs"), [])
+        with patch.object(hub, "not_shareable", lambda team, here: []):     # a server with a key: taken
+            team["accounts"]["spark"]["secret"] = SERVER_KEY
+            self.put(team)
+            code, said = self.request("/ui/servers/app-3/agents", dict(
+                request_id=str(uuid.uuid4()), db="test-generation", base_sha256=self.sha(), agent="beside",
+                runtime="claude", role="worker", reports_to=None))
+        self.assertEqual(code, 200, said)
+
+    def test_an_open_model_server_refuses_a_second_agent_that_names_it(self):
+        """The spec writer's answer, rule 3: a second agent that names an open model server is refused, at the write
+        that would add it and at the owner's change of an agent's account."""
+        team = copy.deepcopy(TEAM)
+        team["accounts"]["spark"] = {"provider": "own", "title": "Spark", "kind": "server",
+                                     "address": "http://127.0.0.1:11434/v1"}
+        team["agents"]["own-1"].pop("secrets")
+        self.put(team)
+        second = copy.deepcopy(team)
+        second["agents"]["own-2"] = dict(OPENCODE, machine="app-6", account="spark")     # alone on its own server
+        with self.assertRaises(ValueError) as said:
+            hub.validate_team(second)
+        self.assertEqual(str(said.exception), hub.ACCOUNT_WORDS["open"].format(aid="spark"))
+        code, said = self.request("/ui/team/agents/gem-2", dict(request_id=str(uuid.uuid4()), db="test-generation",
+                                                                base_sha256=self.sha(), account="spark"))
+        self.assertEqual(code, 409)                 # the owner's route refuses it first: no change of account (K7)
+        self.assertEqual(self.stored()["agents"]["gem-2"]["account"], "gemini")
 
     def test_an_agent_on_an_account_runs_its_program_on_a_linux_server(self):
         W = hub.ACCOUNT_WORDS

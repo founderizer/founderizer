@@ -88,6 +88,7 @@ FLOOR_FILE = ETC + "/floor"                 # the revision the door runs; update
 RELEASE_JSON = ETC + "/release.json"        # the signed manifest of that release, which root keeps for the hosts
 HOSTS_FILE = STATE + "/hosts.json"          # each host's self-update: the release that it was sent, and how it ended
 HOST_FILES = ("ops-root", "ops-read", "inventory", "app-release")     # what self-update takes (host/ops-root)
+HELP_LINE = r"ops-root [0-9]{1,6}, mode [a-z-]+(?:, release ([0-9a-f]{40}|none))?"     # the first line of its help
 HOST_RETRY = 3600                           # seconds before a host that did not answer is asked again for a release
 RECORD_FILE = STATE + "/record.jsonl"
 MINTED_FILE = STATE + "/minted.json"        # ids of the keys this door minted (never their values)
@@ -943,12 +944,14 @@ class Door:
         """(outcome, words) of one host's update to the host parts of the release that the door runs: current, done,
         refused, failed or unreachable. Its help says its version and its release (an ops-root of version 1 names no
         release, and one that no self-update gave says none): a host of another release gets the bundle, with the
-        commits down to its own release, which self-update checks the way down by."""
+        commits down to its own release, which self-update checks the way down by. After a self-update that ended well
+        the door asks the help once more: the new ops-root runs at once, and each of its calls puts the host's own parts
+        in order (keep_sshd_folder), which no call of the old one did. A new ops-root that gives no version line there
+        does not run on that host, and the update failed."""
         status, out = self.ssh(host, {"v": 1, "op": "help", "args": []}, None)
         if status in (255, 124):        # no session, or no answer within HELP_WAIT: the door asks again later
             return "unreachable", f"{name} did not answer the door: {out.strip()[-200:]}"
-        found = re.match(r"ops-root [0-9]{1,6}, mode [a-z-]+(?:, release ([0-9a-f]{40}|none))?", out.strip()) \
-            if status == 0 else None
+        found = re.match(HELP_LINE, out.strip()) if status == 0 else None
         if not found:
             return "failed", f"{name}'s ops-root gave no version ({status}): {out.strip()[-200:]}"
         if found.group(1) == manifest["revision"]:
@@ -958,10 +961,14 @@ class Door:
         except (OSError, ValueError, subprocess.SubprocessError) as e:
             return "failed", f"the door could not make the bundle for {name}: {e}"
         status, out = self.ssh(host, {"v": 1, "op": "self-update", "args": []}, json.dumps(bundle).encode())
-        if status == 0:
-            return "done", out.strip() or f"{name} takes release {manifest['version']}"
-        return ("refused" if status == 3 else "unreachable" if status == 255 else "failed"), \
-            out.strip().removeprefix("refused: ")[-300:]
+        if status != 0:
+            return ("refused" if status == 3 else "unreachable" if status == 255 else "failed"), \
+                out.strip().removeprefix("refused: ")[-300:]
+        said = out.strip() or f"{name} takes release {manifest['version']}"
+        status, out = self.ssh(host, {"v": 1, "op": "help", "args": []}, None)
+        if status in (255, 124) or (status == 0 and re.match(HELP_LINE, out.strip())):
+            return "done", said         # a session that did not come: the next call of the host runs the new file
+        return "failed", f"{said}, and the new ops-root gave no version ({status}): {out.strip()[-200:]}"
 
     def full_access(self, access, host, agent):
         """True when the owner's signed mode of this host is Full access and the door honours it here: the access file

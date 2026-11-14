@@ -79,6 +79,16 @@ LIB = "/usr/local/lib/ops-root"
 INVENTORY = LIB + "/inventory"
 READER = LIB + "/ops-read"
 SSHD_UNIT = "ops-sshd.service"              # the second sshd
+# /run/sshd, which the second sshd needs for each new connection, is the RuntimeDirectory of the host's own
+# ssh.service, and systemd removes it at each stop of that unit unless this drop-in keeps it (keep_sshd_folder).
+# install.sh writes the same bytes.
+SSH_UNITS = ("/usr/lib/systemd/system/ssh.service", "/lib/systemd/system/ssh.service",
+             "/etc/systemd/system/ssh.service")
+SSHD_FOLDER_KEEP = "/etc/systemd/system/ssh.service.d/ops-sshd-folder.conf"
+SSHD_FOLDER_TEXT = ("# The door's second sshd (ops-sshd.service) needs /run/sshd for each new connection:\n"
+                    "# systemd keeps the folder at a stop of this unit (written by the door: install.sh, ops-root)\n"
+                    "[Service]\n"
+                    "RuntimeDirectoryPreserve=yes\n")
 TIMER_UNIT = "ops-root-rollback"            # the 600-second rollback timer
 BOOT_UNIT = "ops-root-rollback-at-boot.service"     # what a reboot keeps of the timer; 25 characters, so no app's name
 BOOT_ID = "/proc/sys/kernel/random/boot_id"  # one id for each boot of the host: a snapshot of this boot is kept
@@ -127,7 +137,7 @@ REFUSED_ARGS = {"-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-f
 PROTECTED = ("/usr/local/sbin/ops-root", LIB + "/", ETC + "/", STATE + "/", "/var/lib/ops-agent/",
              "/etc/sudoers.d/ops-agent", "/etc/passwd", "/etc/shadow", "/etc/group", "/etc/gshadow", "/etc/sudoers",
              "/etc/ld.so.preload", "/etc/pam.d/", "/etc/ssh/", "/etc/security/",
-             "/etc/systemd/system/" + SSHD_UNIT, "/etc/systemd/system/" + SSHD_UNIT + ".d/",
+             "/etc/systemd/system/" + SSHD_UNIT, "/etc/systemd/system/" + SSHD_UNIT + ".d/", SSHD_FOLDER_KEEP,
              "/etc/systemd/system/" + BOOT_UNIT, "/etc/systemd/system/" + BOOT_UNIT + ".d/",
              "/etc/fleet-door/", "/var/lib/fleet-door/", "/opt/fleet-door/", CI_STATE + "/")
 # The app trees and secret paths of every host, beside the host's own list (HIDDEN_FILE). The door's keys and state
@@ -3374,6 +3384,22 @@ def call(req, data=None):
         return f["run"](req, data)
 
 
+def keep_sshd_folder():
+    """The drop-in SSHD_FOLDER_KEEP, with exactly SSHD_FOLDER_TEXT, on a host that has an ssh.service, masked or not.
+    /run/sshd is that unit's RuntimeDirectory, and systemd removed the folder at each stop of it: an update of
+    openssh-server stops ssh.service, and so does a person or a failed restart. With the folder gone, the second sshd
+    refused every new connection while its unit still said active, so Restart=always did nothing, until a connection
+    to the public port 22 started ssh.service again (measured on Ubuntu 24.04, 14 November 2026). install.sh writes the
+    drop-in; each call here writes it again on a host that an older install left without it, or with other bytes, and
+    then systemd reads it. It never stops the call: the next call tries again."""
+    if read(SSHD_FOLDER_KEEP) == SSHD_FOLDER_TEXT or not any(os.path.lexists(P(unit)) for unit in SSH_UNITS):
+        return
+    with contextlib.suppress(OSError):
+        os.makedirs(os.path.dirname(P(SSHD_FOLDER_KEEP)), mode=0o755, exist_ok=True)
+        replace(SSHD_FOLDER_KEEP, SSHD_FOLDER_TEXT.encode(), 0o644)
+        systemctl("daemon-reload")
+
+
 def main(argv):
     if len(argv) == 2 and argv[1] in ("--fire", "--boot"):
         if os.getppid() != 1:
@@ -3387,6 +3413,7 @@ def main(argv):
     try:
         if len(argv) != 2:
             raise Refused("ops-root takes one argument: the request")
+        keep_sshd_folder()      # each call: the door's second sshd keeps its folder (install.sh writes it too)
         req = decode(argv[1])
         data = None if sys.stdin is None or sys.stdin.isatty() else sys.stdin.buffer.read(FILE_MAX * 2 + 1) or None
         print(call(req, data)[-(LOOK_OUT if req.get("op") == "look" else OUT_MAX):])

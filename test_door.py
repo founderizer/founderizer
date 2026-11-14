@@ -4100,7 +4100,7 @@ class HostUpdates(HostPath):
         self.assertTrue(self.host_file(root.SELF).endswith(b"# the next release\n"))
         self.assertEqual(self.host_file(root.RELEASE_FILE).decode().strip(), second["revision"])
         requests = [json.loads(base64.b64decode(argv[-1]))["op"] for argv in self.commands]
-        self.assertEqual(requests, ["help", "self-update", "help", "self-update"])
+        self.assertEqual(requests, ["help", "self-update", "help", "help", "self-update", "help"])
         self.assertEqual(door.read_json(door.HOSTS_FILE, {}),
                          {"web-1": {"revision": second["revision"], "outcome": "done",
                                     "at": door.read_json(door.HOSTS_FILE, {})["web-1"]["at"]}})
@@ -4138,6 +4138,47 @@ class HostUpdates(HostPath):
         answers["self-update"] = (0, "ops-root 2 from release 2026.11.9\n")
         self.assertEqual(door.update_hosts(self.door), [("web-1", "done")])
         self.assertEqual(manifest["revision"] != door.read_json(door.HOSTS_FILE, {})["web-1"]["revision"], True)
+
+    def test_the_new_ops_root_runs_right_after_its_update_and_keeps_the_folder_of_the_second_sshd(self):
+        """An older install left a host's ssh.service with no drop-in, and a stop of that unit took /run/sshd away from
+        the second sshd. The door asks the help once more after a self-update that ended well, so the new ops-root
+        runs at once, and its call writes the drop-in (test_host_parts.SshdFolder), on the whole path."""
+        reloads = []
+        unit = self.host + "/usr/lib/systemd/system/ssh.service"
+        os.makedirs(os.path.dirname(unit))
+        with open(unit, "w") as f:
+            f.write("[Service]\nRuntimeDirectory=sshd\n")
+        self.release()
+        with patch.object(door_targets.OPS_ROOT, "systemctl", lambda *words: reloads.append(words) or (0, "")):
+            self.assertEqual(door.update_hosts(self.door), [("web-1", "done")])
+        self.assertEqual([json.loads(base64.b64decode(a[-1]))["op"] for a in self.commands],
+                         ["help", "self-update", "help"])
+        self.assertEqual(self.host_file(door_targets.OPS_ROOT.SSHD_FOLDER_KEEP).decode(),
+                         door_targets.OPS_ROOT.SSHD_FOLDER_TEXT)
+        self.assertEqual(reloads, [("daemon-reload",)])
+
+    def test_a_new_ops_root_that_gives_no_version_after_its_update_failed_on_that_host(self):
+        """The help after the self-update: a file that does not run on the host is a failed update, with its words on
+        the record; a session that did not come leaves it done, as the host's next call runs the new file."""
+        manifest, answers, sent = self.release(), [], []
+
+        def ssh(host, req, stdin):
+            sent.append(req["op"])
+            return answers.pop(0)
+        self.door.ssh = ssh
+        answers.extend([(0, "ops-root 3, mode fix, release none\n"), (0, "ops-root 3 from release 2026.11.9\n"),
+                        (1, "Traceback (most recent call last):\nSyntaxError: invalid syntax\n")])
+        self.assertEqual(door.update_hosts(self.door), [("web-1", "failed")])
+        line = self.door.record.after(0)[-1]
+        self.assertEqual((line["action"], line["outcome"]), ("self-update", "failed"))
+        self.assertIn("ops-root 3 from release 2026.11.9, and the new ops-root gave no version (1)", line["why"])
+        self.assertIn("SyntaxError", line["why"])
+        self.release(extra="# next\n")
+        answers.extend([(0, "ops-root 3, mode fix, release none\n"), (0, "ops-root 3 from release 2026.11.10\n"),
+                        (255, "ssh: connect to host 100.64.1.1 port 2244: Connection timed out\n")])
+        self.assertEqual(door.update_hosts(self.door), [("web-1", "done")])
+        self.assertEqual(sent, ["help", "self-update", "help"] * 2)
+        self.assertNotEqual(manifest["revision"], door.read_json(door.HOSTS_FILE, {})["web-1"]["revision"])
 
     def test_a_host_whose_help_does_not_answer_in_time_is_asked_again_later(self):
         """A help that ran into its short wait is a host that did not answer, not one that failed for this release."""
