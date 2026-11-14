@@ -1052,6 +1052,26 @@ class Install(unittest.TestCase):
         self.assertEqual(listed["inputSchema"]["properties"]["servers"]["enum"], [1, 2])
         self.assertIn("Never choose for them", listed["description"])
 
+    def test_only_the_tools_that_read_say_that_they_read(self):
+        """A client that asks its user before a tool that can write (Codex) reads each tool's readOnlyHint. Without
+        one, Codex asked before each call, also before a read (14 November 2026). Five tools say that they only read:
+        the four reads of the owner API, none of whose pages is a GET route that the hub counts as a write, and
+        which_hub. Each other tool says false, install_log too: it opens the owner's SSH to a host that the agent
+        names."""
+        listed = [one for one in self.client().tools().values() if "annotations" in one]
+        self.assertEqual(len(listed), len(owner_mcp.tools()))        # each tool that a client lists has them
+        reads = sorted(one["name"] for one in listed if one["annotations"]["readOnlyHint"])
+        self.assertEqual(reads, ["fleet_overview", "fleet_read", "search_history", "see_costs", "which_hub"])
+        self.assertEqual([one["name"] for one in listed if set(one["annotations"]) != {"readOnlyHint"}
+                          or not isinstance(one["annotations"]["readOnlyHint"], bool)], [])
+        writes = [route for route, _what in owner_mcp.PAGES.values()
+                  if hub.get_writes([part for part in route.split("/") if part])]
+        self.assertEqual(writes, [])
+        # No tool that reaches a server over SSH, writes a file on this Mac or sends a command says that it reads.
+        self.assertEqual([name for name in ("install_hub", "install_log", "claim_hub", "add_machine", "use_hub",
+                                            "read_attachment", "take_backup", "attach_file", "check_releases",
+                                            "check_machine", "check_mcp_server") if name in reads], [])
+
     def test_it_refuses_an_auth_key_file_that_other_users_can_read_and_never_opens_it(self):
         client = self.client()
         self.key.chmod(0o644)

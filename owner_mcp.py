@@ -1531,8 +1531,22 @@ def add_machine(args):
 # ---- the tools
 
 
+# The tools that only read, which each says in its MCP annotations (readOnlyHint), as the hub's own tools do. A client
+# can then ask its user before a tool that can write and let a read pass. Codex asks before each MCP tool call that
+# does not say so: on 14 November 2026 a new Codex session with this server stopped at its first read, which_hub,
+# with "MCP tool call requires approval". Each of these five changes nothing in a fleet: the four reads of the owner
+# API (no page of fleet_read is a GET route that writes, hub.py get_writes), and which_hub, whose one write is this
+# server's own label file at its first call (client_label).
+#
+# install_log is not here, though its command on the server is `tail`: it opens the owner's own SSH to the host and
+# the user that the agent names, and its first connection to a new host keeps that host's key in the owner's
+# known_hosts. A call that makes the owner's Mac log in to a server is the owner's to see first. read_attachment and
+# take_backup are not here either: each writes a file on this Mac, and take_backup tells the hub.
+READ_ONLY = ("fleet_overview", "fleet_read", "search_history", "see_costs", "which_hub")
+
+
 def tool(name, about, properties, required, run):
-    return {"name": name, "description": about, "run": run,
+    return {"name": name, "description": about, "run": run, "annotations": {"readOnlyHint": name in READ_ONLY},
             "inputSchema": {"type": "object", "properties": properties, "required": list(required),
                             "additionalProperties": False}}
 
