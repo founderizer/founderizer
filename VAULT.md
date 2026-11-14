@@ -67,9 +67,12 @@ The vault protects the value of each secret. The design gives these results:
   and its address when the Mac has no saved connection to it, come from the hub. The app seals only while the hub names
   the same key (`Sources/FleetCore/CentralVault.swift`, `Sources/Founderizer/CentralVaultSection.swift`).
 - With the sealed copy, the hub gets the secret's name, its catalog entry and salted SHA-256 fingerprints of the value
-  (`Sources/Founderizer/SecretEntryView.swift`).
-- The catalog takes no second API key with the variable name of another one (`hub.py`). When the owner saves a key
-  under a variable name that one key of the catalog has, the app replaces the value of that key: the new value goes
+  (`Sources/Founderizer/SecretEntryView.swift`). An import sends these for all its items in one command, and the hub
+  puts them into the catalog with one commit (`Sources/Founderizer/SecretImportView.swift`, `hub.py`). A title that
+  holds a value, of the catalog or of the same import, is refused before the hub keeps the command (`hub.py`).
+- The catalog takes no second API key with the variable name of another one, also not from one import (`hub.py`).
+  When the owner saves a key under a variable name that one key of the catalog has, the app replaces the value of
+  that key: the new value goes
   under the same reference, with a `replace` statement that the owner key signs about that one sealed copy (see "The
   owner's signatures"). The catalog entry, its site and each grant stay as they are
   (`Sources/Founderizer/SecretEntryView.swift`, `Sources/FleetCore/Secrets.swift`,

@@ -199,6 +199,7 @@ NOT_TOOLS = {
     "/ui/mcp/connect": "an MCP server's OAuth client, and a browser flow of the owner's own",
     "/ui/mcp/finish": "the authorization code of that flow",
     "/ui/secrets/add": "the value of a login",
+    "/ui/secrets/import": "the values of an import's logins, as /ui/secrets/add",
     "/ui/secrets/fingerprints": "the owner's own secret catalog",
     "/ui/needs/{}/secret": "a secret request's answer with a login, which the app's secure form gives once the value "
                            "is in a vault; its decline carries no value, and decline_secret_request sends that",

@@ -106,6 +106,113 @@ class Grants(VaultAccess):
                 self.assertEqual(self.add(**bad)[0], 400)
         self.assertNotIn(VALUE, json.dumps([dict(r) for r in hub.q("SELECT * FROM ui_controls")]))
 
+    # ---- an import: all of its entries in one command and one commit (owner feature secrets_import)
+    def importing(self, entries, request_id=None, **fields):
+        return self.request("/ui/secrets/import", dict({"request_id": request_id or str(uuid.uuid4()),
+                                                        "db": "test-generation", "secrets": entries}, **fields))
+
+    @staticmethod
+    def ref(n):
+        return f"bws://{n:08x}-2222-4333-8444-55555555555b"
+
+    def key(self, n, env, value):
+        return {"login": self.ref(n), "title": env, "kind": "api_key", "env": env,
+                "fingerprints": self.prints(self.ref(n), value)}
+
+    def test_an_import_adds_all_its_entries_in_one_commit_with_an_answer_for_each(self):
+        self.assertIn("secrets_import", self.request()[1]["ui_features"])
+        before = self.commits()
+        values = [f"sk-example-{n}-Pr4ct!ce-2026" for n in range(3)]
+        entries = [self.key(0x51 + n, f"EXAMPLE_{n}_API_KEY", values[n]) for n in range(3)] + \
+            [{"login": self.ref(0x60), "title": "shop.test · editor", "kind": "login"}]     # a short value: no print
+        code, receipt = self.importing(entries)
+        self.assertEqual(code, 200, receipt)
+        self.assertEqual([(r["login"], r["stored"], r["known"], r["changed"]) for r in receipt["results"]],
+                         [(self.ref(0x51), 1, 0, True), (self.ref(0x52), 1, 0, True), (self.ref(0x53), 1, 0, True),
+                          (self.ref(0x60), 0, 0, True)])
+        self.assertTrue(receipt["changed"])
+        self.assertEqual(self.commits(), before + 1)                    # one commit, not one for each entry
+        logins = self.committed()["logins"]
+        self.assertEqual(logins[self.ref(0x52)], {"title": "EXAMPLE_1_API_KEY", "kind": "api_key",
+                                                   "env": "EXAMPLE_1_API_KEY"})
+        self.assertEqual(logins[self.ref(0x60)], {"title": "shop.test · editor", "kind": "login"})
+        self.assertTrue(all(hub.secret_hit(f"the key is {value}") for value in values))
+        code, again = self.importing(entries)                           # the same step again: found, nothing committed
+        self.assertEqual(code, 200, again)
+        self.assertEqual([(r["stored"], r["known"], r["changed"]) for r in again["results"]],
+                         [(0, 1, False)] * 3 + [(0, 0, False)])
+        self.assertEqual((again["changed"], self.commits()), (False, before + 1))
+        self.assertNotIn(values[0], json.dumps([dict(r) for r in hub.q("SELECT * FROM ui_controls")]))
+
+    def test_an_import_refuses_an_entry_alone_and_takes_the_others(self):
+        self.assertEqual(self.add(**self.key(0x70, "EXAMPLE_HELD_KEY", "sk-example-held-2026"))[0], 200)
+        before = self.commits()
+        good, twin = self.key(0x71, "EXAMPLE_SHOP_KEY", "sk-example-shop-2026"), self.key(0x72, "EXAMPLE_SHOP_KEY", "x" * 20)
+        entries = [good, twin, dict(self.key(0x73, "PATH", "y" * 20)), dict(good),
+                   self.key(0x74, "EXAMPLE_HELD_KEY", "z" * 20), self.key(0x75, "EXAMPLE_MAIL_KEY", "sk-example-mail-2026")]
+        code, receipt = self.importing(entries)
+        self.assertEqual(code, 200, receipt)
+        said = [(r["login"], r.get("status"), r.get("changed")) for r in receipt["results"]]
+        self.assertEqual(said, [(self.ref(0x71), None, True),
+                                (self.ref(0x72), 409, None),            # its name is the entry's before it
+                                (self.ref(0x73), 400, None),            # PATH is a variable that a session sets itself
+                                (self.ref(0x71), 400, None),            # the same reference twice in one list
+                                (self.ref(0x74), 409, None),            # its name is a key that the list holds
+                                (self.ref(0x75), None, True)])
+        self.assertIn("The list already has an API key named EXAMPLE_SHOP_KEY", receipt["results"][1]["error"])
+        self.assertIn("this reference is in the list twice", receipt["results"][3]["error"])
+        self.assertEqual(self.commits(), before + 1)
+        logins = self.committed()["logins"]
+        self.assertEqual((self.ref(0x71) in logins, self.ref(0x72) in logins, self.ref(0x74) in logins,
+                          self.ref(0x75) in logins), (True, False, False, True))
+        self.assertFalse(hub.secret_hit("the key is " + "x" * 20))         # a refused entry registers nothing
+
+    def test_no_value_of_an_import_goes_into_a_title_whatever_the_order(self):
+        """A login whose user name is an API key of the same export: before, with the login first, its title went into
+        team.json with the key in it. The route checks each title against the list's own fingerprints too, before the
+        hub keeps the command, so neither team.json nor the command's record holds the key."""
+        key_value = "sk-example-basic-Pr4ct!ce-2026"
+        login = {"login": self.ref(0x91), "title": f"acme.example.test · {key_value}", "kind": "login"}
+        code, receipt = self.importing([login, self.key(0x92, "EXAMPLE_BASIC_KEY", key_value)])
+        self.assertEqual(code, 200, receipt)
+        self.assertEqual([(r["login"], r.get("status"), r.get("changed")) for r in receipt["results"]],
+                         [(self.ref(0x91), 422, None), (self.ref(0x92), None, True)])
+        logins = self.committed()["logins"]
+        self.assertEqual((self.ref(0x91) in logins, self.ref(0x92) in logins), (False, True))
+        self.assertNotIn(key_value, (self.root / "kit" / "team.json").read_text())
+        # A title with a value that the hub knows already gets its own refusal, and the rest of the list goes on.
+        other = {"login": self.ref(0x93), "title": f"shop.example.test · {key_value}", "kind": "login"}
+        code, receipt = self.importing([other, self.key(0x94, "EXAMPLE_NEXT_KEY", "sk-example-next-2026")])
+        self.assertEqual(code, 200, receipt)
+        self.assertEqual([(r["login"], r.get("status")) for r in receipt["results"]],
+                         [(self.ref(0x93), 422), (self.ref(0x94), None)])
+        self.assertNotIn(key_value, json.dumps([dict(r) for r in hub.q("SELECT * FROM ui_controls")]))
+
+    def test_an_entry_past_the_lists_room_is_refused_alone(self):
+        entries = [{"login": self.ref(0xa0 + n), "title": f"site{n}.example.test · editor", "kind": "login"} for n in range(3)]
+        entries.insert(1, "not an object")
+        with patch.object(hub, "CATALOG_MOST", 4):                    # the list holds two: room for two more
+            code, receipt = self.importing(entries)
+        self.assertEqual(code, 200, receipt)
+        self.assertEqual([(r["login"], r.get("status")) for r in receipt["results"]],
+                         [(self.ref(0xa0), None), (None, 400), (self.ref(0xa1), None), (self.ref(0xa2), 400)])
+        self.assertEqual(receipt["results"][3]["error"], "The list has 4 secrets and takes no more.")
+        self.assertEqual(len(self.committed()["logins"]), 4)
+
+    def test_an_import_list_that_is_not_valid_is_refused_whole(self):
+        before = self.commits()
+        one = [self.key(0x80, "EXAMPLE_ONE_KEY", "sk-example-one-2026")]
+        many = [{"login": self.ref(0x100 + n), "title": f"site{n}.test · editor", "kind": "login"} for n in range(257)]
+        for fields, entries in (({}, None), ({}, []), ({}, many), ({}, "not a list"), ({"logins": one}, one)):
+            with self.subTest(fields=fields, entries=None if entries is None else str(entries)[:40]):
+                body = dict({"request_id": str(uuid.uuid4()), "db": "test-generation"}, **fields)
+                if entries is not None:
+                    body["secrets"] = entries
+                self.assertEqual(self.request("/ui/secrets/import", body)[0], 400)
+        with patch.dict(hub.CENTRAL, dict(hub.CENTRAL_START, status=None, read_at=None), clear=True):
+            self.assertEqual(self.importing(one)[0], 503)                  # no central vault: no value could go on
+        self.assertEqual(self.commits(), before)
+
     def test_a_click_gives_and_takes_back_a_secret_and_read_is_only_for_an_api_key(self):
         before = self.commits()
         self.assertIn("not given it to you", hub.grant_refusal("alpha", KEY))

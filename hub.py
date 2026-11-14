@@ -1409,6 +1409,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # card, from GET /ui/history?mode=messages (UI-API.md 1.128)
                "secret_compare",    # the same yes: "Changed in 1Password" on the import page, from
                                     # GET /ui/secrets/same (UI-API.md 1.129)
+               "secrets_import",    # the owner, 13 November 2026, of a 9-minute import: "it needs to be much
+                                    # faster!!": POST /ui/secrets/import, all of an import's entries in one commit
                "default_models",    # the owner, 9 November 2026: "a default for each [AI provider] somewhere under
                                     # settings, and then each agent can be changed individually"
                "web_hosts",         # the host list of an agent whose Shell box is off (UI-API.md, "the host list")
@@ -2909,6 +2911,20 @@ def secret_hit(*texts):
             if bare is not plain and spans_of(bare, key):
                 return True
     return False
+
+
+def holds_value(text, rows):
+    """True when text holds a value whose fingerprint is one of rows, (salt, hash, len) each, as secret_hit searches the
+    registered ones, its skeleton included. rows: the fingerprints of a list that the hub has not registered yet (POST
+    /ui/secrets/import), so that one entry's value never goes on in another entry's title, not even into the record of
+    the command."""
+    rows, text = tuple(rows), str(text or "")
+    if not rows or len(text) < SECRET_TEXT_LEAST:
+        return False
+    if find_secret_spans(text, rows):
+        return True
+    bare = login_skeleton(text)
+    return bare is not text and bool(find_secret_spans(bare, rows))
 
 
 def guard(agent, *texts):
@@ -33787,8 +33803,8 @@ def validate_team(team):
             raise ValueError(f"account {aid!r} needs an ID of 2 to 31 characters a-z 0-9 - that starts with a letter, a "
                              f"provider of 1 to 30 characters a-z 0-9 -, and a title of at most 60 characters")
     catalog = team.get("logins", {})
-    if not isinstance(catalog, dict) or len(catalog) > 256:
-        raise ValueError("logins must map up to 256 bws://<uuid> references to {title}")
+    if not isinstance(catalog, dict) or len(catalog) > CATALOG_MOST:
+        raise ValueError(f"logins must map up to {CATALOG_MOST} bws://<uuid> references to {{title}}")
     for ref, entry in catalog.items():
         if not (isinstance(ref, str) and BWS_REF.fullmatch(ref) and ref == ref.lower()) or not isinstance(entry, dict) \
                 or "title" not in entry or set(entry) - {"title", "kind", "env", "site", "form"} \
@@ -36673,6 +36689,67 @@ def save_secret(body):
                                                 f"{entry['title']}")
     apply_team(team)
     log("owner", f"added {ref} ({entry['title']}) to the catalog in {commit[:12]}")
+    return dict(result, revision=commit, sha256=hashlib.sha256(data).hexdigest(), changed=True)
+
+
+CATALOG_MOST = 256              # the catalog's room: validate_team, and each entry of an import (save_secrets)
+SECRETS_IMPORT_MAX = CATALOG_MOST       # entries of one POST /ui/secrets/import
+
+
+def save_secrets(body):
+    """POST /ui/secrets/import (owner feature secrets_import): save_secret for each entry of an import, with one read
+    of the team, one validation and one commit for them all. An import of 143 keys made 143 commits of team.json, each
+    one a fetch, a clone, a commit and a push, about 3.9 seconds a key (the owner, 13 November 2026: "it needs to be
+    much faster!!").
+
+    Each entry has its own answer, in the order of the list: {login, stored, known, changed}, or {login, error,
+    status} for one that the hub refuses. An entry is refused for what POST /ui/secrets/add refuses, and the others go
+    in: a field that is not valid, a reference that is in the list twice (400, from the route), a title or a variable
+    that holds a value, of the catalog or of the same list (422, from the route's read, before the hub keeps the
+    command), a new API key whose variable name the catalog has, or an entry before it that the hub took (409,
+    key_named), and an entry that the catalog has no room for (400). An entry is registered as save_secret registers
+    one: its fingerprints first, so a commit that fails leaves them, and the same step again finds them. Only a refusal
+    of team.json itself (validate_team) refuses the whole list, with 400. No value comes in."""
+    rev = kit_revision(fresh=True)
+    team, current, _ = team_view(rev)
+    logins = dict(team.get("logins") or {})
+    results, changed = [], []
+    for item in body["secrets"]:
+        if "error" in item:
+            results.append({"login": item["login"], "error": item["error"], "status": item["status"]})
+            continue
+        ref = item["login"]
+        entry = {k: item[k] for k in ("title", "kind", "env") if item.get(k) is not None}
+        was = logins.get(ref) or {}
+        if ref not in logins and len(logins) >= CATALOG_MOST:
+            results.append({"login": ref, "status": 400, "error": f"The list has {CATALOG_MOST} secrets and takes no "
+                                                                   f"more."})
+            continue
+        if entry.get("kind") == "api_key" and was.get("env") != entry["env"] and \
+                key_named(dict(team, logins=logins), entry["env"], ref):
+            results.append({"login": ref, "status": 409, "error": f"The list already has an API key named "
+                                                                   f"{entry['env']}, and it takes no second key of that "
+                                                                   f"name."})
+            continue
+        stored, known = register_fingerprints(ref, item["fingerprints"], newest=True) if item["fingerprints"] else (0, 0)
+        entry.update({k: was[k] for k in ("site",) + (("form",) if entry.get("kind") == "api_key" else ()) if k in was})
+        new = logins.get(ref) != entry
+        if new:
+            logins[ref] = entry
+            changed.append(ref)
+        results.append({"login": ref, "stored": stored, "known": known, "changed": new})
+    result = {"results": results, "revision": rev, "sha256": current, "changed": False}
+    if not changed:
+        return result
+    team["logins"] = logins
+    try:
+        validate_team(team)
+    except ValueError as e:
+        raise Refusal(400, str(e)) from None
+    data = (json.dumps(team, indent=2) + "\n").encode()
+    commit = commit_kit_file("team.json", data, f"Owner imported {len(changed)} secret" + ("s" if len(changed) != 1 else ""))
+    apply_team(team)
+    log("owner", f"imported {len(changed)} secret(s) into the catalog in {commit[:12]}")
     return dict(result, revision=commit, sha256=hashlib.sha256(data).hexdigest(), changed=True)
 
 
@@ -45057,24 +45134,74 @@ class Handler(BaseHTTPRequestHandler):
             refused = central_refusal()
             if refused:
                 raise Refusal(503, refused)
-            extra = sorted(set(data) - {"request_id", "db", "login", "title", "kind", "env", "fingerprints"})
+            return self.secret_fields({k: v for k, v in data.items() if k not in ("request_id", "db")})
+        return self.ui_command("secrets/add", read, save_secret)
+
+    def secret_fields(self, data):
+        """The checked fields of one catalog entry with its fingerprints, as POST /ui/secrets/add takes it and each entry
+        of POST /ui/secrets/import: {login, title, kind, env, fingerprints}, so that the two have one rule. Raises
+        ValueError with the reason."""
+        if not isinstance(data, dict):
+            raise ValueError("an entry is an object of login, title, kind, env and fingerprints")
+        extra = sorted(set(data) - {"login", "title", "kind", "env", "fingerprints"})
+        if extra:
+            raise ValueError(f"unknown field {extra[0]}")
+        title, kind, env = data.get("title"), data.get("kind"), data.get("env")
+        if not (isinstance(title, str) and "\n" not in title and 1 <= len(title.strip()) <= 60):
+            raise ValueError("title must be one line of 1 to 60 characters")
+        if kind not in SECRET_KINDS:
+            raise ValueError("kind must be login or api_key")
+        if (kind == "api_key") != (env is not None) or (env is not None and not env_name(env)):
+            raise ValueError("an API key has env, a variable name of A-Z 0-9 _ that starts with a letter, at most 60 "
+                             "characters and not one that a session sets itself; a login has none")
+        prints = data.get("fingerprints") or []
+        if prints and not fingerprint_items(prints):
+            raise ValueError("fingerprints: up to three items, at most one password and two totp, each "
+                             "{kind, hash (64 lowercase hex), len (8 or more)}")
+        return {"login": self.login_reference(data.get("login")), "title": title.strip(), "kind": kind, "env": env,
+                "fingerprints": [{k: x[k] for k in ("kind", "hash", "len")} for x in prints]}
+
+    def ui_secret_import(self):
+        """POST /ui/secrets/import (owner feature secrets_import): the hub step of an import of many items, in one command
+        and one commit (save_secrets). {secrets: [entry, ...]}: 1 to SECRETS_IMPORT_MAX entries of POST
+        /ui/secrets/add's shape. An entry that is not valid, or whose reference is in the list twice, gets its own answer
+        and stops no other one. Refused (503) as POST /ui/secrets/add is, when the central vault cannot take values."""
+        def read(data):
+            refused = central_refusal()
+            if refused:
+                raise Refusal(503, refused)
+            extra = sorted(set(data) - {"request_id", "db", "secrets"})
             if extra:
                 raise ValueError(f"unknown field {extra[0]}")
-            title, kind, env = data.get("title"), data.get("kind"), data.get("env")
-            if not (isinstance(title, str) and "\n" not in title and 1 <= len(title.strip()) <= 60):
-                raise ValueError("title must be one line of 1 to 60 characters")
-            if kind not in SECRET_KINDS:
-                raise ValueError("kind must be login or api_key")
-            if (kind == "api_key") != (env is not None) or (env is not None and not env_name(env)):
-                raise ValueError("an API key has env, a variable name of A-Z 0-9 _ that starts with a letter, at most 60 "
-                                 "characters and not one that a session sets itself; a login has none")
-            prints = data.get("fingerprints") or []
-            if prints and not fingerprint_items(prints):
-                raise ValueError("fingerprints: up to three items, at most one password and two totp, each "
-                                 "{kind, hash (64 lowercase hex), len (8 or more)}")
-            return {"login": self.login_reference(data.get("login")), "title": title.strip(), "kind": kind, "env": env,
-                    "fingerprints": [{k: x[k] for k in ("kind", "hash", "len")} for x in prints]}
-        return self.ui_command("secrets/add", read, save_secret)
+            items = data.get("secrets")
+            if not isinstance(items, list) or not 1 <= len(items) <= SECRETS_IMPORT_MAX:
+                raise ValueError(f"secrets must be a list of 1 to {SECRETS_IMPORT_MAX} entries")
+            entries, seen = [], set()
+            for item in items:
+                said = item.get("login") if isinstance(item, dict) else None
+                try:
+                    entry = self.secret_fields(item)
+                except ValueError as e:
+                    entries.append({"login": said.lower() if isinstance(said, str) and BWS_REF.fullmatch(said.lower())
+                                    else None, "error": str(e), "status": 400})
+                    continue
+                if entry["login"] in seen:
+                    entries.append({"login": entry["login"], "error": "this reference is in the list twice", "status": 400})
+                    continue
+                seen.add(entry["login"])
+                entries.append(entry)
+            # A title or a variable that holds a value: the hub's registered ones, or one of this list's own values,
+            # whatever their order (a login whose user name is an API key of the same export). Each one gets its own
+            # answer before the command is checked and kept whole (command_run), so no record holds the value.
+            with LOCK:          # fingerprint_salt writes the hub's fingerprint key the first time
+                own = [(fingerprint_salt(fingerprint_label(e["login"], x["kind"])), x["hash"], x["len"])
+                       for e in entries if "error" not in e for x in e["fingerprints"]]
+            for n, e in enumerate(entries):
+                if "error" not in e and (secret_hit(e["title"], e["env"] or "") or holds_value(e["title"], own)
+                                         or holds_value(e["env"], own)):
+                    entries[n] = {"login": e["login"], "error": "a registered login cannot be sent as text", "status": 422}
+            return {"secrets": entries}
+        return self.ui_command("secrets/import", read, save_secrets, limit=SECRETS_IMPORT_MAX * 2048)
 
     def ui_need_secret(self, need_id):
         """POST /ui/needs/<id>/secret (owner feature secret_requests): the answer of one request_secret, from the app's
@@ -47519,6 +47646,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_secret_fingerprints()
         if parts == ["ui", "secrets", "add"]:
             return self.ui_secret_add()
+        if parts == ["ui", "secrets", "import"]:
+            return self.ui_secret_import()
         if parts == ["ui", "secrets", "grant"]:
             return self.ui_secret_grant()
         if parts == ["ui", "vault", "intake"]:
