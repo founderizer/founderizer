@@ -74,7 +74,7 @@ ENTITLEMENT_KEY_FILE = "entitlement-key.pub"    # the entitlement public keys: a
 
 CHANNEL_TIMEOUT = 10        # seconds for GET /releases/latest: a channel that does not answer changes nothing
 SELFTEST_WAIT = 300         # seconds for selftest.py, as verify.py gives it
-VERIFY_WAIT = 420           # seconds for fleet.py verify, which runs selftest.py again inside itself
+VERIFY_WAIT = 420           # seconds for fleet.py verify; the run's own selftest.py comes before it, and it runs none
 SCHEMA_WAIT = 120           # seconds for the released code's schema against a copy of this fleet's database
 GIT_WAIT = 300              # seconds for one git step; a fetch of the whole repository is the slow one
 PUSH_TRIES = 4              # the push of the configuration ref, and three more when the hub moved the ref under it
@@ -770,7 +770,7 @@ class Update:
     def checks(self):
         """The schema against a copy of this fleet's records, then `selftest.py` and `fleet.py verify`, all three
         in the clone, so they read the released code and not this hub's. Any one failing keeps the fleet where it
-        is. The schema goes first because it takes a second and the other two take minutes."""
+        is. The schema goes first because it takes a second and selftest.py about a minute."""
         from verify import OWNER_STEPS
         answer = self.schema_check()
         if answer:
@@ -792,8 +792,13 @@ class Update:
             return self.answer(ROLLED_BACK, "selftest", f"selftest.py ended with {code} for release {version} and "
                                                         f"named no failure; {passed} of {total} passed. The fleet "
                                                         f"stays at {pinned}.")
-        code, out, err = self.run([self.python, os.path.join(self.clone, "fleet.py"), "verify", "--json"],
-                                  timeout=self.verify_wait, cwd=self.clone)
+        # **Without its own self-test** (verify.WITHOUT): selftest.py has just passed on this clone, and fleet.py verify
+        # ran the same file in the same clone a second time. Each run waits for the hub's timers, so that second run
+        # was a minute of the two that the owner waited on Updates for every release (14 November 2026: "clicked on
+        # Update fleet, seems stuck, not a great ux"). The released fleet.py always knows the option: a release
+        # comes after the code that runs this, which already has it.
+        code, out, err = self.run([self.python, os.path.join(self.clone, "fleet.py"), "verify", "--no-selftest",
+                                   "--json"], timeout=self.verify_wait, cwd=self.clone)
         try:
             results = json.loads(out)
             # A check the owner alone can pass says nothing about the release (verify.OWNER_STEPS): a fleet that has

@@ -34645,6 +34645,11 @@ def broker_report(name, t0=None):
 
 VAULT_PROGRAM = "vault.py"      # the broker's program: a root-owned copy outside every checkout a helper updates
 _vault_source = {}              # what it must hash to, by revision: {revision: sha256 or None}
+# Seconds after a release in which a broker that still runs the vault.py it replaced is not said (health_view): a
+# server learns the new revision at its next status report (server.REPORT_EVERY, 300), catches its broker up at once,
+# and the agent's helper carries the new checksum at its own next report (lifecycle.REPORT_EVERY, 300). Measured on
+# the owner's fleet on 14 November 2026, release 2026.11.442: the four Linux servers took about six minutes.
+VAULT_SETTLES = 900
 
 
 def vault_source(rev):
@@ -40683,10 +40688,20 @@ def health_view():
     #
     # A machine that is stale or behind is left out: it has not taken the release at all, its own warning already
     # carries that, and two lines for one cause say less than one.
+    #
+    # **A broker in the middle of its own catch-up is not said** (VAULT_SETTLES): one that runs the vault.py that a
+    # release of that time replaced, read at the revision the release left (`pinned`). A release that changed vault.py
+    # raised this warning on every Linux server at once, for the six minutes that their own catch-up took, in orange
+    # and with the dot on Settings, over a release that had gone well: the owner pressed Update on 14 November 2026
+    # and wrote "seems stuck, not a great ux". A broker that runs anything else was behind before that release, and is
+    # said at once, however often releases come.
     want = vault_source(desired)
     held = {m["machine"] for m in machines if m["stale"] or m["update"]["state"] != "current"}
+    replaced = {vault_source(row["pinned"]) for row in q(
+        "SELECT pinned FROM releases WHERE reached IS NOT NULL AND pinned IS NOT NULL AND finished IS NOT NULL AND "
+        "? - finished BETWEEN 0 AND ?", (t0, VAULT_SETTLES))} - {None}
     for machine, broker in (broker_programs(t0).items() if want else ()):
-        if machine in held or broker["source"] == want:
+        if machine in held or broker["source"] == want or broker["source"] in replaced:
             continue
         warn("vault_behind", f"The vault on {machine} has not taken the last update.",
              "It updates itself within ten minutes; tell us if it does not.", agent=broker["agent"])
@@ -41630,8 +41645,8 @@ def poll_release(fetch=None):
 def start_release_work(applying, automatic=False, fetch=None):
     """Start the poll — and, when `applying`, the update that follows it — in a thread of its own.
 
-    Called under LOCK, so it only checks what is cheap and starts the thread: an update takes minutes, because
-    `selftest.py` and `fleet.py verify` both run on the released code before anything is published."""
+    Called under LOCK, so it only checks what is cheap and starts the thread: an update takes a minute or more,
+    because `selftest.py` and `fleet.py verify` run on the released code before anything is published."""
     with _release_lock:
         if release_running():
             raise Refusal(409, "this fleet is already checking or updating; wait for that to finish")

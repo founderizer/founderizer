@@ -81,7 +81,7 @@ def checks_pass(argv, timeout=None, cwd=None, input=None):
         return releases._run(argv, timeout=timeout or releases.GIT_WAIT, cwd=cwd, input=input)
     if argv[-1].endswith("selftest.py"):
         return 0, "1 of 1 checks passed.", ""
-    if argv[-2:] == ["verify", "--json"]:
+    if argv[-3:] == ["verify", "--no-selftest", "--json"]:
         return 0, "[]", ""
     raise AssertionError("the update ran something unexpected: " + " ".join(argv))
 

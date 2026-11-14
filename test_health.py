@@ -459,6 +459,43 @@ class Health(OwnerAPI):
         hub.q("UPDATE machine_status SET reported=? WHERE agent='vps'", (hub.now() - hub.MACHINE_STALE - 1,))
         self.assertEqual(self.vault_warnings(), [])
 
+    def test_no_vault_warning_while_each_server_still_catches_its_broker_up_after_a_release(self):
+        """A release that changed vault.py: each server learns the new revision at its next status report, catches its
+        broker up at once, and its agent's helper carries the new checksum at its own next report. On the owner's
+        fleet that was six minutes after release 2026.11.442 (14 November 2026), and System status said "The vault
+        on app-1 has not taken the last update" for four servers all that time, with the dot on Settings, about a
+        release that had gone well: "seems stuck, not a great ux". So a broker that still runs the vault.py that a
+        release replaced is not said for VAULT_SETTLES after that release; a broker that runs anything else was behind
+        before it, and is said at once, however often releases come."""
+        hub.TEAM["addresses"]["vps"] = "127.0.0.3"
+        hub.TEAM["agents"]["vps"] = {"role": "worker", "runtime": "codex", "machine": "vps", "can": ["shell"],
+                                     "vault": "broker"}
+        left = "d" * 40                                             # the revision the release left (`pinned`)
+        sources = {self.REVISION: "a" * 64, left: "c" * 64}        # the vault.py of each revision
+
+        def warnings():
+            with unittest.mock.patch.object(hub, "vault_source", side_effect=sources.get), \
+                    unittest.mock.patch.object(hub, "kit_revision", return_value=self.REVISION):
+                return [w["agent"] for w in self.health()["warnings"] if w["kind"] == "vault_behind"]
+        self.vault_report("vps", "c" * 64)
+        self.assertEqual(warnings(), ["vps"])                       # behind, and no release explains it
+        t0 = hub.now()
+        hub.ins("INSERT INTO releases(seen,revision,version,hold,state,started,finished,pinned,reached) "
+                "VALUES(?,?,?,0,?,?,?,?,?)", (t0, "e" * 40, "2026.11.442", hub.releases.DONE, t0 - 140, t0 - 10, left,
+                                              self.REVISION))
+        self.assertEqual(warnings(), [])                            # its own server catches it up by itself
+        self.vault_report("vps", "f" * 64)                          # a broker that was behind before the release
+        self.assertEqual(warnings(), ["vps"])
+        self.vault_report("vps", "c" * 64)
+        hub.q("UPDATE releases SET finished=?", (t0 - hub.VAULT_SETTLES - 1,))
+        self.assertEqual(warnings(), ["vps"])                       # still behind after its time: said as before
+        # A run that reached nothing (rolled back) changed no vault.py, and a finish ahead of this clock holds nothing.
+        hub.ins("INSERT INTO releases(seen,revision,version,hold,state,started,finished,pinned) "
+                "VALUES(?,?,?,0,?,?,?,?)", (t0, "f" * 40, "2026.11.443", hub.releases.ROLLED_BACK, t0 - 60, t0 - 5, left))
+        self.assertEqual(warnings(), ["vps"])
+        hub.q("UPDATE releases SET finished=? WHERE state=?", (t0 + 3600, hub.releases.DONE))
+        self.assertEqual(warnings(), ["vps"])
+
     def test_the_integrity_check_runs_and_reports(self):
         hub.integrity_check(hub.now())
         self.assertEqual(self.health()["hub"]["integrity"]["result"], "ok")

@@ -894,14 +894,24 @@ class Verify:
         found = getattr(self, name)()
         return self.and_agents(found) if name in AGENT_CHECKS else found
 
-    def all(self):
-        """The array of PRODUCT.md 4.1 for this machine, in the order of CHECKS and without what does not apply."""
-        return [found for found in (self.one(name) for name in CHECKS) if found is not None]
+    def all(self, skip=()):
+        """The array of PRODUCT.md 4.1 for this machine, in the order of CHECKS and without what does not apply.
+        `skip` names checks that the caller has just made itself (WITHOUT), which are then absent too."""
+        return [found for found in (self.one(name) for name in CHECKS if name not in skip) if found is not None]
 
 
-def checks(kit, team, hub="", **how):
-    """The array of PRODUCT.md 4.1 for the machine this runs on."""
-    return Verify(kit, team, hub, **how).all()
+# The checks a caller may leave out because it has just made them itself: only the self-test. A release run
+# (releases.Update.checks) runs selftest.py on the released code in its clone, and its fleet.py verify then ran the
+# same file in the same clone a second time, which was a minute of the owner's two-minute wait on Updates
+# (14 November 2026: "clicked on Update fleet, seems stuck, not a great ux"). **`fleet.py verify --no-selftest` stays**
+# (PRODUCT.md 4.1): every hub since then passes it to the fleet.py of the release it takes, and a release without it
+# would end every update at verify.
+WITHOUT = ("selftest",)
+
+
+def checks(kit, team, hub="", skip=(), **how):
+    """The array of PRODUCT.md 4.1 for the machine this runs on, without the checks of `skip` (of WITHOUT)."""
+    return Verify(kit, team, hub, **how).all(skip=tuple(name for name in skip if name in WITHOUT))
 
 
 def failed(results):

@@ -291,7 +291,7 @@ class Updates(unittest.TestCase):
                 return releases._run(argv, timeout=timeout or releases.GIT_WAIT, cwd=cwd, input=input)
             if argv[-1].endswith("selftest.py"):
                 return HEALTHY_SELFTEST
-            if argv[-2:] == ["verify", "--json"]:
+            if argv[-3:] == ["verify", "--no-selftest", "--json"]:
                 return HEALTHY_VERIFY
             raise AssertionError("the update ran something unexpected: " + " ".join(argv))
         return run

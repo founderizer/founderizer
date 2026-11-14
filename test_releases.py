@@ -512,7 +512,7 @@ class Repositories(unittest.TestCase):
                 return releases._run(argv, timeout=timeout or releases.GIT_WAIT, cwd=cwd, input=input)
             if argv[-1].endswith("selftest.py"):
                 return selftest
-            if argv[-2:] == ["verify", "--json"]:
+            if argv[-3:] == ["verify", "--no-selftest", "--json"]:
                 return verify
             if "--check-schema" in argv:
                 return schema
@@ -571,6 +571,17 @@ class Updates(Repositories):
         self.assertEqual(git("rev-parse", reached + "^2", cwd=self.kit), released)
         self.assertEqual(self.ref("main"), self.seeded)              # the code branch of origin is not touched
         self.assertIn("Blue, and the owner's own.", (self.kit / "knowledge/owner/brand.md").read_text())
+
+    def test_the_run_starts_the_self_test_once(self):
+        """selftest.py waits for the hub's timers, about a minute, and `fleet.py verify` ran it a second time in the
+        same clone: the owner waited two minutes on Updates for each release, and wrote "seems stuck" (14 November
+        2026). The run starts it itself, and asks verify for the other checks only (verify.WITHOUT)."""
+        answer = self.update(self.publish(self.code(2)))
+        self.assertEqual(answer["state"], releases.DONE, answer["says"])
+        self.assertEqual(len([argv for argv in self.ran if argv[-1].endswith("selftest.py")]), 1)
+        verify = [argv for argv in self.ran if "verify" in argv]
+        self.assertEqual(len(verify), 1)
+        self.assertIn("--no-selftest", verify[0])
 
     def test_a_release_that_fails_selftest_leaves_the_fleet_at_the_pinned_revision(self):
         released = self.publish(self.code(2))

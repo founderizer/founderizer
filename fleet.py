@@ -6,7 +6,8 @@ Setting up
                                write the machines' Tailscale addresses into team.json
   fleet.py connect <agent>     point this machine's CLI at the team tools
   fleet.py check <agent>       is this machine ready?
-  fleet.py verify [--json]     is this machine of the fleet healthy? (PRODUCT.md 4.1)
+  fleet.py verify [--json] [--no-selftest]
+                               is this machine of the fleet healthy? (PRODUCT.md 4.1)
 
 Running
   fleet.py run <agent>         the stand-in helper: one session per task, hub messages typed in,
@@ -8236,7 +8237,8 @@ def cmd_verify(args):
     """PRODUCT.md 4.1: is this machine of the fleet healthy? Read-only, no root, Linux and macOS. The installers
     end with it, the app shows it as the owner's checklist, and the support duty runs it from a heartbeat."""
     import verify
-    results = verify.checks(KIT, TEAM, HUB, agent=AGENT or os.environ.get("FLEET_AGENT") or None)
+    results = verify.checks(KIT, TEAM, HUB, agent=AGENT or os.environ.get("FLEET_AGENT") or None,
+                            skip=("selftest",) if getattr(args, "no_selftest", False) else ())
     print(json.dumps(results, indent=2) if args.json else verify.report(results))
     sys.exit(1 if verify.failed(results) else 0)
 
@@ -9106,7 +9108,9 @@ def main():
                    help="the runtime of that conversation, when it is not the agent's runtime now (after a switch)")
     p.set_defaults(fn=cmd_chat_session)
     p = sub.add_parser("install-pinned"); p.add_argument("name"); p.set_defaults(fn=cmd_install_pinned)
-    p = sub.add_parser("verify"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_verify)
+    p = sub.add_parser("verify"); p.add_argument("--json", action="store_true")
+    # A release run has just run selftest.py on the same code itself (releases.Update.checks, verify.WITHOUT).
+    p.add_argument("--no-selftest", action="store_true"); p.set_defaults(fn=cmd_verify)
     p = sub.add_parser("verify-case"); p.add_argument("--case"); p.add_argument("--run")
     p.set_defaults(fn=cmd_verify_case)
     p = sub.add_parser("watch"); p.set_defaults(fn=cmd_watch)
