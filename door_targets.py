@@ -209,6 +209,8 @@ def decide(access, agent, target, op, args, content=None, lookups=None):
         if kind == "deploy":
             return decide_deploy(access, me, name, op, args, lookups or {})
         return decide_gitops(access, me, name, op, args, content, lookups or {})
+    if kind == "db":
+        return decide_db(access, agent, me, name, op, args, never, content)
     import door_providers
     if kind not in door_providers.PROVIDERS:
         return refused(f"{kind} is no kind of target")
@@ -217,6 +219,63 @@ def decide(access, agent, target, op, args, content=None, lookups=None):
     if target not in (me.get("providers") or []):
         return refused(f"{agent} holds no grant on {target}", route="holder")
     return door_providers.decide(access, agent, kind, name, op, args, content, lookups or {})
+
+
+# ---------------------------------------------------------------- databases
+
+# Incident intake, part 4: a database through the door. The agent sends SQL and gets rows, or the count of changed
+# rows; the door holds the logins, and no password enters a session. The database refuses, not the door: the door
+# parses no SQL to decide. `query` runs with a login that can only read, `change` and `dry` with one that reads and
+# writes rows and can create, alter and drop nothing.
+DB_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")     # as the hub names a provider's account (hub.DOOR_CREDENTIAL)
+DB_ENGINES = ("postgresql", "sqlserver")
+DB_LEVELS = ("read", "data")
+DB_OPS = {"query": "read", "change": "data", "dry": "data"}     # the level that each action needs
+DB_SECONDS, DB_SECONDS_MAX = 30, 300        # how long one statement may run: the default, and the most
+
+
+def decide_db(access, agent, me, name, op, args, never, content=None):
+    """The decision on one call to db:<name>. A read is a read. A change is the agent's own call, which it answers
+    for: no yes of the owner and no window, because the grant is the authorization (the owner: an agent that owns a
+    product's data may change all of it). `dry` is a change that the door rolls back; it needs the level of a
+    change, because SQL can end its transaction itself and the locks are the same. The plan is what the door's
+    database helper runs: {db, engine, op, seconds}."""
+    target = f"db:{name}"
+    db = (access.get("databases") or {}).get(name)
+    # One answer for a name that is no database and for a database of another business, before every other check:
+    # an agent of one business does not learn from the door's words which databases another business has.
+    if db is None or db.get("business") != me.get("business"):
+        return refused(f"{target} is no database of this agent's business at the door", target=target)
+    if target in (never.get("accounts") or []):
+        return refused(f"{target} is never a target of the door", target=target)
+    if op not in DB_OPS:
+        return refused("a database takes query, change and dry, each with its SQL as content", target=target)
+    level = (me.get("databases") or {}).get(name)
+    if level not in DB_LEVELS:
+        return refused(f"{agent} holds no grant on {target}", target=target, route="holder", needs=target,
+                       level=DB_OPS[op])
+    if DB_OPS[op] == "data" and level != "data":
+        return refused(f"{op} writes rows, and {agent} holds {target} at read", target=target, route="holder",
+                       needs=target, level="data")
+    try:
+        sql = (content or b"").decode("utf-8")
+    except UnicodeDecodeError:
+        return refused("the SQL is text in UTF-8", target=target)
+    if not sql.strip() or "\0" in sql:
+        return refused(f"{op} takes its SQL as content, as text", target=target)
+    seconds = DB_SECONDS
+    if args:
+        if len(args) != 1 or not re.fullmatch(r"[1-9][0-9]{0,2}", args[0]) or int(args[0]) > DB_SECONDS_MAX:
+            return refused(f"the one argument is the seconds that a statement may run, 1 to {DB_SECONDS_MAX}",
+                           target=target)
+        seconds = int(args[0])
+    plan = {"db": name, "engine": db["engine"], "op": op, "seconds": seconds}
+    if op == "query":
+        return Decision("read", f"a query with the read login of {target}", target=target, plan=plan,
+                        business=db["business"])
+    return Decision("own", f"rows of {target} change" if op == "change" else
+                    f"a change of {target} that the door rolls back", target=target, plan=plan,
+                    business=db["business"])
 
 
 # ---------------------------------------------------------------- hosts

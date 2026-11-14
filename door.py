@@ -341,7 +341,7 @@ def validate_access(data):
     if not isinstance(data, dict) or data.get("v") != 1:
         raise ValueError("the access file is {v: 1, ...}")
     known = {"v", "hub", "agents", "hosts", "credentials", "windows", "never", "workflows", "exposure", "pools",
-             "images", "owner_keys", "fleet"}
+             "images", "owner_keys", "fleet", "databases"}
     if set(data) - known:
         raise ValueError(f"unknown field {sorted(set(data) - known)[0]}")
     hub = data.get("hub") or {}
@@ -370,8 +370,28 @@ def validate_access(data):
         if not isinstance(h.get("port", SSHD_PORT), int):
             raise ValueError(f"host {name}: the port is a number")
     credentials = data.get("credentials") or {}
+    # Incident intake, part 4: a database by its name, with its engine and its business. Its one credential,
+    # db:<name>, is the login that makes logins, which the owner saved with the door as its holder: the door makes
+    # the read login and the data login from it, and no agent's session gets one.
+    databases = data.get("databases") or {}
+    if not isinstance(databases, dict):
+        raise ValueError("databases is {<name>: {engine, business}}")
+    for name, d in databases.items():
+        if not door_targets.DB_NAME.fullmatch(str(name)) or not isinstance(d, dict) or set(d) != {"engine", "business"}:
+            raise ValueError(f"database {name!r} is a name like shop-db with {{engine, business}}")
+        if d["engine"] not in door_targets.DB_ENGINES or not NAME.fullmatch(str(d["business"])):
+            raise ValueError(f"database {name}: its engine is one of {', '.join(door_targets.DB_ENGINES)}, and it "
+                             f"names its business")
+        if f"db:{name}" not in credentials:
+            raise ValueError(f"database {name} has no credential db:{name} in this file")
     for key, c in credentials.items():
         kind, _, name = key.partition(":")
+        if kind == "db":        # the login that makes a database's logins
+            if name not in databases or not isinstance(c, dict) or set(c) != {"secret"} or \
+                    not REF.fullmatch(str(c["secret"])):
+                raise ValueError(f"credential {key!r} is db:<a database of this file> and names its secret by "
+                                 f"bws://<uuid>")
+            continue
         if kind == "app":       # new-projects plan N4: a key that the owner saved for one setting of one app
             if not APP_KEY.fullmatch(key) or not isinstance(c, dict) or set(c) != {"secret"} or \
                     not REF.fullmatch(str(c["secret"])):
@@ -399,7 +419,7 @@ def validate_access(data):
             seen[address] = name
         # An agent that only gets its GitHub tokens from the door, through the hub (plan 13, item 4), names no
         # business: it has no address, no server, no provider and no repository of its own forms here.
-        tokens_only = address is None and not any(a.get(k) for k in ("servers", "providers", "repos"))
+        tokens_only = address is None and not any(a.get(k) for k in ("servers", "providers", "repos", "databases"))
         if not (tokens_only and "business" not in a) and not NAME.fullmatch(a.get("business", "")):
             raise ValueError(f"agent {name} needs its business")
         for host, level in (a.get("servers") or {}).items():
@@ -408,8 +428,19 @@ def validate_access(data):
             if level == "fix" and hosts[host]["business"] != a["business"] and hosts[host]["mode"] != "rule-only":
                 raise ValueError(f"agent {name}: Fix on {host} of another business is rule-only or nothing")
         for target in a.get("providers") or []:
-            if target not in credentials:
+            if target not in credentials or target.startswith("db:"):
                 raise ValueError(f"agent {name}: {target} has no credential in this file")
+        held = a.get("databases") or {}
+        if not isinstance(held, dict):
+            raise ValueError(f"agent {name}: databases is {{<name>: read or data}}")
+        # A grant to an agent with no address, or of another business's database, is no fault of the file: the
+        # first calls nothing, and the decision gives the second the words of a name that is no database
+        # (decide_db). An app of an earlier version rewrites this file without a look at `databases` (it moves an
+        # address to another agent, or changes a business), and a file that the door refused for that would hold
+        # every later change of the owner's back.
+        for db, level in held.items():
+            if db not in databases or level not in door_targets.DB_LEVELS:
+                raise ValueError(f"agent {name}: {db} is no database of this file, or {level!r} is not read or data")
         for repo, entry in (a.get("repos") or {}).items():
             if not door_targets.REPO.fullmatch(repo) or not isinstance(entry, dict) or \
                     entry.get("kind") not in ("devops", "app", "gitops"):
@@ -1109,6 +1140,9 @@ class Door:
         return lock
 
     def act(self, access, d, op, args, content):
+        if "db" in (d.plan or {}):      # incident intake, part 4: the decision is here, and the helper is not yet
+            raise Refused(f"this door runs no SQL yet: it knows {d.target} and what {op} needs, and its database "
+                          f"helper comes with a later release")
         if d.plan is None:
             req = {"v": 1, "op": op, "args": d.args}
             stdin = content if op in door_targets.HOST_CONTENT else None

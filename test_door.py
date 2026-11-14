@@ -113,7 +113,7 @@ ACCESS = {
 
 
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite(cls(name) for cls in (Access, Callers, Look, RuleArguments, Refusals, OwnCalls, Order,
+    return unittest.TestSuite(cls(name) for cls in (Access, Callers, Look, Databases, RuleArguments, Refusals, OwnCalls, Order,
                                                     HubLine, HubRights, GitHubFacts, SyncRuns, CommitChecks, PruneParts, Prunes, Vault, AuditReplay, AWSRole,
                                                     OwnerYes, CallHash, ScriptsAndRuns, FullAccess, Routes, MadeDeletes,
                                                     HostPath, AppSettingsPath, ScriptPath, HostUpdates, KeyCardAccount,
@@ -749,6 +749,121 @@ class Look(Served):
             self.assertEqual(self.ops("ci-1", "look", "--content", path)[0], 3)
         self.assertEqual(err.getvalue(), "")
         self.assertEqual([line.get("task") for line in self.door.record.after(0)[-2:]], ["T-62", "T-62"])
+
+
+class Databases(Served):
+    """Incident intake, part 4: a database through the door, db:<name>. This release brings the kind: the door's
+    access file names databases and who holds each at read or at data, and the door decides a call. It runs no SQL
+    yet. The order matters: a door of the release before this one refuses a file with a field that it does not
+    know, so the door's release is live before any file names a database."""
+    SQL = b"select count(*) from orders where created > now() - interval '1 day';\n"
+
+    def with_database(self, level="read", **more):
+        data = json.loads(json.dumps(ACCESS))
+        data["databases"] = {"shop-db": {"engine": "postgresql", "business": "one"}}
+        data["credentials"]["db:shop-db"] = {"secret": ref(40)}
+        if level:
+            data["agents"]["ops-one"]["databases"] = {"shop-db": level}
+        data.update(more)
+        return data
+
+    def test_the_access_file_names_databases_their_one_credential_and_who_holds_each(self):
+        door.validate_access(self.with_database())
+        door.validate_access(self.with_database("data"))
+        door.validate_access(self.with_database(None))          # a database that no agent holds yet
+        wrong = {
+            "an engine that the door has no driver for": lambda d: d["databases"]["shop-db"].update(engine="mysql"),
+            "no business": lambda d: d["databases"]["shop-db"].pop("business"),
+            "a business that is no name": lambda d: d["databases"]["shop-db"].update(business="One Ltd"),
+            "an agent's databases that are a list": lambda d: d["agents"]["ops-one"].update(databases=["shop-db"]),
+            "a field that is no field of a database": lambda d: d["databases"]["shop-db"].update(address="10.0.0.5"),
+            "a name that is no name": lambda d: d["databases"].update({"Shop DB": d["databases"]["shop-db"]}),
+            "a name of 41 characters": lambda d: d["databases"].update({"d" * 41: d["databases"]["shop-db"]}),
+            "no credential": lambda d: d["credentials"].pop("db:shop-db"),
+            "a credential of no database": lambda d: d["credentials"].update({"db:other": {"secret": ref(41)}}),
+            "a credential with a value in it": lambda d: d["credentials"]["db:shop-db"].update(password="x"),
+            "a credential that names no secret": lambda d: d["credentials"].update({"db:shop-db": {"secret": "x"}}),
+            "a level that is no level": lambda d: d["agents"]["ops-one"]["databases"].update({"shop-db": "admin"}),
+            "a database that is not in the file": lambda d: d["agents"]["ops-one"]["databases"].update({"x-db": "read"}),
+            "the maker's login as a provider": lambda d: d["agents"]["ops-one"]["providers"].append("db:shop-db"),
+            "databases that are a list": lambda d: d.update(databases=["shop-db"]),
+        }
+        for name, change in wrong.items():
+            data = self.with_database()
+            change(data)
+            with self.subTest(name), self.assertRaises(ValueError):
+                door.validate_access(data)
+        # What an app of an earlier version can leave in the file is no fault of the file: it rewrites agents with
+        # no look at their databases. An agent that lost its address calls nothing, and a database of another
+        # business is refused at each call, with the words of a name that is no database.
+        data = self.with_database()
+        data["agents"]["ops-one"].pop("address")
+        data["agents"]["ops-two"]["databases"] = {"shop-db": "data"}
+        door.validate_access(data)
+        self.assertIn("is no database of this agent's business at the door",
+                      door_targets.decide(data, "ops-two", "db:shop-db", "change", [], self.SQL).why)
+
+    def test_the_door_decides_a_database_call_by_the_level_and_runs_no_sql_yet(self):
+        self.write_access(self.with_database("data"))
+        for op, kind in (("query", "read"), ("change", "own"), ("dry", "own")):
+            got = self.call(ONE, "db:shop-db", op, content=self.SQL)
+            self.assertEqual((got["ok"], got["kind"]), (False, kind), got)
+            self.assertIn("this door runs no SQL yet", got["why"])
+            self.assertNotIn("call", got)                       # nothing for the owner to lift: no hash
+            line = self.door.record.after(0)[-1]
+            self.assertEqual((line["caller"], line["target"], line["action"], line["kind"], line["outcome"]),
+                             ("ops-one", "db:shop-db", op, kind, "failed"))
+            self.assertNotIn("orders", json.dumps(line))        # the record keeps no SQL
+        self.assertEqual((self.stubs.ssh_calls, self.stubs.http_calls), ([], []))       # no host and no provider were asked
+        # a change is the holder's own call: no window of the owner's policy holds it, and it asks for no yes
+        data = self.with_database("data", windows=[{"forms": ["restart", "deploy", "upgrade"], "deny": [["00:00", "23:59"]]}])
+        self.write_access(data)
+        self.assertIn("runs no SQL yet", self.call(ONE, "db:shop-db", "change", content=self.SQL)["why"])
+
+    def test_a_database_call_that_the_door_refuses_says_who_holds_what(self):
+        decide = door_targets.decide
+        read, data = self.with_database("read"), self.with_database("data")
+        plan = decide(read, "ops-one", "db:shop-db", "query", [], self.SQL).plan
+        self.assertEqual(plan, {"db": "shop-db", "engine": "postgresql", "op": "query", "seconds": 30})
+        self.assertEqual(decide(data, "ops-one", "db:shop-db", "dry", ["300"], self.SQL).plan["seconds"], 300)
+        # a read login changes no row: the route is the agent that holds the database at data
+        for op in ("change", "dry"):
+            d = decide(read, "ops-one", "db:shop-db", op, [], self.SQL)
+            self.assertEqual((d.kind, d.route, d.needs, d.level), ("refused", "holder", "db:shop-db", "data"), d)
+        d = decide(self.with_database(None), "ops-one", "db:shop-db", "query", [], self.SQL)
+        self.assertEqual((d.kind, d.route, d.needs, d.level), ("refused", "holder", "db:shop-db", "read"), d)
+        # An agent of another business gets the words of a name that is no database, with no route: it does not
+        # learn from the door which databases the other business has. Also in a file that validate_access refuses
+        # (a grant across businesses), with the never list, and for an action that is none.
+        crossed = self.with_database("read", never={"accounts": ["db:shop-db"]})
+        crossed["agents"]["ops-two"]["databases"] = {"shop-db": "data"}
+        for file, op in ((read, "query"), (read, "drop"), (crossed, "change"), (crossed, "query")):
+            there, none = (decide(file, "ops-two", target, op, [], self.SQL) for target in ("db:shop-db", "db:nope-db"))
+            self.assertEqual((there.kind, there.route, there.needs, there.why.replace("shop-db", "nope-db")),
+                             ("refused", None, None, none.why))
+            self.assertIn("is no database of this agent's business at the door", there.why)
+        refusals = (
+            ("db:other", "query", [], self.SQL, "is no database of this agent's business at the door"),
+            ("db:shop-db", "drop", [], self.SQL, "a database takes query, change and dry"),
+            ("db:shop-db", "query", [], None, "takes its SQL as content"),
+            ("db:shop-db", "query", [], b"  \n", "takes its SQL as content"),
+            ("db:shop-db", "query", [], b"select 1\0", "takes its SQL as content"),
+            ("db:shop-db", "query", [], b"select '\xff'", "the SQL is text in UTF-8"),
+            ("db:shop-db", "query", ["0"], self.SQL, "the seconds that a statement may run, 1 to 300"),
+            ("db:shop-db", "query", ["301"], self.SQL, "the seconds that a statement may run, 1 to 300"),
+            ("db:shop-db", "query", ["30", "dry"], self.SQL, "the seconds that a statement may run, 1 to 300"),
+        )
+        for target, op, args, content, why in refusals:
+            d = decide(data, "ops-one", target, op, args, content)
+            with self.subTest(why=why, args=args):
+                self.assertEqual(d.kind, "refused")
+                self.assertIn(why, d.why)
+        # the owner's never list names a database as it names an account
+        never = self.with_database("data", never={"accounts": ["db:shop-db"]})
+        self.assertIn("is never a target of the door", decide(never, "ops-one", "db:shop-db", "query", [], self.SQL).why)
+        # the door parses no SQL to decide: the database refuses, not the door
+        for sql in (b"drop table orders;", b"select 1; commit; delete from orders;"):
+            self.assertEqual(decide(read, "ops-one", "db:shop-db", "query", [], sql).kind, "read")
 
 
 class RuleArguments(DoorCase):
