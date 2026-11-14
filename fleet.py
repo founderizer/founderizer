@@ -412,6 +412,15 @@ def shell_off(conf):
 
 
 READ_MISSING = {}       # C11: {agent: {"missing": [...], "logins": [...]}} of its last read, for the hub (vault_status)
+# A session's read that leaves out a key which the read before did not leave out reads again (read_env): the vault gives
+# a value only after the hub took its fingerprints, and the hub does not answer for 2 to 4 seconds when it starts again
+# for a release (measured on 14 November 2026). So at most READ_AGAIN more reads, READ_WAIT seconds apart, at one start.
+READ_WAIT = 5
+READ_AGAIN = 3
+READ_PATIENCE = 30      # no read starts again once this many seconds passed since the first read of a start began
+# The wait's own record of each agent's last session read: the names that it left out, and whether it failed as a
+# whole. Only a session's read writes it, so the read of a check in the gap of a restart keeps no session from its wait.
+READ_BEFORE = {}        # {agent: {"missing": [...], "failed": bool}}
 
 
 def read_env(agent, conf, kind):
@@ -419,7 +428,18 @@ def read_env(agent, conf, kind):
     gives the values, and the hub has their fingerprints before a value comes here, so it masks each one in texts.
     The agent may read them and never prints or stores them. The helper asks only when this checkout's team.json
     gives the agent a read grant, and the hub decides what it gets. A session starts without a value that the vault
-    cannot give now; the helper's log says which."""
+    cannot give now; the helper's log says which.
+
+    A session's read reads again, READ_WAIT seconds later and at most READ_AGAIN times, while it leaves out a name that
+    this agent's session read before did not leave out, or while it fails as a whole: the vault leaves a value out when
+    its call to the hub does not answer, and a session keeps what its start got for its whole life. A name that the
+    session read before left out too, a whole failure after a session read that failed as a whole too, a name with the
+    shape of a login (C11, no fault that time repairs) and the read of a check (which reads again by itself) start no
+    wait, so a fault that stays makes one slow start and not each start slow. No read starts again once READ_PATIENCE
+    seconds passed since the first read of this start began (a clock that does not jump), so a hub that answers slowly
+    gets no more calls and a start stays about as long as before. The record of the read before is READ_BEFORE, of
+    session reads only; READ_MISSING stays the hub's record of the last read of any kind. After the last read, the
+    session starts with what it got, as before."""
     try:
         with open(os.path.join(KIT, "team.json"), encoding="utf-8") as f:
             grants = (json.load(f)["agents"].get(agent) or {}).get("secrets") or {}
@@ -429,18 +449,42 @@ def read_env(agent, conf, kind):
         return {}
     # what the keys are for: the hub gives none for a session of an agent whose Shell box is off (support plan F1)
     purpose = "check" if kind == "check" else "session"
-    try:
-        done = broker_job_request(agent, {"op": "read", "for": purpose}, timeout=60)
-    except Exception as e:          # the session starts in every case
-        print(time.strftime("%H:%M:%S"), f"{kind}: the session starts without its read variables: "
-              f"{e if isinstance(e, Refused) else type(e).__name__}", flush=True)
-        return {}
-    given = done.get("env") if isinstance(done.get("env"), dict) else {}
-    env = {k: v for k, v in given.items() if key_env(k) and isinstance(v, str) and v and "\0" not in v}   # plan 0.2
-    missing = [x for x in done.get("missing") or [] if isinstance(x, str) and ENV_NAME.fullmatch(x)]
-    # C11: the names that the vault left out because their value has the shape of a login. Both lists go to the hub in
-    # this helper's status (vault_status), and the hub tells the agent's manager once when a name starts to be missing.
-    logins = sorted(x for x in done.get("logins") or [] if isinstance(x, str) and x in missing)
+    session = purpose == "session"
+    before = READ_BEFORE.get(agent) or {"missing": [], "failed": False}   # this agent's session read before
+    done, began = None, time.monotonic()
+    for again in range(READ_AGAIN + 1):
+        try:
+            fresh = broker_job_request(agent, {"op": "read", "for": purpose}, timeout=60)
+        except Exception as e:          # the session starts in every case
+            why = e if isinstance(e, Refused) else type(e).__name__
+            if session and not before["failed"] and again < READ_AGAIN and \
+                    time.monotonic() - began <= READ_PATIENCE:              # the same fault at a restart, all keys
+                print(time.strftime("%H:%M:%S"), f"{kind}: the vault did not answer the read ({why}): the helper reads "
+                      f"again in {READ_WAIT} seconds", flush=True)
+                time.sleep(READ_WAIT)
+                continue
+            if done is not None:        # an earlier read of this start gave some keys: the session takes those
+                break
+            if session:
+                READ_BEFORE[agent] = {"missing": [], "failed": True}
+            print(time.strftime("%H:%M:%S"), f"{kind}: the session starts without its read variables: {why}", flush=True)
+            return {}
+        done = fresh
+        given = done.get("env") if isinstance(done.get("env"), dict) else {}
+        env = {k: v for k, v in given.items() if key_env(k) and isinstance(v, str) and v and "\0" not in v}   # plan 0.2
+        missing = [x for x in done.get("missing") or [] if isinstance(x, str) and ENV_NAME.fullmatch(x)]
+        # C11: the names that the vault left out because their value has the shape of a login. Both lists go to the hub
+        # in this helper's status (vault_status), and the hub tells the agent's manager once when a name starts to be
+        # missing.
+        logins = sorted(x for x in done.get("logins") or [] if isinstance(x, str) and x in missing)
+        lost = sorted(x for x in missing if x not in logins and x not in before["missing"])
+        if not session or not lost or again == READ_AGAIN or time.monotonic() - began > READ_PATIENCE:
+            break
+        print(time.strftime("%H:%M:%S"), f"{kind}: the vault did not give {', '.join(lost)}: the helper reads again "
+              f"in {READ_WAIT} seconds", flush=True)
+        time.sleep(READ_WAIT)
+    if session:
+        READ_BEFORE[agent] = {"missing": sorted(missing), "failed": False}
     READ_MISSING[agent] = {"missing": sorted(missing), "logins": logins}
     if missing:
         print(time.strftime("%H:%M:%S"), f"{kind}: the vault did not give {', '.join(missing)}"

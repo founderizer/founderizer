@@ -337,6 +337,114 @@ class VaultBroker(OwnerAPI):
         self.item(OTHER_ID, {"username": "", "password": seeded})
         self.assertNotIn("logins", fleet.vault_call({"op": "read"}))
 
+    def test_a_session_read_reads_again_while_it_leaves_out_a_key_that_the_read_before_gave(self):
+        """The helper's read at a session start (fleet.read_env), through the broker and the hub. The broker gives a value
+        only after the hub took its fingerprints, so a hub call that does not answer (the hub starts again for a
+        release) leaves that key out for the whole session, and a first call that does not answer leaves out each key.
+        The helper then reads again, READ_WAIT seconds later and at most READ_AGAIN more times, while the read leaves out
+        a name that the session read before did not leave out, or fails as a whole. A fault that stays makes one wait and
+        none at the next start; a name with the shape of a login makes none, and so does the read of a check, which also
+        keeps no session from its wait (READ_BEFORE is of session reads only). No read starts again once READ_PATIENCE
+        seconds passed since the first read began, by the helper's clock that does not jump (a stand-in here)."""
+        value, plain = "sk-fake-only-key-20261114", "sk-fake-plain-20261114"
+        refs = {"SHOP_API_KEY": self.item(SECRET_ID, {"username": "", "password": value}),
+                "PLAIN_KEY": self.item(THIRD_ID, {"username": "", "password": plain})}
+        gone = "bws://5c0c1d2e-3f40-4a5b-8c6d-7e8f90a1b2c3"      # granted, but the store has no such item
+        hub.TEAM["logins"] = dict({ref: {"title": env, "kind": "api_key", "env": env} for env, ref in refs.items()},
+                                  **{gone: {"title": "GONE_KEY", "kind": "api_key", "env": "GONE_KEY"}})
+        self.addCleanup(hub.TEAM.pop, "logins", None)
+        hub.TEAM["agents"]["vps"]["secrets"] = {ref: "read" for ref in refs.values()}
+        self.addCleanup(hub.TEAM["agents"]["vps"].pop, "secrets", None)
+        fleet.TEAM["agents"]["vps"].update(secrets=dict(hub.TEAM["agents"]["vps"]["secrets"]), vault="broker")
+        self.addCleanup(fleet.READ_MISSING.pop, "vps", None)
+        self.addCleanup(fleet.READ_BEFORE.pop, "vps", None)
+        conf = {"runtime": "claude", "role": "worker", "can": ["shell"]}
+        real_hub, real_read, fails, reads = vault.hub, fleet.broker_job_request, {"/fingerprints": 0, "/read": 0}, []
+        both, took = {"SHOP_API_KEY": value, "PLAIN_KEY": plain}, []
+
+        class Clock:                            # the helper's time: only monotonic() is the test's, the rest is time's
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+            def __getattr__(self, name):
+                return getattr(time, name)
+        clock = Clock()
+
+        def hub_call(conf, method, path, body=None):
+            for end in fails:                   # a call of the hub that does not answer
+                if path.endswith(end) and fails[end]:
+                    fails[end] -= 1
+                    raise vault.Refused("the vault broker could not reach the hub")
+            return real_hub(conf, method, path, body)
+
+        def counted(agent, request, **kw):
+            reads.append(request.get("for"))
+            try:
+                return real_read(agent, request, **kw)
+            finally:
+                clock.now += took.pop(0) if took else 0     # this read took so many seconds
+
+        def start(kind="task", failing=0, names=0, seconds=()):
+            fails["/fingerprints"], fails["/read"], printed = failing, names, io.StringIO()
+            del reads[:]
+            took[:] = seconds
+            with patch.object(fleet, "KIT", str(self.home / "no-kit")), patch.object(fleet, "READ_WAIT", 0), \
+                    patch.object(vault, "hub", hub_call), patch.object(fleet, "broker_job_request", counted), \
+                    patch.object(fleet, "time", clock), patch("sys.stdout", printed):
+                return fleet.read_env("vps", conf, kind), printed.getvalue()
+        # One fingerprint call that does not reach the hub: one key out, one more read, and the session gets both.
+        env, said = start(failing=1)
+        self.assertEqual((env, reads), (both, ["session", "session"]))
+        self.assertIn("the helper reads again in 0 seconds", said)
+        self.assertEqual((fleet.READ_MISSING["vps"], fleet.READ_BEFORE["vps"]),
+                         ({"missing": [], "logins": []}, {"missing": [], "failed": False}))
+        # The patience: a first read that takes more than READ_PATIENCE seconds and loses a name makes no second read,
+        # and the limit that passes between the second read and the third makes no third one.
+        env, _ = start(failing=1, seconds=[31])
+        self.assertEqual((len(env), reads), (1, ["session"]))
+        fleet.READ_BEFORE.pop("vps")
+        env, _ = start(failing=3, seconds=[10, 25])            # both keys out at the first read, one at the second
+        self.assertEqual((len(env), reads), (1, ["session", "session"]))
+        env, _ = start()                                        # a good start: no name is out at the read before
+        self.assertEqual((env, fleet.READ_BEFORE["vps"]), (both, {"missing": [], "failed": False}))
+        # A read of a check waits for nothing: it reads again by itself.
+        env, _ = start("check", failing=1)
+        self.assertEqual((len(env), reads), (1, ["check"]))
+        # The name that the check lost is in the hub's record, and a session that starts in the same gap still waits.
+        self.assertEqual(len(fleet.READ_MISSING["vps"]["missing"]), 1)
+        env, _ = start(failing=1)
+        self.assertEqual((env, reads), (both, ["session", "session"]))
+        # A first call that does not answer: the read fails as a whole, and one more read gives each key.
+        env, said = start(names=1)
+        self.assertEqual((env, reads), (both, ["session", "session"]))
+        self.assertIn("the vault did not answer the read", said)
+        # A whole failure that stays makes READ_AGAIN more reads once, and none at the next start.
+        env, said = start(names=99)
+        self.assertEqual((env, reads), ({}, ["session"] * (fleet.READ_AGAIN + 1)))
+        self.assertEqual(fleet.READ_BEFORE["vps"], {"missing": [], "failed": True})
+        self.assertIn("the session starts without its read variables", said)
+        env, _ = start(names=99)
+        self.assertEqual((env, reads), ({}, ["session"]))
+        env, _ = start()                                        # a good read after it: each key, and the record again
+        self.assertEqual((env, fleet.READ_BEFORE["vps"]), (both, {"missing": [], "failed": False}))
+        # A name that stays out (no item in the store) makes READ_AGAIN more reads once, and none at the next start.
+        hub.TEAM["agents"]["vps"]["secrets"][gone] = "read"
+        env, said = start()
+        self.assertEqual((env, reads), (both, ["session"] * (fleet.READ_AGAIN + 1)))
+        self.assertEqual(fleet.READ_MISSING["vps"], {"missing": ["GONE_KEY"], "logins": []})
+        start()
+        self.assertEqual(reads, ["session"])
+        # A value with the shape of a login (C11) is no fault that time repairs: no wait.
+        del hub.TEAM["agents"]["vps"]["secrets"][gone]
+        self.item(SECRET_ID, {"username": "pilot-b", "password": value})
+        fleet.READ_BEFORE.pop("vps", None)
+        env, _ = start()
+        self.assertEqual((env, reads), ({"PLAIN_KEY": plain}, ["session"]))
+        self.assertEqual(fleet.READ_MISSING["vps"], {"missing": ["SHOP_API_KEY"], "logins": ["SHOP_API_KEY"]})
+        self.assertEqual((fleet.READ_WAIT, fleet.READ_AGAIN, fleet.READ_PATIENCE), (5, 3, 30))
+
     def test_a_task_and_a_duty_of_an_agent_with_read_keys_start_through_their_real_paths(self):
         """C11 through the paths that write a start text inside a transaction: a task that the manager makes
         (create_task, admit_task) and a duty with a watch (duty_save, its watch task). The start text reads what the

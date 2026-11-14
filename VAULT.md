@@ -300,13 +300,17 @@ The vault protects the value of each secret. The design gives these results:
   the hub deletes it when that task ends, or after one day if no task opened it (`hub.py`).
 - **An API key that the owner lets it read** ("Reads it" in the app). The value is in the agent's sessions as an
   environment variable, except a key that swaps (see the next item) (`hub.py`,
-  `Sources/Founderizer/SecretEntryView.swift`). The broker registers its
-  fingerprints with the hub before it gives the value (`vault.py`). The helper writes the values into a file of mode
-  600, and the session's command reads the file and deletes it before the program starts, so no value is in a
-  command line (`fleet.py`). A session of an agent whose Shell box is off gets no key. The checks of such an agent
-  still get its keys when the broker tells the hub that the read is for a check, which a Linux broker does (`hub.py`,
-  `vault.py`). Fleet Vault on a Mac does not tell the hub what a read is for, so the hub gives it no key for such an
-  agent (`Sources/FleetVaultCore/VaultHub.swift`, `hub.py`).
+  `Sources/Founderizer/SecretEntryView.swift`). The broker registers its fingerprints with the hub before it gives the
+  value, and leaves the key out when the hub does not answer (`vault.py`). The hub does not answer for some seconds
+  when it starts again for a release, so the helper reads again at a session's start, 5 seconds later and at most 3
+  more times, while the read leaves out a key that the agent's session read before did not leave out, or fails as a
+  whole; a fault that stays makes one slow start, no read starts again once 30 seconds passed since the first read
+  began, so a hub that answers slowly gets no more calls, and a session keeps what its start got (`fleet.py`). The
+  helper writes the values into a file of mode 600, and the session's command reads the file and deletes it before the
+  program starts, so no value is in a command line (`fleet.py`). A session of an agent whose Shell box is off gets no
+  key. The checks of such an agent still get its keys when the broker tells the hub that the read is for a check,
+  which a Linux broker does (`hub.py`, `vault.py`). Fleet Vault on a Mac does not tell the hub what a read is for, so
+  the hub gives it no key for such an agent (`Sources/FleetVaultCore/VaultHub.swift`, `hub.py`).
 - **An API key that it reads, as a placeholder.** On a Linux server that swaps keys, a key that the hub names with
   a site is not in the sessions (see "The key swap"). The variable holds a placeholder in each session of the
   agent, the owner chat included, and in the agent's checks, because each of them gets its keys by the same read

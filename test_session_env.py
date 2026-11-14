@@ -73,6 +73,11 @@ class SessionEnv(Checkout):
             fleet.TEAM["agents"]["alpha"]["vault"] = "broker"
         given = {"ok": True, "v": 2, "missing": ["GONE_KEY"],
                  "env": {"OPENAI_API_KEY": VALUE, "FLEET_SESSION_TOKEN": "x" * 43, "PATH": "/tmp", "lower": "x", "EMPTY": ""}}
+        # GONE_KEY was out at the session read before too, so this start reads once (fleet.READ_AGAIN is for a key that
+        # was there)
+        fleet.READ_BEFORE["alpha"] = {"missing": ["GONE_KEY"], "failed": False}
+        self.addCleanup(fleet.READ_BEFORE.pop, "alpha", None)
+        self.addCleanup(fleet.READ_MISSING.pop, "alpha", None)
         printed = io.StringIO()
         with patch.object(fleet, "broker_job_request", return_value=given) as vault, patch("sys.stdout", printed):
             self.assertEqual(fleet.session_env("alpha", CLAUDE, "task"), {"OPENAI_API_KEY": VALUE})
@@ -80,9 +85,11 @@ class SessionEnv(Checkout):
         self.assertIn("task: the vault did not give GONE_KEY", printed.getvalue())
         self.assertNotIn(VALUE, printed.getvalue())
         printed = io.StringIO()
-        with patch.object(fleet, "broker_job_request", side_effect=fleet.Refused("the vault broker refused: no")), \
-                patch("sys.stdout", printed):
+        with patch.object(fleet, "broker_job_request", side_effect=fleet.Refused("the vault broker refused: no")) as vault, \
+                patch.object(fleet, "READ_WAIT", 0), patch("sys.stdout", printed):
             self.assertEqual(fleet.session_env("alpha", CLAUDE, "chat"), {})      # the session starts without them
+        self.assertEqual(vault.call_count, fleet.READ_AGAIN + 1)                   # after READ_AGAIN more reads
+        self.assertEqual(fleet.READ_BEFORE["alpha"], {"missing": [], "failed": True})
         self.assertIn("chat: the session starts without its read variables: the vault broker refused: no",
                       printed.getvalue())
 
@@ -90,6 +97,8 @@ class SessionEnv(Checkout):
         """C11: the vault's answer names the variables that it left out because their value has the shape of a login.
         The helper keeps both lists of its last read and sends them in its status (vault_status), and its log says why."""
         self.addCleanup(fleet.READ_MISSING.pop, "alpha", None)
+        fleet.READ_BEFORE["alpha"] = {"missing": ["GONE_KEY"], "failed": False}   # out at the read before: no read again
+        self.addCleanup(fleet.READ_BEFORE.pop, "alpha", None)
         given = {"ok": True, "v": 2, "env": {"OPENAI_API_KEY": VALUE}, "missing": ["SHOP_KEY", "GONE_KEY"],
                  "logins": ["SHOP_KEY", "NOT_MISSING"]}
         printed = io.StringIO()
