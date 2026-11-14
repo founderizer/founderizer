@@ -15,10 +15,12 @@ that route's own body, its own refusals and its own command rules: a `request_id
 it passes the fields through and gives the hub's own words back, so the two can never drift apart. It validates
 only what no hub sees — the SSH host and user it puts in a command line, and the mode of the Tailscale key file.
 
-**Its authority is the owner's Mac, granted once.** `hub.py` `ui_allowed` knows the owner by the address the call
-comes from (`addresses.owner` in `team.json`, which the install's claim proved) and refuses a bearer token on those
-routes. So this server holds no credential at all: it runs on the owner's Mac and inherits that Mac's identity.
-There is no second credential path, nothing to store and nothing to revoke but the Mac itself. The server asks
+**Its authority is the owner's Mac, granted once.** `hub.py` `owner_allowed` knows the owner by the address the call
+comes from (`addresses.owner` in `team.json`, which the install's claim proved) and by the key that this Mac made
+for that hub (`owner_key`, a file of `~/.founderizer/owner-keys` that only the owner's user reads; the hub keeps its
+SHA-256). The key is what a VM or a container on this Mac does not have: it leaves through the Mac's address. So
+this server holds one credential, which it reads at each call and never gives to a tool, and which every owner
+program of this Mac shares: Founderizer registers it, or `claim_hub` does at the claim. The server asks
 nothing itself, because the grant is the authorization (RULES.md, "Access that the fleet already holds"): the
 owner's hand is the MCP client's own question before a tool, and the agent does not ask the owner in the chat for
 what a tool can read or for a yes that the owner gave already (OWNER-MCP-BOUNDARY.md section 7, `INSTRUCTIONS`).
@@ -43,7 +45,9 @@ import json
 import os
 import pathlib
 import re
+import secrets
 import shlex
+import socket
 import stat
 import subprocess
 import sys
@@ -62,6 +66,13 @@ SUPPORTED = ("2025-03-26", "2025-06-18")
 HOME = pathlib.Path(os.path.expanduser("~/.founderizer"))
 HUB_FILE = HOME / "hub"                 # where the hub is: one line, no credential
 CLIENT_FILE = HOME / "client"           # this installation's own public label, as the app keeps its UUID
+# This computer's key for each hub (hub.py, owner feature owner_key): one file each, `<address>_<port>` by the hub's
+# numeric address, mode 600, which Founderizer, its program `founderizer-cli` and this server all read
+# (owner_key_place). The hub keeps only the key's SHA-256.
+OWNER_KEYS = "owner-keys"               # in HOME, read at each use: a test's own HOME has its own keys
+OWNER_KEY = re.compile(r"[A-Za-z0-9_-]{32,128}")
+OWNER_KEY_HEADER = "X-Fleet-Owner-Key-Sha256"       # hubsetup.py: the key's SHA-256, beside the code of a claim
+OWNER_KEY_KEPT = "X-Fleet-Owner-Key"                # hubsetup.py: the claim's answer says "kept"
 PORT = 8765
 TIMEOUT = 30                            # seconds for one owner-API call
 READ_MAX = 8 * 1024 * 1024              # the largest answer this server reads from the hub
@@ -212,7 +223,14 @@ SERVERS_ASK = ("Ask the owner which one, with both in these words, before you ca
 # test_owner_mcp holds this one to. It is not lifecycle.SWITCH_RUNTIMES: a runtime that the hub gains is not one that
 # hub.sh installs until hub.sh says so.
 HUB_SH_RUNTIMES = ("claude", "codex")
-OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is an answer, never a second request: this computer's key for the hub must not go to another place
+    with it (`urllib` would send the same headers there)."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
 
 # Every owner command route of hub.py that is deliberately NOT a tool here, with the reason (OWNER-MCP-BOUNDARY.md
 # section 6). The owner asked for an admin server that is "super powerful and flexible" (20 October 2026), so the
@@ -344,6 +362,143 @@ def set_hub(base):
     HUB_FILE.write_text(base.rstrip("/") + "\n", encoding="utf-8")
 
 
+def canonical_address(text):
+    """An address in the one spelling that names a key's file, or None for what is no address: IPv4 as it is
+    written, IPv6 as the system writes it (so `fd7a:115c:a1e0:0:0:0:0:1` and `fd7a:115c:a1e0::1` are one file, as
+    `OwnerMacKey.canonical` in the app has it)."""
+    try:
+        return socket.inet_ntop(socket.AF_INET, socket.inet_pton(socket.AF_INET, text))
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        return socket.inet_ntop(socket.AF_INET6, socket.inet_pton(socket.AF_INET6, text)).lower()
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def chosen_address(addresses):
+    """The one address of a name's addresses that names its key's file, the same one for the same set in any order:
+    an address of the fleet's private network first (100.64.0.0/10, as a hub's own address in team.json is one),
+    else the lowest IPv4 address, else the lowest of the others (`OwnerMacKey.chosen` in the app)."""
+    fours, others = [], []
+    for text in addresses:
+        try:
+            fours.append((socket.inet_pton(socket.AF_INET, text), text))
+        except (OSError, ValueError, TypeError):
+            one = canonical_address(text)
+            if one:
+                others.append(one)
+    fours.sort()
+    for packed, text in fours:
+        if packed[0] == 100 and 64 <= packed[1] <= 127:
+            return text
+    return fours[0][1] if fours else (sorted(others)[0] if others else None)
+
+
+def host_address(host):
+    """The numeric address of a host: an address as it is, a name through the system's own lookup
+    (`chosen_address`), or None."""
+    one = canonical_address(host)
+    if one:
+        return one
+    try:
+        found = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return None
+    return chosen_address([a[4][0] for a in found])
+
+
+def owner_key_place(base, lookup=None):
+    """(the file of this computer's key for the hub at `base`, the address that a call with that key goes to), or
+    None.
+
+    **One hub address has one key file, named by its number**: `<address>_<port>` in `~/.founderizer/owner-keys`, the
+    name that Founderizer and the claim's own script give it (`OwnerMacKey.place` in the app, `hubsetup.py`
+    `claim_script`). A hub's address is written as a number or as a name of the private network: a name is looked
+    up, so that both ways read one file, and there is no second file of another spelling that could hold an older
+    key. **A name that has no number now has no key**: nothing is read and nothing is written for it.
+
+    **The key goes to the number that named its file, and never to the name again**: the second part is
+    `scheme://<number>:<port>`. A connection looks a name up by itself, and that second answer can be another host
+    than the first: a name that somebody else controls could answer the hub's number to the one and its own host to
+    the other, and get the key. So one lookup decides the key and where the call goes (`call`)."""
+    parts = urllib.parse.urlsplit(base if "://" in base else "http://" + base)
+    host = (parts.hostname or "").lower()
+    if not host:
+        return None
+    address = canonical_address(host) or canonical_address((lookup or host_address)(host) or "")
+    if not address:
+        return None
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        return None
+    shown = f"[{address}]" if ":" in address else address
+    return (HOME / OWNER_KEYS / (re.sub(r"[^a-z0-9.-]", "-", address) + f"_{port}"),
+            f"{parts.scheme or 'http'}://{shown}:{port}")
+
+
+def owner_key_file(base, lookup=None):
+    """The file of this computer's key for the hub at `base`, or None (`owner_key_place`)."""
+    place = owner_key_place(base, lookup)
+    return place[0] if place else None
+
+
+def key_in(path):
+    """The key that a file holds, or None: 32 to 128 letters of base64url and nothing else."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read(257).strip()
+    except (OSError, ValueError):
+        return None
+    return text if OWNER_KEY.fullmatch(text) else None
+
+
+def owner_key_sent(base, lookup=None):
+    """What one call to the hub at `base` carries: (key, waits, file, address). key: this computer's key for that
+    hub, or None. waits: the key that waits for a hub's answer, when there is no key (`_claim_post`; the app writes
+    one too). file: the key's file. address: where a call that carries either one goes, the hub's number
+    (`owner_key_place`). All None when this computer has no key for that hub. Read at each call, so a key that
+    Founderizer registered a moment ago counts at once. For a hub that is called by a name, nothing is looked up
+    while the folder holds no file of that port."""
+    parts = urllib.parse.urlsplit(base if "://" in base else "http://" + base)
+    if not canonical_address((parts.hostname or "").lower()):
+        try:
+            tail = f"_{parts.port or (443 if parts.scheme == 'https' else 80)}"
+            if not any((n.endswith(tail) or n.endswith(tail + ".pending")) and not n.startswith(".")
+                       for n in os.listdir(HOME / OWNER_KEYS)):
+                return None, None, None, None
+        except (OSError, ValueError):
+            return None, None, None, None
+    place = owner_key_place(base, lookup)
+    if not place:
+        return None, None, None, None
+    key = key_in(place[0])
+    waits = None if key else key_in(place[0].with_name(place[0].name + ".pending"))
+    return (key, waits, place[0], place[1]) if key or waits else (None, None, None, None)
+
+
+def owner_key(base, pending=False, lookup=None):
+    """This computer's key for that hub, or None (`owner_key_sent`). pending: the key that waits beside it, whether
+    there is a key or not."""
+    key, waits, file, _address = owner_key_sent(base, lookup)
+    if not pending:
+        return key
+    return waits or (key_in(file.with_name(file.name + ".pending")) if file else None)
+
+
+def write_owner_key(path, key):
+    """One key file, mode 600 from its first byte, in a folder that only this user opens."""
+    HOME.mkdir(parents=True, exist_ok=True)
+    (HOME / OWNER_KEYS).mkdir(mode=0o700, exist_ok=True)
+    os.chmod(HOME / OWNER_KEYS, 0o700)
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(key + "\n")
+
+
 def hub_address(address, port=PORT):
     """`http://<address>:<port>` from an address the owner named. The hub is on the fleet's own private network, so
     this is plain HTTP on that network, exactly as the app and `hubsetup.py` reach it."""
@@ -396,16 +551,86 @@ def read_whole(answer, limit, total, started):
 
 
 def call(method, path, body=None, base=None, timeout=TIMEOUT, limit=READ_MAX, mime=None, extra=None, total=None):
-    """One call to the owner API from this Mac. No Authorization header and no Origin, because `ui_allowed` refuses
-    both on an owner route: this Mac's own address is the whole credential.
+    """One call to the owner API from this Mac: no Origin, which `ui_allowed` refuses on an owner route, and this
+    Mac's key for that hub as the bearer when it has one (`owner_key`). The hub knows the owner by this Mac's address
+    and that key, both.
+
+    A hub from before the key, and a hub whose owner's computer registered none, refuses a bearer on an owner route
+    (403, `auth: key_not_expected`) before it does anything: the same call then goes again with no key, and each
+    later call of this run goes with none at once, until the key changes (NO_KEY). A claim whose answer was lost
+    left its key as pending: it is tried when there is no other, or once when the hub refuses the key as another
+    one than it holds, and kept when the hub answers such a call of an owner route (`/ui/*`, not `/ui/owner/*`)
+    with 2xx; a route that asks nobody for a key says nothing of it.
+
+    A call that carries the key goes to the hub's number, which named the key's file, and a call with no key goes
+    to `base` as it is written (`owner_key_place`).
 
     `mime`: the body is those bytes under that media type, instead of JSON — the one route whose body is a file
     (`POST /ui/attachments`). `extra`: that route's own headers, which carry what a JSON body would carry as fields.
     `total`: the seconds that the read of the whole answer may take (the file tools, FILE_TOTAL)."""
+    base = base or hub_base()
+    key, waits, file, numbered = owner_key_sent(base)
+    sent = key or waits
+    if sent and NO_KEY.get(base) == sent:   # this hub said that it expects no key, and the key is the same one
+        answer = _call(method, path, body, base, timeout, limit, mime, extra, total, None)
+        if not (isinstance(answer.data, dict) and answer.status == 403
+                and answer.data.get("auth") == "owner_key_required"):
+            return answer
+        del NO_KEY[base]                    # the hub holds a key now: the call goes with this computer's key
+    answer = _call(method, path, body, numbered if sent else base, timeout, limit, mime, extra, total, sent)
+    refused = isinstance(answer.data, dict) and answer.status == 403 and answer.data.get("auth")
+    if sent and refused == "key_not_expected":
+        NO_KEY[base] = sent                 # for this server's run: each later call goes once, not twice
+        return _call(method, path, body, base, timeout, limit, mime, extra, total, None)
+    # The routes under /ui/owner/ are how a computer or a device gets its key: they ask nobody for this one.
+    ruled = path.startswith("/ui/") and not path.startswith("/ui/owner/")
+    if key and refused == "owner_key_mismatch":
+        # The hub holds another key than this computer's key, and a key waits beside it: the hub can hold the one
+        # that waits (a claim or a registration whose answer was lost). The hub refused the call before it did
+        # anything, so the same call goes once more, with the key that waits.
+        waits = key_in(file.with_name(file.name + ".pending"))
+        if waits and waits != key:
+            again = _call(method, path, body, numbered, timeout, limit, mime, extra, total, waits)
+            if not (isinstance(again.data, dict) and again.status == 403
+                    and again.data.get("auth") in ("owner_key_mismatch", "owner_key_required", "key_not_expected")):
+                answer = again
+            else:
+                waits = None
+    # The hub took a call of an owner route with the key that waited: it is this computer's key.
+    if waits and 200 <= answer.status < 300 and ruled:
+        with contextlib.suppress(OSError):
+            keep_owner_key(base, waits, file)
+    return answer
+
+
+def keep_owner_key(base, key, path=None):
+    """`key` is this computer's key for the hub at `base`: the hub took it. Written as the key's file (`path`, or the
+    file of `base`), whatever waits beside it, because the hub holds this key's SHA-256: two programs of this
+    computer can claim or register at one time, and the one whose key the hub took keeps it. The key that waited
+    goes when it is this one."""
+    path = path or owner_key_file(base)
+    if path is None:
+        raise OSError("the hub's address has no number now")
+    if key_in(path) != key:
+        write_owner_key(path.with_name(path.name + ".new"), key)
+        os.replace(path.with_name(path.name + ".new"), path)
+    waits = path.with_name(path.name + ".pending")
+    if key_in(waits) == key:
+        with contextlib.suppress(OSError):
+            os.remove(waits)
+    NO_KEY.pop(base, None)
+
+
+NO_KEY = {}             # a hub's base -> the key that it refused as not expected (a hub from before the key)
+
+
+def _call(method, path, body, base, timeout, limit, mime, extra, total, key):
+    """One request of `call`, with `key` as its bearer or with none."""
     next_step(f"the call {method} {path}")
     started = time.monotonic()
-    base = base or hub_base()
     headers = {"Accept": "application/json", "User-Agent": f"{NAME}/{VERSION}"}
+    if key:
+        headers["Authorization"] = "Bearer " + key
     data = None
     if body is not None:
         data = body if mime else json.dumps(body).encode()
@@ -446,6 +671,14 @@ def refusal(answer, what):
     """The hub's own refusal, as the agent must read it, with everything else the hub said beside the reason: a
     refusal often carries what is still missing, which revision it is now at or which tasks are open, and that is
     the part the agent needs to act on. 403 is the one refusal that is about this server itself."""
+    if answer.status == 403 and isinstance(answer.data, dict) and \
+            answer.data.get("auth") in ("owner_key_required", "owner_key_mismatch"):
+        return Refused(f"The hub refused {what}: {answer.error}. The hub asks each call from the owner's computer "
+                       f"for that computer's key, and this server has "
+                       f"{'none' if answer.data['auth'] == 'owner_key_required' else 'another one'} for this hub in "
+                       f"{HOME / OWNER_KEYS}. Open Founderizer on this computer once: it registers the key by itself. With "
+                       f"no app, make a second claim on the hub's server (sh hub.sh --reclaim) and call claim_hub. "
+                       f"A program in a VM or a container on this computer is not the owner.")
     if answer.status == 403:
         return Refused(f"The hub refused {what}: {answer.error or 'this is not the owner machine'}. This server is "
                        f"the owner only while it runs on the Mac whose address is \"owner\" in team.json. Read the "
@@ -1630,12 +1863,12 @@ def claim_hub(args):
     if not CLAIM_CODE.fullmatch(code):
         raise Refused("claim_code must be the code the installer printed, as three groups of four.")
     listener = hub_address(args.get("address"), int(args.get("claim_port") or PORT))
-    answer = _claim_post(listener, re.sub(r"[\s-]", "", code))
+    base = hub_address(args.get("address"), int(args.get("port") or PORT))
+    answer = _claim_post(listener, re.sub(r"[\s-]", "", code), base)
     if answer.status != 200:
         raise Refused(f"the claim was refused ({answer.status}): "
                       f"{answer.raw[:300].decode(errors='replace').strip()}. A code works once and for 30 minutes; "
                       f"read install_log again, and start install_hub again if it expired.")
-    base = hub_address(args.get("address"), int(args.get("port") or PORT))
     # The hub took this Mac as its owner, and the code works once: the address is saved before the wait for the
     # owner API, so that a cancel of the call during the wait (`next_step`) does not lose it.
     set_hub(base)
@@ -1657,20 +1890,62 @@ def claim_hub(args):
                     "for the installer's own last words."}
 
 
-def _claim_post(listener, code):
-    """The claim code to the installer's listener, on the request body, as `hubsetup.py` `claim_script` sends it."""
+def _claim_post(listener, code, base):
+    """The claim code to the installer's listener, on the request body, as `hubsetup.py` `claim_script` sends it,
+    with the SHA-256 of this computer's new key for the hub at `base` in a header (`owner_key`). The key is made
+    here and written as pending before the call, so that no answer is lost with it: it becomes this computer's key
+    when the listener says that it kept the SHA-256, it goes when the claim went through to an installer from before
+    the key, and it stays pending when no answer came or the listener refused (`call` then tries it, and the next
+    claim sends the same key)."""
     next_step("the claim")
+    place = owner_key_place(base)
+    if place is None:       # a name with no number now: the key would have no place, and the hub would have no key
+        raise Refused(f"this computer finds no numeric address for the hub at {base}, so nothing was sent and the "
+                      f"claim code is not used. Call claim_hub with the hub's numeric address on the fleet's private "
+                      f"network.")
+    path = place[0]
+    pending = path.with_name(path.name + ".pending")
+    # The claim goes to the number that names the key's file, never to a name again: the answer that makes this
+    # key the key must come from the host whose number the file has (owner_key_place). `claim_hub` gives the
+    # listener and the hub one host; a listener of another host is called only when it is written as a number.
+    asked, hub_host = urllib.parse.urlsplit(listener), urllib.parse.urlsplit(base).hostname
+    if (asked.hostname or "").lower() == (hub_host or "").lower():
+        listener = f"{asked.scheme}://{urllib.parse.urlsplit(place[1]).netloc.rsplit(':', 1)[0]}:{asked.port or 80}"
+    elif not canonical_address(asked.hostname or ""):
+        raise Refused(f"the claim listener {listener} and the hub {base} are two hosts, and the listener is written "
+                      f"as a name. Nothing was sent, and the claim code is not used.")
+    # A claim whose answer was lost left its key here, and the hub can hold its SHA-256: that key goes again.
+    key = key_in(pending) or secrets.token_urlsafe(32)
+    try:
+        write_owner_key(pending, key)
+    except OSError as e:
+        raise Refused(f"this computer could not write its key for the hub in {HOME / OWNER_KEYS} ({e}), so nothing was "
+                      f"sent and the claim code is not used.") from None
     request = urllib.request.Request(listener + "/claim", data=code.encode(), method="POST",
-                                     headers={"Content-Type": "text/plain", "User-Agent": f"{NAME}/{VERSION}"})
+                                     headers={"Content-Type": "text/plain", "User-Agent": f"{NAME}/{VERSION}",
+                                              OWNER_KEY_HEADER: hashlib.sha256(key.encode()).hexdigest()})
     try:
         with OPENER.open(request, timeout=25) as answer:
-            return Answer(answer.status, None, answer.read(4096), answer.headers)
+            got = Answer(answer.status, None, answer.read(4096), answer.headers)
     except urllib.error.HTTPError as e:
         with e:
-            return Answer(e.code, None, e.read(4096), e.headers)
+            got = Answer(e.code, None, e.read(4096), e.headers)
     except (urllib.error.URLError, OSError) as e:
         raise Refused(f"the installer's claim listener at {listener} did not answer ({e}). The claim is open only "
                       f"while the install waits, and only on the fleet's private network.") from None
+    # A claim that the listener refused changes nothing here: the key that waits can be the key of an earlier claim
+    # whose answer was lost, which the hub holds. It goes only when a claim went through to an installer from
+    # before the key, which keeps none.
+    try:
+        if got.status == 200 and (got.headers.get(OWNER_KEY_KEPT) or "").strip() == "kept":
+            keep_owner_key(base, key, path)
+        elif got.status == 200 and key_in(pending) == key:
+            os.remove(pending)
+    except OSError as e:
+        raise Refused(f"the hub took this computer as its owner, and this computer could not keep its key in "
+                      f"{path} ({e}). Put that right, then make a second claim on the hub's server (sh hub.sh "
+                      f"--reclaim) and call claim_hub again.") from None
+    return got
 
 
 def use_hub(args):
@@ -1686,8 +1961,9 @@ def use_hub(args):
     return {"hub": base, "generation": state.get("db"), "features": state.get("ui_features"),
             "agents": [a.get("name") for a in state.get("agents") or []],
             "where": str(HUB_FILE),
-            "note": "This server holds no credential: the hub knows this Mac by its address (team.json "
-                    "\"addresses\": \"owner\"), so pointing at a hub is all there is to it."}
+            "note": "The hub knows this Mac by its address (team.json \"addresses\": \"owner\") and by this "
+                    "Mac's own key for it, which Founderizer or the claim made: this server reads the key from a "
+                    "file at each call and never shows it."}
 
 
 def which_hub(_args):

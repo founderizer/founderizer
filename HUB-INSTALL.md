@@ -415,8 +415,15 @@ the checkout and the service of an agent that was added since.
   one for Tailscale. A session that is open keeps going. To undo the SSH part: delete
   `/etc/ssh/sshd_config.d/10-fleet-hardening.conf`, then `systemctl reload ssh`.
 - **The owner's Mac is lost, or it has a new address.** Run the line with `--reclaim`: it
-  makes a new code, waits for the new Mac, and changes only `addresses.owner`. The hub is
-  away for the time of the claim; the part below says what happens.
+  makes a new code, waits for the new Mac, and changes only `addresses.owner` and the key
+  of the owner's Mac. The hub is away for the time of the claim; the part below says what
+  happens.
+- **The owner's Mac has no key for the hub, or lost it.** The hub knows the owner's Mac by
+  its address and by a key that the Mac made (`owner-key.json` beside the hub's records
+  holds its SHA-256; SECURITY.md, "How the hub knows the owner's computer"). Founderizer
+  registers the key by itself over its SSH connection to this server. A Mac that has no
+  such connection gets its key with the same line, `--reclaim`: the Mac that sends the code
+  back makes a new key and sends its SHA-256 with the code.
 - **New code for the fleet.** This is a deployment, not an install: fetch, merge `main`
   into `config`, check `import hub`, push `config`, restart `fleet-hub` (COORDINATION.md,
   "The configuration ref"). The hub serves the new code to every machine from its own
@@ -504,7 +511,13 @@ and changes nothing:
 A claim that cannot commit or push its change takes it back: `team.json` is as it was, and
 the hub starts on what it ran before.
 
-**It changes the owner's address and nothing else.** An enrolled phone keeps its access,
+**It changes the owner's address and the key of the owner's Mac, and nothing else.** The Mac
+that sends the code back makes a new key and sends its SHA-256 with the code, and the claim
+writes it beside the hub's records (`~fleet/.fleet/owner-key.json`) in place of the key of the
+Mac from before. A Mac whose program is from before the key sends none: the claim then takes
+the old key away, and the hub knows the new Mac by its address until Founderizer on it
+registers a key. A claim that fails and takes `team.json` back leaves the key as it found it
+too. An enrolled phone keeps its access,
 because it has an address and a key of its own. The central vault keeps the owner key of the
 Mac from before until a `central-vault` run from the new Mac replaces it ("The central
 vault", below).

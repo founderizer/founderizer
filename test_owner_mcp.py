@@ -1316,7 +1316,7 @@ class Progress(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(home), True)
         posted = []
 
-        def claim(listener, code):
+        def claim(listener, code, base):
             posted.append(listener)
             self.gate.wait(10)
             return owner_mcp.Answer(200, None, b"claimed", {})

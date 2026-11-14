@@ -176,9 +176,65 @@ def write_private(path, text):
         f.write(text)
 
 
+def owner_computer_call():
+    """On the owner's own computer: (its key for this hub, the address that a call with that key goes to), or
+    (None, HUB) (hub.py, owner feature owner_key). The hub knows that computer by its address and this key, both, so
+    the owner's own commands here (say, board, verify-case) send it. The file is `<address>_<port>` in
+    ~/.founderizer/owner-keys, named by the hub's number, which Founderizer or the claim wrote and only the owner's
+    user reads. A machine of the fleet has no such file. A hub that is called by a name: the name is looked up once,
+    only when the folder holds a file of that port, and the call with the key goes to that number, never to the name
+    again (owner_mcp.owner_key_place says why)."""
+    parts = urllib.parse.urlsplit(HUB)
+    folder = os.path.join(os.path.expanduser("~"), ".founderizer", "owner-keys")
+    def canonical(text):        # an address in the one spelling that names a key's file (owner_mcp.canonical_address)
+        for family in (socket.AF_INET, socket.AF_INET6):
+            try:
+                return socket.inet_ntop(family, socket.inet_pton(family, text)).lower()
+            except (OSError, ValueError, TypeError):
+                pass
+        return None
+
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        host = (parts.hostname or "").lower()
+        if not host:
+            return None, HUB
+        address = canonical(host)
+        if not address:             # a name: the file has the hub's number in its name
+            if not any(n.endswith(f"_{port}") and not n.startswith(".") for n in os.listdir(folder)):
+                return None, HUB
+            found = [a[4][0] for a in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)]
+            # The same one for the same set in any order (owner_mcp.chosen_address): the fleet's private network
+            # first, else the lowest IPv4 address, else the lowest of the others.
+            fours = sorted((socket.inet_pton(socket.AF_INET, a), a) for a in found if canonical(a) and ":" not in a)
+            private = [a for packed, a in fours if packed[0] == 100 and 64 <= packed[1] <= 127]
+            others = sorted(canonical(a) for a in found if canonical(a) and ":" in a)
+            address = (private or [a for _, a in fours] or others)[0]
+        host = address
+        with open(os.path.join(folder, re.sub(r"[^a-z0-9.-]", "-", host) + f"_{port}"), encoding="utf-8") as f:
+            key = f.read(256).strip()
+    except (OSError, ValueError, IndexError):
+        return None, HUB
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", key):
+        return None, HUB
+    return key, f"{parts.scheme or 'http'}://{'[' + host + ']' if ':' in host else host}:{port}"
+
+
+def owner_computer_key():
+    """The key of owner_computer_call, or None."""
+    return owner_computer_call()[0]
+
+
 def http(method, path, data=None, timeout=40):
     if not HUB:
         die("no hub address yet. On the hub's machine run: python3 fleet.py addresses ...")
+    if not AGENT:           # no agent's helper: a command of the owner's own computer, or of a machine with no key
+        key, numbered = owner_computer_call()
+        code, answer = http_once(method, path, data, timeout, key, numbered)
+        # a hub that holds no key of the owner's computer refuses a bearer there, before it does anything
+        if key and code == 403 and isinstance(answer, dict) and answer.get("auth") == "key_not_expected":
+            return http_once(method, path, data, timeout, None)
+        return code, answer
     for _ in range(2):
         key = load_agent_key(AGENT) if AGENT and not path.startswith("/mcp/") else None    # never a session credential
         code, answer = http_once(method, path, data, timeout, key)
@@ -190,7 +246,7 @@ def http(method, path, data=None, timeout=40):
     return code, answer
 
 
-def http_once(method, path, data, timeout, key):
+def http_once(method, path, data, timeout, key, base=None):
     body = None
     headers = {"Accept": "application/json"}
     if key:
@@ -198,7 +254,7 @@ def http_once(method, path, data, timeout, key):
     if data is not None:
         body = json.dumps(data).encode()
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(HUB + path, data=body, method=method, headers=headers)
+    req = urllib.request.Request((base or HUB) + path, data=body, method=method, headers=headers)
     try:
         with OPENER.open(req, timeout=timeout) as r:
             raw = r.read()

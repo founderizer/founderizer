@@ -51,7 +51,12 @@ adds the key of that address.
 The server runs the code of that folder, as it was when the agent's session started it. So a tool that a later
 release adds reaches the agent only when the folder holds that release and a new session starts.
 
-Nothing else is needed. There is no token to issue, no key to copy and nothing to rotate.
+Nothing else is needed. There is no token to issue and no key to copy. The hub knows this Mac by
+its address and by a key that the Mac made for it (owner API 1.169): `claim_hub` makes that key at
+the claim, and on a fleet from before the key the Founderizer app registers one by itself. The
+server reads it at each call from `~/.founderizer/owner-keys`, a folder of the owner's user, and
+shows it in no tool. A VM or a container on the Mac has the Mac's address and not that file, so the
+hub refuses it.
 
 The server asks nothing itself. The owner's hand before a call is the client's own question before
 a tool (OWNER-MCP-BOUNDARY.md section 7), and the server's first words tell the agent not to ask
@@ -466,14 +471,17 @@ app's start: no test starts the real app.
 
 ## How it authenticates to the hub, and why that is the whole of it
 
-**It does not.** The hub knows the owner by the address the call comes from.
+**With the Mac's own identity, and with nothing of its own.** The hub knows the owner by the address
+the call comes from and by the key that the owner's Mac made for that hub.
 
 `hub.py` `ui_allowed` is the gate on every owner route: the call must come from the address that
-`team.json` holds as `addresses.owner`, it must carry **no** bearer token, and it must carry no
-browser `Origin`. The Mac app is authorized by exactly that and by nothing else — "The native app
+`team.json` holds as `addresses.owner`, it must carry the Mac's own key as its bearer token once the
+Mac has registered one (`owner_allowed`; a hub that holds no such key yet refuses a bearer token), and
+it must carry no browser `Origin`. The Mac app is authorized by exactly that and by nothing else — "The native app
 uses the existing owner machine identity." So an MCP server that runs on the owner's Mac inherits
-that identity as it stands. It holds no credential of its own, and there is no second credential
-path to secure, leak or revoke. (The hub's remote MCP address for the owner's Claude or ChatGPT app,
+that identity as it stands. Since owner API 1.169 that identity is the Mac's address and the Mac's
+own key for the hub, which every owner program of the Mac reads from one file of the owner's user;
+the server has no credential beside it. (The hub's remote MCP address for the owner's Claude or ChatGPT app,
 when a later release turns it on, is another server with its own OAuth tokens at the phone's level
 or less; those tokens never reach an owner route: OWNER-MCP-BOUNDARY.md, section 7a.)
 

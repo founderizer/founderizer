@@ -53,6 +53,36 @@ has a valid signature (`releases.py`). A fleet gets a fix when it takes the rele
 - A problem in a service that a fleet uses, for example an AI provider, Tailscale or GitHub, goes to that service. A
   problem in how Founderizer uses the service goes to us.
 
+## How the hub knows the owner's computer
+
+The hub serves the owner's routes to one computer: the one that claimed the hub. It knows that computer by two
+things, and a call needs both (`hub.py`, `owner_allowed`):
+
+- **Its address** on the fleet's private network, which the claim proved with a one-time code of the hub's own server.
+- **A key that the computer made** for that hub: 32 random bytes. The hub keeps only the SHA-256. The computer keeps
+  the key in a file that only the owner's user reads, `~/.founderizer/owner-keys/<address>_<port>`, with the hub's
+  numeric address in its name. The key only ever goes to that number: a program that calls its hub by a name looks
+  the name up once, and sends the call that carries the key to the number that it got, never to the name again,
+  and it follows no redirect with the key. Before a computer registers a key for a hub that it calls by a name, it
+  checks that the name's number is an address of the fleet's private network that the hub's own server has, which
+  it reaches over SSH with a known host key: whoever answers a name's lookup chooses its number.
+
+**What the key guards against.** A VM or a container on the owner's computer sends its traffic out through that
+computer, so the hub sees the computer's address. Such a guest has the address and not the key, and the hub refuses
+it.
+
+**What the key does not guard against.** A program that runs on the owner's computer as the owner's user can read the
+file, as it can read the owner's SSH keys. A guest to which the owner gives the folder `~/.founderizer`, or the whole
+home folder, can read it too. To the hub, each of these is the owner.
+
+**How a computer gets its key.** At the claim of a new hub, the computer sends the SHA-256 with the one-time code, and
+the claim keeps it before it names the owner. On a fleet from before the key, Founderizer registers one by itself: the
+hub writes a one-time value into a file of its own server, and the computer reads that file over its own SSH
+connection to that server, as the user that owns the file and never as root. No call that has only the address
+registers, replaces or removes a key. Until a computer has registered a key, its hub knows it by the address
+alone: Founderizer says so in System status when it cannot register one, and a second claim on the hub's server
+(`sh hub.sh --reclaim`) makes one.
+
 ## How the vault keeps secrets
 
 [VAULT.md](VAULT.md) tells what the vault protects, how it protects it, what it does not protect, and what the owner

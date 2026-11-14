@@ -1448,8 +1448,11 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "chat_waits",        # the owner, 13 November 2026 ("Yes, fix it"): the phone's list of chats says
                                     # "Thinking" for every conversation, from agents[].waits_since of GET /ui/mobile
                                     # (UI-API.md 1.142)
-               "diagnostics"]       # the owner, 14 November 2026, to the pictures C0, E1, E2 and E3: GET
+               "diagnostics",       # the owner, 14 November 2026, to the pictures C0, E1, E2 and E3: GET
                                     # /ui/diagnostics, the hub's own faults and refused calls (UI-API.md 1.167)
+               "owner_key"]         # the owner, 14 November 2026 ("it needs to be tested and verified"): the owner's
+                                    # computer sends a key with its address, and POST /ui/owner/key registers it
+                                    # (UI-API.md 1.169)
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -1779,6 +1782,163 @@ def device_rows(source):
                     "recovery_binding": signing["recovery_binding"] if signing else None,
                     "recovery": {"sealed": bool(copy["sealed"]), "held": copy["held"]} if copy else None})
     return out
+
+
+# ---------------------------------------------------------------- The key of the owner's computer (owner feature owner_key)
+#
+# The hub knew the owner's computer by its address alone. A VM or a container on that computer leaves through the
+# computer's own address (NAT), so the hub took such a guest for the owner (proved three times on 14 November 2026).
+# So the owner's computer proves itself with its address AND a key, as an owner device does (device_allowed). The
+# computer makes the key and the hub keeps only its SHA-256, in one file beside its records: not in team.json, which
+# every machine reads, and not in the records, which a restore replaces with the records of another time.
+#
+# Three things write that file, and each one proves more than the address:
+#   - the claim of a new hub and a second claim (hubsetup.py cmd_claim): the one-time code of the hub's own server;
+#   - POST /ui/owner/key with a proof: the one-time value that the hub wrote into a file of its own server, which the
+#     owner's computer read over its SSH connection to that server (owner_key_proof);
+#   - nothing else. No route gives, replaces or removes the key for a caller that has only the address.
+# The rule itself is in Handler.allowed("owner"), which every route of the owner goes through: ui_allowed, the board,
+# the records, the older writes and GET /events/owner.
+# A hub that holds no key file (a fleet from before the key, until its owner's computer registers one) keeps the
+# address rule. What the key does not guard against: a program that runs on the owner's computer as the owner's user
+# reads the key there, as it reads the owner's SSH keys.
+OWNER_KEY_FILE = "owner-key.json"       # {"sha256", "since"}, mode 600, in CFG owner_key_dir (the folder of --db)
+OWNER_PROOF_FILE = "owner-key.proof"    # the one-time value of a registration, mode 600, in the same folder
+OWNER_PROOF_LIFE = 600                  # seconds that one value works
+OWNER_KEY_SHA = re.compile(r"[0-9a-f]{64}")
+OWNER_KEY_LOCK = threading.Lock()
+OWNER_KEY = {"stamp": None, "value": None}      # the file as it was last read: (mtime_ns, size, inode) and its key
+OWNER_PROOF = {"value": None, "expires": 0.0,   # the open one-time value, in memory only: a restart ends it
+               "stamp": None}                   # its file as this hub wrote it (owner_key_proof)
+OWNER_KEY_BROKEN = {"sha256": "", "since": None}    # a key file that cannot be read matches no key: the hub refuses
+OWNER_REFUSALS = {}     # (auth code, address) -> the calls from an address that the key's rule refused (refuse_counted)
+
+
+def owner_key_path(name=OWNER_KEY_FILE):
+    """Where the hub keeps the key's SHA-256 (or, with `name`, the one-time value), or None for a hub with no such
+    folder: main() sets it beside --db, so a hub that a test imports as a module holds no key and reads no file of
+    the machine that the test runs on."""
+    folder = CFG.get("owner_key_dir")
+    return os.path.join(folder, name) if folder else None
+
+
+def owner_key():
+    """{sha256, since} of the key that the owner's computer registered, or None while it registered none. A file
+    that is there and cannot be read, or that holds no SHA-256, is OWNER_KEY_BROKEN: it matches no key, so a damaged
+    file never opens the owner's routes to the address alone. Read again only when the file changed."""
+    path = owner_key_path()
+    if not path:
+        return None
+    with OWNER_KEY_LOCK:
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            gone = bool(OWNER_KEY["value"] and OWNER_KEY["value"].get("sha256"))
+            OWNER_KEY.update(stamp=None, value=None)
+            # Nothing at all at the path is "no key". A link whose file is gone is a key file that is damaged.
+            if os.path.islink(path):
+                return dict(OWNER_KEY_BROKEN)
+            if gone:        # in the service's own output, as the line of a start with no key (main)
+                print("The file of the key of the owner's computer is gone, so this hub knows that computer by its "
+                      "address alone again, and so does a VM or a container on it. Founderizer on that computer "
+                      "registers a key by itself; a second claim does too: sh hub.sh --reclaim", flush=True)
+            return None
+        except OSError:
+            return dict(OWNER_KEY_BROKEN)
+        stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
+        if OWNER_KEY["stamp"] != stamp:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    held = json.loads(f.read(4096))
+                ok = isinstance(held, dict) and isinstance(held.get("sha256"), str) and \
+                    OWNER_KEY_SHA.fullmatch(held["sha256"]) is not None
+            except (OSError, ValueError, RecursionError):
+                ok = False
+            since = held.get("since") if ok else None
+            OWNER_KEY.update(stamp=stamp, value={"sha256": held["sha256"], "since": since if isinstance(
+                since, (int, float)) and not isinstance(since, bool) else None} if ok else dict(OWNER_KEY_BROKEN))
+        return dict(OWNER_KEY["value"])
+
+
+def owner_key_matches(token):
+    """True when token is the key that the owner's computer registered."""
+    held = owner_key()
+    return bool(held and held["sha256"] and token) and \
+        hmac.compare_digest(held["sha256"], hashlib.sha256(token.encode()).hexdigest())
+
+
+def write_owner_file(path, text):
+    """One file of the key's folder, mode 600 from its first byte, in place of anything that was there."""
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.new"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
+
+
+def keep_owner_key(digest):
+    """The SHA-256 of the key of the owner's computer, in place of any earlier one. The time it was kept."""
+    t0 = now()
+    with OWNER_KEY_LOCK:
+        write_owner_file(owner_key_path(), json.dumps({"sha256": digest, "since": t0}) + "\n")
+        # The next read takes the file as it is now. Until then this is the key, so a file that goes before that
+        # read is a key that went, and the hub says so (owner_key).
+        OWNER_KEY.update(stamp=None, value={"sha256": digest, "since": t0})
+        OWNER_PROOF.update(value=None, expires=0.0, stamp=None)
+        with contextlib.suppress(OSError):
+            os.remove(owner_key_path(OWNER_PROOF_FILE))
+    log("owner", "the owner's computer registered its key")     # the hub never has the key itself
+    return t0
+
+
+def owner_key_proof():
+    """(path, expires) of the one-time value of a key registration: 32 random bytes in a file that only the hub's
+    own user and root read. The owner's computer reads it over its SSH connection to this server and sends it back
+    with the SHA-256 of its key (owner_proof_taken), which a guest behind that computer cannot do: it has the
+    address and no SSH key. An open value is given again and not replaced, so a second asker cannot take the value
+    away from the one that reads it now. The path is the real one, with no link in it. The owner's computer reads it
+    as the file's own user, never as root (OwnerMacKeyRegistration.program in the app), so whatever this hub names
+    there, the read gets nothing that the hub's own user could not read."""
+    path, t0 = os.path.realpath(owner_key_path(OWNER_PROOF_FILE)), now()
+    with OWNER_KEY_LOCK:
+        if not OWNER_PROOF["value"] or OWNER_PROOF["expires"] <= t0:
+            OWNER_PROOF.update(value=secrets.token_urlsafe(32), expires=t0 + OWNER_PROOF_LIFE, stamp=None)
+        # Written once for each value, and again only when the file is not as this hub left it: a caller with the
+        # address alone can ask as often as it likes, and each owner call takes this lock.
+        try:
+            st = os.lstat(path)
+            stamp = (st.st_mtime_ns, st.st_size, st.st_ino, stat.S_IMODE(st.st_mode), stat.S_ISREG(st.st_mode))
+        except OSError:
+            stamp = None
+        if stamp is None or stamp != OWNER_PROOF.get("stamp"):
+            write_owner_file(path, OWNER_PROOF["value"] + "\n")
+            st = os.lstat(path)
+            OWNER_PROOF["stamp"] = (st.st_mtime_ns, st.st_size, st.st_ino, stat.S_IMODE(st.st_mode),
+                                    stat.S_ISREG(st.st_mode))
+        return path, OWNER_PROOF["expires"]
+
+
+def owner_proof_taken(proof):
+    """True when proof is the open one-time value, which this call then takes: the compare and the end of the value
+    are one step, so two calls that bring one value at the same time register one key. Whether it matches or not, a
+    value is compared in constant time and never written to the log."""
+    with OWNER_KEY_LOCK:
+        value, expires = OWNER_PROOF["value"], OWNER_PROOF["expires"]
+        if not (value and isinstance(proof, str) and expires > now()
+                and hmac.compare_digest(value.encode(), proof.strip().encode())):
+            return False
+        OWNER_PROOF.update(value=None, expires=0.0, stamp=None)
+        with contextlib.suppress(OSError):
+            os.remove(owner_key_path(OWNER_PROOF_FILE))
+        return True
 
 
 def save_recovery_copy(device, sealed):
@@ -44185,14 +44345,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self.foreign()
         return self.site_allowed()
 
-    def allowed(self, who, broker=False):
+    def allowed(self, who, broker=False, address_only=False):
         """True when this call comes from `who`'s own machine with what owner API 1.12 asks. An agent with a key sends
         it on every route, also while it is alone on its address, except broker: a vault route that the machine's
         broker calls, which keeps the address rule while the agent is alone. An agent without a key, alone on its
         address, keeps the address rule. A credential that is sent but does not match is refused, never taken as
         absent. A name whose machine has no address at all is refused on a hub that checks addresses
         (address_checked), because then the hub cannot tell this caller from any other. Otherwise answers 403 and
-        returns False."""
+        returns False.
+
+        **The owner is that computer's address and its key, both** (owner_key_allowed; owner feature owner_key): the
+        key is asked here, inside this one function, so that no route asks for the owner's address alone, whether
+        it names the owner in its code or takes the name from its path (GET /events/owner did, until the review of
+        14 November 2026). address_only: for the one route that registers the key, which a computer calls before
+        it has one (ui_owner_key), and for no other."""
         if unplaced(who):
             return self.no_server(who)
         want, src = address_of(who), self.client_address[0]
@@ -44204,7 +44370,7 @@ class Handler(BaseHTTPRequestHandler):
                             **({"auth": "moved"} if want and moved_away(who, src) else {})})   # agent_move
             return False
         if who == "owner":
-            return True
+            return True if address_only else self.owner_key_allowed()
         self.works_for(who)             # before the next line: a name that left since its route looked it up is held
         if who not in agents():         # by the lock too, at the route's next take of it
             return True
@@ -44301,14 +44467,105 @@ class Handler(BaseHTTPRequestHandler):
         device = owner_device_at(self.client_address[0])         # the owner's phone (MOBILE-APP.md)
         if device is not None:
             return self.device_allowed(device)
-        if not self.allowed("owner"):
+        if not self.owner_allowed():
             return False
-        if self.bearer() is not None:
-            return self.refuse("owner", "key_not_expected",
-                               "the owner's Mac is known by its address; send no bearer token")
         if self.headers.get(PRESENCE_HEADER) == "1":       # only here: the owner's Mac, after its check
             owner_seen_present(self.client_address[0])
         return True
+
+    def owner_allowed(self):
+        """The owner's own computer: its address and its key, both (allowed). The name that the owner's routes outside
+        ui_allowed ask by: the board, the records and the older writes beside them."""
+        return self.allowed("owner")
+
+    def owner_key_allowed(self):
+        """The key half of the owner's rule (owner feature owner_key), after allowed() checked the address: the key
+        that the owner's computer registered. A VM or a container on that computer has the address and not the key.
+        A key that is sent and does not match is refused, never taken as absent. A hub whose owner's computer
+        registered no key yet (a fleet from before the key) keeps the address rule and refuses a bearer token, as
+        every hub did before, so a client reads from `key_not_expected` that it must send none. Answers 403 and
+        returns False otherwise."""
+        held, token = owner_key(), self.bearer()
+        if held is None:
+            if token is not None:
+                return self.refuse_counted("owner", "key_not_expected",
+                                           "the owner's Mac is known by its address; send no bearer token")
+            return True
+        if token is None:
+            return self.refuse_counted(
+                "owner", "owner_key_required",
+                "this call came from the owner's computer without that computer's key. A program that started before "
+                "the key was made must start again. A program in a VM or a container on that computer is not the "
+                "owner. A computer that lost its key gets a new one with a second claim on the hub's server: "
+                "sh hub.sh --reclaim")
+        if not owner_key_matches(token):
+            return self.refuse_counted(
+                "owner", "owner_key_mismatch",
+                "this is not the key of the owner's computer. Open Founderizer on that computer: it registers its key "
+                "again by itself. Or make a second claim on the hub's server: sh hub.sh --reclaim")
+        return True
+
+    def refuse_counted(self, who, code, why):
+        """refuse(), for a refusal that a caller can bring about as often as it likes with the owner's address alone:
+        no key, a wrong key, a key for a hub that expects none, a wrong one-time value. A program from before the key
+        that is left open asks every few seconds, and so does a guest that tries. The log gets a row for the first
+        such call of an address, then for each tenth up to the hundredth, then for each hundredth, with the count:
+        never one for each call, and never a long silence."""
+        with REFUSED_LOCK:
+            count = OWNER_REFUSALS[(code, self.client_address[0])] = OWNER_REFUSALS.get((code, self.client_address[0]), 0) + 1
+        if count == 1:
+            return self.refuse(who, code, why)
+        if count % 100 == 0 or (count < 100 and count % 10 == 0):
+            log("hub", f"REFUSED {count} calls for {who} from {self.client_address[0]} since this hub started: {code}")
+        self.json(403, {"error": why, "auth": code})
+        return False
+
+    def ui_owner_key(self):
+        """POST /ui/owner/key {sha256?, proof?} (owner feature owner_key): the owner's computer registers the SHA-256
+        of the key that it made, in place of any earlier one. It comes from that computer's address and before the
+        computer has a key, so owner_allowed cannot apply; the address alone registers nothing. Without `proof` the
+        hub writes a one-time value into a file of its own server and answers with that file's path
+        (owner_key_proof). With `proof`, that value, read over the computer's own SSH connection to the hub's
+        server, and `sha256`, the hub keeps the SHA-256: from then on every owner route asks for the key."""
+        if not address_of("owner"):
+            return self.json(503, {"error": "owner address is not configured"})
+        if self.headers.get("Origin"):
+            return self.json(403, {"error": "browser origins are not accepted"})
+        if not self.allowed("owner", address_only=True):        # the one route that takes the address alone
+            return
+        if owner_key_path() is None:
+            return self.json(409, {"error": "this hub keeps no key of the owner's computer"})
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            return self.json(415, {"error": "application/json required"})
+        if len(self.body()) > 4096:
+            return self.json(413, {"error": "request is too large"})
+        data = self.form()
+        extra = sorted(set(data) - {"sha256", "proof"})
+        if extra:
+            return self.json(400, {"error": f"unknown field {extra[0]}"})
+        proof, digest = data.get("proof"), data.get("sha256")
+        if proof is None:
+            if digest is not None:
+                return self.json(400, {"error": "sha256 comes with proof, in the second call"})
+            try:
+                path, expires = owner_key_proof()
+            except OSError as e:
+                log("hub", f"the one-time value of a key registration could not be written: {type(e).__name__}")
+                return self.json(500, {"error": "the hub could not write the one-time value on its server"})
+            return self.json(200, {"registered": False, "proof_file": path, "expires": expires},
+                             {"Cache-Control": "no-store"})
+        if not isinstance(digest, str) or not OWNER_KEY_SHA.fullmatch(digest):
+            return self.json(400, {"error": "sha256 must be 64 lowercase hex characters"})
+        if not owner_proof_taken(proof):
+            return self.refuse_counted("owner", "owner_proof_mismatch",
+                                       "this is not the one-time value of the file on the hub's server, or its time "
+                                       "is over. Ask for a new one.")
+        try:
+            since = keep_owner_key(digest)
+        except OSError as e:
+            log("hub", f"the key of the owner's computer could not be kept: {type(e).__name__}")
+            return self.json(500, {"error": "the hub could not keep the key on its server"})
+        return self.json(200, {"registered": True, "since": since}, {"Cache-Control": "no-store"})
 
     def device_allowed(self, device):
         """An enrolled owner device (MOBILE-APP.md): its own address and its own key, both. A key that is sent and
@@ -48366,11 +48623,11 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["ui", "tasks"] and parts[3] == "events":
             return self.ui_events(parts[2], query)
         if not parts or parts == ["board"]:          # the owner's machine only, his words of 2 November 2026
-            if not self.allowed("owner"):
+            if not self.owner_allowed():
                 return
             return self.send(200, board_html(), "text/html; charset=utf-8")
         if parts == ["board.txt"]:
-            if not self.allowed("owner"):
+            if not self.owner_allowed():
                 return
             return self.send(200, overview_text() + "\n", "text/plain; charset=utf-8")
         if parts == ["health"]:
@@ -48380,7 +48637,7 @@ class Handler(BaseHTTPRequestHandler):
         if parts[:1] == ["events"] and len(parts) == 2:
             return self.events(parts[1], query)
         if parts == ["records"]:
-            if not self.allowed("owner"):
+            if not self.owner_allowed():
                 return
             tables = ("tasks", "notes", "attempts", "questions", "prompts", "needs", "events", "hits", "outbox", "log", "calls", "cases", "evidence", "agents", "holds", "outcomes", "agent_limits")
             with LOCK:
@@ -48824,6 +49081,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_owner_device_recovery_held(parts[3])
         if parts == ["ui", "owner", "enroll"]:
             return self.ui_owner_enroll()
+        if parts == ["ui", "owner", "key"]:         # owner feature owner_key: the owner's computer registers its key
+            return self.ui_owner_key()
         if parts == ["bridge", "inbound"]:
             return self.bridge_inbound()
         if len(parts) == 3 and parts[:2] == ["bridge", "out"] and re.fullmatch(r"[1-9][0-9]{0,17}", parts[2]):
@@ -49071,7 +49330,7 @@ class Handler(BaseHTTPRequestHandler):
                 q("UPDATE events SET helper_ack=? WHERE id=? AND agent=? AND kind NOT IN ('say','chat')", (now(), eid, agent))
             return self.json(200, {"ok": True})
         if parts == ["cases"]:
-            if not self.allowed("owner"):
+            if not self.owner_allowed():
                 return
             f = self.form()
             try:
@@ -49084,7 +49343,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(400, {"error":"invalid or duplicate case"})
             return self.json(200, {"ok":True})
         if parts == ["evidence"]:
-            if not self.allowed("owner"):
+            if not self.owner_allowed():
                 return
             f = self.form()
             if not q1("SELECT id FROM cases WHERE id=?", (f.get("case_id"),)) or not f.get("kind"):
@@ -49092,7 +49351,7 @@ class Handler(BaseHTTPRequestHandler):
             ins("INSERT INTO evidence(case_id,kind,ts,data) VALUES(?,?,?,?)", (f["case_id"], f["kind"], now(), json.dumps(f.get("data",{}))))
             return self.json(200, {"ok":True})
         if parts == ["say"]:
-            if not self.allowed("owner"):
+            if not self.owner_allowed():
                 return
             text = (self.form().get("text") or "").strip()
             if text and secret_hit(text):
@@ -49102,7 +49361,7 @@ class Handler(BaseHTTPRequestHandler):
                 log("owner", f"said to the manager: {text}")
             return self.back()
         if parts[:1] == ["needs"] and len(parts) == 2:
-            if not self.allowed("owner"):
+            if not self.owner_allowed():
                 return
             nid = int(re.sub(r"\D", "", parts[1]) or 0)
             form = self.form()
@@ -49227,7 +49486,7 @@ class Handler(BaseHTTPRequestHandler):
             log(f["sender"], f"sealed handover S-{sid} \"{f.get('label') or ''}\" for {f['recipient']}")
             return self.json(200, {"ok": True, "id": sid, "ref": f"sealed:{sid}"})
         if parts == ["secrets"]:
-            if not self.allowed("owner"):       # only you say which logins the hub must watch for
+            if not self.owner_allowed():        # only you say which logins the hub must watch for
                 return
             f = self.form()
             if not f.get("label") or not f.get("salt") or not re.fullmatch(r"[0-9a-f]{64}", f.get("hash") or ""):
@@ -51009,6 +51268,9 @@ def main():
     # owner feature chat_apps: the bridge's key, next to the records (~/.fleet/chat-apps with the default --db), so a
     # test hub with its own --db never writes in ~/.fleet
     CFG["chat_apps_dir"] = os.path.expanduser(args.chat_apps or os.path.join(os.path.dirname(db_path), "chat-apps"))
+    # owner feature owner_key: the SHA-256 of the key of the owner's computer, beside the records too, where
+    # hubsetup.py's claim writes it (owner_key_dir): a hub that holds none there keeps the address rule
+    CFG["owner_key_dir"] = os.path.dirname(os.path.abspath(db_path))
     ensure_bridge_key()
     settle_stopped_calls()
     settle_pings()
@@ -51037,6 +51299,12 @@ def main():
     print(f"Founderizer hub on http://{host}:{port}  board: http://{host}:{port}/board")
     print(f"It answers the Host values: {', '.join(sorted(allowed_hosts(server.server_address)))}.", flush=True)
     print(f"Agents: {', '.join(agents())}. Records: {db_path}.")
+    if address_of("owner") and owner_key() is None:
+        # In the service's own output, as the lines above: an operator reads it at the start. A key file that is gone
+        # takes the key with it, and nothing on a screen says so.
+        print("This hub holds no key of the owner's computer, so it knows that computer by its address alone, and so "
+              "a VM or a container on it. Founderizer on that computer registers a key by itself, and a second claim "
+              "on this server makes one: sh hub.sh --reclaim", flush=True)
     # flush, because the service writes this output to the journal, where a block buffer would hold a warning back
     # until the hub has printed 8 KiB of other things: an operator reads it at the start or not at all.
     if CFG["team_problem"]:

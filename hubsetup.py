@@ -8,7 +8,7 @@ Standard library only, and it reads no credential of a model provider.
                                                     this hub's own repository: the bare one that every machine of the
                                                     fleet fetches from, and the hub's checkout on the configuration ref
     python3 hubsetup.py claim --address IP --out PATH [--port N] [--timezone Z] [--wait S] [--reclaim] [--commit]
-                              [--manager-later] [--manager-name NAME] [--shared]
+                              [--manager-later] [--manager-name NAME] [--shared] [--db PATH]
                                                     the owner claim, then write team.json, and commit it on the ref;
                                                     --manager-later: the app gives the manager a server of its own;
                                                     --manager-name: the manager's own name, `manager` without it;
@@ -56,10 +56,13 @@ Standard library only, and it reads no credential of a model provider.
                                                     of the remote MCP address, its own user and service, and Tailscale
                                                     Funnel on port 443 to it; off undoes the Funnel and the service
 
-Why the claim exists. The owner is a Tailscale address and no token (hub.py `allowed("owner")`), so a hub with the
-wrong `addresses.owner` serves the owner's pages to the wrong machine, and one with none serves them to nobody. The
-installer therefore proves the address before it finishes, with the same one-time code that join.sh uses, the other
-way round: this machine makes the code, the owner's Mac sends it back, and the address of that call is the owner.
+Why the claim exists. The owner is a Tailscale address and a key that the owner's computer made (hub.py
+`owner_allowed`), so a hub with the wrong `addresses.owner` serves the owner's pages to the wrong machine, and one
+with none serves them to nobody. The installer therefore proves the address before it finishes, with the same one-time
+code that join.sh uses, the other way round: this machine makes the code, the owner's Mac sends it back, and the
+address of that call is the owner. The same call carries the SHA-256 of that computer's key (OWNER_KEY_HEADER), which
+the claim keeps beside the hub's records (keep_owner_key): a VM or a container on the owner's computer leaves through
+that computer's address, and it has no key.
 
 The claim listener holds the hub's own address and port, so the Tailscale access rules for port 8765 are proved
 before the hub exists. It keeps only the code's SHA-256, never writes the code anywhere, takes one code once, and
@@ -77,6 +80,7 @@ says that the manager holds no credential of ours.
 """
 import argparse
 import base64
+import contextlib
 import errno
 import fnmatch
 import glob
@@ -149,6 +153,10 @@ OWNER_COMMIT = "The owner of this hub is another Mac: a second owner claim, made
 # no second copy of the name can drift from it. The agent's name comes from the hub's own pattern.
 AGENT_USER = "fleet-%s"
 DB_PATH = os.path.join("~", ".fleet", "pilot.db")   # the hub's own records, where hub.py --db keeps them
+# The key of the owner's computer (hub.py, owner feature owner_key). The computer makes the key and sends its SHA-256
+# in this header of its claim, beside the code; the claim's answer says in the second header that the SHA-256 is kept.
+OWNER_KEY_HEADER = "X-Fleet-Owner-Key-Sha256"
+OWNER_KEY_KEPT = "X-Fleet-Owner-Key"
 USER_LIMIT = 32                                     # the longest user name this system makes (useradd)
 AGENT_GROUP = "fleet-agents"                        # every agent user of this machine, and nobody else
 VAULT_USER = "fleet-vault"                          # the broker's own user: the only one that reads the store's key
@@ -2734,10 +2742,13 @@ def normalise(text):
 
 
 def claim_script(hub_ip, port):
-    """The script that GET /claim serves and the owner's Mac runs: it sends the code on standard input, then waits for
-    the hub itself on the same port and prints the address to paste in Founderizer, whose first-run window connects
-    to it at once. The code is in the environment of that line and goes to curl's standard input, never in an
-    argument and never in a URL."""
+    """The script that GET /claim serves and the owner's Mac runs: it makes this Mac's own key for the hub, sends the
+    code on standard input with the key's SHA-256 in a header, then waits for the hub itself on the same port and
+    prints the address to paste in Founderizer, whose first-run window connects to it at once. The code is in the
+    environment of that line and goes to curl's standard input, never in an argument and never in a URL. The key
+    never leaves this Mac but as the bearer of a call to this hub: it goes to curl through its configuration on
+    standard input, never in an argument, and it stays in a file that only this user reads, where Founderizer and
+    the owner's other programs find it (hub.py, owner feature owner_key)."""
     base = f"http://{hub_ip}:{port}"
     return f"""#!/bin/sh
 # Claim a new Founderizer hub for this Mac. The hub printed the line that runs this script; FLEET_CLAIM holds the one-time
@@ -2746,14 +2757,45 @@ set -eu
 [ -n "${{FLEET_CLAIM:-}}" ] || {{ echo "Founderizer: no claim code. Copy the whole line from the hub's installer." >&2; exit 1; }}
 code=$FLEET_CLAIM
 unset FLEET_CLAIM
-printf '%s' "$code" | curl -fsS -m 20 -X POST --data-binary @- {base}/claim || {{
+# This Mac's own key for this hub: 32 random bytes that are made here. The hub gets only their SHA-256.
+umask 077
+folder="$HOME/.founderizer/owner-keys"
+mkdir -p "$folder"
+chmod 700 "$HOME/.founderizer" "$folder"
+file="$folder/{hub_ip}_{port}"
+# The key waits in a file of its own until the hub says that it keeps the SHA-256. A claim whose answer was lost left
+# such a file, and the hub can hold its SHA-256: so that key goes again, and a claim that fails takes none away.
+key=
+[ -f "$file.pending" ] && key=$(cat "$file.pending")
+# Only a whole key goes again: 32 to 128 letters, as this Mac's other programs read one. Anything else in that file
+# (a write that broke off) makes way for a new key.
+case "$key" in *[!A-Za-z0-9_-]*) key= ;; esac
+[ "${{#key}}" -ge 32 ] && [ "${{#key}}" -le 128 ] || key=$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\\n')
+if command -v shasum >/dev/null 2>&1; then sum=$(printf '%s' "$key" | shasum -a 256); else sum=$(printf '%s' "$key" | sha256sum); fi
+sum=${{sum%% *}}
+[ "${{#key}}" -ge 32 ] && [ "${{#sum}}" -eq 64 ] || {{ echo "Founderizer: this Mac could not make its key for the hub. Nothing was sent, and the code is not used." >&2; exit 1; }}
+printf '%s\\n' "$key" > "$file.pending"
+said="$folder/.claim.$$"
+trap 'rm -f "$said"' EXIT
+printf '%s' "$code" | curl -fsS -m 20 -D "$said" -X POST -H "{OWNER_KEY_HEADER}: $sum" --data-binary @- {base}/claim || {{
     echo "Founderizer: this Mac could not claim the hub. Check the code and the Tailscale access rules for port {port}." >&2
     exit 1
 }}
 unset code
+if grep -qi '^{OWNER_KEY_KEPT}: kept' "$said"; then
+    mv -f "$file.pending" "$file"
+else
+    rm -f "$file.pending"
+    key=
+fi
 i=0
 while [ "$i" -lt 60 ]; do
-    if curl -fsS -m 5 -o /dev/null "{base}/ui/state"; then
+    if [ -n "$key" ]; then
+        printf 'header = "Authorization: Bearer %s"\\n' "$key" | curl -fsS -m 5 -o /dev/null -K - "{base}/ui/state" && ok=1 || ok=0
+    else
+        curl -fsS -m 5 -o /dev/null "{base}/ui/state" && ok=1 || ok=0
+    fi
+    if [ "$ok" = 1 ]; then
         echo "Founderizer: this Mac reads the hub. Paste this address in Founderizer: {base}"
         exit 0
     fi
@@ -2773,6 +2815,7 @@ class ClaimServer(http.server.HTTPServer):
     def __init__(self, where, hub_ip, port, digest, away=False):
         self.hub_ip, self.hub_port, self.digest, self.away = hub_ip, port, digest, away
         self.owner, self.wrong = None, {}
+        self.owner_key = None       # the SHA-256 of the key that the owner's computer made, when its claim sent one
         super().__init__(where, ClaimHandler)
 
     def handle_error(self, request, client_address):
@@ -2816,11 +2859,13 @@ class ClaimHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args):
         return          # a request line can hold a code: this listener writes none
 
-    def text(self, status, body):
+    def text(self, status, body, headers=()):
         data = body.encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        for name, value in headers:
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -2852,6 +2897,12 @@ class ClaimHandler(http.server.BaseHTTPRequestHandler):
             return self.text(403, "Founderizer: this address is the hub itself. Claim the hub from the Mac that will own it.\n")
         if self.server.wrong.get(src, 0) >= CLAIM_TRIES:
             return self.text(429, "Founderizer: too many wrong codes from this address.\n")
+        # The key of the owner's computer (hub.py, owner feature owner_key): the computer makes it and sends its
+        # SHA-256 beside the code, never the key. Checked before the code, so that a wrong one uses no code and no try.
+        key = self.headers.get(OWNER_KEY_HEADER)
+        if key is not None and not hub.OWNER_KEY_SHA.fullmatch(key.strip()):
+            return self.text(400, f"Founderizer: {OWNER_KEY_HEADER} is the SHA-256 of this computer's key, as 64 "
+                                  f"lowercase hex characters.\n")
         try:
             size = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -2860,15 +2911,20 @@ class ClaimHandler(http.server.BaseHTTPRequestHandler):
         if not given or hashlib.sha256(given.encode()).hexdigest() != self.server.digest:
             self.server.wrong[src] = self.server.wrong.get(src, 0) + 1
             return self.text(403, "Founderizer: this is not the claim code. Copy the whole line from the installer again.\n")
-        self.server.owner = src
+        self.server.owner, self.server.owner_key = src, key.strip() if key is not None else None
+        # OWNER_KEY_KEPT tells the computer that this installer keeps the SHA-256: only then does it keep its key file
+        # (an installer from before the key says nothing, and the computer then sends no key to that hub).
         self.text(200, f"Founderizer: this Mac ({src}) is now the owner of the hub at "
-                       f"http://{self.server.hub_ip}:{self.server.hub_port}\n")
+                       f"http://{self.server.hub_ip}:{self.server.hub_port}\n",
+                  ((OWNER_KEY_KEPT, "kept"),) if key is not None else ())
 
 
-def claim(hub_ip, port, wait=CLAIM_LIFE, where=None, away=False):
+def claim(hub_ip, port, wait=CLAIM_LIFE, where=None, away=False, sent=None):
     """Make a one-time code, print the line for the owner's Mac, and serve the claim until that Mac sends the code
     back. Returns the address of the call that sent it. The code is kept only as its SHA-256. away: this is a second
-    claim, on the port of a hub that has a fleet, and that fleet's calls get 503 meanwhile (ClaimHandler.elsewhere)."""
+    claim, on the port of a hub that has a fleet, and that fleet's calls get 503 meanwhile (ClaimHandler.elsewhere).
+    sent: a dict that gets "owner_key", the SHA-256 of the key that the owner's computer made, or None when its claim
+    sent none (a program from before the key)."""
     raw, code = new_code()
     server = ClaimServer(where or (hub_ip, int(port)), hub_ip, int(port), hashlib.sha256(raw.encode()).hexdigest(),
                          away)
@@ -2896,6 +2952,8 @@ def claim(hub_ip, port, wait=CLAIM_LIFE, where=None, away=False):
     if owner is None:
         raise Stop(f"no Mac claimed this hub in {int(wait / 60)} minutes, so nothing was written. Run the installer "
                    f"again; it makes a new code.")
+    if sent is not None:
+        sent["owner_key"] = server.owner_key
     if not PRIVATE.match(owner):
         say(f"the claim came from {owner}, which is not a Tailscale address (100.64.0.0/10). It is taken as the "
             f"owner, but check that the app reaches the hub over the private network.")
@@ -2976,11 +3034,11 @@ def take_back(kit, head):
     file of `head` again. The hub then starts on what it ran before, and it can write. With team.json changed and not
     committed, or with a commit that its ref does not have, it refuses every write from then on (hub.commit_kit_file).
     Nothing but team.json is touched. A commit that did reach the ref stays: that write is whole, and what failed
-    came after it."""
+    came after it. True when team.json is the file of `head` again."""
     now, fault = git("rev-parse", "HEAD", folder=kit)[1], ""
     if now != head:
         if ref_tip(kit) == now:
-            return
+            return False
         code, _out, err = git("reset", "-q", "--soft", head, folder=kit)
         if code != 0:
             fault = (f"the commit that the claim made and could not push is still on the branch of {kit} "
@@ -2993,6 +3051,7 @@ def take_back(kit, head):
         say(fault or "team.json is as it was before the claim.")
     except OSError:
         pass
+    return code == 0
 
 
 # The program of a claim's guard (HubPause.watch), which runs in a session of its own. It waits for one byte on its
@@ -3039,6 +3098,7 @@ class HubPause:
         self.hub_ip, self.port, self.out, self.commit, self.before = hub_ip, int(port), out, commit, before
         self.kit, self.where = os.path.dirname(os.path.abspath(out)), f"{hub_ip}:{int(port)}"
         self.stopped, self.handlers, self.guard = False, {}, None
+        self.sent = {}          # what the claim's call sent beside the code (claim: "owner_key")
 
     def __enter__(self):
         return self
@@ -3047,13 +3107,13 @@ class HubPause:
         """The owner claim. When a hub that runs holds its address and port: with that hub's service stopped. A hub
         that has an owner has a fleet, whose calls to this port get 503 while the claim holds it, and no 404."""
         try:
-            return claim(self.hub_ip, self.port, wait, away=bool(self.before))
+            return claim(self.hub_ip, self.port, wait, away=bool(self.before), sent=self.sent)
         except OSError as e:
             if e.errno != errno.EADDRINUSE:
                 raise
         self.stop()
         try:
-            owner = claim(self.hub_ip, self.port, wait, away=True)
+            owner = claim(self.hub_ip, self.port, wait, away=True, sent=self.sent)
         except OSError as e:
             if e.errno != errno.EADDRINUSE:
                 raise
@@ -3309,8 +3369,27 @@ def cmd_claim(args):
         # A second claim changes the team.json of a fleet. When its write, its commit or its push fails, the checkout
         # goes back to this commit (take_back), and the hub starts on what it ran before.
         head = git("rev-parse", "HEAD", folder=kit)[1] if already and args.commit else ""
+        # A claim that brings a key: the key first, before team.json names that computer, so that a claim which
+        # stops between the two leaves a hub that asks for the key, never a hub that has an owner and knows it by its
+        # address alone. The key from before gets a second name first (a hard link), so that a claim which fails can
+        # put it back with a rename, also on a disk that is full, and so that the path holds a key at each moment:
+        # a hub that starts after a kill in the middle reads one. A claim that brings no key (a program from before
+        # the key) takes an earlier key away only after team.json names its computer: until then nothing of the key
+        # changed.
+        # A claim with no records named keeps no key: argparse always names them (--db), a test's own args do not.
+        db, sent = getattr(args, "db", None), (getattr(pause, "sent", None) or {}).get("owner_key")
+        aside = False
+        if db and sent:
+            aside = set_owner_key_aside(db)
+            try:
+                keep_owner_key(db, sent, not already)
+            except BaseException:
+                put_owner_key_back(db, aside, quiet=True)
+                raise
+        written = False
         try:
             write_team(args.out, team)
+            written = True
             try:
                 say(f"{args.out} names {owner} as the owner.")
             except OSError:
@@ -3322,9 +3401,144 @@ def cmd_claim(args):
             if args.commit:     # the record says which of the two it was: a second claim is not the first team.json
                 commit_team(kit, OWNER_COMMIT if already else FIRST_COMMIT, more=more)
         except BaseException:
-            if head:
-                take_back(kit, head)
+            # A second claim that failed: when team.json names the owner from before again (it was put back, or it
+            # was never written), that owner's key comes back with it, so the hub is as it was. One case keeps the
+            # new key: the same computer claimed again and sent a key. The listener told it that the key is kept,
+            # and it keeps that key from that answer on, so with the key from before it would lose the hub that it
+            # had. A first claim keeps its key: a hub that asks for a key and has no owner yet lets nobody in.
+            took = take_back(kit, head) if head else False
+            if db and sent:
+                if already and (took or not written) and owner != already:
+                    put_owner_key_back(db, aside)
+                else:
+                    drop_owner_key_aside(db)
             raise
+        if db and sent:
+            drop_owner_key_aside(db)
+        elif db:
+            keep_owner_key(db, None)
+
+
+def set_owner_key_aside(db):
+    """The key's file as a claim found it gets a second name, `<file>.before`, by a hard link: the path itself keeps
+    its key until the claim's own key takes its place in one step. True when there was one. Where a hard link is
+    refused (a file system with none), the file is copied instead. When neither works, the claim stops here with
+    the key in its place: without what was there, a claim that fails later could not put it back."""
+    path = owner_key_file(db)
+    with contextlib.suppress(OSError):
+        os.remove(path + ".before")             # of a claim that ended before its last line
+    try:
+        os.link(path, path + ".before")
+        return True
+    except (FileNotFoundError, NotADirectoryError):     # no key, or no folder for one yet (keep_owner_key says more)
+        if os.path.lexists(path):       # a link whose file is gone: a damaged key file, never "no earlier key"
+            raise Stop(f"what stands at {path} is no key file (a link whose file is gone), so the key of the owner's "
+                       f"computer could not be set aside for the time of the claim. Nothing was written, and the hub "
+                       f"is as it was. Remove what is there and run the installer again: it makes a new "
+                       f"code.") from None
+        return False
+    except OSError:
+        pass
+    try:
+        with open(path, "rb") as f:
+            data = f.read(4096)
+        fd = os.open(path + ".before", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        return True
+    except OSError as e:
+        with contextlib.suppress(OSError):
+            os.remove(path + ".before")
+        raise Stop(f"the key of the owner's computer in {path} could not be set aside for the time of the claim: {e}. "
+                   f"Nothing was written, and the hub is as it was. If {path} is no file, remove what is there and "
+                   f"run the installer again: it makes a new code.") from None
+
+
+def put_owner_key_back(db, aside, quiet=False):
+    """The key's file as the claim found it, after a second claim that failed: the file from before by a rename, or
+    no file. Neither needs room on the disk. A file that cannot be put back stays as the claim left it, and the line
+    says so."""
+    path = owner_key_file(db)
+    try:
+        if aside:
+            os.replace(path + ".before", path)
+            # A rename between two names of one file does nothing (the claim wrote no key of its own): the second
+            # name goes then.
+            with contextlib.suppress(OSError):
+                os.remove(path + ".before")
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(path)
+    except OSError as e:
+        told(f"the key of the owner's computer could not be put back as it was before the claim ({e}): {path} holds "
+             f"what this claim wrote. A second claim that goes through puts it right.")
+        return
+    if not quiet:
+        told("the key of the owner's computer is as it was before the claim.")
+
+
+def drop_owner_key_aside(db):
+    """The key from before the claim goes: the claim's key is the key."""
+    with contextlib.suppress(OSError):
+        os.remove(owner_key_file(db) + ".before")
+
+
+def owner_key_file(db):
+    """Where the hub of these records keeps the SHA-256 of the key of the owner's computer: beside the records, as
+    hub.py reads it (hub.owner_key_path)."""
+    return os.path.join(os.path.dirname(os.path.abspath(os.path.expanduser(db))), hub.OWNER_KEY_FILE)
+
+
+def keep_owner_key(db, digest, first=True):
+    """What a claim leaves of the key of the owner's computer (hub.py, owner feature owner_key), for the hub that
+    starts next. first: the hub has no owner yet, for the words of a key that cannot be kept. The claim proved the computer by the one-time code, so its key takes the place of any earlier one:
+    the hub then asks each call from the owner's address for that key, and a VM or a container on that computer,
+    which has the address and no key, is refused. A claim that sent no SHA-256 came from a program from before the
+    key, whose computer has none: the file of an earlier owner goes, and the hub knows the new owner by its address
+    until its computer registers a key (POST /ui/owner/key)."""
+    path = owner_key_file(db)
+    if digest is None:      # after team.json names the new owner (cmd_claim)
+        try:
+            with contextlib.suppress(FileNotFoundError, NotADirectoryError):
+                os.remove(path)
+        except OSError as e:
+            told(f"the key of the owner from before could not be taken away ({e}): {path}. The hub asks the new "
+                 f"owner's computer for that key until the file is gone. Remove the file, then start the hub again.")
+            return
+        told("the owner's computer sent no key with its claim, so the hub knows it by its address until that "
+             "computer registers one: Founderizer does that by itself.")
+        return
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.new"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"sha256": digest, "since": time.time()}) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
+    except OSError as e:
+        raise Stop(f"the key of the owner's computer could not be kept in {path}: {e}. Nothing else was written, so "
+                   + ("this hub has no owner yet" if first else "this hub is as it was before the claim, with its owner")
+                   + ". Put that right, then run the installer again: it makes a new code.") from None
+    told(f"the hub keeps the SHA-256 of the key of the owner's computer in {path}, and asks each call from that "
+         f"computer's address for the key.")
+
+
+def told(text):
+    """say(), for a line after a step that is done: a terminal that is gone does not undo the step."""
+    try:
+        say(text)
+    except OSError:
+        pass
 
 
 def cmd_runtime(args):
@@ -3566,6 +3780,8 @@ def main(argv=None):
                            help="a new claim although this hub has an owner; a hub that runs is stopped for the "
                                 "time of the claim and started again (with --commit, as the hub's own user)")
             p.add_argument("--commit", action="store_true", help="commit team.json on the configuration ref too")
+            p.add_argument("--db", default=DB_PATH, help="the hub's own records: the key of the owner's computer is "
+                                                         "kept beside them; the default is where hub.py keeps them")
     args = ap.parse_args(argv)
     try:
         args.fn(args)

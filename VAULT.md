@@ -542,7 +542,11 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
 13. **The owner's Mac while it is unlocked.** The app signs with the owner key with no Touch ID or password prompt
     (`Sources/FleetCore/OwnerKey.swift`). So a person or a program that controls the Mac as the owner can sign
     statements. A copy of the app with a different signature must first get the owner's login password from macOS to
-    read the key's item (`Sources/FleetCore/OwnerKey.swift`).
+    read the key's item (`Sources/FleetCore/OwnerKey.swift`). The hub takes each call from the Mac's address that
+    carries the Mac's own key for the hub, which is a file of the owner's user (`hub.py`, SECURITY.md, "How the hub
+    knows the owner's computer"). So a program that runs on the Mac as the owner uses every owner route. A VM or a
+    container on the Mac has the Mac's address and not that file, and the hub refuses it, unless the owner gives it
+    the folder `~/.founderizer`.
 14. **The hub's own sign-ins.** The Google refresh tokens and their client secret, the GitHub App private key, the
     credentials of the MCP servers and the Discord bot tokens are not in the vault. They are files of the hub's OS user
     on the hub's server, so a person who controls that user has them (`hub.py`, `channels.py`).

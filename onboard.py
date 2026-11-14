@@ -384,13 +384,25 @@ class System:
         return r.returncode, r.stdout, r.stderr
 
     def http(self, method, url, body=None, headers=None):
+        """One call, with this computer's key for that hub as its bearer when it has one, to the hub's number
+        (owner_computer_call). A hub from before the key refuses a bearer on an owner route before it does anything
+        (403, auth key_not_expected): the same call then goes again with none, to the address as it is written."""
+        key, numbered = owner_computer_call(url)
+        code, answer = self.http_once(method, numbered, body, headers, key)
+        if key and code == 403 and answer.get("auth") == "key_not_expected":
+            return self.http_once(method, url, body, headers, None)
+        return code, answer
+
+    def http_once(self, method, url, body, headers, key):
         data = None if body is None else json.dumps(body).encode()
         h = {"Accept": "application/json"}
+        if key:
+            h["Authorization"] = "Bearer " + key
         if body is not None:
             h["Content-Type"] = "application/json"
         h.update(headers or {})
         req = urllib.request.Request(url, data=data, method=method, headers=h)
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
         try:
             with opener.open(req, timeout=30) as r:
                 return r.status, json.loads(r.read() or b"{}")
@@ -410,6 +422,103 @@ class System:
 
 
 # ---------------------------------------------------------------- helpers
+
+def canonical_address(text):
+    """An address in the one spelling that names a key's file, or None for what is no address: IPv4 as it is
+    written, IPv6 as the system writes it (owner_mcp.canonical_address)."""
+    try:
+        return socket.inet_ntop(socket.AF_INET, socket.inet_pton(socket.AF_INET, text))
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        return socket.inet_ntop(socket.AF_INET6, socket.inet_pton(socket.AF_INET6, text)).lower()
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def chosen_address(addresses):
+    """The one address of a name's addresses that names its key's file, the same one for the same set in any order:
+    an address of the fleet's private network first (100.64.0.0/10), else the lowest IPv4 address, else the lowest
+    of the others (owner_mcp.chosen_address)."""
+    fours, others = [], []
+    for text in addresses:
+        try:
+            fours.append((socket.inet_pton(socket.AF_INET, text), text))
+        except (OSError, ValueError, TypeError):
+            one = canonical_address(text)
+            if one:
+                others.append(one)
+    fours.sort()
+    for packed, text in fours:
+        if packed[0] == 100 and 64 <= packed[1] <= 127:
+            return text
+    return fours[0][1] if fours else (sorted(others)[0] if others else None)
+
+
+def host_address(host):
+    """The numeric address of a host: an address as it is, a name through the system's own lookup, or None."""
+    one = canonical_address(host)
+    if one:
+        return one
+    try:
+        found = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return None
+    return chosen_address([a[4][0] for a in found])
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is an answer, never a second request: this computer's key for the hub must not go to another place
+    with it (urllib would send the same headers there)."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def owner_computer_call(url, home=None, lookup=host_address):
+    """(this computer's key for the hub of `url`, the address that a call with that key goes to), or (None, url)
+    (hub.py, owner feature owner_key): the hub knows the owner's computer by its address and this key, both, so that
+    a VM or a container on it is not the owner. One file for each hub address, `<address>_<port>` in
+    ~/.founderizer/owner-keys, named by the hub's number, which Founderizer or the claim wrote and only this user
+    reads. A call to anything that is no hub of this computer has no such file, and so no key.
+
+    A hub that is called by a name: the name is looked up once, the file of that number is the key, and the call
+    with the key goes to that number, never to the name again, as the app and owner_mcp.py do it
+    (owner_mcp.owner_key_place says why). A name that has no number now has no key. While the folder holds no file
+    of that port nothing is looked up."""
+    parts = urllib.parse.urlsplit(url)
+    host = (parts.hostname or "").lower()
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        return None, url
+    folder = os.path.join(home or os.path.expanduser("~"), ".founderizer", "owner-keys")
+    if not host:
+        return None, url
+    address = canonical_address(host)
+    if not address:
+        try:
+            if not any(n.endswith(f"_{port}") and not n.startswith(".") for n in os.listdir(folder)):
+                return None, url
+        except OSError:
+            return None, url
+        address = canonical_address(lookup(host) or "")
+        if not address:
+            return None, url
+    try:
+        with open(os.path.join(folder, re.sub(r"[^a-z0-9.-]", "-", address) + f"_{port}"), encoding="utf-8") as f:
+            key = f.read(257).strip()
+    except (OSError, ValueError):
+        return None, url
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", key):
+        return None, url
+    shown = f"[{address}]" if ":" in address else address
+    return key, urllib.parse.urlunsplit(parts._replace(netloc=f"{shown}:{port}"))
+
+
+def owner_computer_key(url, home=None, lookup=host_address):
+    """This computer's key for the hub of `url`, or None (owner_computer_call)."""
+    return owner_computer_call(url, home, lookup)[0]
+
 
 def fingerprint(blob_b64):
     digest = hashlib.sha256(base64.b64decode(blob_b64)).digest()
