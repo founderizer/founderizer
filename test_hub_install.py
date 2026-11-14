@@ -54,7 +54,7 @@ STEPS = ["this server and this copy of Founderizer", "base packages", "the user 
          "the root helpers that make an agent's OS user and update this machine's vault broker",
          "one OS user for each agent of this machine",
          "the services fleet-hub, fleet-git and fleet-channels", "each agent of this machine, under its own OS user",
-         "the checks the owner can act on", "this fleet's own id", "security updates",
+         "the checks the owner can act on", "this fleet's own id", "security updates", "this server's own hardening",
          "the network: a kept connection keeps its speed", "verify: is this machine of the fleet healthy?"]
 PROMPT = KIT / "INSTALL-PROMPT.md"      # the text a customer pastes into the agent they already run
 # The systems a VPS may run, as `ID` and `VERSION_ID` of its /etc/os-release: both installers and the setup executor
@@ -1601,6 +1601,12 @@ class Firewall(unittest.TestCase):
         self.state = self.tmp / "ufw.json"
         self.ran = []
         self.listening, self.ssh_ports = "", ""
+        # sshd's own folder in a /run of the test's own, there as on a machine whose SSH service runs
+        self.sshd_run = self.tmp / "run/sshd"
+        self.sshd_run.mkdir(parents=True)
+        patched = patch.object(hubsetup, "SSHD_RUN", str(self.sshd_run))
+        patched.start()
+        self.addCleanup(patched.stop)
 
     def machine(self, active, rules, incoming="allow"):
         self.state.write_text(json.dumps({"active": active, "incoming": incoming, "outgoing": "allow",
@@ -1626,7 +1632,8 @@ class Firewall(unittest.TestCase):
             if script.startswith("ss -H"):
                 return 0, self.listening, ""
             if script.startswith("sshd -T"):
-                return 0, self.ssh_ports, ""
+                # Without its folder sshd stops before it prints a setting, and its words go to /dev/null.
+                return 0, self.ssh_ports if self.sshd_run.is_dir() else "", ""
             env = dict(os.environ, PATH=f"{self.tmp / 'bin'}:{os.environ['PATH']}", UFW_STATE=str(self.state))
             done = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=60, env=env)
             return done.returncode, done.stdout.strip(), done.stderr.strip()
@@ -1697,6 +1704,23 @@ class Firewall(unittest.TestCase):
                                self.rule("Anywhere on tailscale0", "fleet tailscale")])
         self.assertNotIn("22/tcp", [r["to"] for r in state["rules"]])
         self.assertIn("these ports stay open as they were: 80/tcp, 443/tcp, 8080/tcp, 41641/udp", said.getvalue())
+
+    def test_ssh_on_a_port_of_its_own_moves_also_while_its_service_is_stopped(self):
+        """Ubuntu 24.04 and 26.04 start OpenSSH from ssh.socket, so systemd holds SSH's port, and only `sshd -T` says
+        that the port is SSH's. `sshd -T` names no port while sshd's own folder is missing (hubsetup.SSHD_RUN), and the
+        folder is gone while the service is stopped: an update of openssh-server in the join's security updates
+        leaves it so. Until 14 November 2026 the firewall step then read SSH's own port as a service that the internet
+        reaches, and kept it open (measured on Ubuntu 24.04 with SSH on port 2222)."""
+        self.machine(False, [])
+        self.listening = SS_ON_A_USED_VPS + 'tcp LISTEN 0 4096 0.0.0.0:2222 0.0.0.0:* users:(("systemd",pid=1,fd=110))\n'
+        self.ssh_ports = "2222"
+        self.sshd_run.rmdir()
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            self.assertEqual(hubsetup.firewall(run=self.run_on_machine()), "set")
+        self.assertCountEqual([r["to"] for r in self.left()["rules"] if not r["v6"]],
+                              ["80/tcp", "443/tcp", "8080/tcp", "41641/udp", "Anywhere on tailscale0"])
+        self.assertNotIn("2222", said.getvalue())
+        self.assertEqual(self.sshd_run.stat().st_mode & 0o777, 0o755, "the folder as SSH's service makes it")
 
     def test_an_active_firewall_keeps_its_own_rules_and_gets_no_kept_port(self):
         self.machine(True, [self.rule("22/tcp")], incoming="deny")
@@ -1781,10 +1805,12 @@ class Firewall(unittest.TestCase):
     def test_the_check_says_what_it_would_do_and_changes_nothing(self):
         self.machine(True, [self.rule("22/tcp", "fleet ssh")], incoming="deny")
         before = self.state.read_text()
+        self.sshd_run.rmdir()
         with contextlib.redirect_stdout(io.StringIO()) as said:
             self.assertEqual(hubsetup.firewall(check=True, run=self.run_on_machine()), "would set")
         self.assertEqual(self.state.read_text(), before)
         self.assertIn("remove the public SSH rule", said.getvalue())
+        self.assertFalse(self.sshd_run.exists(), "the check makes no folder for sshd either")
 
     def test_a_script_that_fails_stops_the_installer_with_its_words(self):
         def run(script, timeout=120):
@@ -1809,6 +1835,38 @@ class Firewall(unittest.TestCase):
         self.assertIn("sshd -T", body)
         self.assertIn('--ssh-port "$(printf', body)
 
+    def test_both_installers_make_sshds_folder_before_they_read_its_port(self):
+        """`sshd -T` names no port while sshd's own folder is missing, and on Ubuntu 24.04 the folder is missing from a
+        start of the server to its first SSH connection (measured on 14 November 2026). A join or a hub install that
+        runs in the server's own console then read no port, and both scripts take 22 when the read gives none. Each
+        script now makes the folder first, as SSH's service makes it, and only on a server that has sshd."""
+        # sshd as measured: with no folder it stops, and prints no setting
+        sshd = 'sshd() { [ -d "$SSHD_RUN" ] && echo "port 2222"; }\n'
+        function = shell_function(SCRIPT, "sshd_folder")
+        self.assertEqual(shell_function(KIT / "join.sh", "sshd_folder"), function, "the two copies differ")
+        for script, reader in ((KIT / "join.sh", "linux"), (SCRIPT, "first_team")):
+            with self.subTest(script=script.name):
+                body = shell_function(script, reader)
+                self.assertLess(body.index("    sshd_folder\n"), body.index("ports=$(sshd -T"), script.name)
+                self.assertIn("\nSSHD_RUN=/run/sshd\n", script.read_text())
+                read = next(line.strip() for line in body.splitlines() if "ports=$(sshd -T" in line)
+                folder = self.tmp / script.name / "run" / "sshd"
+                folder.parent.mkdir(parents=True)
+                start = function + f'SSHD_RUN="{folder}"\n'
+                code, out = run_shell(start + sshd + "umask 077\nsshd_folder\n" + read + '\necho "ports=$ports"\n')
+                self.assertEqual((code, out.strip()), (0, "ports=2222"), out)
+                self.assertEqual(folder.stat().st_mode & 0o777, 0o755, "the folder as SSH's service makes it")
+                folder.chmod(0o700)
+                code, out = run_shell(start + sshd + "sshd_folder\n")
+                self.assertEqual((code, folder.stat().st_mode & 0o777), (0, 0o700), "a folder that is there stays")
+                folder.rmdir()
+                # A server with no sshd: its program is in no folder of this PATH, and mkdir is.
+                code, out = run_shell(start + "PATH=/usr/bin:/bin\nsshd_folder\n")
+                self.assertEqual((code, folder.exists()), (0, False), out)
+                folder.parent.rmdir()
+                code, out = run_shell(start + sshd + "sshd_folder\n" + read + '\necho "ports=$ports"\n')
+                self.assertEqual((code, out.strip()), (0, "ports="), "a folder that cannot be made stops nothing")
+
 
 class Harden(unittest.TestCase):
     """hubsetup.py harden, the join's step after its firewall (the owner, 3 November 2026: Add server ends at the
@@ -1829,12 +1887,39 @@ class Harden(unittest.TestCase):
         self.home = self.root / "home/fleet"
         self.home.mkdir(parents=True)
         self.account = (str(self.home)[len(str(self.root)):], os.getuid(), os.getgid())
+        self.sshd_run = self.root / "run/sshd"      # sshd's own folder, there while SSH's service runs
+        self.sshd_run.mkdir(parents=True)
+        self.hardening = self.root / hubsetup.SSHD_HARDENING.lstrip("/")
         self.ran, self.answers = [], {"sshd -T": (0, self.HARDENED, ""),
                                       "systemctl is-active ssh.service ssh.socket": (0, "active\ninactive", "")}
+        self.checked = []       # the hardening's file as each `sshd -t` found it: its text, or None when not there
+        self.refused = None     # which files sshd's check refuses: OWN_FILES, NEW_FILE, or none
+
+    # sshd's words for a bad line of the server's own files, in two lines as sshd prints them (OpenSSH 9.6)
+    OWN_FILES = ("/etc/ssh/sshd_config: line 130: Bad configuration option: PermitRootLogn\n"
+                 "/etc/ssh/sshd_config: terminating, 1 bad configuration options")
+    NEW_FILE = "/etc/ssh/sshd_config.d/10-fleet-hardening.conf line 2: Bad configuration"
 
     def run_cmd(self, script, timeout=120):
         self.ran.append(script)
+        # sshd's own checks stop here first, whatever its files say (measured on Ubuntu 24.04 and 26.04)
+        if script in ("sshd -t", "sshd -T") and not self.sshd_run.is_dir():
+            if script == "sshd -t":
+                self.checked.append(self.hardening.read_text() if self.hardening.exists() else None)
+            return 255, "", "Missing privilege separation directory: /run/sshd"
+        if script == "sshd -t":         # the check answers for the files that are there when it runs
+            there = self.hardening.read_text() if self.hardening.exists() else None
+            self.checked.append(there)
+            if self.refused == self.OWN_FILES or (self.refused == self.NEW_FILE and there == hubsetup.SSHD_TEXT):
+                return 255, "", self.refused
         return self.answers.get(script, (0, "", ""))
+
+    def service_stopped(self):
+        """SSH as Ubuntu 24.04 and 26.04 start it, from ssh.socket, with its service stopped: the socket waits for the
+        next connection, and systemd took the service's own folder away at the stop."""
+        self.answers["systemctl is-active ssh.service ssh.socket"] = (0, "inactive\nactive", "")
+        if self.sshd_run.is_dir():
+            self.sshd_run.rmdir()
 
     def harden(self, check=False):
         with contextlib.redirect_stdout(io.StringIO()) as said:
@@ -1854,9 +1939,10 @@ class Harden(unittest.TestCase):
         self.assertEqual(self.mode(hubsetup.SSHD_HARDENING), 0o644)
         for setting in ("PasswordAuthentication no", "KbdInteractiveAuthentication no", "X11Forwarding no"):
             self.assertIn(setting + "\n", hubsetup.SSHD_TEXT)
-        self.assertEqual(self.ran, ["systemctl is-active ssh.service ssh.socket", "sshd -t",
+        self.assertEqual(self.ran, ["systemctl is-active ssh.service ssh.socket", "sshd -t", "sshd -t",
                                     "systemctl try-reload-or-restart ssh.service", "sshd -T",
                                     "tailscale set --auto-update"])
+        self.assertEqual(self.checked, [None, hubsetup.SSHD_TEXT], "sshd checks before the write, and the new file")
         # The bytes that the owner's devops repository pins for /etc/npmrc (trust-anchors.tsv of its workers)
         self.assertEqual(hashlib.sha256((self.root / "etc/npmrc").read_bytes()).hexdigest(),
                          "519276feb13d043ab3c200e50cbc4136fc84c243d8cc74342afde0ce22fa502c")
@@ -1898,17 +1984,74 @@ class Harden(unittest.TestCase):
         self.assertEqual(lines[0], "SSH: OpenSSH does not run on this server, so no password lets anybody in through it")
         self.assertEqual(self.file("/etc/npmrc"), "min-release-age=7\n")
 
+    def test_ssh_whose_service_is_stopped_takes_keys_only_too(self):
+        """**The first server that Add server made at a provider kept password login** (14 November 2026). Its image
+        was older than an update of openssh-server, so the join's own security updates installed that update, which
+        stops ssh.service and leaves ssh.socket to start it at the next connection. The join is one SSH session, so
+        none came before the hardening. The service's own folder was gone, `sshd -t` stopped with "Missing privilege
+        separation directory: /run/sshd", and the hardening read that as a refusal of its file and took the file
+        back. Now sshd gets its folder first, so its check answers for the file, and the next connection starts sshd
+        with it."""
+        self.service_stopped()
+        self.addCleanup(os.umask, os.umask(0o077))      # the folder's mode does not follow a narrow mode mask
+        lines = self.harden()
+        self.assertEqual(lines[0], "SSH takes keys only, with no X11 forwarding")
+        self.assertEqual(self.file(hubsetup.SSHD_HARDENING), hubsetup.SSHD_TEXT)
+        self.assertEqual(self.ran[:5], ["systemctl is-active ssh.service ssh.socket", "sshd -t", "sshd -t",
+                                        "systemctl try-reload-or-restart ssh.service", "sshd -T"])
+        self.assertEqual(self.mode("/run/sshd"), 0o755, "the folder as SSH's service makes it")
+        # The service stopped again after a run (one more update): the file is there, and sshd -T still answers.
+        self.service_stopped()
+        self.ran.clear()
+        self.assertEqual(self.harden()[0], "SSH takes keys only, with no X11 forwarding")
+        self.assertNotIn("sshd -t", self.ran, "an unchanged file needs no new check")
+        self.assertEqual(self.file(hubsetup.SSHD_HARDENING), hubsetup.SSHD_TEXT)
+
+    def test_a_folder_of_sshd_that_cannot_be_made_leaves_the_server_as_it_was(self):
+        """sshd's check is the proof that sshd starts with the new file. Where it cannot answer, nothing is written."""
+        self.service_stopped()
+        (self.root / "run").rmdir()
+        lines = self.harden()
+        self.assertEqual(lines[0], "SSH keeps its settings: sshd's own check fails on this server before any change "
+                                   "(Missing privilege separation directory: /run/sshd)")
+        self.assertEqual(self.checked, [None], "no file was there at the one check, and none came after it")
+        self.assertFalse(self.hardening.exists())
+        self.assertNotIn("systemctl try-reload-or-restart ssh.service", self.ran)
+
+    def test_a_server_whose_own_sshd_files_fail_the_check_gets_no_file_and_sshds_own_words(self):
+        """**sshd checks its files once before the write.** A check that fails already is a fault of the server's own
+        files: the hardening writes nothing, and its line gives sshd's words and does not blame the new file. Until
+        14 November 2026 the only check came after the write, so every failure read as "sshd refused the new file",
+        also the one of a server whose check could not answer at all."""
+        self.refused = self.OWN_FILES
+        lines = self.harden()
+        self.assertEqual(lines[0], "SSH keeps its settings: sshd's own check fails on this server before any change "
+                                   "(/etc/ssh/sshd_config: line 130: Bad configuration option: PermitRootLogn "
+                                   "/etc/ssh/sshd_config: terminating, 1 bad configuration options)",
+                         "sshd's two lines, as one line of the join")
+        self.assertEqual(self.checked, [None], "one check, with no file of the hardening there")
+        self.assertFalse(self.hardening.exists())
+        self.assertNotIn("systemctl try-reload-or-restart ssh.service", self.ran)
+        self.assertEqual(self.file("/etc/npmrc"), "min-release-age=7\n", "npm's rule does not wait for SSH")
+        # A file of this name that the server holds already stays as it is, byte for byte.
+        old = "# the owner's own\nX11Forwarding no\n"
+        self.hardening.write_text(old)
+        self.checked.clear()
+        self.assertIn("before any change", self.harden()[0])
+        self.assertEqual((self.checked, self.hardening.read_text()), ([old], old))
+
     def test_a_file_that_sshd_refuses_is_taken_back(self):
         old = "# the owner's own\nX11Forwarding no\n"
-        (self.root / hubsetup.SSHD_HARDENING.lstrip("/")).write_text(old)
-        self.answers["sshd -t"] = (255, "", "/etc/ssh/sshd_config.d/10-fleet-hardening.conf line 2: Bad configuration")
+        self.hardening.write_text(old)
+        self.refused = self.NEW_FILE
         lines = self.harden()
         self.assertEqual(self.file(hubsetup.SSHD_HARDENING), old)
+        self.assertEqual(self.checked, [old, hubsetup.SSHD_TEXT], "the check passed before the write, and not after")
         self.assertNotIn("systemctl try-reload-or-restart ssh.service", self.ran)
-        self.assertIn("SSH keeps its settings: sshd refused the new file", lines[0])
-        (self.root / hubsetup.SSHD_HARDENING.lstrip("/")).unlink()
+        self.assertEqual(lines[0], f"SSH keeps its settings: sshd refused the new file ({self.NEW_FILE})")
+        self.hardening.unlink()
         self.harden()
-        self.assertFalse((self.root / hubsetup.SSHD_HARDENING.lstrip("/")).exists(), "a new file goes again")
+        self.assertFalse(self.hardening.exists(), "a new file goes again")
 
     def test_an_earlier_file_that_lets_passwords_in_is_said_and_not_hidden(self):
         self.answers["sshd -T"] = (0, self.HARDENED.replace("passwordauthentication no", "passwordauthentication yes"),
@@ -1932,8 +2075,10 @@ class Harden(unittest.TestCase):
                                            "on this platform")
 
     def test_the_check_says_what_it_would_do_and_changes_nothing(self):
+        self.service_stopped()
         lines = self.harden(check=True)
         self.assertEqual(self.ran, ["systemctl is-active ssh.service ssh.socket"], "it only reads")
+        self.assertFalse(self.sshd_run.exists(), "the check makes no folder for sshd either")
         self.assertFalse((self.root / hubsetup.SSHD_HARDENING.lstrip("/")).exists())
         self.assertFalse((self.root / "etc/npmrc").exists())
         self.assertEqual(lines, ["would make SSH take keys only, with no X11 forwarding",
@@ -1949,6 +2094,85 @@ class Harden(unittest.TestCase):
         for script in (SCRIPT, KIT / "join.sh"):
             self.assertNotIn("10-fleet-hardening", script.read_text(), f"{script.name} writes sshd's file itself")
             self.assertNotIn("min-release-age", script.read_text(), f"{script.name} writes npm's rule itself")
+
+    def test_the_hub_installer_takes_it_after_its_security_updates_and_goes_on_when_it_fails(self):
+        """**The first server of a fleet gets the same hardening as each server that joins.** hub.sh installs that
+        server, and it never runs the join. Until 14 November 2026 only the join had the step: a hub's own server got
+        the firewall and the security updates, and kept the SSH settings of its image. As root, the step runs the copy
+        that the installer runs from, as the firewall does."""
+        main = shell_function(SCRIPT, "main")
+        steps = [line.strip() for line in main.splitlines() if re.fullmatch(r" {4}[a-z_]+", line)]
+        self.assertEqual(steps[steps.index("updates"):],
+                         ["updates", "harden", "tcp_window", "verify_step", "done_text"])
+        body = shell_function(SCRIPT, "harden")
+        self.assertIn('python3 "$tree/hubsetup.py" harden --user "$HUB_USER" </dev/null', body)
+        self.assertNotIn("$kit", body, "the hub user's checkout is not root's to run")
+        ran = 'tree=/tree\nreclaim=no\npython3() { echo "ran $*"; }\n'
+        code, out = run_shell(body + "\nharden\nsay went on\n",
+                              extra='tree=/tree\nreclaim=no\npython3() { echo "the stand-in failed"; return 1; }\n')
+        self.assertEqual(code, 0, out)
+        self.assertIn("Founderizer:   the hardening of this server did not finish: the lines above say why", out)
+        self.assertIn("Founderizer: went on", out)
+        code, out = run_shell(body + "\nharden\n", extra=ran)
+        self.assertEqual((code, out.split("\n")[-2]), (0, "ran /tree/hubsetup.py harden --user fleet"))
+        code, out = run_shell(body + "\nharden\n", extra=ran + "check=yes\n")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("\nran ", out, "the check runs nothing")
+        self.assertIn("Founderizer:   would run: python3 /tree/hubsetup.py harden --user fleet\n", out)
+
+    def test_a_second_claim_leaves_the_hubs_hardening_out(self):
+        """`hub.sh --reclaim` is for an owner whose Mac is lost. The only SSH key of the hub's server can be that
+        Mac's, so a hub from before the step, which a second claim then made take keys only, would let its owner in
+        through its provider's console alone. A second claim changes the owner's address and nothing else."""
+        body = shell_function(SCRIPT, "harden")
+        ran = 'tree=/tree\nreclaim=yes\npython3() { echo "ran $*"; }\n'
+        code, out = run_shell(body + "\nharden\nsay went on\n", extra=ran)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("\nran ", out, "a second claim runs no hardening")
+        self.assertIn("Founderizer:   a second claim leaves this server's own settings as they are", out)
+        self.assertIn("Founderizer: went on", out)
+        code, out = run_shell(body + "\nharden\n", extra=ran + "check=yes\n")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("ran ", out)
+        self.assertNotIn("would run", out)
+        self.assertIn("Founderizer:   would leave this server's SSH, npm and Tailscale settings as they are", out)
+
+    def test_sshds_words_come_as_one_line_and_keep_their_end(self):
+        """sshd says a fault of its files in two lines, and a long path makes them long. The join's line gives them
+        as one line and cuts them at their start, because their end names the fault. sshd's error comes first, and
+        its output only when the error holds no word."""
+        self.assertEqual(hubsetup.one_line("a\n b\tc\n"), "a b c")
+        self.assertEqual(hubsetup.one_line(None), "")
+        words = "/etc/ssh/sshd_config.d/" + "x" * 300 + ".conf: line 1: Bad configuration option: Nope"
+        self.assertEqual(hubsetup.one_line(words), words[-200:])
+
+        def run(script, timeout=120):
+            return (255, "the words on standard output", " \n") if script == "sshd -t" else self.run_cmd(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            lines = hubsetup.harden(run=run, root=str(self.root), account=self.account)
+        self.assertEqual(lines[0], "SSH keeps its settings: sshd's own check fails on this server before any change "
+                                   "(the words on standard output)")
+        # The same for the line of a file that sshd refuses after the write: the first check passes, the second fails.
+        checks = []
+
+        def refuses(script, timeout=120):
+            if script != "sshd -t":
+                return self.run_cmd(script)
+            checks.append(script)
+            return (0, "", "") if len(checks) == 1 else (255, "the fault of the file on standard output", "\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            lines = hubsetup.harden(run=refuses, root=str(self.root), account=self.account)
+        self.assertEqual(lines[0], "SSH keeps its settings: sshd refused the new file (the fault of the file on "
+                                   "standard output)")
+        self.assertEqual((len(checks), self.hardening.exists()), (2, False))
+
+    def test_both_installers_take_the_hardening(self):
+        """A step that is for every server stands in both installers: join.sh for each server that joins, and hub.sh
+        for the first server of a fleet. Each runs the one command of its own copy, for its own service user."""
+        for script, caller, command in ((KIT / "join.sh", "linux", 'python3 "$1/hubsetup.py" harden --user "$WORKER"'),
+                                        (SCRIPT, "main", 'python3 "$tree/hubsetup.py" harden --user "$HUB_USER"')):
+            self.assertRegex(shell_function(script, caller), r"(?m)^ {4}harden( |$)", f"{script.name} runs no hardening")
+            self.assertIn(command, shell_function(script, "harden"), script.name)
 
 
 class HubTcp(unittest.TestCase):
@@ -2113,7 +2337,7 @@ class HubTcp(unittest.TestCase):
     def test_the_hub_installer_takes_it_before_verify_and_goes_on_when_it_fails(self):
         main = shell_function(SCRIPT, "main")
         steps = [line.strip() for line in main.splitlines() if re.fullmatch(r" {4}[a-z_]+", line)]
-        self.assertEqual(steps[-4:], ["updates", "tcp_window", "verify_step", "done_text"])
+        self.assertEqual(steps[-3:], ["tcp_window", "verify_step", "done_text"])
         body = shell_function(SCRIPT, "tcp_window")
         self.assertIn('python3 "$tree/hubsetup.py" tcp </dev/null', body, "root runs the copy it runs from")
         self.assertNotIn("$kit", body, "the hub user's checkout is not root's to run")
@@ -2369,7 +2593,7 @@ class StandInServer:
     HOSTKEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEZvdW5kZXJpemVyU3RhbmRJbkhvc3RLZXkwMTIzNDU2Nzg5"
     COMMIT = "1a2b3c4"                                          # what `git rev-parse --short HEAD` prints
     CODE = "ABCD-EFGH-JKLM"                                     # the one-time code of the join line
-    VERIFY = "Founderizer step 16: verify: is this machine of the fleet healthy?\nFounderizer:   ok  the hub answers\nREADY\n"
+    VERIFY = "Founderizer step 17: verify: is this machine of the fleet healthy?\nFounderizer:   ok  the hub answers\nREADY\n"
     INSTALL_LOG = ("Founderizer step 1: this server and this copy of Founderizer\n"
                    f'FLEET_CLAIM={CODE} sh -c "$(curl -fsS http://{ADDRESS}:8765/claim)"\n' + VERIFY)
     # The start of /etc/os-release on Ubuntu 24.04, which A1 reads (`readable`).
@@ -3643,7 +3867,7 @@ class NoProviderCredential(unittest.TestCase):
         """FLEET_MANAGER_SERVER=later in the installer's environment is the app's word (Founderizer 0.1.112 and
         later): only then does the claim write a manager with no server."""
         body = shell_function(SCRIPT, "first_team") + "first_team\n"
-        stubs = ("sshd() { echo 'port 22'; }\nas_user() { echo \"CLAIM $*\"; }\n"
+        stubs = ("sshd() { echo 'port 22'; }\nsshd_folder() { :; }\nas_user() { echo \"CLAIM $*\"; }\n"
                  "address=100.80.1.2\nport=8765\nruntime=claude\nclaim_wait=1800\ntimezone=\nreclaim=no\n")
         for later, asks in (("no", False), ("yes", True)):
             code, out = run_shell(body, extra=stubs + f"manager_later={later}\n")

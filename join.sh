@@ -57,6 +57,17 @@ apt_update() {
     done
     apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" update -q </dev/null >/dev/null
 }
+# sshd's own folder, which `sshd -T` needs before it names SSH's port: without it sshd stops with "Missing privilege
+# separation directory" and prints nothing, and the join then records port 22. The folder is the SSH service's own, so
+# it is gone while that service is stopped: on Ubuntu 24.04, from a start of the server to its first SSH connection,
+# which is where a line that runs in the server's own console finds it. This makes the folder as the service makes
+# it, and only on a server that has sshd. hubsetup.py's sshd_folder does the same for the firewall and the hardening,
+# and hub.sh has the same function.
+SSHD_RUN=/run/sshd
+sshd_folder() {
+    command -v sshd >/dev/null 2>&1 || return 0
+    [ -d "$SSHD_RUN" ] || mkdir -m 0755 "$SSHD_RUN" 2>/dev/null || true
+}
 
 linux() {
     [ "$(id -u)" = 0 ] || stop "Run the line as root (for example after sudo -i)."
@@ -94,6 +105,7 @@ linux() {
     uid=$(id -u "$WORKER")
     i=0
     while [ ! -d "/run/user/$uid" ] && [ "$i" -lt 30 ]; do sleep 1; i=$((i + 1)); done
+    sshd_folder
     ports=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -u)
     first=$(printf '%s\n' "$ports" | head -n 1)
     checkout "/home/$WORKER/fleet-server" as_worker

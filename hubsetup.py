@@ -817,6 +817,34 @@ def firewall_script(kept=()):
             'echo "kept=$kept"\n')
 
 
+# sshd's privilege separation folder on Debian and Ubuntu. While it is missing, sshd's own checks (`sshd -t`, `sshd -T`)
+# stop with "Missing privilege separation directory: /run/sshd" before they say anything of sshd's files. On Ubuntu
+# 24.04 and 26.04 SSH starts from ssh.socket, and the folder is ssh.service's own (RuntimeDirectory): systemd removes it
+# when the service stops. An update of openssh-server stops the service, and the socket starts it again only at the
+# next connection. On 24.04 the folder is also missing from a start of the server to its first SSH connection.
+# Measured on both systems on 14 November 2026.
+SSHD_RUN = "/run/sshd"
+
+
+def sshd_folder(root=""):
+    """Makes sshd's privilege separation folder (SSHD_RUN) when it is missing, so that sshd's own checks answer for
+    sshd's files, whether its service runs or not. The join's security updates install an update of openssh-server
+    when the server's image is older than it, and the join is one SSH session: no new connection starts the service
+    again before the firewall and the hardening run. Until 14 November 2026 the hardening then read sshd's "Missing
+    privilege separation directory" as a refusal of its own file and took the file back, so the first server that Add
+    server made at a provider kept password login; and the firewall got no port from `sshd -T`.
+
+    The folder is the one that ssh.service makes, with its owner and mode, and the service takes it as its own at its
+    next start. Nothing removes it here: a running sshd needs it for each new connection. A folder that cannot be made
+    changes nothing: sshd's own words then say what is missing."""
+    path = root + SSHD_RUN
+    try:
+        os.mkdir(path, 0o755)
+        os.chmod(path, 0o755)       # whatever the mode mask of this process is
+    except OSError:
+        pass
+
+
 def firewall(check=False, run=None):
     """The firewall of this Linux machine: incoming traffic over the private network only, SSH included (the owner's
     words, 2 November 2026: SSH reachable only over Tailscale after setup). Both installers call it as their firewall
@@ -859,6 +887,8 @@ def firewall(check=False, run=None):
         raise off_network("tailscale status failed" + (f"; Tailscale's state is {backend}"
                                                        if isinstance(backend, str) and backend.isalpha() else ""))
     _code, listening, _err = run("ss -H -ltnup 2>/dev/null")
+    if not check:
+        sshd_folder()       # without it `sshd -T` names no port, and SSH on a port of its own would stay open
     _code, ports, _err = run("sshd -T 2>/dev/null | sed -n 's/^port //p'")
     kept = public_listeners(listening, ssh_ports={"22", *(ports or "").split()})
     if check:
@@ -926,9 +956,18 @@ def has_ssh_key(root=""):
     return False
 
 
+def one_line(text, limit=200):
+    """What a program said on several lines, as one line of words, cut to its last `limit` characters."""
+    return " ".join((text or "").split())[-limit:]
+
+
 def harden_ssh(check, run, root=""):
     """SSH takes keys only, with no X11 forwarding, through one file in sshd's own folder. sshd checks the new file
-    (sshd -t) before it reloads, and a file that it refuses is taken back. The words of what it did."""
+    (sshd -t) before it reloads, and a file that it refuses is taken back. sshd's checks get the folder that they need
+    first (`sshd_folder`), so they answer also while SSH's service is stopped and its socket waits for the next
+    connection, which then starts sshd with the new file. sshd also checks its files once before the write: a check
+    that fails already is a fault of the server's own files, so nothing is written, and the words are sshd's own and
+    do not blame the new file. The words of what it did."""
     _code, out, _err = run("systemctl is-active ssh.service ssh.socket")
     if "active" not in out.split():
         return "SSH: OpenSSH does not run on this server, so no password lets anybody in through it"
@@ -946,7 +985,12 @@ def harden_ssh(check, run, root=""):
     if check:
         return "would make SSH take keys only, with no X11 forwarding" if before != SSHD_TEXT \
             else "SSH takes keys only already, with no X11 forwarding"
+    sshd_folder(root)
     if before != SSHD_TEXT:
+        code, out, err = run("sshd -t")
+        if code != 0:
+            return ("SSH keeps its settings: sshd's own check fails on this server before any change "
+                    f"({one_line(err) or one_line(out)})")
         put_file(path, SSHD_TEXT, 0o644, *((0, 0) if not root else ()))
         code, out, err = run("sshd -t")
         if code != 0:
@@ -954,7 +998,7 @@ def harden_ssh(check, run, root=""):
                 os.remove(path)
             else:
                 put_file(path, before, 0o644, *((0, 0) if not root else ()))
-            return f"SSH keeps its settings: sshd refused the new file ({(err or out).strip()[-200:]})"
+            return f"SSH keeps its settings: sshd refused the new file ({one_line(err) or one_line(out)})"
     run("systemctl try-reload-or-restart ssh.service")      # a session that is open keeps going
     code, out, _ = run("sshd -T")
     seen = dict(line.split(" ", 1) for line in out.lower().splitlines() if " " in line)

@@ -15,8 +15,8 @@
 # repository and the hub's checkout on the configuration ref, the first team.json with the owner's own Mac proved by
 # a one-time code, the root helper that makes an agent's OS user, one OS user for each agent of this machine,
 # the fleet-hub and fleet-git user services, each agent of this machine under its own OS user (its checkout,
-# its runtime and its service), the end checks, this fleet's own id, security updates, the TCP window of a kept
-# connection, and verify.
+# its runtime and its service), the end checks, this fleet's own id, security updates, this server's own hardening
+# (SSH keys only, npm's seven days, Tailscale's own updates), the TCP window of a kept connection, and verify.
 #
 # With FLEET_MANAGER_SERVER=later, which Founderizer 0.1.112 and later set when they start it, it makes the fleet
 # and no agent: no agent runs on the hub's server, because an agent has a shell and the central vault on this server
@@ -104,6 +104,17 @@ apt_update() {
         sleep 15
     done
     apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" update -q </dev/null >/dev/null
+}
+# sshd's own folder, which `sshd -T` needs before it names SSH's port: without it sshd stops with "Missing privilege
+# separation directory" and prints nothing, and the install then records port 22. The folder is the SSH service's
+# own, so it is gone while that service is stopped: on Ubuntu 24.04, from a start of the server to its first SSH
+# connection, which is where a line that runs in the server's own console finds it. This makes the folder as the
+# service makes it, and only on a server that has sshd. hubsetup.py's sshd_folder does the same for the firewall and
+# the hardening, and join.sh has the same function.
+SSHD_RUN=/run/sshd
+sshd_folder() {
+    command -v sshd >/dev/null 2>&1 || return 0
+    [ -d "$SSHD_RUN" ] || mkdir -m 0755 "$SSHD_RUN" 2>/dev/null || true
 }
 
 usage() {
@@ -402,6 +413,7 @@ in time; the hub then serves the owner's pages to the new address and refuses th
         plan "commit team.json on config and push it to $bare"
         return 0
     fi
+    sshd_folder
     ports=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -u)     # the SSH port team.json records
     [ -n "$ports" ] || ports=22
     zone=""
@@ -540,6 +552,38 @@ tries again"
 no work"
 }
 
+harden() {      # this server's own hardening, the same as each server that joins gets (join.sh): SSH takes keys only
+                # with no X11 forwarding, npm takes no package version newer than seven days, and Tailscale updates
+                # itself (hubsetup.py harden). Each part checks first and says what it did. A part that cannot be done
+                # leaves the server as it was, and none of them stops the install. It comes after the security
+                # updates, as in the join. As root, it runs the copy this script runs from, as the firewall does, and
+                # never the hub user's checkout. Until 14 November 2026 only the join had this step, so the first
+                # server of a fleet kept the SSH settings of its image. A second claim (--reclaim) leaves it out: its
+                # owner's Mac may be lost, the only SSH key of this server can be that Mac's, and a server that then
+                # takes keys only would let its owner in through its provider's console alone.
+    heading "this server's own hardening"
+    if [ "$reclaim" = yes ]; then
+        if [ "$check" = yes ]; then
+            plan "leave this server's SSH, npm and Tailscale settings as they are: a second claim changes the owner's \
+address and nothing else"
+        else
+            say "  a second claim leaves this server's own settings as they are; the line with no --reclaim takes \
+this step"
+        fi
+        return 0
+    fi
+    if [ "$check" = yes ]; then
+        plan "run: python3 $tree/hubsetup.py harden --user $HUB_USER"
+        plan "make SSH take keys only, with no X11 forwarding, through one file in sshd's own folder, which sshd \
+checks before it reloads (not where no account of this server has an SSH key, and not where OpenSSH does not run); \
+make npm take no package version newer than seven days, in npm's file for every user and in $HUB_USER's own, each \
+where no such rule is; and turn on Tailscale's own updates. A part that cannot be done leaves this server as it was"
+        return 0
+    fi
+    python3 "$tree/hubsetup.py" harden --user "$HUB_USER" </dev/null \
+        || say "  the hardening of this server did not finish: the lines above say why"
+}
+
 tcp_window() {  # the apps read this hub every few seconds on one kept connection, and each answer keeps the TCP window
                 # of the one before: Linux would start it again after a pause (hubsetup.py tcp). The hub works without
                 # it, so it stops nothing. As root, it runs the copy this script runs from, as the firewall does, and
@@ -674,6 +718,7 @@ main() {
     checks
     fleet_identity
     updates
+    harden
     tcp_window
     verify_step
     done_text
