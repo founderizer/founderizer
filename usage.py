@@ -569,7 +569,7 @@ def run_json(args, cwd, timeout=25, ok=(0,)):
 # own Mac Studio on 13 November 2026 (Codex 0.166.0), in the answer to account/read: "Your access token could not be
 # refreshed because your refresh token was revoked. Please log out and sign in again." The same machine's
 # account/rateLimits/read named the provider's own code, token_revoked.
-SIGN_IN_AGAIN = re.compile(r"sign in again|token_revoked|refresh_token_(?:expired|reused|invalidated)", re.I)
+SIGN_IN_AGAIN = re.compile(r"(?:sign|log) in again|token_revoked|refresh_token_(?:expired|reused|invalidated)", re.I)
 SIGN_IN_AGAIN_WAIT = 3      # seconds from such an answer to the read that confirms it
 ACCOUNT_AGAIN = 15          # seconds from one early account read to the next one (Collector.sign_in_ended)
 NO_ANSWER_READS = 3         # account reads in a row with no answer, after which "the provider ended it" says nothing
@@ -630,7 +630,24 @@ def codex_account(kit, command="codex"):
         response(1)
         send({"method": "initialized"})
         send({"id": 2, "method": "account/read", "params": {"refreshToken": False}})
-        answer = response(2)
+        try:
+            answer = response(2)
+        except SignedOut:
+            raise
+        except ValueError as failed:
+            # Not every Codex answers the account read of a sign-in that the provider ended in those words. The
+            # ChatGPT app's own copy (0.163.0-alpha.10.2, the screen runtime of the owner's Mac Studio, 14 November
+            # 2026) said "workspace routing discovery unauthorized (401)" there, and gave the provider's code,
+            # token_revoked, only at the limits. So the limits are asked before this is a read with no answer; an
+            # answer of theirs without the account is still that.
+            try:
+                send({"id": 3, "method": "account/rateLimits/read"})
+                response(3)
+            except SignedOut:
+                raise
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            raise failed
         if "account" in answer and answer["account"] is None:
             raise SignedOut("no account")        # the runtime's own answer, not a failed read
         account = answer.get("account") or {}

@@ -611,6 +611,7 @@ class TokenRecords(unittest.TestCase):
                              "{\"message\": \"Encountered invalidated oauth token for user, failing request\", "
                              "\"code\": \"token_revoked\"}}"}}
         other = {"error": {"code": -32603, "message": "failed to fetch codex rate limits: 503"}}
+        routing = {"error": {"code": -32603, "message": "workspace routing discovery unauthorized (401)"}}
         good = {"result": {"rateLimits": {"limitId": "codex", "primary": {
             "usedPercent": 10, "windowDurationMins": 300, "resetsAt": 20000}}}}
         with patch("usage.SIGN_IN_AGAIN_WAIT", 0):
@@ -618,14 +619,25 @@ class TokenRecords(unittest.TestCase):
                     (revoked, other, usage.SignInAgain, 2),         # the account read itself says so, two times
                     (known, refused, usage.SignInAgain, 2),         # or the provider's code at the limits
                     (known, other, usage.Unrefreshed, 1),           # another failure is a failed refresh
+                    # The ChatGPT app's own Codex says it in other words at the account, and only its limits give
+                    # the provider's code (the owner's Mac Studio, 14 November 2026): the limits are asked too.
+                    (routing, refused, usage.SignInAgain, 2),
+                    (routing, other, ValueError, 1),                # with no such code it is a read with no answer
+                    (routing, good, ValueError, 1),                 # and limits without their account are that too
                     ({"error": {"message": "internal error"}}, other, ValueError, 1)):
-                with self.subTest(account=account.get("error"), limits=limits["error"]["message"][-40:]):
+                with self.subTest(account=account.get("error"), limits=str(limits.get("error") or "an answer")[-40:]):
                     fake, starts = self.fake_codex(account, limits)
                     with self.assertRaises(want) as failed:
                         usage.codex_limits(str(self.home), fake)
                     self.assertIs(type(failed.exception), want)
                     self.assertEqual(starts(), reads)
             self.assertTrue(issubclass(usage.SignInAgain, usage.SignedOut))
+            for words in ("Your session has ended. Please log in again.", "refresh_token_invalidated",
+                          "Please log out and sign in again."):
+                self.assertTrue(usage.SIGN_IN_AGAIN.search(words), words)
+            for words in ("failed to fetch codex rate limits: 503", "workspace routing discovery unauthorized (401)",
+                          "rate limit reached", "connection reset by peer"):
+                self.assertIsNone(usage.SIGN_IN_AGAIN.search(words), words)
             # One such answer can be a lost race with another Codex process that renewed the sign-in at that moment
             # ("was already used"): the read a moment later answers, and nothing says signed out.
             reused = {"error": {"code": -32603, "message": "Your access token could not be refreshed because your "
