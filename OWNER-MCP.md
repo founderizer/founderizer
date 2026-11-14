@@ -143,8 +143,9 @@ kind is `swift`, a read that the program's own code wrote: `fleet_overview`, `fl
 `search_history` and `see_costs`. A tool that the table builds and that a table marked as a read by
 mistake is sent by neither verb. `call` leaves out one page of `fleet_read`, `chat_link`, whose QR
 links a WhatsApp account to the fleet: the owner reads that QR in the app, and `call` says so.
-Since 14 November 2026 `call` also takes the two setup tools, `setup_state` and `setup_show`, by
-name (below, "The link to the running app"). `write` takes each other tool that the
+Since 14 November 2026 `call` also takes the setup tools `setup_state` and `setup_show` by
+name (below, "The link to the running app"), and the read `setup_diagnosis` on the same link.
+`write` takes each other tool that the
 program has: the nine below, the 54 of the table, and `save_bot_token` on the link. A read through `write` is refused, and a write
 through `call` is refused, each with words that name the right verb; a tool that the program does
 not have gets the words of the MCP form. The JSON is one word of the shell, an object of the tool's
@@ -190,10 +191,10 @@ in the same order, with the same refusals and the same result. A table of a newe
 file can name a `swift` tool that an older program does not have: that program refuses it with
 "not in this version of the app yet" and does not list it. Never in the program, because the app's
 own pages do that work and its own setting says which hub it reads: `install_hub`, `install_log`,
-`claim_hub`, `add_machine`, `use_hub` and `which_hub`. Two more are the program's own and are not
-in the table or in this server: `setup_state` and `setup_show`, on the link to the running app
-(below). A third, `save_bot_token`, writes on the same link (below). So `tools/list` gives 70
-tools: the 54 of the table, the thirteen, the two and the one.
+`claim_hub`, `add_machine`, `use_hub` and `which_hub`. Three more are the program's own and are not
+in the table or in this server: `setup_state`, `setup_show` and `setup_diagnosis`, on the link to
+the running app (below). A fourth, `save_bot_token`, writes on the same link (below). So
+`tools/list` gives 71 tools: the 54 of the table, the thirteen, the three and the one.
 
 **The link to the running app.** Some work only the running app can do: its first run, its pages,
 and in later slices its keys and its engine. So the program asks the app on a local socket, the
@@ -233,8 +234,8 @@ link, which the app listens on while it runs (`OwnerChannel.swift` in `FleetOwne
   it closes, also after its line while its answer is made) or by that count, and never by a clock.
   A client keeps its side open until the answer: one that closes it has gone. When a connection
   ends, the work of its answer is cancelled, and a wait of `setup_state` in it ends at once. At
-  most 4 calls of `setup_state` wait at one time; one more answers "no change" at once. The
-  listener runs on a queue of its own; only the answers are made on the main thread, from the app's
+  most 4 calls of `setup_state` and `setup_diagnosis` together wait at one time; one more answers
+  "no change" at once (`setup_diagnosis` after its read of Tailscale, when the hub is `set`). The listener runs on a queue of its own; only the answers are made on the main thread, from the app's
   store. A request that comes while the app starts waits for the app's store 100 times a tenth of
   a second, then is refused in words. With no file descriptor left, the listener stops taking
   connections and ends its oldest one, and goes on when that one closes (or after half a second when
@@ -287,6 +288,21 @@ free text of an agent or a person). Its one field, `after`, is optional. The ans
 
 Each value is a fixed name, a boolean, a number or a text from a fixed list, and a value that is
 not on its list is left out; `OwnerSetupToolsTests` fails when a key is added to the answer.
+
+**`setup_diagnosis`** (a read): why the hub does not answer, and
+where the app's window stands, for the owner's own agent when a setup stopped. It gives the hub as
+`setup_state` does; the kind of the last failed read of the hub (one of 14 fixed names, such as a
+time-out, a refused connection, a hub that refused this Mac, or an answer that this app cannot
+read); whether the launch's first read ended, whether the hub answered at this launch or before,
+whether the app holds a reading, and the seconds since the last answer; Tailscale on this Mac and
+what it says of the hub's server (online, offline, not in the network), read only while the hub
+is `set` (its last read did not answer, or the launch's first read has not ended yet); and the
+window, by a fixed name (Settings counts as `fleet`), with an agent's setup when one shows.
+Every value is a boolean, a whole number or a name of a fixed list: no address, no name and no
+line of a log. It has a change number of its own and takes `after` as `setup_state` does, with a
+wait of 40 seconds at most, so that the Tailscale read after it (about 15 seconds at most) stays
+under the program's 60 quiet seconds; the seconds and Tailscale move no number. Its words in the
+tool list name every value.
 
 **`setup_show`** (marked as a read: it changes no fleet, no server and no file): asks macOS to
 bring the app to the front, on one of its own pages. Fields: `page`, which is `front` (the app as
@@ -471,8 +487,8 @@ program wrote, and the media types to the hub's own. The Swift tests (`swift tes
 kind of tool, the thirteen written in Swift, the two verbs, the refusals, the MCP exchange and the
 link's rules on a stand-in hub that opens no port. `OwnerChannelTests` runs the link to the app on a
 real socket in a temporary folder, with a stand-in check of the peer (and the real check against
-the test process itself), and `OwnerSetupToolsTests` the two setup tools, with a stand-in for the
-app's start: no test starts the real app.
+the test process itself), and `OwnerSetupToolsTests` and `OwnerSetupDiagnosisTests` the three
+setup reads, with a stand-in for the app's start: no test starts the real app.
 
 ## How it authenticates to the hub, and why that is the whole of it
 
