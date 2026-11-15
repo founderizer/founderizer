@@ -2486,25 +2486,33 @@ class Fact(test_grants.Grants):
 
     def test_a_start_text_says_that_the_variable_holds_a_placeholder_on_such_a_server(self):
         words = (hub.key_words("alpha"), hub.key_words("alpha", short=True))
-        self.assertEqual(words[0], " (OPENAI_API_KEY is for api.example.com only: when its value begins with "
-                                   "vaultswap_, it is a placeholder, and this machine's vault puts the key into the "
-                                   "Authorization header of an HTTPS request to that host, and nowhere else; a program "
-                                   "that needs the key itself does not work with a placeholder, so ask your requester "
-                                   "then, and do not look for the key)")
+        # with no owner's word, the words of before, with the key's form beside its host (Part D, the manager's point 6)
+        self.assertEqual(words[0], " (OPENAI_API_KEY is for api.example.com only, as Bearer: when its value begins "
+                                   "with vaultswap_, it is a placeholder, and this machine's vault puts the key into "
+                                   "the Authorization header of an HTTPS request to that host, and nowhere else; a "
+                                   "program that needs the key itself does not work with a placeholder, so ask your "
+                                   "requester then, and do not look for the key)")
         self.assertEqual(words[1], " (a placeholder when its value begins with vaultswap_: OPENAI_API_KEY for "
-                                   "api.example.com)")
+                                   "api.example.com as Bearer)")
         self.assertEqual(self.says("box", True)[0], 200)
+        # with the owner's word, the words of Part D (C41): the key's form beside its host, the clause on files and
+        # on what to do, and the clause of a site that the owner set (test_key_table.Catalog holds the other cases)
         self.assertEqual(hub.key_words("alpha"),
-                         " (OPENAI_API_KEY is for api.example.com only: the variable holds a placeholder, which begins "
-                         "with vaultswap_, and not the key, and this machine's vault puts the key into the "
-                         "Authorization header of an HTTPS request to that host, and nowhere else; a program that "
-                         "needs the key itself does not work with a placeholder, so ask your requester then, and do "
-                         "not look for the key)")
+                         " (OPENAI_API_KEY is for api.example.com only, as Bearer: the variable holds a placeholder, "
+                         "which begins with vaultswap_, and not the key, and this machine's vault puts the key in its "
+                         "place only in the Authorization header of an HTTPS request to that host, in that form, and "
+                         "nowhere else; a request with the placeholder in another form or another place gets a "
+                         "refusal; never write a placeholder into a file or into an application's configuration, on a "
+                         "server or in a repository: it works only in this session's own requests; when a program "
+                         "needs the key itself, sends it in another form, or the work must put a key into a "
+                         "configuration, ask your requester, say which key, which program and what it answered, and do "
+                         "not look for the key; OPENAI_API_KEY has the owner's own site, which only the owner changes)")
         self.assertEqual(hub.key_words("alpha", short=True),
                          " (a placeholder, which begins with vaultswap_, and not the key: OPENAI_API_KEY for "
-                         "api.example.com)")
+                         "api.example.com as Bearer; never in a file or a configuration; when a program cannot use it, "
+                         "ask your requester)")
         self.assertIn("API keys in this session: OPENAI_API_KEY, SHOP_API_KEY (OPENAI_API_KEY is for api.example.com "
-                      "only: the variable holds a placeholder, which begins with vaultswap_, and not the key,",
+                      "only, as Bearer: the variable holds a placeholder, which begins with vaultswap_, and not the key,",
                       " ".join(hub.holdings_parts("alpha")))
         with patch.dict(hub.agents()["alpha"], {"secrets": {self.BARE: "read"}}):   # no key of it has a site
             self.assertEqual(hub.key_words("alpha"), "")

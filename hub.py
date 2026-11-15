@@ -1464,30 +1464,96 @@ def switch_key_site(by, key, to, why):
     return entry["env"], True, commit
 
 
+# The form of a key's placeholder in a request (lifecycle.KEY_FORMS), in the words of a start text: the proxy puts the
+# key in only in that form (vault.py swap_found), so the words name it beside the host (the changed key swap, Part D)
+KEY_FORM_WORDS = {"bearer": "as Bearer", "token": "as token", "basic-user": "as the user name of Basic",
+                  "basic-password": "as the password of Basic"}
+
+
+def key_names(names):
+    """"A", "A and B", "A, B and C": each name, for a clause that must name each key that it is true of."""
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
 def key_words(agent, short=False):
     """What a start text says of this agent's keys that can swap, after their names, or "": which host each one is
     for, and what a placeholder is. On a server that swaps keys by the owner's word (key_swaps), the words say that
     the variable holds a placeholder, for an agent whose sessions get the variable (session_keys' first rule); they
     keep the prefix, so a session sees a wrong word of the owner's itself. Elsewhere the hub does not know whether
-    the agent's machine swaps keys, so the words say how the session sees it: the value begins with vaultswap_. From
-    team.json only: a start text reads nothing else."""
+    the agent's machine swaps keys, so the words say how the session sees it: the value begins with vaultswap_, and
+    they stay the words of before Part D but for each key's form (its brief, section 4, and the manager's point 6).
+    From team.json only: a start text reads nothing else.
+
+    The changed key swap, Part D (the manager's choice C41): each key's form beside its host, in the long and the
+    short words (KEY_FORM_WORDS), because the proxy refuses another form and a duty's run sends requests too. On a
+    server with the owner's word the words also say that a placeholder in a file or a configuration does not work,
+    and when a program cannot use one, the agent asks its requester (RULES.md: nobody skips a level) with which key,
+    which program and what it answered, and does not look for the key. Then one clause for the keys whose site the
+    table made (the entry's mark is on: the fleet manager can switch it off, switch_key_site) and one for the keys
+    whose site the owner set (only the owner changes it), each naming only its own keys. The manager's own words name
+    its own acts, under its rule's condition (a program cannot use the placeholder and the work needs the key):
+    switch_key_site for a table's site, and one Needs-you item for an owner's site.
+    A key whose mark is off has no site, so key_swap gives nothing and it gets no words here: it is a value. An owner
+    chat reads none of this: its start text (fleet.chat_instructions) names no key, and its work goes to a task
+    (start_task), whose start text has these words."""
     gone = vault_missing(agent)         # C11: a key that the last read did not give has no placeholder to speak of
-    held = [(name, key_swap(agent, ref)) for ref, name in read_secrets(agent) if name not in gone]
-    held = [(name, found[0].split("://", 1)[1]) for name, found in held if found]
+    catalog = (TEAM.get("logins") if isinstance(TEAM, dict) else None) or {}
+    held = []
+    for ref, name in read_secrets(agent):
+        found = key_swap(agent, ref) if name not in gone else None
+        if found:
+            entry = catalog.get(ref) if isinstance(catalog.get(ref), dict) else {}
+            mark = entry.get("table")
+            held.append((name, found[0].split("://", 1)[1], found[1], isinstance(mark, dict) and mark.get("on") is True))
     if not held:
         return ""
+    said = lambda form: KEY_FORM_WORDS.get(form, f"in the form {form}")    # a later release's form: by its name
     sure = not shell_off(agent) and (agents().get(agent) or {}).get("vault") == "broker" \
         and any(key_swaps(agent, ref) for ref, _name in read_secrets(agent))    # one server, so each of them or none
+    if not sure:                # the words of before Part D with each key's form, and no new clause (its section 4)
+        if short:
+            return " (a placeholder when its value begins with vaultswap_: " \
+                + ", ".join(f"{name} for {host} {said(form)}" for name, host, form, _made in held) + ")"
+        return (" (" + ", ".join(f"{name} is for {host} only, {said(form)}" for name, host, form, _made in held)
+                + ": when its value begins with vaultswap_, it is a placeholder, and this machine's vault puts the key "
+                "into the Authorization header of an HTTPS request to that host, and nowhere else; a program that needs "
+                "the key itself does not work with a placeholder, so ask your requester then, and do not look for the "
+                "key)")
+    manager = role_of(agent) == "manager"
+    table = [name for name, _host, _form, made in held if made]
+    owner = [name for name, _host, _form, made in held if not made]
     if short:
-        return (" (a placeholder, which begins with vaultswap_, and not the key: " if sure else
-                " (a placeholder when its value begins with vaultswap_: ") \
-            + ", ".join(f"{name} for {host}" for name, host in held) + ")"
-    return (" (" + ", ".join(f"{name} is for {host} only" for name, host in held)
-            + (": the variable holds a placeholder, which begins with vaultswap_, and not the key, " if sure else
-               ": when its value begins with vaultswap_, it is a placeholder, ")
-            + "and this machine's vault puts the key into the Authorization header of an "
-            "HTTPS request to that host, and nowhere else; a program that needs the key itself does not work with a "
-            "placeholder, so ask your requester then, and do not look for the key)")
+        return (" (a placeholder, which begins with vaultswap_, and not the key: "
+                + ", ".join(f"{name} for {host} {said(form)}" for name, host, form, _made in held)
+                + "; never in a file or a configuration"
+                + ((f"; when a program cannot use {key_names(table)} and the work needs it, switch that key's site off "
+                    "with switch_key_site" if table else "")
+                   + (f"; when a program cannot use {key_names(owner)} and the work needs it, raise a Needs-you item"
+                      if owner else "")
+                   if manager else
+                   "; when a program cannot use it, ask your requester"
+                   + (f"; the fleet manager can give your next session {key_names(table)} itself" if table else ""))
+                + ")")
+    return (" (" + ", ".join(f"{name} is for {host} only, {said(form)}" for name, host, form, _made in held)
+            + ": the variable holds a placeholder, which begins with vaultswap_, and not the key, and this machine's "
+            "vault puts the key in its place only in the Authorization header of an HTTPS request to that host, in "
+            "that form, and nowhere else; a request with the placeholder in another form or another place gets a "
+            "refusal; never write a placeholder into a file or into an application's configuration, on a server or "
+            "in a repository: it works only in this session's own requests; when a program needs the key itself, "
+            "sends it in another form, or the work must put a key into a configuration, "
+            + ("do not look for the key" if manager else
+               "ask your requester, say which key, which program and what it answered, and do not look for the key")
+            + (f"; {key_names(table)} {'has its site' if len(table) == 1 else 'have their sites'} from the fleet's "
+               "table of well-known services: "
+               + ("when a program cannot use the placeholder of such a key and the work needs the key, switch its "
+                  "site off with switch_key_site" if manager else
+                  "the fleet manager can switch such a site off")
+               + ", and your next session then holds that key itself" if table else "")
+            + (f"; {key_names(owner)} {'has' if len(owner) == 1 else 'have'} the owner's own "
+               f"{'site' if len(owner) == 1 else 'sites'}, which only the owner changes"
+               + (": when a program cannot use the placeholder of such a key and the work needs the key, raise one "
+                  "Needs-you item" if manager else "") if owner else "")
+            + ")")
 
 
 def machine_agents(name):
@@ -4343,7 +4409,10 @@ def holdings_start_text(agent):
     # it costs the session no fact; "" for a Claude or a Codex session, whose text stays byte for byte
     words = acp_tool_words(agent)
     calls = " " + words["fleet"][:1].upper() + words["fleet"][1:] + "." if words else ""
-    return "\n" + clip(said, max(120, HOLDINGS_CHARS - len(closing))) + calls + closing + "\n"
+    # The words of the agent's keys that swap (key_words, the changed key swap, Part D) are advice too: they say what
+    # to do with a placeholder, and they end their part of the facts, where a clip cuts first. So they raise the cap
+    # by their own length, by the rule of HOLDINGS_CHARS, and no fact that fit before is cut for them.
+    return "\n" + clip(said, max(120, HOLDINGS_CHARS + len(key_words(agent)) - len(closing))) + calls + closing + "\n"
 
 
 # No prompt named a colleague. A worker's start text said what it holds and then, for anything it does not hold,
@@ -12157,8 +12226,8 @@ def key_table_count():
     the central vault is good and its status says key_addresses (a program that serves it), how many API keys of
     today's list the table would give a site, for each row, and how many each condition leaves out. One line of the
     hub's log with numbers only, no key's name and no address, and a record in kv, so a restart does not count
-    again. It writes no site: the pass that writes, one time, is a release of its own after
-    the manager's reading of this line."""
+    again. It writes no site, and no pass writes one: the owner left that pass out (C39, 15 November 2026), after this
+    line counted no key of the list to give a site."""
     with LOCK:
         if kv_get(KEY_TABLE_PASS):
             return

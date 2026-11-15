@@ -337,12 +337,18 @@ class Catalog(test_grants.Grants):
         a = self.born(1, "OPENAI_A_KEY", "https://platform.openai.com/api-keys")
         self.assertEqual(self.grant(a, "alpha", "read")[0], 200)
         self.assertEqual(self.says("box", True)[0], 200)
-        self.assertIn("OPENAI_A_KEY is for api.openai.com only: the variable holds a placeholder", hub.key_words("alpha"))
+        self.assertIn("OPENAI_A_KEY is for api.openai.com only, as Bearer: the variable holds a placeholder",
+                      hub.key_words("alpha"))
         tid = hub.ins("INSERT INTO tasks(title,owner,requester,state,created,needs,attempt) VALUES(?,?,?,?,?,?,?)",
                       ("Work", "alpha", "manager", "working", hub.now(), "none", 1))
         start = hub.start_text("alpha", tid)                               # a task session's whole start text
         self.assertIn("WHAT YOU HOLD IN THIS SESSION", start)
-        self.assertIn("OPENAI_A_KEY is for api.openai.com only: the variable holds a placeholder", start)
+        self.assertIn("OPENAI_A_KEY is for api.openai.com only, as Bearer: the variable holds a placeholder", start)
+        self.assertIn("; OPENAI_A_KEY has its site from the fleet's table of well-known services: the fleet manager "
+                      "can switch such a site off, and your next session then holds that key itself)", start)
+        said = hub.holdings_start_text("alpha")             # the words raise the block's cap by their own length
+        self.assertIn(hub.key_words("alpha"), said)
+        self.assertLessEqual(len(said.strip()), hub.HOLDINGS_CHARS + len(hub.key_words("alpha")))
         self.assertIn("API keys in this session: OPENAI_A_KEY (OPENAI_A_KEY is for api.openai.com only",
                       " ".join(hub.holdings_parts("alpha")))
         self.assertEqual(hub.session_keys("alpha"), [])                    # no value of it in the sessions
@@ -351,6 +357,94 @@ class Catalog(test_grants.Grants):
         team["agents"]["beta"].update(secrets={a: "read"}, vault="broker")
         self.assertIsNone(lifecycle.key_swap(team, "beta", a))
         self.assertEqual(lifecycle.key_swap(team, "alpha", a), (OPENAI, "bearer"))
+
+    def test_the_words_name_each_keys_form_and_kind_and_the_managers_own_acts(self):
+        """The changed key swap, Part D (the manager's choice C41): on a server with the owner's word, each key's form
+        beside its host, the clause on files and on what to do, and one clause for the table's keys and one for the
+        owner's, each naming only its own keys; the manager's own acts in its own words; elsewhere the words of
+        before."""
+        a = self.born(1, "OPENAI_A_KEY", "https://api.openai.com")         # a site from the table: its mark is on
+        self.assertEqual(self.grant(a, "alpha", "read")[0], 200)
+        self.assertEqual(self.label(test_grants.KEY, "OPENAI_API_KEY", site="https://api.example.com",
+                                    form="basic-password")[0], 200)       # the owner's own site, in another form
+        self.assertEqual(self.grant(test_grants.KEY, "alpha", "read")[0], 200)
+        before = hub.key_words("alpha")         # no owner's word yet: the words of before, with each key's form
+        self.assertTrue(before.startswith(" (OPENAI_API_KEY is for api.example.com only, as the password of Basic, "
+                                          "OPENAI_A_KEY is for api.openai.com only, as Bearer: when its value begins "
+                                          "with vaultswap_"), before)
+        self.assertNotIn("table of well-known services", before)
+        self.assertNotIn("never write a placeholder", before)
+        self.assertEqual(hub.key_words("alpha", short=True),
+                         " (a placeholder when its value begins with vaultswap_: OPENAI_API_KEY for api.example.com "
+                         "as the password of Basic, OPENAI_A_KEY for api.openai.com as Bearer)")
+        self.assertEqual(self.says("box", True)[0], 200)
+        shared = (": the variable holds a placeholder, which begins with vaultswap_, and not the key, and this machine's "
+                  "vault puts the key in its place only in the Authorization header of an HTTPS request to that host, "
+                  "in that form, and nowhere else; a request with the placeholder in another form or another place "
+                  "gets a refusal; never write a placeholder into a file or into an application's configuration, on a "
+                  "server or in a repository: it works only in this session's own requests; when a program needs the "
+                  "key itself, sends it in another form, or the work must put a key into a configuration, ")
+        self.assertEqual(hub.key_words("alpha"),
+                         " (OPENAI_API_KEY is for api.example.com only, as the password of Basic, OPENAI_A_KEY is for "
+                         "api.openai.com only, as Bearer" + shared + "ask your requester, say which key, which program "
+                         "and what it answered, and do not look for the key; OPENAI_A_KEY has its site from the "
+                         "fleet's table of well-known services: the fleet manager can switch such a site off, and your "
+                         "next session then holds that key itself; OPENAI_API_KEY has the owner's own site, which only "
+                         "the owner changes)")
+        self.assertEqual(hub.key_words("alpha", short=True),
+                         " (a placeholder, which begins with vaultswap_, and not the key: OPENAI_API_KEY for "
+                         "api.example.com as the password of Basic, OPENAI_A_KEY for api.openai.com as Bearer; never in "
+                         "a file or a configuration; when a program cannot use it, ask your requester; the fleet "
+                         "manager can give your next session OPENAI_A_KEY itself)")
+        with patch.dict(hub.agents()["alpha"], {"role": "manager"}):       # the manager's own acts, and no requester
+            words, short = hub.key_words("alpha"), hub.key_words("alpha", short=True)
+            self.assertNotIn("ask your requester", words + short)
+            self.assertTrue(words.endswith(
+                shared + "do not look for the key; OPENAI_A_KEY has its site from the fleet's table of well-known "
+                "services: when a program cannot use the placeholder of such a key and the work needs the key, switch "
+                "its site off with switch_key_site, and your next session then holds that key itself; OPENAI_API_KEY "
+                "has the owner's own site, which only the owner changes: when a program cannot use the placeholder of "
+                "such a key and the work needs the key, raise one Needs-you item)"), words)
+            self.assertTrue(short.endswith(
+                "; never in a file or a configuration; when a program cannot use OPENAI_A_KEY and the work needs it, "
+                "switch that key's site off with switch_key_site; when a program cannot use OPENAI_API_KEY and the "
+                "work needs it, raise a Needs-you item)"), short)
+        # a manager with an owner's key alone: the item only under its condition, never as an order at each start (the
+        # switch writes team.json and reads it again, so the manager's role is given after it)
+        self.assertFalse(self.switch("OPENAI_A_KEY", "off")[1])
+        with patch.dict(hub.agents()["alpha"], {"role": "manager"}):
+            self.assertEqual(hub.key_words("alpha", short=True),
+                             " (a placeholder, which begins with vaultswap_, and not the key: OPENAI_API_KEY for "
+                             "api.example.com as the password of Basic; never in a file or a configuration; when a "
+                             "program cannot use OPENAI_API_KEY and the work needs it, raise a Needs-you item)")
+        self.assertFalse(self.switch("OPENAI_A_KEY", "on")[1])
+        # each form in its words, as the proxy takes it (vault.swap_found)
+        self.assertEqual(set(hub.KEY_FORM_WORDS), set(lifecycle.KEY_FORMS))
+        for form, said in (("bearer", "as Bearer"), ("token", "as token"), ("basic-user", "as the user name of Basic"),
+                           ("basic-password", "as the password of Basic")):
+            with self.subTest(form=form):
+                self.assertEqual(self.label(test_grants.KEY, "OPENAI_API_KEY", site="https://api.example.com",
+                                            form=form)[0], 200)
+                self.assertIn(f"OPENAI_API_KEY is for api.example.com only, {said}, OPENAI_A_KEY is for",
+                              hub.key_words("alpha"))
+        # the table's key switched off: a value, with no words of a placeholder, and the owner's key alone is named
+        self.assertFalse(self.switch("OPENAI_A_KEY", "off")[1])
+        words = hub.key_words("alpha")
+        self.assertNotIn("OPENAI_A_KEY", words)
+        self.assertNotIn("table of well-known services", words)
+        self.assertTrue(words.endswith("; OPENAI_API_KEY has the owner's own site, which only the owner changes)"), words)
+        self.assertFalse(self.switch("OPENAI_A_KEY", "on")[1])
+        # a key that the vault left out at its last read gets no words (C11), and its clause goes with it
+        hub.kv_set("read_missing:alpha", json.dumps({"OPENAI_API_KEY": "other"}))
+        words = hub.key_words("alpha")
+        self.assertNotIn("OPENAI_API_KEY", words)
+        self.assertNotIn("the owner's own site", words)
+        self.assertIn("OPENAI_A_KEY is for api.openai.com only, as Bearer", words)
+        # a duty's text, through the real path of its run, has the short form
+        self.assertIn("OPENAI_A_KEY (a placeholder, which begins with vaultswap_, and not the key: OPENAI_A_KEY for "
+                      "api.openai.com as Bearer; never in a file or a configuration; when a program cannot use it, ask "
+                      "your requester; the fleet manager can give your next session OPENAI_A_KEY itself)",
+                      hub.duty_mechanism_text({"agent": "alpha"}))
 
     def test_the_settings_check_says_why_a_key_that_the_manager_switched_off_is_a_value(self):
         a = self.born(1, "OPENAI_A_KEY", "https://api.openai.com")

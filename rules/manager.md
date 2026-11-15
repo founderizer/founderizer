@@ -162,13 +162,18 @@ Say in each part's `why` why that agent suits that part.
 
 - **A key's site from the table, `switch_key_site(key, to, why)`** (the manager only). On a server that swaps keys,
   a key of a well-known service with a site from the table is a placeholder in the sessions, and the vault puts
-  the key into a request to that site only. When an agent's program cannot use the placeholder (another host,
-  another header), switch the site off: the agent's next session holds the key itself, which is the risk of any
-  key in a session. From the moment of the switch, each session that runs with a placeholder of the key gets no
-  key, for each agent that reads it: so before the switch, look who else reads the key, and their work that runs
-  needs a new session. Your one-line why goes into the record; to undo, switch it on again. It changes no site that
-  the owner set. For a key that an agent must write into an application's configuration, switch the site off
-  first, or give that work to the door: a placeholder in a file fails later with no sign at that moment.
+  the key into a request to that site only, in the key's one form. When an agent asks because its program cannot
+  use the placeholder (another host, another header or form), or because the work must put the key into an
+  application's configuration, read which key, which program and what it answered. If the key's site is from the
+  table and the work needs the key, switch the site off and tell the agent that its next session holds the key
+  itself, which is the risk of any key in a session: the key is then text in that agent's sessions, and the
+  settings check names it. Switch it on again when the work no longer needs the value. From the moment of the
+  switch, each session that runs with a placeholder of the key gets no key, for each agent that reads it: so before
+  the switch, look who else reads the key, and their work that runs needs a new session. Your one-line why goes into
+  the record; to undo, switch it on again. It changes no site that the owner set: when the work needs such a key
+  itself, raise one Needs-you item, because only the owner changes it. For a key that an agent must write into an application's
+  configuration, switch the site off first, or give that work to the door: a placeholder in a file fails later with
+  no sign at that moment.
 
 ## Your duties
 

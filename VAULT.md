@@ -360,7 +360,9 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
   `KEY_TABLE`, with its sources). When the owner adds a key whose address selects a row (Add secret's "Service
   address", the site of an agent's request on its card, an import row), the hub writes the row's site and form into
   the key's catalog entry, with a mark that the table made them. The hub takes that address from a version of the
-  app that sends it; an app from before sends none, and its keys get no site from the table. It does this only at the key's birth, and only when
+  app that sends it; an app from before sends none, and its keys get no site from the table. The app sends only the
+  address's scheme, host and port, because a path can be a secret, so the table's key pages never match from the app
+  (the manager's choice C40). It does this only at the key's birth, and only when
   nothing holds the key: no grant of an agent at any level, no profile, no account, and no MCP server or saved check
   that names its variable (`hub.py`). The hub keeps nothing of the address but the row. An API host selects its row
   with any path; a web page selects it only by its exact host and the exact path of the key page (one slash at the
@@ -369,8 +371,8 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
   the Global API Key, which goes in another header (`lifecycle.py` `key_table_row`). For the keys that are stored
   already, the central vault answers one question of the hub: which stored keys (not logins) have an address that
   selects a row of its own copy of the table, and which row; the hub then reads its own catalog for them. It gives no value, no address and no host, and it takes no host
-  from the hub (`vault.py` `key_addresses`). The first release only counts with it: one line of the hub's log with
-  numbers, and nothing written (`hub.py` `key_table_count`).
+  from the hub (`vault.py` `key_addresses`). The hub counts once with it: one line of the hub's log with numbers, and
+  nothing written (`hub.py` `key_table_count`); no pass writes the sites of today's keys (the owner's choice C39).
 - **A table-made site is a default, not a lock.** The fleet manager switches such a site off, with no approval and
   a one-line why that goes into the commit of `team.json` and the hub's log, and on again (`switch_key_site`). Off,
   the key is a value in the sessions of the agents that read it, from their next start. From the moment of the
@@ -485,7 +487,14 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
    - A placeholder works only in a request through the proxy. An agent that writes the key's variable into an
      application's configuration, on a server or in a file, writes the placeholder there, and the application fails
      later, with no sign at that moment. The fleet manager switches the table's site off first for such work, or the
-     door does it (`rules/manager.md`).
+     door does it (`rules/manager.md`). A task's start text says so, with each key's form, and asks the agent to
+     ask its requester when a program cannot use a placeholder (`hub.py` `key_words`).
+   - An owner chat holds the placeholders, as each session of its agent does, but its start text names no key and
+     says nothing of a placeholder (`fleet.py` `chat_instructions`): an agent that runs a program in its owner chat
+     and gets the proxy's refusal has no words for it. A chat sends its work to a task (`start_task`, with the
+     agent's line as its requester), whose start text has the words, and it reaches its line with `message_agent`,
+     with no step of the owner. To name the keys in a chat's start text would change that text, and so start a new
+     conversation of each owner chat.
    - A hub of a release before the table refuses a `team.json` with a mark, whose field `table` it does not know. So
      the app's part, which sends the address that makes the first marks, comes only after the hub's part is live and
      proved, and a fleet with marks does not go back to a hub from before it.
