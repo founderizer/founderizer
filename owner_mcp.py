@@ -223,6 +223,16 @@ SERVERS_ASK = ("Ask the owner which one, with both in these words, before you ca
 # test_owner_mcp holds this one to. It is not lifecycle.SWITCH_RUNTIMES: a runtime that the hub gains is not one that
 # hub.sh installs until hub.sh says so.
 HUB_SH_RUNTIMES = ("claude", "codex")
+# The manager's own name at a hub's first install (hub.sh --manager-name, which the Mac app's first run gives too, from
+# its page "Name your manager"): hub.sh's own rule, which test_owner_mcp holds these three to, and hubsetup.py's
+# manager_name. The pattern leaves no character that a shell reads, so the name goes into hub.sh's line as it is.
+MANAGER_NAME = re.compile(r"[a-z][a-z0-9-]{1,25}")
+MANAGER_NAMES_TAKEN = ("owner", "hub", "agents", "channels", "chats", "checks", "git", "pilot", "server", "vault",
+                       "watch", "work")
+MANAGER_NAME_STARTS_TAKEN = ("login-", "vault-")
+MANAGER_NAME_RULE = ("2 to 26 characters a-z 0-9 -, a letter first, and none of the names that the fleet uses itself ("
+                     + ", ".join(MANAGER_NAMES_TAKEN) + ", and each name that starts with "
+                     + " or ".join(MANAGER_NAME_STARTS_TAKEN) + ")")
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     """A redirect is an answer, never a second request: this computer's key for the hub must not go to another place
     with it (`urllib` would send the same headers there)."""
@@ -1711,10 +1721,21 @@ def install_hub(args):
         raise Refused("runtime is the AI provider of a manager that runs on the hub's server: claude or codex, and only "
                       "with servers 1. With servers 2, move_agent takes the manager's provider. Nothing on "
                       f"{host} was changed.")
+    name = args.get("manager_name")
+    if isinstance(name, str):
+        # As the Mac app's page does (`ManagerName.agentName`): the owner's "Juno" names the agent juno. What goes on
+        # is the text after this line, and only when it is whole by the rule.
+        name = name.strip().lower()
+    if name is not None and (not isinstance(name, str) or not MANAGER_NAME.fullmatch(name)
+                             or name in MANAGER_NAMES_TAKEN or name.startswith(MANAGER_NAME_STARTS_TAKEN)):
+        raise Refused(f"manager_name is the name that the owner chose for the fleet's manager: {MANAGER_NAME_RULE}. "
+                      "The hub lets nobody rename the manager afterwards, so ask the owner for another name, or "
+                      f"leave manager_name out: the manager is then named manager. Nothing on {host} was changed.")
     # The word of the layout in front of both runs of hub.sh, and the same options behind both, so that the plan says
     # what the install does.
     hub_sh = ("FLEET_MANAGER_SERVER=later " if servers == 2 else "") + f"sh {KIT}/hub.sh" + \
-        (f" --port {int(args['port'])}" if args.get("port") else "") + (f" --runtime {runtime}" if runtime else "")
+        (f" --port {int(args['port'])}" if args.get("port") else "") + (f" --runtime {runtime}" if runtime else "") + \
+        (f" --manager-name {name}" if name else "")
     key_path = key_file(args)
     steps = {}
     via, steps["read_machine"], tried = first_read(
@@ -1811,6 +1832,11 @@ def install_hub(args):
               "server with move_agent, which takes its AI provider, and then the owner signs it in." if servers == 2
               else "the manager runs on this server, and the install ends NOT READY: runtime_signed_in until the owner "
                    "signs it in. That is the next step, and no fault of the install."))
+    if name:
+        after += (f" The manager's name counts at a hub's first install too: on a new hub the manager is {name}, and each "
+                  "tool that takes an agent takes that name. A hub that was there keeps the name that its manager has. "
+                  "When that hub's own copy of Founderizer is older than this option, the install stops and "
+                  "install_log says so: then send install_hub again without manager_name.")
     return {"host": host, "address": address, "root_prefix": root or "none", "plan": plan["out"], "steps": steps,
             "servers": servers,
             "next": f"The install runs on its own and waits up to 30 minutes for this Mac to claim the hub. Read "
@@ -2163,7 +2189,9 @@ def tools():
                             "of a mode-600 file on this Mac, never the key: it travels on standard input to the step "
                             "that puts the server on the fleet's private network. Then read install_log with the same "
                             "host, and call claim_hub. servers is the owner's own choice of how many servers the "
-                            "fleet starts with. " + SERVERS_ASK + ONE_CALL,
+                            "fleet starts with. " + SERVERS_ASK + " manager_name is the owner's own name for the "
+                            "fleet's manager, its first agent: ask the owner for it too, and leave it out when "
+                            "they want none." + ONE_CALL,
              {"host": S["text"], "ssh_user": S["text"], "source": {"type": "string",
               "description": "The address of the Founderizer repository, from the owner's download page."},
               "authkey_file": {"type": "string", "description": "The path on this Mac of the file that holds the "
@@ -2174,6 +2202,13 @@ def tools():
               "runtime": {"type": "string", "enum": list(HUB_SH_RUNTIMES),
                           "description": "Only with servers 1: the AI provider of the manager on the hub's server, "
                                          "which the owner chose (claude when left out)."},
+              "manager_name": {"type": "string",
+                               "description": "The name that the owner chose for the fleet's manager, which counts "
+                                              "at the first install of a hub: " + MANAGER_NAME_RULE + ". Never "
+                                              "choose it for them. Capital letters, and spaces around the name, "
+                                              "do not count: Juno names the manager juno. Left out, the manager "
+                                              "is named manager. The hub lets nobody rename the manager "
+                                              "afterwards."},
               "port": S["int"]},
              ("host", "ssh_user", "source", "authkey_file", "servers"), install_hub),
         tool("install_log", "The install's own log on that server, with the claim code and the hub address read out "

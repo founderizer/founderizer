@@ -1054,6 +1054,91 @@ class Install(unittest.TestCase):
         self.assertEqual(listed["inputSchema"]["properties"]["servers"]["enum"], [1, 2])
         self.assertIn("Never choose for them", listed["description"])
 
+    def test_it_gives_hub_sh_the_owners_name_for_the_manager(self):
+        """**The manager's name is the owner's choice at a hub's first install.** The Mac app's first run asks for it on
+        "Name your manager" and gives it to hub.sh as `--manager-name` (15 November 2026), so install_hub takes it too,
+        as `manager_name`: both runs of hub.sh (the plan and the install) get the option, behind the other options and
+        with the layout's word still in front. A name that hub.sh would refuse sends no command at all, because the
+        hub lets nobody rename the manager afterwards, and the refusal says the rule and repeats nothing of the name.
+        Without the field the line is the line of before. The rule is hub.sh's own and hubsetup.py's."""
+        client, reach = self.client(), {"host": "203.0.113.9", "ssh_user": "root", "servers": 1,
+                                        "source": "https://example.invalid/f.git", "authkey_file": str(self.key)}
+        for bad in ("j", "9lives", "-juno", "j" * 27, "ju no", "Ju No", "juno;id", "juno\nid", "$(id)", "owner", "Hub",
+                    "vault", "work", "login-x", "vault-2", "", "  ", 7, True, ["juno"]):
+            with self.assertRaises(Refused, msg=repr(bad)) as caught:
+                client.call("install_hub", **reach, manager_name=bad)
+            said = str(caught.exception)
+            self.assertEqual([part for part in ("manager_name is the name that the owner chose for the fleet's manager",
+                                                "2 to 26 characters a-z 0-9 -, a letter first", "login- or vault-",
+                                                "nobody rename the manager afterwards",
+                                                "Nothing on 203.0.113.9 was changed") if part not in said], [], said)
+            if isinstance(bad, str) and len(bad) > 3 and bad not in owner_mcp.MANAGER_NAMES_TAKEN:
+                self.assertNotIn(bad.strip(), said)
+        self.assertEqual(self.sent(), [])
+
+        def hub_sh():
+            return [" ".join(c["args"]).rpartition("root@203.0.113.9 ")[2] for c in self.sent()
+                    if "sh /root/fleet-kit/hub.sh" in " ".join(c["args"]) and "ps -A" not in " ".join(c["args"])]
+        plan = self.MACHINE["hub.sh --check"]           # the stand-in's plan, for the plan with the option too
+        (self.calls / "table.json").write_text(json.dumps(dict(self.MACHINE, **{
+            "hub.sh --manager-name juno --check": plan, "hub.sh --port 9000 --manager-name a-9 --check": plan,
+            "hub.sh --runtime codex --manager-name " + "m" * 26 + " --check": plan})))
+        # As the Mac app's page does, capital letters and spaces around the name do not count: the owner's "Juno".
+        done = client.call("install_hub", **reach, manager_name=" Juno\n")
+        ran = hub_sh()
+        self.assertEqual(len(ran), 2, ran)
+        self.assertIn("sh /root/fleet-kit/hub.sh --manager-name juno --check", ran[0])     # the plan names it too
+        self.assertIn('setsid sh -c "sh /root/fleet-kit/hub.sh --manager-name juno < /dev/null', ran[1])
+        self.assertIn("on a new hub the manager is juno", done["next"])
+        self.assertIn("A hub that was there keeps the name that its manager has", done["next"])
+        self.assertIn("is older than this option, the install stops and install_log says so", done["next"])
+        done = client.call("install_hub", **dict(reach, servers=2), manager_name="a-9", port=9000)
+        ran = hub_sh()[2:]
+        self.assertIn("FLEET_MANAGER_SERVER=later sh /root/fleet-kit/hub.sh --port 9000 --manager-name a-9 --check", ran[0])
+        self.assertIn('setsid sh -c "FLEET_MANAGER_SERVER=later sh /root/fleet-kit/hub.sh --port 9000 --manager-name a-9 '
+                      '< /dev/null', ran[1])
+        self.assertIn("the manager is a-9", done["next"])
+        client.call("install_hub", **reach, runtime="codex", manager_name="m" * 26)
+        self.assertIn("sh /root/fleet-kit/hub.sh --runtime codex --manager-name " + "m" * 26 + " --check", hub_sh()[4])
+        self.assertIn('setsid sh -c "sh /root/fleet-kit/hub.sh --runtime codex --manager-name ' + "m" * 26
+                      + " < /dev/null", hub_sh()[5])
+        # Without the field: the line of before, and no word of a name.
+        done = client.call("install_hub", **reach)
+        self.assertEqual([one for one in hub_sh()[6:] if "--manager-name" in one], [])
+        self.assertEqual(len(hub_sh()[6:]), 2)
+        self.assertNotIn("manager's name", done["next"])
+
+        # The rule is hub.sh's own, and hubsetup.py's manager_name takes and refuses the same names.
+        script = (HERE / "hub.sh").read_text()
+        self.assertIn("|".join((*owner_mcp.MANAGER_NAMES_TAKEN,
+                                *(start + "*" for start in owner_mcp.MANAGER_NAME_STARTS_TAKEN)))
+                      + ') stop "$name_rule" ;;', script)
+        self.assertIn('[!a-z]*|*[!a-z0-9-]*) stop "$name_rule" ;;', script)
+        self.assertIn('if [ "${#manager_name}" -lt 2 ] || [ "${#manager_name}" -gt 26 ]; then stop "$name_rule"; fi', script)
+        self.assertEqual(owner_mcp.MANAGER_NAME.pattern, "[a-z][a-z0-9-]{1,25}")
+        self.assertEqual(owner_mcp.MANAGER_NAMES_TAKEN, (*hub.RESERVED_AGENT_NAMES, *hubsetup.FLEET_OWN_NAMES))
+        self.assertEqual(owner_mcp.MANAGER_NAME_STARTS_TAKEN, hubsetup.FLEET_OWN_STARTS)
+
+        def takes(name):
+            return bool(owner_mcp.MANAGER_NAME.fullmatch(name)) and name not in owner_mcp.MANAGER_NAMES_TAKEN \
+                and not name.startswith(owner_mcp.MANAGER_NAME_STARTS_TAKEN)
+
+        def installer_takes(name):
+            try:
+                return hubsetup.manager_name(name) == name
+            except hubsetup.Stop:
+                return False
+        for name in ("juno", "a-9", "manager", "m" * 26, "m" * 27, "j", "ju", "Juno", "9lives", "-juno", "ju no",
+                     "juno\n", "owner", "hub", "agents", "vault", "work", "login-x", "vault-2", "logins", "vaults", ""):
+            self.assertEqual(takes(name), installer_takes(name), repr(name))
+        listed = {one["name"]: one for one in owner_mcp.tools()}["install_hub"]
+        self.assertNotIn("manager_name", listed["inputSchema"]["required"])
+        # No pattern in the schema: the tool takes "Juno" as the app's page does, and a client that holds a call to
+        # its schema must not refuse that.
+        self.assertNotIn("pattern", listed["inputSchema"]["properties"]["manager_name"])
+        self.assertIn("Juno names the manager juno", listed["inputSchema"]["properties"]["manager_name"]["description"])
+        self.assertIn("Never choose it for them", listed["inputSchema"]["properties"]["manager_name"]["description"])
+
     def test_only_the_tools_that_read_say_that_they_read(self):
         """A client that asks its user before a tool that can write (Codex) reads each tool's readOnlyHint. Without
         one, Codex asked before each call, also before a read (14 November 2026). Five tools say that they only read:

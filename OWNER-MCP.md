@@ -274,8 +274,8 @@ free text of an agent or a person). Its one field, `after`, is optional. The ans
 - `app`: `version` and `build`.
 - `hub`: `none` (no hub's address), `set` (an address, and its last read did not answer), or
   `answers`. It is what the app's store knows; the call makes no request of its own.
-- `first_run`: `shows`; `page`, by a fixed name: `welcome`, `paste`, `vps` ("A VPS for your
-  fleet"), `tailscale`, `tailscale_key`, `token`, `building` (a provider's server is made),
+- `first_run`: `shows`; `page`, by a fixed name: `welcome`, `paste`, `name` ("Name your
+  manager"), `vps` ("A VPS for your fleet"), `tailscale`, `tailscale_key`, `token`, `building` (a provider's server is made),
   `other_vps` (a server by its address), `machine`, `installing`, `address`, `done`, `restore`;
   `title`, the page's title in English as the app's string table has it, and a title with a
   placeholder as its key ("Your %@ token"; a title that is a server's address is none); `works`,
@@ -311,9 +311,11 @@ tool list name every value.
 
 **`setup_show`** (marked as a read: it changes no fleet, no server and no file): asks macOS to
 bring the app to the front, on one of its own pages. Fields: `page`, which is `front` (the app as
-it is, with no change of page, from any page), or for a first run `welcome` or `vps`; and `seen`,
+it is, with no change of page, from any page), or for a first run `welcome` or `name` ("Name your
+manager", the first page of the setup, from which the owner's own Continue goes on to the VPS
+page; until 15 November 2026 this second page was `vps`, which went past the name); and `seen`,
 the page that `setup_state` gave last (`first_run.page`, or `none` with no first run). It refuses,
-and says which, when `seen` is not the page that shows now; and for `welcome` and `vps`, when no
+and says which, when `seen` is not the page that shows now; and for `welcome` and `name`, when no
 first run shows, when the page that shows is not one of the first run's start pages (`welcome`,
 `paste`, `vps`: on every other page the owner may be typing a token, a key or a password that a
 change of page would erase), when the first run holds the window, when its work runs, or when an
@@ -322,7 +324,11 @@ between counts; the wait for the window has no clock, and ends on its answer, on
 the window's going or on the end of the call. An ask for the page that shows already changes
 nothing in the wizard (not even a failure line on it). It never presses anything, and it gives back the
 state as `setup_state` does, with `"front": "asked"`: macOS was asked, which says nothing of
-whether another app stays in front. **Who asks macOS:** the app asks first, with its own
+whether another app stays in front. **After it, the app takes no key press until the owner's first
+click in its window**, so that keys which the owner typed for another window do nothing in the app. The
+same holds after each `guide` and after a start of the app by its program. It does not hold when the app
+was in front and the owner clicked in it since it came there (`OWNER-MCP-BOUNDARY.md` 7b has the reason
+and the limits). **Who asks macOS:** the app asks first, with its own
 activate, and then the program runs `/usr/bin/open` on its own bundle, with no shell and no word
 of the request, after each `setup_show` that the app took, and `founderizer-cli guide` does the
 same after its sign to the app. On a test Mac on 14 November 2026 (macOS 26.6, Terminal in front)
@@ -588,7 +594,7 @@ would read as an empty fleet instead of as a mistake.
 | `search_history` | `/ui/history` | Search what one agent, or every agent, took part in, by words, dates, person, task and kind; with `ref`, one record in full. |
 | `see_costs` | `/ui/costs` | What every agent's work cost, against the period before: list dollars, the four kinds of tokens, results without rework by kind of work, checks, each account's window and the model changes. |
 | `which_hub` / `use_hub` | `/ui/state` | Which hub, on what authority; and point at one. |
-| `install_hub` | SSH, `hub.sh` (INSTALL-PROMPT.md A1–A5) | Install a hub on a server the owner names. It puts the server on the private network first (A2), with `authkey_file`, and starts the install at the server's address there. It changes nothing on a server where an install runs. `servers` is the owner's own choice, 1 or 2, and the tool takes no default ("How many servers a fleet starts with", below). |
+| `install_hub` | SSH, `hub.sh` (INSTALL-PROMPT.md A1–A5) | Install a hub on a server the owner names. It puts the server on the private network first (A2), with `authkey_file`, and starts the install at the server's address there. It changes nothing on a server where an install runs. `servers` is the owner's own choice, 1 or 2, and the tool takes no default ("How many servers a fleet starts with", below). `manager_name` is the owner's own name for the manager, which the tool gives to `hub.sh` (the same section). |
 | `install_log` | SSH, `tail` | The install's own log, with the claim code read out of it. When SSH gets no connection to the host, because of the install's firewall, it reads the log at the server's address on the private network. |
 | `claim_hub` | `POST /claim` | Prove this Mac's address. This is what grants the authority. |
 | `add_machine` | `/ui/servers/join` | The one-time join line, and with `host` it runs it over SSH: as root on Linux, as the Mac user on a Mac. A Linux server that is not on the private network goes on it first, with `authkey_file` (B2); without that file, it stops before the hub makes a code. |
@@ -666,6 +672,16 @@ Until 14 November 2026 `install_hub` gave `hub.sh` no word, so each hub that thi
 the hub's own server, and the owner was not asked. A manager that started on the hub's server and moves later
 (`move_agent`) leaves its OS user and its home on the hub's server: the hub's machine runs no server service that
 could remove them. Nothing removes them yet.
+
+**The manager's name is the owner's choice too.** `install_hub` takes it as `manager_name` and gives both runs of
+`hub.sh` the option `--manager-name`, as the Mac app's first run does from its page "Name your manager". The rule is
+`hub.sh`'s own: 2 to 26 characters `a-z 0-9 -`, a letter first, and none of the names that the fleet uses itself. A
+name outside the rule sends no command, because the hub lets nobody rename the manager afterwards. Capital letters,
+and spaces around the name, do not count, as on the app's page: "Juno" names the manager `juno`. Left out, the
+manager is named `manager`. The name counts at a hub's first install: a hub that is there keeps the name that its
+manager has, and when that hub's own copy of Founderizer is older than the option, the install stops and its log
+says so (then `install_hub` again, without `manager_name`). From then on, each tool that takes an agent takes the
+manager by that name.
 
 ## The three things it cannot do without the owner
 
