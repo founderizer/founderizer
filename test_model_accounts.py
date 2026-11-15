@@ -299,7 +299,8 @@ class ModelAccounts(OwnerAPI):
             code, said = self.request("/ui/servers/app-3/agents", dict(
                 request_id=str(uuid.uuid4()), db="test-generation", base_sha256=self.sha(), agent="beside",
                 runtime="claude", role="worker", reports_to=None))
-        self.assertEqual((code, said["error"]), (400, hub.ACCOUNT_WORDS["open"].format(server="app-3")))
+        self.assertEqual((code, said["error"], said.get("code")), (400, hub.ACCOUNT_WORDS["open"].format(
+            server="app-3"), "open"))       # with B2 its code too (open_server_refusal)
         self.assertNotIn("beside", self.stored()["agents"])
         self.assertEqual(hub.q("SELECT * FROM server_jobs"), [])
         with patch.object(hub, "not_shareable", lambda team, here: []):     # a server with a key: taken
@@ -406,7 +407,8 @@ class ModelAccounts(OwnerAPI):
             "kind_kept": "This account runs on a key or a model server, and this change would drop that. To remove the "
                          "account, delete it.",
             "in_use": "Agents use this account, so its AI and its key stay as they are. For a new key, save it in "
-                      "Settings \u203a Secrets under the same name."})
+                      "Settings \u203a Secrets under the same name.",
+            "placement": "Founderizer no longer has this key or address. Start again from Add agent."})
         self.assertEqual(W["open"].format(server="app-1"), "app-1 has an agent on a model server with no key, so it "
                                                            "takes no other agent. Choose another server.")
         self.assertEqual(W["change"].format(agent="Iris", provider="Gemini"),
@@ -415,7 +417,7 @@ class ModelAccounts(OwnerAPI):
                          "Iris stays on its model server. For another AI, add a new agent.")
         self.assertEqual(W["model_prefix"].format(prefix="openrouter", model="qwen/qwen3.8-max"),
                          "Write the model as openrouter/ and then its name, for example openrouter/qwen/qwen3.8-max.")
-        self.assertEqual(set(hub.APPROVED_WORDS.values()), {1, 2, 3, 4, 5, 10, 11, 12})
+        self.assertEqual(set(hub.APPROVED_WORDS.values()), {1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12})     # 6-8: B2's
         for code_, aid in (("aid", "{aid}"),):         # no approved sentence names an account's id
             self.assertFalse([k for k in hub.APPROVED_WORDS if aid in W[k]])
         # Each refusal of the owner's route gives its words, its code and its names.
@@ -1062,6 +1064,161 @@ class ModelAccounts(OwnerAPI):
     def test_an_agent_with_an_account_kind_cannot_chat(self):
         for agent in ("gem-1", "own-1"):
             self.assertEqual(hub.conversation_refusal(agent), f"{hub.agent_display(agent)} cannot chat now.")
+
+
+    # ---- B2: the route that adds an agent with an account (spec 5.2 items 3 and 4; held until the lane "One OS user
+    # per agent" is on main, plan section 2.5)
+    def add(self, server, **fields):
+        return self.request(f"/ui/servers/{server}/agents", dict(dict(
+            request_id=str(uuid.uuid4()), db="test-generation", base_sha256=self.sha(), agent="gem-3", role="worker",
+            reports_to=None), **fields))
+
+    def jobs(self, server):
+        with patch.object(hub.Handler, "server_caller", lambda handler, name: name):
+            code, said = self.request(f"/server/{server}/jobs")
+        self.assertEqual(code, 200, said)
+        return said["jobs"]
+
+    def test_an_agent_on_an_account_is_added_with_its_program_and_installs_with_no_sign_in(self):
+        self.service("app-6")
+        code, receipt = self.add("app-6", account="gemini")
+        self.assertEqual(code, 200, receipt)
+        self.assertEqual(receipt["runtime"], "opencode")
+        entry = self.stored()["agents"]["gem-3"]
+        self.assertEqual((entry["account"], entry["runtime"], entry["machine"], entry["active"], entry["vault"]),
+                         ("gemini", "opencode", "app-6", False, "none"))
+        self.assertTrue(lifecycle.start_form("opencode", entry["start"]))
+        (job,) = self.jobs("app-6")
+        self.assertEqual((job["kind"], job["agent"], job["runtime"], job["sign_in"], job["provider_label"]),
+                         ("install", "gem-3", "opencode", "none", "Gemini"))
+        # The runtime may be given when it is the account's program; another is refused before anything is read.
+        code, said = self.add("app-6", agent="gem-4", account="gemini", runtime="claude")
+        self.assertEqual((code, said["error"]), (400, hub.ACCOUNT_WORDS["account_runtime"].format(
+            aid="gemini", label="OpenCode")))
+        team = self.stored()
+        del team["agents"]["dev-lead"]          # app-4 is free now
+        hub.commit_kit_file("team.json", (json.dumps(team, indent=2) + "\n").encode(), "Owner removed dev-lead")
+        hub.apply_team(team)
+        self.service("app-4")
+        code, receipt = self.add("app-4", agent="gem-4", account="gemini", runtime="opencode")
+        self.assertEqual((code, receipt.get("runtime")), (200, "opencode"), receipt)
+        # A plan's job is as before: no sign_in field on a Linux server.
+        hub.q("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated) VALUES(?,?,?,?,?,?,?)",
+              ("app-5", "install", "seller-9", "claude", "queued", hub.now(), hub.now()))
+        self.assertNotIn("sign_in", self.jobs("app-5")[0])
+
+    def test_an_install_job_names_the_provider_that_the_owner_picked(self):
+        """The wave 1 review, R2: the job of an agent on an account with a kind carries `provider_label`, a key's
+        provider's label or "Model server", which the server's service writes into its lines in the place of the
+        program's name (server.provider_label). A plan's job has none."""
+        import server
+        self.assertEqual(hub.MODEL_SERVER_LABEL, server.MODEL_SERVER_LABEL)
+        hub.q("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated) VALUES(?,?,?,?,?,?,?)",
+              ("app-5", "install", "seller-1", "opencode", "queued", hub.now(), hub.now()))
+        hub.q("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated) VALUES(?,?,?,?,?,?,?)",
+              ("app-3", "install", "own-1", "opencode", "queued", hub.now(), hub.now()))
+        hub.q("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated) VALUES(?,?,?,?,?,?,?)",
+              ("app-4", "install", "dev-lead", "claude", "queued", hub.now(), hub.now()))
+        (seller,), (own,), (plan,) = self.jobs("app-5"), self.jobs("app-3"), self.jobs("app-4")
+        self.assertEqual((seller["provider_label"], own["provider_label"]), ("OpenRouter", "Model server"))
+        self.assertNotIn("provider_label", plan)
+        for job in (seller, own):           # the label that the server's service takes for this job's runtime
+            self.assertEqual(server.provider_label(job, job["runtime"]), job["provider_label"])
+
+    def test_a_mac_an_older_server_and_an_account_with_no_kind_are_refused(self):
+        """In the owner's words of round 2 (sentences 6, 7, 8), with their code and names (D7)."""
+        self.service("mac-1", os_name="macOS 15.6")
+        code, said = self.add("mac-1", account="gemini")
+        self.assertEqual((code, said["error"], said["code"], said["names"]), (
+            409, "mac-1 is a Mac. An agent on Gemini needs a Linux server: choose another one.", "mac",
+            {"server": "mac-1", "provider": "Gemini"}))
+        self.service("app-6", features=("install_key",))
+        code, said = self.add("app-6", account="gemini")
+        self.assertEqual((code, said["error"], said["code"], said["names"]), (
+            409, "app-6 runs an older Founderizer that cannot do this yet. It updates itself when it has no job; then "
+                 "try again.", "older", {"server": "app-6"}))
+        self.service("app-6")
+        for account in ("codex-main", "nobody"):
+            code, said = self.add("app-6", account=account)
+            self.assertEqual((code, said["error"], said["code"]), (
+                409, "Founderizer no longer has this key or address. Start again from Add agent.", "placement"))
+        # Grok with no account stays refused: Grok Build by a plan's sign-in is step 4.
+        code, said = self.add("app-6", runtime="grok")
+        self.assertEqual((code, said["error"]), (400, "runtime must be codex or claude"))
+        self.assertNotIn("gem-3", self.stored()["agents"])
+        self.assertEqual(hub.q("SELECT * FROM server_jobs"), [])
+
+    def test_an_agent_on_an_account_moves_only_to_a_linux_server_that_can_install_it(self):
+        def move(agent, server):
+            return self.request(f"/ui/team/agents/{agent}/move", dict(request_id=str(uuid.uuid4()),
+                                                                       db="test-generation", base_sha256=self.sha(),
+                                                                       server=server))
+        self.service("app-1")
+        self.service("mac-1", os_name="macOS 15.6")
+        code, said = move("gem-1", "mac-1")
+        self.assertEqual((code, said["error"], said["code"]), (
+            409, hub.ACCOUNT_WORDS["mac"].format(server="mac-1", provider="Gemini"), "mac"))
+        self.service("app-6", features=("install_key",))
+        code, said = move("gem-1", "app-6")
+        self.assertEqual((code, said["error"], said["code"]), (
+            409, hub.ACCOUNT_WORDS["older"].format(server="app-6"), "older"))
+        self.service("app-6")
+        code, said = move("gem-1", "app-6")
+        self.assertEqual(code, 200, said)
+        self.assertEqual(self.stored()["agents"]["gem-1"]["machine"], "app-6")
+        self.assertEqual([j["sign_in"] for j in self.jobs("app-6")], ["none"])
+        # D21 and D25: the move asks for the agent's check when its key is in the vault of its new server, and that
+        # check then waits for the helper's settings
+        self.assertEqual(hub.q("SELECT * FROM machine_checks WHERE agent='gem-1'"), [])
+        did = hub.ins("INSERT INTO deposits(login,machine,agent,recipient,sha256,ciphertext,request_id,created) "
+                      "VALUES(?,?,?,?,?,?,?,?)", (GEMINI_KEY, "app-6", "gem-1", "age1" + "q" * 58, "0" * 64, "x",
+                                                  "r-1", hub.now()))
+        hub.finish_deposit(hub.q1("SELECT * FROM deposits WHERE id=?", (did,)), True, "Saved.")
+        (due,) = hub.q("SELECT * FROM machine_checks WHERE agent='gem-1'")
+        self.assertEqual((due["state"], hub.check_view(due)["waits_for"]), ("requested", "settings"))
+        # A key that the new server's vault holds already: the check is asked at the move.
+        self.service("app-2")
+        hub.q("DELETE FROM server_jobs")
+        team = self.stored()
+        del team["agents"]["gem-2"]             # app-2 is free now, and its vault keeps the Gemini key
+        hub.commit_kit_file("team.json", (json.dumps(team, indent=2) + "\n").encode(), "Owner removed gem-2")
+        hub.apply_team(team)
+        hub.ins("INSERT INTO deposits(login,machine,agent,recipient,sha256,request_id,created,finished,ok) "
+                "VALUES(?,?,?,?,?,?,?,?,1)", (GEMINI_KEY, "app-2", "gem-2", "age1" + "q" * 58, "0" * 64, "r-2",
+                                              hub.now(), hub.now()))
+        code, said = move("gem-1", "app-2")
+        self.assertEqual(code, 200, said)
+        self.assertEqual([r["state"] for r in hub.q("SELECT state FROM machine_checks WHERE agent='gem-1' ORDER BY id")],
+                         ["failed", "requested"])        # the first one replaced, the new one waits for the settings
+
+    def test_an_agent_on_an_account_activates_only_with_its_key_and_is_renamed_and_removed_as_each_agent(self):
+        self.service("app-6")
+        self.assertEqual(self.add("app-6", account="gemini")[0], 200)
+        hub.q("UPDATE server_jobs SET state='done'")
+        # No read grant of the account's key: the helper's check says so, and the agent does not activate.
+        merged = hub.verify_merge("gem-3", [{"kind": "account", "ref": "gemini", "state": "failed",
+                                             "detail": lifecycle.NO_KEY}], {})
+        (item,) = [i for i in merged if i["kind"] == "account"]
+        self.assertEqual(item["detail"], lifecycle.NO_KEY)
+        self.assertTrue(hub.item_required("gem-3", item))
+        # Rename and remove, as for each agent with a read grant: the account and the grant go with the name.
+        self.service("app-1")
+        code, said = self.request("/ui/team/agents/gem-1/rename", dict(request_id=str(uuid.uuid4()),
+                                                                        db="test-generation", base_sha256=self.sha(),
+                                                                        name="gem-9"))
+        self.assertEqual(code, 200, said)
+        entry = self.stored()["agents"]["gem-9"]
+        self.assertEqual((entry["account"], entry["secrets"], entry["runtime"]),
+                         ("gemini", {GEMINI_KEY: "read"}, "opencode"))
+        self.assertEqual([(j["kind"], j["sign_in"]) for j in self.jobs("app-1")], [("rename", "none")])
+        self.assertEqual(hub.model_group("gem-9"), "account:gemini")
+        self.service("app-2")
+        code, said = self.request("/ui/team/agents/gem-2/remove", dict(request_id=str(uuid.uuid4()),
+                                                                        db="test-generation", base_sha256=self.sha()))
+        self.assertEqual(code, 200, said)
+        self.assertNotIn("gem-2", self.stored()["agents"])
+        self.assertEqual([j["kind"] for j in self.jobs("app-2")], ["remove"])
+        self.assertNotIn("sign_in", self.jobs("app-2")[0])
 
 
 class CheckReport(unittest.TestCase):

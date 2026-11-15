@@ -620,14 +620,28 @@ class Helper(unittest.TestCase):
     def test_every_session_start_of_the_helper_passes_the_settings_that_it_starts_with(self):
         """A conversation with tools started with the agent's raw settings, so a Codex agent's ran on its machine's
         config model, and the reuse rule then started it again before each message (adversarial review, 28 October
-        2026). Every builder call of the helper passes run_conf()."""
+        2026). Every builder call of the helper passes run_conf(), or a name that the same block binds to it and
+        writes no more before the call: a task's start reads the settings once for its own test and for its session
+        (fleet.start_refusal, decision D24)."""
         source = Path(fleet.__file__).read_text(encoding="utf-8")
         helper = source[source.index("\nclass Helper:"):]
         helper = helper[:re.search(r"\n(?=[^\s#])", helper[1:]).start() + 1]
         for builder in ("session_command", "chat_command", "conversation_command", "conversation_work_command",
                         "manager_start"):
             with self.subTest(builder):
-                given = re.findall(rf"\b{builder}\(\s*self\.agent,\s*([^,]+),", helper)
+                given = []
+                for call in re.finditer(rf"\b{builder}\(\s*self\.agent,\s*([^,]+),", helper):
+                    value = call.group(1).strip()
+                    if re.fullmatch(r"[A-Za-z_]\w*", value):
+                        bound = list(re.finditer(rf"\n( *){value} = ([^\n]+)\n", helper[:call.start()]))
+                        self.assertTrue(bound, f"{value} is bound nowhere before {builder}")
+                        indent, between = bound[-1].group(1), helper[bound[-1].end() - 1:call.start()]
+                        self.assertIsNone(re.search(rf"\n {{0,{len(indent) - 1}}}[^\s#]", between),
+                                          f"{value} is bound in another block than {builder}'s call")
+                        self.assertIsNone(re.search(rf"\b{value}(\[[^\]]*\]\s*=|\.(update|pop|setdefault|clear)\(|\s*\|?=[^=])",
+                                                    between), f"{value} changes before {builder}'s call")
+                        value = bound[-1].group(2).strip()
+                    given.append(value)
                 self.assertTrue(given)
                 # an app-server task's runner reads the account's list itself, fresh, at its start
                 # (its own model and effort, else the owner's default where the helper's reading offers it)

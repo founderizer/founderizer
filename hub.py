@@ -11454,6 +11454,8 @@ def finish_deposit(row, ok, text, t0=None):
     because the owner watches it in the app and the manager only needs to know when an agent there can use it."""
     t0 = t0 or now()
     q("UPDATE deposits SET ok=?, result=?, finished=?, ciphertext=NULL WHERE id=?", (1 if ok else 0, text, t0, row["id"]))
+    if ok:
+        account_key_delivered(row["machine"], row["login"])     # the AI providers build, D25 (lane B2)
     entry = logins().get(row["login"]) or {}
     name = f"The API key {entry['env']}" if entry.get("env") else f"The login {entry.get('title') or row['login']}"
     holders = sorted(a for a, x in agents().items() if x.get("machine") == row["machine"]
@@ -36995,7 +36997,7 @@ def start_server_login(server, agent, runtime):
     return start_machine_login(agent, runtime)
 
 
-def server_agent_entry(team, agent, server, runtime, role, parent):
+def server_agent_entry(team, agent, server, runtime, role, parent, account=None):
     """The team.json entry of a new agent on a server. How its runtime starts comes from a worker or lead that runs that
     runtime or keeps a policy for it ("start" and "allow"), from a server of the same kind first; never another agent's
     identity, placement or grants, and never the app-server policy. The first worker of a fleet has none to copy from,
@@ -37029,6 +37031,8 @@ def server_agent_entry(team, agent, server, runtime, role, parent):
     with_desktop(entry, team)
     if parent:
         entry["reports_to"] = parent
+    if account is not None:     # the AI providers build: the account whose program `runtime` is (add_server_agent)
+        entry["account"] = account
     return entry
 
 
@@ -37038,6 +37042,7 @@ def add_server_agent(server, body):
     install it under its own OS user (a Mac's agents share one), which also gives it its agent key. The same command for
     the agent on this server whose last install or rename failed gives that job again, and changes nothing else."""
     agent, runtime, role, parent, t0 = body["agent"], body["runtime"], body["role"], body["reports_to"], now()
+    account = body.get("account")       # the AI providers build: an account with a key or a model server's address
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     if body["base_sha256"] != current:
@@ -37086,11 +37091,15 @@ def add_server_agent(server, body):
         if not_shareable(team, here):       # its helper or its vault would stop answering beside a second agent
             raise Refusal(409, f"{', '.join(shown_role(n) for n in not_shareable(team, here))} on {server} cannot share "
                                f"it yet: an agent beside another needs its own agent key and a vault that serves both.")
+        if account is not None and account_placement_refusal(team, account, server):    # the AI providers build
+            raise account_placement_refusal(team, account, server)
+        if open_server_refusal(team, server):       # the owner's sentence 3, with its code (D7)
+            raise open_server_refusal(team, server)
         boss = team["agents"].get(parent) if parent else None
         if parent and (boss is None or boss.get("role") not in ("manager", "lead")):
             raise Refusal(400, "reports_to must be the manager or a lead")
         team["agents"][agent] = server_agent_entry(team, agent, server, runtime, role,
-                                                   parent if boss and boss.get("role") == "lead" else None)
+                                                   parent if boss and boss.get("role") == "lead" else None, account)
         try:
             validate_team(team)
         except ValueError as e:
@@ -37476,6 +37485,8 @@ def move_agent(agent, body):
         raise Refusal(404, "no such server")
     if not q1("SELECT 1 FROM server_keys WHERE server=?", (server,)):
         raise Refusal(409, f"{server} has no server service: it did not join with a join code")
+    if lifecycle.model_account(team, a) and account_placement_refusal(team, a["account"], server):   # AI providers
+        raise account_placement_refusal(team, a["account"], server)
     expire_server_jobs(t0)
     last = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (server,))
     if last and last["state"] in JOB_OPEN:
@@ -37558,6 +37569,7 @@ def move_agent(agent, body):
                 if old != server else f"asked server {server} again to install {agent}: job {job}")
     if old != server:
         apply_team(team)
+        move_account_check(agent, server)   # the AI providers build, D21 and D25: its account's check ran there
     return {"agent": agent, "server": server, "was": old, "runtime": a["runtime"], "job": job, "revision": commit,
             "sha256": digest}
 
@@ -38256,10 +38268,16 @@ ACCOUNT_WORDS = {
     "in_use": "Agents use this account, so its AI and its key stay as they are. For a new key, save it in Settings "
               "\u203a Secrets under the same name.",
     "model_prefix": "Write the model as {prefix}/ and then its name, for example {prefix}/{model}.",
+    # lane B2: the route that adds an agent with an account (sentences 6, 7 and 8 are the owner's)
+    "placement": "Founderizer no longer has this key or address. Start again from Add agent.",
+    "mac": "{server} is a Mac. An agent on {provider} needs a Linux server: choose another one.",
+    "older": "{server} runs an older Founderizer that cannot do this yet. It updates itself when it has no job; then "
+             "try again.",
+    "account_runtime": "An agent of the account {aid} runs {label}.",
 }
 # The owner's approved words of ACCOUNT_WORDS, with their numbers in his round 2 (sentence 5 has two forms).
 APPROVED_WORDS = {"plain_http": 1, "address": 2, "open": 3, "pooled": 4, "change": 5, "change_server": 5,
-                  "kind_kept": 10, "in_use": 11, "model_prefix": 12}
+                  "placement": 6, "mac": 7, "older": 8, "kind_kept": 10, "in_use": 11, "model_prefix": 12}
 
 
 class AccountRuleError(ValueError):
@@ -38531,6 +38549,58 @@ def pool_statement_refusal(data):
     login = said.get("login") if isinstance(said, dict) and said.get("kind") == "pool" else None
     return account_refusal(409, "pool_statement") if isinstance(login, str) and \
         login.lower() in account_secrets(team_read()) else None
+
+
+SERVER_MODEL_ACCOUNTS = "model_accounts"    # a server service that installs an agent of such an account (server.py)
+
+
+def account_placement_refusal(team, account, server):
+    """The Refusal of an agent of this account on this server, or None (spec 5.2 item 3; lane B2), in the owner's
+    words (round 2, sentences 6, 7 and 8) with their code and names (D7): an account with no kind or of a provider
+    that this release does not know, a Mac (version 1 is for Linux servers), and a server whose service cannot
+    install such an agent with no sign-in (its reading lacks model_accounts). add_server_agent and move_agent ask it,
+    for the owner's route and for the manager's tool alike."""
+    acc = lifecycle.model_account(team, {"account": account})
+    if acc is None or acc["runtime"] is None:
+        return account_refusal(409, "placement")
+    if server_kind_of(team, server) != "linux":
+        return account_refusal(409, "mac", server=server, provider=account_label(acc) or runtime_label(acc["runtime"]))
+    if SERVER_MODEL_ACCOUNTS not in server_features(server):
+        return account_refusal(409, "older", server=server)
+    return None
+
+
+def open_server_refusal(team, server):
+    """The Refusal of a new agent on this server while an agent there is on a model server with no key (the owner's
+    sentence 3, with its code), or None. validate_team refuses the same team (account_rule); this says it first, so
+    that the answer of Add agent has its code and names (D7)."""
+    for a in (team.get("agents") or {}).values():
+        acc = lifecycle.model_account(team, a) if a.get("machine") == server else None
+        if acc and acc["kind"] == "server" and not acc["secret"]:
+            return account_refusal(400, "open", server=server)
+    return None
+
+
+def move_account_check(agent, server):
+    """The coordinator's decisions D21 and D25 (the fifth review, X3): after a move, the agent's check waits for the
+    event that makes it possible: its vault on the new server has its account's key. That event is the key's delivery
+    there (finish_deposit, account_key_delivered). An account with no key, and a key that the new server's vault holds
+    already, ask for the check at once, which then waits for the helper's settings (account_check_due)."""
+    held = lifecycle.model_account(team_read(), agents().get(agent))
+    if not held:
+        return
+    done = latest_deposits(held["secret"]).get(server) if held["secret"] else None
+    if not held["secret"] or done is not None and deposit_view(done)["state"] == "delivered":
+        account_check_due(agent)
+
+
+def account_key_delivered(machine, ref):
+    """D25: a key that reached a machine's vault asks for a check of each agent there whose model account it is the
+    key of: after a move, a new grant or the replace of its value, its check can prove it now."""
+    for name, a in sorted(agents().items()):
+        held = lifecycle.model_account(team_read(), a) if a.get("machine") == machine else None
+        if held and held["secret"] == ref:
+            account_check_due(name)
 
 
 def account_change_refusal(team, agent, old, new):
@@ -46121,14 +46191,26 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("base_sha256 must be the SHA-256 of team.json")
             if not (isinstance(agent, str) and AGENT_NAME.match(agent)) or agent in RESERVED_AGENT_NAMES:
                 raise ValueError("agent must be 2 to 31 characters a-z 0-9 -, starting with a letter, and not owner")
-            if runtime not in SWITCH_RUNTIMES:
+            # the AI providers build: an account with a key or a model server's address, whose program the agent runs
+            account = data.get("account")
+            if account is not None and not (isinstance(account, str) and ENTRY_ID.fullmatch(account)):
+                raise ValueError("account must be the ID of an account")
+            held = lifecycle.model_account(team_read(), {"account": account}) if account is not None else None
+            if account is not None:
+                # an account that Founderizer no longer has: add_server_agent says it, with its code (D7), as a
+                # refusal of the route's read part gives its words alone
+                if held and held["runtime"] and runtime not in (None, held["runtime"]):
+                    raise ValueError(ACCOUNT_WORDS["account_runtime"].format(
+                        aid=account, label=runtime_label(held["runtime"])))
+                runtime = held["runtime"] if held else None
+            elif runtime not in SWITCH_RUNTIMES:
                 raise ValueError("runtime must be codex or claude")
             if role not in ("worker", "lead"):
                 raise ValueError("role must be worker or lead")
             if parent is not None and not (isinstance(parent, str) and AGENT_NAME.match(parent)):
                 raise ValueError("reports_to must be the manager, a lead or null")
-            return {"server": server, "base_sha256": base, "agent": agent, "runtime": runtime, "role": role,
-                    "reports_to": parent}
+            return dict({"server": server, "base_sha256": base, "agent": agent, "runtime": runtime, "role": role,
+                         "reports_to": parent}, **({"account": account} if account is not None else {}))
         return self.ui_command(f"servers/{server}/agents", read, lambda body: add_server_agent(server, body))
 
     def ui_server_prepare(self, server):
@@ -46313,8 +46395,14 @@ class Handler(BaseHTTPRequestHandler):
             # A remove job names the user itself: the agent is no longer in team.json (agent_remove)
             user = r["user"] if r["kind"] == "remove" else (agents().get(r["agent"]) or {}).get("user")
             here = q1("SELECT 1 FROM mac_setups WHERE server=? AND agent=? AND state='waiting'", (name, r["agent"]))
+            # the AI providers build: an agent on a key or a model server signs in nowhere. The job's field decides,
+            # not the table: a Grok agent with a key installs with no sign-in also when Grok has one (step 4). Its
+            # lines name the provider that the owner picked, never the program (the wave 1 review, R2): the server's
+            # service takes `provider_label` (server.provider_label).
+            none = lifecycle.model_account(team_read(), agents().get(r["agent"]))
             jobs.append(dict(job, **({"was": r["was"]} if r["was"] else {}), **({"user": user} if user else {}),
-                             **({"sign_in": "at_the_mac"} if here else {})))
+                             **({"sign_in": "none"} if none else {"sign_in": "at_the_mac"} if here else {}),
+                             **({"provider_label": account_label(none)} if none and account_label(none) else {})))
         return self.json(200, {"jobs": jobs})
 
     def server_signin(self, name):
