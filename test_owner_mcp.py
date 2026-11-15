@@ -1192,6 +1192,61 @@ class Install(unittest.TestCase):
         self.assertIsNone(read["stopped"])
         self.assertIn("claim_hub", read["next"])
 
+    def test_a_hub_that_has_its_owner_makes_no_code_and_the_log_read_says_so(self):
+        """**A user's report of 15 November 2026**: an install that runs again on a hub that has its owner waits for a
+        claim code that the hub no longer makes. `hubsetup.py` says "this hub belongs to the Mac at <owner> already,
+        so no code was made and nothing changed." and prints no FLEET_CLAIM= line. Until that day install_log
+        answered "Read the log again in 20 seconds" for ever. Now it gives the owner's address as `owned_already`,
+        tells the agent to call no claim_hub and to read fleet_overview, and says what a refusal there means. The
+        same holds when the install ended and the sentence is above the lines that were read."""
+        said = "Founderizer: this hub belongs to the Mac at 100.64.0.7 already, so no code was made and nothing changed.\n"
+        table = dict(self.MACHINE, **{"tail -n": "Founderizer step 7 of 15: the owner claim\n" + said})
+        (self.calls / "table.json").write_text(json.dumps(table))
+        client = self.client()
+        read = client.call("install_log", host="203.0.113.9", ssh_user="root")
+        self.assertEqual(read["owned_already"], "100.64.0.7")
+        self.assertIsNone(read["claim_code"])
+        self.assertIsNone(read["stopped"])
+        for part in ("has its owner already, the computer at 100.64.0.7", "Do not call claim_hub",
+                     "read the log until it says READY, and then call use_hub with the hub's address",
+                     "use_hub reads exactly that hub from this Mac", "refuses this Mac there (403)",
+                     "another computer owns the hub, or this Mac's key for it is gone", "do not start the install again",
+                     "No answer at all is no refusal"):
+            self.assertIn(part, read["next"])
+        self.assertNotIn("Read the log again in 20 seconds", read["next"])
+        # fleet_overview reads the hub that this server knows already, which can be another one: it proves nothing here.
+        self.assertNotIn("fleet_overview", read["next"])
+        # Only an address of four numbers goes into the tool's own words; another text there stays in the log.
+        odd = dict(self.MACHINE, **{"tail -n": said.replace("100.64.0.7", "$(reboot);x")})
+        (self.calls / "table.json").write_text(json.dumps(odd))
+        read = client.call("install_log", host="203.0.113.9", ssh_user="root")
+        self.assertIs(read["owned_already"], True)
+        self.assertNotIn("reboot", read["next"])
+        self.assertIn("This hub has its owner already, so this install made no claim code", read["next"])
+        # The install ended, and the sentence is above these lines: still no wait for a code.
+        (self.calls / "table.json").write_text(json.dumps(dict(self.MACHINE, **{"tail -n": "READY\n"})))
+        read = client.call("install_log", host="203.0.113.9", ssh_user="root")
+        self.assertIsNone(read["owned_already"])
+        self.assertTrue(read["ready"])
+        self.assertIn("The install ended, and these lines of its log hold no claim code", read["next"])
+        self.assertIn("Do not call claim_hub. Now call use_hub", read["next"])
+        self.assertNotIn("read the log until it says READY", read["next"])
+        # A code in the log comes first, as before, and a log with neither waits, as before.
+        code = "Founderizer: the owner claim is open on http://100.64.0.1:8765 for 30 minutes.\n" \
+               "    FLEET_CLAIM=ABCD-EFGH-JKLM sh -c \"$(curl -fsS http://100.64.0.1:8765/claim)\"\n"
+        (self.calls / "table.json").write_text(json.dumps(dict(self.MACHINE, **{"tail -n": code})))
+        self.assertIn("claim_hub with hub_address", client.call("install_log", host="203.0.113.9", ssh_user="root")["next"])
+        (self.calls / "table.json").write_text(json.dumps(dict(self.MACHINE, **{"tail -n": "Founderizer step 3 of 15\n"})))
+        self.assertIn("Read the log again in 20 seconds",
+                      client.call("install_log", host="203.0.113.9", ssh_user="root")["next"])
+        # The sentence is the installer's own: a change of its words there fails here.
+        self.assertIn('say(f"this hub belongs to the Mac at {already} already, so no code was made and nothing changed.")',
+                      (HERE / "hubsetup.py").read_text())
+        self.assertTrue(owner_mcp.OWNED_ALREADY.search(said))
+        self.assertIn("call no claim_hub", client.call(
+            "install_hub", host="203.0.113.9", ssh_user="root", source="https://example.invalid/f.git",
+            authkey_file=str(self.key), servers=2)["next"])
+
     def test_an_install_that_stopped_is_given_to_the_owner_and_nothing_is_tried_round_it(self):
         self.MACHINE["tail -n"] = "Founderizer install stopped: port 8765 is in use by another program.\n"
         (self.calls / "table.json").write_text(json.dumps(self.MACHINE))

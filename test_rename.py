@@ -279,9 +279,9 @@ class Rename(Servers):
 
     def test_on_a_mac_the_agent_keeps_the_one_user_of_its_server(self):
         self.joined()                                                       # mini, a Mac
-        self.assertEqual(self.add_agent(agent="pilot")[0], 200)
+        self.assertEqual(self.add_agent(agent="piper")[0], 200)
         self.job("mini", self.servers()[1]["mini"]["job"]["id"], "done", "sign_in", source=NEW)
-        status, receipt = self.rename("pilot", "ace")
+        status, receipt = self.rename("piper", "ace")
         self.assertEqual(status, 200, receipt)
         self.assertNotIn("user", self.origin_team()["agents"]["ace"])
         self.assertNotIn("user", self.service("/server/mini/jobs", source=NEW)[1]["jobs"][0])
@@ -331,30 +331,30 @@ class Rename(Servers):
 
     def test_an_install_that_stopped_comes_first(self):
         self.joined()
-        self.assertEqual(self.add_agent(agent="pilot")[0], 200)
+        self.assertEqual(self.add_agent(agent="piper")[0], 200)
         self.job("mini", self.servers()[1]["mini"]["job"]["id"], "failed", "sign_in", source=NEW)
-        code, answer = self.rename("pilot", "ace")
+        code, answer = self.rename("piper", "ace")
         self.assertEqual(code, 409, answer)
-        self.assertIn("The install of pilot stopped. Try it again before you rename it.", answer["error"])
+        self.assertIn("The install of piper stopped. Try it again before you rename it.", answer["error"])
 
     def test_an_install_that_stopped_at_its_sign_in_is_done_once_a_later_sign_in_ended_done(self):
         """Two DevOps agents, 3 November 2026: each install stopped at its sign-in, the owner signed the
         agent in from the app afterwards, and it ran; only the stopped install refused its rename."""
         self.joined()
-        self.assertEqual(self.add_agent(agent="pilot")[0], 200)
+        self.assertEqual(self.add_agent(agent="piper")[0], 200)
         job = self.servers()[1]["mini"]["job"]
         self.job("mini", job["id"], "failed", "sign_in", "Claude Code did not sign in within 15 minutes.", source=NEW)
         stopped = hub.q1("SELECT updated FROM server_jobs WHERE id=?", (job["id"],))["updated"]
-        signed = "INSERT INTO signin_jobs(agent,runtime,state,created,updated) VALUES('pilot',?,'done',?,?)"
+        signed = "INSERT INTO signin_jobs(agent,runtime,state,created,updated) VALUES('piper',?,'done',?,?)"
         hub.ins(signed, (job["runtime"], stopped - 9, stopped - 1))         # before it stopped: it says nothing
-        self.assertEqual(self.rename("pilot", "ace")[0], 409)
+        self.assertEqual(self.rename("piper", "ace")[0], 409)
         hub.ins(signed, ("codex", stopped + 5, stopped + 9))                # another runtime says nothing either
-        self.assertEqual(self.rename("pilot", "ace")[0], 409)
+        self.assertEqual(self.rename("piper", "ace")[0], 409)
         hub.ins(signed, (job["runtime"], stopped + 60, stopped + 90))
         hub.q("UPDATE server_jobs SET step='service' WHERE id=?", (job["id"],))
-        self.assertEqual(self.rename("pilot", "ace")[0], 409)               # one that stopped earlier is not done
+        self.assertEqual(self.rename("piper", "ace")[0], 409)               # one that stopped earlier is not done
         hub.q("UPDATE server_jobs SET step='sign_in' WHERE id=?", (job["id"],))
-        status, receipt = self.rename("pilot", "ace")
+        status, receipt = self.rename("piper", "ace")
         self.assertEqual(status, 200, receipt)
         self.assertEqual(self.servers()[1]["mini"]["job"]["kind"], "rename")
 

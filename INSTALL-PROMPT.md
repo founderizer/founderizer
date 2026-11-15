@@ -235,6 +235,12 @@ Then read the log every 20 seconds, until it holds the line that starts with `FL
 
     ssh "$SSHUSER@$HOST" 'tail -n 40 /root/fleet-install.log'
 
+If the log says `this hub belongs to the Mac at <address> already, so no code was made`, the hub has its owner,
+and this run makes no code: do not wait for one, and skip A6. `tailscale ip -4` on this machine gives its own
+address. When the log's address is that one, this machine owns the hub already: go on with A7, where the install
+ends by itself. When it is another computer's, this machine cannot take the hub: tell the owner, stop here, and
+do not start the install again.
+
 If the log says `Founderizer install stopped:`, the install stopped. Read the reason, tell the owner what
 it says, and do what the reason says to do — usually one thing, and then the same line of A5 again.
 Every step of the installer checks first, so running it again changes nothing that is already done.
