@@ -493,7 +493,12 @@ class Runner:
         try:
             try:
                 head, effort = self.start(gone)
-                self.records.add({"type": "session", "runtime": self.runtime, "session_id": str(self.sid)[:80]})
+                # The hub files a session's tokens under the task whose `session` record names the session as the
+                # usage report names it (hub.session_kind, goal_tokens): the Fleet session here, which the usage file
+                # names (Usage), as a Claude Code session's record and transcript do. The program's own id of the
+                # session named neither, so each task session's tokens counted as a standing session's (decision D13).
+                self.records.add({"type": "session", "runtime": self.runtime,
+                                  "session_id": str(self.session or self.sid)[:80]})
                 if self.model or effort or self.current:
                     self.records.add({"type": "model", "requested_model": self.model, "requested_effort": self.effort,
                                       "model": self.current, "effort": effort})
