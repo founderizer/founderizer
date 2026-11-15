@@ -72,6 +72,18 @@ set -eu
 
 HUB_USER=fleet
 HUB_PORT=8765
+# Root's own clone of the code, which the root steps of the owner's app run from (hubsetup.py ROOT_KIT, the same
+# path: test_hub_install holds the two equal).
+ROOT_KIT=/usr/local/lib/founderizer-kit
+# The mark of a hub that this install makes: a file in root's own folder, which only root can write. The step of the
+# hub's user writes it when it makes that user itself, with a new home folder, and the step of the repository takes
+# it away, before this script runs anything as that user. While it is there, this script has run nothing as the
+# hub's user, and that user has no file of its own that could run: its home came from the system's own skeleton.
+# (Its lingering starts that user's systemd manager, which then has only the units that root installed.) A run that
+# stopped before the step of the repository leaves the mark for the next run. That is right while nothing but this
+# script ran as the hub's user between the two runs: an older copy of this script, or a command by hand, is what
+# the mark cannot know.
+NEW_HUB_MARK=/root/.founderizer-new-hub
 PACKAGES="git tmux python3 curl ca-certificates ufw unattended-upgrades sudo"
 # The Founderizer files this installer needs in the copy it runs from. The rules, the manager's parts of them and its
 # profile are in the list because the manager reads them at every start: a hub without them runs but has no manager
@@ -341,7 +353,12 @@ hub_user() {
     if id -u "$HUB_USER" >/dev/null 2>&1; then
         say "  the user $HUB_USER is there"
     else
+        # NEW_HUB_MARK, but not over a home folder that an earlier user of this name left: useradd keeps such a
+        # folder, and its files would be this user's own.
+        left=no
+        [ ! -e "$home" ] || left=yes
         act useradd --create-home --shell /bin/bash --user-group "$HUB_USER"
+        [ "$check" = yes ] || [ "$left" = yes ] || : > "$NEW_HUB_MARK"
     fi
     if [ "$check" = yes ]; then act passwd -l "$HUB_USER"; else passwd -l "$HUB_USER" >/dev/null; fi
     act chmod 700 "/home/$HUB_USER"
@@ -442,11 +459,43 @@ repository() {
 every worker and joined server of this fleet fetches from"
         plan "clone it to $kit, the hub's checkout, on the configuration ref config"
         plan "give both to $HUB_USER"
+        plan "run: python3 $tree/hubsetup.py kit-clone, which keeps root's own clone of the code in $ROOT_KIT; with \
+--first on a hub that this install makes (it made the user $HUB_USER itself, and has run nothing as that user): the \
+clone is then a clone of $tree at its commit, which root alone can write. \
+The steps that your app runs as root on this server run from that clone, and never from a folder that $HUB_USER can \
+change"
         return 0
     fi
+    # A hub that this install makes: the step of the hub's user made that user itself (its mark is there, in a
+    # folder that only root can write), and neither the hub's repository nor its checkout is there yet. This script
+    # has run nothing as the hub's user then, and that user has no file of its own that could run, so "this hub has
+    # taken no release" is root's own knowledge, and not something that the hub's user shows. The two folders alone
+    # do not say it: they are the hub user's, which can move them away.
+    new_hub=no
+    if [ -e "$NEW_HUB_MARK" ] && [ ! -e "$bare" ] && [ ! -e "$kit" ]; then new_hub=yes; fi
     python3 "$tree/hubsetup.py" repository --tree "$tree" --bare "$bare" --kit "$kit" \
         || stop "the hub's own repository could not be made."
     chown -R "$HUB_USER:$HUB_USER" "$bare" "$kit"
+    # Root's own clone of the code (hubsetup.py kit_clone), which each root step of the owner's app runs from. Until
+    # 15 November 2026 nothing made the first clone, and each of those steps stopped on a new hub. On a hub that this
+    # install makes, --first makes the clone from this script's own tree, at its commit. On any other hub the word
+    # is not given: kit-clone takes the hub's signed release, as the app's steps do, and makes no first clone without
+    # one. The hub works without the clone, so a run that cannot make it goes on: the tree is not root's alone (a
+    # copy outside /root), or git failed. Its reason is said without the installer's stop mark, which the owner's
+    # app reads as a stopped install. The mark goes in each case, before this script runs anything as the hub's user.
+    first=""
+    [ "$new_hub" = no ] || first="--first"
+    # shellcheck disable=SC2086
+    if said=$(python3 "$tree/hubsetup.py" kit-clone --hub-user "$HUB_USER" $first </dev/null 2>&1); then
+        printf '%s\n' "$said" | sed 's/^Founderizer: /Founderizer:   /'
+    else
+        # the whole reason, from the stop mark on, as one line; a run that printed no mark gives its last line
+        why=$(printf '%s\n' "$said" | sed -n '/^Founderizer install stopped: /,$p' \
+            | sed 's/^Founderizer install stopped: //' | tr '\n' ' ')
+        [ -n "$why" ] || why=$(printf '%s\n' "$said" | tail -n 1)
+        say "  root's own clone of the code was not made in this run: $why"
+    fi
+    rm -f "$NEW_HUB_MARK"
 }
 
 first_team() {

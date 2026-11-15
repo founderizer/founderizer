@@ -4656,6 +4656,111 @@ class CheckMode(unittest.TestCase):
             self.assertIn(wanted, out, f"the plan does not mention {wanted}")
         self.assertEqual(sorted(p.relative_to(self.tmp).as_posix() for p in self.tmp.rglob("*")), before)
 
+    def test_the_repository_step_makes_roots_own_clone_and_never_stops_the_install_for_it(self):
+        """The root steps of the owner's app run from root's own clone (hubsetup.ROOT_KIT). Until 15 November 2026
+        nothing made the first one, and each of those steps stopped on a new hub. So the installer runs `kit-clone`
+        from its own tree in its step of the repository: under no heading of its own, because the app shows a
+        heading's place in the install, and with its stop words taken out, because the app reads the installer's stop
+        mark as a stopped install and the hub works without the clone."""
+        text = SCRIPT.read_text()
+        self.assertEqual(re.search(r"^ROOT_KIT=(\S+)$", text, re.M).group(1), hubsetup.ROOT_KIT)
+        step = shell_function(SCRIPT, "repository")
+        self.assertEqual(step.count("heading "), 1)
+        self.assertNotIn('"$kit/hubsetup.py" kit-clone', text)          # never from the hub user's checkout
+        out = self.run_check()
+        self.assertIn(f"hubsetup.py kit-clone, which keeps root's own clone of the code in {hubsetup.ROOT_KIT}", out)
+        self.assertEqual(len(re.findall(r"^Founderizer step \d+: ", out, re.M)), len(STEPS))
+
+    def repository_step(self, before="", clone="exit 0", mark=True):
+        """The step `repository` of hub.sh, run for real with stand-ins for python3 and chown: (exit status, what it
+        printed, each call of hubsetup.py, whether the mark of a new hub is there after it). `mark`: the step of the
+        hub's user made that user in this install, and left its mark. `before` makes what else is there before the
+        step; `clone` is what the stand-in of kit-clone does."""
+        home = Path(tempfile.mkdtemp(dir=self.tmp))                     # each run starts with no hub there
+        calls, made = home / "calls.txt", home / "new-hub-mark"
+        if mark:
+            made.write_text("")
+        extra = (f'tree=/root/fleet-kit\nbare="{home}/fleet-pilot.git"\nkit="{home}/fleet-pilot"\n'
+                 f'ROOT_KIT={hubsetup.ROOT_KIT}\nNEW_HUB_MARK="{made}"\n: > "{calls}"\n'
+                 'chown() { :; }\n'
+                 'python3() {\n'
+                 f'    shift; echo "$*" >> "{calls}"\n'
+                 '    case "$1" in\n'
+                 '        repository) mkdir -p "$bare" "$kit" ;;\n'
+                 f'        kit-clone) {clone} ;;\n'
+                 '    esac\n'
+                 '}\n' + before)
+        code, out = run_shell(shell_function(SCRIPT, "repository") + "\nrepository\necho after-the-step\n", extra)
+        return code, out, calls.read_text().splitlines(), made.exists()
+
+    def test_the_installer_gives_its_word_for_the_first_clone_only_for_a_hub_that_it_makes(self):
+        """`kit-clone --first` lets root's clone come from the installer's tree with no signed release. That is safe
+        only while nothing has run as the hub's user, and only root may say so. So the step of the user leaves a mark
+        in root's own folder when it makes that user itself, and the step of the repository gives the word only with
+        that mark and with neither the hub's repository nor its checkout there. It takes the mark away in each case,
+        before the installer starts anything as that user. The two folders alone say nothing: they are the hub
+        user's, which can move them away before a second run of the installer."""
+        text = SCRIPT.read_text()
+        self.assertRegex(text, r"(?m)^NEW_HUB_MARK=/root/\.[a-z-]+$")           # a folder that only root can write
+        self.assertEqual(text.count(': > "$NEW_HUB_MARK"'), 1)
+        self.assertIn('        act useradd --create-home --shell /bin/bash --user-group "$HUB_USER"\n'
+                      '        [ "$check" = yes ] || [ "$left" = yes ] || : > "$NEW_HUB_MARK"\n    fi\n',
+                      shell_function(SCRIPT, "hub_user"))
+        code, out, calls, mark = self.repository_step()
+        self.assertEqual((code, calls[0].split()[0], calls[1], mark),
+                         (0, "repository", "kit-clone --hub-user fleet --first", False), out)
+        for there in ('mkdir -p "$kit"\n', 'mkdir -p "$bare"\n', 'mkdir -p "$bare" "$kit"\n'):
+            code, out, calls, mark = self.repository_step(before=there)
+            self.assertEqual((code, calls[1], mark), (0, "kit-clone --hub-user fleet", False), there)
+        # A hub that is there, whose user moved both folders away: no mark, so no word
+        code, out, calls, mark = self.repository_step(mark=False)
+        self.assertEqual((code, calls[1], mark), (0, "kit-clone --hub-user fleet", False), out)
+
+    def user_step(self, user_there=False, home_left=False, check="no"):
+        """The step `hub_user` of hub.sh, run for real with stand-ins for the system's commands: whether it left the
+        mark of a new hub. The step goes on to wait for the user's services, which this machine does not have, so its
+        own end is not read."""
+        base = Path(tempfile.mkdtemp(dir=self.tmp))
+        mark, made, home = base / "new-hub-mark", base / "user-made", base / "home" / "fleet"
+        if user_there:
+            made.write_text("")
+        if home_left:
+            home.mkdir(parents=True)
+        extra = (f'home="{home}"\nNEW_HUB_MARK="{mark}"\ncheck={check}\n'
+                 'act() { if [ "$check" = yes ]; then :; else "$@"; fi; }\n'
+                 f'id() {{ [ -e "{made}" ] && echo 1002; }}\n'
+                 f'useradd() {{ : > "{made}"; }}\n'
+                 'passwd() { :; }\nchmod() { :; }\ngpasswd() { :; }\nloginctl() { :; }\nsleep() { :; }\n')
+        run_shell(shell_function(SCRIPT, "hub_user") + "\nhub_user\n", extra)
+        return mark.exists()
+
+    def test_the_mark_of_a_new_hub_is_left_only_with_a_user_that_this_install_makes_from_nothing(self):
+        self.assertTrue(self.user_step())
+        self.assertFalse(self.user_step(user_there=True))               # a user from before has run its own code
+        self.assertFalse(self.user_step(home_left=True))                # useradd keeps a home that an old user left
+        self.assertFalse(self.user_step(check="yes"))                   # the plan writes nothing
+
+    def test_a_clone_that_cannot_be_made_stops_no_install_and_prints_no_stop_mark(self):
+        said = "echo 'Founderizer: root's own clone is at the installer's revision (0123456789ab)'"
+        code, out, _, _ = self.repository_step(clone=said.replace("'s", "s"))
+        self.assertEqual(code, 0, out)
+        self.assertIn("Founderizer:   roots own clone is at the installers revision (0123456789ab)", out)
+        self.assertIn("after-the-step", out)
+        stopped = ("echo 'Founderizer: a line of progress'; echo 'Founderizer install stopped: the clone could not "
+                   "be made: fatal: the first line of git' >&2; echo 'and its second line' >&2; return 1")
+        code, out, calls, mark = self.repository_step(clone=stopped)
+        self.assertEqual((code, calls[1], mark), (0, "kit-clone --hub-user fleet --first", False), out)
+        self.assertIn("Founderizer:   root's own clone of the code was not made in this run: the clone could not be "
+                      "made: fatal: the first line of git and its second line", out)
+        self.assertNotIn("install stopped", out)
+        self.assertNotIn("a line of progress", out)
+        self.assertIn("after-the-step", out)                            # the install goes on
+        # A run that broke with no stop mark gives its last line
+        code, out, _, _ = self.repository_step(clone="echo Traceback; echo 'KeyError: 7' >&2; return 1")
+        self.assertEqual(code, 0, out)
+        self.assertIn("was not made in this run: KeyError: 7", out)
+        self.assertIn("after-the-step", out)
+
     def test_roots_own_step_reads_the_hubs_checkout_under_its_real_name(self):
         """kit-clone, which root runs on the hub's machine with no folder named (the app's central vault and TCP
         steps), reads release.json in the hub's own checkout: founderizer on a new hub, fleet-pilot on a hub made

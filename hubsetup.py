@@ -42,10 +42,13 @@ Standard library only, and it reads no credential of a model provider.
                                                     as the hub's user, from the server service's own clone, and only
                                                     on a hub whose own server takes agents: that server's server
                                                     service, with its key's SHA-256 in the hub's records
-    python3 hubsetup.py kit-clone [--hub-user fleet] [--source URL]
+    python3 hubsetup.py kit-clone [--hub-user fleet] [--source URL] [--first]
                                                     as root on the hub's machine: root's own clone of the published
                                                     repository at /usr/local/lib/founderizer-kit, at the revision of
-                                                    the hub's signed release.json and never older; safe to run again
+                                                    the hub's signed release.json and never older; a clone stays where
+                                                    it is while the hub has taken no release; --first is hub.sh's own
+                                                    word, in the run that makes the hub: the first clone, at the commit
+                                                    of the installer's tree; safe to run again
     python3 /usr/local/lib/founderizer-kit/hubsetup.py central-vault --owner-key KEY [--hub-user fleet] [--fleet ID]
                                                     as root on the hub's machine, from that clone only: the central
                                                     vault, its own user and service, which the hub's user can ask and
@@ -1957,8 +1960,34 @@ def server_known(db, name):
 # root keeps a clone of the published repository of its own, in one fixed place (ROOT_KIT), at the revision of the
 # release that the hub runs, whose manifest (release.json on the configuration ref) one of the release keys signed.
 # The keys are the clone's own, at its current revision, or, the first time, those of the copy of this program that
-# runs (the day of the cut-over, when the hub is trusted once). A revision that does not descend from the clone's own
-# is refused, so no old release comes back. A second run with nothing new changes nothing.
+# runs. A revision that does not descend from the clone's own is refused, so no old release comes back. A second run
+# with nothing new changes nothing.
+#
+# **Before the hub's first release** (15 November 2026). A new hub runs the code of its installer and has no
+# release.json: it writes one only with the first release that it takes, and the public source gives a new hub code
+# that its channel offers only later. Until then no manifest names the code that the hub runs, and every root step of
+# the owner's app stopped at its first command, because nothing had made the clone. So two things, and no more:
+#
+# 1. **The installer makes the first clone, for a hub that it makes itself and for no other** (hub.sh, in its step
+#    of the repository: `kit-clone --first`), from its own tree at that tree's commit. It gives the word only when
+#    its own step made the hub's user in this install, with a new home folder (a mark in root's own folder says so,
+#    and goes before the installer runs anything as that user), and neither the hub's repository nor its checkout is
+#    there yet. The installer has run nothing as the hub's user then, and that user has no file of its own that
+#    could run, so "this hub has no release" is what root itself knows, and not something that the hub's user
+#    shows: the two folders alone would not say it, because they are that user's to move away. The tree
+#    is root's alone (roots_alone): root owns it, everything in it and each folder above it, nobody else can write
+#    them, and nothing in it is a link. So nothing of the hub's user or of the network is in the clone, and its commit
+#    is the code that root runs as root in that same run: a tree that were wrong has root already, with or without a
+#    clone. Without the word, a run with no release.json makes no clone: a hand command, a later run of the installer
+#    and the app's own steps stop there as before, and get the first clone with the hub's first signed release.
+# 2. **A clone that is there stays where it is while the hub's checkout has no release.json**, and `kit-clone` ends
+#    well, so the app's steps run from it. That gives the hub's user nothing new. With a clone at release R it can
+#    make root's steps run R's code today: it puts R's own signed manifest back, and `kit-clone` says "there
+#    already". Taking release.json away has the same effect and no other: the clone never goes to an older revision,
+#    and never to code of the hub's user.
+#
+# Each move of the clone keeps the rule of above: only to a release that a key of the clone's own files signed, and
+# only forward.
 
 def git_root(*args, cwd=None, timeout=releases.GIT_WAIT):
     """(exit status, stdout, stderr) of one git command as root, with no prompt and no hooks of anybody's."""
@@ -1988,6 +2017,55 @@ def give_to_root(path):
         raise Stop(f"root's own clone could not be given to root: {(err or out).strip()[-200:]}")
 
 
+def roots_alone(path):
+    """True when nobody but root can change this folder or put another in its place: root owns it and everything in
+    it, no group or other user can write any of it, nothing in it is a link (a link would lead out of what is checked
+    here), and root owns each folder above it, up to the root of the file system, with no write for anybody else.
+    /root/fleet-kit, where every install puts the installer's tree, is such a folder; a copy in a home folder or in
+    /tmp is not, whoever owns its files."""
+    path = os.path.realpath(path)
+    if not _is_folder(path):
+        return False
+    for folder, folders, files in os.walk(path):
+        for one in [folder] + [os.path.join(folder, name) for name in folders + files]:
+            info = os.lstat(one)
+            if info.st_uid != 0 or info.st_mode & 0o022 or stat.S_ISLNK(info.st_mode):
+                return False
+    while True:
+        above = os.path.dirname(path)
+        if above == path:
+            return True
+        path = above
+        info = os.lstat(path)
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            return False
+
+
+def installer_commit(tree, git, alone):
+    """The commit that root's first clone takes from the installer's own tree, or None when `tree` cannot give one.
+    The tree must be root's alone (roots_alone), which is asked before git reads anything there; its `.git` must be a
+    folder of its own, never a file that names a repository elsewhere, and with no file that sends git to objects or
+    refs of another folder (a clone from the published repository has none); and it must be the top folder of a
+    checkout with a commit. The hub's own checkout is its user's, so it never passes."""
+    inside = os.path.join(tree, ".git")
+    elsewhere = (os.path.join(inside, "objects", "info", "alternates"), os.path.join(inside, "commondir"))
+    if not _is_folder(inside) or any(os.path.lexists(one) for one in elsewhere) or not alone(tree):
+        return None
+    code, top, _ = git("rev-parse", "--show-toplevel", cwd=tree)
+    if code != 0 or os.path.realpath(top) != tree:
+        return None
+    code, commit, _ = git("rev-parse", "--verify", "--quiet", "HEAD^{commit}", cwd=tree)
+    return commit if code == 0 and releases.REVISION.fullmatch(commit) else None
+
+
+def _is_folder(path):
+    """True for a folder itself, never for a link to one."""
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
 def hub_checkout(home):
     """The hub's own checkout in the home folder of its user: the first name of HUB_CHECKOUTS that is a folder there,
     and the first name when none is. A link is not taken: root reads that folder, and a link of the hub's user could
@@ -2002,17 +2080,26 @@ def hub_checkout(home):
     return os.path.join(home, HUB_CHECKOUTS[0])
 
 
-def kit_clone(hub_user="fleet", source=None, root_kit=None, checkout=None, git=None, own=None, keys=None):
+def kit_clone(hub_user="fleet", source=None, root_kit=None, checkout=None, git=None, own=None, keys=None,
+              first=False, tree=None, alone=None):
     """As root on the hub's machine: root's own clone of the published repository at the revision of the hub's signed
-    release.json (the section above). Returns {"revision", "version", "state": "made"|"moved"|"there"}.
+    release.json (the section above). Returns {"revision", "version", "state": "made"|"moved"|"there"|"kept"}.
+
+    A hub that has taken no release has no release.json. A clone that is there then stays where it is ("kept", and
+    "version" is None). Where there is no clone, the run stops as before, but for the installer's own run that makes
+    the hub: `first` is its word (hub.sh), and the clone is then made from the installer's tree, at that tree's commit
+    (installer_commit, kit_first). A release.json that is there and cannot be read, or that no release key signed,
+    stops the run as before, and so does a checkout that is not a folder.
 
     checkout: the hub's own checkout, where release.json is read (default: hub_checkout of the hub user). source: the
     published repository (releases.DEFAULT_UPSTREAM); the signature names the commit, so it is the same commit from
-    any source. git, own and keys are for the tests: git_root, the step that gives the clone to root, and the release
-    keys a run trusts when it cannot read them from the clone itself."""
+    any source. git, own, keys, tree and alone are for the tests: git_root, the step that gives the clone to root, the
+    release keys a run trusts when it cannot read them from the clone itself, the folder of this program, and
+    roots_alone."""
     git, root_kit = git or git_root, root_kit or ROOT_KIT
     source = source or releases.DEFAULT_UPSTREAM
     checkout = checkout or hub_checkout(hub_account(hub_user)["home"])
+    there = os.path.isdir(os.path.join(root_kit, ".git"))
     try:
         # The hub's user writes this folder: root reads a plain file of it, never a link or a pipe of that user's
         fd = os.open(os.path.join(checkout, RELEASE_FILE), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -2023,10 +2110,21 @@ def kit_clone(hub_user="fleet", source=None, root_kit=None, checkout=None, git=N
             raw = json.loads(os.read(fd, 65537).decode("utf-8"))
         finally:
             os.close(fd)
-    except (OSError, ValueError):
-        raise Stop(f"the hub's checkout {checkout} carries no {RELEASE_FILE} that can be read, so no release is signed "
-                   f"for it yet: the hub writes one with the release it takes") from None
-    there = os.path.isdir(os.path.join(root_kit, ".git"))
+    except (OSError, ValueError) as e:
+        # No release.json in a checkout that is a folder: the hub has taken no release yet. Anything else stops.
+        unreleased = isinstance(e, FileNotFoundError) and _is_folder(checkout)
+        if unreleased and there:
+            return kit_kept(root_kit, checkout, source, git, own)
+        if unreleased and first:
+            tree = os.path.realpath(tree or KIT)
+            commit = installer_commit(tree, git, alone or roots_alone)
+            if not commit:
+                raise Stop(f"the installer's tree {tree} gives no first clone: it must be a git checkout with a "
+                           f"commit that root alone can write, with each folder above it. Root's own clone then "
+                           f"comes with the first release that the hub takes") from None
+            return kit_first(root_kit, tree, commit, source, git, own)
+        raise Stop(f"the hub's checkout {checkout} carries no {RELEASE_FILE} that can be read, so no release is "
+                   f"signed for it yet: the hub writes one with the release it takes") from None
     trusted = releases.every_key(root_kit) if there else (keys if keys is not None else releases.every_key(KIT))
     try:
         manifest = releases.check(raw, trusted)
@@ -2057,6 +2155,46 @@ def kit_clone(hub_user="fleet", source=None, root_kit=None, checkout=None, git=N
     (own or give_to_root)(root_kit)
     say(f"root's own clone is at release {manifest['version']} ({revision[:12]}) in {root_kit}")
     return {"revision": revision, "version": manifest["version"], "state": "moved" if there else "made"}
+
+
+def kit_kept(root_kit, checkout, source, git, own):
+    """kit_clone on a hub that has taken no release, with root's clone there: the clone stays at its own commit. A
+    clone whose files are not that commit's (a first clone that stopped half-way, in any of its steps) gets them
+    again from its own objects, and its `origin` is set as kit_first sets it."""
+    code, current, _ = git("rev-parse", "--verify", "--quiet", "HEAD^{commit}", cwd=root_kit)
+    if code != 0 or not releases.REVISION.fullmatch(current):
+        raise Stop(f"root's own clone in {root_kit} names no revision: remove it. kit-clone makes it again with the "
+                   f"first release that the hub takes")
+    if git("status", "--porcelain", cwd=root_kit)[1]:
+        git("remote", "set-url", "origin", source, cwd=root_kit)
+        code, _, err = git("checkout", "-q", "--force", "--detach", current, cwd=root_kit)
+        if code != 0:
+            raise Stop(f"root's own clone could not take its own revision again ({current[:12]}): "
+                       f"{' '.join(err.split())[-200:]}")
+        git("clean", "-q", "-f", "-d", "-x", cwd=root_kit)
+        (own or give_to_root)(root_kit)
+    say(f"root's own clone stays at {current[:12]}: the hub's checkout {checkout} carries no {RELEASE_FILE}, so the "
+        f"hub has taken no release yet")
+    return {"revision": current, "version": None, "state": "kept"}
+
+
+def kit_first(root_kit, tree, commit, source, git, own):
+    """kit_clone on the installer's word, in the run that makes the hub: root's clone is made from the installer's own
+    tree, at that tree's commit (installer_commit gave both). Nothing comes from the network or from the hub's user.
+    Its `origin` is the published repository, as in a clone that a release made."""
+    code, _, err = git("clone", "-q", "--no-checkout", "--no-local", tree, root_kit)
+    if code != 0:
+        raise Stop(f"root's own clone of {tree} could not be made: {' '.join(err.split())[-200:]}")
+    git("remote", "set-url", "origin", source, cwd=root_kit)
+    code, _, err = git("checkout", "-q", "--force", "--detach", commit, cwd=root_kit)
+    if code != 0 or git("rev-parse", "HEAD", cwd=root_kit)[1] != commit:
+        raise Stop(f"root's own clone could not take the installer's revision ({commit[:12]}): "
+                   f"{' '.join(err.split())[-200:]}")
+    git("clean", "-q", "-f", "-d", "-x", cwd=root_kit)
+    (own or give_to_root)(root_kit)
+    say(f"root's own clone is at the installer's revision ({commit[:12]}) in {root_kit}: the hub has taken no "
+        f"release yet")
+    return {"revision": commit, "version": None, "state": "made"}
 
 
 # ---------------------------------------------------------------- the central vault (owner feature central_vault)
@@ -3953,7 +4091,7 @@ def cmd_kit_clone(args):
         raise Stop("root's own clone is for the hub's Linux server, and this machine is not one.")
     if os.geteuid() != 0:
         raise Stop("run it as root on the hub's machine: sudo python3 hubsetup.py kit-clone")
-    kit_clone(hub_user=args.hub_user, source=args.source)
+    kit_clone(hub_user=args.hub_user, source=args.source, first=args.first)
 
 
 def cmd_check(args):
@@ -4032,6 +4170,8 @@ def main(argv=None):
     kc = sub.add_parser("kit-clone")
     kc.add_argument("--hub-user", default="fleet", help="the user the hub runs as: its checkout holds release.json")
     kc.add_argument("--source", help="the published repository; default: " + releases.DEFAULT_UPSTREAM)
+    kc.add_argument("--first", action="store_true", help="hub.sh's own word, in the run that makes the hub: with no "
+                    "clone and no release.json, make the clone from the tree that this runs from, at its commit")
     kc.set_defaults(fn=cmd_kit_clone)
     cv = sub.add_parser("central-vault")
     cv.add_argument("--owner-key", required=True, help="the owner's public key, as their app gives it (base64)")

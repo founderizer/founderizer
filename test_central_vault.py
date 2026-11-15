@@ -18,6 +18,7 @@ import shutil
 import socket
 import subprocess
 import sqlite3
+import stat
 import tempfile
 import threading
 import unittest
@@ -1805,6 +1806,8 @@ class KitClone(unittest.TestCase):
         self.assertEqual(self.head(), self.revisions[0])
 
     def test_a_hub_with_no_signed_release_gets_no_clone(self):
+        """From a copy of this program that is not root's alone (here: this checkout, which its user can write), as
+        the hub's own checkout is."""
         with self.assertRaises(hubsetup.Stop) as stop:
             self.clone()
         self.assertIn("carries no release.json", str(stop.exception))
@@ -1812,6 +1815,246 @@ class KitClone(unittest.TestCase):
         with self.assertRaises(hubsetup.Stop):
             self.clone()
         self.assertFalse(self.root_kit.exists())
+
+    # ---- before the hub's first release: the installer's own tree gives the first clone
+
+    def installer(self, at=0):
+        """The installer's own tree, as /root/fleet-kit is: a clone of the published repository at one commit."""
+        tree = self.tmp / "installer"
+        if not tree.exists():
+            self.git("clone", "-q", str(self.published), str(tree))
+        self.git("checkout", "-q", "--detach", self.revisions[at], cwd=tree)
+        return os.path.realpath(tree)
+
+    def installer_copy(self, name):
+        """One more clone of the published repository, at its first commit."""
+        tree = self.tmp / name
+        self.git("clone", "-q", str(self.published), str(tree))
+        self.git("checkout", "-q", "--detach", self.revisions[0], cwd=tree)
+        return os.path.realpath(tree)
+
+    def first(self, tree, alone=lambda path: True, first=True, **more):
+        """kit-clone as hub.sh runs it in the run that makes the hub: with the installer's word, from its tree."""
+        return hubsetup.kit_clone(checkout=str(self.hub), source=str(self.published), root_kit=str(self.root_kit),
+                                  own=self.owned.append, first=first, tree=tree, alone=alone, **more)
+
+    def again(self, **more):
+        """kit-clone as the app's steps run it: from root's clone, with no word of the installer."""
+        return self.first(str(self.root_kit), first=False, **more)
+
+    def test_a_new_hub_gets_its_first_clone_from_the_installers_own_tree(self):
+        tree = self.installer()
+        self.assertEqual(self.first(tree), {"revision": self.revisions[0], "version": None, "state": "made"})
+        self.assertEqual(self.head(), self.revisions[0])
+        self.assertEqual((self.root_kit / "hubsetup.py").read_text(), "# the installer of release 1\n")
+        self.assertEqual(self.owned, [str(self.root_kit)])
+        self.assertEqual(self.git("status", "--porcelain", cwd=self.root_kit), "")
+        # Its origin is the published repository, as in a clone that a release made, and never the installer's tree
+        self.assertEqual(self.git("remote", "get-url", "origin", cwd=self.root_kit), str(self.published))
+        # A second run, from the clone itself as the app's steps run it, changes nothing while no release is there
+        self.assertEqual(self.again(), {"revision": self.revisions[0], "version": None, "state": "kept"})
+        self.assertEqual(self.head(), self.revisions[0])
+        self.assertEqual(self.owned, [str(self.root_kit)])
+        # And so does the installer's own second run, which finds the clone there
+        self.assertEqual(self.first(tree)["state"], "kept")
+        self.assertEqual(self.owned, [str(self.root_kit)])
+
+    def test_without_the_installers_word_no_tree_gives_a_clone(self):
+        """The first clone with no signed release is the installer's alone, in the run that makes the hub. A hand
+        command, a later run of the installer and the app's steps run with no word: also from a tree that is root's
+        alone, and also when the hub's user took release.json away, they make no clone."""
+        tree = self.installer()
+        asked = []
+        with self.assertRaises(hubsetup.Stop) as stop:
+            self.first(tree, first=False, alone=lambda path: asked.append(path) or True)
+        self.assertIn("carries no release.json", str(stop.exception))
+        self.assertEqual(asked, [])                                     # the tree is not even asked about
+        self.assertFalse(self.root_kit.exists())
+        self.assertEqual(self.owned, [])
+        # With a signed release there, the same run makes the clone at that release, as before
+        self.release(self.revisions[1], version="2026.11.201")
+        self.assertEqual(self.first(tree, first=False, keys=(releases.public_key(SEED),))["state"], "made")
+        self.assertEqual(self.head(), self.revisions[1])
+
+    def test_only_a_tree_that_is_roots_alone_gives_the_first_clone(self):
+        tree = self.installer()
+        asked, ran = [], []
+
+        def git(*args, **kwargs):
+            ran.append(args)
+            return hubsetup.git_root(*args, **kwargs)
+
+        with self.assertRaises(hubsetup.Stop) as stop:
+            self.first(tree, alone=lambda path: asked.append(path) or False, git=git)
+        self.assertIn("gives no first clone", str(stop.exception))
+        self.assertEqual(asked, [tree])                                 # the tree itself was asked about,
+        self.assertEqual(ran, [])                                       # before git read anything in it
+        # A folder inside a checkout is not the installer's tree, and neither is a folder with no commit
+        inside = os.path.join(tree, "inside")
+        os.mkdir(inside)
+        bare = self.tmp / "no-commit"
+        self.git("init", "-q", str(bare))
+        # A `.git` that is a file names a repository elsewhere: git would read that one, so it gives no clone
+        elsewhere = self.tmp / "worktree"
+        self.git("worktree", "add", "-q", "--detach", str(elsewhere), self.revisions[0], cwd=tree)
+        self.assertTrue((elsewhere / ".git").is_file())
+        for folder in (inside, os.path.realpath(bare), os.path.realpath(self.tmp), os.path.realpath(elsewhere)):
+            with self.assertRaises(hubsetup.Stop) as stop:
+                self.first(folder)
+            self.assertIn("gives no first clone", str(stop.exception))
+        # And so does a tree whose own `.git` sends git to the objects or the refs of another folder
+        other = self.installer_copy("other")
+        for sends in (Path(other, ".git", "objects", "info", "alternates"), Path(other, ".git", "commondir")):
+            sends.write_text(str(self.published / ".git" / "objects") + "\n")
+            with self.assertRaises(hubsetup.Stop) as stop:
+                self.first(other)
+            self.assertIn("gives no first clone", str(stop.exception))
+            sends.unlink()
+        self.assertFalse(self.root_kit.exists())
+        self.assertEqual(self.owned, [])
+        self.assertEqual(self.first(other)["state"], "made")            # the same tree with neither file
+
+    def test_roots_alone_asks_for_root_on_the_folder_all_of_it_and_each_folder_above(self):
+        tree = Path(self.installer())
+        self.assertFalse(hubsetup.roots_alone(str(tree)))               # this test's user owns it
+        real = os.lstat
+
+        def rooted(changed):
+            """os.lstat as if root owned every path and nobody else could write one, but for `changed`."""
+            def lstat(path, *args, **kwargs):
+                info = real(path, *args, **kwargs)
+                uid, mode = changed.get(os.fspath(path), (0, info.st_mode & ~0o022))
+                return SimpleNamespace(st_uid=uid, st_mode=mode)
+            return patch.object(hubsetup.os, "lstat", lstat)
+
+        folder = stat.S_IFDIR | 0o755
+        with rooted({}):
+            self.assertTrue(hubsetup.roots_alone(str(tree)))
+        for changed in ({str(tree): (501, folder)},                                 # the tree is another user's
+                        {str(tree / "hubsetup.py"): (0, stat.S_IFREG | 0o664)},     # a group can write a file of it
+                        {str(tree / ".git" / "HEAD"): (501, stat.S_IFREG | 0o644)},
+                        {str(tree / ".git" / "objects"): (0, stat.S_IFDIR | 0o757)},    # anybody can add an object
+                        {str(tree.parent): (0, stat.S_IFDIR | 0o777)},              # anybody can swap the tree itself
+                        {str(tree.parent.parent): (501, folder)}):                  # or a folder above it
+            with rooted(changed):
+                self.assertFalse(hubsetup.roots_alone(str(tree)), changed)
+        # A link in the tree leads out of what was checked: to a folder (which a walk does not enter) or to a file
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        for name, target in (("linked-folder", outside), (os.path.join(".git", "linked"), outside),
+                             ("linked-file", tree / "hubsetup.py")):
+            link = tree / name
+            link.symlink_to(target)
+            with rooted({}):
+                self.assertFalse(hubsetup.roots_alone(str(tree)), name)
+            link.unlink()
+        with rooted({}):
+            self.assertTrue(hubsetup.roots_alone(str(tree)))
+            self.assertFalse(hubsetup.roots_alone(str(tree / "hubsetup.py")))       # a file is no tree
+
+    def test_the_first_release_moves_the_clone_forward_under_the_clones_own_keys(self):
+        self.first(self.installer())
+        # A release that another key signed is refused, also when the run is given that key: the clone has its own
+        self.release(self.revisions[1], seed=OTHER_SEED)
+        with self.assertRaises(hubsetup.Stop) as stop:
+            self.again(keys=(releases.public_key(OTHER_SEED),))
+        self.assertIn("not a release that this clone can trust", str(stop.exception))
+        self.assertEqual(self.head(), self.revisions[0])
+        self.release(self.revisions[1], version="2026.11.201")
+        self.assertEqual(self.again(), {"revision": self.revisions[1], "version": "2026.11.201", "state": "moved"})
+        self.assertEqual(self.head(), self.revisions[1])
+
+    def test_a_release_before_the_installers_revision_is_refused(self):
+        self.first(self.installer(at=1))
+        self.release(self.revisions[0])
+        with self.assertRaises(hubsetup.Stop) as stop:
+            self.again()
+        self.assertIn("does not descend from the revision", str(stop.exception))
+        self.assertEqual(self.head(), self.revisions[1])
+
+    def test_a_release_json_that_is_there_and_cannot_be_trusted_still_stops(self):
+        """Only a checkout with no release.json is a hub before its first release. A file that is there and is not a
+        signed manifest, a link, and a checkout that is not there stop the run, with a clone and without one."""
+        tree = self.installer()
+        elsewhere = self.tmp / "elsewhere.json"
+        elsewhere.write_text("{}")
+        gone = self.tmp / "no-checkout"
+
+        def cases():
+            (self.hub / "release.json").write_text("not JSON")
+            yield str(self.hub)
+            (self.hub / "release.json").write_text(json.dumps({"revision": self.revisions[1]}))     # no signature
+            yield str(self.hub)
+            (self.hub / "release.json").unlink()
+            (self.hub / "release.json").symlink_to(elsewhere)
+            yield str(self.hub)
+            (self.hub / "release.json").unlink()
+            (self.hub / "release.json").symlink_to(self.tmp / "nothing-there")                     # a link to nothing
+            yield str(self.hub)
+            (self.hub / "release.json").unlink()
+            yield str(gone)
+            link = self.tmp / "linked-checkout"
+            if not link.is_symlink():
+                link.symlink_to(self.hub)                               # a link to a checkout is not a checkout
+            yield str(link)
+
+        def run(checkout, kit, first):
+            return hubsetup.kit_clone(checkout=checkout, source=str(self.published), root_kit=str(self.root_kit),
+                                      own=self.owned.append, first=first, tree=kit, alone=lambda path: True)
+
+        for checkout in cases():
+            with self.assertRaises(hubsetup.Stop) as stop:
+                run(checkout, tree, True)                               # also on the installer's word
+            self.assertNotIn("gives no first clone", str(stop.exception))
+            self.assertFalse(self.root_kit.exists(), checkout)
+        self.first(tree)
+        for checkout in cases():
+            for word in (False, True):
+                with self.assertRaises(hubsetup.Stop):
+                    run(checkout, str(self.root_kit), word)
+            self.assertEqual(self.head(), self.revisions[0], checkout)
+        self.assertEqual(self.owned, [str(self.root_kit)])
+
+    def test_a_first_clone_that_stopped_before_its_files_is_finished_by_the_next_run(self):
+        """The first clone's steps are: the clone with no files, its origin, its files, its owner. A run that stopped
+        after the first of them leaves a clone with the installer's commit, no file, and the installer's tree as its
+        origin. The next run, of the app or of the installer, makes it whole."""
+        tree = self.installer()
+        self.git("clone", "-q", "--no-checkout", "--no-local", tree, str(self.root_kit))
+        self.assertFalse((self.root_kit / "hubsetup.py").exists())
+        self.assertEqual(self.again(), {"revision": self.revisions[0], "version": None, "state": "kept"})
+        self.assertEqual((self.root_kit / "hubsetup.py").read_text(), "# the installer of release 1\n")
+        self.assertEqual(self.git("status", "--porcelain", cwd=self.root_kit), "")
+        self.assertEqual(self.git("remote", "get-url", "origin", cwd=self.root_kit), str(self.published))
+        self.assertEqual(self.owned, [str(self.root_kit)])
+
+    def test_a_clone_folder_with_no_commit_stops_and_says_what_brings_it_back(self):
+        self.git("init", "-q", str(self.root_kit))
+        with self.assertRaises(hubsetup.Stop) as stop:
+            self.again()
+        self.assertIn("names no revision: remove it. kit-clone makes it again with the first release",
+                      str(stop.exception))
+
+    def test_a_clone_whose_files_were_changed_gets_its_own_files_again(self):
+        self.first(self.installer())
+        (self.root_kit / "hubsetup.py").unlink()
+        (self.root_kit / "stray.py").write_text("# not of the release\n")
+        self.assertEqual(self.again()["state"], "kept")
+        self.assertEqual((self.root_kit / "hubsetup.py").read_text(), "# the installer of release 1\n")
+        self.assertFalse((self.root_kit / "stray.py").exists())
+        self.assertEqual(self.owned, [str(self.root_kit)] * 2)          # given to root again after the repair
+        self.assertEqual(self.head(), self.revisions[0])
+
+    def test_a_hub_that_has_a_release_and_a_clone_is_read_as_before(self):
+        """The hub of before this change: its clone was made at a signed release, and each run reads the manifest."""
+        self.release(self.revisions[0])
+        self.assertEqual(self.clone()["state"], "made")
+        asked = []
+        for word in (False, True):
+            self.assertEqual(self.first(str(self.root_kit), first=word, alone=lambda path: asked.append(path) or True),
+                             {"revision": self.revisions[0], "version": "2026.11.200", "state": "there"})
+        self.assertEqual(asked, [])                                     # no tree is asked about where a release is
+        self.assertEqual(self.owned, [str(self.root_kit)])
 
 
 if __name__ == "__main__":

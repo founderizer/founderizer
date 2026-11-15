@@ -173,7 +173,15 @@ notification of a Needs-you item, the chat that opens first), so with those apps
    `~fleet/fleet-pilot` is the hub's own checkout and it stands on `config`, the
    configuration ref — the branch the hub writes and nothing else writes (PILOT.md,
    "The configuration ref"). Both refs start at the commit of the copy you ran, so the
-   code the hub serves is the code it runs.
+   code the hub serves is the code it runs. For a hub that this install makes (step 3
+   made the user `fleet` itself), the step also makes root's own clone of that code in
+   `/usr/local/lib/founderizer-kit` (`hubsetup.py kit-clone --first`, from the copy you
+   ran; below, "Who makes the first clone"): the steps that Founderizer runs as root on
+   this server run from it. It needs a copy that root alone can write, as
+   `/root/fleet-kit` is. From any other copy the step says so and the install goes on,
+   because the hub works without the clone. On any other hub the step runs `kit-clone`
+   with no `--first`, which takes the hub's signed release and makes no clone without
+   one.
 7. **The first `team.json`, and the owner's own Mac.** One manager on this machine, or,
    when the app that starts the install gives the manager its own server
    (`FLEET_MANAGER_SERVER=later`, Founderizer 0.1.112 and later), one manager with no
@@ -603,10 +611,56 @@ signed manifest, and one of the release keys of the clone itself must have signe
 release that does not descend from the clone's own revision is refused, so no older release
 comes back, and a second run with nothing new changes nothing. `--source` names another
 copy of the published repository (default: `https://github.com/founderizer/founderizer.git`);
-the signature names the commit, so it is the same commit from any copy. The first clone is
-made once, as root, from the hub's own checkout (`sudo python3 ~fleet/fleet-pilot/hubsetup.py
-kit-clone`), on the day the hub is trusted with its first signed release; every later run is
-the clone's own. `central-vault` refuses to run from anywhere else.
+the signature names the commit, so it is the same commit from any copy. `central-vault`
+refuses to run from anywhere else.
+
+**Who makes the first clone** (since 15 November 2026; before that day nothing made it, and
+each root step of the app stopped on a new hub at its first command). A new hub runs the
+code of its installer and has no `release.json`: the hub writes one with the first release
+that it takes, and the public source gives a new hub code that its channel offers only
+later. So the first clone comes from the installer's own tree, `/root/fleet-kit`, and
+never from the hub's checkout:
+
+- **The installer makes it, for a hub that it makes itself and for no other**, in its
+  step of the repository: `python3 /root/fleet-kit/hubsetup.py kit-clone --first`. It
+  gives `--first` only when its own step made the user `fleet` in this install, and
+  neither the hub's repository nor its checkout is there yet. A mark in root's own folder
+  (`/root/.founderizer-new-hub`) says the first: the step of the user writes it when it
+  makes the user with a new home folder, and the step of the repository takes it away
+  before the installer runs anything as that user. So the installer has run nothing as
+  the hub's user then, and that user has no file of its own that could run: "this hub has
+  no release" is what root itself knows, not something that the hub's user shows. The two
+  folders alone would not say it: they are that user's, which can move them away. With
+  the word, and with no
+  `release.json` and no clone, `kit-clone` puts the clone at the commit of the tree that
+  it runs from. It does that only from a tree that is root's alone: root owns it,
+  everything in it and each folder above it, no group or other user can write any of
+  them, and nothing in it is a link. It takes nothing from the network and nothing from
+  the hub's user, and that commit is the code that root runs as root in that same run.
+- **Without the word, a run with no `release.json` makes no first clone.** A command by
+  hand, a later run of the installer and the app's own steps stop there, as before, with
+  "the hub's checkout ... carries no release.json that can be read".
+- **While the hub has taken no release, a clone that is there stays at its commit**:
+  `kit-clone` from the clone ends well, so the app's steps run. On a new hub that commit
+  is the hub's own code. A clone whose files are not its commit's gets them again from
+  its own objects.
+- **From the hub's first release on, the rule above holds with no exception**: the clone
+  moves only to a release that a key of its own files signed, and only forward. A hub's
+  user that takes its `release.json` away gets a clone that stays where it is, as it gets
+  today with the manifest of the release that the clone is at. It never gets an older
+  revision, and it never gets its own code run. A `release.json` that is there and that no
+  release key signed, or that is not a plain file, stops `kit-clone` as before.
+- **A hub that was installed before that day** has no clone. One command makes it, as
+  root, from the installer's tree and never from the hub's checkout: `python3
+  /root/fleet-kit/hubsetup.py kit-clone`. It makes the clone only when the hub has a
+  `release.json`, at that signed release, and with the release keys of root's own tree.
+  Until such a hub takes its first release, the command stops with the words above. A
+  real server proved both on 15 November 2026, with the installer of 2026.11.493. A hub
+  with no `/root/fleet-kit` either gets its installer's copy again with the install's own
+  first lines (INSTALL-PROMPT.md, A2). Founderizer runs that command by itself, as the
+  first command of each root step, where the clone has no `hubsetup.py` and
+  `/root/fleet-kit` has one (the Mac app after version 0.1.261). An app from before stops
+  there at its first command: "python3: can't open file".
 
 `--hub-user` names the user the hub runs as (default `fleet`), and `--fleet` the fleet's id
 (default: the one in the hub's own records, read and never written). `central-vault` makes:
