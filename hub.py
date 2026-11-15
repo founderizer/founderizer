@@ -39378,6 +39378,15 @@ def settle_checks(t0):
           ("offline" if offline else "failed", t0,
            f"{name} has been silent since the check was asked." if offline else
            f"{name} sent no report in {CHECK_WAIT} seconds.", c["id"]))
+        # The coordinator's decision D23 (the fifth review, X1): its probe job ends with it. Each check keeps its own
+        # (W1), and a report of an ended check ends none, so without this the job stayed open until the hub started
+        # again, and the agent's sign-out and runtime switch were refused. A check from before that mark ends each
+        # open probe job of its agent that is no newer than it.
+        if kv_get(CHECK_PROBE + str(c["id"])):
+            check_ended(c["id"])
+        else:
+            q("UPDATE jobs SET finished=COALESCE(finished,?) WHERE agent=? AND kind='probe' AND finished IS NULL "
+              "AND created<=?", (t0, c["agent"], c["requested"] + 1))
 
 
 def record_status(agent, data):

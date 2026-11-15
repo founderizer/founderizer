@@ -570,6 +570,34 @@ class ModelAccounts(OwnerAPI):
         hub.save_agent_settings("dev-lead", {"base_sha256": self.sha(), "title": "Developer"})
         self.assertEqual(checks("dev-lead"), [])
 
+    def test_a_check_that_ends_by_time_leaves_no_probe_job_open(self):
+        """The coordinator's decision D23 (the fifth review, X1, live since release 2026.11.477): a check that
+        settle_checks ends ("has been silent", "sent no report in 60 seconds") ends its own probe job, also for an
+        agent of today's shape with a key. Before, its job stayed open until the hub started again, and "Use another
+        account" and the runtime switch were refused for that agent."""
+        team = copy.deepcopy(TEAM)
+        team["agents"]["dev-lead"]["secrets"] = {FREE_KEY: "read"}
+        self.put(team)
+
+        def open_jobs():
+            return [r["id"] for r in hub.q("SELECT id FROM jobs WHERE agent='dev-lead' AND kind='probe' AND "
+                                           "finished IS NULL")]
+        for touched in (False, True):        # offline, then failed: the helper checks in after the request
+            with self.subTest(touched=touched):
+                cid = hub.start_machine_check("dev-lead")["check"]["id"]
+                self.assertEqual(len(open_jobs()), 1)
+                if touched:
+                    hub.touch("dev-lead")
+                hub.settle_checks(hub.now() + hub.CHECK_WAIT + 1)
+                row = hub.q1("SELECT state FROM machine_checks WHERE id=?", (cid,))
+                self.assertEqual(row["state"], "failed" if touched else "offline")
+                self.assertEqual(open_jobs(), [])
+                self.assertIsNone(hub.switch_busy("dev-lead"))
+                code, said = self.request("/helper/status/dev-lead", {"revision": hub.kit_revision(fresh=True),
+                                                                       "check": cid, "verify": []})
+                self.assertEqual(code, 200, said)       # its late report: no job opens or stays open
+                self.assertEqual(open_jobs(), [])
+
     def test_a_second_check_while_the_first_runs_probes_its_own_key(self):
         """W1 of the fourth review: the report of a check that a new one replaced ends no probe job of the new one,
         so the new check can still probe the agent's key."""
