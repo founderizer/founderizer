@@ -6,22 +6,24 @@ still runs alone, and the refusal has a code that the app can read. A hub withou
 agent there gets its vault when that server's broker reports, and a restore keeps the records of that server's own
 keys. A local hub with a temporary Fleet repository; no AI, no machine, no systemd: what a real server proved, and
 what it did not, is in UI-API.md, version 1.171."""
+import contextlib
 import hashlib
 import json
+import os
 import unittest
 from unittest.mock import patch
 
 import hub
 import hubsetup
 import server
-from test_servers import HUB, NEW, OWNER, Servers, sha
+from test_servers import HUB, NEW, OWNER, Servers, git, sha
 
 REPO = "git://127.0.0.2/fleet-pilot.git"        # the address that the hub's git service gives its machines
 LINUX = "Ubuntu 24.04.1 LTS"
 
 
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite(cls(name) for cls in (NotShared, Shared) for name in cls.__dict__
+    return unittest.TestSuite(cls(name) for cls in (NotShared, Shared, Later) for name in cls.__dict__
                               if name.startswith("test_"))
 
 
@@ -435,6 +437,303 @@ class Shared(HubService, Servers):
         self.write_team(team)
         status, answer = self.owner("/ui/team/agents/scout/move", base_sha256=self.team_sha(), server="hub")
         self.assertEqual((status, answer["error"]), (409, "hub has an agent already: manager"))
+
+
+class Later(HubService, Servers):
+    """The owner chooses the fleet's servers for a fleet that runs (owner features fleet_shape, hub_shared_later and
+    manager_rename; the owner, 15 November 2026: "Yes, start it"). The fleet keeps the step of the slider that the
+    owner chose last. The step one gives a hub that runs what only a first install gave before: its own server takes
+    agents. A manager that has no server yet takes a new name. The hub in these tests runs on Linux, as a hub's
+    server does."""
+
+    def setUp(self):
+        super().setUp()
+        kind = patch.object(hub, "HUB_KIND", "linux")
+        kind.start()
+        self.addCleanup(kind.stop)
+
+    def shape(self, step, base=None):
+        return self.owner("/ui/servers/shape", base_sha256=base or self.team_sha(), step=step)
+
+    def test_the_fleet_keeps_the_step_that_the_owner_chose(self):
+        team = self.fresh_fleet(placed=False)
+        self.assertNotIn("shape", team)
+        self.assertIsNone(self.servers()[0]["shape"])
+        self.assertTrue({"fleet_shape", "hub_shared_later", "manager_rename"} <= set(hub.UI_FEATURES))
+        status, answer = self.shape("two")
+        self.assertEqual(status, 200, answer)
+        self.assertEqual((answer["step"], answer["hub_shared"], answer["root_step"]), ("two", False, False))
+        self.assertEqual(self.origin_team()["shape"], {"step": "two"})
+        self.assertEqual(self.origin_team()["hub"], team["hub"])
+        self.assertEqual(self.servers()[0]["shape"], {"step": "two"})
+        self.assertEqual(self.team_sha(), answer["sha256"])
+        # the same step again changes nothing, and makes no commit
+        status, again = self.shape("two")
+        self.assertEqual((status, again["revision"], again["sha256"]), (200, answer["revision"], answer["sha256"]))
+        status, other = self.shape("each")
+        self.assertEqual((status, other["step"], self.origin_team()["shape"]), (200, "each", {"step": "each"}))
+        self.assertNotEqual(other["revision"], answer["revision"])
+        # what the command refuses: another word, a field that it does not know, and a team.json that moved
+        self.assertEqual(self.shape("three")[0], 400)
+        self.assertEqual(self.owner("/ui/servers/shape", base_sha256=self.team_sha(), step="two", shared=True)[0], 400)
+        status, moved = self.shape("two", base=answer["sha256"])
+        self.assertEqual((status, moved["sha256"]), (409, self.team_sha()))
+        self.assertEqual(self.origin_team()["shape"], {"step": "each"})
+        # the word in team.json is one of the three steps, or absent
+        team = self.origin_team()
+        for bad in ("two", {"step": "three"}, {"step": "two", "more": 1}, {}, []):
+            wrong = dict(team, shape=bad)
+            with self.assertRaises(ValueError, msg=repr(bad)) as refused:
+                hub.validate_team(wrong)
+            self.assertIn('shape is {"step": "one", "two" or "each"}', str(refused.exception))
+        self.assertIsNone(hub.shape_view({"shape": {"step": "three"}}))
+        # the installer keeps the step at a first install: one server for all is the step one, and the two agree
+        self.assertEqual(hubsetup.template(HUB, owner=OWNER, shape="each")["shape"], {"step": "each"})
+        self.assertEqual(hubsetup.template(HUB, owner=OWNER, shared=True)["shape"], {"step": "one"})
+        self.assertEqual(hubsetup.template(HUB, owner=OWNER, shared=True, shape="one")["shape"], {"step": "one"})
+        self.assertNotIn("shape", hubsetup.template(HUB, owner=OWNER))
+        said = []
+        with patch("builtins.print", lambda *a, **k: said.append(" ".join(map(str, a)))):
+            self.assertEqual(hubsetup.main(["template", "--address", HUB, "--shape-step", "two"]), 0)
+            self.assertEqual(json.loads(said[-1])["shape"], {"step": "two"})
+            self.assertEqual(hubsetup.main(["template", "--address", HUB, "--shape-step", "one"]), 1)
+        for shared, step, words in ((True, "two", "give --shared, or --shape-step two, not both"),
+                                    (False, "one", "give --shared with it"), (False, "three", "is no step")):
+            with self.assertRaises(hubsetup.Stop, msg=step) as refused:
+                hubsetup.template(HUB, owner=OWNER, shared=shared, shape=step)
+            self.assertIn(words, str(refused.exception))
+
+    def test_the_step_one_gives_a_hub_that_runs_a_server_that_takes_agents(self):
+        """The real case of 15 November 2026: a hub that was installed with FLEET_MANAGER_SERVER=later, a manager
+        with no server yet, and an owner who chooses "1 server". The owner's command writes the word, root's step on
+        the hub's server makes the server service (hubsetup.py one-server, which runs hub-server as the hub's user),
+        and the move that the app has puts the manager there."""
+        import pwd
+        self.fresh_fleet(placed=False)
+        self.assertEqual(self.servers()[1]["hub"]["why"], ["hub_machine", "no_service"])
+        status, answer = self.shape("one")
+        self.assertEqual(status, 200, answer)
+        self.assertEqual((answer["step"], answer["hub_shared"], answer["root_step"]), ("one", True, True))
+        team = self.origin_team()
+        self.assertEqual(team["hub"], {"machine": "hub", "port": 8765, "shared": True})
+        self.assertEqual(team["servers"], {"hub": {"kind": "linux", "user": pwd.getpwuid(os.getuid()).pw_name}})
+        self.assertEqual((team["shape"], team["agents"]["manager"]["placed"]), ({"step": "one"}, False))
+        view, servers = self.servers()
+        self.assertEqual((view["hub_shared"], view["shape"], servers["hub"]["joined"], servers["hub"]["agents"]),
+                         (True, {"step": "one"}, False, []))
+        # root's step: the manager has no server, so the service waits for no key of it
+        key = self.hub_service()
+        self.assertEqual((self.ended, self.started), (0, [True]))
+        self.assertIsNotNone(key)
+        status, again = self.shape("one")
+        self.assertEqual((status, again["root_step"], again["revision"]), (200, False, answer["revision"]))
+        self.assertEqual(self.reading("hub", key=key, source=HUB, os_name=LINUX, features=[hub.INSTALL_KEY])[0], 200)
+        hub_ = self.servers()[1]["hub"]
+        self.assertEqual((hub_["joined"], hub_["available"], hub_["why"]), (True, True, []))
+        # The manager still has no server, though its entry names the hub's machine, which has a service now: no
+        # job of that service is for it yet, and its new name pins no OS user, because none was made.
+        status, refused = self.owner("/ui/servers/hub/prepare", agent="manager", runtime="codex")
+        self.assertEqual((status, refused["error"]), (409, "Manager is not on hub."))
+        status, renamed = self.owner("/ui/team/agents/manager/rename", base_sha256=self.team_sha(), name="juno")
+        self.assertEqual((status, renamed.get("job")), (200, None), renamed)
+        self.assertEqual(self.origin_team()["agents"]["juno"],
+                         dict(team["agents"]["manager"]))               # the same entry, with no "user"
+        self.assertEqual(hub.q("SELECT id FROM server_jobs"), [])
+        # the move of the manager, as onto each server: it has a server now, and that server's own service installs it
+        status, moved = self.owner("/ui/team/agents/juno/move", base_sha256=self.team_sha(), server="hub",
+                                   runtime="claude")
+        self.assertEqual(status, 200, moved)
+        team = self.origin_team()
+        self.assertNotIn("placed", team["agents"]["juno"])
+        self.assertEqual(team["agents"]["juno"]["machine"], "hub")
+        self.assertEqual(self.service("/server/hub/jobs", key=key, source=HUB)[1]["jobs"],
+                         [{"id": moved["job"], "kind": "install", "agent": "juno", "runtime": "claude",
+                           "state": "queued"}])
+        self.assertEqual(self.servers()[1]["hub"]["agents"], ["juno"])
+
+    def test_the_step_one_is_refused_with_a_code_where_the_hubs_server_can_take_no_agent(self):
+        team = self.fresh_fleet(placed=False)
+        team["door"] = {"address": HUB}             # the door runs on the hub's server
+        self.write_team(team)
+        status, refused = self.shape("one")
+        self.assertEqual((status, refused["why"]), (409, ["door_at_hub"]))
+        self.assertIn("A fleet on one server has no door.", refused["error"])
+        self.assertNotIn("shape", self.origin_team())               # a refusal writes nothing, the step neither
+        self.assertEqual(self.shape("two")[0], 200)                 # each other step is free there
+        team = self.origin_team()
+        del team["door"]
+        team["agents"]["git"] = {"role": "worker", "runtime": "codex", "machine": "hub", "can": ["shell"]}
+        self.write_team(team)
+        status, refused = self.shape("one")
+        self.assertEqual((status, refused["why"], refused["agents"]), (409, ["hub_own_name"], ["git"]))
+        team["agents"]["vault"] = team["agents"].pop("git")         # the name of the vault broker's own user
+        self.write_team(team)
+        status, refused = self.shape("one")
+        self.assertEqual((status, refused["why"], refused["agents"]), (409, ["hub_own_name"], ["vault"]))
+        del team["agents"]["vault"]
+        # an agent that has root on the hub's server through the door, and a manager that holds servers through it:
+        # the hub's server would take no second agent, so the step says so, and not Add agent one press later
+        team["addresses"]["spare"] = NEW
+        team["agents"]["scout"] = {"role": "worker", "runtime": "codex", "machine": "spare", "can": ["shell"],
+                                   "servers": {"hub": "fix"}}
+        self.write_team(team)
+        status, refused = self.shape("one")
+        self.assertEqual((status, refused["why"], refused["agents"]), (409, ["fix_holder"], ["scout"]))
+        del team["agents"]["scout"]
+        team["agents"]["manager"]["servers"] = {"app-1": "read"}
+        self.write_team(team)
+        status, refused = self.shape("one")
+        self.assertEqual((status, refused["why"], refused["agents"]), (409, ["door_caller"], ["manager"]))
+        del team["agents"]["manager"]["servers"]
+        self.write_team(team)
+        with patch.object(hub, "HUB_KIND", "mac"):
+            status, refused = self.shape("one")
+        self.assertEqual((status, refused["why"]), (409, ["hub_on_mac"]))
+        self.assertNotIn("shared", self.origin_team()["hub"])
+
+    def test_another_step_takes_the_word_away_when_no_agent_runs_on_the_hubs_server(self):
+        """The way back. While an agent runs on the hub's server, the word stays, and the answer says so. When none
+        runs there, the same command takes the word away: no new agent goes onto the hub's server, and a door can run
+        there again. The server's own service keeps its record and does nothing."""
+        self.fresh_fleet(shared=True)               # the manager runs on the hub's server
+        self.manager_has_its_key()
+        key = self.hub_service()
+        self.assertEqual(self.servers()[0]["shape"], {"step": "one"})
+        status, answer = self.shape("two")
+        self.assertEqual((status, answer["step"], answer["hub_shared"]), (200, "two", True))
+        team = self.origin_team()
+        self.assertEqual((team["shape"], team["hub"].get("shared")), ({"step": "two"}, True))
+        self.joined("spare", "linux", source=NEW, user="fleet")
+        team = self.origin_team()
+        team["agents"]["manager"]["machine"] = "spare"              # the manager moved to a server of its own
+        self.write_team(team)
+        status, answer = self.shape("two")
+        self.assertEqual((status, answer["hub_shared"], answer["root_step"]), (200, False, False))
+        team = self.origin_team()
+        self.assertEqual(team["hub"], {"machine": "hub", "port": 8765})
+        self.assertEqual(team["servers"]["hub"], {"kind": "linux", "user": "fleet"})
+        self.assertEqual(self.reading("hub", key=key, source=HUB, os_name=LINUX, features=[hub.INSTALL_KEY])[0], 200)
+        hub_ = self.servers()[1]["hub"]
+        self.assertEqual((hub_["joined"], hub_["available"], hub_["why"]), (True, False, ["hub_machine"]))
+        hub.validate_team(dict(self.origin_team(), door={"address": HUB}))     # a door can run there again
+        # and one server again: the service is there already, so no root step is left
+        status, answer = self.shape("one")
+        self.assertEqual((status, answer["hub_shared"], answer["root_step"]), (200, True, False))
+
+    def test_a_manager_with_no_server_takes_a_new_name(self):
+        """The first run's page "Name your manager" for a fleet that exists. Nothing of such a manager is on a
+        server, so its rename is one commit and one move of its records, with no job. Its name has the installer's
+        rule, because its OS user is made from the name when it gets its server. A manager that has a server keeps
+        its name, as before."""
+        self.fresh_fleet(placed=False)
+        hub.q("INSERT INTO tasks(id,title,owner,requester,state,created,done_when) VALUES(7,'Say hello','manager',"
+              "'manager','submitted',1,'said')")       # a task of a manager that never had a session waits for nothing
+        for name, code, words in (("a" + "b" * 26, 409, "at most 26 characters"),
+                                  ("git", 409, "Founderizer uses the name git itself on a server"),
+                                  ("vault-keeper", 409, "Founderizer uses the name vault-keeper itself on a server")):
+            status, refused = self.owner("/ui/team/agents/manager/rename", base_sha256=self.team_sha(), name=name)
+            self.assertEqual(status, code, refused)
+            self.assertIn(words, refused["error"])
+        status, receipt = self.owner("/ui/team/agents/manager/rename", base_sha256=self.team_sha(), name="juno")
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual((receipt["agent"], receipt["was"], receipt["server"], receipt["job"]),
+                         ("juno", "manager", None, None))
+        team = self.origin_team()
+        self.assertEqual(list(team["agents"]), ["juno"])
+        self.assertEqual((team["agents"]["juno"]["role"], team["agents"]["juno"]["placed"]), ("manager", False))
+        self.assertEqual(hub.manager_name(), "juno")
+        origin = str(self.root / "origin.git")
+        self.assertIn("juno", git("--git-dir", origin, "show", "main:profiles/juno.md").splitlines()[0])
+        self.assertNotIn("profiles/manager.md", git("--git-dir", origin, "ls-tree", "-r", "--name-only", "main"))
+        self.assertEqual(hub.q("SELECT id FROM server_jobs"), [])
+        self.assertEqual(hub.q1("SELECT owner, requester FROM tasks WHERE id=7")["owner"], "juno")
+        # a second name while it still has no server, and then none after it has one
+        status, receipt = self.owner("/ui/team/agents/juno/rename", base_sha256=self.team_sha(), name="iris")
+        self.assertEqual((status, receipt["agent"]), (200, "iris"))
+        team = self.origin_team()
+        del team["agents"]["iris"]["placed"]
+        self.write_team(team)
+        status, refused = self.owner("/ui/team/agents/iris/rename", base_sha256=self.team_sha(), name="juno")
+        self.assertEqual((status, refused["error"]), (409, "The manager keeps its name."))
+
+    def test_roots_step_makes_the_vault_and_the_server_service_of_a_hub_that_runs(self):
+        """hubsetup.py one-server, which the owner's Mac runs as root from root's own clone after the owner's
+        command: the root helpers, the vault broker from root's clone, and, as the hub's user, the service's own
+        clone and hub-server. Without the owner's word in team.json it stops and runs nothing."""
+        home = self.root / "home-of-fleet"
+        checkout = home / "fleet-pilot"
+        checkout.mkdir(parents=True)
+        git("init", "-q", str(checkout))
+        git("remote", "add", "origin", str(home / "fleet-pilot.git"), cwd=checkout)
+        ran, parts = [], []
+        account = lambda user: {"uid": 1000, "group": user, "home": str(home)}
+        run = lambda script, timeout=None: (ran.append(script), (0, "Founderizer: the server service of hub runs", ""))[1]
+        fakes = dict(kit="/usr/local/lib/founderizer-kit", run=run, account=account,
+                     vault=lambda **given: (parts.append(("vault", given["kit"], given["hub_address"])),
+                                            {"state": "made"})[1],
+                     known=lambda db, name: (parts.append(("known", db, name)), False)[1])
+        helper = patch.object(hubsetup, "agent_helper", lambda **given: parts.append(
+            ("helper", given["service_user"], given["repo"], given["kit"])))
+        quiet = patch.object(hubsetup, "say", lambda *_a: None)
+        with helper, quiet:
+            (checkout / "team.json").write_text(json.dumps(hubsetup.template(HUB, owner=OWNER, placed=False)))
+            with self.assertRaises(hubsetup.Stop) as refused:
+                hubsetup.one_server(**fakes)
+            self.assertIn("the owner chooses one server in Founderizer first", str(refused.exception))
+            self.assertEqual((ran, parts), ([], []))
+            team = hubsetup.template(HUB, owner=OWNER, placed=False)
+            team["hub"]["shared"] = True
+            team["servers"] = {"hub": {"kind": "linux", "user": "fleet"}}
+            (checkout / "team.json").write_text(json.dumps(team))
+            done = hubsetup.one_server(**fakes)
+        self.assertEqual(done, {"server": "hub", "vault": "made", "service": "made"})
+        repo = f"git://{HUB}/fleet-pilot.git"
+        self.assertEqual(parts, [("helper", "fleet", repo, "/usr/local/lib/founderizer-kit"),
+                                 ("vault", "/usr/local/lib/founderizer-kit", f"http://{HUB}:8765"),
+                                 ("known", str(home / ".fleet" / "pilot.db"), "hub")])
+        as_user = (f"cd / && runuser -u fleet -- env HOME={home} XDG_RUNTIME_DIR=/run/user/1000 "
+                   f"PATH={home}/.local/bin:/usr/local/bin:/usr/bin:/bin ")
+        self.assertEqual(ran, [as_user + f"git clone -q -b config {repo} {home}/fleet-server </dev/null",
+                               as_user + f"python3 {home}/fleet-server/hubsetup.py hub-server --team "
+                                         f"{checkout}/team.json --repo {repo} </dev/null"])
+        # a second run: the vault is there, the hub knows the service, and the service's clone is not made again
+        (home / "fleet-server" / ".git").mkdir(parents=True)
+        ran.clear()
+        again = dict(fakes, vault=lambda **given: {"state": "there"}, known=lambda db, name: True)
+        with helper, quiet:
+            self.assertEqual(hubsetup.one_server(**again), {"server": "hub", "vault": "there", "service": "there"})
+            self.assertEqual(len(ran), 1)
+            self.assertIn("hub-server", ran[0])
+            # each stop has its reason: a hub-server that failed, and a checkout whose origin is no repository of the hub
+            failed = dict(again, run=lambda script, timeout=None: (1, "", "the hub keeps no records yet"))
+            with self.assertRaisesRegex(hubsetup.Stop, "the server service of hub could not be made: the hub keeps"):
+                hubsetup.one_server(**failed)
+            git("remote", "set-url", "origin", "https://example.com/another place", cwd=checkout)
+            with self.assertRaisesRegex(hubsetup.Stop, "is not the hub's own repository"):
+                hubsetup.one_server(**again)
+        # the command itself is root's, on Linux, from root's own clone: anywhere else its last line says why
+        def last_line(**patches):
+            said = []
+            more = patch.multiple(hubsetup, **patches) if patches else contextlib.nullcontext()
+            with patch("builtins.print", lambda *a, **k: said.append(" ".join(map(str, a)))), more:
+                ended = hubsetup.main(["one-server"])
+            return ended, json.loads([line for line in said if line.startswith("{")][-1])
+        linux = patch.object(hubsetup.platform, "system", lambda: "Linux")
+        with patch.object(hubsetup.platform, "system", lambda: "Darwin"):
+            ended, last = last_line()
+        self.assertEqual((ended, last["ok"]), (1, False))
+        self.assertIn("for a hub on a Linux server", last["error"])
+        with linux, patch.object(hubsetup.os, "geteuid", lambda: 1000):
+            ended, last = last_line()
+        self.assertEqual(ended, 1)
+        self.assertIn("run it as root on the hub's machine", last["error"])
+        with linux, patch.object(hubsetup.os, "geteuid", lambda: 0):
+            ended, last = last_line()
+            self.assertEqual(ended, 1)
+            self.assertIn("only from root's own clone", last["error"])
+            ended, last = last_line(ROOT_KIT=os.path.realpath(hubsetup.KIT), root_owned=lambda path: True,
+                                    one_server=lambda hub_user: {"server": "hub", "vault": "made", "service": "made"})
+        self.assertEqual((ended, last), (0, {"ok": True, "server": "hub", "vault": "made", "service": "made"}))
 
 
 if __name__ == "__main__":

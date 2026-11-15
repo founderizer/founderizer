@@ -275,9 +275,9 @@ def manager_name(name=None):
     """The name of a new hub's manager: the one that the installer was given, which is the owner's own choice, or
     `manager` when it was given none. It is one name by the hub's own rule for an agent's name (hub.AGENT_NAME, and
     not `owner` or `hub`), it is no name that the fleet uses itself on a server (FLEET_OWN_NAMES, FLEET_OWN_STARTS),
-    and it is short enough for its OS user `fleet-<name>`. The hub lets nobody rename the manager afterwards
-    (hub.rename_agent), so a name that fails stops the install: hub.sh checks it before its first step, and the claim
-    checks it here before it makes a code."""
+    and it is short enough for its OS user `fleet-<name>`. The hub lets nobody rename a manager that has a server
+    (hub.rename_agent: only a manager with no server yet takes a new name), so a name that fails stops the install:
+    hub.sh checks it before its first step, and the claim checks it here before it makes a code."""
     if name is None:
         return MANAGER
     if not isinstance(name, str) or not hub.AGENT_NAME.fullmatch(name) or name in hub.RESERVED_AGENT_NAMES \
@@ -293,8 +293,24 @@ def manager_name(name=None):
     return name
 
 
+def shape_step(step=None, shared=False):
+    """The step of the fleet's servers that a new hub keeps (hub.shape_view, owner feature fleet_shape): the one that
+    the installer was given (hub.sh's FLEET_SHAPE_STEP, which the owner's app sends from its slider), `one` for one
+    server for all, or None when it was given none. One server for all is the step `one` and no other, so the two
+    words must agree: a pair that does not stops the install, as a manager's name that it cannot have does."""
+    if step is not None and step not in hub.SHAPE_STEPS:
+        raise Stop(f"{step!r} is no step of the fleet's servers: it is {', '.join(hub.SHAPE_STEPS[:-1])} or "
+                   f"{hub.SHAPE_STEPS[-1]}.")
+    if shared and step not in (None, "one"):
+        raise Stop(f"one server for all is the step one of the fleet's servers, not {step}: give --shared, or "
+                   f"--shape-step {step}, not both.")
+    if step == "one" and not shared:
+        raise Stop("the step one of the fleet's servers is one server for all: give --shared with it.")
+    return "one" if shared else step
+
+
 def template(hub_ip, port=8765, timezone=None, owner=None, runtime="claude", ssh_user="fleet", ssh_port=22,
-             placed=True, manager=None, shared=False):
+             placed=True, manager=None, shared=False, shape=None):
     """The first team.json of a new hub: one manager, this machine's address, and the owner's Mac when the claim has
     proved it. Nothing here holds a credential: `"vault": "none"` says that the manager has no vault access, because
     its runtime is the customer's own subscription, signed in by the customer.
@@ -307,6 +323,9 @@ def template(hub_ip, port=8765, timezone=None, owner=None, runtime="claude", ssh
     server is named (`servers`: Linux, with `ssh_user`, which hub.sh gives as the user of the hub's services), because
     its own server service installs each agent that the owner adds there (hub_server). It does not go with
     `placed=False`: that manager is on no server.
+
+    `shape` (`claim --shape-step`; hub.sh's FLEET_SHAPE_STEP): the step of the fleet's servers that the owner chose
+    in the first run, which the file keeps as `"shape": {"step"}` (shape_step). One server for all keeps `one`.
 
     `placed=False` (`claim --manager-later`; hub.sh's FLEET_MANAGER_SERVER=later, which Founderizer 0.1.112 and later
     set): the manager has no server yet (`"placed": false`, hub.unplaced), so no agent runs on the hub's server, and
@@ -324,6 +343,7 @@ def template(hub_ip, port=8765, timezone=None, owner=None, runtime="claude", ssh
     if owner is not None:
         addresses["owner"] = address(owner, "the owner's address")
     name = manager_name(manager)
+    step = shape_step(shape, shared)
     if shared and not placed:
         raise Stop("one server for all puts the manager on the hub's server, so it does not go with a manager that "
                    "has no server yet: give --shared or --manager-later, not both.")
@@ -341,6 +361,8 @@ def template(hub_ip, port=8765, timezone=None, owner=None, runtime="claude", ssh
     if shared:
         team["hub"]["shared"] = True
         team["servers"] = {"hub": {"kind": "linux", "user": ssh_user}}
+    if step:
+        team["shape"] = {"step": step}
     return team
 
 
@@ -1791,7 +1813,8 @@ def hub_server(team_path, db=None, repo=None):
     name = conf["machine"]
     if conf.get("shared") is not True:
         raise Stop(f"this hub's own server takes no agent (\"hub\": {{\"shared\": true}} is not in {team_path}), so "
-                   f"it gets no server service. Only a hub's first install decides that.")
+                   f"it gets no server service. A hub's first install decides that, or the owner's own command in "
+                   f"Founderizer for a hub that runs.")
     if os.path.realpath(server.KIT) == os.path.realpath(os.path.dirname(os.path.abspath(team_path))):
         raise Stop("run hub-server from the server service's own clone, not from the hub's checkout: the service "
                    "brings its checkout up to date by itself, and the hub's checkout is the hub's to move.")
@@ -1850,6 +1873,81 @@ def hub_server(team_path, db=None, repo=None):
     say(f"the server service of {name} runs: it installs each agent that the owner adds on this server, each under "
         f"its own OS user")
     return digest
+
+
+def one_server(hub_user="fleet", kit=None, run=None, account=None, vault=None, known=None):
+    """The root part of one server for a hub that runs (owner feature hub_shared_later), as root on the hub's server,
+    from root's own clone: what a first install with FLEET_HUB_SERVER=shared makes in its two steps, for a hub whose
+    owner chose that step afterwards (hub.set_shape wrote `"hub": {"shared": true}` into team.json).
+
+    - The root helpers of this server's agent users and its vault broker (agent_helper), which each hub's install
+      makes: again here, because a hub from before them has none, and its server service needs them.
+    - This server's own vault broker (vault_install), from root's clone: the program that root installs is one that
+      the hub's user cannot change.
+    - As the hub's user: the server service's own clone beside the hub's checkout, and hub_server, which makes the
+      service's key, writes its SHA-256 into the hub's records and starts the service. That part needs no root, and
+      the key is a file of the hub's user.
+
+    It restarts no service of the hub, and it is safe to run again: each part reads first. The word is the owner's
+    command alone: without it in team.json this stops and changes nothing. Returns {"server", "vault", "service"},
+    each of the last two "made" or "there"."""
+    run = run or _shell
+    kit = kit or KIT
+    info = (account or hub_account)(hub_user)
+    checkout = hub_checkout(info["home"])
+    team_path = os.path.join(checkout, "team.json")
+    team = read_team(team_path)
+    if team is None:
+        raise Stop(f"{team_path} is not a team.json the hub can run, so this server gets no server service.")
+    conf = team["hub"]
+    name = conf["machine"]
+    if conf.get("shared") is not True:
+        raise Stop("this hub's own server takes no agent: the owner chooses one server in Founderizer first, and "
+                   "then this step makes the server ready. Nothing changed.")
+    address, port = team["addresses"][name], int(conf.get("port") or 8765)
+    # The address that this fleet's machines clone from: the hub's checkout has the hub's bare repository as its
+    # origin, and the hub's git service serves that folder under its own name (hub.py served_repository).
+    code, origin, err = git("config", "--get", "remote.origin.url", folder=checkout)
+    served = os.path.basename((origin or "").rstrip("/"))
+    if code != 0 or not re.fullmatch(r"[A-Za-z0-9._-]+\.git", served):
+        raise Stop(f"the origin of the hub's checkout {checkout} is not the hub's own repository, so the address "
+                   f"that this fleet's machines clone from is not known: {(err or origin)[-200:]}")
+    repo = f"git://{address}/{served}"
+    agent_helper(service_user=hub_user, repo=repo, run=run, kit=kit)
+    broker = (vault or vault_install)(kit=kit, hub_address=f"http://{address}:{port}", run=run)
+    had = (known or server_known)(os.path.join(info["home"], ".fleet", "pilot.db"), name)
+    as_user = ("runuser -u %(u)s -- env HOME=%(home)s XDG_RUNTIME_DIR=/run/user/%(uid)d "
+               "PATH=%(home)s/.local/bin:/usr/local/bin:/usr/bin:/bin " % {
+                   "u": shlex.quote(hub_user), "home": shlex.quote(info["home"]), "uid": info["uid"]})
+    server_kit = os.path.join(info["home"], "fleet-server")
+    if not os.path.isdir(os.path.join(server_kit, ".git")):
+        code, out, err = run(f"cd / && {as_user}git clone -q -b {lifecycle.CONFIG_BRANCH} {shlex.quote(repo)} "
+                             f"{shlex.quote(server_kit)} </dev/null", timeout=600)
+        if code != 0:
+            raise Stop(f"the checkout of the server service could not be cloned from {repo}: "
+                       f"{(err or out).strip()[-300:]}. Check that the hub's git service runs.")
+    code, out, err = run(f"cd / && {as_user}python3 {shlex.quote(os.path.join(server_kit, 'hubsetup.py'))} hub-server "
+                         f"--team {shlex.quote(team_path)} --repo {shlex.quote(repo)} </dev/null", timeout=900)
+    for line in (out or "").splitlines():
+        if line.strip():
+            say(line.strip().removeprefix("Founderizer: "))
+    if code != 0:
+        raise Stop(f"the server service of {name} could not be made: {(err or out).strip()[-300:]}")
+    return {"server": name, "vault": "there" if broker.get("state") == "there" else "made",
+            "service": "there" if had else "made"}
+
+
+def server_known(db, name):
+    """True when the hub's records hold the key of this server's own server service. Read and never written: this
+    runs as root, and a write could leave a file of root's beside the hub's own records."""
+    try:
+        con = sqlite3.connect(pathlib.Path(db).resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+        try:
+            return con.execute("SELECT 1 FROM server_keys WHERE server=?", (name,)).fetchone() is not None
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
 
 
 # ---------------------------------------------------------------- root's own clone (DevOps plan V2)
@@ -3489,7 +3587,8 @@ def cmd_template(args):
     print(json.dumps(template(args.address, args.port, args.timezone or machine_timezone(), args.owner,
                               args.runtime, args.ssh_user, args.ssh_port, placed=not args.manager_later,
                               manager=getattr(args, "manager_name", None),
-                              shared=getattr(args, "shared", False)), indent=2))
+                              shared=getattr(args, "shared", False),
+                              shape=getattr(args, "shape_step", None)), indent=2))
 
 
 def cmd_repository(args):
@@ -3500,6 +3599,8 @@ def cmd_claim(args):
     here = address(args.address, "the hub's address")
     named = getattr(args, "manager_name", None)     # a caller from before the option gives none: `manager`
     manager_name(named)                 # a name that the manager cannot have stops the claim before its code
+    shape_step(getattr(args, "shape_step", None), getattr(args, "shared", False))       # and so does a step that
+    # does not go with one server for all
     if getattr(args, "shared", False) and args.manager_later:       # and so do two layouts at one time (template)
         raise Stop("one server for all puts the manager on the hub's server, so it does not go with a manager that "
                    "has no server yet: give --shared or --manager-later, not both.")
@@ -3532,7 +3633,8 @@ def cmd_claim(args):
                                                                args.timezone or machine_timezone(),
                                                                runtime=args.runtime, ssh_user=args.ssh_user,
                                                                ssh_port=args.ssh_port, placed=not args.manager_later,
-                                                               manager=named, shared=getattr(args, "shared", False))
+                                                               manager=named, shared=getattr(args, "shared", False),
+                                                               shape=getattr(args, "shape_step", None))
         team.setdefault("addresses", {})["owner"] = owner
         kit = os.path.dirname(os.path.abspath(args.out))
         if named and manager_of(team) not in (None, named):     # a team.json that is this hub's own keeps its fleet
@@ -3822,6 +3924,29 @@ def cmd_connect(args):
     print(json.dumps(dict({"ok": True}, **done)), flush=True)
 
 
+def cmd_one_server(args):
+    """one-server, as root on the hub's Linux machine, from root's own clone. The owner's app runs it over its root
+    connection and reads its last line on standard output, which is always one JSON object: {"ok": true, "server",
+    "vault", "service"}, or {"ok": false, "error": "<one sentence>"} with a non-zero exit. Every line before it is
+    progress."""
+    try:
+        if platform.system() != "Linux":
+            raise Stop("one server for all is for a hub on a Linux server, and this machine is not one.")
+        if os.geteuid() != 0:
+            raise Stop(f"run it as root on the hub's machine: sudo python3 {ROOT_KIT}/hubsetup.py one-server")
+        if os.path.realpath(KIT) != ROOT_KIT or not root_owned(ROOT_KIT):
+            raise Stop(f"this step runs only from root's own clone, {ROOT_KIT}, which kit-clone makes: never from a "
+                       f"folder that the hub's user can change")
+        done = one_server(hub_user=args.hub_user)
+    except Stop as e:
+        print(json.dumps({"ok": False, "error": str(e)}), flush=True)
+        raise
+    except Exception as e:          # never a trace on the last line: the app reads it as the answer
+        print(json.dumps({"ok": False, "error": f"one-server stopped ({type(e).__name__})."}), flush=True)
+        raise Stop(f"one-server stopped ({type(e).__name__}).") from None
+    print(json.dumps(dict({"ok": True}, **done)), flush=True)
+
+
 def cmd_kit_clone(args):
     """kit-clone, as root on the hub's machine (kit_clone)."""
     if platform.system() != "Linux":
@@ -3901,6 +4026,9 @@ def main(argv=None):
     hs.add_argument("--repo", required=True, help="the git:// address that this fleet's machines clone from")
     hs.add_argument("--db", default=DB_PATH, help="the hub's own records; the default is where hub.py keeps them")
     hs.set_defaults(fn=cmd_hub_server)
+    osv = sub.add_parser("one-server")
+    osv.add_argument("--hub-user", default="fleet", help="the user the hub runs as: its server service runs as it")
+    osv.set_defaults(fn=cmd_one_server)
     kc = sub.add_parser("kit-clone")
     kc.add_argument("--hub-user", default="fleet", help="the user the hub runs as: its checkout holds release.json")
     kc.add_argument("--source", help="the published repository; default: " + releases.DEFAULT_UPSTREAM)
@@ -3942,6 +4070,9 @@ def main(argv=None):
                                               f"{MANAGER} when it is left out")
         p.add_argument("--shared", action="store_true",
                        help="one server for all: this hub's own server takes agents (not with --manager-later)")
+        p.add_argument("--shape-step", choices=hub.SHAPE_STEPS,
+                       help="the step of the fleet's servers that the owner chose, which the first team.json keeps; "
+                            "one goes with --shared, and --shared alone keeps one")
         if name == "template":
             p.add_argument("--owner")
         else:

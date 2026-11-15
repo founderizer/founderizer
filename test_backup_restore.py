@@ -624,6 +624,10 @@ class Restore(Fixture):
         reset = []
         team = json.loads(hub.restored_team(bundle, reset))        # this hub has no pin for its own server
         self.assertEqual((team["vault_stores"], reset), ({"vps": other}, ["scout"]))
+        # the step of the fleet's servers is the owner's choice and comes with the copy; the hub's block is this hub's
+        stepped = dict(copy, shape={"step": "one"}, hub=dict(copy["hub"], shared=True))
+        team = json.loads(hub.restored_team({"config": {"team.json": json.dumps(stepped).encode()}}, []))
+        self.assertEqual((team["shape"], team["hub"]), ({"step": "one"}, hub.TEAM["hub"]))
         self.assertEqual((team["agents"]["scout"]["vault"], "vault_recipient" in team["agents"]["scout"]), ("none", False))
         self.assertEqual((team["agents"]["vps"]["vault"], team["agents"]["vps"]["vault_recipient"]), ("broker", other))
         hub.TEAM["vault_stores"] = {"hub": here}                    # this hub pinned its own server's broker

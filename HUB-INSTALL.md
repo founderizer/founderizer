@@ -51,8 +51,15 @@ counts at a hub's first install, and it does not go with `FLEET_MANAGER_SERVER=l
 Without it the steps are the seventeen below, and no new agent goes onto the hub's server.
 Founderizer gives the word since version 0.1.249, when the owner chooses "1 server" on the
 first run's page "Your fleet's servers" (the owner approved this layout on 14 November
-2026). Only a hub's first install takes the word: a fleet that runs cannot change to one
-server yet.
+2026). With `FLEET_SHAPE_STEP=one`, `two` or `each` the first `team.json` also keeps the
+step that the owner chose on that slider (`"shape": {"step"}`, UI-API.md 1.176);
+`FLEET_SHAPE_STEP=one` is `FLEET_HUB_SERVER=shared`, and that word alone keeps the step
+`one`. Both are words of a hub's first install. A fleet that runs changes to one server
+by the owner's command and one root step on the hub's server, from root's own clone, which
+`hubsetup.py kit-clone` brings to the hub's release first: `python3
+/usr/local/lib/founderizer-kit/hubsetup.py one-server`. It makes this server's vault broker
+and its server service and restarts no service of the hub. Founderizer does both from the
+manager's setup of a fleet that exists, on a hub that has them.
 
 What such a fleet does not have: **a door**. The hub knows the door's own calls by the
 door's address alone, and each agent on the hub's server calls from the hub's address. So

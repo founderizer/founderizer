@@ -36,6 +36,12 @@
 # goes onto the hub's server, as before. Such a fleet has no door on this server (HUB-INSTALL.md, "One server for
 # all"). Founderizer gives the word since version 0.1.249, when the owner chooses "1 server" for a new fleet.
 #
+# With FLEET_SHAPE_STEP=one, two or each, the first team.json keeps the step of the fleet's servers that the owner
+# chose on the slider in Founderizer ("shape": {"step"}), so that both apps read one value. FLEET_SHAPE_STEP=one is
+# FLEET_HUB_SERVER=shared, and that word alone keeps the step one. It is a word of a hub's first install: for a hub
+# that runs, the owner's own command changes the step (POST /ui/servers/shape), and `hubsetup.py one-server` is the
+# root part of one server for all there.
+#
 # With FLEET_VERIFY=caller, which the app sets when its own next step is `fleet.py verify`, the last step here runs
 # no verify: the app's step answers for this machine, and the self-test, about a minute, runs one time and not two.
 # Without it this script ends with verify, as it always did, so an agent or a person that ran this line knows.
@@ -155,7 +161,7 @@ case "$runtime" in claude|codex) ;; *) stop "--runtime must be claude or codex" 
 # The manager's name, by the hub's own rule for an agent's name (hub.py AGENT_NAME), and at most 26 characters: its OS
 # user is fleet-<name>, and a user name has at most 32. It is none of the names that the fleet uses itself on a
 # server (hubsetup.py FLEET_OWN_NAMES and FLEET_OWN_STARTS). It is checked here, before the first step, because the
-# hub lets nobody rename the manager afterwards. hubsetup.py's manager_name has the same rule.
+# hub lets nobody rename a manager that has a server. hubsetup.py's manager_name has the same rule.
 if [ -n "$manager_name" ]; then
     name_rule="--manager-name must be a name of 2 to 26 characters a-z 0-9 -, which starts with a letter and is none \
 of the names that the fleet uses itself (owner, hub, agents, channels, chats, checks, git, pilot, server, vault, \
@@ -170,6 +176,22 @@ manager_later=no        # the app gives the manager a server of its own (see the
 if [ "${FLEET_MANAGER_SERVER:-}" = later ]; then manager_later=yes; fi
 hub_shared=no           # the owner chose one server for all: this server takes agents (see the top of this file)
 if [ "${FLEET_HUB_SERVER:-}" = shared ]; then hub_shared=yes; fi
+# The step of the fleet's servers that the owner chose in the first run (the slider "Your fleet's servers"), which the
+# first team.json keeps (hubsetup.py shape_step): one, two or each. One server for all is the step one, so each of
+# the two words gives the other, and the two must agree. It is checked here, before the first step.
+shape_step=${FLEET_SHAPE_STEP:-}
+case "$shape_step" in
+    ""|two|each) ;;
+    one) hub_shared=yes ;;
+    *) stop "FLEET_SHAPE_STEP is \"$shape_step\": the step of the fleet's servers is one, two or each" ;;
+esac
+if [ "$hub_shared" = yes ]; then
+    case "$shape_step" in
+        ""|one) shape_step=one ;;
+        *) stop "FLEET_HUB_SERVER=shared is the step one of the fleet's servers, so it does not go with \
+FLEET_SHAPE_STEP=$shape_step" ;;
+    esac
+fi
 if [ "$hub_shared" = yes ] && [ "$manager_later" = yes ]; then
     stop "FLEET_HUB_SERVER=shared puts the manager on this server, so it does not go with FLEET_MANAGER_SERVER=later"
 fi
@@ -444,6 +466,8 @@ $kit/profiles/$manager_name.md, which is the published profiles/manager.md with 
         fi
         [ "${hub_shared:-no}" = no ] || plan "write \"hub\": {\"shared\": true} and this server's own entry in \
 \"servers\" there: the owner chose one server for all, so this server takes agents"
+        [ -z "${shape_step:-}" ] || plan "write \"shape\": {\"step\": \"$shape_step\"} there: the step of the \
+fleet's servers that the owner chose"
         plan "make a one-time claim code, print the line for the owner's Mac, and serve it on $address:$port until \
 that Mac sends the code back; its address becomes addresses.owner"
         [ "$reclaim" = no ] || plan "stop the service fleet-hub of a hub that runs for the time of that claim, because \
@@ -466,7 +490,7 @@ in time; the hub then serves the owner's pages to the new address and refuses th
     #   stops here with the reason. It never goes on without the name: a manager gets its name once.
     #   --shared: a hub that is there keeps its rule, so the step goes on without the word and says so, and the step
     #   of the server service then has nothing to do.
-    if [ -n "${manager_name:-}" ] || [ "${hub_shared:-no}" = yes ]; then
+    if [ -n "${manager_name:-}" ] || [ "${hub_shared:-no}" = yes ] || [ -n "${shape_step:-}" ]; then
         known=$(as_user python3 "$kit/hubsetup.py" claim --help 2>&1) \
             || stop "the hub's own copy of hubsetup.py in $kit did not answer, so the owner claim cannot start. It \
 said: $known"
@@ -484,7 +508,16 @@ cannot give the manager that name. A hub that has its owner keeps the name of it
                 *--shared*) more="$more --shared" ;;
                 *) say "  the copy of Founderizer in $kit is from before one server for all, so this hub keeps its \
 rule: no new agent goes onto its own server"
-                   hub_shared=no ;;
+                   hub_shared=no
+                   shape_step="" ;;
+            esac
+        fi
+        # --shape-step: a hub that is there keeps the step that it has, or none, so the step goes on without it.
+        if [ -n "${shape_step:-}" ]; then
+            case "$known" in
+                *--shape-step*) more="$more --shape-step $shape_step" ;;
+                *) say "  the copy of Founderizer in $kit is from before the kept step of the fleet's servers, so \
+this hub keeps none" ;;
             esac
         fi
     fi

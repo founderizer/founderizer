@@ -272,6 +272,9 @@ NOT_TOOLS = {
                            "is in a vault; its decline carries no value, and decline_secret_request sends that",
     "/ui/vault/intake": "a value sealed to the central vault, which only the owner's own vault makes",
     "/ui/vault/pin": "a statement signed with the owner's own key, which only their app on their Mac holds",
+    "/ui/servers/shape": "the step of the fleet's servers, which the owner chooses on the slider of their app: the "
+                         "app moves the agents for it, and for one server it runs root's part on the hub's server "
+                         "over the owner's own SSH (hubsetup.py one-server)",
     "/ui/servers/grant": "a server goes with its business: the owner's app gives each server that carries a "
                          "business's Tailscale tag to that business's DevOps agent (or the manager while it has "
                          "none), puts the host's parts in place and writes the door's access file over the owner's "

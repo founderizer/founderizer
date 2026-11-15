@@ -218,7 +218,8 @@ class Template(unittest.TestCase):
         shared = hubsetup.template(HUB_IP, owner="100.90.3.4", ssh_user="fleet", shared=True)
         self.assertEqual(shared["hub"], dict(plain["hub"], shared=True))
         self.assertEqual(shared["servers"], {"hub": {"kind": "linux", "user": "fleet"}})
-        self.assertEqual({k: v for k, v in shared.items() if k not in ("hub", "servers")},
+        self.assertEqual(shared["shape"], {"step": "one"})          # one server for all is the step one
+        self.assertEqual({k: v for k, v in shared.items() if k not in ("hub", "servers", "shape")},
                          {k: v for k, v in plain.items() if k != "hub"})
         self.assertNotIn("servers", plain)
         self.assertNotIn("shared", plain["hub"])
@@ -4426,6 +4427,44 @@ class CheckMode(unittest.TestCase):
                       "FLEET_MANAGER_SERVER=later", refused)
         self.assertNotIn("Founderizer step 1", refused)
         self.assertEqual(self.run_check(more_env={"FLEET_HUB_SERVER": "yes"}), plain)       # only the one word counts
+
+    def test_the_installer_takes_the_step_of_the_fleets_servers(self):
+        """FLEET_SHAPE_STEP=one, two or each: the step that the owner chose on the slider, which the first team.json
+        keeps. The step one is one server for all, so each of the two words gives the other, and a pair that does not
+        agree stops the install before its first step. Without the word the plan is the plan of before."""
+        plain = self.run_check()
+        self.assertNotIn('"shape"', plain)
+        for step in ("two", "each"):
+            out = self.run_check(more_env={"FLEET_SHAPE_STEP": step})
+            self.assertIn(f'would write "shape": {{"step": "{step}"}} there: the step of the fleet\'s servers that the '
+                          f'owner chose', out)
+            self.assertEqual([line for line in out.splitlines() if '"shape"' not in line], plain.splitlines())
+        shared = self.run_check(more_env={"FLEET_HUB_SERVER": "shared"})
+        self.assertIn('would write "shape": {"step": "one"} there', shared)
+        self.assertEqual(self.run_check(more_env={"FLEET_SHAPE_STEP": "one"}), shared)
+        self.assertEqual(self.run_check(more_env={"FLEET_SHAPE_STEP": "one", "FLEET_HUB_SERVER": "shared"}), shared)
+        for env, words in (({"FLEET_SHAPE_STEP": "three"}, 'FLEET_SHAPE_STEP is "three"'),
+                           ({"FLEET_SHAPE_STEP": "each", "FLEET_HUB_SERVER": "shared"},
+                            "so it does not go with FLEET_SHAPE_STEP=each"),
+                           ({"FLEET_SHAPE_STEP": "one", "FLEET_MANAGER_SERVER": "later"},
+                            "so it does not go with FLEET_MANAGER_SERVER=later")):
+            refused = self.run_check(more_env=env, expect=1)
+            self.assertIn(words, refused)
+            self.assertNotIn("Founderizer step 1", refused)
+        # the claim gets the step from the hub's own copy of hubsetup.py, when that copy knows the option
+        body = shell_function(SCRIPT, "first_team") + "first_team\n"
+        stubs = ("as_user() { case \"$*\" in *'claim --help'*) printf '%s\\n' \"$KNOWS\" ;; "
+                 "*) printf 'RAN: %s\\n' \"$*\" ;; esac; }\n"
+                 "sshd_folder() { :; }\nsshd() { echo 'port 22'; }\n"
+                 "kit=/kit\naddress=100.80.1.2\nport=8765\nruntime=claude\nclaim_wait=1800\ntimezone=\n"
+                 "reclaim=no\nmanager_later=yes\nmanager_name=\nhub_shared=no\n")
+        code, out = run_shell(body, extra=stubs + "shape_step=two\nKNOWS='[--shared] [--shape-step {one,two,each}]'\n")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(out.strip().endswith("--wait 1800 --commit --manager-later --shape-step two"), out)
+        code, out = run_shell(body, extra=stubs + "shape_step=two\nKNOWS='[--shared]'\n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("is from before the kept step of the fleet's servers, so this hub keeps none", out)
+        self.assertNotIn("--shape-step", [line for line in out.splitlines() if line.startswith("RAN: ")][-1])
 
     def test_the_server_service_step_clones_its_own_checkout_and_runs_only_on_the_word(self):
         """The step itself: with the word it clones the service's own checkout as the hub's user and runs

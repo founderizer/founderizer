@@ -1084,6 +1084,21 @@ def fleet_own_name(name):
     return name in FLEET_OWN_NAMES or str(name).startswith(FLEET_OWN_STARTS)
 
 
+# The steps of the slider "Your fleet's servers" (owner feature fleet_shape), as the apps name them (ServersStep):
+# everything on one server; the hub on a server of its own and the agents on a second one; the hub and each agent on
+# a server of its own.
+SHAPE_STEPS = ("one", "two", "each")
+
+
+def shape_view(team=None):
+    """{"step"} of the step of the slider that the owner chose last (team.json "shape", owner feature fleet_shape), or
+    None for a fleet that keeps none. It is the owner's choice and no fact of the fleet: the apps read where the
+    agents run for the step where the fleet stands, and this word where two steps fit (a fleet with only its manager
+    is both "two" and "each"). Only the step one has a rule in the hub, hub.shared, which set_shape writes with it."""
+    shape = (TEAM if team is None else team).get("shape")
+    return {"step": shape["step"]} if isinstance(shape, dict) and shape.get("step") in SHAPE_STEPS else None
+
+
 def hub_shared(team=None):
     """True for a hub whose own server takes agents (owner feature hub_shared, team.json `"hub": {"shared": true}`): the
     owner chose one server for all at the install (the first step of the slider "Your fleet's servers", which the
@@ -1093,7 +1108,8 @@ def hub_shared(team=None):
     the hub's server, where the central vault holds every key. Such a server has its own vault broker (hub.sh's vault
     step) and keeps the records of its own keys over a restore (own_server_records). It has no door: validate_door
     says why. Founderizer gives the installer the word since version 0.1.249, for the slider's step "1 server" of a
-    new fleet (UI-API.md 1.168 and 1.171). No command gives it to a hub that runs."""
+    new fleet (UI-API.md 1.168 and 1.171). A hub that runs gets it from the owner's command set_shape, whose root
+    part is hubsetup.py one-server (UI-API.md 1.176)."""
     conf = (TEAM if team is None else team).get("hub")
     return isinstance(conf, dict) and conf.get("shared") is True
 
@@ -1579,6 +1595,14 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # hub's own server takes agents when team.json says "hub": {"shared": true};
                                     # GET /ui/servers has hub_shared, and the door's refusals have `why`
                                     # (UI-API.md 1.168)
+               "fleet_shape",       # the owner, 15 November 2026 ("Yes, start it", of the hub work for the name page
+                                    # and the slider in a fleet that exists): the fleet keeps the step of the
+                                    # slider that the owner chose last, team.json "shape": {"step"}; GET
+                                    # /ui/servers has shape, POST /ui/servers/shape writes it (UI-API.md 1.176)
+               "hub_shared_later",  # the same yes: POST /ui/servers/shape with the step one gives a hub that
+                                    # runs the word hub.shared, and hubsetup.py one-server is its root part
+               "manager_rename",    # the same yes: a manager that has no server yet takes a new name
+                                    # (POST /ui/team/agents/<agent>/rename, with no job)
                "chat_waits",        # the owner, 13 November 2026 ("Yes, fix it"): the phone's list of chats says
                                     # "Thinking" for every conversation, from agents[].waits_since of GET /ui/mobile
                                     # (UI-API.md 1.142)
@@ -34611,6 +34635,11 @@ def validate_team(team):
             raise ValueError("hub.connect must be true or false")
     if "shared" in hub_conf and hub_conf["shared"] is not True:        # owner feature hub_shared
         raise ValueError("hub.shared is true for a hub whose own server takes agents, or absent")
+    shape = team.get("shape")           # owner feature fleet_shape: the step of the slider that the owner chose last
+    if shape is not None and not (isinstance(shape, dict) and set(shape) == {"step"}
+                                  and shape["step"] in SHAPE_STEPS):
+        raise ValueError('shape is {"step": "one", "two" or "each"}, the step of the fleet\'s servers that the owner '
+                         'chose last, or absent')
     for machine, ip in addresses.items():
         try:
             ipaddress.ip_address(ip)
@@ -36591,7 +36620,8 @@ def installing(job, agent):
 
 def servers_view():
     """GET /ui/servers: each server with its kind, address, agents, newest reading, availability (why: the codes of
-    what stops a new agent) and newest job; whether the hub's own server takes agents (hub_shared); on the hub's own
+    what stops a new agent) and newest job; whether the hub's own server takes agents (hub_shared), and the step
+    of the slider that the owner chose last (shape); on the hub's own
     row the hub's own read of its server (hardening); on each row how the fleet reaches that server, by its own record
     (access); and the state of the newest join code."""
     t0, desired = now(), kit_revision()
@@ -36637,7 +36667,7 @@ def servers_view():
                     "access": {"ssh": {"user": ways["ssh_user"], "port": ways.get("ssh_port", 22)}
                                if ways.get("ssh_user") else None}})
     return {"desired_revision": desired, "servers": out, "apps": app_servers_view(team),
-            "hub_shared": hub_shared(team),
+            "hub_shared": hub_shared(team), "shape": shape_view(team),
             "join": join_view(q1("SELECT * FROM join_codes ORDER BY id DESC LIMIT 1"), t0)}
 
 
@@ -37119,6 +37149,83 @@ def add_server_agent(server, body):
     return {"agent": agent, "server": server, "runtime": runtime, "job": job, "revision": commit, "sha256": digest}
 
 
+def set_shape(body):
+    """POST /ui/servers/shape {base_sha256, step}: the owner chose a step of the slider "Your fleet's servers" for a
+    fleet that runs (owner features fleet_shape and hub_shared_later). One commit of team.json keeps the step, and
+    with it the one rule that a step has in the hub:
+
+    - **one**, on a hub whose own server takes no agent yet: the word `"hub": {"shared": true}` and that server's
+      entry in "servers", as the installer writes them at a first install with FLEET_HUB_SERVER=shared
+      (hubsetup.template). The server then still needs its vault broker and its server service, which only root on
+      that server makes: `hubsetup.py one-server`, which the owner's Mac runs over its root connection. Until then
+      the answer says `root_step`, and the hub's row of GET /ui/servers has `joined` false. Refused, with a code: the
+      door runs at the hub's address (validate_door: the hub knows the door by its address, and each agent there
+      calls from it), the hub runs on a Mac, an agent on the hub's server has a name that the fleet uses itself
+      there, an agent holds Fix on the hub's server, or an agent of the hub's server holds servers through the door.
+      A server that has agents already gets its vault broker after their first sessions, so its first key is the
+      one that its helpers report then (VAULT.md, limit 21).
+    - **two** or **each**, on a hub whose own server takes agents: the way back. When no agent runs there, the word
+      goes, so that no new agent comes onto the hub's server and a door can run there again. While an agent runs
+      there, the word stays and the answer says so: the same command again takes it away after the agents left. The
+      server's vault broker and its service stay installed, and do nothing.
+
+    The same step again, with nothing to change, makes no commit."""
+    step = body["step"]
+    rev = kit_revision(fresh=True)
+    team, current, _ = team_view(rev)
+    if body["base_sha256"] != current:
+        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+    conf = team["hub"]
+    machine, shared = conf["machine"], hub_shared(team)
+    here = server_agents(machine, team)
+    if step == "one" and not shared:
+        if HUB_KIND != "linux":
+            raise refusal_why("This hub runs on a Mac, and a Mac's agents share one user: its own server takes no "
+                              "agent.", ["hub_on_mac"])
+        if (team.get("door") or {}).get("address") == team["addresses"][machine]:
+            raise refusal_why("The door runs on the hub's server, and the hub knows the door by that address: an agent "
+                              "there would be the door to the hub. A fleet on one server has no door.", ["door_at_hub"])
+        named = [n for n in here if fleet_own_name(n)]         # the hub's own names, and the vault's and the group's
+        if named:
+            raise refusal_why(f"Founderizer uses the name {named[0]} itself on the hub's server. Rename "
+                              f"{shown_role(named[0])} first.", ["hub_own_name"], agents=named)
+        # A server takes a second agent only where no agent has root through the door, and where no agent of it holds
+        # servers through the door (add_server_agent): the step is refused here, and not one press later.
+        holders = fix_holders(team, machine)
+        if holders:
+            raise refusal_why(f"{', '.join(shown_role(n) for n in holders)} holds Fix on the hub's server through the "
+                              f"door: an agent goes to a server where no other agent has root.", ["fix_holder"],
+                              agents=holders)
+        callers = door_callers_at(team, machine)
+        if callers:
+            raise refusal_why(f"{', '.join(shown_role(n) for n in callers)} holds servers through the door and runs "
+                              f"alone on its server, by which the door knows it: the hub's server would take no "
+                              f"second agent.", ["door_caller"], agents=callers)
+        import pwd                      # the user that the hub runs as: its server service runs as that user too
+        team["hub"] = dict(conf, shared=True)
+        team.setdefault("servers", {}).setdefault(machine, {"kind": "linux",
+                                                            "user": pwd.getpwuid(os.getuid()).pw_name})
+    elif step != "one" and shared and not here:
+        team["hub"] = {k: v for k, v in conf.items() if k != "shared"}
+    team["shape"] = {"step": step}
+    try:
+        validate_team(team)
+    except ValueError as e:
+        raise Refusal(400, str(e)) from None
+    data = (json.dumps(team, indent=2) + "\n").encode()
+    commit, digest = rev, hashlib.sha256(data).hexdigest()
+    if digest != current:
+        commit = commit_kit_file("team.json", data, f"Owner chose the fleet's servers: {step}")
+        apply_team(team)
+        log("owner", f"chose the fleet's servers: {step}"
+                     + ("; the hub's own server takes agents now" if hub_shared(team) and not shared else
+                        "; the hub's own server takes no agent any more" if shared and not hub_shared(team) else "")
+                     + f" in {commit[:12]}")
+    return {"step": step, "hub_shared": hub_shared(team),
+            "root_step": hub_shared(team) and not q1("SELECT 1 FROM server_keys WHERE server=?", (machine,)),
+            "revision": commit, "sha256": digest}
+
+
 def job_busy(server, last):
     """The refusal for a server whose newest job is still open: one job at a time."""
     doing = {"install": f"installs {last['agent']}", "rename": f"renames {last['was']} to {last['agent']}",
@@ -37140,7 +37247,7 @@ def prepare_server_agent(server, body):
     a = agents().get(agent)
     if a is None:
         raise Refusal(404, "no such agent")
-    if a.get("machine") != server:
+    if a.get("machine") != server or unplaced(agent):      # its entry names the hub's machine until it has a server
         raise Refusal(409, f"{shown_role(agent)} is not on {server}.")
     if a.get("runtime") == runtime:
         raise Refusal(409, f"{shown_role(agent)} runs {runtime_label(runtime)} already.")
@@ -37284,8 +37391,10 @@ def renamed_team(team, old, new):
     out = json.loads(json.dumps(team))
     entry = out["agents"][old]
     user = f"fleet-{old}"
+    # Not an agent with no server yet (unplaced): nothing was installed under its old name, and its entry names the
+    # hub's machine only until it has a server, which can have an entry of its own (set_shape).
     if (out.get("servers") or {}).get(entry.get("machine"), {}).get("kind") == "linux" and "user" not in entry \
-            and AGENT_OS_USER.fullmatch(user):
+            and AGENT_OS_USER.fullmatch(user) and entry.get("placed") is not False:
         entry["user"] = user
     out["agents"] = {(new if name == old else name): a for name, a in out["agents"].items()}
     for a in out["agents"].values():
@@ -37363,7 +37472,13 @@ def rename_agent(agent, body):
     every reference to it, its profile and its skills; one transaction moves every record of it; and its server's
     service gets the job to move its checkout, its key file and its service to the new name, under the OS user it
     already has, so it keeps its runtime and its sign-in. Not the manager, and not while the agent has an open task: a
-    task session carries the name it started with."""
+    task session carries the name it started with.
+
+    One manager takes a new name (owner feature manager_rename): the manager of a new fleet while it has no server
+    yet (unplaced). Nothing of it is on a server: no OS user, no checkout, no key, no session. So its rename has no
+    job, no server to ask and no open task to wait for, and the receipt's `job` and `server` are null. Its name has
+    the installer's rule (hubsetup.manager_name), because its OS user is made from the name when it gets its server.
+    From then on it keeps its name, as each manager."""
     new, t0 = body["name"], now()
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
@@ -37372,7 +37487,8 @@ def rename_agent(agent, body):
     a = team["agents"].get(agent)
     if a is None:
         raise Refusal(404, "no such agent")
-    if a.get("role") == "manager":
+    placing = a.get("role") == "manager" and unplaced(agent, team)      # owner feature manager_rename
+    if a.get("role") == "manager" and not placing:
         raise Refusal(409, "The manager keeps its name.")
     if new == agent:
         raise Refusal(409, f"{shown_name(agent)} has this name already.")
@@ -37387,29 +37503,34 @@ def rename_agent(agent, body):
     if q1("SELECT 1 FROM agents WHERE name=?", (new,)):
         raise Refusal(409, f"An agent named {new} was in this fleet before, and its records are still here. Choose "
                            f"another name.")
-    if q1("SELECT 1 FROM tasks WHERE (owner=? OR requester=?) AND state NOT IN ('completed','failed','rejected',"
-          "'canceled') LIMIT 1", (agent, agent)):
+    if placing and not AGENT_OS_USER.fullmatch("fleet-" + new):
+        raise Refusal(409, "The manager's name has at most 26 characters, because its account on its server is "
+                           "fleet-<name>. Choose a shorter name.")
+    if not placing and q1("SELECT 1 FROM tasks WHERE (owner=? OR requester=?) AND state NOT IN ('completed','failed',"
+                          "'rejected','canceled') LIMIT 1", (agent, agent)):
         raise Refusal(409, f"{shown_role(agent)} has open tasks. Rename it when they are done.")
-    server = a.get("machine")
-    if server not in server_names(team) or not q1("SELECT 1 FROM server_keys WHERE server=?", (server,)):
-        raise Refusal(409, f"{server} runs no Founderizer service, so {shown_role(agent)} cannot take its new name "
-                           f"there.")
-    expire_server_jobs(t0)
-    last = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (server,))
-    if last and last["state"] in JOB_OPEN:
-        raise job_busy(server, last)
-    # An install that stopped at its sign-in, its last step, is done once a later sign-in of that runtime ended done:
-    # its user, runtime, checkout, key and service are there (server.py install), and the agent runs.
-    if last and last["kind"] == "install" and last["agent"] == agent and last["state"] == "failed" and not (
-            last["step"] == "sign_in" and (finished_sign_in(agent, last["runtime"]) or 0) > last["updated"]):
-        raise Refusal(409, f"The install of {agent} stopped. Try it again before you rename it.")
-    reading = server_reading(server, [])
-    if reading is None or reading["stale"]:
-        raise Refusal(409, f"{server} sent no reading in the last 10 minutes: check that it is on")
-    if open_login(agent):
-        raise Refusal(409, f"{shown_role(agent)} has an open sign-in. Finish it or let it run out, then try again.")
-    st = q1("SELECT data FROM server_status WHERE server=?", (server,))
-    key_moves = KEY_FEATURE in (json.loads(st["data"]).get("features") or [])
+    server, key_moves = None, False     # a manager with no server yet: nothing of it is on a server
+    if not placing:
+        server = a.get("machine")
+        if server not in server_names(team) or not q1("SELECT 1 FROM server_keys WHERE server=?", (server,)):
+            raise Refusal(409, f"{server} runs no Founderizer service, so {shown_role(agent)} cannot take its new name "
+                               f"there.")
+        expire_server_jobs(t0)
+        last = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (server,))
+        if last and last["state"] in JOB_OPEN:
+            raise job_busy(server, last)
+        # An install that stopped at its sign-in, its last step, is done once a later sign-in of that runtime ended done:
+        # its user, runtime, checkout, key and service are there (server.py install), and the agent runs.
+        if last and last["kind"] == "install" and last["agent"] == agent and last["state"] == "failed" and not (
+                last["step"] == "sign_in" and (finished_sign_in(agent, last["runtime"]) or 0) > last["updated"]):
+            raise Refusal(409, f"The install of {agent} stopped. Try it again before you rename it.")
+        reading = server_reading(server, [])
+        if reading is None or reading["stale"]:
+            raise Refusal(409, f"{server} sent no reading in the last 10 minutes: check that it is on")
+        if open_login(agent):
+            raise Refusal(409, f"{shown_role(agent)} has an open sign-in. Finish it or let it run out, then try again.")
+        st = q1("SELECT data FROM server_status WHERE server=?", (server,))
+        key_moves = KEY_FEATURE in (json.loads(st["data"]).get("features") or [])
     profile = git_blob(rev, f"profiles/{agent}.md")
     if git_blob(rev, f"profiles/{new}.md") is not None:
         raise Refusal(409, f"A profile for {new} is in the fleet already. Choose another name.")
@@ -37430,12 +37551,16 @@ def rename_agent(agent, body):
     manager = next(n for n, x in renamed["agents"].items() if x.get("role") == "manager")
     with transaction():
         rename_rows(agent, new, t0, key_moves)
-        job = DB.execute("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated,was) "
-                         "VALUES(?,?,?,?,?,?,?,?)", (server, "rename", new, renamed["agents"][new]["runtime"],
-                                                     "queued", t0, t0, agent)).lastrowid
-        event_rows([(manager, "say", None, f"[hub] The owner renamed {agent} to {new}. Its tasks, messages, memory "
-                                           f"and duties stay with it, under {new}: use {new} from now on.", None)], t0)
-        log_row("owner", f"renamed agent {agent} to {new} on server {server} in {commit[:12]}: job {job}")
+        job = None
+        if placing:         # no session ever ran under the old name, so nobody is told, and no server has a job
+            log_row("owner", f"renamed the manager {agent} to {new}, which has no server yet, in {commit[:12]}")
+        else:
+            job = DB.execute("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated,was) "
+                             "VALUES(?,?,?,?,?,?,?,?)", (server, "rename", new, renamed["agents"][new]["runtime"],
+                                                         "queued", t0, t0, agent)).lastrowid
+            event_rows([(manager, "say", None, f"[hub] The owner renamed {agent} to {new}. Its tasks, messages, memory "
+                                               f"and duties stay with it, under {new}: use {new} from now on.", None)], t0)
+            log_row("owner", f"renamed agent {agent} to {new} on server {server} in {commit[:12]}: job {job}")
     apply_team(renamed)
     return {"agent": new, "was": agent, "server": server, "job": job, "revision": commit,
             "sha256": hashlib.sha256(data).hexdigest()}
@@ -46224,6 +46349,21 @@ class Handler(BaseHTTPRequestHandler):
             return {"server": server, "agent": agent, "runtime": runtime}
         return self.ui_command(f"servers/{server}/prepare", read, lambda body: prepare_server_agent(server, body))
 
+    def ui_servers_shape(self):
+        """POST /ui/servers/shape (owner features fleet_shape and hub_shared_later): the step of the slider that the
+        owner chose for a fleet that runs."""
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "base_sha256", "step"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            base, step = data.get("base_sha256"), data.get("step")
+            if not (isinstance(base, str) and re.fullmatch(r"[0-9a-f]{64}", base)):
+                raise ValueError("base_sha256 must be the SHA-256 of team.json")
+            if step not in SHAPE_STEPS:
+                raise ValueError("step must be one, two or each")
+            return {"base_sha256": base, "step": step}
+        return self.ui_command("servers/shape", read, set_shape)
+
     def ui_servers_grant(self):
         """POST /ui/servers/grant (owner feature server_access): Read or Fix on one server for one agent, or null."""
         def read(data):
@@ -50208,6 +50348,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_servers_join()
         if parts == ["ui", "servers", "grant"]:      # DevOps plan C4
             return self.ui_servers_grant()
+        if parts == ["ui", "servers", "shape"]:      # owner features fleet_shape and hub_shared_later
+            return self.ui_servers_shape()
         if parts == ["ui", "door"]:                  # DevOps plan 13, item 1: the app writes the door's entry
             return self.ui_door_save()
         if parts == ["ui", "door", "secrets"]:       # DevOps plan 13, item 4: the hub gets its tokens from the door
