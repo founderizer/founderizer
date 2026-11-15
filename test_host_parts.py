@@ -31,7 +31,7 @@ SEED = bytes(range(32))         # the test's own release key; never the product'
 
 def load_tests(loader, _tests, _pattern):
     return unittest.TestSuite(cls(name) for cls in (Files, ModeAndLock, ScriptForms, Runners, PristineRunners,
-                                                    Accounts, SshdFolder, SelfUpdate,
+                                                    Accounts, SshdFolder, SshdCalls, SelfUpdate,
                                                     Reader, Scripts, NewApp, AppUnitAndSettings, AppRunner, AppVhost,
                                                     ReleaseHelper, Look, LookBoxLive)
                               for name in cls.__dict__ if name.startswith("test_"))
@@ -718,13 +718,47 @@ class SshdFolder(HostCase):
     said active, until a connection to port 22 started ssh.service again (measured on a temporary Ubuntu 24.04 server,
     14 November 2026). A drop-in keeps the folder: install.sh writes it, and each call of ops-root writes it again on a
     host that an older install left without it."""
+    CALLS = "/etc/systemd/system/ops-sshd.service.d/ops-sshd-calls.conf"       # the paths themselves: a test of the
+    OWED = "/run/ops-root.reload-owed"                                          # code before fails, with no error
 
     def setUp(self):
         super().setUp()
-        self.reloads = []
-        patcher = patch.object(ROOT, "systemctl", lambda *words: self.reloads.append(words) or (0, ""))
+        self.reloads, self.seen, self.status = [], [], []
+
+        def systemctl(*words, timeout=900):
+            """A reload's words, and what systemd reads then: each drop-in's bytes at that moment and the wait."""
+            self.reloads.append(words)
+            self.seen.append(([self.text(path) for path in (ROOT.SSHD_FOLDER_KEEP, self.CALLS)], timeout))
+            answer = self.status.pop(0) if self.status else 0
+            if isinstance(answer, Exception):
+                raise answer
+            return answer, ""
+        patcher = patch.object(ROOT, "systemctl", systemctl)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.marked, replace = [], ROOT.replace
+
+        def marked_replace(path, data, mode_bits):
+            """Whether the mark was there at each write: a call killed right after a write leaves it."""
+            self.marked.append(self.owed())
+            return replace(path, data, mode_bits)
+        patcher = patch.object(ROOT, "replace", marked_replace)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def text(self, path):
+        return self.get(path) if os.path.isfile(self.tmp + path) else None
+
+    def settings(self, path):
+        """The lines of a drop-in that are not comments, or None where it is not there."""
+        text = self.text(path)
+        return None if text is None else [line for line in text.splitlines() if not line.startswith("#")]
+
+    def owed(self):
+        return os.path.exists(self.tmp + self.OWED)
+
+    def test_the_paths_are_the_ones_of_ops_root(self):
+        self.assertEqual((ROOT.SSHD_CALLS_KEEP, ROOT.RELOAD_OWED), (self.CALLS, self.OWED))
 
     def help(self):
         req = base64.b64encode(json.dumps({"v": 1, "op": "help", "args": []}).encode()).decode()
@@ -745,8 +779,56 @@ class SshdFolder(HostCase):
         self.assertEqual(self.get(ROOT.SSHD_FOLDER_KEEP), ROOT.SSHD_FOLDER_TEXT)
         self.assertEqual(os.stat(self.tmp + ROOT.SSHD_FOLDER_KEEP).st_mode & 0o777, 0o644)
         self.assertEqual(self.reloads, [("daemon-reload",)])
+        self.assertEqual([read for read, _ in self.seen], [[ROOT.SSHD_FOLDER_TEXT, None]])     # read after the write
+        self.assertEqual(self.marked, [True])
+        self.assertFalse(self.owed())
         self.help()
         self.assertEqual(self.reloads, [("daemon-reload",)])         # the same bytes: no write, no reload
+
+    def test_the_drop_in_keeps_the_folder_at_a_stop(self):
+        """The one setting that keeps /run/sshd: the comments aside, nothing else."""
+        self.unit()
+        self.help()
+        self.assertEqual(self.settings(ROOT.SSHD_FOLDER_KEEP), ["[Service]", "RuntimeDirectoryPreserve=yes"])
+
+    def test_a_reload_that_failed_or_gave_no_answer_is_made_again_by_the_next_call(self):
+        """A reload that failed left the drop-in with the door's bytes and systemd without it, so no later call wrote
+        it or read the units again, and a stop of ssh.service took the folder away (the session "Find why Add server
+        left SSH password login on", Ubuntu 24.04 and 26.04, 14 November 2026). The mark stays until a reload ends
+        well: here one that failed (1), one that gave no answer in RELOAD_SECONDS (124) and one that the system did not
+        start, and no call stops for them."""
+        self.unit()
+        self.status = [1, 124, OSError(12, "Cannot allocate memory")]
+        self.help()
+        self.assertEqual(self.get(ROOT.SSHD_FOLDER_KEEP), ROOT.SSHD_FOLDER_TEXT)
+        self.assertTrue(self.owed())
+        self.help()
+        self.assertTrue(self.owed())
+        self.help()
+        self.assertTrue(self.owed())
+        self.help()
+        self.assertFalse(self.owed())
+        self.help()
+        self.assertEqual(self.reloads, [("daemon-reload",)] * 4)
+        self.assertEqual({timeout for _, timeout in self.seen}, {ROOT.RELOAD_SECONDS})
+        self.assertLess(ROOT.RELOAD_SECONDS, 60)
+
+    def test_a_call_that_was_killed_before_its_reload_leaves_it_to_the_next_call(self):
+        """The mark comes before the first write: a call that ended after the write and before the reload, or before
+        the write, leaves the mark, and the next call writes what is missing and reads the units again."""
+        self.unit()
+        os.makedirs(os.path.dirname(self.tmp + ROOT.SSHD_FOLDER_KEEP))
+        self.put(ROOT.SSHD_FOLDER_KEEP, ROOT.SSHD_FOLDER_TEXT)
+        self.put(self.OWED, "")
+        self.help()
+        self.assertEqual(self.reloads, [("daemon-reload",)])
+        self.assertFalse(self.owed())
+        os.remove(self.tmp + ROOT.SSHD_FOLDER_KEEP)
+        self.put(self.OWED, "")
+        self.help()
+        self.assertEqual(self.seen[-1][0][0], ROOT.SSHD_FOLDER_TEXT)
+        self.assertEqual(self.reloads, [("daemon-reload",)] * 2)
+        self.assertFalse(self.owed())
 
     def test_a_masked_ssh_service_gets_it_too_and_other_bytes_are_written_again(self):
         """A host where install.sh put OpenSSH in with its own units masked: the drop-in keeps the folder if a person
@@ -769,13 +851,50 @@ class SshdFolder(HostCase):
         os.makedirs(self.tmp + "/etc/systemd/system")
         self.put("/etc/systemd/system/ssh.service.d", "a file where the folder goes\n")
         self.help()
-        self.assertEqual(self.reloads, [])
+        self.help()
+        self.assertEqual(self.reloads, [])          # nothing written, nothing to read: no reload at any call
+        self.assertFalse(self.owed())
 
     def test_no_file_install_and_no_exec_command_writes_the_drop_in(self):
         """PROTECTED: a file install refuses the path, and an exec command's box sees it read-only."""
         self.assertIn(ROOT.SSHD_FOLDER_KEEP, ROOT.PROTECTED)
         self.assertTrue(ROOT.protected(ROOT.SSHD_FOLDER_KEEP))
         self.assertFalse(ROOT.protected("/etc/systemd/system/ssh.service.d/other.conf"))
+
+
+class SshdCalls(SshdFolder):
+    """needrestart restarts the second sshd after each update of openssh-server or of a library that sshd uses (an
+    unattended upgrade of libc6 on 9 of 11 door servers on 14 November 2026), and under systemd's default
+    KillMode=control-group that restart ended every open call of the door (the session "Find why Add server left SSH
+    password login on", Ubuntu 24.04 and 26.04). A drop-in stops only the listener, as ssh.service has it: install.sh
+    writes it, and each call of ops-root writes it again on a host that an older install left without it."""
+
+    def test_a_host_with_the_second_sshd_gets_the_drop_in_at_its_first_call_and_only_then(self):
+        """It ends only the listener: the comments aside, nothing else."""
+        self.unit("/etc/systemd/system/ops-sshd.service")
+        self.help()
+        self.assertEqual(self.settings(self.CALLS), ["[Service]", "KillMode=process"])
+        self.assertEqual(self.get(self.CALLS), ROOT.SSHD_CALLS_TEXT)
+        self.assertEqual(os.stat(self.tmp + self.CALLS).st_mode & 0o777, 0o644)
+        self.assertEqual([read for read, _ in self.seen], [[None, ROOT.SSHD_CALLS_TEXT]])
+        self.put(self.CALLS, "[Service]\nKillMode=control-group\n")
+        self.help()
+        self.help()
+        self.assertEqual(self.get(self.CALLS), ROOT.SSHD_CALLS_TEXT)
+        self.assertEqual(self.reloads, [("daemon-reload",)] * 2)
+
+    def test_both_drop_ins_of_an_older_install_come_with_one_reload(self):
+        self.unit()
+        self.unit("/etc/systemd/system/ops-sshd.service")
+        self.help()
+        self.assertEqual([[text is not None for text in read] for read, _ in self.seen], [[True, True]])
+        self.assertEqual(self.seen[0][0], [ROOT.SSHD_FOLDER_TEXT, ROOT.SSHD_CALLS_TEXT])
+        self.help()
+        self.assertEqual(len(self.reloads), 1)
+
+    def test_no_file_install_and_no_exec_command_writes_this_drop_in(self):
+        self.assertTrue(ROOT.protected(self.CALLS))
+        self.assertTrue(ROOT.protected("/etc/systemd/system/ops-sshd.service.d/other.conf"))
 
 
 class SelfUpdate(HostCase):
@@ -2956,6 +3075,36 @@ class Scripts(unittest.TestCase):
         remove = text[text.index("remove() {"):text.index("\n}\n", text.index("remove() {"))]
         self.assertIn('rm -f "$UNIT" "$BOOT_UNIT" "$SUDOERS" "$KEEP"\n', remove)
         self.assertLess(remove.index('"$KEEP"'), remove.index("systemctl daemon-reload"))
+
+    def test_install_keeps_open_calls_at_a_restart_and_a_new_install_or_a_remove_ends_them(self):
+        """The drop-in that stops only the listener of the second sshd (SshdCalls): install.sh's own block writes
+        ops-root's exact bytes before systemd reads the units. A new install, which can change the level, the mode or
+        the key, and a remove end every open call, the ones that hold root too, as a stop of the whole unit did:
+        `systemctl kill` signals every process of the unit, before the restart and before the stop."""
+        with open("host/install.sh") as f:
+            text = f.read()
+        self.assertIn(f"\nCALLS={SshdCalls.CALLS} ", text)
+        start = text.index('mkdir -p "${CALLS%/*}"\n')
+        block = text[start:text.index('mv -f "$CALLS.new" "$CALLS"\n', start) + len('mv -f "$CALLS.new" "$CALLS"\n')]
+        reload = text.index("systemctl daemon-reload\nsystemctl enable ops-sshd.service")
+        self.assertLess(text.index(block), reload)
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = os.path.join(tmp, "system", "ops-sshd.service.d", "ops-sshd-calls.conf")
+            for _ in range(2):
+                subprocess.run(["bash", "-c", "set -euo pipefail\n" + block], check=True, capture_output=True,
+                               env={"PATH": os.environ["PATH"], "CALLS": calls})
+            with open(calls) as f:
+                self.assertEqual(f.read(), ROOT.SSHD_CALLS_TEXT)
+            self.assertEqual(os.stat(calls).st_mode & 0o777, 0o644)
+            self.assertEqual(os.listdir(os.path.dirname(calls)), ["ops-sshd-calls.conf"])
+        kill = text.index("\nsystemctl kill ops-sshd.service 2>/dev/null || true\n", reload)
+        self.assertLess(kill, text.index("\nsystemctl restart ops-sshd.service\n", reload))
+        remove = text[text.index("remove() {"):text.index("\n}\n", text.index("remove() {"))]
+        commands = [line.strip() for line in remove.splitlines()[1:]
+                    if line.strip() and not line.strip().startswith("#")]
+        self.assertEqual(commands[:2], ["systemctl kill ops-sshd.service 2>/dev/null || true",
+                                        "systemctl disable --now ops-sshd.service 2>/dev/null || true"])
+        self.assertIn(f"rm -rf {os.path.dirname(ROOT.SSHD_CALLS_KEEP)}\n", remove)
 
     def test_read_takes_away_the_files_that_only_ops_root_reads(self):
         """From Fix down to Read, ops-root's own files go with it, so a later Fix without one of their options finds

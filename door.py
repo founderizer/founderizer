@@ -946,7 +946,7 @@ class Door:
         release, and one that no self-update gave says none): a host of another release gets the bundle, with the
         commits down to its own release, which self-update checks the way down by. After a self-update that ended well
         the door asks the help once more: the new ops-root runs at once, and each of its calls puts the host's own parts
-        in order (keep_sshd_folder), which no call of the old one did. A new ops-root that gives no version line there
+        in order (keep_drop_ins), which no call of the old one did. A new ops-root that gives no version line there
         does not run on that host, and the update failed."""
         status, out = self.ssh(host, {"v": 1, "op": "help", "args": []}, None)
         if status in (255, 124):        # no session, or no answer within HELP_WAIT: the door asks again later

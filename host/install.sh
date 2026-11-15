@@ -33,6 +33,7 @@ ETC=/etc/ops-root LIB=/usr/local/lib/ops-root SBIN=/usr/local/sbin/ops-root STAT
 UNIT=/etc/systemd/system/ops-sshd.service SUDOERS=/etc/sudoers.d/ops-agent
 BOOT_UNIT=/etc/systemd/system/ops-root-rollback-at-boot.service      # ops-root's own: each arm puts it in place
 KEEP=/etc/systemd/system/ssh.service.d/ops-sshd-folder.conf          # /run/sshd stays at a stop of ssh.service
+CALLS=/etc/systemd/system/ops-sshd.service.d/ops-sshd-calls.conf     # a restart of the second sshd keeps open calls
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 
@@ -57,6 +58,9 @@ done
 [[ "$PORT" =~ ^[1-9][0-9]{2,4}$ ]] || die "--port is a port number"
 
 remove() {
+    # A stop ends only the listener (KillMode=process, the drop-in CALLS): first every process of the unit, the calls
+    # that hold root too, gets the signal that a stop of the whole unit gave them before that drop-in
+    systemctl kill ops-sshd.service 2>/dev/null || true
     systemctl disable --now ops-sshd.service 2>/dev/null || true
     systemctl disable "${BOOT_UNIT##*/}" 2>/dev/null || true
     rm -f "$UNIT" "$BOOT_UNIT" "$SUDOERS" "$KEEP"
@@ -192,7 +196,7 @@ install -d -m 0755 -o root -g root /run/sshd
 # That folder is the RuntimeDirectory of the host's own ssh.service, and systemd removed it at each stop of that unit:
 # an update of openssh-server stops it. Then the second sshd refused every new connection while its unit still said
 # active, until a connection to port 22 started ssh.service again (measured on Ubuntu 24.04, 14 November 2026). This
-# drop-in keeps the folder; ops-root writes the same bytes again where they are not (keep_sshd_folder).
+# drop-in keeps the folder; ops-root writes the same bytes again where they are not (keep_drop_ins).
 mkdir -p "${KEEP%/*}"
 cat > "$KEEP.new" <<'EOF'
 # The door's second sshd (ops-sshd.service) needs /run/sshd for each new connection:
@@ -221,8 +225,24 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
+# needrestart restarts the second sshd after each update of openssh-server or of a library that sshd uses, and under
+# systemd's default KillMode=control-group that restart ended every open call of the door (measured on Ubuntu 24.04 and
+# 26.04, 14 November 2026). This drop-in stops only the listener, as the host's own ssh.service does; ops-root writes
+# the same bytes again where they are not (keep_drop_ins).
+mkdir -p "${CALLS%/*}"
+cat > "$CALLS.new" <<'EOF'
+# A restart or a stop of the door's second sshd ends only its listener, as for ssh.service: open
+# calls end by themselves (written by the door: install.sh, ops-root). install.sh --remove and
+# `systemctl kill ops-sshd.service` end every call.
+[Service]
+KillMode=process
+EOF
+chmod 0644 "$CALLS.new"
+mv -f "$CALLS.new" "$CALLS"
 systemctl daemon-reload
 systemctl enable ops-sshd.service >/dev/null 2>&1
+# A new install changes the level, the mode or the key: every call that is open ends, as at a stop before the drop-in
+systemctl kill ops-sshd.service 2>/dev/null || true
 systemctl restart ops-sshd.service
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
     ufw allow in on tailscale0 to any port "$PORT" proto tcp comment 'ops-sshd' >/dev/null

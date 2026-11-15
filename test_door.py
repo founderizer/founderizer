@@ -4149,7 +4149,7 @@ class HostUpdates(HostPath):
         with open(unit, "w") as f:
             f.write("[Service]\nRuntimeDirectory=sshd\n")
         self.release()
-        with patch.object(door_targets.OPS_ROOT, "systemctl", lambda *words: reloads.append(words) or (0, "")):
+        with patch.object(door_targets.OPS_ROOT, "systemctl", lambda *words, **_: reloads.append(words) or (0, "")):
             self.assertEqual(door.update_hosts(self.door), [("web-1", "done")])
         self.assertEqual([json.loads(base64.b64decode(a[-1]))["op"] for a in self.commands],
                          ["help", "self-update", "help"])
@@ -4179,6 +4179,11 @@ class HostUpdates(HostPath):
         self.assertEqual(door.update_hosts(self.door), [("web-1", "done")])
         self.assertEqual(sent, ["help", "self-update", "help"] * 2)
         self.assertNotEqual(manifest["revision"], door.read_json(door.HOSTS_FILE, {})["web-1"]["revision"])
+        self.release(extra="# one more\n")         # an answer that ended well is not yet a version line
+        answers.extend([(0, "ops-root 3, mode fix, release none\n"), (0, "ops-root 3 from release 2026.11.11\n"),
+                        (0, "Usage: python3 [option] ...\n")])
+        self.assertEqual(door.update_hosts(self.door), [("web-1", "failed")])
+        self.assertIn("the new ops-root gave no version (0): Usage", self.door.record.after(0)[-1]["why"])
 
     def test_a_host_whose_help_does_not_answer_in_time_is_asked_again_later(self):
         """A help that ran into its short wait is a host that did not answer, not one that failed for this release."""
