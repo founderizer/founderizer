@@ -2498,6 +2498,12 @@ class Lifecycle:
         self.last_report = monotonic() - REPORT_EVERY
         self.lock = threading.Lock()
         self.report_lock = threading.Lock()     # one report at a time, so that the hub gets them in the order read
+        # The account item of a check runs outside report_lock (the coordinator's decision D26): one at a time, by the
+        # thread of the check that started it. account_waiting is the newest check whose item waits for it:
+        # (check, verify items of its first report); account_runs is True while a thread runs items.
+        self.account_lock = threading.Lock()
+        self.account_done = threading.Condition(self.account_lock)      # notified when account_runs ends
+        self.account_waiting, self.account_runs = None, False
         self.gate = threading.Lock()    # held while a session starts, and from the idle check to the restart
         self.tools_changed = False      # the hub says the standing session's tool list is not the current one
         self.restarting = None          # when this process asked for its own restart
@@ -3130,6 +3136,7 @@ class Lifecycle:
         report says how old its runtime reading is when it leaves (reading_age), so the hub dates it by when it was
         taken. One that does not reach the hub is tried again within RETRY_MAX, fast, and only one that does moves the
         report clock."""
+        runs = False
         with self.report_lock:
             try:
                 if check:
@@ -3139,29 +3146,81 @@ class Lifecycle:
                 if check:
                     status["check"] = check         # this report answers the owner's "check this machine"
                     status["verify"] = self.verify(status, probe_job, checking=True)
-                    running = [i for i in status["verify"] if i["kind"] == "account" and i["state"] == CHECKING]
-                    if running:
+                    if any(i["kind"] == "account" and i["state"] == CHECKING for i in status["verify"]):
                         # The coordinator's decision D12: the account item can take minutes (a model server's tool
                         # call and context), and the hub fails a check that sends no report in its CHECK_WAIT. So a
-                        # first report says that the item runs, and the hub then waits for this report's second
-                        # half. A hub of an older release refuses the first one, and takes the second as before.
-                        self.leaving(status)
-                        self.post(status)
-                        item = self.account_item(self.account())    # with its code and names (D7), as verify adds it
-                        done = dict({"kind": item[0], "ref": item[1], "state": item[2], "detail": item[3][:300]},
-                                    **(item[4] if len(item) > 4 and item[4] else {}))
-                        status["verify"] = [done if i in running else i for i in status["verify"]]
+                        # first report says that the item runs, and the hub then waits for its second half. A hub of
+                        # an older release refuses the first one, and takes the second as before. The item runs
+                        # outside this lock (D26): a later check and the status thread's reports do not wait for it.
+                        with self.account_lock:
+                            self.account_waiting = (check, status["verify"])
+                            runs, self.account_runs = not self.account_runs, True
                 self.leaving(status)
                 code, data = self.post(status)
             except Exception:
                 code, data = None, None
-            if code == 200:
-                self.last_report, self.failures, self.retry_at = self.monotonic(), 0, None
-                self.reported_once = True
-            else:
-                self.failures += 1
-                self.retry_at = self.monotonic() + min(RETRY_MAX, 2 ** (self.failures - 1))
-                return False
+            sent = self.sent(code, data)
+        if runs:
+            return self.account_rounds()
+        return sent
+
+    def account_rounds(self):
+        """The account items of the checks that wait, one at a time, outside report_lock (the coordinator's decision
+        D26): each item's result goes to the newest check that waits, in that check's second report. A check that
+        came while an item ran takes that item's result, unless the account or the agent's model changed since the
+        item began: then the item runs again. True when the last second report reached the hub."""
+        sent, ended = False, False
+        try:
+            while True:
+                with self.account_lock:
+                    if self.account_waiting is None:  # in the same hold: a check that comes later runs its own
+                        self.account_runs, ended = False, True
+                        self.account_done.notify_all()
+                        return sent
+                account, model = self.account(), self.own_model()
+                try:
+                    item = self.account_item(account) if account else None
+                except Exception:
+                    item = None
+                with self.account_lock:
+                    if (self.account(), self.own_model()) != (account, model):
+                        continue        # the settings moved while it ran: the newest check gets a new item
+                    check, items = self.account_waiting
+                    self.account_waiting = None
+                done = dict({"kind": item[0], "ref": item[1], "state": item[2], "detail": item[3][:300]},
+                            **(item[4] if len(item) > 4 and item[4] else {})) if item else None
+                with self.report_lock:
+                    try:
+                        status = self.collect(fast=True)  # a reading of now: never older than a report that left
+                        status["check"] = check
+                        status["verify"] = [(done or dict(i, state="not_verified")) if i["kind"] == "account" and
+                                            i["state"] == CHECKING else i for i in items]
+                        self.leaving(status)
+                        code, data = self.post(status)
+                    except Exception:
+                        code, data = None, None
+                    sent = self.sent(code, data)
+        finally:
+            if not ended:               # an error: never left on, for an update's restart waits for it
+                with self.account_lock:
+                    self.account_runs, self.account_waiting = False, None
+                    self.account_done.notify_all()
+
+    def account_running(self):
+        """True while an account item of a check runs: an update's restart, which ends this process, waits for it
+        (the fifth review's Y10)."""
+        with self.account_lock:
+            return self.account_runs
+
+    def sent(self, code, data):
+        """The report clock and the hub's answer of one report that left; True when it reached the hub."""
+        if code == 200:
+            self.last_report, self.failures, self.retry_at = self.monotonic(), 0, None
+            self.reported_once = True
+        else:
+            self.failures += 1
+            self.retry_at = self.monotonic() + min(RETRY_MAX, 2 ** (self.failures - 1))
+            return False
         if code == 200 and isinstance(data, dict):
             # The standing manager session is running on a tool list this hub would no longer serve: its helper
             # starts it again (Helper.restart_for_tools). It stays true in every answer until that session has
@@ -3246,6 +3305,9 @@ class Lifecycle:
     def apply(self, desired):
         """Runs with the gate held. True when the restart was asked for: this process ends soon."""
         self.set("updating", "Updating Fleet while idle.")
+        with self.account_lock:         # a check's account item that began after the idle test ends first (Y10)
+            while self.account_runs:
+                self.account_done.wait()
         self.report()
         target = desired or self.upstream()
         # A checkout that has the requested commit already needs no fetch or merge: on the hub machine the checkout is
@@ -3295,7 +3357,7 @@ class Lifecycle:
             # Checked while no session can start, and with the update marked under the same lock that a sign-in
             # checks it with (Helper.begin_signin), so none can start between this check and the update.
             with self.lock:
-                idle = not self.busy()
+                idle = not self.busy() and not self.account_running()
                 if idle:
                     self.state, self.detail = "updating", "Updating Fleet while idle."
             if idle:
@@ -3332,7 +3394,7 @@ class Lifecycle:
         if not self.runtimes_due() or not self.gate.acquire(blocking=False):
             return
         try:
-            idle = not self.busy() and not self.runtimes_busy()
+            idle = not self.busy() and not self.runtimes_busy() and not self.account_running()
         except Exception:
             idle = False
         if not idle:
