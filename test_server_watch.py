@@ -4,17 +4,25 @@ holding and once when it holds again, with the words that send it first to the a
 No monitoring host and no outside alert route is needed. Against a local hub with a temporary Fleet repository, as
 test_servers."""
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import hub
-from test_servers import NEW, Servers
+import lifecycle
+from test_servers import HUB, KEY, NEW, OWNER, Servers, sha
 
 DAY = 86400
+# What the manager reads of the hub's own server (hub.MENDED_WORDS_HUB), word for word.
+HUB_WORDS = ("The owner's Mac puts this right by itself: while the Founderizer app runs there, it gives the hub's own "
+             "server the hardening of every fleet server, as root. Take no step for it and raise no Needs-you item: if "
+             "it still stands in 3 days, the hub tells you again.")
 
 
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite(ServerWatch(name) for name in ServerWatch.__dict__ if name.startswith("test_"))
+    return unittest.TestSuite(case(name) for case in (ServerWatch, HubOwnServer, HardeningRead)
+                              for name in case.__dict__ if name.startswith("test_"))
 
 
 class ServerWatch(Servers):
@@ -32,6 +40,15 @@ class ServerWatch(Servers):
         patcher = patch.object(hub.lifecycle, "machine_load", lambda platform: dict(self.hub_load))
         patcher.start()
         self.addCleanup(patcher.stop)
+        # And the hub reads the SSH and npm of its own server itself on Linux (lifecycle.hardening): here what this test
+        # sets, by default facts that say nothing, never this machine's own; and no read of an earlier test.
+        self.hub_facts = {"ssh_keys_only": None, "npm_rule": None}
+        # (create: these tests run on the code before this read too, and fail there on what they check)
+        for module, name, value in ((hub.lifecycle, "hardening", lambda run=None: dict(self.hub_facts)),
+                                    (hub, "HUB_HARDENING", {"read": None, "thread": None})):
+            patcher = patch.object(module, name, value, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.joined("box", "linux")
         self.t0 = hub.now()
         hub.q("UPDATE server_keys SET created=? WHERE server='box'", (self.t0 - 2 * hub.JOIN_GRACE,))
@@ -59,7 +76,10 @@ class ServerWatch(Servers):
             hub.q("UPDATE server_status SET reported=? WHERE server='box'", (t0,))
         hub.WATCH["at"] = 0.0
         with hub.LOCK:
-            hub.server_watch_sweep(t0)
+            asked = hub.server_watch_sweep(t0)
+        if asked is not None:           # the read of the hub's own server that this pass asked for, for the next pass
+            asked.join(10)
+            self.assertFalse(asked.is_alive())
 
     def said(self):
         return [r["text"] for r in hub.q("SELECT text FROM events WHERE agent=? AND kind='say' AND text LIKE "
@@ -127,6 +147,24 @@ class ServerWatch(Servers):
         self.report(ssh_keys_only=None, npm_rule=None)
         self.sweep()
         self.assertEqual(self.said(), [])
+
+    def test_a_reading_that_leaves_a_fact_out_ends_no_fault_and_moves_no_mend(self):
+        """A server's service leaves ssh_keys_only out of its reading when its systemctl gives no answer
+        (lifecycle.hardening): that reading cannot say, and what was said holds. A null is still an answer that OpenSSH
+        does not run there, and ends it."""
+        self.report(ssh_keys_only=False)
+        self.sweep()
+        mend = json.loads(hub.kv_get("server_watch"))["box"]["mend"]
+        self.report(ssh_keys_only="absent")
+        self.sweep(self.t0 + 60)
+        self.report(ssh_keys_only=False)
+        self.sweep(self.t0 + 120)
+        self.assertEqual(len(self.said()), 1)
+        self.assertEqual(json.loads(hub.kv_get("server_watch"))["box"]["mend"], mend)
+        self.report(ssh_keys_only=None)
+        self.sweep(self.t0 + 180)
+        self.assertEqual(self.said()[-1], "[hub] The server box is in order again: its SSH takes keys only.")
+        self.assertEqual(len(self.said()), 2)
 
     def test_npms_rule_that_is_gone_is_said(self):
         self.report(npm_rule=False)
@@ -301,6 +339,275 @@ class ServerWatch(Servers):
         self.sweep()
         self.assertEqual(self.said(), [])
         self.assertNotIn("vps", json.loads(hub.kv_get("server_watch") or "{}"))
+
+
+class HubOwnServer(ServerWatch):
+    """The hub's own server ("hub", which carries the manager and has no server service) on a Linux hub, whose install's
+    claim was two hours ago: the hub reads its SSH and npm itself, the manager hears of them as of a joined server's,
+    and GET /ui/servers carries them for the owner's Mac (the owner, 14 November 2026: "get some opus 5.5 extra thread
+    to fix them")."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = patch.object(hub, "HUB_KIND", "linux", create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        hub.kv_set("hub_claim", json.dumps({"owner": OWNER, "at": self.t0 - 2 * hub.JOIN_GRACE}))
+
+    def own(self, t0=None, **facts):
+        """One pass at t0, after the hub's read of a moment before said these facts of its own server."""
+        t0 = self.t0 if t0 is None else t0
+        self.hub_facts = dict({"ssh_keys_only": True, "npm_rule": None}, **facts)
+        hub.HUB_HARDENING["read"] = dict(self.hub_facts, at=t0 - 5)
+        self.sweep(t0)
+
+    def test_the_hub_s_row_carries_its_own_read_of_its_server_and_no_other_row_does(self):
+        """Owner API 1.170: `hardening` on the hub's own row, for the owner's Mac's sweep (ServerHardening), and null on
+        each other row and before the hub's first read. Nothing else of a row changes, so no screen does."""
+        _, before = self.servers()
+        self.assertIsNone(before["hub"]["hardening"])
+        self.hub_facts = {"ssh_keys_only": False, "npm_rule": True}
+        self.sweep(fresh=False)         # the pass asks for the read, which a thread of its own makes
+        _, servers = self.servers()
+        self.assertEqual(servers["hub"]["hardening"], {"ssh_keys_only": False, "npm_rule": True, "at": self.t0,
+                                                       "claimed_at": self.t0 - 2 * hub.JOIN_GRACE})
+        self.assertEqual({n: s["hardening"] for n, s in servers.items() if n != "hub"},
+                         dict.fromkeys(set(servers) - {"hub"}))
+        rest = lambda rows: {n: {k: v for k, v in s.items() if k not in ("hardening", "load")} for n, s in rows.items()}
+        self.assertEqual(rest(servers), rest(before))
+        self.assertIsNone(servers["hub"]["reading"], "the hub's own server still has no reading of a service")
+        # A second claim: the time of its claim, once the watch has kept it.
+        hub.TEAM["addresses"]["owner"] = "127.0.0.11"
+        self.addCleanup(hub.TEAM["addresses"].__setitem__, "owner", OWNER)
+        self.assertIsNone(hub.hub_hardening_view(self.t0 + 60)["claimed_at"], "a claim that the watch has not kept")
+        self.sweep(self.t0 + 60)
+        self.assertEqual(hub.hub_hardening_view(self.t0 + 60)["claimed_at"], self.t0 + 60)
+
+    def test_the_hub_s_own_ssh_and_npm_are_said_once_in_its_own_words_and_in_order_again_once(self):
+        self.own(ssh_keys_only=False, npm_rule=False)
+        self.own(self.t0 + 60, ssh_keys_only=False, npm_rule=False)
+        self.assertEqual(self.said(), ["[hub] The server hub needs care: npm has no seven-day rule; its SSH lets "
+                                       "passwords in. The owner's Mac puts this right by itself: while the Founderizer "
+                                       "app runs there, it gives the hub's own server the hardening of every fleet "
+                                       "server, as root. Take no step for it and raise no Needs-you item: if it still "
+                                       "stands in 3 days, the hub tells you again."])
+        self.own(self.t0 + 120, ssh_keys_only=True, npm_rule=False)
+        self.own(self.t0 + 180, ssh_keys_only=True, npm_rule=True)
+        self.own(self.t0 + 240, ssh_keys_only=True, npm_rule=True)
+        self.assertEqual(self.said()[1:], ["[hub] The server hub is in order again: its SSH takes keys only.",
+                                          "[hub] The server hub is in order again: npm has its seven-day rule."])
+        self.assertIsNone(hub.kv_get("server_watch"), "a server in order keeps no record")
+
+    def test_what_the_mac_has_not_put_right_on_the_hub_s_server_in_3_days_is_said_once_more(self):
+        self.own(ssh_keys_only=False)
+        self.own(self.t0 + hub.MENDED_WAIT - 60, ssh_keys_only=False)
+        self.assertEqual(len(self.said()), 1)
+        for t in (self.t0 + hub.MENDED_WAIT, self.t0 + 4 * DAY, self.t0 + 10 * DAY):
+            self.own(t, ssh_keys_only=False)
+        self.assertEqual(self.said()[1:], [
+            "[hub] The server hub still needs care after 3 days: its SSH lets passwords in. The owner's Mac has not put "
+            "it right: it does so only while the Founderizer app runs there, and it stops after six tries. Raise one "
+            "Needs-you item that says this in plain words, with no step by hand in it: this is the hub's own server, "
+            "where the hub runs, and the owner's Mac is what puts its SSH and npm right."])
+
+    def test_the_hub_s_own_server_is_not_judged_in_the_hour_after_its_claim(self):
+        """Its install hardens it after the claim (hub.sh's step 15 comes after its security updates), and the hub runs
+        from the claim on. The first pass of a new hub keeps the claim at the oldest line of its log, else at its own
+        time; a second claim is a new owner's address in team.json; and a restore of its records counts as one."""
+        hub.kv_set("hub_claim", None)
+        hub.q("DELETE FROM log")
+        self.own(ssh_keys_only=False)
+        self.assertEqual(json.loads(hub.kv_get("hub_claim")), {"owner": OWNER, "at": self.t0})
+        self.own(self.t0 + hub.JOIN_GRACE - 60, ssh_keys_only=False)
+        self.assertEqual(self.said(), [])
+        self.own(self.t0 + hub.JOIN_GRACE, ssh_keys_only=False)
+        self.assertEqual(self.said(), ["[hub] The server hub needs care: its SSH lets passwords in. "
+                                       + HUB_WORDS])
+        # A second claim: what was said holds for its hour, and nothing is said in it.
+        hub.TEAM["addresses"]["owner"] = "127.0.0.11"
+        self.addCleanup(hub.TEAM["addresses"].__setitem__, "owner", OWNER)
+        t1 = self.t0 + 2 * hub.JOIN_GRACE
+        for t in (t1, t1 + 600, t1 + hub.JOIN_GRACE - 60):
+            self.own(t, ssh_keys_only=True)
+        self.assertEqual(len(self.said()), 1)
+        self.own(t1 + hub.JOIN_GRACE, ssh_keys_only=True)
+        self.assertEqual(self.said()[-1], "[hub] The server hub is in order again: its SSH takes keys only.")
+        # A restore of its records (take_restore keeps its time).
+        t2 = t1 + 2 * hub.JOIN_GRACE
+        hub.kv_set("restored_at", t2)
+        self.own(t2 + 60, ssh_keys_only=False)
+        self.own(t2 + hub.JOIN_GRACE - 60, ssh_keys_only=False)
+        self.assertEqual(len(self.said()), 2)
+        self.own(t2 + hub.JOIN_GRACE, ssh_keys_only=False)
+        self.assertEqual(len(self.said()), 3)
+
+    def test_a_hub_from_before_the_claim_record_counts_from_the_oldest_line_of_its_log(self):
+        hub.kv_set("hub_claim", None)
+        hub.q("DELETE FROM log")
+        hub.q("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (self.t0 - 30 * DAY, "hub", "the first start"))
+        self.own(ssh_keys_only=False)
+        self.assertEqual(json.loads(hub.kv_get("hub_claim")), {"owner": OWNER, "at": self.t0 - 30 * DAY})
+        self.assertEqual(len(self.said()), 1)
+
+    def test_a_read_that_does_not_count_keeps_what_was_said(self):
+        """None yet after a start of the hub, or older than MACHINE_STALE: nothing ends and nothing starts."""
+        self.own(ssh_keys_only=False)
+        hub.HUB_HARDENING["read"] = None
+        self.hub_facts = {"ssh_keys_only": True, "npm_rule": True}
+        self.sweep(self.t0 + 60)
+        hub.HUB_HARDENING["read"] = dict(self.hub_facts, at=self.t0 + 120 - hub.MACHINE_STALE)
+        self.sweep(self.t0 + 120)
+        self.assertEqual(len(self.said()), 1)
+        self.assertEqual(json.loads(hub.kv_get("server_watch"))["hub"]["told"], ["ssh"])
+
+    def test_a_read_in_which_systemctl_gives_no_answer_ends_no_fault_and_moves_no_mend(self):
+        """The verifier's case of 14 November 2026: systemd answers nothing while it starts itself again, and the read
+        leaves SSH out (lifecycle.hardening). Before, it read as "OpenSSH does not run": a false "in order again", the
+        same fault said again, and the 3 days of MENDED_WAIT counted again from it. A real answer that OpenSSH does not
+        run (masked) still ends it."""
+        self.own(ssh_keys_only=False)
+        mend = json.loads(hub.kv_get("server_watch"))["hub"]["mend"]
+        self.hub_facts = {"npm_rule": None}             # no answer from systemctl, in this read and the next
+        for t in (self.t0 + 60, self.t0 + 120):
+            hub.HUB_HARDENING["read"] = dict(self.hub_facts, at=t - 5)
+            self.sweep(t)
+        self.assertNotIn("ssh_keys_only", self.servers()[1]["hub"]["hardening"], "the app's sweep reads no fact")
+        self.own(self.t0 + 180, ssh_keys_only=False)    # systemctl answers again, and the fault still stands
+        self.assertEqual(len(self.said()), 1)
+        self.assertEqual(json.loads(hub.kv_get("server_watch"))["hub"]["mend"], mend)
+        self.own(self.t0 + hub.MENDED_WAIT, ssh_keys_only=False)
+        self.assertTrue(self.said()[-1].startswith("[hub] The server hub still needs care after 3 days: its SSH lets "
+                                                   "passwords in."), self.said()[-1])
+        self.own(self.t0 + hub.MENDED_WAIT + 60, ssh_keys_only=None)
+        self.assertEqual(self.said()[-1], "[hub] The server hub is in order again: its SSH takes keys only.")
+        self.assertEqual(len(self.said()), 3)
+
+    def test_a_hub_on_a_mac_reads_nothing_of_its_ssh_and_says_nothing(self):
+        """A Mac's SSH and npm are no baseline of the fleet's, and the hub reads them nowhere but on Linux."""
+        with patch.object(hub, "HUB_KIND", "mac"):
+            self.hub_facts = {"ssh_keys_only": False, "npm_rule": False}
+            for minutes in (0, 1, 2):
+                self.sweep(self.t0 + minutes * 60)
+            self.assertIsNone(hub.HUB_HARDENING["read"])
+            self.assertIsNone(hub.HUB_HARDENING["thread"])
+            self.assertIsNone(self.servers()[1]["hub"]["hardening"])
+        self.assertEqual(self.said(), [])
+
+    def test_a_hub_whose_openssh_does_not_run_says_nothing_of_its_ssh(self):
+        """Its SSH is Tailscale's own, as on a hub where hub.sh masked OpenSSH: lifecycle.hardening reads null, which
+        says nothing, also over days; npm is still its own fact."""
+        for t in (self.t0, self.t0 + 60, self.t0 + 120, self.t0 + 4 * DAY):
+            self.own(t, ssh_keys_only=None, npm_rule=None)
+        self.assertEqual(self.said(), [])
+        self.own(self.t0 + 4 * DAY + 60, ssh_keys_only=None, npm_rule=False)
+        self.assertEqual(self.said(), ["[hub] The server hub needs care: npm has no seven-day rule. "
+                                       + HUB_WORDS])
+
+    def test_a_hub_with_a_server_service_of_its_own_says_each_thing_once_by_its_own_read(self):
+        """A hub whose own server also has a server service (FLEET_HUB_SERVER=shared) has a reading of its own too: SSH
+        and npm still come from the hub's own read alone, so a thing is never said twice, nor in the words of another
+        server, and the reading says what it says of the rest."""
+        hub.q("INSERT INTO server_keys(server,sha256,created) VALUES('hub',?,?)", (sha(KEY), self.t0 - 2 * hub.JOIN_GRACE))
+        self.report("hub", source=HUB, ssh_keys_only=False, npm_rule=False, firewall="inactive")
+        self.own(ssh_keys_only=False, npm_rule=True)
+        self.own(self.t0 + 60, ssh_keys_only=False, npm_rule=True)
+        self.assertEqual(self.said(), [
+            "[hub] The server hub needs care: its firewall is off. Give it to the agent whose duty covers this server; "
+            "fix it yourself when no duty covers it; raise Needs-you only for a step that no agent can take.",
+            "[hub] The server hub needs care: its SSH lets passwords in. " + HUB_WORDS])
+        self.report("hub", source=HUB, ssh_keys_only=True, npm_rule=True, firewall="inactive")
+        self.own(self.t0 + 120, ssh_keys_only=False, npm_rule=True)
+        self.assertEqual(len(self.said()), 2, "its service's reading ends nothing that the hub's own read still says")
+        self.own(self.t0 + 180, ssh_keys_only=True, npm_rule=True)
+        self.own(self.t0 + 240, ssh_keys_only=True, npm_rule=True)
+        self.assertEqual(self.said()[2:], ["[hub] The server hub is in order again: its SSH takes keys only."])
+
+    def test_the_hub_s_own_disk_is_watched_while_a_service_of_its_own_is_quiet(self):
+        """The lane "Hub: the manager's name, agents on the hub's server" (UI-API.md 1.168, open point 4): a hub's server
+        with a service of its own is watched as a joined server, and while that service sends no reading the watch read
+        nothing new, so a disk that filled was not said. The hub measures its own disk and memory itself (server_load):
+        those count whatever its service says. A restore that left the service's key behind made the same silence."""
+        hub.q("INSERT INTO server_keys(server,sha256,created) VALUES('hub',?,?)", (sha(KEY), self.t0 - 2 * hub.JOIN_GRACE))
+        self.report("hub", source=HUB)
+        quiet = self.t0 + hub.SERVER_QUIET + 60         # its service's newest reading is older than 30 minutes now
+        self.hub_load = self.load(disk=96, memory=95)   # the disk and the memory of a Linux hub: both are measured
+        hub.HUB_LOAD.update(at=None)
+        self.sweep(quiet)
+        self.assertEqual(self.said(), [
+            "[hub] The server hub needs care: its disk is 96% full (38.4 of 40.0 GB); 95% of its memory is in use (3.8 "
+            "of 4.0 GB). It runs Manager. Give it to the agent whose duty covers this server; fix it yourself when no "
+            "duty covers it; raise Needs-you only for a step that no agent can take."])
+        self.hub_load = self.load(disk=80, memory=80)   # and both end, while the service is still quiet
+        hub.HUB_LOAD.update(at=None)
+        self.sweep(quiet + 120)
+        self.assertEqual(self.said()[-1], "[hub] The server hub is in order again: its disk is under 85% full; its memory "
+                                          "in use is under 85%.")
+        self.assertEqual(len(self.said()), 2)
+        self.assertIsNone(hub.kv_get("server_watch"), "a server in order keeps no record")
+
+
+class HardeningRead(unittest.TestCase):
+    """lifecycle.hardening, with which a server's service reads its SSH and npm and the hub reads its own server's: the
+    state of OpenSSH from systemctl, then sshd's own files, as any user reads them."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory(prefix="fleet-hardening-")
+        self.addCleanup(folder.cleanup)
+        self.etc = Path(folder.name)
+        (self.etc / "sshd_config.d").mkdir()
+        (self.etc / "sshd_config").write_text("Include sshd_config.d/*.conf\nKbdInteractiveAuthentication no\n")
+        for name, value in (("SSHD_CONFIG", str(self.etc / "sshd_config")), ("NPMRC", str(self.etc / "npmrc"))):
+            patcher = patch.object(lifecycle, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.npm = []
+        patcher = patch.object(lifecycle, "npm_rule", lambda path: self.npm.append(path) or True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.asked = []
+
+    def run_says(self, out, code=0):
+        def run(argv, timeout=20, cwd=None):
+            self.asked.append(argv)
+            return code, out, ""
+        return run
+
+    def test_openssh_from_its_socket_or_its_service_is_read_from_its_files(self):
+        for says in ("inactive\nactive\n", "active\nactive\n", "active\ninactive\n"):
+            self.assertEqual(lifecycle.hardening(self.run_says(says)), {"ssh_keys_only": False, "npm_rule": True})
+        (self.etc / "sshd_config.d" / "10-fleet-hardening.conf").write_text("PasswordAuthentication no\n")
+        self.assertEqual(lifecycle.hardening(self.run_says("inactive\nactive\n", code=3)),
+                         {"ssh_keys_only": True, "npm_rule": True})
+        self.assertEqual(self.asked[0], ["systemctl", "is-active", "ssh.service", "ssh.socket"])
+        self.assertEqual(self.npm, [str(self.etc / "npmrc")] * 4)
+
+    def test_openssh_that_does_not_run_says_nothing_of_its_files(self):
+        """Masked or stopped, as on a hub that Tailscale's own SSH serves: systemctl's answer, a state for each unit."""
+        for says in ("inactive\ninactive\n", "failed\ninactive\n", "activating\ninactive\n"):
+            self.assertEqual(lifecycle.hardening(self.run_says(says, 3)), {"ssh_keys_only": None, "npm_rule": True})
+
+    def test_a_systemctl_with_no_answer_leaves_the_fact_out(self):
+        """systemd answers nothing for a second or two while it starts itself again (an update of systemd or libc6), and
+        _run gives the same for a call that runs out of time: such a read cannot say, so it leaves ssh_keys_only out,
+        where a null would end a fault that still stands. Also half an answer. npm's fact is its own."""
+        bus = self.run_says("", 1)
+        self.assertEqual(lifecycle.hardening(bus), {"npm_rule": True})
+        late = lambda argv, timeout=20, cwd=None: lifecycle._run(["sleep", "5"], timeout=0.2)      # the real _run
+        self.assertEqual(late(["systemctl"])[:2], (1, ""))
+        self.assertEqual(lifecycle.hardening(late), {"npm_rule": True})
+        self.assertEqual(lifecycle.hardening(self.run_says("inactive\n", 3)), {"npm_rule": True})
+        # And a server's own reading, which takes the same function: the fact is left out of it too.
+        life = lifecycle.Lifecycle("/kit", None, {"role": "worker", "runtime": "claude"}, None, None, run=bus,
+                                   platform_name="linux")
+        self.assertNotIn("ssh_keys_only", life.security())
+        self.assertIs(life.security()["npm_rule"], True)
+
+    def test_a_server_s_own_reading_takes_the_same_function(self):
+        life = lifecycle.Lifecycle("/kit", None, {"role": "worker", "runtime": "claude"}, None, None,
+                                   run=self.run_says("inactive\nactive\n"), platform_name="linux")
+        with patch.object(lifecycle, "hardening", lambda run: {"ssh_keys_only": "by hardening", "npm_rule": "too"}):
+            reading = life.security()
+        self.assertEqual((reading["ssh_keys_only"], reading["npm_rule"]), ("by hardening", "too"))
 
 
 if __name__ == "__main__":

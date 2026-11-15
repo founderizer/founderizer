@@ -35963,12 +35963,12 @@ MACOS_UPDATE_WAIT = 14 * 86400  # seconds that a Mac's macOS update may wait bef
 # Seconds after its join in which a server is still being set up: its service reads it as soon as it starts, which is
 # before the join's updates, firewall and hardening (join.sh), so a reading of that time is no news.
 JOIN_GRACE = 3600
-# What the owner's Mac puts right by itself on a joined Linux server that is not the hub's own machine (the owner, 14
-# November 2026: "Yes, all of it", after a join kept password login and the manager asked the owner for a root
-# command): the Mac app runs the join's hardening again there as root, over the SSH connection that it has to each
-# server, in its first rounds after JOIN_GRACE, and tries six times at most (ServerHardening in the app). So the
-# manager takes no step and raises no Needs-you item for these, and hears of them once more only when one still stands
-# MENDED_WAIT after it was said.
+# What the owner's Mac puts right by itself on a joined Linux server (the owner, 14 November 2026: "Yes, all of it",
+# after a join kept password login and the manager asked the owner for a root command): the Mac app runs the join's
+# hardening again there as root, over the SSH connection that it has to each server, in its first rounds after
+# JOIN_GRACE, and tries six times at most (ServerHardening in the app). So the manager takes no step and raises no
+# Needs-you item for these, and hears of them once more only when one still stands MENDED_WAIT after it was said. On
+# the hub's own server too, by the hub's own read of it (HUB_HARDENING), from JOIN_GRACE after the hub's claim.
 MENDED_BY_MAC = ("ssh", "npm")
 # Three days: the app puts it right only while it runs on the owner's Mac, and a Mac can stay shut over a weekend
 # (Friday evening to Monday morning is about 64 hours); and 3 days is UPDATES_STALLED, the hub's measure of a fact that
@@ -35980,6 +35980,15 @@ MENDED_WORDS = ("The owner's Mac puts this right by itself: while the Founderize
 MENDED_LATE = ("The owner's Mac has not put it right: it does so only while the Founderizer app runs there, and it "
                "stops after six tries. Raise one Needs-you item that says this in plain words, with no step by hand in "
                "it: this server is a fleet machine, where agents run, and no agent holds it through the door.")
+# The same two messages for the hub's own server, which no join hardened: until release 2026.11.441 the hub's installer
+# did not harden it at all, and the owner's Mac gives it what every server of the fleet gets.
+MENDED_WORDS_HUB = ("The owner's Mac puts this right by itself: while the Founderizer app runs there, it gives the hub's "
+                    "own server the hardening of every fleet server, as root. Take no step for it and raise no Needs-you "
+                    "item: if it still stands in 3 days, the hub tells you again.")
+MENDED_LATE_HUB = ("The owner's Mac has not put it right: it does so only while the Founderizer app runs there, and it "
+                   "stops after six tries. Raise one Needs-you item that says this in plain words, with no step by "
+                   "hand in it: this is the hub's own server, where the hub runs, and the owner's Mac is what puts its "
+                   "SSH and npm right.")
 WATCH = {"at": 0.0}
 WATCH_WORDS = {                 # what stopped holding, and what holds again
     "quiet": ("it has sent no reading for 30 minutes", "it sends its readings again"),
@@ -36043,17 +36052,109 @@ def server_troubles(reading, joined, restart_since, t0):
     return found
 
 
+# The hub's own server against the two facts that the owner's Mac puts right (the owner, 14 November 2026: "get some
+# opus 5.5 extra thread to fix them"). That server has no server service, so no reading says how its SSH and npm stand,
+# and a hub that was installed before its installer hardened it (hub.sh's step 15, release 2026.11.441) kept the SSH of
+# its image. So the hub reads the two facts itself, as its own user, with the function that a server's service reads
+# them with (lifecycle.hardening), on Linux only. That function runs systemctl, which can wait for systemd, so a thread
+# reads them outside LOCK, one at a time, and the watch and GET /ui/servers read what it left.
+HUB_KIND = "mac" if sys.platform == "darwin" else "linux"      # the hub's own machine: a hub runs on Linux or on a Mac
+HUB_HARDENING = {"read": None, "thread": None}  # the newest read ({ssh_keys_only, npm_rule, at}), and the thread
+HUB_CLAIM = "hub_claim"         # kv: the owner's address that the hub's claim wrote into team.json, and since when
+
+
+def hub_hardening_read(t0):
+    """Outside LOCK, in its own thread: the two facts of the hub's own server as the hub's own user reads them
+    (lifecycle.hardening), with the time of the pass that asked for them."""
+    HUB_HARDENING["read"] = dict(lifecycle.hardening(), at=t0)
+
+
+def hub_hardening_ask(t0):
+    """Inside LOCK: a thread reads the hub's own server again (hub_hardening_read), on Linux and while no other read of
+    it runs. The thread, else None."""
+    if HUB_KIND != "linux" or (HUB_HARDENING["thread"] is not None and HUB_HARDENING["thread"].is_alive()):
+        return None
+    thread = HUB_HARDENING["thread"] = threading.Thread(target=hub_hardening_read, args=(t0,), name="hub-hardening",
+                                                        daemon=True)
+    thread.start()
+    return thread
+
+
+def hub_claimed(t0, keep=False):
+    """When the owner's Mac that team.json names claimed this hub, or when its records were restored, if that is later.
+    A claim (the install's, or a second one) writes that Mac's address into team.json before the hub starts, so the
+    first pass of the watch that sees an address that it has not kept keeps it with its own time (keep: inside LOCK,
+    the watch's own pass). A hub from before this record keeps the time of the oldest line of its log, which its first
+    start wrote after its claim. None until the watch kept one."""
+    owner = address_of_machine("owner")
+    try:
+        kept = json.loads(kv_get(HUB_CLAIM) or "{}")
+    except ValueError:
+        kept = {}
+    kept = kept if isinstance(kept, dict) else {}
+    at = kept.get("at") if kept.get("owner") == owner and isinstance(kept.get("at"), (int, float)) else None
+    if at is None and keep:
+        first = None if kept else q1("SELECT MIN(ts) AS t FROM log")["t"]
+        at = first if isinstance(first, (int, float)) and first <= t0 else t0
+        kv_set(HUB_CLAIM, json.dumps({"owner": owner, "at": at}))
+    if at is None:
+        return None
+    try:
+        restored = float(kv_get("restored_at") or 0)
+    except ValueError:
+        restored = 0.0
+    return max(float(at), restored)
+
+
+# The name in a reading of each fact that the owner's Mac puts right. A null says nothing (OpenSSH does not run there,
+# or npm is not there). A reading that leaves one out cannot say: a server's service and the hub leave out
+# ssh_keys_only when systemctl gives no answer (lifecycle.hardening), and a null there would end a fault that still
+# stands with a false "in order again" and start its MENDED_WAIT again (14 November 2026, measured on the hub).
+MENDED_FACTS = {"ssh": "ssh_keys_only", "npm": "npm_rule"}
+
+
+def left_out(security, told):
+    """The MENDED_BY_MAC keys that were said and that this reading leaves out: they hold."""
+    return {k for k, fact in MENDED_FACTS.items() if k in told and fact not in security}
+
+
+def hub_hardening_troubles(read, claimed, told, t0):
+    """SSH and npm of the hub's own server, as MENDED_BY_MAC keys, from the hub's own newest read while it counts
+    (MACHINE_STALE, as a reading), from JOIN_GRACE after the hub's claim: its install hardens it after the claim, as a
+    join hardens a server after that server's service starts. A null fact says nothing, as in a reading
+    (server_troubles), and one that the read leaves out keeps what was said (left_out). With no read that counts, or
+    before that hour, what was said holds."""
+    if read is None or not 0 <= t0 - read["at"] < MACHINE_STALE or claimed is None or t0 - claimed < JOIN_GRACE:
+        return {k for k in told if k in MENDED_BY_MAC}
+    return {k for k, fact in MENDED_FACTS.items() if read.get(fact) is False} | left_out(read, told)
+
+
+def hub_hardening_view(t0):
+    """GET /ui/servers `hardening` on the hub's own row (owner API 1.170): the hub's newest read of its own server, when
+    it was read and when the hub was claimed (hub_claimed), or None before the first read and on a hub on a Mac. The
+    app's sweep reads it (ServerHardening); no page reads it."""
+    read = HUB_HARDENING["read"]
+    return dict(read, claimed_at=hub_claimed(t0)) if read else None
+
+
 def server_watch_sweep(t0):
     """Inside LOCK, once a minute: each joined Linux server against its own baseline (server_troubles), from its
     newest reading, once its join is JOIN_GRACE old, and the disk and memory of every joined server and of the hub's
-    own machine, which may have no service, a Mac's disk only (load_troubles). A server with no agent whose reading
-    stops is quiet; one with agents is offline_sweep's. The
-    manager hears once when something stops holding and once when it holds again, and gives it first to the agent
+    own machine, which may have no service, a Mac's disk only (load_troubles), by the hub's own measurement also
+    while a service of that machine is quiet. The SSH and npm of the hub's own server
+    on Linux come from the hub's own read of it, also when that server has a service of its own
+    (hub_hardening_troubles). SSH and npm that a reading or a read leaves out hold as they were said (left_out). A
+    server with no agent whose reading stops is quiet; one with agents is offline_sweep's.
+    The manager hears once when something stops holding and once when it holds again, and gives it first to the agent
     whose duty covers that server (the coordinator of the DevOps plan, 3 November 2026: the owner asked why he gets so
-    many Needs-you items)."""
+    many Needs-you items). Returns the thread that reads the hub's own server again, else None."""
     if t0 - WATCH["at"] < WATCH_EVERY:
-        return
+        return None
     WATCH["at"] = t0
+    # What the newest read of the hub's own server left, before this pass asks for the next one, which the next pass
+    # reads: a pass never reads half of a read.
+    hub_read, claimed = HUB_HARDENING["read"], hub_claimed(t0, keep=True)
+    asked = hub_hardening_ask(t0)
     joined = {r["server"]: r["created"] for r in q("SELECT server, created FROM server_keys")}
     state = json.loads(kv_get("server_watch") or "{}")
     kept, hub_machine = {}, (TEAM.get("hub") or {}).get("machine")
@@ -36064,7 +36165,7 @@ def server_watch_sweep(t0):
             continue
         here = server_agents(name)
         reading = server_reading(name, here) if watched else None
-        kind = ("mac" if sys.platform == "darwin" else "linux") if own else server_kind(reading)
+        kind = HUB_KIND if own else server_kind(reading)
         if kind is None:
             continue
         load = server_load(name, reading, t0)
@@ -36082,12 +36183,17 @@ def server_watch_sweep(t0):
                 now_found.add("macos_update")
         elif reading["source"] == "server" and t0 - max(reading["reported_at"], STARTED) > SERVER_QUIET:
             now_found = (told - {"quiet"}) | ({"quiet"} if not here else set())    # nothing else is read while quiet
+            if own:     # but the hub measures its own disk and memory itself (server_load), whatever its service says
+                now_found = (now_found - {"disk", "memory"}) | set(load_troubles(load, told))
         else:
             sec = reading.get("security") or {}
             since = (since or t0) if sec.get("reboot_required") else None
             now_found = set(server_troubles(reading, joined[name], since, t0) + load_troubles(load, told))
+            now_found |= left_out(sec, told)    # what this reading cannot say holds
+        if own and kind == "linux":     # its SSH and npm by the hub's own read, never by a reading of its service
+            now_found = (now_found - set(MENDED_BY_MAC)) | hub_hardening_troubles(hub_read, claimed, told, t0)
         new, ended = sorted(now_found - told), sorted(told - now_found)
-        mended = [] if own else [k for k in new if k in MENDED_BY_MAC]      # the owner's Mac puts these right
+        mended = [k for k in new if k in MENDED_BY_MAC]         # the owner's Mac puts these right
         other = [k for k in new if k not in mended]
         if other:
             names = [shown_role(a) for a in here] if {"disk", "memory"} & set(other) else []    # what runs there
@@ -36100,16 +36206,18 @@ def server_watch_sweep(t0):
             log("hub", f"the server {name} needs care ({', '.join(other)}); the manager was told")
         if mended:
             emit(manager_name(), "say", f"[hub] The server {name} needs care: "
-                                        f"{'; '.join(watch_words(k, load) for k in mended)}. {MENDED_WORDS}")
+                                        f"{'; '.join(watch_words(k, load) for k in mended)}. "
+                                        f"{MENDED_WORDS_HUB if own else MENDED_WORDS}")
             log("hub", f"the server {name} needs care ({', '.join(mended)}), which the owner's Mac puts right; the "
                        f"manager was told")
         # Since when what the owner's Mac puts right stands, and whether the manager heard that it still does.
-        standing = [] if own else [k for k in sorted(now_found) if k in MENDED_BY_MAC]
+        standing = [k for k in sorted(now_found) if k in MENDED_BY_MAC]
         mend = (was.get("mend") or t0) if standing else None
         late = bool(standing and was.get("late"))
         if standing and not late and t0 - mend >= MENDED_WAIT:
             emit(manager_name(), "say", f"[hub] The server {name} still needs care after 3 days: "
-                                        f"{'; '.join(watch_words(k, load) for k in standing)}. {MENDED_LATE}")
+                                        f"{'; '.join(watch_words(k, load) for k in standing)}. "
+                                        f"{MENDED_LATE_HUB if own else MENDED_LATE}")
             log("hub", f"the server {name} still needs care after 3 days ({', '.join(standing)}); the manager was told")
             late = True
         if ended:
@@ -36121,6 +36229,7 @@ def server_watch_sweep(t0):
                               **({"mend": mend} if mend else {}), **({"late": True} if late else {}))
     if kept != state:
         kv_set("server_watch", json.dumps(kept, sort_keys=True) if kept else None)
+    return asked
 
 
 def not_shareable(team, here):
@@ -36138,8 +36247,8 @@ def installing(job, agent):
 
 def servers_view():
     """GET /ui/servers: each server with its kind, address, agents, newest reading, availability (why: the codes of
-    what stops a new agent) and newest job; whether the hub's own server takes agents (hub_shared); and the state of
-    the newest join code."""
+    what stops a new agent) and newest job; whether the hub's own server takes agents (hub_shared); on the hub's own
+    row the hub's own read of its server (hardening); and the state of the newest join code."""
     t0, desired = now(), kit_revision()
     expire_server_jobs(t0)
     team, hub_machine = TEAM, (TEAM.get("hub") or {}).get("machine")
@@ -36171,7 +36280,9 @@ def servers_view():
         out.append({"name": name, "kind": entry.get("kind") or server_kind(reading),
                     "address": team["addresses"][name], "user": entry.get("user") or (reading or {}).get("user"),
                     "hub": name == hub_machine, "joined": name in keys, "agents": here, "reading": reading,
-                    "load": load, "available": not why, "why": why, "job": job_view(job)})
+                    "load": load, "available": not why, "why": why, "job": job_view(job),
+                    # owner API 1.170: the hub's own read of its own server, for the app's sweep and no page
+                    "hardening": hub_hardening_view(t0) if name == hub_machine else None})
     return {"desired_revision": desired, "servers": out, "apps": app_servers_view(team),
             "hub_shared": hub_shared(team),
             "join": join_view(q1("SELECT * FROM join_codes ORDER BY id DESC LIMIT 1"), t0)}

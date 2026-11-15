@@ -110,6 +110,29 @@ def upgraded_at(path=UPGRADE_STAMP):
         return os.path.getmtime(path)
     except OSError:
         return None
+
+
+SSH_UNITS = ("ssh.service", "ssh.socket")      # OpenSSH runs when either is active: the socket starts the service
+
+
+def hardening(run=None):
+    """The two facts of the join's hardening that any user reads in a moment, with the names that a reading gives them:
+    `ssh_keys_only` (sshd_keys_only), None where OpenSSH does not run, because neither its service nor its socket is
+    active and it then lets nobody in with a password (a server that Tailscale's own SSH serves), and `npm_rule`. A
+    server's own service reads them for its reading (Lifecycle.security), and the hub reads them of its own server,
+    which has no service (hub.hub_hardening_read): one function, so that the two never read them in two ways.
+
+    `ssh_keys_only` is left out when systemctl gives no state for each unit: systemd answers nothing for a second or
+    two while it starts itself again (an update of systemd or libc6: "Failed to connect to system scope bus", status 1),
+    and _run gives the same for a call that ran out of time. Such a read cannot say, so the hub keeps what was said of
+    it (server_watch_sweep), where a null would end a fault that still stands (14 November 2026, measured)."""
+    _code, out, _err = (run or _run)(["systemctl", "is-active", *SSH_UNITS])
+    states, facts = out.split(), {"npm_rule": npm_rule(NPMRC)}
+    if len(states) == len(SSH_UNITS):
+        facts["ssh_keys_only"] = sshd_keys_only(SSHD_CONFIG) if "active" in states else None
+    return facts
+
+
 OWNER_ONLY = re.compile(r"(?:^|/)(?:test_[^/]*|ui_fixture|selftest|verify|pilot|vault|place)\.py$")  # never loaded here
 TICK = 15                   # seconds between idle checks
 RESTART_GRACE = 120         # seconds this process may live on after it asked for its own restart
@@ -2481,10 +2504,7 @@ class Lifecycle:
             if code == 0:
                 s["pending_security"] = len(re.findall(r"^Inst .*[Ss]ecurity", out, re.M))
             s["reboot_required"] = os.path.exists("/var/run/reboot-required")
-            # OpenSSH that does not run lets nobody in with a password (a server that Tailscale's own SSH serves)
-            code, out, _ = self.run(["systemctl", "is-active", "ssh.service", "ssh.socket"])
-            s.update(ssh_keys_only=sshd_keys_only() if "active" in out.split() else None, npm_rule=npm_rule(),
-                     upgraded_at=upgraded_at())
+            s.update(hardening(self.run), upgraded_at=upgraded_at())   # the hub reads its own server with it too
             try:
                 with open("/etc/ufw/ufw.conf") as f:
                     m = re.search(r"^ENABLED=(\w+)", f.read(), re.M)
