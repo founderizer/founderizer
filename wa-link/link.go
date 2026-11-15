@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -32,7 +34,23 @@ const (
 	maxError     = 300
 	recentLimit  = 1000
 	opsQueueSize = 1024
+
+	// A file of a send (CHAT-APPS.md 20): at most maxFile bytes, the hub's own limit. A PNG or a JPEG of at most
+	// maxImage bytes goes as a picture, every other file as a document with its name. The upload and the send of
+	// one file end within fileTimeout, under the bridge's wait for the "sent" event.
+	maxFile     = 25 << 20
+	maxImage    = 16 << 20
+	maxFileName = 200
+	fileTimeout = 110 * time.Second
 )
+
+// The types that a send can carry: the hub's own list (hub.py CHAT_FILE_TYPES).
+var fileTypes = map[string]bool{
+	"application/pdf": true, "image/png": true, "image/jpeg": true, "text/csv": true, "text/plain": true,
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":         true,
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document":   true,
+	"application/vnd.openxmlformats-officedocument.presentationml.presentation": true,
+}
 
 // Client is the part of whatsmeow that wa-link uses.
 type Client interface {
@@ -41,6 +59,7 @@ type Client interface {
 	Connect() error
 	Pair(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error)
 	Send(ctx context.Context, to types.JID, id types.MessageID, msg *waE2E.Message) error
+	Upload(ctx context.Context, data []byte, kind whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
 	MarkRead(ctx context.Context, chat, sender types.JID, ids []types.MessageID) error
 	Typing(ctx context.Context, chat types.JID, on bool) error
 	Logout(ctx context.Context) error
@@ -48,15 +67,24 @@ type Client interface {
 }
 
 type command struct {
-	Op      string   `json:"op"`
-	ID      string   `json:"id"`
-	To      string   `json:"to"`
-	Text    string   `json:"text"`
-	ReplyTo *string  `json:"reply_to"`
-	Chat    string   `json:"chat"`
-	Sender  string   `json:"sender"`
-	IDs     []string `json:"ids"`
-	On      *bool    `json:"on"`
+	Op      string    `json:"op"`
+	ID      string    `json:"id"`
+	To      string    `json:"to"`
+	Text    string    `json:"text"`
+	ReplyTo *string   `json:"reply_to"`
+	Chat    string    `json:"chat"`
+	Sender  string    `json:"sender"`
+	IDs     []string  `json:"ids"`
+	On      *bool     `json:"on"`
+	File    *fileSpec `json:"file"`
+}
+
+// fileSpec is the file of a send: a file that the bridge wrote into the outbox folder beside the database, and the
+// name and type that the person sees. Its bytes never travel in a line.
+type fileSpec struct {
+	Path string `json:"path"`
+	Name string `json:"name"`
+	Mime string `json:"mime"`
 }
 
 type stateEvent struct {
@@ -65,6 +93,16 @@ type stateEvent struct {
 	JID   *string `json:"jid"`
 	Error *string `json:"error"`
 }
+
+// helloEvent is the first line of a wa-link: what this build can do, so that a bridge never gives a file to a
+// wa-link that would send its caption alone and report it sent (CHAT-APPS.md 20).
+type helloEvent struct {
+	Ev       string   `json:"ev"`
+	Features []string `json:"features"`
+}
+
+// features is what a hello says.
+var features = []string{"file"}
 
 type qrEvent struct {
 	Ev      string `json:"ev"`
@@ -110,6 +148,8 @@ type Link struct {
 	cli     Client
 	log     waLog.Logger
 	ackWait time.Duration
+	outbox  string           // the one folder that a send's file may be in: outbox beside the database
+	now     func() time.Time // the time of a file's media key
 
 	ctx    context.Context // ends at shutdown
 	cancel context.CancelFunc
@@ -137,6 +177,7 @@ func NewLink(cli Client, out io.Writer, log waLog.Logger) *Link {
 		cli:     cli,
 		log:     log,
 		ackWait: ackWait,
+		now:     time.Now,
 		ctx:     ctx,
 		cancel:  cancel,
 		out:     enc,
@@ -151,6 +192,7 @@ func NewLink(cli Client, out io.Writer, log waLog.Logger) *Link {
 // Messages that still wait for their ack are not confirmed to WhatsApp, so
 // WhatsApp delivers them again after the next start.
 func (l *Link) Run(ctx context.Context, in io.Reader) {
+	l.emit(helloEvent{Ev: "hello", Features: features})
 	workerDone := make(chan struct{})
 	go func() {
 		defer close(workerDone)
@@ -394,27 +436,140 @@ func (l *Link) send(c command) error {
 	if err != nil {
 		return err
 	}
+	if c.File != nil {
+		return l.sendFile(c, to)
+	}
 	if c.Text == "" || len(c.Text) > maxText {
 		return fmt.Errorf("%w: text must have 1 to %d bytes", errInvalid, maxText)
 	}
 	msg := &waE2E.Message{Conversation: proto.String(c.Text)}
-	if c.ReplyTo != nil && *c.ReplyTo != "" {
-		if q, ok := l.quoted(types.MessageID(*c.ReplyTo), to); ok {
-			msg = &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
-				Text: proto.String(c.Text),
-				ContextInfo: &waE2E.ContextInfo{
-					StanzaID:      proto.String(*c.ReplyTo),
-					Participant:   proto.String(q.jids[1].String()),
-					QuotedMessage: q.msg,
-				},
-			}}
-		} else {
-			l.log.Infof("Message %s to quote is not known, sending %s without a quote", clip(*c.ReplyTo), c.ID)
-		}
+	if quote := l.quoteInfo(c, to); quote != nil {
+		msg = &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String(c.Text), ContextInfo: quote}}
 	}
 	ctx, cancel := context.WithTimeout(l.ctx, 90*time.Second)
 	defer cancel()
 	return l.cli.Send(ctx, to, types.MessageID(c.ID), msg)
+}
+
+// quoteInfo quotes reply_to when it is a known inbound message of the chat with to, else nil.
+func (l *Link) quoteInfo(c command, to types.JID) *waE2E.ContextInfo {
+	if c.ReplyTo == nil || *c.ReplyTo == "" {
+		return nil
+	}
+	q, ok := l.quoted(types.MessageID(*c.ReplyTo), to)
+	if !ok {
+		l.log.Infof("Message %s to quote is not known, sending %s without a quote", clip(*c.ReplyTo), c.ID)
+		return nil
+	}
+	return &waE2E.ContextInfo{
+		StanzaID:      proto.String(*c.ReplyTo),
+		Participant:   proto.String(q.jids[1].String()),
+		QuotedMessage: q.msg,
+	}
+}
+
+// sendFile uploads the file of a send to WhatsApp's media servers and sends it as a picture or a document, with the
+// text as its caption (which can be empty). An upload that fails sent nothing, so its error is "not sent"; the send
+// after it has the errors of a text.
+func (l *Link) sendFile(c command, to types.JID) error {
+	if len(c.Text) > maxText {
+		return fmt.Errorf("%w: a caption has at most %d bytes", errInvalid, maxText)
+	}
+	f := c.File
+	if !fileTypes[f.Mime] {
+		return fmt.Errorf("%w: a file of the type %q cannot be sent", errInvalid, clip(f.Mime))
+	}
+	if !validFileName(f.Name) {
+		return fmt.Errorf("%w: a file name has 1 to %d bytes, and no path or control character", errInvalid, maxFileName)
+	}
+	data, err := l.readFile(f.Path)
+	if err != nil {
+		return err
+	}
+	image := (f.Mime == "image/png" || f.Mime == "image/jpeg") && len(data) <= maxImage
+	kind := whatsmeow.MediaDocument
+	if image {
+		kind = whatsmeow.MediaImage
+	}
+	ctx, cancel := context.WithTimeout(l.ctx, fileTimeout)
+	defer cancel()
+	l.log.Infof("Uploading the file of %s (%d bytes)", c.ID, len(data))
+	up, err := l.cli.Upload(ctx, data, kind)
+	if err != nil {
+		return fmt.Errorf("%w: the upload of the file failed: %v", errNotSent, err)
+	}
+	return l.cli.Send(ctx, to, types.MessageID(c.ID), fileMessage(up, f, c.Text, l.quoteInfo(c, to), image, l.now()))
+}
+
+func validFileName(name string) bool {
+	if name == "" || len(name) > maxFileName || !utf8.ValidString(name) || strings.ContainsAny(name, "/\\") ||
+		strings.HasPrefix(name, ".") {
+		return false
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// readFile reads a send's file: a regular file, directly in the outbox folder, of 1 to maxFile bytes.
+func (l *Link) readFile(path string) ([]byte, error) {
+	if l.outbox == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path || filepath.Dir(path) != l.outbox {
+		return nil, fmt.Errorf("%w: the file is not in the outbox folder of wa-link", errInvalid)
+	}
+	st, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("%w: the file cannot be read: %v", errNotSent, err)
+	}
+	if !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: the file is not a regular file", errInvalid)
+	}
+	if st.Size() < 1 || st.Size() > maxFile {
+		return nil, fmt.Errorf("%w: a file has 1 to %d bytes", errInvalid, maxFile)
+	}
+	fh, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("%w: the file cannot be read: %v", errNotSent, err)
+	}
+	defer fh.Close()
+	data, err := io.ReadAll(io.LimitReader(fh, maxFile+1))
+	if err != nil {
+		return nil, fmt.Errorf("%w: the file cannot be read: %v", errNotSent, err)
+	}
+	if len(data) != int(st.Size()) {
+		return nil, fmt.Errorf("%w: the file changed while it was read", errNotSent)
+	}
+	return data, nil
+}
+
+// fileMessage is the message of an uploaded file: a picture, or a document with its name.
+func fileMessage(up whatsmeow.UploadResponse, f *fileSpec, caption string, quote *waE2E.ContextInfo, image bool, at time.Time) *waE2E.Message {
+	var text *string
+	if caption != "" {
+		text = proto.String(caption)
+	}
+	if image {
+		return &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+			URL: proto.String(up.URL), DirectPath: proto.String(up.DirectPath), MediaKey: up.MediaKey,
+			Mimetype: proto.String(f.Mime), FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256,
+			FileLength: proto.Uint64(up.FileLength), MediaKeyTimestamp: proto.Int64(at.Unix()),
+			Caption: text, ContextInfo: quote,
+		}}
+	}
+	doc := &waE2E.DocumentMessage{
+		URL: proto.String(up.URL), DirectPath: proto.String(up.DirectPath), MediaKey: up.MediaKey,
+		Mimetype: proto.String(f.Mime), FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256,
+		FileLength: proto.Uint64(up.FileLength), MediaKeyTimestamp: proto.Int64(at.Unix()),
+		FileName: proto.String(f.Name), Title: proto.String(f.Name), Caption: text, ContextInfo: quote,
+	}
+	if text == nil {
+		return &waE2E.Message{DocumentMessage: doc}
+	}
+	// A document with a caption goes in the form that WhatsApp's own apps send it in, which a phone shows with its
+	// words; whatsmeow sends that form (send.go) and unwraps it on receipt (events.Message.UnwrapRaw).
+	return &waE2E.Message{DocumentWithCaptionMessage: &waE2E.FutureProofMessage{Message: &waE2E.Message{DocumentMessage: doc}}}
 }
 
 func (l *Link) read(c command) error {

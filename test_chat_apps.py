@@ -3,17 +3,26 @@ WhatsApp, link codes, replies and delivery, and the owner routes. An in-process 
 temporary git repository and a temporary chat-apps folder; no bridge, no platform, no live hub, no ~/.fleet."""
 import hashlib
 import http.client
+import base64
+import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
+import struct
 import subprocess
 import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
+import urllib.error
+import urllib.request
 import uuid
+import zipfile
+import zlib
 
 import hub
 from test_ui_api import OwnerAPI
@@ -81,8 +90,9 @@ class ChatApps(OwnerAPI):
     def own(self, app="discord", ident=OWNER_DISCORD, alias=None):
         hub.q("INSERT INTO owner_handles(app,id,alias,name,linked) VALUES(?,?,?,?,?)", (app, ident, alias, "miguel", hub.now()))
 
-    def out(self):
-        code, data = self.bridge("/bridge/out?wait=0")
+    def out(self, files=True):
+        """The queued items, as a bridge that sends files asks for them (files=1, CHAT-APPS.md 20)."""
+        code, data = self.bridge("/bridge/out?wait=0" + ("&files=1" if files else ""))
         self.assertEqual(code, 200, data)
         self.assertEqual(data["version"], hub.chat_version())
         return data["items"]
@@ -1320,8 +1330,630 @@ class ChatApps(OwnerAPI):
         self.assertEqual((config["db"], config["paused"]), ("test-generation", False))
 
 
+# ---------------------------------------------------------------- an agent's files in chats (CHAT-APPS.md 20)
+
+CANARY, CANARY_SALT = "SPARROW-CANARY-9931", "canary-salt"
+
+
+def pdf(*streams, extra=b""):
+    """A small PDF: a catalog, `extra` in its syntax, and one object for each (dictionary, plain bytes) stream, packed
+    with FlateDecode."""
+    out = [b"%PDF-1.7\n", b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n", extra]
+    for i, (dictionary, plain) in enumerate(streams, 3):
+        body = zlib.compress(plain)
+        out.append(b"%d 0 obj << %s /Filter /FlateDecode /Length %d >>\nstream\n" % (i, dictionary, len(body)) + body +
+                   b"\nendstream\nendobj\n")
+    out.append(b"trailer << /Root 1 0 R >>\n%%EOF\n")
+    return b"".join(out)
+
+
+def office(parts=None, main="xl/workbook.xml"):
+    """An Office file: its content types, its main part, and the other parts, {name: text}."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as package:
+        if "[Content_Types].xml" not in (parts or {}):
+            package.writestr("[Content_Types].xml", "<Types/>")
+        if main:
+            package.writestr(main, "<workbook/>")
+        for name, text in (parts or {}).items():
+            package.writestr(name, text)
+    return buf.getvalue()
+
+
+def png(*chunks):
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", bytes(13)) + b"".join(chunk(k, b) for k, b in chunks) + \
+        chunk(b"IEND", b"")
+
+
+def jpeg(comment):
+    return b"\xff\xd8\xff\xfe" + struct.pack(">H", len(comment) + 2) + comment + b"\xff\xda\x00\x02\x00\xff\xd9"
+
+
+PDF_FILE = pdf((b"", b"BT /F1 12 Tf 72 712 Td (Invoice for October) Tj ET"))
+XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+class AgentFiles(ChatApps):
+    """An agent's file with its words: the upload line, the check of the bytes, the four tools that carry it, the
+    bridge's read of the bytes, Send again, the daily limit of a WhatsApp number, the sweep and the sending window."""
+    def setUp(self):
+        super().setUp()
+        self.files = tempfile.TemporaryDirectory(prefix="fleet-agent-files-")
+        self.addCleanup(self.files.cleanup)
+        hub.CFG["attachment_dir"] = self.files.name
+        self.addCleanup(hub.CFG.pop, "attachment_dir", None)
+        self.addCleanup(hub.CHAT_FILE_UPLOADS.clear)
+
+    # ---- helpers
+    def raw(self, method, path, data=None, headers=None, source="127.0.0.3"):
+        req = urllib.request.Request(self.base + path, data=data, method=method,
+                                     headers=dict({"X-Test-Source": source}, **(headers or {})))
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with op.open(req, timeout=30) as r:
+                return r.status, r.read(), dict(r.headers)
+        except urllib.error.HTTPError as r:
+            with r:
+                return r.code, r.read(), dict(r.headers)
+
+    def line(self, agent="manager", name="Invoice October.pdf", context=None):
+        text, error = hub.call_tool(agent, "attach_file", {"name": name}, context)
+        self.assertFalse(error, text)
+        return re.search(r'/attachment/file/([A-Za-z0-9_-]+)"', text).group(1), text
+
+    def put(self, token, data):
+        code, body, _ = self.raw("POST", f"/attachment/file/{token}", data,
+                                 {"Content-Type": "application/octet-stream"})
+        return code, body.decode()
+
+    def attach(self, data=PDF_FILE, agent="manager", name="Invoice October.pdf", context=None):
+        code, text = self.put(self.line(agent, name, context)[0], data)
+        self.assertEqual(code, 200, text)
+        return int(re.match(r"A-(\d+) ", text).group(1))
+
+    def canary(self):
+        hub.ins("INSERT INTO secrets(label,salt,hash,len) VALUES(?,?,?,?)",
+                ("canary", CANARY_SALT, hashlib.sha256((CANARY_SALT + CANARY).encode()).hexdigest(), len(CANARY)))
+
+    def bridge_file(self, aid, item):
+        return self.raw("GET", f"/bridge/files/{aid}?item={item}", headers={"Authorization": f"Bearer {self.key}"},
+                        source=BRIDGE)
+
+    def messages(self):
+        return [i for i in self.out() if i["kind"] == "message"]
+
+    def task_context(self, owner="studio"):
+        with hub.LOCK, hub.transaction():
+            tid = hub.admit_task("manager", {"owner": owner, "title": "Make the invoice", "details": "",
+                                             "done_when": "sent", "needs": "none", "goal": None, "goal_id": None,
+                                             "parent": None, "follows": None, "case_id": None})
+        hub.q("UPDATE tasks SET state='working', started=? WHERE id=?", (hub.now(), tid))
+        return ("test-generation", hub.tref(tid), "1")
+
+    def owner_message(self, files, request_id=None, text="Here is the October invoice."):
+        return hub.call_tool("manager", "message_owner", {"request_id": request_id or str(uuid.uuid4()), "text": text,
+                                                          "files": files}, None)
+
+    # ---- the upload
+    def test_attach_file_gives_one_line_and_its_upload_names_the_file(self):
+        token, text = self.line(name="../Invoice: October?.pdf")
+        self.assertIn("curl -sS --fail-with-body --data-binary @'<path>'", text)
+        self.assertIn("The person sees it as __Invoice_ October_.pdf.", text)
+        self.assertEqual(self.count("attachments"), 0)              # nothing is on the hub before the upload
+        code, said = self.put(token, PDF_FILE)
+        self.assertEqual(code, 200, said)
+        aid = int(re.match(r"A-(\d+) ", said).group(1))
+        self.assertEqual(said, f"A-{aid} __Invoice_ October_.pdf (PDF, 1 KB) is on the hub for one hour. Give A-{aid} "
+                               f"in files of the message that sends it.\n")
+        row = hub.q1("SELECT * FROM attachments WHERE id=?", (aid,))
+        self.assertEqual((row["agent"], row["mime"], row["size"], row["sha256"], row["message"], row["report"],
+                          row["cm"], row["carried"]),
+                         ("manager", "application/pdf", len(PDF_FILE), hashlib.sha256(PDF_FILE).hexdigest(), None, None,
+                          None, None))
+        self.assertEqual(hub.attachment_bytes(row), PDF_FILE)
+        self.assertEqual(self.put(token, PDF_FILE)[0], 404)          # one use
+        logs = json.dumps([dict(r) for r in hub.q("SELECT * FROM log")])
+        self.assertNotIn(token, logs)
+        # an ended line takes nothing
+        token, _ = self.line()
+        hub.CHAT_FILE_UPLOADS[token]["ends"] = hub.now() - 1
+        self.assertEqual(self.put(token, PDF_FILE), (404, "This upload line is not valid: it was used, or it ended. "
+                                                          "Call attach_file for a new one.\n"))
+        # a name of another kind of file gets no line at all
+        for name in ("report.zip", "run.sh", "notes", ".pdf", "macro.xlsm"):
+            text, error = hub.call_tool("manager", "attach_file", {"name": name}, None)
+            self.assertTrue(error, name)
+            self.assertIn("with one of these extensions: .pdf, .png, .jpg, .xlsx, .docx, .pptx, .csv or .txt", text)
+
+    def test_the_upload_checks_the_bytes_before_the_hub_keeps_them(self):
+        self.canary()
+        secret = CANARY.encode()
+        refused = [
+            ("a.pdf", b"not a pdf", 415, "these bytes are not a PDF"),
+            ("a.pdf", pdf(extra=b"2 0 obj << /S /JavaScript /JS (app.alert(1)) >> endobj\n"), 415,
+             "a PDF that runs a script, carries a file or launches a program cannot go to a chat"),
+            ("a.pdf", pdf(extra=b"2 0 obj << /S /J#61vaScript >> endobj\n"), 415, "a PDF that runs a script"),
+            ("a.pdf", pdf((b"/Type /ObjStm /N 1 /First 4", b"5 0 << /Type /Filespec /EF << /F 6 0 R >> /EmbeddedFile 7 "
+                                                         b"0 R >>")), 415, "carries a file"),
+            ("a.pdf", pdf(extra=b"trailer << /Encrypt 9 0 R >>\n"), 415, "the hub cannot read an encrypted PDF"),
+            ("a.pdf", pdf((b"", b"BT (key " + secret + b") Tj ET")), 422, "the file holds a registered secret"),
+            ("a.pdf", pdf(extra=b"2 0 obj << /Author (" + secret + b") >> endobj\n"), 422, "registered secret"),
+            ("a.xlsx", b"PK\x03\x04 nothing", 415, "these bytes are not a spreadsheet"),
+            ("a.xlsx", office(main=None), 415, "these bytes are not a spreadsheet"),
+            ("a.xlsx", office(main="word/document.xml"), 415, "these bytes are not a spreadsheet"),
+            ("a.xlsx", office({"xl/vbaProject.bin": "x"}), 415, "a spreadsheet with a macro, an ActiveX control"),
+            ("a.docx", office({"word/document.xml": "<w:t>x</w:t>", "word/embeddings/oleObject1.bin": "x",
+                               "word/_rels/document.xml.rels": '<Relationships><Relationship Id="r1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="embeddings/oleObject1.bin"/></Relationships>'}, main=None), 415,
+             "a Word document with a macro, an ActiveX control, an OLE object"),
+            ("a.xlsx", office({"xl/sharedStrings.xml": f"<sst><si><t>{CANARY}</t></si></sst>"}), 422,
+             "registered secret"),
+            ("a.xlsx", office({"xl/_rels/workbook.xml.rels": f'<Relationship Target="https://x.example/?k={CANARY}"/>'}),
+             422, "registered secret"),
+            # a stream that calls itself a picture is read when its bytes are text
+            ("a.pdf", pdf((b"/Type /XObject /Subtype /Image /Width 1", b"(" + secret + b")")), 422, "registered secret"),
+            ("a.csv", f"name,key\nmain,{CANARY},x\n".encode(), 422, "registered secret"),
+            ("a.csv", b"\xff\xfe not utf-8", 415, "a CSV file must be UTF-8 text"),
+            ("a.txt", b"one\0two", 415, "a text file must hold no NUL byte"),
+            ("a.png", b"GIF89a", 415, "these bytes are not a PNG picture"),
+            ("a.png", png((b"tEXt", b"Comment\0" + secret)), 422, "registered secret"),
+            ("a.png", png((b"zTXt", b"Comment\0\0" + zlib.compress(secret))), 422, "registered secret"),
+            ("a.png", png((b"iTXt", b"Comment\0\x01\0en\0\0" + zlib.compress(secret))), 422, "registered secret"),
+            ("a.jpg", jpeg(b"key " + secret), 422, "registered secret"),
+            ("a.pdf", b"", 400, "the file is empty"),
+            # the first review, 15 November 2026: a stream with no filter, a dictionary that holds <<, an object stream
+            # whose first object is binary, an embedded file with no /Type, and a key written the way a CSV, an XML
+            # part or a hidden character writes it
+            ("a.pdf", b"%PDF-1.4\n3 0 obj << /Length 40 >>\nstream\nBT (key " + secret + b") Tj ET\nendstream\nendobj\n",
+             422, "registered secret"),
+            ("a.pdf", pdf((b"/X (<<)", b"BT (key " + secret + b") Tj ET")), 422, "registered secret"),
+            ("a.pdf", pdf((b"/Type /ObjStm /N 2 /First 9", b"5 0 6 4096 (" + bytes(range(256)) * 16 + b") "
+                                                           b"<< /S /JavaScript /JS (app.alert(1)) >>")), 415,
+             "a PDF that runs a script"),
+            ("a.pdf", b"%PDF-1.4\n3 0 obj << /Type /ObjStm /N 1 /First 4 /Length 30 >>\nstream\n5 0 << /S /Launch >>\n"
+                      b"endstream\nendobj\n", 415, "launches a program"),
+            ("a.pdf", pdf(extra=b"4 0 obj << /Type /Filespec /F (a.exe) /EF << /F 6 0 R >> >> endobj\n"), 415,
+             "carries a file"),
+            ("a.pdf", pdf(extra=b"2 0 obj << /S /Lau#6Ech >> endobj\n"), 415, "launches a program"),
+            # the second review: reportlab writes [/ASCII85Decode /FlateDecode], and its page text is read through it
+            ("a.pdf", b"%PDF-1.4\n3 0 obj << /Filter [/ASCII85Decode /FlateDecode] >>\nstream\n" +
+             base64.a85encode(zlib.compress(b"BT (key " + secret + b") Tj ET"), wrapcol=72) + b"~>\nendstream\nendobj\n",
+             422, "registered secret"),
+            ("a.pdf", b"%PDF-1.4\n3 0 obj << /Type /ObjStm /N 1 /First 4 /Filter [/ASCII85Decode /FlateDecode] >>\n"
+                      b"stream\n" + base64.a85encode(zlib.compress(b"5 0 << /S /JavaScript >>")) + b"~>\nendstream\n",
+             415, "a PDF that runs a script"),
+            ("a.csv", b"name;key\nbank;" + secret + b",x\n", 422, "registered secret"),
+            ("a.txt", ("key " + CANARY[:5] + "\u200b" + CANARY[5:] + "\n").encode(), 422, "registered secret"),
+            ("a.docx", office({"word/document.xml": "<w:t>" + CANARY.replace("-", "&#45;") + "</w:t>"},
+                              main=None), 422, "registered secret"),
+            ("a.docx", office({"word/document.xml": "<w:t>x</w:t>", "[Content_Types].xml":
+                               '<Types><Default Extension="bin" ContentType="application/vnd.openxmlformats-'
+                               'officedocument.oleObject"/></Types>'}, main=None), 415, "a Word document with a macro"),
+            ("a.docx", office({"word/document.xml": "<w:t>x</w:t>", "word/_rels/settings.xml.rels":
+                               '<Relationships><Relationship Id="r1" Type="http://schemas.openxmlformats.org/'
+                               'officeDocument/2006/relationships/attachedTemplate" Target="http://x.example/t.dotm" '
+                               'TargetMode="External"/></Relationships>'}, main=None), 415,
+             "a template from another computer"),
+            ("a.docx", office({"word/document.xml": "<w:r><w:instrText>DD</w:instrText></w:r><w:r><w:instrText>"
+                               "EAUTO c:\\x\\cmd.exe</w:instrText></w:r>"}, main=None), 415, "a Word document with a macro"),
+            ("a.xlsx", office({"xl/externalLinks/externalLink1.xml": "<externalLink><ddeLink ddeService=\"cmd\"/>"
+                               "</externalLink>"}), 415, "a spreadsheet with a macro"),
+        ]
+        for name, data, status, words in refused:
+            with self.subTest(name=name, words=words, data=data[:40]):
+                code, said = self.put(self.line(name=name)[0], data)
+                self.assertEqual(code, status, said)
+                self.assertTrue(said.startswith("Not taken: "), said)
+                self.assertIn(words, said)
+                self.assertTrue(said.endswith("Nothing is on the hub. Call attach_file for a new line.\n"), said)
+        self.assertEqual(self.count("attachments"), 0)
+        self.assertNotIn(CANARY, json.dumps([dict(r) for r in hub.q("SELECT * FROM log")]))
+        # what passes: a picture's pixels in a PDF, and files with no registered login
+        for name, data in (("a.pdf", pdf((b"/Type /XObject /Subtype /Image /Width 16", bytes(range(256)) * 64))),
+                           ("a.pdf", PDF_FILE), ("a.xlsx", office({"xl/sharedStrings.xml": "<sst><si><t>Total</t></si></sst>"})),
+                           ("a.png", png((b"tEXt", b"Comment\0a chart"))), ("a.jpg", jpeg(b"a photo")),
+                           ("a.csv", b"a,b\n1,2\n"), ("a.txt", "Grüße\n".encode()),
+                           # a hyperlink to a page outside is a link that a person clicks, not one that a file opens
+                           ("a.docx", office({"word/document.xml": "<w:t>x</w:t>", "word/_rels/document.xml.rels":
+                                              '<Relationships><Relationship Id="r3" Type="http://schemas.openxmlformats.'
+                                              'org/officeDocument/2006/relationships/hyperlink" Target="https://x.'
+                                              'example/" TargetMode="External"/></Relationships>'}, main=None)),
+                           # a short iTXt chunk does not parse, and is read as it stands: no fault of the hub
+                           ("a.png", png((b"iTXt", b"k\0\0\0en"))),
+                           # the second review: ordinary files that the first rules refused
+                           ("a.pdf", b"%PDF-1.4\n3 0 obj << /Filter [/ASCII85Decode /DCTDecode] >>\nstream\n" +
+                            base64.a85encode(b"\xff\xd8\xff" + bytes(range(256)) * 64) + b"~>\nendstream\nendobj\n"),
+                           ("a.pdf", b"%PDF-1.4\n3 0 obj << /Filter [/ASCII85Decode /FlateDecode] >>\nstream\n" +
+                            base64.a85encode(zlib.compress(b"BT /F1 9 Tf (a /JS $ b) Tj ET")) + b"~>\nendstream\n"),
+                           ("a.docx", office({"word/document.xml": "<w:t>x</w:t>", "word/_rels/settings.xml.rels":
+                                              '<Relationships><Relationship Id="r4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/attachedTemplate" Target="Normal" TargetMode="External"/></Relationships>'}, main=None)),
+                           ("a.docx", office({"word/document.xml": "<w:t>x</w:t>", "word/_rels/document.xml.rels":
+                                              '<Relationships><Relationship Id="r5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="http://x.example/a.png" TargetMode="External"/></Relationships>'}, main=None)),
+                           ("a.pptx", office({"ppt/embeddings/Microsoft_Excel_Worksheet.xlsx": "chart data",
+                                              "ppt/charts/_rels/chart1.xml.rels": '<Relationships><Relationship Id="r6" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/package" Target="../embeddings/Microsoft_Excel_Worksheet.xlsx"/></Relationships>'},
+                                             main="ppt/presentation.xml")),
+                           ("a.docx", office({"word/document.xml": '<w:r><w:instrText> INCLUDEPICTURE "http://x.'
+                                                                   'example/a.png" \\* MERGEFORMATINET </w:instrText>'
+                                                                   '</w:r>'}, main=None)),
+                           ("a.xlsx", office({"xl/worksheets/sheet1.xml": "<c r=\"A1\"><v>1</v></c>" * 400000})),
+                           ("a.csv", "".join(f"{i},{'v' * 40},{'w' * 40},x\n" for i in range(20000)).encode())):
+            with self.subTest(name=name, data=data[:40]):
+                code, said = self.put(self.line(name=name)[0], data)
+                self.assertEqual(code, 200, said)
+
+    def test_the_check_has_limits_of_its_own(self):
+        self.canary()
+        with patch.object(hub, "CHAT_FILE_UNPACK", 2000):
+            code, said = self.put(self.line(name="a.xlsx")[0], office({"xl/sharedStrings.xml": "<t>" + "x " * 3000 + "</t>"}))
+            self.assertEqual((code, "the spreadsheet packs more than" in said), (413, True), said)
+            code, said = self.put(self.line(name="a.pdf")[0], pdf((b"", b"x " * 3000)))
+            self.assertEqual((code, "the PDF packs more than" in said), (413, True), said)
+        with patch.object(hub, "CHAT_FILE_HASHES", 1000):
+            code, said = self.put(self.line(name="a.txt")[0], ("y" * 5000 + "\n").encode())
+            self.assertEqual(code, 413, said)
+            self.assertIn("too much text without spaces for the hub's check for saved keys", said)
+        with patch.object(hub, "CHAT_FILE_MAX", 1000):
+            code, said = self.put(self.line()[0], PDF_FILE + b" " * 1000)
+            self.assertEqual((code, said), (413, "Not taken: a file is at most 0 MB.\n"))
+        self.assertEqual(self.count("attachments"), 0)
+
+    def test_only_a_session_with_a_shell_gets_attach_file(self):
+        names = lambda agent, context: {t["name"] for t in hub.tools_for(agent, context)}
+        self.assertIn("attach_file", names("manager", None))
+        self.assertIn("attach_file", names("studio", self.task_context()))
+        self.assertNotIn("attach_file", names("studio", CHAT))           # an owner chat has no shell
+        self.assertNotIn("attach_file", hub.CHAT_TOOLS)
+        self.assertNotIn("attach_file", hub.SHELL_OFF_TOOLS + hub.SHELL_OFF_CHAT)
+
+    # ---- the four tools and the outbound queue
+    def test_the_managers_file_goes_to_whatsapp_and_the_bridge_reads_it_while_it_sends(self):
+        self.own("whatsapp", OWNER_WA)
+        aid = self.attach()
+        rid = str(uuid.uuid4())
+        text, error = self.owner_message([f"A-{aid}"], rid)
+        self.assertFalse(error, text)
+        answer = json.loads(text)
+        self.assertEqual((answer["via"], answer["files"]), ({"app": "whatsapp", "account": "whatsapp-main"},
+                                                            [f"A-{aid}"]))
+        self.assertEqual(self.owner_message([f"A-{aid}"], rid)[0], text)              # the same call: its answer
+        row = hub.q1("SELECT * FROM attachments WHERE id=?", (aid,))
+        self.assertEqual((row["report"], row["cm"]), (answer["report"], None))
+        self.assertIsNotNone(row["carried"])
+        report = self.request()[1]["reports"][-1]
+        self.assertEqual(([f["id"] for f in report["attachments"]], report["attachments"][0]["name"]),
+                         ([aid], "Invoice October.pdf"))
+        items = self.messages()
+        self.assertEqual(items[0]["files"], [{"id": aid, "name": "Invoice October.pdf", "mime": "application/pdf",
+                                              "size": len(PDF_FILE), "sha256": hashlib.sha256(PDF_FILE).hexdigest()}])
+        code, data, headers = self.bridge_file(aid, items[0]["id"])
+        self.assertEqual((code, data, headers["X-Fleet-SHA256"]), (200, PDF_FILE, row["sha256"]))
+        other = self.attach()
+        self.assertEqual(self.bridge_file(other, items[0]["id"])[0], 404)         # a file that the item does not name
+        self.assertEqual(self.bridge_file(aid, items[0]["id"] + 1)[0], 404)       # an item that does not exist
+        self.assertEqual(self.raw("GET", f"/bridge/files/{aid}?item={items[0]['id']}", source="127.0.0.3")[0], 403)
+        self.report(items[0]["id"], parts=2, platform_ids=["p1", "p2"])
+        self.assertEqual(self.bridge_file(aid, items[0]["id"])[0], 404)           # sent: the bridge reads it no more
+        # one file goes with one message, and a message carries what this agent sent up only
+        text, error = self.owner_message([f"A-{aid}"])
+        self.assertTrue(error)
+        self.assertIn(f"A-{aid} went with another message already", text)
+        hub.q("UPDATE attachments SET agent=NULL WHERE id=?", (other,))          # the owner's own file
+        for files, words in (([f"A-{other}"], "is not a file that you sent up with attach_file"),
+                             ([f"A-{other + 1}"], "is not a file that you sent up with attach_file"),
+                             (["A-1", "A-1"], "files names each file one time"),
+                             (["A-1", "A-2", "A-3", "A-4", "A-5"], "files is a list of at most 4 files"),
+                             (["invoice.pdf"], "files names each file as attach_file's upload named it"),
+                             ("A-1", "files is a list of at most 4 files")):
+            with self.subTest(files=files):
+                text, error = self.owner_message(files)
+                self.assertTrue(error, text)
+                self.assertIn(words, text)
+        self.assertEqual(self.count("owner_reports"), 1)
+        # a file that no message took goes after an hour
+        late = self.attach(agent="manager")
+        hub.q("UPDATE attachments SET created=? WHERE id=?", (hub.now() - hub.ATTACH_WAIT - 1, late))
+        text, error = self.owner_message([f"A-{late}"])
+        self.assertTrue(error)
+        self.assertIn("is no longer on the hub: a file that no message takes goes after one hour", text)
+
+    def test_a_reply_to_discord_takes_a_file_of_at_most_10_mb_and_a_repeat_sends_nothing(self):
+        self.own()
+        self.inbound("Send me the invoice")
+        self.read()
+        req = self.last_request()
+        here = self.task_context()
+        big = self.attach(b"%PDF-1.4\n" + b"0" * (10 * 1024 * 1024), agent="studio", context=here)
+        text, error = hub.call_tool("studio", "tell_owner", {"text": "The file.", "about": "invoice",
+                                                             "in_reply_to": req["request_id"], "files": [f"A-{big}"]},
+                                    CHAT)
+        self.assertTrue(error)
+        self.assertIn(f"A-{big} has 10.0 MB, and Discord takes at most 10 MB of files in one message", text)
+        self.assertEqual(self.count("owner_reports"), 0)
+        aid = self.attach(agent="studio", context=here)
+        said = self.tell(in_reply_to=req["request_id"], files=[f"A-{aid}"])
+        self.assertIn(f"queued for Studio. With A-{aid} Invoice October.pdf.", said)
+        self.assertIn("No duplicate was sent", self.tell(in_reply_to=req["request_id"], files=[f"A-{aid}"]))
+        text, error = hub.call_tool("studio", "tell_owner", {"text": "On it. T-9 is 80% done.", "about": "scrape",
+                                                             "in_reply_to": req["request_id"]}, CHAT)
+        self.assertTrue(error)
+        self.assertIn("already has a different reply", text)        # the same words without the file are another
+        item = self.messages()[-1]
+        self.assertEqual((item["account"], item["reply_to"], [f["id"] for f in item["files"]]),
+                         ("discord-studio", "m1", [aid]))
+
+    def test_a_number_sends_at_most_20_files_a_day(self):
+        self.own("whatsapp", OWNER_WA)
+        with hub.transaction():
+            hub.chat_count("whatsapp-main", "files", hub.now(), 19)
+        two = [f"A-{self.attach()}", f"A-{self.attach()}"]
+        text, error = self.owner_message(two)
+        self.assertFalse(error, text)
+        r = hub.q1("SELECT state, error FROM chat_out ORDER BY id DESC LIMIT 1")
+        self.assertEqual((r["state"], r["error"]), ("failed", "daily limit of 20 WhatsApp files"))
+        text, error = self.owner_message([f"A-{self.attach()}"])
+        self.assertFalse(error, text)
+        self.assertEqual(hub.q1("SELECT state FROM chat_out ORDER BY id DESC LIMIT 1")["state"], "queued")
+        self.assertEqual(hub.chat_count("whatsapp-main", "files", hub.now()), 20)
+        self.assertEqual(self.request()[1]["reports"][0]["delivery"]["error"], "daily limit of 20 WhatsApp files")
+
+    def test_send_again_sends_the_words_and_their_files(self):
+        self.own("whatsapp", OWNER_WA)
+        aid = self.attach()
+        self.assertFalse(self.owner_message([f"A-{aid}"])[1])
+        first = self.messages()[0]
+        self.report(first["id"], state="unknown", parts=0, platform_ids=[], error="unknown: connection lost")
+        code, data = self.post(f"/ui/outbound/{first['id']}/again")
+        self.assertEqual(code, 200, data)
+        again = self.messages()[0]
+        self.assertEqual((again["id"], again["files"]), (data["outbound"]["id"], first["files"]))
+        self.assertEqual(self.bridge_file(aid, again["id"])[:2], (200, PDF_FILE))
+
+    def test_an_item_whose_file_is_gone_fails_and_the_window_grows_with_its_files(self):
+        self.own("whatsapp", OWNER_WA)
+        aid = self.attach()
+        self.assertFalse(self.owner_message([f"A-{aid}"])[1])
+        row = hub.q1("SELECT * FROM attachments WHERE id=?", (aid,))
+        os.remove(os.path.join(self.files.name, hub.attachment_disk_name(row["sha256"], row["mime"])))
+        self.assertEqual(self.out(), [])
+        r = hub.q1("SELECT state, error FROM chat_out ORDER BY id DESC LIMIT 1")
+        self.assertEqual((r["state"], r["error"]), ("failed", "a file of this message is no longer on the hub"))
+        # the sending window: 120 seconds and 150 more for each file
+        one = self.attach()
+        self.assertFalse(self.owner_message([f"A-{one}"])[1])
+        item = self.messages()[0]["id"]
+        given = hub.q1("SELECT given FROM chat_out WHERE id=?", (item,))["given"]
+        hub.chat_sweep(given + hub.CHAT_SENDING + 1)
+        self.assertEqual(hub.q1("SELECT state FROM chat_out WHERE id=?", (item,))["state"], "sending")
+        hub.chat_sweep(given + hub.CHAT_SENDING + hub.CHAT_FILE_SENDING)
+        r = hub.q1("SELECT state, error FROM chat_out WHERE id=?", (item,))
+        self.assertEqual((r["state"], r["error"]), ("unknown", "no report from the bridge in the time of its files"))
+
+    def test_an_older_bridge_gets_no_item_with_files(self):
+        """The first review, 15 November 2026: a bridge from before files would send the words alone and report them
+        sent. Only a poll with files=1 gets an item with files; a text item goes to every poll as before."""
+        self.own("whatsapp", OWNER_WA)
+        self.assertFalse(self.owner_message([f"A-{self.attach()}"])[1])
+        self.assertFalse(hub.call_tool("manager", "message_owner", {"request_id": str(uuid.uuid4()), "text": "No file."},
+                                       None)[1])
+        old = self.out(files=False)
+        self.assertEqual([(i["text"], "files" in i) for i in old], [("No file.", False)])
+        self.assertEqual(hub.q1("SELECT state FROM chat_out WHERE files IS NOT NULL")["state"], "queued")
+        new = self.out()
+        self.assertEqual([i["text"] for i in new], ["Here is the October invoice."])
+
+    def test_the_count_of_the_search_is_no_less_than_its_hashes(self):
+        """secret_cost counts what find_secret_spans hashes, so the budget holds the time of a check: windows, the ends
+        of a run with JSON line breaks in it, and a login with no length."""
+        key = (("s1", "0" * 64, 24), ("s2", "1" * 64, 9), ("s3", "2" * 64, 0))
+        texts = ["plain words and a token-of-thirty-two-characters-xyz", "\\n".join(["abc.:)"] * 30) + " tail",
+                 "x" * 3000 + " " + ",".join(["v" * 40] * 50), "short"]
+        made = [0]
+
+        class Counting:
+            def __init__(self, h):
+                self.h = h
+
+            def copy(self):
+                made[0] += 1
+                return Counting(self.h.copy())
+
+            def update(self, data):
+                self.h.update(data)
+
+            def hexdigest(self):
+                return self.h.hexdigest()
+
+        counting = type("hashlib", (), {"sha256": staticmethod(lambda data=b"": Counting(hashlib.sha256(data)))})
+        for text in texts:
+            with self.subTest(text=text[:30]):
+                made[0] = 0
+                with patch.object(hub, "hashlib", counting):
+                    hub.find_secret_spans(text, key)
+                cost = hub.secret_cost(text, key, 10 ** 9)
+                self.assertGreaterEqual(cost, made[0])
+                self.assertLessEqual(cost, 2 * made[0] + 64)            # an upper bound, and not a wild one
+        self.assertEqual(hub.secret_cost("y" * 5000, key, 100), 101)     # it stops past its most
+
+    def test_an_agent_holds_at_most_four_open_lines_and_a_line_that_is_not_open_reads_no_body(self):
+        tokens = [self.line()[0] for _ in range(hub.CHAT_FILE_LINES)]
+        text, error = hub.call_tool("manager", "attach_file", {"name": "e.pdf"}, None)
+        self.assertTrue(error)
+        self.assertIn(f"You have {hub.CHAT_FILE_LINES} upload lines open", text)
+        self.assertEqual(self.put(tokens[0], PDF_FILE)[0], 200)          # a used line frees its place
+        self.line()
+        self.assertEqual(self.put("no-such-line", b"x" * 1000), (404, "This upload line is not valid: it was used, or "
+                                                                     "it ended. Call attach_file for a new one.\n"))
+
+    def test_a_text_behind_a_file_of_its_account_waits_with_it(self):
+        """The reviews of 15 November 2026: the bridge sends the items of one account one after the other, and says when
+        it begins each one. An item that it has not begun waits while an item before it is sent; a begun item counts
+        from its begin; a receipt of another item moves nothing; and the items that a stopped bridge lost all become
+        unknown when the first of them does, never one after another."""
+        self.own("whatsapp", OWNER_WA)
+        self.assertFalse(self.owner_message([f"A-{self.attach()}"])[1])
+        self.assertFalse(hub.call_tool("manager", "message_owner", {"request_id": str(uuid.uuid4()), "text": "Behind."},
+                                       None)[1])
+        first, second = [i["id"] for i in self.messages()]
+        given = hub.q1("SELECT given FROM chat_out WHERE id=?", (second,))["given"]
+        state = lambda item: hub.q1("SELECT state FROM chat_out WHERE id=?", (item,))["state"]
+        self.assertEqual(self.bridge(f"/bridge/out/{first}", {"state": "sending"}), (200, {"db": "test-generation", "ok": True}))
+        hub.chat_sweep(given + hub.CHAT_SENDING + 1)
+        self.assertEqual((state(first), state(second)), ("sending", "sending"))      # the second waits behind the first
+        self.report(first, parts=1, platform_ids=["pf"])
+        later = given + 200
+        with patch.object(hub, "now", lambda: later):
+            self.assertEqual(self.bridge(f"/bridge/out/{second}", {"state": "sending"})[0], 200)
+        hub.q("UPDATE chat_out SET updated=? WHERE id=?", (later + 100, first))       # a receipt of the first one
+        hub.chat_sweep(later + hub.CHAT_SENDING - 1)
+        self.assertEqual(state(second), "sending")
+        hub.chat_sweep(later + hub.CHAT_SENDING)
+        r = hub.q1("SELECT state, error FROM chat_out WHERE id=?", (second,))
+        self.assertEqual((r["state"], r["error"]), ("unknown", "no report from the bridge in 120 seconds"))
+        # a begin report after the sweep: the bridge sends it after all
+        self.assertEqual(self.bridge(f"/bridge/out/{second}", {"state": "sending"})[0], 200)
+        self.assertEqual((state(second), hub.q1("SELECT error FROM chat_out WHERE id=?", (second,))["error"]),
+                         ("sending", None))
+        self.report(second, parts=1, platform_ids=["ps"])
+        # three texts that a stopped bridge lost: all unknown in one sweep
+        for n in range(3):
+            self.assertFalse(hub.call_tool("manager", "message_owner", {"request_id": str(uuid.uuid4()),
+                                                                        "text": f"Lost {n}."}, None)[1])
+        lost = [i["id"] for i in self.messages()]
+        given = max(hub.q1("SELECT given FROM chat_out WHERE id=?", (i,))["given"] for i in lost)
+        hub.chat_sweep(given + hub.CHAT_SENDING)
+        self.assertEqual([state(i) for i in lost], ["unknown"] * 3)
+        # a begin report for an item that is sent already is refused, and changes nothing
+        self.assertEqual(self.bridge(f"/bridge/out/{first}", {"state": "sending"})[0], 409)
+
+    def test_an_older_bridge_is_never_starved_by_items_with_files(self):
+        """The second review: the filter is in the read, so that 50 items with files ahead of a text do not keep the
+        text from a bridge that does not take files."""
+        self.own("whatsapp", OWNER_WA)
+        for _ in range(2):
+            self.assertFalse(self.owner_message([f"A-{self.attach()}"])[1])
+        self.assertFalse(hub.call_tool("manager", "message_owner", {"request_id": str(uuid.uuid4()), "text": "Text."},
+                                       None)[1])
+        given = hub.chat_give(hub.now(), limit=2, files=False)
+        self.assertEqual([i["text"] for i in given], ["Text."])
+
+    def test_a_csv_value_in_quotes_is_read_whole(self):
+        """The second review: a CSV is read by its own rules, so a value with the separator in it is one value."""
+        value, salt = "Tr0ub,4dor;Horse", "csv-salt"
+        hub.ins("INSERT INTO secrets(label,salt,hash,len) VALUES(?,?,?,?)",
+                ("csv", salt, hashlib.sha256((salt + value).encode()).hexdigest(), len(value)))
+        for data in (f'name,key\nbank,"{value}"\n'.encode(), f'name;key\nbank;"{value}"\n'.encode()):
+            with self.subTest(data=data):
+                code, said = self.put(self.line(name="a.csv")[0], data)
+                self.assertEqual(code, 422, said)
+
+    def test_discord_takes_at_most_10_mb_of_files_in_one_message(self):
+        self.own()
+        self.inbound("Send me both")
+        self.read()
+        req = self.last_request()
+        here = self.task_context()
+        two = [f"A-{self.attach(PDF_FILE + bytes(600), agent='studio', context=here)}" for _ in range(2)]
+        with patch.dict(hub.CHAT_FILE_APP_MAX, {"discord": 1000}):
+            text, error = hub.call_tool("studio", "tell_owner", {"text": "Both.", "about": "x",
+                                                                 "in_reply_to": req["request_id"], "files": two}, CHAT)
+        self.assertTrue(error)
+        self.assertIn("These files have 1 KB, and Discord takes at most 0 MB of files in one message.", text)
+
+    def test_a_session_that_sends_no_file_up_names_none_and_sees_no_files_field(self):
+        """The third review, 15 November 2026: a Shell-off agent and a narrowed conversation name no file, and their
+        message tools show no `files`; an owner chat with a shell shows it, since its task may send a file up."""
+        here = self.task_context()
+        aid = self.attach(agent="studio", context=here)
+        self.own()
+        self.inbound("Send it")
+        self.read()
+        req = self.last_request()
+        schema = lambda agent, context, tool: next(t for t in hub.tools_for(agent, context)
+                                                   if t["name"] == tool)["inputSchema"]["properties"]
+        self.assertIn("files", schema("studio", CHAT, "tell_owner"))
+        with patch.object(hub, "session_scope", lambda agent, context=None: {"person": 1, "grants": {}}):
+            with self.assertRaises(hub.ToolError) as refused:     # call_tool offers a narrowed session no such tool
+                hub.chat_files_check_session("studio", (aid,))
+        self.assertEqual(str(refused.exception), "Refused: a narrowed conversation sends no file. Nothing was sent.")
+        hub.TEAM["agents"]["studio"]["can"] = []                    # its Shell box goes off
+        self.addCleanup(hub.TEAM["agents"]["studio"].__setitem__, "can", ["shell"])
+        text, error = hub.call_tool("studio", "tell_owner", {"text": "Here.", "about": "x", "files": [f"A-{aid}"],
+                                                             "in_reply_to": req["request_id"]}, CHAT)
+        self.assertEqual((error, text), (True, "Refused: an agent whose Shell box is off sends no file. Nothing was "
+                                               "sent."))
+        self.assertNotIn("files", schema("studio", CHAT, "tell_owner"))
+        self.assertEqual(self.count("owner_reports"), 0)
+
+    def test_an_app_that_takes_no_file_is_refused_and_a_failed_item_is_told(self):
+        """The third review: a chat app whose adapter sends no file yet gets none (never the words alone), and an item
+        that fails at once, the 21st file of a WhatsApp number's day, is told to the agent, not only queued."""
+        self.own("whatsapp", OWNER_WA)
+        aid = self.attach()
+        with patch.object(hub, "CHAT_FILE_APPS", ("discord",)):
+            text, error = self.owner_message([f"A-{aid}"])
+        self.assertTrue(error)
+        self.assertIn("WhatsApp takes no file from the fleet yet", text)
+        with hub.transaction():
+            hub.chat_count("whatsapp-main", "files", hub.now(), hub.WHATSAPP_FILES_DAY)
+        text, error = self.owner_message([f"A-{aid}"])
+        self.assertFalse(error, text)
+        self.assertEqual(json.loads(text)["not_sent"], "daily limit of 20 WhatsApp files")
+        # tell_owner, to his message on studio's own WhatsApp number once it sent its parts of the day
+        hub.TEAM["chat_apps"]["whatsapp-studio"] = WHATSAPP_STUDIO
+        self.inbound("Status?", account="whatsapp-studio", sender=OWNER_WA)
+        req = self.last_request()
+        self.read()
+        with hub.transaction():
+            hub.chat_count("whatsapp-studio", "parts", hub.now(), hub.WHATSAPP_PARTS_DAY)
+        said = self.tell(in_reply_to=req["request_id"])
+        self.assertIn("added to the owner's studio chat, but not sent to Studio WA: daily WhatsApp limit.", said)
+        self.assertEqual(hub.q1("SELECT state FROM chat_out WHERE kind='message' ORDER BY id DESC LIMIT 1")["state"],
+                         "failed")
+
+    def test_an_agent_sends_up_at_most_20_loose_files_an_hour_and_a_gone_file_is_gone_for_the_bridge(self):
+        with patch.object(hub, "CHAT_FILE_LOOSE", 2):
+            self.attach()
+            self.attach()
+            text, error = hub.call_tool("manager", "attach_file", {"name": "c.pdf"}, None)
+        self.assertTrue(error)
+        self.assertIn("You sent up 2 files in the last hour that no message took", text)
+        # the bridge reads a file that is gone from the disk as gone (410), not as a fault
+        self.own("whatsapp", OWNER_WA)
+        aid = self.attach()
+        self.assertFalse(self.owner_message([f"A-{aid}"])[1])
+        item = self.messages()[0]["id"]
+        row = hub.q1("SELECT * FROM attachments WHERE id=?", (aid,))
+        os.remove(os.path.join(self.files.name, hub.attachment_disk_name(row["sha256"], row["mime"])))
+        self.assertEqual(self.bridge_file(aid, item)[0], 410)
+
+    def test_two_messages_cannot_take_one_file(self):
+        """The race of chat_files_carry: the write that takes a file asks that no message took it, so the second of
+        two messages that checked the same free file writes nothing."""
+        row = hub.q1("SELECT * FROM attachments WHERE id=?", (self.attach(),))
+        with hub.transaction():
+            hub.chat_files_carry([row], hub.now(), report=1)
+        with self.assertRaises(hub.ToolError):
+            with hub.transaction():
+                hub.chat_files_carry([row], hub.now(), report=2)
+        self.assertEqual(hub.q1("SELECT report FROM attachments WHERE id=?", (row["id"],))["report"], 1)
+
+    def test_the_sweep_keeps_a_carried_file_as_a_file_of_the_owners_message(self):
+        carried, alone = self.attach(), self.attach(b"%PDF-1.4\nanother")
+        self.assertFalse(self.owner_message([f"A-{carried}"])[1])           # no chat app route: the app only
+        t0 = hub.now() + hub.ATTACH_WAIT + 60
+        hub.kv_set("attachment_sweep_at", 0)
+        hub.attachment_sweep(t0)
+        self.assertEqual([r["id"] for r in hub.q("SELECT id FROM attachments ORDER BY id")], [carried])
+        hub.kv_set("attachment_sweep_at", 0)
+        hub.attachment_sweep(hub.now() + hub.attachment_keep() + 60)
+        self.assertEqual(self.count("attachments"), 0)
+        self.assertEqual(alone, carried + 1)
+
+
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite(ChatApps(name) for name in ChatApps.__dict__ if name.startswith("test_"))
+    return unittest.TestSuite(cls(name) for cls in (ChatApps, AgentFiles) for name in cls.__dict__
+                              if name.startswith("test_"))
 
 
 if __name__ == "__main__":

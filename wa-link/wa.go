@@ -139,6 +139,12 @@ func lidFor(ctx context.Context, lids store.LIDStore, lookup func(context.Contex
 	return nil
 }
 
+// Upload encrypts the file with a new media key and puts it on WhatsApp's media servers. Nothing is sent yet: the
+// message that names the upload goes with Send.
+func (w *waClient) Upload(ctx context.Context, data []byte, kind whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
+	return w.client().Upload(ctx, data, kind)
+}
+
 func (w *waClient) MarkRead(ctx context.Context, chat, sender types.JID, ids []types.MessageID) error {
 	return w.client().MarkRead(ctx, ids, time.Now(), chat, sender)
 }

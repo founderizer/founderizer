@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -58,6 +59,10 @@ func run(dbPath string) error {
 		return err
 	}
 	link := NewLink(w, os.Stdout, log.Sub("Link"))
+	// The bridge writes the file of a send here, beside the database, and a send takes a file from here only.
+	if abs, err := filepath.Abs(dbPath); err == nil {
+		link.outbox = filepath.Join(filepath.Dir(abs), "outbox")
+	}
 	w.handler = link.HandleEvent
 	link.Run(ctx, os.Stdin)
 	return nil

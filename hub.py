@@ -2981,9 +2981,11 @@ def mobile_chat(agent, since):
               "attachments": files.get(r["request_id"], []),
               "answer_to": r["need_id"] if r["kind"] == "answer" else None}
              for r in said]
+    reports = q("SELECT * FROM owner_reports WHERE agent=? AND created>? ORDER BY id", (agent, since))
+    carried = carried_files("report", [r["id"] for r in reports])      # CHAT-APPS.md 20: an agent's files
     items += [{"kind": "report", "ts": r["created"], "id": r["id"], "text": r["text"], "about": r["about"],
-               "in_reply_to": r["in_reply_to"], "pushed": bool(r["pushed"])}
-              for r in q("SELECT * FROM owner_reports WHERE agent=? AND created>? ORDER BY id", (agent, since))]
+               "in_reply_to": r["in_reply_to"], "pushed": bool(r["pushed"]), "attachments": carried.get(r["id"], [])}
+              for r in reports]
     items.sort(key=lambda i: i["ts"])
     return items[:MOBILE_CHAT] if since else items[-MOBILE_CHAT:]
 
@@ -3861,7 +3863,10 @@ def migrate():
                  # outcome told to the task since then
                  "timeout": "REAL", "returned": "REAL", "told": "TEXT"},
         # attachment_knowledge: the day the owner said this one matters, and the knowledge file made from it
-        "attachments": {"kept": "REAL", "knowledge": "TEXT"},
+        "attachments": {"kept": "REAL", "knowledge": "TEXT",
+                        # CHAT-APPS.md 20: the agent that sent the file up (null: the owner's), the report or the
+                        # conversation message that carries it to a chat, and when that message took it
+                        "agent": "TEXT", "report": "INTEGER", "cm": "INTEGER", "carried": "REAL"},
         "ui_requests": {"recipient": "TEXT NOT NULL DEFAULT 'manager'", "replaces_request_id": "TEXT",
                         "origin": "TEXT",           # owner feature chat_apps: the chat app message, as JSON
                         "edits": "TEXT",            # edit_in_place: each edit of this message, as JSON
@@ -3911,7 +3916,9 @@ def migrate():
                           # 10 November 2026: the request id of the owner's message from the app whose turn this
                           # report of the manager took, with no link to it (t_tell_owner)
                           "turn": "TEXT"},
-        "chat_out": {"recipient": "TEXT"},          # chat apps round 2: a Discord user ID when chat is null
+        "chat_out": {"recipient": "TEXT",           # chat apps round 2: a Discord user ID when chat is null
+                     "files": "TEXT",               # CHAT-APPS.md 20: the attachment ids of a message, as JSON
+                     "begun": "REAL"},              # and when the bridge said that it begins the item (chat_sweep)
         "owner_device_push": {"seal": "TEXT",       # sealed_push: the phone's own key for what a ping says, base64
                               "badge": "INTEGER"},  # the icon's number that Apple took last for this token (badge_look)
         # plan V12: the phone's own key that the recovery code is sealed to, and its HMAC of the QR's one-time value
@@ -5024,6 +5031,7 @@ DOING_FLEET = {
     "see_notes": "Reading its notes", "write_notes": "Writing its notes", "remember": "Saving a lesson",
     "recall": "Reading its lessons", "search_history": "Searching its history", "read_history": "Reading its history",
     "report_up": "Reporting to its line", "write_skill": "Writing a skill", "read_attachment": "Reading a file",
+    "attach_file": "Preparing a file",
     "see_goals": "Reading the goals", "update_goal": "Updating a goal", "see_triggers": "Reading the wake-up rules",
     "save_trigger": "Saving a wake-up rule", "sign_in": "Signing in", "call_api": "Calling an API",
     "repo_read": "Reading a repository", "repo_search": "Searching a repository", "repo_change": "Changing a repository",
@@ -12878,6 +12886,8 @@ def t_tell_owner(agent, a):
     if not text or len(text) > 16000 or len(about) > 500:
         raise ToolError("A report needs 1 to 16000 characters; about is at most 500 characters.")
     guard(agent, text, about)
+    ids = chat_files_ids(a.get("files"))        # CHAT-APPS.md 20: a report with the same words and files is the same
+    chat_files_check_session(agent, ids)
     reply, role = a.get("in_reply_to"), agents()[agent].get("role")
     before = a.get("before_task")
     if before is not None and not isinstance(before, bool):
@@ -12930,7 +12940,7 @@ def t_tell_owner(agent, a):
         if isinstance(reply, str) and not reply.strip():
             reply = None        # an empty field is no name
         last = q1("SELECT * FROM owner_reports WHERE agent=? ORDER BY id DESC LIMIT 1", (agent,))
-        if last and (last["text"], last["about"]) == (text, about) and not q1(
+        if last and (last["text"], last["about"], report_file_ids(last["id"])) == (text, about, sorted(ids)) and not q1(
                 "SELECT 1 FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE u.recipient=? AND u.kind='message' "
                 "AND u.need_id IS NULL AND e.read_at>? LIMIT 1", (agent, last["created"])):
             return f"Report R-{last['id']} already saved. No duplicate was sent."
@@ -12940,7 +12950,7 @@ def t_tell_owner(agent, a):
         if m and m["read_at"] is None:
             raise ToolError(f"Read {named.group(0)} before you answer it: call read_messages.")
         old = owner_report(agent, m["request_id"]) if m else None
-        if old and (old["text"], old["about"]) == (text, about):
+        if old and (old["text"], old["about"], report_file_ids(old["id"])) == (text, about, sorted(ids)):
             return f"Report R-{old['id']} already saved. No duplicate was sent."
         reply, also = (None, m["request_id"]) if old else (m["request_id"] if m else None, None)
         if reply is None:
@@ -12973,7 +12983,7 @@ def t_tell_owner(agent, a):
             raise ToolError("Read this agent's owner message before replying; another agent's message cannot be answered.")
         old = q1("SELECT * FROM owner_reports WHERE agent=? AND in_reply_to=?", (agent, reply))
         if old:
-            if (old["text"], old["about"]) != (text, about):
+            if (old["text"], old["about"], report_file_ids(old["id"])) != (text, about, sorted(ids)):
                 raise ToolError("This owner message already has a different reply. Do not replace it.")
             return f"Report R-{old['id']} already saved. No duplicate was sent."
         if before:
@@ -12985,7 +12995,7 @@ def t_tell_owner(agent, a):
             # (owner_reports.turn, as a manager's report can), the owner reads it, the message stays open, and
             # start_task links it. It still goes to the chat app that the message came from.
             early, opened = early_word(agent, reply), task_of_message(agent, reply)
-            if early and (early["text"], early["about"]) != (text, about):
+            if early and (early["text"], early["about"], report_file_ids(early["id"])) != (text, about, sorted(ids)):
                 raise ToolError("You told the owner already what you will do for this message. Call start_task for "
                                 "it now; if you open no task, reply with tell_owner without before_task.")
             if early:
@@ -13001,14 +13011,19 @@ def t_tell_owner(agent, a):
                         "before_task.")
     chat = chat_source(agent, reply or also, about)  # owner feature chat_apps: the reply goes back to that chat
     t0 = now()
+    rows = chat_files_rows(agent, ids, chat["origin"]["app"] if chat else None, t0)
     with transaction():
         rid = DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to,turn) VALUES(?,?,?,?,?,?)",
                          (text, about, t0, agent, reply, turn)).lastrowid
-        if chat:
-            chat_answer(agent, chat, rid, text, t0)
+        files = chat_files_carry(rows, t0, report=rid)
+        failure = queued_failure(chat_answer(agent, chat, rid, text, t0, files)) if chat else None
+    if failure:
+        return (f"Report R-{rid} added to the owner's {agent} chat, but not sent to {chat['label']}: {failure}."
+                f"{chat_files_words(rows)}{note}")
     if chat:
-        return f"Report R-{rid} added to the owner's {agent} chat and queued for {chat['label']}.{note}"
-    return f"Report R-{rid} added to the owner's {agent} chat. No notification was sent.{note}"
+        return (f"Report R-{rid} added to the owner's {agent} chat and queued for {chat['label']}."
+                f"{chat_files_words(rows)}{note}")
+    return f"Report R-{rid} added to the owner's {agent} chat. No notification was sent.{chat_files_words(rows)}{note}"
 
 
 # The owner chat of a worker or lead lives in two halves, and only one of them travels: the hub keeps every message
@@ -13139,6 +13154,12 @@ def chat_queue(kind, account, t0, **fields):
     state, error = "queued", None
     if kind == "message" and app == "whatsapp" and chat_count(account, "parts", t0) >= WHATSAPP_PARTS_DAY:
         state, error = "failed", "daily WhatsApp limit"
+    files = len(json.loads(fields.get("files") or "[]")) if kind == "message" else 0
+    if files and app == "whatsapp" and state == "queued":       # CHAT-APPS.md 20: a number's files of the day
+        if chat_count(account, "files", t0) + files > WHATSAPP_FILES_DAY:
+            state, error = "failed", f"daily limit of {WHATSAPP_FILES_DAY} WhatsApp files"
+        else:
+            chat_count(account, "files", t0, files)
     cols = dict(kind=kind, app=app, account=account, state=state, error=error, created=t0, updated=t0, **fields)
     return DB.execute(f"INSERT INTO chat_out({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
                       tuple(cols.values())).lastrowid
@@ -13338,11 +13359,12 @@ def chat_source(agent, reply, about):
     return None
 
 
-def chat_answer(agent, source, report_id, text, t0):
-    """Inside a transaction: the report goes to the chat of the owner message as a message item."""
+def chat_answer(agent, source, report_id, text, t0, files=None):
+    """Inside a transaction: the report goes to the chat of the owner message as a message item, with the files that
+    it carries (CHAT-APPS.md 20: the attachment ids as JSON, or None)."""
     o = source["origin"]
     return chat_queue("message", o["account"], t0, chat=o["chat"], text=text, reply_to=o["id"], report=report_id,
-                      request_id=source["request_id"])
+                      request_id=source["request_id"], files=files)
 
 
 def chat_read_signals(event_ids, t0):
@@ -13513,9 +13535,25 @@ def chat_inbound(m):
 
 
 def chat_sweep(t0):
-    """A message item that stays sending for 120 seconds becomes unknown."""
-    q("UPDATE chat_out SET state='unknown', error=COALESCE(error,?), updated=? WHERE kind='message' AND state='sending' "
-      "AND given<=?", (f"no report from the bridge in {CHAT_SENDING} seconds", t0, t0 - CHAT_SENDING))
+    """A message item that the bridge has sent nothing of for 120 seconds becomes unknown, and one that carries files
+    150 seconds more for each file (CHAT-APPS.md 20): the bridge uploads each one before it sends it. The bridge sends
+    the items of one account one after the other, and says when it begins each one (`begun`, bridge_out_begun): the
+    time of a begun item counts from then, and an item that it has not begun waits while an item before it of its
+    account is still being sent, so a text behind a message with files is not lost while it waits. The time of an item
+    that waits counts from when the hub gave it out, so the items that a bridge lost when it stopped all become unknown
+    when the first of them does, and never one after another."""
+    busy = set()            # the accounts with an item that is still being sent, in the order of the items
+    for r in q("SELECT id, account, given, begun, files FROM chat_out WHERE kind='message' AND state='sending' AND "
+               "given IS NOT NULL ORDER BY id"):
+        if r["begun"] is None and r["account"] in busy:
+            continue
+        files = len(json.loads(r["files"] or "[]"))
+        if (r["begun"] if r["begun"] is not None else r["given"]) + CHAT_SENDING + CHAT_FILE_SENDING * files > t0:
+            busy.add(r["account"])
+            continue
+        q("UPDATE chat_out SET state='unknown', error=COALESCE(error,?), updated=? WHERE id=? AND state='sending'",
+          ("no report from the bridge in the time of its files" if files else
+           f"no report from the bridge in {CHAT_SENDING} seconds", t0, r["id"]))
 
 
 def chat_item(r):
@@ -13532,6 +13570,8 @@ def chat_item(r):
         item.update(chat=r["chat"], recipient=r["recipient"], text=mask_secrets(text),
                     reply_to=r["reply_to"],
                     prefix=None)        # 17.5: one agent for each account, so no name before the text
+        if "files" in r.keys() and r["files"]:      # CHAT-APPS.md 20: only an item that carries files names them
+            item["files"] = chat_file_items(r["files"])
     elif r["kind"] == "typing":
         item.update(chat=r["chat"], seconds=r["seconds"])
     elif r["kind"] == "read":
@@ -13569,14 +13609,17 @@ def item_owned(r):
     return True
 
 
-def chat_give(t0, limit=50):
+def chat_give(t0, limit=50, files=False):
     """The queued items for the bridge, oldest first; none while Pause all is on. A message item is sending from now;
     the other kinds are done when given out. A typing item older than its seconds expires instead. An item for the
     owner at a chat that is not the owner's now is not given (item_owned): a message fails, so that the app shows it
     as not sent, with the reason, and a signal of a read expires."""
     if chat_paused():
         return []
-    rows = q("SELECT * FROM chat_out WHERE state='queued' ORDER BY id LIMIT ?", (limit,))
+    # CHAT-APPS.md 20: a bridge from before files would send the words of an item with files alone, so such an item
+    # waits for a bridge that says files=1; the filter is in the read, so that every other item still goes to it
+    rows = q("SELECT * FROM chat_out WHERE state='queued'" + ("" if files else " AND files IS NULL") +
+             " ORDER BY id LIMIT ?", (limit,))
     out = []
     with transaction():
         for r in rows:
@@ -13586,6 +13629,10 @@ def chat_give(t0, limit=50):
             if not item_owned(r):
                 gone = ("failed", GONE_HANDLE) if r["kind"] == "message" else ("expired", None)
                 DB.execute("UPDATE chat_out SET state=?, error=?, updated=? WHERE id=?", (*gone, t0, r["id"]))
+                continue
+            if r["kind"] == "message" and r["files"] and not chat_files_there(r):     # CHAT-APPS.md 20
+                DB.execute("UPDATE chat_out SET state='failed', error=?, updated=? WHERE id=?",
+                           ("a file of this message is no longer on the hub", t0, r["id"]))
                 continue
             DB.execute("UPDATE chat_out SET state=?, given=?, updated=? WHERE id=?",
                        ("sending" if r["kind"] == "message" else "done", t0, t0, r["id"]))
@@ -13872,21 +13919,29 @@ def t_message_owner(agent, a):
         raise ToolError("text must be 1 to 4,000 characters.")
     text = text.strip()
     guard(agent, text)
-    command, old = agent_write(agent, "message_owner", a, {"text": text})
+    ids = chat_files_ids(a.get("files"))                # CHAT-APPS.md 20: files that go with the words
+    chat_files_check_session(agent, ids)
+    command, old = agent_write(agent, "message_owner", a, dict({"text": text}, **({"files": list(ids)} if ids else {})))
     if old:
         return json.dumps(old)
     if chat_paused():
         raise ToolError("Refused: the owner turned on Pause all for chat apps. Nothing was sent.")
     t0 = now()
     route = owner_route(agent)
+    rows = chat_files_rows(agent, ids, route["app"] if route else None, t0)
     with transaction():
         rid = DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to,pushed) "
                          "VALUES(?,'',?,?,NULL,1)", (text, t0, agent)).lastrowid
-        if route:
-            chat_queue("message", route["account"], t0, chat=route["chat"], recipient=route["recipient"], text=text,
-                       reply_to=None, report=rid, request_id=route["request"])
+        files = chat_files_carry(rows, t0, report=rid)
+        item = chat_queue("message", route["account"], t0, chat=route["chat"], recipient=route["recipient"],
+                          text=text, reply_to=None, report=rid, request_id=route["request"], files=files) \
+            if route else None
         answer = {"ok": True, "report": rid,
                   "via": {"app": route["app"], "account": route["account"]} if route else None}
+        if queued_failure(item):            # in the app, and not sent: the agent is told why
+            answer["not_sent"] = queued_failure(item)
+        if ids:
+            answer["files"] = [f"A-{i}" for i in ids]
         keep_command(command, answer, t0)
     return json.dumps(answer)
 
@@ -15510,12 +15565,14 @@ def t_reply(agent, a):
     if not text or len(text) > CONVERSATION_TEXT_MAX:
         raise ToolError(f"A reply is 1 to {CONVERSATION_TEXT_MAX} characters.")
     guard(agent, text)
+    ids = chat_files_ids(a.get("files"))        # CHAT-APPS.md 20: files that go with the words
     m = CM_REF.match(str(a.get("in_reply_to") or ""))
     if not m:
         raise ToolError("in_reply_to must be the id of the message that you answer, for example CM-12.")
     ended = None
     with LOCK:
         conv, person = conversation_fence(agent)
+        chat_files_check_session(agent, ids, person)
         row = q1("SELECT * FROM conversation_messages WHERE id=? AND conversation=?", (int(m.group(1)), conv["id"]))
         readable = row and (row["who"] in ("person", "owner") or (row["who"] == "action" and row["event"]))
         if not readable or row["read_at"] is None:
@@ -15523,7 +15580,7 @@ def t_reply(agent, a):
         old = q1("SELECT * FROM conversation_messages WHERE conversation=? AND who='agent' AND reply_to=?",
                  (conv["id"], row["id"]))
         if old:
-            if old["text"] != text:
+            if (old["text"], cm_file_ids(old["id"])) != (text, sorted(ids)):
                 raise ToolError(f"You already answered {cm_ref(row['id'])} with another text. It was sent and cannot "
                                 f"be taken back. Answer the newest message instead.")
             return f"{cm_ref(old['id'])} was already sent to {person['name']}. Nothing was sent again."
@@ -15531,12 +15588,15 @@ def t_reply(agent, a):
             raise ToolError("This conversation's chat app is gone, so nothing can be sent. The owner must add it "
                             "again.")
         t0 = now()
+        rows = chat_files_rows(agent, ids, chat_apps()[conv["account"]]["app"], t0)
         with transaction():
+            new = unused_id("conversation_messages")
+            files = chat_files_carry(rows, t0, cm=new)
             item = chat_queue("message", conv["account"], t0, chat=conv["chat"], text=text,
-                              reply_to=row["msg_id"] if row["who"] == "person" else None)
+                              reply_to=row["msg_id"] if row["who"] == "person" else None, files=files)
             new = DB.execute("INSERT INTO conversation_messages(id,conversation,who,text,created,reply_to,outbound) "
-                             "VALUES(?,?,?,?,?,?,?)", (unused_id("conversation_messages"), conv["id"], "agent",
-                                                       text, t0, row["id"], item)).lastrowid
+                             "VALUES(?,?,?,?,?,?,?)", (new, conv["id"], "agent", text, t0, row["id"], item)).lastrowid
+            failure = queued_failure(item)
             DB.execute("UPDATE conversations SET last=? WHERE id=?", (t0, conv["id"]))
             DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, agent, f"{cm_ref(new)} to a "
                        f"{person['role']} in C-{conv['id']}"))
@@ -15545,7 +15605,9 @@ def t_reply(agent, a):
         if ended:
             unfile_notices(ended)
             end_waits(ended)
-    return f"Sent as {cm_ref(new)} to {person['name']}." + (f" {tref(ended)} is done." if ended else "")
+    said = (f"{cm_ref(new)} is in the conversation, but not sent to {person['name']}: {failure}." if failure else
+            f"Sent as {cm_ref(new)} to {person['name']}.")
+    return said + chat_files_words(rows) + (f" {tref(ended)} is done." if ended else "")
 
 
 def t_ask_owner(agent, a):
@@ -16536,6 +16598,8 @@ def t_message_contact(agent, a):
     if not text or len(text) > CONVERSATION_TEXT_MAX:
         raise ToolError(f"text is 1 to {CONVERSATION_TEXT_MAX} characters.")
     guard(agent, text)
+    ids = chat_files_ids(a.get("files"))        # CHAT-APPS.md 20: files that go with the words
+    chat_files_check_session(agent, ids)
     waits = a.get("waits") is True
     if not contacts_v2():
         raise ToolError("message_contact works once contacts.v2 is on.")
@@ -16549,7 +16613,8 @@ def t_message_contact(agent, a):
             t = fence(agent, parse_task(a.get("task_id")))
         person = contact_person(agent, a.get("person"))
         command, old = agent_write(agent, "message_contact", a,
-                                   {"person": person["id"], "text": text, **({"waits": True} if waits else {})})
+                                   {"person": person["id"], "text": text, **({"waits": True} if waits else {}),
+                                    **({"files": list(ids)} if ids else {})})
         if old:
             return old["text"]
         if person["blocked"] is not None:
@@ -16573,6 +16638,7 @@ def t_message_contact(agent, a):
         if conv and conv["state"] != "open":
             raise ToolError(f"The owner paused C-{conv['id']}. Nothing was sent.")
         t0 = now()
+        rows = chat_files_rows(agent, ids, chat_apps()[account]["app"], t0)
         with transaction():
             if conv is None:            # a first message on Discord opens the conversation; their answer sets its chat
                 cid = DB.execute("INSERT INTO conversations(id,person,agent,account,chat,sender,state,created,last) "
@@ -16581,18 +16647,26 @@ def t_message_contact(agent, a):
                 conv = DB.execute("SELECT * FROM conversations WHERE id=?", (cid,)).fetchone()
                 chat_queue("message", account, t0, chat=chat, recipient=recipient, reply_to=None,     # EU AI Act 50
                            text=CONVERSATION_NOTICE.format(agent=agent_display(agent)))
-            item = chat_queue("message", account, t0, chat=chat, recipient=recipient, text=text, reply_to=None)
+            cm = unused_id("conversation_messages")
+            files = chat_files_carry(rows, t0, cm=cm)
+            item = chat_queue("message", account, t0, chat=chat, recipient=recipient, text=text, reply_to=None,
+                              files=files)
+            # CHAT-APPS.md 20: a message that its number's daily limit failed at once reached nobody, so its task
+            # waits for no answer to it
+            failure = queued_failure(item)
+            waiting = waits and not failure
             cm = DB.execute("INSERT INTO conversation_messages(id,conversation,who,text,created,outbound,task,waits) "
-                            "VALUES(?,?,?,?,?,?,?,?)", (unused_id("conversation_messages"), conv["id"], "agent",
-                                                        text, t0, item, t["id"], t["id"] if waits else None)).lastrowid
-            if waits:
+                            "VALUES(?,?,?,?,?,?,?,?)", (cm, conv["id"], "agent", text, t0, item, t["id"],
+                                                        t["id"] if waiting else None)).lastrowid
+            if waiting:
                 DB.execute("UPDATE tasks SET state='input-required', waiting_on=? WHERE id=?", (cm_ref(cm), t["id"]))
             DB.execute("UPDATE conversations SET last=? WHERE id=?", (t0, conv["id"]))
             DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)",
                        (t0, agent, f"{cm_ref(cm)} to P-{person['id']} in C-{conv['id']} from {tref(t['id'])}"))
-            answer = (f"Sent as {cm_ref(cm)} to {person['name']} in C-{conv['id']}." +
+            answer = ((f"{cm_ref(cm)} is in C-{conv['id']}, but not sent to {person['name']}: {failure}." if failure
+                       else f"Sent as {cm_ref(cm)} to {person['name']} in C-{conv['id']}.") + chat_files_words(rows) +
                       (f" {tref(t['id'])} waits for their next message there, which comes to it as the answer."
-                       if waits else ""))
+                       if waiting else f" {tref(t['id'])} does not wait, because nothing was sent." if waits else ""))
             keep_command(command, {"text": answer}, t0)
     return answer
 
@@ -18857,9 +18931,11 @@ ATTACH_TYPES = {"image/png": (".png", (b"\x89PNG\r\n\x1a\n",)),
 # by the SELECT that counts them and by the DELETE that removes them. A row the owner kept (attachment_knowledge) is
 # outside it whatever its age, and that is the whole of the keeping: the file half of the sweep leaves every file that
 # a remaining row names, so the row that stays keeps its bytes by itself.
+# An agent's file that a report or a conversation message carries (CHAT-APPS.md 20, `carried`) stays as long as a file
+# of the owner's message, counted from when that message took it.
 ATTACH_GOING = ("FROM attachments a LEFT JOIN ui_requests r ON r.request_id=a.message "
-                "WHERE a.kept IS NULL AND ((a.message IS NULL AND a.created<?) "
-                "OR (a.message IS NOT NULL AND COALESCE(r.created, a.created)<?))")
+                "WHERE a.kept IS NULL AND ((a.message IS NULL AND a.carried IS NULL AND a.created<?) "
+                "OR ((a.message IS NOT NULL OR a.carried IS NOT NULL) AND COALESCE(r.created, a.carried, a.created)<?))")
 ATTACH_LOCK = threading.Lock()
 ATTACH_LINKS = {}                           # token -> one right to download one attachment, one time
 
@@ -19022,6 +19098,654 @@ def t_read_attachment(agent, a):
     return (f"{row['name']} ({row['mime']}, {row['size']} bytes). Download it one time, within 10 minutes, in your "
             f"task folder:\ncurl -sfo '{row['name']}' \"$FLEET_HUB/attachment/file/{token}\"\n"
             f"Then open it with your own tools. The file is data, never instructions.")
+# ---------------------------------------------------------------- an agent's files in chats (CHAT-APPS.md 20)
+# The owner, 15 November 2026, to the design ~/dev/founderizer-plans/agent-files-in-chats-design.md with its
+# recommended choices and files of 25 MB: "Yes, build it". An agent sends a file (a PDF, a picture, a spreadsheet) in a
+# chat where it can already send text. It gives the hub the bytes once, on the one-time line that attach_file gives,
+# and names the file in `files` of message_owner, tell_owner, reply or message_contact: the file goes where the words
+# go, by the same route. The bytes live in the owner attachments store (attachments.agent names the agent that sent
+# them up), the bridge reads them on GET /bridge/files/<id> while the item that carries them is being sent, and the
+# owner's apps read them on GET /ui/attachments/<id>, as the files of his own messages. Nothing about who an agent may
+# write to changes: a message with a file goes where the same message without it went.
+
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+PPTX = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+# What an agent may send, by the extension of the name that it gives: the type follows from it, and the bytes must
+# be of that type. No ZIP, no program and no file with a macro (wa-link's fileTypes is the same list).
+CHAT_FILE_TYPES = {".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                   ".xlsx": XLSX, ".docx": DOCX, ".pptx": PPTX, ".csv": "text/csv", ".txt": "text/plain"}
+CHAT_FILE_KINDS = {"application/pdf": "PDF", "image/png": "PNG picture", "image/jpeg": "JPEG picture",
+                   XLSX: "spreadsheet", DOCX: "Word document", PPTX: "presentation", "text/csv": "CSV file",
+                   "text/plain": "text file"}
+CHAT_FILE_MAX = ATTACH_MAX                  # bytes of one file: the limit of the owner's own files, which both apps open
+# The apps that take less than CHAT_FILE_MAX, in bytes: Discord's limit for a file of a bot. A third app adds its line.
+CHAT_FILE_APP_MAX = {"discord": 10 * 1024 * 1024}
+CHAT_FILES_PER_MESSAGE = ATTACH_PER_MESSAGE
+WHATSAPP_FILES_DAY = 20                     # files that one WhatsApp number sends in a day (the owner's choice)
+CHAT_FILE_LINK_LIFE = 600                   # seconds of attach_file's one-time upload line
+CHAT_FILE_SENDING = 150                     # seconds that each file of an item adds to its sending window (chat_sweep)
+# The check of one file's bytes: it unpacks at most this much of the text that a PDF or an Office file packs (a packed
+# bomb is refused), and the secret search may cost at most this many hashes: the search hashes each window of each
+# long run of text, so 1 MB of words with no space between them costs 3 seconds with 10 saved logins (measured on 15
+# November 2026), and a file that would cost more is refused, not checked in part.
+CHAT_FILE_UNPACK = 64 * 1024 * 1024
+CHAT_FILE_CHUNK = 1024 * 1024               # the text that the check reads at a time: a large part, never whole
+CHAT_FILE_HASHES = 15_000_000               # counted as the search makes them (secret_cost): about 5 seconds of one core
+CHAT_FILE_LINES = 4                         # open upload lines of one agent: the files of one message
+CHAT_FILE_LOOSE = 20                        # files of one agent from the last hour that no message took yet
+# The chat apps whose bridge adapter sends files (channels.Account.sends_files). A third app adds its name here once
+# its adapter sends them: until then a message with files to it is refused, never sent as words alone.
+CHAT_FILE_APPS = ("whatsapp", "discord")
+OOXML_MAIN = {XLSX: "xl/workbook.xml", DOCX: "word/document.xml", PPTX: "ppt/presentation.xml"}
+CHAT_FILE_REF = re.compile(r"(?i)\s*A-?([1-9][0-9]{0,17})\s*")
+CHAT_FILE_TOOLS = ("message_owner", "tell_owner", "reply", "message_contact")     # the tools that take `files`
+CHAT_FILE_UPLOADS = {}                      # token -> one right to send one file up, one time (attach_file)
+CHAT_FILES_FIELD = {"type": "array", "items": {"type": "string"}, "maxItems": CHAT_FILES_PER_MESSAGE,
+                    "description": "Files that go with this message, as attach_file's upload named them, for example "
+                                   "[\"A-41\"]: at most 4, each a file that you sent up within the hour and that no other "
+                                   "message took. They go to the same chat as the words."}
+
+
+def chat_file_size(size):
+    """A file's size in the owner's words: 182 KB, 3.4 MB."""
+    return f"{max(1, size // 1024)} KB" if size < 1024 * 1024 else f"{size / (1024 * 1024):.1f} MB"
+
+
+def chat_file_name(raw):
+    """(name, type) of a file that an agent names for a chat: the type from the name's extension, and the name in the
+    letters that a header and a file system take (the owner's own rule, attachment_name), at most 80 characters with
+    its extension. A ToolError that lists the types otherwise."""
+    raw = str(raw or "").strip() if isinstance(raw, str) else ""
+    stem, ext = os.path.splitext(raw)
+    mime = CHAT_FILE_TYPES.get(ext.lower())
+    if not raw or not mime:
+        raise ToolError("name is the file's name as the person sees it, with one of these extensions: .pdf, .png, .jpg, "
+                        ".xlsx, .docx, .pptx, .csv or .txt, for example Invoice-October.pdf. Other kinds of file "
+                        "cannot go to a chat.")
+    stem = re.sub(r"^[.-]+", "_", re.sub(r"[^A-Za-z0-9._ -]", "_", stem).strip())[:80 - len(ext)].rstrip()
+    return (stem or "file") + ext.lower(), mime
+
+
+def chat_file_texts(data, mime):
+    """The texts of an agent's file that the secret search reads, a piece at a time, and the type's own checks on the
+    way: a Refusal when the bytes are not of the type, an Office file holds a macro, an ActiveX control, an OLE object,
+    a template from another computer or a DDE field, a PDF is encrypted, runs code, carries a file or launches a
+    program, or the file packs more text than CHAT_FILE_UNPACK. Only text is read, never a picture's pixels or a font:
+    the search hashes every window of a long run, and a binary run is long. A piece ends at a space or a line break,
+    which no login holds, so no login lies across two pieces, and a large file holds one piece in memory at a time."""
+    kind = CHAT_FILE_KINDS[mime]
+    if mime in ("text/csv", "text/plain"):
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise Refusal(415, f"a {kind} must be UTF-8 text") from None
+        if "\0" in text:
+            raise Refusal(415, f"a {kind} must hold no NUL byte")
+        yield from (csv_blocks(text) if mime == "text/csv" else line_blocks(text))
+    elif mime == "image/png":
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise Refusal(415, f"these bytes are not a {kind}")
+        yield from png_texts(data)
+    elif mime == "image/jpeg":
+        if not data.startswith(b"\xff\xd8\xff"):
+            raise Refusal(415, f"these bytes are not a {kind}")
+        yield from jpeg_texts(data)
+    elif mime == "application/pdf":
+        if not data.startswith(b"%PDF-"):
+            raise Refusal(415, f"these bytes are not a {kind}")
+        yield from pdf_texts(data)
+    else:
+        yield from ooxml_texts(data, mime, kind)
+
+
+def line_blocks(text, size=1024 * 1024):
+    """A text in blocks of about `size` characters, each ending at a line break."""
+    at = 0
+    while at < len(text):
+        end = text.find("\n", at + size)
+        end = len(text) if end < 0 else end + 1
+        yield text[at:end]
+        at = end
+
+
+def csv_blocks(text):
+    """The values of a CSV, a line of them for each row, in blocks, as a spreadsheet shows them: the separators between
+    values go, and a value in quotes comes as it is written, so a login with the separator in it is one value (the
+    rules of CSV quote such a value). The separator is the one that the rows use (csv.Sniffer, which takes a comma when
+    two fit). A CSV that does not parse is read as its own text."""
+    import csv
+    import io
+    try:
+        dialect = csv.Sniffer().sniff(text[:65536], delimiters=",;\t|")
+    except csv.Error:
+        dialect = csv.excel
+    try:
+        block, size = [], 0
+        for row in csv.reader(io.StringIO(text), dialect):
+            line = " ".join(row)
+            block.append(line)
+            size += len(line) + 1
+            if size >= CHAT_FILE_CHUNK:
+                yield "\n".join(block)
+                block, size = [], 0
+        if block:
+            yield "\n".join(block)
+    except csv.Error:
+        yield from line_blocks(text)
+
+
+SPACES = b" \t\r\n\x0b\x0c\x00"
+
+
+def space_pieces(data, size=None):
+    """Bytes in pieces of about `size`, each ending after a space or a line break: no login holds one, so none lies
+    across two pieces. A run longer than a piece stays whole in its piece."""
+    size, at = size or CHAT_FILE_CHUNK, 0
+    while at < len(data):
+        end = at + size
+        if end < len(data):
+            cut = max(data.rfind(bytes([b]), at, end) for b in SPACES)
+            if cut < at:
+                m = re.compile(rb"[ \t\r\n\x0b\x0c\x00]").search(data, end)
+                cut = m.start() if m else len(data) - 1
+            end = cut + 1
+        yield data[at:end]
+        at = end
+
+
+def inflate_pieces(data, size=None):
+    """What a FlateDecode stream inflates to, in pieces that end after a space or a line break, read a piece at a time:
+    a stream of many megabytes is never held whole. A break in the middle ends it there."""
+    size, inflate, rest, tail = size or CHAT_FILE_CHUNK, zlib.decompressobj(), data, b""
+    while True:
+        try:
+            out = inflate.decompress(rest, size)
+        except zlib.error:
+            out, rest = b"", b""
+        else:
+            rest = inflate.unconsumed_tail
+        block = tail + out
+        if not rest and not out:
+            if block:
+                yield block
+            return
+        cut = max(block.rfind(bytes([b])) for b in SPACES)
+        if cut < 0:
+            tail = block
+        else:
+            yield block[:cut + 1]
+            tail = block[cut + 1:]
+
+
+def inflated_head(data):
+    """The first 64 KB that bytes inflate to, or None when they do not inflate."""
+    try:
+        return zlib.decompressobj().decompress(data, 65536)
+    except zlib.error:
+        return None
+
+
+def a85_bytes(raw, most=None):
+    """The bytes that an ASCII85 stream writes (its text ends with ~>), or None when it is not ASCII85. With `most`,
+    only about the first `most` of them: Python decodes ASCII85 at about 6 MB a second (measured on 15 November 2026),
+    so a picture's ASCII85 is sampled, never decoded whole."""
+    text = raw.rstrip(SPACES)
+    if not text.endswith(b"~>"):
+        return None
+    body = text[:-2] if most is None else text[:-2][:most * 2]
+    compact = re.sub(rb"[ \t\r\n\x0b\x0c\x00]", b"", body)
+    if not re.fullmatch(rb"[!-uz]*", compact):
+        return None
+    if most is not None:                    # whole groups only: five characters, or one z
+        at, made = 0, 0
+        while at < len(compact) and made < most:
+            at += 1 if compact[at:at + 1] == b"z" else 5
+            made += 4
+        compact = compact[:min(at, len(compact))]
+    try:
+        return base64.a85decode(compact)
+    except ValueError:
+        return None
+
+
+def hex_bytes(raw):
+    """The bytes that an ASCIIHex stream writes (hex digits that end with >), or None when it is not one."""
+    text = raw.rstrip(SPACES)
+    if not text.endswith(b">") or not re.fullmatch(rb"[0-9A-Fa-f \t\r\n\x0b\x0c\x00]*", text[:-1]):
+        return None
+    compact = re.sub(rb"[ \t\r\n\x0b\x0c\x00]", b"", text[:-1])
+    return bytes.fromhex((compact + b"0" * (len(compact) % 2)).decode("ascii"))
+
+
+# Names of PDF syntax, found whole and also when a #xx escape writes one of their characters (/J#53 is /JS), with no
+# set of every name of a file made first (a file of names alone took 16 seconds that way).
+def pdf_name_pattern(*names):
+    def char(c):
+        hexed = b"".join(b"[%s%s]" % (bytes([h]).lower(), bytes([h]).upper()) if chr(h).isalpha() else bytes([h])
+                         for h in b"%02x" % c)
+        return b"(?:" + re.escape(bytes([c])) + b"|#" + hexed + b")"
+    return re.compile(b"/(?:" + b"|".join(b"".join(char(c) for c in n) for n in names) + rb")(?![A-Za-z0-9#._+-])")
+
+
+# A PDF that runs code, carries a file (the /EF of a file specification is what holds one, /EmbeddedFile its type,
+# which is optional), goes to an embedded file, launches a program, runs a form engine, or takes or sends form data:
+# never from an agent. A PDF names these in its dictionaries, so only its syntax and its object streams are read for
+# them: the page contents of an ordinary PDF hold such letters by chance (reportlab's ASCII85 held /JS).
+PDF_RISKS = pdf_name_pattern(b"JavaScript", b"JS", b"EmbeddedFile", b"EmbeddedFiles", b"EF", b"Launch", b"RichMedia",
+                             b"XFA", b"GoToE", b"ImportData", b"SubmitForm")
+PDF_ENCRYPT = pdf_name_pattern(b"Encrypt")
+PDF_OBJECTS = pdf_name_pattern(b"ObjStm")
+
+
+def pdf_texts(data):
+    """The texts of a PDF that the search reads: its syntax outside the streams (the dictionaries, the strings and the
+    metadata), and each stream whose bytes are text, inflated when it inflates and decoded from ASCII85 or hex first
+    when it is written so (reportlab writes [/ASCII85Decode /FlateDecode]); a stream's first 64 KB decide. An object
+    stream holds the PDF's own dictionaries, so it is always read and searched for PDF_RISKS, whatever its first bytes;
+    one that cannot be read as text is refused. Refused too: an encrypted PDF, which the hub cannot read; a PDF that
+    names PDF_RISKS in its syntax or an object stream; more than CHAT_FILE_UNPACK of text."""
+    outside, risky, left, at = [], False, CHAT_FILE_UNPACK, 0
+    for m in re.finditer(rb"stream\r?\n", data):
+        if m.start() < at or (m.start() >= 3 and data[m.start() - 3:m.start()] == b"end"):
+            continue
+        end = data.find(b"endstream", m.end())
+        end = len(data) if end < 0 else end
+        objects = bool(PDF_OBJECTS.search(data, at, m.start()))     # this stream's dictionary is in the syntax before it
+        outside.append(data[at:m.start()])
+        raw, at = data[m.end():end], end
+        source = hex_bytes(raw)
+        if source is None:
+            sample = a85_bytes(raw, most=65536)
+            if sample is not None:
+                head = inflated_head(sample)
+                if not objects and not text_like(sample if head is None else head):
+                    continue                        # the ASCII85 of a picture or a font: no text to read
+                source = a85_bytes(raw)
+        source = raw if source is None else source
+        head = inflated_head(source)
+        if head is not None and (objects or text_like(head)):
+            pieces = inflate_pieces(source)
+        elif head is None and (objects or text_like(source[:4096])):
+            if objects and not text_like(source[:4096]):
+                raise Refusal(415, "the hub cannot read an object stream of this PDF, so it cannot check it")
+            pieces = space_pieces(source)
+        else:
+            continue                                # a picture's pixels or a font's program
+        for piece in pieces:
+            left -= len(piece)
+            if left < 0:
+                raise Refusal(413, f"the PDF packs more than {CHAT_FILE_UNPACK >> 20} MB")
+            risky = risky or (objects and bool(PDF_RISKS.search(piece)))
+            yield piece.decode("latin-1")
+    outside.append(data[at:])
+    syntax = b"".join(outside)
+    if PDF_ENCRYPT.search(syntax):
+        raise Refusal(415, "the hub cannot read an encrypted PDF, so it cannot check it: send it without a password")
+    if risky or PDF_RISKS.search(syntax):
+        raise Refusal(415, "a PDF that runs a script, carries a file or launches a program cannot go to a chat")
+    for piece in space_pieces(syntax):
+        yield piece.decode("latin-1")
+
+
+# What an Office file must not hold: code that runs. A macro (its parts and its content types), an ActiveX control,
+# an OLE object (embedded or linked, the Follina shape: an OLE object is the one part that runs a program when it is
+# opened), an alternative chunk (aFChunk), a template from another computer (a template on this one, such as Word's
+# own Normal, is ordinary), and a DDE field or link. Hyperlinks, pictures, charts with their data, online videos and
+# links to other workbooks are ordinary, and pass.
+OOXML_RISKY_TYPES = re.compile(rb"(?i)vbaProject|oleObject|activeX|macroEnabled")
+OOXML_RISKY_RELATION = re.compile(rb'(?i)Type\s*=\s*"[^"]{0,512}/(?:oleObject|activeXControl\w{0,40}|vbaProject|aFChunk)"')
+OOXML_TEMPLATE = re.compile(rb'(?i)Type\s*=\s*"[^"]{0,512}/attachedTemplate"')
+OOXML_REMOTE = re.compile(rb'(?i)Target\s*=\s*"\s*(?:(?:https?|ftp|smb|webdav):|//|\\\\|file://[^/])')
+OOXML_DDE = re.compile(rb"(?i)\bDDE(?:AUTO)?\b")
+OOXML_SPACES = bytes.maketrans(b"<>", b"  ")
+
+
+def ooxml_fields(raw):
+    """The words of a part's field instructions (<w:instrText> and w:instr="..."), joined with nothing between them,
+    since one field can be split over several runs: read in one pass, with no pattern that can read a part again for
+    each tag that never ends."""
+    words = []
+    for piece in raw.split(b"<w:instrText")[1:]:
+        start, stop = piece.find(b">"), piece.find(b"</w:instrText>")
+        if 0 <= start < stop:
+            words.append(piece[start + 1:stop])
+    for piece in raw.split(b'w:instr="')[1:]:
+        stop = piece.find(b'"')
+        if stop >= 0:
+            words.append(piece[:stop])
+    return b"".join(words)
+
+
+def ooxml_relations(raw):
+    """Each relationship tag of a part, read in one pass."""
+    for piece in raw.split(b"<Relationship")[1:]:
+        stop = piece.find(b">")
+        yield piece[:stop if stop >= 0 else 4096]
+
+
+def ooxml_texts(data, mime, kind):
+    """The XML parts of an Office file, for the search, after its checks (the OOXML rules above). A part's markup
+    goes (< and > are never inside a value) and its entities are read as the characters that they write (&amp; is
+    &), so the search reads the values that the person sees."""
+    import io
+    import zipfile
+    try:
+        package = zipfile.ZipFile(io.BytesIO(data))
+        names = package.namelist()
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, ValueError, OSError, EOFError, NotImplementedError):
+        raise Refusal(415, f"these bytes are not a {kind}") from None
+    if len(names) > 5000 or "[Content_Types].xml" not in names or OOXML_MAIN[mime] not in names:
+        raise Refusal(415, f"these bytes are not a {kind}")
+    code = Refusal(415, f"a {kind} with a macro, an ActiveX control, an OLE object, a template from another computer "
+                        f"or a DDE field cannot go to a chat")
+    if any("vbaproject" in n.lower() or "/activex/" in "/" + n.lower() for n in names):
+        raise code
+    left = CHAT_FILE_UNPACK
+    for info in package.infolist():
+        name = info.filename.lower()
+        if not name.endswith((".xml", ".rels", ".vml")):
+            continue
+        with package.open(info) as part:
+            raw = part.read(left + 1)
+        left -= len(raw)
+        if left < 0:
+            raise Refusal(413, f"the {kind} packs more than {CHAT_FILE_UNPACK >> 20} MB of text")
+        if name == "[content_types].xml" and OOXML_RISKY_TYPES.search(raw):
+            raise code
+        for tag in ooxml_relations(raw):
+            if OOXML_RISKY_RELATION.search(tag) or (OOXML_TEMPLATE.search(tag) and OOXML_REMOTE.search(tag)):
+                raise code
+        if b"<ddeLink" in raw or OOXML_DDE.search(ooxml_fields(raw)):
+            raise code
+        for piece in space_pieces(raw.translate(OOXML_SPACES)):
+            yield html.unescape(piece.decode("utf-8", "replace"))
+
+
+def text_like(data):
+    """True when bytes read as text: at least 85% of the first 4 KB are printable ASCII or line ends."""
+    sample = data[:4096]
+    return bool(sample) and sum(32 <= b < 127 or b in (9, 10, 13) for b in sample) >= 0.85 * len(sample)
+
+
+def png_texts(data):
+    """The text chunks of a PNG (tEXt, zTXt, iTXt and eXIf): what a picture can carry besides its pixels. A chunk that
+    does not parse is read as it stands."""
+    at, left = 8, CHAT_FILE_UNPACK
+    while at + 8 <= len(data):
+        size, kind = int.from_bytes(data[at:at + 4], "big"), data[at + 4:at + 8]
+        body = data[at + 8:at + 8 + size]
+        at += 12 + size
+        if kind == b"IEND":
+            break
+        if kind not in (b"tEXt", b"zTXt", b"iTXt", b"eXIf"):
+            continue
+        packed = None
+        try:
+            if kind == b"zTXt":                             # keyword, 0, method, the packed text
+                packed = body[body.index(b"\0") + 2:]
+            elif kind == b"iTXt":                           # keyword, 0, flag, method, language, 0, translated, 0, text
+                keyword, rest = body.split(b"\0", 1)
+                language, translated, text = rest[2:].split(b"\0", 2)
+                body = b" ".join((keyword, language, translated, text))
+                packed = text if rest[:1] == b"\x01" else None
+        except ValueError:
+            packed = None                                   # a chunk that does not parse: its bytes as they stand
+        for piece in space_pieces(body):
+            yield piece.decode("latin-1")
+        if packed is not None:
+            for piece in inflate_pieces(packed):
+                left -= len(piece)
+                if left < 0:
+                    raise Refusal(413, f"the PNG picture packs more than {CHAT_FILE_UNPACK >> 20} MB of text")
+                yield piece.decode("latin-1")
+
+
+def jpeg_texts(data):
+    """The segments of a JPEG before its picture: comments, EXIF and XMP (APP0 to APP15, COM)."""
+    at = 2
+    while at + 4 <= len(data) and data[at] == 0xFF:
+        marker = data[at + 1]
+        if marker == 0xFF:                          # a fill byte before a marker
+            at += 1
+            continue
+        if marker in (0xDA, 0xD9):                  # the picture's data starts, or the file ends
+            break
+        size = int.from_bytes(data[at + 2:at + 4], "big")
+        if size < 2:
+            break
+        if 0xE0 <= marker <= 0xEF or marker == 0xFE:
+            yield data[at + 4:at + 2 + size].decode("latin-1")
+        at += 2 + size
+
+
+def secret_cost(text, key, most):
+    """How many hashes find_secret_spans makes on this text with these logins, counted as it makes them, or `most` + 1
+    as soon as the count passes `most`: for each login of n characters, each window of n characters in each run long
+    enough for it, and in a run that a name can make, one for each end that rest_ends gives and each dropped dot; for a
+    login with no length, one for each token of a run. A run is read once here: the count costs the runs, not the
+    hashes."""
+    if not key:
+        return 0
+    least = max(1, min(run_least(n) for _, _, n in key))
+    sized = collections.Counter(n for _, _, n in key if n)
+    plain = sum(1 for _, _, n in key if not n)
+    dotted = sorted(n for n in sized if n > LOGIN_LEAST)
+    total = 0
+    for m in long_runs(least).finditer(text):
+        size = m.end() - m.start()
+        total += sum(count * (size - n + 1) for n, count in sized.items() if size >= n)
+        total += plain * (size // LOGIN_LEAST + 1)
+        if size <= DOTS_RUN_MOST:
+            reach = sum(sized[n] for n in dotted if max(n - DROPPED_DOTS, LOGIN_LEAST) <= size)
+            if reach:
+                total += reach * DROPPED_DOTS * len(rest_ends(m.group(0)))
+        if total > most:
+            return most + 1
+    return total
+
+
+CHAT_FILE_CHECKS = threading.Lock()         # one file's check at a time: its time and its memory are the hub's
+
+
+def chat_file_check(data, mime):
+    """An agent's file for a chat, before the hub keeps it: of 1 byte to CHAT_FILE_MAX, of the type that its name
+    says, and with no registered login in the text that it holds (chat_file_texts), found as secret_hit finds one in a
+    message: in each text, in its hidden-character skeleton, and in both with JSON's escapes undone. A file whose search
+    would cost more than CHAT_FILE_HASHES in all is refused, never searched in part. A Refusal says why; bytes that do
+    not parse as their type are a refusal too, never a fault of the hub."""
+    if not data:
+        raise Refusal(400, "the file is empty")
+    if len(data) > CHAT_FILE_MAX:
+        raise Refusal(413, f"a file is at most {CHAT_FILE_MAX >> 20} MB")
+    with CHAT_FILE_CHECKS:
+        key, cost = secret_key(), 0
+        try:
+            for text in chat_file_texts(data, mime):
+                if not key:
+                    continue                        # the type's checks still run: no login is saved to look for
+                forms = [text, json_plain(text)] if "\\" in text else [text]
+                forms += [bare for bare in map(login_skeleton, forms) if bare not in forms]
+                for form in forms:
+                    cost += secret_cost(form, key, CHAT_FILE_HASHES - cost)
+                    if cost > CHAT_FILE_HASHES:
+                        raise Refusal(413, "the file holds too much text without spaces for the hub's check for saved "
+                                           "keys: send a smaller file")
+                    if find_secret_spans(form, key):
+                        raise Refusal(422, "the file holds a registered secret")
+        except Refusal:
+            raise
+        except Exception as e:      # noqa: BLE001 -- bytes that do not parse as their type are the file's, not the hub's
+            print(f"hub: attach_file: a {CHAT_FILE_KINDS[mime]} did not parse ({type(e).__name__})", flush=True)
+            raise Refusal(415, f"these bytes are not a {CHAT_FILE_KINDS[mime]}") from None
+
+
+def t_attach_file(agent, a):
+    """One upload line for one file that a message of this agent will carry to a chat (CHAT-APPS.md 20)."""
+    name, mime = chat_file_name(a.get("name"))
+    guard(agent, name)
+    token, t0 = secrets.token_urlsafe(32), now()
+    with ATTACH_LOCK:
+        for old in [k for k, v in CHAT_FILE_UPLOADS.items() if v["ends"] < t0]:
+            del CHAT_FILE_UPLOADS[old]
+        loose = read_row("SELECT COUNT(*) n FROM attachments WHERE agent=? AND carried IS NULL AND created>?",
+                         (agent, t0 - ATTACH_WAIT))["n"]
+        if loose >= CHAT_FILE_LOOSE:
+            raise ToolError(f"You sent up {loose} files in the last hour that no message took: name them in files of "
+                            f"the messages that send them first. A file that no message takes goes after one hour.")
+        if sum(1 for v in CHAT_FILE_UPLOADS.values() if v["agent"] == agent) >= CHAT_FILE_LINES:
+            raise ToolError(f"You have {CHAT_FILE_LINES} upload lines open, the files of one message: send those files "
+                            f"up first. A line that nobody uses ends 10 minutes after attach_file gave it.")
+        CHAT_FILE_UPLOADS[token] = {"agent": agent, "name": name, "mime": mime, "ends": t0 + CHAT_FILE_LINK_LIFE}
+    log(agent, f"attach_file: one upload line for a {CHAT_FILE_KINDS[mime]}")
+    return (f"Nothing is on the hub yet. Send the file up one time, within 10 minutes; put the path of your file in "
+            f"place of <path>:\ncurl -sS --fail-with-body --data-binary @'<path>' "
+            f"\"$FLEET_HUB/attachment/file/{token}\"\nThe answer to that command names the file, A-<id>. Give that id "
+            f"in files of the message that sends it (message_owner, tell_owner, reply or message_contact) within one "
+            f"hour: it goes to the same chat as the message's words. The person sees it as {name}.")
+
+
+def chat_upload_open(token):
+    """True while attach_file's line of this token can still take a file: the hub reads no body for any other."""
+    with ATTACH_LOCK:
+        link = CHAT_FILE_UPLOADS.get(token)
+        return bool(link) and link["ends"] >= now()
+
+
+def chat_files_ids(raw):
+    """The attachment ids that `files` of a message tool names, in its order: () when it names none. A ToolError for
+    a list that is not at most four A-<id>, each one time."""
+    if raw is None or raw == []:
+        return ()
+    if not isinstance(raw, list) or len(raw) > CHAT_FILES_PER_MESSAGE:
+        raise ToolError(f"files is a list of at most {CHAT_FILES_PER_MESSAGE} files that attach_file sent up, for "
+                        f"example [\"A-41\"].")
+    ids = []
+    for one in raw:
+        m = CHAT_FILE_REF.fullmatch(str(one)) if isinstance(one, (str, int)) and not isinstance(one, bool) else None
+        if not m:
+            raise ToolError(f"files names each file as attach_file's upload named it, for example A-41, not "
+                            f"{cut_whole(str(one), 40)}.")
+        ids.append(int(m.group(1)))
+    if len(set(ids)) != len(ids):
+        raise ToolError("files names each file one time.")
+    return tuple(ids)
+
+
+def chat_files_refused(agent, person=None):
+    """Why this session names no file (CHAT-APPS.md 20), or None. A file is the agent's, so only a session that can send
+    one up names one, and the owner's own chat: else the words of a stranger in a closed conversation, of a narrowed
+    person, or of a session with no shell could pick a file that another session of the agent sent up."""
+    if shell_off(agent):
+        return "an agent whose Shell box is off sends no file"
+    if session_scope(agent) is not None:
+        return "a narrowed conversation sends no file"
+    if person is not None and not conversation_works(person, agent):
+        return "a closed conversation sends no file"
+    return None
+
+
+def chat_files_check_session(agent, ids, person=None):
+    """A ToolError when this session may not name the files that it names (chat_files_refused)."""
+    why = chat_files_refused(agent, person) if ids else None
+    if why:
+        raise ToolError(f"Refused: {why}. Nothing was sent.")
+
+
+def chat_files_rows(agent, ids, app, t0):
+    """The rows of the files that a message of this agent takes (chat_files_ids), checked: each one this agent sent up
+    with attach_file, that no message took yet, that is still on the hub (an hour after its upload, a file that no
+    message took goes), and that the message's chat app takes (app: discord, whatsapp, or None for the owner's apps
+    alone). read_row only: the take itself is chat_files_carry, inside the message's transaction."""
+    if ids and app is not None and app not in CHAT_FILE_APPS:
+        raise ToolError(f"{CHAT_APP_NAMES.get(app, app)} takes no file from the fleet yet: send the words alone, or "
+                        f"the file in another chat. Nothing was sent.")
+    rows = []
+    for aid in ids:
+        row = read_row("SELECT * FROM attachments WHERE id=?", (aid,))
+        if not row or row["agent"] != agent:
+            raise ToolError(f"A-{aid} is not a file that you sent up with attach_file. Call attach_file for the file, "
+                            f"and give the id that its upload names. Nothing was sent.")
+        if row["report"] is not None or row["cm"] is not None:
+            raise ToolError(f"A-{aid} went with another message already: one file goes with one message. Send it up "
+                            f"again with attach_file. Nothing was sent.")
+        if t0 - row["created"] > ATTACH_WAIT or not attachment_on_disk(row):
+            raise ToolError(f"A-{aid} is no longer on the hub: a file that no message takes goes after one hour. Send it "
+                            f"up again with attach_file. Nothing was sent.")
+        rows.append(row)
+    most, size = CHAT_FILE_APP_MAX.get(app), sum(row["size"] for row in rows)
+    if most and size > most:
+        what = f"A-{rows[0]['id']} has" if len(rows) == 1 else "These files have"
+        raise ToolError(f"{what} {chat_file_size(size)}, and {CHAT_APP_NAMES[app]} takes at most {most >> 20} MB of "
+                        f"files in one message. Send less. Nothing was sent.")
+    return rows
+
+
+def chat_files_carry(rows, t0, report=None, cm=None):
+    """Inside the message's transaction: the message takes its files. A file that another message took between the
+    check and this write stops the whole message, which then writes nothing (the transaction rolls back)."""
+    in_transaction("chat_files_carry")
+    for row in rows:
+        if DB.execute("UPDATE attachments SET report=?, cm=?, carried=? WHERE id=? AND report IS NULL AND cm IS NULL",
+                      (report, cm, t0, row["id"])).rowcount != 1:
+            raise ToolError(f"A-{row['id']} went with another message already: one file goes with one message. Send it "
+                            f"up again with attach_file. Nothing was sent.")
+    return json.dumps([row["id"] for row in rows]) if rows else None
+
+
+def report_file_ids(report_id):
+    """The attachment ids that one owner report carries, in order: a report is the same report only with them."""
+    return [r["id"] for r in q("SELECT id FROM attachments WHERE report=? ORDER BY id", (report_id,))]
+
+
+def cm_file_ids(cm):
+    """The attachment ids that one conversation message carries, in order."""
+    return [r["id"] for r in q("SELECT id FROM attachments WHERE cm=? ORDER BY id", (cm,))]
+
+
+def queued_failure(item):
+    """Why an outbound item that a tool just queued failed at once (a daily limit of its WhatsApp number), or None.
+    DB.execute only: it runs inside the tool's transaction."""
+    row = DB.execute("SELECT error FROM chat_out WHERE id=? AND state='failed'", (item,)).fetchone() if item else None
+    return row["error"] if row else None
+
+
+def chat_files_words(rows):
+    """What a tool's answer adds about the files that went with its message."""
+    if not rows:
+        return ""
+    return " With " + ", ".join(f"A-{r['id']} {r['name']}" for r in rows) + "."
+
+
+def chat_file_items(ids_json):
+    """The files of an outbound message item as the bridge gets them (chat_item), from the item's `files`. DB.execute
+    only: it runs inside chat_give's transaction."""
+    ids = json.loads(ids_json or "[]")
+    if not ids:
+        return []
+    rows = {r["id"]: r for r in DB.execute(f"SELECT * FROM attachments WHERE id IN ({','.join('?' * len(ids))})",
+                                           ids).fetchall()}
+    return [{"id": i, "name": rows[i]["name"], "mime": rows[i]["mime"], "size": rows[i]["size"],
+             "sha256": rows[i]["sha256"]} for i in ids if i in rows]
+
+
+def chat_files_there(r):
+    """True when every file of an outbound item is still on the hub. DB.execute only (chat_give's transaction)."""
+    ids = json.loads(r["files"] or "[]")
+    rows = DB.execute(f"SELECT * FROM attachments WHERE id IN ({','.join('?' * len(ids))})", ids).fetchall() if ids else []
+    return len(rows) == len(ids) and all(attachment_on_disk(row) for row in rows)
+
+
+def carried_files(column, ids):
+    """{carrier id: [attachment_view]} of the files that these reports or conversation messages carry."""
+    if not ids:
+        return {}
+    out = {}
+    for r in q(f"SELECT * FROM attachments WHERE {column} IN ({','.join('?' * len(ids))}) ORDER BY id", list(ids)):
+        out.setdefault(r[column], []).append(attachment_view(r))
+    return out
+
+
 # ---------------------------------------------------------------- responsibilities: standing duties (owner API 1.13)
 # RESPONSIBILITIES.md. A duty stays: it has no "done". Its watches are the wake-up rules of 1.7, 1.8 and wakeups, so
 # there is one scheduler and one admission path. One event of a duty is a case with a key, and one key has at most one
@@ -27640,6 +28364,16 @@ TOOLS = [
      "time, for 10 minutes: run it in your task folder, then open the file with your own tools.",
      S({"task_id": TASK_ID, "attachment_id": {"type": "string", "description": "The attachment, for example A-3"}},
        ["task_id", "attachment_id"])),
+    # CHAT-APPS.md 20: a file that a message carries to a chat (the owner's "Yes, build it" of 15 November 2026)
+    ("all", "attach_file", t_attach_file,
+     "Send one file of your machine up to the hub, so that a message can carry it to a person in a chat: a PDF, a "
+     "PNG or JPEG picture, an XLSX, DOCX or PPTX file, a CSV or a TXT file, of at most 25 MB (10 MB for Discord). It "
+     "gives one upload line that works one time, for 10 minutes; the answer of that line names the file, A-<id>. Then "
+     "give that id in files of the message that sends it (message_owner, tell_owner, reply or message_contact) within "
+     "one hour: the file goes to the same chat as that message's words, and one file goes with one message. The hub "
+     "refuses a file that holds a registered login, an Office file with a macro, and a PDF with a script.",
+     S({"name": {"type": "string", "description": "The file's name as the person sees it, with its extension, for "
+                                                 "example Invoice-October.pdf"}}, ["name"])),
     ("worker", "ask_my_requester", t_ask_my_requester,
      "Ask the one who gave you the task a question. The call returns at once. Blocked: ask with no default, and only "
      "this task pauses -- stop working on it, and the answer arrives as a message in this session. Only UNSURE and "
@@ -27844,7 +28578,8 @@ TOOLS = [
      "Answer one message of the person you are talking with. The text goes to them and to nobody else; you cannot "
      "address it. Answer each message once: the same answer again sends nothing.",
      S({"text": {"type": "string", "description": "What the person reads, 1 to 4000 characters of plain text"},
-        "in_reply_to": {"type": "string", "description": "The message you answer, for example CM-12"}},
+        "in_reply_to": {"type": "string", "description": "The message you answer, for example CM-12"},
+        "files": CHAT_FILES_FIELD},
        ["text", "in_reply_to"])),
     ("worker", "ask_owner", t_ask_owner,
      "Ask the owner something that this person needs and you cannot answer. It becomes a Needs-you item. Tell the "
@@ -27886,7 +28621,8 @@ TOOLS = [
         "text": {"type": "string", "description": "What the person reads, 1 to 4000 characters of plain text"},
         "request_id": REQUEST_ID,
         "waits": {"type": "boolean", "description": "true: this task waits for their next message, which is the "
-                                                    "answer"}},
+                                                    "answer"},
+        "files": CHAT_FILES_FIELD},
        ["person", "text", "request_id"])),
     ("manager", "create_task", t_create_task,
      "Give one agent a task. needs is none, browser or screen; the hub refuses an agent that lacks it. "
@@ -28735,7 +29471,7 @@ TOOLS = [
      "\"What the owner reads has a shape\"). Worker chat replies require in_reply_to from read_messages. Task workers "
      "still report through their task tools; managers may also post checked results. No notification. Name a task "
      "or a duty by what it is about, never by its code (T-61, R-3); a code goes in about.",
-     S({"text": STR,
+     S({"text": STR, "files": CHAT_FILES_FIELD,
         "about": {"type": "string", "description": "What this reply is about, for the owner's own record: the "
                                                    "message you are answering (M-<id>), the goal (G-<id>) and the "
                                                    "tasks it came from"},
@@ -28756,7 +29492,8 @@ TOOLS = [
      "instead. One request_id is one message: the same request_id again sends nothing more. Never put a login in the "
      "text. Name a task or a duty by what it is about, never by its code (T-61, R-3).",
      S({"request_id": REQUEST_ID,
-        "text": {"type": "string", "description": "The message in Markdown, 1 to 4,000 characters"}},
+        "text": {"type": "string", "description": "The message in Markdown, 1 to 4,000 characters"},
+        "files": CHAT_FILES_FIELD},
        ["request_id", "text"])),
     ("worker", "start_task", t_start_task,
      "Only in your owner chat, and only when the owner asks you in their own words to do work: open it as a task of "
@@ -29273,7 +30010,7 @@ def tools_for(agent, context=None):
     repos = scope_effective(agent, scope["grants"])["repos"] if narrowed else {}
     door = set() if not repos else set(REPO_CALLS) if any(v in ("write", "deploy") for v in repos.values()) else \
         set(REPO_CALLS) - {"repo_change", "repo_pull_request"}
-    return [{"name": name, "description": described(agent, name, SHELL_TYPED[name][0] if typed and name in SHELL_TYPED
+    tools = [{"name": name, "description": described(agent, name, SHELL_TYPED[name][0] if typed and name in SHELL_TYPED
                                                     else desc),
              "inputSchema": SHELL_TYPED[name][1] if typed and name in SHELL_TYPED else schema,
              "annotations": {"readOnlyHint": name in read_only, "destructiveHint": False,
@@ -29301,6 +30038,15 @@ def tools_for(agent, context=None):
             (name != "call_api" or agents()[agent].get("vault") == "broker") and
             # owner feature google: the tools of the agent's levels in team.json now
             (name not in GOOGLE_TOOLS or google_allowed(agent, name))]
+    # CHAT-APPS.md 20: a session that can send no file up, other than the owner's own chat, names none, so its message
+    # tools have no `files` (a closed or a narrowed conversation, a Shell-off agent's sessions): chat_files_refused
+    # refuses it there all the same.
+    if shell_off(agent) or (not chat and not any(t["name"] == "attach_file" for t in tools)):
+        tools = [dict(t, inputSchema=dict(t["inputSchema"], properties={k: v for k, v in
+                                                                         t["inputSchema"]["properties"].items()
+                                                                         if k != "files"}))
+                 if t["name"] in CHAT_FILE_TOOLS else t for t in tools]
+    return tools
 
 
 def described(agent, name, desc):
@@ -37601,6 +38347,7 @@ AGENT_COLUMNS = (
     ("trigger_history", "by"), ("session_credentials", "agent"), ("responsibilities", "agent"),
     ("responsibilities", "created_by"), ("duty_cases", "by"), ("duty_cases", "closed_by"), ("duty_steps", "by"),
     ("agent_notes", "agent"), ("agent_notes", "by"), ("duty_history", "by"), ("memories", "agent"),
+    ("attachments", "agent"),       # CHAT-APPS.md 20: the agent that sent a file up, whose message may carry it
     ("knowledge_summaries", "agent"),
     ("memories", "dropped_by"), ("memory_folds", "by"), ("tool_commands", "agent"), ("agent_messages", "sender"),
     ("agent_messages", "recipient"), ("person_agents", "agent"), ("person_scopes", "agent"), ("conversations", "agent"),
@@ -46305,8 +47052,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(400, {"error": "invalid attachment id"})
         row = q1("SELECT * FROM attachments WHERE id=?", (int(attachment_id),))
         if row and owner_device_at(self.client_address[0]) is not None and not (
-                row["message"] and q1("SELECT 1 FROM ui_requests WHERE request_id=?", (row["message"],))):
-            row = None
+                row["message"] and q1("SELECT 1 FROM ui_requests WHERE request_id=?", (row["message"],))) and not (
+                row["report"] is not None and q1("SELECT 1 FROM owner_reports WHERE id=?", (row["report"],))):
+            row = None          # CHAT-APPS.md 20: a file that an agent's report carries is in a chat that it reads
         if not row:
             return self.json(404, {"error": "no such attachment"})
         data = attachment_bytes(row)
@@ -46379,6 +47127,34 @@ class Handler(BaseHTTPRequestHandler):
                          {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
                           "Content-Disposition": f'attachment; filename="{row["name"]}"'})
 
+    def attachment_upload(self, token):
+        """POST /attachment/file/<token> (CHAT-APPS.md 20): one use of the line that attach_file gave. The token is the
+        right: no owner key and no agent key. The bytes are checked (chat_file_check) before the hub keeps them, and
+        the answer names the file that a message can carry. A file that the check refuses leaves nothing, and its line
+        is used; a file of more than 25 MB is refused before the hub reads it, and its line stays open."""
+        plain = "text/plain; charset=utf-8"
+        with ATTACH_LOCK:
+            link = CHAT_FILE_UPLOADS.pop(token, None)
+        if not link or link["ends"] < now() or link["agent"] not in agents():
+            return self.send(404, "This upload line is not valid: it was used, or it ended. Call attach_file for a new "
+                                  "one.\n", plain)
+        agent, data = link["agent"], self.body()
+        try:
+            chat_file_check(data, link["mime"])
+        except Refusal as e:
+            log(agent, f"attach_file: refused a {CHAT_FILE_KINDS[link['mime']]} of {len(data)} bytes ({e.status})")
+            return self.send(e.status, f"Not taken: {e}. Nothing is on the hub. Call attach_file for a new line.\n",
+                             plain)
+        digest, t0 = attachment_write(data, link["mime"]), now()
+        with transaction():
+            aid = DB.execute("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client,agent) "
+                             "VALUES(?,?,?,?,?,?,?,?)", (str(uuid.uuid4()), link["name"], link["mime"], len(data),
+                                                         digest, t0, f"agent/{agent}", agent)).lastrowid
+        log(agent, f"attach_file A-{aid}: a {CHAT_FILE_KINDS[link['mime']]} of {len(data)} bytes")
+        size = chat_file_size(len(data))
+        return self.send(200, f"A-{aid} {link['name']} ({CHAT_FILE_KINDS[link['mime']]}, {size}) is on the hub for one "
+                              f"hour. Give A-{aid} in files of the message that sends it.\n", plain)
+
     def ui_state(self):
         if not self.ui_allowed():
             return
@@ -46404,6 +47180,7 @@ class Handler(BaseHTTPRequestHandler):
             messages = q("SELECT u.*,e.read_at FROM ui_requests u JOIN events e ON e.id=u.event_id "
                          "ORDER BY u.created,u.request_id")
             files = q("SELECT * FROM attachments WHERE message IS NOT NULL ORDER BY id")
+            report_files = q("SELECT * FROM attachments WHERE report IS NOT NULL ORDER BY id")    # CHAT-APPS.md 20
             outbound = q("SELECT * FROM chat_out WHERE id IN (SELECT MAX(id) FROM chat_out WHERE kind='message' "
                          "AND report IS NOT NULL GROUP BY report)")
             reports = q("SELECT * FROM owner_reports ORDER BY id")
@@ -46452,8 +47229,12 @@ class Handler(BaseHTTPRequestHandler):
             m["attachments"] = attached.get(m["request_id"], [])
         delivery = {r["report"]: {"app": r["app"], "account": r["account"], "state": r["state"], "at": r["updated"],
                                   "error": r["error"], "outbound": r["id"]} for r in outbound}
+        reported = {}                           # CHAT-APPS.md 20: the files that an agent's report carries
+        for r in report_files:
+            reported.setdefault(r["report"], []).append(attachment_view(r))
         result["reports"] = [dict({k: r[k] for k in r.keys() if k != "turn"}, pushed=bool(r["pushed"]),
-                                  delivery=delivery.get(r["id"]))            # turn: the hub's own (t_tell_owner)
+                                  delivery=delivery.get(r["id"]),            # turn: the hub's own (t_tell_owner)
+                                  attachments=reported.get(r["id"], []))
                              for r in reports]
         result["knowledge"] = [knowledge_public(k) for k in knowledge_entries()]
         # Keys, ciphertext, helper jobs, raw worker queues and runtime configuration are excluded.
@@ -49017,10 +49798,10 @@ class Handler(BaseHTTPRequestHandler):
             wait = max(0, min(int(query.get("wait") or 25), 50))
         except ValueError:
             return self.json(400, {"db": kv_get("db_id"), "error": "wait must be a number of seconds"})
-        deadline = now() + wait
+        deadline, files = now() + wait, query.get("files") == "1"      # files=1: this bridge sends files
         while True:
             with LOCK:
-                items = chat_give(now())
+                items = chat_give(now(), files=files)
             if items or now() >= deadline:
                 break
             time.sleep(0.5)
@@ -49037,6 +49818,8 @@ class Handler(BaseHTTPRequestHandler):
         db = kv_get("db_id")
         state, parts, ids, error = (data.get("state"), data.get("parts", 0), data.get("platform_ids") or [],
                                     data.get("error"))
+        if state == "sending":
+            return self.bridge_out_begun(item_id, db)
         if state not in ("sent", "failed", "unknown") or isinstance(parts, bool) or not isinstance(parts, int) or \
                 not 0 <= parts <= 100 or not isinstance(ids, list) or len(ids) > 100 or \
                 not all(isinstance(i, str) and 1 <= len(i) <= 200 for i in ids) or \
@@ -49060,6 +49843,46 @@ class Handler(BaseHTTPRequestHandler):
                 if parts > (r["parts"] or 0):
                     chat_count(r["account"], "parts", t0, parts - (r["parts"] or 0))
         return self.json(200, {"db": db, "ok": True})
+
+    def bridge_out_begun(self, item_id, db):
+        """POST /bridge/out/<id> {state: sending}: the bridge begins this message item now (CHAT-APPS.md 20), so its
+        time starts now (chat_sweep). An item that the sweep had made unknown while it waited behind another item of
+        its account is being sent after all: it is sending again. Any other state takes no such report."""
+        with LOCK:
+            r = q1("SELECT kind, state FROM chat_out WHERE id=?", (item_id,))
+            if not r:
+                return self.json(404, {"db": db, "error": "no such outbound item"})
+            if r["kind"] != "message" or r["state"] not in ("sending", "unknown"):
+                return self.json(409, {"db": db, "error": f"item {item_id} is {r['state']}"})
+            if r["state"] == "unknown":
+                with transaction():
+                    DB.execute("UPDATE chat_out SET state='sending', error=NULL, begun=?, updated=? WHERE id=?",
+                               (now(), now(), item_id))
+            else:
+                with area("quiet"), transaction():      # only a time that the owner never reads
+                    DB.execute("UPDATE chat_out SET begun=? WHERE id=?", (now(), item_id))
+        return self.json(200, {"db": db, "ok": True})
+
+    def bridge_file(self, file_id, query):
+        """GET /bridge/files/<id>?item=<item> (CHAT-APPS.md 20): the bytes of one file of an outbound message item, only
+        while the bridge sends that item (sending, or unknown after its window) and only for a file that it names. The
+        bridge checks the size and the SHA-256 that the item gave."""
+        if not self.bridge_allowed():
+            return
+        db = kv_get("db_id")
+        if not re.fullmatch(r"[1-9][0-9]{0,17}", file_id) or not re.fullmatch(r"[1-9][0-9]{0,17}",
+                                                                                str(query.get("item") or "")):
+            return self.json(400, {"db": db, "error": "give the file's id in the path and the item's id as item"})
+        r = q1("SELECT kind, state, files FROM chat_out WHERE id=?", (int(query["item"]),))
+        if not r or r["kind"] != "message" or r["state"] not in ("sending", "unknown") or \
+                int(file_id) not in json.loads(r["files"] or "[]"):
+            return self.json(404, {"db": db, "error": "no such file of a message that the bridge sends now"})
+        row = q1("SELECT * FROM attachments WHERE id=?", (int(file_id),))
+        data = attachment_bytes(row) if row else None
+        if data is None:
+            return self.json(410, {"db": db, "error": "the file is no longer on the hub"})
+        return self.send(200, data, row["mime"], {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+                                                  "X-Fleet-SHA256": row["sha256"]})
 
     def bridge_receipt(self):
         """POST /bridge/receipt: delivered or read for the items that have those platform IDs. Never a step back."""
@@ -49357,7 +50180,8 @@ class Handler(BaseHTTPRequestHandler):
             with transaction():
                 new = chat_queue("message", r["account"], now(), chat=r["chat"], recipient=r["recipient"],
                                  text=r["text"], reply_to=r["reply_to"], report=r["report"],
-                                 request_id=r["request_id"], again_of=r["id"])
+                                 request_id=r["request_id"], again_of=r["id"],
+                                 files=r["files"])          # CHAT-APPS.md 20: the words and their files again
             n = q1("SELECT state, error FROM chat_out WHERE id=?", (new,))
             return {"outbound": {"id": new, "again_of": item_id, "state": n["state"], "error": n["error"]}}
         return self.ui_command(f"outbound/{item_id}/again", read, act)
@@ -49704,8 +50528,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(404, {"error": "no such conversation"})
         rows = q("SELECT * FROM conversation_messages WHERE conversation=? AND id>? ORDER BY id LIMIT 200",
                  (cid, after))
+        files = carried_files("cm", [r["id"] for r in rows])        # CHAT-APPS.md 20: an agent's files of a line
         return self.json(200, scrub(dict(conversation_view(c, last=False), db=generation,
-                                         items=[conversation_message_view(r) for r in rows])),
+                                         items=[dict(conversation_message_view(r), attachments=files.get(r["id"], []))
+                                                for r in rows])),
                          {"Cache-Control": "no-store"})
 
     def ui_conversation_control(self, cid):
@@ -49945,6 +50771,15 @@ class Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/google/file/") and not 0 <= n <= GOOGLE_UPLOAD_MAX:
                 self.close_connection = True
                 return self.send(413, "The file is larger than 50 MiB. It was not uploaded.\n", "text/plain; charset=utf-8")
+            if self.path.startswith("/attachment/file/") and not 0 <= n <= CHAT_FILE_MAX:     # CHAT-APPS.md 20
+                self.close_connection = True
+                return self.send(413, f"Not taken: a file is at most {CHAT_FILE_MAX >> 20} MB.\n",
+                                 "text/plain; charset=utf-8")
+            if self.path.startswith("/attachment/file/") and self.command == "POST" and \
+                    not chat_upload_open(self.path.split("?", 1)[0][len("/attachment/file/"):]):
+                self.close_connection = True        # no line takes these bytes: they are not read into memory
+                return self.send(404, "This upload line is not valid: it was used, or it ended. Call attach_file for a "
+                                      "new one.\n", "text/plain; charset=utf-8")
             self._raw = self.rfile.read(n) if n else b""
             # after the body, so the client reads its 421
             if not self.funnel_refused() and self.host_allowed() and self.origin_allowed():
@@ -50003,6 +50838,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.bridge_config()
         if parts == ["bridge", "out"]:
             return self.bridge_out(query)
+        if len(parts) == 3 and parts[:2] == ["bridge", "files"]:     # CHAT-APPS.md 20
+            return self.bridge_file(parts[2], query)
         if parts == ["ui", "chat-apps"]:
             return self.ui_chat_apps(query)
         if len(parts) == 4 and parts[:2] == ["ui", "chat-apps"] and parts[3] == "link":
@@ -50649,6 +51486,8 @@ class Handler(BaseHTTPRequestHandler):
             return getattr(self, "ui_google_" + parts[2])()
         if len(parts) == 3 and parts[:2] == ["google", "file"]:
             return self.google_file(parts[2])
+        if len(parts) == 3 and parts[:2] == ["attachment", "file"]:     # CHAT-APPS.md 20: attach_file's line
+            return self.attachment_upload(parts[2])
         if parts == ["ui", "backups", "confirm"]:
             return self.ui_backup_confirm()
         if parts == ["ui", "restore"]:

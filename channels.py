@@ -44,6 +44,9 @@ INTENTS = 1 << 12                                   # DIRECT_MESSAGES only
 FATAL_CLOSE = {4004, 4010, 4011, 4012, 4013, 4014}  # the account stops with state error
 NEW_SESSION_CLOSE = {4007, 4009}                    # the session cannot resume
 DISCORD_LIMIT, WHATSAPP_LIMIT, MOST_PARTS = 2000, 4000, 4
+WA_CAPTION = 1024           # WhatsApp: a text this short is the caption of a message's first file (CHAT-APPS.md 20)
+FILE_MOST = 25 << 20        # bytes of one file of a message: the hub's own limit (hub.CHAT_FILE_MAX)
+OUTBOX = "outbox"           # beside the sessions: the files of the messages that are being sent, mode 600
 REST_NOTE = "The rest is in Founderizer."
 
 # Timings in seconds. The tests make them short.
@@ -57,6 +60,7 @@ SEND_TRIES = 3              # Discord: tries of one part with the same nonce whe
 WA_SEND_TIMEOUT = 25        # WhatsApp: wait this long for wa-link's "sent" event (4 parts stay under the hub's 120)
 WA_STABLE = 60              # a wa-link that ran this long starts its backoff again
 WA_LOGOUT_WAIT = 5          # WhatsApp: wait this long for wa-link to end the phone's link of a number that left the fleet
+WA_FILE_TIMEOUT = 120       # WhatsApp: wait this long for wa-link's "sent" of a file part (its upload and its send)
 CODE_CHECK = 60             # how often the bridge looks whether a release changed its own code
 
 # wa-link on the hub machine. The bridge builds it itself, so that no hub needs a step by hand: the first time a
@@ -210,11 +214,14 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
 
 
-def request(url, method="GET", data=None, headers=None, timeout=30):
-    """(status, headers, parsed JSON or None). Status 0: no answer (refused, reset or timed out)."""
+def request(url, method="GET", data=None, headers=None, timeout=30, raw=None):
+    """(status, headers, parsed JSON or None). Status 0: no answer (refused, reset or timed out). raw: (bytes, content
+    type) of a body that is not JSON, such as a Discord message with files."""
     body = None if data is None else json.dumps(data).encode()
     sent = {"Accept": "application/json", **(headers or {})}
-    if body is not None:
+    if raw is not None:
+        body, sent["Content-Type"] = raw
+    elif body is not None:
         sent["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=body, method=method, headers=sent)
     try:
@@ -236,16 +243,36 @@ class Hub:
     def __init__(self, url, key_path):
         self.url, self.key_path = url.rstrip("/"), key_path
 
-    def call(self, method, path, data=None, timeout=30):
+    def key(self):
         try:
             with open(self.key_path, encoding="utf-8") as f:
-                key = f.read().strip()
+                return f.read().strip()
         except OSError:
-            key = ""
+            return ""
+
+    def call(self, method, path, data=None, timeout=30):
+        key = self.key()
         if not key:
             return 0, {"error": "no bridge key"}
         status, _, body = request(self.url + path, method, data, {"Authorization": "Bearer " + key}, timeout)
         return status, body if isinstance(body, dict) else {}
+
+    def fetch(self, path, timeout=60, most=FILE_MOST):
+        """(status, bytes) of a GET whose answer is not JSON: the bytes of a file of a message (CHAT-APPS.md 20). b""
+        with any other status, or with more than `most` bytes."""
+        key = self.key()
+        if not key:
+            return 0, b""
+        req = urllib.request.Request(self.url + path, headers={"Authorization": "Bearer " + key})
+        try:
+            with OPENER.open(req, timeout=timeout) as r:
+                data = r.read(most + 1)
+                return r.status, data if len(data) <= most else b""
+        except urllib.error.HTTPError as e:
+            e.close()
+            return e.code, b""
+        except (OSError, http.client.HTTPException, ValueError):
+            return 0, b""
 
 
 def hub_url(team):
@@ -555,6 +582,9 @@ class Typing:
 class Account:
     """One chat app account: its connection, its send queue and its typing signals."""
     app = None
+    # CHAT-APPS.md 20: an adapter that sends a message's files says so; any other one fails such a message, and never
+    # sends its words alone with the report "sent" (a third app's adapter sets it once it sends files).
+    sends_files = False
 
     def __init__(self, bridge, conf):
         self.bridge, self.id = bridge, conf["id"]
@@ -602,8 +632,15 @@ class Account:
             if job is None:
                 return
             item, db, typing = job
+            # The hub counts this item's time from now (CHAT-APPS.md 20): the items of one account go one after the
+            # other, so a text behind a message with files waits for its uploads without being lost.
+            self.bridge.report_item(item["id"], {"state": "sending", "parts": 0, "platform_ids": [], "error": None})
             try:
-                result = self.send(item, db)
+                if item.get("files") and not self.sends_files:
+                    app = {"whatsapp": "WhatsApp"}.get(self.app, str(self.app).capitalize())
+                    result = outcome("failed", [], f"The bridge sends no file to {app} yet.")
+                else:
+                    result = self.send(item, db)
             except Exception as e:      # a fault here must not stop the queue; the outcome is then not known
                 log(f"{self.app} {self.id}: out {item['id']} raised {type(e).__name__}")
                 result = outcome("unknown", [], "The bridge failed while it sent this message.")
@@ -621,6 +658,36 @@ class Account:
     def send(self, item, db):
         raise NotImplementedError
 
+    def fetch_files(self, item):
+        """The files of a message item (CHAT-APPS.md 20), read from the hub and written into the outbox folder, each
+        held to the size and the SHA-256 that the item gave: (paths, None), or (the paths written so far, why not). The
+        caller gives the paths to drop_files when the send ends, whatever its outcome."""
+        paths = []
+        for n, f in enumerate(item.get("files") or [], 1):
+            fid, size = f.get("id") if isinstance(f, dict) else None, f.get("size") if isinstance(f, dict) else None
+            if not isinstance(fid, int) or isinstance(fid, bool) or not isinstance(size, int) or \
+                    not 0 < size <= FILE_MOST or not re.fullmatch(r"[0-9a-f]{64}", str(f.get("sha256") or "")):
+                return paths, "The hub described a file of this message in a way that the bridge does not take."
+            status, data = self.bridge.hub.fetch(f"/bridge/files/{fid}?item={int(item['id'])}")
+            if status != 200 or len(data) != size or hashlib.sha256(data).hexdigest() != f["sha256"]:
+                return paths, f"The bridge could not read file {n} of this message from the hub ({status or 'no answer'})."
+            path = os.path.join(self.bridge.outbox_dir, f"{int(item['id'])}-{n}")
+            try:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(path)
+                with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as out:
+                    out.write(data)
+            except OSError as e:
+                return paths, f"The bridge could not write file {n} of this message ({type(e).__name__})."
+            paths.append(path)
+        return paths, None
+
+    @staticmethod
+    def drop_files(paths):
+        for path in paths:
+            with contextlib.suppress(OSError):
+                os.remove(path)
+
     def command_item(self, item):
         log(f"{self.app} {self.id}: out {item['id']} {item.get('kind')} does not apply; skipped")
 
@@ -631,6 +698,21 @@ class Account:
         pass
 
 
+def multipart(payload, files):
+    """(body, content type) of a Discord message with files: payload_json and files[n], Discord's own form. files:
+    (name, type, bytes) each; the hub gives names of letters, digits, . _ - and spaces only."""
+    boundary = "founderizer-" + os.urandom(12).hex()
+
+    def head(name, filename=None, kind="application/json"):
+        named = f'; filename="{filename}"' if filename else ""
+        return (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"{named}\r\n"
+                f"Content-Type: {kind}\r\n\r\n").encode()
+    body = head("payload_json") + json.dumps(payload).encode() + b"\r\n"
+    for n, (name, kind, data) in enumerate(files):
+        body += head(f"files[{n}]", name, kind) + data + b"\r\n"
+    return body + f"--{boundary}--\r\n".encode(), f"multipart/form-data; boundary={boundary}"
+
+
 class DiscordREST:
     """Discord's REST API for one bot. It obeys the rate-limit headers and `retry_after`."""
     def __init__(self, base, token):
@@ -639,7 +721,8 @@ class DiscordREST:
         self.blocked = {}           # route -> monotonic time when its bucket has room again
         self.global_until = 0.0
 
-    def call(self, method, path, body=None, timeout=20):
+    def call(self, method, path, body=None, timeout=20, files=None):
+        """files: (name, type, bytes) of a message's files, which go with the body in one multipart request."""
         token = self.token()
         if not token:
             return 0, {}, {"message": "no bot token"}
@@ -650,7 +733,8 @@ class DiscordREST:
             if delay > 0:
                 time.sleep(min(delay, 60))
             status, headers, answer = request(self.base + path, method, body,
-                                              {"Authorization": "Bot " + token, "User-Agent": USER_AGENT}, timeout)
+                                              {"Authorization": "Bot " + token, "User-Agent": USER_AGENT}, timeout,
+                                              raw=multipart(body, files) if files else None)
             now = time.monotonic()
             with self.lock:
                 if headers.get("X-RateLimit-Remaining") == "0":
@@ -681,6 +765,7 @@ class _Reconnect(Exception):
 class Discord(Account):
     """One bot: one Gateway connection (DIRECT_MESSAGES only) and the REST calls."""
     app = "discord"
+    sends_files = True          # with the last part of a message (CHAT-APPS.md 20)
 
     def __init__(self, bridge, conf):
         super().__init__(bridge, conf)
@@ -932,15 +1017,36 @@ class Discord(Account):
         text = str(item.get("text") or "")
         if item.get("prefix"):
             text = f"**{item['prefix']}:** " + text
+        files, paths = item.get("files") or [], []
+        try:
+            if files:
+                paths, error = self.fetch_files(item)
+                if error:
+                    return outcome("failed", [], error)
+            return self.send_parts(item, chat, split_parts(text, DISCORD_LIMIT), files, paths)
+        finally:
+            self.drop_files(paths)
+
+    def send_parts(self, item, chat, parts, files, paths):
+        """The parts of one message, each with its own nonce; the last one carries the files (CHAT-APPS.md 20)."""
         reply_to = str(item.get("reply_to") or "")
         ids = []
-        for n, part in enumerate(split_parts(text, DISCORD_LIMIT), 1):
+        for n, part in enumerate(parts, 1):
             body = {"content": part, "nonce": f"f{item['id']}p{n}", "enforce_nonce": True}
             if n == 1 and SNOWFLAKE.match(reply_to):
                 body["message_reference"] = {"message_id": reply_to, "fail_if_not_exists": False}
+            attached = None
+            if n == len(parts) and paths:
+                body["attachments"] = [{"id": i, "filename": f["name"]} for i, f in enumerate(files)]
+                attached = []
+                for f, path in zip(files, paths):
+                    with open(path, "rb") as fh:
+                        attached.append((f["name"], f["mime"], fh.read()))
             backoff = Backoff()
             for attempt in range(SEND_TRIES):
-                code, _, answer = self.rest.call("POST", f"/channels/{chat}/messages", body)
+                # a request with up to 10 MB of files: as long as a file part waits for wa-link (WA_FILE_TIMEOUT)
+                code, _, answer = self.rest.call("POST", f"/channels/{chat}/messages", body, files=attached,
+                                                 timeout=WA_FILE_TIMEOUT if attached else 20)
                 answer = answer if isinstance(answer, dict) else {}
                 if code == 200 and answer.get("id"):
                     ids.append(str(answer["id"]))
@@ -1168,6 +1274,7 @@ def forget_store(folder, aid):
 class WhatsApp(Account):
     """One linked number: a wa-link child process that speaks JSON lines (CHAT-APPS.md 15.12)."""
     app = "whatsapp"
+    sends_files = True          # each file as one more message, through wa-link (CHAT-APPS.md 20)
 
     def __init__(self, bridge, conf):
         super().__init__(bridge, conf)
@@ -1177,6 +1284,7 @@ class WhatsApp(Account):
         self.waiting = {}           # message ID -> [Event, the "sent" event or None]
         self.wa_state = None
         self.link_state = None
+        self.features = set()       # what the running wa-link said it can do (its hello): "file" for a file
         # A link request while no wa-link runs (it is built, or it starts again): the pair goes at wa-link's first
         # state, and the next try to start it does not wait. Both under plock.
         self.pair_wanted = False
@@ -1281,6 +1389,7 @@ class WhatsApp(Account):
                 continue
             with self.plock:
                 self.proc = proc
+                self.features = set()           # until its hello: a wa-link of an older source says none
             if self.stopping.is_set():
                 self.halt()
             log(f"whatsapp {self.id}: wa-link started (pid {proc.pid})")
@@ -1341,7 +1450,9 @@ class WhatsApp(Account):
 
     def on_event(self, event):
         kind = event.get("ev")
-        if kind == "message":
+        if kind == "hello":
+            self.features = {str(f) for f in event.get("features") or [] if isinstance(f, str)}
+        elif kind == "message":
             self.on_message(event)
         elif kind == "sent":
             waiter = self.waiting.get(str(event.get("id") or ""))
@@ -1403,15 +1514,37 @@ class WhatsApp(Account):
         text = wa_format(str(item.get("text") or ""))
         if item.get("prefix"):
             text = f"*{item['prefix']}:* " + text
+        files, paths = item.get("files") or [], []
+        if files and "file" not in self.features:
+            # a wa-link of an older source (its build failed, or FLEET_WA_LINK names one) would send the words alone
+            return outcome("failed", [], "The wa-link on the hub machine is too old to send files.")
+        try:
+            if files:
+                paths, error = self.fetch_files(item)
+                if error:
+                    return outcome("failed", [], error)
+            # CHAT-APPS.md 20: a short text is the caption of the first file, so the words and the file are one bubble;
+            # a longer one goes in its own parts first. Each file is one message more, with the ID of its part.
+            caption = text if files and len(text) <= WA_CAPTION else None
+            sends = [{"text": part} for part in ([] if caption is not None else split_parts(text, WHATSAPP_LIMIT))]
+            sends += [{"text": caption if n == 0 and caption is not None else "",
+                       "file": {"path": path, "name": f["name"], "mime": f["mime"]}}
+                      for n, (f, path) in enumerate(zip(files, paths))]
+            return self.send_parts(item, db, sends)
+        finally:
+            self.drop_files(paths)
+
+    def send_parts(self, item, db, sends):
         ids = []
-        for n, part in enumerate(split_parts(text, WHATSAPP_LIMIT), 1):
+        for n, part in enumerate(sends, 1):
             mid = wa_message_id(db, item["id"], n)
             waiter = self.waiting[mid] = [threading.Event(), None]
             try:
-                if not self.command({"op": "send", "id": mid, "to": str(item.get("chat") or ""), "text": part,
-                                     "reply_to": (item.get("reply_to") or None) if n == 1 else None}):
+                if not self.command({"op": "send", "id": mid, "to": str(item.get("chat") or ""), "text": part["text"],
+                                     "reply_to": (item.get("reply_to") or None) if n == 1 else None,
+                                     **({"file": part["file"]} if "file" in part else {})}):
                     return outcome("failed", ids, "wa-link is not running.")
-                if not waiter[0].wait(WA_SEND_TIMEOUT) or waiter[1] is None:
+                if not waiter[0].wait(WA_FILE_TIMEOUT if "file" in part else WA_SEND_TIMEOUT) or waiter[1] is None:
                     return outcome("unknown", ids, f"wa-link did not confirm part {n}.")
                 if not waiter[1].get("ok"):
                     error = str(waiter[1].get("error") or "WhatsApp refused the message.")
@@ -1461,6 +1594,14 @@ class Bridge:
         os.chmod(folder, 0o700)
         self.hub = Hub(hub, os.path.join(folder, "bridge.key"))
         self.journal = Journal(os.path.join(folder, "journal"))
+        # CHAT-APPS.md 20: the files of the messages on their way, which wa-link reads beside its database. A file
+        # stays only while its message is sent, so what a stop left goes now.
+        self.outbox_dir = os.path.abspath(os.path.join(folder, OUTBOX))    # wa-link takes the clean, absolute path only
+        os.makedirs(self.outbox_dir, mode=0o700, exist_ok=True)
+        os.chmod(self.outbox_dir, 0o700)
+        for name in os.listdir(self.outbox_dir):
+            with contextlib.suppress(OSError):
+                os.remove(os.path.join(self.outbox_dir, name))
         self.stopping = threading.Event()
         self.lock = threading.Lock()
         self.accounts = {}
@@ -1588,7 +1729,9 @@ class Bridge:
             if not self.configured and not self.refresh():
                 self.stopping.wait(backoff.next())
                 continue
-            code, answer = self.hub.call("GET", f"/bridge/out?wait={OUT_WAIT}", timeout=OUT_WAIT + 15)
+            # files=1: this bridge sends the files of a message (CHAT-APPS.md 20); the hub keeps an item with files
+            # back from a bridge that does not say so, which would send its words alone and report it sent
+            code, answer = self.hub.call("GET", f"/bridge/out?wait={OUT_WAIT}&files=1", timeout=OUT_WAIT + 15)
             if self.stopping.is_set():
                 return
             if code != 200:

@@ -216,7 +216,9 @@ EVERY_AGENT = ["read_messages", "search_knowledge", "read_knowledge", "write_kno
                # design v4 D2: an agent's own skills
                "write_skill",
                # support plan F4: a typed report that reached a duty of the agent joins one of its cases
-               "join_report"]
+               "join_report",
+               # CHAT-APPS.md 20: a file that a message carries to a person in a chat
+               "attach_file"]
 MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "answer", "check_result",
                                "decide_permission", "see_team", "see_capacity", "see_goals",
                                "update_goal", "record_spend", "raise_needs_you", "withdraw_need", "request_secret",

@@ -289,6 +289,29 @@ class Devices(OwnerAPI):
         self.assertEqual(self.raw(f"/ui/attachments/{sent['id'] + 1}?db=test-generation", source=PHONE,
                                   token=key)[0], 404)
 
+    def test_a_device_reads_a_file_that_an_agents_report_carries(self):
+        """CHAT-APPS.md 20: a file that the manager sent with its words is in the chat that the phone reads, so the phone
+        reads it as a file of the owner's own message. A file that no report carries yet is in none of its reads."""
+        key = self.enrolled()
+        text, error = hub.call_tool("manager", "attach_file", {"name": "Report.pdf"}, None)
+        self.assertFalse(error, text)
+        token = re.search(r'/attachment/file/([A-Za-z0-9_-]+)"', text).group(1)
+        req = urllib.request.Request(self.base + f"/attachment/file/{token}", data=b"%PDF-1.4\nreport", method="POST",
+                                     headers={"X-Test-Source": "127.0.0.2"})
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=PATIENCE) as r:
+            aid = int(re.match(r"A-(\d+) ", r.read().decode()).group(1))
+        path = f"/ui/attachments/{aid}?db=test-generation"
+        self.assertEqual(self.raw(path, source=PHONE, token=key)[0], 404)
+        text, error = hub.call_tool("manager", "message_owner", {"request_id": str(uuid.uuid4()), "text": "The report.",
+                                                                 "files": [f"A-{aid}"]}, None)
+        self.assertFalse(error, text)
+        status, chat = self.call("/ui/mobile/chat/manager", source=PHONE, token=key)
+        self.assertEqual(status, 200, chat)
+        report = [i for i in chat["items"] if i["kind"] == "report"][-1]
+        self.assertEqual(([f["id"] for f in report["attachments"]], report["attachments"][0]["name"]), ([aid], "Report.pdf"))
+        status, headers, data = self.raw(path, source=PHONE, token=key)
+        self.assertEqual((status, data), (200, b"%PDF-1.4\nreport"))
+
     def test_a_device_never_keeps_a_file_and_its_key_is_checked_on_each_file_route(self):
         key = self.enrolled()
         status, sent = self.upload(token=key)

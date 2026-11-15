@@ -11,6 +11,7 @@ import shlex
 import shutil
 import socket
 import socketserver
+import stat
 import struct
 import subprocess
 import sys
@@ -20,6 +21,7 @@ import threading
 import time
 import unittest
 import urllib.parse
+import urllib.request
 import uuid
 from unittest.mock import patch
 
@@ -208,7 +210,21 @@ class JSONHandler(http.server.BaseHTTPRequestHandler):
 
     def body(self):
         n = int(self.headers.get("Content-Length") or 0)
-        return json.loads(self.rfile.read(n)) if n else None
+        raw = self.rfile.read(n) if n else b""
+        kind = self.headers.get("Content-Type") or ""
+        if kind.startswith("multipart/form-data"):      # a Discord message with files: payload_json and files[n]
+            boundary = kind.split("boundary=", 1)[1].encode()
+            payload, files = None, []
+            for part in raw.split(b"--" + boundary)[1:-1]:
+                head, _, data = part.partition(b"\r\n\r\n")
+                named = re.search(rb'name="([^"]+)"(?:; filename="([^"]*)")?', head)
+                typed = re.search(rb"Content-Type: (\S+)", head)
+                if named.group(1) == b"payload_json":
+                    payload = json.loads(data[:-2])
+                else:
+                    files.append((named.group(1).decode(), named.group(2).decode(), typed.group(1).decode(), data[:-2]))
+            return dict(payload, _files=files)
+        return json.loads(raw) if raw else None
 
     def do_GET(self):
         self.route("GET")
@@ -307,6 +323,18 @@ class HubHandler(JSONHandler):
         if self.headers.get("Authorization") != "Bearer " + KEY:
             return self.answer(403, {"db": "testdb", "error": "forbidden"})
         path, _, query = self.path.partition("?")
+        m = re.match(r"^/bridge/files/(\d+)$", path)
+        if m and method == "GET":                       # CHAT-APPS.md 20: the bytes of a file of a message item
+            with hub.lock:
+                hub.calls.append((method, path))
+                data = hub.files.get((int(m.group(1)), urllib.parse.parse_qs(query).get("item", [""])[0]))
+            if data is None:
+                return self.answer(404, {"db": "testdb", "error": "no such file"})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            return self.wfile.write(data)
         code, answer = hub.handle(method, path, query, self.body())
         answer.setdefault("db", "testdb")
         self.answer(code, answer)
@@ -321,6 +349,8 @@ class FakeHub:
         self.calls, self.inbound, self.posted, self.journaled, self.forced = [], [], [], [], []
         self.seen, self.items, self.results = set(), [], {}
         self.receipts, self.statuses, self.links = [], [], []
+        self.files = {}                 # (file id, item id as text) -> the bytes that GET /bridge/files serves
+        self.out_queries, self.begun = [], []
         self.bridge_code = None
         self.server = serve(HubHandler, self)
         self.port = self.server.server_address[1]
@@ -347,6 +377,8 @@ class FakeHub:
                 self.inbound.append(body)
             return 200, {"result": "stored"}
         if (method, path) == ("GET", "/bridge/out"):
+            with self.lock:
+                self.out_queries.append(query)
             wait = float(urllib.parse.parse_qs(query)["wait"][0])
             with self.lock:
                 self.lock.wait_for(lambda: self.items, timeout=min(wait, 1.0))
@@ -354,7 +386,9 @@ class FakeHub:
                 return 200, {"version": self.config["version"], "items": items}
         m = re.match(r"^/bridge/out/(\d+)$", path)
         with self.lock:
-            if m and method == "POST":
+            if m and method == "POST" and body.get("state") == "sending":
+                self.begun.append(int(m.group(1)))     # CHAT-APPS.md 20: the bridge begins this item now
+            elif m and method == "POST":
                 self.results[int(m.group(1))] = body
             elif path == "/bridge/receipt":
                 self.receipts.append(body)
@@ -386,7 +420,7 @@ class FakeHub:
 # ---------------------------------------------------------------- stand-in: wa-link
 
 STUB = r'''
-import json, os, sys, threading, time
+import hashlib, json, os, sys, threading, time
 args = sys.argv[1:]
 db = args[args.index("--db") + 1]
 ctl = os.environ["WA_STUB_DIR"]
@@ -405,6 +439,8 @@ def record(obj):
         f.write(json.dumps(obj) + "\n")
 
 record({"op": "start", "db": db})
+if not os.environ.get("WA_STUB_OLD"):           # a wa-link of today says what it can do first; an older one says nothing
+    emit({"ev": "hello", "features": ["file"]})
 emit({"ev": "state", "state": "connecting", "jid": None, "error": None})
 if os.path.exists(db):
     emit({"ev": "state", "state": "linked", "jid": JID, "error": None})
@@ -433,6 +469,11 @@ for line in sys.stdin:
     if op == "ack" and journal:
         cmd["journaled"] = any(cmd["id"] in open(os.path.join(journal, n)).read()
                                for n in os.listdir(journal) if n.endswith(".json"))
+    if op == "send" and cmd.get("file"):        # the bytes that it found at the path, and that folder's mode
+        with open(cmd["file"]["path"], "rb") as f:
+            cmd["file_sha256"] = hashlib.sha256(f.read()).hexdigest()
+        cmd["file_mode"] = oct(os.stat(cmd["file"]["path"]).st_mode & 0o777)
+        cmd["outbox"] = os.path.dirname(cmd["file"]["path"]) == os.path.join(os.path.dirname(db), "outbox")
     record(cmd)
     if op == "pair":
         if not os.path.exists(db):
@@ -442,8 +483,9 @@ for line in sys.stdin:
     elif op == "send":
         if "NOREPLY" in cmd["text"]:
             continue
-        ok = "REFUSE" not in cmd["text"] and "LOST" not in cmd["text"]
-        error = None if ok else "refused by the stand-in" if "REFUSE" in cmd["text"] else "unknown: connection lost"
+        refuse = "REFUSE" in cmd["text"] or "REFUSE" in (cmd.get("file") or {}).get("name", "")
+        ok = not refuse and "LOST" not in cmd["text"]
+        error = None if ok else "refused by the stand-in" if refuse else "unknown: connection lost"
         emit({"ev": "sent", "id": cmd["id"], "ok": ok, "error": error})
     elif op == "logout":
         os.unlink(db)
@@ -761,6 +803,43 @@ class DiscordTests(Base):
         self.assertEqual(result, {"state": "sent", "parts": 3, "platform_ids": [i for _, _, i in self.rest.created],
                                   "error": None})
 
+    def test_the_files_of_a_message_go_with_its_last_part_in_one_multipart_request(self):
+        """CHAT-APPS.md 20: Discord takes a message's files in the request of its last part, with the same nonce rule:
+        a retry of that request makes no second message."""
+        self.ready()
+        pdf, png = b"%PDF-1.4 invoice", b"\x89PNG\r\n\x1a\n chart"
+        files = []
+        for n, (name, mime, data) in enumerate((("Invoice-October.pdf", "application/pdf", pdf),
+                                               ("chart.png", "image/png", png)), 1):
+            self.hub.files[(450 + n, "45")] = data
+            files.append({"id": 450 + n, "name": name, "mime": mime, "size": len(data),
+                          "sha256": hashlib.sha256(data).hexdigest()})
+        self.rest.script = [None, "create-then-drop"]       # the second part's answer is lost once
+        waits, real = [], channels.DiscordREST.call         # how long each message request may take
+
+        def call(rest, method, path, body=None, timeout=20, files=None):
+            if method == "POST" and path.endswith("/messages"):
+                waits.append((bool(files), timeout))
+            return real(rest, method, path, body, timeout=timeout, files=files)
+        spy = patch.object(channels.DiscordREST, "call", call)
+        spy.start()
+        self.addCleanup(spy.stop)
+        self.hub.queue({"id": 45, "kind": "message", "account": "discord-studio", "chat": "700",
+                        "text": "A" * 1500 + "\n\n" + "B" * 600, "reply_to": "1104", "prefix": None, "files": files})
+        result = self.result(45)
+        self.assertEqual(waits, [(False, 20), (True, 120), (True, 120)])    # the request with files: 120 s
+        bodies = [body for _, body, _ in self.rest.created]
+        self.assertEqual([b["nonce"] for b in bodies], ["f45p1", "f45p2"])
+        self.assertNotIn("_files", bodies[0])
+        self.assertEqual(bodies[1]["attachments"], [{"id": 0, "filename": "Invoice-October.pdf"},
+                                                    {"id": 1, "filename": "chart.png"}])
+        self.assertEqual(bodies[1]["_files"], [("files[0]", "Invoice-October.pdf", "application/pdf", pdf),
+                                               ("files[1]", "chart.png", "image/png", png)])
+        self.assertEqual([r[3]["nonce"] for r in self.rest.posts()], ["f45p1", "f45p2", "f45p2"])
+        self.assertEqual(result, {"state": "sent", "parts": 2, "platform_ids": [i for _, _, i in self.rest.created],
+                                  "error": None})
+        self.assertEqual(os.listdir(os.path.join(self.folder, "outbox")), [])
+
     def test_a_retry_after_429_and_a_lost_answer_makes_one_message(self):
         self.ready()
         self.private.append("send me once w0")
@@ -993,6 +1072,94 @@ class WhatsAppTests(Base):
                         "reply_to": None, "prefix": None})
         self.assertEqual(self.result(44), {"state": "unknown", "parts": 0, "platform_ids": [],
                                            "error": "unknown: connection lost"})
+
+    def file_item(self, item_id, text, *files):
+        """A message item with files, and the bytes that the fake hub serves for each one."""
+        described = []
+        for n, (name, mime, data) in enumerate(files, 1):
+            fid = item_id * 10 + n
+            self.hub.files[(fid, str(item_id))] = data
+            described.append({"id": fid, "name": name, "mime": mime, "size": len(data),
+                              "sha256": hashlib.sha256(data).hexdigest()})
+        return {"id": item_id, "kind": "message", "account": "whatsapp-main", "chat": WA_CHAT, "text": text,
+                "reply_to": "WAMSG1", "prefix": None, "files": described}
+
+    def test_a_message_with_files_goes_as_one_bubble_or_as_its_parts_and_then_its_files(self):
+        """CHAT-APPS.md 20: the bridge reads each file from the hub, held to the item's size and hash, writes it into
+        the outbox beside the sessions, and gives wa-link its path; the file is gone when the send ends."""
+        self.linked()
+        pdf, sheet = b"%PDF-1.4 invoice", b"PK\x03\x04 a sheet"
+        self.private.append("Invoice-October.pdf")
+        self.hub.queue(self.file_item(51, "Here is the invoice.", ("Invoice-October.pdf", "application/pdf", pdf)))
+        result = self.result(51)
+        sends = self.commands("send")
+        ids = ["3EB0" + hashlib.sha256(f"testdb:51:{n}".encode()).hexdigest()[:16].upper() for n in (1,)]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual((sends[0]["id"], sends[0]["text"], sends[0]["reply_to"], sends[0]["file"]["name"],
+                          sends[0]["file"]["mime"], sends[0]["file_sha256"], sends[0]["file_mode"], sends[0]["outbox"]),
+                         (ids[0], "Here is the invoice.", "WAMSG1", "Invoice-October.pdf", "application/pdf",
+                          hashlib.sha256(pdf).hexdigest(), "0o600", True))
+        self.assertEqual(result, {"state": "sent", "parts": 1, "platform_ids": ids, "error": None})
+        self.assertIn(51, self.hub.begun)           # the bridge said when it began the item, before its result
+        outbox = os.path.join(self.folder, "outbox")
+        self.assertEqual((stat.S_IMODE(os.stat(outbox).st_mode), os.listdir(outbox)), (0o700, []))
+        # a longer text goes in its own parts first, and each file follows with no caption
+        self.hub.queue(self.file_item(52, "y" * 1500, ("a.pdf", "application/pdf", pdf),
+                                      ("b.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                       sheet)))
+        result = self.result(52)
+        sends = self.commands("send")[1:]
+        self.assertEqual([(s["text"][:3], (s.get("file") or {}).get("name")) for s in sends],
+                         [("yyy", None), ("", "a.pdf"), ("", "b.xlsx")])
+        self.assertEqual([s["reply_to"] for s in sends], ["WAMSG1", None, None])
+        self.assertEqual(result["parts"], 3)
+        # a file that wa-link does not take stops the message there; the parts before it are sent
+        self.hub.queue(self.file_item(53, "z" * 1500, ("REFUSE.pdf", "application/pdf", pdf)))
+        self.assertEqual(self.result(53), {"state": "failed", "parts": 1,
+                                           "platform_ids": ["3EB0" + hashlib.sha256(b"testdb:53:1").hexdigest()[:16].upper()],
+                                           "error": "refused by the stand-in"})
+        # bytes that are not the item's file: nothing goes to wa-link
+        item = self.file_item(54, "x", ("c.pdf", "application/pdf", pdf))
+        self.hub.files[(541, "54")] = b"other bytes"
+        self.hub.queue(item)
+        self.assertEqual(self.result(54), {"state": "failed", "parts": 0, "platform_ids": [],
+                                           "error": "The bridge could not read file 1 of this message from the hub (200)."})
+        item = self.file_item(55, "x", ("d.pdf", "application/pdf", pdf))
+        del self.hub.files[(551, "55")]
+        self.hub.queue(item)
+        self.assertEqual(self.result(55)["error"], "The bridge could not read file 1 of this message from the hub (404).")
+        self.assertEqual(len(self.commands("send")), 6)     # 1 + 3 + 2: no send for items 54 and 55
+        self.assertEqual(os.listdir(outbox), [])
+
+    def test_an_older_wa_link_gets_no_file_and_the_bridge_asks_the_hub_for_files(self):
+        """The first review, 15 November 2026: a wa-link of an older source (its build failed, or FLEET_WA_LINK names
+        one) ignores a send's file and sends the caption alone. Only a wa-link that says "file" in its hello gets one;
+        and the bridge asks the hub for items with files (files=1), which the hub keeps back from an older bridge."""
+        with patch.dict(os.environ, {"WA_STUB_OLD": "1"}):
+            self.linked()
+            self.hub.queue(self.file_item(56, "Here.", ("a.pdf", "application/pdf", b"%PDF-1.4 x")))
+            self.assertEqual(self.result(56), {"state": "failed", "parts": 0, "platform_ids": [],
+                                               "error": "The wa-link on the hub machine is too old to send files."})
+        self.assertEqual(self.commands("send"), [])
+        self.assertTrue(all("files=1" in q for q in self.hub.out_queries), self.hub.out_queries)
+
+    def test_an_adapter_that_sends_no_file_fails_a_message_with_files(self):
+        """The third review: an adapter that does not say it sends files (a third app's, until it does) fails such a
+        message, and never sends its words alone with the report "sent"."""
+        with patch.object(channels.WhatsApp, "sends_files", False):
+            self.linked()
+            self.hub.queue(self.file_item(57, "Here.", ("a.pdf", "application/pdf", b"%PDF-1.4 x")))
+            self.assertEqual(self.result(57), {"state": "failed", "parts": 0, "platform_ids": [],
+                                               "error": "The bridge sends no file to WhatsApp yet."})
+        self.assertEqual(self.commands("send"), [])
+
+    def test_the_bridge_empties_the_outbox_that_a_stop_left(self):
+        outbox = os.path.join(self.folder, "outbox")
+        os.makedirs(outbox)
+        with open(os.path.join(outbox, "9-1"), "wb") as f:
+            f.write(b"left from a stop")
+        self.start()
+        self.assertEqual(os.listdir(outbox), [])
 
     def test_read_typing_and_unlink_items(self):
         self.linked()
@@ -1358,6 +1525,38 @@ class RealHub(test_ui_api.OwnerAPI):
         wait_for(self, lambda: not [n for n in os.listdir(os.path.join(self.folder, "journal"))
                                     if n.endswith(".json")], "an empty journal")
         self.assertNotIn("the hub refused", self.log.getvalue())
+
+    def test_an_agents_file_goes_through_the_hubs_queue_and_the_bridge(self):
+        """CHAT-APPS.md 20, the done-when of the owner's yes of 15 November 2026: the manager sends a PDF up with
+        attach_file's line, names it in message_owner, and the bridge reads its bytes from the real hub and gives them
+        to the wa-link stand-in with the words as its caption; the hub records the delivery and the owner's apps read
+        the file under the report."""
+        wait_for(self, lambda: self.accounts()["whatsapp-main"]["state"] == "connected", "WhatsApp connected")
+        fleet_hub.q("INSERT INTO owner_handles(app,id,alias,name,linked) VALUES('whatsapp',?,NULL,'owner',?)",
+                    (WA_CHAT, fleet_hub.now()))
+        text, error = fleet_hub.call_tool("manager", "attach_file", {"name": "Invoice-October.pdf"}, None)
+        self.assertFalse(error, text)
+        token = re.search(r'/attachment/file/([A-Za-z0-9_-]+)"', text).group(1)
+        pdf = b"%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\n%%EOF\n"
+        req = urllib.request.Request(self.base + f"/attachment/file/{token}", data=pdf, method="POST",
+                                     headers={"X-Test-Source": "127.0.0.1"})
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=10) as r:
+            aid = int(re.match(r"A-(\d+) ", r.read().decode()).group(1))
+        text, error = fleet_hub.call_tool("manager", "message_owner", {"request_id": str(uuid.uuid4()),
+                                                                       "text": "Here is the invoice.",
+                                                                       "files": [f"A-{aid}"]}, None)
+        self.assertFalse(error, text)
+        send = wait_for(self, lambda: [c for c in self.wa.commands("send") if c.get("file")], "the file at wa-link")[0]
+        item = fleet_hub.q1("SELECT * FROM chat_out WHERE kind='message' ORDER BY id DESC LIMIT 1")
+        self.assertEqual((send["id"], send["to"], send["text"], send["file"]["name"], send["file"]["mime"],
+                          send["file_sha256"], send["outbox"]),
+                         (channels.wa_message_id("test-generation", item["id"], 1), WA_CHAT, "Here is the invoice.",
+                          "Invoice-October.pdf", "application/pdf", hashlib.sha256(pdf).hexdigest(), True))
+        report = wait_for(self, lambda: (self.owner("/ui/state")[1]["reports"][-1]["delivery"] or {}).get("state")
+                          == "sent" and self.owner("/ui/state")[1]["reports"][-1], "the sent delivery")
+        self.assertEqual([f["id"] for f in report["attachments"]], [aid])
+        self.assertEqual(fleet_hub.q1("SELECT parts FROM chat_out WHERE id=?", (item["id"],))["parts"], 1)
+        self.assertEqual(os.listdir(os.path.join(self.folder, "outbox")), [])
 
 
 # ---------------------------------------------------------------- functions

@@ -5,8 +5,10 @@ platform, no model, no runtime and no live hub."""
 import ast
 import inspect
 import json
+import re
 import textwrap
 import unittest
+import urllib.request
 import uuid
 from unittest.mock import patch
 
@@ -656,6 +658,92 @@ class Conversations(Base):
         self.assertTrue(self.tool("ask_owner", self.context(cid), question="x")[1])
 
     # ---- message_contact
+    def upload(self, context, name, data):
+        """attach_file's line in this session, and its one upload, as the agent's curl sends it: the file's id."""
+        text, error = hub.call_tool("studio", "attach_file", {"name": name}, context)
+        self.assertFalse(error, text)
+        token = re.search(r'/attachment/file/([A-Za-z0-9_-]+)"', text).group(1)
+        req = urllib.request.Request(self.base + f"/attachment/file/{token}", data=data, method="POST",
+                                     headers={"X-Test-Source": "127.0.0.3"})
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=10) as r:
+            return int(re.match(r"A-(\d+) ", r.read().decode()).group(1))
+
+    def test_a_reply_and_a_message_to_a_person_carry_the_agents_files(self):
+        """CHAT-APPS.md 20: a file goes where the words go, by the same route, and the record of the conversation shows
+        it under the agent's words. A closed conversation has no shell, so it gets no attach_file."""
+        said = self.says(PAT, "Send me the November price list, please")
+        cid = said["conversation"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        sheet = test_chat_apps.office({"xl/sharedStrings.xml": "<sst><si><t>Price</t></si></sst>"})
+        aid = self.upload(self.context(cid), "Prices November.xlsx", sheet)
+        answer = self.ok("reply", self.context(cid), text="Here is the list.", in_reply_to=f"CM-{said['id']}",
+                         files=[f"A-{aid}"])
+        self.assertIn(f"With A-{aid} Prices November.xlsx.", answer)
+        again = self.ok("reply", self.context(cid), text="Here is the list.", in_reply_to=f"CM-{said['id']}",
+                        files=[f"A-{aid}"])
+        self.assertIn("was already sent", again)                # the same words and file: nothing sent again
+        reply = hub.q1("SELECT * FROM conversation_messages WHERE who='agent' ORDER BY id DESC LIMIT 1")
+        item = hub.q1("SELECT * FROM chat_out WHERE id=?", (reply["outbound"],))
+        self.assertEqual((item["account"], item["chat"], json.loads(item["files"])), ("whatsapp-studio", PAT, [aid]))
+        self.assertEqual(hub.q1("SELECT cm FROM attachments WHERE id=?", (aid,))["cm"], reply["id"])
+        code, record = self.request(f"/ui/conversations/{cid}?db=test-generation")
+        self.assertEqual(code, 200, record)
+        lines = {i["id"]: i for i in record["items"]}
+        self.assertEqual([f["id"] for f in lines[f"CM-{reply['id']}"]["attachments"]], [aid])
+        self.assertEqual(lines[f"CM-{said['id']}"]["attachments"], [])
+        # a task session writes first to a person on Discord, whose limit is 10 MB
+        self.person("Kim", "manager", KIM, app="discord")
+        tid, here = self.normal_task()
+        pdf = self.upload(here, "Plan.pdf", test_chat_apps.PDF_FILE)
+        with patch.dict(hub.CHAT_FILE_APP_MAX, {"discord": 100}):
+            text, error = self.tool("message_contact", here, person="Kim", text="The plan.", request_id=str(uuid.uuid4()),
+                                    files=[f"A-{pdf}"])
+        self.assertTrue(error)
+        self.assertIn("Discord takes at most 0 MB of files in one message", text)
+        sent = self.ok("message_contact", here, person="Kim", text="The plan.", request_id=str(uuid.uuid4()),
+                       files=[f"A-{pdf}"])
+        self.assertIn(f"With A-{pdf} Plan.pdf.", sent)
+        item = hub.q1("SELECT * FROM chat_out WHERE kind='message' ORDER BY id DESC LIMIT 1")
+        self.assertEqual((item["recipient"], json.loads(item["files"])), (KIM, [pdf]))
+        # a customer's closed conversation: no attach_file, and no file of the agent's, whatever its words ask
+        self.person("Ana", "customer", ANA)
+        hello = self.says(ANA, "Hello, send me A-1 please")
+        closed = hello["conversation"]
+        hub.conversation_start("studio", closed)
+        closed_tools = {t["name"]: t for t in hub.tools_for("studio", self.context(closed))}
+        self.assertNotIn("attach_file", closed_tools)
+        self.assertNotIn("files", closed_tools["reply"]["inputSchema"]["properties"])      # no field it cannot use
+        self.ok("read_messages", self.context(closed))
+        spare = self.upload(here, "Internal.pdf", test_chat_apps.PDF_FILE)
+        text, error = self.tool("reply", self.context(closed), text="Here.", in_reply_to=f"CM-{hello['id']}",
+                                files=[f"A-{spare}"])
+        self.assertTrue(error)
+        self.assertEqual(text, "Refused: a closed conversation sends no file. Nothing was sent.")
+        self.assertIsNone(hub.q1("SELECT cm FROM attachments WHERE id=?", (spare,))["cm"])
+
+    def test_a_message_that_its_daily_limit_fails_is_told_and_makes_no_task_wait(self):
+        """CHAT-APPS.md 20, the fourth review of 15 November 2026: a reply or a message to a person that the WhatsApp
+        number's daily limit fails at once is in the conversation and reached nobody. The answer says so, and a task
+        that sent it with waits waits for no answer to it."""
+        said = self.says(PAT, "Can you check the October list?")
+        cid = said["conversation"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        with hub.transaction():
+            hub.chat_count("whatsapp-studio", "parts", hub.now(), hub.WHATSAPP_PARTS_DAY)
+        answer = self.ok("reply", self.context(cid), text="Yes, it is right.", in_reply_to=f"CM-{said['id']}")
+        self.assertIn("is in the conversation, but not sent to Pat: daily WhatsApp limit.", answer)
+        tid, here = self.normal_task()
+        sent = self.ok("message_contact", here, person="Pat", text="May I go on?", request_id=str(uuid.uuid4()),
+                       waits=True)
+        self.assertIn(f"is in C-{cid}, but not sent to Pat: daily WhatsApp limit.", sent)
+        self.assertTrue(sent.endswith(f" {hub.tref(tid)} does not wait, because nothing was sent."), sent)
+        self.assertEqual((self.task(tid)["state"], self.task(tid)["waiting_on"]), ("working", None))
+        mine = hub.q1("SELECT * FROM conversation_messages WHERE who='agent' ORDER BY id DESC LIMIT 1")
+        self.assertEqual((mine["task"], mine["waits"]), (tid, None))
+        self.assertEqual(hub.q1("SELECT state FROM chat_out WHERE id=?", (mine["outbound"],))["state"], "failed")
+
     def test_a_customers_words_cannot_end_the_quote_of_their_question(self):
         """The security review of 27 October 2026: a question that held the closing mark of the quote put the rest of
         it outside, where it read as the hub's own text in a session with every tool of the agent."""
