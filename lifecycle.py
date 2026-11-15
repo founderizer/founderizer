@@ -2987,7 +2987,7 @@ class Lifecycle:
         if account["kind"] == "key" or (account["secret"] and not key):
             state, detail = check_key(account, key) if account["kind"] == "key" else ("failed", NO_KEY)
             # the account's model is in the program's own list (R6 part 2); the agent's own model is model_item's
-            if state == "ok" and account["kind"] == "key" and account["model"] and not self.conf.get("model"):
+            if state == "ok" and account["kind"] == "key" and account["model"] and not self.own_model():
                 offered = self.offered_models()
                 if offered is not None and account["model"] not in offered:
                     state, detail = "failed", NOT_OFFERED
@@ -2997,7 +2997,7 @@ class Lifecycle:
         # the program's list of a model server is made from its configuration, which names the model: so the server's
         # own list is the one that the named model must be in (check_server)
         kept = kept_account(self.home, self.agent, account)
-        wanted = self.conf.get("model") or account["model"]
+        wanted = self.own_model() or account["model"]
         state, detail, keep = check_server(account, key, kept, clock=self.clock, wanted=wanted)
         if keep is None and state == "ok" and kept and not os.path.exists(account_path(self.home, self.agent)):
             keep = kept         # the result of another name, as after a rename: this agent's own file from now on
@@ -3040,6 +3040,18 @@ class Lifecycle:
             detail = NOT_OFFERED.format(provider=known.get("label") or account.get("provider") or "",
                                         model=shown or "", agent=role or shown_name(self.agent))
         return ("account", account["id"], state, detail, words)
+
+    def own_model(self):
+        """The agent's own model as this checkout's team.json has it now, which a session's start takes
+        (fleet.checkout_conf): a change in the Model menu restarts no helper, so the entry of the helper's start
+        (self.conf) can be old (the coordinator's decision D21, proved by lane H). That entry's model only when the
+        file cannot be read."""
+        try:
+            with open(os.path.join(self.kit, "team.json"), encoding="utf-8") as f:
+                entry = (json.load(f).get("agents") or {}).get(self.agent)
+        except (OSError, ValueError, AttributeError):
+            return self.conf.get("model")
+        return entry.get("model") if isinstance(entry, dict) else self.conf.get("model")
 
     def offered_models(self):
         """The model names of the program's own list, as the last reading has it (read_models), or None when there is
