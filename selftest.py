@@ -25,6 +25,55 @@ if sys.argv[1:2] == ["--guard"]:
     guard(sys.argv[2], int(sys.argv[3]))
     sys.exit(0)
 
+# The checks of the source read hub.py as a tree (ast). A tree of the whole file holds about 280 MB while it lives
+# (52,000 lines, Python 3.12), and until 15 November 2026 these checks made it eight times, each time beside the hubs
+# that this run starts. A release runs this file on the fleet's own hub, beside the hub that serves the fleet: on a
+# server with 1 GB there was no room for it, the run ended at its caller's 300 seconds, and the hub answered nothing
+# meanwhile. So the file is read in pieces, each some whole top-level statements, and one pass keeps what the checks
+# read (module_read): the largest tree that lives is the one of the longest piece.
+PIECE_LINES = 400           # lines of one piece at least, where the file has them
+PIECE_GOES_ON = re.compile(r"(else|elif|except|finally)\b")     # a line at the margin that begins no statement
+
+
+def source_pieces(path, least=PIECE_LINES):
+    """The trees of one module's source, piece by piece, with every node at its line of the file.
+
+    A piece ends before a line that begins at the margin, when the piece parses by itself. Then that line begins a
+    top-level statement: a text that stops inside a string, a bracket, a decorated definition or a line that goes on
+    does not parse, and the four words that go on with a statement at the margin are no place to cut. A place that
+    does not parse is inside a statement, and the piece goes on. The last piece is the rest of the file, so a file
+    that does not parse raises its SyntaxError here, as a parse of the whole file does."""
+    lines = open(path).read().split("\n")
+    start = 0
+    while start < len(lines):
+        at, tree = start + least, None
+        while at < len(lines) and tree is None:
+            line = lines[at]
+            if not line.strip() or line[0] in " \t\f#)]}" or PIECE_GOES_ON.match(line):
+                at += 1         # an empty line, a line inside a block, a comment, or a line that goes on
+                continue
+            try:
+                tree = ast.parse("\n" * start + "\n".join(lines[start:at]) + "\n")
+            except SyntaxError:
+                at += max(1, least // 16)       # inside a statement with lines at the margin, a long text: further on
+        if tree is None:
+            at, tree = len(lines), ast.parse("\n" * start + "\n".join(lines[start:]))
+        yield tree
+        start = at
+
+
+if sys.argv[1:2] == ["--pieces"]:
+    # python3 selftest.py --pieces <file> [lines]: one line for each top-level statement of the file, as the pieces
+    # give them (its line, its last line, a checksum of its tree), and then how many pieces. Nothing is started.
+    # test_selftest_cleanup.py holds it against a parse of the whole file.
+    count = 0
+    for piece in source_pieces(sys.argv[2], int(sys.argv[3]) if sys.argv[3:] else PIECE_LINES):
+        count += 1
+        for one in piece.body:
+            print(one.lineno, one.end_lineno, hashlib.sha256(ast.dump(one, include_attributes=True).encode()).hexdigest())
+    print("pieces", count)
+    sys.exit(0)
+
 VERBOSE = "-v" in sys.argv
 KIT = os.path.dirname(os.path.abspath(__file__))
 TMP = tempfile.mkdtemp(prefix="fleet-selftest-")
@@ -39,6 +88,17 @@ TMP = tempfile.mkdtemp(prefix="fleet-selftest-")
 # - a guard process reads GONE, whose write ends this process and every hub hold, so that read ends when all of
 #   them have ended, and then it removes TMP. A session of its own keeps a Ctrl-C or a kill of this process group
 #   from reaching it.
+# When the machine's memory runs out, this run and its hubs are the first that the system ends, before the fleet's own
+# hub and every other service of the machine: a release runs this file beside them. Linux has the file, and a process
+# may always raise its own value; every process that this run starts takes the value with it. The hub that started
+# the run is not safe by this alone: by systemd's default (OOMPolicy=stop) a service stops when the system ends one
+# of its processes, and its unit starts it again. The hub then counts the run as one that failed (settle_releases).
+try:
+    with open("/proc/self/oom_score_adj", "w") as f:
+        f.write("1000")
+except OSError:
+    pass
+
 LIFE, LIFE_W = os.pipe()
 GONE, GONE_W = os.pipe()
 subprocess.Popen([sys.executable, os.path.abspath(__file__), "--guard", TMP, str(GONE)], pass_fds=(GONE,),
@@ -105,9 +165,14 @@ def start_hub(name, addresses, *flags, agents=None, extra=None):
     team.update(json.loads(json.dumps(extra or {})))        # other entries of the check's own, a catalog of secrets
     path = os.path.join(TMP, f"{name}.json")
     json.dump(team, open(path, "w"))
-    proc = subprocess.Popen([sys.executable, os.path.join(KIT, "hub.py"), "--host", "127.0.0.1", "--port", str(port),
+    # `python3 -m hub`, from the code's folder, and not `python3 hub.py`: Python compiles a file that it runs by its
+    # path at every start, and keeps what it compiled only for a module (__pycache__). The compile of hub.py takes
+    # about 190 MB for a moment (and seconds of a small server's processor), five times in one run, each beside the
+    # hubs that already run; as a module the first hub compiles it and the others read what it kept: 42 MB each,
+    # measured on 15 November 2026. Where that folder cannot be written, each hub compiles as before.
+    proc = subprocess.Popen([sys.executable, "-m", "hub", "--host", "127.0.0.1", "--port", str(port),
                              "--db", os.path.join(TMP, f"{name}.db"), "--team", path, "--parent-pipe", str(LIFE),
-                             *flags],
+                             *flags], cwd=KIT,
                             pass_fds=(LIFE, GONE_W), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             # a home of this run's own: ~/.fleet holds the owner's Google, MCP and GitHub App files,
                             # which are the machine's and not these checks'
@@ -232,20 +297,38 @@ AMBIGUOUS = ("answer", "reply", "recall", "remember", "forget")
 NO_PROMPT = {}
 
 
-def tool_table(path, which, at):
-    """The names in one tool table, as the source has it: TOOLS in hub.py, TOOL_SPECS in wakeups.py."""
-    names = []
-    for node in ast.parse(open(path).read()).body:
-        if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == which for t in node.targets):
-            names += [e.elts[at].value for e in node.value.elts
-                      if isinstance(e, ast.Tuple) and len(e.elts) > at and isinstance(e.elts[at], ast.Constant)]
-    return names
+def bound_twice(body, where="", first=None):
+    """Each name that this body binds a second time, with the lines of both (check 0c says why). `first` holds the
+    names that the pieces before this one bound, when the body is one piece of a module's."""
+    first, out = {} if first is None else first, []
+    for node in body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if any(isinstance(d, ast.Attribute) and isinstance(d.value, ast.Name) and d.value.id == node.name
+                   for d in node.decorator_list):
+                continue                    # @rows.setter on def rows: the decorator keeps the one before
+            bound = [(node.name, None)]     # (the name, what an import binds it to; None: a new object)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and getattr(node, "value", None) is not None:
+            bound = [(n.id, None) for target in getattr(node, "targets", None) or [node.target]
+                     for n in ast.walk(target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)]
+        elif isinstance(node, ast.Import):  # import a.b binds a, to the package a
+            bound = [(a.asname, a.name) if a.asname else (a.name.partition(".")[0],) * 2 for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            bound = [(a.asname or a.name, f"{'.' * node.level}{node.module or ''}.{a.name}")
+                     for a in node.names if a.name != "*"]
+        else:
+            continue
+        for name, to in bound:
+            if name not in first:
+                first[name] = (node.lineno, to)
+            elif to is None or first[name][1] != to:
+                out.append(f"{where}{name} (lines {first[name][0]} and {node.lineno})")
+    return out
 
 
-def prose(path):
-    """The strings of one module that an agent can end up reading: every string literal except the tool table, the
-    docstrings, the log's own words and the SQL. A literal with no space in it is a name in code, not a sentence."""
-    tree = ast.parse(open(path).read())
+def prose_of(tree, whole):
+    """The strings of one piece of a module that an agent can end up reading: every string literal except the tool
+    table, the docstrings, the log's own words and the SQL. A literal with no space in it is a name in code, not a
+    sentence. `whole`: the piece begins the module, so a text that it begins with is the module's docstring."""
     out, skip = [], set()
 
     def mark(node):
@@ -255,7 +338,7 @@ def prose(path):
         if isinstance(node, ast.Assign) and any(getattr(t, "id", "") in ("TOOLS", "TOOL_SPECS") for t in node.targets):
             mark(node.value)
     for n in ast.walk(tree):
-        if isinstance(n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) or (whole and isinstance(n, ast.Module)):
             first = n.body[0] if n.body else None       # a docstring
             if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
                 skip.add(id(first.value))
@@ -284,6 +367,68 @@ def prose(path):
 
     walk(tree, False)
     return [t for t in out if " " in t.strip() and not SQL_VERB.match(t.strip())]
+
+
+MODULES = {}        # path: what module_read kept of it
+
+
+def memory_given_back():
+    """The memory that this process no longer uses goes back to the system (glibc's malloc_trim, as hub.py does at
+    the end of its start): the trees of a pass stay with the process as free space of its heap, some 70 MB after
+    hub.py. Another C library has no such call."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError, ImportError, MemoryError):
+        pass
+
+
+def module_read(path):
+    """What the checks of the source read of one module, from one pass over its pieces (source_pieces): its lines,
+    the lines of each top-level assignment by the name that it binds, the prose that an agent can end up reading, and
+    the names that it binds twice at its top level or in the body of one of its classes. No tree outlives the pass.
+    A module that cannot be read raises at each call, so each check that reads it says so."""
+    if path not in MODULES:
+        assigned, said, twice, in_classes, first, whole = {}, [], [], [], {}, True
+        for tree in source_pieces(path):
+            for node in tree.body:
+                if isinstance(node, ast.Assign):
+                    for name in {t.id for t in node.targets if isinstance(t, ast.Name)}:
+                        assigned.setdefault(name, []).append((node.lineno, node.end_lineno))
+            said += prose_of(tree, whole)
+            twice += bound_twice(tree.body, "", first)
+            in_classes += [one for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+                           for one in bound_twice(node.body, f"{node.name}.")]
+            whole = whole and not tree.body         # a piece of comments only comes before the docstring
+        MODULES[path] = {"lines": open(path).read().split("\n"), "assigned": assigned, "prose": said,
+                         "twice": twice + in_classes}
+        memory_given_back()
+    return MODULES[path]
+
+
+def assigned(path, name):
+    """The value of each top-level assignment to one name of a module, in the file's order, each as a tree of its
+    own statement."""
+    read, values = module_read(path), []
+    for first, last in read["assigned"].get(name, ()):
+        for node in ast.parse("\n".join(read["lines"][first - 1:last])).body:
+            if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == name for t in node.targets):
+                values.append(node.value)
+    return values
+
+
+def tool_table(path, which, at):
+    """The names in one tool table, as the source has it: TOOLS in hub.py, TOOL_SPECS in wakeups.py."""
+    names = []
+    for value in assigned(path, which):
+        names += [e.elts[at].value for e in value.elts
+                  if isinstance(e, ast.Tuple) and len(e.elts) > at and isinstance(e.elts[at], ast.Constant)]
+    return names
+
+
+def prose(path):
+    """The strings of one module that an agent can end up reading (prose_of), in the file's order."""
+    return list(module_read(path)["prose"])
 
 
 def named_in_the_moment(name, corpus):
@@ -376,15 +521,13 @@ def board():
 
 def constants(path, name):
     """One tuple, list or dict constant of a module, as the source has it (its keys, for a dict), or one text."""
-    for node in ast.parse(open(path).read()).body:
-        if isinstance(node, ast.Assign) and any(getattr(x, "id", "") == name for x in node.targets):
-            value = node.value
-            if isinstance(value, ast.Dict):
-                return tuple(k.value for k in value.keys if isinstance(k, ast.Constant))
-            if isinstance(value, (ast.Tuple, ast.List)):
-                return tuple(e.value for e in value.elts if isinstance(e, ast.Constant))
-            if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                return value.value
+    for value in assigned(path, name):
+        if isinstance(value, ast.Dict):
+            return tuple(k.value for k in value.keys if isinstance(k, ast.Constant))
+        if isinstance(value, (ast.Tuple, ast.List)):
+            return tuple(e.value for e in value.elts if isinstance(e, ast.Constant))
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            return value.value
     return None
 
 def owner_api_routes():
@@ -606,42 +749,20 @@ except Exception as root_rights_problem:     # a changed shape is a failure, nev
 # only. This block failed on the hub.py of da272623 before it shipped, with the two lines of `statement_kind`.
 
 try:
-    def bound_twice(body, where=""):
-        """Each name that this body binds a second time, with the lines of both."""
-        first, out = {}, []
-        for node in body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if any(isinstance(d, ast.Attribute) and isinstance(d.value, ast.Name) and d.value.id == node.name
-                       for d in node.decorator_list):
-                    continue                    # @rows.setter on def rows: the decorator keeps the one before
-                bound = [(node.name, None)]     # (the name, what an import binds it to; None: a new object)
-            elif isinstance(node, (ast.Assign, ast.AnnAssign)) and getattr(node, "value", None) is not None:
-                bound = [(n.id, None) for target in getattr(node, "targets", None) or [node.target]
-                         for n in ast.walk(target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)]
-            elif isinstance(node, ast.Import):  # import a.b binds a, to the package a
-                bound = [(a.asname, a.name) if a.asname else (a.name.partition(".")[0],) * 2 for a in node.names]
-            elif isinstance(node, ast.ImportFrom):
-                bound = [(a.asname or a.name, f"{'.' * node.level}{node.module or ''}.{a.name}")
-                         for a in node.names if a.name != "*"]
-            else:
-                continue
-            for name, to in bound:
-                if name not in first:
-                    first[name] = (node.lineno, to)
-                elif to is None or first[name][1] != to:
-                    out.append(f"{where}{name} (lines {first[name][0]} and {node.lineno})")
-        return out
-
-    def bound_twice_in(path):
-        """bound_twice over a module and over the body of each of its classes. The tree stays in this call: a tree
-        of hub.py holds about 300 MB while it lives."""
-        tree = ast.parse(open(path).read())
-        return bound_twice(tree.body) + [one for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
-                                         for one in bound_twice(node.body, f"{node.name}.")]
-
-    twice = bound_twice_in(os.path.join(KIT, "hub.py"))
+    twice = module_read(os.path.join(KIT, "hub.py"))["twice"]       # bound_twice, over each piece and each class
     check("no name is bound twice at the top level of hub.py or in one of its classes", not twice,
           "the later one replaces the earlier in silence: " + "; ".join(twice))
+    # The module is read in pieces, and the two definitions of da272623 were 20,000 lines apart: a check that held
+    # each piece by itself would have passed that hub.py. So a module of this run's own, whose two definitions of one
+    # name are in different pieces, and whose class binds a name twice.
+    far = os.path.join(TMP, "far_apart.py")
+    with open(far, "w") as f:
+        f.write("def twin():\n    return 1\n" + "".join(f"FILL_{n} = {n}\n" for n in range(PIECE_LINES * 2))
+                + "def twin():\n    return 2\nclass Pair:\n    def one(self): pass\n    def one(self): pass\n")
+    found = (len(list(source_pieces(far))) > 2, module_read(far)["twice"])
+    check("a name that two pieces of a module bind is found, and a name that a class binds twice",
+          found == (True, [f"twin (lines 1 and {PIECE_LINES * 2 + 3})",
+                           f"Pair.one (lines {PIECE_LINES * 2 + 6} and {PIECE_LINES * 2 + 7})"]), repr(found))
 except Exception as bound_twice_problem:     # a changed shape is a failure, never a silent pass
     check("hub.py can be read for names bound twice", False, repr(bound_twice_problem))
 

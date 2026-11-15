@@ -1600,14 +1600,84 @@ class HubUpdates(Repositories, HubRoutes):
         self.assertEqual(self.ref(hub.CONFIG_BRANCH), self.pinned)
         self.assertIsNone(hub.q1("SELECT * FROM machine_updates WHERE agent='vps'"))
 
-    def sweep(self, fetch):
+    def sweep(self, fetch, run=None):
         """One automatic sweep after the poll time, run to its end, and each release's (state, step) by version."""
         hub.kv_set("releases_swept", None)
         with patch.object(releases, "latest", functools.partial(releases.latest, fetch=fetch)), \
-                patch.object(releases, "Update", functools.partial(releases.Update, run=self.runner())):
+                patch.object(releases, "Update", functools.partial(releases.Update, run=run or self.runner())):
             hub.release_sweep(hub.now())
             self.finish()
         return {r["version"]: (r["state"], r["step"]) for r in self.releases_state()["releases"]}
+
+    def test_a_release_that_fails_its_checks_here_is_run_again_after_more_polls_each_time(self):
+        """Until 15 November 2026 the sweep ran such a release again at every poll, 15 minutes apart: on a hub with
+        1 GB of memory the self-test of each release ended at its 300 seconds, and the hub answered nothing for five
+        minutes of every fifteen. The polls that pass between two runs double with each run that ended rolled back.
+        The owner's own Update runs the release at once, and the sweep takes another release at once."""
+        self.assertEqual(self.press("entitlement", token=self.token())[0], 200)
+        released = self.publish(self.code(2), "a release that this hub cannot check")
+        fetch = channel_of({"latest": manifest(released)})
+        broken = self.runner(selftest=(1, "110 of 121 checks passed. FAILED: ['the hub answers nothing']", ""))
+        runs = lambda: hub.q1("SELECT COUNT(*) n FROM log WHERE what LIKE 'release %: rolled_back at selftest%'")["n"]
+        seen = []
+        for _ in range(8):
+            self.assertEqual(self.sweep(fetch, run=broken), {"2026.10.2": (releases.ROLLED_BACK, "selftest")})
+            seen.append(runs())
+        self.assertEqual(seen, [1, 2, 2, 3, 3, 3, 3, 4])        # then 7 polls pass, then 15, to 95 at most
+        self.assertEqual(self.head(), self.pinned)
+        hub.kv_set("release_rolled", json.dumps({"revision": released, "runs": 40, "passed": 94}))
+        self.sweep(fetch, run=broken)
+        self.assertEqual(runs(), 4)                             # the 95th poll that passes it over
+        self.sweep(fetch, run=broken)
+        self.assertEqual(runs(), 5)                             # and the run after them: one a day at least
+        code, _ = self.run_update(released, run=broken)         # his own press runs it at once
+        self.assertEqual((code, runs()), (200, 6))
+        other = self.publish(self.code(3), "another release that this hub cannot check")
+        fetch = channel_of({"latest": manifest(other, "2026.10.3")})
+        self.sweep(fetch, run=broken)
+        self.sweep(fetch, run=broken)
+        self.assertEqual(runs(), 8)                             # another release has its own count, from its first run
+        newer = self.publish(self.code(4), "the release that fits this hub")
+        fetch = channel_of({"latest": manifest(newer, "2026.10.4")})
+        self.assertEqual(self.sweep(fetch)["2026.10.4"], (releases.DONE, "follow"))    # and a release that fits: at once
+        self.assertEqual((self.kit / "hub.py").read_text(), "# the hub\nVERSION = 4\n")
+
+    def test_a_run_that_a_stop_of_the_hub_cut_off_counts_as_a_run_that_failed_here(self):
+        """A server with too little memory for the checks: the system ends one of them, systemd stops the hub's
+        service with it, and the next start ends the run's row as failed at the merge. Until 15 November 2026 the next
+        poll ran that release again, and each run stopped the hub again. Such a run counts as a run that rolled back
+        does: more polls pass between two runs each time. A run that was cut off after its push has a `reached`: the
+        release is on the ref, and the next run only finds that out."""
+        self.assertEqual(self.press("entitlement", token=self.token())[0], 200)
+        released = self.publish(self.code(2), "a release whose checks stop this hub")
+        fetch = channel_of({"latest": manifest(released)})
+        started = []
+
+        def cut_off(*args, **kwargs):
+            """An Update whose run never ends: the hub stops under it, and its next start finds the row."""
+            class Run:
+                def apply(self):
+                    started.append(1)
+                    raise SystemExit()          # the run's thread ends with no answer, as when the process is gone
+            return Run()
+
+        def poll():
+            hub.kv_set("releases_swept", None)
+            with patch.object(releases, "latest", functools.partial(releases.latest, fetch=fetch)), \
+                    patch.object(releases, "Update", cut_off):
+                hub.release_sweep(hub.now())
+                self.finish()
+            if self.newest()["state"] == "updating":
+                hub.settle_releases()           # the next start of the hub
+            return (self.newest()["state"], self.newest()["step"], len(started))
+
+        self.assertEqual([poll() for _ in range(5)],
+                         [(releases.FAILED, "merge", 1), (releases.FAILED, "merge", 2), (releases.FAILED, "merge", 2),
+                          (releases.FAILED, "merge", 3), (releases.FAILED, "merge", 3)])
+        self.assertEqual(json.loads(hub.kv_get("release_rolled")), {"revision": released, "runs": 3, "passed": 1})
+        hub.q("UPDATE releases SET reached=? WHERE revision=?", (self.pinned, released))   # cut off after its push
+        hub.kv_set("release_rolled", json.dumps({"revision": released, "runs": 9, "passed": 0}))
+        self.assertEqual(self.sweep(fetch)["2026.10.2"], (releases.DONE, "follow"))    # no rest: the run goes on
 
     def marked(self):
         """The release before (2026.11.121) and the marked release (2026.11.122) that needs it, both published, and

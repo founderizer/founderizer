@@ -9,6 +9,8 @@ Each test starts selftest.py, waits until its first hub has its records, ends th
 process that names the run's folder (its hubs, its guard) and no folder. A run takes a few seconds this way: the
 checks of selftest.py itself do not run.
 """
+import ast
+import hashlib
 import os
 import shutil
 import signal
@@ -61,6 +63,8 @@ class AnEndedRun(unittest.TestCase):
         self.assertTrue(records, f"the run started no hub in {WAIT} seconds (it ended with {run.poll()})")
         folder = os.path.dirname(records[0])
         self.assertTrue(naming(records[0]), "the hub of the run is not running, so there is nothing to leave")
+        self.assertTrue([line for line in naming(folder) if " -m hub " in line],
+                        f"no hub of the run is found by the words that the check at its end reads: {naming(folder)}")
         held = []
         if hold_the_guard:
             held = [int(line.split()[0]) for line in naming(folder) if " --guard " in line]
@@ -75,7 +79,7 @@ class AnEndedRun(unittest.TestCase):
             self.addCleanup(go_on)
         os.kill(run.pid, number)
         run.wait(timeout=GONE_WAIT)
-        at_its_end = ([line for line in naming(folder) if "hub.py" in line], os.path.exists(folder))
+        at_its_end = ([line for line in naming(folder) if " -m hub " in line], os.path.exists(folder))
         if held:
             go_on()
         deadline = time.time() + GONE_WAIT
@@ -98,14 +102,124 @@ class AnEndedRun(unittest.TestCase):
 
 
 # What a run's first hub does at its start, before a line of hub.py runs: Python reads sitecustomize.py at each start,
-# and the run gives its hubs its own environment. The mark makes it the first hub only.
+# and the run gives its hubs its own environment. The mark makes it the first hub only. The run starts each hub as
+# `python3 -m hub`, and at that moment Python's own arguments still hold those two words.
 FIRST_HUB = """import os, sys, time
 mark = os.environ.get("SELFTEST_FIRST_HUB")
-if mark and os.path.basename(sys.argv[0]) == "hub.py" and not os.path.exists(mark):
+if mark and sys.orig_argv[1:3] == ["-m", "hub"] and not os.path.exists(mark):
     open(mark, "w").close()
     %s
 """
 LATE = 12           # seconds before that hub goes on: more than the 80 readings, about 8 seconds, of before
+
+
+# Top-level statements that have a line at the margin inside them, or that go on at the margin: each is a place where
+# a cut of the text would give a piece that is no whole statement.
+MARGINS = '''"""A module's text,
+with a line at the margin."""
+import os
+TEXT = """a text
+at the margin
+else: no statement
+"""
+if os.name:
+    A = 1
+elif os.sep:
+    A = 2
+else:
+    A = 3
+try:
+    import json
+except ImportError:
+    json = None
+else:
+    B = 1
+finally:
+    C = 1
+@staticmethod
+def f():
+    return (1,
+2)
+class Kept:
+# a comment at the margin
+    def m(self):
+        first = 1
+\f        after_a_form_feed = 2
+
+        return """a text
+in a method"""
+LIST = [1,
+2,
+]
+SUM = 1 + \\
+2
+for one in ():
+    pass
+else:
+    D = 1
+while False:
+    pass
+else:
+    E = 1
+with open(os.devnull) as g:
+    pass
+'''
+
+
+class ThePiecesOfAModule(unittest.TestCase):
+    """selftest.py reads hub.py in pieces, because a tree of the whole file holds about 280 MB while it lives, and a
+    release runs selftest.py on the fleet's own hub (15 November 2026: a hub with 1 GB had no room for it). The
+    pieces are the file's whole tree: `selftest.py --pieces` prints each top-level statement as the pieces give it,
+    and a parse of the whole file gives the same ones, at the same lines."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="selftest-pieces-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def pieces(self, path, least=None):
+        """(the statements as the pieces give them, how many pieces), or the run's error."""
+        done = subprocess.run([sys.executable, os.path.join(KIT, "selftest.py"), "--pieces", path,
+                               *([str(least)] if least else [])], capture_output=True, text=True, timeout=WAIT,
+                              stdin=subprocess.DEVNULL, env=dict(os.environ, TMPDIR=self.tmp))
+        if done.returncode != 0:
+            return done.stderr, None
+        lines = done.stdout.splitlines()
+        return lines[:-1], int(lines[-1].split()[1])
+
+    def whole(self, path):
+        with open(path) as f:
+            return [f"{one.lineno} {one.end_lineno} "
+                    f"{hashlib.sha256(ast.dump(one, include_attributes=True).encode()).hexdigest()}"
+                    for one in ast.parse(f.read()).body]
+
+    def test_the_pieces_are_whole_statements_where_a_statement_has_lines_at_the_margin(self):
+        path = os.path.join(self.tmp, "margins.py")
+        with open(path, "w") as f:
+            f.write(MARGINS)
+        whole = self.whole(path)
+        self.assertEqual(len(whole), 12)
+        counts = {}
+        for least in (1, 2, 3, 5, 8, 13, 400):
+            given, counts[least] = self.pieces(path, least)
+            self.assertEqual(given, whole, least)
+        self.assertGreaterEqual(counts[1], 10, counts)      # a piece for almost every statement: each place is tried
+        self.assertEqual(counts[400], 1, counts)            # and one long piece is the whole file
+        self.assertEqual(os.listdir(self.tmp), ["margins.py"])          # and the reading starts nothing
+
+    def test_the_pieces_of_the_hub_s_own_files_are_their_whole_trees(self):
+        for name, least in (("hub.py", 50), ("wakeups.py", 2), ("selftest.py", 2)):
+            path = os.path.join(KIT, name)
+            given, count = self.pieces(path)
+            self.assertEqual(given, self.whole(path), name)
+            self.assertGreaterEqual(count, least, name)
+
+    def test_a_file_that_does_not_parse_is_an_error_of_the_reading(self):
+        path = os.path.join(self.tmp, "broken.py")
+        with open(path, "w") as f:
+            f.write("A = 1\n" * 5 + "B = (1,\n" + "C = 2\n" * 5)
+        said, count = self.pieces(path, 2)
+        self.assertIsNone(count)
+        self.assertIn("SyntaxError", said)
 
 
 class AHubThatStartsLate(unittest.TestCase):

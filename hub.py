@@ -43015,6 +43015,7 @@ def machine_rows():
 RELEASE_POLL = 900              # seconds between automatic polls of the channel
 RELEASE_ROWS = 10               # releases the app reads at once, newest first
 RELEASE_WALK = 50               # releases one poll goes back from the newest to the one this fleet can take
+RELEASE_REST_MOST = 96          # polls between two automatic runs of one release that keeps failing here: a day
 RESTART_DELAY = 2               # seconds before the hub restarts itself, so this run's row is written first
 HUB_RESTART = ["systemctl", "--user", "restart", "fleet-hub"]       # CFG["hub_restart"] = [] turns it off
 BRIDGE_RESTART = ["systemctl", "--user", "try-restart", "fleet-channels"]     # an old bridge, with the hub
@@ -43253,6 +43254,51 @@ def release_wait(row):
                f"starts meanwhile")
 
 
+def release_rolled_said():
+    """{revision, runs, passed} of the release whose last run failed on this hub before its push (release_rolled):
+    how many of its runs ended so, and how many automatic polls passed it over since the last one. None when no run
+    ended so."""
+    try:
+        said = json.loads(kv_get("release_rolled") or "null")
+    except ValueError:
+        return None
+    if not isinstance(said, dict) or not all(isinstance(said.get(k), int) and not isinstance(said.get(k), bool)
+                                             and said[k] >= 0 for k in ("runs", "passed")):
+        return None
+    return said
+
+
+def release_rolled(row):
+    """Inside LOCK: one more run of this release failed on this hub before its push: it ended rolled back
+    (finish_release), or a stop of the hub or an error in it cut it off (settle_releases)."""
+    said = release_rolled_said()
+    runs = said["runs"] + 1 if said and said.get("revision") == row["revision"] else 1
+    kv_set("release_rolled", json.dumps({"revision": row["revision"], "runs": runs, "passed": 0}))
+
+
+def release_rests(row):
+    """Inside LOCK: True when the automatic sweep leaves this release alone at this poll, which it counts.
+
+    Until 15 November 2026 the sweep ran a release whose merge or checks had failed on this hub again at every poll,
+    15 minutes apart, for as long as the channel offered it. Each run copies the records, runs the checks for a
+    minute or more and holds the start of every session meanwhile, and a failure that is the machine's own comes back
+    each time: on a hub with 1 GB of memory the self-test of each release had no room and ended at its 300 seconds,
+    and the hub answered nothing for five minutes of every fifteen. So the polls that pass between two automatic runs
+    of one release double with each run of it that failed before its push (release_rolled): none after the first,
+    then 1, 3, 7 and so on, to RELEASE_REST_MOST at most, about a day. It is a count of polls, so a hub that was off
+    loses none of it, and it does not go down for one release: after a cause that passed (a push that an outage
+    refused), the release waits about as long again as that cause took. The owner's own Update runs the release at
+    once, and so does the sweep for another release. The caller asks only for a release whose last run failed so."""
+    said = release_rolled_said()
+    if not said or said.get("revision") != row["revision"]:
+        return False
+    rest = min(2 ** min(max(said["runs"] - 1, 0), 16), RELEASE_REST_MOST) - 1
+    if said["passed"] >= rest:
+        return False
+    kv_set("release_rolled", json.dumps(dict(said, passed=said["passed"] + 1)))
+    return True
+
+
 def release_holds_starts():
     """True while no new session starts, because the hub restarts soon (plan P0): for the whole update run
     (release_applying), and for the first RELEASE_POLL of a release that waits for the turns that run now, so that
@@ -43411,6 +43457,10 @@ def release_work(applying, automatic=False, fetch=None):
         with LOCK:
             if row["state"] in (releases.DONE, PASSED):
                 return                                  # this fleet runs this release already, or one that holds it
+            if automatic and (row["state"] == releases.ROLLED_BACK or
+                              (row["state"] == releases.FAILED and not row["reached"])) and release_rests(row):
+                kv_set("release_waits", None)
+                return                                  # its runs failed here: more polls pass before the next one
             idle, busy = fleet_idle()
             fresh = automatic and row["state"] == "verified"        # no run has tried it yet
             if not idle and not fresh:
@@ -43502,6 +43552,12 @@ def settle_releases(says="the hub stopped before this update ended; the next upd
                     request_update(name, row["reached"])
                 except Exception:
                     print_fault()
+        # A run that was cut off before its push took nothing, and the next poll runs its release again. When the run
+        # itself is what stops the hub (a server with too little memory for the checks: the system ends one of them,
+        # and systemd's default then stops the service that started it), that is a stop of the hub at every poll: so
+        # the run counts as one that failed here, and more polls pass before the next one (release_rests).
+        for row in q("SELECT * FROM releases WHERE state='updating' AND reached IS NULL"):
+            release_rolled(row)
         q("UPDATE releases SET state=?, step=?, says=?, finished=? WHERE state='updating'",
           (releases.FAILED, "merge", says, now()))
         return cut
@@ -43525,6 +43581,8 @@ def finish_release(rid, state, step, says, automatic, result=None):
     row = q1("SELECT * FROM releases WHERE id=?", (rid,))
     log("hub" if automatic else "owner",
         f"release {row['version']} ({(row['revision'] or '')[:12]}): {state} at {step} — {says}")
+    if state == releases.ROLLED_BACK:
+        release_rolled(row)     # the sweep runs it again after more polls each time (release_rests)
     if state != releases.DONE:
         return row
     kit_revision(fresh=True)
@@ -43624,6 +43682,25 @@ def restart_hub_soon(pinned, reached, always=False):
 
 TEAM_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "team.json")      # main()'s --team
 DB_DEFAULT = os.path.join("~", ".fleet", "pilot.db")                                       # main()'s --db
+
+
+def memory_given_back():
+    """The memory that this process holds and no longer uses goes back to the system (glibc's malloc_trim). True
+    when the system's C library did it. One call, at the end of the start.
+
+    What it gives back is the compiler's working memory, which stays with the process as free space of its heap.
+    Measured on Linux with Python 3.12 on 15 November 2026, 8 seconds after a hub's start:
+    - `python3 -m hub`, the first start in a folder: 172 MB without this call, 54 MB with it. selftest.py starts its
+      hubs so, beside the fleet's own hub, and on a server with 1 GB those 118 MB were room that its run lacked.
+    - `python3 -m hub`, a later start: 40 MB. Python read what the first start had compiled, so nothing was to give.
+    - `python3 hub.py`, as a hub's service starts it: 189 MB without, 178 MB with. Python keeps the parsed text of
+      a file that it runs by its path for as long as that file runs, so that memory is in use and stays.
+    Another C library has no such call, and the hub runs as before."""
+    try:
+        import ctypes
+        return bool(ctypes.CDLL("libc.so.6").malloc_trim(0))
+    except (OSError, AttributeError, ImportError, MemoryError):     # MemoryError: ctypes where no page may be both
+        return False                                                # written and run
 
 
 def installed_hub():
@@ -52733,6 +52810,7 @@ def main():
               + ("A name on one of those machines is refused, because this hub tells its agents apart by address."
                  if address_checked() else "Calls under those names are accepted from anywhere.")
               + " Run: python3 fleet.py addresses ...", flush=True)
+    memory_given_back()         # what the compile of this file and the start's own steps no longer use
     try:
         server.serve_forever()
     except KeyboardInterrupt:
