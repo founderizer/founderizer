@@ -293,7 +293,10 @@ free text of an agent or a person). Its one field, `after`, is optional. The ans
   `task.<number>` (`task` alone for a task that the hub no longer has); `agent.<name>` (the agent's
   chat); `agent.<name>.<part>` with part `runs_on`,
   `behaviour`, `tasks`, `people`, `can_use`; `agent.<name>.rule` (one rule's editor, never the
-  rule's id); `agent.<name>.setup.<page>` with page `server`, `provider`, `installing`,
+  rule's id); `agent.<name>.setup.<page>` with page `name`, `servers` (the first two pages of the
+  setup of a manager with no server, on a hub that keeps the fleet's shape: the manager's name, whose
+  Continue can rename it, so that the place goes on under its new name, and the slider of the fleet's
+  servers), `server`, `provider`, `installing`,
   `switching`, `sign_in`, `activate` (`agent.<name>.setup` when the page is not known);
   `agent.<name>.setup.server.<page>` with a page of `add_server`, while the setup's server page
   shows the pages of Add server inside it (`key`, `token` and `vps` take a secret there too);
