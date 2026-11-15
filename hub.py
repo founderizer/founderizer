@@ -1092,7 +1092,8 @@ def hub_shared(team=None):
     its own OS user `fleet-<agent>`. Each other hub keeps the rule of 2 November 2026, that no new agent goes onto
     the hub's server, where the central vault holds every key. Such a server has its own vault broker (hub.sh's vault
     step) and keeps the records of its own keys over a restore (own_server_records). It has no door: validate_door
-    says why. No app and no tool gives the installer the word yet (UI-API.md 1.168 and 1.171)."""
+    says why. Founderizer gives the installer the word since version 0.1.249, for the slider's step "1 server" of a
+    new fleet (UI-API.md 1.168 and 1.171). No command gives it to a hub that runs."""
     conf = (TEAM if team is None else team).get("hub")
     return isinstance(conf, dict) and conf.get("shared") is True
 

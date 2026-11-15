@@ -34,7 +34,7 @@
 # owner gives it, and its own server service, which installs those agents as a joined server's service does. It is a
 # word of a hub's first install, and it does not go with FLEET_MANAGER_SERVER=later. Without the word no new agent
 # goes onto the hub's server, as before. Such a fleet has no door on this server (HUB-INSTALL.md, "One server for
-# all"). No app and no tool gives the word yet.
+# all"). Founderizer gives the word since version 0.1.249, when the owner chooses "1 server" for a new fleet.
 #
 # With FLEET_VERIFY=caller, which the app sets when its own next step is `fleet.py verify`, the last step here runs
 # no verify: the app's step answers for this machine, and the self-test, about a minute, runs one time and not two.

@@ -49,8 +49,10 @@ what a joined server gets from its join:
 An agent that breaks out of its account there can reach every key of the fleet. The word
 counts at a hub's first install, and it does not go with `FLEET_MANAGER_SERVER=later`.
 Without it the steps are the seventeen below, and no new agent goes onto the hub's server.
-No app and no tool gives the word yet: the owner approved this layout on 14 November 2026,
-and the page of the app that gives it is not in the first run yet.
+Founderizer gives the word since version 0.1.249, when the owner chooses "1 server" on the
+first run's page "Your fleet's servers" (the owner approved this layout on 14 November
+2026). Only a hub's first install takes the word: a fleet that runs cannot change to one
+server yet.
 
 What such a fleet does not have: **a door**. The hub knows the door's own calls by the
 door's address alone, and each agent on the hub's server calls from the hub's address. So
