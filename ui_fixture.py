@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local owner-app fixture for API versions 1.1 to 1.3. Real hub code, synthetic data, loopback only.
 
-    python3 -B ui_fixture.py [--port 0] [--manager-limited]
+    python3 -B ui_fixture.py [--port 0] [--manager-limited] [--silent-server vps-2]
 
 It never connects to the fleet, starts an agent or reads a vault. The first JSON line gives the PID, the
 address for the app (use the printed http://localhost:<port>), the synthetic generation and the task
@@ -14,6 +14,12 @@ Every agent of this fleet answers on loopback, so the hub reads them as sharing 
 of them for its agent key (owner API 1.12). The fixture registers one key for each of them, as the owner's
 app does, and its stand-in helper sends it: it plays by that rule instead of turning it off. It needs no
 wrapper and no patch -- run the line above as it stands.
+
+Two refusals of this hub say their code (owner API 1.181, "A refusal's code and its names"), for an app that shows its
+own words for a code: any call that holds an older `db` gets `hub_changed`, and with `--silent-server vps-2` (any of
+the three servers) an Add agent or a Move on that server gets `server_silent`, with the server's name in `names`. The
+server's reading is then older than ten minutes, as a server that is off gives it. Without the option every server
+has sent a reading a moment ago, and no screen of the fixture changes.
 """
 import argparse
 import hashlib
@@ -80,7 +86,8 @@ def say(event, **safe):
 
 
 class Fixture:
-    def __init__(self, port, manager_limited):
+    def __init__(self, port, manager_limited, silent_server=None):
+        self.silent_server = silent_server      # the server whose reading is old: its refusals say server_silent
         self.tmp = tempfile.mkdtemp(prefix="fleet-ui-fixture-")
         hub.TEAM.clear()
         hub.TEAM.update(TEAM)
@@ -439,7 +446,8 @@ class Fixture:
                  (1.5, 1145614336, 3999657984, 15115923456, 80290492416))):
             hub.q("INSERT INTO server_keys(server,sha256,created) VALUES(?,?,?)", (name, "0" * 64, now - 3600))
             hub.q("INSERT INTO server_status(server,data,reported) VALUES(?,?,?)",
-                  (name, reading(system, codex, claude, user, load), now - 40))
+                  (name, reading(system, codex, claude, user, load),
+                   now - (2 * hub.MACHINE_STALE if name == self.silent_server else 40)))
         # The sign-in of that new agent is the one the owner finishes in the app (machine_signin): the job's prompt
         # only says which agent and which sign-in, and the link lives in the hub's memory, on scout's machine row.
         lid = hub.ins("INSERT INTO signin_jobs(agent,runtime,state,detail,created,updated) "
@@ -541,8 +549,10 @@ def main():
     ap = argparse.ArgumentParser(description="Local owner-app fixture for API versions 1.1 to 1.3 (synthetic, loopback only)")
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--manager-limited", action="store_true", help="also show the manager's own usage-limit flag")
+    ap.add_argument("--silent-server", choices=sorted(TEAM["servers"]),
+                    help="this server sent no reading in the last ten minutes: Add agent and Move on it say server_silent")
     args = ap.parse_args()
-    fixture = Fixture(args.port, args.manager_limited)
+    fixture = Fixture(args.port, args.manager_limited, args.silent_server)
     port = fixture.server.server_port
     print(json.dumps({"pid": os.getpid(), "app_url": f"http://localhost:{port}", "db": fixture.db,
                       "tasks": fixture.tasks, "features": ["thread_events", "task_controls", "limit_holds", "liveness",

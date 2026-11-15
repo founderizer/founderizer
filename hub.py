@@ -64,6 +64,8 @@ import diagnostics  # the lane "Bug reports": the hub's own faults and refused c
 import mcp
 import oauth_server     # the connected apps' own OAuth server: its pure parts (the MCP address build spec)
 import push
+import refusal_words     # a refusal's code and names: the table of its words, and the answer of an exception
+from refusal_words import refusal_body
 import releases
 from lifecycle import (APP_SERVER, APP_SERVER_RUNTIME, DEPLOY_APP_NOTE, GITHUB_TOKEN, MCP_LIMIT, MCP_NAME,
                        REPO_ACCESS, REPO_NAME, REUSE_SETTINGS, RUNTIMES, RUNTIME_RESULTS, SWITCH_RUNTIMES, TOOL_CATALOG,
@@ -1933,7 +1935,7 @@ def enroll_new_device(address, code, signing=None, kind="iphone"):
              (NEW_DEVICE, hashlib.sha256(raw.encode()).hexdigest(), t0)) if raw else None
     if not row:
         ins("INSERT INTO owner_device_tries(device,ts) VALUES(?,?)", (tries, t0))
-        raise Refusal(403, f"{address} is not an owner device, and that is not a code for a new one")
+        raise Refusal(403, code="not_owner_device_no_code", names={"address": address})
     taken, number, named = owner_devices(), 1, OWNER_DEVICE_KINDS[kind]
     while (named["name"] if number == 1 else f"{named['name']}-{number}") in taken:
         number += 1
@@ -2934,7 +2936,7 @@ def phone_ended(query):
     task. GET /ui/mobile keeps its 20 newest in `recent`, so it does not grow with them."""
     generation = kv_get("db_id")
     if query.get("db") != generation:               # a read of a generation that the client holds (its mark)
-        return 409, {"error": "hub generation changed; refresh state"}, None
+        return 409, refusal_words.answer("hub_changed"), None
     with LOCK:
         tasks = [{k: r[k] for k in MOBILE_HEAD + ("trigger_id",)}
                  for r in q(f"SELECT * FROM tasks WHERE state IN {ENDED_STATES} ORDER BY id")]
@@ -11264,13 +11266,13 @@ def answer_secret(body, request_id, client):
     agent that asked, in the hub's words, through the same rows as every owner answer (owner_message_rows)."""
     need = q1("SELECT * FROM needs WHERE id=?", (body["need"],))
     if not need:
-        raise Refusal(404, "owner request does not exist: a request whose task ended is gone with it")
+        raise Refusal(404, code="request_unknown_ended")
     if need["kind"] != "secret":
         raise Refusal(409, "this owner request asks for no secret: answer it in words (POST /ui/needs/<id>)")
     if need["answer"] is not None:
-        raise Refusal(409, "owner request is already answered")
+        raise Refusal(409, code="request_answered")
     if q1("SELECT 1 FROM ui_requests WHERE request_id=?", (request_id,)):
-        raise Refusal(409, "request_id was already used for an owner message; send the answer with a new one")
+        raise Refusal(409, code="command_reused_message")
     spec, ref = need_secret(need), body["login"]
     # the tasks that wait on it, when a task session asked: his answer goes to them, not to a chat
     waiters = [t for t in spec.get("tasks") or [] if q1(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (t,))]
@@ -18063,7 +18065,7 @@ def save_profile(agent, base, sections):
     """The owner's profile, committed through the hub."""
     rev = kit_revision(fresh=True)
     if not rev:
-        raise Refusal(503, "the hub cannot read its own revision")
+        raise Refusal(503, code="revision_unreadable")
     path = f"profiles/{agent}.md"
     old = git_blob(rev, path)
     current = hashlib.sha256(old).hexdigest() if old is not None else None
@@ -18977,7 +18979,7 @@ def attachment_check(data, mime):
         if "\0" in text:
             raise Refusal(415, "a text attachment must hold no NUL byte")
         if secret_hit(text):
-            raise Refusal(422, "a registered login cannot be sent as a file")
+            raise Refusal(422, code="login_as_file")
 
 
 def attachment_write(data, mime):
@@ -25626,7 +25628,7 @@ def skill_remove(agent, name):
     write their skills themselves; beside a revert, this is the owner's one step on them."""
     rev = kit_revision(fresh=True)
     if not rev:
-        raise Refusal(503, "the hub cannot read its own revision")
+        raise Refusal(503, code="revision_unreadable")
     paths = [f"{SKILLS}/{agent}/{name}/{p}" for p in skill_files(rev, agent, name)]
     if not paths:
         raise Refusal(404, f"{agent} has no skill {name}")
@@ -25898,7 +25900,7 @@ def take_resource(body):
     rid, agent = body["resource"], body["agent"]
     kind, what = resource_parts(rid)
     if agent not in agents():
-        raise Refusal(404, "no such agent")
+        raise Refusal(404, code="no_such_agent")
     if not resource_known(kind, what, TEAM):
         raise Refusal(404, f"the fleet does not hold {rid}")
     if kind == "server":        # DevOps plan C4 and "Yes, by business": the app gives a server and takes it back
@@ -32623,9 +32625,9 @@ def save_agent_settings(agent, body):
     team, current, _ = team_view(rev)
     a = team["agents"].get(agent)
     if a is None:
-        raise Refusal(404, "no such agent")
+        raise Refusal(404, code="no_such_agent")
     if body["base_sha256"] != current:
-        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+        raise Conflict(code="team_changed", sha256=current)
     if a.get("role") == "manager" and body.get("active") is False:
         raise Refusal(400, "the manager is always active")
     old = {"active": a.get("active", True) is not False, "model": a.get("model"), "effort": a.get("effort"),
@@ -33022,9 +33024,9 @@ def save_runtime(agent, body):
     team, current, _ = team_view(rev)
     a = team["agents"].get(agent)
     if a is None:
-        raise Refusal(404, "no such agent")
+        raise Refusal(404, code="no_such_agent")
     if body["base_sha256"] != current:
-        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+        raise Conflict(code="team_changed", sha256=current)
     old, to = a.get("runtime"), body["runtime"]
     if to == old:
         return {"agent": agent, "revision": rev, "sha256": current, "changed": [], "updates_requested": [],
@@ -34383,8 +34385,20 @@ def get_writes(parts):
 # ---------------------------------------------------------------- http
 
 class ArtifactError(Exception):
-    def __init__(self, status, message):
+    """A refusal with its HTTP status. The words are `message`, as the hub writes them. A refusal that a person can meet
+    gives `code` and `names` instead, and no message: its words are the table's (refusal_words.WORDS) with the names in
+    their holes, so the code, the English and the names cannot drift apart (UI-API.md, "A refusal's code and its
+    names"). `extra`: more fields of the answer, as a Conflict has them. The fields are `self.extra`, which each route
+    that answers an exception writes with refusal_body."""
+    def __init__(self, status, message=None, code=None, names=None, extra=None):
         self.status = status
+        if message is None:
+            message = refusal_words.words(code, names)
+            names = refusal_words.shown(names or {}) or None
+        if code is not None:
+            extra = refusal_words.fields(code, names, extra)
+        if extra is not None:
+            self.extra = extra
         super().__init__(message)
 
 
@@ -34394,9 +34408,8 @@ class Refusal(ArtifactError):
 
 class Conflict(Refusal):
     """A 409 that tells the app the current value, so it can reload and show the difference."""
-    def __init__(self, message, **extra):
-        super().__init__(409, message)
-        self.extra = extra
+    def __init__(self, message=None, code=None, names=None, **extra):
+        super().__init__(409, message, code, names, extra)
 
 
 def refusal_why(message, why, **extra):
@@ -34515,7 +34528,7 @@ def knowledge_content(title, source, how, text, heading=None):
     if len(content) > KNOWLEDGE_LIMITS["owner"][1]:
         raise Refusal(413, f"the file is larger than {KNOWLEDGE_LIMITS['owner'][1] // MIB} MiB of Markdown")
     if secret_hit(content.decode()):
-        raise Refusal(422, "a registered login cannot be sent as text")
+        raise Refusal(422, code="login_as_text")
     return content
 
 
@@ -34753,7 +34766,7 @@ def knowledge_add(path, content, attachment=None):
     attachment: the id of the file he attached that this one was made of, for the commit message he reads."""
     rev = kit_revision(fresh=True)
     if not rev:
-        raise Refusal(503, "the hub cannot read its own revision")
+        raise Refusal(503, code="revision_unreadable")
     if git_blob(rev, path) is not None:
         raise Refusal(409, f"{path} exists already. Delete it first.")
     files, _, in_all = KNOWLEDGE_LIMITS["owner"]
@@ -34774,7 +34787,7 @@ def knowledge_delete(path):
     there: the profile save would then refuse a file that is not in the catalog."""
     rev = kit_revision(fresh=True)
     if not rev:
-        raise Refusal(503, "the hub cannot read its own revision")
+        raise Refusal(503, code="revision_unreadable")
     if git_blob(rev, path) is None:
         raise Refusal(404, f"{path} is not in the repository")
     users = [name for name in agents() if path in profile_knowledge_files(name, rev)]
@@ -34792,7 +34805,7 @@ def knowledge_replace(path, text):
     from a page is no longer read again (PAGE_SOURCE matches only "fetched")."""
     rev = kit_revision(fresh=True)
     if not rev:
-        raise Refusal(503, "the hub cannot read its own revision")
+        raise Refusal(503, code="revision_unreadable")
     before = git_blob(rev, path)
     if before is None:
         raise Refusal(404, f"{path} is not in the repository")
@@ -34894,7 +34907,7 @@ def task_artifacts(task):
         raise ArtifactError(409, "the requester has not accepted this result")
     text = task["where_"] or ""
     if secret_hit(text):
-        raise ArtifactError(422, "registered login text cannot be displayed")
+        raise ArtifactError(422, code="login_not_shown")
     pattern = r"(?<![A-Za-z0-9_./-])(outputs/[A-Za-z0-9_./-]+\.(?:png|jpe?g|txt|md|json|csv))(?=$|[^A-Za-z0-9_./-])"
     paths = sorted(set(re.findall(pattern, text, re.I)))
     paths = [p for p in paths if all(x not in ("", ".", "..") for x in p.split("/"))]
@@ -34939,7 +34952,7 @@ def task_artifacts(task):
             if "\0" in plain:
                 continue
             if secret_hit(plain):
-                raise ArtifactError(422, "registered login text cannot be displayed")
+                raise ArtifactError(422, code="login_not_shown")
         result.append(dict(path=path, commit=commit, sha256=hashlib.sha256(content).hexdigest(),
                            bytes=len(content), mime=mime, content=content))
     return result
@@ -36172,7 +36185,7 @@ def save_lines(base, lines):
     rev = kit_revision(fresh=True)
     team, current, old_lines = team_view(rev)
     if base != current:
-        raise Conflict("team.json changed meanwhile; reload the reporting lines", sha256=current)
+        raise Conflict(code="team_changed_lines", sha256=current)
     old = {l["agent"]: l for l in old_lines}
     new = {l["agent"]: l for l in lines}
     if set(new) != set(old) or len(new) != len(lines):
@@ -36470,9 +36483,9 @@ def save_vault(agent, body):
     team, current, _ = team_view(rev)
     a = team["agents"].get(agent)
     if a is None:
-        raise Refusal(404, "no such agent")
+        raise Refusal(404, code="no_such_agent")
     if body["base_sha256"] != current:
-        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+        raise Conflict(code="team_changed", sha256=current)
     if a.get("role") not in ("worker", "lead"):
         raise Refusal(400, "the fleet manager's vault is set at installation")
     old, new = a.get("vault", "none"), body["vault"]
@@ -36602,9 +36615,9 @@ def save_vault_create(agent, body):
     team, current, _ = team_view(rev)
     a = team["agents"].get(agent)
     if a is None:
-        raise Refusal(404, "no such agent")
+        raise Refusal(404, code="no_such_agent")
     if body["base_sha256"] != current:
-        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+        raise Conflict(code="team_changed", sha256=current)
     old, new = a.get("vault_create") is True, body["vault_create"]
     receipt = {"agent": agent, "revision": rev, "sha256": current, "changed": [], "updates_requested": [],
                "settings_pending": settings_pending(agent), "activation": None}
@@ -36725,7 +36738,7 @@ def save_access(body):
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     if body["base_sha256"] != current:
-        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+        raise Conflict(code="team_changed", sha256=current)
     addresses = team.get("addresses") or {}
     if machine not in addresses:
         known = ", ".join(sorted(m for m in addresses if m != "owner"))
@@ -38066,18 +38079,18 @@ def add_server_agent(server, body):
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     if body["base_sha256"] != current:
-        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+        raise Conflict(code="team_changed", sha256=current)
     if server not in server_names(team):
-        raise Refusal(404, "no such server")
+        raise Refusal(404, code="no_such_server")
     if not q1("SELECT 1 FROM server_keys WHERE server=?", (server,)):
-        raise Refusal(409, f"{server} has no server service: it did not join with a join code")
+        raise Refusal(409, code="server_no_service", names={"server": server})
     expire_server_jobs(t0)
     last = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (server,))
     if last and last["state"] in JOB_OPEN:
         raise job_busy(server, last)
     reading = server_reading(server, [])
     if reading is None or reading["stale"]:
-        raise Refusal(409, f"{server} sent no reading in the last 10 minutes: check that it is on")
+        raise Refusal(409, code="server_silent", names={"server": server})
     a, kind, was = team["agents"].get(agent), "install", None
     if a is not None:
         if (a.get("machine"), a.get("runtime"), a.get("role")) != (server, runtime, role) or not last or \
@@ -38164,7 +38177,7 @@ def set_shape(body):
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     if body["base_sha256"] != current:
-        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+        raise Conflict(code="team_changed", sha256=current)
     conf = team["hub"]
     machine, shared = conf["machine"], hub_shared(team)
     here = server_agents(machine, team)
@@ -38231,12 +38244,12 @@ def prepare_server_agent(server, body):
     own command, with the readiness that the agent's helper then reports. Try again is the same command again."""
     agent, runtime, t0 = body["agent"], body["runtime"], now()
     if server not in server_names(TEAM):
-        raise Refusal(404, "no such server")
+        raise Refusal(404, code="no_such_server")
     if not q1("SELECT 1 FROM server_keys WHERE server=?", (server,)):
-        raise Refusal(409, f"{server} has no server service: it did not join with a join code")
+        raise Refusal(409, code="server_no_service", names={"server": server})
     a = agents().get(agent)
     if a is None:
-        raise Refusal(404, "no such agent")
+        raise Refusal(404, code="no_such_agent")
     if a.get("machine") != server or unplaced(agent):      # its entry names the hub's machine until it has a server
         raise Refusal(409, f"{shown_role(agent)} is not on {server}.")
     if a.get("runtime") == runtime:
@@ -38249,7 +38262,7 @@ def prepare_server_agent(server, body):
         raise job_busy(server, last)
     reading = server_reading(server, [])
     if reading is None or reading["stale"]:
-        raise Refusal(409, f"{server} sent no reading in the last 10 minutes: check that it is on")
+        raise Refusal(409, code="server_silent", names={"server": server})
     job = ins("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated) VALUES(?,?,?,?,?,?,?)",
               (server, "prepare", agent, runtime, "queued", t0, t0))
     log("owner", f"asked server {server} to prepare {runtime} for {agent}: job {job}")
@@ -38262,9 +38275,9 @@ def remove_server(server, body):
     rev, t0 = kit_revision(fresh=True), now()
     team, current, _ = team_view(rev)
     if body["base_sha256"] != current:
-        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+        raise Conflict(code="team_changed", sha256=current)
     if server not in server_names(team):
-        raise Refusal(404, "no such server")
+        raise Refusal(404, code="no_such_server")
     if server == (team.get("hub") or {}).get("machine"):
         raise Refusal(409, "The hub's server stays in your fleet.")
     here = server_agents(server, team)
@@ -38302,10 +38315,10 @@ def server_key_swap(server, body):
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     if body["base_sha256"] != current:
-        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+        raise Conflict(code="team_changed", sha256=current)
     entry = (team.get("servers") or {}).get(server)
     if not isinstance(entry, dict):
-        raise Refusal(404, "no such server")
+        raise Refusal(404, code="no_such_server")
     if entry.get("kind") != "linux":
         raise Refusal(409, "The key swap is for a Linux server.")
     if entry.get("key_swap") is True if body["on"] else "key_swap" not in entry:
@@ -38474,10 +38487,10 @@ def rename_agent(agent, body):
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     if body["base_sha256"] != current:
-        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+        raise Conflict(code="team_changed", sha256=current)
     a = team["agents"].get(agent)
     if a is None:
-        raise Refusal(404, "no such agent")
+        raise Refusal(404, code="no_such_agent")
     placing = a.get("role") == "manager" and unplaced(agent, team)      # owner feature manager_rename
     if a.get("role") == "manager" and not placing:
         raise Refusal(409, "The manager keeps its name.")
@@ -38517,9 +38530,9 @@ def rename_agent(agent, body):
             raise Refusal(409, f"The install of {agent} stopped. Try it again before you rename it.")
         reading = server_reading(server, [])
         if reading is None or reading["stale"]:
-            raise Refusal(409, f"{server} sent no reading in the last 10 minutes: check that it is on")
+            raise Refusal(409, code="server_silent", names={"server": server})
         if open_login(agent):
-            raise Refusal(409, f"{shown_role(agent)} has an open sign-in. Finish it or let it run out, then try again.")
+            raise Refusal(409, code="agent_open_signin", names={"agent": shown_role(agent)})
         st = q1("SELECT data FROM server_status WHERE server=?", (server,))
         key_moves = KEY_FEATURE in (json.loads(st["data"]).get("features") or [])
     profile = git_blob(rev, f"profiles/{agent}.md")
@@ -38589,18 +38602,18 @@ def move_agent(agent, body):
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     if body["base_sha256"] != current:
-        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+        raise Conflict(code="team_changed", sha256=current)
     a = team["agents"].get(agent)
     if a is None:
-        raise Refusal(404, "no such agent")
+        raise Refusal(404, code="no_such_agent")
     placing = unplaced(agent, team)
     runtime = body.get("runtime") or a["runtime"]
     if runtime != a["runtime"] and not placing:
         raise Refusal(409, f"A move keeps {shown_role(agent)}'s AI provider. Switch it with a command of its own.")
     if server not in server_names(team):
-        raise Refusal(404, "no such server")
+        raise Refusal(404, code="no_such_server")
     if not q1("SELECT 1 FROM server_keys WHERE server=?", (server,)):
-        raise Refusal(409, f"{server} has no server service: it did not join with a join code")
+        raise Refusal(409, code="server_no_service", names={"server": server})
     if lifecycle.model_account(team, a) and account_placement_refusal(team, a["account"], server):   # AI providers
         raise account_placement_refusal(team, a["account"], server)
     expire_server_jobs(t0)
@@ -38624,7 +38637,7 @@ def move_agent(agent, body):
                            f"an agent goes to a server where no other agent has root.")
     reading = server_reading(server, [])
     if reading is None or reading["stale"]:
-        raise Refusal(409, f"{server} sent no reading in the last 10 minutes: check that it is on")
+        raise Refusal(409, code="server_silent", names={"server": server})
     old = where
     kinds = (server_kind_of(team, old), server_kind_of(team, server)) if old not in (None, server) else (None, None)
     if None not in kinds and kinds[0] != kinds[1]:
@@ -38632,9 +38645,9 @@ def move_agent(agent, body):
                            f"{server} is {'a Mac' if kinds[1] == 'mac' else 'Linux'}: an agent moves to a server of "
                            f"its own kind.")
     if running_turns(owner=agent, t0=t0):
-        raise Refusal(409, f"{shown_role(agent)} is in the middle of a turn. Move it when the turn ends.")
+        raise Refusal(409, code="agent_mid_turn", names={"agent": shown_role(agent)})
     if open_login(agent):
-        raise Refusal(409, f"{shown_role(agent)} has an open sign-in. Finish it or let it run out, then try again.")
+        raise Refusal(409, code="agent_open_signin", names={"agent": shown_role(agent)})
     commit, digest = rev, current
     if old != server:
         a["machine"] = server
@@ -38790,7 +38803,7 @@ def remove_agent(agent, body):
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     if body["base_sha256"] != current:
-        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+        raise Conflict(code="team_changed", sha256=current)
     expire_server_jobs(t0)
     expire_logins(t0)
     a = team["agents"].get(agent)
@@ -38798,7 +38811,7 @@ def remove_agent(agent, body):
         # the removal again, after its job failed on the server: the agent left team.json with the first command
         last = q1("SELECT * FROM server_jobs WHERE agent=? AND kind='remove' ORDER BY id DESC LIMIT 1", (agent,))
         if not last or last["state"] != "failed":
-            raise Refusal(404, "no such agent")
+            raise Refusal(404, code="no_such_agent")
         newest = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (last["server"],))
         if newest and newest["state"] in JOB_OPEN:
             raise job_busy(last["server"], newest)
@@ -39105,7 +39118,7 @@ def save_team_entry(body, key, what, entry, busy):
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     if body["base_sha256"] != current:
-        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+        raise Conflict(code="team_changed", sha256=current)
     eid, conf = body[what], dict(team.get(key) or {})
     old, deleting = conf.get(eid), body.get("delete") is True
     if deleting and old is None:
@@ -39287,7 +39300,7 @@ def save_grant(body, by="owner"):
         return save_door_grant(team, rev, current, ref, grant, by)
     a = team["agents"].get(agent)
     if a is None:
-        raise Refusal(404, "no such agent")
+        raise Refusal(404, code="no_such_agent")
     entry = (team.get("logins") or {}).get(ref)
     if entry is None:
         raise Refusal(404, "no such secret")
@@ -39407,9 +39420,7 @@ class AccountRuleError(ValueError):
 def account_refusal(status, code, extra=None, **names):
     """A Refusal in the words of ACCOUNT_WORDS[code], filled with names, whose answer also gives `code` and `names`
     (the coordinator's decision D7). extra: more fields of the answer, as a Conflict has them."""
-    refusal = Refusal(status, ACCOUNT_WORDS[code].format(**names))
-    refusal.extra = dict(extra or {}, code=code, names=names)
-    return refusal
+    return Refusal(status, ACCOUNT_WORDS[code].format(**names), code, names, extra)
 
 
 # The state of its group with no hold, by the account's kind: the owner's words for an account with no allowance (his
@@ -40639,7 +40650,7 @@ def save_integration(base, change, message, by="owner", left=()):
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     if base is not None and base != current:
-        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+        raise Conflict(code="team_changed", sha256=current)
     if not change(team):
         return {"revision": rev, "sha256": current, "changed": False}
     try:
@@ -41156,7 +41167,7 @@ def grant_server(body):
     agent, server, level = body["agent"], body["server"], body["level"]
     a = agents().get(agent)
     if a is None:
-        raise Refusal(404, "no such agent")
+        raise Refusal(404, code="no_such_agent")
     if a.get("role") not in SERVER_ROLES:
         raise Refusal(409, f"{shown_role(agent)} is the {a.get('role')}: a server through the door is for a worker, a "
                            f"lead or the manager.")
@@ -43532,7 +43543,7 @@ def start_machine_login(agent, runtime, replace=False):
     open, in the same words a switch is: nothing is signed out from under a running task."""
     a = agents().get(agent)
     if a is None:
-        raise Refusal(404, "no such agent")
+        raise Refusal(404, code="no_such_agent")
     why = no_sign_in(runtime, "that")       # a runtime the fleet knows and drives no sign-in for says why itself
     if why:
         raise Refusal(409, why)
@@ -44870,7 +44881,7 @@ def phone_mobile(query):
     route compares it with If-None-Match."""
     generation = kv_get("db_id")
     if query.get("db") not in (None, generation):
-        return 409, {"error": "hub generation changed; refresh state"}, None
+        return 409, refusal_words.answer("hub_changed"), None
     with state_moment() as (token, at):
         # The rows, the token, the time and the team of one moment, as GET /ui/state reads them (state_moment):
         # LOCK is held for that moment only. A write after it is not in this answer, and it moves the token past
@@ -44889,9 +44900,9 @@ def phone_chat(agent, query):
     """GET /ui/mobile/chat/<agent> after ui_allowed: one agent's conversation, one page at a time."""
     generation = kv_get("db_id")
     if query.get("db") not in (None, generation):
-        return 409, {"error": "hub generation changed; refresh state"}, None
+        return 409, refusal_words.answer("hub_changed"), None
     if agent not in agents():
-        return 404, {"error": "no such agent"}, None
+        return 404, refusal_words.answer("no_such_agent"), None
     try:
         since = float(query.get("since") or 0)
     except (TypeError, ValueError):
@@ -44907,7 +44918,7 @@ def phone_task(task_id, query):
     outcomes."""
     generation = kv_get("db_id")
     if query.get("db") not in (None, generation):
-        return 409, {"error": "hub generation changed; refresh state"}, None
+        return 409, refusal_words.answer("hub_changed"), None
     try:
         since = int(query.get("since") or 0)
     except (TypeError, ValueError):
@@ -44915,7 +44926,7 @@ def phone_task(task_id, query):
     with LOCK:
         task = q1("SELECT * FROM tasks WHERE id=?", (task_id,))
         if not task:
-            return 404, {"error": "no such task"}, None
+            return 404, refusal_words.answer("no_such_task"), None
         notes = [dict(r) for r in q("SELECT * FROM notes WHERE task=? AND id>? ORDER BY id", (task_id, since))]
         holds = [dict(r) for r in q("SELECT * FROM holds WHERE task=? ORDER BY id", (task_id,))]
         outcomes = [dict(r) for r in q("SELECT * FROM outcomes WHERE task=? ORDER BY id", (task_id,))]
@@ -44945,7 +44956,7 @@ def phone_knowledge(query):
     Internal files stay internal."""
     generation = kv_get("db_id")
     if query.get("db") != generation:
-        return 409, {"error": "hub generation changed; refresh state"}, None
+        return 409, refusal_words.answer("hub_changed"), None
     entry = next((k for k in knowledge_entries() if k["path"] == query.get("path") and k["scope"] == "owner"), None)
     text = knowledge_text(entry) if entry else None
     if text is None:
@@ -44971,19 +44982,17 @@ def command_run(route, request_id, client, db, body, act, keep=None, outside=Non
     must not be stored whole (a link code); a repeat returns that. outside(body): a call that must not run under LOCK
     (Handler.ui_command says how)."""
     if secret_hit(json.dumps(body)):
-        return 422, {"error": "a registered login cannot be sent as text"}
+        return 422, refusal_words.answer("login_as_text")
     canonical = json.dumps(body, sort_keys=True)
     with LOCK:
         if db != kv_get("db_id"):
-            return 409, {"error": "hub generation changed; refresh state before sending"}
+            return 409, refusal_words.answer("hub_changed_sending")
         old = q1("SELECT * FROM ui_controls WHERE request_id=?", (request_id,))
         if old:
             if (old["route"], old["body"], old["client"]) != (route, canonical, client):
-                return 409, {"error": "request_id was already used for a different command"}
+                return 409, refusal_words.answer("command_reused")
             if not old["result"]:
-                return 409, {"error": "this command was interrupted and the hub does not know what came of it. Read "
-                                      "the thing it was about, and send the command again with a new request_id if "
-                                      "it did not take effect"}
+                return 409, refusal_words.answer("command_interrupted")
             return 200, dict(json.loads(old["result"]), replayed=True)
         ins("INSERT INTO ui_controls(request_id,route,body,client,created,result) VALUES(?,?,?,?,?,'')",
             (request_id, route, canonical, client, now()))
@@ -44992,7 +45001,7 @@ def command_run(route, request_id, client, db, body, act, keep=None, outside=Non
                 result = act(body)
             except Refusal as e:        # checked before any write of its own, so it leaves no record
                 q("DELETE FROM ui_controls WHERE request_id=?", (request_id,))
-                return e.status, dict(getattr(e, "extra", {}), error=str(e))
+                return e.status, refusal_body(e)
             result = command_kept(route, request_id, client, keep, result)
     if outside is not None:
         try:
@@ -45001,7 +45010,7 @@ def command_run(route, request_id, client, db, body, act, keep=None, outside=Non
                 result = command_kept(route, request_id, client, keep, act(body, answer))
         except Refusal as e:
             q("DELETE FROM ui_controls WHERE request_id=?", (request_id,))
-            return e.status, dict(getattr(e, "extra", {}), error=str(e))
+            return e.status, refusal_body(e)
     return 200, result
 
 
@@ -45018,7 +45027,7 @@ def task_control_read(task_id, data):
 def task_control_act(task_id, body):
     """POST /ui/tasks/<id>/control, under LOCK (command_run): the owner's hold or release of one task."""
     if not q1("SELECT id FROM tasks WHERE id=?", (task_id,)):
-        raise Refusal(404, "no such task")
+        raise Refusal(404, code="no_such_task")
     try:
         if body["action"] in ("pause", "stop"):
             hold, changed = request_hold(task_id, body["action"], "owner", body["note"])
@@ -45047,7 +45056,7 @@ def task_steer_act(task_id, body, client, via=None, connection=None):
     connection id, which the steer's row keeps (steers.connection), so that the history says it too (history_steer)."""
     t = q1("SELECT * FROM tasks WHERE id=?", (task_id,))
     if not t:
-        raise Refusal(404, "no such task")
+        raise Refusal(404, code="no_such_task")
     if t["state"] in TERMINAL:
         raise Refusal(409, f"{tref(task_id)} is {t['state']}")
     if active_hold(task_id):
@@ -45154,7 +45163,7 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
             return (400, {"error": "text must contain 1 to 16000 characters, or the message carries a file"})
         value = value.strip()
         if secret_hit(value):
-            return (422, {"error": "a registered login cannot be sent as text"})
+            return (422, refusal_words.answer("login_as_text"))
     kind = "answer" if need_id is not None else "message"
     recipient = data.get("recipient", manager_name())
     replaces = data.get("replaces_request_id")
@@ -45173,14 +45182,14 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
         return (400, {"error": "owner answers use the request's own recipient and cannot correct another message"})
     with LOCK:
         if data.get("db") != kv_get("db_id"):
-            return (409, {"error": "hub generation changed; refresh state before sending"})
+            return (409, refusal_words.answer("hub_changed_sending"))
         if recipient not in agents():       # a delete or a rename took the name while this message waited for it
             return (400, {"error": "recipient must name a configured agent"})
         need = None
         if need_id is not None:
             need = DB.execute("SELECT * FROM needs WHERE id=?", (need_id,)).fetchone()
             if not need:
-                return (404, {"error": "owner request does not exist"})
+                return (404, refusal_words.answer("request_unknown"))
             recipient = need["by"]
             if need["kind"] == "secret":            # owner feature secret_requests: its secure form answers it
                 return (409, {"error": SECRET_NO_WORDS.format(id=need_id)})
@@ -45237,7 +45246,7 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
                 if need["multi"]:       # an app that presses one row of combining options: he chose that one
                     ticked = [choice]
                 if secret_hit(value):
-                    return (422, {"error": "a registered login cannot be sent as text"})
+                    return (422, refusal_words.answer("login_as_text"))
             if ticked is not None and choice is None:     # the options he ticked, their words joined
                 picks = need_options(need)
                 if not need["multi"]:
@@ -45246,13 +45255,13 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
                     return (400, {"error": f"choices are 0 to {len(picks) - 1} for this owner request"})
                 value = "; ".join(picks[c] for c in ticked)
                 if secret_hit(value):
-                    return (422, {"error": "a registered login cannot be sent as text"})
+                    return (422, refusal_words.answer("login_as_text"))
         old = DB.execute("SELECT * FROM ui_requests WHERE request_id=?", (request_id,)).fetchone()
         if old:
             had = [r["id"] for r in DB.execute("SELECT id FROM attachments WHERE message=? ORDER BY id",
                                                (request_id,)).fetchall()]
             if (old["kind"], old["need_id"], old["text"], old["client"], old["recipient"], old["replaces_request_id"]) != (kind, need_id, value, client, recipient, replaces) or had != sorted(files):
-                return (409, {"error": "request_id was already used for different content or recipient"})
+                return (409, refusal_words.answer("command_reused_content"))
             read_at = DB.execute("SELECT read_at FROM events WHERE id=?", (old["event_id"],)).fetchone()[0]
             return (200, dict(ok=True, request_id=request_id, event_id=old["event_id"],
        created=old["created"], read_at=read_at, replayed=True, client=client, edited=False,
@@ -45260,7 +45269,7 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
        recipient=recipient, replaces_request_id=replaces, attachments=had,
        chosen=need["chosen"] if need is not None else None))
         if need is not None and need["answer"] is not None:
-            return (409, {"error": "owner request is already answered"})
+            return (409, refusal_words.answer("request_answered"))
         if need is not None and choice is None and ticked is None and isinstance(value, str):
             unsigned = door_signed_answer(need, value)
             if unsigned:        # the refusal of the unsigned press, and the item stays open
@@ -45277,7 +45286,7 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
             said = next((e for e in json.loads(previous["edits"] or "[]") if e["request_id"] == request_id), None)
             if said is not None:
                 if said["text"] != value or files:
-                    return (409, {"error": "request_id was already used for different content or recipient"})
+                    return (409, refusal_words.answer("command_reused_content"))
                 read_at = DB.execute("SELECT read_at FROM events WHERE id=?", (previous["event_id"],)).fetchone()[0]
                 return (200, dict(ok=True, request_id=request_id, event_id=previous["event_id"],
            created=previous["created"], read_at=read_at, replayed=True, client=client, edited=True,
@@ -45560,7 +45569,7 @@ def capp_call(connection, params):
         else:
             request_id, (code, answer) = capp_act(connection, tool["name"], args)
     except ValueError as e:
-        code, answer = 400, {"error": str(e)}
+        code, answer = 400, refusal_body(e)
     if tool["level"] == "act":
         detail = "ok" if code == 200 else f"{code} {answer.get('error', '')}"
         event = answer.get("event_id") if code == 200 else None
@@ -46770,7 +46779,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") not in (None, generation):
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         with LOCK:
             rows = device_rows(self.client_address[0])
         return self.json(200, {"db": generation, "devices": rows, "limit": OWNER_DEVICE_LIMIT},
@@ -46787,7 +46796,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(409, {"error": CAPP_NOT_HERE})
         generation = kv_get("db_id")
         if query.get("db") not in (None, generation):
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         return self.json(200, scrub(dict(capp_view(), db=generation)), {"Cache-Control": "no-store"})
 
     def ui_connect_code(self):
@@ -46901,7 +46910,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.ui_allowed():
             return
         if query.get("db") != kv_get("db_id"):
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         if owner_device_at(self.client_address[0]) != device:
             return self.json(403, {"error": "a phone reads its own copy, from its own address"})
         row = q1("SELECT sealed FROM owner_device_recovery WHERE device=?", (device,))
@@ -46950,8 +46959,7 @@ class Handler(BaseHTTPRequestHandler):
         device = owner_device_at(self.client_address[0])
         if device is None and not q1("SELECT 1 FROM owner_device_codes WHERE device=? AND used IS NULL AND expires>?",
                                      (NEW_DEVICE, now())):
-            return self.json(403, {"error": f"{self.client_address[0]} is not an owner device. See "
-                                            f'"owner_devices" in team.json.'})
+            return self.json(403, refusal_words.answer("not_owner_device", address=self.client_address[0]))
         if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
             return self.json(415, {"error": "application/json required"})
         if len(self.body()) > 4096:
@@ -46965,7 +46973,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 result = enroll_device(device, self.form().get("code"), signing, kind)
         except Refusal as e:
-            return self.json(e.status, {"error": str(e)})
+            return self.json(e.status, refusal_body(e))
         return self.json(200, result, {"Cache-Control": "no-store"})
 
     def ui_mobile(self, query):
@@ -47004,7 +47012,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.ui_allowed():
             return
         if query.get("db") != kv_get("db_id"):
-            return self.json(409, {"error": "hub generation changed; refresh state before sending"})
+            return self.json(409, refusal_words.answer("hub_changed_sending"))
         client = self.headers.get("X-Fleet-Client", "").strip()
         if not client or len(client) > 128:
             return self.json(400, {"error": "X-Fleet-Client is required (at most 128 characters)"})
@@ -47019,7 +47027,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             attachment_check(data, mime)
         except Refusal as e:
-            return self.json(e.status, {"error": str(e)})
+            return self.json(e.status, refusal_body(e))
         name = attachment_name(self.headers.get("X-Fleet-Name", ""), mime)
         digest, t0 = attachment_write(data, mime), now()
         with LOCK:
@@ -47032,7 +47040,7 @@ class Handler(BaseHTTPRequestHandler):
                 rollback()
                 old = DB.execute("SELECT * FROM attachments WHERE request_id=?", (request_id,)).fetchone()
                 if not old or (old["sha256"], old["mime"], old["name"], old["client"]) != (digest, mime, name, client):
-                    return self.json(409, {"error": "request_id was already used for another file"})
+                    return self.json(409, refusal_words.answer("command_reused_file"))
                 return self.json(200, dict(ok=True, replayed=True, **attachment_view(old)))
         log("owner", f"attachment A-{row_id} {mime} {len(data)} bytes from {client}")
         return self.json(200, dict(ok=True, replayed=False, id=row_id, name=name, mime=mime, size=len(data),
@@ -47047,7 +47055,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.ui_allowed():
             return
         if query.get("db") != kv_get("db_id"):
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         if not re.fullmatch(r"[1-9][0-9]*", attachment_id):
             return self.json(400, {"error": "invalid attachment id"})
         row = q1("SELECT * FROM attachments WHERE id=?", (int(attachment_id),))
@@ -47248,7 +47256,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         with LOCK:
             desired, rows = machine_rows()
         return self.json(200, scrub(dict(db=generation, desired_revision=desired, machines=rows)),
@@ -47258,7 +47266,7 @@ class Handler(BaseHTTPRequestHandler):
         """Check this machine now: the helper runs its usual status collection at once (no AI turn, no change)."""
         def act(body):
             if agent not in agents():
-                raise Refusal(404, "no such agent")
+                raise Refusal(404, code="no_such_agent")
             return start_machine_check(agent)
         return self.ui_command(f"machines/{agent}/check", lambda data: {"agent": agent}, act)
 
@@ -47308,10 +47316,10 @@ class Handler(BaseHTTPRequestHandler):
 
         def act(body):
             if agents().get(agent) is None:
-                raise Refusal(404, "no such agent")
+                raise Refusal(404, code="no_such_agent")
             desired = kit_revision(fresh=True)
             if not desired:
-                raise Refusal(503, "the hub cannot read its own revision")
+                raise Refusal(503, code="revision_unreadable")
             return {"agent": agent, "state": request_update(agent, desired), "desired_revision": desired}
 
         return self.ui_command(f"machines/{agent}/update", read, act)
@@ -47335,7 +47343,7 @@ class Handler(BaseHTTPRequestHandler):
 
         def act(body):
             if agents().get(agent) is None:
-                raise Refusal(404, "no such agent")
+                raise Refusal(404, code="no_such_agent")
             if agents()[agent].get("role") != "manager":
                 raise Refusal(409, "only the manager has a standing session")
             emit(agent, "manager_start", "Start the manager session")
@@ -47352,7 +47360,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         with LOCK:
             view = release_view()
         return self.json(200, scrub(dict(db=generation, time=now(), **view)), {"Cache-Control": "no-store"})
@@ -47406,7 +47414,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         with LOCK:
             view = servers_view()
         return self.json(200, scrub(dict(db=generation, time=now(), **view)), {"Cache-Control": "no-store"})
@@ -47514,7 +47522,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             return self.json(200, act())
         except Refusal as e:
-            return self.json(e.status, {"error": str(e)})
+            return self.json(e.status, refusal_body(e))
 
     def ui_server_remove(self, server):
         """POST /ui/servers/<server>/remove: a server with no agent leaves Fleet."""
@@ -47575,7 +47583,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = join_input(self.form())
         except ValueError as e:
-            return self.json(400, {"error": str(e)})
+            return self.json(400, refusal_body(e))
         # Its name in Tailscale is its name in Fleet: the last read of the machine names first, and a new read only for
         # a good code that the last read's name did not join, outside LOCK, because the command may take 5 seconds
         src = self.client_address[0]
@@ -47587,7 +47595,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(200, result)
             except Refusal as e:
                 if e.status not in (409, 503) or fresh:     # a 409 of the last read's name may be older than Tailscale
-                    return self.json(e.status, {"error": str(e)})
+                    return self.json(e.status, refusal_body(e))
             status = tailnet_status()
             body["name"] = tailnet_machines(status).get(src)
             if status is not None and not body["name"]:
@@ -47688,7 +47696,7 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 started = start_server_login(name, data.get("agent"), data.get("runtime"))
         except Refusal as e:
-            return self.json(e.status, {"error": str(e)})
+            return self.json(e.status, refusal_body(e))
         return self.json(200, started)
 
     def server_job(self, name, job):
@@ -47699,7 +47707,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             update = job_input(self.form())
         except ValueError as e:
-            return self.json(400, {"error": str(e)})
+            return self.json(400, refusal_body(e))
         if secret_hit(json.dumps(update)):
             return self.json(422, {"error": "registered login refused"})
         with LOCK:
@@ -47716,7 +47724,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     install_key(row, update["key_sha256"])
                 except Refusal as e:
-                    return self.json(e.status, {"error": str(e)})
+                    return self.json(e.status, refusal_body(e))
             q("UPDATE server_jobs SET state=?, step=?, detail=?, prompt=?, timed_out=?, updated=? WHERE id=?",
               (update["state"], update["step"], update["detail"],
                json.dumps(update["prompt"]) if update["prompt"] else None, 1 if update["timed_out"] else None,
@@ -47748,7 +47756,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         with LOCK:
             g = goal_row(goal_id)
             if not g:
@@ -47788,7 +47796,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         with LOCK:
             t0 = now()
             rows = q("SELECT * FROM triggers WHERE state<>'deleted' ORDER BY id")
@@ -47802,7 +47810,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         try:
             before, limit = int(query.get("before") or 0), int(query.get("limit") or 50)
             if not 0 <= before < 2 ** 53 or not 1 <= limit <= 200:
@@ -47833,7 +47841,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         rev, checks, skipped = check_catalog()
         if not rev:
             return self.json(503, {"error": "the hub checkout has no commit"})
@@ -47852,7 +47860,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = check_body(self.form())
         except ValueError as e:
-            return self.json(400, {"error": str(e)})
+            return self.json(400, refusal_body(e))
         stored = json.dumps(body, sort_keys=True)
         with LOCK:
             r = q1("SELECT * FROM trigger_runs WHERE id=?", (run_id,))
@@ -47889,7 +47897,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         with LOCK:
             result = dict(health_view(), db=generation, changes=change_counts())
         return self.json(200, scrub(result), {"Cache-Control": "no-store"})
@@ -47902,7 +47910,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         try:
             with LOCK:
                 rows = fault_rows()
@@ -47922,7 +47930,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         try:
             wait = max(0.0, min(float(query.get("wait") or WAIT_MAX), WAIT_MAX))
         except ValueError:
@@ -47946,7 +47954,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         if not backups_enabled():
             return self.json(403, {"error": "owner backups are turned off on this hub"})
         central = central_backup()          # owner feature central_vault: its socket is never asked under LOCK
@@ -47975,7 +47983,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state before sending"})
+            return self.json(409, refusal_words.answer("hub_changed_sending"))
         if not backups_enabled():
             return self.json(403, {"error": "owner backups are turned off on this hub"})
         client = self.headers.get("X-Fleet-Client", "").strip()
@@ -47999,7 +48007,7 @@ class Handler(BaseHTTPRequestHandler):
             old = q1("SELECT * FROM ui_controls WHERE request_id=?", (request_id,))
             if old:
                 if (old["route"], old["body"], old["client"]) != ("restore", asked, client):
-                    return self.json(409, {"error": "request_id was already used for a different command"})
+                    return self.json(409, refusal_words.answer("command_reused"))
                 return self.json(200, dict(json.loads(old["result"]), replayed=True))
             if fleet_has_records() and not replace:
                 return self.json(409, {"error": "This hub already holds a fleet's work. A restore is for a new "
@@ -48007,7 +48015,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 staged = stage_restore(data, CFG["db_path"], commit_kit_file, replace=replace)
             except Refusal as e:
-                return self.json(e.status, {"error": str(e)})
+                return self.json(e.status, refusal_body(e))
             result = dict(staged, ok=True, restarting=bool(CFG.get("hub_restart", HUB_RESTART)))
             q("INSERT INTO ui_controls(request_id,route,body,client,created,result) VALUES(?,?,?,?,?,?)",
               (request_id, "restore", asked, client, now(), json.dumps(result)))
@@ -48043,13 +48051,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         with LOCK:
             rev = kit_revision(fresh=True)
             try:
                 _, digest, lines = team_view(rev)
             except Refusal as e:
-                return self.json(e.status, {"error": str(e)})
+                return self.json(e.status, refusal_body(e))
             busy = {r["owner"]: r["c"] for r in q(f"SELECT owner, COUNT(*) c FROM tasks WHERE {OPEN_TASK} GROUP BY owner")}
             team = json.loads(git_blob(rev, "team.json"))
             for line in lines:              # owner API 1.9: the settings at this revision, and what the runtime reported
@@ -48562,7 +48570,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(entry, dict):
                     raise Refusal(404, f"no MCP server {name}")
             if secret_hit(json.dumps(entry)):       # before the server is asked, not after it was told
-                raise Refusal(422, "a registered login cannot be sent as text")
+                raise Refusal(422, code="login_as_text")
             got["result"] = check_mcp_server(name, entry, who, new)     # ValueError with the reason: its 400
             return {"name": name, "server": entry, "agent": who}
 
@@ -48785,11 +48793,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self.ui_allowed():
             return
         if query.get("db") != kv_get("db_id"):
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         try:
             ref = self.login_reference(query.get("login"))
         except ValueError as e:
-            return self.json(400, {"error": str(e)})
+            return self.json(400, refusal_body(e))
         with LOCK:
             salts = {k: fingerprint_salt(fingerprint_label(ref, k)) for k in ("password", "totp")}
         return self.json(200, dict(salts, login=ref), {"Cache-Control": "no-store"})
@@ -48802,12 +48810,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self.ui_allowed():
             return
         if query.get("db") != kv_get("db_id"):
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         try:
             ref = self.login_reference(query.get("login"))
             items = fingerprint_words(query.get("fingerprints"))
         except ValueError as e:
-            return self.json(400, {"error": str(e)})
+            return self.json(400, refusal_body(e))
         with LOCK:
             same = fingerprints_same(ref, items)
         return self.json(200, {"login": ref, "same": same}, {"Cache-Control": "no-store"})
@@ -48962,7 +48970,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.ui_allowed():
             return
         if query.get("db") != kv_get("db_id"):
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         with LOCK:
             view = vault_view()
         return self.json(200, dict(view, db=kv_get("db_id")), {"Cache-Control": "no-store"})
@@ -48972,7 +48980,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.ui_allowed():
             return
         if query.get("db") != kv_get("db_id"):
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         if query.get("renew") == "form":     # plan 13, item 4: this Mac app's GitHub App rows take the App's new key
             DOOR_RENEW["form"] = now()
         with LOCK:
@@ -49177,7 +49185,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         expertise, needs, login = (query.get(k) or None for k in ("expertise", "needs", "login"))
         if expertise is not None and not TAG.fullmatch(expertise) or needs not in (None, "none", "browser", "screen") \
                 or login is not None and not BWS_REF.fullmatch(login):
@@ -49193,7 +49201,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         with LOCK:
             rev = kit_revision(fresh=True)
             profiles = [profile_view(name, rev) for name in agents()]
@@ -49206,7 +49214,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         found, problem = github_repo_list()
         return self.json(200, {"db": generation, "problem": problem,
                                "accounts": [{"account": e["name"], "repos": e["repos"]} for e in found.values()]},
@@ -49220,13 +49228,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         with LOCK:
             rev = kit_revision(fresh=True)
             try:
                 team, sha, _ = team_view(rev)
             except Refusal as e:
-                return self.json(e.status, {"error": str(e)})
+                return self.json(e.status, refusal_body(e))
             result = dict(resources_view(team), db=generation, revision=rev, sha256=sha)
             result["github"] = {"unreached": github_unreached(r["what"] for r in result["resources"]
                                                               if r["kind"] == "repo")}
@@ -49270,10 +49278,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         with LOCK:
             if agent not in agents():
-                return self.json(404, {"error": "no such agent"})
+                return self.json(404, refusal_words.answer("no_such_agent"))
             result = dict(notes_view(agent), db=generation)
         return self.json(200, scrub(result), {"Cache-Control": "no-store"})
 
@@ -49284,10 +49292,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         agent = query.get("agent") or None
         if agent is not None and agent not in agents():
-            return self.json(404, {"error": "no such agent"})
+            return self.json(404, refusal_words.answer("no_such_agent"))
         result = {"db": generation, "agent": agent, "skills": skills_view(agent)}
         return self.json(200, scrub(result), {"Cache-Control": "no-store"})
 
@@ -49311,10 +49319,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         with LOCK:
             if agent not in agents():
-                return self.json(404, {"error": "no such agent"})
+                return self.json(404, refusal_words.answer("no_such_agent"))
             result = dict(memory_view(agent), db=generation)
         return self.json(200, scrub(result), {"Cache-Control": "no-store"})
 
@@ -49326,11 +49334,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         try:
             result = history_view(query)
         except ToolError as e:
-            return self.json(400, {"error": str(e)})
+            return self.json(400, refusal_body(e))
         return self.json(200, scrub(dict(result, db=generation)), {"Cache-Control": "no-store"})
 
     def ui_costs(self, query):
@@ -49341,7 +49349,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         try:
             end = history_when(query["to"], "to", end=True) if query.get("to") else now()
             start = history_when(query["from"], "from") if query.get("from") else end - HISTORY_WINDOW * 86400
@@ -49356,7 +49364,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self.json(400, {"error": "minimum is a whole number from 1 to 1000."})
         except ToolError as e:
-            return self.json(400, {"error": str(e)})
+            return self.json(400, refusal_body(e))
         with LOCK:
             result = costs_view([who] if who else list(agents()), start, end, minimum)
         return self.json(200, scrub(dict(result, db=generation)), {"Cache-Control": "no-store"})
@@ -49367,7 +49375,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         with LOCK:
             t0 = now()
             result = {"db": generation,
@@ -49382,7 +49390,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         try:
             before, limit = int(query.get("before") or 0), int(query.get("limit") or 50)
             if not 0 <= before < 2 ** 53 or not 1 <= limit <= 200:
@@ -49409,7 +49417,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         agent = query.get("agent") or None
         try:
             before, limit = int(query.get("before") or 0), int(query.get("limit") or STANDING_PAGE)
@@ -49420,7 +49428,7 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             holders = [agent] + line_above(agent) if agent else None
             if agent and agent not in agents() and not q1("SELECT 1 FROM standing WHERE agent=?", (agent,)):
-                return self.json(404, {"error": "no such agent"})
+                return self.json(404, refusal_words.answer("no_such_agent"))
             rows = q("SELECT * FROM standing WHERE (?=0 OR id<?)"
                      + (f" AND (agent=? OR (scope='team' AND agent IN ({','.join('?' * len(holders))})))"
                         if agent else "") + " ORDER BY id DESC LIMIT ?",
@@ -49482,7 +49490,7 @@ class Handler(BaseHTTPRequestHandler):
 
         def act(body):
             if agent not in agents():
-                raise Refusal(404, "no such agent")
+                raise Refusal(404, code="no_such_agent")
             listed = next((knowledge_list(x["text"]) for x in body["sections"] if x["key"] == "knowledge_files"), [])
             catalog = {k["path"] for k in knowledge_entries()}
             unknown = [p for p in listed if p not in catalog]
@@ -49617,7 +49625,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         if not re.fullmatch(r"[1-9][0-9]*", task_id):
             return self.json(400, {"error": "invalid task id"})
         try:
@@ -49628,7 +49636,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self.json(400, {"error": "after must be 0 or more and limit 1 to 500"})
         if not q1("SELECT id FROM tasks WHERE id=?", (int(task_id),)):
-            return self.json(404, {"error": "no such task"})
+            return self.json(404, refusal_words.answer("no_such_task"))
         rows = q("SELECT * FROM thread_events WHERE task=? AND id>? ORDER BY id LIMIT ?", (int(task_id), after, limit + 1))
         events = [dict(json.loads(r["data"]), id=r["id"], attempt=r["attempt"], session=r["session"], seq=r["seq"],
                        ts=r["ts"], type=r["type"]) for r in rows[:limit]]
@@ -49674,9 +49682,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = read(data)
         except ValueError as e:
-            return self.json(400, {"error": str(e)})
+            return self.json(400, refusal_body(e))
         except Refusal as e:
-            return self.json(e.status, {"error": str(e)})
+            return self.json(e.status, refusal_body(e))
         return self.json(*command_run(route, request_id, client, data.get("db"), body, act, keep, outside))
 
     def ui_control(self, task_id):
@@ -49976,7 +49984,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         with LOCK:
             t0 = now()
             result = {"db": generation, "paused": chat_paused(), "bridge_seen": float(kv_get("bridge_seen") or 0) or None,
@@ -50036,7 +50044,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         acc = chat_apps().get(aid)
         if not acc:
             return self.json(404, {"error": "no such chat app account"})
@@ -50147,7 +50155,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         name = query.get("agent")
         if not isinstance(name, str) or not AGENT_NAME.match(name):
             return self.json(400, {"error": "agent must be an agent name"})
@@ -50193,7 +50201,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         with LOCK:
             t0 = now()
             result = {"db": generation,
@@ -50371,7 +50379,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         return self.json(200, scrub({"db": generation, "roles": role_list()}), {"Cache-Control": "no-store"})
 
     def ui_role(self):
@@ -50464,7 +50472,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         return self.json(200, {"db": generation, "settings": settings_view(), "runtime_facts": runtime_facts_view(),
                                "models": model_choices()},          # owner feature default_models
                          {"Cache-Control": "no-store"})
@@ -50495,7 +50503,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         where, args = [], []
         if query.get("agent"):
             where, args = where + ["agent=?"], args + [query["agent"]]
@@ -50516,7 +50524,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         try:
             after = int(query.get("after") or 0)
             if after < 0:
@@ -50575,7 +50583,7 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 answer = conversation_start(agent, cid)
         except Refusal as e:
-            return self.json(e.status, {"error": str(e)})
+            return self.json(e.status, refusal_body(e))
         return self.json(200, answer, {"Cache-Control": "no-store"})
 
     def ui_people_handle(self):
@@ -50603,16 +50611,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, {"error": "hub generation changed; refresh state"})
+            return self.json(409, refusal_words.answer("hub_changed"))
         if not re.fullmatch(r"[1-9][0-9]*", task_id):
             return self.json(400, {"error": "invalid task id"})
         task = q1("SELECT * FROM tasks WHERE id=?", (int(task_id),))
         if not task:
-            return self.json(404, {"error": "no such task"})
+            return self.json(404, refusal_words.answer("no_such_task"))
         try:
             artifacts = task_artifacts(task)
         except ArtifactError as e:
-            return self.json(e.status, {"error": str(e)})
+            return self.json(e.status, refusal_body(e))
         headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
         if not binary:
             return self.json(200, dict(db=generation, task=task["id"], artifacts=[
@@ -50665,7 +50673,7 @@ class Handler(BaseHTTPRequestHandler):
                 task, key = self.desktop_task("T-" + task_id, query.get("db"), query.get("attempt"))
                 answer = dict(db=key[0], task=task["id"], attempt=task["attempt"], **DESKTOP.view(key, now()))
         except ToolError as e:
-            return self.json(409, {"error": str(e)})
+            return self.json(409, refusal_body(e))
         return self.json(200, answer, {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
     def helper_desktop(self, agent, task_id, data, write=False):
@@ -50682,7 +50690,7 @@ class Handler(BaseHTTPRequestHandler):
                     DESKTOP.put(key, data.get("frame", {}), now())
                 watching = DESKTOP.watching(key, now())
         except ToolError as e:
-            return self.json(409, {"error": str(e)})
+            return self.json(409, refusal_body(e))
         except (ValueError, TypeError, KeyError):
             return self.json(400, {"error": "invalid desktop frame"})
         return self.json(200, {"watching": watching}, {"Cache-Control": "no-store"})
@@ -52833,12 +52841,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             update = login_input(self.form())
         except ValueError as e:
-            return self.json(400, {"error": str(e)})
+            return self.json(400, refusal_body(e))
         try:
             with LOCK:
                 return self.json(200, login_report(agent, lid, update))
         except Refusal as e:
-            return self.json(e.status, {"error": str(e)})
+            return self.json(e.status, refusal_body(e))
 
     def helper_job_done(self, agent, job):
         """The helper reports what came of a sign-in or a handover it was asked to do."""
@@ -53145,7 +53153,7 @@ class Handler(BaseHTTPRequestHandler):
                 if t["state"] not in TERMINAL:
                     activity(tid, str(data.get("tool_name") or "tool")[:40])
         except ToolError as e:
-            return self.json(409, {"error": str(e)})
+            return self.json(409, refusal_body(e))
         self.json(200, {})
 
     def hook_permission(self, agent, task):
