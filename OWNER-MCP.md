@@ -731,7 +731,7 @@ would read as an empty fleet instead of as a mistake.
 | `server_key_swap` | `/ui/servers/<s>/key-swap` | The owner's word that the vault of a Linux server swaps keys, after root's step `hubsetup.py vault --swap` there (the key swap, `VAULT.md`), or its end. It changes only what the hub says about the keys of the agents there. |
 | `activate_agent` / `agent_settings` | `/ui/team/agents/<a>` | Turn an agent on or off; its model, effort, capabilities and host list. |
 | `agent_key` | `/ui/team/agents/<a>/key` | Register, replace or remove an agent's key, by its SHA-256. Never a key. A key that a server service registered is replaced, never removed. |
-| `rename_agent` | `/ui/team/agents/<a>/rename` | A new name for an agent: everything it has moves with it, and nobody signs in again. |
+| `rename_agent` | `/ui/team/agents/<a>/rename` | A new name for an agent: everything it has moves with it, and nobody signs in again. The manager only while it has no server yet. |
 | `move_agent` | `/ui/team/agents/<a>/move` | An agent onto an empty server of its own kind: the install job there, and its old session ends. A new fleet's manager onto its first server, with `runtime` its AI provider. |
 | `remove_agent` | `/ui/team/agents/<a>/remove` | Delete an agent: what is its own goes, on the hub and on its server (its service, files and own OS user), and nothing of another agent. Its tasks stay as history. |
 | `switch_runtime` | `/ui/team/agents/<a>` | Switch one agent to its other runtime. A command of its own. |
@@ -804,7 +804,8 @@ could remove them. Nothing removes them yet.
 **The manager's name is the owner's choice too.** `install_hub` takes it as `manager_name` and gives both runs of
 `hub.sh` the option `--manager-name`, as the Mac app's first run does from its page "Name your manager". The rule is
 `hub.sh`'s own: 2 to 26 characters `a-z 0-9 -`, a letter first, and none of the names that the fleet uses itself. A
-name outside the rule sends no command, because the hub lets nobody rename the manager afterwards. Capital letters,
+name outside the rule sends no command, because the manager keeps its name once it has its server (the hub renames
+it only before that, with `rename_agent`, on a hub that has the feature `manager_rename`). Capital letters,
 and spaces around the name, do not count, as on the app's page: "Juno" names the manager `juno`. Left out, the
 manager is named `manager`. The name counts at a hub's first install: a hub that is there keeps the name that its
 manager has, and when that hub's own copy of Founderizer is older than the option, the install stops and its log

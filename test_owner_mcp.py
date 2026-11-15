@@ -1059,7 +1059,8 @@ class Install(unittest.TestCase):
         "Name your manager" and gives it to hub.sh as `--manager-name` (15 November 2026), so install_hub takes it too,
         as `manager_name`: both runs of hub.sh (the plan and the install) get the option, behind the other options and
         with the layout's word still in front. A name that hub.sh would refuse sends no command at all, because the
-        hub lets nobody rename the manager afterwards, and the refusal says the rule and repeats nothing of the name.
+        hub renames a manager only while it has no server yet, and the refusal says the rule and repeats nothing of
+        the name.
         Without the field the line is the line of before. The rule is hub.sh's own and hubsetup.py's."""
         client, reach = self.client(), {"host": "203.0.113.9", "ssh_user": "root", "servers": 1,
                                         "source": "https://example.invalid/f.git", "authkey_file": str(self.key)}
@@ -1070,7 +1071,7 @@ class Install(unittest.TestCase):
             said = str(caught.exception)
             self.assertEqual([part for part in ("manager_name is the name that the owner chose for the fleet's manager",
                                                 "2 to 26 characters a-z 0-9 -, a letter first", "login- or vault-",
-                                                "nobody rename the manager afterwards",
+                                                "renames a manager only while it has no server yet",
                                                 "Nothing on 203.0.113.9 was changed") if part not in said], [], said)
             if isinstance(bad, str) and len(bad) > 3 and bad not in owner_mcp.MANAGER_NAMES_TAKEN:
                 self.assertNotIn(bad.strip(), said)

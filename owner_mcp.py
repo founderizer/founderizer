@@ -1735,7 +1735,7 @@ def install_hub(args):
     if name is not None and (not isinstance(name, str) or not MANAGER_NAME.fullmatch(name)
                              or name in MANAGER_NAMES_TAKEN or name.startswith(MANAGER_NAME_STARTS_TAKEN)):
         raise Refused(f"manager_name is the name that the owner chose for the fleet's manager: {MANAGER_NAME_RULE}. "
-                      "The hub lets nobody rename the manager afterwards, so ask the owner for another name, or "
+                      "The hub renames a manager only while it has no server yet, so ask the owner for another name, or "
                       f"leave manager_name out: the manager is then named manager. Nothing on {host} was changed.")
     # The word of the layout in front of both runs of hub.sh, and the same options behind both, so that the plan says
     # what the install does.
@@ -2243,8 +2243,8 @@ def tools():
                                               "at the first install of a hub: " + MANAGER_NAME_RULE + ". Never "
                                               "choose it for them. Capital letters, and spaces around the name, "
                                               "do not count: Juno names the manager juno. Left out, the manager "
-                                              "is named manager. The hub lets nobody rename the manager "
-                                              "afterwards."},
+                                              "is named manager. Afterwards the hub renames the manager only "
+                                              "while it has no server yet (rename_agent)."},
               "port": S["int"]},
              ("host", "ssh_user", "source", "authkey_file", "servers"), install_hub),
         tool("install_log", "The install's own log on that server, with the claim code and the hub address read out "
@@ -2297,8 +2297,12 @@ def tools():
              with_base("/ui/team/agents/{agent}", ("active",), "the activation of this agent")),
         tool("rename_agent", "Give an agent a new name. The hub moves everything it has to that name in one step "
                              "(its tasks, chat, messages, memory, notes, duties, grants and profile), and its server "
-                             "moves its checkout and service; it keeps its OS user, so nobody signs in again. Not the "
-                             "manager, and not while the agent has an open task. Read servers to see the job end.",
+                             "moves its checkout and service; it keeps its OS user, so nobody signs in again. Not "
+                             "while the agent has an open task. The manager takes a new name only while it has no "
+                             "server yet (placed false in state, on a hub with the feature manager_rename): its "
+                             "new name then has the rule of install_hub's manager_name, no server has anything of "
+                             "it, and no job runs. Once it has its server, the manager keeps its name. Read servers "
+                             "to see the job end.",
              {"agent": S["text"], "name": S["text"], **rid}, ("agent", "name"),
              with_base("/ui/team/agents/{agent}/rename", ("name",), "the new name of this agent")),
         tool("move_agent", "Move an agent to an empty server of its own kind, which joined with a join code: one "

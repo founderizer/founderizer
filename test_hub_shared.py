@@ -521,6 +521,11 @@ class Later(HubService, Servers):
         view, servers = self.servers()
         self.assertEqual((view["hub_shared"], view["shape"], servers["hub"]["joined"], servers["hub"]["agents"]),
                          (True, {"step": "one"}, False, []))
+        # The app starts root's step only from the 200 of this command, at the owner's press. A setup that was closed
+        # before that step ended sends the step a second time: 200 again, and root's step is still to do.
+        status, again = self.shape("one")
+        self.assertEqual((status, again["step"], again["hub_shared"], again["root_step"], again["revision"]),
+                         (200, "one", True, True, answer["revision"]))
         # root's step: the manager has no server, so the service waits for no key of it
         key = self.hub_service()
         self.assertEqual((self.ended, self.started), (0, [True]))
