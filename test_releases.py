@@ -1664,6 +1664,51 @@ class HubUpdates(Repositories, HubRoutes):
         self.assertEqual(self.sweep(fetch), {"2026.10.2": (releases.DONE, "follow")})
         self.assertEqual(fetch.seen, ["https://channel.invalid/releases/latest"])
 
+    def by_version(self):
+        return {r["version"]: r["state"] for r in self.releases_state()["releases"]}
+
+    def test_a_release_that_no_run_took_is_passed_by_the_later_one_that_holds_it(self):
+        """The owner's fleet, 15 November 2026: 2026.11.488 came while turns ran, 2026.11.494 came after it and was
+        taken, and .488 stood `verified` under it, so the app offered "Update to 2026.11.488" and his press found
+        nothing to take. The run that reaches the later release passes the earlier one; a release that is really
+        newer, whose revision this checkout does not have, stays `verified`."""
+        earlier = self.publish(self.code(2), "the release that came while turns ran")
+        with self.channel(manifest(earlier, "2026.11.488")):
+            self.assertEqual(self.press("check")[0], 200)
+            self.finish()
+        self.assertEqual(self.by_version(), {"2026.11.488": "verified"})
+        later = self.publish(self.code(3), "the release the fleet took")
+        self.assertEqual(self.run_update(later, version="2026.11.494")[0], 200)
+        self.assertEqual(self.by_version(), {"2026.11.494": releases.DONE, "2026.11.488": hub.PASSED})
+        self.assertIn("1 release(s) that no run took are passed",
+                      hub.q1("SELECT what FROM log WHERE what LIKE '%are passed%'")["what"])
+        newer = self.publish(self.code(4), "a release on the channel that no run took yet")
+        with self.channel(manifest(newer, "2026.11.495")):
+            self.assertEqual(self.press("check")[0], 200)
+            self.finish()
+        self.assertEqual(self.by_version()["2026.11.495"], "verified")
+
+    def test_an_update_to_a_release_this_fleet_holds_already_does_nothing_and_the_start_passes_old_rows(self):
+        """A channel that answers a release this fleet's code holds already (it went back, or a new hub whose
+        checkout came at that release): the poll records it `passed`, and the update stops there, as for `done`.
+        The rows of a hub from before the state `passed` are passed at its next start."""
+        earlier = self.publish(self.code(2), "an earlier release")
+        later = self.publish(self.code(3), "the release the fleet took")
+        self.assertEqual(self.run_update(later, version="2026.11.494")[0], 200)
+        head = self.head()
+        self.assertEqual(self.run_update(earlier, version="2026.11.488")[0], 200)
+        row = self.releases_state()["releases"][0]
+        self.assertEqual((row["version"], row["state"], row["started_at"]), ("2026.11.488", hub.PASSED, None))
+        self.assertEqual(self.head(), head)
+        hub.q("UPDATE releases SET state='verified' WHERE version='2026.11.488'")          # a row from before
+        hub.ins("INSERT INTO releases(seen,revision,version,hold,state) VALUES(?,?,?,0,'verified')",
+                (hub.now(), "c" * 40, "2026.11.495"))
+        with hub.LOCK:
+            self.assertEqual(hub.pass_held_releases(), 1)
+        self.assertEqual(self.by_version(), {"2026.11.495": "verified", "2026.11.488": hub.PASSED,
+                                             "2026.11.494": releases.DONE})
+        self.assertIn("pass_held_releases()", inspect.getsource(hub.main))       # the hub's start runs it
+
     def test_a_fleet_with_no_entitlement_takes_a_release_by_itself(self):
         """The whole of it on real repositories (the owner, 10 November 2026: Founderizer is free, with no account):
         a fleet that never held an entitlement, whose hub runs as installed on the configuration ref, finds the

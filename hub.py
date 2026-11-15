@@ -42775,8 +42775,10 @@ RESTART_DELAY = 2               # seconds before the hub restarts itself, so thi
 HUB_RESTART = ["systemctl", "--user", "restart", "fleet-hub"]       # CFG["hub_restart"] = [] turns it off
 BRIDGE_RESTART = ["systemctl", "--user", "try-restart", "fleet-channels"]     # an old bridge, with the hub
 # "verified" and "held" are a release this fleet knows about; "updating" is a run going on; the four of
-# releases.STATES are what a finished run came to.
-RELEASE_STATES = ("verified", "held", "updating") + releases.STATES
+# releases.STATES are what a finished run came to; "passed" is a release that no run took, whose code this fleet
+# runs all the same, because a later release holds it (pass_held_releases).
+PASSED = "passed"
+RELEASE_STATES = ("verified", "held", "updating", PASSED) + releases.STATES
 _release = {"thread": None, "applying": False}      # the one check or update that may run at a time
 _release_lock = threading.Lock()
 
@@ -43060,6 +43062,27 @@ def record_manifest(manifest, t0=None):
     return q1("SELECT * FROM releases WHERE id=?", (rid,))
 
 
+def pass_held_releases():
+    """Inside LOCK: each release that this fleet learned about and no run took, whose code its checkout runs all the
+    same, is `passed`: its revision is an ancestor of HEAD, as releases.Update's step `already` reads it. That is a
+    release that a later one holds, and it is not one to take.
+
+    Until 15 November 2026 such a release stayed `verified` for ever. A release that comes while turns run waits
+    (plan P0), and the next release can come before the fleet is idle, so on the owner's fleet 2026.11.482 to .488
+    stood `verified` under 2026.11.494, which the fleet ran. Every reader took them for releases still to take: the
+    Updates page offered "Update to 2026.11.488", and his press found nothing to take. A revision that this checkout
+    does not have is no ancestor (git answers 128), so a release that is really newer stays `verified`. A poll, a run
+    that reached its release, and the hub's start call this. Returns how many rows it passed."""
+    passed = 0
+    for row in q("SELECT id, revision FROM releases WHERE state='verified'"):
+        if git_kit("merge-base", "--is-ancestor", row["revision"], "HEAD")[0] == 0:
+            q("UPDATE releases SET state=? WHERE id=? AND state='verified'", (PASSED, row["id"]))
+            passed += 1
+    if passed:
+        log("hub", f"{passed} release(s) that no run took are passed: this fleet runs a later release that holds them")
+    return passed
+
+
 def poll_release(fetch=None):
     """One poll of the channel, and what the hub keeps of it. Returns (the answer, the release's row or None).
 
@@ -43095,6 +43118,8 @@ def poll_release(fetch=None):
                 log("hub", f"the release channel sent an entitlement that the hub did not keep: {e}")
         if answer["manifest"]:
             row = [record_manifest(manifest, t0) for manifest in reversed(chain)][0]
+            if pass_held_releases():    # a release this fleet runs already, which the channel may still answer
+                row = q1("SELECT * FROM releases WHERE id=?", (row["id"],))
             answer = dict(answer, manifest=chain[-1])
             if missed:
                 log("hub", f"release {chain[-1]['version']} needs the release at {chain[-1]['minimum'][:12]} first, "
@@ -43130,7 +43155,7 @@ def release_work(applying, automatic=False, fetch=None):
     """The thread. Nothing in it holds LOCK while it waits for the network, for git, or for a check."""
     try:
         answer, row = poll_release(fetch)
-        if applying and automatic and (row is None or row["state"] == releases.DONE):
+        if applying and automatic and (row is None or row["state"] in (releases.DONE, PASSED)):
             with LOCK:
                 kv_set("release_waits", None)           # plan P0: nothing to take, so nothing waits
         if not applying or row is None:
@@ -43140,8 +43165,8 @@ def release_work(applying, automatic=False, fetch=None):
         # and would carry that write in without the steps it never ran. One cut during the run is not followed (own).
         settle_kit_push()
         with LOCK:
-            if row["state"] == releases.DONE:
-                return                                  # this release is already the one the fleet runs
+            if row["state"] in (releases.DONE, PASSED):
+                return                                  # this fleet runs this release already, or one that holds it
             idle, busy = fleet_idle()
             fresh = automatic and row["state"] == "verified"        # no run has tried it yet
             if not idle and not fresh:
@@ -43259,6 +43284,7 @@ def finish_release(rid, state, step, says, automatic, result=None):
     if state != releases.DONE:
         return row
     kit_revision(fresh=True)
+    pass_held_releases()        # the releases that came while the fleet worked, and that this one holds
     # Quiet (QUIET_SAY): it comes with the manager's next read. It woke the manager at every release, ten a day, to
     # read RULES.md and its profile again: each one a turn of the standing session and some 17,000 tokens that stayed
     # in its context, while no release changes a profile and most change no rule. So it names the sections of
@@ -52409,6 +52435,8 @@ def main():
     settle_pings()
     settle_kit_push()           # before the release asks the machines, so they follow the commit that undoes it
     settle_releases(ask=not restored)
+    with LOCK:
+        pass_held_releases()    # the rows from before the state `passed`, or from a run that this start ended
     settle_task_numbers()
     settle_people_names()
     settings_checked()          # the team that this hub starts with: a release that brings the check finds what is there

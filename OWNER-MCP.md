@@ -437,8 +437,8 @@ channel offers (the build that installs itself, the one that the channel's last 
 the one that waited when the app last quit), or null; and `state`, by this rule:
 `waits_for_restart` when `on_disk` is newer than `running` (an update is in place and the app
 still runs the old build, so the owner restarts the app); else `installing` while an update that
-the owner started with the sidebar's "Update and Restart" downloads, checks or installs (an update
-that the app installs by itself, from its Updates page or from the window of Check for Updates…,
+the owner started from the window of the sidebar's Update downloads, checks or installs (an update
+that the app installs by itself, or from the window of Check for Updates…,
 shows as `offered` while it installs, and as `waits_for_restart` when the build is in place);
 else `offered` when
 `offered` is not null; else `current`. `on_disk` moves no number; an offer and an install do.
@@ -473,7 +473,7 @@ last `setup_state`, in that form only. The rules are pure functions with fixed w
 page, with the store's own state and the windows of that moment (`SetupChannel.showPlace`).
 
 - **It opens only these places** (`SetupShow.targetForms`): `needs`, `tasks`, `agents`,
-  `agent.<name>` (the agent's chat), `settings.general`, `settings.updates`, `settings.status`,
+  `agent.<name>` (the agent's chat), `settings.general`, `settings.status`,
   `task.<number>`, `agent.<name>.behaviour`, `agent.<name>.tasks`, `agent.<name>.people`,
   `agent.<name>.can_use`, `settings.secrets`, `settings.knowledge`, `settings.apps`,
   `settings.people`, `settings.team`. A place is on the list only when its page does nothing by
@@ -494,9 +494,10 @@ page, with the store's own state and the windows of that moment (`SetupChannel.s
   that a change of page loses something on the other pages: on Needs you with a request, the
   options that the owner ticked, the request that they chose and a secret's form; in an agent's
   chat, the words in its text field can go to another agent (one field serves every agent's chat);
-  Settings › Updates clears its failure line when it goes; Settings › System status loses the
-  state of a run's button, so a second press would send again; Settings › General loses a model
-  choice that the hub refused, with its "Try again". These four stay places that it opens.
+  Settings › System status loses the state of a run's button, so a second press would send again;
+  Settings › General loses a model choice that the hub refused, with its "Try again", and its group
+  Updates clears its failure line when it goes (Settings › Updates did so until it went, on 15
+  November 2026). These three stay places that it opens.
 - **It refuses** while the first run shows or holds the window (its own two pages keep their
   rules), while a setup fills the window, while the app has no reading of the hub, and while a
   card, a sheet, a panel or a menu is open over the page (`over` is `card`). `setup_state`'s
