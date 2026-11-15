@@ -1911,6 +1911,46 @@ def account_key(agent, conf):
 NO_CHECKED_MODEL = "this agent's model server has no checked model yet"
 
 
+def start_model(agent, conf, account):
+    """(model, names) of a session of `conf` on its model account `account` (lifecycle.model_account, or None): the
+    agent's own model of this checkout's team.json; else the account's; else, for a model server, the one that its
+    check kept; and the names of the server's own models. Raises Refused(NO_CHECKED_MODEL) when a start on a model
+    server has no kept result of this machine for that model (decision D21). It reads only this machine's files, so a
+    task's start runs it before it asks anybody for anything (start_refusal, decision D24); acp_command runs it too."""
+    mine = checkout_conf(agent)
+    model = (mine if mine else conf).get("model") if account else conf.get("model")
+    if not account:
+        return model, []
+    kept = lifecycle.kept_account(os.path.dirname(HOME), agent, account) if account["kind"] == "server" else None
+    model = model or account["model"] or (kept or {}).get("model")
+    names = [m for m in (kept or {}).get("models") or [] if isinstance(m, str)]
+    # A start on a model server needs this machine's kept result of the model that it starts with (decision D21): a
+    # model picked in the Model menu, a new model of the account, another server, or a later check that failed leaves
+    # none, and that model never passed the check here. The name is read as the check and the session's
+    # configuration read it: "<program>/<name>" or <name>. The hub asks for a check itself at each of those changes,
+    # and the helper tries the start again (handle_events), so the start that follows a passed check runs.
+    own = f"{account['program']}/"
+    if account["kind"] == "server" and (not model or not kept or
+                                        (model if model.startswith(own) else own + model) != kept["model"]):
+        raise Refused(NO_CHECKED_MODEL)
+    return model, names
+
+
+def start_refusal(agent, conf):
+    """Raise the refusal of a task's start that this machine's own files give, before the start asks the hub for the
+    session's credential, the vault for its keys, GitHub for its tokens and each mint server for its token (decision
+    D24; the fifth review, X6): today a start on a model server with no kept result of its model. Only for a start
+    that reaches that test in acp_command (an ACP runtime on an account of its own program), with the same cause.
+    It runs after the checkout's sync, because it must read the team.json that the start reads: nothing else brings
+    the checkout up to date, so a test before the sync could refuse on an old model for ever."""
+    runtime = conf.get("runtime")
+    if runtime_fact(runtime, "driver") != "acp":
+        return
+    account = lifecycle.model_account(checkout_team() or TEAM, conf)
+    if account and account["runtime"] == runtime:
+        start_model(agent, conf, account)
+
+
 def acp_command(agent, conf, prompt, task, attempt, generation, session, values, stable, tools, catalog, minted):
     """The window command of a task session of a runtime of driver acp (the AI providers build spec, section 3.5):
 
@@ -1954,23 +1994,8 @@ def acp_command(agent, conf, prompt, task, attempt, generation, session, values,
                                          f"own settings is no read variable of its session", flush=True)
     if key:
         values[fact("key_env")] = key
-    # The model: the agent's own; else the account's; else, for a model server, the one that its check kept
-    mine = checkout_conf(agent)
-    model, effort = (mine if mine else conf).get("model") if account else conf.get("model"), conf.get("effort")
-    names = []
-    if account:
-        kept = lifecycle.kept_account(os.path.dirname(HOME), agent, account) if account["kind"] == "server" else None
-        model = model or account["model"] or (kept or {}).get("model")
-        names = [m for m in (kept or {}).get("models") or [] if isinstance(m, str)]
-        # A start on a model server needs this machine's kept result of the model that it starts with (decision D21):
-        # a model picked in the Model menu, a new model of the account, another server, or a later check that failed
-        # leaves none, and that model never passed the check here. The name is read as the check and the session's
-        # configuration read it: "<program>/<name>" or <name>. The hub asks for a check itself at each of those
-        # changes, and the helper tries the start again (handle_events), so the start that follows a passed check runs.
-        own = f"{account['program']}/"
-        if account["kind"] == "server" and (not model or not kept or
-                                            (model if model.startswith(own) else own + model) != kept["model"]):
-            raise Refused(NO_CHECKED_MODEL)
+    model, names = start_model(agent, conf, account)
+    effort = conf.get("effort")
     methods = fact("acp_auth") or {}
     auth = methods.get(account["kind"] if account else "plan")
     system = stable + github_text(values, tools) if stable is not None else None
@@ -5714,17 +5739,21 @@ class Helper:
                                   (f" (its screen showed: {seen})" if seen else ""))
             elif task not in self.look_sure():
                 session = str(uuid.uuid4())     # a new id for every start, so a repeated start never reuses one
-                token = session_credential(self.agent, "task", extra.get("generation", ""), task=task,
-                                           attempt=extra.get("attempt", 1))
                 # an app-server task's runner reads the account's list itself at its start (screen_runner
                 # default_model), which is fresher than this helper's reading of up to six hours
                 runner = app_server_task(self.conf, needs)
 
                 def command():          # after the checkout's sync, which Helper.start runs first
+                    conf = self.runner_conf(needs) if runner else self.run_conf()
+                    # A start that this machine's own files refuse asks nobody first: not the hub, the vault, GitHub
+                    # or a mint server (decision D24). Its cause is told once (report_start), as before.
+                    start_refusal(self.agent, conf)
+                    token = session_credential(self.agent, "task", extra.get("generation", ""), task=task,
+                                               attempt=extra.get("attempt", 1))
                     env = session_env(self.agent, self.conf, "task",
                                       task_place(self.agent, extra.get("generation"), task),
                                       closed=isinstance(extra.get("shell_off"), dict), attempt=extra.get("attempt", 1))
-                    return session_command(self.agent, self.runner_conf(needs) if runner else self.run_conf(), ev["text"],
+                    return session_command(self.agent, conf, ev["text"],
                         task=task, needs=needs, attempt=extra.get("attempt",1), generation=extra.get("generation",""),
                         session=session, token=token, env=env, opening=extra.get("opening"), rules=extra.get("rules"),
                         closed=extra.get("shell_off"),    # support plan F1: the hub's closed start
