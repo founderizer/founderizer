@@ -814,6 +814,9 @@ PAGES = {
     "team": ("/ui/team", "the reporting lines with each agent's settings, access and logins"),
     "capacity": ("/ui/capacity", "who can take work now: suitability and availability per runtime account"),
     "health": ("/ui/health", "hub, database, backup and machine health in one answer"),
+    "diagnostics": ("/ui/diagnostics", "the hub's own record of its faults and of the calls that it refused, for the "
+                                       "code that runs now: exception classes, files and lines, counts and times, "
+                                       "and no words of an error. Read it before you prepare a problem report"),
     "releases": ("/ui/releases", "this fleet's revision, the release channel and the subscription it carries"),
     "checks": ("/ui/checks", "the code checks that a wake-up rule can read"),
     "triggers": ("/ui/triggers", "every wake-up rule of the fleet"),

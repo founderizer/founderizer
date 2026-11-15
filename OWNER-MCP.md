@@ -146,7 +146,7 @@ links a WhatsApp account to the fleet: the owner reads that QR in the app, and `
 Since 14 November 2026 `call` also takes the setup tools `setup_state` and `setup_show` by
 name (below, "The link to the running app"), and the read `setup_diagnosis` on the same link.
 `write` takes each other tool that the
-program has: the nine below, the 54 of the table, and `save_bot_token` on the link. A read through `write` is refused, and a write
+program has: the nine below, the 54 of the table, and `save_bot_token` and `prepare_problem_report` on the link. A read through `write` is refused, and a write
 through `call` is refused, each with words that name the right verb; a tool that the program does
 not have gets the words of the MCP form. The JSON is one word of the shell, an object of the tool's
 fields; none means `{}`.
@@ -193,8 +193,8 @@ file can name a `swift` tool that an older program does not have: that program r
 own pages do that work and its own setting says which hub it reads: `install_hub`, `install_log`,
 `claim_hub`, `add_machine`, `use_hub` and `which_hub`. Three more are the program's own and are not
 in the table or in this server: `setup_state`, `setup_show` and `setup_diagnosis`, on the link to
-the running app (below). A fourth, `save_bot_token`, writes on the same link (below). So
-`tools/list` gives 71 tools: the 54 of the table, the thirteen, the three and the one.
+the running app (below). Two more, `save_bot_token` and `prepare_problem_report`, write on the same
+link (below). So `tools/list` gives 72 tools: the 54 of the table, the thirteen, the three and the two.
 
 **The link to the running app.** Some work only the running app can do: its first run, its pages,
 and in later slices its keys and its engine. So the program asks the app on a local socket, the
@@ -352,6 +352,24 @@ It answers `account`, `set` and `replaced` (null when the hub does not say), and
 `clipboard` (`cleared` or `kept`), never the token. No command lock: the app does the
 write, as its page does. The value part and what any process of the owner's user can do with the
 tool: OWNER-MCP-BOUNDARY.md section 7b.
+
+**`prepare_problem_report`** (a write, so `founderizer-cli write` and the MCP form take it, and `call`
+does not): the owner's own agent writes a problem report, and the owner sends it (the owner, 15 November
+2026: "does admin mcp have some sort of bug_report tool call so we can receive them somehow?"). Its one
+field is `text`, 1 to 4000 characters: what went wrong, what the agent tried and what the tools answered.
+The app opens its own window Report a problem (Help › Report a problem) with that text in its box, beside
+the facts that the app adds itself, and with one more fact, "Written by: Your AI agent", which is on the
+screen and in the report. **It sends nothing**: the owner reads the report, gives the address for the
+answer and presses Send, so the form's rule stays whole, that nothing travels that the owner has not read.
+A sent report goes where each report of the app goes: to the website's `api/report`, which keeps it,
+mails it to support and answers with a reference (`FR-<n>`). The tool refuses a text that holds something
+like a key (the form's own check), a part after its request line, and each other field. It never writes
+over text that the owner wrote or changed in the form: it fills an empty box, replaces an agent's text
+that nobody changed, and replaces the unchanged text of a report that was sent. The fact stays while the
+box still holds the agent's text whole; when the owner changes that text, the report is the owner's own. It answers `{"shown": true}`, and the window
+takes no key press until the owner's click, as after each front from outside. The hub's own record of
+its faults is the page `diagnostics` of `fleet_read` (`GET /ui/diagnostics`: exception classes, files and
+lines, counts and times, and no words), which the agent reads first.
 
 **The file tools, in both programs.** `attach_file` sends at most 25 MiB (the hub's
 `ATTACH_MAX`), with its request id and the file's name as headers (`X-Fleet-Request-Id`,
