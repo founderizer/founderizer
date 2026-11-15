@@ -305,7 +305,9 @@ free text of an agent or a person). Its one field, `after`, is optional. The ans
   `settings.<section>` with section `general`, `servers`, `updates`, `backup`, `status`,
   `secrets`, `knowledge`, `apps`, `people`, `team`; `app.<app>` with app `github`, `drive`,
   `gmail`, `mcp`; `server.<name>`; `add_server.<page>` with page `ways`, `ai`, `opening`,
-  `machine`, `install`, `key`, `token`, `vps` (or `add_server`); `add_agent.<step>` with step
+  `machine`, `install`, `key`, `token`, `vps`, `again` (or `add_server`; `again` is "Start again" on the manager's
+  server pages, which forgets the fleet on this Mac: no list of the guide and no list of `setup_show` has it);
+  `add_agent.<step>` with step
   `server`, `name`, `progress` (or `add_agent`); `connect_key`; `shape_change` (the wizard of a later change of the fleet's shape, from the
   slider of Settings › Servers; its own pages have no name yet); `first_run.<page>` with the page
   of `first_run` (or `first_run`); `waiting` (the hub answered this Mac before, and the app has no
@@ -333,9 +335,34 @@ free text of an agent or a person). Its one field, `after`, is optional. The ans
   wait that ends by time reads the windows once more, and a call with no `after` always does.
   `over` knows only the app's own windows (no notification and no pop-up of macOS), and it is
   `nothing` also when the app shows no window.
+- `show` (set `owner` only): whether `setup_show` can change the page now to a place of the fleet's
+  own pages, by a fixed name (`ShowNow`; the rule is `SetupShow.now`, from the same facts that the
+  tool's own check reads): `yes`; `first_run` (the first run shows, also its welcome page in front
+  of a setup that never finished, or it holds the window behind a page of Settings that the owner
+  opened over it: `setup_show` takes only `front`, `welcome` and `name` there);
+  `setup` (a setup fills the window: Add server, Add agent, a later change of the fleet's shape,
+  the setup of an agent that is being added or of a new fleet's manager); `shown` (`setup_show`
+  changed the page, and no click of the owner reached the app's main window since: it ends at the
+  next click that reaches the app and that the app's watch sees to its end; a click on a text
+  field, a switch or a slider can pass unseen, and then the next one counts; a key does not end
+  it); `in_use` (the
+  place that shows is not one from which
+  the page changes, because the owner can be in the middle of typing or of work there; Needs you
+  is such a place while a request waits); `card` (`over` is `card`); `no_reading` (the app has no
+  reading of the hub). Their order, when more than one holds: `first_run`, `no_reading`, `setup`,
+  `shown`, `card`, `in_use`. A change of it moves `change`.
+- `in_front` (set `owner` only): true while Founderizer is the active app and its main window (the
+  window of the fleet's pages) is on the screen, on the Space that shows, not in the Dock, and is
+  AppKit's main window or key window of the app (`AppInFront.of`; the app reads AppKit at each
+  call, as for `over`). With Report a problem as the app's main and key window it is false: the
+  main window can then stand behind another app's window. While it is false another app can stand
+  in front of the main window, so the guide lets an agent look only while it is true. True does
+  not say that a picture of every display shows the window. The app's coming to the front and its
+  leaving move `change`, with the window changes that `over` has; a change of Space moves none, so
+  only a call with no `after` is of that moment.
 
 Only the set `owner` exists today, and its route asks for the map. The answer's own default is
-without `place`, `places` and `over`, so a set that comes later (the guide inside the app's window must
+without `place`, `places`, `over`, `show` and `in_front`, so a set that comes later (the guide inside the app's window must
 read no agent's name) gets the answer of before unless its route asks for the map too.
 
 Each value is a fixed name, a boolean, a number or a text from a fixed list, and a value that is
@@ -420,25 +447,138 @@ else `offered` when
 bring the app to the front, on one of its own pages. Fields: `page`, which is `front` (the app as
 it is, with no change of page, from any page), or for a first run `welcome` or `name` ("Name your
 manager", the first page of the setup, from which the owner's own Continue goes on to the VPS
-page; until 15 November 2026 this second page was `vps`, which went past the name); and `seen`,
-the page that `setup_state` gave last (`first_run.page`, or `none` with no first run). It refuses,
-and says which, when `seen` is not the page that shows now; and for `welcome` and `name`, when no
-first run shows, when the page that shows is not one of the first run's start pages (`welcome`,
-`paste`, `vps`: on every other page the owner may be typing a token, a key or a password that a
-change of page would erase), when the first run holds the window, when its work runs, or when an
+page; until 15 November 2026 this second page was `vps`, which went past the name), or a place of
+the fleet's own pages (below); and `seen`, the place that `setup_state` gave last (`place`). For
+`front`, `welcome` and `name` the short form of before the map passes too (the first run's page
+alone, or `none` with no first run), so a caller of an earlier version still works. It refuses,
+and says which, when `seen` is not the place that shows now; the refusal names the place that
+shows, and says nothing back of what the caller sent. For `welcome` and `name` it refuses when no
+first run shows, when the page that shows is not one of the first run's start pages
+(`first_run.welcome`, `first_run.paste`, `first_run.vps`: on every other page the owner may be
+typing a token, a key or a password that a change of page would erase), when the first run holds
+the window, when its work runs, or when an
 install of it began. It also refuses `name` while the fleet has its hub and its manager already:
 the first run's welcome page then stands in front of a manager's setup that never finished
 (`setup_state` gives `hub` as `set` or `answers` there), the manager has its name, and the app
 shows the manager's setup after that page (`FirstRunView.noNamePage`). The first run's window checks the ask again when it takes it, so a change in
 between counts; the wait for the window has no clock, and ends on its answer, on another ask, on
 the window's going or on the end of the call. An ask for the page that shows already changes
-nothing in the wizard (not even a failure line on it). It never presses anything, and it gives back the
+nothing in the wizard (not even a failure line on it).
+
+**A place of the fleet's own pages** (the owner's "Yes, build it" of 15 November 2026 to the plan
+of the app's pages and actions, whose part 2 has the rules). `page` is then the name that `setup_state` gives a place, and `seen` is the `place` of the
+last `setup_state`, in that form only. The rules are pure functions with fixed words
+(`SetupShow.refusal` in `OwnerShowRules.swift`), asked twice: when the request comes, with what
+`setup_state`'s facts can tell, and again on the main actor in the same turn that changes the
+page, with the store's own state and the windows of that moment (`SetupChannel.showPlace`).
+
+- **It opens only these places** (`SetupShow.targetForms`): `needs`, `tasks`, `agents`,
+  `agent.<name>` (the agent's chat), `settings.general`, `settings.updates`, `settings.status`,
+  `task.<number>`, `agent.<name>.behaviour`, `agent.<name>.tasks`, `agent.<name>.people`,
+  `agent.<name>.can_use`, `settings.secrets`, `settings.knowledge`, `settings.apps`,
+  `settings.people`, `settings.team`. A place is on the list only when its page does nothing by
+  itself when it shows (a read of the hub, or of the app's update channel, is nothing) and makes
+  macOS ask nothing; each page's code was read for that. **Left out for what their code does by
+  itself:** `agent.<name>.runs_on` (it carries out a Rename… or a Deactivate that waits in the
+  store, and its part for the AI provider asks this Mac's installer and starts a machine check),
+  `settings.servers` (with the connected apps on it makes a code on the hub when it shows, its
+  devices make a device's code that a Needs-you answer asked for, and its going ends a stop of
+  Turn on) and `settings.backup` (not decided: its row "Where" looks for iCloud Drive on the disk
+  when it draws). **Never a target:** `add_server`, `add_agent`, `shape_change`, `connect_key`,
+  `server.<name>`, `app.<app>`, `agent.<name>.rule`, and each place of an agent's setup, "Setting
+  up" or sign-in.
+- **It changes the page only from these places** (`SetupShow.fromForms`): `tasks`, `agents`, and
+  `needs` while the hub lists no open request. From every other place it refuses, and says that
+  the page changes only from the listed places because on every other place the owner can be in
+  the middle of typing or of work. The list is narrow in this version, because two reviews found
+  that a change of page loses something on the other pages: on Needs you with a request, the
+  options that the owner ticked, the request that they chose and a secret's form; in an agent's
+  chat, the words in its text field can go to another agent (one field serves every agent's chat);
+  Settings › Updates clears its failure line when it goes; Settings › System status loses the
+  state of a run's button, so a second press would send again; Settings › General loses a model
+  choice that the hub refused, with its "Try again". These four stay places that it opens.
+- **It refuses** while the first run shows or holds the window (its own two pages keep their
+  rules), while a setup fills the window, while the app has no reading of the hub, and while a
+  card, a sheet, a panel or a menu is open over the page (`over` is `card`). `setup_state`'s
+  `show` says which of these holds now.
+- **One change of page for each click of the owner that reached the app.** After a show that
+  changed the page, the next one is refused (`show` is `shown`) until the app handled a click of
+  the owner that reached its main window (`ShownPage.waitsForOwner`; the click is over at its
+  mouse-up). Three things are no such click (`ShownPage.handled`):
+  - **the click that the app drops** after a change of page. If it freed the next change, a
+    caller that waits with `after` and shows again at once would make the app drop every click;
+  - **a key**. With a key as an act the same caller did the same: a show; the click is dropped
+    and frees the keys; a key frees the next show; and so on. A key ends nothing;
+  - **an event that began before the latest show**: a click whose button went down on the page
+    before, or an event whose handling still waited on the main queue when the show came. Each
+    show that changes the page has a number, and the watch notes it at the mouse-down and at
+    the key-down.
+  **So of any two clicks of the owner at least one reaches the app**, whole and on the page that
+  it was aimed at, whatever keys come between and whenever the caller shows: a pure test plays
+  that caller at seven moments of a click, with keys in four positions
+  (`aCallerThatShowsAgainAtOnceCostsOneClickInTwo`). `front`, which changes no page, stays
+  allowed. A click whose mouse-up a control of AppKit takes in its own tracking loop (a text
+  field, a switch, a slider) is not seen by the app's watch to its end, so it frees no change of
+  page: the next click that the watch sees to its end does.
+- **It refuses a place that this fleet does not have**, in words: an agent that the hub does not
+  list, a task that it does not have, a part that the agent's details do not offer (Tasks and Can
+  use are parts of a worker or a lead, and the manager has neither), a section that
+  Settings does not offer for this hub; and each place of an agent whose setup, "Setting up" or
+  sign-in would show in place of its pages. It judges these by the reading of the hub that the app
+  has, which can be minutes old while the hub does not answer. Before the change the app asks its
+  own rule of what
+  the window draws for the new page (the rule behind `place`): when that is not exactly the place
+  that was asked for, it changes nothing. So a show never falls back to another page (General for
+  an unknown section, "Task not found").
+- **What it does:** the page changes through the app's store, so Back (⌘[) returns to the page
+  before and the sidebar's row follows, and the app asks macOS for the front as for `front`. The
+  place that shows already changes nothing. No notice says that the page was moved, and nothing is
+  added to any page: the agent says in its own window what it opened.
+- **A change of page holds the keys and the first click of every owner**, also of one who works
+  in the app (`OutsideFront.came` with `pageChanged`): what they type or click at that moment is
+  for the page that went (a message in a chat's box), and on the page that came it would do
+  another thing (on Needs you a number and Return, or one click, answer a request; on Can use one
+  click on "−" takes access away). So the app takes no key press, and it drops the owner's first
+  click in it (its mouse-down, its drags and its mouse-up): that click only ends the hold. **That
+  click is one click**: a click of the app that is under way when the page changes is the one
+  (the rest of it is dropped, and the next click reaches the app), and a double or a triple click
+  is one click (a mouse-down with a click count above 1 that follows a dropped mouse-down is
+  dropped too). The
+  hold comes before the page changes. It also ends when the app leaves the front: the owner who
+  comes back sees the page that came. A show of the place that shows already changes no page, and
+  holds nothing new for an owner who was at work in the app. Each other watch of the app's keys
+  asks the hold first (Command with 1 to 9, the paste watches, the page keys and Escape on Needs
+  you, the keys of the app's own menu), so no key that the hold drops acts before it. Each watch
+  of the app's mouse-downs asks one function of the hold, which gives one answer for one event
+  whichever watch asks first (`AppFront.reaches`; the rule keeps the event's number and time): so
+  a right click or a Control click that the hold drops opens no menu of the app. A test finds
+  every event watch of the app, and fails for one that is not on its list.
+- **It marks nothing as read.** The app counts an agent's open chat as read. A chat that
+  `setup_show` opened does not count until a click or a key of the owner reached the app's main
+  window **and that chat still shows after the app handled that click or key** (`ShownPage`; the
+  app's watch tells the store on a later turn of the main queue than the mouse-up or the key). So
+  the first click after the change of page, which the app drops, marks nothing; a click or a key
+  that began before the show marks nothing; the click that
+  leaves the chat does not mark it; a click in another window of the app (Report a
+  problem) does not count; and a new name of the agent keeps the mark. A change of page by the
+  owner ends it: the chat that the owner opens counts as before. A click whose mouse-up a control
+  of AppKit takes in its own tracking loop (a text field, a switch) is not seen by the watch, so
+  such a click alone marks nothing: the chat stays not read until the next key or click that the
+  watch sees.
+- **A refusal never repeats a text that the caller sent**, with one limit: it can name the place
+  that was asked for, and the place that shows, in their fixed form (fixed words, an agent's name
+  in the narrow alphabet, a task's number), which the app made itself. A `page` that is no name of
+  a place gets one fixed sentence, and so does a field that the tool does not take.
+
+It never presses anything, and it gives back the
 state as `setup_state` does, with `"front": "asked"`: macOS was asked, which says nothing of
 whether another app stays in front. **After it, the app takes no key press until the owner's first
 click in its window**, so that keys which the owner typed for another window do nothing in the app. The
 same holds after each `guide` and after a start of the app by its program. It does not hold when the app
-was in front and the owner clicked in it since it came there (`OWNER-MCP-BOUNDARY.md` 7b has the reason
-and the limits). **Who asks macOS:** the app asks first, with its own
+was in front and the owner clicked in it since it came there, unless the call changed the page;
+after a call that changed the page the first click is dropped too. Each hold ends at a click in
+the app and when the app leaves the front
+(`OWNER-MCP-BOUNDARY.md` 7b has the reason and the limits). **Who asks macOS:** the app asks first, with its own
 activate, and then the program runs `/usr/bin/open` on its own bundle, with no shell and no word
 of the request, after each `setup_show` that the app took, and `founderizer-cli guide` does the
 same after its sign to the app. On a test Mac on 14 November 2026 (macOS 26.6, Terminal in front)
