@@ -479,6 +479,8 @@ class ModelAccounts(OwnerAPI):
         checking = [{"kind": "account", "ref": "spark", "state": "checking", "detail": ""}]
         first = hub.start_machine_check("own-1")["check"]["id"]
         report("own-1", check=first, verify=checking)
+        self.assertEqual(hub.check_view(hub.q1("SELECT * FROM machine_checks WHERE id=?", (first,)))["waits_for"],
+                         "account")                                 # D22: a new request replaces it
         hub.settle_checks(hub.now() + 30 * 86400)                   # no time ends it
         self.assertEqual(hub.q1("SELECT state FROM machine_checks WHERE id=?", (first,))["state"], "requested")
         again = hub.start_machine_check("own-1")
@@ -502,6 +504,93 @@ class ModelAccounts(OwnerAPI):
         hub.settle_checks(hub.now())
         self.assertIsNone(hub.kv_get(hub.CHECK_RUNNING + str(second)))
         self.assertIn(("machine_checks", "agent"), hub.REMOVED_OWN)
+
+    def test_the_hub_asks_for_a_check_itself_when_what_the_check_proved_changes(self):
+        """The coordinator's decision D21: a change of the agent's model, or of its account's model or address, asks
+        for a machine check under the hood. It replaces an open check, it goes out at the helper's report that holds
+        the new settings, and no check's own result asks for one."""
+        def checks(agent):
+            return [dict(r) for r in hub.q("SELECT id, state, detail FROM machine_checks WHERE agent=? ORDER BY id",
+                                           (agent,))]
+
+        def sent(agent):
+            return [json.loads(r["extra"])["check"] for r in hub.q(
+                "SELECT extra FROM events WHERE agent=? AND kind='check' ORDER BY id", (agent,))]
+
+        def report(agent, revision, **body):
+            code, said = self.request(f"/helper/status/{agent}", dict({"revision": revision}, **body))
+            self.assertEqual(code, 200, said)
+        helper_reports("gem-1", "acp_tasks", "model_accounts",
+                       models=models("opencode", "google/gemini-3.1-pro", "google/gemini-3.5-flash"))
+        before = hub.kit_revision(fresh=True)
+        open_check = hub.start_machine_check("gem-1")["check"]["id"]        # one that the owner asked, sent
+        code, said = self.request("/ui/team/agents/gem-1", dict(request_id=str(uuid.uuid4()), db="test-generation",
+                                                                base_sha256=self.sha(), model="google/gemini-3.5-flash"))
+        self.assertEqual(code, 200, said)
+        (replaced, due) = checks("gem-1")
+        self.assertEqual((replaced["id"], replaced["state"], replaced["detail"]),
+                         (open_check, "failed", hub.CHECK_REPLACED))
+        self.assertEqual((due["state"], sent("gem-1")), ("requested", [open_check]))     # not sent yet
+        self.assertEqual(hub.check_view(hub.q1("SELECT * FROM machine_checks WHERE id=?", (due["id"],)))["waits_for"],
+                         "settings")
+        hub.settle_checks(hub.now() + hub.CHECK_WAIT + 600)                 # no time ends its wait
+        self.assertEqual(checks("gem-1")[-1]["state"], "requested")
+        report("gem-1", before)                                             # the helper has not loaded it yet
+        self.assertEqual(sent("gem-1"), [open_check])
+        after = hub.kit_revision(fresh=True)
+        report("gem-1", after)                                              # now it has: the check goes out
+        self.assertEqual(sent("gem-1"), [open_check, due["id"]])
+        self.assertIsNone(hub.check_view(hub.q1("SELECT * FROM machine_checks WHERE id=?", (due["id"],)))["waits_for"])
+        report("gem-1", after, check=due["id"], verify=[{"kind": "account", "ref": "gemini", "state": "ok",
+                                                         "detail": ""}])
+        self.assertEqual(checks("gem-1")[-1]["state"], "completed")
+        report("gem-1", after)
+        self.assertEqual(len(checks("gem-1")), 2)                           # its result asks for no other check
+        # The account's model or address: each of its agents; its title alone: none.
+        self.assertEqual(self.account("router", provider="openrouter", title="OpenRouter", kind="key",
+                                      secret=ROUTER_KEY, model="openrouter/kimi-k3")[0], 200)
+        self.assertEqual([c["state"] for c in checks("seller-1")], ["requested"])
+        self.assertEqual(self.account("spark", provider="own", title="Spark", kind="server",
+                                      address="http://100.64.0.8:8000", secret=SERVER_KEY)[0], 200)
+        self.assertEqual([c["state"] for c in checks("own-1")], ["requested"])
+        self.assertEqual(self.account("spark", provider="own", title="Spark (box)", kind="server",
+                                      address="http://100.64.0.8:8000/v1", secret=SERVER_KEY)[0], 200)
+        self.assertEqual(len(checks("own-1")), 1)
+        # The manager's tool: a new model asks for one, an effort alone does not.
+        helper_reports("gem-2", "acp_tasks", "model_accounts",
+                       models=models("opencode", "google/gemini-3.1-pro", "google/gemini-3.5-flash"))
+        said, error = hub.call_tool("manager", "set_agent_model", {"agent": "gem-2", "effort": "low", "why": "drafts"})
+        self.assertFalse(error, said)
+        self.assertEqual(checks("gem-2"), [])
+        said, error = hub.call_tool("manager", "set_agent_model", {"agent": "gem-2", "model": "google/gemini-3.5-flash",
+                                                                  "effort": "low", "why": "drafts"})
+        self.assertFalse(error, said)
+        self.assertEqual([c["state"] for c in checks("gem-2")], ["requested"])
+        # An agent of today's shape: no check of the hub's own.
+        hub.save_agent_settings("dev-lead", {"base_sha256": self.sha(), "title": "Developer"})
+        self.assertEqual(checks("dev-lead"), [])
+
+    def test_a_second_check_while_the_first_runs_probes_its_own_key(self):
+        """W1 of the fourth review: the report of a check that a new one replaced ends no probe job of the new one,
+        so the new check can still probe the agent's key."""
+        def report(agent, **body):
+            code, said = self.request(f"/helper/status/{agent}", dict({"revision": hub.kit_revision(fresh=True)},
+                                                                      **body))
+            self.assertEqual(code, 200, said)
+
+        def probes():
+            return [(r["id"], r["finished"] is not None) for r in
+                    hub.q("SELECT id, finished FROM jobs WHERE agent='gem-1' AND kind='probe' ORDER BY id")]
+        first = hub.start_machine_check("gem-1")["check"]["id"]
+        report("gem-1", check=first, verify=[{"kind": "account", "ref": "gemini", "state": "checking", "detail": ""}])
+        second = hub.start_machine_check("gem-1")["check"]["id"]            # it replaces the first (D20)
+        (old, new) = probes()
+        self.assertEqual((old[1], new[1]), (True, False))
+        report("gem-1", check=first, verify=[{"kind": "account", "ref": "gemini", "state": "ok", "detail": ""}])
+        self.assertEqual(probes()[1], (new[0], False))                      # the late report of the first: no end
+        report("gem-1", check=second, verify=[{"kind": "account", "ref": "gemini", "state": "ok", "detail": ""}])
+        self.assertEqual(probes()[1], (new[0], True))
+        self.assertEqual(hub.q1("SELECT state FROM machine_checks WHERE id=?", (second,))["state"], "completed")
 
     def test_a_check_waits_for_its_account_item_on_the_next_report(self):
         """The coordinator's decision D12: a check whose first report has the account item in state checking stays

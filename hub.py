@@ -26676,6 +26676,8 @@ def t_set_agent_model(agent, a):
     if not result["changed"]:
         return f"{target} is no longer in team.json. Nothing changed."
     told = request_update(target, result["revision"]) == "requested"
+    if new["model"] != old["model"]:
+        account_check_due(target)       # the AI providers build, D21: the new model of a model account is checked
     with transaction():
         DB.execute('INSERT INTO model_changes(agent,by,"from","to",why,at) VALUES(?,?,?,?,?,?)',
                    (target, agent, json.dumps(old), json.dumps(new), why, now()))
@@ -31236,24 +31238,45 @@ def check_holds(agent, rev, desired):
     return dict(old, agents=old["agents"].get(agent)) == dict(new, agents=new["agents"].get(agent))
 
 
-def start_machine_check(agent):
-    """Check this machine now: the helper runs its usual status collection at once (no AI turn, no change)."""
+def start_machine_check(agent, replace=False, settings=False):
+    """Check this machine now: the helper runs its usual status collection at once (no AI turn, no change).
+
+    The coordinator's decision D20: a check that waits (check_waits: its account item, or its helper's settings)
+    has no clock, so a new request is the event that ends it, and a new check starts. replace: end any open check,
+    for a request of the hub's own (D21). settings: the new check goes out only at the helper's report that holds the
+    agent's settings of now (record_status), so that it proves what the agent's next session runs."""
     pending = q1("SELECT * FROM machine_checks WHERE agent=? AND state='requested' ORDER BY id DESC LIMIT 1", (agent,))
-    if pending and kv_get(CHECK_RUNNING + str(pending["id"])):
-        # The coordinator's decision D20: a check that waits for its account item (D12) has no clock, so the owner's
-        # new request is the event that ends it, and a new check starts. A server that went away during the item
-        # would otherwise keep the check open, and each request would give it back.
+    if pending and (replace or check_waits(pending["id"])):
         q("UPDATE machine_checks SET state='failed', completed=?, detail=? WHERE id=? AND state='requested'",
           (now(), CHECK_REPLACED, pending["id"]))
-        kv_set(CHECK_RUNNING + str(pending["id"]), None)
+        check_ended(pending["id"])
         pending = None
     if pending:
         return {"agent": agent, "check": check_view(pending), "changed": False}
     cid = ins("INSERT INTO machine_checks(agent,requested,state) VALUES(?,?,'requested')", (agent, now()))
+    if settings:
+        kv_set(CHECK_AFTER + str(cid), agent)
+    else:
+        send_machine_check(agent, cid)
+    return {"agent": agent, "check": check_view(q1("SELECT * FROM machine_checks WHERE id=?", (cid,))), "changed": True}
+
+
+def send_machine_check(agent, cid):
+    """The event that asks the agent's helper for check `cid`, with a probe job of its logins when it holds any, kept
+    as this check's own (CHECK_PROBE, W1)."""
     probe = ins("INSERT INTO jobs(agent,task,kind,login,created) VALUES(?,NULL,'probe',NULL,?)",
                 (agent, now())) if granted_logins(agent) else None
+    if probe:
+        kv_set(CHECK_PROBE + str(cid), probe)
     emit(agent, "check", "Check this machine now", extra=dict({"check": cid}, **({"probe_job": probe} if probe else {})))
-    return {"agent": agent, "check": check_view(q1("SELECT * FROM machine_checks WHERE id=?", (cid,))), "changed": True}
+
+
+def account_check_due(agent, team=None):
+    """D21: the hub asks for a check of this agent itself, under the hood, when what its model account's check proved
+    changed: the agent's model, its account's model or address, or its server. Only for an agent whose account has a
+    kind. It replaces an open check, and goes out when the helper holds the new settings (start_machine_check)."""
+    if lifecycle.model_account(team if team is not None else team_read(), (agents().get(agent) or {})):
+        start_machine_check(agent, replace=True, settings=True)
 
 
 def activation_missing(agent):
@@ -31430,6 +31453,8 @@ def save_agent_settings(agent, body):
     # holds its runtime switch. Its running standing session keeps the settings that it started with.
     updates = [agent] if fields & {"model", "effort", "can", "screen"} and \
         request_update(agent, commit) == "requested" else []
+    if "model" in fields:
+        account_check_due(agent)        # the AI providers build, D21: the new model of a model account is checked
     told = {"active", "can", "title", "expertise", "account", WEB_HOSTS}
     if fields & told:
         words = "; ".join(("it is active now and can get tasks" if c["after"] else "it is in setup now and gets no tasks")
@@ -38284,8 +38309,13 @@ def save_account(body):
         if users:
             raise Conflict(f"account {aid} is the label of {', '.join(users)}; change them first", agents=users)
     entry = None if body.get("delete") else account_entry(body)
+    before = (team_read().get("accounts") or {}).get(body["account"]) or {}
     result = save_team_entry(body, "accounts", "account", entry, busy)
     result.pop("done", None)
+    if entry and entry.get("kind") and result["changed"] and \
+            any(entry.get(k) != before.get(k) for k in ("model", "address")):
+        for name in sorted(n for n, a in agents().items() if a.get("account") == body["account"]):
+            account_check_due(name)     # D21: its agents' checks proved the account's model and address before
     return result
 
 
@@ -39296,22 +39326,50 @@ CHECK_RUNNING = "check_running:"
 # The detail of such a check that the owner's new request ended (the coordinator's decision D20). Proposed, not
 # approved: the new check stands in its place at once, so the owner's apps show this only in a check's history.
 CHECK_REPLACED = "Replaced by a new check."
+# D21: a check that the hub asks itself, at a change of what a model account's check proves (the agent's model, the
+# account's model or address, the agent's server), waits for the helper's report that holds those settings
+# (check_holds) and only then goes out: kv CHECK_AFTER<check id> (the agent) marks it until then.
+CHECK_AFTER = "check_after:"
+# W1 of the fourth review: the probe job of one check, so that its report ends that job and no newer check's.
+CHECK_PROBE = "check_probe:"
+CHECK_MARKS = (CHECK_RUNNING, CHECK_AFTER, CHECK_PROBE)
 
 
 def check_view(r):
+    """A machine check as the owner's answers give it. waits_for (the coordinator's decision D22): what a requested
+    check waits for, so that a new request replaces it (start_machine_check): "account", its account item that runs
+    long (D12), or "settings", the helper's load of the settings of a check that the hub asked itself (D21); null
+    for each other check, which a new request gives back as before."""
     return {"id": r["id"], "state": r["state"], "requested_at": r["requested"], "completed_at": r["completed"],
-            "detail": r["detail"]} if r else None
+            "detail": r["detail"], "waits_for": check_waits(r["id"]) if r["state"] == "requested" else None} \
+        if r else None
+
+
+def check_waits(cid):
+    """"account" while a requested check waits for its account item (D12), "settings" while one that the hub asked
+    itself waits for its helper's settings (D21), else None: a new request replaces such a check (D20, D21)."""
+    return "account" if kv_get(CHECK_RUNNING + str(cid)) else "settings" if kv_get(CHECK_AFTER + str(cid)) else None
+
+
+def check_ended(cid):
+    """The end of a check's marks, and of its own probe job (W1), when a new request replaced it."""
+    probe = kv_get(CHECK_PROBE + str(cid))
+    if probe and str(probe).isdigit():
+        q("UPDATE jobs SET finished=COALESCE(finished,?) WHERE id=? AND kind='probe'", (now(), int(probe)))
+    for mark in CHECK_MARKS:
+        kv_set(mark + str(cid), None)
 
 
 def settle_checks(t0):
     """A check whose report did not come in time: offline when the helper has not checked in since it was asked,
     otherwise failed (the helper is there but sent no report, for example an older helper)."""
     # D20: the mark of a check that no longer waits (answered, replaced, or gone with its agent's removal) goes
-    q("DELETE FROM kv WHERE k LIKE ? AND k NOT IN (SELECT ? || id FROM machine_checks WHERE state='requested')",
-      (CHECK_RUNNING + "%", CHECK_RUNNING))
+    for mark in CHECK_MARKS:
+        q("DELETE FROM kv WHERE k LIKE ? AND k NOT IN (SELECT ? || id FROM machine_checks WHERE state='requested')",
+          (mark + "%", mark))
     for c in q("SELECT * FROM machine_checks WHERE state='requested' AND requested < ?", (t0 - CHECK_WAIT,)):
-        if kv_get(CHECK_RUNNING + str(c["id"])):
-            continue        # D12: its account item runs, and the helper's next report ends the wait
+        if check_waits(c["id"]):
+            continue        # D12: its account item runs; D21: its helper has not loaded its settings yet
         seen = (q1("SELECT last_seen FROM agents WHERE name=?", (c["agent"],)) or {"last_seen": None})["last_seen"]
         offline = not seen or seen < c["requested"]
         name = shown_role(c["agent"])          # the server check's line, which he reads
@@ -39331,17 +39389,34 @@ def record_status(agent, data):
         # ends it: the report that follows does (the helper sends it when the item is done).
         if q1("SELECT 1 FROM machine_checks WHERE id=? AND agent=? AND state='requested'", (check, agent)):
             kv_set(CHECK_RUNNING + str(check), agent)
-    elif check:
+    elif check and q1("SELECT 1 FROM machine_checks WHERE id=? AND agent=? AND state='requested'", (check, agent)):
         items = verify_merge(agent, verify or [], data)          # owner API 1.9: the setup check of this report
         q("UPDATE machine_checks SET state='completed', completed=?, detail=NULL, verify=?, revision=? "
           "WHERE id=? AND agent=? AND state='requested'", (now(), json.dumps(items), data.get("revision"), check, agent))
-        q("UPDATE jobs SET finished=COALESCE(finished,?) WHERE agent=? AND kind='probe' AND finished IS NULL", (now(), agent))
-        kv_set(CHECK_RUNNING + str(check), None)
-    else:
+        # W1 of the fourth review: this check's own probe job, and no newer check's; a check from before that mark
+        # ends each open one, as before
+        probe = kv_get(CHECK_PROBE + str(check))
+        if probe and str(probe).isdigit():
+            q("UPDATE jobs SET finished=COALESCE(finished,?) WHERE id=? AND agent=? AND kind='probe'",
+              (now(), int(probe), agent))
+        else:
+            q("UPDATE jobs SET finished=COALESCE(finished,?) WHERE agent=? AND kind='probe' AND finished IS NULL",
+              (now(), agent))
+        for mark in CHECK_MARKS:
+            kv_set(mark + str(check), None)
+    elif not check:
         # D12: a report with no check, from a helper whose check ran: it no longer runs (the helper started again,
         # or its last report did not arrive), so settle_checks answers it as any check
         for c in q("SELECT id FROM machine_checks WHERE agent=? AND state='requested'", (agent,)):
             kv_set(CHECK_RUNNING + str(c["id"]), None)
+    # D21: a check that the hub asked itself goes out once a report of this helper holds the settings that it is for.
+    # Only the owner's and the manager's writes ask for one (account_check_due): no report, and no check's own
+    # result, ever asks for a check.
+    for c in q("SELECT id FROM machine_checks WHERE agent=? AND state='requested'", (agent,)):
+        if kv_get(CHECK_AFTER + str(c["id"])) and check_holds(agent, data.get("revision"), desired):
+            kv_set(CHECK_AFTER + str(c["id"]), None)
+            q("UPDATE machine_checks SET requested=? WHERE id=?", (now(), c["id"]))     # its CHECK_WAIT counts now
+            send_machine_check(agent, c["id"])
     old = q1("SELECT data FROM machine_status WHERE agent=?", (agent,))
     with area("state" if not old or said(json.loads(old["data"])) != said(data) else "activity"):
         q("INSERT INTO machine_status(agent,data,reported) VALUES(?,?,?) "
