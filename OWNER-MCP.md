@@ -146,7 +146,8 @@ links a WhatsApp account to the fleet: the owner reads that QR in the app, and `
 Since 14 November 2026 `call` also takes the setup tools `setup_state` and `setup_show` by
 name (below, "The link to the running app"), and the read `setup_diagnosis` on the same link.
 `write` takes each other tool that the
-program has: the nine below, the 54 of the table, and `save_bot_token` and `prepare_problem_report` on the link. A read through `write` is refused, and a write
+program has: the nine below, the 54 of the table, and `save_bot_token`, `prepare_problem_report` and
+`save_secret` on the link. A read through `write` is refused, and a write
 through `call` is refused, each with words that name the right verb; a tool that the program does
 not have gets the words of the MCP form. The JSON is one word of the shell, an object of the tool's
 fields; none means `{}`.
@@ -193,8 +194,9 @@ file can name a `swift` tool that an older program does not have: that program r
 own pages do that work and its own setting says which hub it reads: `install_hub`, `install_log`,
 `claim_hub`, `add_machine`, `use_hub` and `which_hub`. Three more are the program's own and are not
 in the table or in this server: `setup_state`, `setup_show` and `setup_diagnosis`, on the link to
-the running app (below). Two more, `save_bot_token` and `prepare_problem_report`, write on the same
-link (below). So `tools/list` gives 72 tools: the 54 of the table, the thirteen, the three and the two.
+the running app (below). Three more, `save_bot_token`, `prepare_problem_report` and `save_secret`,
+write on the same link (below). So `tools/list` gives 73 tools: the 54 of the table, the thirteen,
+the three reads of the link and its three writes.
 
 **The link to the running app.** Some work only the running app can do: its first run, its pages,
 and in later slices its keys and its engine. So the program asks the app on a local socket, the
@@ -210,8 +212,8 @@ link, which the app listens on while it runs (`OwnerChannel.swift` in `FleetOwne
   link's version (`"v": 1`). The request names the program's set (`"set": "owner"`), one tool of the
   link and its fields; the answer is `"result"` or `"refused"` with words. A request of another
   version, set or tool is refused in words, and a later tool is one more entry of the same link. A
-  tool that takes a value (`save_bot_token`, except from the clipboard, which the app reads itself)
-  gets it as a value part, never in the line: the line's
+  tool that takes a value (`save_bot_token` and `save_secret`, except from the clipboard, which the
+  app reads itself) gets it as a value part, never in the line: the line's
   envelope says `"value_bytes": N`, and exactly N bytes, at most 64 KiB, follow its line end.
 - **Each side checks the other by its code signature**, from the socket's peer: the peer's audit
   token (`LOCAL_PEERTOKEN`), the Security framework's guest lookup by that token, and a requirement.
@@ -610,6 +612,60 @@ It answers `account`, `set` and `replaced` (null when the hub does not say), and
 write, as its page does. The value part and what any process of the owner's user can do with the
 tool: OWNER-MCP-BOUNDARY.md section 7b.
 
+**`save_secret`** (a write, so `founderizer-cli write` and the MCP form take it, and `call` does
+not; since Founderizer 0.1.266): a NEW login or a NEW API key of the fleet into the fleet's central
+vault, as the app's own form Add secret saves a new value with no grant. The app seals the value to
+the central vault's key, the hub gets the entry of its list of secrets, and the hub passes the
+sealed copy on to the vault. The tool gives the secret to no agent, replaces nothing and sets no
+site itself.
+
+- **Its fields:** `kind` (`login` or `api_key`), `from` (`file` with `path`, `stdin`, or
+  `clipboard`) and `request_id`. A login takes `url` (the address of its sign-in page) and
+  `username`, and no `env`. An API key takes `env` (its variable name, by the hub's own rule), may
+  take `url` (the address of its service), and takes no `username`. A login's name in the list is
+  the host of its `url` with its `username`, and a key's name is its `env`: the tool's words tell
+  the agent to put nothing secret in them. For an API key with an https `url`, only the scheme,
+  the host and the port go to the hub, which can then give the key its site from its own table of
+  well-known services. The whole address stays in the value that the vault keeps.
+- **The value** (a login's password, or the key) is never a field, never a word of a command line
+  and never a word of a chat. It comes as the bot token does: from a file, or from a program's pipe
+  with `stdin` (only with `write`; never `pbpaste`, an echo or a here-string), which the program
+  reads and sends as a value part with no `path`; or from the clipboard, which the app reads
+  itself, last and one time, and clears after the save when nothing else changed it since the
+  read. The agent never sees, types or repeats the value, and never asks the owner to paste it
+  into a chat.
+- **The one line end.** The value is text of 8 characters or more, at most 4096 bytes, with no
+  white space and no invisible character. The app takes nothing off a value but the one line end
+  (LF, or CR LF) at the very end of a file's or a pipe's text. Every other white space or invisible
+  character at an end, and a text of two lines, is refused. The clipboard's text is taken as it is.
+- **A save can take longer than its call.** The answer then says `state` `running`, with `stage`
+  `registering` or `storing`, and the save goes on in the app. A later call with only `request_id`
+  reads its state and changes nothing. The same call again with the same fields, the same `from`
+  and the same `request_id` goes on with that save and makes nothing twice. `founderizer-cli` makes
+  the id when the caller gives none, and the words that ask for another call name the id.
+- **Only to the pinned key.** The app seals only to the vault key that this Mac pinned. With no
+  pin, with another key, with no recovery key in the vault, or with a vault that does not answer,
+  nothing is sent, and each case has its own sentence. For another key the agent tells the owner
+  and saves nothing until the owner knows why, and never sets the vault up again to get past it.
+- **Only a new secret.** A name that the list has already is refused. The owner replaces a secret
+  in Founderizer, on Secrets, and saves a login with a seed for one-time codes there too.
+- **Its answers.** When the save is done: `request_id`, `state` `done`, `reference`, `title` and
+  `kind`, and after a save from the clipboard `clipboard` (`cleared` or `kept`). No answer has the
+  value, its length or a fingerprint. A refusal is a fixed sentence that quotes no field's text
+  and none of the hub's words: only the entry's reference, the hub's status number and the save's
+  own `request_id` change in one.
+- **After a save** no agent holds the secret. `grant_access` of a secret writes the grant into
+  the fleet's list with no signature of the owner's, and the central vault seals a copy for an
+  agent only for a grant that the app signs with the owner's own key (`POST /ui/vault/grant`,
+  which is no tool), or for a secret that the owner signed into the grantable pool. A new secret
+  is in no pool, so a grant from the program brings its value to no server, while the list shows
+  the secret as given, and the guide tells the agent not to make one: the owner gives the secret
+  to an agent in the Founderizer app, on Secrets.
+
+No command lock: the app does the write, as its form does. What any process of the owner's user
+can do with the tool, and what a refusal tells of a file that a caller names:
+OWNER-MCP-BOUNDARY.md section 7b.
+
 **`prepare_problem_report`** (a write, so `founderizer-cli write` and the MCP form take it, and `call`
 does not): the owner's own agent writes a problem report, and the owner sends it (the owner, 15 November
 2026: "does admin mcp have some sort of bug_report tool call so we can receive them somehow?"). Its one
@@ -973,7 +1029,10 @@ server is not allowed to carry.
    the owner's money and the owner's liability (RULES.md, "Access that the fleet already holds"),
    and the value would have to pass through a tool. So the owner does these in the app, and this
    server hands out only what the fleet already holds. The Tailscale key is the one it touches,
-   and only as the path of a file it never opens.
+   and only as the path of a file it never opens. The program inside the app has two tools for
+   two of these, still with no value in a tool's field: `save_bot_token` for a bot token and
+   `save_secret` for a new login or API key of the vault. Each takes the value from a file, a pipe
+   or the clipboard of this Mac, and the app does the write ("The link to the running app").
 2. **Finish a provider sign-in.** `sign_in_machine` starts it and `sign_in_code` carries the code,
    but the page in between is the provider's own, in the owner's own browser, under the terms on
    which Founderizer may host the unmodified runtime at all: each end user signs in through the

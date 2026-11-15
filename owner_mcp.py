@@ -265,12 +265,16 @@ NOT_TOOLS = {
     "/ui/google/finish": "the authorization code of that flow",
     "/ui/mcp/connect": "an MCP server's OAuth client, and a browser flow of the owner's own",
     "/ui/mcp/finish": "the authorization code of that flow",
-    "/ui/secrets/add": "the value of a login",
+    "/ui/secrets/add": "the value of a login; for a new login or API key the app's program has save_secret, which "
+                       "takes the value from a file or a pipe on this Mac, or has the app read the clipboard, and "
+                       "never as a field",
     "/ui/secrets/import": "the values of an import's logins, as /ui/secrets/add",
     "/ui/secrets/fingerprints": "the owner's own secret catalog",
     "/ui/needs/{}/secret": "a secret request's answer with a login, which the app's secure form gives once the value "
                            "is in a vault; its decline carries no value, and decline_secret_request sends that",
-    "/ui/vault/intake": "a value sealed to the central vault, which only the owner's own vault makes",
+    "/ui/vault/intake": "a value sealed to the central vault, which only the owner's own app or vault makes; for a new "
+                        "login or API key the app's program has save_secret, and the app then makes that sealed "
+                        "copy and sends it",
     "/ui/vault/pin": "a statement signed with the owner's own key, which only their app on their Mac holds",
     "/ui/servers/shape": "the step of the fleet's servers, which the owner chooses on the slider of their app: the "
                          "app moves the agents for it, and for one server it runs root's part on the hub's server "
