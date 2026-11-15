@@ -31260,6 +31260,8 @@ def start_machine_check(agent, replace=False, settings=False):
     cid = ins("INSERT INTO machine_checks(agent,requested,state) VALUES(?,?,'requested')", (agent, now()))
     if settings:
         kv_set(CHECK_AFTER + str(cid), agent)
+    elif server_check_out(agent):
+        kv_set(CHECK_QUEUED + str(cid), agent)      # D27: after the check of another agent of its model server
     else:
         send_machine_check(agent, cid)
     return {"agent": agent, "check": check_view(q1("SELECT * FROM machine_checks WHERE id=?", (cid,))), "changed": True}
@@ -39372,7 +39374,12 @@ CHECK_REPLACED = "Replaced by a new check."
 CHECK_AFTER = "check_after:"
 # W1 of the fourth review: the probe job of one check, so that its report ends that job and no newer check's.
 CHECK_PROBE = "check_probe:"
-CHECK_MARKS = (CHECK_RUNNING, CHECK_AFTER, CHECK_PROBE)
+# The coordinator's decision D27 (the fifth review X7, as lane S3 measured it on 15 November 2026: four checks at once
+# of one llama.cpp server with -c 65536 all failed "Its context is smaller than 64,000 tokens.", and each passes
+# alone): the hub sends the checks of the agents of one model server one after the other. kv CHECK_QUEUED<check id>
+# (the agent) marks a check that waits for its turn, which it gets at its helper's report after the earlier one ended.
+CHECK_QUEUED = "check_queued:"
+CHECK_MARKS = (CHECK_RUNNING, CHECK_AFTER, CHECK_PROBE, CHECK_QUEUED)
 
 
 def check_view(r):
@@ -39387,8 +39394,21 @@ def check_view(r):
 
 def check_waits(cid):
     """"account" while a requested check waits for its account item (D12), "settings" while one that the hub asked
-    itself waits for its helper's settings (D21), else None: a new request replaces such a check (D20, D21)."""
-    return "account" if kv_get(CHECK_RUNNING + str(cid)) else "settings" if kv_get(CHECK_AFTER + str(cid)) else None
+    itself waits for its helper's settings (D21), "turn" while one waits for the check of another agent of its model
+    server to end (D27), else None: a new request replaces such a check (D20, D21)."""
+    return "account" if kv_get(CHECK_RUNNING + str(cid)) else "settings" if kv_get(CHECK_AFTER + str(cid)) else \
+        "turn" if kv_get(CHECK_QUEUED + str(cid)) else None
+
+
+def server_check_out(agent):
+    """True while a check of another agent of this agent's model server is out: sent to its helper and not ended
+    (D27). Only for an account of kind server: a key account's check is one call to its provider."""
+    held = lifecycle.model_account(team_read(), agents().get(agent))
+    if not held or held["kind"] != "server":
+        return False
+    others = [n for n, a in agents().items() if n != agent and a.get("account") == held["id"]]
+    return any(not kv_get(CHECK_AFTER + str(c["id"])) and not kv_get(CHECK_QUEUED + str(c["id"]))
+               for n in others for c in q("SELECT id FROM machine_checks WHERE agent=? AND state='requested'", (n,)))
 
 
 def check_ended(cid):
@@ -39462,10 +39482,18 @@ def record_status(agent, data):
     # Only the owner's and the manager's writes ask for one (account_check_due): no report, and no check's own
     # result, ever asks for a check.
     for c in q("SELECT id FROM machine_checks WHERE agent=? AND state='requested'", (agent,)):
-        if kv_get(CHECK_AFTER + str(c["id"])) and check_holds(agent, data.get("revision"), desired):
-            kv_set(CHECK_AFTER + str(c["id"]), None)
-            q("UPDATE machine_checks SET requested=? WHERE id=?", (now(), c["id"]))     # its CHECK_WAIT counts now
-            send_machine_check(agent, c["id"])
+        after, queued = kv_get(CHECK_AFTER + str(c["id"])), kv_get(CHECK_QUEUED + str(c["id"]))
+        if not (after or queued) or after and not check_holds(agent, data.get("revision"), desired):
+            continue
+        if server_check_out(agent):         # D27: its model server checks one agent at a time
+            if after:
+                kv_set(CHECK_AFTER + str(c["id"]), None)
+                kv_set(CHECK_QUEUED + str(c["id"]), agent)      # its settings hold: it waits for its turn only
+            continue
+        kv_set(CHECK_AFTER + str(c["id"]), None)
+        kv_set(CHECK_QUEUED + str(c["id"]), None)
+        q("UPDATE machine_checks SET requested=? WHERE id=?", (now(), c["id"]))     # its CHECK_WAIT counts now
+        send_machine_check(agent, c["id"])
     old = q1("SELECT data FROM machine_status WHERE agent=?", (agent,))
     with area("state" if not old or said(json.loads(old["data"])) != said(data) else "activity"):
         q("INSERT INTO machine_status(agent,data,reported) VALUES(?,?,?) "

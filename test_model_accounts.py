@@ -657,6 +657,41 @@ class ModelAccounts(OwnerAPI):
         self.assertEqual(len(told(refused("dev-lead"))), 1)
         self.assertEqual(hub.q("SELECT * FROM machine_checks WHERE agent='dev-lead'"), [])
 
+    def test_the_agents_of_one_model_server_are_checked_one_after_the_other(self):
+        """The coordinator's decision D27, as lane S3 measured it (15 November 2026: four checks at once of one
+        llama.cpp server all failed its context step, and each passes alone): a check of an agent waits while a check
+        of another agent of the same model server is out, and goes out at its helper's report after that one ended.
+        A key account's checks are not held."""
+        team = copy.deepcopy(TEAM)
+        team["agents"]["own-2"] = dict(OPENCODE, machine="app-6", account="spark", secrets={SERVER_KEY: "read"})
+        self.put(team)
+
+        def report(agent, **body):
+            code, said = self.request(f"/helper/status/{agent}", dict({"revision": hub.kit_revision(fresh=True)},
+                                                                      **body))
+            self.assertEqual(code, 200, said)
+
+        def sent(agent):
+            return [json.loads(r["extra"])["check"] for r in hub.q(
+                "SELECT extra FROM events WHERE agent=? AND kind='check' ORDER BY id", (agent,))]
+        first = hub.start_machine_check("own-1")["check"]
+        second = hub.start_machine_check("own-2")["check"]
+        self.assertEqual((first["waits_for"], second["waits_for"]), (None, "turn"))
+        self.assertEqual((sent("own-1"), sent("own-2")), ([first["id"]], []))
+        report("own-2")                                              # own-1's check is still out
+        self.assertEqual(sent("own-2"), [])
+        hub.settle_checks(hub.now() + hub.CHECK_WAIT + 600)          # no time ends its wait
+        self.assertEqual(hub.q1("SELECT state FROM machine_checks WHERE id=?", (second["id"],))["state"], "requested")
+        report("own-1", check=first["id"], verify=[{"kind": "account", "ref": "spark", "state": "ok",
+                                                    "detail": "own/qwen3.8-max"}])
+        report("own-2")                                              # its turn: it goes out now
+        self.assertEqual(sent("own-2"), [second["id"]])
+        self.assertIsNone(hub.check_view(hub.q1("SELECT * FROM machine_checks WHERE id=?", (second["id"],)))["waits_for"])
+        # Two agents of one key account: each check goes out at once.
+        a, b = hub.start_machine_check("gem-1")["check"], hub.start_machine_check("gem-2")["check"]
+        self.assertEqual((a["waits_for"], b["waits_for"], sent("gem-1"), sent("gem-2")),
+                         (None, None, [a["id"]], [b["id"]]))
+
     def test_a_second_check_while_the_first_runs_probes_its_own_key(self):
         """W1 of the fourth review: the report of a check that a new one replaced ends no probe job of the new one,
         so the new check can still probe the agent's key."""

@@ -418,6 +418,7 @@ class Columns(unittest.TestCase):
     NOT_AGENT_KV = {
         "check_fails:": "a wake-up rule", "check_lost:": "a run of a check", "check_running:": "a machine check",
         "check_after:": "a machine check", "check_probe:": "a machine check",
+        "check_queued:": "a machine check",
         "conversation_brief:": "a conversation",
         "deliver_running:": "a task", "desktop_click:": "a Mac", "desktop_seen:": "a Mac", "desktop_told:": "a Mac",
         "door_mode:": "a server of the door",
