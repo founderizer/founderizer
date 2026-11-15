@@ -937,6 +937,25 @@ def type_into(session, name, text, asks=True):
 # command or file.
 UNSEEN_TOOLS = ["CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "RemoteTrigger", "PushNotification"]
 NO_TIMERS = "CLAUDE_CODE_DISABLE_CRON=1"
+# Claude Code's own two ways from one session to another, which the hub cannot see either (the owner, 15 November 2026:
+# "Yes, build both"). Every Claude session that a helper starts for an agent's work has both off. The window of a
+# sign-in or a sign-out (runtime_login_command) is no such session and has neither.
+# Its inbox: each session has one (by Claude Code's documents since 2.1.224), and each other Claude Code session of
+# the same OS user on its machine can put a message into it. A session in dontAsk takes that message with no question,
+# unless its sender says that it runs with no permission check, and an idle one starts a turn for it: a real task
+# session and a real owner chat did, after 1 second. No record of the hub has it, no hidden character is taken out of
+# it, and it is no message_agent. On a Mac the agent's user is the desktop account, where its person can run Claude
+# Code too, and so can a second agent of that Mac while two still share a user (VAULT.md, "Agents of one Mac").
+# "refuse" drops each such message. It also drops what a session's own hook or command writes into its own inbox,
+# which Fleet does not use; the end notice of a session's own Workflow still arrives (test_efficiency.LiveAskingUp).
+NO_PEER_MESSAGES = {"crossSessionInbound": "refuse"}
+# Its agent teams: with this variable on, in the machine's environment today and maybe by default in a later version,
+# Claude Code's documents say that a subagent that the model gives a name starts as a teammate, and that nobody is
+# asked. Measured here: the model is then offered other tools. The helper's reader of a session's records
+# (threads.py) knows a subagent, a fork and a workflow, and no teammate: work that it cannot see is work that a
+# delivery does not wait for. The word in the start command wins over the machine's environment, and no session loads
+# a settings file of its machine that could turn it on again (kept_user_settings).
+NO_TEAMS = "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0"
 # Plan C2: Claude Code's screen-reader mode draws "no decorative borders or animations", and its "Reduce motion"
 # (prefersReducedMotion) stops the spinner's timer. Either would still the counters by which the screen watch tells a
 # frozen runtime from a working one, so a task or manager session starts with both off: this variable wins over the
@@ -1058,6 +1077,7 @@ def settings_arg(agent, conf, task, tools=(), needs="none"):
         settings["enableWorkflows"] = True
     settings["prefersReducedMotion"] = False        # the screen watch reads its counters (MOTION)
     settings.update(NO_SUGGESTION)
+    settings.update(NO_PEER_MESSAGES)               # a message reaches a session through the hub only
     # AUTONOMY.md decision 41: what an agent learns is the fleet's (its notes and its memory, which the owner reads),
     # never a memory folder of Claude Code's own that a later session would load unseen
     settings.update(CLAUDE_NO_MEMORY)
@@ -2099,7 +2119,7 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         cmd = cmd.replace("codex ", "codex resume ", 1)     # last, so that it comes first: codex resume [options] <thread>
     env = f"FLEET_ATTEMPT={attempt} FLEET_GENERATION={shlex.quote(generation)} FLEET_HUB={shlex.quote(HUB)} FLEET_AGENT={shlex.quote(agent)} FLEET_TASK={shlex.quote(task or '')}"
     if conf.get("runtime") == "claude":
-        env += f" {NO_TIMERS} {MOTION}" + (f" {TODO_TOOLS}" if task else "")
+        env += f" {NO_TIMERS} {NO_TEAMS} {MOTION}" + (f" {TODO_TOOLS}" if task else "")
     if not task and conf.get("runtime") == "claude":
         env += f" CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"
     return f"{prefix}env {env} {cmd}"
@@ -2205,7 +2225,7 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
         allow.append(CHROME_TOOLS)
         deny += CLOSED_CHROME_DENY
     hook = f"{shlex.quote(sys.executable)} {shlex.quote(os.path.join(KIT, 'fleet.py'))} hook"
-    settings = dict({**CLAUDE_NO_MEMORY, "prefersReducedMotion": False,
+    settings = dict({**CLAUDE_NO_MEMORY, **NO_PEER_MESSAGES, "prefersReducedMotion": False,
                      "permissions": {"allow": allow, "deny": deny},
                      # the activity of its tool calls for the hub's views, as every task session sends it (C7)
                      "hooks": {"PostToolUse": [{"hooks": [{"type": "command", "async": True, "timeout": 10,
@@ -2233,7 +2253,7 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
             "--settings", json.dumps(settings)] + (["--chrome"] if needs == "browser" else []) + first + \
         shlex.split(model_flags(conf))
     words = ["env", f"FLEET_ATTEMPT={attempt}", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}",
-             f"FLEET_AGENT={agent}", f"FLEET_TASK={task}", NO_TIMERS, MOTION, CLOSED_NO_UPDATES] + \
+             f"FLEET_AGENT={agent}", f"FLEET_TASK={task}", NO_TIMERS, NO_TEAMS, MOTION, CLOSED_NO_UPDATES] + \
         [f"{name}={values[name]}" for name in ("CLAUDE_CODE_AUTO_COMPACT_WINDOW",) if name in values]   # a window
     return shlex.join(words + args)
 
@@ -2661,7 +2681,7 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
             raise Refused("a Claude chat resumes only a session id")
         # no memory folder of Claude Code's own either (AUTONOMY.md decision 41, settings_arg), and none of this
         # machine user's settings (kept_user_settings)
-        settings = dict({**CLAUDE_NO_MEMORY, **NO_SUGGESTION,
+        settings = dict({**CLAUDE_NO_MEMORY, **NO_SUGGESTION, **NO_PEER_MESSAGES,
                          "permissions": {"allow": [f"mcp__fleet__{t}" for t in CHAT_TOOLS], "deny": DENY}},
                         **kept_user_settings())
         args = ["claude"] + (["--resume", resume] if resume else ["--session-id", marker] if marker else []) + \
@@ -2679,7 +2699,8 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
     values = dict(env or {}, **({"FLEET_SESSION_TOKEN": token}
                                 if token and runtime_fact(conf.get("runtime"), "token_in_env", True) else {}))
     words = ["env", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}", f"FLEET_AGENT={agent}", "FLEET_TASK="] + \
-        ([NO_TIMERS, f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"] if conf.get("runtime") == "claude" else [])
+        ([NO_TIMERS, NO_TEAMS, f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"]
+         if conf.get("runtime") == "claude" else [])
     command = env_prefix(agent, "owner-chat", values) + shlex.join(words + args)
     if stable is not None and conf.get("runtime") == "codex" and not resume:
         # A first prompt longer than a tmux command can carry: the window's shell reads it from its file, which it
@@ -3033,7 +3054,7 @@ def conversation_command(agent, conf, generation, conversation, url, token, prom
     kept = {key: value for key, value in kept_user_settings().items() if runtime is None or key != "env"}
     # mode "narrowed" (the person access plan): the same lock, with the narrowed tools as the allow list
     allowed = NARROWED_TOOLS if narrowed_mode(mode) else CONVERSATION_TOOLS
-    settings = dict({**CLAUDE_NO_MEMORY, **NO_SUGGESTION,
+    settings = dict({**CLAUDE_NO_MEMORY, **NO_SUGGESTION, **NO_PEER_MESSAGES,
                      "permissions": {"allow": [f"mcp__fleet__{t}" for t in allowed], "deny": DENY}}, **kept)
     # --setting-sources "": no user, project or local settings, so no CLAUDE.md, hook or plugin of this machine, and
     # --settings still applies. --safe-mode would also drop the --mcp-config server, so the session had no tools.
@@ -3043,6 +3064,7 @@ def conversation_command(agent, conf, generation, conversation, url, token, prom
             "--append-system-prompt-file", session_file(agent, window, "md", prompt)] + \
         (shlex.split(model_flags(conf)) if own else [])
     words = ["env", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}", f"FLEET_AGENT={agent}", "FLEET_TASK=", NO_TIMERS,
+             NO_TEAMS,
              f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"]     # a window that stays open: a bounded context
     if runtime is not None:
         words.append(CLOSED_NO_UPDATES)         # the pinned version stays the version that runs

@@ -127,6 +127,7 @@ class Helper(unittest.TestCase):
         env, args, option = self.parts(self.build())
         self.assertEqual(env[0], "env")
         self.assertIn(fleet.CLOSED_NO_UPDATES, env)
+        self.assertIn(fleet.NO_TEAMS, env)
         self.assertTrue(all(w.startswith(("FLEET_", "CLAUDE_", "DISABLE_")) for w in env[1:]), env)
         self.assertEqual((option("--setting-sources"), option("--permission-mode"), option("--tools")),
                          ("", "dontAsk", "WebSearch"))
@@ -141,6 +142,7 @@ class Helper(unittest.TestCase):
         self.assertEqual(settings["permissions"], {"allow": ["mcp__fleet__*", "WebSearch"],
                                                    "deny": fleet.DENY})
         self.assertFalse(settings["autoMemoryEnabled"])
+        self.assertEqual(settings["crossSessionInbound"], "refuse")       # no message of another Claude session
         self.assertNotIn("enableWorkflows", settings)
         self.assertEqual(list(settings["hooks"]), ["PostToolUse", "PostToolUseFailure"])
         self.assertNotIn(TOKEN, self.build())

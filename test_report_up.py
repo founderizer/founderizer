@@ -8,6 +8,7 @@ same question, the same chain and the same refusal kept coming back.
 """
 import datetime
 import json
+import os
 import sqlite3
 import time
 import unittest
@@ -445,6 +446,47 @@ class Circles(Base):
         self.clock += 86400
         hub.circle_sweep(self.clock)
         self.assertEqual(len(self.said()), 2)
+
+    def test_the_notice_that_first_names_a_chain_says_to_test_the_cause_first_and_no_other_notice_says_it(self):
+        """A chain of follow-ups is often one reading of the cause, tried once more (the owner, 15 November 2026:
+        "do 3 and 4 too"). The notice that names a chain for the first time says so, and names the rule of
+        rules/manager.md, which says the same. A notice with no chain says what it always said, and so does a later
+        notice that shows the same chain again, because a chain's line never leaves the notice."""
+        as_before = "see_history tells you what moved and what did not."
+        again = self.new_task(restarts=3, title="The task that keeps starting")
+        hub.circle_sweep(self.clock)
+        self.assertEqual(len(self.said()), 1)
+        self.assertTrue(self.said()[0].endswith(as_before), self.said()[0])              # no chain among them
+        first = self.new_task(state="failed", outcome="failed")
+        second = self.new_task(state="failed", outcome="failed", follows=first)
+        third = self.new_task(state="failed", outcome="failed", follows=second)
+        before = [dict(r) for r in hub.q("SELECT * FROM tasks ORDER BY id")]
+        self.clock += 86400
+        hub.circle_sweep(self.clock)
+        self.assertEqual(len(self.said()), 2)
+        self.assertIn(f"{hub.tref(third)} is the 3rd task of one chain", self.said()[1])
+        self.assertTrue(self.said()[1].endswith(as_before + hub.CIRCLE_CHAIN_SAYS), self.said()[1])
+        self.assertIn("causes that exclude each other", hub.CIRCLE_CHAIN_SAYS)
+        self.assertIn("When its results do not show the cause", hub.CIRCLE_CHAIN_SAYS)   # a known cause needs none
+        self.assertIn("(rules/manager.md)", hub.CIRCLE_CHAIN_SAYS)
+        self.assertEqual(before, [dict(r) for r in hub.q("SELECT * FROM tasks ORDER BY id")])  # it starts no task
+        hub.q("UPDATE tasks SET restarts=4 WHERE id=?", (again,))                        # another circle joins them
+        self.clock += 86400
+        hub.circle_sweep(self.clock)
+        self.assertEqual(len(self.said()), 3)
+        self.assertIn(f"{hub.tref(third)} is the 3rd task of one chain", self.said()[2])  # the chain's line again
+        self.assertTrue(self.said()[2].endswith(as_before), self.said()[2])               # and not the sentence
+        fourth = self.new_task(state="failed", outcome="failed", follows=third)          # the chain grew: a new one
+        self.clock += 86400
+        hub.circle_sweep(self.clock)
+        self.assertIn(f"{hub.tref(fourth)} is the 4th task of one chain", self.said()[3])
+        self.assertTrue(self.said()[3].endswith(hub.CIRCLE_CHAIN_SAYS), self.said()[3])
+        with open(os.path.join(os.path.dirname(os.path.abspath(hub.__file__)), "rules", "manager.md"),
+                  encoding="utf-8") as f:
+            rule = f.read()
+        self.assertIn("**A chain of follow-ups whose last task ended badly**", rule)     # the rule that it names
+        self.assertIn("causes that exclude each other", rule)
+        self.assertIn("The decision stays yours", rule)
 
 
 class Resume(Base):

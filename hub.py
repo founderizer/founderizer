@@ -26700,6 +26700,9 @@ def t_see_history(agent, a):
 
 CIRCLE_QUESTION_DAYS = 14       # the same question twice inside this is a circle
 CIRCLE_CHAIN = 3                # tasks in one follows chain whose last one ended badly
+CIRCLE_CHAIN_SAYS = (" A chain is often one reading of the cause, tried once more. When its results do not show the "
+                     "cause, give the cause itself as a task of its own before one more follow-up: at least two "
+                     "causes that exclude each other, each tested against the data (rules/manager.md).")
 CIRCLE_RESTARTS = 2             # counted losses in a row of one task: its automatic restarts stopped (plan C6)
 CIRCLE_REFUSALS = 5             # identical refusals inside one task
 CIRCLE_SHOWN = 10
@@ -26902,16 +26905,23 @@ def circle_sweep(t0):
         return
     kv_set("circle_sweep_at", t0)
     found = circles(t0)
-    circle_watched(found, t0)       # before the signature check: an unchanged set keeps its first sighting
+    seen = circle_watched(found, t0)        # before the signature check: an unchanged set keeps its first sighting
     if not sweep_news("circle_sweep_sig", [s for s, _ in found]):
         return
+    # A chain that this notice names for the first time, among the lines it shows: said where the manager stands when
+    # it decides the next follow-up (the owner, 15 November 2026, "do 3 and 4 too"; rules/manager.md has the rule). A
+    # session that starts from the earlier result takes that result's reading of the cause with it, so one more
+    # follow-up is that reading once more. A chain's line stays in every later notice, because nothing ends a chain:
+    # the sentence does not, or the manager would read it again for a chain that it settled.
+    chain = any(sig.startswith("chain:") and seen[sig][0] == t0 for sig, _ in found[:CIRCLE_SHOWN])
     kv_set("circle_notice", emit(manager_name(), "say", f"[hub] {len(found)} thing(s) look like running in circles:\n" +
          "\n".join("  " + line for _, line in found[:CIRCLE_SHOWN]) +
          (f"\n  and {len(found) - CIRCLE_SHOWN} more." if len(found) > CIRCLE_SHOWN else "") +
          "\nThe hub only sees the pattern and changes nothing: the third attempt is sometimes the right one. Decide "
          "each: write the answer where it is read next time (a profile, a knowledge file, the task's own words), "
          "give the work to a suitable agent, settle the access, cancel what nothing needs, or leave it as it is. "
-         "see_history tells you what moved and what did not.", extra=LATER_SAY))
+         "see_history tells you what moved and what did not." +
+         (CIRCLE_CHAIN_SAYS if chain else ""), extra=LATER_SAY))
 
 
 ALLOWANCE_STAGES = {"pace": 1, "last": 2, "spent": 3}  # allowance_worth_saying's why, each one worse than the one before
