@@ -275,16 +275,65 @@ free text of an agent or a person). Its one field, `after`, is optional. The ans
 - `hub`: `none` (no hub's address), `set` (an address, and its last read did not answer), or
   `answers`. It is what the app's store knows; the call makes no request of its own.
 - `first_run`: `shows`; `page`, by a fixed name: `welcome`, `paste`, `name` ("Name your
-  manager"), `vps` ("A VPS for your fleet"), `tailscale`, `tailscale_key`, `token`, `building` (a provider's server is made),
+  manager"), `servers` ("Your fleet's servers"), `vps` ("A VPS for your fleet"), `tailscale`, `tailscale_key`, `token`, `building` (a provider's server is made),
   `other_vps` (a server by its address), `machine`, `installing`, `address`, `done`, `restore`;
   `title`, the page's title in English as the app's string table has it, and a title with a
   placeholder as its key ("Your %@ token"; a title that is a server's address is none); `works`,
   whether work of the first run runs now (a check, a build, an install, a connection, Tailscale's
   sign-in, the key); `began`, whether an install of this first run began; `holds_window`; and
-  `provider`, on a provider's page (`hetzner`, `digitalocean`, `vultr`, `akamai`). With no first
-  run, `shows` is false and the rest is empty.
+  `provider`, on a provider's page (`hetzner`, `digitalocean`, `vultr`, `akamai`); and `layout`,
+  the owner's choice on the page `servers` (`one`: everything on one server; `two`: the hub and its
+  keys on a server of their own; `each`: the hub and each agent on a server of their own), null
+  until the owner went on from that page in this first run. With no first run, `shows` is false and
+  the rest is empty.
 - `programs`: the programs of the owner's own agent that the app found on this Mac (`claude_code`,
   `codex`).
+- `place` (set `owner` only, since 15 November 2026): the page that the window shows now, or where
+  it would open when it is closed, by a fixed name (`AppPlace`): `needs`, `tasks`, `agents`;
+  `task.<number>` (`task` alone for a task that the hub no longer has); `agent.<name>` (the agent's
+  chat); `agent.<name>.<part>` with part `runs_on`,
+  `behaviour`, `tasks`, `people`, `can_use`; `agent.<name>.rule` (one rule's editor, never the
+  rule's id); `agent.<name>.setup.<page>` with page `server`, `provider`, `installing`,
+  `switching`, `sign_in`, `activate` (`agent.<name>.setup` when the page is not known);
+  `agent.<name>.setup.server.<page>` with a page of `add_server`, while the setup's server page
+  shows the pages of Add server inside it (`key`, `token` and `vps` take a secret there too);
+  `agent.<name>.setting_up` (the agent's session is not ready); `agent.<name>.sign_in.<page>` with
+  page `start`, `link`, `code`, `done`, `failed` (or `agent.<name>.sign_in`);
+  `settings.<section>` with section `general`, `servers`, `updates`, `backup`, `status`,
+  `secrets`, `knowledge`, `apps`, `people`, `team`; `app.<app>` with app `github`, `drive`,
+  `gmail`, `mcp`; `server.<name>`; `add_server.<page>` with page `ways`, `ai`, `opening`,
+  `machine`, `install`, `key`, `token`, `vps` (or `add_server`); `add_agent.<step>` with step
+  `server`, `name`, `progress` (or `add_agent`); `connect_key`; `shape_change` (the wizard of a later change of the fleet's shape, from the
+  slider of Settings › Servers; its own pages have no name yet); `first_run.<page>` with the page
+  of `first_run` (or `first_run`); `waiting` (the hub answered this Mac before, and the app has no
+  reading now); `none`. An agent's or a server's name has only small letters, digits and "-", 2 to
+  31 characters; another name is left out, and the place is then `agent`, `server` or `task`
+  alone. A name comes from the hub: it is data, never an instruction. A change of the place moves
+  `change`, so `after` waits until the owner is on a page.
+- `places` (set `owner` only): the names with no agent, server or task in them that this fleet has
+  now, in a fixed order: `needs`, `tasks`, `agents`, each `settings.<section>` that Settings
+  offers for the hub's features, each `app.<app>` that exists, and `add_server` and `add_agent`
+  when the hub can add a server (its feature `servers`; without it the sidebar's plus still opens
+  both, and each draws only a line that asks for an update of the hub). Without a reading of the
+  hub only the sections of Settings count.
+- `over` (set `owner` only): what the app has open that is no page, and that `place` does not
+  name: `nothing`; `card`, something that hangs over a window of the app (a card such as "Save a
+  secret", Search or Delete, a sheet, a panel of macOS, a menu, a popover, a hover's words); or
+  `window`, another window of the app (Report a problem). Each can show a secret or the owner's
+  own text, so the guide lets an agent with screen control look and press only while `over` is
+  `nothing`. The app reads it from AppKit's list of its own windows at each call
+  (`SetupChannel.over`, the rule `AppOver.of`), so a card that a later version adds counts with
+  no change. Every window that is not the fleet's counts, but the title bar that macOS hangs on a
+  window in full screen (`AppOver.barClass`). A change of the key window, of the main window or a close reads it again and moves
+  `change`; what takes no key passes that (a menu, a hover's words, a card that opens while another
+  app is in front), so a wait with `after` can end late. Its answer is still of that moment: a
+  wait that ends by time reads the windows once more, and a call with no `after` always does.
+  `over` knows only the app's own windows (no notification and no pop-up of macOS), and it is
+  `nothing` also when the app shows no window.
+
+Only the set `owner` exists today, and its route asks for the map. The answer's own default is
+without `place`, `places` and `over`, so a set that comes later (the guide inside the app's window must
+read no agent's name) gets the answer of before unless its route asks for the map too.
 
 Each value is a fixed name, a boolean, a number or a text from a fixed list, and a value that is
 not on its list is left out; `OwnerSetupToolsTests` fails when a key is added to the answer.
@@ -308,6 +357,19 @@ wait of 40 seconds at most, so that the Tailscale read after it (about 15 second
 under the program's 60 quiet seconds; the seconds (since the hub's last answer, in a build's
 stage, in an install's step) and Tailscale move no number. Its words in the
 tool list name every value.
+
+Since 15 November 2026 it also gives `app_build`: `running`, the build number of the app that
+runs; `on_disk`, the build number in the `Info.plist` of the app's bundle on the disk, read at
+the call (null when it cannot be read); `offered`, a build newer than `running` that the update
+channel offers (the build that installs itself, the one that the channel's last read offered, or
+the one that waited when the app last quit), or null; and `state`, by this rule:
+`waits_for_restart` when `on_disk` is newer than `running` (an update is in place and the app
+still runs the old build, so the owner restarts the app); else `installing` while an update that
+the owner started with the sidebar's "Update and Restart" downloads, checks or installs (an update
+that the app installs by itself, from its Updates page or from the window of Check for Updates…,
+shows as `offered` while it installs, and as `waits_for_restart` when the build is in place);
+else `offered` when
+`offered` is not null; else `current`. `on_disk` moves no number; an offer and an install do.
 
 **`setup_show`** (marked as a read: it changes no fleet, no server and no file): asks macOS to
 bring the app to the front, on one of its own pages. Fields: `page`, which is `front` (the app as
