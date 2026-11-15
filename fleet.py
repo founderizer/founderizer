@@ -1905,6 +1905,12 @@ def account_key(agent, conf):
     return read_env(agent, conf, "check").get(account["env"])
 
 
+# The owner's approved words for a start on a model server with no kept result of its model (the AI providers step 5
+# answers, round 1, answer 11; decision D21). The requester reads them inside the hub's sentence of a failed start
+# (report_start), so they have no capital and no stop.
+NO_CHECKED_MODEL = "this agent's model server has no checked model yet"
+
+
 def acp_command(agent, conf, prompt, task, attempt, generation, session, values, stable, tools, catalog, minted):
     """The window command of a task session of a runtime of driver acp (the AI providers build spec, section 3.5):
 
@@ -1956,8 +1962,15 @@ def acp_command(agent, conf, prompt, task, attempt, generation, session, values,
         kept = lifecycle.kept_account(os.path.dirname(HOME), agent, account) if account["kind"] == "server" else None
         model = model or account["model"] or (kept or {}).get("model")
         names = [m for m in (kept or {}).get("models") or [] if isinstance(m, str)]
-        if account["kind"] == "server" and not model:
-            raise Refused("this agent's model server has no checked model yet")
+        # A start on a model server needs this machine's kept result of the model that it starts with (decision D21):
+        # a model picked in the Model menu, a new model of the account, another server, or a later check that failed
+        # leaves none, and that model never passed the check here. The name is read as the check and the session's
+        # configuration read it: "<program>/<name>" or <name>. The hub asks for a check itself at each of those
+        # changes, and the helper tries the start again (handle_events), so the start that follows a passed check runs.
+        own = f"{account['program']}/"
+        if account["kind"] == "server" and (not model or not kept or
+                                            (model if model.startswith(own) else own + model) != kept["model"]):
+            raise Refused(NO_CHECKED_MODEL)
     methods = fact("acp_auth") or {}
     auth = methods.get(account["kind"] if account else "plan")
     system = stable + github_text(values, tools) if stable is not None else None
