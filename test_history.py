@@ -14,6 +14,7 @@ Run: python3 -m unittest -v test_history.py
 """
 import datetime
 import hashlib
+import inspect
 import json
 import re
 import sqlite3
@@ -42,6 +43,31 @@ SECRET = "Hx7-Pw!q2Zr9-Lk4"
 
 def at(text):
     return datetime.datetime.fromisoformat(text).replace(tzinfo=MADRID).timestamp()
+
+
+def index_words():
+    """{id: sorted (column, word)} of what the history's index holds now, read from the index itself (fts5vocab)."""
+    hub.q("CREATE VIRTUAL TABLE IF NOT EXISTS temp.test_held USING fts5vocab(main, 'history_fts', 'instance')")
+    out = {}
+    for r in hub.q("SELECT doc, col, term FROM temp.test_held"):
+        out.setdefault(r["doc"], []).append((r["col"], r["term"]))
+    return {doc: sorted(words) for doc, words in out.items()}
+
+
+def row_words():
+    """{id: sorted (column, word)} that each row of the history gives the index as it reads now (its words beside its
+    agent's key), made into words by a contentless FTS5 table of the index's own shape. Only for rows that keep their
+    words: a tool record keeps its words in its session record, not in its row."""
+    shape = sqlite3.connect(":memory:")
+    shape.execute("CREATE VIRTUAL TABLE f USING fts5(text, agent, content='', tokenize='unicode61 remove_diacritics 2')")
+    shape.execute("CREATE VIRTUAL TABLE v USING fts5vocab(f, 'instance')")
+    for h in hub.q("SELECT id, agent, text FROM history"):
+        shape.execute("INSERT INTO f(rowid, text, agent) VALUES(?,?,?)", (h["id"], h["text"], hub.history_key(h["agent"])))
+    out = {}
+    for doc, column, word in shape.execute("SELECT doc, col, term FROM v"):
+        out.setdefault(doc, []).append((column, word))
+    shape.close()
+    return {doc: sorted(words) for doc, words in out.items()}
 
 
 def load_tests(loader, _tests, _pattern):
@@ -738,6 +764,109 @@ class Keeping(Base):
         self.assertGreater(new, need)
         self.assertEqual(self.refs(self.search("vps", query="kayak")), [f"CM-{said}"])
         self.assertEqual(self.refs(self.search(hub.manager_name(), query="domain")), [f"N-{new}"])
+
+    def gone_tool_record(self, word):
+        """A tool record of vps that is the history's newest row, and then leaves it: its session record goes, which
+        nothing tells the history, and a search that finds the row takes it out. Its words stay in the index, because
+        the row holds none to take them out with. Gives the row's id."""
+        self.session("vps")                         # the task that vps's calls come from, in the history before it
+        tid = self.task(title="An export")
+        self.records(tid, [{"seq": 1, "type": "agent_message", "text": f"The {word} export went out at noon"},
+                           {"seq": 2, "type": "agent_thought", "text": "thinking"}])      # no history row: a thought
+        hub.history_catch_up()
+        row = hub.q1("SELECT id FROM history WHERE kind='tool' ORDER BY id DESC LIMIT 1")["id"]
+        self.assertEqual(row, hub.q1("SELECT MAX(id) n FROM history")["n"])
+        # the record goes and the thought stays, so that SQLite gives no session record its id again
+        hub.q("DELETE FROM thread_events WHERE task=? AND type='agent_message'", (tid,))
+        self.assertIn("Nothing", self.search("vps", query=word))
+        self.assertIsNone(hub.q1("SELECT id FROM history WHERE id=?", (row,)))
+        return row
+
+    def reply(self, word):
+        """A message from vps to studio, in the history of both, the sender's row first."""
+        sent = hub.ins("INSERT INTO agent_messages(sender,recipient,text,created,request_id) VALUES('vps','studio',?,?,"
+                       "?)", (f"The {word} report is ready", self.clock, word))
+        hub.history_catch_up()
+        return sent
+
+    def test_an_id_that_left_the_history_is_never_given_again(self):
+        """15 November 2026, the owner's hub: GET /ui/history answered 500 to each ranked search that held "that" or
+        "i". A row that leaves the history keeps its words in the contentless index when the row holds none (a tool
+        record), and SQLite gave its id to the next row: the index then held the old words at the new row's id, a
+        search found the new row by them, and when the new row left the index with its own words, the old ones stayed
+        with no size. The index's ranking reads the size of each match: "database disk image is malformed". So no id
+        of the history comes back, the ranking reads only what joins a row, and the start takes the old words out."""
+        tool = self.gone_tool_record("walrus")
+        sent = self.reply("otter")
+        hub.q("UPDATE agent_messages SET text='The otter report is late' WHERE id=?", (sent,))
+        self.assertEqual(self.refs(self.search("vps", query="otter")), [f"AM-{sent}"])   # read as it reads now
+        code, found = self.owner(query="walrus otter noon")
+        self.assertEqual(code, 200, found)                                # until 15 November 2026: a hub error
+        self.assertEqual([r["ref"] for r in found["results"]], [f"AM-{sent}"] * 2, found)
+        self.assertTrue(all("late" in r["snippet"] for r in found["results"]), found)
+        self.assertGreater(min(r["id"] for r in hub.q("SELECT id FROM history WHERE ref=?", (f"AM-{sent}",))), tool)
+        self.assertIn("Nothing", self.search("vps", query="walrus noon"))   # no row is found by the old words
+        self.assertIn(tool, index_words())          # which stay at an id that no row has and none takes
+        hub.settle_history_index()
+        self.assertEqual(index_words(), row_words())
+
+    def test_the_start_puts_right_an_index_that_an_older_release_left(self):
+        """What the owner's hub held on 15 November 2026, made with the ids that SQLite gave until then: a row whose id
+        holds an older record's words beside its own, which a search finds the row by, and an id with words and no
+        size and no row, at which each ranked search failed. The start takes out each word that is not its row's,
+        indexes the row again as it reads now, and puts the floor of the ids above them; then it does nothing."""
+        given = hub.unused_id
+        sqlite_ids = lambda table: ((hub.DB.execute(f"SELECT MAX(id) FROM {table}").fetchone()[0] or 0) + 1
+                                    if table == "history" else given(table))
+        with patch.object(hub, "unused_id", sqlite_ids):
+            walrus = self.gone_tool_record("walrus")
+            otter = self.reply("otter")                                   # its row takes the walrus's id
+            beaver = self.gone_tool_record("beaver")
+            heron = self.reply("heron")                                   # and this one the beaver's
+            hub.q("UPDATE agent_messages SET text='The heron report is late' WHERE id=?", (heron,))
+            self.assertEqual(self.refs(self.search("vps", query="heron")), [f"AM-{heron}"])
+        self.assertEqual(hub.q1("SELECT ref FROM history WHERE id=?", (walrus,))["ref"], f"AM-{otter}")
+        self.assertIsNone(hub.q1("SELECT id FROM history WHERE id=?", (beaver,)))
+        self.assertEqual(self.refs(self.search("vps", query="walrus")), [f"AM-{otter}"])     # by a word not its own
+        with self.assertRaisesRegex(sqlite3.DatabaseError, "malformed"):
+            hub.q("SELECT rowid FROM history_fts WHERE history_fts MATCH 'beaver' ORDER BY rank")
+        held, rows = index_words(), row_words()
+        self.assertEqual(sorted(i for i in set(held) | set(rows) if held.get(i) != rows.get(i)), [walrus, beaver])
+        hub.settle_history_index()
+        self.assertEqual(index_words(), row_words())
+        self.assertEqual(hub.q("SELECT rowid FROM history_fts WHERE history_fts MATCH 'beaver' ORDER BY rank"), [])
+        self.assertIn("Nothing", self.search("vps", query="walrus"))
+        self.assertEqual(self.refs(self.search("vps", query="otter")), [f"AM-{otter}"])      # in the index again
+        self.assertGreater(hub.unused_id("history"), max(walrus, beaver, hub.q1("SELECT MAX(id) n FROM history")["n"]))
+        self.assertTrue(hub.kv_get(hub.HISTORY_MENDED))
+        self.assertIn("2 id(s)", hub.q1("SELECT what FROM log WHERE what LIKE 'the history''s index%'")["what"])
+        with hub.LOCK, hub.transaction():           # words that no row holds, after that start
+            hub.DB.execute("INSERT INTO history_fts(rowid,text,agent) VALUES(?,'a kayak','a9')", (walrus,))
+        hub.settle_history_index()                  # once is enough: no id comes back now
+        self.assertIn(("text", "kayak"), index_words()[walrus])
+        self.assertNotIn("history_held", [r["name"] for r in hub.q("SELECT name FROM sqlite_temp_master")])
+        start = inspect.getsource(hub.main)         # the start runs it after the schema, before the hub answers
+        self.assertLess(start.index("build_schema()"), start.index("settle_history_index()"))
+        self.assertLess(start.index("settle_history_index()"), start.index("HubServer("))
+        self.assertLess(start.index("settle_history_index()"), start.index("target=history_indexer"))
+
+    def test_a_damaged_index_still_answers_and_diagnostics_counts_it(self):
+        """An index that answers "database disk image is malformed" to a read: the search answers all the same, the
+        newest first and then from the words read linearly, never with a hub error, and diagnostics counts each."""
+        tid = self.task(title="Renew the TLS certificate")
+        hub.history_catch_up()
+        faults, read = [], hub.read_rows
+
+        def damaged(sql, args=()):
+            if "history_fts MATCH" in sql:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return read(sql, args)
+        with patch.object(hub, "read_rows", damaged), patch.object(hub, "print_fault", lambda: faults.append(1)):
+            code, found = self.owner(query="certificate")
+            self.assertEqual((code, [r["ref"] for r in found.get("results", [])]), (200, [f"T-{tid}"] * 2), found)
+            code, cards = self.owner(mode="messages", query="certificate")
+            self.assertEqual((code, [r["ref"] for r in cards.get("results", [])]), (200, [f"T-{tid}"]), cards)
+        self.assertEqual(len(faults), 3)            # the ranked read, the newest first, and the search card's read
 
     def test_an_edited_message_is_indexed_as_it_reads_now(self):
         """The owner edits a message that nothing has read (edit_in_place), through his own route."""

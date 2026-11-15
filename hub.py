@@ -14860,8 +14860,9 @@ def conversation_refusal(agent, person=None):
 # removed person's number, and a task, an event, the history's cursor, a CM-<id> or the owner's N-<id> push that still
 # named it would reach another person. person_remove keeps the highest id that each table gave out in kv
 # row_floor:<table>. A task's number names its folder on the configuration ref, which outlives the records, so the
-# tasks' floor comes from there too (settle_task_numbers).
-ID_FLOOR_TABLES = ("conversations", "conversation_messages", "needs", "tasks")
+# tasks' floor comes from there too (settle_task_numbers). The history's floor rises with each row that leaves it
+# (history_drop_row), because its contentless index can keep a row's words after the row (15 November 2026).
+ID_FLOOR_TABLES = ("conversations", "conversation_messages", "needs", "tasks", "history")
 TASK_FOLDER = re.compile(r"outputs/T-([0-9]+)")
 
 
@@ -23065,6 +23066,12 @@ def memory_shown_rows(agent, task_id, attempt, t0):
 # history in that same write (person_remove, owner_message_replace); under that, every search and read holds each row
 # it finds against its record as it reads now (history_heal), so a lane that changes a record and does not say so
 # never has the old words answered.
+#
+# And an id of the history is given once (unused_id). The index is contentless: it takes out only the words that it is
+# given again, so a row that leaves with words that it does not hold (a tool record's) leaves them in the index, where
+# no row joins them. Until 15 November 2026 SQLite gave such an id again to the next row: a search then found that row
+# by the old words, and once it left with its own words, the old ones stayed with no size, and each ranked search that
+# met one failed, "database disk image is malformed" (settle_history_index takes them out).
 HISTORY_KINDS = ("conversation", "owner_chat", "message", "task", "result", "note", "question", "report", "case",
                  "step", "duty", "memory", "standing", "tool")
 HISTORY_SHOWN = 15              # records in one answer of search_history
@@ -23509,14 +23516,16 @@ def history_masked(text):
 def history_insert(src, src_id, recs, keys, keep=False):
     """Inside the caller's transaction: the records of one source row into history and its index. The words are
     masked on the way in and kept in the row, except a tool record's on a machine with the index: those are read
-    back from their session record. `keys` caches the agents' index keys for the caller's step."""
+    back from their session record. `keys` caches the agents' index keys for the caller's step. Each row takes an id
+    that no row had before (unused_id), so the index holds no other record's words at it."""
     in_transaction("history_insert")
     for r in recs:
         text = history_masked(r["text"])
-        hid = DB.execute("INSERT INTO history(agent,kind,ref,person,task,at,owner_chat,src,src_id,text) "
-                         "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                         (r["agent"], r["kind"], r["ref"], r["person"], r["task"], r["at"], r["owner_chat"], src,
-                          src_id, text if keep or r["kind"] != "tool" or not HISTORY_FTS[0] else None)).lastrowid
+        hid = DB.execute("INSERT INTO history(id,agent,kind,ref,person,task,at,owner_chat,src,src_id,text) "
+                         "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                         (unused_id("history"), r["agent"], r["kind"], r["ref"], r["person"], r["task"], r["at"],
+                          r["owner_chat"], src, src_id,
+                          text if keep or r["kind"] != "tool" or not HISTORY_FTS[0] else None)).lastrowid
         if HISTORY_FTS[0]:
             if r["agent"] not in keys:
                 keys[r["agent"]] = history_key(r["agent"], create=True)
@@ -23686,13 +23695,22 @@ def history_rewrite(src, src_id, ref):
 def history_drop_row(h):
     """Inside the caller's write: one history row out of the history and out of the index. Only words that the row
     keeps can leave the contentless index exactly; a tool record keeps none, and its words stay behind with no row to
-    join them, so no search can reach them."""
+    join them, so no search can reach them. No row joins them later either: the history's floor of ids goes up to
+    this one (unused_id), so its id is never given again."""
     in_transaction("history_drop_row")
     key = history_key(h["agent"])
     if HISTORY_FTS[0] and key and h["text"] is not None:
         DB.execute("INSERT INTO history_fts(history_fts,rowid,text,agent) VALUES('delete',?,?,?)",
                    (h["id"], h["text"], key))
+    history_floor(h["id"])
     DB.execute("DELETE FROM history WHERE id=?", (h["id"],))
+
+
+def history_floor(top):
+    """Inside the caller's write: the history's floor of ids (kv row_floor:history) up to `top`, never down."""
+    in_transaction("history_floor")
+    DB.execute("INSERT INTO kv(k,v) VALUES('row_floor:history',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v "
+               "WHERE CAST(kv.v AS INTEGER) < CAST(excluded.v AS INTEGER)", (str(int(top)),))
 
 
 def history_heal(h):
@@ -23838,6 +23856,116 @@ def records_recut():
             DB.execute("INSERT INTO kv(k,v) VALUES('records_recut',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                        (str(upper),))
         last = upper
+
+
+HISTORY_MENDED = "history_mended"       # kv: when settle_history_index made the index hold only its rows' words
+HISTORY_MEND_IDS = 500                  # ids of one read of the words that the index holds at them
+
+
+def settle_history_index():
+    """At the start, before the hub answers, once (kv history_mended): the history's index holds only the words of
+    its rows as they read now.
+
+    Until 15 November 2026 SQLite gave the id of a row that had left the history to the next row, and the contentless
+    index can keep a row's words after the row (history_drop_row). The index then held another record's words at that
+    id beside the new row's own, so a search found the new row by them, and when that row too left the index with its
+    own words, the old ones stayed with no size: each ranked search that met one failed, "database disk image is
+    malformed". The owner's hub held 4 such ids and 25 such rows on that day, all of them ids that were given again
+    after the owner removed people on 28 October 2026. The ids never come back now (unused_id), so this runs once:
+    the floor of the ids goes above every id that the index holds, and each id whose words in the index are not its
+    row's (it has no row, or the index holds more words or keys at it than its size says) loses all of them, and a
+    row among them is indexed again as history_insert indexes it. The index itself says which words it holds at each
+    id (fts5vocab), so exactly those go. One write or none: an error leaves the work to the next start, and the hub
+    starts."""
+    if not HISTORY_FTS[0] or kv_get(HISTORY_MENDED):
+        return
+    try:
+        with LOCK:
+            DB.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.history_held USING "
+                       "fts5vocab(main, 'history_fts', 'instance')")
+        try:
+            history_mend()
+        finally:
+            with LOCK:
+                DB.execute("DROP TABLE IF EXISTS temp.history_held")
+    except Exception as e:      # a start step never stops the start (main): the hub starts, and says why
+        print_fault()
+        with contextlib.suppress(sqlite3.Error):
+            log("hub", f"the history's index was not put right at this start, and the next start tries again: "
+                       f"{type(e).__name__}: {e}")
+
+
+def history_mend():
+    """settle_history_index's one write, with the index's words read from temp.history_held."""
+    with area("quiet"), transaction():
+        held = {}
+        for r in DB.execute("SELECT doc, col, COUNT(*) n FROM temp.history_held GROUP BY doc, col").fetchall():
+            held.setdefault(r["doc"], {})[r["col"]] = r["n"]
+        sizes = {r["id"]: history_sizes(r["sz"]) for r in DB.execute("SELECT id, sz FROM history_fts_docsize")}
+        rows = {r["id"] for r in DB.execute("SELECT id FROM history").fetchall()}
+        history_floor(max([0, *held, *sizes]))
+        wrong = sorted(i for i in set(held) | set(sizes) if i not in rows or i not in sizes
+                       or [held.get(i, {}).get(column, 0) for column in ("text", "agent")] != sizes[i][:2])
+        words = {}
+        for part in range(0, len(wrong), HISTORY_MEND_IDS):
+            ids = wrong[part:part + HISTORY_MEND_IDS]
+            for r in DB.execute(f"SELECT doc, col, term FROM temp.history_held WHERE doc IN "
+                                f"({','.join('?' * len(ids))})", ids).fetchall():
+                words.setdefault(r["doc"], {}).setdefault(r["col"], []).append(r["term"])
+        again = 0
+        for i in wrong:
+            DB.execute("INSERT INTO history_fts(history_fts,rowid,text,agent) VALUES('delete',?,?,?)",
+                       (i, " ".join(words.get(i, {}).get("text", ())), " ".join(words.get(i, {}).get("agent", ()))))
+            if i in rows:
+                again += history_index_again(i)
+        DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                   (HISTORY_MENDED, str(now())))
+        if wrong:
+            log_row("hub", f"the history's index held words at {len(wrong)} id(s) that are not their rows' words now: "
+                           f"they went, and {again} row(s) of them are indexed again as they read now")
+
+
+def history_sizes(blob):
+    """The words of each column of one row of the index's sizes (history_fts_docsize): one SQLite varint each."""
+    out, value, n = [], 0, 0
+    for byte in bytes(blob or b""):
+        n += 1
+        if n == 9:                                  # the ninth byte gives all of its 8 bits
+            out.append((value << 8) | byte)
+            value, n = 0, 0
+        elif byte & 0x80:
+            value = (value << 7) | (byte & 0x7F)
+        else:
+            out.append((value << 7) | byte)
+            value, n = 0, 0
+    return out
+
+
+def history_index_again(hid):
+    """Inside history_mend's write: one row of the history into the index again at its own id, which holds no words
+    now, with the words that history_insert gives it: its own, or a tool record's from its record. A tool record
+    that is gone takes its row out. A row whose agent has no key now (an agent that was deleted) stays out of the
+    index. 1 when it is in the index again, else 0."""
+    in_transaction("history_index_again")
+    h = DB.execute("SELECT * FROM history WHERE id=?", (hid,)).fetchone()
+    key = history_key(h["agent"]) if h else None
+    if not key:
+        return 0
+    text = h["text"]
+    if text is None:
+        s = HISTORY_BY_NAME.get(h["src"])
+        row = DB.execute(f"{s.select} WHERE {s.key}=?", (h["src_id"],)).fetchone() \
+            if s and h["src_id"] is not None else None
+        try:
+            recs = [r for r in (s.build(row) if row else []) if r["agent"] == h["agent"]][:1]
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+            return 0            # a record that its builder cannot read: the row stays, as history_heal leaves it
+        if not recs:
+            history_drop_row(h)
+            return 0
+        text = history_masked(recs[0]["text"])
+    DB.execute("INSERT INTO history_fts(rowid,text,agent) VALUES(?,?,?)", (hid, text, key))
+    return 1
 
 
 def contact_session(agent, context=None):
@@ -23989,6 +24117,16 @@ def history_row_visible(agent, task_id, scope):
     return bool(c and c["person"] == scope["person"] and c["agent"] == agent)
 
 
+def history_damaged(e):
+    """For a read of the history that raised `e`: when SQLite answered that the records are damaged (its own
+    DatabaseError, as for "database disk image is malformed"), diagnostics has it and the caller reads another way, so
+    the search still answers. A subclass (ProgrammingError, IntegrityError and the others) is a fault of the code,
+    which no other read hides, and goes on up."""
+    if type(e) is not sqlite3.DatabaseError:
+        raise e
+    print_fault()
+
+
 def history_query(agent, phrases, since, until, people, task, kinds, owner_chats, limit, scope=OWNER_VIEW):
     """The history rows that match, best first, or the newest first when there are no words; at most limit + 1, so
     the caller knows whether there are more. agent None is every agent's (the owner's search). scope: the session's
@@ -24020,13 +24158,20 @@ def history_query(agent, phrases, since, until, people, task, kinds, owner_chats
         if agent and not key:
             return []
         words = " OR ".join(f"text : {p}" for p in phrases)
-        try:
-            return read_rows(f"SELECT h.* FROM history_fts f JOIN history h ON h.id=f.rowid WHERE history_fts MATCH ? "
-                             f"AND {cond} ORDER BY f.rank LIMIT ?",
-                             (f"agent : {key} AND ({words})" if key else words, *args, limit + 1))
-        except sqlite3.OperationalError:
-            return []           # a query the index cannot read, which the phrases above are made never to be
-    # No FTS5 on this machine: the same words, read linearly, the record with more of them first.
+        # bm25 and not the index's own `rank`: the index ranks every id that it holds the words at before the join, and
+        # bm25 here ranks only what joins a row, so the words of an id with no row are never ranked (history_drop_row).
+        # When the index answers that it is damaged, the newest first, and then the words read linearly.
+        for order in ("bm25(history_fts)", "h.at DESC, h.id DESC"):
+            try:
+                return read_rows(f"SELECT h.* FROM history_fts f JOIN history h ON h.id=f.rowid WHERE history_fts "
+                                 f"MATCH ? AND {cond} ORDER BY {order} LIMIT ?",
+                                 (f"agent : {key} AND ({words})" if key else words, *args, limit + 1))
+            except sqlite3.OperationalError:
+                return []       # a query the index cannot read, which the phrases above are made never to be
+            except sqlite3.DatabaseError as e:
+                history_damaged(e)
+    # No FTS5 on this machine, or an index that answers neither read: the same words, read linearly, the record with
+    # more of them first. A tool record keeps no words in its row on a machine with the index, so this finds none.
     likes = ["%" + "%".join(HISTORY_TOKEN.findall(p.lower())) + "%" for p in phrases]
     score = " + ".join("(h.text LIKE ?)" for _ in likes)
     return read_rows(f"SELECT h.* FROM history h WHERE {cond} AND ({score}) > 0 ORDER BY ({score}) DESC, h.at DESC "
@@ -24214,18 +24359,21 @@ def history_messages_query(tokens, limit):
     kinds = ",".join("?" * len(HISTORY_MESSAGE_KINDS))
     one = "SELECT MIN(h.id) FROM {src} WHERE h.kind IN (" + kinds + ") AND {match} " \
           "GROUP BY h.src, COALESCE(h.src_id, -h.id)"
-    if HISTORY_FTS[0]:
+    reads = [(one.format(src="history h", match=" AND ".join("h.text LIKE ?" for _ in tokens)),
+              (*HISTORY_MESSAGE_KINDS, *[f"%{t}%" for t in tokens]))]
+    if HISTORY_FTS[0]:          # the index first, and the words read linearly when it answers that it is damaged
         words = " AND ".join(f'text : "{t}"' + ("*" if i == len(tokens) - 1 else "") for i, t in enumerate(tokens))
-        inner = one.format(src="history_fts f JOIN history h ON h.id=f.rowid", match="history_fts MATCH ?")
-        args = (*HISTORY_MESSAGE_KINDS, words)
-    else:
-        inner = one.format(src="history h", match=" AND ".join("h.text LIKE ?" for _ in tokens))
-        args = (*HISTORY_MESSAGE_KINDS, *[f"%{t}%" for t in tokens])
-    try:
-        return read_rows(f"SELECT h.* FROM history h WHERE h.id IN ({inner}) ORDER BY h.at DESC, h.id DESC LIMIT ?",
-                         (*args, limit + 1))
-    except sqlite3.OperationalError:
-        return []               # a query the index cannot read, which the quoted tokens above are made never to be
+        reads.insert(0, (one.format(src="history_fts f JOIN history h ON h.id=f.rowid", match="history_fts MATCH ?"),
+                         (*HISTORY_MESSAGE_KINDS, words)))
+    for inner, args in reads:
+        try:
+            return read_rows(f"SELECT h.* FROM history h WHERE h.id IN ({inner}) ORDER BY h.at DESC, h.id DESC "
+                             f"LIMIT ?", (*args, limit + 1))
+        except sqlite3.OperationalError:
+            return []           # a query the index cannot read, which the quoted tokens above are made never to be
+        except sqlite3.DatabaseError as e:
+            history_damaged(e)
+    return []
 
 
 def history_messages_view(query, limit):
@@ -52466,6 +52614,7 @@ def main():
         pass_held_releases()    # the rows from before the state `passed`, or from a run that this start ended
     settle_task_numbers()
     settle_people_names()
+    settle_history_index()      # once: the index holds only its rows' words (15 November 2026), before the hub answers
     settings_checked()          # the team that this hub starts with: a release that brings the check finds what is there
     # The heartbeat starts here and not at the first complete pass (tick_heartbeat), so that a hub whose very first
     # pass raises -- a bad row is there before the timers are -- is visible on the owner's screen after TICK_WARN
