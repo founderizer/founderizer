@@ -36357,7 +36357,8 @@ def installing(job, agent):
 def servers_view():
     """GET /ui/servers: each server with its kind, address, agents, newest reading, availability (why: the codes of
     what stops a new agent) and newest job; whether the hub's own server takes agents (hub_shared); on the hub's own
-    row the hub's own read of its server (hardening); and the state of the newest join code."""
+    row the hub's own read of its server (hardening); on each row how the fleet reaches that server, by its own record
+    (access); and the state of the newest join code."""
     t0, desired = now(), kit_revision()
     expire_server_jobs(t0)
     team, hub_machine = TEAM, (TEAM.get("hub") or {}).get("machine")
@@ -36365,6 +36366,7 @@ def servers_view():
     out = []
     for name in server_names(team):
         here, entry = server_agents(name, team), (team.get("servers") or {}).get(name) or {}
+        ways = (team.get("access") or {}).get(name) or {}
         reading = server_reading(name, here)
         load = server_load(name, reading, t0)       # beside the reading, which the hub's own machine may not have
         if reading:                     # the reading's Fleet files are the hub's: same_code, as for a helper
@@ -36391,7 +36393,14 @@ def servers_view():
                     "hub": name == hub_machine, "joined": name in keys, "agents": here, "reading": reading,
                     "load": load, "available": not why, "why": why, "job": job_view(job),
                     # owner API 1.170: the hub's own read of its own server, for the app's sweep and no page
-                    "hardening": hub_hardening_view(t0) if name == hub_machine else None})
+                    "hardening": hub_hardening_view(t0) if name == hub_machine else None,
+                    # owner API 1.173: how the fleet reaches this server, by its own record (team.json "access"), as
+                    # GET /ui/machines gives it for a server that an agent runs on. A server need run no agent, and
+                    # then, of the pages that the app reads for it, only GET /ui/vault has it, and only for the hub's
+                    # own server: the row's `user` is the OS user of the server's service and its agents, and can
+                    # differ from the SSH user. Always an object, so a row without the key is a hub from before it.
+                    "access": {"ssh": {"user": ways["ssh_user"], "port": ways.get("ssh_port", 22)}
+                               if ways.get("ssh_user") else None}})
     return {"desired_revision": desired, "servers": out, "apps": app_servers_view(team),
             "hub_shared": hub_shared(team),
             "join": join_view(q1("SELECT * FROM join_codes ORDER BY id DESC LIMIT 1"), t0)}

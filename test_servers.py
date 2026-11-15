@@ -470,6 +470,53 @@ class Servers(OwnerAPI):
         self.assertEqual(team["servers"]["box"], {"kind": "linux", "user": "fleet"})
         self.assertEqual(team["access"]["box"], {"ssh_user": "root", "ssh_port": 2222})
 
+    def test_each_row_says_how_the_fleet_reaches_that_server_by_its_own_record(self):
+        """Owner API 1.173: `access` on each row of GET /ui/servers, out of team.json `access`. A server that joined and
+        runs no agent is in no other page with it: GET /ui/machines names only a server that an agent runs on, and GET
+        /ui/vault only the hub's own. The row's `user` is the OS user of the server's service, which is not the SSH user
+        of the record and can differ from it."""
+        answer = self.code("box", "linux")
+        self.assertEqual(self.join(answer["code"], kind="linux", user="fleet", ssh_port=2222)[0], 200)
+        _, before = self.servers()
+        self.assertEqual((before["box"]["agents"], before["box"]["user"]), ([], "fleet"))
+        self.assertEqual(before["box"]["access"], {"ssh": {"user": "root", "port": 2222}})
+        status, listed = self.request("/ui/machines?db=test-generation", source=OWNER)
+        self.assertEqual(status, 200, listed)
+        machines = {m["machine"]: m["access"]["ssh"] for m in listed["machines"]}
+        self.assertNotIn("box", machines, "the list of machines names no server without an agent")
+        # A server that an agent runs on: the record that the list of machines gives for it.
+        self.assertEqual(before["vps"]["access"], {"ssh": {"user": "claude", "port": 22}})
+        self.assertEqual({k: machines["vps"][k] for k in ("user", "port")}, before["vps"]["access"]["ssh"])
+        # No record: an object with null on every row, the hub's own too, and never a row without the key.
+        self.assertEqual({n: before[n]["access"] for n in ("hub", "mac-studio")},
+                         {"hub": {"ssh": None}, "mac-studio": {"ssh": None}})
+        self.assertIsNone(machines["hub"])
+        self.assertEqual({n for n, s in before.items() if "access" not in s}, set())
+        # A record without a port is port 22, as in the two other pages; one with Screen Sharing alone is no SSH.
+        hub.TEAM["access"]["hub"] = {"ssh_user": "root"}
+        hub.TEAM["access"]["mac-studio"] = {"screen_sharing": True}
+        _, servers = self.servers()
+        self.assertEqual(servers["hub"]["access"], {"ssh": {"user": "root", "port": 22}})
+        self.assertEqual(servers["mac-studio"]["access"], {"ssh": None})
+        with hub.LOCK:
+            own = hub.vault_view()["hub"]
+        self.assertEqual((own["machine"], own["ssh"]), ("hub", servers["hub"]["access"]["ssh"]))
+        # A change of the record changes no other key of a row.
+        rest = lambda rows: {n: {k: v for k, v in s.items() if k not in ("access", "load")} for n, s in rows.items()}
+        self.assertEqual(rest(servers), rest(before))
+        # A machine from before servers that runs no agent, did not join and is not the hub's: its record too.
+        hub.TEAM["addresses"]["spare"] = OTHER
+        hub.TEAM["access"]["spare"] = {"ssh_user": "admin", "ssh_port": 2200, "screen_sharing": True}
+        spare = self.servers()[1]["spare"]
+        self.assertEqual((spare["joined"], spare["agents"], spare["hub"]), (False, [], False))
+        self.assertEqual(spare["access"], {"ssh": {"user": "admin", "port": 2200}})
+        # A fleet's file with no `access` map at all, as after the owner took the last record out: null on each row.
+        del hub.TEAM["access"]
+        status, view = self.request("/ui/servers?db=test-generation", source=OWNER)
+        self.assertEqual(status, 200, view)
+        self.assertEqual({s["name"]: s["access"] for s in view["servers"]},
+                         dict.fromkeys(("hub", "vps", "mac-studio", "box", "spare"), {"ssh": None}))
+
     def test_the_same_server_can_run_the_line_again(self):
         answer = self.code()
         first = self.join(answer["code"])[1]
