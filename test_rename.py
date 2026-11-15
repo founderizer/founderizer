@@ -416,7 +416,8 @@ class Columns(unittest.TestCase):
              "released_by", "paused_by", "created_by", "closed_by", "dropped_by", "name", "who", "machine", "target",
              "holder", "author", "runner", "approver", "caller"}           # and every column whose name ends in _by
     NOT_AGENT_KV = {
-        "check_fails:": "a wake-up rule", "check_lost:": "a run of a check", "conversation_brief:": "a conversation",
+        "check_fails:": "a wake-up rule", "check_lost:": "a run of a check", "check_running:": "a machine check",
+        "conversation_brief:": "a conversation",
         "deliver_running:": "a task", "desktop_click:": "a Mac", "desktop_seen:": "a Mac", "desktop_told:": "a Mac",
         "door_mode:": "a server of the door",
         "history:": "a stream of the history", "knowledge_asked:": "a knowledge file", "lead_unread:": "an unread item",

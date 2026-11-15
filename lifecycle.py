@@ -2026,6 +2026,9 @@ REQUIRED_CONTEXT = 64000        # the tokens of context that a model server must
 ACCOUNT_FILE = "account-%s.json"    # in ~/.fleet: what the check of a model server kept for one agent
 # The words of the setup check's `account` item. Proposed, not approved: no live fleet shows them before the apps
 # offer an account kind, and the owner says yes to each one before a release shows it.
+# The state of the `account` item in a check's first report while the item runs (the coordinator's decision D12):
+# the hub waits for the report that follows (hub.CHECKING).
+CHECKING = "checking"
 NO_ANSWER = "This server does not answer."
 OPEN_SERVER = "This server answers with no key, and more than one agent can reach it."
 NO_TOOL_CALL = "No model here passed a tool call."
@@ -2898,9 +2901,10 @@ class Lifecycle:
             return options, error, "claude --help"
         return None, "This runtime reports no model list.", None
 
-    def verify(self, status, probe_job=None):
+    def verify(self, status, probe_job=None, checking=False):
         """The setup check: what this machine can prove now, with no AI. Each item is ok, failed or not_verified;
-        the hub adds its own items and decides which ones are required."""
+        the hub adds its own items and decides which ones are required. checking: the item of the agent's model
+        account is in state CHECKING and not checked yet (report: the coordinator's decision D12)."""
         items = []
 
         def add(kind, ref, state, detail, words=None):
@@ -2922,7 +2926,7 @@ class Lifecycle:
             add("runtime", name, "not_verified", f"{rt['version']}; the sign-in could not be read")
         add(*self.model_item(status.get("models")))
         if account:
-            add(*self.account_item(account))
+            add(*(("account", account["id"], CHECKING, "") if checking else self.account_item(account)))
         user = pwd.getpwuid(os.getuid()).pw_name
         add("capability", "shell", "ok", f"Commands run as {user}.")
         add("capability", "web", "not_verified", "Web access is a runtime tool; Fleet cannot check it without a model turn.")
@@ -3086,11 +3090,20 @@ class Lifecycle:
                 status = self.collect(fast=fast and not check)
                 if check:
                     status["check"] = check         # this report answers the owner's "check this machine"
-                    status["verify"] = self.verify(status, probe_job)
-                # Tailscale, as the report leaves, and never saved: a report goes over the private network, so a reading
-                # from before it says "off" when the network is back, and a retry after a break would repeat that.
-                status["security"]["tailscale"] = self.private_network()
-                status["reading_age"] = round(max(0.0, self.monotonic() - self.read_mono), 3)
+                    status["verify"] = self.verify(status, probe_job, checking=True)
+                    running = [i for i in status["verify"] if i["kind"] == "account" and i["state"] == CHECKING]
+                    if running:
+                        # The coordinator's decision D12: the account item can take minutes (a model server's tool
+                        # call and context), and the hub fails a check that sends no report in its CHECK_WAIT. So a
+                        # first report says that the item runs, and the hub then waits for this report's second
+                        # half. A hub of an older release refuses the first one, and takes the second as before.
+                        self.leaving(status)
+                        self.post(status)
+                        item = self.account_item(self.account())    # with its code and names (D7), as verify adds it
+                        done = dict({"kind": item[0], "ref": item[1], "state": item[2], "detail": item[3][:300]},
+                                    **(item[4] if len(item) > 4 and item[4] else {}))
+                        status["verify"] = [done if i in running else i for i in status["verify"]]
+                self.leaving(status)
                 code, data = self.post(status)
             except Exception:
                 code, data = None, None
@@ -3126,6 +3139,13 @@ class Lifecycle:
                 return
             self.pending = desired
             self.state, self.detail = "waiting_idle", "Waits until no turn runs in a task session."
+
+    def leaving(self, status):
+        """What a report says as it leaves. Tailscale, and never saved: a report goes over the private network, so a
+        reading from before it says "off" when the network is back, and a retry after a break would repeat that."""
+        status["security"]["tailscale"] = self.private_network()
+        status["reading_age"] = round(max(0.0, self.monotonic() - self.read_mono), 3)
+        return status
 
     def check(self, extra):
         """The owner's "check this machine": collect and report now. The same checks as every report, no change."""

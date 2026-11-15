@@ -31063,15 +31063,18 @@ def verify_items(value):
         raise ValueError("verify must be a list of at most 80 items")
     items = []
     for v in value:
-        if not isinstance(v, dict) or v.get("kind") not in VERIFY_KINDS or v.get("state") not in ("ok", "failed", "not_verified") \
+        states = ("ok", "failed", "not_verified") + ((CHECKING,) if v.get("kind") == "account" else ()) \
+            if isinstance(v, dict) else ()
+        if not isinstance(v, dict) or v.get("kind") not in VERIFY_KINDS or v.get("state") not in states \
                 or not isinstance(v.get("ref"), str) or not 1 <= len(v["ref"]) <= 200:
             raise ValueError("each verify item needs kind, ref and state")
         if v["kind"] == "login" and v.get("detail") not in LOGIN_REASONS + ("not probed",):
             raise ValueError("a login item gives one of the fixed probe reasons")
         detail = _optional(v.get("detail"), str, 300) or ""
-        if v["kind"] == "account" and not account_detail(detail):
-            detail = ""         # a helper of another release can have another sentence: kept as none, never refused
-        items.append({"kind": v["kind"], "ref": v["ref"], "state": v["state"], "detail": detail})
+        item = {"kind": v["kind"], "ref": v["ref"], "state": v["state"], "detail": detail}
+        if v["kind"] == "account":      # its fixed words and their code only (account_item_words)
+            item.update(account_item_words(v, detail))
+        items.append(item)
     return items
 
 
@@ -31302,8 +31305,8 @@ def save_agent_settings(agent, body):
     model, effort = new.get("model", old["model"]), new.get("effort", old["effort"])
     if ("model" in new or "effort" in new) and (model, effort) != (old["model"], old["effort"]) and (model or effort):
         offered(agent, model, effort)
-    if "account" in new and account_change_refusal(team, old["account"], new["account"]):     # the AI providers build
-        raise Refusal(409, account_change_refusal(team, old["account"], new["account"]))
+    if "account" in new and account_change_refusal(team, agent, old["account"], new["account"]):  # AI providers
+        raise account_change_refusal(team, agent, old["account"], new["account"])
     if "screen" in new:                     # owner API 1.11: the screen runtime's own model and effort
         if old["screen"] is None:
             raise Refusal(400, f"{shown_role(agent)} has no screen runtime.")
@@ -37854,9 +37857,12 @@ ACCOUNT_ADDRESS_MOST = 200      # characters of a model server's address
 ACCOUNT_PATH = re.compile(r"(?:/[A-Za-z0-9._~-]+)*/?")
 ACCOUNT_HOST = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*")
 ACCOUNT_GROUP = "account:"      # the group key of an account with a kind: account:<its id>
-# The words of the refusals of an account with a kind and of its agents, and of the state of its group. Proposed, not
-# approved: no released app shows them before the apps offer an account kind (spec section 9), and the owner says
-# yes to each one before a release shows it.
+# The words of the refusals of an account with a kind and of its agents. The owner approved some of them: his answers to
+# round 2 of the AI providers' step 5 pictures (14 November 2026; ai-providers-step-5-answers.md, "The approved words,
+# as templates"). APPROVED_WORDS names them with their numbers there, and each is filled with the case's names, never
+# an account's id. Each other one is proposed, not approved: no released app shows it. A refusal's answer gives the
+# words as `error`, their key here as `code` and the values that fill them as `names` (the coordinator's decision D7),
+# so that an app shows its own string in the device's language for a code that it knows, and these words for another.
 ACCOUNT_WORDS = {
     "kind": 'account {aid}: kind is "key" or "server", or absent',
     "labels": "account {aid}: secret, address and model are only for an account with a kind",
@@ -37867,25 +37873,47 @@ ACCOUNT_WORDS = {
     "model": "account {aid}: model must be 1 to 120 characters of A-Z a-z 0-9 . _ : / - [ ]",
     "key_model": "account {aid}: {label} sells the models of several makers, so the account names its model",
     "key_address": "account {aid}: only a model server has an address",
-    "address": f"account {{aid}}: address is http:// or https://, a host, an optional port and an optional path, "
-               f"with no user, query or fragment, at most {ACCOUNT_ADDRESS_MOST} characters",
-    "plain_http": "account {aid}: plain http is only for a loopback or a Tailscale address; use https",
-    "open": "account {aid}: a model server with no key is only for a loopback address that one agent reaches, and "
-            "that agent is alone on its server",
+    "address": "Write the address as http:// or https://, then the host, and a port and a path if it has them.",
+    "plain_http": "Plain http works only over Tailscale or on the agent's own server. Use that machine's Tailscale "
+                  "address, or https.",
+    "open": "{server} has an agent on a model server with no key, so it takes no other agent. Choose another server.",
+    "open_address": "account {aid}: a model server with no key is only for a loopback address that one agent reaches, "
+                    "and that agent is alone on its server",
     "unknown": "agent {name}: the account {aid} is of a provider that this release does not know",
     "runtime": "agent {name}: an agent on the account {aid} runs {label}",
     "linux": "agent {name}: an agent on a key or a model server runs on a Linux server",
     "resource": "resource {rid}: the key of the account {aid} is the owner's alone to give, and no pool holds it",
-    "pooled": "This key is in the pool that the manager gives from. Take it out of the pool first.",
+    "pooled": "The fleet manager may give this key. Set it to You alone in Settings \u203a Secrets, then save again.",
     "pool_statement": "This key belongs to an account, and only the owner gives it: it goes into no pool.",
-    "change": "An agent on a key or a model server stays on its account. Add a new agent for another account.",
-    # the wave 1 review, R1 and R6 (14 November 2026)
-    "kind_kept": "This account has a key or a model server's address, so each write of it names its kind. Delete it "
-                 "to remove it.",
-    "in_use": "Agents use this account, so its kind, its provider and its key stay as they are. To give it a new key, "
-              "replace the key's value in the vault.",
-    "model_prefix": 'account {aid}: model is "{prefix}/" and then the name of the model',
+    "change": "{agent} stays on {provider}. For another AI, add a new agent.",
+    "change_server": "{agent} stays on its model server. For another AI, add a new agent.",
+    "kind_kept": "This account runs on a key or a model server, and this change would drop that. To remove the "
+                 "account, delete it.",
+    "in_use": "Agents use this account, so its AI and its key stay as they are. For a new key, save it in Settings "
+              "\u203a Secrets under the same name.",
+    "model_prefix": "Write the model as {prefix}/ and then its name, for example {prefix}/{model}.",
 }
+# The owner's approved words of ACCOUNT_WORDS, with their numbers in his round 2 (sentence 5 has two forms).
+APPROVED_WORDS = {"plain_http": 1, "address": 2, "open": 3, "pooled": 4, "change": 5, "change_server": 5,
+                  "kind_kept": 10, "in_use": 11, "model_prefix": 12}
+
+
+class AccountRuleError(ValueError):
+    """A rule of an account with a kind, broken: the words of ACCOUNT_WORDS[code] filled with names. validate_team
+    gives it as any ValueError; account_entry gives it with its code and names (account_refusal)."""
+    def __init__(self, code, **names):
+        super().__init__(ACCOUNT_WORDS[code].format(**names))
+        self.code, self.names = code, names
+
+
+def account_refusal(status, code, extra=None, **names):
+    """A Refusal in the words of ACCOUNT_WORDS[code], filled with names, whose answer also gives `code` and `names`
+    (the coordinator's decision D7). extra: more fields of the answer, as a Conflict has them."""
+    refusal = Refusal(status, ACCOUNT_WORDS[code].format(**names))
+    refusal.extra = dict(extra or {}, code=code, names=names)
+    return refusal
+
+
 # The state of its group with no hold, by the account's kind: the owner's words for an account with no allowance (his
 # "Yes, these words" of 14 November 2026 to picture 11 of the AI providers' step 5, ai-providers-step-5-answers.md).
 MODEL_ACCOUNT_STATE = {"key": "Paid per use.", "server": "Local model."}
@@ -37901,6 +37929,20 @@ def model_group(agent, team=None):
     return ACCOUNT_GROUP + acc["id"] if acc else None
 
 
+# The name of the owner's own model server where the owner reads the name of an agent's AI: his answer 12 to the AI
+# providers' pictures (14 November 2026, "The name I picked"), as server.MODEL_SERVER_LABEL has it.
+MODEL_SERVER_LABEL = "Model server"
+
+
+def account_label(acc):
+    """The name of the provider that the owner picked, for an account with a kind (lifecycle.model_account): a key's
+    provider's label (lifecycle.KEY_PROVIDERS), or MODEL_SERVER_LABEL for his own model server; None for a provider
+    that this release does not know."""
+    if acc["kind"] == "server":
+        return MODEL_SERVER_LABEL if acc["provider"] == lifecycle.OWN_SERVER["provider"] else None
+    return (lifecycle.KEY_PROVIDERS.get(acc["provider"]) or {}).get("label")
+
+
 def model_group_entry(group, team=None):
     """The team.json entry of the account of an account:<id> group, or {} for every other group."""
     if not str(group or "").startswith(ACCOUNT_GROUP):
@@ -37909,33 +37951,32 @@ def model_group_entry(group, team=None):
     return entry if isinstance(entry, dict) else {}
 
 
-def account_address(value, aid):
+def account_address(value):
     """A model server's address as team.json keeps it (spec 3.8): http or https, a host, an optional port and an
     optional path, else /v1; no user, no query, no fragment; at most ACCOUNT_ADDRESS_MOST characters; plain http only
     for a loopback host (127.0.0.0/8, ::1, localhost) or a Tailscale one (100.64.0.0/10, or a name in .ts.net).
-    ValueError with its words for anything else."""
+    AccountRuleError with the owner's words (address, plain_http) for anything else."""
     import ipaddress
-    words = ACCOUNT_WORDS["address"].format(aid=aid)
     if not isinstance(value, str) or not 0 < len(value) <= ACCOUNT_ADDRESS_MOST or \
             any(c in value for c in "?#@\\") or any(not 32 < ord(c) < 127 for c in value):
-        raise ValueError(words)
+        raise AccountRuleError("address")
     try:
         parts = urllib.parse.urlsplit(value)
         port = parts.port
     except ValueError:
-        raise ValueError(words) from None
+        raise AccountRuleError("address") from None
     scheme, host = parts.scheme.lower(), parts.hostname or ""
     if scheme not in ("http", "https") or not host or port == 0 or not ACCOUNT_PATH.fullmatch(parts.path):
-        raise ValueError(words)
+        raise AccountRuleError("address")
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
         ip = None
     if ip is None and not ACCOUNT_HOST.fullmatch(host):
-        raise ValueError(words)
+        raise AccountRuleError("address")
     if scheme == "http" and not (account_loopback(host) or host.endswith(".ts.net") or
                                  ip is not None and ip.version == 4 and ip in ipaddress.ip_network("100.64.0.0/10")):
-        raise ValueError(ACCOUNT_WORDS["plain_http"].format(aid=aid))
+        raise AccountRuleError("plain_http")
     where = (f"[{host}]" if ip is not None and ip.version == 6 else host) + (f":{port}" if port is not None else "")
     return f"{scheme}://{where}{parts.path.rstrip('/') or '/v1'}"
 
@@ -37953,48 +37994,53 @@ def account_loopback(host):
 
 
 def account_rule(team, aid, acc):
-    """ValueError with its words when one entry of team.json "accounts" breaks a rule of its kind (spec 3.1, 3.3,
-    3.8). An entry with no kind keeps the rule of before: a provider and a title, and nothing more. validate_team
-    checks the ID, the fields, the provider's shape and the title first, and the agents before this."""
-    W = ACCOUNT_WORDS
+    """AccountRuleError (a ValueError) with its words when one entry of team.json "accounts" breaks a rule of its
+    kind (spec 3.1, 3.3, 3.8). An entry with no kind keeps the rule of before: a provider and a title, and nothing
+    more. validate_team checks the ID, the fields, the provider's shape and the title first, and the agents before
+    this; account_entry asks it before a write, so that its answer has the refusal's code (D7)."""
+    E = AccountRuleError
     if "kind" not in acc:
         if set(acc) & {"secret", "address", "model"}:
-            raise ValueError(W["labels"].format(aid=aid))
+            raise E("labels", aid=aid)
         return
     kind = acc["kind"]
     if kind not in lifecycle.ACCOUNT_KINDS:
-        raise ValueError(W["kind"].format(aid=aid))
+        raise E("kind", aid=aid)
     if "model" in acc and not (isinstance(acc["model"], str) and MODEL_NAME.fullmatch(acc["model"])):
-        raise ValueError(W["model"].format(aid=aid))
+        raise E("model", aid=aid)
     logins = team.get("logins") if isinstance(team.get("logins"), dict) else {}
     if "secret" in acc and not (isinstance(acc["secret"], str) and isinstance(logins.get(acc["secret"]), dict)
                                 and logins[acc["secret"]].get("kind") == "api_key"):
-        raise ValueError(W["secret"].format(aid=aid))
+        raise E("secret", aid=aid)
     if kind == "key":
         known = lifecycle.KEY_PROVIDERS.get(acc["provider"])
         if not known:
-            raise ValueError(W["key_provider"].format(aid=aid, providers=", ".join(lifecycle.KEY_PROVIDERS)))
+            raise E("key_provider", aid=aid, providers=", ".join(lifecycle.KEY_PROVIDERS))
         if "address" in acc:
-            raise ValueError(W["key_address"].format(aid=aid))
+            raise E("key_address", aid=aid)
         if "secret" not in acc:
-            raise ValueError(W["key_secret"].format(aid=aid))
+            raise E("key_secret", aid=aid)
         if known["makers"] == "many" and "model" not in acc:
-            raise ValueError(W["key_model"].format(aid=aid, label=known["label"]))
+            raise E("key_model", aid=aid, label=known["label"])
         account_model_rule(aid, acc, known["program"])
         return
     if acc["provider"] != lifecycle.OWN_SERVER["provider"]:
-        raise ValueError(W["own_provider"].format(aid=aid))
+        raise E("own_provider", aid=aid)
     account_model_rule(aid, acc, lifecycle.OWN_SERVER["program"])
-    if account_address(acc.get("address"), aid) != acc.get("address"):
-        raise ValueError(W["address"].format(aid=aid))
+    if account_address(acc.get("address")) != acc.get("address"):
+        raise E("address")
     if "secret" not in acc:
         # An open server: at most one agent names it, alone on its server, and the server listens on loopback. An
-        # entry that no agent names yet is taken, so that the owner's writes can come in the order of spec 3.1.
+        # entry that no agent names yet is taken, so that the owner's writes can come in the order of spec 3.1. The
+        # owner's words (round 2, sentence 3) are for the case that he meets in a flow: a second agent on the server
+        # of the agent of such a server.
         users = [a for a in team["agents"].values() if a.get("account") == aid]
-        alone = len(users) <= 1 and all(
-            sum(1 for b in team["agents"].values() if b.get("machine") == a.get("machine")) == 1 for a in users)
-        if not alone or not account_loopback(urllib.parse.urlsplit(acc["address"]).hostname or ""):
-            raise ValueError(W["open"].format(aid=aid))
+        if len(users) > 1 or not account_loopback(urllib.parse.urlsplit(acc["address"]).hostname or ""):
+            raise E("open_address", aid=aid)
+        crowded = [a.get("machine") for a in users
+                   if sum(1 for b in team["agents"].values() if b.get("machine") == a.get("machine")) != 1]
+        if crowded:
+            raise E("open", server=crowded[0])
 
 
 def account_model_rule(aid, acc, program):
@@ -38004,7 +38050,7 @@ def account_model_rule(aid, acc, program):
     them, and this holds nothing there."""
     model = acc.get("model")
     if model is not None and program and not (model.startswith(program + "/") and len(model) > len(program) + 1):
-        raise ValueError(ACCOUNT_WORDS["model_prefix"].format(aid=aid, prefix=program))
+        raise AccountRuleError("model_prefix", prefix=program, model=model)
 
 
 def agent_account_rule(team, name, a):
@@ -38015,12 +38061,11 @@ def agent_account_rule(team, name, a):
     if acc is None:
         return
     if acc["runtime"] is None:
-        raise ValueError(ACCOUNT_WORDS["unknown"].format(name=name, aid=acc["id"]))
+        raise AccountRuleError("unknown", name=name, aid=acc["id"])
     if a.get("runtime") != acc["runtime"]:
-        raise ValueError(ACCOUNT_WORDS["runtime"].format(name=name, aid=acc["id"],
-                                                         label=runtime_label(acc["runtime"])))
+        raise AccountRuleError("runtime", name=name, aid=acc["id"], label=runtime_label(acc["runtime"]))
     if ((team.get("servers") or {}).get(a.get("machine")) or {}).get("kind") != "linux":
-        raise ValueError(ACCOUNT_WORDS["linux"].format(name=name))
+        raise AccountRuleError("linux", name=name)
 
 
 def account_secrets(team):
@@ -38038,7 +38083,7 @@ def account_resources_rule(team):
     for rid in team.get("resources") or {}:
         kind, what = resource_parts(rid)
         if kind == "secret" and what in held:
-            raise ValueError(ACCOUNT_WORDS["resource"].format(rid=rid, aid=held[what]))
+            raise AccountRuleError("resource", rid=rid, aid=held[what])
 
 
 def account_fields(data):
@@ -38057,8 +38102,10 @@ def account_fields(data):
         if not isinstance(data["secret"], str) or not BWS_REF.fullmatch(data["secret"]):
             raise ValueError("secret must be a bws://<uuid> reference")
         out["secret"] = data["secret"].lower()
-    if data.get("address") is not None:
-        out["address"] = account_address(data["address"], data.get("account"))
+    if data.get("address") is not None:         # its rules are account_entry's, whose refusal has its code (D7)
+        if not isinstance(data["address"], str):
+            raise ValueError(ACCOUNT_WORDS["address"])
+        out["address"] = data["address"]
     if data.get("model") is not None:
         if not (isinstance(data["model"], str) and MODEL_NAME.fullmatch(data["model"])):
             raise ValueError("model must be 1 to 120 characters of A-Z a-z 0-9 . _ : / - [ ]")
@@ -38082,52 +38129,87 @@ def account_entry(body):
     run that program with the grant of that secret; a new key goes into the vault's replace under the same reference
     (POST /ui/vault/intake with the owner's signed replace), which keeps each grant. An owner label (no kind, before
     and after) reads and writes as before."""
-    entry = {k: body[k] for k in ACCOUNT_FIELDS if k in body}
+    aid, entry = body["account"], {k: body[k] for k in ACCOUNT_FIELDS if k in body}
     team, _, _ = team_view(kit_revision(fresh=True))
-    old = (team.get("accounts") or {}).get(body["account"])
+    old = (team.get("accounts") or {}).get(aid)
     old = old if isinstance(old, dict) else {}
     if old.get("kind") and not entry.get("kind"):
-        raise Refusal(409, ACCOUNT_WORDS["kind_kept"])
-    users = sorted(n for n, a in team["agents"].items() if a.get("account") == body["account"])
+        raise account_refusal(409, "kind_kept")
+    users = sorted(n for n, a in team["agents"].items() if a.get("account") == aid)
     if users and (old.get("kind") or entry.get("kind")) and \
             any(entry.get(k) != old.get(k) for k in ("kind", "provider", "secret")):
-        raise Conflict(ACCOUNT_WORDS["in_use"], agents=users)
-    secret = entry.get("secret") if entry.get("kind") else None
-    if secret:
-        with CENTRAL_LOCK:
-            status = CENTRAL["status"]
-        if f"secret:{secret}" in (team.get("resources") or {}) or secret in central_signatures(status)[1]:
-            raise Refusal(409, ACCOUNT_WORDS["pooled"])
+        raise account_refusal(409, "in_use", {"agents": users})
+    try:
+        if "address" in entry:
+            entry["address"] = account_address(entry["address"])
+        secret = entry.get("secret") if entry.get("kind") else None
+        if secret:
+            with CENTRAL_LOCK:
+                status = CENTRAL["status"]
+            if f"secret:{secret}" in (team.get("resources") or {}) or secret in central_signatures(status)[1]:
+                raise account_refusal(409, "pooled")
+        # the account's own rules before the write, so that a refusal's answer has its code and names (D7);
+        # validate_team holds the same rules at the write
+        account_rule(dict(team, accounts=dict(team.get("accounts") or {}, **{aid: entry})), aid, entry)
+    except AccountRuleError as e:
+        raise account_refusal(400, e.code, **e.names) from None
     return entry
 
 
 def pool_statement_refusal(data):
-    """The words that refuse the owner's signed statement of kind pool for a secret that an account names (spec 3.1,
-    the third of its three refusals), or None. Read before the statement goes to the central vault
-    (Handler.ui_vault_grant); everything else of it is the central vault's to check."""
+    """The Refusal of the owner's signed statement of kind pool for a secret that an account names (spec 3.1, the
+    third of its three refusals), or None. Read before the statement goes to the central vault (Handler.ui_vault_grant;
+    a refusal of a route's read part gives its `error` alone); everything else of it is the central vault's to check."""
     try:
         said = json.loads(data.get("statement")) if isinstance(data.get("statement"), str) else None
     except ValueError:
         return None
     login = said.get("login") if isinstance(said, dict) and said.get("kind") == "pool" else None
-    return ACCOUNT_WORDS["pool_statement"] if isinstance(login, str) and \
+    return account_refusal(409, "pool_statement") if isinstance(login, str) and \
         login.lower() in account_secrets(team_read()) else None
 
 
-def account_change_refusal(team, old, new):
-    """The words that refuse an owner's change of an agent's `account`, or None (plan K7). An agent whose account has
-    a kind runs that account's program on its own Linux server, and an agent with a plan has its runtime's sign-in, so
-    no change moves an agent into or out of an account with a kind, or between two of them, in version 1."""
-    kinds = [lifecycle.model_account(team, {"account": x}) for x in (old, new) if x]
-    return ACCOUNT_WORDS["change"] if old != new and any(kinds) else None
+def account_change_refusal(team, agent, old, new):
+    """The Refusal of an owner's change of an agent's `account`, or None (plan K7, the coordinator's D2). An agent
+    whose account has a kind runs that account's program on its own Linux server, and an agent with a plan has its
+    runtime's sign-in, so no change moves an agent into or out of an account with a kind, or between two of them, in
+    version 1. The owner's words (round 2, sentence 5) name the agent and the AI that it stays on: the provider that he
+    picked, or, for a plan, its runtime."""
+    held = lifecycle.model_account(team, {"account": old}) if old else None
+    if old == new or not (held or (new and lifecycle.model_account(team, {"account": new}))):
+        return None
+    name = agent_display(agent)
+    if held and held["kind"] == "server":
+        return account_refusal(409, "change_server", agent=name)
+    runtime = runtime_label(((team.get("agents") or {}).get(agent) or {}).get("runtime"))
+    return account_refusal(409, "change", agent=name, provider=(account_label(held) if held else None) or runtime)
 
 
 def account_detail(detail):
-    """True for a detail of the setup check's `account` item that the hub keeps: none, one of the six fixed sentences
-    of lifecycle, or a model of the owner's server (own/<name>). No text of a model server reaches the records."""
-    return detail in ("", lifecycle.NO_ANSWER, lifecycle.OPEN_SERVER, lifecycle.NO_TOOL_CALL,
-                      lifecycle.SMALL_CONTEXT, lifecycle.NO_KEY, lifecycle.KEY_REFUSED) or \
+    """True for a detail of the setup check's `account` item that the hub keeps: none, one of the fixed sentences of
+    lifecycle (ACCOUNT_CODES, but the template of NOT_OFFERED, which account_item_words keeps filled), or a model of
+    the owner's server (own/<name>). No text of a model server reaches the records."""
+    return detail == "" or detail in lifecycle.ACCOUNT_CODES and detail != lifecycle.NOT_OFFERED or \
         detail.startswith("own/") and len(detail) > 4 and bool(MODEL_NAME.fullmatch(detail))
+
+
+ITEM_NAME = re.compile(r"[^\x00-\x1f\x7f]{1,120}")      # a name that fills a check item's sentence: one line
+
+
+def account_item_words(v, detail):
+    """What the hub keeps of a check's `account` item beside its kind, ref and state: {detail, code, names}. The code
+    is one of lifecycle.ACCOUNT_CODES (the coordinator's decision D7), and the names fill NOT_OFFERED, the owner's
+    sentence 9 (the provider that he picked, the model as he pasted it, the agent's name): its filled sentence is kept
+    only when it is that sentence with those names. Each other detail is kept by account_detail, else as "". A helper
+    of another release can have other words: they are never refused."""
+    code = v.get("code") if isinstance(v.get("code"), str) and v["code"] in lifecycle.ACCOUNT_CODES.values() else None
+    names = v.get("names")
+    if code == lifecycle.ACCOUNT_CODES[lifecycle.NOT_OFFERED] and isinstance(names, dict) and \
+            set(names) == {"provider", "model", "agent"} and \
+            all(isinstance(x, str) and ITEM_NAME.fullmatch(x) for x in names.values()) and \
+            detail == lifecycle.NOT_OFFERED.format(**names):
+        return {"detail": detail, "code": code, "names": dict(names)}
+    return dict({"detail": detail if account_detail(detail) else ""}, **({"code": code} if code else {}))
 
 
 def save_account(body):
@@ -39142,6 +39224,11 @@ def manager_warning():
 
 
 CHECK_WAIT = 60      # seconds a requested machine check may take before it counts as failed or offline
+# The AI providers build (the coordinator's decision D12): a helper whose `account` item runs long (a model server's
+# check takes minutes) sends a first report with that item in state CHECKING, and the check's wait then ends on the
+# helper's next report, not at CHECK_WAIT. kv CHECK_RUNNING<check id> (the agent) marks it while it runs.
+CHECKING = "checking"
+CHECK_RUNNING = "check_running:"
 
 
 def check_view(r):
@@ -39153,6 +39240,8 @@ def settle_checks(t0):
     """A check whose report did not come in time: offline when the helper has not checked in since it was asked,
     otherwise failed (the helper is there but sent no report, for example an older helper)."""
     for c in q("SELECT * FROM machine_checks WHERE state='requested' AND requested < ?", (t0 - CHECK_WAIT,)):
+        if kv_get(CHECK_RUNNING + str(c["id"])):
+            continue        # D12: its account item runs, and the helper's next report ends the wait
         seen = (q1("SELECT last_seen FROM agents WHERE name=?", (c["agent"],)) or {"last_seen": None})["last_seen"]
         offline = not seen or seen < c["requested"]
         name = shown_role(c["agent"])          # the server check's line, which he reads
@@ -39167,11 +39256,22 @@ def record_status(agent, data):
     desired = kit_revision()
     data, released = dict(data), False
     check, verify = data.pop("check", None), data.pop("verify", None)
-    if check:
+    if check and any(i.get("kind") == "account" and i.get("state") == CHECKING for i in verify or []):
+        # D12: the first report of a check whose account item runs long. The check stays requested, and no clock
+        # ends it: the report that follows does (the helper sends it when the item is done).
+        if q1("SELECT 1 FROM machine_checks WHERE id=? AND agent=? AND state='requested'", (check, agent)):
+            kv_set(CHECK_RUNNING + str(check), agent)
+    elif check:
         items = verify_merge(agent, verify or [], data)          # owner API 1.9: the setup check of this report
         q("UPDATE machine_checks SET state='completed', completed=?, detail=NULL, verify=?, revision=? "
           "WHERE id=? AND agent=? AND state='requested'", (now(), json.dumps(items), data.get("revision"), check, agent))
         q("UPDATE jobs SET finished=COALESCE(finished,?) WHERE agent=? AND kind='probe' AND finished IS NULL", (now(), agent))
+        kv_set(CHECK_RUNNING + str(check), None)
+    else:
+        # D12: a report with no check, from a helper whose check ran: it no longer runs (the helper started again,
+        # or its last report did not arrive), so settle_checks answers it as any check
+        for c in q("SELECT id FROM machine_checks WHERE agent=? AND state='requested'", (agent,)):
+            kv_set(CHECK_RUNNING + str(c["id"]), None)
     old = q1("SELECT data FROM machine_status WHERE agent=?", (agent,))
     with area("state" if not old or said(json.loads(old["data"])) != said(data) else "activity"):
         q("INSERT INTO machine_status(agent,data,reported) VALUES(?,?,?) "
@@ -47024,7 +47124,7 @@ class Handler(BaseHTTPRequestHandler):
             if extra:
                 raise ValueError(f"unknown field {extra[0]}")
             if pool_statement_refusal(data):        # the AI providers build: an account's key goes into no pool
-                raise Refusal(409, pool_statement_refusal(data))
+                raise pool_statement_refusal(data)
             return self.signed_statement(data, ("grant", "ungrant", "pool", "unpool"))
         return self.ui_command("vault/grant", read, self.signed_receipt, outside=central_statement)
 

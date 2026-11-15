@@ -6,6 +6,7 @@ checkout; no helper, no vault, no model server and no AI call. Each agent of an 
 own, so these tests hold with the rule "one OS user for each agent" and without it."""
 import copy
 import json
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -74,7 +75,8 @@ def models(runtime, *names, efforts=("low", "medium", "high")):
 
 
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite(ModelAccounts(name) for name in ModelAccounts.__dict__ if name.startswith("test_"))
+    return unittest.TestSuite(cls(name) for cls in (ModelAccounts, CheckReport) for name in cls.__dict__
+                              if name.startswith("test_"))
 
 
 class ModelAccounts(OwnerAPI):
@@ -213,8 +215,8 @@ class ModelAccounts(OwnerAPI):
                             ("https://models.example.com/api/v1", "https://models.example.com/api/v1"),
                             ("https://203.0.113.5:8443", "https://203.0.113.5:8443/v1")):
             with self.subTest(given=given):
-                self.assertEqual(hub.account_address(given, "box"), kept)
-        address, plain = hub.ACCOUNT_WORDS["address"].format(aid="box"), hub.ACCOUNT_WORDS["plain_http"].format(aid="box")
+                self.assertEqual(hub.account_address(given), kept)
+        address, plain = hub.ACCOUNT_WORDS["address"], hub.ACCOUNT_WORDS["plain_http"]      # the owner's words, no name
         for given, words in (("ftp://models.example.com/v1", address), ("models.example.com", address),
                              ("http://owner@100.64.0.7/v1", address), ("http://u:p@100.64.0.7/v1", address),
                              ("http://100.64.0.7/v1?key=1", address), ("http://100.64.0.7/v1#top", address),
@@ -226,7 +228,7 @@ class ModelAccounts(OwnerAPI):
                              ("http://100.128.0.1/v1", plain), ("http://ts.net.example.com/v1", plain)):
             with self.subTest(given=given):
                 with self.assertRaises(ValueError) as said:
-                    hub.account_address(given, "box")
+                    hub.account_address(given)
                 self.assertEqual(str(said.exception), words)
         code, receipt = self.account("box", provider="own", title="Box", kind="server",
                                      address="HTTP://LocalHost:11434")
@@ -236,7 +238,7 @@ class ModelAccounts(OwnerAPI):
                                       address="http://models.example.com")[1]["error"], plain)
         # A hand-written address that is not in the hub's one form is refused by validate_team.
         self.assertEqual(self.refused(lambda t: t["accounts"]["spark"].update(address="http://100.64.0.7:8000")),
-                         hub.ACCOUNT_WORDS["address"].format(aid="spark"))
+                         hub.ACCOUNT_WORDS["address"])
 
     def test_a_model_server_with_no_key_is_one_agents_alone_on_its_server_on_the_loopback(self):
         def open_spark(address):
@@ -244,7 +246,7 @@ class ModelAccounts(OwnerAPI):
                 team["accounts"]["spark"] = {"provider": "own", "title": "Spark", "kind": "server", "address": address}
                 team["agents"]["own-1"].pop("secrets")
             return change
-        words = hub.ACCOUNT_WORDS["open"].format(aid="spark")
+        words = hub.ACCOUNT_WORDS["open_address"].format(aid="spark")
         self.assertEqual(self.refused(open_spark("http://100.64.0.7:8000/v1")), words)
         team = copy.deepcopy(TEAM)
         open_spark("http://127.0.0.1:11434/v1")(team)
@@ -256,13 +258,13 @@ class ModelAccounts(OwnerAPI):
             {"own-2": dict(OPENCODE, machine="app-6", account="spark")}))), words)        # two agents reach it
         self.assertEqual(self.refused(lambda t: (open_spark("http://localhost:11434/v1")(t), t["agents"].update(
             {"beside": {"role": "worker", "runtime": "claude", "machine": "app-3", "can": ["shell"]}}))),
-            words)                                                                       # its server has two agents
+            hub.ACCOUNT_WORDS["open"].format(server="app-3"))                            # its server has two agents
         # The route takes an open loopback server that no agent names.
         self.assertEqual(self.account("local", provider="own", title="Local", kind="server",
                                       address="http://127.0.0.1:1234")[0], 200)
         self.assertEqual(self.account("local", provider="own", title="Local", kind="server",
                                       address="https://models.example.com")[1]["error"],
-                         hub.ACCOUNT_WORDS["open"].format(aid="local"))
+                         hub.ACCOUNT_WORDS["open_address"].format(aid="local"))
 
     def test_an_owner_label_reads_and_writes_exactly_as_before(self):
         """The spec writer's answer of 14 November 2026, rule 2: a write replaces the whole entry and carries nothing
@@ -296,7 +298,7 @@ class ModelAccounts(OwnerAPI):
             code, said = self.request("/ui/servers/app-3/agents", dict(
                 request_id=str(uuid.uuid4()), db="test-generation", base_sha256=self.sha(), agent="beside",
                 runtime="claude", role="worker", reports_to=None))
-        self.assertEqual((code, said["error"]), (400, hub.ACCOUNT_WORDS["open"].format(aid="spark")))
+        self.assertEqual((code, said["error"]), (400, hub.ACCOUNT_WORDS["open"].format(server="app-3")))
         self.assertNotIn("beside", self.stored()["agents"])
         self.assertEqual(hub.q("SELECT * FROM server_jobs"), [])
         with patch.object(hub, "not_shareable", lambda team, here: []):     # a server with a key: taken
@@ -319,7 +321,7 @@ class ModelAccounts(OwnerAPI):
         second["agents"]["own-2"] = dict(OPENCODE, machine="app-6", account="spark")     # alone on its own server
         with self.assertRaises(ValueError) as said:
             hub.validate_team(second)
-        self.assertEqual(str(said.exception), hub.ACCOUNT_WORDS["open"].format(aid="spark"))
+        self.assertEqual(str(said.exception), hub.ACCOUNT_WORDS["open_address"].format(aid="spark"))
         code, said = self.request("/ui/team/agents/gem-2", dict(request_id=str(uuid.uuid4()), db="test-generation",
                                                                 base_sha256=self.sha(), account="spark"))
         self.assertEqual(code, 409)                 # the owner's route refuses it first: no change of account (K7)
@@ -376,8 +378,9 @@ class ModelAccounts(OwnerAPI):
                                      secret=FREE_KEY, model="qwen3.8-max"), "own")):
             with self.subTest(fields=fields):
                 code, said = self.account("acc-x", title="X", **fields)
-                self.assertEqual((code, said["error"]), (400, hub.ACCOUNT_WORDS["model_prefix"].format(
-                    aid="acc-x", prefix=prefix)))
+                self.assertEqual((code, said["error"], said["code"], said["names"]), (
+                    400, hub.ACCOUNT_WORDS["model_prefix"].format(prefix=prefix, model=fields["model"]),
+                    "model_prefix", {"prefix": prefix, "model": fields["model"]}))
         for account, fields in (("acc-g", dict(provider="google", kind="key", secret=FREE_KEY,
                                                model="google/gemini-3.1-pro")),
                                 ("acc-r", dict(provider="openrouter", kind="key", secret=FREE_KEY,
@@ -387,6 +390,89 @@ class ModelAccounts(OwnerAPI):
                                 ("acc-x", dict(provider="xai", kind="key", secret=FREE_KEY, model="grok-4.7"))):
             with self.subTest(taken=account):
                 self.assertEqual(self.account(account, title="X", **fields)[0], 200)
+
+    def test_the_owners_words_fill_with_the_cases_names_and_each_refusal_gives_its_code(self):
+        """The coordinator's decision D7: the hub holds the owner's approved words of round 2 (14 November 2026,
+        ai-providers-step-5-answers.md, "The approved words, as templates"), filled with the case's names and never
+        an account's id, and each refusal's answer adds `code` and `names`."""
+        W = hub.ACCOUNT_WORDS
+        self.assertEqual({k: W[k] for k in hub.APPROVED_WORDS if not re.search(r"{\w+}", W[k])}, {
+            "plain_http": "Plain http works only over Tailscale or on the agent's own server. Use that machine's "
+                          "Tailscale address, or https.",
+            "address": "Write the address as http:// or https://, then the host, and a port and a path if it has them.",
+            "pooled": "The fleet manager may give this key. Set it to You alone in Settings \u203a Secrets, then save "
+                      "again.",
+            "kind_kept": "This account runs on a key or a model server, and this change would drop that. To remove the "
+                         "account, delete it.",
+            "in_use": "Agents use this account, so its AI and its key stay as they are. For a new key, save it in "
+                      "Settings \u203a Secrets under the same name."})
+        self.assertEqual(W["open"].format(server="app-1"), "app-1 has an agent on a model server with no key, so it "
+                                                           "takes no other agent. Choose another server.")
+        self.assertEqual(W["change"].format(agent="Iris", provider="Gemini"),
+                         "Iris stays on Gemini. For another AI, add a new agent.")
+        self.assertEqual(W["change_server"].format(agent="Iris"),
+                         "Iris stays on its model server. For another AI, add a new agent.")
+        self.assertEqual(W["model_prefix"].format(prefix="openrouter", model="qwen/qwen3.8-max"),
+                         "Write the model as openrouter/ and then its name, for example openrouter/qwen/qwen3.8-max.")
+        self.assertEqual(set(hub.APPROVED_WORDS.values()), {1, 2, 3, 4, 5, 10, 11, 12})
+        for code_, aid in (("aid", "{aid}"),):         # no approved sentence names an account's id
+            self.assertFalse([k for k in hub.APPROVED_WORDS if aid in W[k]])
+        # Each refusal of the owner's route gives its words, its code and its names.
+        for fields, code_, names in (
+                (dict(provider="own", kind="server", address="http://192.168.1.50:11434", secret=FREE_KEY),
+                 "plain_http", {}),
+                (dict(provider="own", kind="server", address="ftp://models.example.com", secret=FREE_KEY),
+                 "address", {}),
+                (dict(provider="own", kind="server", address="https://models.example.com"), "open_address",
+                 {"aid": "box"}),
+                (dict(provider="openrouter", kind="key", secret=FREE_KEY, model="qwen/qwen3.8-max"), "model_prefix",
+                 {"prefix": "openrouter", "model": "qwen/qwen3.8-max"}),
+                (dict(provider="google", kind="key"), "key_secret", {"aid": "box"})):
+            with self.subTest(code=code_):
+                code, said = self.account("box", title="Box", **fields)
+                self.assertEqual((code, said["error"], said["code"], said["names"]),
+                                 (400, W[code_].format(**names), code_, names))
+        code, said = self.account("gemini", provider="google", title="Gemini")
+        self.assertEqual((code, said["error"], said["code"], said["names"]), (409, W["kind_kept"], "kind_kept", {}))
+        code, said = self.account("gemini", provider="google", title="Gemini", kind="key", secret=FREE_KEY)
+        self.assertEqual((said["code"], said["names"], said["agents"]), ("in_use", {}, ["gem-1", "gem-2"]))
+
+    def test_a_check_waits_for_its_account_item_on_the_next_report(self):
+        """The coordinator's decision D12: a check whose first report has the account item in state checking stays
+        requested past CHECK_WAIT, and the report after it ends the wait: as the check's report, or as one with no
+        check, after which the check is answered as before."""
+        def report(agent, **body):
+            code, said = self.request(f"/helper/status/{agent}", dict({"revision": hub.kit_revision(fresh=True)},
+                                                                      **body))
+            self.assertEqual(code, 200, said)
+        runtime = {"kind": "runtime", "ref": "opencode", "state": "ok", "detail": "2.2.5"}
+        cid = hub.start_machine_check("own-1")["check"]["id"]
+        hub.touch("own-1")
+        report("own-1", check=cid, verify=[runtime, {"kind": "account", "ref": "spark", "state": "checking",
+                                                     "detail": ""}])
+        hub.settle_checks(hub.now() + hub.CHECK_WAIT + 600)
+        row = hub.q1("SELECT * FROM machine_checks WHERE id=?", (cid,))
+        self.assertEqual((row["state"], row["verify"]), ("requested", None))
+        report("own-1", check=cid, verify=[runtime, {"kind": "account", "ref": "spark", "state": "ok",
+                                                     "detail": "own/qwen3.8-max"}])
+        row = hub.q1("SELECT * FROM machine_checks WHERE id=?", (cid,))
+        self.assertEqual(row["state"], "completed")
+        self.assertIn({"kind": "account", "ref": "spark", "state": "ok", "detail": "own/qwen3.8-max"},
+                      json.loads(row["verify"]))
+        self.assertIsNone(hub.kv_get(hub.CHECK_RUNNING + str(cid)))
+        # A helper that started again sends a report with no check: the wait ends, and the check is answered.
+        cid = hub.start_machine_check("own-1")["check"]["id"]
+        hub.touch("own-1")                      # its helper polls the hub, as each helper does
+        report("own-1", check=cid, verify=[runtime, {"kind": "account", "ref": "spark", "state": "checking",
+                                                     "detail": ""}])
+        report("own-1")
+        hub.settle_checks(hub.now() + hub.CHECK_WAIT + 1)
+        row = hub.q1("SELECT * FROM machine_checks WHERE id=?", (cid,))
+        self.assertEqual((row["state"], row["detail"]), ("failed", f"{hub.shown_role('own-1')} sent no report in "
+                                                                   f"{hub.CHECK_WAIT} seconds."))
+        # Only the account item has the state checking.
+        with self.assertRaises(ValueError):
+            hub.verify_items([dict(runtime, state="checking")])
 
     def test_an_agent_on_an_account_runs_its_program_on_a_linux_server(self):
         W = hub.ACCOUNT_WORDS
@@ -455,7 +541,7 @@ class ModelAccounts(OwnerAPI):
                                                              "secret": FREE_KEY})
         code, said = self.account("box", provider="own", title="Box", kind="server",
                                   address="https://models-3.example.com")
-        self.assertEqual((code, said["error"]), (400, hub.ACCOUNT_WORDS["open"].format(aid="box")))
+        self.assertEqual((code, said["error"]), (400, hub.ACCOUNT_WORDS["open_address"].format(aid="box")))
         self.assertEqual(self.stored()["accounts"]["box"]["address"], "https://models-2.example.com/v1")
 
     def test_the_owner_moves_no_agent_into_out_of_or_between_accounts_with_a_kind(self):
@@ -466,10 +552,15 @@ class ModelAccounts(OwnerAPI):
         team["accounts"]["gemini-2"] = {"provider": "google", "title": "G2", "kind": "key", "secret": FREE_KEY}
         hub.commit_kit_file("team.json", (json.dumps(team, indent=2) + "\n").encode(), "Owner added an account")
         hub.apply_team(team)
-        for agent, account in (("gem-1", "gemini-2"), ("gem-1", None), ("dev-lead", "gemini"), ("own-1", "gemini")):
+        for agent, account, code_, names in (
+                ("gem-1", "gemini-2", "change", {"provider": "Gemini"}), ("gem-1", None, "change", {"provider": "Gemini"}),
+                ("dev-lead", "gemini", "change", {"provider": "Claude Code"}),     # a plan: its runtime's name
+                ("own-1", "gemini", "change_server", {})):
             with self.subTest(agent=agent, account=account):
                 code, said = settings(agent, account=account)
-                self.assertEqual((code, said["error"]), (409, hub.ACCOUNT_WORDS["change"]))
+                names = dict(names, agent=hub.agent_display(agent))
+                self.assertEqual((code, said["error"], said["code"], said["names"]),
+                                 (409, hub.ACCOUNT_WORDS[code_].format(**names), code_, names))
         self.assertEqual(self.stored()["agents"]["gem-1"]["account"], "gemini")
         team["accounts"]["codex-team"] = {"provider": "openai", "title": "Codex Team"}       # labels: as before
         hub.commit_kit_file("team.json", (json.dumps(team, indent=2) + "\n").encode(), "Owner added a label")
@@ -491,6 +582,18 @@ class ModelAccounts(OwnerAPI):
                                                                          "state": "ok", "detail": "2.2.5"}]})
                 self.assertEqual(report["verify"][0], item(kept))
         self.assertTrue(hub.item_required("gem-1", item("")))
+        # The item's code and, for the owner's sentence 9, its names (lifecycle.account_words, decision D7).
+        names = {"provider": "OpenRouter", "model": "qwen/qwen3.8-max", "agent": "Seller-1"}
+        sentence = lifecycle.NOT_OFFERED.format(**names)
+        for given, kept in (
+                (dict(item(sentence), code="not_offered", names=names),
+                 dict(item(sentence), code="not_offered", names=names)),
+                (dict(item(sentence), code="not_offered", names=dict(names, model="other")), dict(item(""), code="not_offered")),
+                (dict(item(lifecycle.NOT_OFFERED), code="not_offered"), dict(item(""), code="not_offered")),
+                (dict(item(lifecycle.PATH_NAMES), code="path_names"), dict(item(lifecycle.PATH_NAMES), code="path_names")),
+                (dict(item(lifecycle.NO_KEY), code="made_up"), item(lifecycle.NO_KEY))):
+            with self.subTest(given=given):
+                self.assertEqual(hub.validate_status({"verify": [given]})["verify"], [kept])
 
     def test_an_agent_with_a_key_account_activates_with_no_sign_in_and_not_without_its_account_item(self):
         def check(items):
@@ -682,6 +785,57 @@ class ModelAccounts(OwnerAPI):
     def test_an_agent_with_an_account_kind_cannot_chat(self):
         for agent in ("gem-1", "own-1"):
             self.assertEqual(hub.conversation_refusal(agent), f"{hub.agent_display(agent)} cannot chat now.")
+
+
+class CheckReport(unittest.TestCase):
+    """The helper's half of the coordinator's decision D12: the check of an agent on a model account sends a first
+    report with its account item in state checking, then the report with the item checked."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="fleet-check-report-"))
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        (self.tmp / "kit").mkdir()
+        (self.tmp / "kit" / "team.json").write_text(json.dumps(TEAM))
+
+    def life(self, agent):
+        posts, order = [], []
+        life = lifecycle.Lifecycle(str(self.tmp / "kit"), agent, TEAM["agents"][agent],
+                                   lambda payload: (posts.append(copy.deepcopy(payload)), (200, {}))[1],
+                                   lambda: False, run=lambda argv, **k: (1, "", ""), platform_name="linux",
+                                   home=str(self.tmp), read_key=lambda: "k-test-0001")
+
+        def collect(fast=False):
+            life.read_mono = life.monotonic()
+            return {"runtime": {"name": TEAM["agents"][agent]["runtime"], "version": "2.2.5", "signed_in": None},
+                    "models": None, "security": {}}
+
+        def account_item(account):
+            order.append(len(posts))            # how many reports had left when the item ran
+            return ("account", account["id"], "ok", "own/qwen3.8-max", {})
+        for name, stand_in in (("collect", collect), ("read_models", lambda force=False: None),
+                               ("read_screen_models", lambda force=False: None), ("private_network", lambda: None),
+                               ("login_items", lambda job: []), ("admin_item", lambda: ("access", "admin", "ok", "-")),
+                               ("account_item", account_item)):
+            setattr(life, name, stand_in)
+        return life, posts, order
+
+    def test_a_first_report_says_that_the_account_item_runs(self):
+        life, posts, order = self.life("own-1")
+        self.assertTrue(life.report(check=7))
+        self.assertEqual([p["check"] for p in posts], [7, 7])
+        self.assertEqual(order, [1])            # the item ran after the first report had left
+        items = [{(i["kind"], i["ref"]): (i["state"], i["detail"]) for i in p["verify"]} for p in posts]
+        self.assertEqual(items[0][("account", "spark")], (lifecycle.CHECKING, ""))
+        self.assertEqual(items[1][("account", "spark")], ("ok", "own/qwen3.8-max"))
+        self.assertEqual({k: v for k, v in items[0].items() if k[0] != "account"},
+                         {k: v for k, v in items[1].items() if k[0] != "account"})     # the rest is checked once
+        self.assertEqual(lifecycle.CHECKING, hub.CHECKING)
+
+    def test_an_agent_with_no_account_kind_reports_its_check_once(self):
+        life, posts, order = self.life("dev-lead")
+        self.assertTrue(life.report(check=8))
+        self.assertEqual(([p["check"] for p in posts], order), ([8], []))
+        self.assertNotIn("account", [i["kind"] for i in posts[0]["verify"]])
 
 
 if __name__ == "__main__":
