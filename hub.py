@@ -1058,6 +1058,30 @@ def unplaced(name, team=None):
 # The names that the hub's own user uses on the hub's server, as fleet-<name>: its git service, its chat bridge, the
 # server service of a hub server that takes agents, and the hub's checkout (hubsetup.py FLEET_OWN_NAMES has them too).
 HUB_OWN_NAMES = ("channels", "git", "pilot", "server")
+# The names that the fleet uses itself on a server, as fleet-<name>, so that no new agent gets one (fleet_own_name):
+# the user of the vault broker (vault), the group of the agents' users (agents), the services that `fleet.py service`
+# makes under these names and not as an agent's helper (git, channels, and watch on a Mac), the folders of the hub's
+# checkout and of a server's service (pilot, server), and the folders that an agent's helper keeps in the agent's own
+# home beside its checkout (work, chats, checks: fleet.py WORK and CHATS, lifecycle.py CHECK_STORE). And each name
+# that starts with one of FLEET_OWN_STARTS: vault- (fleet-vault-central was the central vault's user, and the vault
+# has more parts with such names) and login- (fleet-login-<agent> is the tmux session of an agent's sign-in).
+# hubsetup.py takes these two lists for the manager of a new hub, and hub.sh has the names in its own check, which
+# a test holds to them.
+FLEET_OWN_NAMES = ("agents", "channels", "chats", "checks", "git", "pilot", "server", "vault", "watch", "work")
+FLEET_OWN_STARTS = ("login-", "vault-")
+
+
+def fleet_own_name(name):
+    """True for a name that the fleet uses itself on a server (FLEET_OWN_NAMES, FLEET_OWN_STARTS). An agent of such a
+    name cannot run there: `git` and `channels` get the hub's git service and the chat bridge as their service
+    (fleet.py cmd_service), `vault` has the OS user of the vault broker and `agents` the name of the agents' group
+    (hubsetup.py user_script), and the others share a folder or a session with a part of the fleet. Until 15 November
+    2026 only a new hub's manager was held to this (hubsetup.manager_name): Add agent took `git` on a joined server,
+    and its install job then failed or made the wrong service. The rule is for a new name (add_server_agent,
+    rename_agent, a Mac's join code), never for a team.json that is there: validate_team does not ask it, and an
+    agent that has such a name from before keeps it, also at a move (on Linux some of them run: `watch` is a
+    service of the fleet on a Mac only)."""
+    return name in FLEET_OWN_NAMES or str(name).startswith(FLEET_OWN_STARTS)
 
 
 def hub_shared(team=None):
@@ -1066,8 +1090,9 @@ def hub_shared(team=None):
     owner approved on 14 November 2026). The installer writes the word (hubsetup.template) and gives that server a
     server service (hubsetup.hub_server), so an agent comes onto it as onto a joined server: by an install job, under
     its own OS user `fleet-<agent>`. Each other hub keeps the rule of 2 November 2026, that no new agent goes onto
-    the hub's server, where the central vault holds every key. No app and no tool gives the installer the word yet:
-    UI-API.md 1.168 lists what is still open (no vault broker there, the door, a restore, the hub's own watch)."""
+    the hub's server, where the central vault holds every key. Such a server has its own vault broker (hub.sh's vault
+    step) and keeps the records of its own keys over a restore (own_server_records). It has no door: validate_door
+    says why. No app and no tool gives the installer the word yet (UI-API.md 1.168 and 1.171)."""
     conf = (TEAM if team is None else team).get("hub")
     return isinstance(conf, dict) and conf.get("shared") is True
 
@@ -36736,6 +36761,8 @@ def add_server_agent(server, body):
         # there would share them: its removal could end the hub's own git service.
         if server == (team.get("hub") or {}).get("machine") and hub_shared(team) and agent in HUB_OWN_NAMES:
             raise Refusal(409, f"The hub uses the name {agent} itself on its own server. Choose another name.")
+        if fleet_own_name(agent):           # on each server: its install would fail, or make another service
+            raise Refusal(409, f"Founderizer uses the name {agent} itself on a server. Choose another name.")
         if here and INSTALL_KEY not in server_features(server):
             raise Refusal(409, f"{server} runs an older Founderizer that cannot add a second agent. Update Founderizer "
                                f"on {server}, then try again.")
@@ -37033,6 +37060,8 @@ def rename_agent(agent, body):
         raise Refusal(409, f"{shown_name(agent)} has this name already.")
     if new in team["agents"]:
         raise Refusal(409, f"An agent named {new} exists.")
+    if fleet_own_name(new):     # its service and its folder take the new name: `git` would get the hub's git service
+        raise Refusal(409, f"Founderizer uses the name {new} itself on a server. Choose another name.")
     held = next((n for n, x in team["agents"].items() if n != agent and agent_words(x.get("title")) == new), None)
     if held:                    # a name that is another agent's role would take that role's place (agent_called)
         raise Refusal(409, f"{team['agents'][held]['title'].strip()} is the role of {shown_name(held)}. Choose another "
@@ -41068,13 +41097,14 @@ def fleet_has_records():
     return any(q1(f"SELECT 1 FROM {table} LIMIT 1") for table in WORK_TABLES)
 
 
-def restored_team(bundle):
+def restored_team(bundle, reset=None):
     """The `team.json` a restore writes: the saved fleet, standing on the new machine.
 
     Everything that says who this fleet is — its agents, their roles, machines, runtimes and grants — comes from
     the copy. Everything that says where this fleet is now stays as the new hub's own installer wrote it: the
     addresses (including the owner's Mac, which claimed this hub) and the hub block. Taking the old addresses
-    would point the new fleet at the dead machine and lock the owner out of it."""
+    would point the new fleet at the dead machine and lock the owner out of it. The vault store of the hub's own
+    server is this machine's too (own_vault_store): `reset` gets the agents there whose vault goes back to none."""
     try:
         team = json.loads(bundle["config"]["team.json"])
         if not isinstance(team, dict):
@@ -41092,10 +41122,165 @@ def restored_team(bundle):
                                   if m in ours or ip not in ours.values()}, **ours)
         if TEAM.get("hub"):
             team["hub"] = TEAM["hub"]
+        own_vault_store(team, reset if reset is not None else [])     # the hub's own server: this machine's vault
         validate_team(team)
     except (ValueError, KeyError, TypeError, AttributeError) as e:
         raise Refusal(422, f"this copy and this server do not make a team.json the hub can run: {e}") from None
     return json.dumps(team, indent=2).encode() + b"\n"
+
+
+OWN_SUFFIX = ".restore.own.json"    # beside the database: this machine's own records, of the copy that waits there
+OWN_TAKEN = ".restored.own.json"    # the same file, from the moment that a start takes that copy (take_restore)
+
+
+def own_vault_store(team, reset):
+    """In the team of a copy, on its way onto this hub (restored_team): the vault store of the hub's own server is
+    this machine's. A copy pins the key of the broker that ran on its own hub's server (`vault_stores`, and each
+    agent's `vault_recipient`). On another machine that broker is gone: the pin would refuse this machine's broker for
+    ever (`vault_store_mismatch`), and a sealed copy for it would be locked to a key that no machine holds. So where
+    the copy's pin for that server is another key than this hub's own, this hub's own pin takes its place; and where
+    this hub has none, the pin goes, and each agent of that server is back at `"vault": "none"`, to which the hub gives
+    the vault again when this machine's broker has reported (default_access_sweep; `reset` gets their names, whose
+    marks of a default that ended the start then takes away). A pin for each other machine stays the copy's: that
+    machine and its broker did not change. So does the pin of a hub's own server on which the manager holds a broker
+    vault, where this hub has no pin of its own."""
+    machine = (TEAM.get("hub") or {}).get("machine")
+    if not machine or machine not in (team.get("addresses") or {}):
+        return
+    ours, theirs = store_key(TEAM, machine), store_key(team, machine)
+    if theirs is None or theirs == ours:
+        return
+    there = [a for a in (team.get("agents") or {}).values()
+             if isinstance(a, dict) and a.get("machine") == machine and a.get("vault") == "broker"]
+    # A manager's vault is set at its installation, and no command and no default gives it one again: where this hub
+    # has no pin to give it, the copy's pin stays, as before this function.
+    if not ours and any(a.get("role") == "manager" for a in there):
+        return
+    stores = {m: k for m, k in (team.get("vault_stores") or {}).items() if m != machine}
+    if ours:
+        stores[machine] = ours
+    team.pop("vault_stores", None)
+    if stores:
+        team["vault_stores"] = stores
+    for name, a in (team.get("agents") or {}).items():
+        if isinstance(a, dict) and a.get("machine") == machine and a.get("vault") == "broker":
+            if ours:
+                a["vault_recipient"] = ours
+            else:
+                a["vault"] = "none"
+                a.pop("vault_recipient", None)
+                reset.append(name)
+
+
+def own_server_records(restored, reset=()):
+    """What of this hub's records is its own server's and no fleet's, read before a copy replaces the records
+    (stage_restore), for the start that takes the copy (keep_own_server_records): {"machine", "server", "reading",
+    "agents", "first_store", "vault_reset"}.
+
+    `server`: the record of the key of the server service of the hub's own server (sha256, created), or None. Only a
+    hub whose own server takes agents has one (hub_shared), and only its installer writes it (hubsetup.hub_server):
+    the hub refuses a join from its own address. The key is a file of this machine.
+    `reading`: that service's newest reading (data, reported), or None: what this machine said of itself.
+    `agents`: the agent key (sha256, created, source) of each agent that runs on the hub's own server now and also in
+    the team of the copy. Its key is a file in that agent's home on this machine.
+    `first_store`: the first vault key that the hub kept for this machine (first_stores), or None.
+    `vault_reset`: the agents of this server whose vault the copy's team lost on its way here (own_vault_store).
+
+    A copy's records hold these rows as its own hub had them. On the machine that the copy came from they are the
+    same. On a new machine they are of the machine that is gone: until 15 November 2026 a restore there left the new
+    server's service unknown to the hub (403 on each of its calls, so no reading and no job), and its manager with a
+    key that the hub refused, until root ran the installer again."""
+    machine = (TEAM.get("hub") or {}).get("machine")
+    here = set(server_agents(machine)) & set(server_agents(machine, restored)) if machine else set()
+    row = q1("SELECT sha256, created FROM server_keys WHERE server=?", (machine,)) if machine else None
+    reading = q1("SELECT data, reported FROM server_status WHERE server=?", (machine,)) if machine else None
+    first = q1("SELECT key, at, closed FROM first_stores WHERE machine=?", (machine,)) if machine else None
+    keys = {r["agent"]: {"sha256": r["sha256"], "created": r["created"], "source": r["source"]}
+            for r in q("SELECT agent, sha256, created, source FROM agent_keys") if r["agent"] in here}
+    return {"machine": machine, "server": dict(row) if row else None, "reading": dict(reading) if reading else None,
+            "agents": keys, "first_store": dict(first) if first else None, "vault_reset": sorted(reset)}
+
+
+def keep_own_server_records(own):
+    """At the start that took a copy (restored_own): the records of the hub's own server are this machine's again
+    (own_server_records). Each step can run again after a stop in the middle.
+
+    The server service: this machine's record of its key takes the place of the copy's, and so does this machine's
+    reading of itself: the copy's is the reading of a machine that can be gone, and the watch would read that
+    machine's facts as this server's (server_watch_sweep). An agent of this server: its key of this machine takes the
+    place of the copy's, and the copy's session credentials of it stop. The first vault key of this machine: this
+    machine's, or none. An agent whose vault the copy's team lost on its way here gets the hub's default again.
+    Returns the words for the log, or None."""
+    if not isinstance(own, dict) or not own.get("machine"):
+        return None
+    machine, service, said = own["machine"], own.get("server"), []
+    had = q1("SELECT sha256 FROM server_keys WHERE server=?", (machine,))
+    if (had["sha256"] if had else None) != (service["sha256"] if service else None):
+        q("DELETE FROM server_keys WHERE server=?", (machine,))
+        if service:
+            q("INSERT INTO server_keys(server,sha256,created) VALUES(?,?,?)",
+              (machine, service["sha256"], service["created"]))
+        said.append(f"the server service of {machine} is this machine's own again" if service else
+                    f"the copy's record of a server service of {machine} went: this machine has none")
+    if "reading" in own:        # this machine's own reading of itself, or none: never the copy's
+        reading = own["reading"]
+        q("DELETE FROM server_status WHERE server=?", (machine,))
+        if reading:
+            q("INSERT INTO server_status(server,data,reported) VALUES(?,?,?)",
+              (machine, reading["data"], reading["reported"]))
+    for agent, key in sorted((own.get("agents") or {}).items()):
+        had = agent_key(agent)
+        if (TEAM.get("agents") or {}).get(agent, {}).get("machine") != machine or \
+                (had and had["sha256"] == key["sha256"]):
+            continue
+        with transaction():         # as each change of an agent's key: the copy's session credentials of it stop
+            DB.execute("INSERT INTO agent_keys(agent,sha256,created,source) VALUES(?,?,?,?) ON CONFLICT(agent) DO "
+                       "UPDATE SET sha256=excluded.sha256, created=excluded.created, source=excluded.source",
+                       (agent, key["sha256"], key["created"], key.get("source") or "helper"))
+            revoke_sessions(agent, now())
+        said.append(f"{agent} on {machine} has the agent key of this machine again")
+    if "first_store" in own:
+        first, had = own["first_store"], q1("SELECT key FROM first_stores WHERE machine=?", (machine,))
+        if (had["key"] if had else None) != (first["key"] if first else None):
+            said.append(f"the first vault key of {machine} is this machine's own again" if first and first["key"] else
+                        f"the copy's first vault key of {machine} went: it was of another machine")
+        q("DELETE FROM first_stores WHERE machine=?", (machine,))
+        if first:
+            q("INSERT INTO first_stores(machine, key, at, closed) VALUES(?,?,?,?)",
+              (machine, first["key"], first["at"], first["closed"]))
+    for agent in own.get("vault_reset") or []:      # the default was given on the machine that is gone: it is open again
+        if kv_get(f"default_vault:{agent}"):
+            kv_set(f"default_vault:{agent}", None)
+        said.append(f"{agent} on {machine} gets its vault again when this machine's vault has reported")
+    return "after the copy, " + "; ".join(said) if said else None
+
+
+def restored_own(db_path):
+    """At each start, after the records are open: this machine's own records of its server, which a restore kept in
+    a file beside the database (stage_restore), go back into the records that the start now has, and the file goes.
+    Only the file of a copy that a start took (OWN_TAKEN, which take_restore names so in front of the copy's move
+    into place): a file of a copy that still waits, or that was never taken, is not read, because its records can be
+    older than what this hub wrote since. A start that stopped between the copy's move and this step finds the file
+    at the next start. The records keep the file's id (`restore_own`), so a file that could not be removed is read
+    once. It raises nothing: a hub that cannot start cannot be reached. A file that cannot be read or put back
+    stays, and the log says so at each start. Returns the words for the log, or None."""
+    path = db_path + OWN_TAKEN
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            own = json.load(f)
+        said = None
+        if not isinstance(own, dict) or not own.get("id") or kv_get("restore_own") != own["id"]:
+            said = keep_own_server_records(own)
+            if isinstance(own, dict) and own.get("id"):
+                kv_set("restore_own", own["id"])
+    except Exception as e:
+        return (f"after the copy, this hub's own records of its server could not be put back ({type(e).__name__}); "
+                f"{os.path.basename(path)} stays for the next start")
+    with contextlib.suppress(OSError):
+        os.remove(path)
+    return said
 
 
 def stage_restore(data, db_path, commit, replace=False):
@@ -41107,8 +41292,11 @@ def stage_restore(data, db_path, commit, replace=False):
     that every owner write uses, so a checkout that is not in order refuses the whole restore before anything has
     been staged."""
     bundle = read_bundle(data)
-    files = dict(bundle["config"])
-    files["team.json"] = restored_team(bundle)
+    files, reset = dict(bundle["config"]), []
+    files["team.json"] = restored_team(bundle, reset)
+    # Before anything is written: this machine's own records of its server, for the start (restored_own). Records
+    # that cannot be read now refuse the whole restore, as each read of this function does.
+    own = dict(own_server_records(json.loads(files["team.json"]), reset), id=uuid.uuid4().hex)
     here = owner_files()
     try:        # the same team written out again is not a change: keep this checkout's own bytes and commit none
         if json.loads(here.get("team.json") or b"null") == json.loads(files["team.json"]):
@@ -41137,6 +41325,14 @@ def stage_restore(data, db_path, commit, replace=False):
                    "keep_replaced": bool(replace), "asked_at": now()}, f)
         f.flush()
         os.fsync(f.fileno())
+    # This machine's own records, whole before the copy has its name, and in one step over the file of an earlier
+    # copy that still waits: the start that takes the copy reads them.
+    fd = os.open(db_path + OWN_SUFFIX + ".part", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(own, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(db_path + OWN_SUFFIX + ".part", db_path + OWN_SUFFIX)
     os.replace(part, staged)
     return {"fleet_id": bundle["manifest"]["fleet_id"], "made_at": bundle["manifest"].get("made_at"),
             "records_bytes": len(bundle["records"]), "files": sorted(files), "changed": written,
@@ -41198,6 +41394,10 @@ def take_restore(db_path):
             os.replace(db_path, db_path + REPLACED_SUFFIX)
         else:
             os.remove(db_path)
+    # This machine's own records go with the copy that is taken, under the name that the start reads (restored_own),
+    # in front of the copy's move: a stop between the two leaves the copy waiting, and the next start goes on here.
+    with contextlib.suppress(FileNotFoundError):
+        os.replace(db_path + OWN_SUFFIX, db_path + OWN_TAKEN)
     os.replace(staged, db_path)
     with contextlib.suppress(OSError):
         os.remove(marker)
@@ -45493,6 +45693,8 @@ class Handler(BaseHTTPRequestHandler):
                                       or agent in RESERVED_AGENT_NAMES or agent in agents()
                                       or runtime not in SWITCH_RUNTIMES):
                 raise ValueError("agent is a new first agent of a Mac, on a runtime of a sitting")
+            if agent is not None and fleet_own_name(agent):     # before the Mac's setup, which would stop on it later
+                raise ValueError(f"Founderizer uses the name {agent} itself on a server. Choose another name.")
             if chatgpt is not None and (agent is None or not isinstance(chatgpt, bool)
                                         or ("browser" not in RUNTIME_CAN[runtime] and not chatgpt)):
                 raise ValueError("chatgpt says whether a Mac's sitting has ChatGPT: a runtime with no browser of its own has")
@@ -51526,6 +51728,7 @@ def main():
         kv_set("backup_served", None)
         kv_set("restored_at", now())
         capp_restored()         # the copy's tokens can be of a connection that the owner ended after the copy
+    own_says = restored_own(db_path)        # after a restore: the hub's own server keeps this machine's own records
     if not kv_get("db_id"):
         kv_set("db_id", uuid.uuid4().hex[:12])      # helpers use it to notice a new or wiped database
     contacts_v2_on()        # plan P1: a team.json that came with contacts.v2 on, and no owner write since
@@ -51542,6 +51745,8 @@ def main():
         log("hub", f"the records are not in WAL mode, so each read of the state holds the hub's lock: {unwalled}")
     if restore_says:
         log("hub", restore_says)
+    if own_says:
+        log("hub", own_says)
     # owner feature chat_apps: the bridge's key, next to the records (~/.fleet/chat-apps with the default --db), so a
     # test hub with its own --db never writes in ~/.fleet
     CFG["chat_apps_dir"] = os.path.expanduser(args.chat_apps or os.path.join(os.path.dirname(db_path), "chat-apps"))

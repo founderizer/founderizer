@@ -449,6 +449,84 @@ class Repository(unittest.TestCase):
         self.assertIsNone(hubsetup.commit_team(self.kit, hubsetup.FIRST_COMMIT))     # again: nothing to commit
         self.assertEqual(self.git("rev-parse", hub.CONFIG_BRANCH, folder=self.bare), commit)
 
+    def test_a_first_commit_whose_push_failed_is_pushed_by_the_same_line_again(self):
+        """Until 15 November 2026 the second run found team.json as it was, said "nothing to commit" and went on:
+        the commit of the first run stayed in the hub's checkout only. The hub's repository then had no team of
+        this fleet for the machines that clone it, and the hub refused each write, because its checkout held a
+        commit that its ref lacks."""
+        self.make()
+        start = self.git("rev-parse", hub.CONFIG_BRANCH, folder=self.bare)
+        team = hubsetup.template(HUB_IP, owner="100.90.3.4")
+        team["goals"]["review_hour"] = 7
+        hubsetup.write_team(os.path.join(self.kit, "team.json"), team)
+        real = hubsetup.git
+
+        def no_push(*args, **more):
+            return (1, "", "the hub's own repository did not answer") if args[0] == "push" else real(*args, **more)
+        with patch.object(hubsetup, "git", no_push):
+            with self.assertRaisesRegex(hubsetup.Stop, "could not push team.json to this hub's own repository"):
+                hubsetup.commit_team(self.kit, hubsetup.FIRST_COMMIT)
+            made = self.git("rev-parse", "HEAD", folder=self.kit)
+            self.assertNotEqual(made, start)
+            self.assertEqual(self.git("rev-parse", hub.CONFIG_BRANCH, folder=self.bare), start)
+            # the same line again while the repository still does not answer: it stops again, with the commit named
+            with self.assertRaisesRegex(hubsetup.Stop, f"could not push the commit {made[:7]} of an earlier run"):
+                hubsetup.commit_team(self.kit, hubsetup.FIRST_COMMIT)
+        said = []
+        with patch.object(hubsetup, "say", said.append):
+            self.assertEqual(hubsetup.commit_team(self.kit, hubsetup.FIRST_COMMIT), made)
+        self.assertEqual(self.git("rev-parse", hub.CONFIG_BRANCH, folder=self.bare), made)
+        self.assertEqual(json.loads(self.git("show", f"{hub.CONFIG_BRANCH}:team.json", folder=self.bare)), team)
+        self.assertIn("could not push it: it is pushed to the hub's own repository now", " ".join(said))
+        # and a third run has nothing to do, as each second run of before
+        said.clear()
+        with patch.object(hubsetup, "say", said.append):
+            self.assertIsNone(hubsetup.commit_team(self.kit, hubsetup.FIRST_COMMIT))
+        self.assertEqual(said, ["team.json is as it was; nothing to commit"])
+        # A ref that is ahead of the checkout (the hub is in the middle of a write of its own) is left alone: this
+        # run pushes nothing over it.
+        other = self.tmp / "another-clone"
+        self.git("clone", "-q", "-b", hub.CONFIG_BRANCH, self.bare, str(other))
+        (other / "note.md").write_text("a write of the hub's own\n")
+        self.git("add", "-A", folder=str(other))
+        self.git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "the hub's own write",
+                 folder=str(other))
+        self.git("push", "-q", "origin", f"HEAD:refs/heads/{hub.CONFIG_BRANCH}", folder=str(other))
+        ahead = self.git("rev-parse", hub.CONFIG_BRANCH, folder=self.bare)
+        with patch.object(hubsetup, "say", said.append):
+            self.assertIsNone(hubsetup.commit_team(self.kit, hubsetup.FIRST_COMMIT))
+        self.assertEqual(self.git("rev-parse", hub.CONFIG_BRANCH, folder=self.bare), ahead)
+
+    def test_only_an_installs_own_commit_is_pushed_for_an_earlier_run(self):
+        """The hub's checkout also holds the code. A commit that a person made there by hand is no commit of an
+        install: the same line again leaves it where it is, and says what it said before."""
+        self.make()
+        start = self.git("rev-parse", hub.CONFIG_BRANCH, folder=self.bare)
+        (Path(self.kit) / "hub.py").write_text("# the hub, changed by hand\n")
+        self.git("commit", "-q", "-am", "A change by hand in the hub's checkout", folder=self.kit)
+        said = []
+        with patch.object(hubsetup, "say", said.append):
+            self.assertIsNone(hubsetup.commit_team(self.kit, hubsetup.FIRST_COMMIT))
+        self.assertEqual(said, ["team.json is as it was; nothing to commit"])
+        self.assertEqual(self.git("rev-parse", hub.CONFIG_BRANCH, folder=self.bare), start)
+        # also when an install's own commit stands on top of it: what the ref lacks is then not an install's alone
+        team = hubsetup.template(HUB_IP, owner="100.90.3.4")
+        team["goals"]["review_hour"] = 7
+        hubsetup.write_team(os.path.join(self.kit, "team.json"), team)
+        self.git("commit", "-q", "-m", hubsetup.FIRST_COMMIT, "--", "team.json", folder=self.kit)
+        with patch.object(hubsetup, "say", said.append):
+            self.assertIsNone(hubsetup.commit_team(self.kit, hubsetup.FIRST_COMMIT))
+        self.assertEqual(self.git("rev-parse", hub.CONFIG_BRANCH, folder=self.bare), start)
+
+    def test_a_second_claims_commit_whose_push_failed_is_pushed_too(self):
+        self.make()
+        team = hubsetup.template(HUB_IP, owner="100.90.3.9")
+        hubsetup.write_team(os.path.join(self.kit, "team.json"), team)
+        self.git("commit", "-q", "-m", hubsetup.OWNER_COMMIT, "--", "team.json", folder=self.kit)
+        made = self.git("rev-parse", "HEAD", folder=self.kit)
+        self.assertEqual(hubsetup.commit_team(self.kit, hubsetup.OWNER_COMMIT), made)
+        self.assertEqual(self.git("rev-parse", hub.CONFIG_BRANCH, folder=self.bare), made)
+
     def named_tree(self):
         """The installer's copy with the published profile of the manager, as publish.py seeds it."""
         (self.tree / "profiles" / "manager.md").write_text(
@@ -4319,20 +4397,27 @@ class CheckMode(unittest.TestCase):
             self.assertEqual(hubsetup.manager_name(good), good)
 
     def test_the_plan_has_the_server_service_step_only_on_the_word_for_one_server(self):
-        """FLEET_HUB_SERVER=shared: the plan writes the word into the first team.json and has one more step, the
-        server service of this server, after the hub's records are there. Without the word the plan has neither, as
-        before. The word does not go with the word for a manager with no server yet."""
+        """FLEET_HUB_SERVER=shared: the plan writes the word into the first team.json and has two more steps: this
+        server's own vault, before its first agent starts, and the server service of this server, after the hub's
+        records are there. Without the word the plan has none of them, as before. The word does not go with the word
+        for a manager with no server yet."""
         plain = self.run_check()
         self.assertNotIn("shared", plain)
         self.assertNotIn("fleet-server", plain)
+        self.assertNotIn("hubsetup.py vault", plain)
         self.assertIn("     on its own server.", plain)
         out = self.run_check(more_env={"FLEET_HUB_SERVER": "shared"})
         self.assertIn('would write "hub": {"shared": true} and this server\'s own entry in "servers" there', out)
         steps = [line.partition(": ")[2] for line in out.splitlines() if line.startswith("Founderizer step ")]
         before = [line.partition(": ")[2] for line in plain.splitlines() if line.startswith("Founderizer step ")]
         new = "the server service of this server: it installs the agents that you add here"
-        self.assertEqual([step for step in steps if step != new], before)
+        vault = "this server's vault, kept by its own user: the agents that you add here use it"
+        self.assertEqual([step for step in steps if step not in (new, vault)], before)
         self.assertEqual(steps[steps.index(new) - 1], "this fleet's own id")
+        self.assertEqual((steps[steps.index(vault) - 1], steps[steps.index(vault) + 1]),
+                         ("one OS user for each agent of this machine",
+                          "the services fleet-hub, fleet-git and fleet-channels"))
+        self.assertIn("/home/fleet/fleet-pilot/hubsetup.py vault --hub http://100.64.0.1:8765 --kit ", out)
         self.assertIn("/home/fleet/fleet-server/hubsetup.py hub-server --team", out)
         self.assertIn("would run no join with a join code: the hub refuses a join from its own address", out)
         self.assertIn("     on this server or on a server of its own.", out)
@@ -4346,7 +4431,7 @@ class CheckMode(unittest.TestCase):
         """The step itself: with the word it clones the service's own checkout as the hub's user and runs
         hubsetup.py's hub-server from that clone, with the hub's team.json and the fleet's repository address.
         Without the word it runs nothing and prints no step."""
-        body = shell_function(SCRIPT, "hub_server") + "hub_server\n"
+        body = shell_function(SCRIPT, "hub_word") + shell_function(SCRIPT, "hub_server") + "hub_server\n"
         tmp = Path(tempfile.mkdtemp(prefix="fleet-hub-server-step-"))
         self.addCleanup(shutil.rmtree, str(tmp), True)
         team = tmp / "team.json"
@@ -4379,6 +4464,47 @@ class CheckMode(unittest.TestCase):
         main = shell_function(SCRIPT, "main")
         self.assertLess(main.index("    fleet_identity\n"), main.index("    hub_server\n"))
         self.assertLess(main.index("    hub_server\n"), main.index("    verify_step\n"))
+
+    def test_the_vault_step_gives_the_hubs_server_its_broker_and_runs_only_on_the_word(self):
+        """A joined server gets its vault broker from its join (join.sh). The hub's own server joins nothing, so
+        until 15 November 2026 an agent that the owner added there had no vault: the hub gives an agent its vault
+        only when its server's broker reports (hub.py vault_grant, no_vault_store). With the word, the step runs
+        hubsetup.py's vault as root from the hub's checkout, with the hub's own address and port, before the services
+        and the first agent start. Without the word, and on a hub that was installed without it, it runs nothing."""
+        body = shell_function(SCRIPT, "hub_word") + shell_function(SCRIPT, "vault_broker") + "vault_broker\n"
+        tmp = Path(tempfile.mkdtemp(prefix="fleet-hub-vault-step-"))
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        team = tmp / "team.json"
+        stubs = ("as_user() { case \"$1 $2\" in 'python3 -c') \"$@\" ;; *) printf 'RAN: %s\\n' \"$*\" ;; esac; }\n"
+                 "python3() { printf 'ROOT: python3 %s\\n' \"$*\"; }\n"
+                 f"address=100.80.1.2\nport=8765\nkit={tmp}\n")
+        team.write_text(json.dumps(hubsetup.template(HUB_IP, owner="100.90.3.4", shared=True)))
+        # the read of the hub's own word needs the real python3, so the stub of root's python3 comes after it
+        real = stubs.replace("'python3 -c') \"$@\"", f"'python3 -c') shift; {sys.executable} \"$@\"")
+        code, out = run_shell(body, extra=real + "hub_shared=yes\n")
+        self.assertEqual(code, 0, out)
+        self.assertEqual([line for line in out.splitlines() if line.startswith(("RAN: ", "ROOT: "))],
+                         [f"ROOT: python3 {tmp}/hubsetup.py vault --hub http://100.80.1.2:8765 --kit {tmp}"])
+        self.assertIn("Founderizer step 1: this server's vault, kept by its own user", out)
+        code, out = run_shell(body, extra=real + "hub_shared=no\n")
+        self.assertEqual((code, out), (0, ""))
+        team.write_text(json.dumps(hubsetup.template(HUB_IP, owner="100.90.3.4")))
+        code, out = run_shell(body + 'echo "hub_shared=$hub_shared"\n', extra=real + "hub_shared=yes\n")
+        self.assertEqual(code, 0, out)
+        self.assertEqual([line for line in out.splitlines() if line.startswith(("RAN: ", "ROOT: "))], [])
+        self.assertNotIn("Founderizer step", out)
+        self.assertIn("this hub was installed without the word FLEET_HUB_SERVER=shared", out)
+        self.assertTrue(out.strip().endswith("hub_shared=no"), out)
+        # a vault that could not be set up stops the install with its reason: an agent here would have no vault
+        failing = real.replace("printf 'ROOT: python3 %s\\n' \"$*\"", "return 1")
+        team.write_text(json.dumps(hubsetup.template(HUB_IP, owner="100.90.3.4", shared=True)))
+        code, out = run_shell(body, extra=failing + "hub_shared=yes\n")
+        self.assertEqual(code, 1, out)
+        self.assertIn("The vault of this server could not be set up", out)
+        main = shell_function(SCRIPT, "main")
+        self.assertLess(main.index("    agent_users\n"), main.index("    vault_broker\n"))
+        self.assertLess(main.index("    vault_broker\n"), main.index("    services\n"))
+        self.assertLess(main.index("    vault_broker\n"), main.index("    agents\n"))
 
     def test_the_claim_gets_the_name_and_an_install_with_none_gets_no_option(self):
         """The step that writes the first team.json gives hubsetup.py's claim the option, and only when the script

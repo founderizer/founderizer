@@ -2,9 +2,10 @@
 install (the first step of the slider "Your fleet's servers", 14 November 2026). The installer writes the word into the
 first team.json and gives that server a server service, whose key it puts into the hub's records. Then the owner adds
 an agent there as on a joined server: by an install job of that service. An agent that holds servers through the door
-still runs alone, and the refusal has a code that the app can read. A hub without the word behaves as before. A local
-hub with a temporary Fleet repository; no AI, no machine, no systemd: what a real server must still prove is in
-UI-API.md, version 1.168."""
+still runs alone, and the refusal has a code that the app can read. A hub without the word behaves as before. An
+agent there gets its vault when that server's broker reports, and a restore keeps the records of that server's own
+keys. A local hub with a temporary Fleet repository; no AI, no machine, no systemd: what a real server proved, and
+what it did not, is in UI-API.md, version 1.171."""
 import hashlib
 import json
 import unittest
@@ -104,6 +105,41 @@ class NotShared(HubService, Servers):
         del team["addresses"]["door"]
         hub.validate_team(team)
         self.assertIs(hub.hub_shared(team), True)
+
+    def test_a_new_agent_gets_no_name_that_the_fleet_uses_itself_on_a_server(self):
+        """Until 15 November 2026 only a new hub's manager was held to these names. Add agent took `git` on a joined
+        server, where `fleet.py service git` then wrote the hub's git service and no agent's helper; `vault` there is
+        the OS user of the vault broker and `agents` the group of the agents' users, so the install job failed at its
+        first step. A rename moves an agent's service and folder to the new name, so it has the same rule. A team.json
+        that is there keeps the names it has: validate_team does not ask."""
+        self.fresh_fleet()
+        self.joined("spare", "linux", source=NEW, user="fleet")
+        for name in ("git", "channels", "vault", "agents", "watch", "work", "login-scout", "vault-two"):
+            status, refused = self.add_agent(server="spare", agent=name, runtime="codex")
+            self.assertEqual((status, refused.get("error")),
+                             (409, f"Founderizer uses the name {name} itself on a server. Choose another name."), name)
+        self.assertEqual(list(self.origin_team()["agents"]), ["manager"])
+        self.assertEqual(hub.q("SELECT id FROM server_jobs"), [])
+        # the first agent of a new Mac is named with its join code: refused there, before the Mac's setup starts
+        status, refused = self.owner("/ui/servers/join", kind="mac", agent="watch", runtime="claude")
+        self.assertEqual((status, refused.get("error")),
+                         (400, "Founderizer uses the name watch itself on a server. Choose another name."))
+        self.assertEqual(self.owner("/ui/servers/join", kind="mac", agent="watcher", runtime="claude")[0], 200)
+        self.assertEqual((hub.FLEET_OWN_NAMES, hub.FLEET_OWN_STARTS),
+                         (hubsetup.FLEET_OWN_NAMES, hubsetup.FLEET_OWN_STARTS))
+        self.assertEqual(set(hub.HUB_OWN_NAMES) - set(hub.FLEET_OWN_NAMES), set())
+        status, receipt = self.add_agent(server="spare", agent="gitte", runtime="codex")     # a name that only starts so
+        self.assertEqual(status, 200, receipt)
+        status, answer = self.service(f"/server/spare/jobs/{receipt['job']}", {"state": "done"}, source=NEW)
+        self.assertEqual(status, 200, answer)
+        for name in ("git", "channels", "vault-store"):
+            status, refused = self.owner("/ui/team/agents/gitte/rename", base_sha256=self.team_sha(), name=name)
+            self.assertEqual((status, refused.get("error")),
+                             (409, f"Founderizer uses the name {name} itself on a server. Choose another name."), name)
+        self.assertEqual(sorted(self.origin_team()["agents"]), ["gitte", "manager"])
+        team = self.origin_team()
+        team["agents"]["git"] = dict(team["agents"]["gitte"])       # a fleet that has such an agent keeps its team.json
+        hub.validate_team(team)
 
     def test_a_refusal_with_a_code_is_no_conflict(self):
         """A caller that catches Conflict takes it for a team.json that moved, and tries again with no count
@@ -259,6 +295,110 @@ class Shared(HubService, Servers):
         # each agent of a shared server proves itself with its own key: the manager's helper has one, the new agent's
         # comes with its install job, and until then the two cannot share
         self.assertEqual(hub.placement_missing(["manager", "scout"], team), ["agent_without_key:scout"])
+
+    def test_an_agent_on_the_hubs_server_gets_its_vault_when_that_servers_broker_reports(self):
+        """The hub gives each worker its server's vault by itself, when that server's broker has reported its key
+        (default_access_sweep, vault_grant). Until 15 November 2026 hub.sh put no broker on the hub's server, so an
+        agent there waited for ever with `no_vault_store`. With the broker that hub.sh's vault step installs, the
+        agent's own helper reports it, and the hub pins that server's store and gives the agent its vault, as on a
+        joined server. The manager has no vault of a broker, as on each hub. This is the hub's side, which needed
+        no change and passed before it: the change is the installer's step, which test_hub_install.py holds. It is
+        here so that the hub's side stays so for a hub's own server."""
+        self.hub_reads()
+        status, receipt = self.add_agent(server="hub", agent="scout", runtime="codex")
+        self.assertEqual(status, 200, receipt)
+        hub.ins("INSERT INTO agent_keys(agent,sha256,created,source) VALUES('scout',?,?,'server')",
+                (sha("scout"), hub.now()))
+        self.assertEqual(self.service(f"/server/hub/jobs/{receipt['job']}", {"state": "done"}, key=self.key,
+                                      source=HUB)[0], 200)
+        team = self.origin_team()
+        # before the broker's first report: the reason that each hub's server had until this step
+        hub.q("INSERT INTO machine_status(agent,data,reported) VALUES('scout',?,?)",
+              (json.dumps({"features": ["broker_callers"], "security": {"vault": {}}}), hub.now()))
+        self.assertEqual(hub.vault_grant("scout", team), {"ready": False, "missing": ["no_vault_store"]})
+        store = "age1" + "h" * 58
+        hub.q("UPDATE machine_status SET data=?, reported=? WHERE agent='scout'",
+              (json.dumps({"features": ["broker_callers"], "os": {"name": LINUX},
+                           "security": {"vault": {"broker_recipient": store, "callers": True}}}), hub.now()))
+        self.assertEqual(hub.vault_grant("scout", team), {"ready": True, "missing": []})
+        self.assertIsNone(hub.vault_grant("manager", team))
+        hub.DEFAULT_ACCESS.update(at=0.0, retry={})
+        with hub.LOCK:
+            hub.default_access_sweep(hub.now())
+        team = self.origin_team()
+        self.assertEqual((team["agents"]["scout"]["vault"], team["agents"]["scout"]["vault_recipient"]),
+                         ("broker", store))
+        self.assertEqual(team["vault_stores"], {"hub": store})
+        self.assertEqual(team["agents"]["manager"]["vault"], "none")
+        # and the server still takes a next agent: the agent that is there has its key and a vault that serves both
+        self.assertEqual(hub.not_shareable(team, ["manager", "scout"]), [])
+        self.hub_reads()
+        hub_ = self.servers()[1]["hub"]
+        self.assertEqual((hub_["available"], hub_["why"]), (True, []))
+
+    def test_a_restore_keeps_the_keys_of_the_hubs_own_server(self):
+        """A copy's records hold the key records of the hub that made the copy. On a new machine, the key of the
+        server service and the manager's agent key are other files than those records name: until 15 November 2026
+        the hub then refused its own server's service (no reading, no job) and its manager, until root ran the
+        installer again. The hub reads its own server's records before the copy takes their place
+        (own_server_records), and the start that took the copy puts them back (keep_own_server_records)."""
+        self.hub_reads()
+        ours = {"server": hub.q1("SELECT sha256 FROM server_keys WHERE server='hub'")["sha256"],
+                "manager": hub.agent_key("manager")["sha256"]}
+        copy = self.origin_team()       # the team of the copy: the manager and one more agent ran on its hub's server
+        copy["agents"]["scout"] = {"role": "worker", "runtime": "codex", "machine": "hub", "can": ["shell"]}
+        own = hub.own_server_records(copy)
+        self.assertEqual((own["machine"], own["server"]["sha256"], list(own["agents"])), ("hub", ours["server"], ["manager"]))
+        self.assertEqual((own["first_store"], own["vault_reset"]), (None, []))
+        self.assertEqual(own["agents"]["manager"]["sha256"], ours["manager"])
+        self.assertEqual(own, json.loads(json.dumps(own)))      # it goes into the file beside the staged records
+
+        def the_copys_records():
+            """What the start finds after take_restore: each row as the hub that is gone had it."""
+            hub.q("DELETE FROM server_keys")
+            hub.q("DELETE FROM agent_keys")
+            hub.q("INSERT INTO server_keys(server,sha256,created) VALUES('hub',?,1)", (sha("the old server's key"),))
+            hub.q("INSERT OR REPLACE INTO server_status(server,data,reported) VALUES('hub',?,1)",
+                  (json.dumps({"os": {"name": LINUX}, "features": [hub.INSTALL_KEY]}),))
+            for agent in ("manager", "scout"):
+                hub.q("INSERT INTO agent_keys(agent,sha256,created,source) VALUES(?,?,1,'server')",
+                      (agent, sha(f"the old key of {agent}")))
+            hub.q("INSERT OR REPLACE INTO session_credentials(sha256,agent,kind,generation,created) "
+                  "VALUES(?,?,'chat','the-copy',1)", (sha("a session of the old manager"), "manager"))
+        self.write_team(copy)
+        the_copys_records()
+        said = hub.keep_own_server_records(own)
+        self.assertEqual(said, "after the copy, the server service of hub is this machine's own again; manager on hub "
+                               "has the agent key of this machine again")
+        self.assertEqual(hub.q1("SELECT sha256 FROM server_keys WHERE server='hub'")["sha256"], ours["server"])
+        # the reading is this machine's own again, with what its service can do: never that of a machine that is gone
+        self.assertEqual(dict(hub.q1("SELECT data, reported FROM server_status WHERE server='hub'")), own["reading"])
+        self.assertGreater(own["reading"]["reported"], 1)
+        self.assertIn(hub.INSTALL_KEY, hub.server_features("hub"))
+        self.assertEqual(hub.agent_key("manager")["sha256"], ours["manager"])
+        self.assertIsNotNone(hub.q1("SELECT revoked FROM session_credentials WHERE agent='manager'")["revoked"])
+        # an agent of the copy that this machine never installed keeps the copy's key, which nobody here holds: no
+        # caller from this server's address is that agent
+        self.assertEqual(hub.agent_key("scout")["sha256"], sha("the old key of scout"))
+        self.hub_reads()                # the service of this machine calls with its key, and the hub knows it
+        hub_ = self.servers()[1]["hub"]
+        self.assertEqual((hub_["joined"], hub_["available"], hub_["why"]), (True, True, []))
+        # the copy on the machine that it came from: the rows are the same, and nothing changes, the reading too
+        self.assertIsNone(hub.keep_own_server_records(own))
+        self.assertIsNotNone(hub.q1("SELECT 1 FROM server_status WHERE server='hub'"))
+        # a hub with no server service of its own takes a copy whose hub had one: that record and its reading go
+        the_copys_records()
+        self.assertEqual(hub.keep_own_server_records({"machine": "hub", "server": None, "reading": None, "agents": {},
+                                                      "first_store": None, "vault_reset": []}),
+                         "after the copy, the copy's record of a server service of hub went: this machine has none")
+        self.assertIsNone(hub.q1("SELECT 1 FROM server_keys WHERE server='hub'"))
+        self.assertIsNone(hub.q1("SELECT 1 FROM server_status WHERE server='hub'"))
+        self.assertEqual(hub.agent_key("manager")["sha256"], sha("the old key of manager"))
+        # a copy that a hub from before this rule staged names nothing, and its records stay as they are
+        the_copys_records()
+        self.assertIsNone(hub.keep_own_server_records(None))
+        self.assertEqual(hub.q1("SELECT sha256 FROM server_keys WHERE server='hub'")["sha256"],
+                         sha("the old server's key"))
 
     def test_an_agent_that_holds_servers_through_the_door_runs_alone_and_the_refusal_has_its_code(self):
         """The door knows a caller by its server's address. So the server of an agent that holds servers through the

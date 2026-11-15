@@ -489,6 +489,176 @@ class Restore(Fixture):
         proc.wait(timeout=20)
         self.assertIn("Restored:", proc.stdout.read())
 
+    def test_a_new_machine_keeps_the_keys_of_its_own_server(self):
+        """The copy's records name the key of the server service of the hub that is gone, the agent key that its
+        manager had there, and the vault key of the broker that ran there. The new machine has its own key files and
+        its own broker, and its installer and its manager's helper wrote their records before the restore. The start
+        that takes the copy keeps those records of its own server, so the hub knows its server's service and its
+        manager afterwards, and a worker that ran on the lost hub's server gets its vault from this machine's broker.
+        The key of an agent on another server comes with the copy, as before."""
+        gone = {"server": "a" * 64, "manager": "b" * 64, "vps": "c" * 64, "store": "age1" + "g" * 58}
+        team = json.loads(json.dumps(OWNER))        # the fleet that was saved: one worker ran on its hub's server
+        team["agents"]["scout"] = {"role": "worker", "runtime": "codex", "machine": "hub", "can": ["shell"],
+                                   "vault": "broker", "vault_recipient": gone["store"]}
+        team["vault_stores"] = {"hub": gone["store"]}
+        with open(os.path.join(self.kit, "team.json"), "w", encoding="utf-8") as f:
+            json.dump(team, f, indent=2)
+        git("commit", "-q", "-am", "the owner gave scout the vault of the hub's server", cwd=self.kit)
+        git("push", "-q", "origin", "HEAD", cwd=self.kit)
+        hub._revision_cache.update(at=0.0, value=None)
+        hub.TEAM = team
+        hub.q("INSERT INTO server_keys(server,sha256,created) VALUES('hub',?,1)", (gone["server"],))
+        hub.q("INSERT INTO server_status(server,data,reported) VALUES('hub',?,1)", (json.dumps({"os": {"name": "x"}}),))
+        hub.q("INSERT INTO first_stores(machine, key, at, closed) VALUES('hub',?,1,2)", (gone["store"],))
+        hub.kv_set("default_vault:scout", 1)        # the hub gave scout its vault there, and that default ended
+        for agent in ("manager", "vps"):
+            hub.q("INSERT INTO agent_keys(agent,sha256,created,source) VALUES(?,?,1,'enrolled')", (agent, gone[agent]))
+        _fleet, data = self.copy_of_a_fleet()
+        self.new_machine()
+        here = {"server": "d" * 64, "manager": "e" * 64, "store": "age1" + "h" * 58}
+        hub.q("INSERT INTO server_keys(server,sha256,created) VALUES('hub',?,5)", (here["server"],))
+        hub.q("INSERT INTO agent_keys(agent,sha256,created,source) VALUES('manager',?,6,'enrolled')", (here["manager"],))
+        hub.q("INSERT INTO server_status(server,data,reported) VALUES('hub',?,7)", ('{"os": {"name": "this machine"}}',))
+        hub.q("INSERT INTO first_stores(machine, key, at) VALUES('hub',?,8)", (here["store"],))
+        code, answer = self.send(data)
+        self.assertEqual(code, 200, answer)
+        with open(self.path + hub.OWN_SUFFIX, encoding="utf-8") as f:
+            own = json.load(f)
+        self.assertRegex(own.pop("id"), "^[0-9a-f]{32}$")
+        self.assertEqual(own, {"machine": "hub", "server": {"sha256": here["server"], "created": 5.0},
+                               "reading": {"data": '{"os": {"name": "this machine"}}', "reported": 7.0},
+                               "agents": {"manager": {"sha256": here["manager"], "created": 6.0, "source": "enrolled"}},
+                               "first_store": {"key": here["store"], "at": 8.0, "closed": None},
+                               "vault_reset": ["scout"]})
+        with open(self.path + hub.RESTORE_SUFFIX + ".json", encoding="utf-8") as f:
+            self.assertNotIn("own", json.load(f))
+        self.assertEqual(os.stat(self.path + hub.OWN_SUFFIX).st_mode & 0o777, 0o600)
+        # the copy's team stands on this machine with no pin of the broker that is gone, and scout at no vault
+        restored = json.loads(read(self.kit, "team.json"))
+        self.assertNotIn("vault_stores", restored)
+        self.assertEqual((restored["agents"]["scout"]["vault"], "vault_recipient" in restored["agents"]["scout"]),
+                         ("none", False))
+        self.assertEqual(restored["agents"]["vps"]["vault_recipient"], OWNER["agents"]["vps"]["vault_recipient"])
+        proc, _base = self.start_real_hub()
+        for suffix in (hub.OWN_SUFFIX, hub.OWN_TAKEN):                # put back, and gone
+            self.assertFalse(os.path.exists(self.path + suffix), suffix)
+        opened = self.records()
+        self.assertEqual([tuple(r) for r in opened.execute("SELECT server, sha256, created FROM server_keys")],
+                         [("hub", here["server"], 5.0)])
+        self.assertEqual([tuple(r) for r in opened.execute("SELECT data, reported FROM server_status WHERE server='hub'")],
+                         [('{"os": {"name": "this machine"}}', 7.0)])        # this machine's reading, not the copy's
+        self.assertEqual({r["agent"]: r["sha256"] for r in opened.execute("SELECT agent, sha256 FROM agent_keys")},
+                         {"manager": here["manager"], "vps": gone["vps"]})
+        self.assertEqual([tuple(r) for r in opened.execute("SELECT key, at, closed FROM first_stores WHERE machine='hub'")],
+                         [(here["store"], 8.0, None)])
+        kv = dict(opened.execute("SELECT k,v FROM kv").fetchall())
+        self.assertNotIn("default_vault:scout", kv)
+        self.assertEqual(len(kv["restore_own"]), 32)
+        said = [r[0] for r in opened.execute("SELECT what FROM log WHERE what LIKE 'after the copy,%'")]
+        self.assertEqual(said, ["after the copy, the server service of hub is this machine's own again; manager on "
+                                "hub has the agent key of this machine again; the first vault key of hub is this "
+                                "machine's own again; scout on hub gets its vault again when this machine's vault "
+                                "has reported"])
+        proc.terminate()
+        proc.wait(timeout=20)
+
+    def test_a_start_that_stopped_before_its_own_records_were_back_puts_them_back_at_the_next_start(self):
+        """The copy's move into place and the step that puts this machine's own records back are two steps of one
+        start. A hub that stops between them (a kill, a power cut) has the copy's records and no staged copy. The
+        file with this machine's records has the name of a copy that was taken by then, so the next start reads it,
+        whether it took a copy or not. The file of a copy that still waits, or that no start took, is never read: its
+        records can be older than what this hub wrote since. A file is read once, also when it could not be
+        removed. A file that cannot be read stops no start: the hub says so and keeps it."""
+        hub.q("INSERT INTO server_keys(server,sha256,created) VALUES('hub',?,1)", ("a" * 64,))      # the copy's row
+        own = {"id": "1" * 32, "machine": "hub", "server": {"sha256": "d" * 64, "created": 5.0}, "reading": None,
+               "agents": {}, "first_store": None, "vault_reset": []}
+        with open(self.path + hub.OWN_SUFFIX, "w", encoding="utf-8") as f:      # of a copy that no start took
+            json.dump(own, f)
+        self.assertIsNone(hub.restored_own(self.path))
+        self.assertEqual(hub.q1("SELECT sha256 FROM server_keys WHERE server='hub'")["sha256"], "a" * 64)
+        self.assertTrue(os.path.exists(self.path + hub.OWN_SUFFIX))
+        os.replace(self.path + hub.OWN_SUFFIX, self.path + hub.OWN_TAKEN)       # as take_restore names it
+        self.assertEqual(hub.restored_own(self.path),
+                         "after the copy, the server service of hub is this machine's own again")
+        self.assertEqual(hub.q1("SELECT sha256 FROM server_keys WHERE server='hub'")["sha256"], "d" * 64)
+        self.assertFalse(os.path.exists(self.path + hub.OWN_TAKEN))
+        self.assertIsNone(hub.restored_own(self.path))              # each later start: no file, nothing to do
+        # the same file once more, as after a removal that failed: the owner changed the key since, and it stays
+        hub.q("UPDATE server_keys SET sha256=? WHERE server='hub'", ("f" * 64,))
+        with open(self.path + hub.OWN_TAKEN, "w", encoding="utf-8") as f:
+            json.dump(own, f)
+        self.assertIsNone(hub.restored_own(self.path))
+        self.assertEqual(hub.q1("SELECT sha256 FROM server_keys WHERE server='hub'")["sha256"], "f" * 64)
+        self.assertFalse(os.path.exists(self.path + hub.OWN_TAKEN))
+        for broken in ("not json", json.dumps({"id": "2" * 32, "machine": "hub", "server": {"created": 5.0}})):
+            with open(self.path + hub.OWN_TAKEN, "w", encoding="utf-8") as f:
+                f.write(broken)
+            said = hub.restored_own(self.path)
+            self.assertIn("could not be put back", said)
+            self.assertIn("stays for the next start", said)
+            self.assertTrue(os.path.exists(self.path + hub.OWN_TAKEN))
+        # and a real start, which took no copy, reads the file that the stopped start left
+        with open(self.path + hub.OWN_TAKEN, "w", encoding="utf-8") as f:
+            json.dump(dict(own, id="3" * 32), f)
+        proc, _base = self.start_real_hub()
+        opened = self.records()
+        self.assertEqual(opened.execute("SELECT sha256 FROM server_keys WHERE server='hub'").fetchone()[0], "d" * 64)
+        self.assertFalse(os.path.exists(self.path + hub.OWN_TAKEN))
+        self.assertEqual([r[0] for r in opened.execute("SELECT what FROM log WHERE what LIKE 'after the copy,%'")],
+                         ["after the copy, the server service of hub is this machine's own again"])
+        proc.terminate()
+        proc.wait(timeout=20)
+
+    def test_the_vault_store_of_the_hubs_own_server_is_this_machines_after_a_copy(self):
+        """A copy pins the vault key of the broker that ran on its own hub's server. On another machine that broker
+        is gone, and the pin would refuse this machine's broker for ever. So the copy's team reaches this hub with
+        this hub's own pin for its own server, or with none: then the agents of that server are back at no vault,
+        and the hub gives each its vault again when this machine's broker has reported. The pin of each other
+        machine is the copy's, as before."""
+        gone, here, other = "age1" + "g" * 58, "age1" + "h" * 58, "age1" + "q" * 58
+        copy = json.loads(json.dumps(OWNER))
+        copy["agents"]["scout"] = {"role": "worker", "runtime": "codex", "machine": "hub", "can": ["shell"],
+                                   "vault": "broker", "vault_recipient": gone}
+        copy["vault_stores"] = {"hub": gone, "vps": other}
+        bundle = {"config": {"team.json": json.dumps(copy).encode()}}
+        reset = []
+        team = json.loads(hub.restored_team(bundle, reset))        # this hub has no pin for its own server
+        self.assertEqual((team["vault_stores"], reset), ({"vps": other}, ["scout"]))
+        self.assertEqual((team["agents"]["scout"]["vault"], "vault_recipient" in team["agents"]["scout"]), ("none", False))
+        self.assertEqual((team["agents"]["vps"]["vault"], team["agents"]["vps"]["vault_recipient"]), ("broker", other))
+        hub.TEAM["vault_stores"] = {"hub": here}                    # this hub pinned its own server's broker
+        reset = []
+        team = json.loads(hub.restored_team(bundle, reset))
+        self.assertEqual((team["vault_stores"], reset), ({"vps": other, "hub": here}, []))
+        self.assertEqual((team["agents"]["scout"]["vault"], team["agents"]["scout"]["vault_recipient"]), ("broker", here))
+        hub.TEAM["vault_stores"] = {"hub": gone}                    # the machine that the copy came from: no change
+        reset = []
+        self.assertEqual(json.loads(hub.restored_team(bundle, reset))["vault_stores"], {"hub": gone, "vps": other})
+        self.assertEqual(reset, [])
+        del hub.TEAM["vault_stores"]
+        # A manager's vault is set at its installation, and nothing gives it one again: where the manager holds a
+        # broker vault on the hub's own server and this hub has no pin, the copy's pin stays, as before.
+        managed = json.loads(json.dumps(copy))
+        managed["agents"]["manager"].update(vault="broker", vault_recipient=gone)
+        reset = []
+        team = json.loads(hub.restored_team({"config": {"team.json": json.dumps(managed).encode()}}, reset))
+        self.assertEqual((team["vault_stores"], reset, team["agents"]["manager"]["vault_recipient"],
+                          team["agents"]["scout"]["vault"]), ({"hub": gone, "vps": other}, [], gone, "broker"))
+        # the start after such a copy: the mark of a default that ended and the first key of the machine that is
+        # gone both go, so this machine's broker gets its first pin as on a new server
+        hub.kv_set("default_vault:scout", 1)
+        hub.q("INSERT INTO first_stores(machine, key, at, closed) VALUES('hub',?,1,2)", (gone,))
+        said = hub.keep_own_server_records({"machine": "hub", "server": None, "reading": None, "agents": {},
+                                            "first_store": None, "vault_reset": ["scout"]})
+        self.assertEqual(said, "after the copy, the copy's first vault key of hub went: it was of another machine; "
+                               "scout on hub gets its vault again when this machine's vault has reported")
+        self.assertIsNone(hub.kv_get("default_vault:scout"))
+        self.assertIsNone(hub.first_store("hub"))
+        kept = {"key": here, "at": 3.0, "closed": None}
+        hub.keep_own_server_records({"machine": "hub", "server": None, "reading": None, "agents": {},
+                                     "first_store": kept, "vault_reset": []})
+        self.assertEqual(dict(hub.q1("SELECT key, at, closed FROM first_stores WHERE machine='hub'")), kept)
+
     def test_yesterday_s_copy_goes_back_onto_the_machine_it_came_from(self):
         """The likeliest replacement of all: the records went bad (the six-hourly check says so) and the owner
         puts back the copy he took from this same hub. Its configuration has not moved, so there is nothing to

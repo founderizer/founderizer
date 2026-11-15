@@ -139,15 +139,11 @@ FIRST_COMMIT = "The first team.json of this hub: one manager, and the owner's ow
 # a manager with another name that file under its own.
 MANAGER = "manager"
 # Names that a new hub's manager cannot have, because the fleet uses each one itself on a server, as fleet-<name>:
-# the user of the vault broker (vault), the group of the agents' users (agents), the services that `fleet.py service`
-# makes under these names and not as an agent's helper (git, channels, and watch on a Mac), the folders of the hub's
-# checkout and of a server's service (pilot, server), and the folders that an agent's helper keeps in the agent's own
-# home beside its checkout (work, chats, checks: fleet.py WORK and CHATS, lifecycle.py CHECK_STORE). And each name
-# that starts with one of FLEET_OWN_STARTS: vault- (fleet-vault-central was the central vault's user, and the vault
-# has more parts with such names) and login- (fleet-login-<agent> is the tmux session of an agent's sign-in).
-# hub.sh has the same names in its check, and a test holds the two lists to each other.
-FLEET_OWN_NAMES = ("agents", "channels", "chats", "checks", "git", "pilot", "server", "vault", "watch", "work")
-FLEET_OWN_STARTS = ("login-", "vault-")
+# the hub's own two lists (hub.FLEET_OWN_NAMES and hub.FLEET_OWN_STARTS, which say what each name is), by which
+# the hub also refuses the name of an agent that the owner adds or renames. hub.sh has the same names in its check,
+# and a test holds that check to these lists.
+FLEET_OWN_NAMES = hub.FLEET_OWN_NAMES
+FLEET_OWN_STARTS = hub.FLEET_OWN_STARTS
 OWNER_COMMIT = "The owner of this hub is another Mac: a second owner claim, made on the hub's own server"
 # One OS user for each agent (PRODUCT.md P2), in this one place: both installers call the command that uses it, so
 # no second copy of the name can drift from it. The agent's name comes from the hub's own pattern.
@@ -2836,15 +2832,43 @@ def manager_profile(kit, team, named, first=True):
     return paths if moved or new_here() else ()
 
 
+def push_left(kit, nothing):
+    """A run that finds nothing to commit: the commit of an earlier run that its push did not take to the ref goes
+    there now, and its hash is the answer; with no such commit, the words `nothing` and None, as before.
+
+    Until 15 November 2026 a first run whose push failed (the hub's own repository did not answer, a disk that was
+    full) left its commit in the hub's checkout only. The same line again then found team.json as it was, said
+    "nothing to commit" and went on: the ref never got the first team.json, each machine cloned a repository with no
+    team of this fleet, and the hub refused each write, because its checkout held a commit that its ref lacks
+    (hub.commit_kit_file). The hub pushes each write of its own to the ref before it moves its checkout, so a checkout
+    that is ahead of the ref holds only what an install committed, and only that is pushed: each commit that the ref
+    lacks must have the subject of an install's own commit (FIRST_COMMIT, OWNER_COMMIT). A commit of anybody else in
+    the hub's checkout is left where it is. So are a ref that cannot be read, a ref that the checkout is behind
+    (ref_ahead: the hub is in the middle of a write) and a ref on another line."""
+    head, tip = git("rev-parse", "HEAD", folder=kit)[1], ref_tip(kit)
+    if not head or not tip or tip == head or git("merge-base", "--is-ancestor", tip, head, folder=kit)[0] != 0:
+        say(nothing)
+        return None
+    code, subjects, _ = git("log", "--format=%s", f"{tip}..{head}", folder=kit)
+    if code != 0 or not subjects or set(subjects.splitlines()) - {FIRST_COMMIT, OWNER_COMMIT}:
+        say(nothing)
+        return None
+    code, _, err = git("push", "-q", "origin", f"HEAD:refs/heads/{hub.CONFIG_BRANCH}", folder=kit)
+    if code != 0:
+        raise Stop(f"could not push the commit {head[:7]} of an earlier run to this hub's own repository: {err}")
+    say(f"an earlier run committed {head[:7]} on {hub.CONFIG_BRANCH} and could not push it: it is pushed to the "
+        f"hub's own repository now")
+    return head
+
+
 def commit_team(kit, message, more=()):
     """Commit team.json on the configuration ref and push it to this hub's own bare repository. Nothing to commit is
     no failure: that is what a second run of the installer finds. `more`: the paths of a named manager's profile
     (manager_profile), each committed with team.json when it changed; with none, this is the body of before 14
-    November 2026, command for command."""
+    November 2026, command for command, but for the commit that an earlier run left (push_left)."""
     if not more:
         if git("status", "--porcelain", "--", "team.json", folder=kit)[1] == "":
-            say("team.json is as it was; nothing to commit")
-            return None
+            return push_left(kit, "team.json is as it was; nothing to commit")
         code, _, err = git("commit", "-q", "-m", message, "--", "team.json", folder=kit, identity=True)
         if code != 0:
             raise Stop(f"could not commit team.json in {kit}: {err}")
@@ -2855,8 +2879,7 @@ def commit_team(kit, message, more=()):
         changed = [path for path in ("team.json", *more)
                    if git("status", "--porcelain", "--untracked-files=all", "--", path, folder=kit)[1]]
         if not changed:
-            say("team.json and the manager's profile are as they were; nothing to commit")
-            return None
+            return push_left(kit, "team.json and the manager's profile are as they were; nothing to commit")
         what = " and ".join(changed)
         # A path that is neither in the checkout nor in git's index is a removal that a stopped run added already:
         # `git add` of it would fail, and the commit takes it as it is.

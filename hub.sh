@@ -29,10 +29,12 @@
 #
 # With FLEET_HUB_SERVER=shared the owner chose one server for all (a layout that the owner approved on 14 November
 # 2026): the manager runs on this server, and the owner can add each later agent on this server too, each under its
-# own OS user. The first team.json says so ("hub": {"shared": true}), and one more step gives this server its own
-# server service, which installs those agents as a joined server's service does. It is a word of a hub's first
-# install, and it does not go with FLEET_MANAGER_SERVER=later. Without the word no new agent goes onto the hub's
-# server, as before. No app and no tool gives the word yet: HUB-INSTALL.md says what is still open.
+# own OS user. The first team.json says so ("hub": {"shared": true}), and two more steps give this server what a
+# joined server gets from its join: its own vault broker, so that an agent there can use a login or a key that the
+# owner gives it, and its own server service, which installs those agents as a joined server's service does. It is a
+# word of a hub's first install, and it does not go with FLEET_MANAGER_SERVER=later. Without the word no new agent
+# goes onto the hub's server, as before. Such a fleet has no door on this server (HUB-INSTALL.md, "One server for
+# all"). No app and no tool gives the word yet.
 #
 # With FLEET_VERIFY=caller, which the app sets when its own next step is `fleet.py verify`, the last step here runs
 # no verify: the app's step answers for this machine, and the self-test, about a minute, runs one time and not two.
@@ -697,6 +699,47 @@ lingering on, the group fleet-agents, and the home /home/fleet-<agent> of mode 7
         || stop "the OS users of this machine's agents could not be made."
 }
 
+hub_word() {    # true when this hub's own team.json has the owner's word for one server for all. A hub that is there
+                # keeps its rule (the word counts at a hub's first install): for one that was installed without the
+                # word, this says so one time, and the two steps of one server for all then do nothing.
+    [ "$hub_shared" = yes ] || return 1
+    [ "$check" = no ] || return 0
+    # shellcheck disable=SC2016
+    if as_user python3 -c 'import json, sys
+sys.exit(0 if (json.load(open(sys.argv[1])).get("hub") or {}).get("shared") is True else 1)' "$kit/team.json" \
+            </dev/null; then
+        return 0
+    fi
+    say "this hub was installed without the word FLEET_HUB_SERVER=shared, so no new agent goes onto its own \
+server, and it gets no server service"
+    hub_shared=no
+    return 1
+}
+
+vault_broker() { # only where the owner chose one server for all (FLEET_HUB_SERVER=shared): this server's own vault
+                 # broker, as each server that joins gets one (join.sh). Its own user keeps the key of the store and
+                 # the key that opens sealed handovers, so that no agent of this server can read either. The agents
+                 # that the owner adds here reach it through the group of their OS users, and the hub gives each one
+                 # its vault when the broker has reported (hub.py default_access_sweep). Without it an agent here
+                 # could use no login and no key. It comes before the first agent of this server starts, so that the
+                 # hub reads the broker's key before any agent's code ran here. As root, from the hub's checkout,
+                 # as the root helpers: that checkout is on the configuration ref, whose vault.py the broker's own
+                 # update takes (fleet-vault-program).
+    hub_word || return 0
+    heading "this server's vault, kept by its own user: the agents that you add here use it"
+    if [ "$check" = yes ]; then
+        plan "run: python3 $kit/hubsetup.py vault --hub http://$address:$port --kit $kit"
+        plan "make the user fleet-vault, install age, put the broker's program in a folder of root's, make its \
+handover key and the fleet's own store on this server, and start fleet-vault.service: the store's key and the \
+handover key belong to fleet-vault alone, and no agent of this server can read them"
+        plan "read and change nothing of the owner's: no account, no token and no password"
+        return 0
+    fi
+    python3 "$kit/hubsetup.py" vault --hub "http://$address:$port" --kit "$kit" </dev/null \
+        || stop "The vault of this server could not be set up: the line above says why. Nothing of the owner's was \
+read or changed. Run the line again."
+}
+
 fleet_identity() {  # this fleet's own id, after the hub has answered, so its records are there to keep it in
     heading "this fleet's own id"
     if [ "$check" = yes ]; then
@@ -714,19 +757,10 @@ hub_server() {  # only where the owner chose one server for all (FLEET_HUB_SERVE
                 # service, after the hub has answered, so that its records are there for the SHA-256 of the service's
                 # key. The service installs each agent that the owner adds on this server, as a joined server's does:
                 # under the agent's own OS user, through the root helper that the step agent_helper put in place.
-    [ "$hub_shared" = yes ] || return 0
+    # A hub that is there keeps its rule: one that was installed without the word gets no server service and no
+    # step, and the install goes on (hub_word).
+    hub_word || return 0
     server_kit="$home/fleet-server"
-    # A hub that is there keeps its rule (the word counts at a hub's first install): one that was installed without
-    # the word gets no server service and no step, and the install goes on.
-    # shellcheck disable=SC2016
-    if [ "$check" = no ] && ! as_user python3 -c 'import json, sys
-sys.exit(0 if (json.load(open(sys.argv[1])).get("hub") or {}).get("shared") is True else 1)' "$kit/team.json" \
-            </dev/null; then
-        say "this hub was installed without the word FLEET_HUB_SERVER=shared, so no new agent goes onto its own \
-server, and it gets no server service"
-        hub_shared=no
-        return 0
-    fi
     heading "the server service of this server: it installs the agents that you add here"
     if [ "$check" = yes ]; then
         plan "clone git://$address/$repo_name.git on the configuration ref into $server_kit, the service's own \
@@ -820,6 +854,7 @@ main() {
     first_team
     agent_helper
     agent_users
+    vault_broker
     services
     agents
     checks

@@ -30,22 +30,39 @@ agent, and its own setup page in the app gives it a server of its own (a VPS tha
 with one line, or a Mac), then its AI provider and the sign-in (UI-API.md 1.82). Each
 agent installs only its own AI, on its own server.
 
-**One server for all is one word, and it is not ready for a fleet that does real work.** With
-`FLEET_HUB_SERVER=shared` in the installer's environment, the manager runs on the hub's
-server, and the owner can add each later agent on that server too, each under its own OS
-user. The first `team.json` then says `"hub": {"shared": true}` (UI-API.md 1.168), and one
-more step, after "This fleet's own id", gives this server its own server service:
-`fleet-server.service` of the user `fleet`, from its own clone `/home/fleet/fleet-server`,
-with the SHA-256 of its key in the hub's records (`hubsetup.py hub-server`). That service
-installs each later agent as a joined server's service does. An agent that breaks out of its
-account there can reach every key of the fleet. The word counts at a hub's first install, and
-it does not go with `FLEET_MANAGER_SERVER=later`. Without it the steps are the seventeen
-below, and no new agent goes onto the hub's server. No app and no tool gives the word yet:
-the owner approved this layout on 14 November 2026, and these parts are still open (UI-API.md
-1.168 has the list). The installer puts no vault broker on the hub's server, so an agent that
-is added there can use no saved login and no key. The door cannot run on such a hub's server.
-A restore of the hub's records takes the server service's key record away, and the same line
-again writes it. No real server has run the new step.
+**One server for all is one word.** With `FLEET_HUB_SERVER=shared` in the installer's
+environment, the manager runs on the hub's server, and the owner can add each later agent
+on that server too, each under its own OS user. The first `team.json` then says
+`"hub": {"shared": true}` (UI-API.md 1.168 and 1.171), and two more steps give this server
+what a joined server gets from its join:
+
+- After "One OS user for each agent", **this server's own vault broker**
+  (`fleet-vault.service` of the user `fleet-vault`, `hubsetup.py vault`), before the first
+  agent of this server starts. The hub gives each worker there its vault by itself when
+  the broker has reported, as on a joined server.
+- After "This fleet's own id", **this server's own server service**:
+  `fleet-server.service` of the user `fleet`, from its own clone
+  `/home/fleet/fleet-server`, with the SHA-256 of its key in the hub's records
+  (`hubsetup.py hub-server`). That service installs each later agent as a joined
+  server's service does.
+
+An agent that breaks out of its account there can reach every key of the fleet. The word
+counts at a hub's first install, and it does not go with `FLEET_MANAGER_SERVER=later`.
+Without it the steps are the seventeen below, and no new agent goes onto the hub's server.
+No app and no tool gives the word yet: the owner approved this layout on 14 November 2026,
+and the page of the app that gives it is not in the first run yet.
+
+What such a fleet does not have: **a door**. The hub knows the door's own calls by the
+door's address alone, and each agent on the hub's server calls from the hub's address. So
+a fleet whose hub's server takes agents has its door on a server of its own or has none,
+and with no door no agent of it holds a server for apps, a deploy key or a GitOps
+repository through the door. A restore of a copy keeps this server's own records: of its
+server service, of the keys of the agents that the server has, and of its vault's store
+(UI-API.md 1.171). So after a restore on the server that the copy came from, the same line
+does not have to run again. On another server, an agent that only the lost server had is
+not installed: the same line again installs it, and UI-API.md 1.171 says what its key then
+needs. A real server ran the install on 15 November 2026 (Ubuntu 24.04, 2
+vCPU, 4 GB): UI-API.md 1.171 says what it proved.
 
 ## Before you run it
 
