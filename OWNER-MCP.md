@@ -350,13 +350,55 @@ window, by a fixed name (Settings counts as `fleet`), with an agent's setup when
 also gives where the app's own builds of a server at a provider stand, the first run's and Add
 server's each by itself (the stage, and the stage at which the last try stopped, which is kept
 after the page cleared it until a new try starts), and where the app's own install of a server
-stands (its state, its kind, its step, and the kind of its stop, which the app finds from the
-stop's words and never gives on). Every value is a boolean, a whole number or a name of a fixed list: no address, no name and no
+stands (its state, its kind, its step, and the kind of its stop). Every value is a boolean, a whole number or a name of a fixed list: no address, no name and no
 line of a log. It has a change number of its own and takes `after` as `setup_state` does, with a
 wait of 40 seconds at most, so that the Tailscale read after it (about 15 seconds at most) stays
 under the program's 60 quiet seconds; the seconds (since the hub's last answer, in a build's
-stage, in an install's step) and Tailscale move no number. Its words in the
-tool list name every value.
+stage, in an install's step, since the last install's record changed) and Tailscale move no
+number. Its words in the tool list name every value.
+
+Since 15 November 2026 **the kind of an install's stop is the app's own** (`install.stop`): one of
+the 20 fixed kinds of the error that ended the install (`InstallRecord.Stop`, which the install's
+model holds beside the stop's words), with `none` for an install that did not stop. Until then
+the app sorted the stop's words into one of five names for this read; that sorting is gone, and
+no word of a stop is read for this answer. `waits_for_network` was one of those five names and is
+now a boolean beside the stop: the install stopped only because the server is not on the owner's private
+network, and its page asks for the network's connection in place of "Try again". The same day it
+got two facts from **the app's kept records** (`InstallRecord`, `BuildRecord`: small files in the
+app's own folder, which only the app's process reads; the program never opens them):
+
+- `last_install`: the newest install for this hub that the app kept a record of on this Mac (with
+  `hub` `none`: the newest install of a hub, whatever its address), which is what is left of an
+  install after a restart of the app. It is given only while `install` is null, because an install
+  that the model holds is the same install in other names, and it is null with no record. Its
+  values: `kind` (`hub`, `join`, `mac`: the record's own names, where `join` is a server that
+  joins), `outcome` (`running`, `done`, `stopped`, `cancelled`, `interrupted`: its page ended a
+  cancelled one, and the app quit, crashed or was updated while an interrupted one ran), `step`
+  (where it stood) and `stop`, each of the list of `install`, `waits_for_network`, `steps_done`
+  and `steps_planned` (the plan's own count for a hub and for a join), and `seconds_ago`, the
+  whole seconds since the record's last change. Never the record's hub, its addresses, its
+  server's name or the line of its page.
+- `builds`: whole numbers from the records of the servers that the app asked a provider for, of
+  every fleet and every run of the app (the newest 40 records): `unjoined`, the servers that this
+  Mac never saw join and that can still stand at a provider and be billed, and its three parts by
+  what the build left there, `server` (the provider answered with the server), `left_behind` (a
+  step failed after the provider made something, and the app could not delete all of it) and
+  `not_known`; and `newest_seconds_ago`, whole seconds since the newest of these records last
+  changed (null with none), so that the owner knows which try a count is of. No name, no provider
+  and no id. A record stays after the owner deleted its server at the provider, so a count is no
+  proof that a server exists: the guide sends the owner to the provider's console, and it never
+  tells the owner to delete a server. When the owner looked and found none, the agent goes on.
+
+A change of a record moves the read's number when it changes one of these facts (the records' own
+notification reads the facts again): a write of a record while `install` holds that install, or
+one that changes no count, moves nothing. `seconds_ago` and `newest_seconds_ago` move no number,
+and a date of a record that is damaged gives 0, the bound of about 126 years, or null, and never
+stops the app. The app reads the two folders one time, off its main thread, when
+it starts, and a request of the link waits for that read. The same day **`window` says
+`first_run` for the first run's welcome page in front of a manager's setup that never finished**,
+also while the window is closed (it said `agent_setup` then, the page behind the one that the
+window opens on): with a hub that is not `none` and a reading, `first_run` can be that page,
+which is no first run, and `setup_state` gives its page as `welcome` or `paste`.
 
 Since 15 November 2026 it also gives `app_build`: `running`, the build number of the app that
 runs; `on_disk`, the build number in the `Info.plist` of the app's bundle on the disk, read at
@@ -381,7 +423,10 @@ and says which, when `seen` is not the page that shows now; and for `welcome` an
 first run shows, when the page that shows is not one of the first run's start pages (`welcome`,
 `paste`, `vps`: on every other page the owner may be typing a token, a key or a password that a
 change of page would erase), when the first run holds the window, when its work runs, or when an
-install of it began. The first run's window checks the ask again when it takes it, so a change in
+install of it began. It also refuses `name` while the fleet has its hub and its manager already:
+the first run's welcome page then stands in front of a manager's setup that never finished
+(`setup_state` gives `hub` as `set` or `answers` there), the manager has its name, and the app
+shows the manager's setup after that page (`FirstRunView.noNamePage`). The first run's window checks the ask again when it takes it, so a change in
 between counts; the wait for the window has no clock, and ends on its answer, on another ask, on
 the window's going or on the end of the call. An ask for the page that shows already changes
 nothing in the wizard (not even a failure line on it). It never presses anything, and it gives back the
