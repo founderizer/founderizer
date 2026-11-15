@@ -3221,6 +3221,16 @@ class Lifecycle:
                         with self.account_lock:
                             self.account_waiting = (check, status["verify"])
                             runs, self.account_runs = not self.account_runs, True
+                else:
+                    # Lane S3's live test on a test fleet (15 November 2026): the hub ends a check's wait at a report
+                    # that names no check, as for a helper that started again (hub.record_status, D12), and its
+                    # CHECK_WAIT then failed the first check of a new model server. Since D26 the status thread's
+                    # reports leave while an item runs, so each of them names the check that waits, with its item
+                    # still in CHECKING.
+                    with self.account_lock:
+                        waiting = self.account_waiting
+                    if waiting:
+                        status["check"], status["verify"] = waiting[0], [dict(i) for i in waiting[1]]
                 self.leaving(status)
                 code, data = self.post(status)
             except Exception:
@@ -3248,14 +3258,16 @@ class Lifecycle:
                     item = self.account_item(account) if account else None
                 except Exception:
                     item = None
-                with self.account_lock:
-                    if (self.account(), self.own_model()) != (account, model):
-                        continue        # the settings moved while it ran: the newest check gets a new item
-                    check, items = self.account_waiting
-                    self.account_waiting = None
                 done = dict({"kind": item[0], "ref": item[1], "state": item[2], "detail": item[3][:300]},
                             **(item[4] if len(item) > 4 and item[4] else {})) if item else None
+                # The check that waits leaves account_waiting under report_lock, in the hold of its second report: so
+                # no status report goes out between the two that names no check (report).
                 with self.report_lock:
+                    with self.account_lock:
+                        if (self.account(), self.own_model()) != (account, model):
+                            continue    # the settings moved while it ran: the newest check gets a new item
+                        check, items = self.account_waiting
+                        self.account_waiting = None
                     try:
                         status = self.collect(fast=True)  # a reading of now: never older than a report that left
                         status["check"] = check
