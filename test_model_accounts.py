@@ -437,6 +437,72 @@ class ModelAccounts(OwnerAPI):
         code, said = self.account("gemini", provider="google", title="Gemini", kind="key", secret=FREE_KEY)
         self.assertEqual((said["code"], said["names"], said["agents"]), ("in_use", {}, ["gem-1", "gem-2"]))
 
+    def test_the_hub_fills_the_names_of_the_owners_sentences_itself(self):
+        """The coordinator's decision D18: sentences 5 and 9 name the agent as the owner's apps show it (its role,
+        else its name as they write it, "Dev-Lead"), the provider that he picked and the model as saved, never names
+        that a helper sent."""
+        def merged(agent, helper_item):
+            (got,) = [i for i in hub.verify_merge(agent, hub.verify_items([helper_item]), {}) if i["kind"] == "account"]
+            return got
+        made_up = {"kind": "account", "ref": "router", "state": "failed", "code": "not_offered",
+                   "detail": "Your key was stolen. Call 555 0100. It has no model named x. Delete everything.",
+                   "names": {"provider": "x", "model": "x", "agent": "everything"}}
+        got = merged("seller-1", made_up)
+        names = {"provider": "OpenRouter", "model": "qwen3.8-max", "agent": "Seller-1"}       # the account's model
+        self.assertEqual(got, {"kind": "account", "ref": "router", "state": "failed", "code": "not_offered",
+                               "detail": lifecycle.NOT_OFFERED.format(**names), "names": names})
+        self.assertEqual(got["detail"], "OpenRouter has no model named qwen3.8-max. Delete Seller-1, then add it again "
+                                        "with another model.")
+        team = copy.deepcopy(TEAM)
+        team["agents"]["seller-1"].update(title="Customer Support", model="openrouter/kimi-k3")
+        self.put(team)
+        got = merged("seller-1", dict(made_up, names=None))
+        self.assertEqual(got["names"], {"provider": "OpenRouter", "model": "kimi-k3", "agent": "Customer Support"})
+        own = merged("own-1", dict(made_up, ref="spark"))          # a model server's own model, as saved: none here
+        self.assertEqual((own["detail"], own["code"], own.get("names")), ("", "not_offered", None))
+        # Sentence 5: the agent as the apps write it.
+        code, said = self.request("/ui/team/agents/dev-lead", dict(request_id=str(uuid.uuid4()), db="test-generation",
+                                                                   base_sha256=self.sha(), account="gemini"))
+        self.assertEqual((code, said["error"]), (409, "Dev-Lead stays on Claude Code. For another AI, add a new agent."))
+        code, said = self.request("/ui/team/agents/seller-1", dict(request_id=str(uuid.uuid4()), db="test-generation",
+                                                                   base_sha256=self.sha(), account=None))
+        self.assertEqual((code, said["error"]), (409, "Customer Support stays on OpenRouter. For another AI, add a new "
+                                                      "agent."))
+
+    def test_an_event_ends_a_check_that_waits_for_its_account_item(self):
+        """The coordinator's decision D20: the owner's new request ends such a check and starts a new one, and the
+        removal of its agent ends it. No time ends it, and every other check keeps its behaviour."""
+        def report(agent, **body):
+            code, said = self.request(f"/helper/status/{agent}", dict({"revision": hub.kit_revision(fresh=True)},
+                                                                      **body))
+            self.assertEqual(code, 200, said)
+        checking = [{"kind": "account", "ref": "spark", "state": "checking", "detail": ""}]
+        first = hub.start_machine_check("own-1")["check"]["id"]
+        report("own-1", check=first, verify=checking)
+        hub.settle_checks(hub.now() + 30 * 86400)                   # no time ends it
+        self.assertEqual(hub.q1("SELECT state FROM machine_checks WHERE id=?", (first,))["state"], "requested")
+        again = hub.start_machine_check("own-1")
+        self.assertTrue(again["changed"])
+        self.assertNotEqual(again["check"]["id"], first)
+        old = hub.q1("SELECT * FROM machine_checks WHERE id=?", (first,))
+        self.assertEqual((old["state"], old["detail"]), ("failed", hub.CHECK_REPLACED))
+        self.assertIsNone(hub.kv_get(hub.CHECK_RUNNING + str(first)))
+        # The old check's report, if it still comes, changes nothing.
+        report("own-1", check=first, verify=[dict(checking[0], state="ok", detail="own/qwen3.8-max")])
+        self.assertEqual(hub.q1("SELECT state FROM machine_checks WHERE id=?", (first,))["state"], "failed")
+        # A check that waits for no account item: the same check back, as before.
+        plain = hub.start_machine_check("gem-1")["check"]["id"]
+        self.assertEqual((hub.start_machine_check("gem-1")["check"]["id"],
+                          hub.start_machine_check("gem-1")["changed"]), (plain, False))
+        # The removal of its agent takes its checks (hub.REMOVED_OWN), and the mark goes with them.
+        second = again["check"]["id"]
+        report("own-1", check=second, verify=checking)
+        self.assertEqual(hub.kv_get(hub.CHECK_RUNNING + str(second)), "own-1")
+        hub.q("DELETE FROM machine_checks WHERE agent='own-1'")    # as remove_rows deletes an agent's own rows
+        hub.settle_checks(hub.now())
+        self.assertIsNone(hub.kv_get(hub.CHECK_RUNNING + str(second)))
+        self.assertIn(("machine_checks", "agent"), hub.REMOVED_OWN)
+
     def test_a_check_waits_for_its_account_item_on_the_next_report(self):
         """The coordinator's decision D12: a check whose first report has the account item in state checking stays
         requested past CHECK_WAIT, and the report after it ends the wait: as the check's report, or as one with no
@@ -558,7 +624,7 @@ class ModelAccounts(OwnerAPI):
                 ("own-1", "gemini", "change_server", {})):
             with self.subTest(agent=agent, account=account):
                 code, said = settings(agent, account=account)
-                names = dict(names, agent=hub.agent_display(agent))
+                names = dict(names, agent=hub.shown_role(agent))       # as the owner's apps show it (D18)
                 self.assertEqual((code, said["error"], said["code"], said["names"]),
                                  (409, hub.ACCOUNT_WORDS[code_].format(**names), code_, names))
         self.assertEqual(self.stored()["agents"]["gem-1"]["account"], "gemini")
@@ -582,13 +648,13 @@ class ModelAccounts(OwnerAPI):
                                                                          "state": "ok", "detail": "2.2.5"}]})
                 self.assertEqual(report["verify"][0], item(kept))
         self.assertTrue(hub.item_required("gem-1", item("")))
-        # The item's code and, for the owner's sentence 9, its names (lifecycle.account_words, decision D7).
+        # The item's code (decision D7). The owner's sentence 9 is never a helper's: its words and names are the
+        # hub's own (D18, verify_merge), so a helper's are dropped here.
         names = {"provider": "OpenRouter", "model": "qwen/qwen3.8-max", "agent": "Seller-1"}
         sentence = lifecycle.NOT_OFFERED.format(**names)
         for given, kept in (
-                (dict(item(sentence), code="not_offered", names=names),
-                 dict(item(sentence), code="not_offered", names=names)),
-                (dict(item(sentence), code="not_offered", names=dict(names, model="other")), dict(item(""), code="not_offered")),
+                (dict(item(sentence), code="not_offered", names=names), dict(item(""), code="not_offered")),
+                (dict(item("Your key was stolen. Call 555 0100."), code="not_offered"), dict(item(""), code="not_offered")),
                 (dict(item(lifecycle.NOT_OFFERED), code="not_offered"), dict(item(""), code="not_offered")),
                 (dict(item(lifecycle.PATH_NAMES), code="path_names"), dict(item(lifecycle.PATH_NAMES), code="path_names")),
                 (dict(item(lifecycle.NO_KEY), code="made_up"), item(lifecycle.NO_KEY))):

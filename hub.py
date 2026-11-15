@@ -31129,6 +31129,12 @@ def verify_merge(agent, items, status):
     held = lifecycle.model_account(team_read(), agents().get(agent))
     if held and not any(i["kind"] == "account" and i["ref"] == held["id"] for i in items):
         out.append({"kind": "account", "ref": held["id"], "state": "failed", "detail": ""})
+    # D18: the owner's sentence 9 has the hub's own names (account_sentence_names), whatever a helper sent
+    for i in out:
+        if held and i["kind"] == "account" and i["ref"] == held["id"] and \
+                i.get("code") == lifecycle.ACCOUNT_CODES[lifecycle.NOT_OFFERED]:
+            names = account_sentence_names(agent, held)
+            i.update({"detail": lifecycle.NOT_OFFERED.format(**names), "names": names} if names else {})
     out.append({"kind": "access", "ref": "sandbox", "state": "ok", "detail": start_sandbox(agents().get(agent) or {})})
     out.append({"kind": "access", "ref": "vault", "state": "ok" if vault.get("mode") else "not_verified",
                 "detail": ("The vault token is kept apart from the agent's user." if vault.get("isolated") else
@@ -31208,6 +31214,14 @@ def check_holds(agent, rev, desired):
 def start_machine_check(agent):
     """Check this machine now: the helper runs its usual status collection at once (no AI turn, no change)."""
     pending = q1("SELECT * FROM machine_checks WHERE agent=? AND state='requested' ORDER BY id DESC LIMIT 1", (agent,))
+    if pending and kv_get(CHECK_RUNNING + str(pending["id"])):
+        # The coordinator's decision D20: a check that waits for its account item (D12) has no clock, so the owner's
+        # new request is the event that ends it, and a new check starts. A server that went away during the item
+        # would otherwise keep the check open, and each request would give it back.
+        q("UPDATE machine_checks SET state='failed', completed=?, detail=? WHERE id=? AND state='requested'",
+          (now(), CHECK_REPLACED, pending["id"]))
+        kv_set(CHECK_RUNNING + str(pending["id"]), None)
+        pending = None
     if pending:
         return {"agent": agent, "check": check_view(pending), "changed": False}
     cid = ins("INSERT INTO machine_checks(agent,requested,state) VALUES(?,?,'requested')", (agent, now()))
@@ -38178,7 +38192,7 @@ def account_change_refusal(team, agent, old, new):
     held = lifecycle.model_account(team, {"account": old}) if old else None
     if old == new or not (held or (new and lifecycle.model_account(team, {"account": new}))):
         return None
-    name = agent_display(agent)
+    name = shown_role(agent)            # as the owner's apps show it: its role, else its name ("Web-Dev"), D18
     if held and held["kind"] == "server":
         return account_refusal(409, "change_server", agent=name)
     runtime = runtime_label(((team.get("agents") or {}).get(agent) or {}).get("runtime"))
@@ -38197,19 +38211,29 @@ ITEM_NAME = re.compile(r"[^\x00-\x1f\x7f]{1,120}")      # a name that fills a ch
 
 
 def account_item_words(v, detail):
-    """What the hub keeps of a check's `account` item beside its kind, ref and state: {detail, code, names}. The code
-    is one of lifecycle.ACCOUNT_CODES (the coordinator's decision D7), and the names fill NOT_OFFERED, the owner's
-    sentence 9 (the provider that he picked, the model as he pasted it, the agent's name): its filled sentence is kept
-    only when it is that sentence with those names. Each other detail is kept by account_detail, else as "". A helper
-    of another release can have other words: they are never refused."""
+    """What the hub keeps of a check's `account` item beside its kind, ref and state: {detail, code}. The code is one
+    of lifecycle.ACCOUNT_CODES (the coordinator's decision D7); a fixed sentence is kept by account_detail, else the
+    detail is "". The owner's sentence 9 (NOT_OFFERED) is never a helper's: its names and its words are the hub's
+    own (the coordinator's decision D18, account_sentence_names), filled by verify_merge, so a helper's detail and
+    names of it are dropped here. A helper of another release can have other words: they are never refused."""
     code = v.get("code") if isinstance(v.get("code"), str) and v["code"] in lifecycle.ACCOUNT_CODES.values() else None
-    names = v.get("names")
-    if code == lifecycle.ACCOUNT_CODES[lifecycle.NOT_OFFERED] and isinstance(names, dict) and \
-            set(names) == {"provider", "model", "agent"} and \
-            all(isinstance(x, str) and ITEM_NAME.fullmatch(x) for x in names.values()) and \
-            detail == lifecycle.NOT_OFFERED.format(**names):
-        return {"detail": detail, "code": code, "names": dict(names)}
+    if code == lifecycle.ACCOUNT_CODES[lifecycle.NOT_OFFERED]:
+        return {"detail": "", "code": code}
     return dict({"detail": detail if account_detail(detail) else ""}, **({"code": code} if code else {}))
+
+
+def account_sentence_names(agent, held):
+    """The names that fill the owner's sentence 9 for this agent's account (lifecycle.NOT_OFFERED), all the hub's own
+    (the coordinator's decision D18): the agent as his apps show it (shown_role), the provider that he picked
+    (account_label), and the model as it is saved (the agent's own, else the account's), without the provider's part
+    in the program, as he pasted it. None when the account names no provider that this release knows, or no model."""
+    provider = account_label(held)
+    model = (agents().get(agent) or {}).get("model") or held["model"]
+    program = held.get("program")
+    if not provider or not isinstance(model, str) or not model:
+        return None
+    shown = model[len(program) + 1:] if program and model.startswith(program + "/") else model
+    return {"provider": provider, "model": shown, "agent": shown_role(agent)}
 
 
 def save_account(body):
@@ -39229,6 +39253,9 @@ CHECK_WAIT = 60      # seconds a requested machine check may take before it coun
 # helper's next report, not at CHECK_WAIT. kv CHECK_RUNNING<check id> (the agent) marks it while it runs.
 CHECKING = "checking"
 CHECK_RUNNING = "check_running:"
+# The detail of such a check that the owner's new request ended (the coordinator's decision D20). Proposed, not
+# approved: the new check stands in its place at once, so the owner's apps show this only in a check's history.
+CHECK_REPLACED = "Replaced by a new check."
 
 
 def check_view(r):
@@ -39239,6 +39266,9 @@ def check_view(r):
 def settle_checks(t0):
     """A check whose report did not come in time: offline when the helper has not checked in since it was asked,
     otherwise failed (the helper is there but sent no report, for example an older helper)."""
+    # D20: the mark of a check that no longer waits (answered, replaced, or gone with its agent's removal) goes
+    q("DELETE FROM kv WHERE k LIKE ? AND k NOT IN (SELECT ? || id FROM machine_checks WHERE state='requested')",
+      (CHECK_RUNNING + "%", CHECK_RUNNING))
     for c in q("SELECT * FROM machine_checks WHERE state='requested' AND requested < ?", (t0 - CHECK_WAIT,)):
         if kv_get(CHECK_RUNNING + str(c["id"])):
             continue        # D12: its account item runs, and the helper's next report ends the wait
