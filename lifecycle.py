@@ -2059,6 +2059,8 @@ CHECK_MODELS = 8                # the models of a server's list that the check t
 # more failed the step on any server. CHECK_RATE bounds a word's tokens: a server that counts only the tokens that its
 # cache did not hold gives far fewer, and no size of a long prompt follows from such a count.
 CHECK_WORDS = (1000, 2000)
+# Step 2's own routes of a server, called with no key at its host and port: a 200 whose JSON has the field fails it
+OWN_ROUTES = (("/api/tags", "models"), ("/api/version", "version"), ("/version", "version"))
 CONTEXT_AIM = 0.97
 CHECK_RATE = (0.5, 4.0)
 CHECK_BODY = 4 * 1024 * 1024    # the most of an answer that the check reads
@@ -2131,16 +2133,20 @@ def kept_account(home, agent, account):
     return None
 
 
-def forget_account(home, account):
-    """Remove each kept result of this account in this ~/.fleet, of any agent's name (kept_account)."""
+def forget_account(home, account, keep=None, model=None):
+    """Remove each kept result of this account in this ~/.fleet, of any agent's name (kept_account): but the file
+    `keep`, and with `model` only a result of that model."""
     folder = os.path.dirname(account_path(home, "x"))
     for path in glob.glob(os.path.join(glob.escape(folder), ACCOUNT_FILE % "*")):
+        if keep and os.path.abspath(path) == os.path.abspath(keep):
+            continue
         try:
             with open(path, "rb") as f:
                 kept = json.loads(f.read(1 << 20))
         except (OSError, ValueError):
             continue
-        if isinstance(kept, dict) and kept.get("account") == account["id"]:
+        if isinstance(kept, dict) and kept.get("account") == account["id"] and (model is None or
+                                                                              kept.get("model") == model):
             with contextlib.suppress(OSError):
                 os.remove(path)
 
@@ -2207,6 +2213,13 @@ def cloud_model(name):
     return ":" in name and name.rpartition(":")[2].lower().endswith("cloud")
 
 
+def cloud_rows(answer):
+    """The names of the models of Ollama's cloud in an answer of GET /api/tags: each row with remote_host."""
+    rows = answer.get("models") if isinstance(answer, dict) else None
+    return {row.get(field) for row in rows if isinstance(row, dict) and row.get("remote_host")
+            for field in ("name", "model") if isinstance(row.get(field), str)} if isinstance(rows, list) else set()
+
+
 def server_models(answer):
     """The model names of a server's list that a session can start with, in its order: a name that MODEL_NAME takes
     as own/<name>, and neither a file's path nor a model of Ollama's cloud."""
@@ -2253,6 +2266,14 @@ def check_server(account, key, kept=None, call=model_call, clock=time.time, want
     models = server_models(answer) if status == 200 else []
     if status != 200 or not isinstance(answer, dict):
         return "failed", NO_ANSWER, None
+    parts = urllib.parse.urlsplit(address)
+    base = f"{parts.scheme}://{parts.netloc}"
+    # Ollama marks a model of its cloud itself: a row of /api/tags with remote_host (decision D19, the review's T4). A
+    # copy under a name of the owner's own keeps it, where the name's tag says nothing. Read with the key, as /v1;
+    # a server behind a proxy that passes /v1 only keeps the name's test of server_models alone.
+    status, tags = call("GET", f"{base}/api/tags", key=key, timeout=30)
+    remote = cloud_rows(tags) if status == 200 else set()
+    models = [name for name in models if name not in remote]
     named = (wanted[len("own/"):] if wanted.startswith("own/") else wanted) if wanted else None
     if named is not None and named not in models:
         return "failed", NOT_OFFERED, None      # Lifecycle.account_item fills its names
@@ -2260,9 +2281,11 @@ def check_server(account, key, kept=None, call=model_call, clock=time.time, want
         status, _ = call("GET", f"{address}/models", timeout=30)
         if status not in (401, 403):
             return "failed", OPEN_SERVER, None
-        parts = urllib.parse.urlsplit(address)
-        for route, field in (("/api/tags", "models"), ("/api/version", "version")):
-            status, said = call("GET", f"{parts.scheme}://{parts.netloc}{route}", timeout=30)
+        # The server's own routes, at its host and port, with no key: Ollama's /api/tags and /api/version, and
+        # vLLM's /version, which answers each caller while its --api-key guards /v1 only, as /invocations (inference)
+        # does, and /pause and /update_weights in its dev mode (decision D16, measured on 14 and 15 November 2026)
+        for route, field in OWN_ROUTES:
+            status, said = call("GET", f"{base}{route}", timeout=30)
             if status == 200 and isinstance(said, dict) and field in said:
                 return "failed", OPEN_SERVER, None
     if kept and kept.get("models") == models and (named is None or kept.get("model") == "own/" + named):
@@ -2979,30 +3002,36 @@ class Lifecycle:
                     json.dump(keep, f)
                 os.replace(path + ".new", path)
             except OSError:
-                return ("account", account["id"], "failed", NO_ANSWER)     # without the file no session could start
+                return self.account_words(account, "failed", NO_ANSWER)     # without the file no session could start
+            # this agent's own file is the account's one result here now: a file of another name (a rename) could
+            # stand again after a later failure, with an older list (decision D19, the review's T5)
+            forget_account(self.home, account, keep=path)
         elif state != "ok" and detail != NO_ANSWER:
-            # a server that is open, or that no model of passes, keeps no model; one that only does not answer now
-            # keeps what its last check proved, for when it answers again. An open server is the server's own fault,
-            # so no file of another name may start a session on it either (kept_account reads them)
+            # a server that is open, or that no model of passes, keeps no model, under any agent's name; a model that
+            # this agent names and that failed keeps no result of that model. One that only does not answer now keeps
+            # what its last check proved, for when it answers again
             with contextlib.suppress(OSError):
                 os.remove(account_path(self.home, self.agent))
-            if detail == OPEN_SERVER:
-                forget_account(self.home, account)
+            named = wanted if not wanted or wanted.startswith("own/") else "own/" + wanted
+            forget_account(self.home, account, model=None if detail == OPEN_SERVER or not wanted else named)
         return self.account_words(account, state, detail, wanted)
 
     def account_words(self, account, state, detail, model=None):
-        """The account item, ("account", its id, state, detail, words): words has the detail's code (ACCOUNT_CODES),
-        and for NOT_OFFERED its names, which also fill the detail (decision D7). The model's name is as the owner
-        pasted it: without the provider's part in the program (`openrouter/`, `own/`)."""
+        """The account item, ("account", its id, state, detail, words): words has the detail's code (ACCOUNT_CODES)
+        (decision D7), and for NOT_OFFERED the model as it is saved. The hub fills the names of the sentence itself,
+        the agent as the apps show it among them (decision D18, the review's T3). For a hub of an older release the
+        detail is the sentence filled here: the agent by its role (its title), else its name as the apps write it,
+        and the model as the owner pasted it, without the provider's part in the program (`openrouter/`, `own/`)."""
         words = {"code": ACCOUNT_CODES[detail]} if detail in ACCOUNT_CODES else {}
         if detail == NOT_OFFERED:
+            words["model"] = model if isinstance(model, str) else ""
             program = account.get("program")
             shown = model[len(program) + 1:] if program and isinstance(model, str) and model.startswith(program + "/") \
                 else model
             known = OWN_SERVER if account["kind"] == "server" else KEY_PROVIDERS.get(account.get("provider")) or {}
-            words["names"] = {"provider": known.get("label") or account.get("provider") or "",
-                              "model": shown or "", "agent": shown_name(self.agent)}
-            detail = NOT_OFFERED.format(**words["names"])
+            role = " ".join(str(self.conf.get("title") or "").split())
+            detail = NOT_OFFERED.format(provider=known.get("label") or account.get("provider") or "",
+                                        model=shown or "", agent=role or shown_name(self.agent))
         return ("account", account["id"], state, detail, words)
 
     def offered_models(self):
