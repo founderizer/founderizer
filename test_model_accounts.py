@@ -16,6 +16,7 @@ import unittest
 from unittest.mock import patch
 import uuid
 
+import fleet
 import hub
 import lifecycle
 from test_ui_api import OwnerAPI
@@ -597,6 +598,64 @@ class ModelAccounts(OwnerAPI):
                                                                        "check": cid, "verify": []})
                 self.assertEqual(code, 200, said)       # its late report: no job opens or stays open
                 self.assertEqual(open_jobs(), [])
+
+    def test_a_check_that_replaces_one_that_waits_for_the_settings_keeps_that_wait(self):
+        """The coordinator's decision D26 (the fifth review, X4): the owner's request while the hub's own check waits
+        for the helper's new settings ends that check, and the new one keeps the wait: it never runs on the old
+        model."""
+        helper_reports("gem-1", "acp_tasks", "model_accounts",
+                       models=models("opencode", "google/gemini-3.1-pro", "google/gemini-3.5-flash"))
+        code, said = self.request("/ui/team/agents/gem-1", dict(request_id=str(uuid.uuid4()), db="test-generation",
+                                                                base_sha256=self.sha(), model="google/gemini-3.5-flash"))
+        self.assertEqual(code, 200, said)
+        (due,) = hub.q("SELECT id FROM machine_checks WHERE agent='gem-1'")
+        asked = hub.start_machine_check("gem-1")            # the owner's request, through his own agent's tool
+        self.assertTrue(asked["changed"])
+        self.assertEqual((asked["check"]["waits_for"], hub.q1("SELECT state, detail FROM machine_checks WHERE id=?",
+                                                              (due["id"],))["detail"]), ("settings", hub.CHECK_REPLACED))
+        self.assertEqual(hub.q("SELECT * FROM events WHERE agent='gem-1' AND kind='check'"), [])     # nothing sent
+
+    def test_a_start_refused_for_no_checked_model_asks_for_a_check_and_tells_only_after_one_failed(self):
+        """The coordinator's decision D24 (the fifth review, X2, X6): the helper's word that a start on a model
+        server has no kept result of its model asks for one check when none is open, and the requester hears of it
+        only when no check was open and the last one failed. Other causes, and other agents, are told as before."""
+        self.assertEqual(hub.NO_CHECKED_MODEL, fleet.NO_CHECKED_MODEL)
+
+        def refused(agent, why=hub.NO_CHECKED_MODEL):
+            tid = self.task(agent)
+            code, said = self.request(f"/helper/dialog/{agent}/{hub.tref(tid)}", {"kind": "start_failed",
+                                                                                 "reason": why})
+            self.assertEqual(code, 200, said)
+            return tid
+
+        def told(tid):
+            return [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' AND kind='say' AND task=?",
+                                             (tid,)) if "cannot start" in r["text"]]
+
+        def checks():
+            return [(r["id"], r["state"]) for r in hub.q("SELECT id, state FROM machine_checks WHERE agent='own-1' "
+                                                         "ORDER BY id")]
+
+        def report(**body):
+            code, said = self.request("/helper/status/own-1", dict({"revision": hub.kit_revision(fresh=True)}, **body))
+            self.assertEqual(code, 200, said)
+        ok = [{"kind": "account", "ref": "spark", "state": "ok", "detail": "own/qwen3.8-max"}]
+        first = hub.start_machine_check("own-1")["check"]["id"]
+        report(check=first, verify=ok)                                       # the last check passed
+        tid = refused("own-1")
+        self.assertEqual(told(tid), [])                                     # the check decides
+        self.assertEqual(checks(), [(first, "completed"), (first + 1, "requested")])
+        tid = refused("own-1")                                              # while that check is open
+        self.assertEqual((told(tid), len(checks())), ([], 2))
+        report(check=first + 1, verify=[{"kind": "account", "ref": "spark", "state": "failed",
+                                         "detail": lifecycle.NO_ANSWER, "code": "no_answer"}])
+        tid = refused("own-1")                                              # no check open, the last one failed
+        self.assertEqual(len(told(tid)), 1)
+        self.assertEqual(checks()[-1][1], "requested")                      # and one more check is asked
+        # Another cause, and an agent of today's shape: told as before, and no check.
+        self.assertEqual(len(told(refused("own-1", "the vault gave no key for this agent's account"))), 1)
+        self.assertEqual(len(told(refused("dev-lead"))), 1)
+        self.assertEqual(hub.q("SELECT * FROM machine_checks WHERE agent='dev-lead'"), [])
 
     def test_a_second_check_while_the_first_runs_probes_its_own_key(self):
         """W1 of the fourth review: the report of a check that a new one replaced ends no probe job of the new one,

@@ -31248,6 +31248,9 @@ def start_machine_check(agent, replace=False, settings=False):
     agent's settings of now (record_status), so that it proves what the agent's next session runs."""
     pending = q1("SELECT * FROM machine_checks WHERE agent=? AND state='requested' ORDER BY id DESC LIMIT 1", (agent,))
     if pending and (replace or check_waits(pending["id"])):
+        # D26 (the fifth review, X4): a check that replaces one that waits for the settings keeps that wait, so that
+        # it never runs on the agent's old settings
+        settings = settings or check_waits(pending["id"]) == "settings"
         q("UPDATE machine_checks SET state='failed', completed=?, detail=? WHERE id=? AND state='requested'",
           (now(), CHECK_REPLACED, pending["id"]))
         check_ended(pending["id"])
@@ -31270,6 +31273,33 @@ def send_machine_check(agent, cid):
     if probe:
         kv_set(CHECK_PROBE + str(cid), probe)
     emit(agent, "check", "Check this machine now", extra=dict({"check": cid}, **({"probe_job": probe} if probe else {})))
+
+
+# The helper's cause of a start on a model server with no kept result of its model (fleet.NO_CHECKED_MODEL, the
+# owner's approved words of round 1, answer 11; lane H's decision D21): a test holds the two equal.
+NO_CHECKED_MODEL = "this agent's model server has no checked model yet"
+
+
+def model_start_refused(agent):
+    """The coordinator's decision D24 (the fifth review, X2, X6): a start that the helper refused for lack of a kept
+    result of its model is the event that asks for one machine check of the agent, when none is open (a check that
+    waits is replaced, D20). True when the requester is told: only when no check was open and the last one failed,
+    for while a check is open, the check decides, and a check that passed is old (its model changed)."""
+    open_ = q1("SELECT id FROM machine_checks WHERE agent=? AND state='requested' LIMIT 1", (agent,))
+    last = q1("SELECT * FROM machine_checks WHERE agent=? AND state!='requested' ORDER BY id DESC LIMIT 1", (agent,))
+    start_machine_check(agent)
+    return open_ is None and last is not None and not account_check_passed(agent, last)
+
+
+def account_check_passed(agent, c):
+    """True for a completed check whose item of the agent's model account is ok."""
+    held = lifecycle.model_account(team_read(), agents().get(agent))
+    try:
+        items = json.loads(c["verify"]) if c["state"] == "completed" and c["verify"] else []
+    except ValueError:
+        items = []
+    return bool(held) and any(i.get("kind") == "account" and i.get("ref") == held["id"] and i.get("state") == "ok"
+                              for i in items)
 
 
 def account_check_due(agent, team=None):
@@ -50182,8 +50212,12 @@ class Handler(BaseHTTPRequestHandler):
             t = q1("SELECT * FROM tasks WHERE id=? AND owner=?", (tid, agent))
             if t and t["state"] not in TERMINAL and why and why != kv_get(f"start_failed:{tid}"):
                 kv_set(f"start_failed:{tid}", why)
-                emit(t["requester"], "say", f"[hub] The session of {tref(tid)} ({t['title']}) cannot start on {agent}: "
-                     f"{why}. Its helper tries again, and the hub tells you if that does not help.", task=tid)
+                # the AI providers build, D24: a model server with no checked model asks for a check, which decides
+                if why != NO_CHECKED_MODEL or not lifecycle.model_account(team_read(), agents().get(agent)) or \
+                        model_start_refused(agent):
+                    emit(t["requester"], "say", f"[hub] The session of {tref(tid)} ({t['title']}) cannot start on "
+                         f"{agent}: {why}. Its helper tries again, and the hub tells you if that does not help.",
+                         task=tid)
                 log("hub", f"{tref(tid)} cannot start on {agent}: {why}")
             return self.json(200, {})
         if kind == "undelivered":
