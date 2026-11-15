@@ -2280,6 +2280,13 @@ NEED_TITLE_CHARS = 70
 NEED_WHY_CHARS = 240
 NEED_DETAILS_CHARS = 4000
 NEED_CODES = re.compile(r"(?<![A-Za-z0-9-])(?:AM|UP|OR|[CGIMNPQRT])-[0-9]+(?![0-9])")
+# A code block of a card's task or details, from a line that begins with three backticks to the next such line: a
+# command that the owner pastes is literal (the owner, 15 November 2026: "manager tasks need to be super specific. Like
+# run \"xxx\""), so a part of it such as the curve P-256 is no code of the hub's. Words outside a block, also `code` in
+# a line, are read as before. A block ends where the apps end it (MessageBlock.parse): at the first line that begins
+# with three backticks after any blank, whatever follows them on that line, so no words that the owner reads as prose
+# are inside a block here.
+NEED_FENCED = re.compile(r"^[ \t]*```[^\n]*\n.*?^[^\S\n]*```[^\n]*$", re.M | re.S)
 
 
 def need_words(title, why, todo="", options=(), details=""):
@@ -2294,8 +2301,10 @@ def need_words(title, why, todo="", options=(), details=""):
                 f"shows behind Details. This one has {len(why)}.")
     if len(details) > NEED_DETAILS_CHARS:
         return f"details is at most {NEED_DETAILS_CHARS} characters. This one has {len(details)}."
-    for part in (title, why, todo, *options, details):
-        code = NEED_CODES.search(part)
+    # the task and the details are drawn with their code blocks; the title, the reason and an option are words only
+    for part, blocks in ((title, False), (why, False), (todo, True), *((option, False) for option in options),
+                         (details, True)):
+        code = NEED_CODES.search(NEED_FENCED.sub(" ", part) if blocks else part)
         if code:
             return (f"Say {code.group(0)} in plain words: the owner reads names and what a thing is about, never a "
                     f"code. Name the task, the question or the agent instead.")
@@ -27571,7 +27580,20 @@ TOOLS = [
      "\"Yes to A and C\". The owner answers with an option or in their own words, and either one closes the item. "
      "When their words ask you something back or do not settle it, reply with a new item: its why answers what they "
      "asked, with the options that follow from it. When an open item's options or words change, raise it again with "
-     "replaces.",
+     "replaces. what_to_do is what the owner does, and the card shows it under why. For a thing that the owner does "
+     "by hand, write the exact steps there and nothing else. A command is the whole command in a code block (a line "
+     "of three backticks before it and after it), ready to paste, and the sentence before it says where to run it: "
+     "the owner's Mac or a server, and the folder. The command works as written in that place: a file that it reads "
+     "is a file that the owner has there, or the step before it gets that file. A page is its full address, and "
+     "after it what to click there, by the words on the buttons. More than one step is a numbered list, one action "
+     "on each line. Never describe a command in words (\"apply the Role\"), and never send the owner to a file for "
+     "the steps: when the steps are only in an agent's output, ask that agent for the commands first. For a choice "
+     "that the options settle, what_to_do is one short sentence that names the decision. Two kinds of item have "
+     "their own rule. With a door_call the owner runs nothing: what_to_do shows the call that their yes lets through "
+     "the door one time, and says that they press the first option. The door's card of a run (door_host) takes no "
+     "backtick in why and what_to_do. Use only these marks: `code`, a code block, ** around the words of a button, "
+     "and a numbered list, and write a page's address as it is, with no mark. The Mac app draws them as it draws a "
+     "chat message, and they stay readable as plain text on a phone.",
      S({"title": {"type": "string",
                   "description": f"What the owner decides, in at most {NEED_TITLE_CHARS} characters."},
         "why": {"type": "string", "description": f"One or two plain sentences, at most {NEED_WHY_CHARS} characters: "
@@ -27584,8 +27606,11 @@ TOOLS = [
         "replaces": {"type": "string", "description": "An open item of yours that this one takes the place of, for "
                      "example N-12, when its options or its words changed: that item leaves Needs you. Give "
                      "question_id again if it had one."},
-        "what_to_do": {"type": "string", "description": "The one thing that only the owner can do or decide now. "
-                                                        "If there is none, do not raise the item."},
+        "what_to_do": {"type": "string", "description": "The one thing that only the owner can do or decide now, "
+                       "as the card shows it. For a thing that they do by hand: the exact steps (each command "
+                       "whole in a code block, with where to run it; each page as its full address, with what to "
+                       "click there; a numbered list for more than one step). For a choice: one short sentence. "
+                       "If there is none, do not raise the item."},
         "options": {"type": "array", "items": {"type": "string"},
                     "description": f"The answers to offer, 2 to {NEED_OPTIONS_MAX}, each a short sentence of at "
                                    f"most {NEED_OPTION_CHARS} characters, because the app draws one row for each. "
@@ -27597,8 +27622,9 @@ TOOLS = [
         "door_call": {"type": "string", "description": "The call hash that the door gave with its refusal of a "
                       "call that is the owner's (a delete of what no agent made through the door, an AWS delete, or "
                       "a host's run: a root script with no box): the owner's yes then lets that exact call through "
-                      "the door once. Put the exact command in what_to_do, and give options whose first one is the "
-                      "yes."},
+                      "the door once. Put the exact command in what_to_do as the call that the door lets "
+                      "through after their yes, and say there that the owner presses the first option and runs "
+                      "nothing themselves. Give options whose first one is the yes."},
         "door_host": {"type": "string", "description": "For a host's run that the door refused (its answer names "
                       "full_access): that server, with the run's door_call. The card is then the door's card, which "
                       "the owner approved: the title \"Run one root script on <server>?\", one or two sentences, the "

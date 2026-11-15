@@ -333,6 +333,33 @@ class Talk(NeedsCase):
                 self.raise_item(**{field: value})
         self.raise_item(title="Move the shop off .NET 8 by 7 Dec", why="Mia needs write on 8 repositories.")    # no code
 
+    def test_a_command_in_a_code_block_is_literal_and_the_words_around_it_are_not(self):
+        # the owner, 15 November 2026: "manager tasks need to be super specific. Like run "xxx""
+        command = "openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out key.pem"
+        self.raise_item(what_to_do=f"On your Mac, in the folder of the shop, run:\n\n```\n{command}\n```")
+        self.assertIn(command, self.item()["todo"])                 # as written: the card draws the block
+        with self.assertRaisesRegex(hub.ToolError, "Say P-256 in plain words"):
+            self.raise_item(what_to_do=f"On your Mac, run {command}")                   # in a line of words
+        with self.assertRaisesRegex(hub.ToolError, "Say T-61 in plain words"):
+            self.raise_item(what_to_do=f"For T-61, run:\n\n```\n{command}\n```")      # a hub code beside the block
+        with self.assertRaisesRegex(hub.ToolError, "Say Q-59 in plain words"):
+            self.raise_item(what_to_do=f"Run:\n\n```\n{command}\n```\n\nThen answer Q-59.")
+        with self.assertRaisesRegex(hub.ToolError, "Say R-3 in plain words"):
+            self.raise_item(what_to_do="Run `fleet R-3` on your Mac.")                   # code in a line is read
+        # a block ends where the apps end it: at the first line that begins with three backticks
+        with self.assertRaisesRegex(hub.ToolError, "Say T-61 in plain words"):
+            self.raise_item(what_to_do="Run:\n```\nx\n```y\nFor T-61 do this\n```")
+        with self.assertRaisesRegex(hub.ToolError, "Say T-61 in plain words"):
+            self.raise_item(what_to_do="Run:\n```\nx\n\u00a0```\nFor T-61 do this\n```")
+        with self.assertRaisesRegex(hub.ToolError, "Say P-256 in plain words"):
+            self.raise_item(what_to_do=f"Run:\n\n```\n{command}")                      # a block that never ends
+        # a title, a reason and an option are words only: a block there hides nothing
+        for field, value in (("title", "```\nT-61\n```"), ("why", "```\nT-61\n```"),
+                             ("options", ["```\nT-61\n```", "No"])):
+            with self.subTest(field=field), self.assertRaises(hub.ToolError):
+                self.raise_item(**{field: value})
+        self.raise_item(details=f"The key is made with:\n\n```\n{command}\n```")      # the details draw a block too
+
     def test_options_that_combine_are_ticked_and_their_words_joined_are_the_answer(self):
         with self.assertRaisesRegex(hub.ToolError, "multi needs options"):
             self.raise_item(multi=True)
