@@ -349,6 +349,9 @@ class Runner:
         self.label = label or runtime
         self.servers, self.usage, self.policy = list(servers), usage, policy
         self.adapter = adapter or acp_programs.Program()
+        # the session's server names, the fleet's first, for the adapter's names of their tools (OpenCode.tool, D32)
+        self.adapter.servers = ("fleet", *(s["name"] for s in self.servers
+                                           if isinstance(s, dict) and isinstance(s.get("name"), str) and s["name"]))
         self.env, self.session = env, session
         self.stopping = threading.Event()
         self.unlisted = unlisted if unlisted is not None else threading.Event()

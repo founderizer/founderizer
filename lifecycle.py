@@ -3278,6 +3278,20 @@ class Lifecycle:
                     item = None
                 done = dict({"kind": item[0], "ref": item[1], "state": item[2], "detail": item[3][:300]},
                             **(item[4] if len(item) > 4 and item[4] else {})) if item else None
+                # The coordinator's decision D32 (the review's E4): a model server's list of its own models comes from
+                # the result that the item just kept (acp_model_options), and the first report read it before, when
+                # nothing was kept: "No models are available", and a failed required item for an agent with an effort
+                # of its own and no model, which then did not activate. So it is read again here, outside report_lock
+                # (the reading starts the program), and the second report has its `model` item.
+                again = None
+                if account and account.get("kind") == "server":
+                    try:
+                        reading = self.read_models(force=True)
+                        if reading:
+                            kind, ref, state, detail = self.model_item(reading)
+                            again = {"kind": kind, "ref": ref, "state": state, "detail": detail[:300]}
+                    except Exception:
+                        again = None
                 # The check that waits leaves account_waiting under report_lock, in the hold of its second report: so
                 # no status report goes out between the two that names no check (report).
                 with self.report_lock:
@@ -3286,7 +3300,8 @@ class Lifecycle:
                             continue    # the settings moved while it ran: the newest check gets a new item
                         check, items = self.account_waiting
                         self.account_waiting = None
-                    finished = (check, [(done or dict(i, state="not_verified")) if i["kind"] == "account" and
+                    finished = (check, [again if again and i["kind"] == "model" else
+                                        (done or dict(i, state="not_verified")) if i["kind"] == "account" and
                                         i["state"] == CHECKING else i for i in items])
                     try:
                         status = self.collect(fast=True)  # a reading of now: never older than a report that left

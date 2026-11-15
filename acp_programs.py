@@ -23,6 +23,7 @@ with one of these codes:
 import datetime
 import json
 import os
+import re
 import shutil
 
 FLEET_DIR = ".fleet"
@@ -48,6 +49,12 @@ def record(code, message, resets_at=None):
     """The thread record of a failed prompt. Only a limit is tried again by the fleet."""
     return {"type": "error", "code": code, "message": str(message or "The program gave no reason.")[:500],
             "retryable": code == LIMIT, "resets_at": resets_at if code == LIMIT else None}
+
+
+def tool_name(name):
+    """A name as OpenCode puts it into the name of a tool: each character that is not a letter, a digit, `_` or `-`
+    becomes `_` (at 2.2.5, a tool's name is its namespace, with each dot as `_`, then `_` and its own name)."""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", str(name))
 
 
 def whole(value):
@@ -82,6 +89,10 @@ class Program:
                   "web": "you read the web with your program's own tools for it",
                   "fleet": "you call the fleet's tools, which this text and RULES.md name, as your program calls the "
                            "tools of an MCP server: that server's name is `fleet`"}
+
+    # The names of the session's MCP servers, the fleet's first: the runner sets them at its start
+    # (acp_runner.Runner), and an adapter whose program names a tool by its server reads them (OpenCode.tool).
+    servers = ("fleet",)
 
     def __init__(self, home=None):
         self.home = home or os.path.expanduser("~")
@@ -314,15 +325,14 @@ class OpenCode(Program):
     NO_ANSWERS = ("provider.internal", "provider.transport")
     CONTEXT, OUTPUT = 64000, 8000       # a model of the owner's own server, where the server names no size
     # Its tools at its pin, 2.2.5 (step 0 of the AI providers build, 12 November 2026): `shell`, `webfetch` and
-    # `websearch` of its own, and `execute`, whose JavaScript reaches the tools of an MCP server as
-    # tools.<server>.<tool> and has no other tool: in lane S3's run of 15 November 2026 the model called `shell` there
-    # and got "Unknown tool 'shell'"
-    tool_words = {"shell": "you run commands with OpenCode's own tool `shell`, which you call as a tool and never "
-                           "inside `execute`",
+    # `websearch` of its own. Its Code Mode puts the tools of an MCP server only in the JavaScript of its tool
+    # `execute`, and `shell` only outside it, and gpt-oss-20b failed at that split (0 of 3 tasks delivered, lane S3's
+    # note, section 14.2). The session's configuration turns Code Mode off (config, the coordinator's decision D32), so
+    # each tool of an MCP server is a tool of its own, named `<server>_<tool>`: 1 of 1 delivered with these words.
+    tool_words = {"shell": "you run commands with OpenCode's own tool `shell`",
                   "web": "you read the web with its own tools `webfetch` and `websearch`",
-                  "fleet": "you call the fleet's tools, which this text and RULES.md name, only in the JavaScript of its "
-                           "tool `execute`, as `await tools.fleet.<tool>({ ... })`, for example "
-                           "`tools.fleet.read_messages`; `search({ query })` there lists them"}
+                  "fleet": "you call each of the fleet's tools, which this text and RULES.md name, as a tool of its "
+                           "own named `fleet_<tool>`, for example `fleet_read_messages`"}
 
     def session_env(self, session):
         # Its configuration folder is a source of its own (its AGENTS.md, its skills and its plugins load, and a plugin
@@ -348,7 +358,13 @@ class OpenCode(Program):
 
         The policy is what keeps each other provider out: without it the program offers hosted models that need no
         key, and each provider whose key is in the environment under the program's own name. The last line that
-        matches decides, so the order of the two lines matters."""
+        matches decides, so the order of the two lines matters.
+
+        The rules (`permissions`, the coordinator's decision D32): a rule that wholly denies `execute` turns the
+        program's Code Mode off, and each tool then reaches the model as a tool of its own (at 2.2.5 its tool list keeps
+        Code Mode while no rule denies `execute`). The pattern `opencode_*` denies the program's own tools that Code Mode
+        kept in its namespace `opencode` (models, sessions, worktrees, an MCP server's resources), which no fleet session
+        needs: one pattern, so that a later pin's tools of that namespace are denied too."""
         provider, model = account["provider"], account.get("model")
         settings = {"apiKey": "{env:%s}" % account["key_env"]} if account.get("key_env") else {}
         entry = {"settings": settings}
@@ -363,6 +379,8 @@ class OpenCode(Program):
                                                                "output": self.OUTPUT}}
                                 for name in dict.fromkeys(names) if name}}
         config = {"update": "disable", "providers": {provider: entry},
+                  "permissions": [{"action": "execute", "resource": "*", "effect": "deny"},
+                                  {"action": "opencode_*", "resource": "*", "effect": "deny"}],
                   "policies": [{"action": "provider.use", "resource": "*", "effect": "deny"},
                                {"action": "provider.use", "resource": provider, "effect": "allow"}]}
         return dict({"model": model}, **config) if model else config
@@ -414,8 +432,22 @@ class OpenCode(Program):
         return record(ERROR, error.get("message"))
 
     def tool(self, update, entry):
-        """The model calls the tool of an MCP server with code in the tool `execute`, as tools.<server>.<tool>(...).
-        The update that ends the call names each tool that the code called: each one is a record of its own."""
+        """With Code Mode off (config, D32) the model calls each tool of an MCP server as a tool of its own, which the
+        program names `<server>_<tool>`, the server's name cleaned (tool_name). Such a record gets the server and the
+        title "<server>: <tool>", as the hub's readers take a call of a server's tool: a fleet call by its server
+        `fleet` (hub.history_fleet_call, record_outcome_rows, tool_work_line, doing_words). The server is the longest
+        of the session's own server names (servers) that the name begins with, never a split at the first `_`: a fleet
+        tool's own name has one, and a server's name can.
+
+        In Code Mode the model calls them with code in the tool `execute`, as tools.<server>.<tool>(...). The update
+        that ends the call names each tool that the code called: each one is a record of its own."""
+        title = entry.get("title")
+        if entry.get("type") == "tool_call" and not entry.get("server") and isinstance(title, str):
+            for server in sorted(self.servers, key=lambda name: len(tool_name(name)), reverse=True):
+                prefix = tool_name(server) + "_"
+                if title.startswith(prefix) and len(title) > len(prefix):
+                    entry.update(server=server[:60], title=f"{server}: {title[len(prefix):]}"[:300])
+                    break
         output = update.get("rawOutput") if isinstance(update.get("rawOutput"), dict) else {}
         calls = (output.get("metadata") or {}).get("toolCalls") if isinstance(output.get("metadata"), dict) else None
         records = []

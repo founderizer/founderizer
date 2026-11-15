@@ -1101,8 +1101,13 @@ class ModelAccounts(OwnerAPI):
                 self.assertNotIn("you can use", text)
                 self.assertNotIn("shell, web", text)
         # each program's words name its own tools at its pin, and the fleet's server by its name
-        self.assertIn("`execute`", acp_programs.OpenCode.tool_words["fleet"])
-        self.assertIn("tools.fleet.", acp_programs.OpenCode.tool_words["fleet"])
+        # D32: OpenCode's Code Mode is off, so its words name its own `shell` and the fleet's tools as tools of their
+        # own, and no `execute`
+        self.assertEqual(acp_programs.OpenCode.tool_words["shell"], "you run commands with OpenCode's own tool `shell`")
+        self.assertIn("`fleet_<tool>`", acp_programs.OpenCode.tool_words["fleet"])
+        self.assertIn("`fleet_read_messages`", acp_programs.OpenCode.tool_words["fleet"])
+        for words in acp_programs.OpenCode.tool_words.values():
+            self.assertNotIn("execute", words)
         self.assertIn("`use_tool`", acp_programs.Grok.tool_words["fleet"])
         self.assertIn("`fleet__<tool>`", acp_programs.Grok.tool_words["fleet"])
         for program in (acp_programs.Program, *acp_programs.ADAPTERS.values()):
