@@ -13,6 +13,7 @@ first server (the units under systemd)."""
 import base64
 import contextlib
 import hashlib
+import http.server
 import io
 import json
 import os
@@ -1393,6 +1394,52 @@ class Start(unittest.TestCase):
         self.assertEqual(self.served, [])
 
 
+class HubSilence(unittest.TestCase):
+    """hub() raises HubSilent only when no answer of the hub came. The kept yes of the key swap counts only then
+    (swap_asks, swap_value), so each answer, a code or a body that hub() refuses, must not be one."""
+
+    def test_no_answer_is_silence_and_each_answer_is_not(self):
+        answers = {"/json": (200, b'{"ok": true}'), "/html": (200, b"<html>not JSON</html>"),
+                   "/key": (403, b'{"error": "this is not the agent key of vps", "auth": "key_mismatch"}'),
+                   "/gateway": (502, b"<html>Bad Gateway</html>")}
+
+        class Answers(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                if self.path == "/nothing":     # the connection closes with no answer, as at the stop of a hub
+                    self.close_connection = True
+                    return
+                code, body = answers[self.path]
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Answers)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        conf = {"hub": f"http://127.0.0.1:{server.server_address[1]}"}
+        try:
+            self.assertEqual(vault.hub(conf, "POST", "/json", {}), (200, {"ok": True}))
+            self.assertEqual(vault.hub(conf, "POST", "/gateway", {}), (502, {}))        # a code is an answer
+            for path in ("/html", "/key"):                  # answers that hub() refuses
+                with self.subTest(path), self.assertRaises(vault.Refused) as raised:
+                    vault.hub(conf, "POST", path, {})
+                self.assertNotIsInstance(raised.exception, vault.HubSilent)
+            with self.assertRaises(vault.HubSilent):
+                vault.hub(conf, "POST", "/nothing", {})
+        finally:
+            server.shutdown()
+            server.server_close()
+        with self.assertRaises(vault.HubSilent) as raised:  # nothing listens on the port: the connection is refused
+            vault.hub(conf, "POST", "/json", {})
+        self.assertEqual(str(raised.exception), "the vault broker could not reach the hub")    # the text of before
+        with patch.object(vault.NO_PROXY, "open", side_effect=TimeoutError("timed out")), \
+                self.assertRaises(vault.HubSilent):
+            vault.hub(conf, "POST", "/json", {})
+
+
 class BrokerPart(test_vault.VaultBroker):
     """The broker's part, with the in-process hub: the fixture's broker of vps, started again with the part "swap" in
     its configuration. The machine's users are stand-ins: the proxy's user and the vault's user are this test's own."""
@@ -1606,7 +1653,11 @@ class BrokerPart(test_vault.VaultBroker):
     def test_a_hub_that_is_silent_or_gives_another_answer_is_a_refusal_and_switches_nothing_off(self):
         self.started()
         name = fleet.vault_call({"op": "read"})["env"]["SHOP_API_KEY"]
-        for said, code in ((vault.Refused("the vault broker could not reach the hub"), "hub"), ((500, {}), "hub"),
+        # the first case is silence with no yes before it (a yes that the hub gave a moment ago counts: KeptYes)
+        for said, code in ((vault.HubSilent("the vault broker could not reach the hub"), "hub"),
+                           (vault.Refused("the hub did not accept this agent's key"), "hub"),     # an answer
+                           (vault.Refused("the vault broker could not reach the hub"), "hub"),    # a body, not JSON
+                           ((500, {}), "hub"),
                            ((200, {"ok": True, "login": "bws://" + test_vault.OTHER_ID}), "hub"),    # not an exact yes
                            ((200, {"ok": False, "login": test_vault.REF}), "hub"),
                            ((403, {"error": "127.0.0.9 is not vps's machine"}), "refused"),     # not a word on the grant
@@ -1642,6 +1693,252 @@ class BrokerPart(test_vault.VaultBroker):
             self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})
         self.assertEqual(self.off(), set())
 
+    # ---- the kept yes (the changed key swap, Part A): a hub that restarts for a release is silent for some seconds
+
+    def clock(self):
+        """The broker's clock, which the test moves: only time.monotonic() is the test's, the rest is time's (the
+        broker's threads use time too)."""
+        class Clock:
+            now = 1000.0
+
+            def monotonic(self):
+                return self.now
+
+            def __getattr__(self, name):
+                return getattr(time, name)
+        clock = Clock()
+        patched = patch.object(vault, "time", clock)
+        patched.start()
+        self.addCleanup(patched.stop)
+        return clock
+
+    def silent(self):
+        """The hub does not answer: what hub() raises for a refused connection, a reset or a timeout."""
+        return patch.object(vault, "hub", side_effect=vault.HubSilent("the vault broker could not reach the hub"))
+
+    def test_a_yes_of_the_hub_counts_for_sixty_seconds_while_the_hub_is_silent_and_a_use_does_not_renew_it(self):
+        clock, said = self.clock(), []
+        self.started()
+        name = fleet.vault_call({"op": "read"})["env"]["SHOP_API_KEY"]
+        with self.silent():
+            self.assertEqual(self.swap(name), {"ok": False, "code": "hub"})     # no yes before it: a refusal
+        self.assertEqual(self.swap(name), {"ok": True, "value": self.VALUE})    # the hub's yes, asked at 1000
+        with self.silent(), patch.object(vault, "log", said.append):
+            for at in (1000, 1001.5, 1030, 1059.9):             # each use counts from that yes: none renews it
+                clock.now = at
+                self.assertEqual(self.swap(name), {"ok": True, "value": self.VALUE})
+            for at in (1060, 1061, 5000):
+                clock.now = at
+                self.assertEqual(self.swap(name), {"ok": False, "code": "hub"})
+        self.assertEqual(self.off(), set())                                     # silence switches nothing off
+        lines = [line for line in said if line.startswith("swap: the hub did not answer")]
+        self.assertEqual(lines, [f"swap: the hub did not answer, so its yes of {age} seconds ago counts for the agent "
+                                 f"vps and the key {test_vault.REF}" for age in ("0.0", "1.5", "30.0", "59.9")])
+        entry = self.broker.conf["_swaps"].get(name)
+        for line in said:                                                       # no value, no token, no placeholder
+            for hidden in (self.VALUE, entry["token"], name[10:], "vaultswap_"):
+                self.assertNotIn(hidden, line)
+        clock.now = 6000                                                        # the hub answers again: a new yes,
+        self.assertEqual(self.swap(name)["value"], self.VALUE)                  # which counts from its own question
+        with self.silent():
+            clock.now = 6059
+            self.assertEqual(self.swap(name)["value"], self.VALUE)
+            clock.now = 6060
+            self.assertEqual(self.swap(name), {"ok": False, "code": "hub"})
+
+    def test_the_age_of_a_yes_counts_from_the_moment_that_its_question_left(self):
+        """A slow answer makes no yes last longer than 60 seconds after the hub decided."""
+        clock = self.clock()
+        self.started()
+        name = fleet.vault_call({"op": "read"})["env"]["SHOP_API_KEY"]
+        real = vault.hub
+
+        def slow(conf, method, path, body=None):
+            clock.now += 8                                                      # the answer comes 8 seconds later
+            return real(conf, method, path, body)
+        with patch.object(vault, "hub", slow):
+            self.assertEqual(self.swap(name)["value"], self.VALUE)              # asked at 1000, answered at 1008
+        with self.silent():
+            clock.now = 1059.5
+            self.assertEqual(self.swap(name)["value"], self.VALUE)
+            clock.now = 1060                                                    # 52 seconds after the answer came
+            self.assertEqual(self.swap(name), {"ok": False, "code": "hub"})
+
+    def test_each_answer_of_the_hub_that_is_not_a_yes_ends_the_kept_yes(self):
+        clock = self.clock()
+        self.started()
+        name = fleet.vault_call({"op": "read"})["env"]["SHOP_API_KEY"]
+        for said, code in ((vault.Refused("the hub did not accept this agent's key"), "hub"),     # a 403 with auth
+                           (vault.Refused("the vault broker could not reach the hub"), "hub"),    # a body, not JSON
+                           ((500, {}), "hub"), ((502, {}), "hub"), ((503, {}), "hub"), ((400, {}), "hub"),
+                           ((403, {"error": "127.0.0.9 is not vps's machine"}), "refused"),
+                           ((404, {"error": "unknown agent"}), "refused"),
+                           ((200, {"ok": True, "login": "bws://" + test_vault.OTHER_ID}), "hub")):    # not an exact yes
+            with self.subTest(said=said):
+                clock.now += 1
+                self.assertEqual(self.swap(name)["value"], self.VALUE)          # a yes
+                with self.silent():
+                    self.assertEqual(self.swap(name)["value"], self.VALUE)      # which counts
+                how = dict(side_effect=said) if isinstance(said, Exception) else dict(return_value=said)
+                with patch.object(vault, "hub", **how):
+                    self.assertEqual(self.swap(name), {"ok": False, "code": code})
+                with self.silent():
+                    self.assertEqual(self.swap(name), {"ok": False, "code": "hub"})    # the yes before it is gone
+                self.assertEqual(self.off(), set())
+
+    def test_the_hubs_no_after_a_yes_ends_it_and_switches_the_placeholder_off(self):
+        clock = self.clock()
+        self.started()
+        name = fleet.vault_call({"op": "read"})["env"]["SHOP_API_KEY"]
+        grants = hub.TEAM["agents"]["vps"]["secrets"]
+        self.assertEqual(self.swap(name)["value"], self.VALUE)                  # the hub's yes, at 1000
+        hub.TEAM["agents"]["vps"]["secrets"] = {}                               # the owner ends the grant
+        clock.now = 1001
+        self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})     # the hub's 409
+        self.assertEqual(self.off(), {name})
+        with self.silent():
+            self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})     # off: the hub is not asked
+        hub.TEAM["agents"]["vps"]["secrets"] = grants                           # the grant again; the agent's next read
+        self.assertEqual(fleet.vault_call({"op": "read"})["env"]["SHOP_API_KEY"], name)     # switches it on
+        self.assertEqual(self.off(), set())
+        with self.silent():
+            self.assertEqual(self.swap(name), {"ok": False, "code": "hub"})     # the yes from before the no is gone
+        # a list that cannot be written: the hub's no ends the yes all the same, and the placeholder stays on
+        clock.now = 1002
+        self.assertEqual(self.swap(name)["value"], self.VALUE)                  # a new yes
+        with self.silent():
+            self.assertEqual(self.swap(name)["value"], self.VALUE)              # which counts
+        hub.TEAM["agents"]["vps"]["secrets"] = {}
+        with patch.object(vault.Swaps, "keep", side_effect=vault.Refused("the vault could not keep its list")):
+            self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})
+        self.assertEqual(self.off(), set())
+        with self.silent():
+            self.assertEqual(self.swap(name), {"ok": False, "code": "hub"})
+
+    def two_uses(self, clock, name, first, second):
+        """Two uses at one time, with a list that cannot be written, so the hub's no leaves the placeholder on. The hub
+        gets the first question, then the second one a second later, and its answer to the second one comes back
+        first. Gives what each use got."""
+        inside, second_done, calls, got = threading.Event(), threading.Event(), [], {}
+
+        def answers(conf, method, path, body=None):
+            calls.append(path)
+            if len(calls) == 1:                         # the first question: its answer is slow
+                inside.set()
+                second_done.wait(10)
+                return first
+            return second
+        with patch.object(vault, "hub", answers), \
+                patch.object(vault.Swaps, "keep", side_effect=vault.Refused("the vault could not keep its list")):
+            older = threading.Thread(target=lambda: got.update(first=self.swap(name)))
+            older.start()
+            self.assertTrue(inside.wait(10))
+            clock.now += 1                                                      # the second question leaves later
+            got["second"] = self.swap(name)
+            second_done.set()
+            older.join(10)
+        return got.get("first"), got["second"]
+
+    def test_the_hubs_no_ends_a_kept_yes_whatever_the_order_of_two_uses_at_one_time(self):
+        """A slow yes to the older question does not come back after the hub's no to the newer one, and a slow no to
+        the older question ends the yes to the newer one."""
+        clock = self.clock()
+        self.started()
+        name = fleet.vault_call({"op": "read"})["env"]["SHOP_API_KEY"]
+        yes = (200, {"ok": True, "login": test_vault.REF, "user": "fleet-vps"})
+        no = (409, {"error": "vps does not read this key at this site now"})
+        value, refused = {"ok": True, "value": self.VALUE}, {"ok": False, "code": "refused"}
+        for first, second, got in ((yes, no, (value, refused)), (no, yes, (refused, value))):
+            with self.subTest(first=first[0], second=second[0]):
+                clock.now += 1
+                self.assertEqual(self.two_uses(clock, name, first, second), got)
+                self.assertEqual(self.off(), set())                     # the list could not be written
+                with self.silent():
+                    self.assertEqual(self.swap(name), {"ok": False, "code": "hub"})     # the no stands
+        # the rule itself: each no ends the kept yes, and a yes counts only when its question left after each no's
+        swaps, entry = self.broker.conf["_swaps"], self.broker.conf["_swaps"].get(name)
+        clock.now = 1012
+        for asked, yes_said, counts in ((1010, True, 2.0), (1009, False, None), (1008, True, None), (1011, True, 1.0),
+                                        (1010.5, True, 1.0), (1012, True, 0.0), (1005, False, None)):
+            swaps.said(name, entry, asked, yes_said)
+            self.assertEqual(swaps.kept_yes(name, entry), counts, (asked, yes_said))
+        # a change of the entry whose write fails (a full disk) ends the kept yes, and a slow yes from before it too
+        clock.now = 2000
+        swaps.said(name, entry, 2000, True)
+        self.assertEqual(swaps.kept_yes(name, entry), 0.0)
+        with patch.object(vault.os, "replace", side_effect=OSError("no space left")), self.assertRaises(vault.Refused):
+            swaps.only(os.getuid(), "vps", set())       # a read that names the key with a site no more
+        self.assertEqual((swaps.get(name), swaps.kept_yes(name, entry)), (entry, None))    # on, and no yes
+        swaps.said(name, entry, 1999.5, True)           # the yes to a question from before the change
+        self.assertIsNone(swaps.kept_yes(name, entry))
+        clock.now = 2001
+        swaps.said(name, entry, 2001, True)             # a yes to a question after it
+        self.assertEqual(swaps.kept_yes(name, entry), 0.0)
+
+    def test_a_kept_yes_is_for_its_entry_as_a_whole_and_for_this_broker_process_only(self):
+        """Each change of the entry is a no at that moment, so the test's clock moves after it: a yes whose question
+        left at the same time as a no is not kept."""
+        clock = self.clock()
+        self.started()
+        name = fleet.vault_call({"op": "read"})["env"]["SHOP_API_KEY"]
+        swaps = self.broker.conf["_swaps"]
+        token = swaps.get(name)["token"]
+        def counts():                   # the hub is silent, and a kept yes gives the value
+            with self.silent():
+                return self.swap(name)
+        # another token, as a read gives one: the yes for the old one counts no more, and it does not come back
+        self.assertEqual(self.swap(name)["value"], self.VALUE)
+        self.assertEqual(counts()["value"], self.VALUE)
+        for new in ("1" * 64, token):
+            with self.subTest(token=new[:4]):
+                swaps.place(os.getuid(), "vps", test_vault.REF, HOST, 443, "bearer", new)
+                with self.silent():
+                    self.assertEqual(self.swap(name), {"ok": False, "code": "hub"})
+        # off: a read that names the key with a site no more; then a read that names it again, as it was
+        clock.now += 1
+        self.assertEqual(self.swap(name)["value"], self.VALUE)
+        self.assertEqual(counts()["value"], self.VALUE)
+        site = hub.TEAM["logins"][test_vault.REF].pop("site")
+        self.assertEqual(fleet.vault_call({"op": "read"})["env"]["SHOP_API_KEY"], self.VALUE)  # a value: no site
+        self.assertEqual(self.off(), {name})
+        with self.silent():
+            self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})     # off: the hub is not asked
+        hub.TEAM["logins"][test_vault.REF]["site"] = site
+        self.assertEqual(fleet.vault_call({"op": "read"})["env"]["SHOP_API_KEY"], name)
+        self.assertEqual(swaps.get(name)["token"], token)                       # on again, the same entry
+        with self.silent():
+            self.assertEqual(self.swap(name), {"ok": False, "code": "hub"})
+        # another broker process: the list outlives it, and no yes does
+        clock.now += 1
+        self.assertEqual(self.swap(name)["value"], self.VALUE)
+        self.assertEqual(counts()["value"], self.VALUE)
+        self.started()
+        with self.silent():
+            self.assertEqual(self.swap(name), {"ok": False, "code": "hub"})
+        self.assertEqual(self.swap(name)["value"], self.VALUE)                  # the hub answers: the same placeholder
+        for kept in json.loads((self.dir / "state" / vault.SWAPS).read_text()).values():    # nothing of a yes on disk
+            self.assertLessEqual(set(kept), vault.Swaps.FIELDS | {"off"})
+
+    def test_a_kept_yes_skips_no_check_after_the_question(self):
+        """The value is read from the store at each use, and its shape and characters are checked, also when a kept
+        yes counts. A value that was taken back: Delivery."""
+        self.clock()
+        self.started()
+        name = fleet.vault_call({"op": "read"})["env"]["SHOP_API_KEY"]
+        self.assertEqual(self.swap(name)["value"], self.VALUE)
+        with self.silent():
+            self.item(test_vault.SECRET_ID, {"username": "pilot-b", "password": self.VALUE}, key="SHOP_API_KEY")
+            self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})     # a login's shape (C11)
+            self.item(test_vault.SECRET_ID, {"username": "", "password": self.VALUE}, key="SHOP_API_KEY")
+            self.assertEqual(self.swap(name)["value"], self.VALUE)
+            with patch.object(vault, "check_value", return_value={"password": "two\r\nlines-0123456789"}):
+                self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})     # no header value
+            with patch.object(vault.LocalStore, "item", side_effect=vault.Refused("no such item")):
+                self.assertEqual(self.swap(name), {"ok": False, "code": "refused"})     # the store has no value
+            for changes in (dict(host=OTHER_HOST), dict(form="basic-user"), dict(uid=os.getuid() + 1)):
+                with self.subTest(changes=changes):         # the checks before the question are first, as before
+                    self.assertEqual(self.swap(name, **changes), {"ok": False, "code": "refused"})
+
     def test_the_question_after_a_delivery_is_marked_as_no_use_and_a_use_is_not(self):
         broker = self.started()
         name = fleet.vault_call({"op": "read"})["env"]["SHOP_API_KEY"]
@@ -1670,8 +1967,11 @@ class BrokerPart(test_vault.VaultBroker):
         self.assertEqual(asked, [("vps", None, "POST", "/helper/vault/vps/swap", dict(question, use=False)),
                                  ("vps", None, "POST", "/helper/vault/vps/swap",
                                   dict(question, site="https://" + HOST + ":8443", use=False))])
-        with patch.object(vault, "hub", side_effect=vault.Refused("no hub")):
-            self.assertEqual(vault.swap_asks(broker.conf, entry), (None, False))
+        with patch.object(vault, "hub", side_effect=vault.HubSilent("the vault broker could not reach the hub")):
+            self.assertEqual(vault.swap_asks(broker.conf, entry), (None, False))   # no answer: only this is None
+        for answer in ("the hub did not accept this agent's key", "the vault broker could not reach the hub"):
+            with self.subTest(answer=answer), patch.object(vault, "hub", side_effect=vault.Refused(answer)):
+                self.assertEqual(vault.swap_asks(broker.conf, entry), (0, False))  # a 403 with auth, a body not JSON
         with patch.object(vault, "hub", return_value=(200, {"ok": True, "login": "bws://" + test_vault.OTHER_ID})):
             self.assertEqual(vault.swap_asks(broker.conf, entry), (0, False))
         # the agent's name is one thing and the entry's OS user another: the hub's yes for the name of an agent that
@@ -2439,6 +2739,40 @@ class Delivery(test_central_e2e.EndToEnd):
         with patch.object(vault, "swap_asks", asks):
             vault.swap_given(self.brokers["vps"].conf, test_central_e2e.KEY_REF)
         self.assertEqual(len(asked), 1)                                     # nothing is off: no question
+
+    def test_a_kept_yes_gives_no_value_that_was_taken_back_and_switches_nothing_on_at_a_delivery(self):
+        """The hub's yes to a use, then a take-back of the value whose list cannot be written, so the placeholder
+        stays on: while the hub is silent, the yes counts and the store has no value. Then the take-back as it is,
+        and a delivery whose question the hub does not answer: the placeholder stays off (swap_given uses no yes)."""
+        value, real = test_central_e2e.VALUE["password"], vault.hub
+
+        def swap_silent(conf, method, path, body=None):     # the hub does not answer a key swap question
+            if path.endswith("/swap"):
+                raise vault.HubSilent("the vault broker could not reach the hub")
+            return real(conf, method, path, body)
+        self.assertEqual(self.use(), {"ok": True, "value": value})          # the hub's yes
+        with patch.object(vault, "hub", swap_silent):
+            self.assertEqual(self.use(), {"ok": True, "value": value})      # it counts
+        self.give("vps", None)
+        with patch.object(vault.Swaps, "keep", side_effect=vault.Refused("the vault could not keep its list")):
+            self.pass_once()                                                # the hub takes the value back
+        self.assertEqual((self.held("vps"), self.off()), ({}, set()))
+        with patch.object(vault, "hub", swap_silent):
+            self.assertEqual(self.use(), {"ok": False, "code": "refused"})  # the yes counts; the store has no value
+        self.give("vps", "read")
+        self.pass_once()
+        self.assertEqual(self.use(), {"ok": True, "value": value})          # the value again, and a new yes
+        self.give("vps", None)
+        self.pass_once()                                                    # the take-back as it is
+        self.assertEqual(self.off(), {self.name})
+        self.give("vps", "read")
+        with patch.object(vault, "hub", swap_silent):
+            self.pass_once()                                                # a delivery; its question gets no answer
+            self.assertEqual(self.use(), {"ok": False, "code": "refused"})
+        self.assertEqual(self.held("vps"), {test_central_e2e.KEY_REF: test_central_e2e.VALUE})
+        self.assertEqual(self.off(), {self.name})
+        self.assertEqual(self.read()["env"]["SHOP_API_KEY"], self.name)     # the agent's next read switches it on
+        self.assertEqual(self.use(), {"ok": True, "value": value})
 
     def test_a_list_that_cannot_be_written_stops_no_take_back_and_no_delivery(self):
         self.give("vps", None)

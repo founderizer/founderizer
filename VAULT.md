@@ -403,10 +403,17 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
   another name or for an IP address (`vault.py`). The helper writes two CA files for an agent: the system's list of
   CAs with the CAs of the agent's own keys' sites, and those CAs alone (`fleet.py`).
 - **The grant, at each use.** Before the broker gives the proxy a value, it asks the hub: does this agent still
-  read this key at this site and in this form? Each answer that is not an exact yes is a refusal, and so is a hub
-  that does not answer (`vault.py`, `hub.py`). So the end of a grant stops the next request of a session that runs.
-  The hub's answer does not look at the agent's Shell box: a session that started before that box went off still
-  gets the key in its requests while the grant holds (`hub.py`).
+  read this key at this site and in this form? Each answer that is not an exact yes is a refusal (`vault.py`,
+  `hub.py`). So the end of a grant stops the next request of a session that runs. When no answer comes (a refused
+  connection, a reset or a timeout: the hub does not answer for 2 to 3.4 seconds when it starts again for a
+  release), the hub's yes to an earlier use of the same placeholder counts for 60 seconds from the moment that the
+  question of that yes left. It counts only for the same entry (OS user, agent, key, site, form and token) while
+  the entry stays on. A use does not renew it, each answer of the hub that is not a yes ends it, a yes counts only
+  when its question left after the question of each no, and the broker keeps it in its memory only, so a new broker
+  process has none. The broker writes one line for each use of such a yes, with the agent, the key's reference and
+  the age in seconds (`vault.py`). With no such yes, a hub that does not answer is a refusal. The hub's answer does
+  not look at the agent's Shell box: a session that started before that box went off still gets the key in its
+  requests while the grant holds (`hub.py`).
 - **`call_api` on such a server.** The broker can also send a request itself (`call_api`). On a server that swaps
   keys, it sends a key that the hub names with a site only as the proxy does: to that site, in the `Authorization`
   header, and in the key's own form. A key whose form is `token` or the user name of `Basic` goes through the
@@ -440,6 +447,11 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
    **A key that swaps is not in the sessions, with these limits:**
    - The agent can use the key for each thing that the key can do at its site, also to make a second key there if
      the service has such a call.
+   - A grant that ended still puts the key into requests for up to 60 seconds after the hub's last yes to a use of
+     its placeholder, counted from the question of that yes, while the hub does not answer the vault. An agent of
+     the server can make the hub slow or silent for its vault, for example with requests that keep the hub busy or
+     when it takes each free local port, but no yes counts for longer: a use does not renew it, and each answer of
+     the hub that is not a yes ends it (`vault.py`).
    - A site that sends the key back gives it to the session: an answer that repeats the `Authorization` header.
      The proxy does not look for the key in an answer (`vault.py`).
    - The key goes only in the `Authorization` header, as `Bearer`, `token` or `Basic`. A program that needs the

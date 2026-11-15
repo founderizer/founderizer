@@ -264,6 +264,14 @@ class Refused(Exception):
     """A request that the broker does not serve. The text goes back to the helper; it never holds a secret."""
 
 
+class HubSilent(Refused):
+    """hub(): no answer of the hub came. The connection was refused, was reset, closed before the answer began or timed
+    out: what a vault gets while the hub restarts, because the hub's own process listens on its port and binds it
+    again only near the end of its start. A Refused, so each caller that catches Refused is as before; the key swap
+    tells it from each answer of the hub (swap_asks). A connection that closes in the middle of an answer is
+    http.client's IncompleteRead, which hub() lets through as before: an error of the broker, and no yes."""
+
+
 def log(text):
     print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + " " + text, file=sys.stderr, flush=True)
 
@@ -445,7 +453,9 @@ def hub(conf, method, path, body=None):
         if e.code == 403 and isinstance(data, dict) and data.get("auth"):      # one fixed text, as the Mac vault helper
             raise Refused("the hub did not accept this agent's key") from None
         return e.code, data
-    except (OSError, ValueError):
+    except OSError:                     # no answer came (HubSilent)
+        raise HubSilent("the vault broker could not reach the hub") from None
+    except ValueError:                  # an answer came, and it is not JSON
         raise Refused("the vault broker could not reach the hub") from None
 
 
@@ -2633,6 +2643,8 @@ SWAP_BUSY = "The vault's proxy has too many connections of this user. Close some
 SWAP_CALL = ("On this machine the vault sends this key only to the key's own site, in the Authorization header and in "
              "the key's own form, as its proxy does. Nothing was sent.")
 SWAP_ROOM = 256                             # questions of the proxy that the broker answers at one time
+SWAP_KEPT = 60                              # seconds: the hub's yes to a use of a placeholder counts while the hub
+                                            # does not answer, from the moment that its question left (Swaps.said)
 
 
 def swap_shape(part):
@@ -2704,6 +2716,11 @@ class Swaps:
     the hub (swap_value). An entry that is off opens no connection and gives no value; it keeps its name, so a key
     that the hub names again gets the same placeholder (place).
 
+    The hub's answers to the uses of each placeholder are in memory only (`answers`; said, kept_yes): its last yes,
+    and the time of its newest no. When no answer of the hub comes, that yes counts for SWAP_KEPT seconds from the
+    moment that its question left, for the entry as a whole and while the entry stays on and the same. Nothing of it
+    goes to disk, so a new broker process has no yes.
+
     Each switch is the hub's own word, and none is the agent's. Off: a read of the agent's keys that names the key
     with a site no more (only); the hub's no to a use (refused); the hub's take-back of the value from this machine
     (taken). On: the agent's next read that names the key with a site (place); a delivery of the value, for an entry
@@ -2714,6 +2731,8 @@ class Swaps:
 
     def __init__(self, path):
         self.path, self.lock = path, threading.Lock()
+        self.answers = {}       # {placeholder: ((the entry of the kept yes, when its question left) or None,
+                                #                when the question of the newest no left, or None)}
         info = os.stat(os.path.dirname(os.path.abspath(path)))
         if info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise Refused("the vault's state folder must belong to the vault user and have mode 700")
@@ -2746,7 +2765,17 @@ class Swaps:
         return entries
 
     def keep(self, entries):
-        """Write the list whole: a new file of mode 600, made complete beside the old one and then put in its place."""
+        """Write the list whole: a new file of mode 600, made complete beside the old one and then put in its place.
+        A kept yes ends here when its entry changes or goes off: the hub's no to a use, a take-back of the value, a
+        read that names the key with a site no more and a read that gives a new token are each the hub's own word.
+        It ends before the write, so a list that cannot be written keeps no yes: each change of an entry counts as a
+        no at this moment, so a slow yes to a question from before the change is not kept either (said). A new
+        placeholder gets no such no: no question can be out for it yet."""
+        now = time.monotonic()
+        self.answers = {n: (None, now) if self.entries.get(n) != entries[n] else a
+                        for n, a in self.answers.items() if n in entries}
+        self.answers.update((n, (None, now)) for n, e in entries.items()
+                            if n not in self.answers and n in self.entries and self.entries[n] != e)
         temp = self.path + ".new"
         try:
             fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
@@ -2834,6 +2863,28 @@ class Swaps:
             entry = self.entries.get(name)
             return dict(entry) if entry else None
 
+    def said(self, name, entry, asked, yes):
+        """The hub's answer to a use of this placeholder, whose question left at `asked` (time.monotonic()). Each
+        answer that is not a yes ends the kept yes, whatever the age of its question. A yes is kept for the entry as
+        it was asked about, when the list still has it so, and only when its question left after the question of each
+        no to this placeholder: so a slow yes does not come back after the hub's no to a newer question."""
+        with self.lock:
+            kept, no = self.answers.get(name, (None, None))
+            if not yes:
+                self.answers[name] = (None, asked if no is None else max(no, asked))
+            elif (no is None or asked > no) and (kept is None or asked >= kept[1]) and self.entries.get(name) == entry:
+                self.answers[name] = ((dict(entry), asked), no)
+
+    def kept_yes(self, name, entry):
+        """The seconds since the question of the hub's kept yes for this placeholder left, when that yes counts now: it
+        is for this entry as a whole (uid, user, agent, login, host, port, form, token), the list has the entry so and
+        on, and it is less than SWAP_KEPT seconds old. Else None. A use of it does not renew it."""
+        with self.lock:
+            kept, now = self.answers.get(name, (None, None))[0], time.monotonic()
+            if kept and kept[0] == entry == self.entries.get(name) and 0 <= now - kept[1] < SWAP_KEPT:
+                return now - kept[1]
+            return None
+
 
 def with_swaps(conf):
     """The configuration of a broker that swaps keys: `_swap`, its part "swap" as swap_part reads it, and `_swaps`,
@@ -2855,9 +2906,10 @@ def with_swaps(conf):
 def swap_asks(conf, entry, use=True):
     """Ask the hub now whether the agent of this placeholder reads its key at its site and in its form: (the code,
     whether the hub named the agent's OS user). 200 for the hub's exact yes, the hub's code for each other answer (0
-    for a yes that is not exact), None when the hub did not answer. With no agent key: the token is what the hub
-    knows this question by. use=False says that no request of a session waits for the answer (swap_given), so the
-    hub writes no line about a refused use.
+    for a yes that is not exact, a body that is not JSON, and the hub's refusal of an agent key), None only when no
+    answer of the hub came (HubSilent: a refused connection, a reset, a timeout). Only None lets a kept yes count
+    (swap_value). With no agent key: the token is what the hub knows this question by. use=False says that no request
+    of a session waits for the answer (swap_given), so the hub writes no line about a refused use.
 
     The hub knows an agent by its name, and this list knows an entry by its OS user. A name can change hands on one
     machine (the owner renames an agent, and then gives its old name to another one), and then the hub's yes for
@@ -2870,8 +2922,10 @@ def swap_asks(conf, entry, use=True):
     try:
         code, data = hub(dict(conf, agent=entry["agent"], agent_key=None), "POST",
                          f"/helper/vault/{entry['agent']}/swap", asked)
-    except Refused:
+    except HubSilent:
         return None, False
+    except Refused:                     # an answer that is not a yes: hub() raises it for a 403 with "auth" and for a
+        return 0, False                 # body that is not JSON
     if code != 200:
         return code, False
     if not (isinstance(data, dict) and data.get("ok") is True and data.get("login") == entry["login"]):
@@ -2893,7 +2947,8 @@ def swap_given(conf, login):
     placeholder of an agent that does not hold the key stays off, also when its name is another agent's now. A hub
     that names no OS user switches nothing on: the agent's next read does. Nothing on a broker that does not swap,
     and nothing here stops the delivery: the value is saved, and the broker holds its lock, so the first question
-    with no answer of the hub is the last one."""
+    with no answer of the hub is the last one. No kept yes is used or written here: a placeholder that is off has
+    none (Swaps.keep), and one that comes on again gets its next yes from the hub at its next use."""
     swaps = conf.get("_swaps")
     if swaps is None:
         return
@@ -2926,25 +2981,39 @@ def swap_taken(conf, login):
 def swap_value(conf, uid, host, port, name, form):
     """The header value of this placeholder, for the swap proxy: it must be a placeholder of this OS user (by number
     and by name) and of this host that is not switched off, the proxy must have found it in the form of that key, and
-    the hub must say now that its agent still reads its key at this site. A hub that does not answer is a refusal.
-    Then the value is read from the store. No lock of the broker is held here: the hub call must not wait for another
-    operation, and the store is one file that a save puts in place whole. A refusal has one fixed code and no value:
-    "refused" or "hub"."""
+    the hub must say now that its agent still reads its key at this site. When no answer of the hub comes (a hub that
+    restarts for a release is silent for 2 to 3.4 seconds), its yes to an earlier use of this placeholder counts for
+    SWAP_KEPT seconds from the moment that the question of that yes left, for this entry as a whole and while the
+    entry stays on and the same (Swaps.said, kept_yes). A use of it does not renew it, and each answer of the hub that
+    is not a yes ends it. With no such yes, a hub that does not answer is a refusal. Then the value is read from the
+    store. No lock of the broker is held here: the hub call must not wait for another operation, and the store is one
+    file that a save puts in place whole. A refusal has one fixed code and no value: "refused" or "hub"."""
     entry = conf["_swaps"].get(name) if isinstance(name, str) and PLACEHOLDER.fullmatch(name) else None
     if not entry or entry.get("off") or (entry["uid"], entry["user"], entry["host"], entry["port"], entry["form"]) != (
             uid, swap_user(uid), host, port, form):
         return {"ok": False, "code": "refused"}
+    swaps, asked = conf["_swaps"], time.monotonic()
     code, _named = swap_asks(conf, entry)   # the entry's host, port and form are the ones of this request (above)
-    if code != 200:
-        # Only the hub's 409 switches off: this agent does not read this key so now, or its name is another OS
-        # user's agent now. Not a 404: a hub that does not know the route gives one too, and so would switch off
-        # each placeholder that is used.
-        if code == 409:
-            try:
-                conf["_swaps"].refused(name, entry)
-            except Refused:
-                pass                    # the list could not be written: each use still asks the hub
-        return {"ok": False, "code": "refused" if code in (403, 404, 409) else "hub"}
+    if code is None:
+        age = swaps.kept_yes(name, entry)
+        if age is None:
+            return {"ok": False, "code": "hub"}
+        # the proof at a release reads this line: the agent, the key's reference and the age, and no value, no token
+        # and no placeholder
+        log(f"swap: the hub did not answer, so its yes of {age:.1f} seconds ago counts for the agent {entry['agent']} "
+            f"and the key {entry['login']}")
+    else:
+        swaps.said(name, entry, asked, code == 200)     # in memory, before the list is written: the no always ends it
+        if code != 200:
+            # Only the hub's 409 switches off: this agent does not read this key so now, or its name is another OS
+            # user's agent now. Not a 404: a hub that does not know the route gives one too, and so would switch off
+            # each placeholder that is used.
+            if code == 409:
+                try:
+                    swaps.refused(name, entry)
+                except Refused:
+                    pass                # the list could not be written: each use still asks the hub
+            return {"ok": False, "code": "refused" if code in (403, 404, 409) else "hub"}
     try:
         stored = LocalStore(conf).item(SECRET_REF.fullmatch(entry["login"]).group(1))["value"]
         if login_shaped(stored):

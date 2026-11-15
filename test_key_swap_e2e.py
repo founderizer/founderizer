@@ -16,7 +16,9 @@ agent's user. It proves:
   the end of the grant stops the next request and switches the placeholder off, with no read of the agent: the
   site then gets the placeholder; after the grant is given again, the agent's next read gives the same placeholder,
   and it works;
-  a hub that does not answer is a refusal;
+  a hub that does not answer: the second request of a session gets the key on the hub's yes to the first one, which
+  the broker keeps for 60 seconds and names in one line of its log; a new broker process keeps no yes, so then it is
+  a refusal;
   the proxy's CA for the site is not taken for another host;
   a new vault program takes over from the proxy that runs, with no cut: a tunnel from before still passes bytes, a
   key call works after it, and the old process ends after its tunnel (with a stand-in for systemd's notify socket);
@@ -94,8 +96,16 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.got["the next read gives the same placeholder"], True)
         self.assertEqual(self.got["grant given again"], "key of alpha")
 
-    def test_a_hub_that_does_not_answer_is_a_refusal(self):
-        self.assertEqual(self.got["hub does not answer"], {"status": 503, "site got a request": False})
+    def test_a_yes_of_the_hub_counts_for_a_short_time_while_the_hub_does_not_answer(self):
+        # two requests of one session, with the hub stopped between them: the hub's yes to the first one counts
+        self.assertEqual(self.got["hub stopped, a yes of less than 60 seconds"], "key of alpha", self.log)
+        lines = self.got["the broker's lines of a kept yes"]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertRegex(lines[0], r"^swap: the hub did not answer, so its yes of [0-9]+\.[0-9] seconds ago counts for "
+                                   r"the agent alpha and the key " + REFS["alpha"] + "$")
+        self.assertLess(float(lines[0].split(" of ")[1].split()[0]), 60)
+        # a new broker process keeps no yes: then a hub that does not answer is a refusal, as before
+        self.assertEqual(self.got["hub does not answer, a new broker"], {"status": 503, "site got a request": False})
         self.assertEqual(self.got["hub answers again"], "key of alpha")
 
     def test_a_new_program_takes_over_with_no_cut_of_an_open_connection(self):
@@ -433,10 +443,29 @@ def inside():
     except (ValueError, IndexError):
         raise SystemExit(f"the helper's second step of alpha gave no variables:\n{out}\n{done.stderr[-3000:]}")
     result["the next read gives the same placeholder"] = again.get("SHOP_API_KEY") == alpha["SHOP_API_KEY"]
-    result["grant given again"] = call("alpha", "curl")
+    result["grant given again"] = call("alpha", "curl")                 # the first request: the hub's yes
     hub.kill()
     hub.wait()
-    result["hub does not answer"] = status("alpha", alpha["SHOP_API_KEY"])
+    # the second request of the same session, with the hub stopped: the yes to the first one counts
+    result["hub stopped, a yes of less than 60 seconds"] = call("alpha", "curl")
+    with open("/var/log/e2e/servers.err") as f:
+        result["the broker's lines of a kept yes"] = [line.split(" ", 1)[1] for line in f.read().splitlines()
+                                                      if "swap: the hub did not answer" in line]
+    # a new broker process keeps no yes: a hub that does not answer is a refusal
+    import socket
+    broker.kill()
+    broker.wait()
+    broker = start_broker()
+    for _ in range(100):                # until the new broker listens on the proxy's socket
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect("/run/fleet-vault/swap.sock")
+            break
+        except OSError:
+            time.sleep(0.2)
+    else:
+        raise SystemExit("the new broker did not start:\n" + open("/var/log/e2e/servers.err").read()[-3000:])
+    result["hub does not answer, a new broker"] = status("alpha", alpha["SHOP_API_KEY"])
     start_hub()
     for _ in range(50):
         if listens(8765):
