@@ -2017,7 +2017,10 @@ KEY_PROVIDERS = {
 }
 # The owner's own model server: the provider "own" of a `server` account. The program's configuration names it `own`
 # too, so each of its models is own/<name>.
-OWN_SERVER = {"provider": "own", "runtime": "opencode", "program": "own", "makers": "many"}
+OWN_SERVER = {"provider": "own", "runtime": "opencode", "program": "own", "makers": "many",
+              # the name that the owner picked for it (his answer 12 of 14 November 2026); server.MODEL_SERVER_LABEL
+              # is the same word, and a test holds the two equal
+              "label": "Model server"}
 REQUIRED_CONTEXT = 64000        # the tokens of context that a model server must take: the fleet's rules alone are
                                 # about 17,000 at each start
 ACCOUNT_FILE = "account-%s.json"    # in ~/.fleet: what the check of a model server kept for one agent
@@ -2030,9 +2033,20 @@ SMALL_CONTEXT = f"Its context is smaller than {REQUIRED_CONTEXT:,} tokens."
 NO_KEY = "The vault gave no key for this account."
 KEY_REFUSED = "The provider refused the key."
 # The model that an account or its agent names is not in the program's list, or not in the model server's (the wave 1
-# review, R6 part 2). Proposed, not approved, for the account item: the words of model_item's own refusal, which live
-# fleets show today for an agent's model. The item's own sentence is 5D's question (R6 part 3).
-NOT_OFFERED = "%s is not offered here."
+# review, R6 part 2): the owner's approved sentence 9 for the setup page (round 2 of his answers to the pictures, 14
+# November 2026: "Yes, both places"), filled with the provider's name that he picked, the model's name as he pasted
+# it, and the agent's name as the apps show it (Lifecycle.account_item).
+NOT_OFFERED = "{provider} has no model named {model}. Delete {agent}, then add it again with another model."
+# A server whose models are named by their files' paths (llama.cpp without --alias): the check leaves such a name out
+# (it can hold a home folder's user name), and says so. Proposed, not approved: for the owner's next round of pictures
+# (decision D11 of the coordinator, 15 November 2026).
+PATH_NAMES = ("This server names its models by their files' paths, and no session can start with such a name. Start "
+              "it with a short name for each model (llama.cpp: --alias).")
+# Decision D7 (15 November 2026): each detail of the account item has a stable code, and NOT_OFFERED its names, so
+# that each app shows its own words in the device's language and the hub's text for a code that it does not know.
+ACCOUNT_CODES = {NO_ANSWER: "no_answer", OPEN_SERVER: "open_server", NO_TOOL_CALL: "no_tool_call",
+                 SMALL_CONTEXT: "small_context", NO_KEY: "no_key", KEY_REFUSED: "key_refused",
+                 PATH_NAMES: "path_names", NOT_OFFERED: "not_offered"}
 CHECK_CLIENT = "Founderizer-Fleet/1 (helper)"       # fleet.OUTSIDE_AGENT: an edge can refuse Python's default name
 CHECK_MODELS = 8                # the models of a server's list that the check tries, in the list's order
 # Step 4 measures a word's tokens and the chat template's own tokens with two short prompts of the word "seven", then
@@ -2169,11 +2183,32 @@ def model_call(method, url, key=None, body=None, timeout=30, header=None):
         return status, None
 
 
-def server_models(answer):
-    """The model names of a server's list, GET <address>/models in the OpenAI shape, in its order."""
+def listed_models(answer):
+    """Every model id of a server's list, GET <address>/models in the OpenAI shape, in its order."""
     rows = answer.get("data") if isinstance(answer, dict) else None
-    names = [row.get("id") for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
-    return [name for name in names if isinstance(name, str) and MODEL_NAME.fullmatch("own/" + name)][:64]
+    return [row.get("id") for row in rows if isinstance(row, dict) and isinstance(row.get("id"), str)] \
+        if isinstance(rows, list) else []
+
+
+def model_path(name):
+    """True for a model's name that is a file's path, as llama.cpp names a model without --alias: it can hold a home
+    folder's user name, and a session can start with none (measured on 14 November 2026: 187 characters)."""
+    return name.startswith(("/", "~", "./", "../")) or "\\" in name or bool(re.match(r"[A-Za-z]:[\\/]", name)) or \
+        "/" in name and name.lower().endswith(".gguf")
+
+
+def cloud_model(name):
+    """True for a model of Ollama's cloud, whose tag ends in "cloud" (gpt-oss:120b-cloud, gemma4:cloud): a signed-in
+    Ollama runs it on ollama.com. The owner's own model server never sends a task to a third party's cloud
+    (decision D9 of 15 November 2026). Not proved live: it needs an Ollama sign-in."""
+    return ":" in name and name.rpartition(":")[2].lower().endswith("cloud")
+
+
+def server_models(answer):
+    """The model names of a server's list that a session can start with, in its order: a name that MODEL_NAME takes
+    as own/<name>, and neither a file's path nor a model of Ollama's cloud."""
+    return [name for name in listed_models(answer) if MODEL_NAME.fullmatch("own/" + name) and not model_path(name)
+            and not cloud_model(name)][:64]
 
 
 def pinged(answer):
@@ -2217,7 +2252,7 @@ def check_server(account, key, kept=None, call=model_call, clock=time.time, want
         return "failed", NO_ANSWER, None
     named = (wanted[len("own/"):] if wanted.startswith("own/") else wanted) if wanted else None
     if named is not None and named not in models:
-        return "failed", NOT_OFFERED % wanted, None
+        return "failed", NOT_OFFERED, None      # Lifecycle.account_item fills its names
     if key:
         status, _ = call("GET", f"{address}/models", timeout=30)
         if status not in (401, 403):
@@ -2229,6 +2264,8 @@ def check_server(account, key, kept=None, call=model_call, clock=time.time, want
                 return "failed", OPEN_SERVER, None
     if kept and kept.get("models") == models and (named is None or kept.get("model") == "own/" + named):
         return "ok", kept["model"], None
+    if not models and any(model_path(name) for name in listed_models(answer)):
+        return "failed", PATH_NAMES, None
     passed = None
     for name in [named] if named is not None else models[:CHECK_MODELS]:
         status, answer = call("POST", f"{address}/chat/completions", key=key, timeout=120, body={
@@ -2866,8 +2903,8 @@ class Lifecycle:
         the hub adds its own items and decides which ones are required."""
         items = []
 
-        def add(kind, ref, state, detail):
-            items.append({"kind": kind, "ref": ref, "state": state, "detail": detail[:300]})
+        def add(kind, ref, state, detail, words=None):
+            items.append(dict({"kind": kind, "ref": ref, "state": state, "detail": detail[:300]}, **(words or {})))
         rt = status.get("runtime") or {}
         name = rt.get("name") or "unknown"
         account = self.account()
@@ -2919,15 +2956,15 @@ class Lifecycle:
             if state == "ok" and account["kind"] == "key" and account["model"] and not self.conf.get("model"):
                 offered = self.offered_models()
                 if offered is not None and account["model"] not in offered:
-                    state, detail = "failed", NOT_OFFERED % account["model"]
-            return ("account", account["id"], state, detail)
+                    state, detail = "failed", NOT_OFFERED
+            return self.account_words(account, state, detail, account["model"])
         if not account["address"]:
-            return ("account", account["id"], "failed", NO_ANSWER)
+            return self.account_words(account, "failed", NO_ANSWER)
         # the program's list of a model server is made from its configuration, which names the model: so the server's
         # own list is the one that the named model must be in (check_server)
         kept = kept_account(self.home, self.agent, account)
-        state, detail, keep = check_server(account, key, kept, clock=self.clock,
-                                           wanted=self.conf.get("model") or account["model"])
+        wanted = self.conf.get("model") or account["model"]
+        state, detail, keep = check_server(account, key, kept, clock=self.clock, wanted=wanted)
         if keep is None and state == "ok" and kept and not os.path.exists(account_path(self.home, self.agent)):
             keep = kept         # the result of another name, as after a rename: this agent's own file from now on
         if keep:
@@ -2947,7 +2984,22 @@ class Lifecycle:
                 os.remove(account_path(self.home, self.agent))
             if detail == OPEN_SERVER:
                 forget_account(self.home, account)
-        return ("account", account["id"], state, detail)
+        return self.account_words(account, state, detail, wanted)
+
+    def account_words(self, account, state, detail, model=None):
+        """The account item, ("account", its id, state, detail, words): words has the detail's code (ACCOUNT_CODES),
+        and for NOT_OFFERED its names, which also fill the detail (decision D7). The model's name is as the owner
+        pasted it: without the provider's part in the program (`openrouter/`, `own/`)."""
+        words = {"code": ACCOUNT_CODES[detail]} if detail in ACCOUNT_CODES else {}
+        if detail == NOT_OFFERED:
+            program = account.get("program")
+            shown = model[len(program) + 1:] if program and isinstance(model, str) and model.startswith(program + "/") \
+                else model
+            known = OWN_SERVER if account["kind"] == "server" else KEY_PROVIDERS.get(account.get("provider")) or {}
+            words["names"] = {"provider": known.get("label") or account.get("provider") or "",
+                              "model": shown or "", "agent": shown_name(self.agent)}
+            detail = NOT_OFFERED.format(**words["names"])
+        return ("account", account["id"], state, detail, words)
 
     def offered_models(self):
         """The model names of the program's own list, as the last reading has it (read_models), or None when there is
