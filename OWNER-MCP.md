@@ -297,11 +297,16 @@ read); whether the launch's first read ended, whether the hub answered at this l
 whether the app holds a reading, and the seconds since the last answer; Tailscale on this Mac and
 what it says of the hub's server (online, offline, not in the network), read only while the hub
 is `set` (its last read did not answer, or the launch's first read has not ended yet); and the
-window, by a fixed name (Settings counts as `fleet`), with an agent's setup when one shows.
-Every value is a boolean, a whole number or a name of a fixed list: no address, no name and no
+window, by a fixed name (Settings counts as `fleet`), with an agent's setup when one shows. It
+also gives where the app's own builds of a server at a provider stand, the first run's and Add
+server's each by itself (the stage, and the stage at which the last try stopped, which is kept
+after the page cleared it until a new try starts), and where the app's own install of a server
+stands (its state, its kind, its step, and the kind of its stop, which the app finds from the
+stop's words and never gives on). Every value is a boolean, a whole number or a name of a fixed list: no address, no name and no
 line of a log. It has a change number of its own and takes `after` as `setup_state` does, with a
 wait of 40 seconds at most, so that the Tailscale read after it (about 15 seconds at most) stays
-under the program's 60 quiet seconds; the seconds and Tailscale move no number. Its words in the
+under the program's 60 quiet seconds; the seconds (since the hub's last answer, in a build's
+stage, in an install's step) and Tailscale move no number. Its words in the
 tool list name every value.
 
 **`setup_show`** (marked as a read: it changes no fleet, no server and no file): asks macOS to
