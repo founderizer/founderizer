@@ -33997,13 +33997,14 @@ def validate_status(data):
             "manager_bound": _optional(data.get("manager_bound"), bool), "manager_handover": handover,
             "os": {"name": _optional(system.get("name"), str), "kernel": _optional(system.get("kernel"), str),
                    "boot": _optional(system.get("boot"), str, 80)},
-            "security": {"unattended_upgrades": _optional(sec.get("unattended_upgrades"), bool),
-                         "pending_security": _optional(sec.get("pending_security"), int),
+            "security": {"pending_security": _optional(sec.get("pending_security"), int),
                          "reboot_required": _optional(sec.get("reboot_required"), bool),
                          "firewall": firewall, "tailscale": _optional(sec.get("tailscale"), bool), "vault": vault,
                          "desktop": desktop_status(sec.get("desktop")),
-                         # only what the helper sent: an older one sends none of these, and a null is a reading
-                         **{k: v for k, v in (("ssh_keys_only", _optional(sec.get("ssh_keys_only"), bool)),
+                         # only what the helper sent: an older one sends none of the last four, a newer one leaves
+                         # out a fact that it cannot read now (lifecycle.Lifecycle.security), and a null is a reading
+                         **{k: v for k, v in (("unattended_upgrades", _optional(sec.get("unattended_upgrades"), bool)),
+                                              ("ssh_keys_only", _optional(sec.get("ssh_keys_only"), bool)),
                                               ("npm_rule", _optional(sec.get("npm_rule"), bool)),
                                               ("upgraded_at", upgraded),
                                               ("macos_update", macos_update_status(sec.get("macos_update"))))
@@ -36077,8 +36078,8 @@ def watch_words(key, load, ended=False):
 
 def server_troubles(reading, joined, restart_since, t0):
     """What of the baseline a Linux server's reading says does not hold, as WATCH_WORDS keys. A fact that the reading
-    does not carry (an older helper) or cannot read says nothing. A server with no good update yet counts from its
-    join."""
+    does not carry (an older helper) or cannot read says nothing; the watch keeps a fault that was said while the
+    reading leaves its fact out (left_out, READING_FACTS). A server with no good update yet counts from its join."""
     sec = reading.get("security") or {}
     found = [key for key, bad in (("firewall", sec.get("firewall") == "inactive"),
                                   ("network", sec.get("tailscale") is False),
@@ -36153,11 +36154,15 @@ def hub_claimed(t0, keep=False):
 # ssh_keys_only when systemctl gives no answer (lifecycle.hardening), and a null there would end a fault that still
 # stands with a false "in order again" and start its MENDED_WAIT again (14 November 2026, measured on the hub).
 MENDED_FACTS = {"ssh": "ssh_keys_only", "npm": "npm_rule"}
+# And in a joined server's own reading, the automatic updates too: its service leaves unattended_upgrades out when
+# `systemctl is-enabled` gives no word (lifecycle.Lifecycle.security), so neither of the two faults that rest on it,
+# "updates_off" and "updates", ends on that reading (15 November 2026, the owner's "Yes, fix it").
+READING_FACTS = dict(MENDED_FACTS, updates_off="unattended_upgrades", updates="unattended_upgrades")
 
 
-def left_out(security, told):
-    """The MENDED_BY_MAC keys that were said and that this reading leaves out: they hold."""
-    return {k for k, fact in MENDED_FACTS.items() if k in told and fact not in security}
+def left_out(security, told, facts=MENDED_FACTS):
+    """The keys of facts that were said and that this reading leaves out: they hold."""
+    return {k for k, fact in facts.items() if k in told and fact not in security}
 
 
 def hub_hardening_troubles(read, claimed, told, t0):
@@ -36223,6 +36228,12 @@ def server_watch_sweep(t0):
                 waited = macos is not None and t0 - macos >= MACOS_UPDATE_WAIT
             if waited:
                 now_found.add("macos_update")
+            # The hub's own server with no reading of a service of its own now: in the hour after that service's
+            # record is made again (its installer's step after a lost key file, a restore that keeps the record) a
+            # fault that only a reading says holds, where it ended with an "in order again" that nothing had read
+            # (15 November 2026, seen on a real server by the session "One server for all: the hub's open parts").
+            if own and reading is None:
+                now_found |= told - {"disk", "memory", "macos_update"}
         elif reading["source"] == "server" and t0 - max(reading["reported_at"], STARTED) > SERVER_QUIET:
             now_found = (told - {"quiet"}) | ({"quiet"} if not here else set())    # nothing else is read while quiet
             if own:     # but the hub measures its own disk and memory itself (server_load), whatever its service says
@@ -36231,7 +36242,7 @@ def server_watch_sweep(t0):
             sec = reading.get("security") or {}
             since = (since or t0) if sec.get("reboot_required") else None
             now_found = set(server_troubles(reading, joined[name], since, t0) + load_troubles(load, told))
-            now_found |= left_out(sec, told)    # what this reading cannot say holds
+            now_found |= left_out(sec, told, READING_FACTS)     # what this reading cannot say holds
         if own and kind == "linux":     # its SSH and npm by the hub's own read, never by a reading of its service
             now_found = (now_found - set(MENDED_BY_MAC)) | hub_hardening_troubles(hub_read, claimed, told, t0)
         new, ended = sorted(now_found - told), sorted(told - now_found)

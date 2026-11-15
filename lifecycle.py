@@ -2560,9 +2560,16 @@ class Lifecycle:
                 code, out, _ = self.run(["sw_vers", "-productVersion"])
                 s["macos_update"] = macos_update(out.strip() if code == 0 else None)
         else:
+            # Whether apt installs the security updates by itself: systemctl's word for the unit. With no word
+            # (systemd answers nothing for a second or two while it starts itself again, after an update of systemd or
+            # libc6, and _run gives nothing for a call that ran out of time) the reading cannot say: it leaves the
+            # fact out, and the hub keeps what was said of it (hub.left_out), where a null would end a fault that still
+            # stands with a false "in order again" (15 November 2026, measured on a real Ubuntu).
             code, out, _ = self.run(["systemctl", "is-enabled", "unattended-upgrades"])
             if out.strip():
                 s["unattended_upgrades"] = out.strip() == "enabled"
+            else:
+                del s["unattended_upgrades"]
             code, out, _ = self.run(["apt-get", "-s", "-o", "Debug::NoLocking=1", "upgrade"], timeout=90)
             if code == 0:
                 s["pending_security"] = len(re.findall(r"^Inst .*[Ss]ecurity", out, re.M))

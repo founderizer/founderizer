@@ -18,10 +18,14 @@ DAY = 86400
 HUB_WORDS = ("The owner's Mac puts this right by itself: while the Founderizer app runs there, it gives the hub's own "
              "server the hardening of every fleet server, as root. Take no step for it and raise no Needs-you item: if "
              "it still stands in 3 days, the hub tells you again.")
+# What the manager reads when a joined server's automatic updates are off, word for word.
+OFF_WORDS = ("[hub] The server box needs care: its automatic security updates are off. Give it to the agent whose "
+             "duty covers this server; fix it yourself when no duty covers it; raise Needs-you only for a step that no "
+             "agent can take.")
 
 
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite(case(name) for case in (ServerWatch, HubOwnServer, HardeningRead)
+    return unittest.TestSuite(case(name) for case in (ServerWatch, HubOwnServer, HardeningRead, UpdatesRead)
                               for name in case.__dict__ if name.startswith("test_"))
 
 
@@ -165,6 +169,74 @@ class ServerWatch(Servers):
         self.sweep(self.t0 + 180)
         self.assertEqual(self.said()[-1], "[hub] The server box is in order again: its SSH takes keys only.")
         self.assertEqual(len(self.said()), 2)
+
+    def test_a_reading_that_cannot_read_the_automatic_updates_ends_no_fault_that_they_are_off(self):
+        """15 November 2026, the owner's "Yes, fix it": a server's service leaves unattended_upgrades out of its reading
+        when `systemctl is-enabled` gives no word (lifecycle.Lifecycle.security), as systemd does while it starts itself
+        again, and as a call that runs out of time does. Before, the hub stored it as null, and the watch said "its
+        automatic security updates are on" while they were off, then the fault again at the next reading."""
+        self.report(unattended_upgrades=False)
+        self.sweep()
+        kept = json.loads(hub.kv_get("server_watch"))["box"]
+        for t in (self.t0 + 60, self.t0 + 120):         # no word from its systemctl, in two readings
+            self.report(unattended_upgrades="absent")
+            self.sweep(t)
+            self.assertEqual(json.loads(hub.kv_get("server_watch") or "{}").get("box"), kept, "the fault holds")
+            self.assertEqual(len(self.said()), 1, "the gap makes no word")
+        self.report(unattended_upgrades=False)          # it answers again, and the fault still stands
+        self.sweep(self.t0 + 180)
+        self.assertEqual(self.said(), [OFF_WORDS])
+        self.report()                                   # "enabled": a real answer ends it
+        self.sweep(self.t0 + 240)
+        self.assertEqual(self.said()[1:], ["[hub] The server box is in order again: its automatic security updates "
+                                          "are on."])
+        self.assertIsNone(hub.kv_get("server_watch"), "a server in order keeps no record")
+
+    def test_a_reading_that_cannot_read_the_automatic_updates_ends_no_fault_that_no_update_ended_well(self):
+        """The same reading leaves "no security update has ended well for 3 days" as it was too: that fault rests on the
+        automatic updates being on. A new good update ends it."""
+        old = self.t0 - 4 * DAY
+        self.report(upgraded_at=old)
+        self.sweep()
+        kept = json.loads(hub.kv_get("server_watch"))["box"]
+        for t in (self.t0 + 60, self.t0 + 120):
+            self.report(unattended_upgrades="absent", upgraded_at=old)
+            self.sweep(t)
+            self.assertEqual(json.loads(hub.kv_get("server_watch") or "{}").get("box"), kept, "the fault holds")
+            self.assertEqual(len(self.said()), 1, "the gap makes no word")
+        self.report(upgraded_at=old)                    # it answers again, and still no update has ended well
+        self.sweep(self.t0 + 180)
+        self.assertEqual(len(self.said()), 1)
+        self.assertIn("box needs care: no security update has ended well on it for 3 days.", self.said()[0])
+        self.report(upgraded_at=self.t0 + 200)          # a security update ends well
+        self.sweep(self.t0 + 240)
+        self.assertEqual(self.said()[1:], ["[hub] The server box is in order again: its security updates run again."])
+        self.assertIsNone(hub.kv_get("server_watch"))
+
+    def test_a_reading_that_cannot_read_the_automatic_updates_makes_no_fault(self):
+        """On a server on which nothing was said, such a reading says nothing new, also with no good update for days."""
+        hub.q("UPDATE server_keys SET created=? WHERE server='box'", (self.t0 - 30 * DAY,))
+        for t in (self.t0, self.t0 + 60):
+            self.report(unattended_upgrades="absent", upgraded_at=self.t0 - 10 * DAY)
+            self.sweep(t)
+        self.assertEqual(self.said(), [])
+        self.assertIsNone(hub.kv_get("server_watch"))
+
+    def test_the_hub_keeps_a_reading_that_leaves_the_automatic_updates_out_as_it_came(self):
+        """The hub stores only what a service sent, as for ssh_keys_only: a left-out fact stays left out, and a null
+        stays null (a service from before sends null when it cannot read it). The apps read both as "Not reported"."""
+        self.report(unattended_upgrades="absent")
+        self.assertNotIn("unattended_upgrades", self.servers()[1]["box"]["reading"]["security"])
+        self.report(unattended_upgrades=None)
+        security = self.servers()[1]["box"]["reading"]["security"]
+        self.assertIn("unattended_upgrades", security)
+        self.assertIsNone(security["unattended_upgrades"])
+        self.report()
+        self.assertIs(self.servers()[1]["box"]["reading"]["security"]["unattended_upgrades"], True)
+        # The same check takes an agent's helper's report (GET /ui/machines).
+        self.assertNotIn("unattended_upgrades", hub.validate_status({"security": {}})["security"])
+        self.assertIsNone(hub.validate_status({"security": {"unattended_upgrades": None}})["security"]
+                          ["unattended_upgrades"])
 
     def test_npms_rule_that_is_gone_is_said(self):
         self.report(npm_rule=False)
@@ -522,6 +594,34 @@ class HubOwnServer(ServerWatch):
         self.own(self.t0 + 240, ssh_keys_only=True, npm_rule=True)
         self.assertEqual(self.said()[2:], ["[hub] The server hub is in order again: its SSH takes keys only."])
 
+    def test_a_service_record_made_again_ends_no_fault_that_only_a_reading_says(self):
+        """The session "One server for all: the hub's open parts" saw it on a real server, 15 November 2026: the
+        installer's step that makes the hub's server service again (`hubsetup.py hub-server`, after a lost key file)
+        writes that service's record again, so for an hour the watch has no reading of it, and it said "in order again"
+        for a fault that nothing had read. A restore that keeps that record does the same. What only a reading says
+        holds through that hour, and it is not said again after it."""
+        hub.q("INSERT INTO server_keys(server,sha256,created) VALUES('hub',?,?)", (sha(KEY), self.t0 - 2 * hub.JOIN_GRACE))
+        self.report("hub", source=HUB, firewall="inactive", unattended_upgrades=False)
+        self.own()
+        self.assertEqual(len(self.said()), 1)           # its firewall off and its updates off, in one message
+        kept = json.loads(hub.kv_get("server_watch"))["hub"]
+        made_again = self.t0 + 60
+        hub.q("UPDATE server_keys SET created=? WHERE server='hub'", (made_again,))
+        for t in (made_again + 60, made_again + hub.JOIN_GRACE - 60):
+            self.own(t)
+            self.assertEqual(json.loads(hub.kv_get("server_watch") or "{}").get("hub"), kept, "the faults hold")
+        self.assertEqual(len(self.said()), 1, "the hour says nothing")
+        later = made_again + hub.JOIN_GRACE + 60
+        self.report("hub", source=HUB, firewall="inactive", unattended_upgrades=False)
+        hub.q("UPDATE server_status SET reported=? WHERE server='hub'", (later,))
+        self.own(later)
+        self.assertEqual(len(self.said()), 1, "a reading after the hour says the same faults no second time")
+        self.report("hub", source=HUB)
+        hub.q("UPDATE server_status SET reported=? WHERE server='hub'", (later + 60,))
+        self.own(later + 60)
+        self.assertEqual(self.said()[1:], ["[hub] The server hub is in order again: its firewall is on; its automatic "
+                                          "security updates are on."])
+
     def test_the_hub_s_own_disk_is_watched_while_a_service_of_its_own_is_quiet(self):
         """The lane "Hub: the manager's name, agents on the hub's server" (UI-API.md 1.168, open point 4): a hub's server
         with a service of its own is watched as a joined server, and while that service sends no reading the watch read
@@ -608,6 +708,42 @@ class HardeningRead(unittest.TestCase):
         with patch.object(lifecycle, "hardening", lambda run: {"ssh_keys_only": "by hardening", "npm_rule": "too"}):
             reading = life.security()
         self.assertEqual((reading["ssh_keys_only"], reading["npm_rule"]), ("by hardening", "too"))
+
+
+
+class UpdatesRead(unittest.TestCase):
+    """The automatic updates in a server's own reading (lifecycle.Lifecycle.security): systemctl's word for the unit,
+    and no fact at all where it gives none."""
+
+    @staticmethod
+    def reading(answer, platform="linux"):
+        """One reading whose `systemctl is-enabled unattended-upgrades` answers `answer`: (status, standard output), or
+        a call that gives the run's own answer. Every other command of the reading says nothing here."""
+        def run(argv, timeout=20, cwd=None):
+            if argv[:2] == ["systemctl", "is-enabled"]:
+                return answer() if callable(answer) else (answer[0], answer[1], "")
+            return 1, "", ""
+        life = lifecycle.Lifecycle("/kit", "box", {"role": "worker", "runtime": "claude"}, None, None, run=run,
+                                   platform_name=platform)
+        return life.security()
+
+    def test_systemctl_s_word_is_the_fact(self):
+        self.assertIs(self.reading((0, "enabled\n"))["unattended_upgrades"], True)
+        for word in ("disabled", "masked", "static"):
+            self.assertIs(self.reading((1, word + "\n"))["unattended_upgrades"], False, word)
+
+    def test_no_word_from_systemctl_leaves_the_fact_out(self):
+        """A bus that does not answer while systemd starts itself again (status 1, nothing on standard output), and a
+        call that runs out of time, which the real _run gives in the same way: such a reading cannot say."""
+        self.assertNotIn("unattended_upgrades", self.reading((1, "")))
+        self.assertNotIn("unattended_upgrades", self.reading((1, " \n")))
+        late = lambda: lifecycle._run(["sleep", "5"], timeout=0.2)     # the real _run, with a call that runs out of time
+        self.assertEqual(late()[:2], (1, ""))
+        self.assertNotIn("unattended_upgrades", self.reading(late))
+
+    def test_a_mac_keeps_the_fact_as_null(self):
+        """A Mac has no unattended-upgrades and reads no systemctl: its reading keeps the null of before."""
+        self.assertIsNone(self.reading((1, ""), platform="darwin")["unattended_upgrades"])
 
 
 if __name__ == "__main__":
