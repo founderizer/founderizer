@@ -516,7 +516,11 @@ page, with the store's own state and the windows of that moment (`SetupChannel.s
   **So of any two clicks of the owner at least one reaches the app**, whole and on the page that
   it was aimed at, whatever keys come between and whenever the caller shows: a pure test plays
   that caller at seven moments of a click, with keys in four positions
-  (`aCallerThatShowsAgainAtOnceCostsOneClickInTwo`). `front`, which changes no page, stays
+  (`aCallerThatShowsAgainAtOnceCostsOneClickInTwo`). The one exception is a short moment, usually
+  a few milliseconds and longer while the app's main thread is busy: a show that lands between the
+  release of a button and the delivery of its mouse-up finds no button down, and that click then
+  does nothing too. A caller that reads the button's state can aim at that moment, and such a show
+  costs the owner two clicks in a row. `front`, which changes no page, stays
   allowed. A click whose mouse-up a control of AppKit takes in its own tracking loop (a text
   field, a switch, a slider) is not seen by the app's watch to its end, so it frees no change of
   page: the next click that the watch sees to its end does.
@@ -539,11 +543,13 @@ page, with the store's own state and the windows of that moment (`SetupChannel.s
   for the page that went (a message in a chat's box), and on the page that came it would do
   another thing (on Needs you a number and Return, or one click, answer a request; on Can use one
   click on "−" takes access away). So the app takes no key press, and it drops the owner's first
-  click in it (its mouse-down, its drags and its mouse-up): that click only ends the hold. **That
-  click is one click**: a click of the app that is under way when the page changes is the one
-  (the rest of it is dropped, and the next click reaches the app), and a double or a triple click
-  is one click (a mouse-down with a click count above 1 that follows a dropped mouse-down is
-  dropped too). The
+  click in it (its mouse-down, its drags and its mouse-up): that click only ends the hold. **No
+  page changes while the owner holds a mouse button down**: the app reads the button right before
+  the change, and the tool refuses with fixed words ("The owner holds a mouse button down now ...
+  Call setup_show again."), so a change never cuts a click in two. It is no value of `show`,
+  because nothing observes a button. **A double or a triple click is one click** (a mouse-down
+  with a click count above 1 that follows a dropped mouse-down is dropped too, and so a fast
+  second click close to the first). The
   hold comes before the page changes. It also ends when the app leaves the front: the owner who
   comes back sees the page that came. A show of the place that shows already changes no page, and
   holds nothing new for an owner who was at work in the app. Each other watch of the app's keys
