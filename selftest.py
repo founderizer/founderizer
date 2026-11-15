@@ -159,6 +159,8 @@ MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "an
                                "door_rollout", "door_hold",
                                # DevOps plan X3: a GitOps repository through the door
                                "door_gitops",
+                               # the changed key swap, Part C (the owner's C30): a table-made site off and on
+                               "switch_key_site",
                                "tell_owner",
                                "message_owner", "grant_access",
                                "set_duty", "change_duty", "see_history", "decide_report",

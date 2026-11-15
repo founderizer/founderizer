@@ -152,7 +152,16 @@ AGENT_NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 CALLER_KEY = re.compile(r"[A-Za-z0-9_-]{43}")          # an agent key (owner API 1.12): 256 bits, base64url
 # The central vault's own operations, beside status: a central vault serves only these, and a machine's broker none.
 CENTRAL_OPERATIONS = ("intake", "pin", "unpin", "recovery", "grant", "ungrant", "pool", "unpool", "seal", "inventory",
-                      "export", "remove")
+                      "export", "remove", "key_addresses")
+# The addresses that select each row of the hub's table of well-known services (lifecycle.KEY_TABLE: the API hosts,
+# and the pages as (host, path)), for the central vault's key_addresses. A copy, because the central vault runs this
+# file alone and takes no host from the hub: test_key_table holds it equal to the hub's table.
+KEY_TABLE_PLACES = {
+    "openai": {"hosts": ("api.openai.com",),
+               "pages": (("platform.openai.com", "/api-keys"), ("platform.openai.com", "/settings/organization/api-keys"))},
+    "replicate": {"hosts": ("api.replicate.com",), "pages": (("replicate.com", "/account/api-tokens"),)},
+    "cloudflare": {"hosts": ("api.cloudflare.com",), "pages": ()},
+}
 OPERATIONS = ("status", "signin", "handover", "probe", "create", "request", "cancel", "read", "deposit",
               "withdraw") + CENTRAL_OPERATIONS
 ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,59}")         # read: the variable name of an API key, as the hub checks it
@@ -1988,6 +1997,7 @@ def central_status(conf):
             "pins": pins(state), "recovery": state["recovery"]["recipient"] if state["recovery"] else None,
             "grants": granted(state), "pool": pooled(state), "items": len(store.opened()),
             "removes": True, "replaces": True,      # this program serves remove, and replace in intake (the hub asks)
+            "key_addresses": True,                  # and key_addresses: the hub asks it only when this says so
             # the checksum of the copy of the newest replace of each login: no secret. A hub that stopped between
             # this vault's write and its own record of a replace reads here that a value changed.
             "values": {ref: x["sha256"] for ref, x in sorted(state["values"].items())},
@@ -2224,6 +2234,54 @@ def remove(conf, req):
     return {"ok": True, "login": ref, "removed": removed}
 
 
+KEY_TABLE_HOST = re.compile(r"(?=.{1,240}$)(?![0-9.]+$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+                            r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*")      # lifecycle.KEY_SITE_HOST
+
+
+def key_table_row(address):
+    """The name of the one row of KEY_TABLE_PLACES that this address selects, or None, by the rule of
+    lifecycle.key_table_row (test_key_table gives both the same addresses): an https address of at most 300
+    characters with no space and no user part, a plain ASCII host in any case with or without one dot at its end, no
+    port or 443; an API host with any path; a page by its exact host and its exact path, with or without one slash at
+    its end."""
+    if not isinstance(address, str) or len(address) > 300 or any(c.isspace() for c in address):
+        return None
+    try:
+        parts = urllib.parse.urlsplit(address)
+        host, port = parts.hostname or "", parts.port
+    except ValueError:
+        return None
+    if parts.scheme != "https" or parts.username is not None or parts.password is not None or port not in (None, 443):
+        return None
+    host = host[:-1] if host.endswith(".") else host
+    if not KEY_TABLE_HOST.fullmatch(host):
+        return None
+    path = parts.path[:-1] if parts.path.endswith("/") and parts.path != "/" else parts.path
+    found = {name for name, row in KEY_TABLE_PLACES.items()
+             if host in row["hosts"] or any(host == page_host and path == page_path for page_host, page_path in row["pages"])}
+    return found.pop() if len(found) == 1 else None
+
+
+def key_addresses(conf):
+    """key_addresses (the changed key swap, Part C): for each stored item (not a login, login_shaped) whose value has an
+    address (its `url`) that selects one row of this vault's own copy of the table (key_table_row), that row's name.
+    No value, no address, no path and no host goes out, and no host comes in: so a hub that is broken into learns
+    from it only which stored keys have an address of a row, and which row."""
+    rows = {}
+    for sid, item in sorted(LocalStore(conf).opened().items()):
+        try:
+            url = json.loads(item.get("value") or "").get("url")
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if login_shaped(item.get("value")):
+            continue                    # a login never swaps (C11): its address is not the table's to know
+        row = key_table_row(url)
+        if row:
+            rows["bws://" + sid] = row
+    log(f"key_addresses: {len(rows)} stored item(s) with an address of a row")
+    return {"ok": True, "rows": rows}
+
+
 def central(conf, req):
     """One request to the central vault (handle): its own operations and status, and nothing of a machine's broker."""
     op = req.get("op")
@@ -2237,6 +2295,8 @@ def central(conf, req):
         return seal(conf, req)
     if op == "inventory":
         return {"ok": True, "logins": sorted("bws://" + sid for sid in LocalStore(conf).opened())}
+    if op == "key_addresses":
+        return key_addresses(conf)
     if op == "export":
         return export(conf)
     if op == "remove":

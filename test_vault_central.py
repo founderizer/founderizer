@@ -436,7 +436,8 @@ class CentralVault(unittest.TestCase):
         self.assertEqual(self.ask("status"), {"ok": True, "v": 2, "central": True, "recipient": CENTRAL_KEY,
                                               "store_recipient": STORE_KEY, "fleet": FLEET, "owner_keys": 3,
                                               "pins": {}, "recovery": None, "grants": [], "pool": [], "items": 1,
-                                              "removes": True, "replaces": True, "values": {}, "source": None})
+                                              "removes": True, "replaces": True, "key_addresses": True, "values": {},
+                                              "source": None})
         self.signed("pin", PIN_1, SIG_PIN_1)
         self.signed("recovery", RECOVERY_1, SIG_RECOVERY_1)
         status = self.ask("status")

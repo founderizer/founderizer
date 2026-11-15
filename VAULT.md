@@ -344,13 +344,43 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
   older program does not switch the key swap off.
 - **Which key swaps.** The hub names the site of a key when all of these hold: the agent's grant is "Reads it"; the
   key's catalog entry has a site, an `https` address with a host name, which the owner sets with the tool
-  `save_login` of the owner's MCP server (`owner_mcp.py`); the agent's program is Claude Code or Codex; the key is
-  not the key of a model account; no MCP server names the key; the site is not a host of the provider of the
-  agent's own program (`lifecycle.py`, `hub.py`). Each part comes from the owner's settings in `team.json` and
-  from a fixed table of each program's hosts (`lifecycle.py`). The site is also the address that a check of the
+  `save_login` of the owner's MCP server (`owner_mcp.py`) or which the table of well-known services gives it (the
+  next item); the agent's program is Claude Code or Codex; the key is not the key of a model account; no MCP server
+  names the key; the site is not a host of the provider of the agent's own program (`lifecycle.py`, `hub.py`). Each
+  part comes from `team.json`, where the owner writes it, and where the hub's step at a key's birth and the fleet
+  manager's switch write only a site that the table made, and from a fixed table of each program's hosts
+  (`lifecycle.py`). The site is also the address that a check of the
   key must keep to, so a key that has a site already swaps when root switches its server on (`hub.py`). The hub
   does not decide by a report from an agent's machine. Each broker decides by its own configuration whether its
   server swaps keys (`hub.py`, `vault.py`).
+- **A site from the table of well-known services.** A key of a well-known service gets its site with no person who
+  types it (the owner's choices of 14 November 2026). The signed code has a table: for each service its API host,
+  the form in which the service's own SDK and CLI send the key, and the addresses that select it. Today the table
+  has OpenAI, Replicate and Cloudflare, each read in the service's own reference and SDK source (`lifecycle.py`
+  `KEY_TABLE`, with its sources). When the owner adds a key whose address selects a row (Add secret's "Service
+  address", the site of an agent's request on its card, an import row), the hub writes the row's site and form into
+  the key's catalog entry, with a mark that the table made them. The hub takes that address from a version of the
+  app that sends it; an app from before sends none, and its keys get no site from the table. It does this only at the key's birth, and only when
+  nothing holds the key: no grant of an agent at any level, no profile, no account, and no MCP server or saved check
+  that names its variable (`hub.py`). The hub keeps nothing of the address but the row. An API host selects its row
+  with any path; a web page selects it only by its exact host and the exact path of the key page (one slash at the
+  end, a query and a fragment change nothing; another case of the path, a port other than 443, a user part, a
+  subdomain or a longer name select nothing). Cloudflare's tokens page selects nothing, because the same page shows
+  the Global API Key, which goes in another header (`lifecycle.py` `key_table_row`). For the keys that are stored
+  already, the central vault answers one question of the hub: which stored keys (not logins) have an address that
+  selects a row of its own copy of the table, and which row; the hub then reads its own catalog for them. It gives no value, no address and no host, and it takes no host
+  from the hub (`vault.py` `key_addresses`). The first release only counts with it: one line of the hub's log with
+  numbers, and nothing written (`hub.py` `key_table_count`).
+- **A table-made site is a default, not a lock.** The fleet manager switches such a site off, with no approval and
+  a one-line why that goes into the commit of `team.json` and the hub's log, and on again (`switch_key_site`). Off,
+  the key is a value in the sessions of the agents that read it, from their next start. From the moment of the
+  switch, a session that runs with a placeholder of the key gets no key any more, for each agent that reads it,
+  until its next start: the hub's answer to its use is no (`hub.py` `helper_vault_swap`), and the proxy refuses the
+  request. That holds also for an agent whose program worked with the placeholder. An agent that persuades the
+  fleet manager gets the key as a value. A site that the owner sets with `save_login` ends the mark: that site is
+  the owner's lock, which no table and no tool of an agent changes. A later release can change a row or take it out:
+  an entry that the table made keeps its own site and form, and only the manager's "on" reads the row again, which a
+  row that is gone refuses (`hub.py`).
 - **What the hub says about a server.** The owner can tell the hub that the vault of a server swaps keys, with the
   tool `server_key_swap` of the owner's MCP server, after root's step on that server (`owner_mcp.py`). The hub does
   not check the server, and it reads no report of a machine for this. It uses the owner's word only for what it
@@ -452,6 +482,23 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
      the server can make the hub slow or silent for its vault, for example with requests that keep the hub busy or
      when it takes each free local port, but no yes counts for longer: a use does not renew it, and each answer of
      the hub that is not a yes ends it (`vault.py`).
+   - A placeholder works only in a request through the proxy. An agent that writes the key's variable into an
+     application's configuration, on a server or in a file, writes the placeholder there, and the application fails
+     later, with no sign at that moment. The fleet manager switches the table's site off first for such work, or the
+     door does it (`rules/manager.md`).
+   - A hub of a release before the table refuses a `team.json` with a mark, whose field `table` it does not know. So
+     the app's part, which sends the address that makes the first marks, comes only after the hub's part is live and
+     proved, and a fleet with marks does not go back to a hub from before it.
+   - Replicate's API also takes the word `Token`, which its older clients and documents use, and an agent can write
+     it from memory. The row's form is `bearer`, and the proxy takes a placeholder only in the entry's own form, so a
+     request with `Token` and the placeholder gets the proxy's refusal (403).
+   - A site from the table is only as right as the address that the owner gave. A request that names a host of the
+     table for a key of another service gives a placeholder that does not work; the fleet manager switches it off.
+     A site from the table also does not serve: a websocket (the proxy passes no `Upgrade`, so OpenAI's realtime API
+     gets no key), another host of the same service (a project with OpenAI's data residency sends its key to its
+     region's host, for example `eu.api.openai.com`; an account in Cloudflare's FedRAMP uses
+     `api.fed.cloudflare.com`), and an agent whose program's own provider has that host (an OpenAI key stays a value
+     for an agent of Codex) (`lifecycle.py`).
    - A site that sends the key back gives it to the session: an answer that repeats the `Authorization` header.
      The proxy does not look for the key in an answer (`vault.py`).
    - The key goes only in the `Authorization` header, as `Bearer`, `token` or `Basic`. A program that needs the

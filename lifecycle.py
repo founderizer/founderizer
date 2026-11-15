@@ -1929,9 +1929,75 @@ def key_site(value):
     return f"https://{host}" + (f":{port}" if port not in (None, 443) else "")
 
 
+# The table of well-known services (the changed key swap, Part C; the owner's choices C29 and C30 of 14 November 2026):
+# a key of such a service gets its site with no person who types it. A row has the site (the service's API host),
+# the form in which the service's own SDK and CLI send the key, and the addresses that select the row: an API host by
+# its exact name, with any path, and a web page only by its exact host and the exact path of the key page (a dashboard
+# host holds other kinds of secret too, which must not get the row's site). A service is in the table only when its
+# own SDK and CLI send the key in the Authorization header in the row's form, one API host takes the key, and that
+# host sends no request's headers back. Each row names the sources that it was read from, and what was not checked.
+# The central vault keeps a copy of the selecting addresses (vault.py KEY_TABLE_PLACES), and test_key_table holds the
+# two equal. A row may change
+# or go in a later release: an entry that the table made keeps its own site and form (validate_team does not compare
+# them with the table), and only switch_key_site's "on" reads the row again.
+KEY_TABLE = {
+    # developers.openai.com/api/reference/overview (Bearer, the key pages) and openai-python
+    # src/openai/lib/_client_auth.py ({"Authorization": f"Bearer {api_key}"}, base https://api.openai.com/v1), whose
+    # package is also OpenAI's CLI; read 15 November 2026. Limits (VAULT.md): the realtime API is a websocket, and a
+    # project with data residency uses its region's host (eu.api.openai.com and others). Not checked: an endpoint
+    # that sends a request's headers back.
+    "openai": {"site": "https://api.openai.com", "form": "bearer", "hosts": ("api.openai.com",),
+               "pages": (("platform.openai.com", "/api-keys"), ("platform.openai.com", "/settings/organization/api-keys"))},
+    # replicate.com/docs/reference/http (Bearer, the token page) and the clients replicate-python replicate/client.py,
+    # replicate-javascript index.js and replicate-go client.go, which its CLI uses (each "Bearer", base
+    # https://api.replicate.com/v1); read 15 November 2026. Limit (VAULT.md): the API also takes the word "Token",
+    # which older clients and documents use, and the proxy takes a placeholder only in the row's form, so a request
+    # that sends "Token" gets the proxy's refusal (403). Not checked: an endpoint that sends a request's headers back.
+    "replicate": {"site": "https://api.replicate.com", "form": "bearer", "hosts": ("api.replicate.com",),
+                  "pages": (("replicate.com", "/account/api-tokens"),)},
+    # developers.cloudflare.com/fundamentals/api/get-started/create-token/ (Bearer, base api.cloudflare.com/client/v4),
+    # cloudflare-typescript src/client.ts and Wrangler's workers-utils src/cfetch/index.ts addAuthorizationHeader (an
+    # API token as "Bearer"); read 15 November 2026. No page selects it: the tokens page also shows the Global API Key,
+    # which goes in X-Auth-Key. Limit (VAULT.md): an account in FedRAMP uses api.fed.cloudflare.com. Not checked: an
+    # endpoint that sends a request's headers back.
+    "cloudflare": {"site": "https://api.cloudflare.com", "form": "bearer", "hosts": ("api.cloudflare.com",),
+                   "pages": ()},
+}
+
+
+def key_table_row(address, table=None):
+    """The name of the one row of the table that this address selects, or None. The address is the one that the owner
+    gave with a key (Add secret, a request's card, an import row). The exact rule, which vault.py key_table_row keeps
+    too: an https address of at most 300 characters with no space and no user part; its host is a plain ASCII DNS name
+    (KEY_SITE_HOST), in any case, with or without one dot at its end; its port is none or 443. Then an API host of a
+    row selects it with any path, query and fragment, and a page selects it only when its host is the page's and its
+    path is the page's path exactly, in its own case, with or without one slash at its end (a query and a fragment do
+    not change the page). A longer name that starts with a row's host, a subdomain and another port select nothing,
+    and so does an address that two rows would take."""
+    table = KEY_TABLE if table is None else table
+    if not isinstance(address, str) or len(address) > 300 or any(c.isspace() for c in address):
+        return None
+    try:
+        parts = urllib.parse.urlsplit(address)
+        host, port = parts.hostname or "", parts.port
+    except ValueError:
+        return None
+    if parts.scheme != "https" or parts.username is not None or parts.password is not None or port not in (None, 443):
+        return None
+    host = host[:-1] if host.endswith(".") else host
+    if not KEY_SITE_HOST.fullmatch(host):
+        return None
+    path = parts.path[:-1] if parts.path.endswith("/") and parts.path != "/" else parts.path
+    found = {name for name, row in table.items()
+             if host in row["hosts"] or any(host == page_host and path == page_path for page_host, page_path in row["pages"])}
+    return found.pop() if len(found) == 1 else None
+
+
 def key_swap(team, agent, ref):
     """(the site, the form) of the API key `ref` when a session of `agent` can hold a placeholder for it and not the
-    key, or None. All of these hold, and each one is the owner's own setting in team.json, so no agent changes one:
+    key, or None. All of these hold, each one from team.json: the owner's own setting, except a site that the table of
+    well-known services made (the entry's "table" mark), which the fleet manager switches off and on with
+    switch_key_site, and an agent that persuades the fleet manager gets the key as a value:
     the agent reads the key (its grant is "read"); the key's catalog entry has a site (key_site); the agent's program
     has its own hosts in the table (RUNTIMES "own_hosts": it is proved with the proxy's variables); the key is not
     the key of a model account, which the program itself sends; no MCP server names the key, whose own program

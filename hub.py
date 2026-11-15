@@ -1342,6 +1342,111 @@ def swap_token(agent, ref):
                     f"key swap\n{kv_get('db_id')}\n{agent}\n{ref.lower()}".encode(), hashlib.sha256).hexdigest()
 
 
+# The table of well-known services (the changed key swap, Part C; the owner's choices C29, C30 and C34): a key of such
+# a service gets its site at its birth, from the address that the owner gave with it (Add secret, a request's card, an
+# import row), when nothing holds it. The mark "table" ({row, on}) says that the table made the site. A site that the
+# owner sets (save_login) ends the mark: that site is the owner's lock. The fleet manager switches a table-made site
+# off and on again (switch_key_site). The site is a default, not a lock: a manager that an agent persuades gives the
+# key as a value.
+
+def key_table_mark_ok(entry):
+    """True for the shape of the mark of a table-made site: {"row": a row's name, "on": true or false}, on an API key.
+    On: the entry has a site that can swap (key_site) and a form. Off: it has neither. The row is not compared with
+    the table: a later release can change a row or take one out, and a team.json that it marked loads all the same;
+    only switch_key_site's "on" reads the row again."""
+    mark = entry.get("table")
+    if entry.get("kind") != "api_key" or not isinstance(mark, dict) or set(mark) != {"row", "on"} \
+            or not (isinstance(mark["row"], str) and re.fullmatch(r"[a-z][a-z0-9-]{0,39}", mark["row"])) \
+            or not isinstance(mark["on"], bool):
+        return False
+    if mark["on"]:
+        return bool(lifecycle.key_site(entry.get("site"))) and entry.get("form") in lifecycle.KEY_FORMS
+    return "site" not in entry and "form" not in entry
+
+
+def key_hold_index(team):
+    """What holds the catalog's keys, read once for a write of many entries: (the references that a grant of an agent
+    at any level, a profile or an account names, the variables that an MCP server or a saved check names). A "use"
+    grant counts, because a site limits where the vault sends the key (vault.py swap_call). A saved check is a wake-up
+    rule or a duty's watch, whose arguments name a variable (as checks/url_lines.py's args.key does)."""
+    refs, envs = set(), set()
+    for name, a in (team.get("agents") or {}).items():
+        refs |= set((a.get("secrets") or {}) if isinstance(a, dict) else {}) | profile_logins(name)
+    refs |= {x.get("secret") for x in (team.get("accounts") or {}).values() if isinstance(x, dict)}
+    for server in (team.get("mcp") or {}).values():
+        if isinstance(server, dict):
+            envs |= {server.get("key")} | set((server.get("env") or {}).values())
+    for r in q("SELECT check_spec FROM triggers WHERE check_spec IS NOT NULL"):
+        envs |= set(re.findall(r'"([A-Z][A-Z0-9_]{0,59})"', r["check_spec"] or ""))
+    return refs, envs
+
+
+def key_table_site(team, ref, env, row, index):
+    """The fields that the table gives the API key `ref`, whose variable is `env`, at its birth: {site, form, table},
+    or {} when a condition does not hold: the row is in the table now, the key's entry in `team` (if any) has no site
+    and no mark, and nothing holds the key or names its variable (key_hold_index). The row comes from the address that
+    the owner gave (lifecycle.key_table_row)."""
+    entry = (team.get("logins") or {}).get(ref) or {}
+    found = lifecycle.KEY_TABLE.get(row) if isinstance(row, str) else None
+    refs, envs = index
+    if not found or entry.get("site") or entry.get("table") or ref in refs or env in envs:
+        return {}
+    return {"site": found["site"], "form": found["form"], "table": {"row": row, "on": True}}
+
+
+def key_kept_fields(before, entry):
+    """The fields that an entry which is saved again keeps of the one before it (save_secret, save_secrets): its site,
+    and an API key's form and mark. A site that the table made goes with its mark: an entry that is saved again as
+    another kind keeps neither, so no table-made site stays without its mark, which would make it the owner's lock
+    that the owner never set."""
+    api_key = entry.get("kind") == "api_key"
+    if before.get("table") and not api_key:
+        return ()
+    return ("site",) + (("form", "table") if api_key else ())
+
+
+def switch_key_site(by, key, to, why):
+    """The fleet manager's switch of a table-made site (switch_key_site): "off" takes the site and the form out of an
+    entry with the mark, and the mark says off; "on" writes the site and the form of the mark's row as the table has
+    them now. The manager names no site and no row. An entry with no mark is refused: its site is the owner's, or it
+    has none. One commit of team.json, whose message and the hub's log line name the manager, the key, the direction
+    and the manager's own why. Gives (the entry's variable, whether it changed, the commit or None)."""
+    rev = kit_revision(fresh=True)
+    team, current, _ = team_view(rev)
+    catalog = dict(team.get("logins") or {})
+    refs = [key.lower()] if BWS_REF.fullmatch(key.lower()) else key_named(team, key)
+    if len(refs) != 1 or (catalog.get(refs[0]) or {}).get("kind") != "api_key":
+        raise Refusal(404, f"The list has no API key {key}.")
+    ref = refs[0]
+    entry = catalog[ref]
+    mark = entry.get("table")
+    if not isinstance(mark, dict):
+        raise Refusal(409, f"{entry['env']} has no site from the table of well-known services: its site is the "
+                           f"owner's own, or it has none, and only the owner changes it.")
+    if mark["on"] == (to == "on"):
+        return entry["env"], False, None
+    if to == "off":
+        new = {k: v for k, v in entry.items() if k not in ("site", "form")}
+        new["table"] = {"row": mark["row"], "on": False}
+    else:
+        found = lifecycle.KEY_TABLE.get(mark["row"])
+        if not found:
+            raise Refusal(409, f"The table of well-known services has no row {mark['row']} any more, so "
+                               f"{entry['env']} gets no site from it.")
+        new = dict(entry, site=found["site"], form=found["form"], table={"row": mark["row"], "on": True})
+    team["logins"] = dict(catalog, **{ref: new})
+    try:
+        validate_team(team)
+    except ValueError as e:
+        raise Refusal(400, str(e)) from None
+    data = (json.dumps(team, indent=2) + "\n").encode()
+    commit = commit_kit_file("team.json", data, f"{by.capitalize()} switched the table's site of {entry['env']} {to}: "
+                                                f"{why}")
+    apply_team(team)
+    log(by, f"switched the table's site of {entry['env']} ({ref}) {to} in {commit[:12]}: {why}")
+    return entry["env"], True, commit
+
+
 def key_words(agent, short=False):
     """What a start text says of this agent's keys that can swap, after their names, or "": which host each one is
     for, and what a placeholder is. On a server that swaps keys by the owner's word (key_swaps), the words say that
@@ -1464,6 +1569,9 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # GET /ui/secrets/same (UI-API.md 1.129)
                "secrets_import",    # the owner, 13 November 2026, of a 9-minute import: "it needs to be much
                                     # faster!!": POST /ui/secrets/import, all of an import's entries in one commit
+               "key_table",         # the owner's "Yes to all four" of 14 November 2026 (C29, C30): POST
+                                    # /ui/secrets/add and each entry of /ui/secrets/import take `address`, and a key
+                                    # of a well-known service gets its site from the table at its birth
                "default_models",    # the owner, 9 November 2026: "a default for each [AI provider] somewhere under
                                     # settings, and then each agent can be changed individually"
                "web_hosts",         # the host list of an agent whose Shell box is off (UI-API.md, "the host list")
@@ -10544,6 +10652,44 @@ def t_door_rollout(agent, a):
     return text
 
 
+def t_switch_key_site(agent, a):
+    """switch_key_site (the manager; the changed key swap, Part C, the owner's choice C30 of 14 November 2026): the
+    table's site of one API key off, so that the sessions of the agents that read it hold the key itself at their next
+    start, or on again. With no approval, and with the manager's own why in the commit of team.json and in the hub's
+    log (switch_key_site)."""
+    key = str(a.get("key") or "").strip()
+    to = str(a.get("to") or "").strip().lower()
+    why = str(a.get("why") or "").strip()
+    if not key or len(key) > 60:
+        raise ToolError("key is the variable name of an API key of the list, or its bws://<uuid> reference.")
+    if to not in ("off", "on"):
+        raise ToolError("to is off (the key's sessions hold the key itself) or on (the table's site again).")
+    if not why or len(why) > GRANT_WHY_MAX or "\n" in why:
+        raise ToolError(f"why is one line of 1 to {GRANT_WHY_MAX} characters: why the key is a value now, or a "
+                        f"placeholder again. The owner reads it in the record.")
+    guard(agent, why)
+    command, stored = agent_write(agent, "switch_key_site", a, {"key": key, "to": to, "why": why})
+    if stored:
+        return stored["text"]
+    try:
+        env, changed, commit = switch_key_site(agent, key, to, why)
+    except Refusal as e:
+        raise ToolError(str(e)) from None
+    if not changed:
+        text = f"The table's site of {env} was {to} already. Nothing changed."
+    elif to == "off":
+        text = (f"The table's site of {env} is off (revision {commit[:12]}). From now on the vault puts the key into no "
+                f"request: each session that runs with a placeholder of {env} gets no key until its next start, for "
+                f"each agent that reads it, and the next session holds the key itself. So the work that runs of each "
+                f"agent that reads {env} needs a new session. switch_key_site with to=on switches it back.")
+    else:
+        text = (f"The table's site of {env} is on again (revision {commit[:12]}). On a server that swaps keys, the next "
+                f"session of an agent that reads it holds a placeholder for that site.")
+    with transaction():
+        keep_command(command, {"text": text}, now())
+    return text
+
+
 def t_door_hold(agent, a):
     """door_hold (the manager, new-projects plan N8 (b)): team.json door.holds[host]. parts: the app puts no door parts
     on the server, and nobody gets it through the door. rule-only: it gets its parts and its Operator, and the door's
@@ -11944,6 +12090,65 @@ def central_timer():
             central_sweep()
         except Exception:
             print_fault()
+        try:
+            key_table_count()
+        except Exception:
+            print_fault()
+
+
+KEY_TABLE_PASS = "key_table_pass"       # kv: the one pass of the table over the catalog of today (Part C, point 7)
+
+
+def key_table_count():
+    """The step that only counts (the changed key swap, Part C, point 7; release 1): once, when the hub's last read of
+    the central vault is good and its status says key_addresses (a program that serves it), how many API keys of
+    today's list the table would give a site, for each row, and how many each condition leaves out. One line of the
+    hub's log with numbers only, no key's name and no address, and a record in kv, so a restart does not count
+    again. It writes no site: the pass that writes, one time, is a release of its own after
+    the manager's reading of this line."""
+    with LOCK:
+        if kv_get(KEY_TABLE_PASS):
+            return
+    # Only a central vault that the hub's own status read took as this fleet's (central_ok), and whose program says
+    # that it serves the operation: an older one refuses it, and a refusal at each tick would fill its log.
+    with CENTRAL_LOCK:
+        status = CENTRAL["status"]
+    if not central_ok() or (status or {}).get("key_addresses") is not True:
+        return
+    try:
+        rows = central_call("key_addresses").get("rows")
+    except Refusal:
+        return                          # no central vault, or one that does not know the operation yet: a later tick
+    if not isinstance(rows, dict):
+        return
+    with LOCK:
+        if kv_get(KEY_TABLE_PASS):
+            return
+        team = team_read()
+        refs, envs = key_hold_index(team)
+        catalog = team.get("logins") or {}
+        would = {name: 0 for name in lifecycle.KEY_TABLE}
+        left = {"with a site": 0, "with a mark": 0, "held": 0, "of a row that is gone": 0}
+        for ref, row in rows.items():
+            if not isinstance(row, str):
+                continue                # an answer of another shape: not a row, and never a fault of this count
+            entry = catalog.get(ref)
+            if not isinstance(entry, dict) or entry.get("kind") != "api_key":
+                continue                # a stored value with no API key in the list: not a key of the list
+            reason = "with a site" if entry.get("site") else "with a mark" if entry.get("table") else \
+                "held" if ref in refs or entry.get("env") in envs else \
+                "of a row that is gone" if row not in lifecycle.KEY_TABLE else None
+            if reason:
+                left[reason] += 1
+            else:
+                would[row] += 1
+        keys = sum(1 for e in catalog.values() if isinstance(e, dict) and e.get("kind") == "api_key")
+        none = keys - sum(would.values()) - sum(left.values())
+        log("hub", f"the table of well-known services counted the list of {keys} API keys and wrote nothing: it would "
+                   f"give {sum(would.values())} a site (" + ", ".join(f"{n} {c}" for n, c in would.items()) +
+                   f"); left out: {none} with no address of a row, " + ", ".join(f"{c} {k}" for k, c in left.items()))
+        kv_set(KEY_TABLE_PASS, json.dumps({"step": "counted", "at": now(), "keys": keys, "would": would,
+                                           "left": dict(left, **{"with no address of a row": none})}))
 
 
 def vault_view(t0=None):
@@ -26001,6 +26206,7 @@ def settings_words(agent, keys, boxes):
     several, catalog = len(keys) > 1, logins()
     held = [(ref, env) for ref, env in read_secrets(agent) if env in keys]
     calls = sorted({env for ref, env in held if login_site((catalog.get(ref) or {}).get("site"))})
+    off = sorted({env for ref, env in held if ((catalog.get(ref) or {}).get("table") or {}).get("on") is False})
     server = (team_read().get("servers") or {}).get(a.get("machine"))
     linux = isinstance(server, dict) and server.get("kind") == "linux"        # as the owner's command asks it
     swaps = sorted({env for ref, env in held if key_swap(agent, ref)}) if linux else []
@@ -26066,9 +26272,16 @@ def settings_words(agent, keys, boxes):
         options.append("Leave it as it is. Cost: the risk stays. When the owner chooses this, decide this report as "
                        "noted.")
         ask = "this one option" if len(options) == 1 else f"these {('two', 'three', 'four')[len(options) - 2]} options"
+        # the changed key swap, Part C: a key whose table-made site the fleet manager switched off is a value on
+        # purpose, and no option above offers the key swap for it
+        switched = "" if not off else \
+            (f" The fleet manager switched the table's site of "
+             f"{named_few(off, SETTINGS_FIT_NAMED) if names else f'{len(off)} of these keys'} off, so its sessions "
+             f"hold {'those keys' if len(off) > 1 else 'that key'} on purpose: switch_key_site with to=on gives "
+             f"{'them' if len(off) > 1 else 'it'} the site again.")
         return (f"{who} reads {len(keys)} API key{'s' if several else ''} in its sessions "
                 f"({named_few(keys, shown)}), and it has a shell and the web ({tools}).{rest} A text "
-                f"from outside, a web page for example, can then make it send a key to another place.{fits} The "
+                f"from outside, a web page for example, can then make it send a key to another place.{fits}{switched} The "
                 f"choice is the owner's: put {ask} on your weekly list. "
                 + " ".join(f"({n}) {text}" for n, text in enumerate(options, 1))
                 + " The hub makes no second finding while these settings stay.")
@@ -27726,6 +27939,20 @@ TOOLS = [
                  "description": "parts, rule-only, or none to end the hold"},
         "why": {"type": "string", "description": "The plan step that it waits for, or the reason, in a line"}},
        ["request_id", "host", "hold", "why"])),
+    ("manager", "switch_key_site", t_switch_key_site,
+     "Switch the site that the table of well-known services gave an API key off, or on again. Off: the sessions of "
+     "the agents that read the key hold the key itself from their next start, for a program that cannot use the "
+     "placeholder (another host, another header, a key that goes into a file); from the moment of the switch a "
+     "session that runs with its placeholder gets no key, for each agent that reads it, so look first who reads it: "
+     "their work that runs needs a new session. On: on a server that swaps keys they hold a placeholder for that "
+     "site again. It takes no other site, and it refuses a key whose site is the owner's own. No approval; your why "
+     "goes into the record that the owner reads.",
+     S({"request_id": REQUEST_ID,
+        "key": {"type": "string", "description": "The variable name of the API key, or its bws://<uuid> reference"},
+        "to": {"type": "string", "enum": ["off", "on"], "description": "off: a value in the sessions; on: the "
+               "table's site again"},
+        "why": {"type": "string", "description": "Why, in one line: what the program needs, or that it works again"}},
+       ["request_id", "key", "to", "why"])),
     ("manager", "door_gitops", t_door_gitops,
      "Give Operators a business's GitOps repository through the door, or end it. The door then reads it at HEAD "
      "through its filter (never a Secret, _config/ or a path of the exposure register), commits a checked image tag or "
@@ -34644,7 +34871,7 @@ def validate_team(team):
         raise ValueError(f"logins must map up to {CATALOG_MOST} bws://<uuid> references to {{title}}")
     for ref, entry in catalog.items():
         if not (isinstance(ref, str) and BWS_REF.fullmatch(ref) and ref == ref.lower()) or not isinstance(entry, dict) \
-                or "title" not in entry or set(entry) - {"title", "kind", "env", "site", "form"} \
+                or "title" not in entry or set(entry) - {"title", "kind", "env", "site", "form", "table"} \
                 or not (isinstance(entry["title"], str) and "\n" not in entry["title"]
                         and 1 <= len(entry["title"].strip()) <= 60):
             raise ValueError(f"login {ref!r} needs a bws://<uuid> reference in lower case and a title of one line of "
@@ -34654,6 +34881,10 @@ def validate_team(team):
         if "form" in entry and (entry["form"] not in lifecycle.KEY_FORMS or entry.get("kind") != "api_key"):
             raise ValueError(f"login {ref!r}: form is how an API key goes into the Authorization header, one of "
                              f"{', '.join(lifecycle.KEY_FORMS)}")
+        if "table" in entry and not key_table_mark_ok(entry):
+            raise ValueError(f"login {ref!r}: table is the mark of a site that the table of well-known services made, "
+                             f"{{row, on}}, for an API key: on true with a site that can swap and a form, on false with "
+                             f"neither")
         if entry.get("kind", "login") not in SECRET_KINDS or ("env" in entry) != (entry.get("kind") == "api_key") or \
                 ("env" in entry and not env_name(entry["env"])):
             raise ValueError(f"login {ref!r}: kind is login or api_key, and an API key has env, a variable name of "
@@ -37791,6 +38022,10 @@ def save_login(body):
     for k in ("site", "form"):
         if entry is not None and body.get(k) == "":
             entry.pop(k, None)
+    if entry is not None and any(body.get(k) is not None for k in ("site", "form")):
+        # the owner's own site or form, also one that takes it away: the owner's lock, which no table and no tool of
+        # an agent changes (the changed key swap, Part C), so the mark of a table-made site ends
+        entry.pop("table", None)
     result = save_team_entry(body, "logins", "login", entry, busy)
     result.pop("done", None)
     if entry and entry.get("kind") == "api_key" and entry.get("site"):
@@ -37825,7 +38060,10 @@ def save_secret(body):
         raise Refusal(409, f"The list already has an API key named {entry['env']}, and it takes no second key of "
                            f"that name.")
     stored, known = register_fingerprints(ref, body["fingerprints"], newest=True) if body["fingerprints"] else (0, 0)
-    entry.update({k: before[k] for k in ("site",) + (("form",) if entry.get("kind") == "api_key" else ()) if k in before})
+    entry.update({k: before[k] for k in key_kept_fields(before, entry) if k in before})
+    if body.get("row") and not before and entry.get("kind") == "api_key":
+        # the key's birth, with an address of a row of the table of well-known services (feature key_table)
+        entry.update(key_table_site(team, ref, entry["env"], body["row"], key_hold_index(team)))
     result = {"login": ref, "stored": stored, "known": known, "revision": rev, "sha256": current, "changed": False}
     if (team.get("logins") or {}).get(ref) == entry:
         return result
@@ -37864,6 +38102,7 @@ def save_secrets(body):
     team, current, _ = team_view(rev)
     logins = dict(team.get("logins") or {})
     results, changed = [], []
+    index = key_hold_index(team) if any(item.get("row") for item in body["secrets"]) else None
     for item in body["secrets"]:
         if "error" in item:
             results.append({"login": item["login"], "error": item["error"], "status": item["status"]})
@@ -37882,7 +38121,11 @@ def save_secrets(body):
                                                                    f"name."})
             continue
         stored, known = register_fingerprints(ref, item["fingerprints"], newest=True) if item["fingerprints"] else (0, 0)
-        entry.update({k: was[k] for k in ("site",) + (("form",) if entry.get("kind") == "api_key" else ()) if k in was})
+        entry.update({k: was[k] for k in key_kept_fields(was, entry) if k in was})
+        if item.get("row") and not was and entry.get("kind") == "api_key":
+            # a key's birth with an address of a row of the table (feature key_table), by the same conditions as
+            # save_secret; the entries before it in this list are in `logins` already
+            entry.update(key_table_site(dict(team, logins=logins), ref, entry["env"], item["row"], index))
         new = logins.get(ref) != entry
         if new:
             logins[ref] = entry
@@ -47243,11 +47486,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def secret_fields(self, data):
         """The checked fields of one catalog entry with its fingerprints, as POST /ui/secrets/add takes it and each entry
-        of POST /ui/secrets/import: {login, title, kind, env, fingerprints}, so that the two have one rule. Raises
-        ValueError with the reason."""
+        of POST /ui/secrets/import: {login, title, kind, env, fingerprints} and an optional address (feature key_table),
+        so that the two have one rule. Raises ValueError with the reason.
+
+        address: the key's address as the owner gave it (Add secret's Service address, a request's site on its card,
+        an import row's address). Only the name of the row of the table of well-known services that it selects comes
+        out, as `row` (lifecycle.key_table_row), or None: the hub keeps nothing else of an address and logs none, and the
+        command that it keeps (command_run) holds that name and not the address."""
         if not isinstance(data, dict):
             raise ValueError("an entry is an object of login, title, kind, env and fingerprints")
-        extra = sorted(set(data) - {"login", "title", "kind", "env", "fingerprints"})
+        extra = sorted(set(data) - {"login", "title", "kind", "env", "fingerprints", "address"})
         if extra:
             raise ValueError(f"unknown field {extra[0]}")
         title, kind, env = data.get("title"), data.get("kind"), data.get("env")
@@ -47262,8 +47510,14 @@ class Handler(BaseHTTPRequestHandler):
         if prints and not fingerprint_items(prints):
             raise ValueError("fingerprints: up to three items, at most one password and two totp, each "
                              "{kind, hash (64 lowercase hex), len (8 or more)}")
+        address = data.get("address")
+        if address is not None and not isinstance(address, str):
+            raise ValueError("address is the key's address as the owner gave it, a string")
+        # A login's address, an empty one and one that no row takes give no row, and never a refusal: an import sends
+        # each row's address, and a long sign-in address must not keep a login out of the list.
         return {"login": self.login_reference(data.get("login")), "title": title.strip(), "kind": kind, "env": env,
-                "fingerprints": [{k: x[k] for k in ("kind", "hash", "len")} for x in prints]}
+                "fingerprints": [{k: x[k] for k in ("kind", "hash", "len")} for x in prints],
+                "row": lifecycle.key_table_row(address) if kind == "api_key" and address else None}
 
     def ui_secret_import(self):
         """POST /ui/secrets/import (owner feature secrets_import): the hub step of an import of many items, in one command
