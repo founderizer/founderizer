@@ -640,7 +640,8 @@ this step"
     if [ "$check" = yes ]; then
         plan "run: python3 $tree/hubsetup.py harden --user $HUB_USER"
         plan "make SSH take keys only, with no X11 forwarding, through one file in sshd's own folder, which sshd \
-checks before it reloads (not where no account of this server has an SSH key, and not where OpenSSH does not run); \
+checks before it reloads (not where no account of this server has an SSH key, not when the session that runs it \
+logged in over SSH with a password, and not where OpenSSH does not run); \
 make npm take no package version newer than seven days, in npm's file for every user and in $HUB_USER's own, each \
 where no such rule is; and turn on Tailscale's own updates. A part that cannot be done leaves this server as it was"
         return 0

@@ -989,6 +989,42 @@ SSHD_WANTED = {"passwordauthentication": "no", "kbdinteractiveauthentication": "
 # Where an account of the server keeps the keys it logs in with over SSH (sshd's default AuthorizedKeysFile).
 KEY_FILES = ("/root/.ssh/authorized_keys", "/root/.ssh/authorized_keys2", "/home/*/.ssh/authorized_keys",
              "/home/*/.ssh/authorized_keys2")
+# How the session that runs the hardening logged in over SSH. sshd says it in one line of its own log, with the method:
+# "Accepted publickey for root from 100.64.0.7 port 51234 ssh2: ED25519 SHA256:...", "Accepted password for ...", or
+# "Accepted keyboard-interactive/pam for ...". Measured on 14 November 2026 on Ubuntu 24.04 (OpenSSH 9.6, sudo 1.9.15)
+# and 26.04 (OpenSSH 10.2, sudo-rs 0.2.13), with real key and password logins as root and as a user who becomes root
+# with `sudo -n -i`:
+# - The process that logs the line is the session's own sshd process, which lives as long as the session: on 24.04
+#   "sshd: root@notty" for root, the parent of the session's command, and "sshd: admin [priv]" for another user; on
+#   26.04 "sshd-session: root [priv]". So it is above each command of the session, also through sudo.
+# - SSH_CONNECTION holds the client's address and port of that line. A run that was started detached (`setsid sh -c
+#   '...' &`, as the Mac app starts hub.sh) has no sshd process above it, and it keeps that variable, but not through
+#   `sudo -i`, which clears it with both programs.
+# - A detached run keeps the cgroup of its session (session-<id>.scope), also through sudo, and logind keeps that
+#   session while one of its processes runs (state "closing"), with the process that logged the line as its leader.
+# - Words in sshd's log are not proof. A client with no account puts any text into a line of sshd's own: it offers a
+#   key exchange method named "x sshd[<id>]: Accepted password for root from ...", and sshd logs "Unable to negotiate
+#   with ...: no matching key exchange method found. Their offer: x sshd[<id>]: Accepted password ...", from a process
+#   of root's named sshd. A user with no root sends a line in sshd's words from its own program named sshd. rsyslog
+#   writes such a line to /var/log/auth.log with the process id that its sender names.
+# - The journal sets some fields itself, which no process sets for itself: _PID, _UID and _COMM. So the hardening
+#   reads only the journal, only the lines of root's processes named sshd or sshd-session (_UID=0, _COMM; sshd-session
+#   since OpenSSH 9.8), the process id from _PID and never from the words, and a message only from its start
+#   (ACCEPTED.match). JSON keeps each message whole.
+# - sshd collects a line from each failed login of the internet. At 1,000,262 of root's lines of sshd in this start
+#   (Ubuntu 24.04; 1,000,326 on 26.04), a read of all of them took 9.55 s (4.84 s), and the read by process id, which
+#   takes the journal's own index, 0.00 s. So the client's way reads sshd's newest SSHD_LOG_LAST lines only: 2.30 s
+#   there (1.45 s), with a line at that bound found and the next one not. A read that takes longer than SSHD_LOG_WAIT
+#   finds no line, and the step goes on as before.
+SSHD_COMMS = ("sshd", "sshd-session")
+# This start's lines only (-b): process ids begin again at each start of the server.
+SSHD_LOG = ("journalctl -b -q --no-pager -o json --output-fields=_PID,_UID,_COMM,MESSAGE "
+            "_UID=0 _COMM=sshd _COMM=sshd-session")
+SSHD_LOG_LAST = 100000
+SSHD_LOG_WAIT = 30
+ACCEPTED = re.compile(r"Accepted ([a-z-]+)\S* for (\S+) from (\S+) port ([0-9]+) ssh2")
+# sshd's methods that use no key, which keys only would take away ("none": an empty password).
+WITH_PASSWORD = ("password", "keyboard-interactive", "none")
 NPMRC = "/etc/npmrc"                    # npm's file for every user of the system on Debian and Ubuntu
 NPM_RULE = "min-release-age=7"          # npm takes no package version that was published less than seven days ago
 NPM_RULE_LINE = re.compile(r"^\s*min-release-age\s*=", re.M)
@@ -1013,7 +1049,9 @@ def put_file(path, text, mode, uid=None, gid=None):
 
 def has_ssh_key(root=""):
     """Whether an account of this server logs in with an SSH key: a key line in root's authorized_keys or in that of a
-    user in /home. Without one, a server whose SSH takes keys only would let nobody in."""
+    user in /home. Without one, a server whose SSH takes keys only would let nobody in. Any key line counts, also one
+    that the person who runs the hardening does not hold (the provider's key of the server's creation, a lost Mac's):
+    `ssh_login` covers that person when their session logged in with a password."""
     for pattern in KEY_FILES:
         for path in glob.glob(root + pattern):
             try:
@@ -1023,6 +1061,101 @@ def has_ssh_key(root=""):
             except OSError:
                 continue
     return False
+
+
+def sshd_ancestors(root=""):
+    """The ids of sshd's own processes above this one, the nearest first, from /proc: the processes of the SSH session
+    that runs this, also through sudo. A detached run has none, because its parent is the system's first process.
+    The walk ends at that process, whose parent is 0, which /proc does not have."""
+    found, pid = [], "self"
+    while pid:
+        try:
+            with open(f"{root}/proc/{pid}/status", encoding="utf-8", errors="replace") as f:
+                status = dict(line.split(":", 1) for line in f if ":" in line)
+        except OSError:
+            break
+        if status.get("Name", "").strip() in SSHD_COMMS:
+            found.append(pid)
+        pid = status.get("PPid", "").strip()
+    return found
+
+
+def ssh_client(root=""):
+    """The client's address and port of the SSH session that this process comes from, by SSH_CONNECTION in its
+    environment as it started (/proc/self/environ), which a detached run keeps; None without one."""
+    try:
+        with open(root + "/proc/self/environ", "rb") as f:
+            items = f.read().decode("utf-8", "replace").split("\0")
+    except OSError:
+        return None
+    fields = next((item[len("SSH_CONNECTION="):].split() for item in items if item.startswith("SSH_CONNECTION=")), [])
+    return (fields[0], fields[1]) if len(fields) == 4 else None
+
+
+def session_leader(run, root=""):
+    """The leader of the logind session that this process belongs to, by its cgroup (session-<id>.scope): the process
+    that logged that session's login line. A detached run keeps its session's cgroup, also through sudo. None for a
+    process in no session: a service, cloud-init, a container's own command."""
+    try:
+        with open(root + "/proc/self/cgroup", encoding="utf-8", errors="replace") as f:
+            found = re.search(r"/session-([A-Za-z0-9]+)\.scope", f.read())
+    except OSError:
+        return None
+    if not found:
+        return None
+    try:
+        out = run(f"loginctl show-session -p Leader --value {found.group(1)}", timeout=SSHD_LOG_WAIT)[1].strip()
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+    return out if out.isdigit() else None
+
+
+def sshd_logins(run, more):
+    """sshd's "Accepted" lines in the journal, oldest first, as (process id, method, user, client address, client
+    port): SSHD_LOG with `more`, journalctl's own matches or options. The process id is the journal's own (_PID), and
+    a message counts only from its start, so words that a client or a user put in a line change nothing. A read that
+    fails, or that takes longer than SSHD_LOG_WAIT, finds no line."""
+    try:
+        out = run(f"{SSHD_LOG} {more}", timeout=SSHD_LOG_WAIT)[1]
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return []
+    found = []
+    for line in out.splitlines():
+        try:
+            entry = json.loads(line)
+            hit = ACCEPTED.match(entry["MESSAGE"])
+        except (ValueError, TypeError, KeyError):
+            continue
+        if hit:
+            found.append((entry.get("_PID"), *hit.groups()))
+    return found
+
+
+def ssh_login(run, root=""):
+    """How the SSH session that runs this logged in, by sshd's own "Accepted" line for it: (method, user), such as
+    ("publickey", "root") or ("password", "admin"), or None when no line is found: a run in the server's console, a run
+    that no SSH session started, a log that this system does not keep, a read that failed.
+
+    Three ways find the session, in this order: an sshd process above this one, the leader of this process's logind
+    session (both by process id, in one read of the journal's own index), and the client's address and port of
+    SSH_CONNECTION among sshd's newest SSHD_LOG_LAST lines. Each takes its newest line: a process id or a client's
+    port can have served an older session."""
+    pids, leader = sshd_ancestors(root), session_leader(run, root)
+    if leader and leader not in pids:
+        pids.append(leader)
+    if pids:
+        newest = {pid: (method, user) for pid, method, user, _address, _port in
+                  sshd_logins(run, " ".join(f"_PID={pid}" for pid in pids))}
+        for pid in pids:
+            if pid in newest:
+                return newest[pid]
+    client = ssh_client(root)
+    if client:
+        by_client = [(method, user) for _pid, method, user, address, port in sshd_logins(run, f"-n {SSHD_LOG_LAST}")
+                     if (address, port) == client]
+        if by_client:
+            return by_client[-1]
+    return None
 
 
 def one_line(text, limit=200):
@@ -1036,13 +1169,28 @@ def harden_ssh(check, run, root=""):
     first (`sshd_folder`), so they answer also while SSH's service is stopped and its socket waits for the next
     connection, which then starts sshd with the new file. sshd also checks its files once before the write: a check
     that fails already is a fault of the server's own files, so nothing is written, and the words are sshd's own and
-    do not blame the new file. The words of what it did."""
+    do not blame the new file.
+
+    Nothing is written either when the session that runs this logged in over SSH with a password (`ssh_login`): the
+    key that `has_ssh_key` finds can be one that its person does not hold, and keys only would then leave them the
+    provider's console alone. Where sshd's own files take keys only already (another run, the Mac app's own repair),
+    the words say so, and they tell that person to put a key of their own in place before they log out. A session that
+    logged in with a key, and a run where no line of a session is found (the server's console, a log that this system
+    does not keep), go on as before. The words of what it did."""
     _code, out, _err = run("systemctl is-active ssh.service ssh.socket")
     if "active" not in out.split():
         return "SSH: OpenSSH does not run on this server, so no password lets anybody in through it"
     if not has_ssh_key(root):
         return ("SSH keeps password login: no account on this server has an SSH key, and a server that takes keys only "
                 "would let nobody in")
+    login = ssh_login(run, root)
+    if login and login[0] in WITH_PASSWORD:
+        if lifecycle.sshd_keys_only(root + lifecycle.SSHD_CONFIG):
+            return ("SSH takes keys only already: sshd's own files let nobody in with a password, but the session that "
+                    "runs this step logged in with a password, so its next login with one is refused. Before you log "
+                    f"out, add an SSH key that you hold to ~{login[1]}/.ssh/authorized_keys.")
+        return ("SSH keeps password login: the session that runs this step logged in with a password, so its owner "
+                "may hold no key that this server takes. Log in with an SSH key and run it again.")
     if not os.path.isdir(root + SSHD_DIR):
         return "SSH keeps its settings: this system has no folder for sshd's own files"
     path = root + SSHD_HARDENING

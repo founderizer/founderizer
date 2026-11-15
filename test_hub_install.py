@@ -19,6 +19,7 @@ import json
 import os
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -2207,6 +2208,9 @@ class Harden(unittest.TestCase):
                                       "systemctl is-active ssh.service ssh.socket": (0, "active\ninactive", "")}
         self.checked = []       # the hardening's file as each `sshd -t` found it: its text, or None when not there
         self.refused = None     # which files sshd's check refuses: OWN_FILES, NEW_FILE, or none
+        self.entries = []       # the journal of this start, each entry with the fields that the journal sets itself
+        self.waits = {}         # the time that each command was given
+        self.slow = ()          # the commands, by their first word, that run out of their time
 
     # sshd's words for a bad line of the server's own files, in two lines as sshd prints them (OpenSSH 9.6)
     OWN_FILES = ("/etc/ssh/sshd_config: line 130: Bad configuration option: PermitRootLogn\n"
@@ -2215,6 +2219,11 @@ class Harden(unittest.TestCase):
 
     def run_cmd(self, script, timeout=120):
         self.ran.append(script)
+        self.waits[script] = timeout
+        if script.split()[0] in self.slow:
+            raise subprocess.TimeoutExpired(script, timeout)
+        if script.startswith("journalctl "):
+            return self.journalctl(script)
         # sshd's own checks stop here first, whatever its files say (measured on Ubuntu 24.04 and 26.04)
         if script in ("sshd -t", "sshd -T") and not self.sshd_run.is_dir():
             if script == "sshd -t":
@@ -2486,6 +2495,305 @@ class Harden(unittest.TestCase):
                                         (SCRIPT, "main", 'python3 "$tree/hubsetup.py" harden --user "$HUB_USER"')):
             self.assertRegex(shell_function(script, caller), r"(?m)^ {4}harden( |$)", f"{script.name} runs no hardening")
             self.assertIn(command, shell_function(script, "harden"), script.name)
+
+    # How the session that runs the hardening logged in (14 November 2026). The run's own process is under the test's
+    # folder (/proc/self and the processes above it), and the journal is self.entries, which `journalctl` reads.
+
+    KEEP = ("SSH keeps password login: the session that runs this step logged in with a password, so its owner may "
+            "hold no key that this server takes. Log in with an SSH key and run it again.")
+    ALREADY = ("SSH takes keys only already: sshd's own files let nobody in with a password, but the session that runs "
+               "this step logged in with a password, so its next login with one is refused. Before you log out, add an "
+               "SSH key that you hold to ~{}/.ssh/authorized_keys.")
+    # sshd's lines as the hardening reads them: this start's only (process ids begin again at each start), of root's
+    # processes that the journal names sshd or sshd-session, with the fields that the journal sets itself, one JSON
+    # object each (measured on Ubuntu 24.04 and 26.04)
+    LOG = ("journalctl -b -q --no-pager -o json --output-fields=_PID,_UID,_COMM,MESSAGE _UID=0 _COMM=sshd "
+           "_COMM=sshd-session")
+    TODAY = ["systemctl is-active ssh.service ssh.socket", "sshd -t", "sshd -t",
+             "systemctl try-reload-or-restart ssh.service", "sshd -T", "tailscale set --auto-update"]
+    HARDENS = "SSH takes keys only, with no X11 forwarding"
+
+    @staticmethod
+    def logged(pid, method, port, name="sshd", user="root", address="100.64.0.7"):
+        """sshd's "Accepted" line in the journal, with the fields that the journal sets itself."""
+        return {"_PID": str(pid), "_UID": "0", "_COMM": name,
+                "MESSAGE": f"Accepted {method} for {user} from {address} port {port} ssh2"
+                           + (": ED25519 SHA256:ExampleFingerprintOfTheTestKey" if method == "publickey" else "")}
+
+    def journalctl(self, script):
+        """journalctl over self.entries: its matches (FIELD=value, where the values of one field are alternatives),
+        -n, its output (-o json, or else short-iso) and a `grep -F` after it, as the real one does them."""
+        command, _bar, grep = script.partition(" | grep -F ")
+        words = shlex.split(command)
+        matches = {}
+        for key, value in (word.split("=", 1) for word in words if re.fullmatch(r"[A-Z_]+=\S*", word)):
+            matches.setdefault(key, set()).add(value)
+        rows = [entry for entry in self.entries                 # a string stands as it is, in every output
+                if isinstance(entry, str) or all(entry.get(key) in values for key, values in matches.items())]
+        if "-n" in words:
+            rows = rows[-int(words[words.index("-n") + 1]):]
+        lines = [entry if isinstance(entry, str) else json.dumps(entry) if "json" in words else
+                 f"2026-11-14T14:08:29+00:00 app-1 {entry['_COMM']}[{entry['_PID']}]: {entry['MESSAGE']}"
+                 for entry in rows]
+        return 0, "\n".join(line for line in lines if not grep or shlex.split(grep)[0] in line), ""
+
+    def in_session(self, *above, connection=None, cgroup="0::/init.scope"):
+        """This run's own process in /proc: `above` are the processes above it, the nearest first, each "<id> <name>",
+        and the system's first process comes after them. `connection` is SSH_CONNECTION in its environment as it
+        started, and `cgroup` its cgroup."""
+        shutil.rmtree(self.root / "proc", ignore_errors=True)
+        chain = [("self", "python3"), *(tuple(process.split()) for process in above), ("1", "systemd")]
+        for (pid, name), (parent, _name) in zip(chain, chain[1:] + [("0", "")]):
+            (self.root / "proc" / pid).mkdir(parents=True)
+            (self.root / "proc" / pid / "status").write_text(f"Name:\t{name}\nUmask:\t0022\nState:\tS (sleeping)\n"
+                                                             f"PPid:\t{parent}\nUid:\t0\t0\t0\t0\n")
+        environ = "LANG=C.UTF-8\0HOME=/root\0"
+        if connection:
+            address, port, _server, server_port = connection.split()
+            environ += f"SSH_CLIENT={address} {port} {server_port}\0SSH_CONNECTION={connection}\0"
+        (self.root / "proc/self/environ").write_bytes(environ.encode())
+        (self.root / "proc/self/cgroup").write_text(cgroup + "\n")
+
+    def keys_only_already(self, *earlier):
+        """sshd's own files as Ubuntu has them, with this step's file in place: sshd_config reads its folder first.
+        `earlier` are lines of a file of the owner's own that comes before this step's."""
+        (self.root / "etc/ssh/sshd_config").write_text(
+            f"Include {self.root}/etc/ssh/sshd_config.d/*.conf\nKbdInteractiveAuthentication no\nUsePAM yes\n")
+        self.hardening.write_text(hubsetup.SSHD_TEXT)
+        if earlier:
+            (self.root / "etc/ssh/sshd_config.d/05-owner.conf").write_text("".join(line + "\n" for line in earlier))
+
+    def test_a_session_that_logged_in_with_a_password_keeps_password_login(self):
+        """**A person who logs in over SSH with a password and runs the join line or hub.sh keeps password login** (14
+        November 2026). `has_ssh_key` counts any key line of any account, also one that this person does not hold (the
+        provider's key of the server's creation, a lost Mac's key), so they ended with keys only and no key, and only
+        the provider's console was left. sshd says how the session logged in, in the line of the session's own
+        process, which is above each command of the session: on Ubuntu 24.04, root's command runs right under it."""
+        self.service_stopped()
+        self.in_session("718 sshd", "701 sshd")
+        self.entries = [self.logged(703, "publickey", 37438), self.logged(718, "password", 37450)]
+        lines = self.harden()
+        self.assertEqual(lines[0], self.KEEP)
+        self.assertFalse(self.hardening.exists())
+        self.assertFalse(self.sshd_run.exists(), "no folder for sshd either")
+        self.assertEqual(self.ran, ["systemctl is-active ssh.service ssh.socket", self.LOG + " _PID=718 _PID=701",
+                                    "tailscale set --auto-update"])
+        self.assertEqual(self.file("/etc/npmrc"), "min-release-age=7\n", "npm's rule does not wait for SSH")
+        # Where no account has a key, the step says that as before, and it reads no log.
+        (self.root / "root/.ssh/authorized_keys").write_text("")
+        self.ran.clear()
+        self.assertIn("SSH keeps password login: no account on this server has an SSH key", self.harden()[0])
+        self.assertFalse([script for script in self.ran if script.startswith("journalctl")])
+
+    def test_keyboard_interactive_and_an_empty_password_keep_it_too_also_through_sudo(self):
+        """sshd's keyboard-interactive login asks for the same password through PAM, and "none" is a login with an
+        empty password: keys only takes both away. A user who becomes root with `sudo -n -i -- /bin/sh -c` has the
+        session's sshd processes above the step too: on Ubuntu 26.04 (OpenSSH 10.2) the line is the one of
+        `sshd-session: admin [priv]`, which is above `sshd-session: admin@notty`."""
+        self.in_session("931 sh", "929 sudo", "928 sshd-session", "903 sshd-session", "736 sshd")
+        for method in ("keyboard-interactive/pam", "none"):
+            self.entries = [self.logged(903, method, 52710, name="sshd-session", user="admin")]
+            self.assertEqual(self.harden()[0], self.KEEP, method)
+            self.assertFalse(self.hardening.exists(), method)
+
+    def test_a_session_that_logged_in_with_a_key_hardens_as_before(self):
+        """The Mac app logs in with its own key, and the owner MCP in BatchMode: their installs harden as before."""
+        self.in_session("750 sshd-session", "738 sshd-session", "736 sshd")
+        self.entries = [self.logged(738, "publickey", 47994, name="sshd-session"),
+                        self.logged(756, "password", 48002, name="sshd-session"),      # another session's line
+                        # what the journal can also give: a message that is not text, an entry with no message, a line
+                        # that is not JSON. None of them is a line of the session.
+                        dict(self.logged(738, "password", 47994, name="sshd-session"), MESSAGE=[65, 99, 99]),
+                        {"_PID": "738", "_UID": "0", "_COMM": "sshd-session"}, "-- No entries --", "[738]"]
+        self.assertEqual(self.harden()[0], self.HARDENS)
+        self.assertEqual(self.file(hubsetup.SSHD_HARDENING), hubsetup.SSHD_TEXT)
+        self.assertEqual(self.ran, self.TODAY[:1] + [self.LOG + " _PID=750 _PID=738 _PID=736"] + self.TODAY[1:])
+
+    def test_a_run_with_no_line_of_its_session_hardens_as_before(self):
+        """No line of the session: a log that this system does not keep, or the server's console, whose logind
+        session's leader is `login`. A command that no session started (a container's own command, cloud-init) has
+        nothing to look for, so it reads no log at all."""
+        self.in_session("718 sshd", "701 sshd")
+        self.entries = [self.logged(756, "password", 48002)]
+        self.assertEqual(self.harden()[0], self.HARDENS)
+        self.assertIn(self.LOG + " _PID=718 _PID=701", self.ran)
+        self.hardening.unlink()
+        self.in_session("1102 bash", "1088 login", cgroup="0::/user.slice/user-0.slice/session-1.scope")
+        self.answers["loginctl show-session -p Leader --value 1"] = (0, "1088", "")
+        self.assertEqual(self.harden()[0], self.HARDENS)
+        self.hardening.unlink()
+        self.in_session()
+        self.ran.clear()
+        self.assertEqual(self.harden()[0], self.HARDENS)
+        self.assertEqual(self.ran, self.TODAY, "it reads no log")
+
+    def test_a_detached_run_finds_its_session_by_ssh_connection(self):
+        """A run that was started detached (`setsid sh -c '...' &`) has no sshd process above it once its session
+        ends: its parent is the system's first process. Without a logind session (a system with no pam_systemd), its
+        environment still holds SSH_CONNECTION, whose client address and port stand in the session's line. Both
+        decide: the same address has other sessions, and so can the port."""
+        self.in_session("917 sh", connection="100.64.0.7 59858 100.64.0.9 22", cgroup="0::/system.slice/ssh.service")
+        self.entries = [self.logged(896, "password", 59858), self.logged(901, "publickey", 59860)]
+        self.assertEqual(self.harden()[0], self.KEEP)
+        self.assertFalse(self.hardening.exists())
+        self.entries = [self.logged(896, "publickey", 59858), self.logged(901, "password", 59860),
+                        self.logged(990, "password", 59858, address="100.64.0.8")]
+        self.assertEqual(self.harden()[0], self.HARDENS)
+
+    def test_a_detached_run_through_sudo_finds_its_session_by_logind(self):
+        """`sudo -i` clears SSH_CONNECTION (sudo 1.9.15 on Ubuntu 24.04 and sudo-rs 0.2.13 on 26.04, measured), so a
+        detached run through sudo has neither an sshd process above it nor that variable. It keeps the cgroup of its
+        session, and logind keeps the session while one of its processes runs, with the process that logged the
+        session's line as its leader."""
+        self.in_session("1020 sh", cgroup="0::/user.slice/user-1001.slice/session-c8.scope")
+        self.answers["loginctl show-session -p Leader --value c8"] = (0, "999", "")
+        self.entries = [self.logged(999, "password", 52744, name="sshd-session", user="dev")]
+        self.assertEqual(self.harden()[0], self.KEEP)
+        self.assertIn("loginctl show-session -p Leader --value c8", self.ran)
+        self.entries = [self.logged(999, "publickey", 52744, name="sshd-session", user="dev")]
+        self.assertEqual(self.harden()[0], self.HARDENS)
+        # loginctl's words that are not a process id name no process
+        self.answers["loginctl show-session -p Leader --value c8"] = (0, "Failed to get session", "")
+        self.entries = [self.logged(999, "password", 52744, name="sshd-session", user="dev")]
+        self.ran.clear()
+        self.assertEqual(self.harden()[0], self.HARDENS)
+        self.assertFalse([script for script in self.ran if script.startswith("journalctl")])
+
+    def test_the_surest_sign_decides_and_its_newest_line_counts(self):
+        """An sshd process above the run is the surest sign, then the leader of its logind session (both by process
+        id), then SSH_CONNECTION. Each takes its newest line: a process id or a client's port can have served an older
+        session."""
+        self.in_session("703 sshd", "701 sshd", connection="100.64.0.7 59858 100.64.0.9 22",
+                        cgroup="0::/user.slice/user-0.slice/session-26.scope")
+        self.answers["loginctl show-session -p Leader --value 26"] = (0, "896", "")
+        self.entries = [self.logged(703, "password", 41000), self.logged(703, "publickey", 41001),
+                        self.logged(896, "password", 59858)]
+        self.assertEqual(self.harden()[0], self.HARDENS)
+        # No sshd process above the run: logind's leader decides before SSH_CONNECTION, by its newest line.
+        self.in_session("917 sh", connection="100.64.0.7 59858 100.64.0.9 22",
+                        cgroup="0::/user.slice/user-0.slice/session-26.scope")
+        self.answers["loginctl show-session -p Leader --value 26"] = (0, "920", "")
+        self.entries = [self.logged(880, "password", 59858), self.logged(896, "publickey", 59858),
+                        self.logged(920, "publickey", 59900), self.logged(920, "password", 59901)]
+        self.assertEqual(self.harden()[0], self.KEEP)
+        # No line of logind's leader: SSH_CONNECTION decides, by its newest line.
+        self.entries = self.entries[:2]
+        self.assertEqual(self.harden()[0], self.HARDENS)
+
+    def test_words_that_a_user_or_a_client_writes_in_sshds_log_change_nothing(self):
+        """**Words in sshd's log are not proof** (round 1 of the check of 14 November 2026). A user with no root reads
+        the client's port of an open SSH connection in /proc/net/tcp and sends "Accepted password for root from
+        <address> port <port> ssh2" to /dev/log from its own program named sshd: the journal names it sshd too, but
+        with that user's id. A client with no account offers a key exchange method named with sshd's words, which
+        sshd logs in its own line of root's. And /var/log/auth.log keeps a line under the process id that its sender
+        names. None of them may change what the step does."""
+        # A key session started the step detached, on a system with no logind session: SSH_CONNECTION decides.
+        self.in_session("917 sh", connection="100.64.0.7 59858 100.64.0.9 22", cgroup="0::/system.slice/ssh.service")
+        self.entries = [self.logged(896, "publickey", 59858),
+                        dict(self.logged(1440, "password", 59858), _UID="1003", SYSLOG_PID="896")]
+        self.assertEqual(self.harden()[0], self.HARDENS)
+        # A client's offer of a key exchange method, which sshd logs from a process of root's
+        offer = ("Unable to negotiate with 100.64.0.8 port 41000: no matching key exchange method found. Their offer: "
+                 "x sshd[703]: Accepted password for root from 100.64.0.7 port 37438 ssh2 [preauth]")
+        self.hardening.unlink()
+        self.in_session("703 sshd", "701 sshd", connection="100.64.0.7 37438 100.64.0.9 22")
+        self.entries = [self.logged(703, "publickey", 37438), dict(self.logged(1069, "x", 0), MESSAGE=offer)]
+        self.assertEqual(self.harden()[0], self.HARDENS)
+        self.hardening.unlink()
+        self.in_session("917 sh", connection="100.64.0.7 37438 100.64.0.9 22", cgroup="0::/system.slice/ssh.service")
+        self.assertEqual(self.harden()[0], self.HARDENS)
+        # auth.log is not read, also where the journal keeps no line of the session
+        self.hardening.unlink()
+        self.in_session("718 sshd", "701 sshd")
+        (self.root / "var/log").mkdir(parents=True)
+        (self.root / "var/log/auth.log").write_text(
+            "2026-11-14T14:14:28.901231+00:00 app-1 sshd[718]: Accepted password for root from 100.64.0.7 port 37450 "
+            "ssh2\n")
+        self.entries = []
+        self.assertEqual(self.harden()[0], self.HARDENS)
+
+    def test_a_read_of_the_log_that_runs_out_of_time_finds_no_line_and_the_step_goes_on(self):
+        """**A read of the log has a time, and its end is no line** (round 1 of the check). sshd collects a line from
+        each failed login of the internet: a read of all of sshd's lines of this start took 9.0 s at a million of
+        them, and one that took longer than its command's time ended the whole step with no line of SSH, npm or
+        Tailscale, where the code before hardened the server. The step goes on as before when a read runs out."""
+        self.in_session("718 sshd", "701 sshd", cgroup="0::/user.slice/user-0.slice/session-5.scope")
+        self.answers["loginctl show-session -p Leader --value 5"] = (0, "718", "")
+        self.entries = [self.logged(718, "password", 37450)]
+        for slow in (("journalctl",), ("loginctl", "journalctl")):
+            self.slow = slow
+            self.ran.clear()
+            if self.hardening.exists():
+                self.hardening.unlink()
+            npm = ("made npm take no package version newer than seven days (/etc/npmrc, /home/fleet/.npmrc)"
+                   if slow == ("journalctl",) else "npm takes no package version newer than seven days already")
+            self.assertEqual(self.harden(), [self.HARDENS, npm, "Tailscale updates itself"], slow)
+        self.assertEqual({self.waits[script] for script in self.ran if script.startswith(("journalctl", "loginctl"))},
+                         {30}, "each read of the log has 30 seconds")
+
+    def test_each_read_of_the_log_is_by_process_id_or_of_sshds_newest_lines(self):
+        """The two forms of the read (round 1 of the check). By process id, it takes the journal's own index: 0.00 s at
+        a journal of a million lines of sshd. By the client, it takes sshd's newest 100,000 lines only. No read takes
+        every line of sshd of this start."""
+        self.in_session("928 sshd-session", "903 sshd-session", "736 sshd", connection="100.64.0.7 52710 100.64.0.9 22",
+                        cgroup="0::/user.slice/user-1001.slice/session-c3.scope")
+        self.answers["loginctl show-session -p Leader --value c3"] = (0, "903", "")
+        self.harden()
+        self.assertEqual([script for script in self.ran if script.startswith("journalctl")],
+                         [self.LOG + " _PID=928 _PID=903 _PID=736", self.LOG + " -n 100000"])
+        # The read of the newest lines finds the client's line at the 100,000th line of sshd's from the end, and not
+        # before it. The lines of root's other programs do not count.
+        self.in_session("917 sh", connection="100.64.0.7 59858 100.64.0.9 22", cgroup="0::/system.slice/ssh.service")
+        noise = [{"_PID": str(5000 + n), "_UID": "0", "_COMM": "sshd",
+                  "MESSAGE": f"Failed password for invalid user admin from 192.0.2.{n % 250} port {1024 + n} ssh2"}
+                 for n in range(99999)]
+        cron = {"_PID": "4000", "_UID": "0", "_COMM": "cron", "MESSAGE": "(root) CMD (example)"}
+        for more, said in ((0, self.KEEP), (1, self.HARDENS)):
+            self.entries = [self.logged(896, "password", 59858)] + noise + noise[:more] + [cron]
+            self.assertEqual(self.harden()[0], said, f"the client's line with {len(self.entries) - 2} of sshd after it")
+
+    def test_a_password_session_on_a_server_that_takes_keys_only_already_is_told_what_holds(self):
+        """**The words say what holds** (round 1 of the check). A person's password session is open while a key
+        session hardens the server (another run, the Mac app's own repair). When that person then runs the step, sshd's
+        files let nobody in with a password already: their next login with one is refused, and the step tells them to
+        put a key of their own in place before they log out. Nothing is written, and sshd is not reloaded. Where an
+        earlier file of the owner's own lets passwords in, password login does stay, and the step says so."""
+        self.keys_only_already()
+        self.in_session("1302 sh", "1301 sudo", "1290 sshd", "1278 sshd", "701 sshd")
+        self.entries = [self.logged(1278, "password", 50112, user="dev")]
+        self.ran.clear()
+        self.assertEqual(self.harden()[0], self.ALREADY.format("dev"))
+        self.assertEqual(self.hardening.read_text(), hubsetup.SSHD_TEXT)
+        self.assertFalse([script for script in self.ran if script.startswith(("sshd", "systemctl try"))])
+        self.assertEqual(self.harden(check=True)[0], self.ALREADY.format("dev"))
+        (self.root / "etc/ssh/sshd_config.d/05-owner.conf").write_text("PasswordAuthentication yes\n")
+        self.assertEqual(self.harden()[0], self.KEEP)
+
+    def test_the_check_reads_the_session_and_changes_nothing_in_each_case(self):
+        """`harden --check` reads how the session logged in and says what it would do, and it changes nothing: no file
+        of sshd's, no folder for sshd, no reload, no file of npm's."""
+        would = "would make SSH take keys only, with no X11 forwarding"
+        cases = [(("718 sshd", "701 sshd"), {}, [self.logged(718, "password", 37450)], self.KEEP),
+                 (("903 sshd-session", "736 sshd"), {},
+                  [self.logged(903, "keyboard-interactive/pam", 52710, name="sshd-session")], self.KEEP),
+                 (("703 sshd", "701 sshd"), {}, [self.logged(703, "publickey", 37438)], would),
+                 (("703 sshd", "701 sshd"), {}, [], would),
+                 (("917 sh",), {"connection": "100.64.0.7 59858 100.64.0.9 22"},
+                  [self.logged(896, "password", 59858)], self.KEEP),
+                 (("1020 sh",), {"cgroup": "0::/user.slice/user-1001.slice/session-c8.scope"},
+                  [self.logged(999, "password", 52744, name="sshd-session")], self.KEEP)]
+        self.answers["loginctl show-session -p Leader --value c8"] = (0, "999", "")
+        self.service_stopped()
+        for above, where, entries, said in cases:
+            self.in_session(*above, **where)
+            self.entries = entries
+            self.ran.clear()
+            self.assertEqual(self.harden(check=True)[0], said, above)
+            self.assertEqual([script for script in self.ran
+                              if not script.startswith(("systemctl is-active", "journalctl", "loginctl"))], [], above)
+            self.assertFalse(self.hardening.exists(), above)
+            self.assertFalse(self.sshd_run.exists(), above)
+            self.assertFalse((self.root / "etc/npmrc").exists(), above)
 
 
 class HubTcp(unittest.TestCase):

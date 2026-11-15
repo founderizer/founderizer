@@ -180,11 +180,19 @@ notification of a Needs-you item, the chat that opens first), so with those apps
     gets from its join line. SSH takes keys only, with no X11 forwarding: one file in sshd's own
     folder, which sshd checks before it reloads. It is not written where no account of the server
     has an SSH key, because that server would then let nobody in, and not where OpenSSH does not
-    run. sshd also checks its files once before the write: a server whose own files already fail
-    that check gets no file, and the step's line gives sshd's words. npm takes no package version newer than seven days, for every user and for `fleet`, each
-    where no such rule is. Tailscale updates itself. Each part says what it did, a part that
-    cannot be done leaves the server as it was, and none of them stops the install. Until
-    14 November 2026 only the join had this step. A second claim (`--reclaim`) leaves it out.
+    run. It is not written either when the session that runs the step logged in over SSH with a
+    password, as sshd's own line for that session in the journal says: the key that the server
+    holds can be one that this person does not hold, such as the provider's key of the server's
+    creation, and the step's line then says to log in with an SSH key and run it again. Where
+    sshd's own files take keys only already, the line says so instead, and tells that person to
+    add a key of their own to `authorized_keys` before they log out. A session that logged in
+    with a key, and the server's console, take the step. sshd also checks its files once before
+    the write: a server whose own files already fail that check gets no file, and the step's line
+    gives sshd's words. npm takes no package version newer than seven days, for every user and
+    for `fleet`, each where no such rule is. Tailscale updates itself. Each part says what it
+    did, a part that cannot be done leaves the server as it was, and none of them stops the
+    install. Until 14 November 2026 only the join had this step. A second claim (`--reclaim`)
+    leaves it out.
 16. **A kept connection keeps its speed** (`hubsetup.py tcp`). The Mac app reads the hub's
     state every 3 seconds on one kept connection, and after a pause Linux starts each answer
     from a window of 10 packets again: a state of 474 KB took 6 round trips (0.29 s at a round
@@ -412,7 +420,10 @@ the checkout and the service of an agent that was added since.
   ```
 
   `harden --check` says what the second would do. It prints one line for SSH, one for npm and
-  one for Tailscale. A session that is open keeps going. To undo the SSH part: delete
+  one for Tailscale. A session that is open keeps going. Run them from an SSH session that logged
+  in with a key, or in the provider's console: from a session that logged in with a password, SSH
+  keeps password login, and its line says so; where SSH takes keys only already, the line tells
+  you to add a key of your own before you log out. To undo the SSH part: delete
   `/etc/ssh/sshd_config.d/10-fleet-hardening.conf`, then `systemctl reload ssh`.
 - **The owner's Mac is lost, or it has a new address.** Run the line with `--reclaim`: it
   makes a new code, waits for the new Mac, and changes only `addresses.owner` and the key
