@@ -972,9 +972,19 @@ def mcp_address(value):
     return value
 
 
-def mcp_server(name, entry):
+# The names of the programs whose sessions put a server's name before the names of its tools, and deny that name's
+# tools: OpenCode names each tool of a server `<server>_<tool>`, and its sessions deny the pattern `opencode_*`
+# (acp_programs.OpenCode.config, the coordinator's decision D32), so a server named opencode would give an OpenCode
+# session none of its tools, with nothing that says why (D33, the review's H1).
+MCP_PROGRAM_NAMES = {"opencode": "OpenCode"}
+
+
+def mcp_server(name, entry, new=False):
     """One server of team.json "mcp" as a catalog entry (TOOL_CATALOG's shape, with custom and auth), or ValueError
-    with the reason. A url server has url and, for auth "oauth" or "key", bearer: the session variable that holds its
+    with the reason. new: the owner's write of this server (POST /ui/team/mcp, and the check of a server before its
+    save), which refuses a name of MCP_PROGRAM_NAMES too; team.json's own entries are read without it (validate_team,
+    tool_catalog), because one refused name there refuses the whole team, so a fleet whose file has one would stop
+    taking each write and each reload. A url server has url and, for auth "oauth" or "key", bearer: the session variable that holds its
     token. A stdio server has command and env ({the server's variable: the session variable whose value it gets}), and
     no arguments (DevOps plan 0.2: a command line that team.json writes is code), so its args are always []. Each
     variable has the shape of a key's name (key_env). A session that lacks one of these variables gets no such
@@ -983,6 +993,8 @@ def mcp_server(name, entry):
         raise ValueError(f"the MCP server name {name!r} must be 1 to 31 characters a-z 0-9 - that start with a letter")
     if name in TOOL_CATALOG or name == "fleet":
         raise ValueError(f"the name {name} is Fleet's own: choose another one")
+    if new and name in MCP_PROGRAM_NAMES:
+        raise ValueError(f"the name {name} is the program {MCP_PROGRAM_NAMES[name]}'s own: choose another one")
     if not isinstance(entry, dict) or set(entry) - MCP_FIELDS:
         raise ValueError(f"the MCP server {name} takes only {', '.join(sorted(MCP_FIELDS))}")
     title = entry.get("title")

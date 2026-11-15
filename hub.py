@@ -39762,7 +39762,7 @@ def mcp_probe(names, command):
     return rows
 
 
-def check_mcp_server(name, entry, agent=None):
+def check_mcp_server(name, entry, agent=None, new=False):
     """Does one MCP server answer? What POST /ui/mcp/check says about the server the owner is about to save, with no
     change to anything.
 
@@ -39774,8 +39774,9 @@ def check_mcp_server(name, entry, agent=None):
     machine that was not asked is named with the reason. For both kinds the hub names the API keys that the server
     needs and the fleet does not hold, because that is the other typo that shows only in a session. ValueError (the
     shape) is the caller's 400. agent: whose machine to ask about a command server, for a server that no agent has
-    yet; it changes nothing for a url server."""
-    made = mcp_server(name, entry)                  # ValueError with the reason
+    yet; it changes nothing for a url server. new: a server that the owner is about to save, which takes the rules
+    of a new write (lifecycle.mcp_server, D33)."""
+    made = mcp_server(name, entry, new=new)         # ValueError with the reason
     needs = [v for v in tool_needs(made) if v != mcp_variable(name)]
     result = {"name": name, "kind": "url" if "url" in made else "command", "checked": False, "answers": None,
               "needs": None, "says": "", "server": None, "version": None, "tools": [], "note": None,
@@ -47584,7 +47585,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("delete must be true, without server")
                 return {"base_sha256": base, "name": name, "delete": True}
             server = data.get("server")
-            mcp_server(name, server)         # ValueError with the reason
+            mcp_server(name, server, new=True)      # ValueError with the reason; new: the owner's write (D33)
             return {"base_sha256": base, "name": name, "server": server}
         return self.ui_command("team/mcp", read, save_mcp)
 
@@ -47774,13 +47775,14 @@ class Handler(BaseHTTPRequestHandler):
                 if agents()[who].get("role") not in ("worker", "lead"):
                     raise ValueError("agent must be a worker or a lead: an MCP server reaches task sessions only")
             entry = data.get("server")
+            new = entry is not None         # a server that the owner is about to save (D33); else the saved one
             if entry is None:
                 entry = (TEAM.get("mcp") or {}).get(name)
                 if not isinstance(entry, dict):
                     raise Refusal(404, f"no MCP server {name}")
             if secret_hit(json.dumps(entry)):       # before the server is asked, not after it was told
                 raise Refusal(422, "a registered login cannot be sent as text")
-            got["result"] = check_mcp_server(name, entry, who)   # ValueError with the reason: the 400 of this call
+            got["result"] = check_mcp_server(name, entry, who, new)     # ValueError with the reason: its 400
             return {"name": name, "server": entry, "agent": who}
 
         return self.ui_command("mcp/check", read, lambda body: got["result"])

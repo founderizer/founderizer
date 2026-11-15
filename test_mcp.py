@@ -218,6 +218,26 @@ class HubSide(OwnerAPI):
         self.assertNotIn("crm", self.view()["tools"])
         self.assertEqual(self.save("/ui/team/mcp", name="crm", delete=True)[0], 404)
 
+    def test_a_server_named_opencode_is_refused_at_the_owners_write_and_read_as_before_from_team_json(self):
+        """D33 (the review's H1): OpenCode names each tool of a server `<server>_<tool>`, and its sessions deny the
+        pattern `opencode_*` (D32), so a server named opencode would give an OpenCode session none of its tools. The
+        owner's write of that name, and the check of it before a save, are refused with their reason. A team.json that
+        has such a server reads as before: one refused name there would refuse the whole team at each write."""
+        code, data = self.save("/ui/team/mcp", name="opencode", server=CRM)
+        self.assertEqual(code, 400, data)
+        self.assertIn("the name opencode is the program OpenCode's own: choose another one", data["error"])
+        self.assertNotIn("mcp", self.origin_team())
+        code, data = self.post("/ui/mcp/check", name="opencode", server=CRM)
+        self.assertEqual(code, 400, data)
+        self.assertIn("is the program OpenCode's own", data["error"])
+        team = json.loads(json.dumps(TEAM))
+        team["mcp"] = {"opencode": CRM}
+        hub.validate_team(team)                 # a file that has one still loads
+        self.assertIn("opencode", lifecycle.tool_catalog(team))
+        with self.assertRaisesRegex(ValueError, "is the program OpenCode's own"):
+            lifecycle.mcp_server("opencode", CRM, new=True)
+        self.assertEqual(self.crm()[0], 200)    # another name, as before
+
     def test_the_owner_routes_refuse_a_bad_server_an_old_base_and_the_manager(self):
         for fields, status, words in ((dict(name="crm", server=dict(CRM, url="https://u:p@a.example.com/")), 400, "url must be"),
                                       (dict(name="CRM", server=CRM), 400, "name must be"),

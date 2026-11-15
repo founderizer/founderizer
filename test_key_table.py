@@ -4,6 +4,7 @@ real routes (Add secret and an import), the owner's lock, the fleet manager's sw
 step that only counts. In-process hub and temporary Git repositories, as test_grants; the central vault's operation on
 a store of its own, as test_vault. All keys are made up."""
 import json
+import os
 import subprocess
 import unittest
 import uuid
@@ -508,3 +509,28 @@ class Catalog(test_grants.Grants):
                          "the table of well-known services counted the list of 3 API keys and wrote nothing: it would "
                          "give 0 a site (openai 0, replicate 0, cloudflare 0); left out: 3 with no address of a row, "
                          "0 with a site, 0 with a mark, 0 held, 0 of a row that is gone")
+
+
+APP_SITES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app", "Tests", "FleetCoreTests",
+                         "provider-sites.json")
+
+
+@unittest.skipUnless(os.path.exists(APP_SITES), "the apps' tests are not in this tree")
+class ProviderSites(unittest.TestCase):
+    """The owner's choice C42: the Mac app refuses a secret whose address is an AI provider's own sign-in site before it
+    sends anything, with a copy of the central vault's two lists (FleetCore `ProviderSites`). One file of test hosts
+    holds the copy to the vault: this test holds the file's answers to vault.provider_site, and SecretTests holds the
+    copy to the file."""
+
+    def test_each_host_of_the_apps_file_is_answered_as_the_vault_answers_it(self):
+        with open(APP_SITES) as f:
+            hosts = json.load(f)["hosts"]
+        for host, expected in hosts.items():
+            with self.subTest(host=host):
+                self.assertIs(vault.provider_site(host), expected)
+        # each site of the two lists is in the file, itself and under it: a site that the vault gains and the copy
+        # lacks shows in SecretTests
+        for site in vault.PROVIDER_SITES + vault.PROVIDER_KEY_SITES:
+            with self.subTest(site=site):
+                self.assertIn(site, hosts)
+                self.assertTrue(any(h.lower().endswith("." + site) for h in hosts), site)
