@@ -74,6 +74,14 @@ class Program:
     first_prompt_waits = False
     settle = 0                      # seconds between that signal and the first prompt
     needs_account = False           # no session of it starts for an agent with no model account
+    # What the start text of a task session says for the agent's boxes Shell and Web, and for how its model calls the
+    # fleet's tools (hub.acp_tool_words; the coordinator's decision D31, the sixth review's P3). A box's name is no
+    # tool of the program: the start text said "you can use shell", and a model called a tool `shell` that the code
+    # of OpenCode's `execute` does not have. The standard program's words name no tool of its own.
+    tool_words = {"shell": "you run commands with your program's own tool for them",
+                  "web": "you read the web with your program's own tools for it",
+                  "fleet": "you call the fleet's tools, which this text and RULES.md name, as your program calls the "
+                           "tools of an MCP server: that server's name is `fleet`"}
 
     def __init__(self, home=None):
         self.home = home or os.path.expanduser("~")
@@ -180,6 +188,14 @@ class Grok(Program):
     """Grok Build (`grok agent stdio`)."""
     folder_name = "grok"
     TOOLS_READY = "_x.ai/mcp_initialized"
+    # Its tools at its pin, 1.0.77, as its first model request listed them (step 0 of the AI providers build,
+    # 12 November 2026): `run_terminal_command`, `web_search`, and `search_tool` and `use_tool` for the tools of an MCP
+    # server (tool, below)
+    tool_words = {"shell": "you run commands with Grok Build's own tool `run_terminal_command`",
+                  "web": "you search the web with its own tool `web_search`",
+                  "fleet": "you call each of the fleet's tools, which this text and RULES.md name, through its tool "
+                           "`use_tool` with the name `fleet__<tool>`, for example `fleet__read_messages`; `search_tool` "
+                           "lists them"}
 
     def __init__(self, home=None):
         super().__init__(home)
@@ -297,6 +313,16 @@ class OpenCode(Program):
     # on 14 November 2026 with a real model server)
     NO_ANSWERS = ("provider.internal", "provider.transport")
     CONTEXT, OUTPUT = 64000, 8000       # a model of the owner's own server, where the server names no size
+    # Its tools at its pin, 2.2.5 (step 0 of the AI providers build, 12 November 2026): `shell`, `webfetch` and
+    # `websearch` of its own, and `execute`, whose JavaScript reaches the tools of an MCP server as
+    # tools.<server>.<tool> and has no other tool: in lane S3's run of 15 November 2026 the model called `shell` there
+    # and got "Unknown tool 'shell'"
+    tool_words = {"shell": "you run commands with OpenCode's own tool `shell`, which you call as a tool and never "
+                           "inside `execute`",
+                  "web": "you read the web with its own tools `webfetch` and `websearch`",
+                  "fleet": "you call the fleet's tools, which this text and RULES.md name, only in the JavaScript of its "
+                           "tool `execute`, as `await tools.fleet.<tool>({ ... })`, for example "
+                           "`tools.fleet.read_messages`; `search({ query })` there lists them"}
 
     def session_env(self, session):
         # Its configuration folder is a source of its own (its AGENTS.md, its skills and its plugins load, and a plugin

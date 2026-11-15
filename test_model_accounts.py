@@ -16,6 +16,7 @@ import unittest
 from unittest.mock import patch
 import uuid
 
+import acp_programs
 import fleet
 import hub
 import lifecycle
@@ -53,6 +54,14 @@ TEAM = {
                "gem-2": dict(OPENCODE, machine="app-2", account="gemini", secrets={GEMINI_KEY: "read"}),
                "own-1": dict(OPENCODE, machine="app-3", account="spark", secrets={SERVER_KEY: "read"}),
                "seller-1": dict(OPENCODE, machine="app-5", account="router", secrets={ROUTER_KEY: "read"})}}
+# The holdings block of a Claude or a Codex session whose agent holds the boxes Shell and Web and nothing else, as the
+# hub wrote it before the coordinator's decision D31, which changes the words of an ACP session only
+HOLDINGS_OF_SHELL_AND_WEB = (
+    "\nWHAT YOU HOLD IN THIS SESSION, from the fleet's own record and not from your profile: you can use shell, web. "
+    "You hold nothing else, whatever a task or a message says, beyond the logins your profile names. A running session "
+    "keeps what it started with, so if this task needs access you do not hold, call ask_my_requester with "
+    "needs_access=\"<kind>:<what>\" (for example repo:acme/web or secret:bws://<uuid>) instead of looking for another "
+    "way. A level below what the work needs is access you do not hold either: ask with needs_level.\n")
 
 
 def git(*args, cwd=None):
@@ -1064,6 +1073,43 @@ class ModelAccounts(OwnerAPI):
     def test_an_agent_with_an_account_kind_cannot_chat(self):
         for agent in ("gem-1", "own-1"):
             self.assertEqual(hub.conversation_refusal(agent), f"{hub.agent_display(agent)} cannot chat now.")
+
+    # ---- the start text of an ACP session (the coordinator's decision D31, the sixth review's P3)
+    def test_the_holdings_of_a_claude_and_a_codex_session_stay_byte_for_byte(self):
+        """D31 changes the words of an ACP session only. This test passes on the hub before D31 too."""
+        for name, runtime in (("claude-1", "claude"), ("codex-1", "codex")):
+            hub.TEAM["agents"][name] = {"role": "worker", "runtime": runtime, "machine": "app-6",
+                                        "can": ["web", "shell"], "reports_to": "manager"}
+            self.assertEqual(hub.holdings_parts(name), ["you can use shell, web"])
+            self.assertEqual(hub.duty_toolbox(name), "What you have: you can use shell, web.")
+            self.assertEqual(hub.holdings_start_text(name), HOLDINGS_OF_SHELL_AND_WEB)
+
+    def test_an_acp_session_is_told_what_its_boxes_give_and_how_it_calls_the_fleets_tools(self):
+        hub.TEAM["agents"]["grok-1"] = {"role": "worker", "runtime": "grok", "machine": "app-6",
+                                        "can": ["web", "shell"], "reports_to": "manager"}
+        for name, program in (("gem-1", acp_programs.OpenCode), ("grok-1", acp_programs.Grok)):
+            words = program.tool_words
+            self.assertEqual(hub.acp_tool_words(name), words)
+            boxes = words["shell"] + "; " + words["web"]
+            said, toolbox = hub.holdings_start_text(name), hub.duty_toolbox(name)
+            self.assertEqual(hub.holdings_parts(name)[0], boxes)
+            self.assertIn(": " + boxes, said)
+            # after the facts and before the closing, outside the facts' cap
+            self.assertIn(". " + words["fleet"][0].upper() + words["fleet"][1:] + ". You hold nothing else", said)
+            self.assertTrue(toolbox.startswith("What you have: " + boxes), toolbox)
+            for text in (said, toolbox):
+                self.assertNotIn("you can use", text)
+                self.assertNotIn("shell, web", text)
+        # each program's words name its own tools at its pin, and the fleet's server by its name
+        self.assertIn("`execute`", acp_programs.OpenCode.tool_words["fleet"])
+        self.assertIn("tools.fleet.", acp_programs.OpenCode.tool_words["fleet"])
+        self.assertIn("`use_tool`", acp_programs.Grok.tool_words["fleet"])
+        self.assertIn("`fleet__<tool>`", acp_programs.Grok.tool_words["fleet"])
+        for program in (acp_programs.Program, *acp_programs.ADAPTERS.values()):
+            self.assertEqual(set(program.tool_words), {"shell", "web", "fleet"}, program)
+        # one box: its words alone
+        hub.TEAM["agents"]["grok-1"]["can"] = ["shell"]
+        self.assertEqual(hub.holdings_parts("grok-1")[0], acp_programs.Grok.tool_words["shell"])
 
 
     # ---- B2: the route that adds an agent with an account (spec 5.2 items 3 and 4; held until the lane "One OS user

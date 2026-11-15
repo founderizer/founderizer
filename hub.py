@@ -73,6 +73,7 @@ from lifecycle import SKILL_FILE, SKILL_NAME, SKILLS, skill_front, skill_rows, s
 from lifecycle import CONFIG_FILES, floor_path, keep_floor, may_take    # DevOps plan 0.1: the check of every move
 from lifecycle import KEY_SUFFIXES, SCREEN_COMMANDS, key_env, start_form    # DevOps plan 0.2: data stops being code
 import lifecycle
+import acp_programs     # the AI providers build, D31: an ACP session's words for its tools (acp_tool_words)
 
 DESKTOP = Frames()
 
@@ -4260,6 +4261,28 @@ def google_clauses(agent):
     return out
 
 
+def acp_tool_words(agent):
+    """The words of the adapter of the agent's ACP program for its own tools and for the fleet's
+    (acp_programs.Program.tool_words), or None for an agent whose runtime has another driver, so that the start text
+    of a Claude or a Codex session stays as it was (the coordinator's decision D31, the sixth review's P3)."""
+    runtime = (agents().get(agent) or {}).get("runtime")
+    if runtime_fact(runtime, "driver") != "acp":
+        return None
+    return acp_programs.ADAPTERS.get(runtime_fact(runtime, "acp_adapter"), acp_programs.Program).tool_words
+
+
+def can_clause(agent, can, join):
+    """The clause of the agent's boxes: their names for a Claude or a Codex session, as before, and for an ACP session
+    what they give, in its program's own words (D31). A model of an ACP program reads each name of its text as a name
+    that it can call, and no tool of its program is named `shell` or `web` in the way that the fleet's tools are."""
+    words = acp_tool_words(agent)
+    if words is None:
+        return "you can use " + join(sorted(can))
+    rest = sorted(set(can) - {"shell", "web"})
+    return "; ".join([words[box] for box in ("shell", "web") if box in can] +
+                     (["you can use " + join(rest)] if rest else []))
+
+
 def holdings_parts(agent):
     """What this agent holds, each kind in its own clause, from team.json and nothing else.
 
@@ -4272,7 +4295,7 @@ def holdings_parts(agent):
     a = agents().get(agent) or {}
     parts = []
     if a.get("can"):
-        parts.append("you can use " + named_few(sorted(a["can"])))
+        parts.append(can_clause(agent, a["can"], named_few))
     if a.get("repos"):
         parts.append("GitHub " + named_few(f"{r} ({v})" for r, v in sorted(a["repos"].items())))
     parts += google_clauses(agent)
@@ -4316,7 +4339,11 @@ def holdings_start_text(agent):
                "ask_my_requester with needs_access=\"<kind>:<what>\" (for example repo:acme/web or "
                "secret:bws://<uuid>) instead of looking for another way. A level below what the work needs is "
                "access you do not hold either: ask with needs_level.")
-    return "\n" + clip(said, max(120, HOLDINGS_CHARS - len(closing))) + closing + "\n"
+    # D31: how the model of an ACP program calls the fleet's tools, outside the facts' cap like the closing, so that
+    # it costs the session no fact; "" for a Claude or a Codex session, whose text stays byte for byte
+    words = acp_tool_words(agent)
+    calls = " " + words["fleet"][:1].upper() + words["fleet"][1:] + "." if words else ""
+    return "\n" + clip(said, max(120, HOLDINGS_CHARS - len(closing))) + calls + closing + "\n"
 
 
 # No prompt named a colleague. A worker's start text said what it holds and then, for anything it does not hold,
@@ -19300,7 +19327,7 @@ def duty_toolbox(agent):
     a = agents().get(agent) or {}
     parts = []
     if a.get("can"):
-        parts.append("you can use " + ", ".join(sorted(a["can"])))
+        parts.append(can_clause(agent, a["can"], ", ".join))       # D31: an ACP session's words for its boxes
     parts += google_clauses(agent)
     if a.get("repos"):
         parts.append("GitHub " + ", ".join(f"{r} ({v})" for r, v in sorted(a["repos"].items())))
