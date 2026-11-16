@@ -6736,7 +6736,51 @@ class OwnerFiles(RenderCase):
         self.assertEqual(d.kind, "full", d)
         self.assertIn("the door cannot read which objects apps/core/app/zz.jsonnet makes, and the repository gives "
                       "the owner objects", d.why)
-        d = self.push_owner({"apps/core/app/zz-script.yaml": script_map(name="other")})
+        d = self.push_owner({"apps/web/zz-script.yaml": script_map(name="other")})   # outside the owner's folder
+        self.assertEqual(d.kind, "own", d)
+        self.assertNotIn("gives the owner", d.why)
+
+    def test_the_chain_around_the_owner_s_files_is_the_owner_s_card(self):
+        """What can stop a control or hide its result without touching its files (the coordinator of the DevOps plan,
+        16 November 2026, after a review): a new manifest or a kustomization in the folder of the owner's files, a name
+        that differs only in case or ending, a quota, a limit, a NetworkPolicy or an AlertmanagerConfig in the
+        namespace where a workload of the owner's files runs (core: the CronJob), that Namespace object, and an
+        admission policy or its binding anywhere. Each is the owner's card with its words."""
+        quota = ("apiVersion: v1\nkind: ResourceQuota\nmetadata:\n  name: no-jobs\n  namespace: core\nspec:\n"
+                 "  hard:\n    count/jobs.batch: \"0\"\n")
+        limits = ("apiVersion: v1\nkind: LimitRange\nmetadata:\n  name: tiny\n  namespace: core\nspec:\n  limits:\n"
+                  "    - type: Container\n      max:\n        memory: 1Mi\n")
+        deny = ("apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: deny-all\n"
+                "  namespace: {ns}\nspec:\n  podSelector: {{}}\n  policyTypes: [Egress]\n")
+        space = "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: core\n  labels:\n    quiet: \"true\"\n"
+        route = ("apiVersion: monitoring.coreos.com/v1alpha1\nkind: AlertmanagerConfig\nmetadata:\n  name: quiet\n"
+                 "  namespace: core\nspec:\n  route:\n    receiver: none\n  receivers:\n    - name: none\n")
+        cases = [
+            ({"apps/core/app/zz-quota.yaml": quota}, ["apps/core/app/zz-quota.yaml is a new file in apps/core/app",
+                                                      "holds :ResourceQuota:core/no-jobs, in the namespace where"]),
+            ({"apps/limits/core.yaml": limits}, ["holds :LimitRange:core/tiny, in the namespace where"]),
+            ({"apps/policies/deny.yaml": deny.format(ns="core")},
+             ["holds networking.k8s.io:NetworkPolicy:core/deny-all, in the namespace where"]),
+            ({"namespaces/core.yaml": space}, ["holds :Namespace:/core, the namespace where the owner's controls run"]),
+            ({"apps/alerts/quiet.yaml": route},
+             ["holds monitoring.coreos.com:AlertmanagerConfig:core/quiet, in the namespace where"]),
+            ({"apps/guard/policy.yaml": GUARD_POLICY.replace("exposure-guard", "other-guard")},
+             ["holds admissionregistration.k8s.io:ValidatingAdmissionPolicy:/other-guard, an admission policy",
+              "holds admissionregistration.k8s.io:ValidatingAdmissionPolicyBinding:/other-guard, an admission policy"]),
+            ({"apps/core/app/kustomization.yaml": "resources:\n  - web.yaml\n"},
+             ["apps/core/app/kustomization.yaml is a kustomization in apps/core/app, a folder of the owner's files"]),
+            ({"apps/core/app/Check.YML": script_map(name="checked")},
+             ["apps/core/app/Check.YML is new", "(a name of apps/core/app/check.yaml)"]),
+        ]
+        for files, words in cases:
+            with self.subTest(files=list(files)):
+                d = self.push_owner(files)
+                self.assertEqual(d.kind, "full", d)
+                for word in words:
+                    self.assertIn(word, d.why)
+        # what is not part of the chain keeps its kind: a NetworkPolicy of another namespace, and a changed file of the
+        # owner's folder that holds no object of the chain
+        d = self.push_owner({"apps/policies/deny.yaml": deny.format(ns="web")})
         self.assertEqual(d.kind, "own", d)
         self.assertNotIn("gives the owner", d.why)
 
@@ -6819,6 +6863,34 @@ class OwnerPath(SignedRenderDoor):
         self.assertEqual((blobs, paths, message), ([SUSPENDED.encode()], [OWNER_CHECK], "fix"))
         got = self.call(ONE, GITOPS, "push", content=content)          # the owner's yes was used once
         self.assertEqual((got["ok"], got["route"]), (False, "yes"), got)
+
+    def test_the_card_s_hash_covers_the_file_that_the_door_writes(self):
+        """A commit that changes a file of the owner's and takes an entry out of a generated file: one card, whose call
+        hash covers the commit and the file that the door writes again, so that a yes to the commit alone lets
+        nothing through, and the yes to that hash makes the commit once, with the file."""
+        self.tree = dict(GEN_TREE, **{OWNER_CHECK: CHECK_FILE, ".founderizer/door.json": json.dumps({
+            "generated": [{"path": GEN_PATH, "run": ["ruby", "tools/gen.py"], "rules": ["tools/rules.txt"]}],
+            "owner": [OWNER_CHECK]})})
+        content = json.dumps({"message": "fix", "files": [
+            {"path": OWNER_CHECK, "content": base64.b64encode(SUSPENDED.encode()).decode()},
+            {"path": "apps/core/app/b.yaml", "delete": True}]}).encode()
+        got = self.call(ONE, GITOPS, "push", content=content)
+        self.assertEqual((got["ok"], got["route"]), (False, "yes"), got)
+        self.assertIn(f"with {GEN_PATH} written again, from which entries leave", got["why"])
+        written = inventory("a.example.com").encode()
+        sha = door.call_hash(GITOPS, "push", [], content + GEN_PATH.encode() + b"\0" + written + b"\0")
+        self.assertEqual(got["call"], sha)
+        self.yes(door.call_hash(GITOPS, "push", [], content), need=11)          # a yes to the commit alone
+        got = self.call(ONE, GITOPS, "push", content=content)
+        self.assertEqual((got["ok"], got["route"], got["call"]), (False, "yes", sha), got)
+        self.assertFalse([u for _m, u, _b in self.calls if u.endswith("/git/commits")])
+        self.yes(sha, need=12)
+        got = self.call(ONE, GITOPS, "push", content=content)
+        self.assertEqual((got["ok"], got["kind"]), (True, "approved"), got)
+        blobs, paths, message = self.made()
+        self.assertEqual(paths, [OWNER_CHECK, "apps/core/app/b.yaml", GEN_PATH])
+        self.assertEqual(blobs, [SUSPENDED.encode(), written])
+        self.assertIn(f"The door wrote {GEN_PATH} again, with the generator at HEAD.", message)
 
     def test_a_card_commit_and_then_its_prune(self):
         """The owner's yes lets a commit that deletes a file of the owner's through once, the door keeps what it

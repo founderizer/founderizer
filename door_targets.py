@@ -1331,27 +1331,85 @@ def file_objects(path, info, old, new):
     return found
 
 
+# The chain around the owner's files (the coordinator of the DevOps plan, 16 November 2026, after a review: "the control
+# is the whole chain"). What stops a control or hides its result without touching its files is the owner's too: a new
+# manifest or a kustomization in a folder of the owner's files (a cluster's tools read a folder whole, and a
+# kustomization or a chart changes how), a file whose name differs from an owner's file only in case or in the ending
+# that those tools read, a NetworkPolicy, a ResourceQuota, a LimitRange or an AlertmanagerConfig in a namespace where a
+# workload of the owner's files runs, that Namespace object itself, and an admission policy or its binding anywhere.
+# Routine lines in other files (an image, a replica count, a restart time) stay the rule calls that they were.
+RUNS = ("Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "ReplicationController", "CronJob", "Job", "Pod",
+        "Service")                          # the kinds whose namespace is where a control runs or answers
+GUARD_KINDS = ("NetworkPolicy", "ResourceQuota", "LimitRange", "AlertmanagerConfig")
+ADMISSION_GROUPS = ("admissionregistration.k8s.io", "kyverno.io", "policies.kyverno.io", "templates.gatekeeper.sh",
+                    "constraints.gatekeeper.sh")
+READ_ENDS = (".yaml", ".yml", ".json")      # the endings that a cluster's tools read as manifests, in any case
+MANIFEST_ENDS = READ_ENDS + (".jsonnet", ".libsonnet")
+KUSTOMIZATIONS = ("kustomization.yaml", "kustomization.yml", "kustomization")
+
+
+def name_variant(path):
+    "A path as a cluster's tools may read the same file: in lower case, with no ending that they read as a manifest."
+    name = path.casefold()
+    return next((name[:-len(end)] for end in READ_ENDS if name.endswith(end)), name)
+
+
+def under(path, folders):
+    "The folder of folders that path is in or below, or None. A folder of '' (the top) holds only the files at the top."
+    for folder in sorted(folders):
+        if (path.startswith(folder + "/") if folder else "/" not in path):
+            return folder or "the top of the repository"
+    return None
+
+
+def chain_words(keys, namespaces, where):
+    "The words for each key (object_key) that is part of the owner's chain by its kind (see RUNS, GUARD_KINDS)."
+    out = []
+    for key in sorted(k for k in keys if k):
+        group, kind, rest = key.split(":", 2)
+        namespace, _, name = rest.partition("/")
+        if group in ADMISSION_GROUPS:
+            out.append(f"{where} {key}, an admission policy")
+        elif kind in GUARD_KINDS and (namespace in namespaces or not namespace):
+            out.append(f"{where} {key}, in the namespace where the owner's controls run")
+        elif (group, kind) == ("", "Namespace") and name in namespaces:
+            out.append(f"{where} {key}, the namespace where the owner's controls run")
+    return out
+
+
 def owner_change(report, files):
     """What of a commit is the owner's by DOOR_DECLARATION at HEAD (the report's owner, door_render.owned), as words,
-    or []: each of its files that the declaration names and that it changes, with the exact change; each object of
-    such a file at HEAD that the commit writes or takes away in another file, or in a chart or a Kustomize folder that
-    the box rendered for it (the same object in a second place, which a cluster may take in its stead); and each file
-    of the commit whose objects the door cannot read, which could hold one."""
+    or []: each of its files that the declaration names, or a name of it that differs only in case or ending, and that
+    it changes, with the exact change; each object of such a file at HEAD that the commit writes or takes away in
+    another file, or in a chart or a Kustomize folder that the box rendered for it (the same object in a second place,
+    which a cluster may take in its stead); each new manifest and each kustomization in or below a folder of those
+    files; each object of the owner's chain by its kind (chain_words); and each file of the commit whose objects the
+    door cannot read, which could hold one."""
     if not report:
         return []
     owned = report.get("owner") or []
     if not owned:
         return []
     paths = {o["path"] for o in owned}
+    variants = {name_variant(p): p for p in paths}
+    folders = {p.rpartition("/")[0] for p in paths}
     objects = owner_objects(owned)
+    namespaces = {ns for _g, kind, ns, _n, _p in objects if kind in RUNS and ns}
     out = []
     for path, data, _mode in files:
         info = (report.get("files") or {}).get(path) or {}
         old = None if info.get("head") is None else base64.b64decode(info["head"])
-        if path in paths:
-            if old != data:
-                out.append(change_words(path, old, data))
+        if old == data:
+            continue                # the commit leaves this file as it is at HEAD
+        if path in paths or name_variant(path) in variants:
+            named = variants.get(name_variant(path), path)
+            out.append(change_words(path, old, data) + ("" if path in paths else f" (a name of {named})"))
             continue
+        folder = under(path, folders)
+        if folder and path.rpartition("/")[2].casefold() in KUSTOMIZATIONS:
+            out.append(f"{path} is a kustomization in {folder}, a folder of the owner's files")
+        elif folder and old is None and path.casefold().endswith(MANIFEST_ENDS):
+            out.append(f"{path} is a new file in {folder}, a folder of the owner's files")
         units = [report["units"][u] for u in info.get("units") or []]
         if units and all(u.get("ok") and not u.get("closed") for u in units):
             continue                # the render of each of its units says what it makes: the units, below
@@ -1360,6 +1418,7 @@ def owner_change(report, files):
             out.append(f"the door cannot read which objects {path} makes, and the repository gives the owner objects")
             continue
         out += [f"{path} holds {key}, an object of {owner}" for key, owner in owner_keys_in(found, objects)]
+        out += chain_words(found, namespaces, f"{path} holds")
     for _uid, unit in sorted((report.get("units") or {}).items()):
         if not unit.get("ok") or unit.get("closed"):
             continue                # its files are above: the door cannot read what it makes
@@ -1368,6 +1427,7 @@ def owner_change(report, files):
                      if isinstance(o, dict)}
             out += [f"{unit_name(unit)} renders {key}, an object of {owner}"
                     for key, owner in owner_keys_in(found, objects)]
+            out += chain_words(found, namespaces, f"{unit_name(unit)} renders")
     return list(dict.fromkeys(out))
 
 
