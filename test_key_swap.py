@@ -59,6 +59,7 @@ def load_tests(loader, _tests, _pattern):
     suite.addTests(Fact(name) for name in Fact.__dict__ if name.startswith("test_"))
     suite.addTests(Wish(name) for name in Wish.__dict__ if name.startswith("test_"))
     suite.addTests(ChecksWait(name) for name in ChecksWait.__dict__ if name.startswith("test_"))
+    suite.addTests(AnswerLines(name) for name in AnswerLines.__dict__ if name.startswith("test_"))
     return suite
 
 
@@ -3387,6 +3388,77 @@ class Configure(unittest.TestCase):
 def argparse_args(**kw):
     import argparse
     return argparse.Namespace(**kw)
+
+
+APP_ANSWERS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app", "Tests", "FleetCoreTests",
+                           "key-swap-answers.json")
+
+
+@unittest.skipUnless(os.path.exists(APP_ANSWERS) or os.environ.get("FOUNDERIZER_KEY_SWAP_ANSWERS_OUT"),
+                     "the apps' tests are not in this tree")
+@unittest.skipUnless(os.path.realpath(vault.INSTALLED) == vault.INSTALLED, "the installed program's path is a link here")
+class AnswerLines(Configure):
+    """The lines of `vault.py configure` that the owner's app reads (Part B, app patch 2), in one file for both
+    languages, as provider-sites.json is: this test makes each line with the real configure on the stand-in machine
+    and holds the file to them (with FOUNDERIZER_KEY_SWAP_ANSWERS_OUT set it writes the file), and KeySwapPlanTests
+    reads each line with the app's own reader. The words of the lock and of the kept part, which the app finds by their
+    start, are in it too."""
+
+    def line(self, step):
+        """The JSON line that configure_main prints for one run of configure on the stand-in: the real step runs first,
+        and configure_main prints its answer or its stop."""
+        try:
+            answer = step()
+
+            def effect(*_args, **_kw):
+                return answer
+        except vault.ConfigureStop as stop:
+            def effect(*_args, _stop=stop, **_kw):
+                raise _stop
+        args = argparse_args(config=vault.VAULT_CONF_PATH, add_owner_key=[], fleet=None, swap="keep", check=False)
+        out = io.StringIO()
+        with patch.object(vault, "configure", side_effect=effect), patch.object(vault, "unchangeable"), \
+                contextlib.redirect_stdout(out):
+            vault.configure_main(args, euid=0, program=vault.INSTALLED)
+        return out.getvalue().strip().splitlines()[-1]
+
+    def lines(self):
+        a, b = self.KEYS[0], self.KEYS[1]
+        made = Machine(dict(self.BROKER))
+        answers = {"made": self.line(lambda: self.step(made, owner_keys=[a], fleet=self.FLEET, swap="on")),
+                   "there": self.line(lambda: self.step(made, owner_keys=[a], fleet=self.FLEET, swap="on"))}
+        other = Machine(dict(self.BROKER, owner_keys=[b], fleet="fedcba9876543210"))
+        answers["refused"] = self.line(lambda: self.step(other, owner_keys=[a], fleet=self.FLEET, swap="keep"))
+        back = Machine(dict(self.BROKER))
+        back.proxy_stays = False
+        answers["put back"] = self.line(lambda: self.step(back, swap="on"))
+        kept = self.swapping()
+        kept.state["unit"] = "0" * 64
+        kept.proxy_stays = False
+        answers["kept part"] = self.line(lambda: self.step(kept, swap="on"))
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "configure.lock")
+            held = vault.configure_lock(path)
+            try:
+                answers["lock"] = self.line(lambda: self.step(Machine(dict(self.BROKER)), swap="on", lock=path))
+            finally:
+                os.close(held)
+        return answers
+
+    def test_the_apps_file_holds_the_lines_that_configure_prints(self):
+        answers = self.lines()
+        self.assertEqual(json.loads(answers["made"])["fleet"], True)          # a boolean, never the fleet's ID
+        self.assertEqual(json.loads(answers["put back"]).get("undone"), True)
+        self.assertNotIn("undone", json.loads(answers["kept part"]))
+        if os.environ.get("FOUNDERIZER_KEY_SWAP_ANSWERS_OUT"):
+            with open(APP_ANSWERS, "w", encoding="utf-8") as f:
+                json.dump({"about": "The lines of vault.py configure that the owner's app reads (Part B, app patch 2), "
+                                    "as configure_main prints them: test_key_swap.AnswerLines makes and holds them, and "
+                                    "KeySwapPlanTests reads each one with KeySwapAnswer.read.",
+                           "answers": answers}, f, indent=2, sort_keys=True)
+                f.write("\n")
+        with open(APP_ANSWERS, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["answers"], answers)
 
 
 class Installer(unittest.TestCase):

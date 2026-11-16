@@ -532,7 +532,7 @@ class Devices(OwnerAPI):
         self.assertEqual(status, 200)
         self.assertEqual(set(state), {"schema_version", "db", "time", "manager_flag", "manager_warning", "agents",
                                       "needs", "answered_needs", "tasks", "recent", "holds", "outcomes", "chat_apps",
-                                      "counts", "ui_features", "token", "ended_mark"})
+                                      "counts", "ui_features", "token", "ended_mark", "asked"})
         self.assertEqual([n["id"] for n in state["needs"]], [need])     # the open item only
         self.assertEqual([(n["id"], n["answer"]) for n in state["answered_needs"]], [(answered, "yes")])
         # a head carries what the Mac's state word reads, so the phone's Tasks row can say "Stalled" as its page does
@@ -724,6 +724,32 @@ class Devices(OwnerAPI):
         state = {t["id"]: t for t in self.call("/ui/state")[1]["tasks"]}
         self.assertEqual((heads[child]["parent"], heads[lead]["parent"]), (lead, None))
         self.assertEqual(heads[child]["parent"], state[child]["parent"])
+
+    def test_a_task_head_names_its_ask_and_the_read_names_each_ask(self):
+        """Owner API 1.189: each head carries ask, the value of GET /ui/state, in the open heads, the recent ones and
+        the ended read; asked names each ask that a head of the read names, by its request_id, and nothing else. The
+        phone's chat shows one row for each thing that the owner asked for there, as the Mac's does (the owner, 16
+        November 2026: "this tasks should also show inside the conversation")."""
+        self.message(text="Show the UTC time")
+        self.message(text="Thanks")
+        asked, thanks = (hub.q1("SELECT request_id FROM ui_requests WHERE text=?", (text,))["request_id"]
+                         for text in ("Show the UTC time", "Thanks"))
+        hub.q("UPDATE ui_requests SET asked='Show the UTC time' WHERE request_id=?", (asked,))
+        open_task, ended, alone = self.task(title="Open"), self.task(title="Ended", state="completed"), self.task()
+        hub.q("UPDATE tasks SET ask=? WHERE id IN (?,?)", (asked, open_task, ended))
+        mobile = self.call("/ui/mobile")[1]
+        heads = {t["id"]: t for t in mobile["tasks"] + mobile["recent"]}
+        state = {t["id"]: t for t in self.call("/ui/state")[1]["tasks"]}
+        self.assertEqual([heads[t]["ask"] for t in (open_task, ended, alone)], [asked, asked, None])
+        self.assertEqual(heads[open_task]["ask"], state[open_task]["ask"])
+        page = self.call("/ui/mobile/ended?db=test-generation")[1]
+        self.assertEqual([t["ask"] for t in page["tasks"]], [asked])
+        self.assertEqual(page["asked"], {asked: "Show the UTC time"})       # the names of the ended heads' asks
+        self.assertEqual(mobile["asked"], {asked: "Show the UTC time"})
+        hub.q("UPDATE ui_requests SET asked='Say thanks' WHERE request_id=?", (thanks,))   # no head names it
+        self.assertEqual(self.call("/ui/mobile")[1]["asked"], {asked: "Show the UTC time"})
+        hub.q("UPDATE tasks SET ask=NULL")
+        self.assertEqual(self.call("/ui/mobile")[1]["asked"], {})
 
     def test_a_task_page_holds_its_subtasks_and_its_parent(self):
         """Owner API 1.163: the heads of its subtasks by id, an ended one too, and the head of its parent; a task with

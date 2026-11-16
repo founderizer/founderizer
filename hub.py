@@ -1715,7 +1715,10 @@ MOBILE_HEAD = ("id", "title", "state", "owner", "requester", "goal", "needs", "a
                "stalled_since", "nudge_level", "missing_since",
                # owner API 1.162: the task it is a subtask of, so a device's board puts a task that waits for its open
                # subtasks in Waiting, as the Mac's (HubState.subtaskWaits)
-               "parent")
+               "parent",
+               # owner API 1.189: the owner's message that the task's work began from (owner feature asks), so the
+               # phone's chat shows one row for each thing that the owner asked for there, as the Mac's does
+               "ask")
 MOBILE_ANSWERED = 50            # answered Needs-you items that the phone reads, for the folded cards of its chats
 MOBILE_SEEN = 60                # seconds: a helper seen this recently is online in both apps (helperIsRecent)
 DEVICE_PATHS = (("/ui/mobile", ("GET",)), ("/ui/state", ("GET",)), ("/ui/knowledge", ("GET",)),
@@ -2914,6 +2917,9 @@ def mobile_state(generation, at=None):
     recent = [{k: r[k] for k in MOBILE_HEAD} for r in q(f"SELECT * FROM tasks WHERE state IN {ended} "
                                                         f"ORDER BY id DESC LIMIT {MOBILE_TASKS}")]
     mark = ended_mark()                     # owner API 1.166: read GET /ui/mobile/ended again when it changes
+    # Owner API 1.189: the name of each ask that a head names (owner feature asks), by its message's request_id. The
+    # phone keeps a chat's messages from before the work got its name, so the name comes here and not with them.
+    asked = ask_names(tasks + recent)
     needs = [need_view(r) for r in q("SELECT * FROM needs WHERE answer IS NULL ORDER BY id")]
     # D-7 item 2: an answered request card stays in its chat, folded to two lines, so the phone reads the newest
     # answered items too, oldest first. `needs` stays the open ones, which every phone already reads.
@@ -2923,13 +2929,24 @@ def mobile_state(generation, at=None):
             "manager_flag": kv_get("mgr_flag"), "manager_warning": manager_warning(), "ui_features": ui_features(),
             "agents": [mobile_agent(name, config) for name, config in agents().items()],
             "needs": needs, "answered_needs": list(reversed(answered)), "tasks": tasks,
-            "recent": list(reversed(recent)), "ended_mark": mark,
+            "recent": list(reversed(recent)), "ended_mark": mark, "asked": asked,
             "holds": [dict(r) for r in q("SELECT * FROM holds WHERE released IS NULL ORDER BY id")],
             "outcomes": [dict(r) for r in q("SELECT * FROM outcomes WHERE resolved IS NULL ORDER BY id")],
             "chat_apps": {"paused": chat_paused()},
             "counts": {"tasks_open": len(tasks), "needs_open": len(needs),
                        "messages": q1("SELECT COUNT(*) n FROM ui_requests")["n"],
                        "reports": q1("SELECT COUNT(*) n FROM owner_reports")["n"]}}
+
+
+def ask_names(heads):
+    """Owner API 1.189: {request_id: name} for each ask that one of these task heads names and that has a name (owner
+    feature asks): the phone's rows of what the owner asked for in a chat take their name from it."""
+    named = sorted({t["ask"] for t in heads if t["ask"]})
+    if not named:
+        return {}
+    return {r["request_id"]: r["asked"] for r in q(
+        f"SELECT request_id, asked FROM ui_requests WHERE asked IS NOT NULL AND request_id IN ({','.join('?' * len(named))})",
+        named)}
 
 
 def ended_mark():
@@ -2954,7 +2971,8 @@ def phone_ended(query):
         tasks = [{k: r[k] for k in MOBILE_HEAD + ("trigger_id",)}
                  for r in q(f"SELECT * FROM tasks WHERE state IN {ENDED_STATES} ORDER BY id")]
         mark = ended_mark()
-    return 200, scrub({"db": generation, "mark": mark, "tasks": tasks}), {"Cache-Control": "no-store"}
+        asked = ask_names(tasks)             # owner API 1.189: the names of the asks of these heads
+    return 200, scrub({"db": generation, "mark": mark, "tasks": tasks, "asked": asked}), {"Cache-Control": "no-store"}
 
 
 def mobile_cut(answer):
