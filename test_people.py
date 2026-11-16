@@ -129,7 +129,7 @@ class People(test_chat_apps.ChatApps):
         self.assertEqual([p["id"] for p in page["people"]], [person["id"]])
         self.assertEqual([r["role"] for r in page["roles"]], ["customer", "employee", "supervisor", "deputy"])
         self.assertEqual([r["tools"] for r in page["roles"] if r["role"] == "customer"],
-                         [["read_messages", "reply", "ask_owner"]])
+                         [["read_messages", "reply", "ask_owner", "remind"]])         # remind: WAKEUPS-INTERFACE.md 8
 
     def test_a_handle_belongs_to_one_person_and_never_to_the_owner(self):
         person = self.person_with_handle()
@@ -327,7 +327,7 @@ class Conversations(People):
 
     def test_the_window_has_the_tools_of_the_role_and_nothing_else(self):
         self.assertEqual([t["name"] for t in hub.tools_for("studio", self.context)],
-                         ["read_messages", "reply", "ask_owner", "request_work"])
+                         ["read_messages", "reply", "ask_owner", "request_work", "remind"])
         # studio's Shell box is off (DevOps D5), so its owner chat has F1's list: no way to an agent, to work or a key
         self.assertEqual({t["name"] for t in hub.tools_for("studio", ("test-generation", "owner-chat", "1"))},
                          set(hub.SHELL_OFF_CHAT))
@@ -350,7 +350,7 @@ class Conversations(People):
         self.assertIn("Jordi · customer · Discord", text)
         self.assertNotIn("call me today", text)
         self.assertEqual([t["name"] for t in hub.tools_for("studio", ("test-generation", "conversation", str(second)))],
-                         ["read_messages", "reply", "ask_owner"])            # a customer asks for no work
+                         ["read_messages", "reply", "ask_owner", "remind"])  # a customer asks for no work
         for bad in (("old-generation", "conversation", str(self.cid)), ("test-generation", "conversation", "999"),
                     ("test-generation", "conversation", "0"), ("test-generation", "conversation", "x")):
             self.assertTrue(hub.call_tool("studio", "read_messages", {}, bad)[1], bad)
@@ -465,7 +465,7 @@ class Conversations(People):
         self.assertEqual(self.count("goals"), 0)
         self.assertEqual(self.change(self.person["id"], role="customer")[0], 200)
         self.assertEqual([t["name"] for t in hub.tools_for("studio", self.context)],
-                         ["read_messages", "reply", "ask_owner"])
+                         ["read_messages", "reply", "ask_owner", "remind"])
         self.assertTrue(self.tool("request_work", title="Another", details="x")[1])
 
     def test_three_open_questions_are_enough(self):
@@ -481,7 +481,7 @@ class Conversations(People):
         code, start = self.start()
         self.assertEqual(code, 200, start)
         self.assertEqual(start["path"], f"/mcp/studio/test-generation/conversation/{self.cid}")
-        self.assertEqual(start["tools"], ["read_messages", "reply", "ask_owner", "request_work"])
+        self.assertEqual(start["tools"], ["read_messages", "reply", "ask_owner", "request_work", "remind"])
         self.assertIn("Laura runs the shop with me.", start["prompt"])
         self.assertIn("who is a person who works for the owner", start["prompt"])
         self.assertIn("Can you ask Alex to call me today?", start["prompt"])        # the recap of a fresh window
@@ -499,7 +499,7 @@ class Conversations(People):
         code, data = self.request(start["path"], call, headers, source="127.0.0.3")
         self.assertEqual(code, 200, data)
         self.assertEqual([t["name"] for t in data["result"]["tools"]],
-                         ["read_messages", "reply", "ask_owner", "request_work"])
+                         ["read_messages", "reply", "ask_owner", "request_work", "remind"])
         for other in (f"/mcp/studio/test-generation/conversation/{self.cid + 1}",
                       "/mcp/studio/test-generation/owner-chat/1", "/mcp/studio"):
             self.assertEqual(self.request(other, call, headers, source="127.0.0.3")[0], 403, other)

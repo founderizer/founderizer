@@ -69,6 +69,8 @@ WORDS = {
     # an agent that is busy
     "agent_mid_turn": "{agent} is in the middle of a turn. Move it when the turn ends.",
     "agent_open_signin": "{agent} has an open sign-in. Finish it or let it run out, then try again.",
+    # a one-time rule of "On a schedule" whose time has passed: its Resume (WAKEUPS-INTERFACE.md 8)
+    "time_passed": "this time has passed; change the time first",
 }
 
 

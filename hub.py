@@ -3989,6 +3989,7 @@ def migrate():
                          "result_body": "TEXT", "answer": "TEXT", "event_id": "INTEGER", "parent_task": "INTEGER",
                          "blocked_task": "INTEGER",        # plan C12: the task whose end a waiting check run waits for
                          "lines": "TEXT",      # plan P4: the lines that a line check's run printed, as a JSON list
+                         "outbound": "INTEGER",    # WAKEUPS-INTERFACE.md 8: a send run's receipt, its outbound item
                          "runs": "INTEGER"},   # plan P8: the quiet runs that one folded row stands for (NULL: one)
         # plan P4: the task whose session saved a revision, and how much outside text that session had read
         "trigger_history": {"saved_by_task": "INTEGER", "outside_reads": "INTEGER"},
@@ -4039,6 +4040,7 @@ def migrate():
         "CREATE INDEX IF NOT EXISTS reminder_task ON reminders(task, done) WHERE task IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS chat_out_report ON chat_out(report) WHERE report IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS chat_out_state ON chat_out(state, kind)",
+        "CREATE INDEX IF NOT EXISTS chat_out_again ON chat_out(again_of) WHERE again_of IS NOT NULL",  # send_run_fields
         "CREATE INDEX IF NOT EXISTS conversation_message_of ON conversation_messages(conversation, id)",
         "CREATE INDEX IF NOT EXISTS agent_message_reply ON agent_messages(in_reply_to)",
         "CREATE INDEX IF NOT EXISTS agent_message_event ON agent_messages(event_id) WHERE event_id IS NOT NULL",
@@ -5047,6 +5049,7 @@ DOING_FLEET = {
     "request_secret": "Asking you for a key", "start_task": "Starting a task", "tell_owner": "Writing to you",
     "message_owner": "Writing to you", "message_agent": "Writing to a colleague",
     "message_contact": "Writing to a person", "see_responsibilities": "Reading its duties",
+    "remind": "Setting a reminder for a person",
     "open_case": "Opening a case", "record_step": "Recording a step", "close_case": "Closing a case",
     "see_notes": "Reading its notes", "write_notes": "Writing its notes", "remember": "Saving a lesson",
     "recall": "Reading its lessons", "search_history": "Searching its history", "read_history": "Reading its history",
@@ -9430,6 +9433,8 @@ def t_see_triggers(agent, a):
         rule = trigger_view(t, t0) if t and t["state"] != "deleted" else None
         if rule is None or not wakeups.may_read(org, agent, rule):
             raise ToolError(f"There is no trigger {a['trigger_id']} that you may see.")
+        if reminder_rule(t) and contact_session(agent):     # WAKEUPS-INTERFACE.md 8: another person's words
+            raise ToolError(f"There is no trigger {a['trigger_id']} that you may see.")
         runs = [run_view(r, lines=True) for r in q("SELECT * FROM trigger_runs WHERE trigger_id=? ORDER BY id DESC "
                                                    "LIMIT 10", (t["id"],))]
         history = [dict(h, detail=json.loads(h["detail"])) for h in
@@ -9441,6 +9446,8 @@ def t_see_triggers(agent, a):
         source = found["source"] if found else None
         return wakeups.describe_detail(rule, runs, history, source, wake_when(t))
     rules = [(t, trigger_view(t, t0)) for t in q("SELECT * FROM triggers WHERE state<>'deleted' ORDER BY id")]
+    if contact_session(agent):         # WAKEUPS-INTERFACE.md 8: a person's reminders are their own
+        rules = [(t, rule) for t, rule in rules if not reminder_rule(t)]
     shown = [wakeups.describe(rule, wake_when(t)) for t, rule in rules if wakeups.may_read(org, agent, rule)]
     return "\n\n".join(shown) or "No wake-up rules that you may see. Create one with save_trigger."
 
@@ -9458,10 +9465,14 @@ def t_save_trigger(agent, a):
     command, replay = stored_command(agent, "save_trigger", a)
     if replay:
         return replay
+    if "send" in a or sends_already(a):     # a rule that sends a ready text (WAKEUPS-INTERFACE.md 8): its own rules
+        return t_save_send_rule(agent, a, command)
     org, t0 = wake_org(), now()
     t = trigger_row(wakeups.trigger_ref(a["trigger_id"])) if a.get("trigger_id") is not None else None
     rule = trigger_view(t, t0) if t and t["state"] != "deleted" else None
     rules = [dict(r) for r in q("SELECT id, agent, created_by, state FROM triggers WHERE state<>'deleted'")]
+    reminders = reminder_ids()          # WAKEUPS-INTERFACE.md 8: a person's reminders count apart
+    rules = [r for r in rules if r["id"] not in reminders]
     plan = wakeups.plan_save(org, agent, a, rule, rules)
     if "check" in a and plan.get("check"):
         lines = setting("checks.lines")     # the app 0.1.63 cannot read a line check; one way to wake once it can
@@ -9521,6 +9532,9 @@ def t_change_trigger(agent, a):
     t0 = now()
     t = trigger_row(wakeups.trigger_ref(a.get("trigger_id")))
     rule = trigger_view(t, t0) if t and t["state"] != "deleted" else None
+    if t and reminder_rule(t) and contact_session(agent):      # WAKEUPS-INTERFACE.md 8: remind changes it
+        raise ToolError(f"There is no trigger {a.get('trigger_id')} that you may change here. A person's reminder "
+                        f"changes only in its own conversation, with remind.")
     plan = wakeups.plan_change(wake_org(), agent, a, rule)
     t, run = trigger_action(plan["trigger_id"], plan["base_revision"], plan["op"], agent, t0, command=command)
     return wakeups.receipt_text(wakeups.receipt(plan["op"], t["id"], t["revision"], run["id"] if run else None))
@@ -14568,16 +14582,17 @@ PERSON_ROLES = {
 }
 # The conversation tools of each role (fleet.py CONVERSATION_TOOLS). request_work asks the owner to start work, so a
 # customer does not have it: what a customer needs reaches the owner as a question.
-PERSON_TOOLS = {"customer": ("read_messages", "reply", "ask_owner"),
-                "employee": ("read_messages", "reply", "ask_owner", "request_work"),
-                "supervisor": ("read_messages", "reply", "ask_owner", "request_work"),
-                "deputy": ("read_messages", "reply", "ask_owner", "request_work")}
+PERSON_TOOLS = {"customer": ("read_messages", "reply", "ask_owner", "remind"),
+                "employee": ("read_messages", "reply", "ask_owner", "request_work", "remind"),
+                "supervisor": ("read_messages", "reply", "ask_owner", "request_work", "remind"),
+                "deputy": ("read_messages", "reply", "ask_owner", "request_work", "remind")}
 # The tools that exist only inside a conversation window: no task session and no owner chat offers them.
-CONVERSATION_ONLY = ("reply", "ask_owner", "request_work", "ask_team", "open_work")
+CONVERSATION_ONLY = ("reply", "ask_owner", "request_work", "ask_team", "open_work",
+                     "remind")      # WAKEUPS-INTERFACE.md 8: a person's own reminder, into their own chat
 # AUTONOMY.md P2 and 6.2 (lane L2), with contacts.v2: the conversation tools of a session that runs with the agent's
 # own tools (a role with tools on), beside the tools of the agent's task sessions; and the only tools of a closed one.
-CONVERSATION_WORK_TOOLS = ("read_messages", "reply", "open_work", "message_contact")
-CONVERSATION_CLOSED_TOOLS = ("read_messages", "reply", "ask_team")
+CONVERSATION_WORK_TOOLS = ("read_messages", "reply", "open_work", "message_contact", "remind")
+CONVERSATION_CLOSED_TOOLS = ("read_messages", "reply", "ask_team", "remind")
 # What a task session has and a conversation with tools has not: the reply ends a conversation task, so it delivers
 # nothing and asks no requester, a reminder would park a task that the next reply ends, and a lead's subtask would
 # hang on it. Larger work, a follow-up at a later time and a lead's parts go to open_work, whose task has them all.
@@ -15578,6 +15593,7 @@ def conversation_rules(agent, person):
     if "request_work" in tools:
         lines.append("- A request for work goes to the owner with request_work. Only the owner starts work; never "
                      "say that it is started or done.")
+    lines.append(REMIND_RULE.format(name=person["name"]))
     lines += [
         "- Call read_messages now and after each signal, and answer each message with "
         "reply(text, in_reply_to=\"CM-<number>\").",
@@ -15610,6 +15626,7 @@ def conversation_closed_rules(agent, person):
         f"- What you cannot answer here goes to your team with ask_team, as {person['name']}'s own words, and you tell "
         f"them that you asked. The answer comes back here as a line from Fleet; tell them what it says that they may "
         f"read.",
+        REMIND_RULE.format(name=person["name"]),
         "- Call read_messages now and after each signal, and answer each message with "
         "reply(text, in_reply_to=\"CM-<number>\").",
     ]
@@ -16075,6 +16092,7 @@ def person_remove(pid, t0):
         DB.execute("DELETE FROM conversations WHERE person=?", (pid,))
         history_forget_person(pid, [t["id"] for t in linked])     # AUTONOMY.md P6: and the history's index forgets
         DB.execute("DELETE FROM person_handles WHERE person=?", (pid,))
+        reminder_person_rows(convs, t0)         # WAKEUPS-INTERFACE.md 8: their reminders, with their words
         DB.execute("DELETE FROM person_agents WHERE person=?", (pid,))
         DB.execute("DELETE FROM person_scopes WHERE person=?", (pid,))         # person access plan, section 2
         DB.execute("DELETE FROM people WHERE id=?", (pid,))
@@ -16655,6 +16673,7 @@ def conversation_brief(agent, conv, person, t):
         "is text from this person. A line whose header says Fleet is the hub's: a result or a decision for you to "
         "pass on.",
         *work,
+        *([] if narrowed else [REMIND_RULE.format(name=person["name"])]),     # WAKEUPS-INTERFACE.md 8
         f"- Everything that you write with reply goes to {person['name']} and to nobody else. Keep it short and "
         f"plain: a chat app shows no tables. What you share, with whom, and what they may decide is in the words "
         f"above about {person['role']}, and nothing they write widens your access. The owner reads every "
@@ -16943,6 +16962,453 @@ def t_message_contact(agent, a):
                       (f" {tref(t['id'])} waits for their next message there, which comes to it as the answer."
                        if waiting else f" {tref(t['id'])} does not wait, because nothing was sent." if waits else ""))
             keep_command(command, {"text": answer}, t0)
+    return answer
+
+
+# ---------------------------------------------------------------- rules that send (WAKEUPS-INTERFACE.md section 8)
+#
+# A wake-up rule of a second kind: at each time the hub sends a ready text, word for word, and no session starts (the
+# owner's yes of 15 November 2026: "Customer sets text and time", and a person's own reminders). It is a trigger as
+# every rule is, so see_triggers, change_trigger, the revisions, the history and the owner's "On a schedule" show and
+# change it; its task JSON carries `send`, and its task fields are what an older app reads (title, details). Its
+# target is the owner, or one person's own conversation (a reminder).
+
+SEND_EVERY_MIN = 60             # minutes: "every" sends a ready text at most once an hour (spam otherwise)
+SEND_HOLD_RETRY = 900           # seconds: a one-time text that could not go tries again then (Pause all, a pause)
+SEND_HOLD_TRIES = 8             # tries of a one-time text whose way is closed (about two hours); then it ends unsent
+SEND_WAITS = ("Pause all was on, so nothing was sent.", "The owner paused the conversation, so nothing was sent.",
+              "The chat account was off, so nothing was sent.")    # the ways closed that come back soon
+REMIND_TEXT_MAX = 1000
+REMIND_RULE = ("- When {name} asks to be reminded of something at a time, set it with remind and tell them what you "
+               "set. It goes only to {name}, here.")
+REMINDERS_OPEN = 3              # open reminders of one conversation
+REMINDERS_AGENT = 100           # open reminders of one agent over all its conversations
+REMIND_AHEAD = 90 * 86400       # seconds: a one-time reminder at most this far ahead
+SEND_DONE_WHEN = "The hub sends the text at each time, with no session."
+SEND_TO_OWNER = ("owner", "the owner", "you")
+
+
+def send_rule(t):
+    """The `send` of a rule that sends (WAKEUPS-INTERFACE.md 8), or None for any other rule."""
+    try:
+        task = json.loads(t["task"]) if isinstance(t["task"], str) else t["task"]
+    except (TypeError, ValueError, KeyError, IndexError):
+        return None
+    send = task.get("send") if isinstance(task, dict) else None
+    return send if isinstance(send, dict) else None
+
+
+def reminder_rule(t):
+    """True for a person's reminder: a rule that sends into one conversation."""
+    send = send_rule(t)
+    return bool(send) and send.get("to") == "conversation"
+
+
+def send_rule_id(trigger_id):
+    """True when trigger T-<id> is a rule that sends. read_row only."""
+    row = read_row("SELECT task FROM triggers WHERE id=?", (trigger_id,))
+    return bool(row) and send_rule(row) is not None
+
+
+def reminder_ids():
+    """The ids of every person's reminder that is not deleted: they count in their conversations' limits, apart from
+    the agent's own rules (plan C12's 20)."""
+    return {r["id"] for r in q("SELECT id, task FROM triggers WHERE state<>'deleted' AND task LIKE "
+                                "'%\"conversation\"%'") if reminder_rule(r)}
+
+
+def conversation_session(agent, a):
+    """True in a turn of a person's own words: a conversation window, or a task tool of a conversation with the
+    agent's tools, which call_tool runs for the open conversation task (its task_id). Such a turn saves no rule that
+    sends: that work goes to open_work, whose task has the tools. Every session that a contact drives, open_work's
+    too, sees and changes no person's reminder (contact_session). read_row only."""
+    if conversation_context(agent):
+        return True
+    tid = a.get("task_id")
+    if role_of(agent) not in ("worker", "lead") or tid in (None, ""):
+        return False
+    try:
+        t = read_row("SELECT * FROM tasks WHERE id=?", (parse_task(tid),))
+    except ToolError:
+        return False
+    return is_conversation_task(t)
+
+
+def owner_asked_session(agent, a):
+    """True for the fleet manager, and for a task that the owner asked for in their own words in the agent's own
+    chat (start_task keeps its receipt with the task's number). Only such a session saves a rule that sends to the
+    owner: only the manager and the owner's chats write to him first, and a task session reaches him only up its
+    line (WORKER_CHAT_ONLY). read_row only."""
+    if role_of(agent) == "manager":
+        return True
+    tid = a.get("task_id")
+    if tid in (None, ""):
+        return False
+    try:
+        task = parse_task(tid)
+    except ToolError:
+        return False
+    return read_row("SELECT 1 FROM tool_commands WHERE agent=? AND tool='start_task' AND "
+                    "json_extract(receipt, '$.task')=? LIMIT 1", (agent, task)) is not None
+
+
+def send_title(text):
+    """A rule's title on one line of at most 200 characters, as the app's rows take it."""
+    return cut_whole(" ".join(str(text).split()), 200)
+
+
+def send_target(agent, to, a):
+    """({to}, the rule's title) of a rule that sends to the owner, while the agent has a way to the owner now and the
+    session may write to him (owner_asked_session): a ToolError otherwise."""
+    to = str(to or "").strip()
+    if to.lower() not in SEND_TO_OWNER:
+        raise ToolError('send.to is "owner": a rule that sends goes to the owner. Nothing was saved.')
+    if not owner_asked_session(agent, a):
+        raise ToolError("A rule that sends to the owner is saved by the manager, or in a task that the owner asked you "
+                        "for in your own chat: a task session reaches the owner only up its line. Nothing was saved.")
+    if not owner_route(agent):
+        raise ToolError("You have no chat app route to the owner yet: the owner links one of their chat apps with "
+                        "your account first. Nothing was saved.")
+    return {"to": "owner"}, "Send to the owner"
+
+
+def send_schedule(value, reminder=False):
+    """The schedule of a rule that sends, checked: "every" from SEND_EVERY_MIN minutes on; a reminder's once, daily or
+    monthly, in the fleet's time zone when it gives none."""
+    if reminder and isinstance(value, dict) and value.get("kind") in ("once", "daily", "monthly") and \
+            "timezone" not in value:
+        value = dict(value, timezone=goal_settings()[2].key)
+    schedule = trigger_schedule(value)
+    if schedule["kind"] == "every" and (reminder or schedule["minutes"] < SEND_EVERY_MIN):
+        raise ToolError(f"A ready text goes at most once an hour: every needs {SEND_EVERY_MIN} minutes or more." if
+                        not reminder else "A reminder is once, daily or monthly.")
+    return schedule
+
+
+def own_rules(agent):
+    """The active and paused rules that this agent saved itself, but its people's reminders: plan C12's limit."""
+    return sum(1 for r in q("SELECT created_by, state, task FROM triggers WHERE state IN ('active','paused') AND "
+                            "created_by=?", (agent,)) if not reminder_rule(r))
+
+
+def sends_already(a):
+    """True when save_trigger names a rule that sends: its change goes through t_save_send_rule too, so that no change
+    gives it a check, a task under the old text, another agent or a schedule of minutes."""
+    try:
+        old = trigger_row(wakeups.trigger_ref(a["trigger_id"])) if a.get("trigger_id") is not None else None
+    except wakeups.Refused:
+        return False
+    return bool(old) and send_rule(old) is not None
+
+
+def t_save_send_rule(agent, a, command):
+    """save_trigger with send (WAKEUPS-INTERFACE.md 8): a rule of the agent's own whose times send a ready text with
+    its own bot or account, so only the agent itself sets it. A new one, or a change of one that sends (trigger_id,
+    base_revision, and the fields that change: send, schedule, or both). It has no task and no check."""
+    if conversation_session(agent, a):
+        # A person's words choose no text for the owner, and a rule outlives the conversation: such work goes to
+        # open_work, whose task has the tool.
+        raise ToolError("A rule that sends is saved in a task session, not in a conversation: open the work with "
+                        "open_work.")
+    send = a.get("send")
+    if send is not None and (not isinstance(send, dict) or set(send) - {"to", "text"} or
+                             not isinstance(send.get("to"), str) or not isinstance(send.get("text"), str)):
+        raise ToolError('send must be {"to": "owner", "text": the message}.')
+    if a.get("task") is not None or a.get("check") is not None:
+        raise ToolError("A rule that sends has no task and no check: its text goes out as it is. To make it a rule "
+                        "with a task, delete it and save a new one.")
+    if a.get("agent") not in (None, agent):
+        raise ToolError("A rule that sends uses your own bot or account, so it is yours: leave agent out.")
+    t0 = now()
+    old = None
+    if a.get("trigger_id") is not None:
+        old = trigger_row(wakeups.trigger_ref(a["trigger_id"]))
+        if old and old["state"] != "deleted" and old["agent"] != agent and send_rule(old) is not None and \
+                not reminder_rule(old) and role_of(agent) == "manager":
+            way = ("in a task that the owner asked for in its own chat" if send_rule(old).get("to") == "owner" else
+                   "in one of its own tasks")
+            raise ToolError(f"Rule {a['trigger_id']} sends with {old['agent']}'s own account, so only "
+                            f"{old['agent']} changes it, {way}. Nothing was saved.")
+        if not old or old["state"] == "deleted" or old["agent"] != agent or send_rule(old) is None or \
+                reminder_rule(old):
+            raise ToolError(f"There is no rule of yours that sends with the number {a['trigger_id']}.")
+        if isinstance(a.get("base_revision"), bool) or not isinstance(a.get("base_revision"), int):
+            raise ToolError("A change needs base_revision: the revision that see_triggers shows.")
+        if send is None and "schedule" not in a:
+            raise ToolError("Give at least one of send and schedule.")
+        if send_rule(old).get("to") == "owner" and not owner_asked_session(agent, a):     # also a new schedule
+            raise ToolError("A rule that sends to the owner is changed by the manager, or in a task that the owner "
+                            "asked you for in your own chat: a task session reaches the owner only up its line. "
+                            "Nothing was saved.")
+    elif send is None or "schedule" not in a:
+        raise ToolError("A new rule that sends needs schedule and send.")
+    schedule = send_schedule(a["schedule"]) if "schedule" in a else json.loads(old["schedule"])
+    if send is None:            # a new schedule for the text and the target that it has
+        body = {"agent": agent, "schedule": schedule, "task": json.loads(old["task"]), "check": None}
+        t = trigger_edit(old["id"], a["base_revision"], body, agent, t0, created_by=agent, command=command,
+                         saved_in=save_provenance(agent))
+        return wakeups.receipt_text(wakeups.receipt("edit", t["id"], t["revision"]))
+    text = send["text"].strip()
+    if not text or len(text) > CHAT_TEXT_MAX:
+        raise ToolError("send.text must be 1 to 4,000 characters.")
+    guard(agent, text)
+    spec, title = send_target(agent, send["to"], a)
+    task = {"title": title, "details": text, "done_when": SEND_DONE_WHEN, "needs": "none", "goal_id": None,
+            "send": dict(spec, text=text)}
+    body = {"agent": agent, "schedule": schedule, "task": task, "check": None}
+    saved_in = save_provenance(agent)
+    if old:
+        t = trigger_edit(old["id"], a["base_revision"], body, agent, t0, created_by=agent, command=command,
+                         saved_in=saved_in)
+        return wakeups.receipt_text(wakeups.receipt("edit", t["id"], t["revision"]))
+    have = own_rules(agent)
+    if have >= wakeups.RULES_MAX:
+        raise ToolError(f"You have {have} active or paused wake-up rules of your own; the limit is "
+                        f"{wakeups.RULES_MAX}. Delete one that you no longer need first.")
+    t = trigger_create(dict(body, request_id=command[1]), agent, t0, created_by=agent, command=command,
+                       saved_in=saved_in)
+    return wakeups.receipt_text(wakeups.receipt("create", t["id"], t["revision"]))
+
+
+def reminder_person_rows(convs, t0):
+    """Inside person_remove's transaction: the reminders of a removed person's conversations go, with the words and
+    the name in them (the rule's text and title, and its history; a run's reason is a fixed sentence of the hub's), as
+    every other word of their conversations goes. The rule stays as deleted, with no words, as a deleted rule does."""
+    in_transaction("reminder_person_rows")
+    for r in DB.execute("SELECT id, task FROM triggers WHERE task LIKE '%\"conversation\"%'").fetchall():
+        send = send_rule(r)
+        if not send or send.get("to") != "conversation" or send.get("conversation") not in convs:
+            continue
+        gone = {"title": "Reminder for a removed person", "details": "", "done_when": SEND_DONE_WHEN, "needs": "none",
+                "goal_id": None, "send": {"to": "conversation", "conversation": send["conversation"], "name": None,
+                                          "text": ""}}
+        DB.execute("UPDATE triggers SET state='deleted', next_due=NULL, task=?, updated=? WHERE id=?",
+                   (json.dumps(gone), t0, r["id"]))
+        DB.execute("DELETE FROM trigger_history WHERE trigger_id=?", (r["id"],))
+
+
+def send_conversation(t, send):
+    """(conversation, person) of a reminder while it may still go: the conversation open, the person neither blocked
+    nor without this agent, and its account still this agent's own and on. Else (None, None)."""
+    conv = read_row("SELECT * FROM conversations WHERE id=?", (send.get("conversation"),))
+    person = read_row("SELECT * FROM people WHERE id=?", (conv["person"],)) if conv else None
+    acc = chat_apps().get(conv["account"]) if conv else None
+    if not conv or conv["agent"] != t["agent"] or conv["state"] != "open" or not conv["chat"] or person is None or \
+            person["blocked"] is not None or not person_may(person["id"], t["agent"]) or not acc or \
+            not chat_enabled(acc) or acc["agents"] != [t["agent"]]:
+        return None, None
+    return conv, person
+
+
+def reminder_held(t, send):
+    """Why one run of a reminder only skips, or None: the owner paused its conversation, or turned its account off,
+    while the person is there, not blocked and still has the agent, and the account is still the agent's own. Each
+    of those can come back, so the reminder stays; anything else that stops it ends it (send_way). read_row only."""
+    conv = read_row("SELECT * FROM conversations WHERE id=?", (send.get("conversation"),))
+    person = read_row("SELECT * FROM people WHERE id=?", (conv["person"],)) if conv else None
+    acc = chat_apps().get(conv["account"]) if conv else None
+    if not conv or conv["agent"] != t["agent"] or not conv["chat"] or person is None or \
+            person["blocked"] is not None or not person_may(person["id"], t["agent"]) or not acc or \
+            acc["agents"] != [t["agent"]]:
+        return None
+    if conv["state"] == "paused":
+        return "The owner paused the conversation, so nothing was sent."
+    if conv["state"] == "open" and not chat_enabled(acc):
+        return "The chat account was off, so nothing was sent."
+    return None
+
+
+def owner_way_off(agent):
+    """True when an account of this agent is off that reaches the owner once he turns it on: he has a handle of its
+    app. read_rows only."""
+    for aid, acc in chat_apps().items():
+        if acc["agents"] != [agent] or chat_enabled(acc) or not owner_target(acc["app"]):
+            continue
+        return True
+    return False
+
+
+def send_way(t, send):
+    """(why nothing goes, or None; where it goes; whether the rule ends) for one run of a rule that sends
+    (WAKEUPS-INTERFACE.md 8). Its reads take the lock; the run writes after them."""
+    agent = t["agent"]
+    if agent not in agents():
+        return f"{agent} is no longer in the team.", None, False
+    if chat_paused():
+        return "Pause all was on, so nothing was sent.", None, False
+    if send.get("to") == "owner":
+        route = owner_route(agent)
+        if route:
+            return None, route, False
+        if owner_way_off(agent):
+            return "The chat account was off, so nothing was sent.", None, False
+        return "There was no chat app route to the owner.", None, False
+    if send.get("to") == "conversation":
+        with LOCK:
+            conv, person = send_conversation(t, send)
+            held = None if conv else reminder_held(t, send)
+        if held:
+            return held, None, False
+        if conv is None:
+            return "The person or the conversation is gone, so this reminder ended.", None, True
+        return None, {"conversation": conv["id"], "account": conv["account"], "chat": conv["chat"]}, False
+    return "This rule's target is not one that this release knows.", None, False
+
+
+def send_rows(t, send, way, t0):
+    """Inside run_send's transaction: the text of one run, queued for the bridge where it goes. To the owner it is also
+    the agent's message in the owner's app (as message_owner makes one); a reminder is also the agent's message in the
+    conversation's record. Returns the outbound item."""
+    in_transaction("send_rows")
+    text = send["text"]
+    if send["to"] == "owner":
+        rid = DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to,pushed) VALUES(?,'',?,?,NULL,"
+                         "1)", (text, t0, t["agent"])).lastrowid
+        return chat_queue("message", way["account"], t0, chat=way["chat"], recipient=way["recipient"], text=text,
+                          reply_to=None, report=rid, request_id=way["request"])
+    item = chat_queue("message", way["account"], t0, chat=way["chat"], text=text, reply_to=None)
+    if send["to"] == "conversation":
+        DB.execute("INSERT INTO conversation_messages(id,conversation,who,text,created,outbound) VALUES(?,?,?,?,?,?)",
+                   (unused_id("conversation_messages"), way["conversation"], "agent", text, t0, item))
+        DB.execute("UPDATE conversations SET last=? WHERE id=?", (t0, way["conversation"]))
+    return item
+
+
+def run_send(t, due, manual, t0):
+    """One run of a rule that sends (WAKEUPS-INTERFACE.md 8), as run_trigger: the run, its outbound item (the run's
+    receipt, `outbound`) and the next due time commit together, so a crash leaves either all of them or none, and the
+    next time is past the run that queued its text. The bridge sends an item once, and a lost answer is `unknown`,
+    never a second send.
+    A run that queued its text is `started`, as a wake's is (a check run's `sent` is an open run, which
+    trigger_open_run allows once); one whose way is gone is `not_sent` with why. The secret guard reads the text
+    again at each run, as at the save: a text that holds a login registered since then sends nothing, and the hub
+    pauses the rule. An agent that left the team pauses it too, and a reminder whose person or conversation is gone
+    ends."""
+    send, schedule = send_rule(t), json.loads(t["schedule"])
+    # a one-time text has gone after its run, also one that ran before its own minute
+    later = [] if manual or schedule["kind"] == "once" else trigger_slots(schedule, t["anchor"], max(due, t0), 1)
+    why, way, ends = send_way(t, send)
+    held = why is None and secret_hit(str(send.get("text") or ""))
+    if held:
+        log(t["agent"], f"BLOCKED the text of rule {t['id']}, which contained a login")
+        why = "The text holds a registered login now, so nothing was sent and the hub paused this rule."
+    # a one-time text whose way comes back soon (Pause all, a paused conversation, an account that is off) keeps its
+    # one send and tries again, SEND_HOLD_TRIES times in all; then, or for any other way that is closed, the hub
+    # pauses it with why, so that it stays in "On a schedule" with its reason: never a text that leaves the list
+    # unsent
+    wait = why in SEND_WAITS and schedule["kind"] == "once" and not manual and \
+        q1("SELECT COUNT(*) n FROM trigger_runs WHERE trigger_id=? AND revision=? AND manual=0 AND state='not_sent'",
+           (t["id"], t["revision"]))["n"] < SEND_HOLD_TRIES - 1
+    with transaction():
+        item = send_rows(t, send, way, t0) if why is None else None
+        run = DB.execute("INSERT INTO trigger_runs(trigger_id,revision,due,manual,state,reason,created,finished,"
+                         "outbound) VALUES(?,?,?,?,?,?,?,?,?)", (t["id"], t["revision"], due, int(manual),
+                                                                 "started" if item else "not_sent", why, t0, t0,
+                                                                 item)).lastrowid
+        if held:
+            pause_trigger(t["id"], "hub", "Its text holds a registered login.", t0)
+        elif why and t["agent"] not in agents():
+            pause_trigger(t["id"], "hub", why, t0)
+        elif ends:
+            DB.execute("UPDATE triggers SET state='done', next_due=NULL, updated=? WHERE id=?", (t0, t["id"]))
+        elif item and schedule["kind"] == "once":      # a one-time text has gone, also by Run now: it goes once only
+            DB.execute("UPDATE triggers SET state='done', next_due=NULL, updated=? WHERE id=?", (t0, t["id"]))
+        elif wait:
+            DB.execute("UPDATE triggers SET next_due=? WHERE id=?", (t0 + SEND_HOLD_RETRY, t["id"]))
+        elif why and schedule["kind"] == "once" and not manual:
+            pause_trigger(t["id"], "hub", why, t0)
+        elif not manual:
+            DB.execute("UPDATE triggers SET next_due=?, state=? WHERE id=?",
+                       (later[0] if later else None, t["state"] if later else "done", t["id"]))
+    return q1("SELECT * FROM trigger_runs WHERE id=?", (run,))
+
+
+SEND_RUN_WENT = ("queued", "sending", "sent", "delivered", "read")
+
+
+def send_run_fields(r, view):
+    """The view of one run: a run of a rule that sends says how its text went, as its outbound item says it now, so the
+    owner's "On a schedule" shows a text that did not go out as a run that started nothing: an item that the bridge or
+    the hub failed or let expire is `not_sent` with why (the bridge's words, the WhatsApp day's limit, a handle that is
+    gone, a removed account), and one whose arrival nobody confirmed is `unknown`. Read at each view, so no report of
+    the bridge writes a run. Every other run as it is. read_row only."""
+    outbound = r["outbound"] if "outbound" in r.keys() else None
+    if r["state"] != "started" or not outbound:
+        return view
+    item = read_row("WITH RECURSIVE sends(id) AS (SELECT ? UNION SELECT o.id FROM chat_out o JOIN sends s ON "
+                    "o.again_of=s.id) SELECT state, error FROM chat_out WHERE id=(SELECT MAX(id) FROM sends)",
+                    (outbound,))       # each Send again of the owner's makes a newer item (again_of)
+    if not item or item["state"] in SEND_RUN_WENT:
+        return view
+    if item["state"] == "unknown":
+        return dict(view, state="unknown", reason="Delivery not confirmed.")
+    return dict(view, state="not_sent", reason=cut_whole(f"Not sent: {item['error'] or 'it went no further'}", 300))
+
+
+def reminder_words(r):
+    """One open reminder as its conversation's session reads it: its number, its schedule and its text."""
+    send = send_rule(r) or {}
+    return f"{r['id']}: {wakeups.schedule_text(json.loads(r['schedule']))}: " + \
+        json.dumps(cut_whole(send.get("text") or "", 200), ensure_ascii=False)
+
+
+def t_remind(agent, a):
+    """WAKEUPS-INTERFACE.md 8: a reminder for the person of this conversation, which its session sets: a text that
+    the hub sends into this conversation's own chat at its time, with no session. It reaches nobody else (reply's
+    rule: no address). With cancel, one of this conversation's reminders ends; with neither text nor cancel, the
+    answer lists them."""
+    with LOCK:
+        conv, person = conversation_fence(agent)
+        open_rows = [r for r in q("SELECT * FROM triggers WHERE agent=? AND state IN ('active','paused') ORDER BY id",
+                                  (agent,)) if reminder_rule(r)]
+    here = [r for r in open_rows if (send_rule(r) or {}).get("conversation") == conv["id"]]
+    listing = "Open reminders here: " + ("; ".join(reminder_words(r) for r in here) if here else "none") + "."
+    if a.get("cancel") is None and a.get("text") is None:
+        return listing
+    if a.get("cancel") is not None:
+        rid = a["cancel"]
+        rule = next((r for r in here if r["id"] == rid), None) if isinstance(rid, int) else None
+        command, old = agent_write(agent, "remind", a, {"conversation": conv["id"], "cancel": rid})
+        if old:
+            return old["text"]
+        if rule is None:
+            raise ToolError(f"No open reminder of this conversation has the number {rid}. {listing}")
+        t0 = now()
+        with transaction():
+            trigger_state_rows(rule["id"], rule["revision"], "delete", agent, t0)
+            answer = f"Reminder {rule['id']} is cancelled."
+            keep_command(command, {"text": answer}, t0)
+        return answer
+    text = a.get("text")
+    if not isinstance(text, str) or not text.strip() or len(text.strip()) > REMIND_TEXT_MAX:
+        raise ToolError(f"text is 1 to {REMIND_TEXT_MAX} characters: what the person reads at the time.")
+    text = text.strip()
+    guard(agent, text)
+    try:
+        schedule = send_schedule(a.get("schedule"), reminder=True)
+    except ValueError as e:
+        raise ToolError(f"Refused: {e}.") from None
+    command, old = agent_write(agent, "remind", a, {"conversation": conv["id"], "text": text, "schedule": schedule})
+    if old:
+        return old["text"]
+    t0 = now()
+    first = trigger_slots(schedule, t0, t0, 1)
+    if not first:
+        raise ToolError("That time has passed. Nothing was saved.")
+    if schedule["kind"] == "once" and first[0] - t0 > REMIND_AHEAD:
+        raise ToolError("A one-time reminder is at most 90 days ahead. Nothing was saved.")
+    if len(here) >= REMINDERS_OPEN:
+        raise ToolError(f"This conversation has {len(here)} open reminders, the most it can have. {listing}")
+    if len(open_rows) >= REMINDERS_AGENT:
+        raise ToolError("You have too many open reminders over all your conversations. Nothing was saved.")
+    task = {"title": send_title(f"Reminder for {person['name']}"), "details": text, "done_when": SEND_DONE_WHEN,
+            "needs": "none", "goal_id": None, "send": {"to": "conversation", "conversation": conv["id"],
+                                                       "name": send_title(person["name"]), "text": text}}
+    with transaction():
+        tid = trigger_create_rows({"agent": agent, "schedule": schedule, "task": task, "check": None,
+                                   "request_id": command[1]}, agent, t0, created_by=agent)
+        answer = f"Reminder {tid} is set: {wakeups.schedule_text(schedule)}. The person gets it here at that time."
+        keep_command(command, {"text": answer}, t0)
     return answer
 
 
@@ -20518,6 +20984,8 @@ def duty_watch_target(body, want, t0):
             row = trigger_row(w["trigger"])
             if not row or row["responsibility"] != body.get("id") or row["state"] in ("done", "deleted"):
                 raise Refusal(400, f"watch.trigger {w['trigger']} is not a live watch of this duty")
+            if send_rule(row):      # WAKEUPS-INTERFACE.md 8: a watch list would write a task over its text
+                raise Refusal(400, f"watch.trigger {w['trigger']} sends a ready text, so it is no watch")
 
 
 def duty_watch_states(live=True):
@@ -22870,6 +23338,8 @@ def t_attach_watch(agent, a):
         if rule["watch"] in DUTY_WATCHES + (DUTY_REVIEW,):
             raise ToolError(f"Rule {rule_id} is a {rule['watch']} watch that the hub keeps; make your own rule with "
                             f"save_trigger and attach that one.")
+        if send_rule(rule):         # WAKEUPS-INTERFACE.md 8: it starts no work, so it opens no case
+            raise ToolError(f"Rule {rule_id} sends a ready text and starts no work, so it is no watch of a duty.")
         if r["state"] == "retired":     # a watch attached a second after the manager retired R-2 (28 October 2026)
             raise ToolError(f"{rref(r['id'])} is retired, and a retired duty takes no new watch. If it is needed "
                             f"again, ask your requester to reopen it, then attach the rule.")
@@ -27964,6 +28434,8 @@ def costs_view(names, start, end, minimum=COSTS_MINIMUM):
                                          (t["agent"], f"trigger {t['id']}", since, until)), book)
             # lane L4: a wake is a run that started one; new lines that went into the check's open wake joined it,
             # and the third failure in a row, which wakes the agent once, is still a failure
+            if send_rule_id(t["id"]):      # WAKEUPS-INTERFACE.md 8: a send is no wake
+                runs = [r for r in runs if r["state"] != "started"]
             check[when] = {"wakes": len([r for r in runs if r["state"] == "started"]),
                            "joined": len([r for r in runs if r["state"] == "joined"]),
                            "quiet": sum((r["runs"] or 1) if quiet else 1 for r in runs if r["state"] == "quiet"),
@@ -28867,6 +29339,19 @@ TOOLS = [
        ["title", "details"])),
     # AUTONOMY.md P2 and 6.2 (lane L2), with contacts.v2: ask_team in a closed conversation, open_work in a
     # conversation with the agent's tools, message_contact in every session with the agent's tools
+    ("worker", "remind", t_remind,
+     "Set a reminder that this person asked for, or one that helps them: at its time the hub sends your text into "
+     "this conversation, to this person and to nobody else, with no session. At most 3 open reminders here; a "
+     "one-time one at most 90 days ahead. With cancel, end one of them; with neither text nor cancel, list them. "
+     "Tell the person what you set.",
+     S({"request_id": REQUEST_ID,
+        "text": {"type": "string", "description": "What the person reads at the time, 1 to 1000 characters"},
+        "schedule": {"type": "object",
+                     "description": "{\"kind\":\"once\",\"at\":\"2026-11-20T10:00\"}, {\"kind\":\"daily\","
+                                    "\"time\":\"09:00\",\"days\":[\"mon\"] or null}, or {\"kind\":\"monthly\","
+                                    "\"day\":1,\"time\":\"09:00\"}; timezone is the fleet's unless you give one"},
+        "cancel": {"type": "integer", "description": "The number of an open reminder of this conversation, to end it"}},
+       ["request_id"])),
     ("worker", "ask_team", t_ask_team,
      "Take what you cannot answer in this conversation to your team: it opens a task on you, with the person's words "
      "as quoted data, which you do in a session with your own tools as far as what you do for this person allows. "
@@ -31071,8 +31556,10 @@ def trigger_state_rows(trigger_id, base, action, by, t0, command=None):
         raise Refusal(409, f"trigger {trigger_id} is {t['state']}; {action} does not apply")
     if action == "resume":          # no backlog: the first due time after now
         later = trigger_slots(json.loads(t["schedule"]), t["anchor"], t0, 1)
+        if not later and by == "owner" and send_rule(t) and json.loads(t["schedule"])["kind"] == "once":
+            later = [t0]            # WAKEUPS-INTERFACE.md 8: the owner's Resume sends a one-time text now
         if not later:
-            raise Refusal(409, "this time has passed; change the time first")
+            raise Refusal(409, code="time_passed")
         DB.execute("UPDATE triggers SET state='active', paused_by=NULL, paused_reason=NULL, next_due=?, "
                    "revision=revision+1, updated=? WHERE id=?", (later[0], t0, trigger_id))
         record_trigger(trigger_id, by, "resume", wakeups.history_detail("resume", {"state": t["state"]},
@@ -31189,6 +31676,7 @@ def run_view(r, lines=False):
     """One run, as the owner API gives it; with lines, also the lines that it printed (a list, or None), for an agent's
     own reading of its rule. The owner's answers carry none: they are a check's untrusted output."""
     view = run_fields(r)
+    view = send_run_fields(r, view)        # a rule that sends (WAKEUPS-INTERFACE.md 8): how its text went
     if lines:
         view["lines"] = json.loads(r["lines"]) if r["lines"] else None
     return view
@@ -31306,6 +31794,8 @@ def trigger_decision(t, manual, due, t0):
 def run_trigger(t, due, manual, t0):
     """One run of a trigger. The run, the task that it starts (with its attempt and start event) and the trigger's
     next due time commit together or not at all. Returns the run row."""
+    if send_rule(t):        # a rule that sends a ready text, with no session (WAKEUPS-INTERFACE.md 8)
+        return run_send(t, due, manual, t0)
     if agent_rule(t):
         return run_wake(t, due, manual, t0)
     state, info = trigger_decision(t, manual, due, t0)      # its reads commit, so it runs before the transaction
@@ -31607,6 +32097,8 @@ def wake_last(t):
 
 def wakes_24h(t, t0):
     """The wake-ups that one agent rule started in the last 24 hours: tasks, or messages to the manager."""
+    if send_rule(t):        # WAKEUPS-INTERFACE.md 8: a send starts no task and wakes nobody
+        return 0
     return q1("SELECT COUNT(*) n FROM trigger_runs WHERE trigger_id=? AND state='started' AND finished>?",
               (t["id"], t0 - 86400))["n"]
 

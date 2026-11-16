@@ -633,7 +633,7 @@ class Conversations(Base):
         self.assertIn("ask_team", start["prompt"])
         self.assertNotIn("ask_owner", start["prompt"])
         self.assertEqual([t["name"] for t in hub.tools_for("studio", self.context(cid))],
-                         ["read_messages", "reply", "ask_team"])
+                         ["read_messages", "reply", "remind", "ask_team"])          # remind: WAKEUPS-INTERFACE.md 8
         self.ok("read_messages", self.context(cid))
         notified = hub.q1("SELECT COUNT(*) n FROM events WHERE agent='owner'")["n"]
         answer = self.ok("ask_team", self.context(cid), question="Can I move my plan to next month?")
@@ -1071,7 +1071,7 @@ class SwitchOff(Base):
         self.assertEqual(set(start), {"conversation", "agent", "person", "url", "path", "token", "tools", "prompt"})
         self.assertEqual(start["tools"], list(hub.PERSON_TOOLS["employee"]))
         self.assertEqual([t["name"] for t in hub.tools_for("studio", self.context(cid))],
-                         ["read_messages", "reply", "ask_owner", "request_work"])
+                         ["read_messages", "reply", "ask_owner", "request_work", "remind"])
         self.assertNotIn("message_contact", {t["name"] for t in hub.tools_for("studio", None)})
         tid, here = self.normal_task()
         self.assertNotIn("message_contact", {t["name"] for t in hub.tools_for("studio", here)})

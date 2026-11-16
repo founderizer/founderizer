@@ -2907,7 +2907,9 @@ def tools():
              plain("/ui/standing/{id}/end", ("why",), "the end of this standing item")),
         tool("trigger_state", "Pause, resume, delete, run now or check now one wake-up rule. On an agent's rule with a "
              "check, run_now runs the check now and wakes the agent only for what is new, as a scheduled run does; on "
-             "any other rule it starts the rule's task now. check_now runs the check once and wakes nobody. Read a "
+             "a rule that sends a ready text it sends the text now, also into a person's chat for a reminder, and a "
+             "one-time one then ends; on any "
+             "other rule it starts the rule's task now. check_now runs the check once and wakes nobody. Read a "
              "run's result with fleet_read(page=\"trigger\").",
              {"id": S["int"], "action": {"type": "string",
                                          "enum": ["pause", "resume", "delete", "run_now", "check_now"]}, **rid},

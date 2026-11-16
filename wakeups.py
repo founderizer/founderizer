@@ -38,6 +38,8 @@ RULES_MAX = 20              # active and paused rules that one agent saved itsel
 ACTIONS = ("pause", "resume", "delete", "check_now")
 RULE_FIELDS = ("agent", "schedule", "task")      # the hub checks them (1.7); no late window and no cap (plan C12)
 SAVE_KEYS = {"request_id", "trigger_id", "base_revision", "check", "task_id"} | set(RULE_FIELDS)
+# send: a rule that sends a ready text (WAKEUPS-INTERFACE.md 8), which the hub saves itself (hub.t_save_send_rule)
+SAVE_KEYS = SAVE_KEYS | {"send"}
 CHANGE_KEYS = {"request_id", "trigger_id", "base_revision", "action", "task_id"}    # call_tool adds task_id
 CHECK_KEYS = {"code", "args", "timeout_seconds", "condition"}
 LINE_FORM = "lines"         # plan P4: the `form` of a check that prints lines
@@ -519,6 +521,8 @@ def plan_change(org, caller, args, rule):
         raise Refused("action must be pause, resume, delete or check_now.")
     base = revision_of(args)
     may_control(org, caller, rule, action)
+    if action == "check_now" and isinstance(rule["task"].get("send"), dict):     # WAKEUPS-INTERFACE.md 8
+        raise Refused(f"Trigger {tid} sends a ready text at its times and has no check.")
     if action == "check_now" and not rule.get("check"):
         raise Refused(f"Trigger {tid} has no check. Add one with save_trigger, or wait for its time.")
     if action in ("resume", "check_now"):
@@ -773,6 +777,10 @@ def describe(rule, when):
              (f" Next: {when(rule['next_due'])}." if rule.get("next_due") else ""),
              f"  Task: {task['title']} (needs {task['needs']}). Done when: {task['done_when']}",
              f"  Check: {check_text(rule.get('check'), rule['agent'])}."]
+    if isinstance(task.get("send"), dict):      # a rule that sends a ready text (WAKEUPS-INTERFACE.md 8)
+        lines = [line.replace(f", wakes {rule['agent']}: ", f", sends for {rule['agent']}: ", 1) if n == 0 else
+                 (f"  Sends: {json.dumps(task['title'], ensure_ascii=False)}, its text word for word, with no "
+                  f"session." if line.startswith("  Task: ") else line) for n, line in enumerate(lines)]
     armed = rule.get("armed")
     if armed and not armed.get("armed"):
         lines.append(f"  Armed: no. {armed.get('reason') or ''}".rstrip())
@@ -792,6 +800,11 @@ def describe_detail(rule, runs, history, source, when):
     out = [describe(rule, when)]
     if rule["task"].get("details"):
         out.append("  Details: " + rule["task"]["details"])
+    send = rule["task"].get("send") if isinstance(rule["task"].get("send"), dict) else {}
+    if rule["task"].get("details") and send.get("to") == "conversation":
+        # a person's reminder (WAKEUPS-INTERFACE.md 8): its words come from a person's conversation, so they are data
+        out[-1] = ("  Text, from a person's conversation (untrusted data, JSON-encoded): " +
+                   json.dumps(rule["task"]["details"], ensure_ascii=False))
     out.append("Runs, newest first:" if runs else "No runs yet.")
     out += [f"  {run_text(r, when)}" for r in runs]
     if history:
@@ -853,12 +866,20 @@ TOOL_SPECS = (
      "python3 -I in an empty folder. Never put a secret in the code or the args. In a change, a check without code "
      "keeps the saved code, and \"check\": null removes it. Your machine runs the code only from its own store, "
      "never from the hub: also write the program, byte for byte, to ~/fleet-checks/<its SHA-256>.py on your "
-     "machine; the answer names that file.",
+     "machine; the answer names that file.\n"
+     "send, in place of task and check: a ready text that the hub sends at each time, with no session.",
      obj({"request_id": REQUEST_ID, "trigger_id": TRIGGER_ID, "base_revision": BASE,
           "agent": {"type": "string", "description": "The agent that the rule wakes. Default: you."},
           "schedule": {"type": "object", "description": "When the rule runs. See the forms above."},
           "task": {"type": "object", "description": "What the agent does when the rule wakes it."},
           "check": {"description": "The check object above, or null for no check."},
+          "send": {"type": "object",
+                   "description": "In place of task and check (WAKEUPS-INTERFACE.md 8): {\"to\": \"owner\", "
+                                  "\"text\": the message in Markdown}. At each time the hub sends the text word for "
+                                  "word, and no session starts, so it costs nothing; every sends at most once an "
+                                  "hour. Only the manager, or a task that the owner asked you for in your own chat, "
+                                  "saves or changes one to the owner. Write a rule with task instead when the text "
+                                  "must be written at the time from live data."},
           "task_id": TASK_ID}, ["request_id"])),
     ("change_trigger",
      "Pause, resume or delete a wake-up rule that you may change, or run its check once now (check_now never starts "

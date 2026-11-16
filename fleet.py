@@ -2764,7 +2764,8 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
 
 # The Fleet tools that a closed conversation session may call, MCP context conversation (CHAT-APPS 9.4): the hub offers
 # the ones of the person's role. ask_team is a closed session's way out with contacts.v2 (AUTONOMY.md P2).
-CONVERSATION_TOOLS = ("read_messages", "reply", "ask_owner", "request_work", "ask_team")
+CONVERSATION_TOOLS = ("read_messages", "reply", "ask_owner", "request_work", "ask_team",
+                      "remind")         # WAKEUPS-INTERFACE.md 8: the person's own reminder
 # The person access plan, version 5: the allow list of a narrowed conversation's locked window, which the hub starts
 # with mode "narrowed": hub.SCOPE_TOOLS, the same names (test_person_scope asserts it, because dontAsk refuses a tool
 # that this list does not name, in silence). The hub offers each one only where the person's list allows it.

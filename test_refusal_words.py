@@ -55,6 +55,7 @@ OLD = {
     "not_owner_device_no_code": "{address} is not an owner device, and that is not a code for a new one",
     "agent_mid_turn": "{agent} is in the middle of a turn. Move it when the turn ends.",
     "agent_open_signin": "{agent} has an open sign-in. Finish it or let it run out, then try again.",
+    "time_passed": "this time has passed; change the time first",
 }
 
 # The places of hub.py that were converted to a code, by the function that holds each: the scan of 16 November 2026
