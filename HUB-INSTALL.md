@@ -27,11 +27,13 @@ Founderizer's. See "The sign-in, and renewing it" below.
 **It makes the fleet, and no agent.** No agent runs on the hub's server: an agent has a
 shell, and the central vault on that server holds every key. The manager is the first
 agent, and its own setup page in the app gives it a server of its own (a VPS that joins
-with one line, or a Mac), then its AI provider and the sign-in (UI-API.md 1.82). Each
-agent installs only its own AI, on its own server.
+with one line, or a Mac) and the sign-in (UI-API.md 1.82). The app's first run asks for
+its AI provider before the servers, and the setup gives the server and that provider in
+one command. Each agent installs only its own AI, on its own server.
 
 **One server for all is one word.** With `FLEET_HUB_SERVER=shared` in the installer's
-environment, the manager runs on the hub's server, and the owner can add each later agent
+environment, the manager runs on the hub's server (with `--runtime codex` it runs Codex
+there; the default is Claude Code), and the owner can add each later agent
 on that server too, each under its own OS user. The first `team.json` then says
 `"hub": {"shared": true}` (UI-API.md 1.168 and 1.171), and two more steps give this server
 what a joined server gets from its join:
@@ -422,8 +424,10 @@ same array as the owner's checklist.
 ## The sign-in, and renewing it
 
 One thing is left after the install, and it is done in the app: **set up the manager
-and sign in to your own Claude account.** The manager's page asks for its server first,
-then its AI provider, and then for the sign-in, which happens on that server.
+and sign in to your own account.** The app's first run asked for the manager's AI provider
+already. With two servers or one for each agent, the manager's page asks for its server,
+and then for the sign-in, which happens on that server; with one server, it asks for the
+sign-in alone.
 
 What happens, in order (UI-API.md, "Sign a machine in"):
 

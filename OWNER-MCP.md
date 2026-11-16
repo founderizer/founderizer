@@ -277,13 +277,15 @@ free text of an agent or a person). Its one field, `after`, is optional. The ans
 - `hub`: `none` (no hub's address), `set` (an address, and its last read did not answer), or
   `answers`. It is what the app's store knows; the call makes no request of its own.
 - `first_run`: `shows`; `page`, by a fixed name: `welcome`, `paste`, `name` ("Name your
-  manager"), `servers` ("Your fleet's servers"), `vps` ("A VPS for your fleet"), `tailscale`, `tailscale_key`, `token`, `building` (a provider's server is made),
+  manager"), `ai_provider` ("Juno's AI provider", with the manager's name), `servers` ("Your fleet's servers"), `vps` ("A VPS for your fleet"), `tailscale`, `tailscale_key`, `token`, `building` (a provider's server is made),
   `other_vps` (a server by its address), `machine`, `installing`, `address`, `done`, `restore`;
   `title`, the page's title in English as the app's string table has it, and a title with a
   placeholder as its key ("Your %@ token"; a title that is a server's address is none); `works`,
   whether work of the first run runs now (a check, a build, an install, a connection, Tailscale's
   sign-in, the key); `began`, whether an install of this first run began; `holds_window`; and
-  `provider`, on a provider's page (`hetzner`, `digitalocean`, `vultr`, `akamai`); and `layout`,
+  `provider`, on a provider's page (`hetzner`, `digitalocean`, `vultr`, `akamai`); `ai_provider`, the owner's
+  choice on the page `ai_provider` (`claude` or `codex`: the program of the manager, as `runtime` of `install_hub`
+  has it), null until the owner went on from that page in this first run; and `layout`,
   the owner's choice on the page `servers` (`one`: everything on one server; `two`: the hub and its
   keys on a server of their own; `each`: the hub and each agent on a server of their own), null
   until the owner went on from that page in this first run. With no first run, `shows` is false and
