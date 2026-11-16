@@ -50,13 +50,14 @@ OPENSSL = shutil.which("openssl") or "/usr/bin/openssl"
 
 def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
-    for case in (Reading, Rule, Proxy, Start, Installer, Helper):
+    for case in (Reading, Rule, Proxy, Start, Configure, Installer, Helper):
         suite.addTests(loader.loadTestsFromTestCase(case))
     suite.addTests(Configuration(name) for name in Configuration.__dict__ if name.startswith("test_"))
     suite.addTests(BrokerPart(name) for name in BrokerPart.__dict__ if name.startswith("test_"))
     suite.addTests(HubRoutes(name) for name in HubRoutes.__dict__ if name.startswith("test_"))
     suite.addTests(Delivery(name) for name in Delivery.__dict__ if name.startswith("test_"))
     suite.addTests(Fact(name) for name in Fact.__dict__ if name.startswith("test_"))
+    suite.addTests(Wish(name) for name in Wish.__dict__ if name.startswith("test_"))
     return suite
 
 
@@ -2324,9 +2325,10 @@ class HubRoutes(test_grants.Grants):
 
 
 class Fact(test_grants.Grants):
-    """The owner's word that the vault of a server swaps keys: `"key_swap": true` in the server's entry of team.json,
-    the owner's route that writes it, and the three readers that say what is so by it. The agent alpha is on the
-    Linux server box. It reads two keys, one with a site and one with none, and it has a shell and the web."""
+    """The word that the vault of a server swaps keys: `"key_swap": true` in the server's entry of team.json, the route
+    of the Mac app's own reading that writes it (Part B of the changed key swap), and the three readers that say what
+    is so by it. The agent alpha is on the Linux server box. It reads two keys, one with a site and one with none, and
+    it has a shell and the web."""
     SITE = "https://" + HOST
     KEY, BARE = test_grants.KEY, test_grants.NEW            # OPENAI_API_KEY with a site, SHOP_API_KEY with none
 
@@ -2341,11 +2343,12 @@ class Fact(test_grants.Grants):
             super().setUp()
 
     def says(self, server, on, **more):
+        """The Mac app's reading of the server's vault, as root: it swaps keys (on) or not."""
         body = dict({"request_id": str(uuid.uuid4()), "db": "test-generation", "base_sha256": self.team()["sha256"],
-                     "on": on}, **more)
-        return self.request(f"/ui/servers/{server}/key-swap", body)
+                     "swaps": on, "reason": None}, **more)
+        return self.request(f"/ui/servers/{server}/key-swap-reading", body)
 
-    def test_the_owner_says_that_the_vault_of_a_server_swaps_keys_and_takes_the_word_back(self):
+    def test_the_apps_reading_writes_the_word_and_takes_it_back(self):
         before = self.commits()
         code, receipt = self.says("box", True)
         self.assertEqual((code, receipt.get("server"), receipt.get("key_swap"), receipt.get("changed")),
@@ -2365,11 +2368,11 @@ class Fact(test_grants.Grants):
         commit = lambda path, data, why: written.append(json.loads(data)) or "c" * 40
         with patch.object(hub, "team_view", lambda rev: (team, "a" * 64, None)), \
                 patch.object(hub, "commit_kit_file", commit), patch.object(hub, "apply_team", lambda new: None):
-            receipt = hub.server_key_swap("box", {"on": False, "base_sha256": "a" * 64})
+            receipt = hub.server_key_swap_reading("box", {"swaps": False, "reason": None, "base_sha256": "a" * 64})
         self.assertEqual((receipt["changed"], receipt["key_swap"]), (True, False))
         self.assertEqual(written[0]["servers"]["box"], {"kind": "linux", "user": "fleet"})
 
-    def test_the_word_is_for_a_linux_server_of_the_fleet_and_only_the_owner_gives_it(self):
+    def test_the_word_is_for_a_linux_server_of_the_fleet_and_only_the_owners_app_gives_it(self):
         before = self.commits()
         code, said = self.says("lone", True)
         self.assertEqual((code, said["error"]), (409, "The key swap is for a Linux server."))
@@ -2377,13 +2380,14 @@ class Fact(test_grants.Grants):
             with self.subTest(server):
                 self.assertEqual(self.says(server, True)[0], 404)
         for bad in ("yes", 1, 0, None, [True]):
-            with self.subTest(on=bad):
+            with self.subTest(swaps=bad):
                 self.assertEqual(self.says("box", bad)[0], 400)
         self.assertEqual(self.says("box", True, base_sha256="0" * 64)[0], 409)      # another team.json than he read
         self.assertEqual(self.says("box", True, base_sha256="short")[0], 400)
         # no report and no request of a machine writes it: the route is the owner's
-        body = {"request_id": str(uuid.uuid4()), "db": "test-generation", "base_sha256": self.team()["sha256"], "on": True}
-        code, _ = self.request("/ui/servers/box/key-swap", body, source=hub.address_of("alpha"))
+        body = {"request_id": str(uuid.uuid4()), "db": "test-generation", "base_sha256": self.team()["sha256"],
+                "swaps": True, "reason": None}
+        code, _ = self.request("/ui/servers/box/key-swap-reading", body, source=hub.address_of("alpha"))
         self.assertEqual(code, 403)
         self.assertEqual(self.commits(), before)
         self.assertNotIn("key_swap", self.committed()["servers"]["box"])
@@ -2524,18 +2528,197 @@ class Fact(test_grants.Grants):
         self.assertEqual(self.says("box", False)[0], 200)
         self.assertEqual((hub.key_words("alpha"), hub.key_words("alpha", short=True)), words)
 
-    def test_the_owners_tool_sends_the_word_to_the_route(self):
+    def test_the_owners_tool_sends_the_owners_wish_to_the_route(self):
         found = {t["name"]: t for t in owner_mcp.tools()}["server_key_swap"]
         self.assertEqual((found["inputSchema"]["required"], sorted(found["inputSchema"]["properties"])),
-                         (["server", "on"], ["on", "request_id", "server"]))
-        self.assertIn("after root ran `hubsetup.py vault --swap`", found["description"])
+                         (["server", "wish"], ["request_id", "server", "wish"]))
+        self.assertEqual(found["inputSchema"]["properties"]["wish"]["enum"], ["on", "off", "rule"])
+        self.assertIn("The owner's yes or off", found["description"])
+        self.assertIn("gets no key until its next start", found["description"])        # the cost of off
         sent = []
         with patch.object(owner_mcp, "team", lambda: {"sha256": "a" * 64}), \
                 patch.object(owner_mcp, "command", lambda route, body, what, rid=None: sent.append((route, body))):
-            found["run"]({"server": "box", "on": True})
-            found["run"]({"server": "box", "on": False})                    # false is a word too, not a field left out
-        self.assertEqual(sent, [("/ui/servers/box/key-swap", {"on": True, "base_sha256": "a" * 64}),
-                                ("/ui/servers/box/key-swap", {"on": False, "base_sha256": "a" * 64})])
+            for wish in ("on", "off", "rule"):          # "rule" and not null: the tool's programs drop a null field
+                found["run"]({"server": "box", "wish": wish})
+        self.assertEqual(sent, [("/ui/servers/box/key-swap", {"wish": wish, "base_sha256": "a" * 64})
+                                for wish in ("on", "off", "rule")])
+
+
+class Wish(Fact):
+    """Part B of the changed key swap (the manager's choice C43): the owner's own wish for a server, apart from the
+    app's reading; the key swap fields of GET /ui/servers; the hub's ask to the manager for a server that waits for
+    the owner's word; and the item whose answer is that wish."""
+
+    def wish(self, server, wish, **more):
+        body = dict({"request_id": str(uuid.uuid4()), "db": "test-generation", "base_sha256": self.team()["sha256"],
+                     "wish": wish}, **more)
+        return self.request(f"/ui/servers/{server}/key-swap", body)
+
+    def asks(self):
+        return [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' AND text LIKE ? ORDER BY id",
+                                          ("[hub] %waits for the owner's word on the key swap%",))]
+
+    def raise_item(self, server="box", **more):
+        args = dict({"title": hub.KEY_SWAP_CARD_TITLE.format(server=server),
+                     "why": "An agent there reads a key with a site.", "what_to_do": "Press one of the two answers.",
+                     "key_swap_server": server}, **more)
+        return hub.call_tool("manager", "raise_needs_you", args)
+
+    def press(self, nid, **body):
+        return self.request(f"/ui/needs/{nid}", dict({"request_id": str(uuid.uuid4()), "db": "test-generation"}, **body))
+
+    def row(self, name="box"):
+        return next(r for r in hub.servers_view()["servers"] if r["name"] == name)
+
+    def test_the_owners_wish_is_a_record_of_its_own_and_an_old_tool_writes_no_word(self):
+        before = self.commits()
+        code, receipt = self.wish("box", "on")
+        self.assertEqual((code, receipt.get("key_swap_wish"), receipt.get("changed")), (200, "on", True), receipt)
+        self.assertEqual(self.committed()["servers"]["box"], {"kind": "linux", "user": "fleet", "key_swap_wish": "on"})
+        self.assertEqual((self.wish("box", "on")[1]["changed"], self.commits()), (False, before + 1))
+        self.assertIsNone(hub.key_swaps("alpha", self.KEY))                # a wish is no word: the texts stay
+        self.assertEqual(self.wish("box", "off")[1]["key_swap_wish"], "off")
+        for neither in ("rule", None):                                      # the tool's word, and the app's null
+            with self.subTest(wish=neither):
+                self.wish("box", "on")
+                code, receipt = self.wish("box", neither)
+                self.assertEqual((code, receipt["key_swap_wish"]), (200, None))
+                self.assertEqual(self.committed()["servers"]["box"], {"kind": "linux", "user": "fleet"})
+        # the tool of before Part B said that root had switched the server: refused with what to update
+        body = {"request_id": str(uuid.uuid4()), "db": "test-generation", "base_sha256": self.team()["sha256"],
+                "on": True}
+        code, said = self.request("/ui/servers/box/key-swap", body)
+        self.assertEqual(code, 409)
+        self.assertIn("takes the owner's wish for the key swap now", said["error"])
+        self.assertIn("Update Founderizer (the app, whose program has the owner's tools, or the owner's MCP server)",
+                      said["error"])
+        self.assertNotIn("key_swap", self.committed()["servers"]["box"])
+        for bad in ("yes", True, 1, ["on"]):
+            with self.subTest(wish=bad):
+                self.assertEqual(self.wish("box", bad)[0], 400)
+        self.assertEqual(self.wish("lone", "on")[0], 409)                   # a Mac
+        self.assertEqual(self.wish("nowhere", "on")[0], 404)
+        team = self.committed()
+        for server, value in (("box", "rule"), ("box", True), ("box", None), ("lone", "on")):
+            with self.subTest(server=server, value=value):
+                changed = json.loads(json.dumps(team))
+                changed["servers"][server]["key_swap_wish"] = value
+                with self.assertRaisesRegex(ValueError, "key_swap_wish"):
+                    hub.validate_team(changed)
+
+    def test_the_reading_keeps_its_reason_and_time_and_commits_only_a_new_word(self):
+        before = self.commits()
+        code, receipt = self.says("box", False, reason="The vault broker of this machine did not stay up.")
+        self.assertEqual((code, receipt["changed"], self.commits()), (200, False, before))     # no word to take back
+        read = hub.key_swap_read("box")
+        self.assertEqual((read["swaps"], read["reason"]), (False, "The vault broker of this machine did not stay up."))
+        self.assertLessEqual(abs(read["at"] - hub.now()), 5)
+        self.assertEqual((self.says("box", True)[1]["changed"], self.commits()), (True, before + 1))
+        self.assertIsNone(hub.key_swap_read("box")["reason"])
+        # the new word on a server whose agent reads a key with a site: the manager has that agent's checks run once
+        told = [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' AND text LIKE ?",
+                                         ("[hub] The vault of box swaps keys now%",))]
+        self.assertEqual(len(told), 1)
+        self.assertIn("(Developer (alpha): OPENAI_API_KEY). Have each check of these agents run once now", told[0])
+        self.says("box", True)                                              # the same word again: no second line
+        self.assertEqual(len(hub.q("SELECT id FROM events WHERE agent='manager' AND text LIKE ?",
+                                   ("[hub] The vault of box swaps keys now%",))), 1)
+        for bad in ("two\nlines", "x" * (hub.KEY_SWAP_REASON + 1), "", " ", 3):
+            with self.subTest(reason=bad):
+                self.assertEqual(self.says("box", True, reason=bad)[0], 400)
+
+    def test_the_servers_page_gives_the_word_the_wish_the_waits_and_the_reading(self):
+        self.assertIn("key_swap_reading", hub.UI_FEATURES)
+        names = ("key_swap", "key_swap_wish", "key_swap_waits", "key_swap_reason", "key_swap_read_at")
+        self.assertEqual({k: self.row()[k] for k in names},
+                         {"key_swap": False, "key_swap_wish": None,
+                          "key_swap_waits": [{"agent": "alpha", "keys": ["OPENAI_API_KEY"]}],
+                          "key_swap_reason": None, "key_swap_read_at": None})
+        self.assertEqual(self.row("lone")["key_swap_waits"], [])            # a Mac holds no switch
+        self.says("box", True)
+        self.wish("box", "on")
+        row = self.row()
+        self.assertEqual((row["key_swap"], row["key_swap_wish"], row["key_swap_reason"]), (True, "on", None))
+        self.assertIsNotNone(row["key_swap_read_at"])
+        with patch.dict(hub.agents()["alpha"], {"secrets": {self.BARE: "read"}}):   # no key of it has a site
+            self.assertEqual(self.row()["key_swap_waits"], [])
+
+    def test_a_server_that_waits_asks_the_manager_and_again_after_a_turn_that_failed(self):
+        self.assertFalse(hub.key_swap_ask("box"))           # no reading of the app yet: an app from before Part B
+        self.assertEqual(self.asks(), [])
+        self.says("box", False)                             # the app's first reading: the server waits
+        asks = self.asks()
+        self.assertEqual(len(asks), 1)
+        self.assertIn('key_swap_server "box"', asks[0])
+        self.assertIn('the title "Switch on the key swap on box?" word for word', asks[0])
+        self.assertIn("Developer (alpha): OPENAI_API_KEY", asks[0])
+        for _ in range(5):                                  # no item came: each event asks again, a few times
+            hub.key_swap_checked()
+        self.assertEqual(len(self.asks()), hub.KEY_SWAP_ASKS)
+        with patch.dict(hub.agents()["beta"], {"vault": "broker", "secrets": {self.KEY: "read"}}):   # a new state
+            hub.key_swap_checked()
+        self.assertEqual(len(self.asks()), hub.KEY_SWAP_ASKS + 1)
+        hub.kv_set(hub.KEY_SWAP_ASKED + "box", None)
+        said, error = self.raise_item()
+        self.assertFalse(error, said)
+        hub.key_swap_checked()                              # an open item: no ask
+        self.assertEqual(len(self.asks()), hub.KEY_SWAP_ASKS + 1)
+        self.wish("box", "off")                             # the owner's wish set another way: the item closes
+        need = hub.q1("SELECT * FROM needs WHERE key_swap_server='box'")
+        self.assertEqual((need["answered_by"], need["answer"]),
+                         ("hub", "Closed by the hub: the owner's wish for this server is set"))
+        self.assertIsNone(hub.kv_get(hub.KEY_SWAP_ASKED + "box"))
+        self.assertFalse(hub.key_swap_ask("box"))
+
+    def test_the_item_has_the_hubs_title_answers_and_details_and_a_press_is_the_owners_wish(self):
+        self.says("box", False)
+        for more, words in (({"title": "Switch on the key swap?"}, "word for word"),
+                            ({"options": ["Yes", "No"]}, "leave options"), ({"details": "More."}, "leave options"),
+                            ({"key_swap_server": "nowhere", "title": "Switch on the key swap on nowhere?"},
+                             "a server of this fleet"),
+                            ({"key_swap_server": "lone", "title": "Switch on the key swap on lone?"},
+                             "waits for no word")):
+            with self.subTest(more=more):
+                said, error = self.raise_item(**more)
+                self.assertTrue(error, said)
+                self.assertIn(words, said)
+        said, error = self.raise_item()
+        self.assertFalse(error, said)
+        self.assertIn("When the owner presses Switch it on, the hub sets the owner's wish for box", said)
+        need = hub.q1("SELECT * FROM needs WHERE key_swap_server='box' AND answer IS NULL")
+        self.assertEqual(json.loads(need["options"]), list(hub.KEY_SWAP_CARD_ANSWERS))
+        self.assertEqual(need["details"], hub.key_swap_card_details("box"))
+        self.assertIn("The keys with a site on box:\n- Developer: OPENAI_API_KEY\n", need["details"])
+        said, error = self.raise_item()
+        self.assertTrue(error)
+        self.assertIn("is open already", said)
+        code, receipt = self.press(need["id"], choice=0)                   # the owner presses Switch it on
+        self.assertEqual(code, 200, receipt)
+        self.assertEqual(self.committed()["servers"]["box"].get("key_swap_wish"), "on")
+        self.assertIsNone(hub.kv_get(hub.KEY_SWAP_ANSWERED + "box"))
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (need["id"],))["answer"], "Switch it on")
+        self.wish("box", "rule")
+        for answer, wish in (({"answer": "Ask me again next week"}, None), ({"choice": 1}, "off")):
+            with self.subTest(answer=answer):
+                hub.kv_set(hub.KEY_SWAP_ASKED + "box", None)
+                said, error = self.raise_item()
+                self.assertFalse(error, said)
+                nid = hub.q1("SELECT MAX(id) n FROM needs")["n"]
+                self.assertEqual(self.press(nid, **answer)[0], 200)
+                self.assertEqual(self.committed()["servers"]["box"].get("key_swap_wish"), wish)   # words set none
+
+    def test_no_connected_app_answers_it_and_a_rename_moves_its_records(self):
+        self.assertIn("key_swap_server", hub.CAPP_NEED_OWN_ROUTE)
+        self.says("box", False)
+        said, error = self.raise_item()
+        self.assertFalse(error, said)
+        for prefix in hub.KEY_SWAP_KV:
+            hub.kv_set(prefix + "box", '{"at": 1}')
+        with hub.LOCK, hub.transaction():
+            hub.rename_machine_rows("box", "box-two")
+        self.assertEqual([hub.kv_get(prefix + "box") for prefix in hub.KEY_SWAP_KV], [None] * 3)
+        self.assertEqual([hub.kv_get(prefix + "box-two") for prefix in hub.KEY_SWAP_KV], ['{"at": 1}'] * 3)
+        self.assertEqual([r["key_swap_server"] for r in hub.q("SELECT key_swap_server FROM needs")], ["box-two"])
 
 
 def proxy_asks(path, **request):
@@ -2801,60 +2984,83 @@ class Delivery(test_central_e2e.EndToEnd):
 
 
 class Machine:
-    """The machine that the installer's swap step works on: it answers the step's one reading, records each script,
-    and carries out the few effects that the step then reads."""
-    UNIT = "[Unit]\nAfter=fleet-vault.service\n[Service]\nUser=founderizer-swap\nExecStart=/usr/bin/python3 x swap\nNotifyAccess=all\n"
+    """The machine that the vault's own root step works on (vault.configure): it answers the step's reading, records
+    each script, and carries out the few effects that the step then reads. The broker makes its socket for the proxy
+    only when it starts with the part and the proxy's user is there, as Broker.open_swaps does, and systemd takes the
+    socket away at each stop of the broker."""
 
     def __init__(self, conf, **state):
-        self.conf, self.ran, self.knows, self.proxy_stays, self.broker_stays = conf, [], True, True, True
+        self.conf, self.ran, self.proxy_stays, self.broker_stays, self.socket_comes = conf, [], True, True, True
         self.state = dict({"user": "no", "low": "1024", "unit": "", "broker": "active", "broker_restarts": "0",
-                           "active": "inactive", "restarts": "0"}, **state)
+                           "active": "inactive", "restarts": "0", "enabled": "", "socket": ""}, **state)
 
     def read(self, path):
-        if path != hubsetup.VAULT_CONF or self.conf is None:
+        if path != vault.VAULT_CONF_PATH or self.conf is None:
             raise OSError(path)
         return json.dumps(self.conf)
+
+    def broker_starts(self):
+        stays = self.broker_stays or "swap" not in self.conf
+        self.state.update(broker="active" if stays else "activating", broker_restarts="0" if stays else "3",
+                          socket="fleet-vault" if stays and "swap" in self.conf and self.state["user"] == "yes"
+                          and self.socket_comes else "")
 
     def run(self, script, timeout=120):
         self.ran.append(script)
         if "echo active=" in script:
             return 0, "\n".join(f"{k}={v}" for k, v in self.state.items()), ""
-        if "vault.py unit --swap" in script:
-            return (0, self.UNIT, "") if self.knows else (2, "", "vault.py: error: unrecognized arguments: --swap")
         if "useradd --system" in script:
             self.state["user"] = "yes"
         for line in script.splitlines():
-            if line.startswith("install ") and line.endswith(hubsetup.VAULT_CONF):
+            if line.startswith("install ") and line.endswith(vault.VAULT_CONF_PATH):
                 self.conf = json.loads(Path(line.split()[-2]).read_text())
-                self.state.update(broker="active" if self.broker_stays or "swap" not in self.conf else "activating",
-                                  broker_restarts="0" if self.broker_stays or "swap" not in self.conf else "3")
-            if line.startswith("install ") and line.endswith(hubsetup.SWAP_UNIT):
+            if line == "systemctl restart fleet-vault":
+                self.broker_starts()
+            if line.startswith("install ") and line.endswith(vault.SWAP_UNIT_PATH):
                 self.state["unit"] = hashlib.sha256(Path(line.split()[-2]).read_bytes()).hexdigest()
-            if line == "systemctl restart " + hubsetup.SWAP_SERVICE:
+            if line == f"systemctl enable {vault.SWAP_SERVICE} >/dev/null 2>&1":
+                self.state["enabled"] = "enabled"
+            if line == "systemctl restart " + vault.SWAP_SERVICE:
                 self.state.update(active="active" if self.proxy_stays else "activating",
                                   restarts="0" if self.proxy_stays else "4")
+            if line.startswith("systemctl disable --now " + vault.SWAP_SERVICE):
+                self.state.update(active="inactive", enabled="disabled")
         return 0, "", ""
 
     def changes(self):
-        return [s for s in self.ran if "echo active=" not in s and "unit --swap" not in s]
+        return [s for s in self.ran if "echo active=" not in s]
 
 
-class Installer(unittest.TestCase):
+class Configure(unittest.TestCase):
+    """The vault's own root step (vault.configure; Part B of the changed key swap, the manager's choice C43 of
+    15 November 2026): the owner's keys only added, the fleet's ID, and the key swap on, off or as it is, run only as
+    root and only as the installed program."""
     BROKER = {"hub": "http://100.80.1.2:8765", "store": "/var/lib/fleet-vault/store.age",
               "store_key": "/var/lib/fleet-vault/store.key", "age_key": "/var/lib/fleet-vault/age.key",
               "socket": "/run/fleet-vault/vault.sock", "age": "/usr/bin/age", "curl": "/usr/bin/curl",
               "worker_group": "fleet-agents"}
     PART = {"user": "founderizer-swap", "vault": "fleet-vault", "port": 876, "openssl": "/usr/bin/openssl"}
+    KEYS = [test_vault.owner_key(d) for d in (2, 3, 5)]
+    FLEET = "0123456789abcdef"
+    UNIT_HASH = hashlib.sha256(vault.SWAP_UNIT.format(user=vault.SWAP_USER, config=vault.VAULT_CONF_PATH,
+                                                      script=vault.INSTALLED).encode()).hexdigest()
 
-    def install(self, machine, check=False):
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-            return hubsetup.swap_install(check=check, run=machine.run, read=machine.read), out.getvalue()
+    def step(self, machine, **kw):
+        kw.setdefault("lock", None)
+        return vault.configure(vault.VAULT_CONF_PATH, run=machine.run, read=machine.read, settle=0, **kw)
 
-    def test_it_makes_the_user_the_part_and_the_service_in_that_order(self):
+    def swapping(self):
         machine = Machine(dict(self.BROKER))
-        state, said = self.install(machine)
-        self.assertEqual(state, "made")
+        self.step(machine, swap="on")
+        machine.ran.clear()
+        return machine
+
+    def test_on_makes_the_user_the_part_and_the_service_in_that_order(self):
+        machine = Machine(dict(self.BROKER))
+        answer = self.step(machine, swap="on")
+        self.assertEqual((answer["ok"], answer["state"], answer["swaps"], answer["swaps_from"]),
+                         (True, "made", True, vault.SWAPS_FROM))
+        self.assertEqual(answer["changed"], ["the proxy's user", "the configuration", "the proxy"])
         self.assertEqual(machine.conf, dict(self.BROKER, swap=self.PART))
         made = machine.changes()
         self.assertIn("useradd --system --user-group", made[0])
@@ -2863,91 +3069,322 @@ class Installer(unittest.TestCase):
         self.assertIn("systemctl restart fleet-vault\n", made[1])          # the broker reads its configuration again
         self.assertIn("systemctl enable fleet-vault-swap", made[2])
         self.assertIn("systemctl restart fleet-vault-swap", made[2])
-        self.assertLess(next(i for i, s in enumerate(machine.ran) if "unit --swap" in s),
-                        next(i for i, s in enumerate(machine.ran) if "useradd" in s))     # before anything changes
-        self.assertIn("this machine's key swap is on", said)
+        self.assertEqual(machine.state["unit"], self.UNIT_HASH)            # the installed program's path, not a checkout
         for pinned in (hubsetup.HELPER, hubsetup.VAULT_UPDATE, hubsetup.SUDOERS):
             self.assertFalse([s for s in machine.ran if pinned in s])       # the root helpers and the sudoers file stay
         self.assertNotIn("founderizer-swap", hubsetup.RESERVED_USERS)       # a name there changes fleet-agent-user
         self.assertNotIn("founderizer-swap", hubsetup.helper_script())
 
-    def test_a_second_run_changes_nothing(self):
-        machine = Machine(dict(self.BROKER))
-        self.install(machine)
-        machine.ran.clear()
-        state, said = self.install(machine)
-        self.assertEqual((state, machine.changes()), ("there", []))
-        self.assertIn("in place already", said)
+    def test_a_second_run_changes_nothing_and_restarts_nothing(self):
+        machine = self.swapping()
+        for swap in ("on", "keep"):
+            with self.subTest(swap=swap):
+                answer = self.step(machine, swap=swap)
+                self.assertEqual((answer["state"], answer["swaps"], answer["changed"], machine.changes()),
+                                 ("there", True, [], []))
 
-    def test_a_second_run_starts_a_proxy_that_is_down_again(self):
-        machine = Machine(dict(self.BROKER))
-        self.install(machine)
-        machine.ran.clear()
+    def test_a_proxy_that_is_down_starts_again_and_the_broker_does_not(self):
+        machine = self.swapping()
         machine.state["active"] = "failed"
-        state, said = self.install(machine)
-        self.assertEqual(state, "made")
+        answer = self.step(machine)                     # keep repairs what on would have made
+        self.assertEqual((answer["state"], answer["changed"]), ("made", ["the proxy"]))
         self.assertTrue([s for s in machine.changes() if "systemctl restart fleet-vault-swap" in s])
         self.assertFalse([s for s in machine.changes() if "systemctl restart fleet-vault\n" in s])    # not the broker
         self.assertEqual((machine.state["active"], machine.conf), ("active", dict(self.BROKER, swap=self.PART)))
 
-    def test_a_second_run_with_another_unit_installs_it_and_starts_only_the_proxy_again(self):
-        """A server that got the key swap from the first version: its unit has PartOf, and the program prints another."""
-        machine = Machine(dict(self.BROKER))
-        self.install(machine)
-        first = machine.state["unit"]
-        machine.ran.clear()
-        machine.UNIT = Machine.UNIT + "LimitCORE=0\n"                       # the installed program prints another unit
-        state, said = self.install(machine)
-        self.assertEqual(state, "made")
-        self.assertNotEqual(machine.state["unit"], first)                   # the new unit is in place
+    def test_another_unit_is_installed_and_only_the_proxy_starts_again(self):
+        """A server that got the key swap from a program before: its unit is another one."""
+        machine = self.swapping()
+        machine.state["unit"] = "0" * 64
+        self.assertEqual(self.step(machine, swap="on")["state"], "made")
+        self.assertEqual(machine.state["unit"], self.UNIT_HASH)
         self.assertTrue([s for s in machine.changes() if "systemctl restart fleet-vault-swap" in s])
         self.assertFalse([s for s in machine.changes() if "systemctl restart fleet-vault\n" in s])    # not the broker
         machine.ran.clear()
-        self.assertEqual((self.install(machine)[0], machine.changes()), ("there", []))
+        self.assertEqual((self.step(machine, swap="on")["state"], machine.changes()), ("there", []))
+
+    def test_a_broker_that_runs_without_its_socket_for_the_proxy_starts_again(self):
+        """A broker that started while the part could not be read gives no key that has a site: no file changes."""
+        machine = Machine(dict(self.BROKER, swap=self.PART), user="yes", active="active", enabled="enabled",
+                          unit=self.UNIT_HASH, socket="")
+        answer = self.step(machine)
+        self.assertEqual((answer["state"], answer["swaps"], answer["changed"]), ("made", True, ["the broker"]))
+        self.assertEqual([s for s in machine.changes() if "install " in s], [])
 
     def test_a_check_run_reads_and_changes_nothing(self):
         machine = Machine(dict(self.BROKER))
-        state, said = self.install(machine, check=True)
-        self.assertEqual((state, machine.changes(), machine.conf), ("would make", [], self.BROKER))
-        self.assertIn("would switch this machine's key swap on", said)
-        self.assertEqual(self.install(Machine(None), check=True)[0], "would make")
+        answer = self.step(machine, swap="on", check=True)
+        self.assertEqual((answer["state"], answer["swaps"], machine.changes(), machine.conf),
+                         ("would make", False, [], self.BROKER))
 
     def test_a_machine_that_lets_each_user_listen_on_the_port_is_not_switched_on(self):
         for low in ("0", "80", "876"):
             with self.subTest(low=low):
                 machine = Machine(dict(self.BROKER), low=low)
-                with self.assertRaisesRegex(hubsetup.Stop, "ip_unprivileged_port_start"):
-                    self.install(machine)
+                with self.assertRaisesRegex(vault.ConfigureStop, "ip_unprivileged_port_start"):
+                    self.step(machine, swap="on")
                 self.assertEqual((machine.changes(), machine.conf), ([], self.BROKER))
-        self.assertEqual(self.install(Machine(dict(self.BROKER), low="877"))[0], "made")
+                self.assertEqual(self.step(machine)["state"], "there")             # keep and off are no switch on
+                self.assertEqual(self.step(machine, swap="off")["state"], "there")
+        self.assertEqual(self.step(Machine(dict(self.BROKER), low="877"), swap="on")["state"], "made")
 
-    def test_a_program_that_does_not_know_the_swap_changes_nothing(self):
-        machine = Machine(dict(self.BROKER))
-        machine.knows = False
-        with self.assertRaisesRegex(hubsetup.Stop, "does not know the key swap, so nothing changed"):
-            self.install(machine)
-        self.assertEqual((machine.changes(), machine.conf), ([], self.BROKER))
-
-    def test_a_machine_with_no_broker_is_told_to_install_it_first(self):
-        for conf in (None, {k: v for k, v in self.BROKER.items() if k != "worker_group"}):
-            with self.subTest(conf=conf), self.assertRaisesRegex(hubsetup.Stop, "needs this machine's vault broker"):
-                self.install(Machine(conf))
+    def test_a_machine_with_no_broker_of_its_own_is_refused(self):
+        for conf in (None, {k: v for k, v in self.BROKER.items() if k != "worker_group"},
+                     dict(self.BROKER, central=True)):
+            with self.subTest(conf=conf), self.assertRaisesRegex(vault.ConfigureStop, "no vault broker of its own"):
+                self.step(Machine(conf), swap="on")
 
     def test_a_broker_that_does_not_stay_up_gets_its_configuration_back(self):
         machine = Machine(dict(self.BROKER))
         machine.broker_stays = False
-        with self.assertRaisesRegex(hubsetup.Stop, "the configuration is as it was"):
-            self.install(machine)
-        self.assertEqual(machine.conf, self.BROKER)
-        self.assertEqual(machine.state["broker"], "active")
-        self.assertFalse([s for s in machine.changes() if hubsetup.SWAP_UNIT in s])     # the proxy was not installed
+        with self.assertRaisesRegex(vault.ConfigureStop, "the configuration is as it was"):
+            self.step(machine, swap="on")
+        self.assertEqual((machine.conf, machine.state["broker"]), (self.BROKER, "active"))
+        self.assertFalse([s for s in machine.changes() if vault.SWAP_UNIT_PATH in s])   # the proxy was not installed
 
-    def test_a_proxy_that_does_not_stay_up_is_not_a_finished_step(self):
-        machine = Machine(dict(self.BROKER))
+    def test_a_switch_to_on_that_fails_late_puts_everything_back(self):
+        """Rules 1 and 4 of the brief: this run put the part in, and the proxy or the broker's socket for it did not
+        come. Nothing that worked may stop, so the old configuration goes back, the broker starts on it again, and
+        the proxy stops: each key reaches a session as a value, as before."""
+        for broken in ("proxy", "socket"):
+            with self.subTest(broken=broken):
+                machine = Machine(dict(self.BROKER))
+                if broken == "proxy":
+                    machine.proxy_stays = False
+                else:
+                    machine.socket_comes = False
+                with self.assertRaisesRegex(vault.ConfigureStop,
+                                            "put the configuration back as it was and stopped the proxy"):
+                    self.step(machine, swap="on")
+                self.assertEqual(machine.conf, self.BROKER)
+                self.assertEqual((machine.state["broker"], machine.state["socket"], machine.state["active"],
+                                  machine.state["enabled"]), ("active", "", "inactive", "disabled"))
+
+    def test_a_late_fault_where_the_part_was_there_before_changes_nothing_more(self):
+        machine = self.swapping()
+        machine.state["unit"] = "0" * 64                    # another unit: the proxy starts again, and stays down
         machine.proxy_stays = False
-        with self.assertRaisesRegex(hubsetup.Stop, "journalctl -u fleet-vault-swap"):
-            self.install(machine)
-        self.assertEqual(machine.conf, dict(self.BROKER, swap=self.PART))   # the broker serves, and gives no such key
+        with self.assertRaisesRegex(vault.ConfigureStop, "journalctl -u fleet-vault-swap.*keeps the part, which it "
+                                                         "had before this step"):
+            self.step(machine, swap="on")
+        self.assertEqual(machine.conf, dict(self.BROKER, swap=self.PART))
+        self.assertFalse([s for s in machine.changes() if "disable --now" in s or s.startswith("install") and
+                          s.splitlines()[0].endswith(vault.VAULT_CONF_PATH)])
+
+    def test_the_owner_keys_are_only_added_and_a_second_mac_keeps_its_own(self):
+        a, b, c = self.KEYS
+        machine = Machine(dict(self.BROKER, owner_keys=[a], fleet=self.FLEET))
+        answer = self.step(machine, owner_keys=[b], fleet=self.FLEET)
+        self.assertEqual((machine.conf["owner_keys"], answer["owner_keys"], answer["state"]), ([a, b], 2, "made"))
+        self.assertTrue([s for s in machine.changes() if "systemctl restart fleet-vault\n" in s])  # it reads them
+        machine.ran.clear()
+        self.assertEqual(self.step(machine, owner_keys=[b, a], fleet=self.FLEET)["state"], "there")
+        self.assertEqual(machine.changes(), [])                         # nothing taken away, nothing restarted
+        self.step(machine, owner_keys=[a, c], fleet=self.FLEET)         # the list of another Mac, in its order
+        self.assertEqual(machine.conf["owner_keys"], [a, b, c])
+        self.assertNotIn("swap", machine.conf)                          # keep: the swap is as it was
+
+    def test_the_fleet_is_set_where_the_vault_has_none_and_another_fleet_is_refused(self):
+        a, b, _ = self.KEYS
+        machine = Machine(dict(self.BROKER))                            # a vault of the app's Add server: no key
+        answer = self.step(machine, owner_keys=[a], fleet=self.FLEET)
+        self.assertEqual((machine.conf["owner_keys"], machine.conf["fleet"], answer["fleet"]), ([a], self.FLEET, True))
+        machine.ran.clear()
+        with self.assertRaisesRegex(vault.ConfigureStop, "of another fleet"):
+            self.step(machine, owner_keys=[b], fleet="fedcba9876543210")
+        self.assertEqual((machine.conf["owner_keys"], machine.changes()), ([a], []))
+
+    def test_keys_and_a_fleet_go_together_and_each_is_checked(self):
+        a = self.KEYS[0]
+        machine = Machine(dict(self.BROKER))
+        for kw, words in (({"owner_keys": [a]}, "give --fleet"), ({"fleet": self.FLEET}, "give --add-owner-key"),
+                          ({"owner_keys": ["bm90IGEga2V5"], "fleet": self.FLEET}, "P-256"),
+                          ({"owner_keys": [a], "fleet": "ABCDEF0123456789"}, "16 lowercase hex")):
+            with self.subTest(kw=kw), self.assertRaisesRegex(vault.ConfigureStop, words):
+                self.step(machine, **kw)
+        full = [test_vault.owner_key(d) for d in range(7, 7 + vault.OWNER_KEYS)]
+        with self.assertRaisesRegex(vault.ConfigureStop, f"at most {vault.OWNER_KEYS} owner keys"):
+            self.step(Machine(dict(self.BROKER, owner_keys=full, fleet=self.FLEET)), owner_keys=[a])
+        self.assertEqual((machine.changes(), machine.conf), ([], self.BROKER))
+
+    def test_off_takes_the_part_away_and_stops_the_proxy(self):
+        machine = self.swapping()
+        answer = self.step(machine, swap="off")
+        self.assertEqual((answer["state"], answer["swaps"], answer["changed"]),
+                         ("made", False, ["the configuration", "the proxy"]))
+        self.assertEqual(machine.conf, self.BROKER)
+        self.assertTrue([s for s in machine.changes() if "systemctl restart fleet-vault\n" in s])
+        self.assertTrue([s for s in machine.changes() if "systemctl disable --now fleet-vault-swap" in s])
+        self.assertEqual((machine.state["active"], machine.state["socket"]), ("inactive", ""))
+        machine.ran.clear()
+        self.assertEqual((self.step(machine, swap="off")["state"], machine.changes()), ("there", []))
+
+    def test_swaps_is_read_from_the_broker_that_runs_now_and_not_from_the_file(self):
+        reading = {"broker": "active", "socket": "fleet-vault", "active": "active"}
+        self.assertTrue(vault.configure_swaps(reading))
+        for wrong in ({"socket": ""}, {"socket": "fleet-agent-a"}, {"broker": "activating"}, {"active": "failed"}):
+            with self.subTest(wrong=wrong):
+                self.assertFalse(vault.configure_swaps(dict(reading, **wrong)))
+        self.assertIn("test -S /run/fleet-vault/swap.sock && stat -c %U /run/fleet-vault/swap.sock",
+                      vault.configure_reading(self.BROKER))
+        # The broker's runtime folder goes at each stop of the broker, so its socket there is the running broker's.
+        self.assertIn("RuntimeDirectory=fleet-vault\n", vault.UNIT)
+        self.assertNotIn("RuntimeDirectoryPreserve", vault.UNIT)
+        self.assertEqual(os.path.join(os.path.dirname(self.BROKER["socket"]), vault.SWAP_SOCKET),
+                         "/run/fleet-vault/swap.sock")
+
+    def test_one_step_at_a_time(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "configure.lock")
+            held = vault.configure_lock(path)
+            try:
+                machine = Machine(dict(self.BROKER))
+                with self.assertRaisesRegex(vault.ConfigureStop, "Another step changes this machine's vault now"):
+                    vault.configure(vault.VAULT_CONF_PATH, swap="on", run=machine.run, read=machine.read, settle=0,
+                                    lock=path)
+                self.assertEqual(machine.ran, [])                      # it read nothing and changed nothing
+                self.assertEqual(vault.configure(vault.VAULT_CONF_PATH, swap="on", check=True, run=machine.run,
+                                                 read=machine.read, lock=path)["state"], "would make")
+            finally:
+                os.close(held)
+            os.close(vault.configure_lock(path))                        # free again
+
+    def test_it_runs_only_as_root_and_only_as_the_installed_program(self):
+        args = argparse_args(config=vault.VAULT_CONF_PATH, add_owner_key=[], fleet=None, swap="on", check=False)
+
+        def said(**kw):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = vault.configure_main(args, **kw)
+            return code, json.loads(out.getvalue().strip().splitlines()[-1])
+        with patch.object(vault, "configure", return_value={"ok": True, "state": "there"}) as step:
+            code, answer = said(euid=1000, program=vault.INSTALLED)
+            self.assertEqual((code, answer["ok"]), (1, False))
+            self.assertIn("Run configure as root", answer["reason"])
+            code, answer = said(euid=0, program=os.path.abspath(vault.__file__))      # a checkout's copy
+            self.assertEqual((code, answer["ok"]), (1, False))
+            self.assertIn("only as the installed program", answer["reason"])
+            args.config = "/tmp/another.json"                                   # a root step needs no other file
+            code, answer = said(euid=0, program=vault.INSTALLED)
+            self.assertEqual((code, answer["ok"]), (1, False))
+            self.assertIn("only this machine's own configuration, /etc/fleet-vault/vault.json", answer["reason"])
+            args.config = vault.VAULT_CONF_PATH
+            self.assertEqual(step.call_count, 0)
+            if os.path.realpath(vault.INSTALLED) == vault.INSTALLED:
+                with patch.object(vault, "unchangeable",
+                                  side_effect=SystemExit("The vault broker program must be owned by root")):
+                    code, answer = said(euid=0, program=vault.INSTALLED)
+                self.assertIn("must be owned by root", answer["reason"])
+                with patch.object(vault, "unchangeable"):
+                    self.assertEqual(said(euid=0, program=vault.INSTALLED), (0, {"ok": True, "state": "there"}))
+                self.assertEqual(step.call_args.args, (vault.VAULT_CONF_PATH, [], None, "on", False))
+        with patch.object(vault, "configure_main", return_value=0) as main:
+            vault.main(["configure", "--swap", "off", "--add-owner-key", "x", "--fleet", self.FLEET])
+        parsed = main.call_args.args[0]
+        self.assertEqual((parsed.swap, parsed.add_owner_key, parsed.fleet, parsed.config, parsed.check),
+                         ("off", ["x"], self.FLEET, vault.VAULT_CONF_PATH, False))
+
+    def test_no_rule_of_the_sudoers_file_reaches_the_vault_program(self):
+        """The service user's root rights are two other programs: fleet-agent-user, which takes one agent user name
+        and checks it itself, and fleet-vault-program, which takes no argument at all. Its third right is to run a
+        command as an agent user, which configure refuses (it runs only as root)."""
+        rules = [line for line in hubsetup.sudoers_text("fleet").splitlines() if line and not line.startswith("#")]
+        self.assertEqual(rules, [f"fleet ALL=(root) NOPASSWD: {hubsetup.HELPER}",
+                                 f'fleet ALL=(root) NOPASSWD: {hubsetup.VAULT_UPDATE} ""',
+                                 f"fleet ALL=(%{hubsetup.AGENT_GROUP}) NOPASSWD: ALL"])
+        for text in ("\n".join(rules), hubsetup.helper_script()):
+            self.assertNotIn("vault.py", text)
+            self.assertNotIn(hubsetup.VAULT_LIB + "/", text)
+        program = hubsetup.vault_program_script("git://100.80.1.2/fleet")
+        self.assertIn('test "$#" = 0 ||', program)                      # it takes no argument
+        self.assertNotIn("configure", program)                          # and runs no configure
+
+    def test_its_names_are_the_installers(self):
+        self.assertEqual((vault.INSTALLED, vault.VAULT_CONF_PATH, vault.VAULT_USER, vault.SWAP_SERVICE,
+                          vault.SWAP_UNIT_PATH, vault.SWAP_PORT, vault.SWAP_USER, vault.SWAP_STATE, vault.ROOT_PATH,
+                          vault.CONFIGURE_SETTLE, vault.SWAP_LOW_PORTS),
+                         (hubsetup.VAULT_LIB + "/vault.py", hubsetup.VAULT_CONF, hubsetup.VAULT_USER,
+                          hubsetup.SWAP_SERVICE, hubsetup.SWAP_UNIT, hubsetup.SWAP_PORT, hubsetup.SWAP_USER,
+                          hubsetup.SWAP_STATE, hubsetup.ROOT_PATH, hubsetup.VAULT_SETTLE, hubsetup.SWAP_LOW_PORTS))
+
+
+def argparse_args(**kw):
+    import argparse
+    return argparse.Namespace(**kw)
+
+
+class Installer(unittest.TestCase):
+    """The install's swap step (hubsetup.swap_install): the installed program's own configure, and its answer."""
+    BROKER, PART = Configure.BROKER, Configure.PART
+
+    def install(self, answer, check=False):
+        ran = []
+
+        def run(script, timeout=120):
+            ran.append(script)
+            return answer
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            state = hubsetup.swap_install(check=check, run=run)
+        return state, out.getvalue(), ran
+
+    def test_it_runs_the_installed_programs_own_step_and_says_its_answer(self):
+        for answer, words in (({"ok": True, "state": "made"}, "this machine's key swap is on"),
+                              ({"ok": True, "state": "there"}, "in place already"),
+                              ({"ok": True, "state": "would make"}, "would switch this machine's key swap on")):
+            with self.subTest(answer=answer):
+                state, said, ran = self.install((0, "a line\n" + json.dumps(answer) + "\n", ""),
+                                                check=answer["state"] == "would make")
+                self.assertEqual(state, answer["state"])
+                self.assertIn(words, said)
+                self.assertEqual(ran[0].split()[:4], ["python3", "-I", hubsetup.VAULT_LIB + "/vault.py", "configure"])
+                self.assertIn(f"--config {hubsetup.VAULT_CONF} --swap on", ran[0])
+                self.assertEqual("--check" in ran[0], answer["state"] == "would make")
+
+    def test_a_refusal_is_a_stop_with_the_programs_reason(self):
+        reason = "On this machine each user can listen on port 876 (net.ipv4.ip_unprivileged_port_start is 0)."
+        with self.assertRaisesRegex(hubsetup.Stop, "ip_unprivileged_port_start is 0"):
+            self.install((1, json.dumps({"ok": False, "reason": reason}) + "\n", ""))
+
+    def test_a_program_that_does_not_know_the_step_changes_nothing(self):
+        with self.assertRaisesRegex(hubsetup.Stop, "does not know this step, so nothing changed"):
+            self.install((2, "", "vault.py: error: argument cmd: invalid choice: 'configure'"))
+        state, said, _ = self.install((2, "", "python3: can't open file"), check=True)
+        self.assertEqual(state, "would make")                   # a check before the broker's program is in place
+        self.assertIn("after its vault broker is in place", said)
+
+    def test_key_swap_runs_the_step_alone_and_only_on_linux(self):
+        with patch.object(hubsetup, "swap_install") as swap, \
+                patch.object(hubsetup.platform, "system", return_value="Linux"):
+            hubsetup.main(["key-swap"])
+            self.assertEqual(swap.call_args.kwargs, {"check": False})
+            hubsetup.main(["key-swap", "--check"])
+            self.assertEqual(swap.call_args.kwargs, {"check": True})
+        out = io.StringIO()
+        with patch.object(hubsetup, "swap_install") as swap, \
+                patch.object(hubsetup.platform, "system", return_value="Darwin"), contextlib.redirect_stdout(out):
+            hubsetup.main(["key-swap"])
+        self.assertEqual(swap.call_count, 0)
+        self.assertIn("the key swap is for a Linux server", out.getvalue())
+
+    def test_both_installers_switch_it_on_after_the_vault_and_go_on_when_it_stops(self):
+        join, hub_sh = (Path(hubsetup.KIT, name).read_text() for name in ("join.sh", "hub.sh"))
+        self.assertIn('    vault_broker "/home/$WORKER/fleet-server"\n    key_swap "/home/$WORKER/fleet-server"\n',
+                      join)
+        for text in (join, hub_sh):
+            self.assertIn('hubsetup.py" key-swap </dev/null \\\n        || say "the install goes on, and this', text)
+
+    def test_a_key_swap_that_stops_says_so_and_is_no_stop_of_the_install(self):
+        """key-swap's own line, and exit 1 for the installer's ||: never "install stopped", because it goes on."""
+        reason = "On this machine each user can listen on port 876 (net.ipv4.ip_unprivileged_port_start is 0)."
+        out = io.StringIO()
+        with patch.object(hubsetup, "swap_install", side_effect=hubsetup.Stop(reason)), \
+                patch.object(hubsetup.platform, "system", return_value="Linux"), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(out), self.assertRaises(SystemExit) as stopped:
+            hubsetup.main(["key-swap"])
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertIn("the key swap is not switched on: " + reason, out.getvalue())
+        self.assertNotIn("install stopped", out.getvalue())
 
     def test_the_vault_step_without_the_option_is_as_it_was_and_keeps_the_part(self):
         self.assertEqual(hubsetup.vault_config("http://100.80.1.2:8765", before=dict(self.BROKER, swap=self.PART))["swap"],

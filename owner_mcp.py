@@ -276,6 +276,8 @@ NOT_TOOLS = {
                         "login or API key the app's program has save_secret, and the app then makes that sealed "
                         "copy and sends it",
     "/ui/vault/pin": "a statement signed with the owner's own key, which only their app on their Mac holds",
+    "/ui/servers/{}/key-swap-reading": "what the owner's Mac app read as root of a server's vault, after its own step "
+                                       "there over the owner's own SSH: no agent reads a vault as root",
     "/ui/servers/shape": "the step of the fleet's servers, which the owner chooses on the slider of their app: the "
                          "app moves the agents for it, and for one server it runs root's part on the hub's server "
                          "over the owner's own SSH (hubsetup.py one-server)",
@@ -2419,14 +2421,16 @@ def tools():
         tool("remove_machine", "A server with no agent leaves the fleet.",
              {"server": S["text"], **rid}, ("server",),
              with_base("/ui/servers/{server}/remove", (), "the removal of this server")),
-        tool("server_key_swap", "Say that the vault of one Linux server swaps keys (on true), or take that word back "
-                                "(on false). Give it only after root ran `hubsetup.py vault --swap` on that server, "
-                                "and take it back when that step is undone: the hub does not check the server. The "
-                                "word changes only what the hub says: the settings check does not count a key that "
-                                "swaps there as a key in the agent's sessions, and the agent's start text says that "
-                                "the variable holds a placeholder. It opens nothing, and no vault reads it.",
-             {"server": S["text"], "on": S["bool"], **rid}, ("server", "on"),
-             with_base("/ui/servers/{server}/key-swap", ("on",), "the key swap word of this server")),
+        tool("server_key_swap", "The owner's yes or off for the key swap of one Linux server, or neither again. On: "
+                                "the owner's Mac app switches that server's vault on at its next round, also while "
+                                "an agent there reads a key that has a site. Off: the app switches it off, and each "
+                                "session that runs there with a placeholder gets no key until its next start. Rule: "
+                                "neither, and the app goes by the rule, which switches a server on only where no "
+                                "agent reads a key that has a site. The hub's word that the server swaps comes only "
+                                "from the app's own reading of the vault, never from this tool.",
+             {"server": S["text"], "wish": {"type": "string", "enum": ["on", "off", "rule"]}, **rid},
+             ("server", "wish"),
+             with_base("/ui/servers/{server}/key-swap", ("wish",), "the owner's wish for the key swap of this server")),
         tool("activate_agent", "Turn one agent on or off. An agent in setup takes no work and no message.",
              {"agent": S["text"], "active": S["bool"], **rid}, ("agent", "active"),
              with_base("/ui/team/agents/{agent}", ("active",), "the activation of this agent")),

@@ -815,11 +815,17 @@ vault_broker() { # only where the owner chose one server for all (FLEET_HUB_SERV
 handover key and the fleet's own store on this server, and start fleet-vault.service: the store's key and the \
 handover key belong to fleet-vault alone, and no agent of this server can read them"
         plan "read and change nothing of the owner's: no account, no token and no password"
+        plan "run: python3 $kit/hubsetup.py key-swap, which switches on the key swap of this server's vault: an API \
+key that has a site stays out of the agents' sessions. An install goes on when it stops"
         return 0
     fi
     python3 "$kit/hubsetup.py" vault --hub "http://$address:$port" --kit "$kit" </dev/null \
         || stop "The vault of this server could not be set up: the line above says why. Nothing of the owner's was \
 read or changed. Run the line again."
+    # The key swap (VAULT.md), from the installed vault program, as join.sh switches it on: the install goes on when
+    # it stops, and this server then gives each API key to a session as a value.
+    python3 "$kit/hubsetup.py" key-swap </dev/null \
+        || say "the install goes on, and this server gives each API key to a session as a value."
 }
 
 fleet_identity() {  # this fleet's own id, after the hub has answered, so its records are there to keep it in

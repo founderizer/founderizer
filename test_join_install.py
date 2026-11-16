@@ -23,7 +23,7 @@ TEXT = SCRIPT.read_text()
 # The Linux path, in the order the script takes it. The firewall and the security updates come before the per-agent
 # users and verify, because verify reads the firewall and says whether this machine is healthy as it now stands.
 LINUX = ["reach", "checkout ", "server.py\" join", "updates", "firewall ", "harden ", "current ", "agent_users ",
-         "verify_step "]
+         "vault_broker ", "key_swap ", "verify_step "]
 
 
 def run_step(name, call, stubs):

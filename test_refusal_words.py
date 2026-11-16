@@ -67,6 +67,7 @@ SITES = {
     'command_run': {'command_interrupted': 1, 'command_reused': 1, 'hub_changed_sending': 1, 'login_as_text': 1},
     'enroll_new_device': {'not_owner_device_no_code': 1},
     'grant_server': {'no_such_agent': 1},
+    'key_swap_entry': {'no_such_server': 1},      # Part B of the key swap: the 404 of both of its routes
     'knowledge_add': {'revision_unreadable': 1},
     'knowledge_content': {'login_as_text': 1},
     'knowledge_delete': {'revision_unreadable': 1},
@@ -94,7 +95,7 @@ SITES = {
     'save_team_entry': {'team_changed': 1},
     'save_vault': {'no_such_agent': 1, 'team_changed': 1},
     'save_vault_create': {'no_such_agent': 1, 'team_changed': 1},
-    'server_key_swap': {'no_such_server': 1, 'team_changed': 1},
+    'server_key_swap': {'team_changed': 1},
     'set_shape': {'team_changed': 1},
     'skill_remove': {'revision_unreadable': 1},
     'start_machine_login': {'no_such_agent': 1},

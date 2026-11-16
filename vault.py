@@ -105,6 +105,7 @@ import pwd
 import re
 import secrets
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -4121,6 +4122,283 @@ WantedBy=multi-user.target
 """
 
 
+# ---------------------------------------------------------------- this machine's own root step (configure)
+#
+# Part B of the changed key swap (the manager's choice C43, 15 November 2026): the one command that changes this
+# machine's vault configuration after its install. It adds the owner's keys and never takes one away, so that the step
+# of one Mac of the owner does not take the handovers of another; it sets the fleet's ID where the vault has none; and
+# it switches the key swap on or off. It runs only as root and only as the installed program (configure_main), as
+# store-init does, so the code that root runs here is root's own: the program that the install put in place, or the
+# one that fleet-vault-program took from a signed release above its floor (hubsetup.vault_program_script). Nothing of a
+# checkout runs, and the hub names nothing. The owner's Mac runs it over SSH; join.sh and hub.sh run it at an install
+# (`hubsetup.py key-swap`); `hubsetup.py vault --swap` calls it. No rule of the machine's sudoers file reaches it: the
+# service user's two root commands are other programs, and its third right is to run commands as an agent user, which
+# this command refuses (hubsetup.sudoers_text; test_key_swap.Configure holds both).
+#
+# Its last line on standard output is one JSON object, which the owner's app reads: {"ok": true, "state", "swaps",
+# "swaps_from", "owner_keys", "fleet", "changed"}, or {"ok": false, "reason"} with exit 1.
+
+INSTALLED = "/usr/local/lib/fleet-vault/vault.py"   # hubsetup.VAULT_LIB + "/vault.py": the one copy that configures
+VAULT_CONF_PATH = "/etc/fleet-vault/vault.json"     # hubsetup.VAULT_CONF
+VAULT_USER = "fleet-vault"                          # hubsetup.VAULT_USER: the broker's own user
+SWAP_SERVICE = "fleet-vault-swap"                   # hubsetup.SWAP_SERVICE
+SWAP_UNIT_PATH = "/etc/systemd/system/fleet-vault-swap.service"     # hubsetup.SWAP_UNIT
+SWAP_PORT = 876                                     # hubsetup.SWAP_PORT: below 1024, where no user without the right
+                                                    # can listen
+SWAP_OPENSSL = "/usr/bin/openssl"
+CONFIGURE_LOCK = "/run/fleet-vault-configure.lock"  # root's: two steps never change one vault at the same time
+CONFIGURE_SETTLE = 3                                # hubsetup.VAULT_SETTLE: seconds before a service is read
+ROOT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"   # hubsetup.ROOT_PATH
+# What `swaps` is read from. Root cannot ask the broker itself: its socket admits the agents' users only (admitted).
+# The broker makes its socket for the proxy only after it loaded the part "swap" (Broker.open_swaps), in its runtime
+# folder, which systemd removes at each stop of the broker (RuntimeDirectory, with no Preserve): so a socket of the
+# vault user there is the word of the broker that runs now, and not of a file that a step wrote.
+SWAPS_FROM = "the socket for the proxy of the broker that runs now, and the proxy's service"
+
+
+class ConfigureStop(Exception):
+    """Why configure changed nothing more: one sentence, which the owner's app shows on the server's row."""
+
+
+def root_shell(script, timeout=120):
+    """(code, out, err) of a shell script, run with root's own PATH and nothing of the caller's environment."""
+    try:
+        r = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, timeout=timeout,
+                           env={"PATH": ROOT_PATH, "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError, UnicodeError) as e:
+        return 1, "", f"the command did not run ({type(e).__name__})"
+    return r.returncode, r.stdout, r.stderr
+
+
+def configure_reading(conf):
+    """The shell that reads what runs, so that a second run changes nothing and the answer says what is so: the proxy's
+    user, the kernel's first port that each user can listen on, the hash of the proxy's unit, the broker's and the
+    proxy's services, and the owner of the broker's socket for the proxy (SWAPS_FROM). It changes nothing."""
+    sock = os.path.join(os.path.dirname(str(conf.get("socket") or "/run/fleet-vault/vault.sock")), SWAP_SOCKET)
+    return ("id -u %(u)s >/dev/null 2>&1 && echo user=yes || echo user=no\n"
+            "echo low=$(cat %(low)s 2>/dev/null)\n"
+            "echo unit=$(sha256sum %(unit)s 2>/dev/null | cut -d' ' -f1)\n"
+            "echo broker=$(systemctl is-active fleet-vault 2>/dev/null || true)\n"
+            "echo broker_restarts=$(systemctl show -p NRestarts --value fleet-vault 2>/dev/null || echo unknown)\n"
+            "echo active=$(systemctl is-active %(service)s 2>/dev/null || true)\n"
+            "echo restarts=$(systemctl show -p NRestarts --value %(service)s 2>/dev/null || echo unknown)\n"
+            "echo enabled=$(systemctl is-enabled %(service)s 2>/dev/null || true)\n"
+            "echo socket=$(test -S %(sock)s && stat -c %%U %(sock)s 2>/dev/null)\n") % {
+                "u": SWAP_USER, "low": SWAP_LOW_PORTS, "unit": SWAP_UNIT_PATH, "service": SWAP_SERVICE,
+                "sock": shlex.quote(sock)}
+
+
+def readings(text):
+    """{name: value} of the lines name=value of a reading."""
+    return dict(line.split("=", 1) for line in (text or "").splitlines() if "=" in line)
+
+
+def configure_swaps(reading):
+    """True when the broker that runs now swaps keys (SWAPS_FROM) and the proxy runs."""
+    return reading.get("broker") == "active" and reading.get("socket") == VAULT_USER and \
+        reading.get("active") == "active"
+
+
+def configure_lock(path=CONFIGURE_LOCK):
+    """The lock of this machine's root step: a file of root's, held until the process closes it or ends. A second step
+    that finds it held stops and changes nothing."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise ConfigureStop("Another step changes this machine's vault now, so this one changed nothing. Try again in "
+                            "a minute.") from None
+    return fd
+
+
+def configure_answer(state, conf, reading, changes):
+    return {"ok": True, "state": state, "swaps": configure_swaps(reading), "swaps_from": SWAPS_FROM,
+            "owner_keys": len(conf.get("owner_keys") or []), "fleet": bool(conf.get("fleet")), "changed": changes}
+
+
+def configure(config=VAULT_CONF_PATH, owner_keys=(), fleet=None, swap="keep", check=False, run=None, read=None,
+              settle=CONFIGURE_SETTLE, lock=CONFIGURE_LOCK):
+    """This machine's own root step (the section above). `owner_keys` are added to the vault's list, `fleet` is set
+    where the vault has none, and `swap` is "on", "off" or "keep". With `check` it reads and changes nothing.
+
+    The order of the install's swap step stays: it reads first; it refuses before anything changes (a vault of another
+    fleet, a key that is not in the owner's form, a machine where each user can listen on the proxy's port); it makes
+    the proxy's user; it writes the configuration and restarts the broker once, only when the configuration changes or
+    the broker runs without its socket for the proxy, and a broker that does not stay up gets the old configuration
+    back; then it installs, starts or stops the proxy, and starts it again only when its unit changed or it does not
+    run. A second run with the same arguments changes nothing and restarts nothing. Returns the answer of the section
+    above, or raises ConfigureStop."""
+    run = run or root_shell
+    read = read or (lambda path: open(path, encoding="utf-8").read())
+    if swap not in ("on", "off", "keep"):
+        raise ConfigureStop("swap is on, off or keep. Nothing changed.")
+    held = configure_lock(lock) if lock and not check else None
+    try:
+        return configure_locked(config, list(owner_keys), fleet, swap, check, run, read, settle)
+    finally:
+        if held is not None:
+            os.close(held)
+
+
+def configure_locked(config, owner_keys, fleet, swap, check, run, read, settle):
+    try:
+        current = json.loads(read(config))
+        current = current if isinstance(current, dict) else None
+    except (OSError, ValueError):
+        current = None
+    if current is None or not current.get("worker_group") or current.get("central") is True:
+        raise ConfigureStop("This machine has no vault broker of its own to configure: run `hubsetup.py vault` first.")
+    for text in owner_keys:
+        try:
+            owner_key(text)
+        except ValueError:
+            raise ConfigureStop("Each owner key is the base64 of an uncompressed P-256 public key (65 bytes), as the "
+                                "app shows it. Nothing changed.") from None
+    if fleet is not None and not FLEET_ID.fullmatch(str(fleet)):
+        raise ConfigureStop("fleet is the fleet's ID: 16 lowercase hex characters. Nothing changed.")
+    if fleet and current.get("fleet") and current["fleet"] != fleet:
+        raise ConfigureStop(f"This vault is of another fleet ({current['fleet']}), so nothing changed.")
+    conf, had = dict(current), list(current.get("owner_keys") or [])
+    added = [k for k in dict.fromkeys(owner_keys) if k not in had]
+    if added and not (current.get("fleet") or fleet):
+        raise ConfigureStop("The owner's keys go with the fleet's ID: give --fleet. Nothing changed.")
+    if len(had) + len(added) > OWNER_KEYS:
+        raise ConfigureStop(f"A vault takes at most {OWNER_KEYS} owner keys, and this one would have "
+                            f"{len(had) + len(added)}. Nothing changed.")
+    if added:
+        conf["owner_keys"] = had + added
+    if fleet and not current.get("fleet"):
+        if not conf.get("owner_keys"):
+            raise ConfigureStop("The fleet's ID goes with the owner's keys: give --add-owner-key. Nothing changed.")
+        conf["fleet"] = fleet
+    if swap == "on":
+        conf[SWAP_KEY] = {"user": SWAP_USER, "vault": VAULT_USER, "port": SWAP_PORT, "openssl": SWAP_OPENSSL}
+    elif swap == "off":
+        conf.pop(SWAP_KEY, None)
+    swaps = SWAP_KEY in conf
+    before = readings(run(configure_reading(current))[1])
+    low = before.get("low", "")
+    if swap == "on" and low.isdigit() and int(low) <= SWAP_PORT:
+        raise ConfigureStop(f"On this machine each user can listen on port {SWAP_PORT} "
+                            f"(net.ipv4.ip_unprivileged_port_start is {low}), so an agent could take the place of the "
+                            f"vault's proxy. The key swap is not switched on. Set net.ipv4.ip_unprivileged_port_start "
+                            f"to 1024, its default, and run this step again.")
+    unit = SWAP_UNIT.format(user=SWAP_USER, config=config, script=INSTALLED)
+    user_new = swaps and before.get("user") != "yes"
+    conf_new = conf != current
+    # A broker that started while the part could not be read (no proxy's user yet) serves without its socket for the
+    # proxy, and gives no key that has a site until it starts again; a broker that does not run starts.
+    broker_again = conf_new or (swaps and (before.get("broker") != "active" or before.get("socket") != VAULT_USER))
+    unit_new = swaps and before.get("unit") != hashlib.sha256(unit.encode()).hexdigest()
+    proxy_again = swaps and (unit_new or before.get("active") != "active")
+    proxy_enable = swaps and (unit_new or before.get("enabled") != "enabled")
+    proxy_off = not swaps and swap == "off" and (before.get("active") not in ("", "inactive", "failed", "unknown")
+                                                 or before.get("enabled") == "enabled")
+    changes = [name for name, needed in (("the proxy's user", user_new), ("the configuration", conf_new),
+                                         ("the broker", broker_again and not conf_new),
+                                         ("the proxy", proxy_again or proxy_enable or proxy_off)) if needed]
+    if check or not changes:
+        return configure_answer("would make" if changes else "there", conf, before, changes)
+    if user_new:
+        code, out, err = run("id -u %(u)s >/dev/null 2>&1 || useradd --system --user-group --home-dir %(state)s "
+                             "--shell /usr/sbin/nologin %(u)s\n" % {"u": SWAP_USER, "state": SWAP_STATE})
+        if code != 0:
+            raise ConfigureStop(f"The user {SWAP_USER} of the vault's proxy could not be made: "
+                                f"{(err or out).strip()[-300:]}")
+    folder = tempfile.mkdtemp(prefix="fleet-vault-configure-")
+    try:
+        new, old, service = (os.path.join(folder, name) for name in ("vault.json", "vault.json.before", "unit"))
+        for path, text in ((new, json.dumps(conf, indent=2) + "\n"), (old, json.dumps(current, indent=2) + "\n"),
+                           (service, unit)):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        restart = ("systemctl reset-failed fleet-vault >/dev/null 2>&1 || true\n"
+                   "systemctl restart fleet-vault\nsleep %d\n" % settle)
+        if broker_again:
+            code, out, err = run(("install -o root -g root -m 644 %s %s\n" % (shlex.quote(new), shlex.quote(config))
+                                  if conf_new else "") + restart, timeout=300)
+            now = readings(run(configure_reading(conf))[1])
+            if code != 0 or now.get("broker") != "active" or now.get("broker_restarts") not in ("0", "unknown"):
+                if conf_new:
+                    run("install -o root -g root -m 644 %s %s\n" % (shlex.quote(old), shlex.quote(config)) + restart,
+                        timeout=300)
+                raise ConfigureStop("The vault broker of this machine did not stay up with the new configuration, so "
+                                    "the configuration is as it was. Read `journalctl -u fleet-vault -n 30` on this "
+                                    "machine." if conf_new else
+                                    "The vault broker of this machine did not stay up after its start. Read "
+                                    "`journalctl -u fleet-vault -n 30` on this machine.")
+        if proxy_again or proxy_enable:
+            script = ("install -o root -g root -m 644 %s %s\nsystemctl daemon-reload\n"
+                      % (shlex.quote(service), SWAP_UNIT_PATH)) if unit_new else ""
+            script += "systemctl enable %s >/dev/null 2>&1\n" % SWAP_SERVICE
+            if proxy_again:
+                script += ("systemctl reset-failed %s >/dev/null 2>&1 || true\nsystemctl restart %s\nsleep %d\n"
+                           % (SWAP_SERVICE, SWAP_SERVICE, settle))
+            code, out, err = run(script, timeout=300)
+            if code != 0:
+                raise ConfigureStop(f"The service of the vault's proxy could not be started: "
+                                    f"{(err or out).strip()[-300:]}")
+        if proxy_off:
+            run("systemctl disable --now %s >/dev/null 2>&1 || true\nsystemctl reset-failed %s >/dev/null 2>&1 || "
+                "true\n" % (SWAP_SERVICE, SWAP_SERVICE), timeout=300)
+        after = readings(run(configure_reading(conf))[1])
+        fault = None
+        if swaps and (after.get("active") != "active" or proxy_again and after.get("restarts") not in ("0", "unknown")):
+            fault = (f"The vault's proxy of this machine is {after.get('active') or 'not running'} {settle} seconds "
+                     f"after its start. Read `journalctl -u {SWAP_SERVICE} -n 30` on this machine: a proxy that does "
+                     f"not start says why on its first line.")
+        elif swaps and not configure_swaps(after):
+            fault = ("The vault broker of this machine runs without its socket for the proxy. Read `journalctl -u "
+                     "fleet-vault -n 30` on this machine: the broker says why on its line \"no key swap\".")
+        if fault and SWAP_KEY not in current:
+            # This step put the part in, and the switch did not end well: nothing that worked before may stop (the
+            # brief's rules 1 and 4), so the old configuration goes back, the broker starts on it again, and the proxy
+            # stops. Each key then reaches a session as a value, as before this step.
+            run("install -o root -g root -m 644 %s %s\n" % (shlex.quote(old), shlex.quote(config)) + restart +
+                "systemctl disable --now %s >/dev/null 2>&1 || true\nsystemctl reset-failed %s >/dev/null 2>&1 || "
+                "true\n" % (SWAP_SERVICE, SWAP_SERVICE), timeout=300)
+            back = readings(run(configure_reading(current))[1])
+            raise ConfigureStop(fault + " So this step put the configuration back as it was and stopped the proxy: "
+                                "the key swap is not switched on, and each key reaches a session as a value, as "
+                                "before." + ("" if back.get("broker") == "active" else
+                                             " The vault broker did not come up again on it: read `journalctl -u "
+                                             "fleet-vault -n 30` on this machine."))
+        if fault:
+            raise ConfigureStop(fault + " The configuration keeps the part, which it had before this step, so a key "
+                                        "that has a site is not given to a session until this is repaired.")
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    if swap == "off" and after.get("active") == "active":
+        raise ConfigureStop(f"The vault's proxy of this machine still runs. Read `journalctl -u {SWAP_SERVICE} -n 30` "
+                            f"on this machine.")
+    return configure_answer("made", conf, after, changes)
+
+
+def configure_main(args, euid=None, program=None):
+    """`vault.py configure`: as root and only as the installed program (INSTALLED, which no user can change), and its
+    one JSON line. A program that a checkout holds is the user's, and root runs none of it."""
+    try:
+        if (os.geteuid() if euid is None else euid) != 0:
+            raise ConfigureStop("Run configure as root: it changes this machine's vault configuration and its services.")
+        if args.config != VAULT_CONF_PATH:      # a root step never needs another file: the unit and install name it
+            raise ConfigureStop(f"configure takes only this machine's own configuration, {VAULT_CONF_PATH}.")
+        here = os.path.realpath(program or __file__)
+        if here != INSTALLED:
+            raise ConfigureStop(f"configure runs only as the installed program ({INSTALLED}), never from a checkout. "
+                                f"This one is {here}.")
+        try:
+            unchangeable(here, "The vault broker program")
+        except SystemExit as e:
+            raise ConfigureStop(str(e)) from None
+        answer = configure(args.config, args.add_owner_key, args.fleet, args.swap, args.check)
+    except ConfigureStop as e:
+        print(json.dumps({"ok": False, "reason": str(e)}))
+        return 1
+    print(json.dumps(answer))
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -4147,7 +4425,20 @@ def main(argv=None):
     p = sub.add_parser("store-list", help="The references and titles in the fleet's own store, as the vault user. "
                                           "Never a value")
     p.add_argument("--config", required=True)
+    p = sub.add_parser("configure", help="This machine's own root step, as root and only as the installed program: "
+                                         "add the owner's keys, set the fleet's ID, and switch the key swap on or "
+                                         "off. Its last line is one JSON object")
+    p.add_argument("--config", default=VAULT_CONF_PATH)
+    p.add_argument("--add-owner-key", action="append", default=[], metavar="KEY",
+                   help="one public key of the owner (base64 of 65 bytes): added to the vault's keys, never in their "
+                        "place")
+    p.add_argument("--fleet", help="the fleet's ID, 16 lowercase hex characters: set where the vault has none")
+    p.add_argument("--swap", choices=("on", "off", "keep"), default="keep",
+                   help="the key swap: on, off, or as it is (the default)")
+    p.add_argument("--check", action="store_true", help="read, and change nothing")
     args = parser.parse_args(argv)
+    if args.cmd == "configure":
+        return configure_main(args)
     if args.cmd in ("store-init", "store-list"):
         unchangeable(os.path.realpath(__file__), "The vault broker program")     # the installed copy, not a checkout
         if args.cmd == "store-init":

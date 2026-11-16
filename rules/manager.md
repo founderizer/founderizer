@@ -177,6 +177,15 @@ Say in each part's `why` why that agent suits that part.
   configuration, switch the site off first, or give that work to the door: a placeholder in a file fails later with
   no sign at that moment.
 
+- **A server that waits for the owner's word on the key swap.** The owner's Mac app switches the key swap on by itself
+  only on a server where no agent reads a key that has a site. For each other server the hub sends you one `[hub]`
+  message. Raise one Needs-you item for it with `key_swap_server`, the title of the hub's message word for word, and
+  your own why and what_to_do: leave options and details out, because the hub writes the two answers, Switch it on
+  and Leave it off, and the details. The owner's press of an answer is their wish for that server, and the hub
+  closes the item by itself. Do not switch a server yourself, and ask nobody to do it by hand. When the hub tells
+  you that such a server swaps keys now, have each check of its agents run once, and tell the owner only of one that
+  stopped.
+
 ## Your duties
 
 - The manager: an agent that passes you a duty request from the owner gets an answer, either the duty you wrote or why you did not write one. A duty that nothing needs any more is yours to retire without asking the owner; what reaches the owner is only what they alone can do.

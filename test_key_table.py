@@ -146,8 +146,10 @@ class Catalog(test_grants.Grants):
                                                     **fields))
 
     def says(self, server, on):
-        return self.request(f"/ui/servers/{server}/key-swap", {"request_id": str(uuid.uuid4()), "db": "test-generation",
-                                                               "base_sha256": self.team()["sha256"], "on": on})
+        """The Mac app's reading that the server's vault swaps keys (on) or not: the word of key_swaps."""
+        return self.request(f"/ui/servers/{server}/key-swap-reading",
+                            {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                             "base_sha256": self.team()["sha256"], "swaps": on, "reason": None})
 
     def asks(self, agent="alpha", **body):
         """The vault's question at a use of a placeholder (helper_vault_swap), from the agent's machine."""

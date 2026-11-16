@@ -119,6 +119,7 @@ linux() {
     agent_helper "/home/$WORKER/fleet-server"
     agent_users "/home/$WORKER/fleet-server"
     vault_broker "/home/$WORKER/fleet-server"
+    key_swap "/home/$WORKER/fleet-server"
     verify_step "/home/$WORKER/fleet-server" as_worker
     say "done. Add an agent to this server in Founderizer: Settings, Servers, this server, Add agent."
 }
@@ -203,6 +204,16 @@ vault_broker() { # $1: the checkout. This machine's vault broker: its own user k
     say "this machine's vault, kept by its own user"
     python3 "$1/hubsetup.py" vault --hub "$HUB" --kit "$1" </dev/null \
         || stop "The vault of this machine could not be set up. Nothing of the owner's was read or changed."
+}
+
+key_swap() {     # $1: the checkout. The key swap (VAULT.md): an API key that an agent reads and that has a site stays
+                 # out of the agents' sessions, and the vault's proxy puts it into each request to its site. The step
+                 # is the installed vault program's own (vault.py configure --swap on), which the owner's app also
+                 # runs on a live server. An install goes on when it stops: the line says why, and this machine then
+                 # gives each key to a session as a value, as before.
+    say "this machine's key swap: an API key that has a site stays out of the agents' sessions"
+    python3 "$1/hubsetup.py" key-swap </dev/null \
+        || say "the install goes on, and this machine gives each API key to a session as a value."
 }
 
 # The Mac vault as the app's own Vault/install.py and Vault/update.zsh check it: signed by our Developer ID team, with

@@ -4523,8 +4523,17 @@ class CheckMode(unittest.TestCase):
         code, out = run_shell(body, extra=real + "hub_shared=yes\n")
         self.assertEqual(code, 0, out)
         self.assertEqual([line for line in out.splitlines() if line.startswith(("RAN: ", "ROOT: "))],
-                         [f"ROOT: python3 {tmp}/hubsetup.py vault --hub http://100.80.1.2:8765 --kit {tmp}"])
+                         [f"ROOT: python3 {tmp}/hubsetup.py vault --hub http://100.80.1.2:8765 --kit {tmp}",
+                          f"ROOT: python3 {tmp}/hubsetup.py key-swap"])     # Part B of the key swap: on at the install
         self.assertIn("Founderizer step 1: this server's vault, kept by its own user", out)
+        # a key swap that stops does not stop the install: the line says why, and each key is a value there
+        stopped = real.replace("python3() { printf 'ROOT: python3 %s\\n' \"$*\"; }",
+                               "python3() { case \"$*\" in *key-swap*) return 1 ;; *) printf 'ROOT: python3 %s\\n' "
+                               "\"$*\" ;; esac; }")
+        self.assertNotEqual(stopped, real)
+        code, out = run_shell(body, extra=stopped + "hub_shared=yes\n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("the install goes on, and this server gives each API key to a session as a value", out)
         code, out = run_shell(body, extra=real + "hub_shared=no\n")
         self.assertEqual((code, out), (0, ""))
         team.write_text(json.dumps(hubsetup.template(HUB_IP, owner="100.90.3.4")))

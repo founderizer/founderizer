@@ -332,16 +332,39 @@ The vault protects the value of each secret. The design gives these results:
 ## The key swap
 
 An API key that an agent reads is a variable in its sessions, so an agent with a shell can print it. The key swap
-keeps such a key out of the sessions. It is off until root switches it on for a server, and it is for Linux servers.
+keeps such a key out of the sessions. It is for Linux servers. A new Linux server swaps keys from its install; on a
+server that joined before, it is off until root switches it on.
 
-- **The switch.** Root runs `hubsetup.py vault --swap` on a server. That step makes the OS user `founderizer-swap`
-  and the service `fleet-vault-swap`, and it writes the part `swap` into the broker's configuration, which belongs
-  to root (`hubsetup.py`). With that part, the broker gives a key that the hub names with a site as a placeholder
-  or not at all, never as the key (`vault.py`). No agent can change the configuration. A vault program from before
-  the key swap does not start on a configuration with that part (`vault.py`). The root command that brings the
-  program of a release, `fleet-vault-program`, puts back the program that was serving when the new one does not
-  start. The root step `hubsetup.py vault` with an older program leaves the broker stopped (`hubsetup.py`). So an
-  older program does not switch the key swap off.
+- **The switch.** Root runs the vault program's own step on a server: `vault.py configure --swap on`
+  (`vault.py`). It runs only as root and only as the installed program, `/usr/local/lib/fleet-vault/vault.py`,
+  which no user can change: never from a checkout. So the code that root runs is the program that the install put
+  in place, or the one that `fleet-vault-program` took from a signed release. The step makes the OS user
+  `founderizer-swap` and the service `fleet-vault-swap`, and it writes the part `swap` into the broker's
+  configuration, which belongs to root. With that part, the broker gives a key that the hub names with a site as a
+  placeholder or not at all, never as the key. No agent can change the configuration. A broker that does not stay
+  up gets the old configuration back. The step stops where each user can listen on the proxy's port. A second run
+  changes nothing and restarts nothing. A lock lets only one step change a vault at one time.
+- **Who runs the step.** A new server's install runs it after the vault step (`join.sh`, and `hub.sh` for a hub's
+  own server that takes agents, through `hubsetup.py key-swap`). An install goes on when the step stops: it says
+  why, and the server then gives each key as a value. `hubsetup.py vault --swap` runs it too. No rule of a server's
+  sudoers file reaches it: the service user's two root commands are other programs, and its third right is to run
+  a command as an agent user, which the step refuses (`hubsetup.py`).
+- **Off.** `vault.py configure --swap off` takes the part away, restarts the broker and stops the proxy. Each session
+  that runs on that server with a placeholder then gets no key until its next start, because the proxy stops with
+  the switch.
+- **The owner's keys and the fleet.** The same step adds owner keys to a vault (`--add-owner-key`) and never takes
+  one away, so the step of one Mac of the owner does not take the handovers of another Mac. It sets the fleet's ID
+  (`--fleet`) where the vault has none, and it refuses a vault of another fleet.
+- **What the step reads.** Its last line is one JSON object, with `swaps`: the broker that runs now swaps keys. Root
+  cannot ask the broker itself, because the broker's socket admits only the agents' users. So the step reads the
+  broker's socket for the proxy, which the broker makes only after it loads the part `swap`, in its runtime folder,
+  which systemd removes at each stop of the broker; and it reads that the proxy's service runs (`vault.py`,
+  `SWAPS_FROM`).
+- **An older program.** A vault program from before the key swap does not start on a configuration with that part
+  (`vault.py`). The root command that brings the program of a release, `fleet-vault-program`, puts back the program
+  that was serving when the new one does not start. The root step `hubsetup.py vault` with an older program leaves
+  the broker stopped (`hubsetup.py`). So an older program does not switch the key swap off. A program from before
+  the step does not know `configure`, and an install with it says so and goes on.
 - **Which key swaps.** The hub names the site of a key when all of these hold: the agent's grant is "Reads it"; the
   key's catalog entry has a site, an `https` address with a host name, which the owner sets with the tool
   `save_login` of the owner's MCP server (`owner_mcp.py`) or which the table of well-known services gives it (the
@@ -383,13 +406,17 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
   the owner's lock, which no table and no tool of an agent changes. A later release can change a row or take it out:
   an entry that the table made keeps its own site and form, and only the manager's "on" reads the row again, which a
   row that is gone refuses (`hub.py`).
-- **What the hub says about a server.** The owner can tell the hub that the vault of a server swaps keys, with the
-  tool `server_key_swap` of the owner's MCP server, after root's step on that server (`owner_mcp.py`). The hub does
-  not check the server, and it reads no report of a machine for this. It uses the owner's word only for what it
-  says. The settings check does not count a key that swaps there as a key in the agent's sessions. The start text
-  of an agent whose sessions get the variable says that the variable holds a placeholder, which begins with
-  `vaultswap_`, and not the key (`hub.py`). The word opens nothing, and no vault reads it. A wrong word makes the
-  settings check and the start text say a thing that is not so.
+- **What the hub says about a server.** The hub keeps two records of each Linux server, apart (`hub.py`). The word,
+  `key_swap`: the owner's Mac app read as root that the server's vault swaps keys, after its step there. Only the
+  route of that reading writes it, and it says only what the reading found. The owner's wish, `key_swap_wish`: the
+  owner's own yes or no for the server, with the tool `server_key_swap` of the owner's MCP server (`owner_mcp.py`),
+  or with the answer of a Needs-you item. A server where an agent reads a key that has a site waits for the owner's
+  yes: the hub asks the fleet manager for one item about it, whose title and two answers are the hub's words. The
+  hub reads no report of a machine for these records. It uses the word only for what it says. The settings check
+  does not count a key that swaps there as a key in the agent's sessions. The start text of an agent whose sessions
+  get the variable says that the variable holds a placeholder, which begins with `vaultswap_`, and not the key
+  (`hub.py`). The word opens nothing, and no vault reads it. A wrong word makes the settings check and the start
+  text say a thing that is not so.
 - **The placeholder.** The broker makes one placeholder for each agent and key: `vaultswap_` and 160 random bits.
   It keeps a list of them with the OS user, the agent, the name of the key, the site and the form, and no value
   (`vault.py`). A placeholder is no secret: it is of use only on that server, to that OS user, for that site. At
@@ -458,8 +485,10 @@ keeps such a key out of the sessions. It is off until root switches it on for a 
 
 - A hub takes a release only when the release's manifest has a valid signature (`releases.py`).
 - A root step brings each Linux broker to the `vault.py` of the release. The server's own service starts it, and it
-  installs the new program only when root-owned copies of the release check accept the release's signature
-  (`server.py`, `hubsetup.py`).
+  installs the new program only when root-owned copies of the release check accept the release's signature, and
+  only a release that comes after the floor of the releases that this broker took (`server.py`, `hubsetup.py`). A
+  limit: a server with no floor yet takes any signed release at its first update. The program that its install put
+  in place serves until then.
 - The owner's Mac app brings the central vault to the `vault.py` of the hub's release by itself. It runs the root step
   of the install over the owner's SSH connection. That step takes only a release that a key in root's own clone
   accepts, and that comes after the clone's revision (`hub.py`, `hubsetup.py`, `Sources/FleetCore/CentralVaultPlan.swift`).
