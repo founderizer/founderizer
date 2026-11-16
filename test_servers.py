@@ -2,17 +2,21 @@
 removal of a server. A local hub with a temporary Fleet repository and a test source address for each machine. Also
 the hub's own startup on a team.json that does not validate (PRODUCT.md 4.8), in a real hub process."""
 import contextlib
+import gzip
 import hashlib
+import http.client
 import io
 import json
 import os
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
 import tempfile
 import time
 import sys
+import tracemalloc
 import unittest
 import urllib.request
 import uuid
@@ -57,7 +61,8 @@ def sha(text):
 
 
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite(cls(name) for cls in (Servers, ServerService, TeamAtStartup, InstallRetries)
+    return unittest.TestSuite(cls(name) for cls in (Servers, ServerService, TeamAtStartup, InstallRetries,
+                                                    CodeOverHubPort)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -1330,6 +1335,40 @@ class ServerService(Servers):
                 patch.object(self.mod, "own_kind", lambda: kind), patch("sys.stdin", io.StringIO(code + "\n")):
             self.mod.cmd_join(args)
 
+    def test_the_join_keeps_the_address_that_join_sh_took_the_code_from(self):
+        """FLEET_REPO_USED (join.sh; hub feature code_over_hub_port): the hub's git:// address, or the same repository
+        over the hub's own port, goes into server.json, from which the service clones each agent's checkout. Any
+        other value, or none, keeps the hub's answer, as before."""
+        answer = {"hub": "http://100.64.0.1:8765", "repo": "git://100.64.0.1/founderizer.git"}
+        http_repo = "http://100.64.0.1:8765/code/founderizer.git"
+        for used, kept in ((http_repo, http_repo), (answer["repo"], answer["repo"]), ("", answer["repo"]),
+                           ("http://198.51.100.9:8765/code/founderizer.git", answer["repo"]),
+                           ("http://100.64.0.1:8765/code/other.git", answer["repo"]), (None, answer["repo"])):
+            with patch.dict(os.environ, {"FLEET_REPO_USED": used or ""}):
+                if used is None:
+                    del os.environ["FLEET_REPO_USED"]
+                self.assertEqual(self.mod.repo_used(answer), kept, used)
+        self.assertEqual(self.mod.repo_used({"hub": answer["hub"], "repo": None}), None)
+        given = hub.join_answer("mini")
+        over_port = f"{given['hub']}/code/{given['repo'].rsplit('/', 1)[-1]}"
+        with patch.dict(os.environ, {"FLEET_REPO_USED": over_port}):
+            self.join_by_script(self.code("mini", "linux")["code"], kind="linux")
+        self.assertEqual(json.loads((self.home / ".fleet" / "server.json").read_text())["repo"], over_port)
+        # An agent's checkout clones from it: the service as server.py starts it, from that file.
+        svc = self.service(repo=self.mod.load_conf()["repo"])
+        real, clones = svc.run, []
+
+        def run(argv, cwd=None, timeout=120, env=None):
+            words = [str(a) for a in argv]
+            if "clone" in words:
+                clones.append(words)
+                return 1, "", "this test answers no clone"
+            return real(argv, cwd=cwd, timeout=timeout, env=env)
+        svc.run = run
+        self.add_agent()
+        svc.loop(rounds=1)
+        self.assertTrue(clones and over_port in clones[0], clones)
+
     def test_the_service_s_reading_carries_its_machine_s_load(self):
         self.join_by_script(self.code()["code"])
         load = {"cpu_percent": 10.5, "memory_used": 783446016, "memory_total": 3999657984, "disk_used": 3186442240,
@@ -2396,3 +2435,288 @@ class InstallRetries(unittest.TestCase):
 def lifecycle_exe(name, home):
     import lifecycle
     return lifecycle.exe(name, str(home))
+
+
+class CodeOverHubPort(OwnerAPI):
+    """**The fleet's code over the hub's own port** (owner feature code_over_hub_port; the plan install-auto-repair,
+    part 2): git's smart HTTP protocol, read only, for the repository that the git service serves, through the real
+    `git http-backend`; and the framing rules that keep a kept connection whole. A stand-in program in the place of
+    git shows what no real git does on cue: an answer that never ends, one of 48 MiB, one that git cuts off."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = Path(tempfile.mkdtemp(prefix="fleet-code-"))
+        self.addCleanup(shutil.rmtree, str(self.root), True)
+        for patcher in (patch.dict(os.environ, {"HOME": str(self.root)}),       # the git service's base path
+                        patch.object(hub, "served_repository", lambda: "fleet-pilot.git")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.kit = self.root / "seed"
+        git("init", "-q", str(self.kit))
+        (self.kit / "README").write_text("seed\n")
+        git("add", "-A", cwd=self.kit)
+        git("commit", "-q", "-m", "seed", cwd=self.kit)
+        self.served = self.root / "fleet-pilot.git"
+        git("clone", "-q", "--bare", str(self.kit), str(self.served))
+        (self.served / "git-daemon-export-ok").touch()          # as hubsetup.py marks the fleet's repository
+        self.url = self.base + "/code/fleet-pilot.git"
+        self.client = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") and "proxy" not in k.lower()}
+        self.client.update(GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1", HOME=str(self.root))
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    # ---- helpers
+    def git_client(self, *args, cwd=None):
+        return subprocess.run(["git", "-c", "protocol.version=2", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                              cwd=cwd, env=self.client, capture_output=True, text=True, timeout=60)
+
+    def status(self, path, method="GET", body=None, headers=None):
+        request = urllib.request.Request(self.base + path, data=body, method=method, headers=headers or {})
+        try:
+            with self.opener.open(request, timeout=30) as answer:
+                answer.read()
+                return answer.status
+        except urllib.error.HTTPError as answer:
+            with answer:
+                return answer.code
+
+    def raw(self, head, body=b""):
+        """One request as bytes, on a connection of its own: the answer's status, after the hub closed the connection
+        (a recv that times out fails the test)."""
+        port = self.server.server_port
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
+            conn.sendall(head.replace("HOST", f"127.0.0.1:{port}").encode() + body)
+            data = b""
+            while chunk := conn.recv(65536):
+                data += chunk
+        return int(data.split(b" ", 2)[1])
+
+    def stand_in(self, script):
+        """The program in the place of `git http-backend`: `sh -c script`."""
+        patcher = patch.object(hub, "CODE_BACKEND", ["sh", "-c", script])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def runs_free(self):
+        """Every run of git's has ended: all of CODE_RUNS can be taken (and is given back). The hub's thread gives its
+        run back after the client read the answer's end, so this reads again, up to 200 times."""
+        for _ in range(200):
+            taken = 0
+            while taken < 9 and hub.CODE_RUNS.acquire(blocking=False):
+                taken += 1
+            for _ in range(taken):
+                hub.CODE_RUNS.release()
+            if taken == 8:
+                return True
+            time.sleep(0.05)
+        return False
+
+    # ---- tests
+    def test_a_clone_and_a_fetch_take_the_served_commits(self):
+        clone = self.root / "clone"
+        done = self.git_client("clone", "-q", self.url, str(clone))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=clone), git("rev-parse", "HEAD", cwd=self.served))
+        # A new commit on the served repository, which the fetch takes. 40 commits of the clone's own make its
+        # requests longer than 1 KB, which git sends gzipped.
+        work = self.root / "work"
+        git("clone", "-q", str(self.served), str(work))
+        git("commit", "-q", "--allow-empty", "-m", "new", cwd=work)
+        git("push", "-q", "origin", "HEAD", cwd=work)
+        for n in range(40):
+            git("commit", "-q", "--allow-empty", "-m", f"own {n}", cwd=clone)
+        done = self.git_client("fetch", "-q", "origin", cwd=clone)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(git("rev-parse", "FETCH_HEAD", cwd=clone), git("rev-parse", "HEAD", cwd=work))
+        self.assertTrue(self.runs_free())
+
+    def test_a_gzip_request_is_unpacked_and_answered(self):
+        def packet(text):
+            data = text.encode()
+            return b"%04x" % (len(data) + 4) + data
+        body = gzip.compress(packet("command=ls-refs\n") + packet("object-format=sha1\n") + b"0001"
+                             + packet("symrefs\n") + b"0000")
+        request = urllib.request.Request(self.url + "/git-upload-pack", data=body, headers={
+            "Content-Type": "application/x-git-upload-pack-request", "Content-Encoding": "gzip",
+            "Git-Protocol": "version=2", "Accept": "application/x-git-upload-pack-result"})
+        with self.opener.open(request, timeout=30) as answer:
+            said = answer.read()
+            self.assertEqual(answer.headers["Content-Type"], "application/x-git-upload-pack-result")
+            self.assertEqual(answer.headers["Transfer-Encoding"], "chunked")
+        head = git("rev-parse", "HEAD", cwd=self.served)
+        self.assertIn(f"{head} refs/heads/main".encode(), said)
+
+    def test_a_gzip_request_is_unpacked_here_and_never_past_one_mib(self):
+        """git http-backend unpacks a gzip request with no limit, so the hub unpacks it itself: a body of 1 KiB that
+        unpacks to 2 MiB, a body that is no gzip stream, and one with bytes after its stream are refused, and git
+        gets no Content-Encoding (a review of 16 November 2026)."""
+        def post(body):
+            return self.status("/code/fleet-pilot.git/git-upload-pack", "POST", body, {
+                "Content-Type": "application/x-git-upload-pack-request", "Content-Encoding": "gzip",
+                "Git-Protocol": "version=2"})
+        large = gzip.compress(b"0032have 0123456789abcdef0123456789abcdef01234567\n" * 43000)
+        self.assertLess(len(large), 64 << 10)
+        self.assertEqual(post(large), 413)
+        self.assertEqual(post(b"not gzip at all"), 413)
+        whole = gzip.compress(b"0014command=ls-refs\n0000")
+        self.assertEqual(post(whole + b"more"), 413)
+        self.assertEqual(post(whole + whole), 413)
+        self.assertEqual(hub.code_unpack(whole), b"0014command=ls-refs\n0000")
+        self.assertIsNone(hub.code_unpack(gzip.compress(b"x" * (hub.CODE_BODY_MAX + 1))))
+        self.assertEqual(len(hub.code_unpack(gzip.compress(b"x" * hub.CODE_BODY_MAX))), hub.CODE_BODY_MAX)
+        self.assertTrue(self.runs_free())
+
+    def test_a_push_another_repository_and_every_other_path_are_refused(self):
+        upload = {"Content-Type": "application/x-git-upload-pack-request"}
+        for path, method, body, headers, code in (
+                ("/code/fleet-pilot.git/info/refs?service=git-receive-pack", "GET", None, {}, 403),
+                ("/code/fleet-pilot.git/git-receive-pack", "POST", b"0000", upload, 403),
+                ("/code/other.git/info/refs?service=git-upload-pack", "GET", None, {}, 404),
+                ("/code/origin.git/info/refs?service=git-upload-pack", "GET", None, {}, 404),
+                ("/code/fleet-pilot.git/info/refs", "GET", None, {}, 404),          # git's dumb protocol
+                ("/code/fleet-pilot.git/HEAD", "GET", None, {}, 404),
+                ("/code/fleet-pilot.git/objects/info/packs", "GET", None, {}, 404),
+                ("/code/..%2Ffleet-pilot.git/info/refs?service=git-upload-pack", "GET", None, {}, 404),
+                ("/code/fleet-pilot.git/info/refs?service=git-upload-pack", "POST", b"0000", upload, 404),
+                ("/code/fleet-pilot.git/git-upload-pack", "GET", None, {}, 404),
+                ("/code/fleet-pilot.git/git-upload-pack", "POST", b"0000", {"Content-Type": "text/plain"}, 415),
+                ("/code/fleet-pilot.git/git-upload-pack", "POST", b"0000", dict(upload, **{"Content-Encoding": "br"}),
+                 415)):
+            with self.subTest(path=path, method=method):
+                self.assertEqual(self.status(path, method, body, headers), code)
+        before = git("for-each-ref", cwd=self.served)
+        done = self.git_client("push", self.url, "HEAD:refs/heads/pushed", cwd=self.kit)
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(git("for-each-ref", cwd=self.served), before)
+        # The guards of every route: Funnel, and a Host that is not this hub's.
+        path = "/code/fleet-pilot.git/info/refs?service=git-upload-pack"
+        self.assertEqual(self.status(path, headers={"Tailscale-Funnel-Request": "1"}), 403)
+        # A page's script that a browser on a machine of the fleet runs sends one of these, and git sends neither.
+        self.assertEqual(self.status(path, headers={"Sec-Fetch-Site": "same-origin"}), 403)
+        self.assertEqual(self.status(path, headers={"Origin": self.base}), 403)
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=10)
+        conn.putrequest("GET", path, skip_host=True)
+        conn.putheader("Host", "example.com")
+        conn.endheaders()
+        self.assertEqual(conn.getresponse().status, 421)
+        conn.close()
+        self.assertTrue(self.runs_free())
+
+    def test_a_body_that_no_route_reads_is_refused_and_the_connection_ends(self):
+        """A chunked body (`Transfer-Encoding`): the hub reads Content-Length bytes, so the chunks would stay on the
+        kept connection as the next request. A GET, HEAD or DELETE reads no body at all. A fetch's request is at most
+        1 MiB, refused before it is read."""
+        self.assertEqual(self.raw("POST /join HTTP/1.1\r\nHost: HOST\r\nTransfer-Encoding: chunked\r\n\r\n",
+                                  b"5\r\nhello\r\n0\r\n\r\n"), 411)
+        self.assertEqual(self.raw("GET /join HTTP/1.1\r\nHost: HOST\r\nContent-Length: 5\r\n\r\n", b"hello"), 400)
+        self.assertEqual(self.raw("GET /join HTTP/1.1\r\nHost: HOST\r\nTransfer-Encoding: chunked\r\n\r\n",
+                                  b"0\r\n\r\n"), 400)
+        self.assertEqual(self.raw("DELETE /mcp HTTP/1.1\r\nHost: HOST\r\nContent-Length: 2\r\n\r\n", b"{}"), 400)
+        self.assertEqual(self.raw("POST /code/fleet-pilot.git/git-upload-pack HTTP/1.1\r\nHost: HOST\r\n"
+                                  "Content-Type: application/x-git-upload-pack-request\r\n"
+                                  f"Content-Length: {hub.CODE_BODY_MAX + 1}\r\n\r\n"),
+                         413)
+        # The same route by an encoded path, and in the form of a whole address: the cap reads the route's own parts.
+        for target in ("/%63ode/fleet-pilot.git/git-upload-pack",
+                       f"http://127.0.0.1:{self.server.server_port}/code/fleet-pilot.git/git-upload-pack"):
+            self.assertEqual(self.raw(f"POST {target} HTTP/1.1\r\nHost: HOST\r\n"
+                                      "Content-Type: application/x-git-upload-pack-request\r\n"
+                                      f"Content-Length: {hub.CODE_BODY_MAX + 1}\r\n\r\n"), 413, target)
+        # A length of 0 is no body: the request is answered as before.
+        self.assertEqual(self.raw("GET /join HTTP/1.1\r\nHost: HOST\r\nContent-Length: 0\r\nConnection: close\r\n"
+                                  "\r\n"), 200)
+
+    def test_a_client_that_stops_reading_ends_git_s_process_group(self):
+        """The whole group: real git runs children of its own (upload-pack, pack-objects), and one that writes nothing
+        for a time never meets a closed pipe. So the stand-in has a child that writes nothing, which only an end of the
+        whole group ends."""
+        pid_file, child_file = self.root / "pid", self.root / "child"
+        self.stand_in(f"echo $$ > {pid_file}; sleep 300 & echo $! > {child_file}; printf 'Content-Type: "
+                      "application/x-git-upload-pack-advertisement\\r\\n\\r\\n'; exec cat /dev/zero")
+
+        def end_child():            # a run that failed leaves no sleep behind
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(child_file.read_text()), signal.SIGKILL)
+        self.addCleanup(end_child)
+        port = self.server.server_port
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
+            conn.sendall(f"GET /code/fleet-pilot.git/info/refs?service=git-upload-pack HTTP/1.1\r\n"
+                         f"Host: 127.0.0.1:{port}\r\n\r\n".encode())
+            taken = 0
+            while taken < 1 << 20:
+                taken += len(conn.recv(65536))
+        for pid in (int(pid_file.read_text()), int(child_file.read_text())):
+            for _ in range(200):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail(f"the stand-in of git, or its child, still runs after its client went ({pid})")
+        self.assertTrue(self.runs_free())
+
+    def test_a_large_answer_streams_through_and_the_hub_does_not_hold_it(self):
+        size = 48 << 20
+        self.stand_in("printf 'Content-Type: application/x-git-upload-pack-advertisement\\r\\n\\r\\n'; "
+                      f"head -c {size} /dev/zero")
+        tracemalloc.start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=30)
+            conn.request("GET", "/code/fleet-pilot.git/info/refs?service=git-upload-pack")
+            answer, got = conn.getresponse(), 0
+            self.assertEqual(answer.status, 200)
+            while piece := answer.read(65536):
+                got += len(piece)
+            conn.close()
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(got, size)
+        self.assertLess(peak, 8 << 20, "the hub held the answer in memory")
+        self.assertTrue(self.runs_free())
+
+    def test_git_that_fails_after_its_head_gives_a_cut_answer(self):
+        self.stand_in("printf 'Content-Type: application/x-git-upload-pack-result\\r\\n\\r\\n'; printf part; exit 1")
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=30)
+        conn.request("GET", "/code/fleet-pilot.git/info/refs?service=git-upload-pack")
+        answer = conn.getresponse()
+        self.assertEqual(answer.status, 200)
+        with self.assertRaises(http.client.IncompleteRead):
+            answer.read()
+        conn.close()
+        self.assertTrue(self.runs_free())
+
+    def test_the_runs_at_once_have_a_limit(self):
+        taken = [hub.CODE_RUNS.acquire(blocking=False) for _ in range(8)]
+        try:
+            self.assertTrue(all(taken))
+            request = urllib.request.Request(self.url + "/info/refs?service=git-upload-pack")
+            with self.assertRaises(urllib.error.HTTPError) as refused:
+                self.opener.open(request, timeout=30)
+            with refused.exception:
+                self.assertEqual((refused.exception.code, refused.exception.headers["Retry-After"]), (503, "60"))
+        finally:
+            for _ in taken:
+                hub.CODE_RUNS.release()
+
+    def test_git_gets_an_environment_made_from_nothing_and_its_head_is_read_with_care(self):
+        hostile = {"GIT_DIR": "/elsewhere", "GIT_CONFIG_PARAMETERS": "'core.pager=evil'", "REMOTE_USER": "someone",
+                   "GIT_HTTP_EXPORT_ALL": "1", "PATH_TRANSLATED": "/etc", "GIT_PROJECT_ROOT": "/"}
+        with patch.dict(os.environ, hostile):
+            env = hub.code_environment("POST", "/fleet-pilot.git/git-upload-pack", "", 12,
+                                       "application/x-git-upload-pack-request", "version=2")
+        self.assertEqual(env, {"PATH": hub.CODE_PATH, "GIT_PROJECT_ROOT": str(self.root),
+                               "PATH_INFO": "/fleet-pilot.git/git-upload-pack", "QUERY_STRING": "",
+                               "REQUEST_METHOD": "POST", "CONTENT_LENGTH": "12",
+                               "CONTENT_TYPE": "application/x-git-upload-pack-request",
+                               "HTTP_GIT_PROTOCOL": "version=2"})
+        self.assertEqual(hub.code_head(b"Status: 403 Forbidden\r\nContent-Type: text/plain\r\nSet-Cookie: x=1\r\n"
+                                       b"Cache-Control: no-cache"),
+                         (403, [("Content-Type", "text/plain"), ("Cache-Control", "no-cache")]))
+        self.assertEqual(hub.code_head(b"Status: abc\nContent-Type: text/plain")[0], 502)
+        self.assertIsNone(hub.code_split(b"Content-Type: text/plain\r\n"))
+        for protocol, kept in (("version=2", True), ("version=2:object-format=sha1", True), ("version=2\nX: y", False),
+                               ("version=2 rm -rf /", False), ("v=2", False)):
+            self.assertEqual(bool(hub.CODE_PROTOCOL.fullmatch(protocol)), kept, protocol)
+        self.assertIn("code_over_hub_port", hub.ui_features())
+

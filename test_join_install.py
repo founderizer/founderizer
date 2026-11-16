@@ -55,9 +55,10 @@ class Shape(unittest.TestCase):
     def test_a_machine_checkout_starts_on_the_configuration_ref(self):
         """The hub writes the owner's team.json on that ref, and the join itself put this machine in it, so verify
         reads the fleet as it now is. A hub from before the split has no such ref and keeps the old clone."""
-        body = shell_function(SCRIPT, "checkout")
-        self.assertIn('git clone -q -b config "$REPO" "$1"', body)
-        self.assertIn('|| "$2" git clone -q "$REPO" "$1"', body)
+        body = shell_function(SCRIPT, "clone")
+        self.assertIn('git clone -q -b config "$3" "$1"', body)
+        self.assertIn('|| "$2" git clone -q "$3" "$1"', body)
+        self.assertIn('clone "$1" "$2" "$REPO"', shell_function(SCRIPT, "checkout"))
         self.assertIn('take "$1" "$2"', shell_function(SCRIPT, "current"))
         self.assertIn('lifecycle.py" may-take "$1"', shell_function(SCRIPT, "take"))      # DevOps plan 0.1
 
@@ -490,7 +491,7 @@ class MacRoot(unittest.TestCase):
     """The Founderizer installer runs the same line as root, behind macOS's own password dialog, so that its vault step
     needs no terminal: each step of the Mac user still runs as that user, and the checks are the installer's."""
 
-    STUBS = ('HUB=http://100.64.0.2:8765\nHOME=/var/root\nRAN="$(mktemp)"\n'
+    STUBS = ('HUB=http://100.64.0.2:8765\nREPO=git://100.64.0.2/fleet.git\nHOME=/var/root\nRAN="$(mktemp)"\n'
              'id() { if [ "$1" = -u ]; then echo 0; else echo root; fi; }\n'
              'sw_vers() { echo 26.6; }\n'
              'dscl() { echo "NFSHomeDirectory: /Users/dana"; }\n'
@@ -693,35 +694,35 @@ class MacVault(unittest.TestCase):
 
 class CodeReach(unittest.TestCase):
     """The hub's port 9418 in the first check (`code_reach`, after the hub's health in `reach`): a Tailscale rule that
-    drops that port stops the join in seconds, where the two clones of `checkout` waited about two minutes each (a
-    customer's join of 16 November 2026). Only a connection that timed out stops it: curl ends with 28 and no connect
-    time. The stand-in curl answers as a real one did on this machine: git daemon ends the request at once (56), a
-    closed port refuses it (7), and a dropped one times out (28)."""
+    drops that port made the two clones of `checkout` wait about two minutes each before the join stopped (a customer's
+    join of 16 November 2026). Now the code comes over the hub's own port (REPO_HTTP, hub feature code_over_hub_port)
+    when the connection itself timed out: curl ends with 28 and no connect time. The stand-in curl answers as a real one
+    did on this machine: git daemon ends the request at once (56), a closed port refuses it (7), and a dropped one times
+    out (28)."""
 
     def run_check(self, repo="git://100.64.0.2/fleet.git", ended=56, connect="0.000179"):
         with tempfile.TemporaryDirectory() as folder:
             ran = Path(folder) / "ran"
-            stubs = (f"REPO={repo}\nRAN={ran}\n"
+            stubs = (f"REPO={repo}\nREPO_HTTP=http://100.64.0.2:8765/code/fleet.git\nRAN={ran}\n"
                      f'curl() {{ printf "curl %s\\n" "$*" >> "$RAN"; printf "%s" "{connect}"; return {ended}; }}\n')
-            code, out = run_step("code_reach", "code_reach\necho went-on", stubs)
+            code, out = run_step("code_reach", 'code_reach\necho "went-on with $REPO"', stubs)
             return code, out, ran.read_text() if ran.exists() else ""
 
-    def test_only_a_connection_that_timed_out_stops_the_join(self):
+    def test_only_a_connection_that_timed_out_moves_the_code_to_the_hubs_own_port(self):
         for connect in ("0.000000", "0,000000"):
             code, out, _ = self.run_check(ended=28, connect=connect)
-            self.assertEqual(code, 1, out)
-            self.assertIn("Could not get the Founderizer repository from git://100.64.0.2/fleet.git: this machine "
-                          "reaches the hub, but not its port 9418. Check the Tailscale access rules for the hub's port "
-                          "9418.", out)
-            self.assertNotIn("went-on", out)
+            self.assertEqual(code, 0, out)
+            self.assertIn("the hub's port 9418 does not answer this machine: its code comes over the hub's port 8765",
+                          out)
+            self.assertIn("went-on with http://100.64.0.2:8765/code/fleet.git", out)
         # git daemon that ends the request, a refused port, a port that answered and then took the whole time, and a
-        # curl that cannot make the request: the join goes on, and the clone says what it meets.
+        # curl that cannot make the request: the join goes on to git://, and the clone says what it meets.
         for ended, connect in ((56, "0.000179"), (52, "0.004000"), (7, "0.000000"), (28, "0.004000"), (1, "0.000000"),
                                (0, "0.000412")):
             with self.subTest(ended=ended, connect=connect):
                 code, out, _ = self.run_check(ended=ended, connect=connect)
                 self.assertEqual(code, 0, out)
-                self.assertIn("went-on", out)
+                self.assertIn("went-on with git://100.64.0.2/fleet.git", out)
 
     def test_it_asks_the_port_of_the_code_with_no_curlrc_and_no_proxy_and_a_short_time(self):
         for repo, url in (("git://100.64.0.2/fleet.git", "http://100.64.0.2:9418/"),
@@ -745,9 +746,122 @@ class CodeReach(unittest.TestCase):
         self.assertLess(body.index("/health"), body.index("code_reach"))
         for path in ("linux", "mac"):
             self.assertIn("    reach\n", shell_function(SCRIPT, path))
-        # The sentence of the stop is the clone's own start, so an app reads it as the same cause (InstallCause's
+        # The one stop is the clone's, after both ways, and an app reads it as the same cause as before (InstallCause's
         # row "could not get the founderizer repository").
-        self.assertIn('stop "Could not get the Founderizer repository from $REPO: ', shell_function(SCRIPT, "code_reach"))
+        self.assertNotIn("stop ", shell_function(SCRIPT, "code_reach"))
+        self.assertIn('stop "Could not get the Founderizer repository from $REPO_GIT or from $REPO_HTTP. ',
+                      shell_function(SCRIPT, "checkout"))
+
+
+class CodeOverTheHubsPort(unittest.TestCase):
+    """The fleet's code over the hub's own port (hub feature code_over_hub_port; the plan install-auto-repair, part 2):
+    a clone that git:// does not give comes from REPO_HTTP; a checkout of this hub's git:// address that cannot fetch
+    takes REPO_HTTP as its origin, when that gives it; and the address that worked (REPO) goes on to the server
+    service and to the root helper. git is a stand-in function that answers each address as the case says."""
+
+    GIT = "git://100.64.0.2/fleet.git"
+    HTTP = "http://100.64.0.2:8765/code/fleet.git"
+
+    def run_with(self, name, call, works, repo=None, origin=None):
+        """`works`: the addresses whose clone and fetch work. `origin`: the origin of the checkout that `take` reads."""
+        with tempfile.TemporaryDirectory() as folder:
+            ran = Path(folder) / "ran"
+            stubs = (f"REPO={repo or self.GIT}\nREPO_GIT={self.GIT}\nREPO_HTTP={self.HTTP}\nRAN={ran}\n"
+                     f"ORIGIN={origin or self.GIT}\nWORKS='{' '.join(works)}'\nHERE={folder}\n"
+                     "as_self() { \"$@\"; }\n"
+                     "python3() { return 0; }\n"
+                     "git() {\n"
+                     '    printf "git %s\\n" "$*" >> "$RAN"\n'
+                     '    case "$*" in\n'
+                     '        *"remote get-url origin"*) printf "%s\\n" "$ORIGIN" ;;\n'
+                     '        *"remote set-url origin "*) for a; do ORIGIN=$a; done ;;\n'
+                     '        *"fetch -q origin"*) case " $WORKS " in *" $ORIGIN "*) return 0 ;; esac; return 128 ;;\n'
+                     '        *"rev-parse"*) printf "%s\\n" 0123456789abcdef0123456789abcdef01234567 ;;\n'
+                     '        *clone*) for a in $WORKS; do case "$*" in *" $a "*) return 0 ;; esac; done; return 128 ;;\n'
+                     "    esac\n"
+                     "}\n")
+            code, out = run_step(name, call, stubs + shell_function(SCRIPT, "clone")
+                                 + (shell_function(SCRIPT, "take") if name == "checkout" else ""))
+            return code, out, ran.read_text().splitlines() if ran.exists() else []
+
+    def test_a_clone_that_git_does_not_give_comes_from_the_hubs_own_port(self):
+        call = 'checkout "$HERE/fleet-server" as_self\necho "repo=$REPO"'
+        code, out, ran = self.run_with("checkout", call, [self.HTTP])
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"repo={self.HTTP}", out)
+        self.assertEqual([line.split()[-2] for line in ran], [self.GIT, self.GIT, self.HTTP])
+        # git:// that gives it: the address stays, and the hub's port is not asked
+        code, out, ran = self.run_with("checkout", call, [self.GIT])
+        self.assertEqual((code, len(ran)), (0, 1), out)
+        self.assertIn(f"repo={self.GIT}", out)
+
+    def test_both_ways_refused_stop_the_join_with_both_addresses(self):
+        call = 'checkout "$HERE/fleet-server" as_self\necho went-on'
+        code, out, ran = self.run_with("checkout", call, [])
+        self.assertEqual(code, 1, out)
+        self.assertIn(f"Could not get the Founderizer repository from {self.GIT} or from {self.HTTP}. Check the "
+                      "Tailscale access rules for the hub's ports 8765 and 9418.", out)
+        self.assertNotIn("went-on", out)
+        # The first check moved the code already: the hub's port is tried, and once.
+        code, out, ran = self.run_with("checkout", call, [], repo=self.HTTP)
+        self.assertEqual(code, 1, out)
+        self.assertEqual([line.split()[-2] for line in ran], [self.HTTP, self.HTTP])
+
+    def test_a_checkout_of_this_hub_that_cannot_fetch_takes_the_hubs_own_port(self):
+        call = 'take "$HERE" as_self && echo "took from $ORIGIN, repo=$REPO" || echo "kept $ORIGIN, repo=$REPO"'
+        code, out, _ = self.run_with("take", call, [self.HTTP])
+        self.assertEqual(code, 0, out)
+        self.assertIn("takes its code over the hub's port 8765 from now on", out)
+        self.assertIn(f"took from {self.HTTP}, repo={self.HTTP}", out)
+        # The hub's port does not give it either: the origin goes back, and the checkout stays as it is.
+        code, out, _ = self.run_with("take", call, [])
+        self.assertIn(f"kept {self.GIT}, repo={self.GIT}", out)
+        # A checkout of another address, or one whose fetch works, keeps its origin.
+        stranger = "git://198.51.100.9/fleet.git"
+        code, out, ran = self.run_with("take", call, [self.HTTP], origin=stranger)
+        self.assertIn(f"kept {stranger}, repo={self.GIT}", out)
+        self.assertFalse([line for line in ran if "set-url" in line], ran)
+        code, out, ran = self.run_with("take", call, [self.GIT])
+        self.assertIn(f"took from {self.GIT}, repo={self.GIT}", out)
+        self.assertFalse([line for line in ran if "set-url" in line], ran)
+
+    def test_a_checkout_that_an_earlier_run_moved_keeps_the_hubs_own_port(self):
+        """A second run of the line (the app's retry, or the owner's): the checkout's origin is REPO_HTTP already, and
+        what follows it (the server service, the root helper) gets that address too, where REPO stayed git:// because
+        the first check found port 9418 refused, not dropped (a review of 16 November 2026)."""
+        call = 'take "$HERE" as_self && echo "took from $ORIGIN, repo=$REPO"'
+        code, out, ran = self.run_with("take", call, [self.HTTP], origin=self.HTTP)
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"took from {self.HTTP}, repo={self.HTTP}", out)
+        self.assertFalse([line for line in ran if "set-url" in line], ran)
+        call = 'mkdir -p "$HERE/fleet-server/.git"\ncheckout "$HERE/fleet-server" as_self\necho "repo=$REPO"'
+        code, out, ran = self.run_with("checkout", call, [self.HTTP], origin=self.HTTP)
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"repo={self.HTTP}", out)
+        self.assertFalse([line for line in ran if "clone" in line], ran)
+
+    def test_a_dropped_port_moves_this_hubs_checkout_at_once(self):
+        """The first check found port 9418 dropped (REPO is REPO_HTTP): a checkout of this hub's git:// address moves
+        at once, with no fetch over git:// first, which would wait about two minutes for git's own time-out."""
+        call = 'take "$HERE" as_self && echo "took from $ORIGIN, repo=$REPO"'
+        code, out, ran = self.run_with("take", call, [self.HTTP, self.GIT], repo=self.HTTP)
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"took from {self.HTTP}, repo={self.HTTP}", out)
+        moves = [line for line in ran if " fetch " in line or "set-url" in line]
+        self.assertTrue(moves[0].endswith(f"remote set-url origin {self.HTTP}"), ran)
+
+    def test_the_address_that_worked_goes_on_to_the_service_and_the_root_helper(self):
+        top = [line for line in TEXT.splitlines() if line.startswith(("REPO_GIT=", "REPO_HTTP="))]
+        self.assertEqual(top, ["REPO_GIT=$REPO", 'REPO_HTTP="$HUB/code/${REPO##*/}"'])
+        code, out = run_shell("HUB=http://100.64.0.2:8765\nREPO=git://100.64.0.2/founderizer.git\n" + "\n".join(top)
+                              + '\necho "$REPO_GIT $REPO_HTTP"\n')
+        self.assertEqual(out.split(), ["git://100.64.0.2/founderizer.git",
+                                       "http://100.64.0.2:8765/code/founderizer.git"])
+        self.assertIn('as_worker env FLEET_REPO_USED="$REPO" python3 "/home/$WORKER/fleet-server/server.py" join',
+                      shell_function(SCRIPT, "linux"))
+        self.assertIn('"$runner" env FLEET_REPO_USED="$REPO" "$prefix/bin/python3" "$HOME/fleet-server/server.py" join',
+                      shell_function(SCRIPT, "mac"))
+        self.assertIn('--repo "$REPO"', shell_function(SCRIPT, "agent_helper"))
 
 
 if __name__ == "__main__":

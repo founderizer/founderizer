@@ -35,7 +35,9 @@ import os
 import platform
 import re
 import secrets
+import select
 import shlex
+import shutil
 import signal
 import socketserver
 import sqlite3
@@ -1707,8 +1709,12 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "owner_profile",     # the owner, 16 November 2026 ("bots should talk in Spanish", "your profile
                                     # with the user name"): the settings owner.language and owner.name, which the
                                     # owner's Mac sets from its own language and account (UI-API.md 1.200)
-               "error_reports"]     # the owner, 16 November 2026 ("Yes, as drawn"): Settings › General › Error
+               "error_reports",     # the owner, 16 November 2026 ("Yes, as drawn"): Settings › General › Error
                                     # reports, GET and POST /ui/error-reports, off until he turns it on
+               "code_over_hub_port"]    # the owner, 16 November 2026 ("Yes, build it" to the plan install-auto-repair,
+                                    # part 2): the fleet's code over the hub's own port, git's smart HTTP protocol at
+                                    # /code/<repo>/..., which join.sh takes when port 9418 does not answer (UI-API.md
+                                    # 1.205)
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -42320,6 +42326,112 @@ def join_answer(name, row=None):
             "reboot_time": ((TEAM.get("servers") or {}).get(name) or {}).get("reboot_time")}
 
 
+# **The fleet's code over the hub's own port** (owner feature code_over_hub_port; the plan install-auto-repair-plan.md,
+# part 2, the owner's "Yes, build it" of 16 November 2026): git's smart HTTP protocol, read only, for the one
+# repository that the git service serves (served_repository), at GET /code/<repo>/info/refs?service=git-upload-pack and
+# POST /code/<repo>/git-upload-pack. Every machine of a fleet took its code from that service on port 9418 alone, and a
+# Tailscale rule that opens the hub's port 8765 and not 9418 (as the owner's Mac wrote it from 4 to 14 November 2026)
+# stopped each join at its clone. This serves the same repository, both refs, with no key, as git:// does, to each
+# machine that reaches this port of the hub's private address. join.sh takes it when port 9418 does not answer.
+CODE_SERVICE = "git-upload-pack"
+CODE_TYPE = "application/x-git-upload-pack-request"
+CODE_BODY_MAX = MIB         # git's http.postBuffer: a request within it comes with its length (remote-curl.c)
+CODE_RUNS = threading.BoundedSemaphore(8)      # git's runs at once: a whole pack costs a hub of 1 GB memory
+CODE_IDLE = 300             # seconds in which git writes nothing, or the client takes nothing: the run then ends
+CODE_PATH = "/usr/local/bin:/usr/bin:/bin"
+CODE_PASSED = {"content-type", "cache-control", "expires", "pragma"}     # what of git's head the answer carries
+CODE_PROTOCOL = re.compile(r"version=[0-9](?::[A-Za-z0-9=._-]{1,64}){0,8}")     # git's own Git-Protocol header
+CODE_BACKEND = ["git", "http-backend"]      # the program, which a test replaces
+
+
+def code_environment(method, path_info, query, length=None, ctype=None, protocol=None):
+    """The environment of `git http-backend`, made from nothing: none of the hub's own variables (no GIT_*, no
+    GIT_CONFIG_PARAMETERS, no PATH_TRANSLATED; no REMOTE_USER, so git refuses a push by itself; no GIT_HTTP_EXPORT_ALL,
+    so git serves only a repository marked as served, as the git service does). The project root is the git service's
+    base path (fleet.py service git): the home folder of the hub's user. No HTTP_CONTENT_ENCODING: a gzip request
+    reaches git unpacked (code_unpack)."""
+    env = {"PATH": CODE_PATH, "GIT_PROJECT_ROOT": os.path.expanduser("~"), "PATH_INFO": path_info,
+           "QUERY_STRING": query, "REQUEST_METHOD": method}
+    if length is not None:
+        env.update(CONTENT_LENGTH=str(length), CONTENT_TYPE=ctype or "")
+    if protocol:
+        env["HTTP_GIT_PROTOCOL"] = protocol         # version=2: git's protocol of today
+    return env
+
+
+def code_unpack(body):
+    """A gzip request, unpacked here and never past CODE_BODY_MAX (a review of 16 November 2026): `git http-backend`
+    unpacks one with no limit, so a body of 1 MiB could become about 1 GB of requests inside git. git's client gzips a
+    request only when it fits its 1 MiB buffer (remote-curl.c), so a real one unpacks to at most that. None for a body
+    that is not one whole gzip stream, and for one that is larger unpacked."""
+    unpack = zlib.decompressobj(wbits=31)
+    try:
+        plain = unpack.decompress(body, CODE_BODY_MAX + 1)
+    except zlib.error:
+        return None
+    if len(plain) > CODE_BODY_MAX or unpack.unconsumed_tail or unpack.unused_data or not unpack.eof:
+        return None
+    return plain
+
+
+def code_head(raw):
+    """The status and the headers that the answer passes on, from the head that `git http-backend` wrote (CGI)."""
+    status, headers = 200, []
+    for line in raw.decode("latin-1").splitlines():
+        name, _, value = line.partition(":")
+        name, value = name.strip().lower(), value.strip()
+        if name == "status":
+            code = value.split(" ", 1)[0]
+            status = int(code) if code.isdigit() and 100 <= int(code) <= 599 else 502
+        elif name in CODE_PASSED:
+            headers.append((name.title(), value))
+    return status, headers
+
+
+def code_split(raw):
+    """git's head and the start of what follows it, or None while the head has no end yet."""
+    ends = [(at, len(mark)) for mark in (b"\r\n\r\n", b"\n\n") for at in (raw.find(mark),) if at >= 0]
+    if not ends:
+        return None
+    at, size = min(ends)
+    return raw[:at], raw[at + size:]
+
+
+def code_read(fd):
+    """Up to 64 KiB of what git wrote, and b"" at its end. TimeoutError when git writes nothing for CODE_IDLE
+    seconds."""
+    ready, _, _ = select.select([fd], [], [], CODE_IDLE)
+    if not ready:
+        raise TimeoutError(f"git wrote nothing for {CODE_IDLE} seconds")
+    return os.read(fd, 65536)
+
+
+def code_feed(pipe, body):
+    """The request's body to git, from a thread of its own: git can write before it has read the whole request, and a
+    full pipe each way would hold both."""
+    try:
+        if body:
+            pipe.write(body)
+    except OSError:
+        pass                # git ended, or stopped reading: its answer says why
+    finally:
+        with contextlib.suppress(OSError):
+            pipe.close()
+
+
+def code_end(proc, ended):
+    """The run's last step: git's whole process group ended when the run did not end by itself (`ended`: git wrote
+    its whole answer and exited), then its exit read and its pipes closed."""
+    if not ended:
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    with contextlib.suppress(Exception):
+        proc.wait(timeout=10)
+    for pipe in (proc.stdout, proc.stdin):
+        with contextlib.suppress(Exception):
+            pipe.close()
+
+
 def free_reboot_time(team):
     """The restart time of a Linux server that joins now: the first time of the setting servers.reboot_times that no
     server of team.json has. None when the setting is empty or every time is taken: the join then takes security
@@ -53365,6 +53477,104 @@ class Handler(BaseHTTPRequestHandler):
         text = text.replace("__FLEET_TRACK__", "early" if setting("releases.early") else "approved")
         return self.send(200, text, "text/plain; charset=utf-8", {"Cache-Control": "no-store"})
 
+    def code(self, parts, query):
+        """GET /code/<repo>/info/refs?service=git-upload-pack and POST /code/<repo>/git-upload-pack (owner feature
+        code_over_hub_port, CODE_SERVICE): the one repository that the git service serves, read only. A push is 403,
+        and any other repository or path 404."""
+        plain = "text/plain; charset=utf-8"
+        # git sends neither: a page's script that a browser on a machine of the fleet runs does (a review of 16
+        # November 2026), and it never could speak git://
+        if self.headers.get("Sec-Fetch-Site") is not None or self.headers.get("Origin") is not None:
+            return self.send(403, "A browser does not fetch the fleet's code.\n", plain)
+        if len(parts) < 3 or parts[1] != served_repository():
+            return self.send(404, "This hub serves no such repository.\n", plain)
+        rest, service = parts[2:], query.get("service")
+        if rest == ["git-receive-pack"] or (rest == ["info", "refs"] and service == "git-receive-pack"):
+            return self.send(403, "This repository is read only.\n", plain)
+        if self.command == "GET" and rest == ["info", "refs"] and service == CODE_SERVICE:
+            return self.code_run(f"/{parts[1]}/info/refs", f"service={CODE_SERVICE}", None)
+        if self.command == "POST" and rest == [CODE_SERVICE]:
+            return self.code_run(f"/{parts[1]}/{CODE_SERVICE}", "", self.body())
+        return self.send(404, "This path serves git's smart protocol, to fetch, and nothing else.\n", plain)
+
+    def code_run(self, path_info, query, body):
+        """`git http-backend` for one request (CGI), and its answer streamed: git's head as this answer's status and
+        headers, then what git writes, in chunks as git writes it, never whole in the hub's memory (a hub of 1 GB).
+        Outside LOCK, in a process group of git's own. A client that takes nothing for CODE_IDLE seconds, a client that
+        goes, and a git that writes nothing for as long end that group."""
+        plain = "text/plain; charset=utf-8"
+        if self.request_version != "HTTP/1.1":
+            return self.send(505, "Git fetches over HTTP/1.1 here.\n", plain)
+        ctype = None
+        if body is not None:
+            ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            encoding = (self.headers.get("Content-Encoding") or "").strip().lower()
+            if ctype != CODE_TYPE or encoding not in ("", "identity", "gzip", "x-gzip"):
+                return self.send(415, f"A fetch's request is {CODE_TYPE}, plain or gzip.\n", plain)
+            if encoding in ("gzip", "x-gzip"):
+                body = code_unpack(body)
+                if body is None:
+                    return self.send(413, "A fetch's request is at most 1 MiB, also unpacked, and one whole gzip "
+                                          "stream.\n", plain)
+        protocol = (self.headers.get("Git-Protocol") or "").strip()
+        program = shutil.which(CODE_BACKEND[0], path=CODE_PATH)
+        if program is None:
+            return self.send(503, "This hub has no git.\n", plain)
+        if not CODE_RUNS.acquire(blocking=False):
+            return self.send(503, "The hub serves as many fetches as it can now. Run the line again in a minute.\n",
+                             plain, {"Retry-After": "60"})
+        proc, ended, kept = None, False, self.connection.gettimeout()
+        try:
+            env = code_environment(self.command, path_info, query, None if body is None else len(body), ctype,
+                                   protocol if CODE_PROTOCOL.fullmatch(protocol) else None)
+            proc = subprocess.Popen([program, *CODE_BACKEND[1:]], env=env, cwd=env["GIT_PROJECT_ROOT"],
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    start_new_session=True)
+            threading.Thread(target=code_feed, args=(proc.stdin, body), daemon=True).start()
+            out, raw, split = proc.stdout.fileno(), b"", None
+            try:
+                while split is None:
+                    data = code_read(out)
+                    if not data or len(raw) + len(data) > 65536:
+                        return self.send(502, "git gave no answer that the hub can pass on.\n", plain)
+                    raw += data
+                    split = code_split(raw)
+            except TimeoutError:
+                return self.send(504, "git gave no answer in time.\n", plain)
+            status, headers = code_head(split[0])
+            self.answered = True
+            self.send_response(status)
+            for name, value in headers:
+                self.send_header(name, value)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                self.connection.settimeout(CODE_IDLE)
+                data = split[1] or code_read(out)
+                while data:
+                    self.connection.sendall(b"%x\r\n%s\r\n" % (len(data), data))
+                    data = code_read(out)
+                if proc.wait(timeout=CODE_IDLE) != 0:
+                    self.close_connection = True    # no last chunk: git's client reads a cut answer, never a whole one
+                    return
+                self.connection.sendall(b"0\r\n\r\n")
+                ended = True
+            except (OSError, subprocess.TimeoutExpired):
+                self.close_connection = True        # the client went or took nothing, or git stopped: the group ends
+        finally:
+            if proc is not None:
+                code_end(proc, ended)
+            with contextlib.suppress(OSError):
+                self.connection.settimeout(kept)
+            CODE_RUNS.release()
+
+    def body_sent(self):
+        """Whether a request of a method that reads no body (GET, HEAD, DELETE) came with one: the hub reads none, so
+        its bytes would stay on the kept connection and be read as the next request (the plan install-auto-repair,
+        part 2; the connected apps' socket and the gate answer such a request 400 as well)."""
+        lengths = [value.strip() for value in self.headers.get_all("Content-Length") or []]
+        return bool(self.headers.get_all("Transfer-Encoding")) or any(value != "0" for value in lengths)
+
     def join(self):
         """POST /join: a new server joins with a join code. The code goes in the body, never in a URL, and the hub logs
         only the server's name and address."""
@@ -56719,6 +56929,9 @@ class Handler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_DELETE(self):
+        if self.body_sent():
+            self.close_connection = True
+            return self.json(400, {"error": "a GET, HEAD or DELETE takes no body"})
         if self.funnel_refused() or not self.host_allowed() or not self.origin_allowed():
             return
         parts, _ = self.route()
@@ -56729,6 +56942,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             self.serving, self.answered = True, False
+            if self.body_sent():
+                self.close_connection = True
+                return self.json(400, {"error": "a GET, HEAD or DELETE takes no body"})
             if self.funnel_refused() or not self.host_allowed() or \
                     (get_writes(self.route()[0]) and not self.site_allowed()):
                 return
@@ -56748,6 +56964,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.serving, self.answered = True, False
             # read the whole request first: a refusal must not leave half a request on a kept-alive connection
+            if self.headers.get_all("Transfer-Encoding"):   # a body with no length: the hub reads Content-Length bytes,
+                self.close_connection = True                 # and the chunks would stay as the next request
+                return self.json(411, {"error": "a request body needs its Content-Length"})
             try:
                 n = int(self.headers.get("Content-Length") or 0)
             except ValueError:
@@ -56758,6 +56977,10 @@ class Handler(BaseHTTPRequestHandler):
             if n > max(BACKUP_MAX, GOOGLE_UPLOAD_MAX, OUTPUTS_BODY_MAX, ATTACH_MAX):     # more than any route takes
                 self.close_connection = True
                 return self.json(413, {"error": f"a body is at most {BACKUP_MAX // MIB} MiB"})
+            # by the route's own parts, as code() reads them: "/%63ode/..." is this route too
+            if self.route()[0][:1] == ["code"] and not 0 <= n <= CODE_BODY_MAX:
+                self.close_connection = True
+                return self.send(413, "A fetch's request is at most 1 MiB.\n", "text/plain; charset=utf-8")
             if self.path.startswith("/helper/desktop/") and not 0 <= n <= 1500000:
                 self.close_connection = True
                 return self.json(413, {"error": "desktop frame is too large"})
@@ -56869,6 +57092,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_servers(query)
         if parts == ["join"]:
             return self.join_script()
+        if len(parts) >= 2 and parts[0] == "code":         # owner feature code_over_hub_port
+            return self.code(parts, query)
         if len(parts) == 2 and parts[0] == "mac-setup":
             return self.mac_setup_page(parts[1])
         if len(parts) == 3 and parts[0] == "server" and parts[2] == "needs":
@@ -57582,6 +57807,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_server_key_swap_reading(parts[2])
         if parts == ["join"]:
             return self.join()
+        if len(parts) >= 2 and parts[0] == "code":         # owner feature code_over_hub_port
+            return self.code(parts, query)
         if len(parts) == 2 and parts[0] == "mac-setup":
             return self.mac_setup_seen(parts[1])
         if len(parts) == 3 and parts[0] == "server" and parts[2] == "setup":

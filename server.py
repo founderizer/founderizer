@@ -258,6 +258,17 @@ def own_kind():
     return "mac" if sys.platform == "darwin" else "linux"
 
 
+def repo_used(answer):
+    """The address of the fleet's code that this server keeps (server.json `repo`), from which the service clones each
+    agent's checkout: the address that join.sh took the code from (FLEET_REPO_USED), when it is the hub's git:// address
+    or the same repository over the hub's own port (hub feature code_over_hub_port, for a machine whose way to port 9418
+    a Tailscale rule drops); else the hub's own answer, as before."""
+    repo, used = answer.get("repo"), os.environ.get("FLEET_REPO_USED", "")
+    if isinstance(repo, str) and used in (repo, f"{answer['hub']}/code/{repo.rsplit('/', 1)[-1]}"):
+        return used
+    return repo
+
+
 def cmd_join(args):
     """The join: the server key, POST /join with the code from standard input, then the server service. The same
     server again (the line once more after a failed step) is a repeat for the hub."""
@@ -278,7 +289,7 @@ def cmd_join(args):
     name = answer.get("server")
     if not NAME.fullmatch(str(name)) or not re.fullmatch(r"http://[0-9.:\[\]a-f]+", str(answer.get("hub"))):
         die("The hub gave an answer that Founderizer cannot use.")
-    conf = {"name": name, "hub": answer["hub"], "repo": answer.get("repo")}
+    conf = {"name": name, "hub": answer["hub"], "repo": repo_used(answer)}
     if re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", str(answer.get("reboot_time"))):
         conf["reboot_time"] = answer["reboot_time"]     # join.sh: the fleet patch policy at this server's own time
     save_conf(conf)

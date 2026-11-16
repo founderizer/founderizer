@@ -29,6 +29,11 @@ set -eu
 
 HUB="__FLEET_HUB__"
 REPO="__FLEET_REPO__"
+# The same repository over the hub's own port (hub feature code_over_hub_port), for a machine whose way to the hub's
+# port 9418 a Tailscale rule drops: the hub that serves this script serves its code there too. REPO is the address that
+# works, which the checkout, the server service (FLEET_REPO_USED) and the root helper keep.
+REPO_GIT=$REPO
+REPO_HTTP="$HUB/code/${REPO##*/}"
 FLEET="__FLEET_ID__"            # the fleet's id at its release channel, where a Mac takes its signed vault
 CHANNEL="__FLEET_CHANNEL__"
 TRACK="__FLEET_TRACK__"         # the fleet's track there: early when its setting releases.early is on, else approved
@@ -114,8 +119,8 @@ fail for a moment: run the line again."
     ports=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -u)
     first=$(printf '%s\n' "$ports" | head -n 1)
     checkout "/home/$WORKER/fleet-server" as_worker
-    printf '%s\n' "$code" | as_worker python3 "/home/$WORKER/fleet-server/server.py" join --hub "$HUB" --kind linux \
-        --ssh-port "${first:-22}"
+    printf '%s\n' "$code" | as_worker env FLEET_REPO_USED="$REPO" python3 "/home/$WORKER/fleet-server/server.py" join \
+        --hub "$HUB" --kind linux --ssh-port "${first:-22}"
     hub_time
     updates
     firewall "/home/$WORKER/fleet-server"
@@ -150,11 +155,12 @@ Tailscale is connected, and the Tailscale access rules for the hub's ports 8765 
 
 code_reach() {  # The fleet's code comes from the hub's port 9418 (git). A Tailscale access rule that lets this machine
                 # reach the hub's port 8765 and not 9418 drops each packet there, and each of the two clones of
-                # `checkout` then waits about two minutes for TCP before the join stops (a customer's join of 16
+                # `checkout` then waited about two minutes for TCP before the join stopped (a customer's join of 16
                 # November 2026 stopped after about four). One plain request, which git daemon ends at once, says it in
-                # seconds: curl ends with 28 and no connect time only when the connection itself timed out. A refused
-                # port, a port that answers and a curl without that request all go on to the clone, which says what it
-                # meets. -q first: no .curlrc; no proxy: git does not use one for git://.
+                # seconds: curl ends with 28 and no connect time only when the connection itself timed out. Then the
+                # code comes over the hub's own port (REPO_HTTP). A refused port, a port that answers and a curl
+                # without that request all go on to the clone, which says what it meets, and `checkout` tries the
+                # hub's own port after it. -q first: no .curlrc; no proxy: git does not use one for git://.
     case "$REPO" in git://*) ;; *) return 0 ;; esac
     git_at=${REPO#git://}
     git_at=${git_at%%/*}
@@ -167,8 +173,9 @@ code_reach() {  # The fleet's code comes from the hub's port 9418 (git). A Tails
     git_connect=$(curl -q -s --noproxy '*' -o /dev/null --connect-timeout 10 -m 15 -w '%{time_connect}' \
         "http://$git_at/" </dev/null 2>/dev/null) || git_tried=$?
     case "$git_tried:$git_connect" in
-        28:0.000000|28:0,000000) stop "Could not get the Founderizer repository from $REPO: this machine reaches the hub, \
-but not its port 9418. Check the Tailscale access rules for the hub's port 9418." ;;
+        28:0.000000|28:0,000000)
+            say "the hub's port 9418 does not answer this machine: its code comes over the hub's port 8765"
+            REPO=$REPO_HTTP ;;
     esac
 }
 
@@ -176,7 +183,22 @@ take() {        # $1: the checkout; $2: how to run a command as the user of the 
                 # and taken only where `lifecycle.py may-take` lets it (DevOps plan 0.1): the data that the hub writes,
                 # or a release that a release key signed. A refusal leaves the checkout where it is, and says why.
                 # The ref is read once, as one commit: the commit checked is the commit taken.
-    "$2" git -C "$1" fetch -q origin </dev/null || return 1
+                # A checkout of this hub's git:// address that cannot fetch from it takes the same repository over the
+                # hub's own port from then on (REPO_HTTP), when that port gives it: a Tailscale rule drops port 9418.
+                # At once, with no wait for git's own time-out, when the first check found that port dropped. A
+                # checkout that an earlier run moved keeps it, and so do the server service and the root helper (REPO).
+    was=$("$2" git -C "$1" remote get-url origin </dev/null) || return 1
+    [ "$was" != "$REPO_HTTP" ] || REPO=$REPO_HTTP
+    if { [ "$was" = "$REPO_GIT" ] && [ "$REPO" = "$REPO_HTTP" ]; } || ! "$2" git -C "$1" fetch -q origin </dev/null; then
+        [ "$was" = "$REPO_GIT" ] || return 1
+        "$2" git -C "$1" remote set-url origin "$REPO_HTTP" </dev/null || return 1
+        if ! "$2" git -C "$1" fetch -q origin </dev/null; then
+            "$2" git -C "$1" remote set-url origin "$was" </dev/null || true
+            return 1
+        fi
+        say "$1 takes its code over the hub's port 8765 from now on"
+        REPO=$REPO_HTTP
+    fi
     target=$("$2" git -C "$1" rev-parse --verify -q "@{upstream}^{commit}" </dev/null) || return 1
     "$2" python3 "$1/lifecycle.py" may-take "$1" "$target" </dev/null || return 1
     "$2" git -C "$1" merge -q --ff-only "$target" </dev/null
@@ -188,13 +210,17 @@ checkout() {    # $1: the folder; $2: how to run a command as the user of the se
         take "$1" "$2" || say "$1 could not update; it stays as it is"
     else
         say "the Founderizer repository in $1"
-        # On the configuration ref, which is the branch the hub writes and every machine's checkout stands on. A hub
-        # from before the split of 2026-10-17 has no such ref, and its checkout starts where it always did.
-        "$2" git clone -q -b config "$REPO" "$1" </dev/null \
-            || "$2" git clone -q "$REPO" "$1" </dev/null \
-            || stop "Could not get the Founderizer repository from $REPO. Check the Tailscale access rules for the hub's \
-port 9418."
+        # The address that works (REPO), then the hub's own port when that was git:// (REPO_HTTP).
+        clone "$1" "$2" "$REPO" || { [ "$REPO" != "$REPO_HTTP" ] && clone "$1" "$2" "$REPO_HTTP" && REPO=$REPO_HTTP; } \
+            || stop "Could not get the Founderizer repository from $REPO_GIT or from $REPO_HTTP. Check the Tailscale \
+access rules for the hub's ports 8765 and 9418."
     fi
+}
+
+clone() {       # $1: the folder; $2: how to run a command as the user of the service; $3: the address. On the
+                # configuration ref, which is the branch the hub writes and every machine's checkout stands on. A hub
+                # from before the split of 2026-10-17 has no such ref, and its checkout starts where it always did.
+    "$2" git clone -q -b config "$3" "$1" </dev/null || "$2" git clone -q "$3" "$1" </dev/null
 }
 
 current() {     # $1: the checkout; $2: how to run a command as the user of the service. The join put this machine in
@@ -477,7 +503,8 @@ mac() {
         "$runner" "$brew" install $need </dev/null || stop "Homebrew could not install$need."
     fi
     checkout "$HOME/fleet-server" "$runner"
-    printf '%s\n' "$code" | "$runner" "$prefix/bin/python3" "$HOME/fleet-server/server.py" join --hub "$HUB" --kind mac
+    printf '%s\n' "$code" | "$runner" env FLEET_REPO_USED="$REPO" "$prefix/bin/python3" "$HOME/fleet-server/server.py" join \
+        --hub "$HUB" --kind mac
     current "$HOME/fleet-server" "$runner"
     # No OS user for each agent on a Mac, and no root helper: a Mac agent's service is a LaunchAgent of a desktop
     # session, so a second user would have to be logged in at the screen. A Mac runs one agent, as this desktop

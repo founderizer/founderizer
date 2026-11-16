@@ -97,7 +97,7 @@ def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
     for cls in (Template, Repository, Claim, SecondClaim, AgentUsers, FleetId, VerifyStep, Prompt, PromptThroughSudo,
                 CheckMode, Systems, ZoneData, NoProviderCredential, ProviderToolsRefuse, RuntimeInstall, Firewall,
-                Harden, HubTcp, NetworkStep, AptUpdate):
+                Harden, HubTcp, NetworkStep, PackageStops, AptUpdate):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return suite
 
@@ -1908,7 +1908,9 @@ class VerifyStep(unittest.TestCase):
             lines = [line for line in body.splitlines() if "verify_step" in line or "say \"done." in line]
             self.assertTrue(lines[0].strip().startswith("verify_step"), lines)
         self.assertIn('[ "$ready" = yes ] || exit 1', shell_function(KIT / "join.sh", "main"))
-        self.assertIn('git clone -q -b config "$REPO"', join, "a machine's checkout stands on the configuration ref")
+        # A machine's checkout stands on the configuration ref, over git:// or over the hub's own port (`clone`).
+        self.assertIn('git clone -q -b config "$3" "$1"', shell_function(KIT / "join.sh", "clone"))
+        self.assertIn('clone "$1" "$2" "$REPO"', join)
 
 
 # A stand-in for ufw, as the firewall script uses it: its state in a JSON file, its rules numbered as ufw numbers them
