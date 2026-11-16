@@ -292,7 +292,9 @@ NOT_TOOLS = {
     "/ui/vault/recovery": "a statement signed with the owner's own key, which only their app on their Mac holds",
     "/ui/vault/grant": "a statement signed with the owner's own key, which only their app on their Mac holds; for a "
                        "grant of a secret to an agent, or its end, the app's program on the owner's Mac has "
-                       "grant_secret (~/.founderizer/cli write grant_secret), and the app then signs it",
+                       "grant_secret (~/.founderizer/cli write grant_secret), and for a secret into the grantable "
+                       "pool or out of it, share_secret (~/.founderizer/cli write share_secret); the app then signs "
+                       "the statement",
     "/ui/owner/devices/{}/certify": "a statement signed with the owner's own key, which only their app on their Mac "
                                     "holds, once the phone's key matches the one-time value of that app's QR",
     "/ui/restore": "a whole fleet restored over this one, from a file this server would have to carry",
@@ -850,7 +852,10 @@ PAGES = {
     "standing": ("/ui/standing", "the standing instructions and targets that steer agents, newest first, ended ones "
                                  "included (give agent for the ones that steer one agent)"),
     "goal": ("/ui/goals/{id}", "one goal with its recorded spending and its history"),
-    "resources": ("/ui/resources", "the grantable pool: each resource, the owner's standing for it, who holds it"),
+    "resources": ("/ui/resources", "each resource, the owner's standing for it (grant), who holds it; the signed pool "
+                                   "of secrets is on the page vault"),
+    "vault": ("/ui/vault", "the central vault as the hub last read it, with no value and no title: the owner's signed "
+                           "grants and pool, each server's pin and what each server's vault holds (held)"),
     "profiles": ("/ui/profiles", "every agent's profile at the hub revision"),
     "knowledge": ("/ui/knowledge", "one owner knowledge file with its text (give path)"),
     "people": ("/ui/people", "the people the owner added, their roles and handles, and the unknown senders"),
@@ -1433,16 +1438,20 @@ def _team_command(route, body, what_for, args):
 
 
 # The words when share_resource does not send a standing for a secret (`standing_reaches`). One fixed sentence, the
-# same in the program inside the app (`OwnerTools.shareNotSigned`): it quotes no reference and no word of the hub. Its
-# end asks for no second call: the app's own control signs the secret into the pool and writes the standing itself.
+# same in the program inside the app (`OwnerTools.shareNotSigned`): it quotes no reference and no word of the hub.
+# It names `share_secret`, a tool of the app's program only, which makes the app sign the secret into the pool and
+# write the standing (this server has no such tool: the owner key is the app's). So it says where that tool is (the
+# Mac where the app runs, with the whole command), and no "from here" of it that would be untrue in the app's
+# program, which has the tool. Its end asks for no second call: the app writes the standing itself.
 SHARE_NOT_SIGNED = ("On this fleet the central vault sends a secret's value to a server only for a grant that the "
                     "owner's app signed for an agent on that server, or for a secret that the owner signed into the "
                     "grantable pool. By the hub's last reading, this secret is not in the signed pool, the owner "
                     "signed no grant of it for a server, and no server's vault holds a copy of it. A standing from "
                     "here would let the fleet manager give the secret and, by that reading, bring its value to no "
-                    "server, so nothing was sent. The owner sets who may give the secret in the Founderizer app: on "
-                    "Secrets, the secret's card, Who may give it. The app signs that and writes the standing, and "
-                    "nothing more is needed from here then.")
+                    "server, so nothing was sent. On the Mac where the Founderizer app runs, its program sets it "
+                    "with the owner's signature (~/.founderizer/cli write share_secret): the app signs the secret "
+                    "into the grantable pool and writes the standing, as the owner's own Who may give it on Secrets "
+                    "does, and the owner can also set it there. After either, share_resource needs no second call.")
 
 # The name under which the owner's signed grant for the door stands in the central vault (hub.py DOOR_PIN): the door
 # is no server that an agent of the fleet works on, so such a grant brings no give of the manager to a server.
@@ -1454,13 +1463,14 @@ def standing_reaches(reading, page, what, most):
     value to a server.** `POST /ui/resources` writes the standing into the fleet's list with no signature, and the
     fleet manager can then give the secret to a worker or a lead. But on a fleet with a central vault, a server's
     vault gets a secret only when the owner signed it into the grantable pool, or signed a grant of it for an agent
-    of that server (vault.py `sealable`), and only the owner's app signs: its own control signs the pool statement
-    first and writes the standing after. So until 16 November 2026 a standing from here could let the manager give a
-    secret whose value no server would get. This is the twin of `secret_reaches`, for every server at once, because
-    a standing names no agent: it refuses only what the reading shows as useless, and it sends each standing that it
-    cannot judge. `share_resource` makes the two reads: `reading` is the page of the vault (`vault_read`), which is
-    not None here (1: a page that cannot judge is sent), and `page` is the team's (`GET /ui/team`), the one read that
-    also gives the command its base. True when the standing is sent, which is each of these, in this order:
+    of that server (vault.py `sealable`), and only the owner's app signs: its own control, and `share_secret` of its
+    program, sign the pool statement first and write the standing after. So until 16 November 2026 a standing from
+    here could let the manager give a secret whose value no server would get. This is the twin of `secret_reaches`,
+    for every server at once, because a standing names no agent: it refuses only what the reading shows as useless,
+    and it sends each standing that it cannot judge. `share_resource` makes the two reads: `reading` is the page of
+    the vault (`vault_read`), which is not None here (1: a page that cannot judge is sent), and `page` is the team's
+    (`GET /ui/team`), the one read that also gives the command its base. True when the standing is sent, which is
+    each of these, in this order:
 
     2. The reference is in the grantable pool that the owner signed.
     3. a. The catalog (`logins`) has no entry for the secret, `most` is not `use` or `read`, or the page has no
@@ -2911,8 +2921,9 @@ def tools():
                                "standing for a secret is refused, and nothing is sent, when the hub's reading of the "
                                "vault shows that no give of the manager from it could bring the value to a server "
                                "(the secret is not in the signed pool, the owner signed no grant of it for a server, "
-                               "and no server's vault holds a copy of it): the owner then sets who may give that "
-                               "secret in the Founderizer app, on Secrets (Who may give it), where the app signs. A "
+                               "and no server's vault holds a copy of it): on the Mac where the Founderizer app runs, "
+                               "share_secret of its program (~/.founderizer/cli) sets it with the owner's signature, "
+                               "as the owner does in the app, on Secrets (Who may give it). A "
                                "standing that the reading cannot judge is sent, and taking the entry back always "
                                "goes; for a secret, the owner's signed pool statement then stays in the vault until "
                                "the app ends it.",

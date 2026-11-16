@@ -48,7 +48,7 @@ def load_tests(loader, _tests, _pattern):
     return unittest.TestSuite(cls(name) for cls in (Admin, Boundary, FromNothing, McpServers, Refusals,
                                                     Install, Progress, RootThroughSudo, NoSecret, Shape, Table,
                                                     Parity, SecretGive, ShareStanding, ShareStandingNoWorker,
-                                                    VaultReading, GoogleConnect)
+                                                    SignedGrantWords, SignedPoolWords, VaultReading, GoogleConnect)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -3752,8 +3752,8 @@ class SignedGrantWords(unittest.TestCase):
     signs a grant (16 November 2026). This server has no such tool, because only the app holds the owner key: it
     names the tool in the refusal of a give, in the description of `grant_access` and in the reason of the route
     that takes a signed statement. The program inside the app says the same refusal and the same description (the
-    parity fixture and the table hold the two programs to each other). The pool's words do not change: no tool
-    signs a secret into the pool."""
+    parity fixture and the table hold the two programs to each other). The pool's words name `share_secret`, its
+    own signed tool (`SignedPoolWords`), and never `grant_secret`."""
 
     GIVE = ("On this fleet the central vault sends a secret's value to a server only for a grant that the owner's app "
             "signed for an agent on that server, or for a secret that the owner signed into the grantable pool. By the "
@@ -3796,9 +3796,12 @@ class SignedGrantWords(unittest.TestCase):
         self.assertEqual(owner_mcp.NOT_TOOLS["/ui/vault/grant"],
                          "a statement signed with the owner's own key, which only their app on their Mac holds; for a "
                          "grant of a secret to an agent, or its end, the app's program on the owner's Mac has "
-                         "grant_secret (~/.founderizer/cli write grant_secret), and the app then signs it")
+                         "grant_secret (~/.founderizer/cli write grant_secret), and for a secret into the grantable "
+                         "pool or out of it, share_secret (~/.founderizer/cli write share_secret); the app then signs "
+                         "the statement")
         self.assertNotIn("grant_secret", [t["name"] for t in owner_mcp.tools()])
-        # The other routes of a signed statement keep their reason: this tool signs a grant and its end only.
+        # The other routes of a signed statement keep their reason: these tools sign a grant, the pool and their ends
+        # only.
         for route in ("/ui/vault/pin", "/ui/vault/recovery"):
             self.assertEqual(owner_mcp.NOT_TOOLS[route],
                              "a statement signed with the owner's own key, which only their app on their Mac holds")
@@ -3807,6 +3810,84 @@ class SignedGrantWords(unittest.TestCase):
         self.assertNotIn("grant_secret", owner_mcp.SHARE_NOT_SIGNED)
         self.assertNotIn("grant_secret", self.words("share_resource"))
         self.assertIn("on Secrets", owner_mcp.SHARE_NOT_SIGNED)
+
+
+class SignedPoolWords(unittest.TestCase):
+    """The words that send the owner's agent to `share_secret`, the tool of the app's program with which the app
+    signs a secret into the grantable pool and writes the owner's standing (16 November 2026), as `SignedGrantWords`
+    holds the words of `grant_secret`. This server has no such tool, because only the app holds the owner key: it
+    names the tool in the refusal of a standing, in the description of `share_resource` and in the reason of the
+    route that takes a signed statement. The program inside the app says the same refusal and the same description
+    (the parity fixture and the table hold the two programs to each other)."""
+
+    SHARE = ("On this fleet the central vault sends a secret's value to a server only for a grant that the owner's app "
+             "signed for an agent on that server, or for a secret that the owner signed into the grantable pool. By "
+             "the hub's last reading, this secret is not in the signed pool, the owner signed no grant of it for a "
+             "server, and no server's vault holds a copy of it. A standing from here would let the fleet manager give "
+             "the secret and, by that reading, bring its value to no server, so nothing was sent. On the Mac where "
+             "the Founderizer app runs, its program sets it with the owner's signature (~/.founderizer/cli write "
+             "share_secret): the app signs the secret into the grantable pool and writes the standing, as the owner's "
+             "own Who may give it on Secrets does, and the owner can also set it there. After either, share_resource "
+             "needs no second call.")
+
+    words = staticmethod(SignedGrantWords.words)
+
+    def test_the_refusal_of_a_standing_names_share_secret_and_keeps_each_other_sentence(self):
+        self.assertEqual(owner_mcp.SHARE_NOT_SIGNED, self.SHARE)
+        # The sentences before the last two stay as they were.
+        self.assertTrue(owner_mcp.SHARE_NOT_SIGNED.startswith(
+            "On this fleet the central vault sends a secret's value to a server only for a grant that the owner's app "
+            "signed for an agent on that server, or for a secret that the owner signed into the grantable pool. By the "
+            "hub's last reading, this secret is not in the signed pool, the owner signed no grant of it for a server, "
+            "and no server's vault holds a copy of it. A standing from here would let the fleet manager give the "
+            "secret and, by that reading, bring its value to no server, so nothing was sent. "))
+        # What was true until `share_secret`: only the owner's own control signed a secret into the pool.
+        for gone in ("The owner sets who may give the secret in the Founderizer app", "nothing more is needed from here",
+                     "The app signs that and writes the standing"):
+            self.assertNotIn(gone, owner_mcp.SHARE_NOT_SIGNED)
+        self.assertNotIn("bws://", owner_mcp.SHARE_NOT_SIGNED)
+        # The same words are the app's program's, which has the tool: they say where it is. The one "from here" that
+        # stays is of a standing from `share_resource`, true in both.
+        self.assertEqual(owner_mcp.SHARE_NOT_SIGNED.count("from here"), 1)
+        self.assertIn("A standing from here would let the fleet manager give the secret", owner_mcp.SHARE_NOT_SIGNED)
+        self.assertIn("(~/.founderizer/cli write share_secret)", owner_mcp.SHARE_NOT_SIGNED)
+        self.assertTrue(owner_mcp.SHARE_NOT_SIGNED.endswith(" After either, share_resource needs no second call."))
+
+    def test_the_description_of_share_resource_names_share_secret(self):
+        words = self.words("share_resource")
+        self.assertIn("a standing for a secret is refused, and nothing is sent, when the hub's reading of the vault "
+                      "shows that no give of the manager from it could bring the value to a server (the secret is not "
+                      "in the signed pool, the owner signed no grant of it for a server, and no server's vault holds a "
+                      "copy of it): on the Mac where the Founderizer app runs, share_secret of its program "
+                      "(~/.founderizer/cli) sets it with the owner's signature, as the owner does in the app, on "
+                      "Secrets (Who may give it). A standing that the reading cannot judge is sent, and taking the "
+                      "entry back always goes; for a secret, the owner's signed pool statement then stays in the vault "
+                      "until the app ends it.", words)
+        self.assertNotIn("where the app signs", words)
+        self.assertEqual(words.count("share_secret"), 1)
+
+    def test_the_route_of_a_signed_statement_names_share_secret_and_this_server_has_no_such_tool(self):
+        why = owner_mcp.NOT_TOOLS["/ui/vault/grant"]
+        self.assertIn("and for a secret into the grantable pool or out of it, share_secret (~/.founderizer/cli write "
+                      "share_secret); the app then signs the statement", why)
+        self.assertTrue(why.startswith("a statement signed with the owner's own key, which only their app on their "
+                                       "Mac holds; "))
+        self.assertNotIn("share_secret", [t["name"] for t in owner_mcp.tools()])
+        self.assertNotIn("share_secret", owner_mcp.GRANT_NOT_SIGNED)
+        self.assertNotIn("share_secret", self.words("grant_access"))
+
+    def test_the_vault_is_a_page_of_fleet_read(self):
+        """The words of `grant_secret` and `share_secret` send the agent to `fleet_read` with the page `vault`: the
+        hub's `GET /ui/vault`, which has no value and no title (hub.py `vault_view`, vault.py `central_status`)."""
+        route, what = owner_mcp.PAGES["vault"]
+        self.assertEqual(route, "/ui/vault")
+        self.assertIn("with no value and no title", what)
+        self.assertIn("vault —", self.words("fleet_read"))
+        self.assertIn("vault", next(t for t in owner_mcp.tools()
+                                    if t["name"] == "fleet_read")["inputSchema"]["properties"]["page"]["enum"])
+        source = (HERE / "vault.py").read_text()
+        self.assertIn('"""What the hub reads of the central vault: its keys, the owner\'s records and how many items it '
+                      'holds. Never a\n    value and never a title."""', source)
 
 
 class VaultReading(unittest.TestCase):

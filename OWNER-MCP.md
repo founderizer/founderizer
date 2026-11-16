@@ -147,8 +147,8 @@ Since 14 November 2026 `call` also takes the setup tools `setup_state` and `setu
 name (below, "The link to the running app"), and the read `setup_diagnosis` on the same link.
 `write` takes each other tool that the
 program has: the nine below, the 54 of the table, and `save_bot_token`, `prepare_problem_report`,
-`save_secret` and `grant_secret` on the link. A read through `write` is refused, and a write
-through `call` is refused, each with words that name the right verb; a tool that the program does
+`save_secret`, `grant_secret` and `share_secret` on the link. A read through `write` is refused, and
+a write through `call` is refused, each with words that name the right verb; a tool that the program does
 not have gets the words of the MCP form. The JSON is one word of the shell, an object of the tool's
 fields; none means `{}`.
 
@@ -194,9 +194,9 @@ file can name a `swift` tool that an older program does not have: that program r
 own pages do that work and its own setting says which hub it reads: `install_hub`, `install_log`,
 `claim_hub`, `add_machine`, `use_hub` and `which_hub`. Three more are the program's own and are not
 in the table or in this server: `setup_state`, `setup_show` and `setup_diagnosis`, on the link to
-the running app (below). Four more, `save_bot_token`, `prepare_problem_report`, `save_secret` and
-`grant_secret`, write on the same link (below). So `tools/list` gives 74 tools: the 54 of the table,
-the thirteen, the three reads of the link and its four writes.
+the running app (below). Five more, `save_bot_token`, `prepare_problem_report`, `save_secret`,
+`grant_secret` and `share_secret`, write on the same link (below). So `tools/list` gives 75 tools: the
+54 of the table, the thirteen, the three reads of the link and its five writes.
 
 **The link to the running app.** Some work only the running app can do: its first run, its pages,
 and in later slices its keys and its engine. So the program asks the app on a local socket, the
@@ -743,7 +743,10 @@ app's screen.
   - A give, the statement taken, then the hub's grant refused: the app reads the team one time
     more and decides by that read alone, because the owner's own Give in the app can have made the
     grant since the call's first read. No grant of this secret for this agent in that read: the
-    app signs the `ungrant` and sends it, and the refusal says that nothing is changed; when that
+    app signs the `ungrant` and sends it, and the refusal says that the list has no grant of this
+    secret for this agent and the vault no signed grant of it for this agent (not that nothing is
+    changed: a signed grant is the server's, and while it stood another agent on that server that the
+    list gives the secret to could get the value); when that
     `ungrant` fails, it says that a signed grant stays in the vault with no grant in the list, and
     that `grant_secret` with `level` null ends it. A grant there, at any level: no `ungrant`; the
     list's grant stays as it is, and the signature stands for it. A read that failed: no
@@ -763,9 +766,139 @@ app's screen.
   - No answer of the app at all (the program's own words): what the app signed and wrote is not
     known. The same call again is safe for a give and for a take-back, and `fleet_read` with the
     pages `team` and `vault` shows the list's grant and the signed grants.
-- **What it does not do:** the pool (`share_resource` signs nothing, and only the owner's app
-  signs a secret into the pool), the door, an answer to a secret request, a replace of a value,
+- **What it does not do:** the pool (`share_secret`, below, signs a secret into it, and
+  `share_resource` signs nothing), the door, an answer to a secret request, a replace of a value,
   and a grant on a fleet with no central vault, which `grant_access` gives.
+
+No command lock: the app does the writes, as its page does. What any process of the owner's user
+can do with the tool, its traces and its limits: OWNER-MCP-BOUNDARY.md section 7b.
+
+**`share_secret`** (a write, so `founderizer-cli write` and the MCP form take it, and `call` does
+not; the owner, 16 November 2026, to "the pool's signed tool next (who may give a secret)": "Yes,
+build it"): who may give one secret of the fleet's list, with the owner's signature, or its end, as
+"Who may give it" on the app's Secrets page does. The app signs the owner's statement that puts the
+secret into the grantable pool with the owner key of this Mac and sends it (`POST /ui/vault/grant`),
+and the hub writes the owner's standing for the secret (`POST /ui/resources`): the fleet manager
+may then give the secret itself to any worker or lead, at most at `max`. A give of the manager is a
+grant in the list with no signature, and the central vault sends a value for it only for a secret
+of the pool, or to a server for which the owner signed a grant of that secret. The tool asks the
+owner nothing ("No touch"), has no value part, and shows nothing on the app's screen.
+
+- **Its fields**, both required, and no other: `login` (the secret's reference as the fleet's list
+  has it: `bws://` and a UUID in lower case, never with `secret:` before it) and `max` (`use`,
+  `read`, or null so that only the owner gives the secret again). A call with no `max` is refused: a
+  field that was forgotten ends no standing. There is no `to`: the hub keeps one audience, every
+  worker and lead, and the tool always sends `workers`. The program checks the fields and sends
+  them, and the app checks them again itself.
+- **What must hold before anything is sent**, in this order, each with its own fixed sentence that
+  ends "Nothing was sent.": the app's reading of the fleet is current, and its hub serves the
+  Secrets page; the hub lists `resource_grants` (on a hub without it the sentence says that it keeps
+  no standing at all) and `signed_grants` (on a hub without it the sentence names `share_resource`,
+  which sets who may give a secret there); one read of the team, one read of the resources and one
+  read of the vault's page went; the page names the fleet; the hub has a reading of a central vault;
+  the hub's newest read of that vault did not fail (the three cases of `grant_secret`'s, with
+  `share_resource` in the place of `grant_access`); and this Mac holds the fleet's owner key. **For a
+  standing** also: the list and the resources have the secret (one sentence for both), and `read`
+  only for an API key. **A take-back** makes no check of the secret: an end goes for whatever the hub
+  has, and the hub answers in its own words.
+- **One call writes at a time**, in a line of the tool's own: a call that comes while another one
+  is at its writes is refused, and sends nothing. The app's own pages and `grant_secret` are not in
+  that line.
+- **The order of the writes** keeps the vault the narrower of the two, as the page's own does. A
+  standing: the signed `pool` statement, and then the hub's standing against the base of the
+  call's read of the resources. A take-back: the hub's end of the standing against that base, and
+  then the signed `unpool`. A call whose caller went away before its first write sends nothing;
+  from its first write on, it goes to its end also when its caller went away, as `grant_secret`
+  does. Each request ends by the time limit of its own client.
+- **Its answer** when each write went: `login`, `max` (null for a take-back), `to` (`workers`, for a
+  standing), `signed` true, `changed` (the hub's receipt: false for a standing that the hub had
+  already, which is how a standing that `share_resource` wrote with no signature is repaired) and
+  `note`, of fixed English sentences. For a standing: that the hub had it already, when it changed
+  nothing; that the fleet manager may now give the secret itself to any worker or lead, at most at
+  that level (for `read`, the key's value then goes into the sessions of each agent that the manager
+  gives it to at `read`), and that the grants in the list do not change with the standing
+  (`save_resource`); that the hub told the manager, when the standing changed; and that, when the
+  central vault holds the value, it sends it to the server of each worker or lead that the fleet's
+  list gives the secret to, now and after each give of the manager, where that server's vault takes
+  deliveries, at the hub's next pass (usually within a minute; a delivery that failed waits up to six
+  hours before the next try). For a take-back: the hub ended the standing and the app ended the pool
+  statement; the grants that the manager gave from it stay in the list, and at the hub's next pass
+  the central vault takes its copy back from each server for which the owner signed no grant of the
+  secret, where that server's vault takes withdrawals (`central_plan`, `can_withdraw`); or, when the
+  hub had no standing, that it changed nothing and the end of the statement went, and that if the
+  secret was in the pool the central vault takes its copy back from those servers in the same way.
+- **When a write fails.** A certain refusal is the hub's own status under 500, with the tool's own
+  sentence first and the hub's words after it; no answer, an answer that could not be read and a
+  status of 500 or more are "not known".
+  - A standing that the app could not sign (the owner key's item could not be read, or the key made
+    no signature): nothing was sent, and it is never "not known".
+  - A standing, the signed `pool` refused: nothing was changed (the hub refuses here, with a 409, a
+    statement for a secret that a model account names). Not known: call again in the same way (a
+    second statement of the same pool is no error: the vault keeps the newer one); if the vault took
+    it, the central vault can send the value meanwhile, as below.
+  - **A 409 of the hub's standing**, in a standing and in a take-back alike. `POST /ui/resources`
+    answers 409 most often when its base moved (`team_changed`); the hub also answers 409 for a
+    generation that changed and when its checkout cannot take the commit (`commit_kit_file`). So the
+    app does as its own rule for a conflict says (`HubError.conflict`): it reads the resources again,
+    and only a base that moved was the stale one.
+    - That read fails: a standing says that the standing was not written, that the owner's signed
+      pool statement is in the vault and that, while it stands with no standing, the central vault can
+      send the value to the server of each worker or lead that the list gives the secret to; the next
+      step is the same call again, and `max` null only when the owner no longer wants the standing. A
+      take-back says that this call changed nothing (not the hub's standing, and not the pool
+      statement), and asks for the same call again.
+    - The base is the one that was sent: a certain refusal. A standing decides by that read, as below;
+      a take-back says that the hub refused the end, with its words.
+    - The base moved and this secret's standing is the one of the call's first read: the app sends
+      one more time with that read's base and goes by that answer. A second refusal of a standing is
+      decided by one more read, as below; a second 409 of a take-back says that this call changed
+      nothing.
+    - The base moved and this secret's standing with it (the owner's own control can have changed
+      it): no second send, because it would undo the owner's newer change. A standing decides by that
+      read, as below, with words that say that the standing changed while the call ran and, last,
+      that the agent reads `fleet_read(page="resources")` and asks the owner which standing they want
+      before any further call for this secret (a new call would take the owner's change as its first
+      read and write over it). After a refusal whose own step is the end of the statement that this
+      call left, that end comes first and needs no question, and the words then say that no standing
+      for this secret goes again before the owner's answer. A take-back whose read shows a standing that is not the one of its first read
+      (another level, or one where there was none) says that this call changed nothing and sends the
+      agent to that page and to the owner; one whose read
+      shows no standing (another writer ended it, such as `share_resource` with no max, which leaves
+      the pool statement) has what it asks of the hub, so it sends nothing more there and goes on to
+      the signed end, and its note says that the standing ended while the call ran.
+  - A standing, the statement taken, then the hub's standing not known: the app signed the secret
+    into the pool, and whether the hub wrote the standing is not known; while the statement stands
+    with no standing, the central vault can send the value. The next step: read
+    `fleet_read(page="resources")`, and call again in the same way when this secret's standing there
+    is not the one of this call (no standing, or another `max`).
+  - A standing, the statement taken, then any other certain refusal of the standing: the app reads
+    the resources one time more and decides by that read alone, because the owner's own control can
+    have written a standing since the call's first read. No standing for this secret in that read:
+    the app signs the `unpool` and sends it, and the refusal says that the secret is out of the pool
+    and that, if the central vault sent the value to a server while the statement stood, it takes it
+    back at a later pass from each server for which the owner signed no grant of it, where that
+    server's vault takes withdrawals (a pass of the hub can deliver between the `pool` and the
+    `unpool`). When that `unpool` fails, it says that a signed pool statement can stay in the vault
+    with no standing in the hub, that the central vault can send the value meanwhile, and it sends the
+    agent to `fleet_read(page="resources")` first, to end the statement only when this secret has no
+    standing there. A standing there, at any level: no `unpool`; the hub's standing stays, and the
+    pool statement stands for it. A read that failed: no `unpool`; the sentence sends the agent to
+    `fleet_read(page="resources")` first, in the same way.
+  - A take-back, the hub's end: a 409 goes as above. Another certain refusal: this call changed
+    nothing. Not known: call again in the same way.
+  - A take-back, the hub's end taken (a change, or no change for a hub that had no standing), then
+    the `unpool` failed (the vault refused it, or it did not answer) or its outcome is not known: the
+    hub has no standing for this secret, so only the owner gives it; a pool statement of this secret
+    can stay in the vault, and the central vault
+    can still send the value meanwhile. The same call again ends it: the hub's end is then no change,
+    and the end of the statement is sent again.
+  - No answer of the app at all (the program's own words): what the app signed and wrote is not
+    known. The same call again is safe for a standing and for a take-back, and it signs the pool
+    statement or its end again; `fleet_read` with the pages `resources` and `vault` shows the hub's
+    standing and the signed pool as the hub last read it (`central.pool`), which can be a minute old.
+- **What it does not do:** a grant to one agent (`grant_secret`), an audience other than every
+  worker and lead, the door, an answer to a secret request, a replace of a value, and a standing on
+  a fleet with no central vault, which `share_resource` sets.
 
 No command lock: the app does the writes, as its page does. What any process of the owner's user
 can do with the tool, its traces and its limits: OWNER-MCP-BOUNDARY.md section 7b.
@@ -856,7 +989,8 @@ error of Python, and the program left such a line out and sent the map without i
 vault gets a secret only when the owner signed a grant of it for an agent on that server, or signed
 it into the grantable pool (`vault.py` `sealable`), and only the owner's app signs
 (`POST /ui/vault/grant`, which is no tool: the owner's own Give on Secrets signs, and since 16
-November 2026 the app also signs a grant for `grant_secret` of its program, above).
+November 2026 the app also signs a grant for `grant_secret` of its program, and a pool statement for
+`share_secret`, above).
 `POST /ui/secrets/grant` writes the grant into the
 fleet's list with no signature, so until 16 November 2026 `grant_access` could show a secret as
 given whose value no server would get. Since then both programs read the hub's own reading before
@@ -917,7 +1051,8 @@ which also has what this check cannot see).
 **A standing for a secret from which no give would reach a server.** `share_resource` writes the
 owner's standing for a secret into the fleet's list (`POST /ui/resources`) with no signature, and
 the fleet manager can then give the secret itself; only the owner's app signs the secret into the
-pool, and its own control does that before it writes the standing. So since 16 November 2026 both
+pool: its own control ("Who may give it" on Secrets), and since 16 November 2026 `share_secret` of
+its program (above), sign it before they write the standing. So since 16 November 2026 both
 programs judge a standing for a secret (a resource whose kind, as the hub reads it with spaces
 around it and in any case, is `secret`, and a `max` that is not null) by the same reading, for
 every server at once, because a standing names no agent. It is sent when one of these holds, in
@@ -938,8 +1073,12 @@ A standing that is judged makes two reads, the vault's page and the team, and th
 the one read of the team also gives the command its `base_sha256`. Taking the entry back (`max`
 null or absent) and a standing of every other kind make no read of the vault and are never
 refused here: they read the team once and send the command. The refusal is one fixed sentence that
-quotes no reference and sends the owner to the app (on Secrets, the secret's card, "Who may give
-it"), which signs the pool statement and writes the standing itself. A hub that does not answer, and a generation that moved two times, at
+quotes no reference. It says where the standing with a signature is, in words that are true in both
+programs (this server has no such tool): on the Mac where the Founderizer app runs, its program sets
+it with the owner's signature (`~/.founderizer/cli write share_secret`), the app signs the secret
+into the grantable pool and writes the standing, as the owner's own "Who may give it" on Secrets
+does, and the owner can also set it there; after either, `share_resource` needs no second call. A
+hub that does not answer, and a generation that moved two times, at
 the read of the vault are the program's own errors, and a read of the team that the hub refuses
 stops the standing in the words of that read: nothing is sent then (OWNER-MCP-BOUNDARY.md section
 7).
