@@ -1169,7 +1169,7 @@ would read as an empty fleet instead of as a mistake.
 | `pause_chat_apps` | `/ui/chat-apps/pause` | Pause all: every inbound message and every outbound item at once. |
 | `link_chat_app` | `/ui/chat-apps/<id>/link`, `/unlink` | Link or unlink a WhatsApp account. The QR is a read. |
 | `send_again` | `/ui/outbound/<id>/again` | Send one chat message again, for an unknown or failed one. |
-| `connect_google` | `/ui/google/connect`, `/ui/google/finish` | Connect one service (Gmail or Google Drive) of a Google account, as the app's Connect account does: Google's page in the owner's browser, the code on this server's own listener. The account then has no agent: `grant_access` gives it. The program in the app has it as `absent`. |
+| `connect_google` | `/ui/google/connect`, `/ui/google/finish` | Connect one service (Gmail or Google Drive) of a Google account, as the app's Connect account does: first the owner's agent says the app's notice of that service word for word (`GOOGLE_NOTICE`, the app's `GoogleService.notice`; Google asks for it before each consent) and calls the tool when the owner says to go on, as the app's Continue; then Google's page in the owner's browser, the code on this server's own listener. The account then has no agent: `grant_access` gives it. The program in the app has it as `absent`. |
 | `disconnect_google` / `disconnect_mcp_server` | `/ui/google/disconnect`, `/ui/mcp/disconnect` | End a saved connection. The grants stay. |
 | `attach_file` / `read_attachment` / `keep_attachment` | `/ui/attachments*` | A file to the hub, a file back to this Mac, and keeping one. |
 | `owner_device` / `device_code` | `/ui/owner/devices[/<d>/code]` | The owner's phones, and one enrollment code. Its key is the phone's. |

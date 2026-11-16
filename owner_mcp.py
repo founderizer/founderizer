@@ -2376,6 +2376,20 @@ def add_machine(args):
 # server's own listener and on to the hub: it is never a field or an answer of a tool, so the agent never sees it. The
 # listener, its pages and its rules are the app's (`FleetCore/Google.swift`, `GoogleCallback` and `GoogleAnswer`).
 GOOGLE_SERVICES = ("gmail", "drive")
+# The app's notice before Google's page, word for word (`GoogleService.notice`; the owner's "Yes, both as drawn" of 16
+# November 2026). Google's Workspace User Data and Developer Policy asks for the disclosure before each consent, so the
+# owner's agent says it before connect_google opens Google's page, as the app shows it before its Continue. Its answer
+# would come too late: it arrives after Google's page.
+GOOGLE_NOTICE = {
+    "gmail": "Google will ask you to give Founderizer access to the email of one account. Your hub keeps this access on "
+             "your server. The agents that you give the account search, read, draft, label, archive, trash and send its "
+             "email, as far as their level allows, and send what they read to the AI provider that they run on. "
+             "Founderizer's servers never receive your email.",
+    "drive": "Google will ask you to give Founderizer access to the Google Drive of one account. Your hub keeps this "
+             "access on your server. The agents that you give the account search, read, make, change, move and trash "
+             "its files, as far as their level allows, and send what they read to the AI provider that they run on. "
+             "Founderizer's servers never receive your files.",
+}
 GOOGLE_WAIT = 600                   # seconds for Google's answer, as the app's listener waits (`GoogleLoopback.code`)
 GOOGLE_CONSENT = "https://accounts.google.com/"
 GOOGLE_OK = "Founderizer is connected. You can close this tab."
@@ -2826,7 +2840,11 @@ def tools():
         tool("connect_google", "Connect one service of a Google account to the fleet, as the app's Connect account "
                                "does: Gmail or Google Drive, each a Connect of its own. It opens Google's page in the "
                                "owner's browser on this Mac and waits up to 10 minutes while the owner chooses the "
-                               "account and presses Allow there, so tell the owner first. While Google has not "
+                               "account and presses Allow there. So first tell the owner the app's notice of that "
+                               "service, word for word, and call this tool when the owner says to go on, as the app's "
+                               "Continue does: Google asks for the notice before each consent. Gmail: \""
+                               + GOOGLE_NOTICE["gmail"] + "\" Google Drive: \"" + GOOGLE_NOTICE["drive"] + "\" "
+                               "While Google has not "
                                "verified Founderizer's app, Google shows a warning page first: the owner presses "
                                "Advanced, then Go to Founderizer. Google's code goes to this server's own listener and "
                                "on to the hub, and never to you. account: the email of an account to connect again; "

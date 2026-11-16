@@ -5180,6 +5180,18 @@ class GoogleConnect(unittest.TestCase):
         self.assertNotIn("/ui/google/connect", owner_mcp.NOT_TOOLS)
         self.assertNotIn("/ui/google/finish", owner_mcp.NOT_TOOLS)
 
+    def test_the_description_says_the_apps_notice_before_googles_page(self):
+        """The notice before Google's page (the owner's "Yes, both as drawn" of 16 November 2026), which Google's policy
+        asks for before each consent: the owner's agent says it before the call, word for word as the app shows it
+        (`GoogleService.notice` in FleetCore), because the tool's answer comes only after Google's page."""
+        tool = next(t for t in owner_mcp.tools() if t["name"] == "connect_google")
+        swift = (HERE / "app" / "Sources" / "FleetCore" / "Google.swift").read_text()
+        self.assertEqual(set(owner_mcp.GOOGLE_NOTICE), set(owner_mcp.GOOGLE_SERVICES))
+        for service, words in owner_mcp.GOOGLE_NOTICE.items():
+            self.assertIn(f'"{words}"', tool["description"], service)
+            self.assertIn(f'String(l10n: "{words}")', swift, service)       # the app's words, not a copy that drifts
+        self.assertIn("call this tool when the owner says to go on", tool["description"])
+
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--parity-fixture"]:
