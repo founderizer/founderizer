@@ -1529,6 +1529,80 @@ class Feeds(unittest.TestCase):
             if env is not None:
                 os.environ["CODEX_HOME"] = env
 
+    def test_a_long_first_prompt_after_long_rows_of_codex_is_found_by_its_marker(self):
+        """The marker comes last in a first prompt of up to fleet.ARG_MOST bytes (512 KiB on a Mac), and Codex writes
+        rows of its own before it, up to about 180 KB measured on one Mac (16 November 2026). find read 256 KiB after
+        the first line and took such a rollout for one without a marker for good; it reads to the row of the first
+        prompt now, in Codex's shape of today (the prompt's own user row, then its UserMessage event) and in its older
+        one (a user_message event with the prompt). A row that is still being written is no answer yet, and the reader
+        reads on from there; a row of tools whose schema names UserMessage is no prompt."""
+        folder = os.path.join(self.home, ".codex", "sessions", "2026", "10", "10")
+        os.makedirs(folder)
+        schema = {"type": "object", "$defs": {"UserMessage": {"type": "object"}},
+                  "properties": {"kind": {"enum": ["UserMessage", "user_message"]}}}
+        tools = {"type": "response_item", "payload": {"type": "additional_tools", "tools": [
+            {"name": f"mcp__crm__tool_{i}", "parameters": schema, "description": "d" * 4000} for i in range(30)]}}
+        own = [tools] + [{"type": "response_item", "payload": {"type": "message", "role": "developer", "content": [
+            {"type": "input_text", "text": f"Codex's own row {i}: " + "w" * 20000}]}} for i in range(3)]   # ~180 KB
+        prompt = "Your task is T-8. " + "\"quoted\" \\ line\n" * 40000 + threads.MARKER.format(SESSION)  # 800 KB in JSON
+        today = [{"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
+                     {"type": "input_text", "text": prompt}]}},
+                 {"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "UserMessage", "id": "u1",
+                     "content": [{"type": "text", "text": prompt}]}}}]
+        older = [{"type": "event_msg", "payload": {"type": "user_message", "message": prompt}}]
+        env = os.environ.pop("CODEX_HOME", None)
+        try:
+            for name, rows in (("today", today), ("older", older)):
+                with self.subTest(name):
+                    mine = os.path.join(folder, f"rollout-{name}.jsonl")
+                    text = "\n".join(json.dumps(r, separators=(",", ":")) for r in [CODEX[0], *own, *rows]) + "\n"
+                    before = len("\n".join(json.dumps(r, separators=(",", ":")) for r in [CODEX[0], *own]).encode()) + 1
+                    self.assertGreater(before, 150 * 1024)
+                    self.assertGreater(len(text.encode()) - before, 512 * 1024)
+                    files = threads.CodexFiles(self.home, kit="/kit")
+                    with open(mine, "w") as f:
+                        f.write(text[:before + 1000])                   # its prompt's row is still being written
+                    self.assertIsNone(files.find(SESSION))
+                    self.assertNotIn(mine, files.known)                 # no answer yet
+                    self.assertEqual(files.read[mine], before)          # it reads on from there
+                    with open(mine, "w") as f:
+                        f.write(text)
+                    self.assertEqual(files.find(SESSION), mine)
+                    self.assertNotIn(mine, files.read)
+                    self.assertEqual(threads.CodexFiles(self.home, kit="/kit").find(SESSION), mine)    # a new reader
+                    os.remove(mine)                                     # the next shape's rollout has the same marker
+            other = os.path.join(folder, "rollout-other.jsonl")         # another session's prompt after the same rows
+            with open(other, "w") as f:
+                f.write(text.replace(SESSION, "11111111-2222-4333-8444-555555555555"))
+            files = threads.CodexFiles(self.home, kit="/kit")
+            self.assertIsNone(files.find("22222222-3333-4444-8555-666666666666"))
+            self.assertEqual(files.known[other], "11111111-2222-4333-8444-555555555555")
+        finally:
+            if env is not None:
+                os.environ["CODEX_HOME"] = env
+
+    def test_only_the_event_of_the_users_message_is_the_row_of_a_first_prompt(self):
+        """threads.prompt_row reads the row as JSON: a schema, an enum or a text that names UserMessage or user_message
+        is no prompt's row, and neither is a user_message event of another kind than a plain message; both of Codex's
+        events of the user's message are."""
+        for row, prompt in (({"type": "event_msg", "payload": {"type": "user_message", "message": "Do T-8."}}, True),
+                            ({"type": "event_msg", "payload": {"type": "item_completed", "item": {
+                                "type": "UserMessage", "content": []}}}, True),
+                            ({"type": "response_item", "payload": {"type": "additional_tools", "tools": [
+                                {"parameters": {"$defs": {"UserMessage": {}}}}]}}, False),
+                            ({"type": "event_msg", "payload": {"type": "item_completed", "item": {
+                                "type": "AgentMessage", "text": '"UserMessage"'}}}, False),
+                            ({"type": "event_msg", "payload": {"type": "agent_message", "kind": "user_message"}}, False),
+                            # an older Codex's events of the folder's instructions and of the session's environment
+                            ({"type": "event_msg", "payload": {"type": "user_message", "message": "<user_instructions>",
+                                                               "kind": "user_instructions"}}, False),
+                            ({"type": "event_msg", "payload": {"type": "user_message", "message": "<environment_context>",
+                                                               "kind": "environment_context"}}, False),
+                            ({"type": "event_msg", "payload": {"type": "user_message", "message": "Do T-8.",
+                                                               "kind": "plain"}}, True)):
+            with self.subTest(row=row):
+                self.assertIs(threads.prompt_row(json.dumps(row, separators=(",", ":")).encode() + b"\n"), prompt)
+        self.assertFalse(threads.prompt_row(b'{"type":"event_msg","payload":{"type":"user_message"\n'))   # cut short
 
 THREAD = "01a12fb8-a590-7ff3-b04b-07a9551f9555"
 OTHER = "11111111-2222-4333-8444-555555555555"

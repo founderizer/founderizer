@@ -3,6 +3,7 @@
 Real tmux on a socket of this test, a stand-in command (`sleep`) in every window, and no hub, no runtime and no AI
 call. The helper's conf is this file's own, so no agent of the live team.json is read.
 """
+import ast
 import os
 import pwd
 import re
@@ -225,41 +226,75 @@ class TaskLessMessage(unittest.TestCase):
 class OwnFolder(unittest.TestCase):
     """No test reads or writes the home folder of the person who runs it (leftovers.scratch_home)."""
 
+    # The calls that build a window's command, which write the files of its start into fleet.SESSIONS: since 16
+    # November 2026 every text of a start that grows with the fleet is such a file (test_window_size), so a builder
+    # writes them for a start with no credential and no stable text too. That day the runner tests, which named no
+    # helper, left ten files of their own in the owner's ~/.fleet/sessions. A file whose classes build commands only
+    # through another file's class (test_shell_box.Helper.build) is not found here: test_hidden and test_web_hosts
+    # call scratch_home all the same.
+    BUILDS = re.compile(r"\bfleet\.(?:session_command|chat_command|conversation_command|conversation_work_command|"
+                        r"closed_task_command|manager_start|file_prompt|system_file|session_file|mcp_config_file|"
+                        r"env_prefix|token_prefix)\(")
+    # test_helper_control.py sets HOME, and fleet.HOME with it, before it imports fleet, for its real hub and its real
+    # helper; test_web_hosts_live.py runs only with FLEET_LIVE_LOCKDOWN=1, and its live run is the installed Claude
+    # Code of this machine, with this machine's own ~/.claude and its store of versions.
+    OWN_HOME = ("test_helper_control.py", "test_web_hosts_live.py")
+
     @staticmethod
-    def without_a_folder(text):
-        """True for the text of a test file that names fleet.Helper and does not call scratch_home in its
-        setUpModule."""
-        return bool(re.search(r"\bfleet\.Helper\b", text)) and "def setUpModule():\n    scratch_home()" not in text
+    def calls_scratch_home(text):
+        """True when the file's own setUpModule, at its top level, calls scratch_home first. The words of that call in
+        a string are none: on 16 November 2026 they went into the text of a stand-in program by mistake, the scan of
+        the text found them there, and the file's tests wrote into the owner's ~/.fleet again."""
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return False
+        return any(isinstance(node, ast.FunctionDef) and node.name == "setUpModule" and node.body and
+                   isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Call) and
+                   isinstance(node.body[0].value.func, ast.Name) and node.body[0].value.func.id == "scratch_home"
+                   for node in tree.body)
+
+    @classmethod
+    def without_a_folder(cls, text):
+        """True for the text of a test file that names fleet.Helper or builds a window's command (BUILDS) and whose
+        own setUpModule does not call scratch_home first."""
+        return bool(re.search(r"\bfleet\.Helper\b", text) or cls.BUILDS.search(text)) and \
+            not cls.calls_scratch_home(text)
 
     def test_each_test_file_that_names_the_helper_gets_a_home_folder_of_this_run(self):
         """One rule for every file, so that no class depends on which code its tests reach: a test file that names
-        fleet.Helper calls scratch_home in its setUpModule. A patch of the folder in one class is not enough: the
-        class of 13 November was in a file whose other classes had one. And a call of the constructor is not the only
-        way to a helper: the two tests of the machine sign-in that wrote into ~/.claude.json made theirs with
-        fleet.Helper.__new__. test_helper_control.py sets HOME, and fleet.HOME with it, before it imports fleet, for
-        its real hub and its real helper."""
+        fleet.Helper, or that builds a window's command (BUILDS), calls scratch_home in its setUpModule. A patch of the
+        folder in one class is not enough: the class of 13 November was in a file whose other classes had one. And a
+        call of the constructor is not the only way to a helper: the two tests of the machine sign-in that wrote into
+        ~/.claude.json made theirs with fleet.Helper.__new__. The files of OWN_HOME use a home folder of their own
+        choice."""
         build = "class A(unittest.TestCase):\n    def test(self):\n        fleet.Helper('dev-lead', {})\n"
         bare = "class C(unittest.TestCase):\n    def test(self):\n        h = fleet.Helper.__new__(fleet.Helper)\n"
         method = "class D(unittest.TestCase):\n    def test(self):\n        fleet.Helper.handle(helper, job)\n"
         patched = "class B(unittest.TestCase):\n    def setUp(self):\n        patch.object(fleet, \"HOME\", 'x').start()\n"
-        for text in (build, bare, method, "x = object.__new__(fleet.Helper)\n"):
+        command = "class E(unittest.TestCase):\n    def test(self):\n        fleet.session_command('dev-lead', {}, 'x')\n"
+        for text in (build, bare, method, "x = object.__new__(fleet.Helper)\n", command,
+                     "words = fleet.chat_command('dev-lead', conf, 'g')\n"):
             self.assertTrue(self.without_a_folder(text), text)
             self.assertTrue(self.without_a_folder(patched + text), text)   # one class with its own folder, one without
             self.assertFalse(self.without_a_folder("def setUpModule():\n    scratch_home()      # why\n\n\n" + text))
         self.assertFalse(self.without_a_folder(patched))               # it names none
+        program = "PROGRAM = '''\ndef setUpModule():\n    scratch_home()\n'''\n"     # the words only in a string
+        self.assertTrue(self.without_a_folder(program + command))
+        self.assertFalse(self.without_a_folder(program + "def setUpModule():\n    scratch_home()\n\n\n" + command))
         self.assertFalse(self.without_a_folder("class Helper(unittest.TestCase):\n    x = fleet.HelperState\n"))
         here = os.path.dirname(os.path.abspath(__file__))
         without, named = [], 0
         for name in sorted(os.listdir(here)):
-            if not (name.startswith("test_") and name.endswith(".py")) or name == "test_helper_control.py":
+            if not (name.startswith("test_") and name.endswith(".py")) or name in self.OWN_HOME:
                 continue
             with open(os.path.join(here, name), encoding="utf-8") as f:
                 text = f.read()
             named += "fleet.Helper" in text
             if self.without_a_folder(text):
                 without.append(name)
-        self.assertEqual(without, [], "a test file that names fleet.Helper needs, before its first class: "
-                         "def setUpModule(): scratch_home()  (from leftovers import scratch_home)")
+        self.assertEqual(without, [], "a test file that names fleet.Helper or builds a window's command needs, before "
+                         "its first class: def setUpModule(): scratch_home()  (from leftovers import scratch_home)")
         self.assertGreater(named, 30, "the scan found too few: its pattern no longer matches the tests")
 
     def test_the_folder_is_one_of_this_run_and_a_class_keeps_its_own_inside_it(self):

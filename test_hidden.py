@@ -21,11 +21,16 @@ from unittest.mock import patch
 import hidden
 import hub
 import fleet
+from leftovers import scratch_home
 import test_google
 import test_people
 import test_shell_box
 from test_blocked_access import BlockedAccess
 from test_login_cuts import assert_no_part, register
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def load_tests(loader, _tests, _pattern):
@@ -600,7 +605,7 @@ def hook_clean_line(removed, tags):
 class ClosedHook(test_shell_box.Helper):
     def test_a_closed_task_session_has_the_clean_hook_too(self):
         _, _, option = self.parts(self.build())
-        hooks = json.loads(option("--settings"))["hooks"]["PostToolUse"]
+        hooks = self.private(option("--settings"))["hooks"]["PostToolUse"]
         self.assertEqual(hooks[1], fleet.clean_hook())
         self.assertEqual(len(hooks), 2)
 

@@ -13634,8 +13634,8 @@ def chat_recap_text(agent):
     person window's, which starts without a memory for the same reason: CONVERSATION_RECAP messages, inside
     CONVERSATION_PROMPT_MAX characters. It is built newest first and turned round, so a long conversation loses its
     oldest messages and never its newest. Each message is one line, its own line breaks flattened, so one message is
-    one line of it whoever wrote it: the helper cuts it by lines where a tmux command would be too long (chat_fit),
-    and a cut that could land inside a message would leave a fragment with nobody's name on it. Each message is
+    one line of it whoever wrote it, which begins with the writer's name (the helper gives the recap whole, from a
+    file, since 16 November 2026: fleet.chat_command). Each message is
     masked on the way out, as start_text is: these are real messages, and a login registered after one of them was
     stored was never masked at the write. Each on its own, so a message that mask_secrets can only hold back whole
     does not take the rest of the chat with it, and so the budget counts what really goes out."""

@@ -27,6 +27,7 @@ from unittest.mock import patch
 
 import acp_programs
 import fleet
+from leftovers import scratch_home
 import hub
 import hubsetup
 import lifecycle
@@ -202,6 +203,10 @@ FOURTH = {
     "sign_in": None, "no_sign_in": "Sign in to Fourth yourself on {where} machine.", "sandbox": None,
     "screen_counter": False, "browser_tabs": False,
 }
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 class TheFacts(unittest.TestCase):
@@ -516,9 +521,14 @@ class AFourthEntry(unittest.TestCase):
 
     def test_a_task_session_starts_it_from_its_own_start_form(self):
         conf = {"role": "worker", "runtime": "fourth", "start": FOURTH["full_access"]["start"], "can": ["shell"]}
-        with patch.object(fleet, "team_catalog", dict), patch.object(fleet, "session_env", lambda *a, **k: {}):
+        files = tempfile.mkdtemp(prefix="fleet-fourth-")       # its first prompt is a file that its window reads
+        self.addCleanup(shutil.rmtree, files, True)
+        with patch.object(fleet, "team_catalog", dict), patch.object(fleet, "session_env", lambda *a, **k: {}), \
+                patch.object(fleet, "SESSIONS", files):
             command = fleet.session_command("alpha", conf, "do the thing", task="T-1", generation="g1")
         self.assertIn("fourth --wide-open", command)
+        self.assertEqual([Path(files, name).read_text() for name in os.listdir(files) if name.endswith(".md")],
+                         ["do the thing"])
         self.assertNotIn("acp_runner.py", command)                  # a terminal driver, as its entry says
 
     def test_an_acp_provider_needs_no_more_than_its_command(self):

@@ -659,8 +659,10 @@ class HelperSide(unittest.TestCase):
             n for n in self.files() if n.startswith("manager.") and n.endswith(".json"))).read_text())
         self.assertIn("--strict-mcp-config --mcp-config", cases[3][1])
         legacy = fleet.session_command("alpha", self.conf("claude"), "Go.", task="T-3", generation="g", session="s")
-        self.assertNotIn(fleet.SESSIONS, legacy)                    # without a credential: as before
         self.assertTrue(legacy.startswith("env FLEET_ATTEMPT="))
+        # without a credential, its files hold none: only the file of a credential counts as one (legacy_windows)
+        self.assertEqual([fleet.holds_credential(command) for _, command, _ in cases], [True] * len(cases))
+        self.assertFalse(fleet.holds_credential(legacy))
         self.assertEqual(fleet.launch_words(cases[1][1])[0], "codex")
 
     def test_windows_without_a_credential_are_legacy_and_unused_files_go(self):
@@ -671,6 +673,10 @@ class HelperSide(unittest.TestCase):
                                      ("alpha.T-3.aa.json", "alpha.T-1.bb.json", "alpha.T-4.cc.env", "beta.T-1.dd.json"))
         for p in (used, stale, fresh, other):
             p.write_text("x")
+        # T-3 names the MCP configuration of its credential, which legacy_windows reads (fleet.holds_credential); a
+        # standing session's first prompt, also a file of that folder, is none (test_window_size)
+        used.write_text(json.dumps({"mcpServers": {"fleet": {"type": "http", "url": "http://hub:8765/mcp/alpha/g/T-3/1",
+                                                             "headers": {"Authorization": "Bearer " + "s" * 43}}}}))
         old = time.time() - 120
         for p in (used, stale, other):
             os.utime(p, (old, old))

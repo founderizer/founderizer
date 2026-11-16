@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import fleet
+from leftovers import scratch_home
 import hook_hosts
 import hub
 import lifecycle
@@ -28,6 +29,10 @@ HOSTS = ["docs.example.com", "*.example.org"]
 RULES = ["WebFetch(domain:docs.example.com)", "WebFetch(domain:example.org)", "WebFetch(domain:*.example.org)"]
 PROVED = lifecycle.HOST_LIST_VERSIONS[0]
 WORDS = "docs.example.com; example.org and every host below it"
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def load_tests(loader, _tests, _pattern):
@@ -169,7 +174,7 @@ class Start(test_shell_box.Helper):
         words = shlex.split(self.build(conf, closed=dict({"version": PROVED, "built_ins": ["WebSearch", "WebFetch"],
                                                           "web_hosts": HOSTS}, **closed)))
         option = lambda name: words[words.index(name) + 1]
-        return words, option, json.loads(option("--settings"))
+        return words, option, self.private(option("--settings"))
 
     def test_a_start_with_a_host_list_reads_pages_only_on_its_hosts(self):
         words, option, settings = self.start()
@@ -190,7 +195,7 @@ class Start(test_shell_box.Helper):
                        {"built_ins": ["WebSearch", "WebFetch"], "web_hosts": None}):
             with self.subTest(closed):
                 _, args, option = self.parts(self.build(closed=closed))
-                settings = json.loads(option("--settings"))
+                settings = self.private(option("--settings"))
                 self.assertEqual(option("--tools"), "WebSearch")
                 self.assertEqual([rule for rule in settings["permissions"]["allow"] if "WebFetch" in rule], [])
                 self.assertEqual(sorted(settings["hooks"]), ["PostToolUse", "PostToolUseFailure"])

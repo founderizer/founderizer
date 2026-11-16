@@ -6,6 +6,7 @@ import ast
 import inspect
 import json
 import re
+import shlex
 import textwrap
 import unittest
 import urllib.request
@@ -13,6 +14,7 @@ import uuid
 from unittest.mock import patch
 
 import fleet
+from leftovers import scratch_home
 import hub
 import lifecycle
 import test_chat_apps
@@ -24,6 +26,10 @@ PAT = "34600222333@s.whatsapp.net"              # a peer, on WhatsApp
 KIM = "600700800"                               # a manager, on Discord only
 BEA = "34600444555@s.whatsapp.net"              # another customer, on WhatsApp
 SESSION = "11111111-2222-4333-8444-555555555555"
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def load_tests(loader, _tests, _pattern):
@@ -1009,7 +1015,10 @@ class Conversations(Base):
                                                   "test-generation", cid, start["token"], start["prompt"], SESSION)
         self.assertIn("codex", command)
         self.assertIn(f"/mcp/vps/test-generation/conversation/{cid}", command)
-        self.assertIn(fleet.MARKER.format(SESSION), command)
+        # its first prompt ends with its rollout's marker, from the file that its window's shell reads
+        read = re.fullmatch(r"\$\(cat (\S+); rm -f \1\)", fleet.launch_words(command)[-1])
+        with open(shlex.split(read.group(1))[0], encoding="utf-8") as f:
+            self.assertTrue(f.read().endswith(fleet.MARKER.format(SESSION)))
         # and a Codex agent's closed conversation runs on the chosen provider
         self.add(name="Nora", role="customer", agents=("vps",))
         nora = hub.q1("SELECT id FROM people WHERE name='Nora'")["id"]

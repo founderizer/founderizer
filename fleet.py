@@ -357,16 +357,75 @@ def session_file(agent, window, ext, text):
     return path
 
 
+# What a window command can carry: tmux 3.6 refuses a command over about 16 KiB with "command too long" (on a fleet
+# server, 16 November 2026: 15,000 bytes passed, 17,000 failed). So each part of a command that grows with the
+# fleet's data comes from a mode-600 file of SESSIONS, and a command stays far under it with any data (test_window_size):
+# a first prompt (file_prompt), a Claude start's appended system prompt (system_file), a Claude session's MCP
+# configuration and a closed session's settings (session_file), a Codex task's MCP servers (env_prefix's words) and a
+# runner's prompt (screen_runner.py --prompt-file, acp_runner.py --prompt-file). What stays in a command is bounded: a
+# Claude session's own --settings (settings_arg) names each of its catalog servers once (team.json holds at most
+# lifecycle.MCP_LIMIT servers) and this checkout's path in each of its rules for PROTECTED and its hooks, about 40 bytes
+# for each character of that path. A Claude task with the most servers measured 7,682 bytes with a checkout path of 73
+# characters, 9,609 with 120 and 12,889 with 200 (the reviews of 16 November 2026), so only a path of about 280
+# characters comes near what tmux takes. It stays in the command, where each rule's path means what it meant before.
+
+
+def arg_most(sysconf=os.sysconf, linux=sys.platform.startswith("linux")):
+    """The most bytes of one argument that this machine's exec takes, the next limit after tmux's: a first prompt is
+    one argument (file_prompt). Linux takes at most 32 pages, its closing NUL included (MAX_ARG_STRLEN: 131,071 bytes
+    with pages of 4 KiB, more with larger pages), and refuses a longer one with "Argument list too long". macOS has no
+    limit of its own for one argument, only for all of them and the environment together (SC_ARG_MAX, 1 MiB), so on
+    each machine this is also at most half of that: what the environment and the other arguments leave. A value that
+    the system does not give, or gives as 0 or less, is unknown: then 1 MiB in all and pages of 4 KiB. The helper finds
+    a Codex session by the marker at the end of so long a first prompt too (threads.HEAD_MOST)."""
+    def known(name, otherwise):
+        try:
+            value = sysconf(name)
+        except (AttributeError, ValueError, OSError):
+            return otherwise
+        return value if isinstance(value, int) and value > 0 else otherwise
+    whole = known("SC_ARG_MAX", 1 << 20) // 2
+    return min(known("SC_PAGE_SIZE", 4096) * 32 - 1, whole) if linux else whole
+
+
+ARG_MOST = arg_most()
+
+
 def file_prompt(agent, window, text):
     """A first prompt as one word of a window command: the window's shell reads it from a mode-600 file and removes
-    the file before the program starts. A tmux command must stay under 16 KiB (CHAT_PROMPT_MAX), and a prompt that
-    grows with the fleet cannot ride in it: on 16 November 2026 the manager's brief of about 14,400 bytes made a start
+    the file before the program starts, so the command is as long with any prompt. A prompt that grows with the fleet
+    cannot ride in the command itself: on 16 November 2026 the manager's brief of about 14,400 bytes made a start
     command of 16,419, tmux refused it with "command too long" at every try, and the standing session stayed down.
-    The next limit is the program's: Linux takes one argument of at most 128 KiB (MAX_ARG_STRLEN), so a brief about
-    nine times that one would stop the start again, with exec's "Argument list too long" in a pane that closes. The
-    hub's brief has no bound of its own (hub.manager_resume_text)."""
+    The shell's $(...) drops the line ends at the end of the text, which no prompt needs.
+
+    The prompt is still one argument of the program, so ARG_MOST is its limit: on Linux with pages of 4 KiB, a brief
+    about nine times that one would stop the start again. Nothing bounds the hub's brief (hub.manager_resume_text), or
+    the profile and the hub's recap in a Codex owner chat, so a longer text is refused here with its size, and the
+    helper's log and its report of the failed start say why, instead of exec's "Argument list too long" in a pane that
+    closes. Its callers write no other file of the start before this one: a refused start leaves no file of its
+    credential or its keys behind."""
+    size = len(text.encode("utf-8"))
+    if size > ARG_MOST:
+        raise Refused(f"its first prompt is {size} bytes, and a program takes one argument of at most {ARG_MOST}")
     path = shlex.quote(session_file(agent, window, "md", text))
     return f'"$(cat {path}; rm -f {path})"'
+
+
+def system_file(agent, window, text):
+    """A mode-600 file for --append-system-prompt-file: this checkout's rules (rules_file), then `text`. It is what a
+    Claude start without its stable text gives as its appended system prompt: a task's text with its repositories'
+    list (github_text), or an owner chat's instructions, profile and recap. These grow with the fleet, so no word of
+    the command holds them (ARG_MOST). Claude Code takes one --append-system-prompt-file, which the rules had before, so
+    `text` joins them in the same file, as Claude Code joined that file and an --append-system-prompt (2.1.312: the
+    rules without their last line end, a blank line, then the text): the session's system prompt is the same as
+    before. The helper removes the file after its window has ended."""
+    try:
+        with open(rules_file(), encoding="utf-8") as f:
+            rules = f.read()
+    except (OSError, TypeError):            # no RULES.md in this checkout (rules_file gives None)
+        rules = ""
+    joined = re.sub(r"\r?\n\Z", "", rules) + "\n\n" + text if rules and text else rules or text
+    return session_file(agent, window, "md", joined)
 
 
 def mcp_config_file(agent, window, url, token, servers=None):
@@ -382,14 +441,68 @@ def token_prefix(agent, window, token):
     return env_prefix(agent, window, {"FLEET_SESSION_TOKEN": token})
 
 
-def env_prefix(agent, window, values):
+ARGS = '"$@"'       # where a window command gives its program the words of its env file (env_prefix)
+
+
+def env_prefix(agent, window, values, words=()):
     """The start of a window command that reads {NAME: value} from a mode-600 file into the environment and removes the
-    file before the program starts; "" without values. No value is in the command itself."""
-    if not values:
+    file before the program starts; "" without values and words. No value is in the command itself. words: arguments
+    of the program that come from the same file, as the shell's positional parameters (set --), which the command
+    gives the program where it names ARGS: a part of a command that grows with an agent's data and that is no single
+    argument (a Codex task's MCP servers, session_command). sh, bash, dash and zsh all keep what set -- does in a file
+    that `.` reads, and none of them runs a word of it."""
+    if not values and not words:
         return ""
     text = "".join(f"export {name}={shlex.quote(value)}\n" for name, value in values.items())
+    text += f"set -- {shlex.join(words)}\n" if words else ""
     path = shlex.quote(session_file(agent, window, "env", text))
     return f". {path} && rm -f {path} && exec "
+
+
+def holds_credential(start):
+    """True when a window's start command names the file of its session credential (owner API 1.12). A Claude session
+    reads it from its MCP configuration (--mcp-config), whose fleet server sends it in its header, and which the helper
+    keeps until the window has ended: that file must hold it, and a runtime of the table that takes its credential
+    there (no token_in_env) has none elsewhere. Each other session takes it as FLEET_SESSION_TOKEN from the env file
+    that its window's shell reads first (env_prefix): Codex, whose fleet server is its own -c options, only with the
+    option that names that variable (CODEX_BEARER_OPTION), and a runner (screen_runner.py, acp_runner.py) or another
+    runtime of the table as soon as its command names an env file, as every such window counted before. No other file of
+    SESSIONS is a credential: a first prompt (file_prompt), a stable or a system text, settings, the MCP configuration
+    of a session without a credential, or the env file of a Claude or Codex session that holds its keys alone. Until 16
+    November 2026 each file of that folder in a command counted, and since e749f6071 the standing session of an agent
+    without its key reads its first prompt from one.
+
+    The env file of a runner or of another runtime can hold the session's keys or its repositories without a
+    credential, and then the window counts as one with its credential although it has none. It is the window of an
+    agent without its key: the helper registers the key only while no task window runs (enroll), and the hub places
+    no agent without a key. On a server whose own service registers the key (key_by_server), the key can come while
+    such a window runs: the hub then refuses each of its calls, and its task ends."""
+    try:
+        words = shlex.split(start)
+        if len(words) == 1:
+            words = shlex.split(words[0])   # tmux shows a command given as one string inside quotes
+        program = launch_words(start)
+    except ValueError:
+        return False
+    if words[:1] == ["cd"] and words[2:3] == ["&&"]:
+        words = words[3:]                   # the checkout that the window goes into first (in_checkout)
+    for flag, value in zip(program, program[1:]):
+        if flag == "--mcp-config":
+            if os.path.dirname(value) != SESSIONS:
+                return False                # its configuration in the command: a start without a credential
+            try:
+                with open(value, encoding="utf-8") as f:
+                    header = json.load(f)["mcpServers"]["fleet"]["headers"]["Authorization"]
+            except (OSError, ValueError, KeyError, TypeError):
+                return False
+            return isinstance(header, str) and header.startswith("Bearer ")
+    if not (words[:1] == ["."] and len(words) > 1 and os.path.dirname(words[1]) == SESSIONS):
+        return False
+    if any(word.startswith("mcp_servers.fleet.url=") for word in program):    # Codex's own form of its fleet server
+        return CODEX_BEARER_OPTION in program
+    # a runtime of the table that takes its credential in its MCP configuration (Claude) has none in its env file;
+    # a runner, whose program is no runtime, and each other runtime take it from there
+    return runtime_fact(os.path.basename(program[0]) if program else "", "token_in_env", True) is not False
 
 
 ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,59}")         # an API key's variable name (owner feature secrets)
@@ -590,7 +703,10 @@ def codex_env(names):
             "-c", "shell_environment_policy.exclude=" + json.dumps(sorted(hidden - set(names)))]
 
 
-CODEX_BEARER = "-c " + shlex.quote('mcp_servers.fleet.bearer_token_env_var="FLEET_SESSION_TOKEN"') + " "
+# A Codex session's fleet server sends the session credential, from FLEET_SESSION_TOKEN, only with this option
+# (holds_credential reads it)
+CODEX_BEARER_OPTION = 'mcp_servers.fleet.bearer_token_env_var="FLEET_SESSION_TOKEN"'
+CODEX_BEARER = "-c " + shlex.quote(CODEX_BEARER_OPTION) + " "
 # The standing Codex session approves its Fleet tools itself, as `fleet.py connect` does in a machine's configuration,
 # so that a manager can switch to Codex on a machine whose Codex was never connected (owner feature runtime_switch).
 CODEX_APPROVE = "-c " + shlex.quote('mcp_servers.fleet.default_tools_approval_mode="approve"') + " "
@@ -2123,9 +2239,13 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     if runtime == "codex":
         values.update({catalog[t]["bearer"]: v for t, v in minted.items() if t in catalog})
     acp = runtime_fact(runtime, "driver") == "acp"      # its start writes an env file of its own (acp_command)
-    prefix = "" if acp else env_prefix(agent, task or "manager", values)
     tools = [] if not runtime_fact(runtime, "mcp_servers") or app_server_task(conf, needs) else \
         [t for t in values.get("FLEET_TOOLS", "").split() if t in catalog and (t in minted or not catalog[t].get("mint"))]
+    # A Codex session's catalog servers are -c options, which grow with the owner's servers: a program server's
+    # settings and arguments alone can be thousands of characters (lifecycle.MCP_SETTINGS_MOST). They come from its
+    # env file, and the command gives them to Codex where it names ARGS (env_prefix).
+    served = [w for t in tools for w in shlex.split(codex_server(t, catalog))] if runtime == "codex" else []
+    window = task or "manager"
     if task:
         stable = stable_text(agent, opening, rules) if stable_start(conf, needs, opening, rules) else None
     else:           # the standing manager session (helper feature stable_standing): its first prompt stays its own
@@ -2152,9 +2272,13 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
             chosen += ["--needs", needs]
             if session:
                 prompt += "\n\n" + MARKER.format(session)  # binds the saved primary rollout to this task attempt
-        return prefix + shlex.join(["env", f"FLEET_ATTEMPT={attempt}", f"FLEET_GENERATION={generation}",
-                           f"FLEET_HUB={HUB}", f"FLEET_AGENT={agent}", f"FLEET_TASK={task}", f"FLEET_SESSION={session}",
-                           sys.executable, os.path.join(KIT, "screen_runner.py"), *chosen, "--prompt", prompt])
+        # Its prompt holds the list of its repositories (github_text, up to 500): the runner reads it from its
+        # mode-600 file and removes the file (screen_runner.py --prompt-file).
+        start = shlex.join(["env", f"FLEET_ATTEMPT={attempt}", f"FLEET_GENERATION={generation}",
+                            f"FLEET_HUB={HUB}", f"FLEET_AGENT={agent}", f"FLEET_TASK={task}", f"FLEET_SESSION={session}",
+                            sys.executable, os.path.join(KIT, "screen_runner.py"), *chosen,
+                            "--prompt-file", session_file(agent, task, "md", prompt)])
+        return env_prefix(agent, window, values) + start
     if session and not resume and conf.get("runtime") == "codex":
         prompt += "\n\n" + MARKER.format(session)       # lets the helper find this session's rollout
     flags = model_flags(conf)
@@ -2164,29 +2288,33 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     # throttle. A bounded mitigation, not MCP readiness: a slower server still gives a first turn without the Fleet
     # tools, and the unread task event brings the signal again.
     idle = task and conf.get("runtime") == "claude"
-    # A standing session's first prompt is the hub's brief, which grows with the fleet: its window's shell reads it
-    # from its own file (file_prompt), on each runtime, and the stable start of a Codex session reads its file below.
+    # Each text of a start grows with the fleet: a standing session's first prompt is the hub's brief, and a task's
+    # holds the list of its repositories (github_text). So no word of the command holds one: a first prompt comes
+    # from its own file (file_prompt), and a Claude task's text from the file of its appended system prompt
+    # (system_file), after the rules that the folder's CLAUDE.md gave before (rules_file).
     standing = not task and not resume
-    first = (shlex.quote(session) if conf.get("runtime") == "codex" else "") if resume else \
-        ("--append-system-prompt " if idle else "") + (file_prompt(agent, "manager", prompt)
-                                                       if standing and stable is None else shlex.quote(prompt))
+    if resume:
+        first = shlex.quote(session) if conf.get("runtime") == "codex" else ""
+    elif stable is not None:
+        first = ""                                          # below
+    elif idle:
+        first = "--append-system-prompt-file " + shlex.quote(system_file(agent, window, prompt))
+    else:
+        first = file_prompt(agent, window, prompt)
     if stable is not None:
         # The stable text first, then what is this session's own: its repositories' line, and for Codex its task.
         # Claude's task comes with its first read_messages, so no task text is in its start at all; the standing
         # manager session keeps its first prompt, the brief, after it.
         stable += github_text(values, tools) if task else ""
-        window = task or "manager"
         if opening == "read":
-            first = "--append-system-prompt-file " + shlex.quote(session_file(agent, window, "md", stable)) + \
-                (" " + file_prompt(agent, window, prompt) if standing else "")
+            word = " " + file_prompt(agent, window, prompt) if standing else ""     # first: it may refuse the start
+            first = "--append-system-prompt-file " + shlex.quote(session_file(agent, window, "md", stable)) + word
         elif resume:
             first = f"-c project_doc_max_bytes={codex_rules_limit()} " + shlex.quote(session)   # its thread
         else:
-            # A first prompt longer than a tmux command can carry: the window's shell reads it from its file, which
-            # it removes before Codex starts. Codex reads all of RULES.md as this folder's AGENTS.md.
-            path = shlex.quote(session_file(agent, window, "md", stable + "\n" + prompt))
-            first = f'-c project_doc_max_bytes={codex_rules_limit()} "$(cat {path}; rm -f {path})"'
-    elif conf.get("runtime") == "claude":
+            # Codex reads all of RULES.md as this folder's AGENTS.md.
+            first = f"-c project_doc_max_bytes={codex_rules_limit()} " + file_prompt(agent, window, stable + "\n" + prompt)
+    elif conf.get("runtime") == "claude" and not idle:
         core = rules_file()                                 # the folder's CLAUDE.md loads no more
         first = " ".join(x for x in ("--append-system-prompt-file " + shlex.quote(core) if core else "", first) if x)
     cmd = checked_start(conf).format(prompt=" ".join(x for x in (flags, first) if x),
@@ -2204,12 +2332,15 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         if conf.get("runtime") == "codex":
             cmd = cmd.replace("codex ", "codex -c " + shlex.quote("mcp_servers.fleet.url=" + json.dumps(url)) + " " +
                               (CODEX_BEARER if token else "") + ("" if task else CODEX_APPROVE) +
-                              "".join(codex_server(t, catalog) for t in tools), 1)
+                              (ARGS + " " if served else ""), 1)       # its catalog servers (served, env_prefix)
         else:
             servers = {t: claude_server(t, catalog, {catalog[t]["bearer"]: minted[t]} if t in minted else None)
                        for t in tools}
-            config = mcp_config_file(agent, task or "manager", url, token, servers) if token else \
-                json.dumps({"mcpServers": dict({"fleet": {"type": "http", "url": url}}, **servers)})
+            # A file also without a credential: its catalog servers grow with the owner's. Only a file whose fleet
+            # server sends a credential counts as one (holds_credential).
+            config = mcp_config_file(agent, window, url, token, servers) if token else \
+                session_file(agent, window, "json",
+                             json.dumps({"mcpServers": dict({"fleet": {"type": "http", "url": url}}, **servers)}))
             # Only this configuration: the standing session not the folder's fleet server without a credential, and a
             # task session not the machine's own MCP servers, only Fleet's and its catalog tools (owner feature
             # integrations). --chrome adds its browser server to this configuration.
@@ -2225,7 +2356,9 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         env += f" {NO_TIMERS} {NO_TEAMS} {NO_FILE_MENTIONS} {MOTION}" + (f" {TODO_TOOLS}" if task else "")
     if not task and conf.get("runtime") == "claude":
         env += f" CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"
-    return f"{prefix}env {env} {cmd}"
+    # Its env file last, with its credential, its keys and its catalog servers' options: a start that file_prompt
+    # refused above leaves none of them behind.
+    return f"{env_prefix(agent, window, values, served)}env {env} {cmd}"
 
 
 # Support plan F1: the built-in tools that a closed task session can have, by the Tools box that allows each. Every
@@ -2349,12 +2482,14 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
         raise Refused("a session whose Shell box is off starts only with its rules, its profile and its knowledge "
                       "files in its start, and this start has not got them")
     first = ["--append-system-prompt-file", session_file(agent, task, "md", text + github_text(values, tools))]
+    # Its settings from a file too, as its MCP configuration: they hold one rule for each listed host and for each of
+    # its catalog servers, and the hook of its host list names each host again
     args = [program, "--setting-sources", "", "--session-id", session, "--permission-mode", "dontAsk",
             "--tools", ",".join(built_ins), "--strict-mcp-config", "--mcp-config",
             session_file(agent, task, "json", json.dumps({"mcpServers": dict({"fleet": {
                 "type": "http", "url": url, "headers": {"Authorization": f"Bearer {token}"}}}, **servers)})),
-            "--settings", json.dumps(settings)] + (["--chrome"] if needs == "browser" else []) + first + \
-        shlex.split(model_flags(conf))
+            "--settings", session_file(agent, task, "json", json.dumps(settings))] + \
+        (["--chrome"] if needs == "browser" else []) + first + shlex.split(model_flags(conf))
     words = ["env", f"FLEET_ATTEMPT={attempt}", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}",
              f"FLEET_AGENT={agent}", f"FLEET_TASK={task}", NO_TIMERS, NO_TEAMS, NO_FILE_MENTIONS, MOTION,
              CLOSED_NO_UPDATES] + \
@@ -2674,24 +2809,6 @@ CHAT_SIGNAL = "New fleet messages. Call read_messages now."     # the helper's s
 # worker's chat (owner feature secret_requests), so that no machine that has not updated yet refuses it.
 CHAT_TOOLS = ("read_messages", "tell_owner", "message_owner", "message_agent", "see_responsibilities", "recall",
               "start_task", "request_secret", "search_history", "read_history")
-# Characters of a chat's quoted first prompt. A tmux command must stay under 16 KiB (start_window; tmux refuses a
-# longer one with "command too long"), and a Codex chat has nowhere else to put its prompt. The instructions and the
-# profile are what the chat is, so the recap is what gives way.
-CHAT_PROMPT_MAX = 14000
-
-
-def chat_fit(recap, room):
-    """The hub's record of a chat (chat_recap) cut to `room` quoted characters: its oldest messages go first, and its
-    first line, which says what the recap is, stays with the newest message. "" when not even those two fit, and then
-    the chat starts with no recap rather than not starting at all; one message that long is the unread one, which
-    read_messages brings anyway."""
-    note, _, said = recap.partition("\n")
-    lines = said.splitlines()
-    while lines and len(shlex.quote("\n\n" + note + "\n" + "\n".join(lines))) > room:
-        lines.pop(0)
-    return note + "\n" + "\n".join(lines) if lines else ""
-
-
 def chat_instructions(agent, conf):
     """The instructions of an owner chat, the head of its start text (chat_command, standing_text)."""
     prompt = (f'You are {agent}, speaking directly with the owner in this agent\'s chat. '
@@ -2746,13 +2863,17 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
     always starts so, with the instructions as its appended system prompt: interactive Claude Code runs a first
     prompt before it has connected the fleet MCP server, and with no tools that turn writes tool calls as text. Its
     first turn is the helper's first signal, after the signal throttle. recap: the hub's own record of what was said
-    in this chat before (chat_recap), for a chat that starts without its conversation; it goes last, after the
-    profile, says in its own first line that it is the hub's record and not this session's memory, and gives way
-    where a tmux command would otherwise be too long (chat_fit). env:
+    in this chat before (chat_recap), for a chat that starts without its conversation; it goes last and whole, after
+    the profile, and says in its own first line that it is the hub's record and not this session's memory. env:
     {NAME: value} of session_env, from a file that the window reads and removes, as the credential of a Codex
     chat. rules: the parts of the rules that the hub names (opening_rules); with them the chat starts with its
-    instructions, the rules and its profile first, from a file, the recap last and whole, and no CLAUDE.md or
-    AGENTS.md of the folder besides (plan P9.2, helper feature stable_standing)."""
+    instructions, the rules and its profile first, the recap last, and no CLAUDE.md or AGENTS.md of the folder besides
+    (plan P9.2, helper feature stable_standing).
+
+    Its start text comes from a mode-600 file in each case, and no word of the command holds it: the profile and the
+    recap grow with the fleet, and a tmux command must stay under 16 KiB. Until 16 November 2026 a chat without its
+    stable text had them in its command, cut only the recap to fit, and a profile alone could pass the limit (ARG_MOST
+    says the next one)."""
     if not runtime_fact(conf.get("runtime"), "owner_chat"):
         raise Refused(f"a {runtime_fact(conf.get('runtime'), 'label', conf.get('runtime'))} agent has no direct chat "
                       f"yet: its tools cannot be limited to discussion")
@@ -2762,12 +2883,9 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
     opening = standing_opening(conf, rules)
     stable = stable_text(agent, opening, rules, head=prompt, skills=False) if opening else None
     if stable is None:
-        prompt += " Your profile follows:\n" + profile
-        fitted = chat_fit(recap, CHAT_PROMPT_MAX - len(shlex.quote(prompt))) if recap else ""
-        if fitted:
-            prompt += "\n\n" + fitted
+        prompt += " Your profile follows:\n" + profile + ("\n\n" + recap if recap else "")
     else:
-        prompt = stable + ("\n" + recap if recap else "")           # a file: the recap comes whole
+        prompt = stable + ("\n" + recap if recap else "")
     url = f"{HUB}/mcp/{agent}/{generation}/owner-chat/1"
     if conf.get("runtime") == "codex":
         if resume is not None and not THREAD_ID.fullmatch(str(resume)):
@@ -2775,11 +2893,10 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
         args = ["codex"] + (["resume"] if resume else []) + \
             ["--no-daemon", "--sandbox", "read-only", "--ask-for-approval", "never"] + CODEX_NO_UPDATE_CHECK + \
             CODEX_UNATTENDED + codex_env(env) + ["-c", "mcp_servers.fleet.url=" + json.dumps(url)] + \
-            (["-c", 'mcp_servers.fleet.bearer_token_env_var="FLEET_SESSION_TOKEN"'] if token else []) + \
+            (["-c", CODEX_BEARER_OPTION] if token else []) + \
             ["-c", "features.multi_agent=false", "-c", 'web_search="disabled"'] + shlex.split(model_flags(conf)) + \
             (["-c", f"project_doc_max_bytes={codex_rules_limit()}"] if stable is not None else []) + \
-            ([resume] if resume else [] if stable is not None else
-             [prompt + ("\n\n" + MARKER.format(marker) if marker else "")])
+            ([resume] if resume else [])        # a new chat's prompt: last, from its file (below)
     elif conf.get("runtime") == "claude":
         if resume is not None and not THREAD_ID.fullmatch(str(resume)):
             raise Refused("a Claude chat resumes only a session id")
@@ -2788,16 +2905,16 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
         settings = dict({**CLAUDE_NO_MEMORY, **NO_SUGGESTION, **NO_PEER_MESSAGES,
                          "permissions": {"allow": [f"mcp__fleet__{t}" for t in CHAT_TOOLS], "deny": DENY}},
                         **kept_user_settings())
+        # Without its stable text, the folder's CLAUDE.md loads no more: its rules come from the checkout's RULES.md,
+        # in the same file as the chat's own text (system_file).
+        system = session_file(agent, "owner-chat", "md", prompt) if stable is not None else \
+            system_file(agent, "owner-chat", prompt)
         args = ["claude"] + (["--resume", resume] if resume else ["--session-id", marker] if marker else []) + \
             ["--permission-mode", "dontAsk", "--tools", "", "--strict-mcp-config",
              "--mcp-config", mcp_config_file(agent, "owner-chat", url, token) if token else
              json.dumps({"mcpServers": {"fleet": {"type": "http", "url": url}}}),
              "--settings", json.dumps(settings)] + \
-            ["--setting-sources", ""] + \
-            (["--append-system-prompt-file", session_file(agent, "owner-chat", "md", prompt)] if stable is not None else
-             # the folder's CLAUDE.md loads no more: its rules come from the checkout's RULES.md
-             (["--append-system-prompt-file", core] if (core := rules_file()) else []) +
-             ["--append-system-prompt", prompt]) + shlex.split(model_flags(conf))
+            ["--setting-sources", ""] + ["--append-system-prompt-file", system] + shlex.split(model_flags(conf))
     else:
         raise Refused("direct chat is not configured for this runtime")
     values = dict(env or {}, **({"FLEET_SESSION_TOKEN": token}
@@ -2805,14 +2922,11 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
     words = ["env", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}", f"FLEET_AGENT={agent}", "FLEET_TASK="] + \
         ([NO_TIMERS, NO_TEAMS, NO_FILE_MENTIONS, f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"]
          if conf.get("runtime") == "claude" else [])
-    command = env_prefix(agent, "owner-chat", values) + shlex.join(words + args)
-    if stable is not None and conf.get("runtime") == "codex" and not resume:
-        # A first prompt longer than a tmux command can carry: the window's shell reads it from its file, which it
-        # removes before Codex starts.
-        path = shlex.quote(session_file(agent, "owner-chat", "md",
-                                        prompt + ("\n\n" + MARKER.format(marker) if marker else "")))
-        command += f' "$(cat {path}; rm -f {path})"'
-    return command
+    # The window's shell reads a new Codex chat's first prompt from its file, which it removes before Codex starts.
+    # That file first, the env file with the credential after it: a start that file_prompt refuses leaves no file.
+    word = " " + file_prompt(agent, "owner-chat", prompt + ("\n\n" + MARKER.format(marker) if marker else "")) \
+        if conf.get("runtime") == "codex" and not resume else ""
+    return env_prefix(agent, "owner-chat", values) + shlex.join(words + args) + word
 
 
 # The Fleet tools that a closed conversation session may call, MCP context conversation (CHAT-APPS 9.4): the hub offers
@@ -4919,12 +5033,13 @@ class Helper:
 
     def legacy_windows(self):
         """Owner API 1.12: the windows that started without a session credential (before this agent had a key, or
-        from an older helper). A window with one names its file in ~/.fleet/sessions in its start command. The hub
-        refuses each MCP call of such a window once its agent has a key, also while it is alone on its address (the
-        access review of 10 November 2026), so this helper closes the standing session and the owner chat among them
-        when it first has the key (close_keyless)."""
+        from an older helper). A window with one names the file of its credential in its start command
+        (holds_credential), and no other file of ~/.fleet/sessions counts. The hub refuses each MCP call of such a
+        window once its agent has a key, also while it is alone on its address (the access review of 10 November
+        2026), so this helper closes the standing session and the owner chat among them when it first has the key
+        (close_keyless)."""
         windows = self.started()
-        return None if windows is None else sorted(n for n, start in windows.items() if SESSIONS + os.sep not in start)
+        return None if windows is None else sorted(n for n, start in windows.items() if not holds_credential(start))
 
     def enroll(self):
         """One round of the helper's loop (owner API 1.12): this agent's key. The loop asks before the standing

@@ -482,13 +482,33 @@ class Runner:
             self.close()
 
 
+def prompt_from(path):
+    """The task's first prompt from its mode-600 file (fleet.session_command), which is removed once it is read. A
+    window command carries 16 KiB at most, and the prompt holds the list of the task's repositories (up to 500). Each
+    character as it was written, line ends included, as --prompt gave it."""
+    with open(path, encoding="utf-8", newline="") as f:
+        text = f.read()
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return text
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--prompt", required=True)
+    given = parser.add_mutually_exclusive_group(required=True)
+    given.add_argument("--prompt-file", help="the first prompt, from a file that the runner removes once it read it")
+    given.add_argument("--prompt", help="the first prompt itself, as a helper of before 16 November 2026 gives it")
     parser.add_argument("--model")
     parser.add_argument("--effort")
     parser.add_argument("--needs", choices=("none", "browser", "screen"), default="screen")
     args = parser.parse_args()
+    if args.prompt is None:
+        try:
+            args.prompt = prompt_from(args.prompt_file)
+        except (OSError, ValueError) as exc:     # ValueError: text that is not UTF-8
+            fleet.die(f"the task's prompt cannot be read from {args.prompt_file}: {exc}")
     agent = os.environ.get("FLEET_AGENT", "")
     fleet.AGENT = agent or None         # its hook calls send the agent key (owner API 1.12)
     conf = fleet.agent_conf(agent)

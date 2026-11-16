@@ -139,7 +139,7 @@ class Helper(unittest.TestCase):
         config = self.private(option("--mcp-config"))
         self.assertEqual(config, {"mcpServers": {"fleet": {"type": "http", "url": "http://hub.test:8765/mcp/desk/g1/T-5/1",
                                                            "headers": {"Authorization": f"Bearer {TOKEN}"}}}})
-        settings = json.loads(option("--settings"))
+        settings = self.private(option("--settings"))
         self.assertEqual(settings["permissions"], {"allow": ["mcp__fleet__*", "WebSearch"],
                                                    "deny": fleet.DENY})
         self.assertFalse(settings["autoMemoryEnabled"])
@@ -156,13 +156,13 @@ class Helper(unittest.TestCase):
             with self.subTest(can=conf["can"], closed=closed):
                 _, args, option = self.parts(self.build(conf, closed=closed))
                 self.assertEqual(option("--tools"), tools)
-                allow = json.loads(option("--settings"))["permissions"]["allow"]
+                allow = self.private(option("--settings"))["permissions"]["allow"]
                 self.assertEqual(allow, ["mcp__fleet__*"] + [t for t in tools.split(",") if t])
 
     def test_a_browser_task_gets_chrome_without_file_upload(self):
         _, args, option = self.parts(self.build(dict(DESK, can=["web", "browser"]), needs="browser"))
         self.assertIn("--chrome", args)
-        permissions = json.loads(option("--settings"))["permissions"]
+        permissions = self.private(option("--settings"))["permissions"]
         self.assertIn(fleet.CHROME_TOOLS, permissions["allow"])
         self.assertIn("mcp__claude-in-chrome__file_upload", permissions["deny"])
 
@@ -187,13 +187,16 @@ class Helper(unittest.TestCase):
     def test_its_owner_chat_is_told_only_the_tools_that_it_has(self):
         """The review of 2 November 2026, item 8: the owner chat's words named start_task, message_agent and
         request_secret, which the hub does not give a Shell-off agent's chat."""
-        words = fleet.chat_command("desk", DESK, "g1", token=TOKEN, marker=SESSION)
+        def text(command):          # its words: the file of its appended system prompt (fleet.system_file)
+            words = shlex.split(command)
+            return Path(words[words.index("--append-system-prompt-file") + 1]).read_text()
+        words = text(fleet.chat_command("desk", DESK, "g1", token=TOKEN, marker=SESSION))
         for name in ("read_messages", "tell_owner", "message_owner", "see_responsibilities", "recall"):
             self.assertIn(name, words)
         for name in ("start_task", "message_agent", "request_secret"):
             self.assertNotIn(name + "(", words)
         self.assertIn("your Shell box is off", words)
-        on = fleet.chat_command("desk", dict(DESK, can=["shell", "web"]), "g1", token=TOKEN, marker=SESSION)
+        on = text(fleet.chat_command("desk", dict(DESK, can=["shell", "web"]), "g1", token=TOKEN, marker=SESSION))
         self.assertIn("start_task(title", on)                         # an agent with a shell keeps its words
 
     def test_codex_and_a_screen_task_are_refused(self):
@@ -227,7 +230,7 @@ class Helper(unittest.TestCase):
         config = self.private(option("--mcp-config"))
         self.assertEqual(config["mcpServers"]["crm"], {"type": "http", "url": CRM["url"],
                                                        "headers": {"Authorization": "Bearer tok_case_1.secret-token"}})
-        self.assertIn("mcp__crm__*", json.loads(option("--settings"))["permissions"]["allow"])
+        self.assertIn("mcp__crm__*", self.private(option("--settings"))["permissions"]["allow"])
         without = self.parts(self.build(env={"FLEET_TOOLS": "crm"}, closed={"servers": ["crm"]}))[2]
         self.assertNotIn("crm", self.private(without("--mcp-config"))["mcpServers"])    # no token: no server
 

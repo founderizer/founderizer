@@ -10,6 +10,7 @@ import uuid
 from unittest.mock import patch
 
 import fleet
+from leftovers import scratch_home
 import hub
 import test_chat_apps
 import test_ui_api
@@ -18,6 +19,10 @@ ANA = "34600111999@s.whatsapp.net"          # a person's WhatsApp ID
 JORDI = "500600700"                         # a person's Discord user ID
 CONV = ("test-generation", "conversation", "1")
 CLAUDE = {"runtime": "claude", "machine": "studio-host"}
+
+
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
 def filler(n):

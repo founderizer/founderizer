@@ -6,6 +6,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import stat
@@ -37,6 +38,19 @@ CLAUDE = {"role": "worker", "runtime": "claude", "machine": "w1", "can": ["shell
           "start": "claude --permission-mode dontAsk {chrome} {settings} {prompt}"}
 CODEX_CONF = {"role": "worker", "runtime": "codex", "machine": "w2", "can": ["shell"], "start": CODEX}
 PROGRAM = "/opt/fleet-test/bin/github-mcp-server"
+
+
+def start_text(words):
+    """A task's start text, from its mode-600 file: a Claude task's appended system prompt, after this checkout's rules
+    (fleet.system_file), or the first prompt that a Codex task's window reads (fleet.file_prompt)."""
+    if "--append-system-prompt-file" in words:
+        text, core, rules = Path(words[words.index("--append-system-prompt-file") + 1]).read_text(), fleet.rules_file(), ""
+        if core:
+            with open(core, encoding="utf-8") as f:
+                rules = re.sub(r"\r?\n\Z", "", f.read()) + "\n\n"
+        return text[len(rules):] if rules and text.startswith(rules) else text
+    read = re.fullmatch(r"\$\(cat (\S+); rm -f \1\)", words[-1])
+    return Path(shlex.split(read.group(1))[0]).read_text()
 
 
 def setUpModule():
@@ -562,6 +576,9 @@ class HelperSide(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         values = {}
         for line in path.read_text().splitlines():
+            if line.startswith("set -- "):     # the program's words from this file, which the command names as "$@"
+                values["$@"] = shlex.split(line[len("set -- "):])
+                continue
             name, _, value = line.removeprefix("export ").partition("=")
             values[name] = shlex.split(value)[0] if value else ""
         return values
@@ -591,7 +608,7 @@ class HelperSide(unittest.TestCase):
         settings = json.loads(words[words.index("--settings") + 1])
         # and Workflow, which a task session runs unasked (AUTONOMY.md decision 41)
         self.assertEqual(settings["permissions"]["allow"], ["mcp__fleet__*", "mcp__github__*", "Workflow"])
-        prompt = words[words.index("--append-system-prompt") + 1]
+        prompt = start_text(words)
         self.assertTrue(prompt.startswith("Do T-3.\n\nYour GitHub repositories (2), by access: write: acme/web; read: "
                                           "acme/lib. Before you work in one, run `"), prompt)
         for words_ in ("work on the default branch of origin: git pull --rebase", "do not open a pull request",
@@ -606,15 +623,20 @@ class HelperSide(unittest.TestCase):
         values = self.env_file(command)
         self.assertEqual((values["FLEET_SESSION_TOKEN"], values["GH_TOKEN"]), ("s" * 43, WRITE))
         words = fleet.launch_words(command)
+        # its catalog servers' options come from its env file, where the command names them ("$@", fleet.env_prefix)
+        self.assertEqual(words[words.index("$@") - 2:words.index("$@")], ["-c", fleet.CODEX_BEARER_OPTION])
+        options = values["$@"]
         for option in (f'mcp_servers.github.command="{PROGRAM}"', 'mcp_servers.github.args=["stdio"]',
                        'mcp_servers.github.env_vars=["GITHUB_PERSONAL_ACCESS_TOKEN"]',
                        'mcp_servers.github.default_tools_approval_mode="approve"'):
-            self.assertEqual(words[words.index(option) - 1], "-c")
-        self.assertIn("Your MCP servers besides Fleet's: github (GitHub).", words[-1])
+            self.assertEqual(options[options.index(option) - 1], "-c")
+            self.assertNotIn(option, words)
+        self.assertIn("Your MCP servers besides Fleet's: github (GitHub).", start_text(words))
         runner = self.command(dict(CODEX_CONF, start="app-server"))
         self.assertNotIn("mcp_servers.github", runner)
+        self.assertNotIn("$@", fleet.launch_words(runner))
         self.assertEqual(self.env_file(runner)["GH_TOKEN"], WRITE)
-        self.assertNotIn("Your MCP servers besides Fleet's", fleet.launch_words(runner)[-1])
+        self.assertNotIn("Your MCP servers besides Fleet's", Path(fleet.launch_words(runner)[-1]).read_text())
 
     def test_an_agent_without_repos_or_tools_asks_the_hub_nothing(self):
         def http(*args, **kw):
@@ -755,14 +777,12 @@ class HelperSide(unittest.TestCase):
 
     def test_what_the_session_lacks_is_in_its_start_text(self):
         refused = self.answer(tokens=[], errors=[{"repos": ["acme/lib", "acme/web"], "error": "GitHub answered 404"}])
-        prompt = shlex.split(self.command(CLAUDE, answer=refused))
-        prompt = prompt[prompt.index("--append-system-prompt") + 1]
+        prompt = start_text(shlex.split(self.command(CLAUDE, answer=refused)))
         self.assertIn("In this session: No GitHub token for acme/lib, acme/web: GitHub answered 404. The tool github is "
                       "not loaded: this session has no GH_TOKEN. If that blocks your task, ask your requester.", prompt)
         self.assertNotIn("Your MCP servers besides Fleet's", prompt)
-        prompt = fleet.launch_words(self.command(CLAUDE, program=None))
         self.assertIn("The tool github is not loaded: github-mcp-server is not installed on this machine.",
-                      prompt[prompt.index("--append-system-prompt") + 1])
+                      start_text(fleet.launch_words(self.command(CLAUDE, program=None))))
         with patch.object(fleet, "checkout_conf", return_value={"tools": ["github"]}), \
                 patch.object(fleet, "http", side_effect=OSError("down")):
             self.assertEqual(fleet.integration_env("dev", CLAUDE),

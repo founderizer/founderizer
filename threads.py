@@ -30,6 +30,38 @@ STATUSES = ("pending", "in_progress", "completed", "failed")
 STOPS = ("end_turn", "cancelled", "max_tokens", "refusal", "error")
 MARKER = "[fleet-session {}]"
 MARKER_TEXT = re.compile(r"\s*\[fleet-session [0-9a-f-]{36}\]\s*$")
+MARKER_BYTES = re.compile(rb"\[fleet-session ([0-9a-f-]{36})\]")
+# How much of a Codex rollout CodexFiles.find reads at most: up to the row of its first prompt, whose marker comes
+# last. Codex writes rows of its own before that prompt (its instructions, the folder's AGENTS.md, its tools: up to
+# about 180 KB in the rollouts of one Mac, 16 November 2026), and the prompt is up to fleet.ARG_MOST bytes as the
+# helper gave it (2 MiB at most), which JSON writes in up to six bytes for each character. Until that day find read
+# the first line and 256 KiB more, and took a rollout whose first prompt ended beyond them for one without a marker
+# for good: the session of a long first prompt started, and its helper never read its records or found its thread.
+HEAD_MOST = 16 << 20
+
+
+def prompt_row(row):
+    """True for the row of a session's first prompt in a Codex rollout: the event of the user's message, in either of
+    Codex's shapes (an item_completed event of a UserMessage item, or a user_message event). Read from the row as JSON
+    and not from its text: a row before it, such as the one of the session's tools and their schemas, can name
+    UserMessage. Codex writes the prompt's own user row before that event, so its marker is found first. A
+    user_message event of another kind than a plain message (user_instructions, environment_context) is no prompt: a
+    version of Codex may write the folder's instructions and the session's environment so before the first prompt.
+    None of the rollouts read on one Mac on 16 November 2026 has a user_message event at all."""
+    if b'"UserMessage"' not in row and b'"user_message"' not in row:
+        return False                        # most rows, with no parse
+    try:
+        data = json.loads(row)
+    except ValueError:
+        return False
+    payload = data.get("payload") if isinstance(data, dict) and data.get("type") == "event_msg" else None
+    if not isinstance(payload, dict):
+        return False
+    item = payload.get("item")
+    return (payload.get("type") == "user_message" and payload.get("kind") in (None, "plain")) or \
+        (payload.get("type") == "item_completed" and isinstance(item, dict) and item.get("type") == "UserMessage")
+
+
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 CLAUDE_FIELDS = {"Bash": "command", "Read": "file_path", "Write": "file_path", "Edit": "file_path",
@@ -1244,10 +1276,14 @@ class CodexFiles:
         self.root = os.environ.get("CODEX_HOME") or os.path.join(home, ".codex")
         self.kit = os.path.realpath(kit) if kit else None
         self.known = {}         # path -> session marker found in it, or None when its head has none
+        self.read = {}          # path -> the offset after its whole rows read so far, while it has no answer
         self.threads = {}       # subagent thread id -> its rollout, or None when it is another folder's
 
     def find(self, session, since=None):
-        """since: the oldest change time to read (default two days ago), for a session that was quiet longer."""
+        """The rollout of a session, by the marker at the end of its first prompt: each rollout is read up to the row
+        of that prompt, however long what Codex writes before it and the prompt are (HEAD_MOST), and a reader that is
+        kept (the record reader's) reads a rollout with no answer yet on from where it stopped. since: the oldest
+        change time to read (default two days ago), for a session that was quiet longer."""
         for path, found in self.known.items():
             if found == session:
                 return path
@@ -1259,22 +1295,38 @@ class CodexFiles:
                 if os.path.getmtime(path) < cutoff:
                     continue
                 with open(path, "rb") as stream:
-                    first = stream.readline(MAX_LINE)
-                    if not first.endswith(b"\n"):
-                        continue                    # its first line is still being written: read it again later
-                    if (self.kit and not self.ours(first)) or self.forked(first):
-                        self.known[path] = None     # another folder's session, or a subagent: only its first line
-                        continue
-                    head = first + stream.read(256 * 1024)
+                    offset, match, prompted = self.read.get(path, 0), None, False
+                    if offset:
+                        stream.seek(offset)         # its rows up to there have no answer: read on from there
+                    else:
+                        first = stream.readline(MAX_LINE)
+                        if not first.endswith(b"\n"):
+                            continue                # its first line is still being written: read it again later
+                        if (self.kit and not self.ours(first)) or self.forked(first):
+                            self.known[path] = None     # another folder's session, or a subagent: its first line only
+                            continue
+                        offset, match = len(first), MARKER_BYTES.search(first)
+                    # whole rows up to the one that has the marker, or to the row of the first prompt (HEAD_MOST)
+                    while not (match or prompted) and offset < HEAD_MOST:
+                        row = stream.readline(HEAD_MOST - offset)
+                        if not row.endswith(b"\n"):
+                            if len(row) >= HEAD_MOST - offset:
+                                offset = HEAD_MOST  # one row longer than what is left to read
+                            break                   # else the end of what Codex wrote so far: read on from here later
+                        offset += len(row)
+                        match, prompted = MARKER_BYTES.search(row), prompt_row(row)
             except OSError:
                 continue
-            match = re.search(rb"\[fleet-session ([0-9a-f-]{36})\]", head)
             if match:
                 self.known[path] = match.group(1).decode()
-            # No marker for good only once the first prompt is written: a user-role row of the session's context can
-            # come shortly before it.
-            elif len(head) >= 256 * 1024 or b'"UserMessage"' in head or b'"type":"user_message"' in head:
+            # No marker for good only once the row of the first prompt is written whole: a user-role row of the
+            # session's context can come shortly before it.
+            elif prompted or offset >= HEAD_MOST:
                 self.known[path] = None
+            else:
+                self.read[path] = offset
+            if path in self.known:
+                self.read.pop(path, None)
             if self.known.get(path) == session:
                 return path
         return None

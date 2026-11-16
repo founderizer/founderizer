@@ -31,7 +31,7 @@ import hub
 import lifecycle
 import mcp
 from test_google_api import StandIn, body, form
-from test_integrations import git
+from test_integrations import git, start_text
 from test_ui_api import OwnerAPI
 
 CODEX = "codex --no-daemon --sandbox danger-full-access --ask-for-approval never {prompt}"
@@ -684,6 +684,9 @@ class HelperSide(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         values = {}
         for line in path.read_text().splitlines():
+            if line.startswith("set -- "):     # the program's words from this file, which the command names as "$@"
+                values["$@"] = shlex.split(line[len("set -- "):])
+                continue
             name, _, value = line.removeprefix("export ").partition("=")
             values[name] = shlex.split(value)[0] if value else ""
         return values
@@ -699,16 +702,20 @@ class HelperSide(unittest.TestCase):
                                           "headers": {"Authorization": "Bearer ${%s}" % TOKEN}})
         self.assertEqual(json.loads(words[words.index("--settings") + 1])["permissions"]["allow"],
                          ["mcp__fleet__*", "mcp__crm__*", "Workflow"])          # AUTONOMY.md decision 41
-        prompt = words[words.index("--append-system-prompt") + 1]
+        prompt = start_text(words)                  # from the file of its appended system prompt
         self.assertIn("Your MCP servers besides Fleet's: crm (Acme CRM). Their tools are mcp__<server>__*.", prompt)
 
     def test_a_codex_task_gets_the_owners_server_as_options(self):
-        words = fleet.launch_words(self.command(CODEX_CONF))
+        command = self.command(CODEX_CONF)
+        words, values = fleet.launch_words(command), self.env_file(command)
+        options = values["$@"]          # from its env file, where the command names them (fleet.env_prefix)
+        self.assertIn("$@", words)
         for option in (f'mcp_servers.crm.url="https://mcp.example.org/"',
                        'mcp_servers.crm.bearer_token_env_var="%s"' % TOKEN,
                        'mcp_servers.crm.default_tools_approval_mode="approve"'):
-            self.assertEqual(words[words.index(option) - 1], "-c")
-        self.assertEqual(self.env_file(self.command(CODEX_CONF))[TOKEN], ACCESS)
+            self.assertEqual(options[options.index(option) - 1], "-c")
+            self.assertNotIn(option, words)
+        self.assertEqual(values[TOKEN], ACCESS)
 
     def test_a_stdio_server_of_the_owner_runs_its_program_with_its_key(self):
         self.team(notes=dict(LOCAL, env={"NOTES_TOKEN": "NOTES_KEY"}))
@@ -726,13 +733,13 @@ class HelperSide(unittest.TestCase):
         self.assertEqual((values["NOTES_KEY"], values["FLEET_TOOLS"]), ("shh", "notes"))
         self.assertNotIn("NOTES_TOKEN", values)
         with patch.object(fleet, "read_env", return_value={}):          # the agent has no such key
-            prompt = fleet.launch_words(self.command(CLAUDE, answer=self.answer(tools=("notes",), mcp={})))[-1]
+            prompt = start_text(fleet.launch_words(self.command(CLAUDE, answer=self.answer(tools=("notes",), mcp={}))))
         self.assertIn("The tool notes is not loaded: this session has no NOTES_KEY. The owner gives the agent that "
                       "API key on the Secrets page.", prompt)
 
     def test_a_server_without_its_token_or_outside_this_checkout_is_not_loaded(self):
-        prompt = fleet.launch_words(self.command(CLAUDE, answer=self.answer(
-            mcp={}, mcp_problems=["The MCP server crm is not loaded: " + hub.MCP_UNCONNECTED])))[-1]
+        prompt = start_text(fleet.launch_words(self.command(CLAUDE, answer=self.answer(
+            mcp={}, mcp_problems=["The MCP server crm is not loaded: " + hub.MCP_UNCONNECTED]))))
         self.assertIn("The MCP server crm is not loaded: " + hub.MCP_UNCONNECTED, prompt)
         self.assertIn("The tool crm is not loaded: this session has no FLEET_MCP_CRM. The owner connects this MCP "
                       "server in the app.", prompt)
@@ -740,13 +747,14 @@ class HelperSide(unittest.TestCase):
         self.team(shop=KEYED)       # this checkout does not have the server that the hub gave
         command = self.command(CLAUDE)
         self.assertIn("The tool crm is not loaded: this machine's Fleet does not have it yet.",
-                      fleet.launch_words(command)[-1])
+                      start_text(fleet.launch_words(command)))
         self.assertNotIn("mcp__crm__*", command)
         self.team(crm=dict(LOCAL, env={"NOTES_TOKEN": "GH_TOKEN"}))       # one that a rule of this Fleet refuses
         command = self.command(CLAUDE)
-        self.assertIn("The tool crm is not loaded: the MCP server crm: env maps up to 8 ", fleet.launch_words(command)[-1])
+        self.assertIn("The tool crm is not loaded: the MCP server crm: env maps up to 8 ",
+                      start_text(fleet.launch_words(command)))
         self.assertIn("which is no key of Fleet's own (GH_TOKEN, GITHUB_PERSONAL_ACCESS_TOKEN).",
-                      fleet.launch_words(command)[-1])
+                      start_text(fleet.launch_words(command)))
         self.assertNotIn("mcp__crm__*", command)
 
     def test_a_codex_runner_gets_no_server(self):
