@@ -34,6 +34,7 @@ import hashlib
 import hub
 import hubsetup
 import owner_mcp
+import test_servers
 from test_hub_install import StandInServer
 from test_servers import NEW, OWNER, STUDIO, Servers
 
@@ -44,7 +45,7 @@ SHELLS = [sh for sh in ("/bin/sh", "/bin/dash") if os.access(sh, os.X_OK)]     #
 def load_tests(loader, _tests, _pattern):
     return unittest.TestSuite(cls(name) for cls in (Admin, Boundary, FromNothing, McpServers, Refusals,
                                                     Install, Progress, RootThroughSudo, NoSecret, Shape, Table,
-                                                    Parity)
+                                                    Parity, SecretGive, VaultReading)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -3193,6 +3194,362 @@ class Boundary(WithServer):
         self.assertEqual(hub.agents()["studio"].get("repos") or {}, {})
 
 
+class SecretGive(WithServer):
+    """**A give of a secret that would reach no server is not sent** (`owner_mcp.secret_reaches`), against the real
+    owner API of hub.py. The page of the vault is the hub's own (`vault_view`), from a status of the central vault
+    that the test gives the hub as its timer keeps one (`hub.CENTRAL`). The team's page is the hub's own too. A copy
+    on a machine is a real row of the hub's `deposits`, and a secret that an agent made a real row of its `jobs`. A
+    give that is sent is the hub's own grant, read back from team.json. Only four tests answer the route of the
+    vault's page themselves: a hub with no such page, a read that it refuses, no answer, and a generation that moved
+    two times. `routes` has each request of the three routes in its order, and `pages` each page of the vault that
+    the hub gave.
+
+    The team is the one of `test_servers`, with a catalog of three secrets and with one worker more, on the hub's own
+    machine: the workers vps and lead on the machine vps, studio on mac-studio, and aide beside the manager on hub.
+    Each of the three machines has a vault that takes deliveries: an agent with broker access whose helper reports its
+    broker, a store key in `vault_stores`, and that same key as the machine's pin in the central vault."""
+
+    REF = "bws://aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"          # an API key of the catalog
+    LOGIN = "bws://bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee"        # a login of the catalog
+    MADE = "bws://cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee"         # a login of the catalog, which an agent made
+    ABSENT = "bws://dddddddd-bbbb-4ccc-8ddd-eeeeeeeeeeee"       # no secret of the catalog
+    KEYS = {"vps": "age1" + "q" * 58, "mac-studio": "age1" + "r" * 58, "hub": "age1" + "s" * 58}    # the store keys
+    OTHER = "age1" + "t" * 58
+    BROKERS = {"vps": "vps", "lead": "vps", "studio": "mac-studio", "aide": "hub"}       # each agent's machine
+    ONE = ["ui_vault", "ui_secret_grant"]                       # a give that the page of the vault settles
+    TWO = ["ui_vault", "ui_team", "ui_secret_grant"]            # and one that needs the team too
+
+    def setUp(self):
+        catalog = {self.REF: {"title": "SHOP_API_KEY", "kind": "api_key", "env": "SHOP_API_KEY"},
+                   self.LOGIN: {"title": "shop.example.com · ops", "kind": "login"},
+                   self.MADE: {"title": "mail.example.com · ops", "kind": "login"}}
+        agents = dict(test_servers.TEAM["agents"],
+                      aide={"role": "worker", "runtime": "codex", "machine": "hub", "can": ["shell", "web"]})
+        agents = {name: dict(a, vault="broker", vault_recipient=self.KEYS[self.BROKERS[name]])
+                  if name in self.BROKERS else a for name, a in agents.items()}
+        with patch.dict(test_servers.TEAM, {"logins": catalog, "vault_stores": dict(self.KEYS), "agents": agents}):
+            super().setUp()
+        for agent, machine in self.BROKERS.items():         # each one's key, and its helper's report of the broker
+            hub.q("INSERT INTO agent_keys(agent,sha256,created,source) VALUES(?,?,?,?)",
+                  (agent, hashlib.sha256(agent.encode()).hexdigest(), hub.now(), "test"))
+            row = hub.q1("SELECT data FROM machine_status WHERE agent=?", (agent,))
+            data = dict(json.loads(row["data"]) if row else {}, features=["secret_deposits", "secret_withdrawals"],
+                        security={"vault": {"broker_recipient": self.KEYS[machine], "callers": True, "deposits": True,
+                                            "withdrawals": True, "replaces": True, "broker_read_at": hub.now(),
+                                            "mode": "broker"}})
+            hub.q("INSERT INTO machine_status(agent,data,reported) VALUES(?,?,?) ON CONFLICT(agent) DO UPDATE SET "
+                  "data=excluded.data, reported=excluded.reported", (agent, json.dumps(data), hub.now()))
+        self.routes, self.pages = [], []
+        for name in ("ui_vault", "ui_team", "ui_secret_grant"):
+            self.route(name)
+        view = hub.vault_view
+        self.patched(hub, "vault_view", lambda *args, **kw: self.pages.append(view(*args, **kw)) or self.pages[-1])
+        state = patch.dict(hub.CENTRAL, hub.CENTRAL_START, clear=True)      # no central vault, until `central`
+        state.start()
+        self.addCleanup(state.stop)
+
+    def patched(self, where, name, value):
+        change = patch.object(where, name, value)
+        change.start()
+        self.addCleanup(change.stop)
+
+    def route(self, name, instead=None):
+        """Each request of this route goes into `routes`, and then the hub's own handler answers it, or `instead`."""
+        real = getattr(hub.Handler, name)
+
+        def seen(handler, *args):
+            self.routes.append(name)
+            return instead(handler) if instead else real(handler, *args)
+        self.patched(hub.Handler, name, seen)
+
+    def central(self, pool=(), grants=(), pins=None, **changes):
+        """The hub's last good reading of the central vault, as `hub.central_read` keeps it: the owner pinned each
+        machine's own store key (or `pins`), and signed what `pool` and `grants` say."""
+        pins = self.KEYS if pins is None else pins
+        status = dict({"ok": True, "v": 2, "central": True, "fleet": hub.fleet_id(), "owner_keys": 1,
+                       "pins": {machine: {"recipient": key, "at": 1} for machine, key in pins.items()},
+                       "recovery": None, "grants": list(grants), "pool": list(pool), "items": 3}, **changes)
+        with hub.CENTRAL_LOCK:
+            hub.CENTRAL.update(status=status, read_at=hub.now(), tried_at=hub.now(), error=None)
+
+    def signed(self, agent, machine):
+        """One grant of the secret that the owner signed, as the central vault's status lists it."""
+        return {"login": self.REF, "agent": agent, "machine": machine}
+
+    def holds(self, machine, agent):
+        """The hub's own record that this machine's vault took a copy of the secret, sealed to its pinned key."""
+        hub.q("INSERT INTO deposits(login,machine,agent,recipient,sha256,ciphertext,request_id,created,finished,ok) "
+              "VALUES(?,?,?,?,?,NULL,?,?,?,1)",
+              (self.REF, machine, agent, self.KEYS[machine], "0" * 64, str(uuid.uuid4()), hub.now(), hub.now()))
+
+    def machine(self, name):
+        """One machine's entry of the newest page of the vault that the hub gave."""
+        return next(m for m in self.pages[-1]["machines"] if m["machine"] == name)
+
+    def given(self, agent):
+        """The secrets that the fleet's list gives this agent now, from team.json as the hub committed it."""
+        return self.origin_team()["agents"][agent].get("secrets") or {}
+
+    def give(self, client, agent="vps", level="use", ref=None):
+        return client.call("grant_access", resource="secret:" + (ref or self.REF), agent=agent, level=level)
+
+    def sent(self, client, routes, agent="vps", level="use", ref=None):
+        """The give goes after exactly these requests, and the hub's own grant is in the fleet's list."""
+        self.routes.clear()
+        self.assertTrue(self.give(client, agent=agent, level=level, ref=ref)["changed"])
+        self.assertEqual(self.routes, routes)
+        self.assertEqual(self.given(agent).get((ref or self.REF).lower()), level)
+
+    def refused(self, client, agent="vps", level="use", ref=None):
+        """The give is refused in the one fixed sentence, which names no secret and no agent, after the two reads, and
+        no command reached the hub: its list did not change."""
+        before = self.count("ui_controls"), self.given(agent)
+        self.routes.clear()
+        with self.assertRaises(Refused) as caught:
+            self.give(client, agent=agent, level=level, ref=ref)
+        self.assertEqual(str(caught.exception), owner_mcp.GRANT_NOT_SIGNED)
+        self.assertNotIn("bws://", str(caught.exception))
+        self.assertEqual(self.routes, ["ui_vault", "ui_team"])
+        self.assertEqual((self.count("ui_controls"), self.given(agent)), before)
+
+    # ---- step 1: the page of the vault cannot judge, so the give goes as before, after that one read
+    def test_a_hub_with_no_page_of_the_vault_gets_the_give_as_before(self):
+        self.route("ui_vault", lambda handler: handler.json(404, {"error": "not found"}))
+        self.sent(self.started(), self.ONE)
+
+    def test_a_read_of_the_vault_that_the_hub_refuses_does_not_stop_the_give(self):
+        self.route("ui_vault", lambda handler: handler.json(500, {"error": "the hub could not read its records"}))
+        self.sent(self.started(), self.ONE)
+
+    def test_a_fleet_with_no_central_vault_gets_the_give_as_before(self):
+        with hub.CENTRAL_LOCK:              # what hub.central_read keeps when no socket of a central vault is there
+            hub.CENTRAL.update(tried_at=hub.now(), error="no central vault answers on this hub")
+        self.sent(self.started(), self.ONE, level="read")
+        self.assertEqual((self.pages[-1]["central"], self.pages[-1]["error"]),
+                         (None, "no central vault answers on this hub"))
+
+    def test_a_vault_with_no_good_reading_gets_the_give(self):
+        client = self.started()
+        self.central(ok=False)
+        self.sent(client, self.ONE, agent="vps")
+        self.assertIs(self.pages[-1]["central"]["ok"], False)
+        # The hub's newest read failed: the page still has the last good status, which shows nothing signed.
+        self.central()
+        with hub.CENTRAL_LOCK:
+            hub.CENTRAL.update(error="the central vault did not answer in 5 seconds")
+        self.sent(client, self.ONE, agent="lead")
+        page = self.pages[-1]
+        self.assertEqual((page["central"]["ok"], page["central"]["pool"], page["central"]["grants"], page["error"]),
+                         (True, [], [], "the central vault did not answer in 5 seconds"))
+
+    def test_a_hub_that_does_not_answer_the_read_of_the_vault_stops_the_give(self):
+        self.central()
+        self.route("ui_vault", lambda handler: setattr(handler, "close_connection", True))      # no answer at all
+        with self.assertRaises(Refused) as caught:
+            self.give(self.started())
+        self.assertRegex(str(caught.exception), r"\AThe (call to the hub at \S+ was lost|hub at \S+ did not answer)")
+        self.assertEqual((self.routes, self.given("vps"), self.count("ui_controls")), (["ui_vault"], {}, 0))
+
+    def test_a_generation_that_moved_two_times_at_the_read_of_the_vault_stops_the_give(self):
+        self.central()
+        self.route("ui_vault", lambda handler: handler.json(409, {"error": "hub generation changed; refresh state"}))
+        with self.assertRaises(Refused) as caught:
+            self.give(self.started())
+        self.assertEqual(str(caught.exception),
+                         "The hub refused a read of the vault (409): hub generation changed; refresh state")
+        self.assertEqual((self.routes, self.given("vps"), self.count("ui_controls")),
+                         (["ui_vault", "ui_vault"], {}, 0))
+
+    # ---- step 2: the pool
+    def test_a_secret_of_the_pool_is_given_with_no_read_of_the_team(self):
+        self.central(pool=[self.REF])
+        self.sent(self.started(), self.ONE, ref="bws://" + self.REF[6:].upper())    # compared in lower case
+        self.assertEqual(self.pages[-1]["central"]["pool"], [self.REF])
+
+    # ---- step 3: what the team's page says, each in the state that refuses a give of REF to a worker
+    def test_a_secret_that_the_catalog_does_not_have_and_a_level_that_does_not_fit_get_the_hubs_own_words(self):
+        self.central()
+        client = self.started()
+        for ref, level, words in ((self.ABSENT, "use", "no such secret"),
+                                  (self.LOGIN, "read", "only an API key can be read"),
+                                  ("bws://no-reference", "use", "login must be a bws://<uuid> reference"),
+                                  (self.REF, "write", "grant must be use, read or null")):
+            self.routes.clear()
+            with self.assertRaises(Refused) as caught:
+                self.give(client, ref=ref, level=level)
+            self.assertIn(words, str(caught.exception), ref)
+            self.assertNotIn("central vault", str(caught.exception), ref)
+            self.assertEqual(self.routes, self.TWO, ref)
+        self.assertEqual(self.given("vps"), {})
+        self.refused(client, ref=self.LOGIN)        # a login of the catalog at `use` is judged, and refused
+
+    def test_a_secret_that_an_agent_made_is_not_judged(self):
+        self.central()
+        hub.ins("INSERT INTO jobs(agent,task,kind,login,created,finished,ok) VALUES('lead',1,'create',?,?,?,1)",
+                (self.MADE, hub.now(), hub.now()))          # as the hub keeps a create_login that ended well
+        made = self.request("/ui/team?db=test-generation", source=OWNER)[1]["created_logins"]
+        self.assertEqual([(m["login"], m["agent"], m["state"]) for m in made], [(self.MADE, "lead", "created")])
+        client = self.started()
+        self.sent(client, self.TWO, agent="vps", ref=self.MADE)     # on the maker's server
+        self.sent(client, self.TWO, agent="studio", ref=self.MADE)  # and on another one: it is not judged at all
+        self.assertEqual((self.pages[-1]["central"]["pool"], self.pages[-1]["held"]["vps"]), ([], []))
+        self.refused(client, agent="vps", ref=self.LOGIN)           # a login that no agent made is judged
+
+    def test_a_give_to_an_agent_that_the_list_does_not_have_gets_the_hubs_own_answer(self):
+        self.central()
+        client = self.started()
+        for agent, words in (("ghost", "no such agent"), ("door", "this fleet has no door")):
+            self.routes.clear()
+            with self.assertRaises(Refused) as caught:
+                self.give(client, agent=agent)
+            self.assertIn(words, str(caught.exception), agent)
+            self.assertEqual(self.routes, self.TWO, agent)
+
+    def test_a_give_to_the_manager_is_not_judged_also_on_a_server_with_a_worker(self):
+        self.central()
+        client = self.started()
+        self.sent(client, self.TWO, agent="manager")
+        self.assertEqual((hub.TEAM["agents"]["manager"]["machine"], hub.TEAM["agents"]["aide"]["machine"]),
+                         ("hub", "hub"))
+        self.assertEqual(self.machine("hub")["missing"], [])        # the manager's server takes deliveries
+        self.refused(client, agent="aide")                          # and the worker beside the manager is judged
+
+    def test_a_server_that_takes_no_deliveries_now_is_not_judged(self):
+        client = self.started()
+        self.central(pins={machine: key for machine, key in self.KEYS.items() if machine != "vps"})
+        self.sent(client, self.TWO, agent="vps")                    # the owner's pin of vps is not there
+        self.assertEqual(self.machine("vps")["missing"], ["not_pinned"])
+        self.central(pins=dict(self.KEYS, **{"mac-studio": self.OTHER}))
+        self.sent(client, self.TWO, agent="studio")                 # the pin is another key than its vault's
+        self.assertEqual(self.machine("mac-studio")["missing"], ["pin_mismatch"])
+        self.assertEqual(self.machine("vps")["missing"], [])
+        self.refused(client, agent="lead")                          # vps has its pin again, so it is judged
+
+    # ---- steps 4 and 5: what the owner signed for the machine, and what its vault holds already
+    def test_a_grant_signed_for_another_agent_of_the_same_machine_is_enough(self):
+        self.central(grants=[self.signed("lead", "vps")])
+        self.sent(self.started(), self.TWO, agent="vps")
+        self.assertEqual(self.pages[-1]["central"]["grants"], [self.signed("lead", "vps")])
+
+    def test_a_grant_signed_only_for_another_machine_is_refused(self):
+        self.central(grants=[self.signed("studio", "mac-studio"), self.signed("vps", "mac-studio")])
+        client = self.started()
+        self.refused(client, agent="vps")
+        self.sent(client, self.TWO, agent="studio")         # and it is enough for the machine that it names
+
+    def test_a_copy_that_the_machines_vault_holds_is_enough(self):
+        self.central()
+        self.holds("vps", "lead")
+        self.sent(self.started(), self.TWO, agent="vps")
+        self.assertEqual(self.pages[-1]["held"], {"hub": [], "mac-studio": [], "vps": [self.REF]})
+
+    def test_a_copy_only_in_the_vault_of_another_machine_is_refused(self):
+        self.central()
+        self.holds("mac-studio", "studio")
+        self.refused(self.started(), agent="vps")
+        self.assertEqual(self.pages[-1]["held"], {"hub": [], "mac-studio": [self.REF], "vps": []})
+
+    # ---- step 6, and what the rule never touches
+    def test_a_give_that_the_reading_shows_as_never_delivered_is_refused_and_nothing_reaches_the_hub(self):
+        """A worker on a server that takes deliveries, a secret of the catalog that no agent made, nothing signed and
+        no copy: the one give that is refused, at each level."""
+        self.central()
+        client = self.started()
+        for level in ("use", "read"):
+            self.refused(client, agent="vps", level=level)
+        page = self.pages[-1]
+        self.assertEqual((page["central"]["pool"], page["central"]["grants"], page["held"]["vps"], page["error"],
+                          self.machine("vps")["missing"]), ([], [], [], None, []))
+        team = self.request("/ui/team?db=test-generation", source=OWNER)[1]
+        self.assertEqual((team["logins"][self.REF]["kind"], team["created_logins"]), ("api_key", []))
+        self.assertEqual([(line["role"], line["machine"]) for line in team["lines"] if line["agent"] == "vps"],
+                         [("worker", "vps")])
+        self.assertEqual(self.count("ui_controls"), 0)
+
+    def test_a_take_back_goes_with_no_read_in_the_state_that_refuses_a_give(self):
+        self.central()
+        # The grant is in the list by the hub's own route, which takes it from each process of the owner's computer:
+        # the program's check is no gate (OWNER-MCP-BOUNDARY.md section 7).
+        status, receipt = self.owner("/ui/secrets/grant", login=self.REF, agent="vps", grant="use")
+        self.assertEqual((status, receipt.get("changed"), self.given("vps")), (200, True, {self.REF: "use"}))
+        client = self.started()
+        self.refused(client, agent="lead")
+        self.routes.clear()
+        self.pages.clear()
+        self.assertTrue(self.give(client, agent="vps", level=None)["changed"])
+        self.assertEqual((self.routes, self.pages, self.given("vps")), (["ui_secret_grant"], [], {}))
+
+    def test_a_give_of_a_repository_a_tool_and_a_google_service_reads_no_page_of_the_vault(self):
+        self.central()                      # the state that refuses a give of a secret
+        client = self.started()
+        for resource, level in (("repo:acme/web", "write"), ("tool:github", "use"),
+                                ("gmail:ada@example.com", "read"), ("drive:ada@example.com", "read")):
+            self.routes.clear()
+            try:
+                client.call("grant_access", resource=resource, agent="vps", level=level)
+            except Refused:
+                pass                        # the hub's own words for a tool or an account that it does not have
+            self.assertEqual(self.routes[:1], ["ui_team"], resource)
+            self.assertNotIn("ui_vault", self.routes, resource)
+        self.assertEqual(self.pages, [])
+        self.assertEqual(self.origin_team()["agents"]["vps"]["repos"], {"acme/web": "write"})
+
+
+class VaultReading(unittest.TestCase):
+    """`owner_mcp.vault_reading` and `lower_reference`, with no hub: the hub's page of the vault is data, so a page
+    that does not say what the rule reads is no reading (None, and the give is sent), never an error of Python."""
+
+    PAGE = {"db": "g1", "fleet": "0123456789abcdef", "read_at": 1.0, "error": None, "program": None, "hub": None,
+            "central": {"ok": True, "central": True, "pool": ["bws://AA"],
+                        "grants": [{"login": "bws://BB", "agent": "worker-1", "machine": "web-1"}]},
+            "machines": [{"machine": "web-1", "carrier": "worker-1", "missing": []},
+                         {"machine": "web-2", "carrier": None, "missing": ["not_pinned"]}],
+            "held": {"web-1": ["bws://CC"], "web-2": []}}
+
+    def test_a_page_of_the_shape_gives_what_the_rule_reads_with_each_reference_in_lower_case(self):
+        self.assertEqual(owner_mcp.vault_reading(json.loads(json.dumps(self.PAGE))),
+                         (["bws://aa"], [("bws://bb", "web-1")], [("web-1", True), ("web-2", False)],
+                          {"web-1": ["bws://cc"], "web-2": []}))
+        # Only A to Z change: Python's own lower() would make the last letter here a final sigma.
+        greek = "\N{GREEK CAPITAL LETTER ALPHA}\N{GREEK CAPITAL LETTER SIGMA}"
+        self.assertEqual(owner_mcp.lower_reference("bws://AbC-" + greek), "bws://abc-" + greek)
+        self.assertEqual(greek.lower(), "\N{GREEK SMALL LETTER ALPHA}\N{GREEK SMALL LETTER FINAL SIGMA}")
+
+    def test_a_page_that_does_not_say_it_is_no_reading(self):
+        def page(**changes):
+            return dict(self.PAGE, **changes)
+
+        def central(**changes):
+            return page(central=dict(self.PAGE["central"], **changes))
+        cases = {
+            "no answer in JSON": None, "a list": [self.PAGE], "a text": "central",
+            "no central": {k: v for k, v in self.PAGE.items() if k != "central"},
+            "central null": page(central=None), "central a text": page(central="ok"),
+            "ok false": central(ok=False), "ok 1": central(ok=1), "ok a text": central(ok="true"),
+            "the hub's newest read of the vault failed": page(error="the central vault does not answer"),
+            "an error that is no text": page(error=False),
+            "no ok": page(central={k: v for k, v in self.PAGE["central"].items() if k != "ok"}),
+            "no pool": page(central={k: v for k, v in self.PAGE["central"].items() if k != "pool"}),
+            "a pool that is a text": central(pool="bws://aa"), "a reference that is a number": central(pool=[7]),
+            "no grants": page(central={k: v for k, v in self.PAGE["central"].items() if k != "grants"}),
+            "grants an object": central(grants={}), "a grant that is a text": central(grants=["bws://bb"]),
+            "a grant with no machine": central(grants=[{"login": "bws://bb", "agent": "worker-1"}]),
+            "a grant whose machine is null": central(grants=[{"login": "bws://bb", "machine": None}]),
+            "a grant whose login is a number": central(grants=[{"login": 7, "machine": "web-1"}]),
+            "no machines": {k: v for k, v in self.PAGE.items() if k != "machines"},
+            "machines an object": page(machines={"web-1": {}}), "a machine that is a text": page(machines=["web-1"]),
+            "a machine with no name": page(machines=[{"carrier": None, "missing": []}]),
+            "a machine with no list of what it lacks": page(machines=[{"machine": "web-1"}]),
+            "a machine whose list of what it lacks is a text": page(machines=[{"machine": "web-1", "missing": ""}]),
+            "a machine whose list of what it lacks is null": page(machines=[{"machine": "web-1", "missing": None}]),
+            "no held": {k: v for k, v in self.PAGE.items() if k != "held"}, "held a list": page(held=[]),
+            "copies that are a text": page(held={"web-1": "bws://cc"}),
+            "a copy that is a number": page(held={"web-1": [7]}),
+        }
+        for what, value in cases.items():
+            self.assertIsNone(owner_mcp.vault_reading(value), what)
+
+
 # ---- the parity check of the two programs (plan 3.3): owner_mcp.py and the program inside the Founderizer app
 
 PARITY_FIXTURE = HERE / "app" / "Tests" / "FleetOwnerAPITests" / "Fixtures" / "owner-parity.json"
@@ -3209,6 +3566,33 @@ PARITY_PROFILES = {"profiles": [{"agent": "worker-1", "sha256": "profile-sha-1",
 PARITY_FILE = b"hello attachment\n"
 PARITY_COPY = b"PK\x03\x04 a stand-in copy of a fleet\n"
 PARITY_RID = "6F1C2A3B-0000-4000-8000-00000000000A"
+PARITY_SECRET = "bws://aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"       # an API key of the catalog
+PARITY_LOGIN = "bws://bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee"        # a login of the catalog
+PARITY_MADE = "bws://cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee"         # a login of the catalog, which an agent made
+PARITY_ABSENT = "bws://dddddddd-bbbb-4ccc-8ddd-eeeeeeeeeeee"       # no secret of the catalog
+# The team's page of a hub with a central vault (hub.py ui_team), with the parts that grant_access reads for a give of
+# a secret: the catalog (`logins`), the logins that agents made (`created_logins`: one whose job has no reference yet,
+# and one that names PARITY_MADE, in upper case), and each agent's role and machine. web-1 has two workers and web-2
+# has a lead; the manager is on a server of its own; worker-4 has no machine, worker-5 is on a server that the vault's
+# page does not list, and worker-6 has no role.
+PARITY_SERVERS = {
+    "sha256": "team-sha-1",
+    "logins": {PARITY_SECRET: {"title": "SHOP_API_KEY", "kind": "api_key", "env": "SHOP_API_KEY"},
+               PARITY_LOGIN: {"title": "shop.example.com ops", "kind": "login"},
+               PARITY_MADE: {"title": "mail.example.com ops", "kind": "login"}},
+    "created_logins": [{"login": None, "agent": "worker-2", "state": "waiting"},
+                       {"login": "bws://" + PARITY_MADE[6:].upper(), "agent": "worker-2", "state": "created"}],
+    "lines": [{"agent": "manager", "role": "manager", "machine": "hub-1"},
+              {"agent": "worker-1", "role": "worker", "machine": "web-1"},
+              {"agent": "worker-2", "role": "worker", "machine": "web-1"},
+              {"agent": "worker-3", "role": "lead", "machine": "web-2"},
+              {"agent": "worker-4", "role": "worker"},
+              {"agent": "worker-5", "role": "worker", "machine": "web-3"},
+              {"agent": "worker-6", "machine": "web-1"}]}
+# The one read whose 404 "not found" is no refusal: grant_access takes a hub with no page of the vault as a fleet whose
+# reading cannot judge the give, and sends the grant. So the program inside the app adds no sentence of an older hub
+# for it (`parity_older`).
+PARITY_NO_REFUSAL = ("/ui/vault",)
 
 
 def parity_state(db):
@@ -3274,6 +3658,16 @@ def parity_answer(state, req):
                      "X-Fleet-Backup-SHA256": hashlib.sha256(PARITY_COPY).hexdigest(),
                      "Content-Disposition": 'attachment; filename="founderizer-fleet-20261114T000000Z.zip"'}, PARITY_COPY
     return parity_json(200, {"page": path})
+
+
+def parity_vault(pool=(), grants=(), held=None, machines=("web-1", "web-2"), missing=None, **central):
+    """`GET /ui/vault` of a hub with a central vault (hub.py vault_view), with the parts that grant_access reads: what
+    the owner signed (`pool`, `grants`), each machine with a worker or a lead and what keeps deliveries from it
+    (`missing`, by its name; nothing for a machine that takes them), and what each machine's vault holds."""
+    return {"fleet": "0123456789abcdef", "read_at": PARITY_NOW, "error": None, "program": None, "hub": None,
+            "central": dict({"ok": True, "central": True, "pool": list(pool), "grants": list(grants)}, **central),
+            "machines": [{"machine": name, "missing": list((missing or {}).get(name, ()))} for name in machines],
+            "held": dict({name: [] for name in machines}, **(held or {}))}
 
 
 def parity_sample(name, schema):
@@ -3384,6 +3778,162 @@ def parity_cases():
     case("grant_access: a team read with no lines", "grant_access",
          {"resource": "repo:acme/web", "agent": "worker-1", "level": "read"},
          lambda s, r: parity_json(200, {"sha256": "x"}) if r["path"] == "/ui/team" else None)
+    # grant_access, a give of a secret: each step of its rule (owner_mcp.secret_reaches). The cases above run on a
+    # stand-in hub whose page of the vault has no `central`, so their grant goes as before, after one read. The
+    # stand-in takes each grant that reaches it, so a give that is sent ends in its answer to the POST.
+    give = {"resource": "secret:" + PARITY_SECRET, "agent": "worker-1", "level": "use"}
+
+    def vault(team=PARITY_SERVERS, **page):
+        """A hub with a central vault: its page of the vault (`parity_vault`), and its page of the team."""
+        page = parity_vault(**page)
+        return lambda s, r: parity_json(200, page) if r["path"] == "/ui/vault" else \
+            parity_json(200, team) if r["path"] == "/ui/team" else None
+
+    def vault_page(page):
+        return lambda s, r: page if r["path"] == "/ui/vault" else None
+
+    def team_without(key):
+        return {k: v for k, v in PARITY_SERVERS.items() if k != key}
+
+    def signed(agent, machine):
+        return {"login": PARITY_SECRET, "agent": agent, "machine": machine}
+    # Step 1: the page of the vault cannot judge the give, so it is sent after the one read.
+    case("grant_access: a secret, a hub with no page of the vault", "grant_access", give,
+         vault_page(parity_json(404, {"error": "not found"})))
+    case("grant_access: a secret, a hub that refuses the read of the vault", "grant_access", give,
+         vault_page(parity_json(403, {"error": "is not owner's machine"})))
+    case("grant_access: a secret, a fleet with no central vault", "grant_access", give,
+         vault_page(parity_json(200, dict(parity_vault(), central=None,
+                                          error="no central vault answers on this hub"))))
+    case("grant_access: a secret, a vault with no good reading", "grant_access", give, vault(ok=False))
+    case("grant_access: a secret, a page whose newest read of the vault failed", "grant_access", give,
+         vault_page(parity_json(200, dict(parity_vault(), error="the central vault does not answer"))))
+    for what, page in (
+            ("no object", parity_json(200, ["central"])),
+            ("no JSON", (200, {"Content-Type": "text/html"}, b"<html>The vault</html>")),
+            ("a pool that is a text", parity_json(200, dict(parity_vault(), central={
+                "ok": True, "pool": PARITY_SECRET, "grants": []}))),
+            ("a reference that is a number", parity_json(200, parity_vault(pool=[7]))),
+            ("grants that are an object", parity_json(200, dict(parity_vault(), central={
+                "ok": True, "pool": [], "grants": {PARITY_SECRET: "web-1"}}))),
+            ("a grant with no machine", parity_json(200, parity_vault(
+                grants=[{"login": PARITY_SECRET, "agent": "worker-1"}]))),
+            ("machines that are an object", parity_json(200, dict(parity_vault(), machines={"web-1": {}}))),
+            ("a machine with no name", parity_json(200, dict(parity_vault(), machines=[
+                {"carrier": None, "missing": []}]))),
+            ("a machine with no list of what it lacks", parity_json(200, dict(parity_vault(), machines=[
+                {"machine": "web-1"}, {"machine": "web-2", "missing": []}]))),
+            ("a machine whose list of what it lacks is a text", parity_json(200, dict(parity_vault(), machines=[
+                {"machine": "web-1", "missing": "not_pinned"}, {"machine": "web-2", "missing": []}]))),
+            ("no list of what the vaults hold", parity_json(200, dict(parity_vault(), held=None))),
+            ("copies that are a text", parity_json(200, parity_vault(held={"web-1": PARITY_SECRET})))):
+        case(f"grant_access: a secret, a page of the vault with {what}", "grant_access", give, vault_page(page))
+    # Step 2: a secret of the pool goes with no read of the team. References are compared in lower case.
+    case("grant_access: a secret of the pool", "grant_access", give, vault(pool=[PARITY_SECRET]))
+    case("grant_access: a secret of the pool, with its reference in upper case", "grant_access",
+         dict(give, resource="secret:bws://" + PARITY_SECRET[6:].upper()), vault(pool=[PARITY_SECRET]))
+    case("grant_access: a secret of the pool, which the hub names in upper case", "grant_access", give,
+         vault(pool=["bws://" + PARITY_SECRET[6:].upper()]))
+    # Step 3a: the hub answers in its own words for a secret that its catalog does not have, and for a level that
+    # does not fit the secret. A team's page with no catalog cannot judge, so the give is sent too.
+    case("grant_access: a secret that the catalog does not have", "grant_access",
+         dict(give, resource="secret:" + PARITY_ABSENT), vault())
+    case("grant_access: a secret, a reference of a wrong form", "grant_access",
+         dict(give, resource="secret:sealed:3"), vault())
+    case("grant_access: a secret at read that is a login", "grant_access",
+         dict(give, resource="secret:" + PARITY_LOGIN, level="read"), vault())
+    case("grant_access: a secret at read whose entry has no kind", "grant_access", dict(give, level="read"),
+         vault(team=dict(PARITY_SERVERS, logins={PARITY_SECRET: {"title": "SHOP_API_KEY"}})))
+    for what, level in (("a word that is no level of a secret", "write"), ("an empty text", ""), ("a number", 7),
+                        ("true", True)):
+        case(f"grant_access: a secret, a level that is {what}", "grant_access", dict(give, level=level), vault())
+    for what, team in (("no catalog", team_without("logins")),
+                       ("a catalog that is a list", dict(PARITY_SERVERS, logins=[PARITY_SECRET])),
+                       ("an entry of the catalog that is no object",
+                        dict(PARITY_SERVERS, logins={PARITY_SECRET: "SHOP_API_KEY"})),
+                       ("no object", ["lines"])):
+        case(f"grant_access: a secret, a team's page with {what}", "grant_access", give, vault(team=team))
+    # Step 3b: a secret that an agent made is not judged. A team's page with no list of them cannot judge.
+    case("grant_access: a secret that an agent made", "grant_access",
+         dict(give, resource="secret:" + PARITY_MADE), vault())
+    for what, team in (("no list of the logins that agents made", team_without("created_logins")),
+                       ("such a list that is an object", dict(PARITY_SERVERS, created_logins={})),
+                       ("an entry of that list that is no object",
+                        dict(PARITY_SERVERS, created_logins=[PARITY_LOGIN]))):
+        case(f"grant_access: a secret, a team's page with {what}", "grant_access", give, vault(team=team))
+    case("grant_access: a secret, entries of that list that name no reference", "grant_access", give,
+         vault(team=dict(PARITY_SERVERS, created_logins=[{"login": 7}, {"agent": "worker-2"}, {"login": None}])))
+    # Step 3c: the hub answers for an agent that its lines do not have, and it writes the grant for one with no
+    # machine. The door is no agent of the lines.
+    for what, agent in (("an agent that the list does not have", "ghost"), ("the door", "door"),
+                        ("an agent with no server", "worker-4")):
+        case(f"grant_access: a secret, {what}", "grant_access", dict(give, agent=agent), vault())
+    case("grant_access: a secret, a server that is an empty text", "grant_access", give,
+         vault(team=dict(PARITY_SERVERS, lines=[{"agent": "worker-1", "role": "worker", "machine": ""}])))
+    # Step 3d: only a worker and a lead are judged.
+    case("grant_access: a secret, the manager on a server of its own", "grant_access", dict(give, agent="manager"),
+         vault())
+    case("grant_access: a secret, the manager on a server that it shares with workers", "grant_access",
+         dict(give, agent="manager"),
+         vault(team=dict(PARITY_SERVERS, lines=[{"agent": "manager", "role": "manager", "machine": "web-1"},
+                                                {"agent": "worker-1", "role": "worker", "machine": "web-1"}])))
+    case("grant_access: a secret, an agent with no role", "grant_access", dict(give, agent="worker-6"), vault())
+    case("grant_access: a secret, a role that is no text", "grant_access", give,
+         vault(team=dict(PARITY_SERVERS, lines=[{"agent": "worker-1", "role": ["worker"], "machine": "web-1"}])))
+    case("grant_access: a secret, a lead with nothing signed and no copy", "grant_access",
+         dict(give, agent="worker-3"), vault())
+    # Step 3e: a server that the vault's page does not list, and one that takes no deliveries now.
+    case("grant_access: a secret, a worker on a server that the page of the vault does not list", "grant_access",
+         dict(give, agent="worker-5"), vault())
+    for what, lacks in (("without its pin", ["not_pinned"]), ("with another pin", ["pin_mismatch"]),
+                        ("whose vault no agent can reach", ["no_broker_access", "not_pinned"])):
+        case(f"grant_access: a secret, a server {what}", "grant_access", give, vault(missing={"web-1": lacks}))
+    # Steps 4 and 5: a grant signed for the agent's server, and a copy that its vault holds.
+    case("grant_access: a secret, a grant signed for another agent on the same server", "grant_access", give,
+         vault(grants=[signed("worker-2", "web-1")]))
+    case("grant_access: a secret, a grant signed only for another server", "grant_access", give,
+         vault(grants=[signed("worker-3", "web-2"), signed("worker-1", "web-2")]))
+    case("grant_access: a secret, a copy in the vault of the agent's server", "grant_access", give,
+         vault(held={"web-1": ["bws://" + PARITY_SECRET[6:].upper()]}))
+    case("grant_access: a secret, a copy only in the vault of another server", "grant_access", give,
+         vault(held={"web-2": [PARITY_SECRET]}))
+    # Step 6, and an end of a hold in the same state.
+    case("grant_access: a secret, nothing signed and no copy", "grant_access", give, vault())
+    case("grant_access: a secret at read, nothing signed and no copy", "grant_access", dict(give, level="read"),
+         vault())
+    case("grant_access: a secret that is a login, nothing signed and no copy", "grant_access",
+         dict(give, resource="secret:" + PARITY_LOGIN), vault())
+    case("grant_access: a secret, null in the state that refuses a give", "grant_access", dict(give, level=None),
+         vault())
+    # Text as Python reads it. Only A to Z are lowered, so a reference with a Greek capital sigma at its end is neither
+    # of the two forms that a whole lower() can give it: the catalog has it as it is, and the pool has those two. And a
+    # server's name is compared by code points: the team's name with one composed letter is not the vault's name with
+    # that letter in two code points, so the page of the vault does not list the agent's server.
+    sigma = "bws://\N{GREEK CAPITAL LETTER ALPHA}\N{GREEK CAPITAL LETTER SIGMA}"
+    case("grant_access: a secret, a reference with letters that are not ASCII", "grant_access",
+         dict(give, resource="secret:" + sigma),
+         vault(team=dict(PARITY_SERVERS, logins={sigma: {"title": "A login", "kind": "login"}}),
+               pool=["bws://\N{GREEK SMALL LETTER ALPHA}\N{GREEK SMALL LETTER FINAL SIGMA}",
+                     "bws://\N{GREEK SMALL LETTER ALPHA}\N{GREEK SMALL LETTER SIGMA}"]))
+    case("grant_access: a secret, a server's name in another Unicode form", "grant_access", give,
+         vault(team=dict(PARITY_SERVERS, lines=[
+             {"agent": "worker-1", "role": "worker", "machine": "caf\N{LATIN SMALL LETTER E WITH ACUTE}"}]),
+               machines=("cafe\N{COMBINING ACUTE ACCENT}",)))
+    # The two reads, when they fail: a new generation is read again once, a second one is the program's own error, and
+    # a read of the team that is refused, or whose lines have another shape, stops the give in the words of that read.
+    case("grant_access: a secret, a new generation at the read of the vault, read again once", "grant_access", give,
+         lambda s, r: (s.update(db="g2", moved=1), parity_json(409, {"error": "hub generation changed; refresh "
+                                                                              "state"}))[1]
+         if r["path"] == "/ui/vault" and not s.get("moved") else None)
+    case("grant_access: a secret, a second new generation at the read of the vault", "grant_access", give,
+         vault_page(parity_json(409, {"error": "hub generation changed; refresh state"})))
+    case("grant_access: a secret, a hub that refuses the read of the team", "grant_access", give,
+         lambda s, r: parity_json(200, parity_vault()) if r["path"] == "/ui/vault" else
+         parity_json(403, {"error": "is not owner's machine"}) if r["path"] == "/ui/team" else None)
+    for what, team in (("no lines", team_without("lines")),
+                       ("a server that is no text",
+                        dict(PARITY_SERVERS, lines=[{"agent": "worker-1", "role": "worker", "machine": 7}]))):
+        case(f"grant_access: a secret, a team read with {what}", "grant_access", give, vault(team=team))
     # share_resource.
     case("share_resource: with max", "share_resource", {"resource": "repo:acme/web", "max": "write"})
     case("share_resource: with max and to", "share_resource", {"resource": "tool:github", "max": "use", "to": "workers"})
@@ -3718,7 +4268,8 @@ def parity_fixture():
                             "requests": parity_requests(hub_.requests, c["arguments"].get("request_id")),
                             "outcome": {"refusal": parity_places(text, places)} if bad else
                             {"result": parity_places(json.loads(text), places)},
-                            "older_hub": sum(parity_older(req["answer"]) for req in hub_.requests),
+                            "older_hub": sum(parity_older(req["answer"]) for req in hub_.requests
+                                             if req["path"] not in PARITY_NO_REFUSAL),
                             "after": parity_after(work, home, places)})
             finally:
                 shutil.rmtree(scratch, True)
@@ -3754,11 +4305,14 @@ class Parity(unittest.TestCase):
     def test_the_older_hub_rule_is_what_hub_py_answers(self):
         """`parity_older` is read from the hub, not from the program: its dispatch answers an unknown route with 404
         "not found", and a route's `only` an unknown field with ValueError "unknown field <name>", which ui_command
-        gives as 400."""
+        gives as 400. It writes the exception with `refusal_body(e)` (UI-API.md 1.181): the words as `error`, and the
+        code and names that a coded refusal has beside them; a plain ValueError has none, so its answer is `error`
+        alone, as the program here reads it."""
         src = (HERE / "hub.py").read_text()
         self.assertIn('self.json(404, {"error": "not found"})', src)
         self.assertIn('raise ValueError(f"unknown field {extra[0]}")', src)
-        self.assertIn('return self.json(400, {"error": str(e)})', src)
+        self.assertIn('return self.json(400, refusal_body(e))', src)
+        self.assertEqual(hub.refusal_body(ValueError("unknown field foo")), {"error": "unknown field foo"})
         self.assertTrue(parity_older((404, {}, b'{"error": "not found"}')))
         self.assertTrue(parity_older((400, {}, b'{"error": "unknown field foo"}')))
         self.assertFalse(parity_older((404, {}, b'{"error": "no such attachment"}')))

@@ -655,12 +655,14 @@ site itself.
   and none of the hub's words: only the entry's reference, the hub's status number and the save's
   own `request_id` change in one.
 - **After a save** no agent holds the secret. `grant_access` of a secret writes the grant into
-  the fleet's list with no signature of the owner's, and the central vault seals a copy for an
-  agent only for a grant that the app signs with the owner's own key (`POST /ui/vault/grant`,
-  which is no tool), or for a secret that the owner signed into the grantable pool. A new secret
-  is in no pool, so a grant from the program brings its value to no server, while the list shows
-  the secret as given, and the guide tells the agent not to make one: the owner gives the secret
-  to an agent in the Founderizer app, on Secrets.
+  the fleet's list with no signature of the owner's, and the central vault seals a copy for a
+  server only for a grant that the app signs with the owner's own key for an agent on that server
+  (`POST /ui/vault/grant`, which is no tool), or for a secret that the owner signed into the
+  grantable pool. A new secret is in no pool, no grant of it is signed and no server's vault holds
+  a copy of it, so a grant from the program would bring its value to no server. Since 16 November
+  2026 `grant_access` refuses that give when the hub's reading of the vault shows it, and writes
+  nothing then ("A give of a secret that would reach no server", below), and the guide tells the
+  agent not to try it: the owner gives the secret to an agent in the Founderizer app, on Secrets.
 
 No command lock: the app does the write, as its form does. What any process of the owner's user
 can do with the tool, and what a refusal tells of a file that a caller names:
@@ -748,6 +750,62 @@ of Python's `int()`.
 send nothing and say so in the same words. Before 14 November 2026 this server stopped with an
 error of Python, and the program left such a line out and sent the map without it.
 
+**A give of a secret that would reach no server.** On a fleet with a central vault, a server's
+vault gets a secret only when the owner signed a grant of it for an agent on that server, or signed
+it into the grantable pool (`vault.py` `sealable`), and only the owner's app signs
+(`POST /ui/vault/grant`, which is no tool). `POST /ui/secrets/grant` writes the grant into the
+fleet's list with no signature, so until 16 November 2026 `grant_access` could show a secret as
+given whose value no server would get. Since then both programs read the hub's own reading before
+they give a secret (a `level` that is not null). They refuse only what that reading shows as never
+delivered, and they send each give that it cannot judge. The give is sent when one of these holds,
+in this order, and it is refused otherwise:
+
+1. `GET /ui/vault` cannot judge: the hub has no such page or refuses the read, the answer has
+   another shape than the one that the rule reads, the fleet has no central vault (`central` is
+   null or absent), or the vault has no good reading (`central.ok` is not true, or the page's
+   `error` is set: the hub's newest read of the vault failed, and the page still has the last good
+   `central`, however old).
+2. The reference is in `central.pool`. The team is not read for it.
+3. After the read of `GET /ui/team`:
+   - a. The catalog (`logins` of that page) does not have the secret, or the level does not fit
+     it: it is not `use` or `read`, or it is `read` for an entry whose `kind` is not `api_key`.
+     The hub then answers in its own words ("no such secret", "only an API key can be read", a
+     reference of a wrong form), and the program does not speak of the vault for a secret that
+     does not exist. A page with no `logins` object is sent too.
+   - b. An agent made the secret: `created_logins` of that page names the reference (the agents'
+     `create_login` and `save_key`). Such a value is in the own store of the maker's server, the
+     hub records it in no delivery, and the vault's page does not show it, so the programs do not
+     judge it. A page with no such list is sent too.
+   - c. The lines have no such agent, or the agent has no machine. The program sends the give: the
+     hub refuses an agent that it does not have, and writes the grant for one with no machine. The
+     door is no agent of the lines, so a give to the door is sent as before.
+   - d. The agent is no worker and no lead (the line's `role`): the fleet manager, also when it
+     shares a server with workers. The hub's reconciler counts only what workers and leads hold.
+   - e. The agent's machine is not in `machines` of the vault's page (that list has each machine
+     with a worker or a lead), or its entry there does not take deliveries now: its `missing` is
+     not an empty list. The page adds `not_pinned` and `pin_mismatch` to `missing`, and it counts a
+     copy in `held` only when it was sealed to the machine's pin, so a machine without its pin
+     shows no copy. An entry whose `missing` is no list is another shape of the page: step 1.
+4. `central.grants` has a grant of this reference for this machine, to this agent or to another
+   agent on the same server.
+5. `held` of the vault's page has the reference in the list of this machine: that server's vault
+   holds a copy already, by the hub's own records.
+
+The programs read the vault's page first, and the team only when steps 1 and 2 did not settle the
+give. So a give that is sent makes as few reads as it can: one read on a fleet with no central
+vault and for a secret of the pool, and two for each other give. References are compared in lower
+case, as the vault compares them. An end of a hold (`level` null) makes neither read and is never
+refused. The refusal is one fixed sentence that quotes no reference, no agent's name and no word of
+the hub. It sends the agent to the owner, who gives the secret in the app: the app signs the grant
+and writes it into the list itself, so no second call is needed then. Only for a secret that the
+owner put into the pool a moment ago does it say to call `grant_access` again in a minute: the hub
+reads the vault at least once a minute, and soon after a signed statement. A hub that does not
+answer, and a generation that moved two times, are the program's own errors, as for each of its
+reads; a read of the team that the hub refuses, and lines of another shape, stop the give in the
+words of that read: nothing is sent then. A give that the programs send can still wait for its
+value. This is each program's own check and no gate of the fleet (OWNER-MCP-BOUNDARY.md section 7,
+which also has what this check cannot see).
+
 **What it does as this server does, and what it does besides.**
 
 - The hub's address is the app's own setting (`hubAddress` of `com.founderizer.app`), read only,
@@ -796,7 +854,11 @@ came after that build).
 table, the four reads and the nine writes) runs on one fixed script of arguments against a
 stand-in hub with fixed answers, with more cases for the shared part and the nine: a new
 generation read again once, a 409 with `sha256`, a bad request id and the agent's own, each kind
-of `grant_access`, a profile of no agent, `share_resource` with and without `max`, a file that is
+of `grant_access` and each step of its rule for a give of a secret (with a page of the vault that
+cannot judge, a secret that the catalog does not have or that an agent made, a level that does not
+fit, the manager, a server without its pin, a reference in upper case, a server's name in another
+Unicode form, the door, an end of a hold, and the two reads refused or of another shape), a
+profile of no agent, `share_resource` with and without `max`, a file that is
 not there, a SHA-256 that does not match, a folder as the path, a place that cannot be written, the
 media types, each kind of name of a file from the hub, a read of the team of another shape, a
 combining mark after a colon, Unicode spaces around a name, a name of the hub's that is there
@@ -806,7 +868,9 @@ spaces that `int()` takes, and the routes and fields that the hub does not know.
 `app/Tests/FleetOwnerAPITests/Fixtures/owner-parity.json`: the hub's answers in their order, the
 requests, the result or the refusal's words, every file and folder after the call, the setup's too
 (only the lock and each program's label file in `~/.founderizer` are left out, by their names), and
-how many times the sentence of a hub older than the app must stand. A placeholder stands for each
+how many times the sentence of a hub older than the app must stand (the read of the vault's page
+before a give of a secret does not count: a hub with no such page is no refusal there). A
+placeholder stands for each
 local folder and for the hub's address; both programs run on one fixed clock (the fixture's `now`,
 which the Swift test gives to `OwnerContext.now`), so a fallback name of a copy is compared whole.
 Its class `Parity` fails, with the
@@ -948,7 +1012,7 @@ would read as an empty fleet instead of as a mistake.
 | `check_machine` / `update_machine` | `/ui/machines/<a>/check`, `/update` | Take a reading now; update Fleet when idle. |
 | `check_mcp_server` | `/ui/mcp/check` | Does this MCP server answer? Asked before it is saved, and of a machine for a `command` server. Writes nothing. |
 | `save_mcp_server` | `/ui/team/mcp` | Add one of the owner's own MCP servers, change it, or remove it. An agent loads it only once it also holds `tool:<name>`. |
-| `grant_access` | `/ui/team/repos`, `/ui/team/tools`, `/ui/team/google`, `/ui/secrets/grant` | One agent's hold of one resource, as `<kind>:<what>` and a level. |
+| `grant_access` | `/ui/team/repos`, `/ui/team/tools`, `/ui/team/google`, `/ui/secrets/grant` | One agent's hold of one resource, as `<kind>:<what>` and a level. Before it gives a secret it reads `GET /ui/vault`, and `GET /ui/team` when that page does not settle it: a give that the hub's reading of the central vault shows as one whose value reaches no server is refused ("A give of a secret that would reach no server"). |
 | `share_resource` / `take_resource` | `/ui/resources`, `/ui/resources/take` | The pool's standing; and end one hold. |
 | `save_account` | `/ui/team/accounts` | One runtime account: its provider and the owner's title for it. |
 | `save_login` | `/ui/team/logins` | The owner's title for one vault login, by its `bws://` reference. The label only. For an API key also its `site` and its `form` (the key swap, `VAULT.md`). |
@@ -1179,6 +1243,22 @@ and a tool was taken out of this file's own table, and every check failed naming
 - **`NoSecret`** — no tool takes a secret, the credential-carrying routes are not tools here, a
   registered login in a message is refused and stored nowhere, and the sign-in code is in no row
   and no log line.
+- **`SecretGive`** — a give of a secret, against the hub's own page of the vault, its own team
+  and its own grant ("A give of a secret that would reach no server"). It is sent
+  after one read when the page of the vault cannot judge (no such page, a read that the hub
+  refuses, no central vault, no good reading, a newest read that failed) and for a secret of the
+  pool. It is sent after the read of the team for a secret that the catalog does not have and a
+  level that does not fit (the hub's own words come back), for a secret that an agent made, for an
+  agent that the lines do not have, for the door, for the manager beside a worker, for a server
+  without its pin or with another pin, for a grant signed for another agent of the same machine,
+  and for a copy that the machine's vault holds. It is refused, and the fleet's list does not
+  change, for a grant signed only for another machine, for a copy only in another machine's vault,
+  and for a worker on a server that takes deliveries with nothing signed and no copy. A hub that
+  does not answer the read of the vault, and a generation that moved two times there, send
+  nothing. An end of a hold goes in the refused state with no read, and a give of a repository, a
+  tool and a Google service reads no page of the vault.
+- **`VaultReading`** — the page of the vault is data: each shape that does not say what the rule
+  reads is no reading, and a reference is lowered from A to Z alone.
 - **`Admin`** — the admin actions beside the ones `FromNothing` walks: a profile written as the owner and the
   agent's own notes read but never written; the reporting lines, so a worker reports to a lead; the entries of
   `team.json` (an account, a login's title, how a machine is reached) and one of the owner's own knowledge files

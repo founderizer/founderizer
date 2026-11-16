@@ -755,11 +755,11 @@ def stale(answer):
     return answer.status == 409 and "generation" in (answer.error or "")
 
 
-def get(route, what, transfer=None, **query):
-    """One owner read route, with the generation it asks for. `/ui/state` takes none. The query words are the route's
-    own (`path`, `agent`, `after`, ...), so they are passed in and never named as parameters of this function, except
-    `transfer`, which no route takes: the largest answer of a file route, which then has the time of a file (FILE_WAIT,
-    FILE_TOTAL)."""
+def answered(route, transfer=None, **query):
+    """One owner read route, with the generation it asks for, and its answer whatever its status: a hub with a new
+    generation is read again once. `/ui/state` takes none. The query words are the route's own (`path`, `agent`,
+    `after`, ...), so they are passed in and never named as parameters of this function, except `transfer`, which no
+    route takes: the largest answer of a file route, which then has the time of a file (FILE_WAIT, FILE_TOTAL)."""
     def once():
         q = dict({"db": generation()} if route != "/ui/state" else {},
                  **{k: v for k, v in query.items() if v is not None})
@@ -771,6 +771,12 @@ def get(route, what, transfer=None, **query):
     if stale(answer):
         generation(fresh=True)
         answer = once()
+    return answer
+
+
+def get(route, what, transfer=None, **query):
+    """One owner read route (`answered`), and the hub's own refusal for every answer that is not a 200."""
+    answer = answered(route, transfer, **query)
     if answer.status != 200:
         raise refusal(answer, what)
     return answer
@@ -1186,7 +1192,9 @@ GRANTS = {"repo": "/ui/team/repos", "tool": "/ui/team/tools", "secret": "/ui/sec
 def grant_access(args):
     """One agent's hold of one resource the fleet already has, as the manager's own `grant_access` names it:
     `<kind>:<what>` and a level, or null to end the hold. Each kind is its own owner route, and the three that take
-    a whole map are read from `GET /ui/team` first, so only the named agent moves."""
+    a whole map are read from `GET /ui/team` first, so only the named agent moves. A give of a secret that the hub's
+    reading of the central vault shows as one that brings its value to no server is not sent (`secret_reaches`); an
+    end of a hold always goes, with no read before it."""
     rid, agent, level = args.get("resource"), args.get("agent"), args.get("level")
     kind, _, what = str(rid or "").partition(":")
     if kind == "server":            # DevOps plan C4 and "Yes, by business": the app gives it, and sets up the host
@@ -1199,6 +1207,8 @@ def grant_access(args):
     if not isinstance(agent, str) or not agent:
         raise Refused("agent must be the name of the agent that holds this resource.")
     if kind == "secret":
+        if level is not None and not secret_reaches(what, agent, level):
+            raise Refused(GRANT_NOT_SIGNED)
         return command("/ui/secrets/grant", {"login": what, "agent": agent, "grant": level},
                        f"the grant of {rid} to {agent}", args.get("request_id"))
     lines = team_lines(team())
@@ -1247,6 +1257,127 @@ def team_part(line, key, kind):
     if not isinstance(value, kind):
         raise Refused(TEAM_SHAPE)
     return value
+
+
+# The words when grant_access does not send a give of a secret (`secret_reaches`). One fixed sentence, the same in the
+# program inside the app (`OwnerTools.grantNotSigned`): it quotes no reference, no agent's name and no word of the hub.
+# Its end names only the pool: the app's own give of a secret signs the grant and writes it into the list itself, so a
+# call from here after it would add nothing, and could change the level that the owner chose.
+GRANT_NOT_SIGNED = ("On this fleet the central vault sends a secret's value to a server only for a grant that the "
+                    "owner's app signed for an agent on that server, or for a secret that the owner signed into the "
+                    "grantable pool. By the hub's last reading, this secret is not in the pool, the owner signed no "
+                    "grant of it for this agent's server, and that server's vault holds no copy of it. A grant from "
+                    "here would show the secret as given in the fleet's list and, by that reading, bring its value to "
+                    "no server, so nothing was sent. The owner gives the secret to the agent in the Founderizer app, "
+                    "on Secrets: the app signs the grant and writes it into the list, and nothing more is needed from "
+                    "here then. If the owner put the secret into the grantable pool a moment ago, call grant_access "
+                    "again in a minute: the hub reads the vault at least once a minute.")
+
+
+def lower_reference(text):
+    """A secret's reference in lower case, as the central vault and the hub compare it (vault.py `seal`, hub.py
+    `central_signatures`). A reference is ASCII (`bws://<uuid>`), so only A to Z change: Python's `str.lower()` reads
+    some other letters by the letters around them (a Greek capital sigma at the end of a word), and the program
+    inside the app must lower each text as this server does (`PyText.asciiLower`)."""
+    return "".join(chr(ord(c) + 32) if "A" <= c <= "Z" else c for c in text)
+
+
+def vault_reading(page):
+    """What `secret_reaches` reads of `GET /ui/vault` (hub.py `vault_view`), or None when the answer does not say it:
+    the references that the owner signed into the grantable pool (`central.pool`), each grant that the owner signed
+    as (reference, machine) (`central.grants`), each machine with a worker or a lead and whether it takes deliveries
+    now (`machines`: its `missing` is an empty list; the page adds `not_pinned` and `pin_mismatch` to it), and for
+    each machine the references that its vault holds by the hub's own records (`held`, which counts a copy only when
+    it was sealed to the machine's pin). None for a fleet with no central vault (`central` null or absent), for a
+    vault with no good reading (`central.ok` not true, or the page's `error` is set: the hub's newest read of the
+    vault failed, and the page still has the last good `central`, however old) and for an answer of any other shape
+    than this one. Text of the hub is data: nothing here stops on it."""
+    central = page.get("central") if isinstance(page, dict) else None
+    if not isinstance(central, dict) or central.get("ok") is not True or page.get("error") is not None:
+        return None
+    pool, grants, machines, held = central.get("pool"), central.get("grants"), page.get("machines"), page.get("held")
+    if not (isinstance(pool, list) and all(isinstance(ref, str) for ref in pool)
+            and isinstance(grants, list)
+            and all(isinstance(g, dict) and isinstance(g.get("login"), str) and isinstance(g.get("machine"), str)
+                    for g in grants)
+            and isinstance(machines, list)
+            and all(isinstance(m, dict) and isinstance(m.get("machine"), str) and isinstance(m.get("missing"), list)
+                    for m in machines)
+            and isinstance(held, dict)
+            and all(isinstance(refs, list) and all(isinstance(ref, str) for ref in refs) for refs in held.values())):
+        return None
+    return ([lower_reference(ref) for ref in pool],
+            [(lower_reference(g["login"]), g["machine"]) for g in grants],
+            [(m["machine"], not m["missing"]) for m in machines],
+            {machine: [lower_reference(ref) for ref in refs] for machine, refs in held.items()})
+
+
+def secret_reaches(what, agent, level):
+    """**A give of a secret is sent unless the hub's own reading shows that its value would reach no server.** On a
+    fleet with a central vault, a machine's vault gets a secret only when the owner signed a grant of it for an agent
+    of that machine, or signed it into the grantable pool (vault.py `sealable`, hub.py `central_plan`), and only the
+    owner's app signs. `POST /ui/secrets/grant` writes the grant into the fleet's list with no signature, so until
+    16 November 2026 a give from here could show a secret as given whose value no server would get. This refuses
+    only what the reading shows as never delivered, and it sends each give that it cannot judge. True when the give
+    is sent, which is each of these, in this order:
+
+    1. The hub's page of the vault (`GET /ui/vault`) cannot judge: the hub has no such page or refuses the read, the
+       answer has another shape, the fleet has no central vault, or the vault has no good reading (`vault_reading`).
+    2. The reference is in the grantable pool. No read of the team is made for it.
+    3. After the read of the fleet's list (`GET /ui/team`):
+       a. The catalog (`logins`) does not have the secret, or the level does not fit it: it is not `use` or `read`,
+          or it is `read` for an entry whose `kind` is not `api_key`. The hub then answers in its own words. A page
+          with no `logins` object is sent too.
+       b. An agent made the secret: `created_logins` names it (the agents' `create_login` and `save_key`). Such a
+          value is in the own store of the maker's server, which the page of the vault does not show, so this
+          program does not judge it. A page with no such list is sent too.
+       c. The lines have no such agent, or the agent has no machine. The program sends the give: the hub refuses an
+          agent that it does not have, and writes the grant for one with no machine. The door is no agent of the
+          lines, so a give to it is sent.
+       d. The agent is no worker and no lead (its `role`): the fleet manager, also on a server that it shares with
+          workers. The hub's reconciler counts only what workers and leads hold.
+       e. The agent's machine is not in `machines` of the vault's page, or it does not take deliveries now (it has
+          no pin, or another one): `held` then shows no copy of that machine.
+    4. The owner signed a grant of the secret for an agent of that machine: this agent or another one.
+    5. That machine's vault holds a copy of the secret already, by the hub's own records.
+
+    False for every other give (6): nothing is sent, and `grant_access` says GRANT_NOT_SIGNED.
+
+    The page of the vault is read first, and the team only when the page and the pool did not settle the give, so a
+    give that is sent makes as few reads as it can. The hub reads the vault at least once a minute, and soon after a
+    signed statement (hub.py `central_sweep`: when CENTRAL_READ_EVERY seconds have passed, or at once after
+    `central_due`), so its reading can be that much older than the owner's last signature. A hub that does not
+    answer, and a generation that moved two times, are this program's own errors, as for each of its reads, and
+    lines of the team of another shape are TEAM_SHAPE: nothing is sent then. This is the program's own check and no
+    gate: the hub's route takes a grant from each process of the owner's user, and the vault's own rule is what
+    keeps a value from a server (OWNER-MCP-BOUNDARY.md section 7)."""
+    answer = answered("/ui/vault")
+    if stale(answer):                       # a second new generation: this program's own error, as for any read
+        raise refusal(answer, "a read of the vault")
+    reading = vault_reading(answer.data) if answer.status == 200 else None
+    if reading is None:                     # 1: the reading cannot judge this give
+        return True
+    pool, grants, machines, held = reading
+    ref = lower_reference(what)
+    if ref in pool:                         # 2: the pool needs no machine, so no read of the team
+        return True
+    page = team()
+    catalog = page.get("logins") if isinstance(page, dict) else None
+    entry = catalog.get(ref) if isinstance(catalog, dict) else None
+    if not isinstance(entry, dict) or level not in ("use", "read") or \
+            (level == "read" and entry.get("kind") != "api_key"):      # 3a: the hub answers in its own words
+        return True
+    made = page.get("created_logins")
+    if not isinstance(made, list) or not all(isinstance(one, dict) for one in made) or \
+            any(isinstance(one.get("login"), str) and lower_reference(one["login"]) == ref for one in made):
+        return True                         # 3b: a secret that an agent made is not judged
+    line = next((line for line in team_lines(page) if line["agent"] == agent), None)
+    machine = team_part(line, "machine", str) if line is not None else ""
+    if not machine or line.get("role") not in ("worker", "lead"):      # 3c and 3d
+        return True
+    if not next((takes for name, takes in machines if name == machine), False):    # 3e
+        return True
+    return (ref, machine) in grants or ref in held.get(machine, ())     # 4 and 5, else 6
 
 
 def _one_moved_map(held_now, agent, level):
@@ -2443,7 +2574,13 @@ def tools():
                              "read|write|write_shared, gmail:<email> read|write|send, tool:<name> use. The grant is "
                              "the authorization: the agent then does what that access allows, and the hub records "
                              "who gave what to whom. A repository that the hub's GitHub App does not reach comes back "
-                             "with unreached: the GitHub page where the owner adds it to the App. A server "
+                             "with unreached: the GitHub page where the owner adds it to the App. On a fleet with a "
+                             "central vault, the vault sends a secret's value to an agent's server only when the "
+                             "owner signed the secret into the grantable pool, or signed a grant of it in the app for "
+                             "an agent on that server: a give that the hub's reading of the vault shows as neither, "
+                             "for a server whose vault holds no copy of it, is refused and nothing is sent, and the "
+                             "owner gives that secret in the Founderizer app, on Secrets. A give that the reading "
+                             "cannot judge is sent, and an end of a hold (level null) always goes. A server "
                              "(server:<name> read|fix) is not given here: the owner's app gives each server that "
                              "carries a business's Tailscale tag to that business's DevOps agent (or the manager "
                              "while it has none), because it also puts the host's parts in place.",
