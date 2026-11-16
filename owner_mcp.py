@@ -2383,12 +2383,12 @@ GOOGLE_SERVICES = ("gmail", "drive")
 GOOGLE_NOTICE = {
     "gmail": "Google will ask you to give Founderizer access to the email of one account. Your hub keeps this access on "
              "your server. The agents that you give the account search, read, draft, label, archive, trash and send its "
-             "email, as far as their level allows, and send what they read to the AI provider that they run on. "
-             "Founderizer's servers never receive your email.",
+             "email, as far as their level allows, and send what they read to the AI provider that they run on, and to "
+             "the people and apps that their tasks reach. Founderizer's servers never receive your email.",
     "drive": "Google will ask you to give Founderizer access to the Google Drive of one account. Your hub keeps this "
              "access on your server. The agents that you give the account search, read, make, change, move and trash "
-             "its files, as far as their level allows, and send what they read to the AI provider that they run on. "
-             "Founderizer's servers never receive your files.",
+             "its files, as far as their level allows, and send what they read to the AI provider that they run on, and "
+             "to the people and apps that their tasks reach. Founderizer's servers never receive your files.",
 }
 GOOGLE_WAIT = 600                   # seconds for Google's answer, as the app's listener waits (`GoogleLoopback.code`)
 GOOGLE_CONSENT = "https://accounts.google.com/"
