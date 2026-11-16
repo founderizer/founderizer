@@ -62,6 +62,7 @@ import atrest       # the cipher that seals the hub's Google file at rest (UI-AP
 import google
 import hidden       # hidden characters at the hub's exits (strip_hidden); the helper's hook reads the same rule
 import diagnostics  # the lane "Bug reports": the hub's own faults and refused calls, with no words
+import errorreports  # the lane "Error reports": the day's report of them, while the owner has turned it on
 import mcp
 import oauth_server     # the connected apps' own OAuth server: its pure parts (the MCP address build spec)
 import push
@@ -918,7 +919,8 @@ def kv_get(k, default=None):
 
 
 # Times the hub keeps for itself, which no screen of the owner's shows: their writes are quiet (live_changes).
-QUIET_KEYS = ("tick_ok", "releases_swept", "releases_found", "bridge_seen", "bridge_code")
+QUIET_KEYS = ("tick_ok", "releases_swept", "releases_found", "bridge_seen", "bridge_code",
+              "error_reports_tried", "error_reports_sent", "error_reports_hold", "error_reports_on_at")
 
 
 def kv_set(k, v):
@@ -1702,9 +1704,11 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "need_run",          # the owner, 16 November 2026 ("Yes, as drawn"): Run on the command of a hand
                                     # step, needs[].run_command and run_on, and its answer, POST /ui/needs/<id> ran
                                     # (UI-API.md 1.197)
-               "owner_profile"]     # the owner, 16 November 2026 ("bots should talk in Spanish", "your profile
+               "owner_profile",     # the owner, 16 November 2026 ("bots should talk in Spanish", "your profile
                                     # with the user name"): the settings owner.language and owner.name, which the
                                     # owner's Mac sets from its own language and account (UI-API.md 1.200)
+               "error_reports"]     # the owner, 16 November 2026 ("Yes, as drawn"): Settings › General › Error
+                                    # reports, GET and POST /ui/error-reports, off until he turns it on
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -3503,6 +3507,114 @@ def fault_rows():
     """The stored faults and refused calls of the code that runs now, of the last FAULT_DAYS: a row that no write has
     ended yet is as gone as one that a write ended."""
     return q("SELECT * FROM faults WHERE code=? AND last>=?", (diagnostics.code_id(), now() - FAULT_DAYS * 86400))
+
+
+# ---- the lane "Error reports": the day's report of those faults, while the owner has turned it on
+#
+# The owner, 16 November 2026, to the picture of Settings › General with a section "Error reports" and one switch,
+# "Send to Founderizer's developers", off until he turns it on: "Yes, as drawn" (feedback-diagnostics-plan.md, Phase
+# 3). What goes is errorreports.report: the faults and refused calls of diagnostics.view that came after the report
+# before it and after the owner turned reports on, and the fleet's id, the release's version, the code's id, the
+# system and two counts. Only the owner turns it on: the route is an owner route of the app, and no tool of the
+# owner's MCP server (owner_mcp.NOT_TOOLS) and no fleet tool reaches it.
+_error_report = {"thread": None}        # the one send that may run at a time
+
+
+def error_reports_on():
+    """Off unless the owner turned it on: nothing is stored until then, and "0" is off too."""
+    return kv_get("error_reports") == "1"
+
+
+def set_error_reports(on):
+    """The owner's switch. Turning it on keeps the moment (error_reports_on_at): a report holds only what came after
+    it, as the Mac drops a crash that came while it was off."""
+    if on and not error_reports_on():
+        kv_set("error_reports_on_at", repr(now()))
+    kv_set("error_reports", "1" if on else "0")
+    log("owner", f"error reports are {'on' if on else 'off'}")
+    return {"send": bool(on)}
+
+
+def kv_time(key):
+    """A time that the hub keeps in kv, or None."""
+    try:
+        return float(kv_get(key) or 0) or None
+    except ValueError:
+        return None
+
+
+def running_version():
+    """The version of the release that this checkout runs, from its signed manifest at HEAD of the configuration ref
+    (lifecycle.RELEASE_FILE), else "unknown". Never a commit of the configuration ref: that one is this fleet's own,
+    and it changes with each delivery (the review of 16 November 2026)."""
+    code, out, _ = git_kit("cat-file", "blob", f"HEAD:{errorreports.MANIFEST}")
+    return errorreports.version_of(out) if code == 0 else "unknown"
+
+
+def error_report_body(since):
+    """The day's report (errorreports.report), from the faults of the code that runs now whose last time is after
+    `since`. Under LOCK."""
+    try:
+        rows = fault_rows()
+    except sqlite3.Error:       # a database that refused the table at the start: the facts go alone
+        rows = []
+    view = diagnostics.view(rows, tools={tool[1] for tool in TOOLS})
+    return errorreports.report(fleet_id(), running_version(), errorreports.system_words(), diagnostics.code_id(),
+                               len(TEAM.get("agents") or {}), len(server_names()), view, since)
+
+
+def error_report_sweep(t0):
+    """Once a pass of the tick (under LOCK): when error reports are on and the day's report is due
+    (errorreports.due), start its send in a thread of its own, because a call over the network must not hold the
+    tick. The try is written before anything else, so a step below that raises, or a hub that stops during the send,
+    tries again after errorreports.RETRY and not at each pass. A channel that is not ours holds the reports a DAY."""
+    sent = kv_time("error_reports_sent")
+    if not errorreports.due(error_reports_on(), sent, kv_time("error_reports_tried"), kv_time("error_reports_hold"),
+                            t0):
+        return
+    if _error_report["thread"] is not None and _error_report["thread"].is_alive():
+        return
+    stamp = repr(float(t0))
+    kv_set("error_reports_tried", stamp)
+    try:
+        url = errorreports.endpoint(release_channel())
+    except errorreports.ReportError as e:
+        kv_set("error_reports_hold", repr(t0 + e.retry_after))
+        log("hub", f"the error report did not go: {e}")
+        return
+    # Since the report before it, and never before the owner's yes. A time ahead of t0 (a clock that was ahead) is
+    # none for the report before, and now for the yes: so nothing from before his yes goes, and nothing is lost.
+    on_at = kv_time("error_reports_on_at")
+    body = error_report_body(max(sent if sent and sent <= t0 else 0, min(on_at, t0) if on_at else 0))
+    if body is None:            # a fact out of shape (the fleet's id): nothing goes, and it is tried again later
+        log("hub", "the error report did not go: a fact of this fleet is out of shape")
+        return
+    thread = threading.Thread(target=error_report_send, args=(url, body, stamp), name="error-report", daemon=True)
+    _error_report["thread"] = thread
+    thread.start()
+
+
+def error_report_send(url, body, stamp):
+    """The send of one report, outside LOCK. The switch is read again just before it, so a report that the owner
+    turned off meanwhile does not go. Our side's hold is kept (a 429's Retry-After, a DAY for any other refusal); a
+    report that went marks its day."""
+    with LOCK:
+        if not error_reports_on():
+            return
+    try:
+        errorreports.send(url, body)
+    except errorreports.ReportError as e:
+        with LOCK:
+            if e.retry_after:
+                kv_set("error_reports_hold", repr(now() + e.retry_after))
+            log("hub", f"the error report did not go: {e}")
+        return
+    except Exception:
+        print_fault()
+        return
+    with LOCK:
+        kv_set("error_reports_sent", stamp)
+        log("hub", f"sent the day's error report: {len(body['faults'])} errors, {len(body['refusals'])} refused calls")
 
 
 # ---------------------------------------------------------------- seatbelt
@@ -37659,6 +37771,7 @@ def tick():
         step(report_question_sweep, t0)     # and the questions about a report that waited for one
         step(manager_flag_update, t0)
         step(fault_flush, t0)               # the lane "Bug reports": what diagnostics.py counted in this pass
+        step(error_report_sweep, t0)        # the lane "Error reports": the day's report, while the owner has it on
         step(tick_changes, t0)
         # The last line of the pass, and the only thing that says the pass reached it (tick_heartbeat). It moves
         # unless a step that restarts work raised: the warning it holds up says "no stuck task or session is
@@ -53600,6 +53713,28 @@ class Handler(BaseHTTPRequestHandler):
             answer = {"faults": [], "refusals": []}
         return self.json(200, dict(answer, db=generation), {"Cache-Control": "no-store"})
 
+    def ui_error_reports(self, query):
+        """GET /ui/error-reports?db= (owner feature error_reports, the owner's yes of 16 November 2026): {"send": true}
+        while the owner has turned error reports on, else false. Bound to the generation, as every owner read."""
+        if not self.ui_allowed():
+            return
+        generation = kv_get("db_id")
+        if query.get("db") != generation:
+            return self.json(409, refusal_words.answer("hub_changed"))
+        with LOCK:
+            on = error_reports_on()
+        return self.json(200, {"send": on, "db": generation}, {"Cache-Control": "no-store"})
+
+    def ui_error_reports_set(self):
+        """POST /ui/error-reports {"send": true|false}: the owner's switch of Settings › General › Error reports. Only
+        the owner's app sends it (owner_mcp.NOT_TOOLS); the day's report goes at the tick's next pass when it is due."""
+        def read(data):
+            if not isinstance(data.get("send"), bool):
+                raise ValueError("send must be true or false")
+            return {"send": data["send"]}
+
+        return self.ui_command("error-reports", read, lambda body: set_error_reports(body["send"]))
+
     def ui_wait(self, query):
         """GET /ui/wait?db=&since=&wait= (owner feature live_changes): answers when something the owner sees changed
         since `since`, the token of /ui/state or of an earlier wait, or after `wait` seconds (at most WAIT_MAX) with
@@ -56754,6 +56889,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_health(query)
         if parts == ["ui", "diagnostics"]:
             return self.ui_diagnostics(query)
+        if parts == ["ui", "error-reports"]:                # owner feature error_reports
+            return self.ui_error_reports(query)
         if parts == ["ui", "team"]:
             return self.ui_team(query)
         if parts == ["ui", "capacity"]:
@@ -57414,6 +57551,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_release_auto()
         if parts == ["ui", "releases", "entitlement"]:      # owner feature entitlement
             return self.ui_release_entitlement()
+        if parts == ["ui", "error-reports"]:                # owner feature error_reports
+            return self.ui_error_reports_set()
         if parts == ["ui", "servers", "join"]:
             return self.ui_servers_join()
         if parts == ["ui", "servers", "grant"]:      # DevOps plan C4

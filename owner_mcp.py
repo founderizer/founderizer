@@ -308,6 +308,9 @@ NOT_TOOLS = {
                         "it; connected apps are not in this release",
     "/ui/connect/{}/revoke": "the end of a connected app's connection; connected apps are not in this release",
     "/ui/connect/settings": "connected apps on or off; connected apps are not in this release",
+    "/ui/error-reports": "the owner's consent to send error reports to Founderizer's developers, which only the owner "
+                         "gives, with the switch of Settings › General in the app, and never an agent (the owner's "
+                         "yes of 16 November 2026, feedback-diagnostics-plan.md Phase 3)",
 }
 
 # What this file repeats from the hub because it cannot import it: this server runs on the owner's Mac with the
