@@ -29,6 +29,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+import atrest
 import vault
 from test_vault import FAKE_AGE, LOGIN
 
@@ -436,14 +437,51 @@ class CentralVault(unittest.TestCase):
         self.assertEqual(self.ask("status"), {"ok": True, "v": 2, "central": True, "recipient": CENTRAL_KEY,
                                               "store_recipient": STORE_KEY, "fleet": FLEET, "owner_keys": 3,
                                               "pins": {}, "recovery": None, "grants": [], "pool": [], "items": 1,
-                                              "removes": True, "replaces": True, "key_addresses": True, "values": {},
-                                              "source": None})
+                                              "removes": True, "replaces": True, "key_addresses": True,
+                                              "hub_keys": True, "hub_key_ids": {}, "values": {}, "source": None})
         self.signed("pin", PIN_1, SIG_PIN_1)
         self.signed("recovery", RECOVERY_1, SIG_RECOVERY_1)
         status = self.ask("status")
         self.assertEqual((status["pins"], status["recovery"]), ({"vps": {"recipient": R1, "at": T1}}, RR))
         self.assertNotIn(LOGIN["password"], json.dumps(status))
         self.assertNotIn("example.org", json.dumps(status))             # no title either
+
+    # ---- the key of the hub's Google file (hub_key, UI-API.md 1.202)
+    def test_hub_key_makes_the_key_of_the_hubs_google_file_once_and_gives_it_to_the_hubs_user_alone(self):
+        first = self.ask("hub_key", name="google")
+        self.assertEqual(set(first), {"ok", "key"})
+        self.assertRegex(first["key"], r"^[0-9a-f]{64}$")
+        path = Path(self.conf["state"]).parent / "hub-google.key"
+        self.assertEqual((stat.S_IMODE(path.stat().st_mode), path.read_text()), (0o600, first["key"] + "\n"))
+        self.assertEqual(self.ask("hub_key", name="google"), first)     # made once, never replaced
+        vault.hub_key_make(str(path))           # two requests that make it at once: the link keeps the first key
+        self.assertEqual(path.read_text(), first["key"] + "\n")
+        self.assertEqual([p.name for p in path.parent.iterdir() if p.name.endswith(".new")], [])
+        self.assertEqual(self.logged.count("hub_key: the key of the hub's google file"), 2)
+        for uid in (os.getuid(), HUB_UID + 1, 0):           # the vault's own user, another user, root
+            with self.assertRaises(vault.Refused):
+                self.ask("hub_key", uid=uid, name="google")
+        for name in ("mcp", None, "../google", "GOOGLE", ["google"]):
+            self.assertEqual(self.refused("hub_key", name=name), "name must be one of: google")
+        self.assertIs(self.ask("status")["hub_keys"], True)
+        # The status names the key's id as the hub's atrest.key_id makes it (no key), so a running hub asks again
+        # when the key that it holds is not this one; a key file that cannot be read has no id there.
+        self.assertEqual(self.ask("status")["hub_key_ids"], {"google": atrest.key_id(bytes.fromhex(first["key"]))})
+        # A key file that another user may read, or that holds no key, is refused, and never made again over.
+        path.chmod(0o640)
+        self.assertIn("mode 600", self.refused("hub_key", name="google"))
+        self.assertEqual(self.ask("status")["hub_key_ids"], {})
+        path.chmod(0o600)
+        path.write_text("not a key\n")
+        self.assertEqual(self.refused("hub_key", name="google"), "the vault google key file does not hold one key")
+        self.assertEqual(path.read_text(), "not a key\n")
+        path.write_text(first["key"] + "\n")
+        # It is no value of the owner's: no export carries it.
+        self.intake()
+        self.signed("recovery", RECOVERY_1, SIG_RECOVERY_1)
+        self.assertNotIn(first["key"], json.dumps(self.ask("export")))
+        # A machine's broker serves no hub_key (it is one of the central vault's operations).
+        self.assertIn("hub_key", vault.CENTRAL_OPERATIONS)
 
     # ---- intake
     def test_intake_saves_the_owners_value_under_its_reference(self):

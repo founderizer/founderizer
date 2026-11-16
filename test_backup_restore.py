@@ -123,17 +123,30 @@ class Fixture(OwnerAPI):
                           ("github_app", "github-app.pem"), ("attachment_dir", "attachments")):
             hub.CFG[key] = os.path.join(self.fleet_home, name)
             self.addCleanup(hub.CFG.pop, key, None)
+        # The key of the Google file, outside `~/.fleet` as on a hub machine (UI-API.md 1.202)
+        self.google_key = os.path.join(self.tmp.name, "config-home", "google-file.key")
+        hub.CFG["google_key"] = self.google_key
+        self.addCleanup(hub.CFG.pop, "google_key", None)
+        opened = patch.dict(hub.GOOGLE_OPENED, {"last": None, "key": None, "vault": None, "asked_for": None,
+                                                "said": None, "dropped_for": None})
+        opened.start()
+        self.addCleanup(opened.stop)
 
-    def hub_that_has_been_used(self, google=2, mcp=1, attachments=3):
+    def hub_that_has_been_used(self, google=2, mcp=1, attachments=3, sealed=False):
         """The three sign-ins and the attachments folder that a hub picks up in use, with a marker where each
-        real value would be. Nothing here is in a copy, and these tests are what keeps it that way."""
+        real value would be. Nothing here is in a copy, and these tests are what keeps it that way. sealed: the
+        Google file as a hub of 1.202 and later writes it, sealed with the key of its key file; else as a hub from
+        before wrote it, in the plain form."""
         if google:
             accounts = {f"owner{n}@example.com": {"refresh_token": MARKERS["google_refresh"] + str(n),
                                                   "scopes": ["https://www.googleapis.com/auth/drive"]}
                         for n in range(google)}
-            self.write_hub_file("google.json", json.dumps(
-                {"client_id": "9.apps.googleusercontent.com", "client_secret": MARKERS["google_secret"],
-                 "accounts": accounts}))
+            saved = {"client_id": "9.apps.googleusercontent.com", "client_secret": MARKERS["google_secret"],
+                     "accounts": accounts}
+            if sealed:
+                hub.google_store(saved)
+            else:
+                self.write_hub_file("google.json", json.dumps(saved))
         if mcp:
             servers = {f"crm{n}": {"token_endpoint": "https://crm.example.com/token", "client_id": "fleet",
                                    "client_secret": MARKERS["mcp_secret"],
@@ -334,6 +347,45 @@ class HubOnly(Fixture):
         for name in members:
             self.assertTrue(name in ("fleet.json", "RESTORE.md", hub.BACKUP_DB) or name.startswith("config/"),
                             f"{name} is in this copy and is not the records or a file of the owner's")
+
+    def test_a_sealed_google_file_is_counted_and_neither_its_key_nor_its_tokens_reach_the_copy(self):
+        """Since 1.202 the Google file is sealed, and its key is in a file of its own outside `~/.fleet`. The copy
+        counts the accounts as before, through the hub's own reader, and carries neither the key nor anything that
+        the file holds: a copy and a key would open the file of a disk that somebody kept."""
+        self.work()
+        self.hub_that_has_been_used(google=2, mcp=0, attachments=0, sealed=True)
+        with open(os.path.join(self.fleet_home, "google.json"), "rb") as f:
+            self.assertNotIn(MARKERS["google_refresh"].encode(), f.read())
+        self.assertEqual(self.manifest()["hub_only"]["google"],
+                         {"present": True, "accounts": 2, "client": True, "sealed": True, "vault": False})
+        notes = self.notes()
+        self.assertIn("the 2 Google accounts you connected", notes)
+        self.assertIn("It is sealed with the key in `~/.config/founderizer/google-file.key` on the same machine, which "
+                      "this copy does not hold either: the file is of no use without it.", " ".join(notes.split()))
+        with open(self.google_key, encoding="ascii") as f:
+            key = f.read().strip()
+        data = self.download()[2]
+        zf = zipfile.ZipFile(io.BytesIO(data))
+        for body in [data] + [zf.read(name) for name in zf.namelist()]:
+            for value in (key, key.upper(), MARKERS["google_refresh"], MARKERS["google_secret"]):
+                self.assertNotIn(value.encode(), body)
+            self.assertNotIn(bytes.fromhex(key), body)
+        # A copy taken while the key cannot be read counts the file as there, and claims no number.
+        os.chmod(self.google_key, 0o644)
+        hub.GOOGLE_OPENED.update(last=None, key=None)
+        self.assertEqual(self.manifest()["hub_only"]["google"], {"present": True, "sealed": True, "vault": False})
+        self.assertIn("holds the Google accounts you connected.", self.notes())
+        # Sealed with the central vault's key: the copy says that the vault keeps it, and a plain file has no key.
+        os.chmod(self.google_key, 0o600)
+        hub.GOOGLE_OPENED["vault"] = bytes(32)
+        hub.google_store(hub.google_saved()[0])
+        self.assertEqual(self.manifest()["hub_only"]["google"],
+                         {"present": True, "accounts": 2, "client": True, "sealed": True, "vault": True})
+        self.assertIn("It is sealed with a key that the hub's central vault keeps, which this copy does not hold "
+                      "either: the file is of no use without it.", " ".join(self.notes().split()))
+        self.hub_that_has_been_used(google=2, mcp=0, attachments=0)         # plain, as a hub from before wrote it
+        self.assertNotIn("sealed", self.manifest()["hub_only"]["google"])
+        self.assertNotIn("It is sealed", self.notes())
 
     def test_the_copy_tells_him_what_stops_working_and_what_to_go_and_find(self):
         """The whole point of the manifest's counts: the file says what *this* hub had, what each loss costs

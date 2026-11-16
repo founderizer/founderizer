@@ -9,9 +9,13 @@ import io
 import json
 import os
 from pathlib import Path
+import ast
 import re
 import shutil
+import socket
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -22,10 +26,13 @@ import urllib.parse
 import urllib.request
 import uuid
 
+import atrest
 import google
 import hub
+import refusal_words
 from test_integrations import git
 from test_login_cuts import across, assert_no_part, register
+from leftovers import parent_pipe
 from test_ui_api import OwnerAPI
 
 TEAM = {"hub": {"machine": "hub", "port": 8765},
@@ -53,6 +60,72 @@ DRIVE_TOOLS["write_shared"] = DRIVE_TOOLS["write"]
 GMAIL_TOOLS = {"read": {"gmail_search", "gmail_read"}, "write": {"gmail_search", "gmail_read", "gmail_draft", "gmail_label"}}
 GMAIL_TOOLS["send"] = GMAIL_TOOLS["write"] | {"gmail_send"}
 ALL_TOOLS = set(hub.GOOGLE_TOOLS)
+
+
+class SealAtStart(unittest.TestCase):
+    """UI-API.md 1.202: an updated hub seals the plain Google file of before at its start, before it answers. A real
+    hub process, because the step is main()'s, with a home of its own: never the machine's ~/.fleet or ~/.config."""
+
+    def test_an_updated_hub_seals_its_plain_file_at_its_start_before_it_answers(self):
+        root = Path(tempfile.mkdtemp(prefix="fleet-google-start-"))
+        self.addCleanup(shutil.rmtree, str(root), ignore_errors=True)
+        (root / "team.json").write_text(json.dumps(TEAM, indent=2))
+        fleet = root / ".fleet"
+        fleet.mkdir(mode=0o700)
+        plain = {"clients": {APP_ID: APP_SECRET}, "accounts": {EMAIL: {
+            "refresh_token": REFRESH, "connected_at": 1760600000, "scopes": SCOPES, "client_id": APP_ID}}}
+        (fleet / "google.json").write_text(json.dumps(plain) + "\n")
+        os.chmod(fleet / "google.json", 0o600)
+        (fleet / ".google.cut.tmp").write_text(json.dumps(plain))       # a write of a hub from before that a stop cut
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        out = open(root / "out.txt", "w+")
+        self.addCleanup(out.close)
+        pipe, fds = parent_pipe(root)
+        started = subprocess.Popen([sys.executable, str(Path(__file__).resolve().parent / "hub.py"),
+                                    "--host", "127.0.0.1", "--port", str(port), "--db", str(root / "hub.db"),
+                                    "--team", str(root / "team.json"), "--tick", "60", "--parent-pipe", str(pipe)],
+                                   pass_fds=fds, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                   env=dict(os.environ, HOME=str(root)))
+        self.addCleanup(started.wait)
+        self.addCleanup(started.terminate)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        for _ in range(150):
+            self.assertIsNone(started.poll(), f"the hub did not start: {(root / 'out.txt').read_text()}")
+            try:
+                with opener.open(f"http://127.0.0.1:{port}/health", timeout=5) as answer:
+                    self.assertEqual(answer.status, 200)
+                break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            self.fail(f"the hub never answered /health: {(root / 'out.txt').read_text()}")
+        raw = (fleet / "google.json").read_bytes()
+        for value in (REFRESH, APP_SECRET, EMAIL):
+            self.assertNotIn(value.encode(), raw)
+        self.assertFalse((fleet / ".google.cut.tmp").exists())
+        key_file = root / ".config" / "founderizer" / "google-file.key"
+        self.assertEqual((stat.S_IMODE(os.lstat(key_file).st_mode), stat.S_IMODE(os.lstat(key_file.parent).st_mode),
+                          stat.S_IMODE(os.lstat(fleet / "google.json").st_mode)), (0o600, 0o700, 0o600))
+        envelope = json.loads(raw)
+        key = bytes.fromhex(key_file.read_text().strip())
+        aad = f"founderizer google.json\x001\x00file\x00{envelope['key_id']}".encode()
+        self.assertEqual(json.loads(atrest.decrypt(key, base64.b64decode(envelope["data"]), aad)), plain)
+
+    def test_main_seals_before_the_timers_and_the_server_start(self):
+        """The order of main()'s steps: the seal before the first thread that can read the file and the server."""
+        with open(Path(__file__).resolve().parent / "hub.py", encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        lines = [ast.unparse(statement) for statement in main.body]
+        # its own order: test_the_start_reads_the_vaults_status_...; in a try, so that a fault of it stops no start
+        seal = next(i for i, line in enumerate(lines) if "google_start()" in line)
+        self.assertEqual(lines[seal], "try:\n    google_start()\nexcept Exception:\n    print_fault()")
+        first_thread = next(i for i, line in enumerate(lines) if line.startswith("threading.Thread(target=timers"))
+        server = next(i for i, line in enumerate(lines) if "HubServer(" in line)
+        self.assertLess(seal, first_thread)
+        self.assertLess(seal, server)
 
 
 class Err(google.GoogleError):
@@ -235,9 +308,15 @@ class GoogleHub(OwnerAPI):
         hub._revision_cache.update(at=0.0, value=None)
         hub.TEAM = json.loads(json.dumps(TEAM))
         self.file = self.root / "fleet" / "google.json"         # never the real ~/.fleet
-        for key, value in (("team_path", str(self.root / "kit" / "team.json")), ("google_file", str(self.file))):
+        self.key_file = self.root / "config" / "google-file.key"     # nor the real ~/.config/founderizer
+        for key, value in (("team_path", str(self.root / "kit" / "team.json")), ("google_file", str(self.file)),
+                           ("google_key", str(self.key_file))):
             hub.CFG[key] = value
             self.addCleanup(hub.CFG.pop, key, None)
+        opened = patch.dict(hub.GOOGLE_OPENED, {"last": None, "key": None, "vault": None, "asked_for": None,
+                                                "said": None, "dropped_for": None})
+        opened.start()
+        self.addCleanup(opened.stop)
         self.fake = FakeGoogle()
         for p in (patch.object(hub.Handler, "allowed", lambda handler, who, broker=False: True),
                   patch.object(hub, "google", self.fake),
@@ -249,6 +328,18 @@ class GoogleHub(OwnerAPI):
         self.answers = []
 
     # ---- helpers
+    def opened(self, raw=None):
+        """What the Google file holds (or the bytes `raw` of one): its sealed text opened with the test's key file,
+        with the cipher and the form of UI-API.md 1.202 and none of hub.py's readers, so that a reader that went
+        wrong is seen here."""
+        envelope = json.loads(self.file.read_bytes() if raw is None else raw)
+        self.assertEqual({k: envelope[k] for k in ("sealed", "v", "key", "accounts")},
+                         {"sealed": "chacha20-poly1305", "v": 1, "key": "file", "accounts": None})
+        key = bytes.fromhex(self.key_file.read_text().strip())
+        self.assertEqual(envelope["key_id"], atrest.key_id(key))
+        aad = f"founderizer google.json\x001\x00file\x00{envelope['key_id']}".encode()
+        return json.loads(atrest.decrypt(key, base64.b64decode(envelope["data"]), aad))
+
     def sha(self):
         return self.request("/ui/team?db=test-generation")[1]["sha256"]
 
@@ -273,7 +364,7 @@ class GoogleHub(OwnerAPI):
     def connected(self, scopes=SCOPES, email=EMAIL, refresh=REFRESH, connected_at=1760600000, client_id=None):
         """One more connected account in the Google file. Without client_id, as a hub from before 1.185 wrote it:
         an own client at the top, which made the entry. With client_id, as a finish writes it now."""
-        saved = json.loads(self.file.read_text()) if self.file.exists() else {"client_id": CLIENT_ID,
+        saved = self.opened() if self.file.exists() else {"client_id": CLIENT_ID,
                                                                               "client_secret": CLIENT_SECRET}
         saved.setdefault("accounts", {})[email] = dict(
             {"refresh_token": refresh, "connected_at": connected_at, "scopes": scopes},
@@ -550,7 +641,7 @@ class GoogleHub(OwnerAPI):
         self.assertIn(("account_email", (ACCESS + "first",)), self.fake.calls)
         st = os.lstat(self.file)
         self.assertEqual((stat.S_IMODE(st.st_mode), stat.S_IMODE(os.lstat(self.file.parent).st_mode)), (0o600, 0o700))
-        saved = json.loads(self.file.read_text())
+        saved = self.opened()
         # A new hub's file: the account and the client that made its token, no client of its own at the top, and the
         # secret of Founderizer's app that founderizer.com gave (no public code holds it), read once.
         self.assertEqual(saved, {"clients": {APP_ID: APP_SECRET},
@@ -581,7 +672,7 @@ class GoogleHub(OwnerAPI):
         code, start = self.begin()
         code, data = self.finish(start["state"])
         self.assertEqual((code, data["email"], data["replaced"]), (200, EMAIL2, False))
-        saved = json.loads(self.file.read_text())
+        saved = self.opened()
         self.assertEqual(saved, {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
                                  "clients": {APP_ID: APP_SECRET}, "accounts": {
             EMAIL: old, EMAIL2: {"refresh_token": REFRESH2, "scopes": SCOPES, "client_id": APP_ID,
@@ -596,7 +687,7 @@ class GoogleHub(OwnerAPI):
         code, start = self.begin(account=EMAIL)
         code, data = self.finish(start["state"])
         self.assertEqual((code, data["replaced"]), (200, True))
-        entry = json.loads(self.file.read_text())["accounts"][EMAIL]
+        entry = self.opened()["accounts"][EMAIL]
         self.assertEqual((entry["refresh_token"], entry["client_id"]), (REFRESH + "x", APP_ID))
         self.assertNotIn("revoke", self.fake.names())
         # A release with no client: the own client connects, and its secret keeps its fingerprint as before.
@@ -604,7 +695,7 @@ class GoogleHub(OwnerAPI):
         code, start = self.begin()
         self.assertEqual(self.finish(start["state"])[0], 200)
         self.assertIn(("exchange", (CLIENT_ID, CLIENT_SECRET, CODE, "v" * 64, REDIRECT)), self.fake.calls)
-        self.assertEqual(json.loads(self.file.read_text())["accounts"]["third@example.com"]["client_id"], CLIENT_ID)
+        self.assertEqual(self.opened()["accounts"]["third@example.com"]["client_id"], CLIENT_ID)
         self.assertTrue(hub.secret_hit(CLIENT_SECRET))
         # The secret of Founderizer's app: from the hub's file after a restart, and from founderizer.com again only
         # when the file has none; a Connect that cannot read it starts nothing.
@@ -616,7 +707,7 @@ class GoogleHub(OwnerAPI):
         self.assertEqual(self.finish(start["state"])[0], 200)
         self.assertEqual(self.fake.names().count("client_secret"), fetched)          # the file's own copy
         self.assertEqual(self.fake.calls[-2], ("exchange", (APP_ID, APP_SECRET, CODE, "v" * 64, REDIRECT)))
-        saved = json.loads(self.file.read_text())
+        saved = self.opened()
         hub.google_store(dict({k: v for k, v in saved.items() if k != "clients"}))    # a file with no secret
         hub.GOOGLE["secrets"].clear()                               # and a restart
         hub.GOOGLE["read_at"].clear()
@@ -656,6 +747,596 @@ class GoogleHub(OwnerAPI):
                        {"state": 7, "code": CODE}):
             self.assertEqual(self.owner("/ui/google/finish", **fields)[0], 400, fields)
 
+    # ---- the sealed file (UI-API.md 1.202)
+    def restart(self):
+        """What a restart of the hub forgets: the file that it read last, the key that it held, and the central
+        vault's key."""
+        hub.GOOGLE_OPENED.update(last=None, key=None, vault=None, asked_for=None, said=None, dropped_for=None)
+
+    def vault(self, key=None, hub_keys=True):
+        """A central vault that the hub's status read took as this fleet's: with hub_keys, a program that serves
+        hub_key, which gives `key`. Returns (key, the operations that the hub asked)."""
+        key = key or atrest.new_key()
+        asked = []
+
+        def call(op, fields=None):
+            asked.append(op)
+            if op != "hub_key":
+                raise hub.Refusal(409, "the central vault refused: unknown operation")
+            self.assertEqual(fields, {"name": "google"})
+            return {"ok": True, "key": key.hex()}
+        status = {"central": True, "hub_keys": True, "hub_key_ids": {"google": atrest.key_id(key)}} if hub_keys \
+            else {"central": True}
+        for p in (patch.object(hub, "central_call", side_effect=call),
+                  patch.dict(hub.CENTRAL, {"status": status, "read_at": hub.now(), "error": None})):
+            p.start()
+            self.addCleanup(p.stop)
+        return key, asked
+
+    def holder(self):
+        envelope = json.loads(self.file.read_bytes())
+        return envelope["key"], envelope["key_id"]
+
+    def test_with_a_central_vault_the_file_moves_to_its_key_and_the_key_file_goes(self):
+        """The owner's choice of 16 November 2026 ("Vault (recommended)"): on a hub whose central vault serves
+        hub_key, the vault keeps the key, and the hub's own key file serves only until then."""
+        self.connected(client_id=APP_ID)
+        self.assertEqual(self.holder()[0], "file")
+        key, asked = self.vault()
+        # A move whose write fails keeps the key file, which still opens the file, and says why once.
+        before = self.file.read_bytes()
+        with patch.object(hub, "google_store", side_effect=OSError(28, "No space left on device")):
+            self.assertFalse(hub.google_vault_turn())
+            self.assertFalse(hub.google_vault_turn())
+        self.assertTrue(self.key_file.exists())
+        self.assertEqual(self.file.read_bytes(), before)
+        said = "could not seal the Google file with the central vault's key: No space left on device"
+        self.assertEqual([r["what"] for r in hub.q("SELECT what FROM log WHERE what=?", (said,))], [said])
+        self.assertTrue(hub.google_vault_turn())
+        self.assertEqual(self.holder(), ("vault", atrest.key_id(key)))
+        self.assertFalse(self.key_file.exists())                    # it opens nothing any more
+        self.assertEqual(set(hub.google_saved()[0]["accounts"]), {EMAIL})
+        logged = [r["what"] for r in hub.q("SELECT what FROM log ORDER BY id")]
+        self.assertIn("sealed the Google file with the central vault's key (UI-API.md 1.202)", logged)
+        self.assertIn("removed its own key file of the Google file: the central vault keeps the key", logged)
+        self.assertFalse(hub.google_vault_turn())                   # moved: the pass ends at once
+        self.assertEqual(asked, ["hub_key"])
+        # A restart: until the vault gives its key again, the file waits (google_file_key), and nothing is written.
+        sealed = self.file.read_bytes()
+        self.restart()
+        unread = refusal_words.words("google_file_key")
+        self.assertEqual(hub.google_saved(), ({}, unread))
+        self.assertEqual(self.request("/ui/team?db=test-generation")[1]["google"]["problem"], unread)
+        self.assertIsNone(hub.google_seal_plain())
+        self.assertEqual(self.file.read_bytes(), sealed)
+        hub.GOOGLE["pending"] = {"state": "s" * 43, "verifier": "v" * 64, "redirect_uri": REDIRECT, "kind": "founderizer",
+                                 "client": {"client_id": APP_ID, "client_secret": APP_SECRET}, "service": None,
+                                 "expires_at": hub.now() + 600}
+        with patch.dict(hub.CENTRAL, {"status": None}):          # the vault does not answer now
+            for code, data in (self.begin(), self.finish("s" * 43), self.owner("/ui/google/disconnect", account=EMAIL)):
+                self.assertEqual((code, data.get("code")), (409, "google_file_key"), data)
+        self.assertEqual((self.file.read_bytes(), sorted(os.listdir(self.file.parent))), (sealed, ["google.json"]))
+        self.assertNotIn("exchange", self.fake.names())
+        self.assertFalse(hub.google_vault_turn())   # its thread asks, and the file opens again with nothing written
+        self.assertEqual(set(hub.google_saved()[0]["accounts"]), {EMAIL})
+        self.assertFalse(self.key_file.exists())
+        # A Connect seals with the vault's key, and makes no key file.
+        self.fake.email, self.fake.refresh_token = EMAIL2, REFRESH2
+        code, start = self.begin()
+        self.assertEqual(code, 200, start)
+        self.assertEqual(self.finish(start["state"])[0], 200)
+        self.assertEqual(self.holder(), ("vault", atrest.key_id(key)))
+        self.assertFalse(self.key_file.exists())
+        self.assertEqual(set(hub.google_saved()[0]["accounts"]), {EMAIL, EMAIL2})
+        # A Disconnect after a restart asks the vault first (google_vault_ask): the file opens, and its write seals
+        # with the vault's key.
+        self.restart()
+        code, data = self.owner("/ui/google/disconnect", account=EMAIL2)
+        self.assertEqual((code, data.get("connected")), (200, False), data)
+        self.assertEqual(self.holder(), ("vault", atrest.key_id(key)))
+        self.assertEqual(set(hub.google_saved()[0]["accounts"]), {EMAIL})
+        self.assertFalse(self.key_file.exists())
+
+    def test_a_running_hub_follows_a_new_key_of_the_vault_and_asks_a_refusing_vault_once_a_minute(self):
+        """The vault's status names the id of the key that it keeps (hub_key_ids): a running hub that holds another
+        key asks again, and seals the file, which it still opens with the old key, with the new one; so a restart
+        then opens it. A vault that refuses is asked once for each status that the hub reads, not at each tick."""
+        self.connected(client_id=APP_ID)
+        old, _ = self.vault()
+        self.assertTrue(hub.google_vault_turn())
+        self.assertEqual(self.holder(), ("vault", atrest.key_id(old)))
+        new, asked = self.vault()                               # its key file was made again: the status names it
+        self.assertTrue(hub.google_vault_turn())
+        self.assertEqual((asked, self.holder()), (["hub_key"], ("vault", atrest.key_id(new))))
+        self.restart()
+        hub.GOOGLE_OPENED["vault"] = new
+        self.assertEqual(set(hub.google_saved()[0]["accounts"]), {EMAIL})
+        # A status that names the key that the hub holds: nothing is asked.
+        self.assertFalse(hub.google_vault_turn())
+        self.assertEqual(asked, ["hub_key"])
+        # A vault whose key file cannot be read names no id, and refuses: one ask, then none for a minute.
+        hub.CENTRAL["status"] = {"central": True, "hub_keys": True, "hub_key_ids": {}}
+        refusing = []
+        with patch.object(hub, "central_call", side_effect=lambda op, fields=None: refusing.append(op) or (_ for _ in ()).throw(
+                hub.Refusal(409, "the central vault refused: the vault google key file must belong to the vault user "
+                                 "and have mode 600"))):
+            for _ in range(3):
+                self.assertFalse(hub.google_vault_turn())
+            self.assertEqual(refusing, ["hub_key"])
+            hub.CENTRAL["read_at"] += 60                       # the next read of the vault's status
+            self.assertFalse(hub.google_vault_turn())
+            self.assertEqual(refusing, ["hub_key", "hub_key"])
+        self.assertEqual(self.holder(), ("vault", atrest.key_id(new)))     # the file stays as the vault's key sealed it
+
+    def test_the_start_reads_the_vaults_status_and_seals_a_plain_file_with_its_key(self):
+        """google_start, main()'s step: the vault's status first (a vault of another fleet is not asked), then its key,
+        then the seal of a plain file with that key, and no key file of the hub's own."""
+        old = {"accounts": {EMAIL: {"refresh_token": REFRESH, "connected_at": 1760600000, "scopes": SCOPES}}}
+        self.file.parent.mkdir(mode=0o700)
+        self.file.write_text(json.dumps(old))
+        os.chmod(self.file, 0o600)
+        key = atrest.new_key()
+        asked = []
+        fleet = None
+
+        def call(op, fields=None):
+            asked.append(op)
+            if op == "status":
+                return {"ok": True, "central": True, "pins": {}, "fleet": fleet, "hub_keys": True,
+                        "hub_key_ids": {"google": atrest.key_id(key)}}
+            return {"ok": True, "key": key.hex()}
+        for fleet in ("0" * 16, hub.fleet_id()):            # another fleet's vault, then this fleet's
+            with self.subTest(fleet=fleet), patch.object(hub, "central_call", side_effect=call), \
+                    patch.dict(hub.CENTRAL, dict(hub.CENTRAL_START)):
+                del asked[:]
+                self.restart()
+                sealed = hub.google_start()
+                if fleet != hub.fleet_id():
+                    self.assertEqual((asked, sealed, self.holder()[0]), (["status"], True, "file"))
+                    self.file.write_text(json.dumps(old))       # plain again, for this fleet's vault
+                    self.key_file.unlink()
+                else:
+                    self.assertEqual((asked, sealed), (["status", "hub_key"], True))
+                    self.assertEqual(self.holder(), ("vault", atrest.key_id(key)))
+                    self.assertFalse(self.key_file.exists())
+        self.assertEqual(hub.google_saved()[0], old)
+
+    def test_a_write_keeps_the_key_file_until_the_file_that_the_vaults_key_sealed_is_on_the_disk(self):
+        """google_store's order: the key file goes only after the new file is in place and its folder synced, also at
+        the central vault's pass; a fetch that brings another key of the vault during a write leaves the file for that
+        pass; and a reader that took the bytes of a file that a move sealed again meanwhile reads the new file."""
+        self.connected(client_id=APP_ID)                        # sealed with the hub's own key file
+        before = self.file.read_bytes()
+        key, _ = self.vault()
+        hub.GOOGLE_OPENED["vault"] = key
+        with patch.object(hub.os, "replace", side_effect=OSError(28, "No space left on device")):
+            with self.assertRaises(OSError):
+                hub.google_store(self.opened())
+        self.assertTrue(self.key_file.exists())                 # the file that it still opens keeps its key
+        self.assertEqual(self.file.read_bytes(), before)
+        with patch.object(hub, "google_folder_sync", side_effect=OSError(5, "Input/output error")):
+            hub.google_store(self.opened())                     # in place, but its folder is not synced
+            self.assertEqual((self.holder()[0], self.key_file.exists()), ("vault", True))
+            self.assertFalse(hub.google_vault_turn())           # nor at the central vault's next pass
+        self.assertTrue(self.key_file.exists())
+        self.assertFalse(hub.google_vault_turn())               # tried again at the next status read, not before
+        self.assertTrue(self.key_file.exists())
+        hub.CENTRAL["read_at"] += 60
+        self.assertFalse(hub.google_vault_turn())               # a pass whose sync works removes it
+        self.assertFalse(self.key_file.exists())
+        with patch.object(hub, "google_read", wraps=hub.google_read) as read:
+            self.assertFalse(hub.google_vault_turn())           # and then ends at once, with no read of the file
+        self.assertEqual(read.call_count, 0)
+        # A key file that will not go is said once, and tried again once for each status read, not at each pass.
+        self.key_file.write_text(atrest.new_key().hex() + "\n")
+        os.chmod(self.key_file, 0o600)
+        with patch.object(hub, "google_key_remove", side_effect=PermissionError(1, "Operation not permitted")), \
+                patch.object(hub, "google_read", wraps=hub.google_read) as read:
+            for _ in range(3):
+                self.assertFalse(hub.google_vault_turn())
+            self.assertEqual(read.call_count, 1)
+            hub.CENTRAL["read_at"] += 60                       # the next status read
+            self.assertFalse(hub.google_vault_turn())
+            self.assertEqual(read.call_count, 2)
+        said = "could not remove its own key file of the Google file: Operation not permitted"
+        self.assertEqual([r["what"] for r in hub.q("SELECT what FROM log WHERE what=?", (said,))], [said])
+        hub.CENTRAL["read_at"] += 60
+        self.assertFalse(hub.google_vault_turn())
+        self.assertFalse(self.key_file.exists())
+        self.assertIsNone(hub.GOOGLE_OPENED["said"])            # a removal that worked: the same reason is said again
+        self.assertIn("could not sync the folder of the Google file: Input/output error",
+                      [r["what"] for r in hub.q("SELECT what FROM log")])
+        # A fetch outside LOCK that brings another key while a write seals with the old one: the file keeps the old
+        # key, and the central vault's next pass seals it with the new one.
+        new, real = atrest.new_key(), atrest.encrypt
+
+        def during(*args, **kwargs):
+            hub.GOOGLE_OPENED.update(vault=new)
+            return real(*args, **kwargs)
+        with patch.object(atrest, "encrypt", side_effect=during):
+            hub.google_store(hub.google_saved()[0])
+        self.assertEqual(self.holder()[1], atrest.key_id(key))
+        _, asked = self.vault(key=new)
+        hub.GOOGLE_OPENED["vault"] = new
+        self.assertTrue(hub.google_vault_turn())                # the central vault's thread seals it with the new key
+        self.assertEqual(self.holder(), ("vault", atrest.key_id(new)))
+        # A reader that took the bytes of the file of before: its key is gone, and the read takes the new file.
+        old_bytes, new_bytes = before, self.file.read_bytes()
+        self.file.write_bytes(old_bytes)
+        self.restart()
+        hub.GOOGLE_OPENED["vault"] = new
+        real_opened = hub.google_opened
+
+        def racing(raw, envelope):
+            if raw == old_bytes:
+                self.file.write_bytes(new_bytes)                # the move lands between the two reads
+            return real_opened(raw, envelope)
+        with patch.object(hub, "google_opened", side_effect=racing):
+            self.assertEqual(set(hub.google_saved()[0]["accounts"]), {EMAIL})
+
+    def test_the_vault_is_asked_only_by_a_fresh_status_and_its_answer_must_be_a_key(self):
+        self.connected(client_id=APP_ID)
+        key, asked = self.vault()
+        hub.CENTRAL["read_at"] = hub.now() - hub.CENTRAL_FRESH - 1     # a status read that is too old
+        self.assertFalse(hub.google_vault_turn())
+        self.assertEqual((asked, hub.GOOGLE_OPENED["vault"]), ([], None))
+        for answer in ({"ok": True, "key": "ab" * 31}, {"ok": True, "key": key.hex().upper()}, {"ok": True}):
+            with self.subTest(answer=answer), patch.object(hub, "central_call", return_value=answer):
+                self.assertIsNone(hub.google_vault_fetch())
+                self.assertIsNone(hub.GOOGLE_OPENED["vault"])
+        # A status whose hub_key_ids is not an object, and a start whose read of the vault faults, stop nothing.
+        hub.CENTRAL.update(status={"central": True, "hub_keys": True, "hub_key_ids": ["google"]}, read_at=hub.now())
+        self.assertTrue(hub.google_vault_due(hub.CENTRAL["status"]))
+        with patch.object(hub, "central_read", side_effect=RuntimeError("a fault of the read")), \
+                patch.object(hub, "print_fault") as fault:
+            self.assertIsNone(hub.google_start())
+        self.assertEqual(fault.call_count, 1)
+        # A start that cannot read the vault asks the timer for a read at its next tick.
+        with patch.object(hub, "central_call", side_effect=hub.Refusal(503, "no central vault answers on this hub")), \
+                patch.dict(hub.CENTRAL, dict(hub.CENTRAL_START)):
+            hub.google_start()
+            self.assertTrue(hub.CENTRAL["due"])
+
+    def test_a_connect_asks_the_vault_first_and_makes_no_key_file(self):
+        # A Connect before the hub's first read of the vault's status makes a key file; its finish, after that read,
+        # seals with the vault's key, and that key file goes with the write.
+        code, start = self.begin()
+        self.assertEqual(code, 200, start)
+        self.assertTrue(self.key_file.exists())
+        key, asked = self.vault()
+        self.assertEqual(self.finish(start["state"])[0], 200)
+        self.assertEqual(self.holder(), ("vault", atrest.key_id(key)))
+        self.assertFalse(self.key_file.exists())
+        self.file.unlink()                  # and a hub that starts with no file: its Connect asks the vault first
+        self.restart()
+        del asked[:]
+        code, start = self.begin()
+        self.assertEqual(code, 200, start)
+        self.assertEqual(self.finish(start["state"])[0], 200)
+        self.assertEqual((self.holder(), asked), (("vault", atrest.key_id(key)), ["hub_key"]))
+        self.assertFalse(self.key_file.exists())
+        self.assertEqual(set(hub.google_saved()[0]["accounts"]), {EMAIL})
+
+    def test_a_vault_that_gives_another_key_lost_the_file_and_an_older_vault_leaves_the_key_file(self):
+        self.connected(client_id=APP_ID)
+        before = self.file.read_bytes()
+        _, asked = self.vault(hub_keys=False)                       # a program from before hub_key
+        self.assertFalse(hub.google_vault_turn())
+        self.assertEqual((asked, self.holder()[0], self.key_file.exists()), ([], "file", True))
+        hub.CENTRAL.update(status=None)                             # no central vault answers at all
+        self.assertFalse(hub.google_vault_turn())
+        self.assertEqual(self.file.read_bytes(), before)
+        # The vault's key moves the file; then a vault whose key file was made again gives another key.
+        key, _ = self.vault()
+        self.assertTrue(hub.google_vault_turn())
+        self.restart()
+        other, _ = self.vault(key=atrest.new_key())
+        self.assertFalse(hub.google_vault_turn())
+        self.assertEqual(hub.google_saved(), ({}, hub.GOOGLE_LOST))
+
+    def test_the_file_is_sealed_with_a_key_that_is_not_beside_it(self):
+        code, start = self.begin()
+        code, data = self.finish(start["state"])
+        self.assertEqual(code, 200, data)
+        raw = self.file.read_bytes()
+        for value in (REFRESH, APP_SECRET, EMAIL, "refresh_token", "clients", "connected_at"):
+            self.assertNotIn(value.encode(), raw)               # nothing of the account is in the file's bytes
+        envelope = json.loads(raw)
+        self.assertEqual(sorted(envelope), ["accounts", "data", "key", "key_id", "sealed", "v"])
+        # What a hub from before 1.202 does with it (its google_saved): a file that it cannot use, so it writes
+        # nothing over it, and never a file with no account.
+        self.assertFalse(isinstance(envelope.get("accounts", {}), dict))
+        # The hub's own key file is outside the folder of its Google file, and outside ~/.fleet.
+        self.assertNotEqual(os.path.dirname(hub.GOOGLE_KEY_FILE), os.path.dirname(hub.GOOGLE_FILE))
+        self.assertFalse(hub.GOOGLE_KEY_FILE.startswith(os.path.dirname(hub.GOOGLE_FILE) + os.sep))
+        self.assertEqual((stat.S_IMODE(os.lstat(self.key_file).st_mode),
+                          stat.S_IMODE(os.lstat(self.key_file.parent).st_mode)), (0o600, 0o700))
+        self.assertRegex(self.key_file.read_text(), r"^[0-9a-f]{64}\n$")
+        self.assertEqual(os.listdir(self.key_file.parent), ["google-file.key"])     # no temporary file is left
+        self.assertEqual(self.opened()["accounts"][EMAIL]["refresh_token"], REFRESH)
+        # A write keeps the key and draws a new nonce; a restart reads the file with the key file alone.
+        key = self.key_file.read_bytes()
+        hub.google_store(self.opened())
+        self.assertEqual(self.key_file.read_bytes(), key)
+        self.assertNotEqual(self.file.read_bytes(), raw)
+        self.restart()
+        self.assertEqual(hub.google_saved(), (self.opened(), None))
+        self.assertEqual(hub.google_read()[2], "sealed")
+        # The header is in the tag: a file whose header names another key, another form or another holder is not read
+        unreadable, waits = refusal_words.words("google_file_unreadable"), refusal_words.words("google_file_key")
+        for change, problem in (({"key_id": "0" * 16}, hub.GOOGLE_LOST), ({"v": 2}, unreadable),
+                                ({"sealed": "aes"}, unreadable), ({"key": "nowhere"}, unreadable),
+                                ({"data": "not base64!"}, unreadable),
+                                ({"key": "vault"}, waits)):     # the central vault has given no key to this process
+            with self.subTest(change=change):
+                self.file.write_text(json.dumps(dict(json.loads(raw), **change)))
+                self.restart()
+                self.assertEqual(hub.google_saved()[1], problem)
+        # A header that names the vault, with the vault's key in memory: the tag covers the holder, so it is lost.
+        self.file.write_text(json.dumps(dict(json.loads(raw), key="vault", key_id=atrest.key_id(b"v" * 32))))
+        self.restart()
+        hub.GOOGLE_OPENED["vault"] = b"v" * 32
+        self.assertEqual(hub.google_saved()[1], hub.GOOGLE_LOST)
+        hub.GOOGLE_OPENED["vault"] = None
+        self.file.write_bytes(raw)
+
+    def test_the_cipher_runs_once_for_each_new_file(self):
+        # A file that changed on the disk is read again, with no restart: the memory holds the bytes that it opened.
+        self.connected(client_id=APP_ID)
+        newer = self.file.read_bytes()
+        hub.google_store({"accounts": {}})
+        self.assertEqual(hub.google_saved()[0], {"accounts": {}})
+        self.file.write_bytes(newer)
+        self.assertIn(EMAIL, hub.google_saved()[0]["accounts"])
+        with patch.object(atrest, "decrypt", wraps=atrest.decrypt) as decrypt:
+            for _ in range(3):
+                self.assertIn(EMAIL, hub.google_saved()[0]["accounts"])
+            self.assertEqual(decrypt.call_count, 0)             # the write left what it wrote in memory
+            self.restart()
+            for _ in range(3):
+                saved = hub.google_saved()[0]
+                saved["accounts"].clear()                       # a caller that changes what it got changes no copy
+            self.assertEqual(decrypt.call_count, 1)
+            self.assertIn(EMAIL, hub.google_saved()[0]["accounts"])
+
+    def test_a_plain_file_of_a_hub_from_before_is_read_and_sealed_at_the_start(self):
+        old = {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "clients": {APP_ID: APP_SECRET},
+               "accounts": {EMAIL: {"refresh_token": REFRESH, "connected_at": 1760600000, "scopes": SCOPES}}}
+        self.file.parent.mkdir(mode=0o700)
+        self.file.write_text(json.dumps(old) + "\n")
+        os.chmod(self.file, 0o600)
+        self.assertEqual(hub.google_read(), (old, None, "plain"))     # read as it is, until it is sealed
+        self.assertFalse(self.key_file.exists())
+        self.assertTrue(hub.google_seal_plain())
+        self.assertNotIn(REFRESH.encode(), self.file.read_bytes())
+        self.assertEqual(self.opened(), old)
+        self.restart()
+        self.assertEqual(hub.google_read(), (old, None, "sealed"))
+        self.assertIsNone(hub.google_seal_plain())                     # nothing is left to seal
+        self.assertEqual(hub.q1("SELECT what FROM log ORDER BY id DESC")["what"],
+                         "sealed the Google file with the key of its own key file (UI-API.md 1.202)")
+        # A plain file that cannot be sealed now stays plain and readable, and the next start tries again.
+        self.file.write_text(json.dumps(old) + "\n")
+        self.key_file.unlink()
+        with patch.object(hub, "google_key_make", side_effect=OSError(28, "No space left on device")):
+            self.assertIs(hub.google_seal_plain(), False)
+        self.assertEqual(json.loads(self.file.read_text()), old)
+        self.assertEqual(hub.google_saved(), (old, None))
+        self.assertIn("could not seal the Google file: the key of the Google file cannot be used (No space left on "
+                      "device). It stays as it was",
+                      hub.q1("SELECT what FROM log ORDER BY id DESC")["what"])
+        self.assertTrue(hub.google_seal_plain())
+        self.assertEqual(self.opened(), old)
+        # No file, and a file that the hub cannot use, are left as they are.
+        os.chmod(self.file, 0o644)
+        self.assertIsNone(hub.google_seal_plain())
+        self.file.unlink()
+        self.assertIsNone(hub.google_seal_plain())
+        self.assertFalse(self.file.exists())
+
+    def test_a_key_file_is_made_once_and_never_replaced(self):
+        first = hub.google_key_make()
+        self.assertEqual(hub.google_key_make(), first)          # a second make keeps the first key
+        self.assertEqual(hub.google_key_read(), first)
+        self.assertEqual(os.listdir(self.key_file.parent), ["google-file.key"])
+        hub.google_store({"accounts": {}})
+        sealed = self.file.read_bytes()
+        for text in ("not a key\n", "ab" * 31 + "\n", "ab" * 33 + "\n"):
+            with self.subTest(text=text):
+                self.key_file.write_text(text)
+                with self.assertRaises(OSError):
+                    hub.google_key_read()
+                with self.assertRaises(OSError):                # a write makes no key over one it cannot read
+                    hub.google_store({"accounts": {}})
+                self.assertEqual((self.key_file.read_text(), self.file.read_bytes()), (text, sealed))
+        self.key_file.write_text(first.hex() + "\n")
+        os.chmod(self.key_file, 0o640)
+        with self.assertRaises(OSError):                        # the group may read it: not the key file
+            hub.google_key_read()
+        os.chmod(self.key_file, 0o600)
+        self.key_file.rename(self.root / "elsewhere.key")
+        os.symlink(self.root / "elsewhere.key", self.key_file)
+        with self.assertRaises(OSError):                        # a link in its place is not followed
+            hub.google_key_read()
+
+    def test_a_key_that_cannot_be_read_now_stops_and_loses_nothing(self):
+        self.connected(client_id=APP_ID)
+        self.give(gmail="read")
+        self.assertEqual(self.begin()[0], 200)
+        pending = dict(hub.GOOGLE["pending"])
+        before = self.file.read_bytes()
+        self.restart()
+        os.chmod(self.key_file, 0o644)                          # not mode 600: the hub does not read it
+        unread = refusal_words.words("google_file_key")
+        self.assertEqual(hub.google_saved(), ({}, unread))
+        self.assertEqual(self.request("/ui/team?db=test-generation")[1]["google"]["problem"], unread)
+        code, data = self.begin()
+        self.assertEqual((code, data.get("code")), (409, "google_file_key"), data)
+        code, data = self.owner("/ui/google/disconnect", account=EMAIL)
+        self.assertEqual((code, data.get("code")), (409, "google_file_key"), data)
+        hub.GOOGLE["pending"] = dict(pending)                  # a Connect that started before the key went bad
+        code, data = self.finish(pending["state"])
+        self.assertEqual((code, data.get("code")), (409, "google_file_key"), data)
+        self.assertNotIn("exchange", self.fake.names())
+        self.work = self.task()
+        self.assertEqual(self.refused("gmail_search", {"query": "x"}), hub.GOOGLE_NO_CLIENT)
+        self.assertEqual(self.file.read_bytes(), before)
+        self.assertFalse([p for p in self.file.parent.iterdir() if p.name != "google.json"])
+        os.chmod(self.key_file, 0o600)                          # put right: everything is there again
+        self.assertEqual(set(hub.google_saved()[0]["accounts"]), {EMAIL})
+
+    def test_a_file_that_its_key_no_longer_opens_goes_aside_at_the_next_connect(self):
+        self.connected(client_id=APP_ID)
+        self.give(gmail="read")
+        sealed = self.file.read_bytes()
+        self.key_file.unlink()                                  # the key file is gone, and so is the key
+        self.restart()
+        self.assertEqual(hub.google_saved(), ({}, hub.GOOGLE_LOST))
+        self.assertEqual(self.request("/ui/team?db=test-generation")[1]["google"]["problem"], hub.GOOGLE_LOST)
+        self.work = self.task()
+        self.assertEqual(self.refused("gmail_search", {"query": "x"}), hub.GOOGLE_NO_CLIENT)
+        code, data = self.owner("/ui/google/disconnect", account=EMAIL)
+        self.assertEqual((code, data.get("code")), (409, "google_file_lost"), data)
+        self.assertNotIn("revoke", self.fake.names())
+        # A Connect works: the old file goes aside whole, and the new one holds this account alone.
+        self.fake.email, self.fake.refresh_token = EMAIL2, REFRESH2
+        code, start = self.begin()
+        self.assertEqual(code, 200, start)
+        code, data = self.finish(start["state"])
+        self.assertEqual((code, data["email"]), (200, EMAIL2), data)
+        aside = [p for p in self.file.parent.iterdir() if p.name.startswith("google.json.lost-")]
+        self.assertEqual(len(aside), 1)
+        self.assertEqual(aside[0].read_bytes(), sealed)
+        self.assertEqual(stat.S_IMODE(os.lstat(aside[0]).st_mode), 0o600)
+        self.assertEqual(set(self.opened()["accounts"]), {EMAIL2})
+        self.opened_bytes = self.file.read_bytes()
+        self.assertIn("went aside as google.json.lost-", hub.q1(
+            "SELECT what FROM log WHERE what LIKE '%went aside%' ORDER BY id DESC")["what"])
+        # A second loss in the same second keeps the first copy: each copy has a name of its own.
+        with patch.object(hub, "now", lambda: 1760600000.0):
+            first = hub.google_set_aside()
+            self.file.write_bytes(sealed)
+            os.chmod(self.file, 0o600)
+            second = hub.google_set_aside()
+        self.assertNotEqual(first, second)
+        self.assertEqual([Path(first).read_bytes(), Path(second).read_bytes()], [self.opened_bytes, sealed])
+        Path(first).rename(self.file)
+        # A key that goes bad between the finish's exchange and its write: 409, and the lost file stays where it is.
+        lost_again, kept_key = self.file.read_bytes(), self.key_file.read_text()
+        self.key_file.write_text(atrest.new_key().hex() + "\n")       # another key: the file is lost again
+        self.restart()
+        unread = refusal_words.words("google_file_key")
+        # Connect checks the key twice (before Google and in its own write), the finish before its exchange: a key;
+        # the finish at its write: none.
+        with patch.object(hub, "google_key_ready", side_effect=[None, None, None, unread]):
+            code, start = self.begin()
+            self.assertEqual(code, 200, start)
+            code, data = self.finish(start["state"])
+        self.assertEqual((code, data.get("code")), (409, "google_file_key"), data)
+        self.assertEqual(self.file.read_bytes(), lost_again)
+        self.assertEqual(len([p for p in self.file.parent.iterdir() if p.name.startswith("google.json.lost-")]), 2)
+        self.key_file.write_text(kept_key)
+        self.restart()
+        # A key file with another key, and a changed byte, leave a file lost in the same way.
+        good = self.file.read_bytes()
+        key = self.key_file.read_text()
+        self.key_file.write_text(atrest.new_key().hex() + "\n")
+        self.restart()
+        self.assertEqual(hub.google_saved()[1], hub.GOOGLE_LOST)
+        self.key_file.write_text(key)
+        envelope = json.loads(good)
+        blob = bytearray(base64.b64decode(envelope["data"]))
+        blob[20] ^= 1
+        self.file.write_text(json.dumps(dict(envelope, data=base64.b64encode(bytes(blob)).decode())))
+        self.restart()
+        self.assertEqual(hub.google_saved()[1], hub.GOOGLE_LOST)
+        self.file.write_bytes(good)
+        self.restart()
+        self.assertEqual(set(hub.google_saved()[0]["accounts"]), {EMAIL2})
+
+    def test_a_key_that_goes_bad_while_the_hub_runs_stops_each_step_before_it_leaves_the_hub(self):
+        """The hub opens its file with the key that it holds in memory, so a key file that goes bad while it runs is
+        found by the check of each step that writes (google_key_ready): before the owner signs in at Google, before
+        the finish's exchange, and before a Disconnect's revoke. The tools go on with the key in memory."""
+        self.connected(client_id=APP_ID)
+        self.give(gmail="read")
+        self.work = self.task()
+        code, pending = self.begin()
+        self.assertEqual(code, 200, pending)
+        before = self.file.read_bytes()
+        os.chmod(self.key_file, 0o644)                          # no restart: the hub holds the key in memory
+        unread = refusal_words.words("google_file_key")
+        self.assertEqual(self.request("/ui/team?db=test-generation")[1]["google"]["problem"], unread)
+        self.ok("gmail_search", {"query": "x"})                # the tools go on with the key in memory
+        calls = len(self.fake.calls)
+        code, data = self.begin()
+        self.assertEqual((code, data.get("code")), (409, "google_file_key"), data)
+        code, data = self.finish(pending["state"])
+        self.assertEqual((code, data.get("code")), (409, "google_file_key"), data)
+        code, data = self.owner("/ui/google/disconnect", account=EMAIL)
+        self.assertEqual((code, data.get("code")), (409, "google_file_key"), data)
+        self.assertEqual([c for c in self.fake.calls[calls:] if c[0] in ("consent_url", "exchange", "revoke")], [])
+        self.assertEqual(self.file.read_bytes(), before)
+        os.chmod(self.key_file, 0o600)
+        self.assertIsNone(self.request("/ui/team?db=test-generation")[1]["google"]["problem"])
+        # A key that goes in the moment between the check and the write: a 409 with its code, and nothing written.
+        with patch.object(hub, "google_store", side_effect=hub.GoogleKeyError("the key went")):
+            code, data = self.owner("/ui/google/disconnect", account=EMAIL)
+            self.assertEqual((code, data.get("code")), (409, "google_file_key"), data)
+            code, start = self.begin()
+            code, data = self.finish(start["state"])
+            self.assertEqual((code, data.get("code")), (409, "google_file_key"), data)
+        self.assertEqual(set(self.opened()["accounts"]), {EMAIL})
+
+    def test_a_key_folder_that_is_a_link_to_nothing_is_away_and_not_lost(self):
+        """A key that can come back (a volume that is not mounted yet) is google_file_key: no Connect sets the file
+        aside for it. Only a key file that is gone from a folder that is there is a lost key."""
+        self.connected(client_id=APP_ID)
+        before = self.file.read_bytes()
+        self.key_file.parent.rename(self.root / "volume")
+        os.symlink(self.root / "not-mounted", self.key_file.parent)
+        self.restart()
+        self.assertEqual(hub.google_saved()[1], refusal_words.words("google_file_key"))
+        code, data = self.begin()
+        self.assertEqual((code, data.get("code")), (409, "google_file_key"), data)
+        self.assertEqual(sorted(os.listdir(self.file.parent)), ["google.json"])      # nothing went aside
+        self.assertEqual(self.file.read_bytes(), before)
+        os.remove(self.key_file.parent)
+        (self.root / "volume").rename(self.key_file.parent)     # the volume is back
+        self.assertEqual(set(hub.google_saved()[0]["accounts"]), {EMAIL})
+        # A pipe in the key file's place stops nothing: the read does not wait for a writer.
+        self.key_file.unlink()
+        os.mkfifo(self.key_file, 0o600)
+        done = []
+        reader = threading.Thread(target=lambda: done.append(self.assertRaises(OSError, hub.google_key_read)),
+                                  daemon=True)
+        reader.start()
+        reader.join(10)
+        self.assertEqual(len(done), 1, "the read of the key file waited for a writer of a pipe")
+
+    def test_the_start_removes_what_a_stopped_write_left_and_syncs_to_the_disk_itself(self):
+        self.connected(client_id=APP_ID)
+        left = [self.file.parent / ".google.abc123.tmp", self.key_file.parent / ".google-file.0f0f.tmp"]
+        for path in left:
+            path.write_text('{"accounts": {"owner@example.com": {"refresh_token": "1//plain"}}}')
+        kept = self.file.parent / "google.json.lost-1-abcdef01"     # a copy that a Connect set aside stays
+        kept.write_bytes(self.file.read_bytes())
+        with patch.object(hub, "central_call", side_effect=hub.Refusal(503, "no central vault answers on this hub")), \
+                patch.dict(hub.CENTRAL, dict(hub.CENTRAL_START)):
+            self.assertIsNone(hub.google_start())                  # nothing to seal, and the two are gone
+        self.assertEqual([path.exists() for path in left], [False, False])
+        self.assertTrue(kept.exists())
+        # On a Mac, F_FULLFSYNC for the key, the file and their folders (fsync there stops at the drive's cache).
+        full = getattr(hub.fcntl, "F_FULLFSYNC", None)
+        if full is None:
+            self.skipTest("this system has no F_FULLFSYNC")
+        asked = []
+        with patch.object(hub.fcntl, "fcntl", side_effect=lambda fd, op, *a: asked.append(op)):
+            self.key_file.unlink()
+            self.restart()
+            hub.google_store({"accounts": {}})
+        self.assertGreaterEqual(asked.count(full), 4)               # the key, its folder, the file and its folder
+
     def test_an_account_that_moves_from_an_own_client_keeps_its_other_service(self):
         """Google adds what an account granted before only inside one project, and Founderizer's app is a project of
         its own: a Connect of one service asks for every service that an own client's account has (the one that it
@@ -667,7 +1348,7 @@ class GoogleHub(OwnerAPI):
         code, data = self.finish(start["state"])
         self.assertEqual((code, data["replaced"], data["scopes"], data["dropped"]),
                          (200, True, ["drive", "gmail.modify"], []))
-        self.assertEqual(json.loads(self.file.read_text())["accounts"][EMAIL]["client_id"], APP_ID)
+        self.assertEqual(self.opened()["accounts"][EMAIL]["client_id"], APP_ID)
         # Inside Founderizer's project Google keeps the other service: one service is asked for, as before.
         code, start = self.begin(account=EMAIL, service="drive")
         self.assertEqual(self.fake.calls[-1][1][5], ("https://www.googleapis.com/auth/drive",))
@@ -719,7 +1400,7 @@ class GoogleHub(OwnerAPI):
         code, start = self.begin(service="gmail")
         code, data = self.finish(start["state"])
         self.assertEqual((code, data["scopes"]), (200, ["gmail.modify"]))
-        self.assertEqual(json.loads(self.file.read_text())["accounts"][EMAIL]["scopes"], [SCOPES[1]])
+        self.assertEqual(self.opened()["accounts"][EMAIL]["scopes"], [SCOPES[1]])
         code, start = self.begin(service="drive")                  # Drive here too: the entry keeps its Gmail
         code, data = self.finish(start["state"])
         self.assertEqual((code, data["scopes"], data["dropped"]), (200, ["drive", "gmail.modify"], []))
@@ -738,7 +1419,7 @@ class GoogleHub(OwnerAPI):
         refused = Err("Google answered 401: invalid_client", 401, "invalid_client")
         self.connected()                                            # the own client's account
         self.connected(email=EMAIL2, refresh=REFRESH2, client_id=APP_ID)
-        hub.google_store(dict(json.loads(self.file.read_text()), clients={APP_ID: APP_SECRET}))
+        hub.google_store(dict(self.opened(), clients={APP_ID: APP_SECRET}))
         self.give(drive="read", gmail=(EMAIL2, "read"))
         self.work = self.task()
 
@@ -754,7 +1435,7 @@ class GoogleHub(OwnerAPI):
         self.assertEqual([c for c in self.fake.calls if c[0] in ("refresh", "client_secret")],
                          [("refresh", (APP_ID, APP_SECRET, REFRESH2)), ("client_secret", ()),
                           ("refresh", (APP_ID, new, REFRESH2))])
-        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: new})
+        self.assertEqual(self.opened()["clients"], {APP_ID: new})
         self.assertTrue(hub.secret_hit(new))
         # Within a minute of that read, a refusal reads nothing.
         hub.GOOGLE["tokens"].clear()
@@ -776,14 +1457,14 @@ class GoogleHub(OwnerAPI):
         self.assertIn("(invalid_client)", self.refused("gmail_search", {"query": "x"}))
         del self.fake.during["refresh"]
         self.fake.fail.pop("refresh", None)
-        self.assertEqual((json.loads(self.file.read_text())["clients"], hub.GOOGLE["secrets"][APP_ID]),
+        self.assertEqual((self.opened()["clients"], hub.GOOGLE["secrets"][APP_ID]),
                          ({APP_ID: new}, new))
         self.assertFalse(hub.secret_hit("GOCSPX-founderizer-wrong-01234567"))
         # The site cannot answer: the same.
         later()
         self.fake.fail.update(refresh=refused, client_secret=Err("founderizer.com cannot be reached now"))
         self.assertIn("(invalid_client)", self.refused("gmail_search", {"query": "x"}))
-        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: new})
+        self.assertEqual(self.opened()["clients"], {APP_ID: new})
         later()                                                     # the own client's secret is the owner's
         before = reads()
         self.fake.fail["refresh"] = refused
@@ -798,7 +1479,7 @@ class GoogleHub(OwnerAPI):
         code, data = self.finish(start["state"])
         self.assertEqual(code, 200, data)
         self.assertEqual([c[1][1] for c in self.fake.calls if c[0] == "exchange"], [new, newer])
-        self.assertEqual((json.loads(self.file.read_text())["clients"], hub.GOOGLE["secrets"][APP_ID]),
+        self.assertEqual((self.opened()["clients"], hub.GOOGLE["secrets"][APP_ID]),
                          ({APP_ID: newer}, newer))
         before = self.file.read_bytes()                             # the same one again: nothing is written
         later()
@@ -820,9 +1501,9 @@ class GoogleHub(OwnerAPI):
         del self.fake.during["exchange"]
         self.fake.fail.pop("exchange", None)
         self.assertEqual((code, data.get("error")), (502, "Google refused: invalid_grant. Start Connect again."))
-        saved = json.loads(self.file.read_text())
+        saved = self.opened()
         self.assertEqual((saved["clients"], hub.GOOGLE["secrets"][APP_ID]), ({APP_ID: newest}, newest))
-        self.assertEqual(saved["accounts"], json.loads(before)["accounts"])
+        self.assertEqual(saved["accounts"], self.opened(before)["accounts"])
         # The same when the second exchange works and the email read then fails.
         later()
         latest = "GOCSPX-" "founderizer-latest-0123456789"       # in two parts: no line has a key's whole shape
@@ -832,9 +1513,9 @@ class GoogleHub(OwnerAPI):
         code, data = self.finish(start["state"])
         self.assertEqual((code, data.get("error")),
                          (502, "Google refused: Google cannot be reached now. Start Connect again."))
-        saved = json.loads(self.file.read_text())
+        saved = self.opened()
         self.assertEqual((saved["clients"], hub.GOOGLE["secrets"][APP_ID]), ({APP_ID: latest}, latest))
-        self.assertEqual(saved["accounts"], json.loads(before)["accounts"])
+        self.assertEqual(saved["accounts"], self.opened(before)["accounts"])
         # An own client's Connect (a release with no client): its refusal at the exchange reads nothing.
         later()
         self.fake.CLIENT = None
@@ -872,7 +1553,7 @@ class GoogleHub(OwnerAPI):
         self.assertEqual(code, 200, data)
         self.assertEqual([c[1][1] for c in self.fake.calls if c[0] == "exchange"], [new])
         self.assertEqual(self.fake.names().count("client_secret"), reads)
-        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: new})
+        self.assertEqual(self.opened()["clients"], {APP_ID: new})
         # A call takes newer while the finish runs, and its file cannot keep it: the finish writes newer, with its
         # fingerprint, and not the new that it used.
         code, start = self.begin()
@@ -888,7 +1569,7 @@ class GoogleHub(OwnerAPI):
         self.fake.email, self.fake.refresh_token = EMAIL2, REFRESH2
         code, data = self.finish(start["state"])
         self.assertEqual(code, 200, data)
-        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: newer})
+        self.assertEqual(self.opened()["clients"], {APP_ID: newer})
         self.assertTrue(hub.secret_hit(newer))
         # A refresh that started with newer, refused while another call took a newer one: it goes on with the
         # hub's, and reads nothing.
@@ -968,7 +1649,7 @@ class GoogleHub(OwnerAPI):
         the site's last answer too, also when the call that read it could not try it (no answer from Google)."""
         new, newer = "GOCSPX-founderizer-new-0123456789", "GOCSPX-founderizer-newer-012345678"
         self.connected(email=EMAIL2, refresh=REFRESH2, client_id=APP_ID)
-        hub.google_store(dict(json.loads(self.file.read_text()), clients={APP_ID: APP_SECRET}))
+        hub.google_store(dict(self.opened(), clients={APP_ID: APP_SECRET}))
         self.give(gmail=(EMAIL2, "read"))
         self.work = self.task()
         real_refresh, off, lost = self.fake.refresh, {APP_SECRET}, []
@@ -992,7 +1673,7 @@ class GoogleHub(OwnerAPI):
             thread.join(10)
         self.assertFalse(second["error"], second["text"])
         self.assertEqual(self.fake.names().count("client_secret"), 1)
-        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: new})
+        self.assertEqual(self.opened()["clients"], {APP_ID: new})
         # Once more, and the call that reads the site gets no answer when it tries the new one.
         off.add(new)
         hub.GOOGLE["tokens"].clear()
@@ -1000,10 +1681,10 @@ class GoogleHub(OwnerAPI):
         self.fake.site_secret = newer
         lost.append(newer)
         self.assertIn("Google gave no access now", self.refused("gmail_search", {"query": "x"}))
-        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: new})
+        self.assertEqual(self.opened()["clients"], {APP_ID: new})
         self.ok("gmail_search", {"query": "x"})                     # within the minute: the site's last answer
         self.assertEqual(self.fake.names().count("client_secret"), 2)
-        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: newer})
+        self.assertEqual(self.opened()["clients"], {APP_ID: newer})
         # A wrong answer of the site, which Google refuses too, is not tried again within the minute.
         wrong = "GOCSPX-founderizer-wrong-01234567"
         off.update({newer, wrong})
@@ -1035,7 +1716,7 @@ class GoogleHub(OwnerAPI):
         self.assertEqual(second["text"], hub.GOOGLE_NO_SITE)
         self.assertEqual(self.fake.names().count("client_secret"), 1)
         newer, logged, real_log = "GOCSPX-founderizer-newer-012345678", [], hub.log
-        hub.google_store(dict(json.loads(self.file.read_text()), clients={APP_ID: APP_SECRET}))
+        hub.google_store(dict(self.opened(), clients={APP_ID: APP_SECRET}))
         hub.GOOGLE["read_at"].clear()
 
         def log(agent, what):
@@ -1058,7 +1739,7 @@ class GoogleHub(OwnerAPI):
         """A refresh that runs while a Disconnect of its account revokes it: its call goes on with what it got, but the
         hub keeps no access token that the revoke can have ended."""
         self.connected(email=EMAIL2, refresh=REFRESH2, client_id=APP_ID)
-        hub.google_store(dict(json.loads(self.file.read_text()), clients={APP_ID: APP_SECRET}))
+        hub.google_store(dict(self.opened(), clients={APP_ID: APP_SECRET}))
         self.give(gmail=(EMAIL2, "read"))
         self.work = self.task()
 
@@ -1075,7 +1756,7 @@ class GoogleHub(OwnerAPI):
         the newer one is offered. A read that raises an error of another kind: that error, not one of the hub's own."""
         newer = "GOCSPX-founderizer-newer-012345678"
         self.connected(email=EMAIL2, refresh=REFRESH2, client_id=APP_ID)
-        hub.google_store(dict(json.loads(self.file.read_text()), clients={APP_ID: APP_SECRET}))
+        hub.google_store(dict(self.opened(), clients={APP_ID: APP_SECRET}))
         refused = {"client_id": APP_ID, "client_secret": APP_SECRET}
 
         def meanwhile():
@@ -1085,7 +1766,7 @@ class GoogleHub(OwnerAPI):
         self.assertEqual(hub.google_secret_again(refused), {"client_id": APP_ID, "client_secret": newer})
         hub.GOOGLE["read_at"].clear()
         hub.GOOGLE["secrets"].clear()
-        hub.google_store(dict(json.loads(self.file.read_text()), clients={APP_ID: APP_SECRET}))
+        hub.google_store(dict(self.opened(), clients={APP_ID: APP_SECRET}))
         self.fake.fail["client_secret"] = ValueError("an answer that no rule of google.py knows")
         with self.assertRaises(ValueError):
             hub.google_secret_again(refused)
@@ -1094,7 +1775,7 @@ class GoogleHub(OwnerAPI):
         """A refresh that starts while a Disconnect of its account runs (its revoke out, its write not done yet) and
         ends after it: the hub keeps no access token, as that revoke can have ended it."""
         self.connected(email=EMAIL2, refresh=REFRESH2, client_id=APP_ID)
-        hub.google_store(dict(json.loads(self.file.read_text()), clients={APP_ID: APP_SECRET}))
+        hub.google_store(dict(self.opened(), clients={APP_ID: APP_SECRET}))
         self.give(gmail=(EMAIL2, "read"))
         self.work = self.task()
         refreshing, done, call = threading.Event(), threading.Event(), {}
@@ -1130,7 +1811,7 @@ class GoogleHub(OwnerAPI):
         does not count for the new entry, the call says to try again, and the next call works. While a Disconnect runs:
         the call says that the account is not connected, and no problem stays on it."""
         self.connected(email=EMAIL2, refresh=REFRESH2, client_id=APP_ID)
-        hub.google_store(dict(json.loads(self.file.read_text()), clients={APP_ID: APP_SECRET}))
+        hub.google_store(dict(self.opened(), clients={APP_ID: APP_SECRET}))
         self.give(gmail=(EMAIL2, "read"))
         self.work = self.task()
         fresh, grant = "1//0fresh-token-0123456789abcdefghijklmn", Err("Google answered 400: invalid_grant", 400,
@@ -1183,7 +1864,7 @@ class GoogleHub(OwnerAPI):
         secret from memory until a restart, with no refusal and no read of the site at each refresh."""
         new = "GOCSPX-founderizer-new-0123456789"
         self.connected(email=EMAIL2, refresh=REFRESH2, client_id=APP_ID)
-        hub.google_store(dict(json.loads(self.file.read_text()), clients={APP_ID: APP_SECRET}))
+        hub.google_store(dict(self.opened(), clients={APP_ID: APP_SECRET}))
         self.give(gmail=(EMAIL2, "read"))
         self.work = self.task()
         self.fake.site_secret = new
@@ -1193,7 +1874,7 @@ class GoogleHub(OwnerAPI):
             raise OSError(28, "No space left on device")
         with patch.object(hub, "google_store", full):
             self.ok("gmail_search", {"query": "x"})
-        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: APP_SECRET})
+        self.assertEqual(self.opened()["clients"], {APP_ID: APP_SECRET})
         self.assertEqual(hub.GOOGLE["secrets"][APP_ID], new)
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM log WHERE what LIKE ?",
                                 ("could not keep the secret of Founderizer's Google app in the Google file%",))["n"], 1)
@@ -1256,7 +1937,7 @@ class GoogleHub(OwnerAPI):
         self.assertEqual((fc, fd.get("connected")), (200, True))
         self.assertEqual((dc, dd.get("revoked")), (200, True))
         self.assertEqual(self.fake.names().count("revoke"), 1)
-        self.assertNotIn(EMAIL, json.loads(self.file.read_text()).get("accounts") or {})
+        self.assertNotIn(EMAIL, self.opened().get("accounts") or {})
 
     def test_a_disconnect_that_ends_early_leaves_no_count_running(self):
         """A Disconnect that stops at a file that the hub cannot read, before or after its revoke, still ends its
@@ -1280,7 +1961,7 @@ class GoogleHub(OwnerAPI):
         self.assertEqual((code, data.get("code")), (409, "google_file_mode"), data)
         self.assertNotIn(EMAIL, hub.GOOGLE["tokens"])               # the revoke ended it, whatever the file says
         os.chmod(self.file, 0o600)
-        self.assertIn(EMAIL, json.loads(self.file.read_text())["accounts"])     # the entry stays
+        self.assertIn(EMAIL, self.opened()["accounts"])     # the entry stays
         self.assertEqual(hub.GOOGLE["revokes"][EMAIL], hub.GOOGLE["revoked"][EMAIL])
         code, start = self.begin(account=EMAIL)
         self.assertEqual(self.finish(start["state"])[0], 200)
@@ -1300,7 +1981,7 @@ class GoogleHub(OwnerAPI):
         self.fake.during["exchange"] = disconnect
         code, data = self.finish(start["state"])
         self.assertEqual((code, data.get("error"), data.get("code")), (409, hub.GOOGLE_REVOKED, "google_revoked_during"))
-        self.assertNotIn(EMAIL, json.loads(self.file.read_text()).get("accounts") or {})
+        self.assertNotIn(EMAIL, self.opened().get("accounts") or {})
         self.assertFalse(hub.secret_hit(REFRESH2))
         code, start = self.begin()                                  # a later Connect works
         self.assertEqual(self.finish(start["state"])[0], 200)
@@ -1317,7 +1998,7 @@ class GoogleHub(OwnerAPI):
         code, data = self.owner("/ui/google/disconnect", account=EMAIL)
         self.assertEqual((code, data["revoked"]), (200, True))
         self.assertEqual([(c, d.get("error")) for c, d in answers], [(409, hub.GOOGLE_REVOKED)])
-        self.assertNotIn(EMAIL, json.loads(self.file.read_text()).get("accounts") or {})
+        self.assertNotIn(EMAIL, self.opened().get("accounts") or {})
         self.assertFalse(hub.secret_hit(third))
         code, start = self.begin()                                  # each Disconnect ended: a Connect works again
         self.assertEqual(self.finish(start["state"])[0], 200)
@@ -1358,7 +2039,7 @@ class GoogleHub(OwnerAPI):
         code, data = self.owner("/ui/google/disconnect", account="Owner@Example.com")
         self.assertEqual((code, data["account"], data["revoked"], data["connected"]), (200, EMAIL, True, False), data)
         self.assertIn(("revoke", (REFRESH,)), self.fake.calls)
-        self.assertEqual(json.loads(self.file.read_text()), {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
+        self.assertEqual(self.opened(), {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
                                                              "accounts": {EMAIL2: {"refresh_token": REFRESH2,
                                                                                    "connected_at": 1760600000,
                                                                                    "scopes": SCOPES}}})
@@ -1373,7 +2054,7 @@ class GoogleHub(OwnerAPI):
         self.fake.fail["revoke"] = Err("Google cannot be reached", None, None, unknown=True)
         code, data = self.owner("/ui/google/disconnect", account=EMAIL2)
         self.assertEqual((code, data["revoked"]), (200, False))
-        self.assertEqual(json.loads(self.file.read_text())["accounts"], {})      # removed in each case
+        self.assertEqual(self.opened()["accounts"], {})      # removed in each case
         for fields in ({}, {"account": "owner"}, {"account": EMAIL, "extra": 1}):
             self.assertEqual(self.owner("/ui/google/disconnect", **fields)[0], 400, fields)
         self.assertEqual(self.begin()[0], 200)                        # the next Connect needs nothing of the file
@@ -1501,7 +2182,7 @@ class GoogleHub(OwnerAPI):
         # A hub whose file has no secret of Founderizer's app (connected() writes none) read it from founderizer.com
         # for that refresh, once, and keeps it in the file, with its fingerprint: a restart does not read it again.
         self.assertEqual(self.fake.names().count("client_secret"), 1)
-        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: APP_SECRET})
+        self.assertEqual(self.opened()["clients"], {APP_ID: APP_SECRET})
         self.assertTrue(hub.secret_hit(APP_SECRET))
         hub.GOOGLE["tokens"].clear()
         hub.GOOGLE["secrets"].clear()                               # a restart
@@ -1509,7 +2190,7 @@ class GoogleHub(OwnerAPI):
         self.ok("gmail_search", {"query": "x"})
         self.assertEqual(self.fake.names().count("client_secret"), 1)
         # A file that lost it reads it again, and a site that cannot answer stops only that call.
-        hub.google_store({k: v for k, v in json.loads(self.file.read_text()).items() if k != "clients"})
+        hub.google_store({k: v for k, v in self.opened().items() if k != "clients"})
         hub.GOOGLE["tokens"].clear()
         hub.GOOGLE["secrets"].clear()
         hub.GOOGLE["read_at"].clear()
@@ -1532,7 +2213,7 @@ class GoogleHub(OwnerAPI):
         self.assertEqual([c for c in self.fake.calls if c[0] == "refresh"][-1],
                          ("refresh", (CLIENT_ID, CLIENT_SECRET, REFRESH)))
         # A file with no own client at the top: an entry of the own client has no client that can refresh it.
-        saved = json.loads(self.file.read_text())
+        saved = self.opened()
         hub.google_store({"accounts": saved["accounts"]})
         hub.GOOGLE["tokens"].clear()
         self.assertEqual(self.refused("drive_search", {"words": "x"}), hub.GOOGLE_CLIENT_GONE.format(email=EMAIL))
@@ -2197,7 +2878,7 @@ class ConnectThroughTheStandIn(GoogleHub):
         text = self.ok("drive_search", {"words": "plan"})
         self.assertIn("Data from Google Drive of ana@example.com.", text)
         self.assertIn("d1 | Plan", text)
-        saved = json.loads(self.file.read_text())
+        saved = self.opened()
         # No client of the hub's own: the release's, whose secret founderizer.com gave and the file keeps.
         self.assertEqual((set(saved), saved["clients"]), ({"accounts", "clients"}, {APP_ID: APP_SECRET}))
         entry = saved["accounts"]["ana@example.com"]
@@ -2228,7 +2909,7 @@ class ConnectThroughTheStandIn(GoogleHub):
         self.work = self.task()
         self.ok("gmail_search", {"query": "invoice"})
         self.assertEqual(len(self.g.find("GET", google.CLIENT_PATH)), 2)          # the refused one, then one
-        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: APP_SECRET})
+        self.assertEqual(self.opened()["clients"], {APP_ID: APP_SECRET})
         self.assertTrue(self.tokens and all(t.get("client_secret") == APP_SECRET for t in self.tokens), self.tokens)
         for req in self.g.find("GET", google.CLIENT_PATH):
             self.assertIsNone(req["headers"].get("Authorization"))
@@ -2251,13 +2932,13 @@ class ConnectThroughTheStandIn(GoogleHub):
         self.g.on("GET", google.CLIENT_PATH, {"client_id": APP_ID, "client_secret": new})
         hub.GOOGLE["read_at"].clear()
         self.assertIn("Invoice", self.ok("gmail_search", {"query": "invoice"}))
-        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: new})
+        self.assertEqual(self.opened()["clients"], {APP_ID: new})
         self.secret = newer                                         # one more change, before a Connect of Drive
         self.g.on("GET", google.CLIENT_PATH, {"client_id": APP_ID, "client_secret": newer})
         hub.GOOGLE["read_at"].clear()
         done = self.app_connect("drive")
         self.assertEqual(sorted(done["scopes"]), ["drive", "gmail.modify"])
-        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: newer})
+        self.assertEqual(self.opened()["clients"], {APP_ID: newer})
         self.assertEqual([(t["grant_type"][0], t.get("client_secret")) for t in self.tokens],
                          [("a", APP_SECRET), ("r", APP_SECRET), ("r", APP_SECRET), ("r", APP_SECRET), ("r", new),
                           ("a", new), ("a", newer)])

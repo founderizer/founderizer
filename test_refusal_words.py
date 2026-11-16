@@ -58,6 +58,8 @@ OLD = {
     "time_passed": "this time has passed; change the time first",
     "google_file_mode": "the Google file of the hub must be a regular file of the hub user with mode 600",
     "google_file_unreadable": "the Google file of the hub cannot be read: it is not a JSON object with accounts",
+    "google_file_key": "the hub cannot read the key of its Google file now",
+    "google_file_lost": "the Google file of the hub does not open with its key: connect each Google account again",
     "google_no_client": "This hub's release has no Google client. Update the hub, then connect again.",
     "google_no_secret": "Founderizer's Google app cannot be read from founderizer.com now, so nothing was started. Try "
                         "again in a few minutes.",
@@ -92,7 +94,8 @@ SITES = {
     'attachment_check': {'login_as_file': 1},
     'command_run': {'command_interrupted': 1, 'command_reused': 1, 'hub_changed_sending': 1, 'login_as_text': 1},
     'enroll_new_device': {'not_owner_device_no_code': 1},
-    'google_file_refusal': {'google_file_mode': 1, 'google_file_unreadable': 1},
+    'google_file_refusal': {'google_file_key': 1, 'google_file_lost': 1, 'google_file_mode': 1,
+                            'google_file_unreadable': 1},
     'grant_server': {'no_such_agent': 1},
     'join_server': {'server_name_kept': 1},       # a server named door (C49)
     'key_swap_entry': {'no_such_server': 1},      # Part B of the key swap: the 404 of both of its routes
@@ -422,7 +425,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 156)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 158)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

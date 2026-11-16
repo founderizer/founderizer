@@ -39,15 +39,19 @@ KIT = os.path.dirname(os.path.abspath(__file__))
 # ---- the hub's own files. hub.tick() sweeps the attachment folder and removes every file there that the test's database
 # does not name, so a test that ticks with no folder of its own empties the real ~/.fleet/attachments of the machine
 # that runs it. And a hub with no file of its own for an upload, the Google accounts, the GitHub App's key, the MCP
-# servers or the door's secrets reads and writes the one in ~/.fleet (leftovers.hub_files, for a tool's own hub).
+# servers or the door's secrets reads and writes the one in ~/.fleet, and with no key file of its own for the Google
+# file the one in ~/.config/founderizer (leftovers.hub_files, for a tool's own hub).
 
 REAL_FILES = {key: os.path.realpath(path) for key, path in (
     ("attachment_dir", hub.ATTACH_DIR), ("google_file", hub.GOOGLE_FILE), ("github_app", hub.GITHUB_APP),
-    ("mcp_file", hub.MCP_FILE), ("door_secrets", hub.DOOR_SECRETS_FILE))}
-# what the check holds: the sweep and its caller, and each function of hub.py that makes, writes or removes one of them
+    ("mcp_file", hub.MCP_FILE), ("door_secrets", hub.DOOR_SECRETS_FILE), ("google_key", hub.GOOGLE_KEY_FILE))}
+# what the check holds: the sweep and its caller, and each function of hub.py that makes, writes or removes one of them,
+# and the reader of the Google file's key, which a test reads only as its own
 OWN_FILE_FIRST = {"tick": "attachment_dir", "attachment_sweep": "attachment_dir", "attachment_dir": "attachment_dir",
                   "google_store": "google_file", "github_app_file": "github_app", "github_app_remove": "github_app",
-                  "mcp_store": "mcp_file", "save_door_secrets": "door_secrets"}
+                  "mcp_store": "mcp_file", "save_door_secrets": "door_secrets", "google_set_aside": "google_file",
+                  "google_key_read": "google_key", "google_key_make": "google_key", "google_key_remove": "google_key",
+                  "google_file_sweep": "google_file", "google_key_sweep": "google_key"}
 
 
 def own_attachments(test, folder):
@@ -658,6 +662,12 @@ class AttachmentFolder(unittest.TestCase):
         ~/.fleet here, so a check that let a write through would not reach the machine's own."""
         calls = {"attachment_dir": lambda: hub.attachment_dir(),
                  "google_store": lambda: hub.google_store({"accounts": {}}),
+                 "google_set_aside": lambda: hub.google_set_aside(),
+                 "google_key_read": lambda: hub.google_key_read(),
+                 "google_key_make": lambda: hub.google_key_make(),
+                 "google_key_remove": lambda: hub.google_key_remove(),
+                 "google_file_sweep": lambda: hub.google_file_sweep(),
+                 "google_key_sweep": lambda: hub.google_key_sweep(),
                  "github_app_file": lambda: hub.github_app_file("1", "not a key"),
                  "github_app_remove": lambda: hub.github_app_remove(),
                  "mcp_store": lambda: hub.mcp_store({"servers": {}}),
@@ -668,7 +678,7 @@ class AttachmentFolder(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             for constant, key in (("ATTACH_DIR", "attachment_dir"), ("GOOGLE_FILE", "google_file"),
                                   ("GITHUB_APP", "github_app"), ("MCP_FILE", "mcp_file"),
-                                  ("DOOR_SECRETS_FILE", "door_secrets")):
+                                  ("DOOR_SECRETS_FILE", "door_secrets"), ("GOOGLE_KEY_FILE", "google_key")):
                 stack.enter_context(patch.object(hub, constant, machine[key]))
             stack.enter_context(patch.dict(REAL_FILES, {key: os.path.realpath(path) for key, path in machine.items()}))
             for name, call in calls.items():
@@ -684,16 +694,19 @@ class AttachmentFolder(unittest.TestCase):
                 hub.mcp_store({"servers": {}})
                 self.assertTrue(os.path.isdir(hub.attachment_dir()))
             self.assertEqual(sorted(os.listdir(os.path.join(self.tmp.name, "own"))),
-                             ["attachments", "google.json", "mcp.json"])
+                             ["attachments", "google-file.key", "google.json", "mcp.json"])
             self.assertEqual(os.listdir(os.path.join(self.tmp.name, "machine")), [])
 
     def test_the_check_names_every_file_that_hub_py_keeps_below_the_home_folder(self):
-        """A file that hub.py keeps in ~/.fleet later has no check until it is in REAL_FILES and in
-        leftovers.HUB_FILES, and its writers are in OWN_FILE_FIRST: this fails for it. The database is the one that
-        each test connects."""
+        """A file that hub.py keeps in ~/.fleet (or in ~/.config/founderizer, as the key of the Google file) later has
+        no check until it is in REAL_FILES and in leftovers.HUB_FILES, and its writers are in OWN_FILE_FIRST: this
+        fails for it. The database is the one that each test connects."""
         with open(os.path.join(KIT, "hub.py"), encoding="utf-8") as f:
             source = f.read()
-        below = dict(re.findall(r'^([A-Z_]+) = os\.path\.expanduser\("~/\.fleet/([^"]+)"\)', source, re.M))
+        below = dict(re.findall(r'^([A-Z_]+) = os\.path\.expanduser\("~/(?:\.fleet|\.config/founderizer)/([^"]+)"\)',
+                                source, re.M))
+        self.assertEqual(re.findall(r'^[A-Z_]+ = os\.path\.expanduser\("~/\.config/.*$', source, re.M),
+                         ['GOOGLE_KEY_FILE = os.path.expanduser("~/.config/founderizer/google-file.key")'])
         self.assertEqual(sorted(below.values()), sorted(HUB_FILES.values()))
         self.assertEqual(re.findall(r'^[A-Z_]+ = .*"~".*$', source, re.M),
                          ['DB_DEFAULT = os.path.join("~", ".fleet", "pilot.db")'

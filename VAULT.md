@@ -125,6 +125,12 @@ The vault protects the value of each secret. The design gives these results:
   grant of the value to an agent on that machine, or put the value into the pool. It seals a value of the pool to
   each machine whose key the owner pinned (`vault.py`, `Sources/FleetCore/OwnerKey.swift`).
 - It removes a value only while no grant and no pool entry that the owner signed names it (`vault.py`).
+- It keeps one key for the hub: the key that seals the hub's Google file, with each account's Google refresh token.
+  It makes the key at the hub's first request, as 32 random bytes in `hub-google.key` of its state folder, mode 600,
+  and never replaces it. It gives the key to the hub's OS user alone, and each request is a line of its log. The key
+  is no value of the owner's, it opens nothing of the store, and no export carries it (`vault.py` `hub_key`). Its
+  status names the key's id, a hash that opens nothing, so that a running hub knows when the key changed. The hub
+  keeps the key in memory, so a copy of the hub user's files does not open the Google file (`hub.py`).
 
 ### In a broker on a Linux server
 
@@ -213,6 +219,7 @@ The vault protects the value of each secret. The design gives these results:
 | Broker handover key | age (X25519) | Linux: `/var/lib/fleet-vault/age.key`, mode 600. Mac: the Keychain item `age`. Made one time and never replaced. The hub pins its public half. | The broker, to open copies that are sealed to its machine (`hubsetup.py`, `Sources/FleetVaultCore/VaultPrograms.swift`) |
 | Recovery code | 26 symbols of Crockford's base32 (130 random bits) | The owner's Mac, in the login Keychain, and a phone that enrolled after the Mac had the code | The central vault seals its backup to an age key that comes from this code with HKDF-SHA-256 (`Sources/FleetCore/RecoveryCode.swift`, `Sources/Founderizer/RecoveryCopy.swift`) |
 | Fingerprint key | 32 random bytes | The hub's database | The hub, to make the salt of each fingerprint (`hub.py`) |
+| Google file key | 32 random bytes | `/var/lib/fleet-vault-central/hub-google.key`, mode 600, user `founderizer-vault`. On a hub with no central vault of this program yet, and on a Mac: `~/.config/founderizer/google-file.key` of the hub's user, outside `~/.fleet`. | The hub, to seal its Google file with ChaCha20-Poly1305 (`vault.py` `hub_key`, `hub.py`, `atrest.py`) |
 
 ## The stores
 
@@ -665,7 +672,12 @@ server that joined before, it is off until root switches it on.
     the folder `~/.founderizer`.
 14. **The hub's own sign-ins.** The Google refresh tokens and their client secret, the GitHub App private key, the
     credentials of the MCP servers and the Discord bot tokens are not in the vault. They are files of the hub's OS user
-    on the hub's server, so a person who controls that user has them (`hub.py`, `channels.py`).
+    on the hub's server, so a person who controls that user has them (`hub.py`, `channels.py`). The Google file is
+    sealed with ChaCha20-Poly1305 under a key that the central vault keeps and gives to the hub's user, so a copy of
+    the hub user's files does not open it (`hub.py`, `atrest.py`, `vault.py` `hub_key`). Until a central vault serves
+    that key, and on a Mac, the key is in a second file of the hub's user outside the hub's data folder, so only a copy
+    of that folder alone does not open it. Neither protects the file from that user, who can ask the vault, or from a
+    copy of the whole disk.
 15. **The door's secrets.** The door keeps each secret that it opened, and each key that it made itself, in a file of
     its own OS user, not in an age store. The hub keeps an SHA-256 of each secret that the door opened, with no salt
     (`door.py`, `hub.py`).

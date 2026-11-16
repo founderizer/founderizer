@@ -134,10 +134,12 @@ class Reads(OwnerAPI):
         self.g.on("GET", "/gmail/v1/users/me/messages", self.messages)
         self.boxes = {ACCESS: self.box, ACCESS + "-2": Mailbox()}
         self.file = os.path.join(self.tmp.name, "google.json")
-        old_file = hub.CFG.get("google_file")
-        hub.CFG["google_file"] = self.file
-        self.addCleanup(lambda: hub.CFG.pop("google_file", None) if old_file is None else
-                        hub.CFG.update(google_file=old_file))
+        keys = os.path.join(self.tmp.name, "keys", "google-file.key")     # not beside the file, as on a hub
+        for key, path in (("google_file", self.file), ("google_key", keys)):
+            old = hub.CFG.get(key)
+            hub.CFG[key] = path
+            self.addCleanup(lambda key=key, old=old: hub.CFG.pop(key, None) if old is None else
+                            hub.CFG.update({key: old}))
         scopes = list(google.SCOPES)
         hub.google_store({"client_id": CLIENT_ID, "client_secret": SECRET, "accounts": {
             MAILBOX: {"refresh_token": REFRESH, "scopes": scopes, "connected_at": int(T0)},
@@ -665,6 +667,29 @@ class Reads(OwnerAPI):
         last = self.runs(t)[-1]
         self.assertEqual((last["error"], last["reason"]), ("no_access", hub.GOOGLE_PROBLEM))
         self.assertEqual(hub.GOOGLE["problems"].get(MAILBOX), hub.GOOGLE_PROBLEM)   # the Integrations page has it
+
+    def test_a_key_that_cannot_be_read_now_is_no_answer_and_a_file_that_it_no_longer_opens_is_the_owners_step(self):
+        """The sealed Google file (UI-API.md 1.202): a key file that the hub cannot read now is a time with no answer,
+        and a key that no longer opens the file is what only a new Connect ends."""
+        key_file = hub.CFG["google_key"]
+        t = self.save()
+        hub.GOOGLE_OPENED.update(last=None, key=None)       # a restart: the hub reads the key file again
+        with hub.GOOGLE_LOCK:
+            hub.GOOGLE["tokens"].clear()
+        os.chmod(key_file, 0o644)
+        self.minutes(t, 3)
+        last = self.runs(t)[-1]
+        self.assertEqual((last["error"], last["reason"]), ("no_answer", "Google did not answer the read."))
+        os.chmod(key_file, 0o600)
+        self.minutes(t, 1)
+        self.assertEqual(hub.trigger_row(t["id"])["failures"], 0)
+        os.remove(key_file)                                 # the key is gone: the file no longer opens
+        hub.GOOGLE_OPENED.update(last=None, key=None)
+        with hub.GOOGLE_LOCK:
+            hub.GOOGLE["tokens"].clear()
+        self.minutes(t, 3)
+        last = self.runs(t)[-1]
+        self.assertEqual((last["error"], last["reason"]), ("no_access", hub.GOOGLE_LOST_READ))
 
     def test_on_founderizers_client_a_fault_of_google_is_no_answer_and_a_lost_client_is_the_owners_step(self):
         """A hub that connected with Founderizer's own Google app has no client at the top of its file. A refresh

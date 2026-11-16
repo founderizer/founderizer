@@ -74,6 +74,9 @@ WORDS = {
     # Google's Connect and Disconnect (UI-API.md 1.185)
     "google_file_mode": "the Google file of the hub must be a regular file of the hub user with mode 600",
     "google_file_unreadable": "the Google file of the hub cannot be read: it is not a JSON object with accounts",
+    # the sealed Google file (since owner API 1.202): its key file cannot be read now, or its key no longer opens it
+    "google_file_key": "the hub cannot read the key of its Google file now",
+    "google_file_lost": "the Google file of the hub does not open with its key: connect each Google account again",
     "google_no_client": "This hub's release has no Google client. Update the hub, then connect again.",
     "google_no_secret": "Founderizer's Google app cannot be read from founderizer.com now, so nothing was started. Try "
                         "again in a few minutes.",

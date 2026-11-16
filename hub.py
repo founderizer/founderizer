@@ -58,6 +58,7 @@ from lifecycle import EDITABLE_FACTS, TOKEN_KINDS, facts_now, token_price     # 
 from vault import owner_signed      # owner feature door_calls: a phone's yes, with the central vault's own check
 import wakeups
 from desktop import Frames
+import atrest       # the cipher that seals the hub's Google file at rest (UI-API.md 1.202)
 import google
 import hidden       # hidden characters at the hub's exits (strip_hidden); the helper's hook reads the same rule
 import diagnostics  # the lane "Bug reports": the hub's own faults and refused calls, with no words
@@ -12792,6 +12793,10 @@ def central_timer():
             key_table_count()
         except Exception:
             print_fault()
+        try:
+            google_vault_turn()         # the Google file's key moves to the central vault (UI-API.md 1.202)
+        except Exception:
+            print_fault()
 
 
 KEY_TABLE_PASS = "key_table_pass"       # kv: the one pass of the table over the catalog of today (Part C, point 7)
@@ -19156,6 +19161,21 @@ def save_profile(agent, base, sections):
 # ---------------------------------------------------------------- Google Drive and Gmail (owner feature google)
 
 GOOGLE_FILE = os.path.expanduser("~/.fleet/google.json")
+# The key that seals the Google file at rest (UI-API.md 1.202): 32 random bytes. On a Linux hub whose central vault
+# serves hub_key (the owner's choice of 16 November 2026: "Vault (recommended)"), the central vault keeps it, as its
+# own OS user with no network; else, and on a Mac, a file of the hub's user outside ~/.fleet, which the hub makes once
+# and which leaves once the vault has the key. Either way a copy of the hub's data folder does not open the file.
+# CFG["google_key"] is a key file of its own (a test's, a tool's own hub: leftovers.hub_files).
+GOOGLE_KEY_FILE = os.path.expanduser("~/.config/founderizer/google-file.key")
+GOOGLE_SEALED = "chacha20-poly1305"     # the cipher of a sealed Google file (atrest.py, RFC 8439)
+GOOGLE_HOLDERS = ("file", "vault")      # where a sealed file's key lives: the key file, or the central vault
+GOOGLE_KEY_ID = re.compile(r"[0-9a-f]{16}")
+# In this process only: the last sealed file that the hub read or wrote, with what it holds (the cipher then runs once
+# for each new file, not at each read), and the key that it was sealed with; the central vault's key of the file once
+# it gave it (google_vault_fetch), the status read that the central vault's thread last asked for it with, the
+# last reason why that thread could not seal the file or remove the key file, and the status read of such a removal
+# that failed. Each value is replaced whole, so that no reader takes the bytes of one file with the contents of another.
+GOOGLE_OPENED = {"last": None, "key": None, "vault": None, "asked_for": None, "said": None, "dropped_for": None}
 GOOGLE_LEVELS = {"drive": ("read", "write", "write_shared"), "gmail": ("read", "write", "send")}
 GOOGLE_NAMES = {"drive": "Drive", "gmail": "Gmail"}
 GOOGLE_SCOPES = {"drive": "drive", "gmail": "gmail.modify"}        # the short name of the scope of each service
@@ -19189,6 +19209,9 @@ GOOGLE_TESTING = ("Google refused the saved access. If your Google Cloud client 
                   "Google ends its sign-ins after 7 days. Then connect again.")
 GOOGLE_TESTING_AGE = 7 * 86400 - 3600   # Google's refresh tokens for a client in Testing last 7 days
 GOOGLE_STALE = refusal_words.words("connect_stale")
+# A sealed Google file that its key no longer opens: a Connect sets it aside (google_set_aside) and starts a new one.
+GOOGLE_LOST = refusal_words.words("google_file_lost")
+GOOGLE_LOST_READ = "The hub's Google file no longer opens with its key. Connect each Google account again."
 GOOGLE_NO_CLIENT = "The hub cannot read its Google file now: the owner must put it right. Ask your requester."
 GOOGLE_NO_CONNECT = refusal_words.words("google_no_client")
 GOOGLE_GONE_VIEW = "The hub no longer has the Google client that connected this account. Connect it again."
@@ -19228,28 +19251,240 @@ def google_account(value):
 
 def google_saved():
     """(the saved Google file, problem or None): {} before the first Connect. It must be a regular file of the hub user
-    with mode 600. The hub reads it at each use, so a change needs no restart."""
+    with mode 600. The hub reads it at each use, so a change needs no restart. Since 1.202 the file is sealed, and
+    google_read opens it with its key; a plain file of a hub from before is read as it is until it is sealed."""
+    return google_read()[:2]
+
+
+def google_read():
+    """(the saved Google file, problem or None, form): form is "sealed", "plain" (the form of a hub from before 1.202,
+    which google_seal_plain seals at the hub's start), or None for no file or a file that is neither."""
     path = CFG.get("google_file") or GOOGLE_FILE
     try:
         st = os.lstat(path)
     except FileNotFoundError:
-        return {}, None
+        return {}, None, None
     if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
-        return {}, refusal_words.words("google_file_mode")
+        return {}, refusal_words.words("google_file_mode"), None
     try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
+        with open(path, "rb") as f:
+            raw = f.read()
+        data = json.loads(raw)
     except (OSError, ValueError):
         data = None
+    if isinstance(data, dict) and "sealed" in data:
+        data, problem = google_opened(raw, data)
+        if problem == refusal_words.words("google_file_lost"):
+            # A write under LOCK can seal the file again with another key between this read of its bytes and the
+            # read of its key (a move to the vault, a new key of the vault): such a file is read once more.
+            try:
+                with open(path, "rb") as f:
+                    again = f.read()
+                envelope = json.loads(again) if again != raw else None
+            except (OSError, ValueError):
+                envelope = None
+            if isinstance(envelope, dict) and "sealed" in envelope:
+                data, problem = google_opened(again, envelope)
+        return (data, None, "sealed") if problem is None else ({}, problem, "sealed")
     if not isinstance(data, dict) or not isinstance(data.get("accounts", {}), dict):
-        return {}, refusal_words.words("google_file_unreadable")
+        return {}, refusal_words.words("google_file_unreadable"), None
+    return data, None, "plain"
+
+
+def google_aad(holder, kid):
+    """The associated bytes of a sealed Google file: what the file is, the form's version, and its key's holder and
+    id. The tag covers them, so a sealed text of another file, or a changed header, does not open."""
+    return f"founderizer google.json\x001\x00{holder}\x00{kid}".encode()
+
+
+def google_opened(raw, envelope):
+    """(what a sealed Google file holds, problem): `raw` is the file's bytes and `envelope` their JSON. The file's own
+    key opens it (google_key_of). A file that its key does not open, also when the key is gone, is lost
+    (google_file_lost); a key that cannot be read now is google_file_key."""
+    last = GOOGLE_OPENED["last"]
+    if last is not None and last[0] == raw:
+        return json.loads(last[1]), None
+    holder, kid, blob = envelope.get("key"), envelope.get("key_id"), envelope.get("data")
+    if envelope.get("sealed") != GOOGLE_SEALED or envelope.get("v") != 1 or holder not in GOOGLE_HOLDERS or \
+            not (isinstance(kid, str) and GOOGLE_KEY_ID.fullmatch(kid)) or not isinstance(blob, str):
+        return None, refusal_words.words("google_file_unreadable")
+    try:
+        sealed = base64.b64decode(blob, validate=True)
+    except ValueError:
+        return None, refusal_words.words("google_file_unreadable")
+    key, problem = google_key_of(holder, kid)
+    if problem:
+        return None, problem
+    try:
+        plain = atrest.decrypt(key, sealed, google_aad(holder, kid))
+    except atrest.Unopened:
+        return None, refusal_words.words("google_file_lost")
+    try:
+        data = json.loads(plain)
+    except ValueError:
+        data = None
+    if not isinstance(data, dict) or not isinstance(data.get("accounts", {}), dict):
+        return None, refusal_words.words("google_file_unreadable")
+    GOOGLE_OPENED["last"] = (raw, plain)
     return data, None
+
+
+def google_holder(path):
+    """The holder that a sealed Google file's header names ("vault" or "file"), or None for a plain file or one that
+    cannot be read. Its header only: no key is read."""
+    try:
+        with open(path, "rb") as f:
+            envelope = json.loads(f.read())
+    except (OSError, ValueError):
+        return None
+    holder = envelope.get("key") if isinstance(envelope, dict) and "sealed" in envelope else None
+    return holder if holder in GOOGLE_HOLDERS else None
+
+
+def google_key_path():
+    """The key file of the Google file: the hub's own (GOOGLE_KEY_FILE), or a test's (CFG["google_key"])."""
+    return CFG.get("google_key") or GOOGLE_KEY_FILE
+
+
+def google_key_read():
+    """The key in the key file, or None when there is no key file. An OSError when the hub cannot read it now, or when
+    it is not a regular file of the hub's user with mode 600 that holds one key: the hub then reads it again at the
+    next use, and never makes a key in the place of one that it could not read. A folder on the way to it that is a
+    link to nothing (to a volume that is not mounted yet), or no folder, is such an OSError too, and not a missing key:
+    the key can come back. An empty folder where a volume is not mounted yet cannot be told from a folder without the
+    key (UI-API.md 1.202, "Limits"). The file is opened without blocking, so a pipe in its place stops nothing."""
+    path = google_key_path()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        folder = os.path.dirname(path)
+        while folder != os.path.dirname(folder):
+            if os.path.lexists(folder) and not os.path.isdir(folder):
+                raise OSError(f"{folder} is a link to nothing, or no folder") from None
+            folder = os.path.dirname(folder)
+        return None
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise OSError("the key file of the Google file must be a regular file of the hub's user with mode 600")
+        text = f.read(4 * atrest.KEY_BYTES)
+    try:
+        key = bytes.fromhex(text.decode("ascii").strip())
+    except (UnicodeDecodeError, ValueError):
+        key = b""
+    if len(key) != atrest.KEY_BYTES:
+        raise OSError("the key file of the Google file does not hold one key")
+    return key
+
+
+def google_key_make():
+    """A new key, in a new key file that nothing replaces: written to a temporary file and synced, then linked to its
+    name only when no key file is there (a link fails over a file), and the folder synced, so that the key is on the
+    disk before any file sealed with it is. Another process that made a key meanwhile wins, and its key is the one
+    returned. Read back from the disk before it is used."""
+    path = google_key_path()
+    folder = os.path.dirname(path)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    key = atrest.new_key()
+    tmp = os.path.join(folder, f".google-file.{uuid.uuid4().hex}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(key.hex().encode() + b"\n")
+            f.flush()
+            google_sync(f.fileno())
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            pass                            # a key that another process made first: that one is the key
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+    google_folder_sync(folder)
+    kept = google_key_read()
+    if kept is None:
+        raise OSError("the key file of the Google file was not kept")
+    return kept
+
+
+def google_sync(fd):
+    """A file's bytes on the disk itself. On a Mac fsync leaves them in the drive's cache, with no order between two
+    files, so the hub asks for F_FULLFSYNC there, and for fsync where the file system does not take that."""
+    full = getattr(fcntl, "F_FULLFSYNC", None)
+    if full is not None:
+        try:
+            fcntl.fcntl(fd, full)
+            return
+        except OSError:
+            pass
+    os.fsync(fd)
+
+
+def google_folder_sync(folder):
+    """The folder's entries on the disk: a rename or a link in it outlives a power cut."""
+    fd = os.open(folder, os.O_RDONLY)
+    try:
+        google_sync(fd)
+    finally:
+        os.close(fd)
+
+
+class GoogleKeyError(OSError):
+    """A write of the Google file that found no key that it could use: its key file cannot be read, or none could be
+    made. The file stays as it was (google_store)."""
+
+
+def google_key_ready():
+    """None when the hub can seal the Google file now: its key file holds a key, or there was none and the hub made one
+    here, as the next write would. Else the problem google_file_key. Asked before a step that goes to Google (a Connect,
+    the finish's exchange, a Disconnect's revoke), so that a key that the hub cannot use stops the step before anything
+    leaves the hub, also while the hub opens its file with the key that it holds in memory."""
+    if GOOGLE_OPENED["vault"] is not None:      # the next write seals with the central vault's key
+        return None
+    try:
+        if google_key_read() is None:
+            google_key_make()
+    except OSError:
+        return refusal_words.words("google_file_key")
+    return None
+
+
+def google_key_of(holder, kid):
+    """(the key with the id `kid`, problem): the key that the hub last used, else the key file's. A key file that is
+    gone or holds another key leaves the file lost (google_file_lost); one that cannot be read now is
+    google_file_key."""
+    held = GOOGLE_OPENED["key"]
+    if held is not None and held[:2] == (holder, kid):
+        return held[2], None
+    if holder == "vault":
+        # Only the key that the central vault gave this process: the vault is never asked under a lock
+        # (central_call), so a hub that has not had its answer yet (its start, a vault that is down) waits for the
+        # central vault's thread (google_vault_turn). A vault that gives another key lost the one of this file.
+        vault = GOOGLE_OPENED["vault"]
+        if vault is None:
+            return None, refusal_words.words("google_file_key")
+        if atrest.key_id(vault) != kid:
+            return None, refusal_words.words("google_file_lost")
+        GOOGLE_OPENED["key"] = ("vault", kid, vault)
+        return vault, None
+    try:
+        key = google_key_read()
+    except OSError:
+        return None, refusal_words.words("google_file_key")
+    if key is None or atrest.key_id(key) != kid:
+        return None, refusal_words.words("google_file_lost")
+    GOOGLE_OPENED["key"] = ("file", kid, key)
+    return key, None
 
 
 def google_file_refusal(bad):
     """The 409 of a Google file that the hub cannot use (google_saved's problem), with its code (refusal_words)."""
     if bad == refusal_words.words("google_file_unreadable"):
         return Refusal(409, code="google_file_unreadable")
+    if bad == refusal_words.words("google_file_key"):
+        return Refusal(409, code="google_file_key")
+    if bad == refusal_words.words("google_file_lost"):
+        return Refusal(409, code="google_file_lost")
     return Refusal(409, code="google_file_mode")
 
 
@@ -19440,23 +19675,233 @@ def google_connect_client(saved):
 
 
 def google_store(data):
-    """Write the Google file: a temporary file and a rename in its folder (mode 700), with mode 600."""
+    """Write the Google file sealed (since 1.202): its JSON, sealed with the key of the key file (made first when
+    there is none: google_key_make), in a temporary file and a rename in its folder (mode 700), with mode 600. Never in
+    the plain form: a key that cannot be read or made is an OSError, and the file stays as it was.
+
+    The key is the key file's as it is now, not the one in memory, so a write after the key file was lost seals the
+    file with a key that is on the disk. `accounts` is null in the sealed form, so that a hub from before 1.202 reads
+    the file as one that it cannot use, and writes nothing over it, rather than as a file with no account."""
     import tempfile
     path = CFG.get("google_file") or GOOGLE_FILE
     folder = os.path.dirname(path)
     os.makedirs(folder, mode=0o700, exist_ok=True)
+    holder, key = "vault", GOOGLE_OPENED["vault"]
+    if key is None:
+        holder = "file"
+        try:
+            key = google_key_read()
+            if key is None:
+                key = google_key_make()
+            # The key's folder on the disk before the file that needs it: a run that stopped after a key file's link
+            # and before its sync left a key that this write would otherwise seal with while its link is only in
+            # memory.
+            google_folder_sync(os.path.dirname(google_key_path()))
+        except OSError as e:
+            raise GoogleKeyError(f"the key of the Google file cannot be used ({e.strerror or e})") from None
+    kid = atrest.key_id(key)
+    plain = json.dumps(data).encode()
+    sealed = atrest.encrypt(key, plain, google_aad(holder, kid))
+    raw = (json.dumps({"sealed": GOOGLE_SEALED, "v": 1, "key": holder, "key_id": kid,
+                       "data": base64.b64encode(sealed).decode("ascii"), "accounts": None}) + "\n").encode()
     fd, tmp = tempfile.mkstemp(dir=folder, prefix=".google.", suffix=".tmp")      # mode 600
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(json.dumps(data) + "\n")
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
             f.flush()
-            os.fsync(f.fileno())
+            google_sync(f.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
             os.remove(tmp)
         raise
+    GOOGLE_OPENED["key"] = (holder, kid, key)
+    GOOGLE_OPENED["last"] = (raw, plain)
+    if holder == "vault":   # once the new file is on the disk, the key file opens nothing: google_key_drop
+        google_key_drop()
+    else:
+        with contextlib.suppress(OSError):  # the rename is done: a folder not synced loses only its order on a power cut
+            google_folder_sync(folder)
+
+
+def google_vault_fetch():
+    """The central vault's key of the Google file (vault.py hub_key), kept in memory, or None when no central vault
+    gives one: none on this hub, one that does not answer, or one whose program is older than hub_key. A key that is
+    not the one in memory takes its place, and the central vault's thread then seals the file with it
+    (google_vault_turn). Never under LOCK (central_call)."""
+    try:
+        text = central_call("hub_key", {"name": "google"}).get("key")
+    except Refusal:
+        return None
+    if not (isinstance(text, str) and re.fullmatch(r"[0-9a-f]{64}", text)):
+        return None
+    key = bytes.fromhex(text)
+    GOOGLE_OPENED["vault"] = key
+    return key
+
+
+def google_vault_due(status):
+    """True when the central vault serves hub_key (its status says hub_keys) and the key that this hub holds is not
+    the one that the vault's status names (hub_key_ids): none yet, or the vault's key changed or went."""
+    if not central_ok() or (status or {}).get("hub_keys") is not True:
+        return False
+    ids = (status or {}).get("hub_key_ids")
+    held, named = GOOGLE_OPENED["vault"], ids.get("google") if isinstance(ids, dict) else None
+    return held is None or named != atrest.key_id(held)
+
+
+def google_vault_turn():
+    """The Google file's part of the central vault's thread: once the vault's status says hub_keys (a program that
+    serves hub_key) and there is a Google file, the vault's key, asked outside LOCK and kept in memory; then a file
+    sealed with the hub's own key file, with another key of the vault, or still plain, is sealed again with the vault's
+    key, and the key file goes. A pass ends at once, with no read of the file, while the file that the hub last opened
+    or wrote is the vault's current key's and no key file is left. True when it wrote the file."""
+    with CENTRAL_LOCK:
+        status, read_at = CENTRAL["status"], CENTRAL["read_at"]
+    if not os.path.lexists(CFG.get("google_file") or GOOGLE_FILE):
+        return False                # nothing to move yet: a Connect asks the vault first (google_vault_ask)
+    if google_vault_due(status) and GOOGLE_OPENED["asked_for"] != read_at:
+        # Once for each status that the hub read (every CENTRAL_READ_EVERY seconds), not at each tick: a vault that
+        # refuses its key gets one request a minute, and a key that the vault made again is asked for at the next read.
+        GOOGLE_OPENED["asked_for"] = read_at
+        google_vault_fetch()
+    vault = GOOGLE_OPENED["vault"]
+    if vault is None or not central_ok() or (status or {}).get("hub_keys") is not True:
+        return False
+    held = GOOGLE_OPENED["key"]
+    if held is not None and held[:2] == ("vault", atrest.key_id(vault)) and (
+            not os.path.lexists(google_key_path()) or GOOGLE_OPENED["dropped_for"] == read_at):
+        return False                # done; or a key file that would not go, tried again at the next status read
+    with LOCK:
+        saved, bad, form = google_read()
+        if bad or form is None:
+            return False            # a file that the hub cannot use now stays as it is
+        # The holder and the key that the file names: google_read left its bytes in GOOGLE_OPENED["last"].
+        envelope = json.loads(GOOGLE_OPENED["last"][0]) if form == "sealed" else {}
+        vault, wrote = GOOGLE_OPENED["vault"], False
+        if (envelope.get("key"), envelope.get("key_id")) != ("vault", atrest.key_id(vault)):
+            try:
+                google_store(saved)
+            except OSError as e:
+                said = f"could not seal the Google file with the central vault's key: {e.strerror or e}"
+                if GOOGLE_OPENED["said"] != said:       # once for each new reason, not at each tick
+                    GOOGLE_OPENED["said"] = said
+                    log("hub", said)
+                return False
+            GOOGLE_OPENED["said"], wrote = None, True
+            log("hub", "sealed the Google file with the central vault's key (UI-API.md 1.202)")
+        elif not google_key_drop():     # (google_store does the same after its write)
+            GOOGLE_OPENED["dropped_for"] = read_at
+    return wrote
+
+
+def google_vault_ask():
+    """Before a Connect's or a Disconnect's write, outside LOCK: the central vault's key, when its status says that it
+    serves hub_key and the hub holds none, or another one than the status names, so that the write seals with the key
+    that the vault keeps now and makes no key file."""
+    with CENTRAL_LOCK:
+        status = CENTRAL["status"]
+    if google_vault_due(status):
+        google_vault_fetch()
+
+
+def google_key_drop():
+    """The hub's own key file goes once the Google file that the central vault's key sealed is on the disk: the file's
+    folder is synced first, so a power cut cannot bring back a file of before without its key. A folder that cannot
+    be synced keeps the key file, and the central vault's thread tries again at its next pass (google_vault_turn)."""
+    try:
+        step = "sync the folder of the Google file"
+        google_folder_sync(os.path.dirname(CFG.get("google_file") or GOOGLE_FILE))
+        step = "remove its own key file of the Google file"
+        google_key_remove()
+    except OSError as e:
+        said = f"could not {step}: {e.strerror or e}"
+        if GOOGLE_OPENED["said"] != said:       # once for each new reason, not at each pass
+            GOOGLE_OPENED["said"] = said
+            log("hub", said)
+        return False
+    GOOGLE_OPENED["said"] = None                # the same reason again later is said again
+    return True
+
+
+def google_key_remove():
+    """The hub's own key file, once the file is sealed with the central vault's key: it opens nothing any more."""
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(google_key_path())
+        log("hub", "removed its own key file of the Google file: the central vault keeps the key")
+
+
+def google_start():
+    """main()'s step for the Google file, before a timer or a request reads it, and with no lock held: the temporary
+    files of a write that a stop cut off go; then, when there is a Google file, the central vault's status, which takes
+    only a central vault of this fleet, and its key when it serves hub_key; then a plain file is sealed, with that key
+    when the vault gave it. What google_seal_plain answers."""
+    google_file_sweep()
+    google_key_sweep()
+    if os.path.lexists(CFG.get("google_file") or GOOGLE_FILE):
+        try:
+            if central_read() is None:
+                central_due()       # a vault that starts after the hub is read again at the first tick
+            with CENTRAL_LOCK:
+                status = CENTRAL["status"]
+            if google_vault_due(status):
+                google_vault_fetch()
+        except Exception:           # the hub starts all the same; the central vault's thread asks again
+            print_fault()
+    return google_seal_plain()
+
+
+def google_file_sweep():
+    """The temporary files that a write of the Google file cut off by a stop left beside it: one of a hub from before
+    1.202 holds the plain tokens. Only at the start, when no write of this hub runs."""
+    google_sweep(os.path.dirname(CFG.get("google_file") or GOOGLE_FILE), ".google.")
+
+
+def google_key_sweep():
+    """The temporary files that a cut-off make of the key file left beside it."""
+    google_sweep(os.path.dirname(google_key_path()), ".google-file.")
+
+
+def google_sweep(folder, prefix):
+    with contextlib.suppress(OSError):
+        for name in os.listdir(folder):
+            if name.startswith(prefix) and name.endswith(".tmp"):
+                with contextlib.suppress(OSError):
+                    os.remove(os.path.join(folder, name))
+
+
+def google_seal_plain():
+    """At the hub's start (google_start): a Google file in the plain form of a hub from before 1.202 is written again
+    sealed, with no step by anybody. True when it sealed one, False when it could not (the file stays plain, the hub
+    reads it as before, and the next start or write tries again), None when there was nothing to seal."""
+    saved, bad, form = google_read()
+    if bad or form != "plain":
+        return None
+    try:
+        google_store(saved)
+    except OSError as e:
+        log("hub", f"could not seal the Google file: {e.strerror or e}. It stays as it was, and the next start tries "
+                   f"again")
+        return False
+    log("hub", "sealed the Google file with the key of its own key file (UI-API.md 1.202)")
+    return True
+
+
+def google_set_aside():
+    """A Google file that its key no longer opens (google_file_lost) goes aside under a name of its own, beside it, so
+    that a Connect can start a new file: what it held is lost with its key, and a key file that comes back still opens
+    the copy. The new name, or None when there was no file."""
+    path = CFG.get("google_file") or GOOGLE_FILE
+    aside = f"{path}.lost-{int(now())}-{uuid.uuid4().hex[:8]}"     # a name of its own: a rename replaces a file there
+    try:
+        os.rename(path, aside)
+    except FileNotFoundError:
+        return None
+    GOOGLE_OPENED["last"] = None
+    log("owner", f"the Google file does not open with its key, so it went aside as {os.path.basename(aside)}, "
+                 f"and this Connect starts a new one")
+    return aside
 
 
 def google_scopes(entry):
@@ -19492,8 +19937,15 @@ def google_problem_of(problems, made, email, entry):
 
 
 def google_view(team):
-    """GET /ui/team: the client, and each account of the file and of team.json, without a token or a secret."""
-    saved, bad = google_saved()
+    """GET /ui/team: the client, and each account of the file and of team.json, without a token or a secret. A key file
+    that the hub cannot read is the file's problem too (google_file_key), as the next Connect would answer it; this
+    read makes no key."""
+    saved, bad, form = google_read()
+    if not bad and form == "sealed" and GOOGLE_OPENED["vault"] is None:     # the key file as the next write reads it
+        try:
+            google_key_read()
+        except OSError:
+            bad = refusal_words.words("google_file_key")
     named = {g.get("account") for a in team["agents"].values() for g in (a.get("google") or {}).values()}
     with GOOGLE_LOCK:
         problems, made = dict(GOOGLE["problems"]), dict(GOOGLE["problem_for"])
@@ -36001,7 +36453,11 @@ def gmail_label_read(agent, args, kept, after, before=None):
         # What only a new Connect ends is no_access: the account's problem for the refresh token that the file holds
         # now (google_problem_of), no entry, an entry whose client the hub no longer has (google_client_of), or no
         # Gmail scope. All else is no answer now: Google's own fault, or founderizer.com with no secret of the client.
-        saved = google_saved()[0]
+        saved, bad = google_saved()
+        if bad == refusal_words.words("google_file_key"):     # a key that the hub cannot read now (UI-API.md 1.202)
+            raise ReadFailed("no_answer", READ_NO_ANSWER) from None
+        if bad == GOOGLE_LOST:              # its key no longer opens the file: only a new Connect ends it
+            raise ReadFailed("no_access", GOOGLE_LOST_READ) from None
         entry = google_entry(saved, account)
         with GOOGLE_LOCK:
             problem = google_problem_of(GOOGLE["problems"], GOOGLE["problem_for"], account, entry)
@@ -47001,6 +47457,9 @@ def hub_only_files():
         saved, problem = google_saved()
         found["google"] = {"present": True} if problem else {
             "present": True, "accounts": len(saved.get("accounts") or {}), "client": bool(saved.get("client_id"))}
+        holder = google_holder(path)
+        if holder:      # sealed (UI-API.md 1.202): whether the central vault keeps its key, or the hub's key file
+            found["google"].update(sealed=True, vault=holder == "vault")
     found["github_app"] = {"present": os.path.exists(CFG.get("github_app") or GITHUB_APP)}
     path = CFG.get("mcp_file") or MCP_FILE
     if not os.path.exists(path):
@@ -47084,7 +47543,14 @@ def hub_only_notes(found):
             holds = "the one Google account you connected." + lost
         else:
             holds = f"the {n} Google accounts you connected." + lost
-        said.append("**Your Google sign-in.** `~/.fleet/google.json` on the hub machine holds " + holds)
+        # The key that seals the file (UI-API.md 1.202) is in the central vault or in a file of its own, also on that
+        # machine and also not in this copy: a person who moves ~/.fleet by hand moves its key too, or it opens nothing.
+        key = ("" if not google.get("sealed") else
+               " It is sealed with a key that the hub's central vault keeps, which this copy does not hold either: "
+               "the file is of no use without it." if google.get("vault") else
+               " It is sealed with the key in `~/.config/founderizer/google-file.key` on the same machine, which "
+               "this copy does not hold either: the file is of no use without it.")
+        said.append("**Your Google sign-in.** `~/.fleet/google.json` on the hub machine holds " + holds + key)
         steps.append(
             "**Connect Google again**, one account at a time, in the app under Settings › Apps, signed in to each "
             "account in the browser that opens. `config/team.json` in this copy names the accounts and which agent "
@@ -53847,8 +54313,13 @@ class Handler(BaseHTTPRequestHandler):
             return {"redirect_uri": uri, "account": account, "service": service}
 
         def client_of(saved, bad):
-            if bad:                 # the finish could not write it: say so before the owner signs in at Google
+            # The finish could not write it: say so before the owner signs in at Google. A file that its key no longer
+            # opens is lost already, and the finish sets it aside and starts a new one (GOOGLE_LOST).
+            if bad and bad != GOOGLE_LOST:
                 raise google_file_refusal(bad)
+            unready = google_key_ready()    # the key that the finish seals with, before the owner signs in at Google
+            if unready:
+                raise google_file_refusal(unready)
             client, kind = google_connect_client(saved)
             if not client:
                 raise Refusal(409, code="google_no_client")
@@ -53857,6 +54328,7 @@ class Handler(BaseHTTPRequestHandler):
         def outside(body):
             """The secret of Founderizer's app from founderizer.com when the hub has none yet: a call over the network,
             so it does not hold LOCK (a slow site would stop every other request of the hub)."""
+            google_vault_ask()              # the central vault's key of the file, before the key check of client_of
             client, _ = client_of(*google_saved())
             try:
                 return google_secret_of(client)["client_secret"]
@@ -53914,8 +54386,12 @@ class Handler(BaseHTTPRequestHandler):
         def outside(body):
             """Google's calls of the finish, which hold no LOCK (a slow Google or founderizer.com would stop every other
             request of the hub): the pending Connect, the exchange of its code, and the account's email."""
+            google_vault_ask()
             bad = google_saved()[1]
-            if bad:                 # a write would lose the other accounts of a file that the hub cannot read
+            # A write would lose the other accounts of a file that the hub cannot read; those of a file that its key no
+            # longer opens are lost already (GOOGLE_LOST).
+            bad = bad if bad and bad != GOOGLE_LOST else google_key_ready()     # and the key that the write seals with
+            if bad:
                 raise google_file_refusal(bad)
             with GOOGLE_LOCK:
                 p = GOOGLE["pending"]
@@ -53956,7 +54432,7 @@ class Handler(BaseHTTPRequestHandler):
         def act(body, done):
             p, client, got, email = done["pending"], done["client"], done["got"], done["email"]
             saved, bad = google_saved()
-            if bad:                 # the file went bad meanwhile: nothing is written, and the owner connects again
+            if bad and bad != GOOGLE_LOST:  # the file went bad meanwhile: nothing is written; the owner connects again
                 raise google_file_refusal(bad)
             with GOOGLE_LOCK:       # a Disconnect's revoke can end the whole grant, the token of this Connect too
                 started, ended = (counts.get(email, 0) for counts in done["revokes"])
@@ -53988,7 +54464,15 @@ class Handler(BaseHTTPRequestHandler):
                                       **{client["client_id"]: held})
                 if held != client["client_secret"]:
                     google_fingerprints("", None, held)
-            google_store(dict(top, accounts=accounts))
+            unready = google_key_ready()     # the key, before the write and before a lost file goes aside
+            if unready:
+                raise google_file_refusal(unready)
+            if bad:                 # GOOGLE_LOST: what the file held went with its key, and this one starts anew
+                google_set_aside()
+            try:
+                google_store(dict(top, accounts=accounts))
+            except GoogleKeyError:          # the key went in the moment since its check: nothing was written
+                raise google_file_refusal(refusal_words.words("google_file_key")) from None
             google_fingerprints(email, got["refresh_token"], client["client_secret"])
             with GOOGLE_LOCK:
                 GOOGLE["tokens"].pop(email, None)
@@ -54025,12 +54509,14 @@ class Handler(BaseHTTPRequestHandler):
             (GOOGLE_REVOKED), as the revoke can end the whole grant, a token that such a finish got too; and no
             finish can write the entry that this Disconnect then removes."""
             account, counted = body["account"], False
+            google_vault_ask()
             try:
                 with LOCK:
                     with GOOGLE_LOCK:
                         GOOGLE["revokes"][account] = GOOGLE["revokes"].get(account, 0) + 1
                         counted = True
                     saved, bad = google_saved()
+                bad = bad or google_key_ready()     # the key that the entry's removal seals with, before the revoke
                 if bad:             # nothing was revoked
                     raise google_file_refusal(bad)
                 entry = google_entry(saved, account)
@@ -54057,7 +54543,10 @@ class Handler(BaseHTTPRequestHandler):
                     raise google_file_refusal(bad)
                 entry = (saved.get("accounts") or {}).get(account)
                 if entry is not None:
-                    google_store(dict(saved, accounts={k: v for k, v in saved["accounts"].items() if k != account}))
+                    try:
+                        google_store(dict(saved, accounts={k: v for k, v in saved["accounts"].items() if k != account}))
+                    except GoogleKeyError:  # the entry stays, with its token, until a Disconnect that can write
+                        raise google_file_refusal(refusal_words.words("google_file_key")) from None
             finally:
                 ended(account)
             log("owner", f"disconnected the Google account {account}" +
@@ -59042,6 +59531,10 @@ def main():
     settings_checked()          # the team that this hub starts with: a release that brings the check finds what is there
     key_swap_answered()         # an owner's press of a key swap item that a stop cut before it reached team.json
     key_swap_checked()          # and the asks for the owner's word, again after a turn of the manager that failed
+    try:
+        google_start()          # the Google file, sealed before a timer or a request reads it (UI-API.md 1.202)
+    except Exception:           # a fault of it stops no start: the file is read as it is, and sealed at a write
+        print_fault()
     # The heartbeat starts here and not at the first complete pass (tick_heartbeat), so that a hub whose very first
     # pass raises -- a bad row is there before the timers are -- is visible on the owner's screen after TICK_WARN
     # instead of for ever reading as a hub that has not ticked yet. A process with no timers thread (every test)

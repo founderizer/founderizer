@@ -134,8 +134,10 @@ def tmux_socket(name):
     return removed_when_gone(path)
 
 
+# hub.CFG key: hub.py's own name below ~/.fleet, and below ~/.config/founderizer for the key of the Google file, which
+# is not kept beside the file that it seals (UI-API.md 1.202)
 HUB_FILES = {"attachment_dir": "attachments", "google_file": "google.json", "github_app": "github-app.pem",
-             "mcp_file": "mcp.json", "door_secrets": "door.json"}       # hub.CFG key: hub.py's own name below ~/.fleet
+             "mcp_file": "mcp.json", "door_secrets": "door.json", "google_key": "google-file.key"}
 
 
 def hub_files(folder):

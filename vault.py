@@ -153,7 +153,10 @@ AGENT_NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 CALLER_KEY = re.compile(r"[A-Za-z0-9_-]{43}")          # an agent key (owner API 1.12): 256 bits, base64url
 # The central vault's own operations, beside status: a central vault serves only these, and a machine's broker none.
 CENTRAL_OPERATIONS = ("intake", "pin", "unpin", "recovery", "grant", "ungrant", "pool", "unpool", "seal", "inventory",
-                      "export", "remove", "key_addresses")
+                      "export", "remove", "key_addresses", "hub_key")
+# The hub's own files whose key the central vault keeps for it (hub_key; UI-API.md 1.202): its Google file, which the
+# hub seals so that a copy of the hub user's files does not open it.
+HUB_KEYS = ("google",)
 # The addresses that select each row of the hub's table of well-known services (lifecycle.KEY_TABLE: the API hosts,
 # and the pages as (host, path)), for the central vault's key_addresses. A copy, because the central vault runs this
 # file alone and takes no host from the hub: test_key_table holds it equal to the hub's table.
@@ -2004,6 +2007,8 @@ def central_status(conf):
             "grants": granted(state), "pool": pooled(state), "items": len(store.opened()),
             "removes": True, "replaces": True,      # this program serves remove, and replace in intake (the hub asks)
             "key_addresses": True,                  # and key_addresses: the hub asks it only when this says so
+            "hub_keys": True,                       # and hub_key, the key of the hub's Google file: the same rule
+            "hub_key_ids": hub_key_ids(conf),       # the id of each key that hub_key gave: the hub asks again on news
             # the checksum of the copy of the newest replace of each login: no secret. A hub that stopped between
             # this vault's write and its own record of a replace reads here that a value changed.
             "values": {ref: x["sha256"] for ref, x in sorted(state["values"].items())},
@@ -2288,6 +2293,71 @@ def key_addresses(conf):
     return {"ok": True, "rows": rows}
 
 
+def hub_key_path(conf, name):
+    """The key file of one of the hub's files: `hub-<name>.key` in this vault's state folder."""
+    return os.path.join(os.path.dirname(os.path.abspath(conf["state"])), f"hub-{name}.key")
+
+
+def hub_key_ids(conf):
+    """{name: the id of the key that hub_key keeps}, for each key file that is there and holds one key: 16 hex
+    characters of a SHA-256 of the key, as the hub's atrest.key_id makes them, which open nothing. The hub reads them
+    with each status, and asks hub_key again when the key that it holds has another id: a running hub then seals its
+    file with the key that this vault keeps now. A status makes no key."""
+    ids = {}
+    for name in HUB_KEYS:
+        try:
+            text = read_private(hub_key_path(conf, name), f"{name} key").strip()
+        except Refused:
+            continue
+        if re.fullmatch(r"[0-9a-f]{64}", text):
+            ids[name] = hashlib.sha256(b"founderizer key id\x00" + bytes.fromhex(text)).hexdigest()[:16]
+    return ids
+
+
+def hub_key(conf, req):
+    """hub_key: the key of one of the hub's own files (HUB_KEYS), which this vault keeps for the hub (UI-API.md 1.202):
+    32 random bytes in `hub-<name>.key` of this vault's state folder, which only this vault's user reads, made at the
+    hub's first request and never replaced. The hub seals its Google file with it, so a copy of the hub user's files
+    does not open that file. It is no value of the owner's and opens nothing of the store, and no export carries it.
+    The socket's rule gives it to the hub's user alone (admitted), and each request is a line of this vault's log."""
+    name = req.get("name")
+    if name not in HUB_KEYS:
+        raise Refused("name must be one of: " + ", ".join(HUB_KEYS))
+    path = hub_key_path(conf, name)
+    if not os.path.lexists(path):
+        hub_key_make(path)
+    text = read_private(path, f"{name} key").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", text):
+        raise Refused(f"the vault {name} key file does not hold one key")
+    log(f"hub_key: the key of the hub's {name} file")
+    return {"ok": True, "key": text}
+
+
+def hub_key_make(path):
+    """A new key file that nothing replaces: written whole beside it and synced, then linked to its name, which fails
+    over a file that is there (another request made it first, and that one is the key), and the folder synced, so the
+    key is on the disk before the hub seals anything with it."""
+    temp = f"{path}.{secrets.token_hex(8)}.new"
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write(secrets.token_hex(32) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.link(temp, path)
+        except FileExistsError:
+            pass
+        sync_folder(os.path.dirname(path))
+    except OSError:
+        raise Refused("the key of the hub's file could not be made") from None
+    finally:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+
+
 def central(conf, req):
     """One request to the central vault (handle): its own operations and status, and nothing of a machine's broker."""
     op = req.get("op")
@@ -2303,6 +2373,8 @@ def central(conf, req):
         return {"ok": True, "logins": sorted("bws://" + sid for sid in LocalStore(conf).opened())}
     if op == "key_addresses":
         return key_addresses(conf)
+    if op == "hub_key":
+        return hub_key(conf, req)
     if op == "export":
         return export(conf)
     if op == "remove":
