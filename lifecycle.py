@@ -133,6 +133,120 @@ def hardening(run=None):
     return facts
 
 
+# The fleet's own services of a Linux user (`fleet.py service <name>` writes each as fleet-<name>.service). The text of
+# a unit is here and not in fleet.py, because the hub reads the text of its own unit too: at its start it writes the
+# unit again when the file has the text of an earlier release (hub.unit_follows_code), which is how a hub that an
+# earlier release installed gets a change of its unit with no step of its owner's. One function for the installer
+# and for the hub, so that the two write one text where they read the same folder, program and home.
+HUB_UNIT = "fleet-hub.service"
+
+
+def service_path(home):
+    """The PATH of each service that `fleet.py service` writes, for the user whose home folder is `home`."""
+    return os.pathsep.join([os.path.join(home, ".local/bin"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin",
+                            "/bin", "/usr/sbin", "/sbin"])
+
+
+def hub_start(python):
+    """The command of the hub's service: `python3 -m hub`, which finds hub.py in the unit's WorkingDirectory, the
+    code's folder, and not `python3 <folder>/hub.py`.
+
+    Python keeps the syntax tree of a file that it runs by its path until that file ends (for a module it frees
+    the tree before the module runs), and it compiles the file again at every start. A module it compiles one time
+    and keeps in __pycache__. Measured on a server with 1 GB (Ubuntu 24.04, Python 3.12) on 16 November 2026: a hub
+    by its path holds 185 MB; as a module 37 to 46 MB when its start read the compiled file, and 58 MB after a
+    start that compiled a new hub.py (that start's peak is 201 MB). On such a server about 135 MB are room that the
+    checks of a release need beside the hub. The hub's main() takes no argument from the unit, and hub.py reads how
+    it was started in one place only: to see that systemd started it by this line (hub.unit_follows_code)."""
+    return [python, "-m", "hub"]
+
+
+def _unit(name, argv, folder, path_env, more):
+    """One unit's text: the frame that every fleet-<name>.service has, `folder` as the WorkingDirectory line says
+    it, and `more` as the lines of this unit alone."""
+    def quote(x):
+        return json.dumps(x.replace("%", "%%"))
+    return ("[Unit]\nDescription=Founderizer " + name + "\nAfter=network-online.target\nStartLimitIntervalSec=0\n"
+            "[Service]\nType=simple\nWorkingDirectory=" + folder + "\n"
+            "Environment=" + quote("PATH=" + path_env) + "\nExecStart=" + " ".join(map(quote, argv)) + "\n"
+            "Restart=always\nRestartSec=5\nKillMode=process\nTimeoutStopSec=15\n" + more +
+            "[Install]\nWantedBy=default.target\n")
+
+
+def service_unit(name, argv, kit, path_env):
+    """The text of the systemd user unit fleet-<name>.service: `argv` in the folder `kit`, started again whenever it
+    ends.
+
+    StartLimitIntervalSec=0 turns off systemd's own rate limit, which otherwise gives up after five starts in ten
+    seconds and leaves the unit failed. With Restart=always and RestartSec=5 that is about twenty seconds, and a
+    customer has no console to bring it back: whatever made the process exit, the fleet is then gone for as long as
+    nobody looks. Keeping it trying costs one restart every five seconds and can recover by itself from a cause that
+    passes: a disk that was full, a database that was locked, a machine still booting.
+
+    OOMPolicy=continue, for the hub alone: the checks of a release run as processes of the hub's service
+    (releases.Update.checks), and by systemd's default (stop) the whole service stops when the system ends one of its
+    processes for lack of memory. Measured on a server with 1 GB on 15 and 16 November 2026 (Ubuntu 24.04, systemd
+    255):
+    with the default, one such end stopped the hub, and it answered again 6 seconds later; with continue, systemd
+    wrote the event to the journal and the hub kept its process and answered at every second. The check that ended
+    is then a check that failed, and the fleet keeps its revision. When the system ends the hub's own process, the
+    unit starts it again as before.
+
+    The folder is written as it is, with a space as a space: systemd reads the whole rest of the line as the path
+    and takes \x20 for four characters, so that a unit with it never started (measured on 16 November 2026; until
+    then this text wrote \x20). A percent sign is doubled, because systemd reads %h and its like in that line."""
+    more = ("OOMPolicy=continue\n" if name == "hub" else "") + \
+        ("UMask=0077\n" if name == "channels" else "")      # the bridge's journal holds the text of messages
+    return _unit(name, argv, kit.replace("%", "%%"), path_env, more)
+
+
+def hub_unit(kit, python, home):
+    """The text of the hub's own unit, for the code in the folder `kit`: what `fleet.py service hub` writes, and what
+    the hub compares its unit with at its start. The folder goes in by its real path, because a process that starts
+    in a folder (the module form) reads the folder's real path where a link led to it, and the two texts must be
+    the same one."""
+    return service_unit("hub", hub_start(python), os.path.realpath(kit), service_path(home))
+
+
+def hub_units_before(kit, python, home):
+    """The texts that earlier releases wrote as the hub's unit, for the code in the folder `kit` as the installer of
+    that time named it (links kept). The hub writes its unit again only over one of these (hub.unit_follows_code):
+    a unit with another text is somebody's own, and the hub leaves it.
+
+    **A change of the hub's unit adds the text of before to this list**, or no hub that runs gets the change. The
+    text of today is never in it (test_schema_guard holds that), so the hub moves a unit one time and not back.
+    Each text is written out here, word for word as its release wrote it, and not built from the code of today
+    (_unit, service_unit): that code changes, and these texts are files on servers, which do not.
+
+    1. From 18 October 2026 until the release that brought the module form (16 November 2026): the hub by its
+       path, and no OOMPolicy line. A folder with a space had \x20 there. (hub.sh of 17 and 18 October 2026 wrote
+       two texts before it, without StartLimitIntervalSec. No release carried them, and they are not here.)"""
+    def quote(x):
+        return json.dumps(x.replace("%", "%%"))
+    first = ("[Unit]\nDescription=Founderizer hub\nAfter=network-online.target\nStartLimitIntervalSec=0\n"
+             "[Service]\nType=simple\nWorkingDirectory=" + kit.replace("%", "%%").replace(" ", r"\x20") + "\n"
+             "Environment=" + quote("PATH=" + os.pathsep.join([
+                 os.path.join(home, ".local/bin"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
+                 "/usr/sbin", "/sbin"])) + "\n"
+             "ExecStart=" + quote(python) + " " + quote(os.path.join(kit, "hub.py")) + "\n"
+             "Restart=always\nRestartSec=5\nKillMode=process\nTimeoutStopSec=15\n"
+             "[Install]\nWantedBy=default.target\n")
+    return [first]
+
+
+def unit_of_a_release(text, kit, python, home):
+    """True when `text` is the hub's unit as an earlier release wrote it (hub_units_before) for the folder `kit`, by
+    any name of that folder. The installer of that time wrote the folder as it named it, and a link can lead to the
+    folder: so the name is the one that the text's own WorkingDirectory line gives, and it must lead to `kit`."""
+    line = next((one for one in text.split("\n") if one.startswith("WorkingDirectory=")), "")
+    named = line.partition("=")[2].replace(r"\x20", " ").replace("%%", "%")
+    try:
+        return bool(named) and os.path.realpath(named) == os.path.realpath(kit) and \
+            text in hub_units_before(named, python, home)
+    except ValueError:          # a name that is no path (a character that no path has)
+        return False
+
+
 OWNER_ONLY = re.compile(r"(?:^|/)(?:test_[^/]*|ui_fixture|selftest|verify|pilot|vault|place)\.py$")  # never loaded here
 TICK = 15                   # seconds between idle checks
 RESTART_GRACE = 120         # seconds this process may live on after it asked for its own restart

@@ -1169,8 +1169,12 @@ class HubRoutes(OwnerAPI):
         with patch.dict(hub.CFG, {"team_path": os.path.abspath(hub.TEAM_DEFAULT),
                                   "db_path": os.path.expanduser(hub.DB_DEFAULT)}):
             self.assertTrue(hub.installed_hub())                # only compares paths: nothing is read or written
-        fleet_py = (Path(hub.__file__).parent / "fleet.py").read_text()
-        self.assertIn('argv = [sys.executable, os.path.join(KIT, "hub.py")]\n', fleet_py)     # the unit: no argument
+        import lifecycle
+        self.assertEqual(lifecycle.hub_start("python3"), ["python3", "-m", "hub"])              # the unit: no argument
+        unit = lifecycle.service_unit("hub", lifecycle.hub_start("/usr/bin/python3"), "/home/fleet/founderizer",
+                                      lifecycle.service_path("/home/fleet"))
+        self.assertIn('\nExecStart="/usr/bin/python3" "-m" "hub"\n', unit)
+        self.assertIn("\nWorkingDirectory=/home/fleet/founderizer\n", unit)     # where -m finds hub.py and team.json
 
     def test_a_test_or_scratch_hub_with_no_entitlement_asks_nothing_and_writes_nothing(self):
         """A hub whose team.json is in a folder of its own (this test's), whose records are not at the default place,

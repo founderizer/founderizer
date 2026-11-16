@@ -8066,7 +8066,7 @@ def served_repositories():
 
 def cmd_service(args):
     """Install only this pilot's service definitions; leave activation explicit."""
-    path_env = os.pathsep.join([os.path.expanduser("~/.local/bin"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+    path_env = lifecycle.service_path(os.path.expanduser("~"))
     if sys.platform == "darwin":
         if args.name != "watch" and TEAM["agents"].get(args.name, {}).get("role") not in ("worker", "lead"):
             die("macOS services require a configured worker or lead name, or watch")
@@ -8092,33 +8092,22 @@ def cmd_service(args):
     linger = subprocess.run(["loginctl", "show-user", str(os.getuid()), "-p", "Linger", "--value"], capture_output=True, text=True)
     if linger.stdout.strip() != "yes":
         die("enable linger first: loginctl enable-linger --no-ask-password " + os.environ.get("USER", "claude"))
-    if name == "hub":
-        argv = [sys.executable, os.path.join(KIT, "hub.py")]
-    elif name == "git":     # fetch only: git:// has no authentication, so pushes go over SSH (PILOT.md "Pushes")
-        host = TEAM["addresses"][TEAM["hub"]["machine"]]
-        argv = [shutil.which("git"), "daemon", "--reuseaddr", f"--listen={host}", "--forbid-override=receive-pack",
-                "--base-path=" + os.path.expanduser("~"), *served_repositories()]
-    elif name == "channels":    # the chat apps bridge (CHAT-APPS.md): it reads the hub from team.json beside it
-        argv = [sys.executable, os.path.join(KIT, "channels.py"), "run"]
+    if name == "hub":       # as a module from its folder, and by that folder's real path (lifecycle.hub_start, hub_unit)
+        unit = lifecycle.hub_unit(KIT, sys.executable, os.path.expanduser("~"))
     else:
-        argv = [sys.executable, os.path.join(KIT, "fleet.py"), "run", name]
-    def unit_quote(x):
-        return json.dumps(x.replace("%", "%%"))
-    # StartLimitIntervalSec=0 turns off systemd's own rate limit, which otherwise gives up after five starts in
-    # ten seconds and leaves the unit failed. With Restart=always and RestartSec=5 that is about twenty seconds,
-    # and a customer has no console to bring it back: whatever made the process exit, the fleet is then gone for
-    # as long as nobody looks. Keeping it trying costs one restart every five seconds and can recover by itself
-    # from a cause that passes — a disk that was full, a database that was locked, a machine still booting.
-    unit = ("[Unit]\nDescription=Founderizer " + name + "\nAfter=network-online.target\nStartLimitIntervalSec=0\n"
-            "[Service]\nType=simple\nWorkingDirectory=" + KIT.replace("%", "%%").replace(" ", r"\x20") + "\n"
-            "Environment=" + unit_quote("PATH=" + path_env) + "\nExecStart=" + " ".join(map(unit_quote, argv)) + "\n"
-            "Restart=always\nRestartSec=5\nKillMode=process\nTimeoutStopSec=15\n"
-            + ("UMask=0077\n" if name == "channels" else "") +   # its journal holds the text of messages
-            "[Install]\nWantedBy=default.target\n")
+        if name == "git":   # fetch only: git:// has no authentication, so pushes go over SSH (PILOT.md "Pushes")
+            host = TEAM["addresses"][TEAM["hub"]["machine"]]
+            argv = [shutil.which("git"), "daemon", "--reuseaddr", f"--listen={host}", "--forbid-override=receive-pack",
+                    "--base-path=" + os.path.expanduser("~"), *served_repositories()]
+        elif name == "channels":    # the chat apps bridge (CHAT-APPS.md): it reads the hub from team.json beside it
+            argv = [sys.executable, os.path.join(KIT, "channels.py"), "run"]
+        else:
+            argv = [sys.executable, os.path.join(KIT, "fleet.py"), "run", name]
+        unit = lifecycle.service_unit(name, argv, KIT, path_env)    # the unit's text, and why it says what it says
     folder = os.path.expanduser("~/.config/systemd/user")
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, f"fleet-{name}.service")
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:    # as the hub reads its own unit (hub.unit_follows_code)
         f.write(unit)
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
     subprocess.run(["systemctl", "--user", "enable", f"fleet-{name}.service"], check=True)

@@ -740,7 +740,12 @@ class Update:
 
         The copy is a copy of a copy: the hub already hands over a throwaway, and this makes its own inside the
         folder `apply()` deletes, so the released code can only ever open a file this run wrote. That costs the
-        database's size in the tempdir for the length of the run, which is the right price for the invariant."""
+        database's size in the tempdir for the length of the run, which is the right price for the invariant.
+
+        The released hub runs as a module from the clone (`python3 -m hub`), not by its path. Python then keeps what
+        it compiled in the clone's __pycache__, and the hubs that selftest.py starts next in that clone, also as a
+        module, read it there: the compile of hub.py, about 190 MB for a moment, is paid one time in a run, here,
+        where nothing else of the run holds memory, and not again beside the self-test and its hubs."""
         if not self.database:
             return None
         version, pinned = self.manifest["version"], self.pinned[:12]
@@ -750,7 +755,7 @@ class Update:
         except OSError as e:
             return self.answer(ROLLED_BACK, "schema", f"this fleet's database could not be copied for the schema "
                                                       f"check of release {version}: {e}. The fleet stays at {pinned}.")
-        code, out, err = self.run([self.python, os.path.join(self.clone, "hub.py"), "--check-schema", copy],
+        code, out, err = self.run([self.python, "-m", "hub", "--check-schema", copy],
                                   timeout=self.schema_wait, cwd=self.clone)
         summary = schema_summary(out)
         if summary is None:

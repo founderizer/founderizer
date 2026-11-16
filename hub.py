@@ -45393,7 +45393,8 @@ def settle_releases(says="the hub stopped before this update ended; the next upd
                     print_fault()
         # A run that was cut off before its push took nothing, and the next poll runs its release again. When the run
         # itself is what stops the hub (a server with too little memory for the checks: the system ends one of them,
-        # and systemd's default then stops the service that started it), that is a stop of the hub at every poll: so
+        # and systemd's default then stops the service that started it, as it did until the hub's unit said
+        # OOMPolicy=continue; or the system ends the hub's own process), that is a stop of the hub at every poll: so
         # the run counts as one that failed here, and more polls pass before the next one (release_rests).
         for row in q("SELECT * FROM releases WHERE state='updating' AND reached IS NULL"):
             release_rolled(row)
@@ -45532,8 +45533,9 @@ def memory_given_back():
     - `python3 -m hub`, the first start in a folder: 172 MB without this call, 54 MB with it. selftest.py starts its
       hubs so, beside the fleet's own hub, and on a server with 1 GB those 118 MB were room that its run lacked.
     - `python3 -m hub`, a later start: 40 MB. Python read what the first start had compiled, so nothing was to give.
-    - `python3 hub.py`, as a hub's service starts it: 189 MB without, 178 MB with. Python keeps the parsed text of
-      a file that it runs by its path for as long as that file runs, so that memory is in use and stays.
+    - `python3 hub.py`, as a hub's service started it until its unit became `python3 -m hub`
+      (lifecycle.hub_start): 189 MB without, 178 MB with. Python keeps the syntax tree of a file that it runs by
+      its path until that file ends, so that memory is in use and stays.
     Another C library has no such call, and the hub runs as before."""
     try:
         import ctypes
@@ -45543,7 +45545,7 @@ def memory_given_back():
 
 
 def installed_hub():
-    """True when this process is a hub as hub.sh installs one: its service runs <checkout>/hub.py with no argument,
+    """True when this process is a hub as hub.sh installs one: its service runs <checkout>'s hub with no argument,
     so main() read the team.json of the code's own folder and keeps its records at the default place. Only such a hub
     takes a release by itself when it holds no entitlement (release_sweep): an update merges into that checkout and
     restarts the hub onto it. A test's or a scratch hub is not so: selftest.py, each test that starts a hub, a hub
@@ -45555,6 +45557,338 @@ def installed_hub():
     return os.path.realpath(os.path.dirname(os.path.abspath(team))) == \
         os.path.realpath(os.path.dirname(TEAM_DEFAULT)) and \
         os.path.realpath(os.path.expanduser(db)) == os.path.realpath(os.path.expanduser(DB_DEFAULT))
+
+
+UNIT_WAIT = 60                          # seconds for one call of systemctl at the hub's start
+START_CHECK = "--start-check"           # main(): say which file runs, and stop (the proof of a start line)
+START_CHECK_WAIT = 120                  # seconds for that proof, which compiles this file (as releases.SCHEMA_WAIT)
+UNIT_STATE = "hub-unit-state"           # beside the records: what this hub did since a start found its unit current
+UNIT_CHECK = "fleet-hub_unit_check.service"     # the new text under a name that nothing starts and no agent has
+
+
+def process_started():
+    """When this process began, as a time of the system's clock, or None where nothing says it (a system that is not
+    Linux). The system counts it in ticks since its start (the 22nd field of /proc/self/stat)."""
+    try:
+        with open("/proc/self/stat", "rb") as f:
+            ticks = int(f.read().rsplit(b")", 1)[1].split()[19])
+        return time.time() - (time.clock_gettime(time.CLOCK_BOOTTIME) - ticks / os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError, IndexError, AttributeError):
+        return None
+
+
+def compiled_checked(since, folder=None):
+    """The compiled files of the code's folder that this process wrote (since the time `since`) and that this Python
+    cannot read back are removed, so that the next start compiles them again. Returns their names. With no time
+    (process_started on a system that is not Linux) it reads nothing. It raises nothing.
+
+    Python keeps what it compiled of a module in __pycache__ and reads it at the next start. A file there whose first
+    bytes are whole and whose rest is cut makes that import fail at every start, for ever: Python does not compile
+    again over it. A hub that runs as a module (lifecycle.hub_start) reads such a file of hub.py itself, and then it
+    never starts. A file can be cut when the disk was full at the moment Python wrote it (Python sees a write that
+    was shorter than it asked for only since 3.12.8, 3.13.1 and 3.14: not the Python of Ubuntu 22.04 and 24.04 or of
+    Debian 12). A hub that ran by its path did not read a compiled file of hub.py at its start, and it came back by
+    itself when the disk had room again. So a start reads back what it wrote, as the first step of main(): before
+    anything that a full disk can stop, because the start after a stopped one would read the cut file. The proof of
+    a start line (START_CHECK) and the schema check of a release are starts of this file too, and read back what
+    they wrote. A file that this process did not write is not read here: the start took its module from that file
+    already, where it took the module at all. What stays open is a file that another program cut after this start
+    read it (an installer's step that takes hub as a module), a process that the system ends between its write and
+    this step, a server that loses its power before the file is on its disk, and a module that the hub takes
+    later, inside a function: as for each other module of the hub before this. A check that runs before Python
+    takes the module (a line ExecStartPre of the unit) would close those too.
+
+    Only the files of this start, because the read of every file costs memory that stays: measured on 16 November
+    2026 for the 19 files of a hub's folder (5.8 MB), 0.06 seconds and 5 MB more for as long as the hub runs. The
+    one start that pays this is the start after the hub's move of its unit (unit_follows_code): the proof of the
+    start line wrote the file of hub.py less than two seconds before it."""
+    import marshal
+    removed = []
+    if since is None:
+        return removed
+    folder = folder or os.path.join(os.path.dirname(os.path.abspath(__file__)), "__pycache__")
+    ending = "." + (sys.implementation.cache_tag or "") + ".pyc"
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return removed
+    for name in names:
+        if not name.endswith(ending):
+            continue
+        file = os.path.join(folder, name)
+        try:
+            if os.stat(file).st_mtime < since - 2:      # two seconds: a clock that the system set meanwhile, and a
+                continue                                # file system that keeps whole seconds
+            with open(file, "rb") as f:
+                data = f.read()
+            if len(data) >= 16:             # a shorter file has no whole first bytes: Python compiles again over it
+                marshal.loads(data[16:])
+        except (OSError, MemoryError):      # not read: nothing says that the file is cut
+            continue
+        except Exception:                   # EOFError or ValueError for a cut file; what else marshal may say of one
+            with contextlib.suppress(OSError):
+                os.remove(file)
+                removed.append(name)
+    return removed
+
+
+def command_line():
+    """The words that started this process, as Python keeps them (3.10 and later), or None."""
+    words = getattr(sys, "orig_argv", None)
+    return list(words) if words else None
+
+
+def unit_follows_code(run=subprocess.run):
+    """At the start of a hub that its own service started with no argument, on Linux: the unit of that service has
+    the text that this code writes (lifecycle.hub_unit, which `fleet.py service hub` writes at an install), and
+    systemd started the hub as that text says.
+
+    A release moves the code and nothing else: no installer runs again, so a change of the unit's text reached only
+    the hubs that were installed after it. So the hub does it at its start, before it takes its records. When the
+    file has the text of an earlier release (lifecycle.unit_of_a_release), the hub proves the new start line on this
+    machine, asks systemd if it takes the new text, writes that text, tells systemd to read it (daemon-reload) and
+    restarts its own service: systemd
+    ends this process and starts the hub as the new unit says. That start finds the text and its own start line in
+    order: it asks systemd one time if it is the unit's own process, and ends the record. This is how a hub that
+    an earlier release started by its path (`python3 <folder>/hub.py`) runs as a module (`python3 -m hub`,
+    lifecycle.hub_start) after its first start on the release that brought this, with one more restart of some
+    seconds. Proved on servers with 1 GB on 16 November 2026 (Ubuntu 24.04 and Debian 12): the hub held 185 MB
+    before and 46 MB after, and it answered again 5 seconds after the release's restart.
+
+    **The proof comes before the file changes.** A unit whose start line does not run is a hub that is gone, with
+    nobody at a console. So the hub runs the new line, in the unit's folder, with START_CHECK: the line must end well
+    and name this very file. Only then is the unit written. The proof compiles hub.py and keeps the result
+    (__pycache__), which the start after it reads; it reads that file back first (compiled_checked in main()). It is
+    the system's first choice when memory runs out (oom_score_adj), and it runs in a unit of its own (`systemd-run
+    --scope`), not as a process of the hub's service: with the unit of before, the end of one process of that service
+    for lack of memory stops the hub (lifecycle.service_unit), and the proof must not be what does that. Measured on
+    16 November 2026 with a real such end inside the scope: the hub's unit got no event and kept its process. The
+    scope form needs only the socket of the user's systemd, which `systemctl --user` needs too. The form that waits
+    for a service (`--wait --pipe`) connects to the user's D-Bus: with no address of that bus in its environment it
+    said "Failed to connect to bus" (measured the same day), and a server without dbus-user-session has no such
+    bus. A machine whose Python cannot run the module form at all does not come this far: selftest.py starts its
+    hubs with the same words (`python3 -m hub`), and a hub takes a release only after that self-test passed on its
+    own machine.
+
+    **And systemd says that it takes the text, before the file changes.** A unit whose text systemd refuses never
+    starts again (LoadState bad-setting: a restart of it fails and leaves the process, and after the next stop
+    nothing starts). So the hub writes the new text under another name, which nothing starts (UNIT_CHECK), asks
+    systemd for the LoadState of that name, and removes the file: only "loaded" lets the unit's own file change.
+    After the write and the read, it asks the same of the unit's own name, and restarts only into "loaded".
+    Measured on 16 November 2026 on systemd 252 and 255: "loaded" for this text, "bad-setting" for a folder that is
+    not absolute, and "loaded" for a value of OOMPolicy that systemd does not know (it leaves the line out).
+
+    It changes nothing, and says nothing:
+    - for a process that is not the main process of the hub's unit: a test's hub, a hub that somebody starts by
+      hand, the schema check of a release;
+    - for a hub whose unit gives it an argument: somebody wrote that unit for other records or another port;
+    - where the user has no such unit or the file is no text, and on a system that is not Linux.
+    Where systemd does not say which process is the unit's own, it changes nothing and says that.
+    It changes nothing, and says so in the hub's log at each start, for a unit that is somebody's own:
+    - a text that no release wrote (a line of the operator's own in the file);
+    - a unit with a drop-in file, a unit that is a link, or one that systemd reads from another place. A drop-in can
+      change the folder or the start line, so the proof would not be a proof of what systemd then starts. A drop-in
+      that a package of the system brought for every service (a folder service.d under /usr/lib or /lib, which some
+      systems have) is not the operator's for the hub, and does not count. Before it writes, the hub asks for the
+      drop-ins a second time, after systemd read its files again for the question about the text: a file that
+      somebody wrote is in the answer only then. (A hub that only asks for the read of a unit that has the text
+      already does not ask a second time: it writes nothing.)
+    Such a hub keeps its unit until somebody writes it again: python3 fleet.py service hub.
+
+    **A unit that has the text and a hub that did not start by it** is a systemd that did not read the file (a stop
+    between the write and the daemon-reload, or a daemon-reload that failed): the hub asks for the read and the
+    restart, with no write.
+
+    **No start can restart the hub without an end.** UNIT_STATE, beside the records, holds what this hub did since a
+    start found the unit in order. After one restart for a text, no later start restarts for that text again: when
+    the hub still did not start by it, something is not as this code reads it, and the hub runs as it started and
+    says so. And a start that ended in the middle of its proof (the system ended the hub) is not followed by a
+    second proof at once: the next start runs as it started, and the one after it tries again.
+
+    Returns None when there was nothing to do, and else one line that says which step did not work: the hub then
+    runs as it started. When systemd takes the restart, this does not return."""
+    try:
+        if not sys.platform.startswith("linux") or len(sys.argv) != 1:
+            return None
+        home = os.path.expanduser("~")
+        path = os.path.join(home, ".config", "systemd", "user", lifecycle.HUB_UNIT)
+        kept = os.path.join(os.path.dirname(os.path.expanduser(DB_DEFAULT)), UNIT_STATE)
+        try:
+            with open(path, encoding="utf-8") as f:
+                before = f.read()
+        except (OSError, ValueError):
+            return None
+        kit = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
+        wanted, start = lifecycle.hub_unit(kit, sys.executable, home), lifecycle.hub_start(sys.executable)
+        words = command_line()
+        by_unit = words is None or words[1:] == start[1:]       # what cannot be read says nothing against it
+        in_order = before == wanted and by_unit
+        check = os.path.join(os.path.dirname(path), UNIT_CHECK)
+        if in_order and not os.path.exists(kept) and not os.path.exists(check):
+            return None                 # every start but the first after a change of the unit: nothing is asked
+
+        def ran(argv, wait, **more):
+            try:
+                done = run(argv, capture_output=True, text=True, errors="replace", timeout=wait,
+                           stdin=subprocess.DEVNULL, **more)
+                return done.returncode, (done.stdout or "").strip(), (done.stderr or "").strip()
+            except (OSError, subprocess.SubprocessError) as e:
+                return 1, "", str(e)
+
+        def systemctl(*asked):
+            return ran(["systemctl", "--user", *asked], UNIT_WAIT)
+
+        code, out, err = systemctl("show", "-p", "MainPID", "-p", "FragmentPath", "-p", "DropInPaths",
+                                   lifecycle.HUB_UNIT)
+        shown = dict(line.partition("=")[::2] for line in out.split("\n"))
+        if code != 0 and not in_order:
+            return (f"systemd did not say if this process is the hub's service ({releases._line(err or out) or code}), "
+                    f"so the hub did not change its unit {path}. The next start asks again.")
+        if code != 0 or shown.get("MainPID") != str(os.getpid()):
+            return None
+        with contextlib.suppress(OSError):      # left by a start that was ended in its question to systemd
+            os.remove(check)
+        if in_order:
+            with contextlib.suppress(OSError):
+                os.remove(kept)
+            return None
+        mark = hashlib.sha256(wanted.encode()).hexdigest()
+        try:
+            with open(kept, encoding="utf-8") as f:
+                did = json.load(f)
+            proving, restarted = did.get("proving"), did.get("restarted")
+        except (OSError, ValueError, AttributeError):
+            proving, restarted = None, None
+
+        def keep(proving=None, restarted=None):         # False when the file could not be written
+            try:
+                with open(kept + ".new", "w", encoding="utf-8") as f:
+                    json.dump({"proving": proving, "restarted": restarted}, f)
+                os.replace(kept + ".new", kept)
+                return True
+            except OSError:
+                return False
+
+        def forget():                   # the record ends: a removal works on a full disk too
+            with contextlib.suppress(OSError):
+                os.remove(kept)
+
+        def own(paths):                 # the drop-ins that count: each but a package's own for every service
+            return [one for one in (paths or "").split()
+                    if not (one.startswith(("/usr/lib/", "/lib/"))
+                            and os.path.basename(os.path.dirname(one)) == "service.d")]
+
+        def put(text):                  # the whole new text, or the file as it was: never a part of a text
+            try:
+                mode = stat.S_IMODE(os.stat(path).st_mode)
+                with open(path + ".new", "w", encoding="utf-8") as f:
+                    f.write(text)
+                    f.flush()
+                    os.fsync(f.fileno())    # on the disk before it takes the unit's name: a stop of the server
+                os.chmod(path + ".new", mode)                           # now leaves a whole unit, not an empty one
+                os.replace(path + ".new", path)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    os.remove(path + ".new")
+                raise
+
+        try:
+            import pwd
+            user = pwd.getpwuid(os.getuid()).pw_name
+        except (ImportError, KeyError):
+            user = os.environ.get("USER") or "fleet"
+        as_user = f"runuser -u {user} -- env XDG_RUNTIME_DIR=/run/user/{os.getuid()}"   # measured: it needs that folder
+        again = (f"To write the unit again and restart the hub, run as root: {as_user} {shlex.quote(sys.executable)} "
+                 f"{shlex.quote(os.path.join(kit, 'fleet.py'))} service hub && {as_user} systemctl --user restart "
+                 f"fleet-hub")       # one line to copy, with no mark of a sentence beside a word of it
+        wrote = before != wanted
+        if wrote and not lifecycle.unit_of_a_release(before, kit, sys.executable, home):
+            return (f"The unit {path} does not have the text that an earlier release of Founderizer wrote. The hub "
+                    f"did not change it. Keep a setting of your own in a drop-in file. {again}")
+        fragment = shown.get("FragmentPath") or ""
+
+        def with_drop_in(found):
+            return (f"The unit {path} has a drop-in file ({' '.join(found)}). The hub cannot test its new start "
+                    f"line with that file, so it did not change the unit. {again}")
+
+        if own(shown.get("DropInPaths")):
+            return with_drop_in(own(shown.get("DropInPaths")))
+        if os.path.islink(path) or os.path.realpath(fragment or os.sep) != os.path.realpath(path):
+            return (f"The unit {path} is a link, or systemd reads the hub's unit from another file "
+                    f"({fragment or 'none'}). The hub did not change it.")
+        if restarted == mark:           # before each step that does something: one restart for one text
+            return (f"The hub restarted its service one time for the unit {path}. This start still does not use that "
+                    f"unit. The hub does not restart again by itself. {again}")
+        if wrote:
+            if proving == mark:
+                forget()
+                return (f"The start before this one ended before its test of the new start line of {path} ended. "
+                        f"This start changes nothing. The next start tests the line again.")
+            if not keep(proving=mark):
+                return f"The hub could not write {kept}. It did not change the unit {path}."
+            try:
+                code, out, err = ran(["systemd-run", "--user", "--scope", "--quiet", "--collect", "/bin/sh", "-c",
+                                      'echo 1000 > /proc/self/oom_score_adj; exec "$@"', "sh", *start, START_CHECK],
+                                     START_CHECK_WAIT, cwd=kit)
+            finally:
+                forget()            # this process is here, so the proof ended
+            if code != 0 or out.split("\n")[-1] != os.path.realpath(__file__):
+                return (f"The test of the new start line of the hub's unit ({' '.join(start)} in {kit}) failed "
+                        f"(status {code}: {releases._line(err or out) or 'no output'}). The hub did not change the "
+                        f"unit {path}. The next start tests the line again.")
+            try:                    # does systemd take the new text: asked under a name that nothing starts
+                with open(check, "w", encoding="utf-8") as f:
+                    f.write(wanted)
+                code, out, err = systemctl("daemon-reload")
+                if code != 0:
+                    return (f"systemd did not read its units again ({releases._line(err or out) or code}), so the hub "
+                            f"did not ask it about the new text of its unit. The hub did not change the unit {path}. "
+                            f"The next start asks again.")
+                code, out, err = systemctl("show", "-p", "LoadState", "--value", UNIT_CHECK)
+            except OSError as e:
+                return (f"The hub could not write {check} ({e}), so it did not ask systemd about the new text of its "
+                        f"unit. The hub did not change the unit {path}. The next start tries again.")
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(check)
+            if code != 0 or out != "loaded":
+                return (f"systemd did not take the new text of the hub's unit, which the hub gave it as {UNIT_CHECK} "
+                        f"({releases._line(out or err) or code}). The hub did not change the unit {path}. The next "
+                        f"start asks systemd again.")
+            # For that question systemd read its files again. A drop-in file that somebody wrote and that systemd did
+            # not hold before is in its answer only now.
+            code, out, err = systemctl("show", "-p", "DropInPaths", "--value", lifecycle.HUB_UNIT)
+            if code != 0:
+                return (f"systemd did not say which drop-in files the hub's unit has "
+                        f"({releases._line(err or out) or code}). The hub did not change the unit {path}. The next "
+                        f"start asks again.")
+            if own(out):
+                return with_drop_in(own(out))
+            try:
+                put(wanted)
+            except OSError as e:
+                return (f"The hub could not write the unit {path} ({e}). The unit keeps its text. The next start "
+                        f"tries again.")
+        code, out, err = systemctl("daemon-reload")
+        if code != 0:               # the file keeps this code's text: the next start asks for the read again
+            return (f"systemd did not read the unit {path} again ({releases._line(err or out) or code}). The hub "
+                    f"did not restart. The next start asks systemd again.")
+        code, out, err = systemctl("show", "-p", "LoadState", "--value", lifecycle.HUB_UNIT)
+        if code != 0 or out != "loaded":    # no restart into a unit that systemd does not hold as loaded
+            return (f"systemd does not hold the unit {path} as loaded after it read the file again "
+                    f"({releases._line(out or err) or code}). The hub did not restart. A unit that systemd refuses "
+                    f"does not start again after its next stop: look at systemctl --user status fleet-hub")
+        if not keep(restarted=mark):        # first: no restart without its record
+            return (f"The unit {path} has its new text and systemd read it, but the hub could not write {kept}. The "
+                    f"hub does not restart by itself. Its next start uses the new unit.")
+        print(f"The unit {path} has the text of this code{' now' if wrote else ', and systemd read it again'}. The "
+              f"hub's service restarts with it.", flush=True)
+        code, out, err = systemctl("restart", lifecycle.HUB_UNIT)       # systemd ends this process here
+        return (f"The hub's service did not restart with its unit ({releases._line(err or out) or code}). The next "
+                f"start of the hub uses the unit.")
+    except Exception:           # a hub that cannot start cannot be reached: this step never stops a start
+        print_fault()
+        return "The check of the hub's own unit ended with an error (the journal has it). The hub did not restart."
 
 
 def release_sweep(t0):
@@ -54611,10 +54945,16 @@ def stop_with_parent(fd):
 
 def main():
     global DB
+    for name in compiled_checked(process_started()):    # first: the next start reads what this one compiled and kept
+        print(f"WARNING: The hub could not read back the compiled file __pycache__/{name} and removed it. The "
+              f"next start compiles it again.", file=sys.stderr, flush=True)
     # Before the parser, because an update run calls this on the *released* code and must get the same two words
     # from every version that has it, whatever options that version's parser has gained or lost.
     if len(sys.argv) == 3 and sys.argv[1] == "--check-schema":
         return check_schema(sys.argv[2])
+    if sys.argv[1:] == [START_CHECK]:       # the proof of a start line, before a unit says it (unit_follows_code):
+        print(os.path.realpath(__file__))   # this file ran, and what it compiled and kept was read back above
+        return 0
     diagnostics.code_id()       # the lane "Bug reports": this code's id, before a thread or a release moves a file
     threading.excepthook = thread_fault     # and a thread that ends on an error is a fault of the hub too
     sys.setswitchinterval(SWITCH_INTERVAL)      # for every thread of the hub
@@ -54662,6 +55002,9 @@ def main():
         os.makedirs(os.path.dirname(db_path), mode=0o700, exist_ok=True)
     if args.restore:
         return restore_by_hand(args.restore, db_path)
+    unit_says = unit_follows_code()     # before the hub takes its records: systemd can start the hub again here
+    if unit_says:
+        print("WARNING: " + unit_says, flush=True)
     hub_lock(db_path)           # before anything that takes the records as this process's own
     restored, restore_says = take_restore(db_path)      # the one moment a hub's records can be replaced
     DB = sqlite3.connect(db_path, check_same_thread=False)
@@ -54695,6 +55038,8 @@ def main():
         log("hub", f"the records are not in WAL mode, so each read of the state holds the hub's lock: {unwalled}")
     if restore_says:
         log("hub", restore_says)
+    if unit_says:
+        log("hub", unit_says)
     if own_says:
         log("hub", own_says)
     # owner feature chat_apps: the bridge's key, next to the records (~/.fleet/chat-apps with the default --db), so a

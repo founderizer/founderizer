@@ -93,6 +93,8 @@ TMP = tempfile.mkdtemp(prefix="fleet-selftest-")
 # may always raise its own value; every process that this run starts takes the value with it. The hub that started
 # the run is not safe by this alone: by systemd's default (OOMPolicy=stop) a service stops when the system ends one
 # of its processes, and its unit starts it again. The hub then counts the run as one that failed (settle_releases).
+# So the hub's unit says OOMPolicy=continue (lifecycle.service_unit): the hub keeps running, and the run that lost a
+# process is a check that failed.
 try:
     with open("/proc/self/oom_score_adj", "w") as f:
         f.write("1000")

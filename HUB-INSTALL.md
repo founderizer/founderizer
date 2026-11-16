@@ -200,6 +200,34 @@ notification of a Needs-you item, the chat that opens first), so with those apps
 10. **The services** `fleet-hub` and `fleet-git`, as systemd user services of `fleet`,
     enabled and started. No agent's service is here any more: each one belongs to its
     own user, in the next step.
+
+    The hub's unit starts the hub as a module in the folder of its code
+    (`python3 -m hub`). A hub that starts so holds about 135 MB less memory than a hub
+    that starts by its path. The unit also has `OOMPolicy=continue`: the hub keeps
+    running when the system ends a check of a release for lack of memory. The code
+    writes the unit's text (`lifecycle.hub_unit`).
+
+    A hub that an earlier release installed needs no second run of this installer. At
+    its start, the hub looks at its unit's file. If the file still has the text of an
+    earlier release, the hub first tests the new start line. If the test passes, the hub
+    writes the unit again, and its service starts one more time. If the test fails, the
+    hub does not change the file.
+
+    The hub does not change a unit that you changed: a file with a text of your own, a
+    unit with a drop-in file of its own (for example in
+    `~/.config/systemd/user/fleet-hub.service.d/`), a unit that is a link, and a unit
+    that systemd reads from another file. The hub's log says so at each start. Such a
+    hub keeps its unit until you write the unit again. The command replaces the unit's
+    file, so keep a setting of your own in a drop-in file. Run these two lines as root
+    (the hub's own line in its log gives them, as one line, with this server's values):
+
+    ```
+    runuser -u fleet -- env XDG_RUNTIME_DIR=/run/user/$(id -u fleet) python3 /home/fleet/fleet-pilot/fleet.py service hub
+    runuser -u fleet -- env XDG_RUNTIME_DIR=/run/user/$(id -u fleet) systemctl --user restart fleet-hub
+    ```
+
+    Do this again after a release that changes the unit: with a drop-in file, the hub
+    does not write its unit by itself.
 11. **Each agent of this machine, under its own OS user**, below: its checkout cloned
     over `git://` on the configuration ref, its runtime in its own `~/.local/bin`, and
     its service in its own systemd manager. A new hub has none, and says so: the manager
