@@ -1348,19 +1348,23 @@ def file_objects(path, info, old, new):
 # - in a namespace where a workload of the owner's files runs (RUNS): a NetworkPolicy, a ResourceQuota, a LimitRange,
 #   every kind of monitoring.coreos.com, an Endpoints or an EndpointSlice, a workload whose pods an owner's Service
 #   selects, and that Namespace object; an object with no namespace takes the destination of the Application that
-#   applies its file;
-# - anywhere: an admission policy or its binding; a Prometheus, an Alertmanager or a ThanosRuler; a PriorityClass; a
-#   PrometheusRule that records a name that an owner's rule reads, or that names __name__; and a ServiceMonitor, a
-#   PodMonitor, a Probe or a ScrapeConfig that can give a series another source's labels (SOURCE_LABELS): honorLabels,
-#   a job label or name of its own, target labels, a relabeling that writes one of them, a labelmap, or static labels.
+#   applies its file, and with none it is in no namespace of the owner's;
+# - anywhere: an admission policy or its binding; a Prometheus, an Alertmanager, a ThanosRuler or an
+#   AlertmanagerConfig (an Alertmanager that selects every config lets one in an app's namespace route or mute the
+#   alerts about that namespace); a PriorityClass; a workload whose pods a NetworkPolicy of the owner's admits; and,
+#   new or changed by the commit, a PrometheusRule that records a metric name that an owner's rule reads, or whose
+#   labels or label functions write __name__, and a ServiceMonitor, a PodMonitor, a Probe or a ScrapeConfig that can
+#   give a series a source label (SOURCE_LABELS): honorLabels, target labels or a relabeling that write one of them,
+#   a labelmap, or static labels. A job label or name of its own writes job alone, and the owner's alerts read the
+#   source's service and namespace too, so it fakes no result.
 # Routine lines in other files (an image, a replica count, a restart time) stay the rule calls that they were.
 RUNS = ("Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "ReplicationController", "CronJob", "Job", "Pod",
         "Service")                          # the kinds whose namespace is where a control runs or answers
-GUARD_KINDS = ("NetworkPolicy", "ResourceQuota", "LimitRange", "AlertmanagerConfig")
+GUARD_KINDS = ("NetworkPolicy", "ResourceQuota", "LimitRange")
 ADMISSION_GROUPS = ("admissionregistration.k8s.io", "kyverno.io", "policies.kyverno.io", "templates.gatekeeper.sh",
                     "constraints.gatekeeper.sh")
 MONITORING = "monitoring.coreos.com"
-SERVERS = ("Prometheus", "PrometheusAgent", "Alertmanager", "ThanosRuler")
+SERVERS = ("Prometheus", "PrometheusAgent", "Alertmanager", "ThanosRuler", "AlertmanagerConfig")
 SCRAPES = ("ServiceMonitor", "PodMonitor", "Probe", "ScrapeConfig")
 SOURCE_LABELS = ("__name__", "namespace", "service", "job", "pod", "instance")
 PODS = ("Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "ReplicationController", "CronJob", "Job", "Pod")
@@ -1394,12 +1398,12 @@ def split_key(key):
 
 def chain_words(keys, namespaces, where, default=""):
     """The words for each key (object_key) that is part of the owner's chain by its kind, before or after the commit:
-    see the list above. default: the namespace of an object that names none, or '' when the door does not know it, and
-    then the object counts as in the owner's namespace."""
+    see the list above. default: the namespace of an object that names none, or '' when no Application gives one,
+    and then the object is in no namespace of the owner's."""
     out = []
     for key in sorted(k for k in keys if k):
         group, kind, namespace, name = split_key(key)
-        inside = (namespace or default) in namespaces or not (namespace or default)
+        inside = (namespace or default) in namespaces
         if group in ADMISSION_GROUPS:
             out.append(f"{where} {key}, an admission policy")
         elif group == MONITORING and kind in SERVERS:
@@ -1422,14 +1426,13 @@ def source_labels(spec, depth=0):
     for key, value in spec.items() if isinstance(spec, dict) else enumerate(spec if isinstance(spec, list) else []):
         if key == "honorLabels" and value is True:
             return "honorLabels: true"
-        if key in ("jobLabel", "jobName") and value:
-            return f"a {key} of its own"
-        if key in ("targetLabels", "podTargetLabels") and value:
-            return f"{key}"
+        if key in ("targetLabels", "podTargetLabels") and isinstance(value, list) and \
+                set(map(str, value)) & set(SOURCE_LABELS):
+            return f"{key} that write {sorted(set(map(str, value)) & set(SOURCE_LABELS))[0]}"
         if key == "targetLabel" and isinstance(value, str) and (value in SOURCE_LABELS or "$" in value):
             return f"a relabeling that writes {value}"
-        if key == "action" and isinstance(value, str) and value.lower() in ("labelmap", "hashmod"):
-            return f"a relabeling of action {value}"
+        if key == "action" and isinstance(value, str) and value.lower() == "labelmap":
+            return "a relabeling of action labelmap, which writes the names that it maps"
         if key == "labels" and isinstance(value, dict) and set(map(str, value)) & set(SOURCE_LABELS):
             return "static labels that name a source"
         if isinstance(value, (dict, list)):
@@ -1454,39 +1457,49 @@ def pod_labels(o):
     return {str(k): str(v) for k, v in labels.items()} if isinstance(labels, dict) else {}
 
 
-def content_words(objs, namespaces, where, default, reads, selectors):
-    """The words for each object after the commit that is part of the owner's chain by what it does: a PrometheusRule
-    that records a name that an owner's rule reads (reads) or that names __name__, a scrape object that can give a
-    series another source's labels, and a workload in the owner's namespace whose pods an owner's Service selects."""
+def names_name(rule):
+    "True when a rule of a PrometheusRule writes __name__: a key of its labels, or a quoted __name__ in its expression."
+    labels = rule.get("labels") if isinstance(rule.get("labels"), dict) else {}
+    return "__name__" in labels or bool(re.search(r"""["'`]__name__["'`]""", str(rule.get("expr") or "")))
+
+
+def content_words(objs, before, namespaces, where, default, reads, selectors, admits):
+    """The words for each object after the commit that is part of the owner's chain by what it does, of those that the
+    commit adds or changes (before: the objects at HEAD): a PrometheusRule that records a metric name that an owner's
+    rule reads (reads) or that writes __name__, a scrape object that can give a series a source label, a workload in
+    the owner's namespace whose pods an owner's Service selects, and a workload whose pods an owner's NetworkPolicy
+    admits."""
+    known = {object_key(o): o for o in before if object_key(o)}
     out = []
     for o in objs:
         key = object_key(o)
-        if not key:
-            continue
+        if not key or known.get(key) == o:
+            continue                # the commit leaves this object as it is at HEAD
         group, kind, namespace, _name = split_key(key)
         namespace = namespace or default
         spec = o.get("spec")
         if (group, kind) == (MONITORING, "PrometheusRule"):
             groups = spec.get("groups") if isinstance(spec, dict) and isinstance(spec.get("groups"), list) else []
-            records = {str(r.get("record")) for g in groups if isinstance(g, dict)
-                       for r in (g.get("rules") if isinstance(g.get("rules"), list) else []) if isinstance(r, dict)
-                       and r.get("record")}
+            rules = [r for g in groups if isinstance(g, dict)
+                     for r in (g.get("rules") if isinstance(g.get("rules"), list) else []) if isinstance(r, dict)]
+            records = {str(r["record"]) for r in rules if r.get("record")}
             if records & reads:
-                out.append(f"{where} {key}, which records {sorted(records & reads)[0]}, a name that a rule of the "
+                out.append(f"{where} {key}, which records {sorted(records & reads)[0]}, a metric that a rule of the "
                            f"owner's reads")
-            elif "__name__" in json.dumps(o, default=str):
-                out.append(f"{where} {key}, which names __name__")
+            elif any(names_name(r) for r in rules):
+                out.append(f"{where} {key}, which writes __name__")
         elif group == MONITORING and kind in SCRAPES:
             why = source_labels(spec)
             if why:
-                out.append(f"{where} {key}, a {kind} with {why}, which can give a series another source's labels")
+                out.append(f"{where} {key}, a {kind} with {why}, which can give a series a source's labels")
         elif kind in PODS and group in ("", "apps", "batch"):
             labels = pod_labels(o)
-            for sel in selectors:
-                if sel["selector"] and (sel["namespace"] or default) == namespace and \
-                        all(labels.get(k) == v for k, v in sel["selector"].items()):
-                    out.append(f"{where} {key}, whose pods a Service of the owner's selects")
-                    break
+            if any(sel["selector"] and (sel["namespace"] or default) == namespace
+                   and all(labels.get(k) == v for k, v in sel["selector"].items()) for sel in selectors):
+                out.append(f"{where} {key}, whose pods a Service of the owner's selects")
+            elif any(adm["namespace"] in ("*", namespace) and namespace
+                     and all(labels.get(k) == v for k, v in adm["labels"].items()) for adm in admits):
+                out.append(f"{where} {key}, whose pods a NetworkPolicy of the owner's admits")
     return out
 
 
@@ -1519,6 +1532,8 @@ def owner_change(report, files):
     reads = {r for o in owned for r in o.get("reads") or []}
     selectors = [dict(sel, namespace=sel.get("namespace") or destination(o["path"]))
                  for o in owned for sel in o.get("selectors") or [] if isinstance(sel, dict)]
+    admits = [dict(adm, namespace=adm.get("namespace") or destination(o["path"]))
+              for o in owned for adm in o.get("admits") or [] if isinstance(adm, dict)]
     out = []
     for path, data, _mode in files:
         info = (report.get("files") or {}).get(path) or {}
@@ -1551,7 +1566,8 @@ def owner_change(report, files):
                     f"chain" for k in sorted(k for k in found if k) if split_key(k)[0] == MONITORING
                     or split_key(k)[1] in PODS]
             continue
-        out += content_words(after, namespaces, f"{path} holds", default, reads, selectors)
+        before = docs_of(path, info.get("before"), old) or []
+        out += content_words(after, before, namespaces, f"{path} holds", default, reads, selectors, admits)
     for _uid, unit in sorted((report.get("units") or {}).items()):
         if not unit.get("ok") or unit.get("closed"):
             continue                # its files are above: the door cannot read what it makes
@@ -1563,7 +1579,7 @@ def owner_change(report, files):
             where = f"{unit_name(unit)} renders"
             out += [f"{where} {key}, an object of {owner}" for key, owner in owner_keys_in(found, objects)]
             out += chain_words(found, namespaces, where, default)
-            out += content_words(after, namespaces, where, default, reads, selectors)
+            out += content_words(after, before, namespaces, where, default, reads, selectors, admits)
     return list(dict.fromkeys(out))
 
 

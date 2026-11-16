@@ -6671,13 +6671,22 @@ GATEWAY_FILE = ("apiVersion: v1\nkind: Service\nmetadata:\n  name: pushgateway\n
                 "  selector:\n    app: pushgateway\n  ports:\n    - port: 9091\n---\n"
                 "apiVersion: monitoring.coreos.com/v1\nkind: PrometheusRule\nmetadata:\n  name: exposure-alerts\n"
                 "  namespace: core\nspec:\n  groups:\n    - name: exposure\n      rules:\n        - alert: CheckStale\n"
-                "          expr: time() - max(check_last_success_seconds{job=\"check\"}) > 5400\n")
+                "          expr: time() - max(check_last_success_seconds{job=\"check\"}) > 5400\n---\n"
+                "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: pushgateway\n"
+                "  namespace: core\nspec:\n  podSelector:\n    matchLabels:\n      app: pushgateway\n  ingress:\n"
+                "    - from:\n        - podSelector:\n            matchLabels:\n              app: checker\n")
 EXTRA_APP = ("apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: extra\nspec:\n  source:\n"
              "    repoURL: ssh://git@github.com/one-org/cluster.git\n    path: apps/extra\n  destination:\n"
              "    namespace: core\n")
 CHAIN_TREE = dict(OWNER_TREE, **{".founderizer/door.json": json.dumps({"owner": [OWNER_CHECK, OWNER_POLICY,
                                                                                   OWNER_GATEWAY]}),
-                                 OWNER_GATEWAY: GATEWAY_FILE, "_config/cluster/extra-argocd.yaml": EXTRA_APP})
+                                 OWNER_GATEWAY: GATEWAY_FILE, "_config/cluster/extra-argocd.yaml": EXTRA_APP,
+                                 "apps/web/monitors.yaml": (
+                                     "apiVersion: monitoring.coreos.com/v1\nkind: ServiceMonitor\nmetadata:\n"
+                                     "  name: honest\n  namespace: web\nspec:\n  endpoints:\n    - port: m\n"
+                                     "      honorLabels: true\n  selector:\n    matchLabels:\n      app: web\n---\n"
+                                     "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web\n  namespace: web\n"
+                                     "data:\n  mode: a\n")})
 
 
 def monitor(kind, spec, namespace="web", name="m", api="monitoring.coreos.com/v1"):
@@ -6788,7 +6797,7 @@ class OwnerFiles(RenderCase):
              ["holds networking.k8s.io:NetworkPolicy:core/deny-all, in the namespace where"]),
             ({"namespaces/core.yaml": space}, ["holds :Namespace:/core, the namespace where the owner's controls run"]),
             ({"apps/alerts/quiet.yaml": route},
-             ["holds monitoring.coreos.com:AlertmanagerConfig:core/quiet, in the namespace where"]),
+             ["holds monitoring.coreos.com:AlertmanagerConfig:core/quiet, which runs the checks or routes"]),
             ({"apps/guard/policy.yaml": GUARD_POLICY.replace("exposure-guard", "other-guard")},
              ["holds admissionregistration.k8s.io:ValidatingAdmissionPolicy:/other-guard, an admission policy",
               "holds admissionregistration.k8s.io:ValidatingAdmissionPolicyBinding:/other-guard, an admission policy"]),
@@ -6829,14 +6838,21 @@ class OwnerFiles(RenderCase):
                     "          image: registry.example.com/x:1.0.0\n")
         cases = [
             ("apps/web/record.yaml", monitor("PrometheusRule", record), "which records check_last_success_seconds"),
-            ("apps/web/named.yaml", monitor("PrometheusRule", named), "which names __name__"),
+            ("apps/web/named.yaml", monitor("PrometheusRule", named), "which writes __name__"),
             ("apps/web/honor.yaml", monitor("ServiceMonitor", honor), "a ServiceMonitor with honorLabels: true"),
             ("apps/web/relabel.yaml", monitor("ServiceMonitor", relabel), "with a relabeling that writes job"),
-            ("apps/web/joblabel.yaml", monitor("PodMonitor", "  jobLabel: app\n" + plain.replace("endpoints",
-                                                                                                "podMetricsEndpoints")),
-             "a PodMonitor with a jobLabel of its own"),
-            ("apps/web/probe.yaml", monitor("Probe", "  jobName: check\n  prober:\n    url: x:9115\n"),
-             "a Probe with a jobName of its own"),
+            ("apps/web/podlabels.yaml", monitor("PodMonitor", "  podTargetLabels: [team, service]\n"
+                                                              + plain.replace("endpoints", "podMetricsEndpoints")),
+             "a PodMonitor with podTargetLabels that write service"),
+            ("apps/web/probe.yaml", monitor("Probe", "  prober:\n    url: x:9115\n  targets:\n    staticConfig:\n"
+                                                     "      static: [x]\n      labels:\n        namespace: core\n"),
+             "a Probe with static labels that name a source"),
+            ("apps/web/quiet.yaml", monitor("AlertmanagerConfig", "  route:\n    receiver: none\n  receivers:\n"
+                                                                  "    - name: none\n", api="monitoring.coreos.com/v1alpha1"),
+             "monitoring.coreos.com:AlertmanagerConfig:web/m, which runs the checks or routes their alerts"),
+            ("apps/extra/checker.yaml", workload.replace("name: fake", "name: checker").replace(
+                "app: pushgateway", "app: checker"),
+             "apps:Deployment:core/checker, whose pods a NetworkPolicy of the owner's admits"),
             ("apps/web/scrape.yaml", monitor("ScrapeConfig", "  staticConfigs:\n    - targets: [x:9091]\n"
                                                              "      labels:\n        job: check\n",
                                              api="monitoring.coreos.com/v1alpha1"), "static labels that name a source"),
@@ -6880,6 +6896,16 @@ class OwnerFiles(RenderCase):
                  "          image: registry.example.com/web:1.0.0\n")
         for path, text in (("apps/web/alerts.yaml", monitor("PrometheusRule", alert)),
                            ("apps/web/monitor.yaml", monitor("ServiceMonitor", plain)),
+                           ("apps/web/joblabel.yaml", monitor("PodMonitor", "  jobLabel: app\n  podTargetLabels: [team]\n"
+                                                              + plain.replace("endpoints", "podMetricsEndpoints"))),
+                           ("apps/web/probe.yaml", monitor("Probe", "  jobName: web\n  prober:\n    url: x:9115\n")),
+                           ("apps/web/described.yaml", monitor("PrometheusRule", alert + "          annotations:\n"
+                                                               "            description: the __name__ of a series\n")),
+                           ("apps/web/record.yaml", monitor("PrometheusRule", "  groups:\n    - name: g\n      rules:\n"
+                                                            "        - record: max\n          expr: up\n")),
+                           ("apps/web/np-none.yaml", "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\n"
+                                                     "metadata:\n  name: deny\nspec:\n  podSelector: {}\n"),
+                           ("apps/web/monitors.yaml", CHAIN_TREE["apps/web/monitors.yaml"].replace("mode: a", "mode: b")),
                            ("apps/extra/web.yaml", other),
                            ("apps/web/np.yaml", "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n"
                                                 "  name: deny\n  namespace: web\nspec:\n  podSelector: {}\n")):
@@ -6951,7 +6977,7 @@ class OwnerFiles(RenderCase):
             {"path": "apps/core/app/web.yaml", "size": None, "mode": "100644"}]}
         report = door_render.answer(header, tarball(tree), [None], self.tools, scratch)
         self.assertTrue(report["ok"], report)
-        none = {"selectors": [], "reads": []}
+        none = {"selectors": [], "reads": [], "admits": []}
         self.assertEqual(report["owner"], [dict(none, path=OWNER_CHECK, objects=CHECK_KEYS),
                                            dict(none, path=OWNER_POLICY, objects=POLICY_KEYS),
                                            dict(none, path="apps/core/app/later.yaml", objects=[]),
@@ -6962,7 +6988,8 @@ class OwnerFiles(RenderCase):
         report = door_render.answer(header, tarball(CHAIN_TREE), [None], self.tools, scratch + "/3")
         [gate] = [o for o in report["owner"] if o["path"] == OWNER_GATEWAY]
         self.assertEqual(gate["selectors"], [{"namespace": "core", "selector": {"app": "pushgateway"}}])
-        self.assertIn("check_last_success_seconds", gate["reads"])
+        self.assertEqual(gate["reads"], ["check_last_success_seconds"])      # no function, keyword or label name
+        self.assertEqual(gate["admits"], [{"namespace": "core", "labels": {"app": "checker"}}])
         self.assertEqual(report["generated"], [])
         # a repository with no declaration gives the owner nothing
         report = door_render.answer(dict(header, files=[]), tarball(CLUSTER), [], self.tools, scratch + "/2")

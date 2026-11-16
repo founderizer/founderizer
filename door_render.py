@@ -1039,7 +1039,23 @@ def owner_docs(before):
                            for text in file_docs(read(before, path, most=READ_MAX)) or []]
 
 
-PROMQL_WORD = re.compile(r"[A-Za-z_:][A-Za-z0-9_:]*")      # a name in a rule's expression: a metric, a label, a word
+# The metric names that a rule's expression reads: each name of a vector selector, with the strings, the label
+# matchers, the label lists of by, without, on, ignoring, group_left and group_right, the ranges and the offsets taken
+# out, and with no function, keyword or number.
+PROMQL_STRING = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|`[^`]*`')
+PROMQL_LISTS = re.compile(r"\b(?:by|without|on|ignoring|group_left|group_right)\s*\([^)]*\)", re.I)
+PROMQL_NAME = re.compile(r"(?<![\w:.])([A-Za-z_:][A-Za-z0-9_:]*)(?![\w:])(?!\s*\()")
+PROMQL_WORDS = {"by", "without", "on", "ignoring", "group_left", "group_right", "and", "or", "unless", "bool",
+                "offset", "inf", "nan", "atan2", "start", "end", "e"}
+
+
+def rule_metrics(expr):
+    "The metric names that one PromQL expression reads (a superset only where a name is also a keyword)."
+    text = PROMQL_STRING.sub(" ", str(expr))
+    text = re.sub(r"\{[^}]*\}", " ", text)                  # label matchers
+    text = re.sub(r"\[[^\]]*\]", " ", text)                  # ranges and subqueries
+    text = PROMQL_LISTS.sub(" ", text)
+    return {m for m in PROMQL_NAME.findall(text) if m.lower() not in PROMQL_WORDS and not m[0].isdigit()}
 
 
 def owned(runner, before):
@@ -1058,7 +1074,7 @@ def owned(runner, before):
             if path.lower().endswith((".yaml", ".yml", ".json")) else None
         found = [o for doc in docs or [] if isinstance(doc, dict) for o in objects(doc)]
         keys = {door_targets.object_key(o) for o in found}
-        selectors, reads = [], set()
+        selectors, reads, admits = [], set(), []
         for o in found:
             meta = o.get("metadata") if isinstance(o.get("metadata"), dict) else {}
             spec = o.get("spec") if isinstance(o.get("spec"), dict) else {}
@@ -1070,10 +1086,31 @@ def owned(runner, before):
                 for group in spec.get("groups") if isinstance(spec.get("groups"), list) else []:
                     for rule in group.get("rules") or [] if isinstance(group, dict) else []:
                         if isinstance(rule, dict) and isinstance(rule.get("expr"), (str, int, float)):
-                            reads |= set(PROMQL_WORD.findall(str(rule["expr"])))
+                            reads |= rule_metrics(rule["expr"])
+            if o.get("kind") == "NetworkPolicy" and isinstance(spec.get("ingress"), list):
+                for rule in spec["ingress"]:
+                    for peer in rule.get("from") or [] if isinstance(rule, dict) else []:
+                        admits.append(admitted(peer, namespace))
         out.append({"path": path, "objects": sorted(k for k in keys if k), "selectors": selectors,
-                    "reads": sorted(reads)})
+                    "reads": sorted(reads), "admits": [a for a in admits if a]})
     return out
+
+
+def admitted(peer, namespace):
+    """{namespace, labels} of the pods that one ingress source of a NetworkPolicy admits, or None for an address block:
+    namespace '*' for pods of any namespace that its namespaceSelector names (or of each namespace, for {}), and
+    labels {} for every pod there. A podSelector with matchExpressions counts by its matchLabels alone: more pods."""
+    if not isinstance(peer, dict) or ("podSelector" not in peer and "namespaceSelector" not in peer):
+        return None
+    pods = peer.get("podSelector") if isinstance(peer.get("podSelector"), dict) else {}
+    labels = pods.get("matchLabels") if isinstance(pods.get("matchLabels"), dict) else {}
+    where = namespace
+    if "namespaceSelector" in peer:
+        names = peer["namespaceSelector"] if isinstance(peer["namespaceSelector"], dict) else {}
+        named = (names.get("matchLabels") or {}).get("kubernetes.io/metadata.name") \
+            if isinstance(names.get("matchLabels"), dict) else None
+        where = named if isinstance(named, str) and not names.get("matchExpressions") else "*"
+    return {"namespace": where, "labels": {str(k): str(v) for k, v in labels.items()}}
 
 
 def app_roots(found):
