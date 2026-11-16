@@ -119,7 +119,8 @@ def load_tests(loader, _tests, _pattern):
                                                     HostPath, AppSettingsPath, ScriptPath, HostUpdates, KeyCardAccount,
                                                     WorkKeys,
                                                     Workflows, RunnerNew, Probe, CallerGone, Rendered, RenderPath,
-                                                    GeneratedFiles, GeneratedPath, RenderBoxUnit, RenderBoxLive)
+                                                    GeneratedFiles, GeneratedPath, OwnerFiles, OwnerPath,
+                                                    RenderBoxUnit, RenderBoxLive)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -6484,7 +6485,9 @@ class GeneratedFiles(RenderCase):
         self.assertIn("the pinned ruby is not on the door yet", d.why)
         self.tools = dict(self.tools, ruby=[sys.executable, "-I"])
         # a declaration that the door cannot follow, at HEAD
-        for text, words in (("{", "is not {generated: [1 to 4 files]}"),
+        for text, words in (("{", "is not {generated: [0 to 4 files], owner: [0 to 40 paths]}, with at least one, "
+                                  "and no other key: the door refuses each commit of this repository until a person "
+                                  "writes it again"),
                             (json.dumps({"generated": [{"path": GEN_PATH, "run": ["sh", "tools/gen.py"]}]}),
                              "is not {path, run: [ruby, paths], rules: [paths]}"),
                             (json.dumps({"generated": [{"path": "../x", "run": ["ruby", "tools/gen.py"]}]}),
@@ -6529,11 +6532,9 @@ class GeneratedFiles(RenderCase):
         self.assertNotIn("writes them again", d.why)
 
 
-class GeneratedPath(RenderDoor):
-    """A file that the repository generates, on the door's whole path: the owner's signed yes to the exact call, which covers
-    the written file, lets the commit through once, with the file in it; a commit from which an entry leaves is made
-    at once, with the file."""
-    tree = GEN_TREE
+class SignedRenderDoor(RenderDoor):
+    """The door with its render box, an owner's key in its access file, and the owner's signed yeses that the hub
+    serves (yes)."""
 
     def setUp(self):
         super().setUp()
@@ -6560,6 +6561,13 @@ class GeneratedPath(RenderDoor):
         tree = [b for m, u, b in self.calls if (m, u) == ("POST", f"{api}/trees")][-1]
         commit = [b for m, u, b in self.calls if (m, u) == ("POST", f"{api}/commits")][-1]
         return blobs, [e["path"] for e in tree["tree"]], commit["message"]
+
+
+class GeneratedPath(SignedRenderDoor):
+    """A file that the repository generates, on the door's whole path: the owner's signed yes to the exact call, which covers
+    the written file, lets the commit through once, with the file in it; a commit from which an entry leaves is made
+    at once, with the file."""
+    tree = GEN_TREE
 
     def test_his_yes_lets_the_commit_through_once_with_the_written_file(self):
         content = change(("apps/core/app/c.yaml", host_map("c", "c.example.com")))
@@ -6605,6 +6613,188 @@ class GeneratedPath(RenderDoor):
         self.assertEqual(paths, ["apps/core/app/b.yaml", GEN_PATH])
         self.assertEqual(blobs, [inventory("a.example.com").encode()])
         self.assertEqual(message, f"retire b\n\nThe door wrote {GEN_PATH} again, with the generator at HEAD.")
+
+
+# A repository whose declaration gives the owner its controls (door_render.owned): the CronJob of a check and its
+# ConfigMap in the directory app, and an admission policy with its binding, which have no namespace
+OWNER_CHECK = "apps/core/app/check.yaml"
+OWNER_POLICY = "apps/core/app/policy.yaml"
+CHECK_FILE = ("apiVersion: batch/v1\nkind: CronJob\nmetadata:\n  name: exposure-check\n  namespace: core\nspec:\n"
+              "  schedule: '7 * * * *'\n  jobTemplate:\n    spec:\n      template:\n        spec:\n"
+              "          serviceAccountName: exposure-check\n          restartPolicy: Never\n          containers:\n"
+              "            - name: check\n              image: registry.example.com/check:1.0.0\n---\n"
+              "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: exposure-check\n  namespace: core\ndata:\n"
+              "  mode: strict\n")
+GUARD_POLICY = ("apiVersion: admissionregistration.k8s.io/v1\nkind: ValidatingAdmissionPolicy\nmetadata:\n"
+                "  name: exposure-guard\nspec:\n  validations:\n    - expression: \"object.spec.type != 'NodePort'\"\n"
+                "---\napiVersion: admissionregistration.k8s.io/v1\nkind: ValidatingAdmissionPolicyBinding\n"
+                "metadata:\n  name: exposure-guard\nspec:\n  policyName: exposure-guard\n  validationActions: [Deny]\n")
+OWNER_TREE = dict(CLUSTER, **{".founderizer/door.json": json.dumps({"owner": [OWNER_CHECK, OWNER_POLICY]}),
+                              OWNER_CHECK: CHECK_FILE, OWNER_POLICY: GUARD_POLICY})
+CHECK_KEYS = [":ConfigMap:core/exposure-check", "batch:CronJob:core/exposure-check"]
+POLICY_KEYS = ["admissionregistration.k8s.io:ValidatingAdmissionPolicy:/exposure-guard",
+               "admissionregistration.k8s.io:ValidatingAdmissionPolicyBinding:/exposure-guard"]
+SUSPENDED = CHECK_FILE.replace("  schedule: '7 * * * *'\n", "  schedule: '7 * * * *'\n  suspend: true\n")
+
+
+def script_map(name="exposure-check", namespace="core", mode="off"):
+    return (f"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {name}\n"
+            + (f"  namespace: {namespace}\n" if namespace else "") + f"data:\n  mode: {mode}\n")
+
+
+class OwnerFiles(RenderCase):
+    """Files whose every change is the owner's (the coordinator of the DevOps plan, 16 November 2026, under D25: a
+    weaker control is the owner's): a commit through the door that changes, adds or deletes one, that writes one of
+    their objects in another file, or whose objects the door cannot read, is the door's card (kind full) with the exact
+    change; a refusal stays a refusal; and the box gives the objects that each file holds at HEAD."""
+
+    def setUp(self):
+        super().setUp()
+        self.tools = dict(self.tools, ruby=[sys.executable, "-I"])     # Python in the place of the pinned Ruby
+
+    def push_owner(self, files, tree=OWNER_TREE, render=True):
+        return self.push(files, tree=tree, render=render)
+
+    def test_a_change_of_such_a_file_is_the_owner_s_card_with_the_exact_change(self):
+        d = self.push_owner({OWNER_CHECK: SUSPENDED})
+        self.assertEqual(d.kind, "full", d)
+        self.assertIn(f"{OWNER_CHECK} changes more than its values; and the commit changes what .founderizer/door.json "
+                      f"gives the owner, which is the owner's to decide, once for each change: {OWNER_CHECK} loses 0 "
+                      f"lines and gains 1: +  suspend: true", d.why)
+        self.assertEqual((d.window, d.hash_content, d.host), ("deploy", None, None))
+        self.assertEqual(d.plan["files"], [(OWNER_CHECK, SUSPENDED.encode(), "100644")])
+        # the image of the check, which is a rule call in a file that the declaration does not name
+        d = self.push_owner({OWNER_CHECK: CHECK_FILE.replace("check:1.0.0", "check:0.9.0")})
+        self.assertEqual(d.kind, "full", d)
+        self.assertIn(f"{OWNER_CHECK} loses 1 lines and gains 1: -              image: registry.example.com/check:"
+                      f"1.0.0 | +              image: registry.example.com/check:0.9.0", d.why)
+        # a deleted file, and a new one at a path that the declaration names
+        d = self.push_owner({OWNER_POLICY: None})
+        self.assertEqual(d.kind, "full", d)
+        self.assertIn(f"{OWNER_POLICY} is deleted ({len(GUARD_POLICY.splitlines())} lines at HEAD)", d.why)
+        self.assertEqual(sorted(d.plan["objects"]["removed"]), POLICY_KEYS)
+        without = {k: v for k, v in OWNER_TREE.items() if k != OWNER_POLICY}
+        d = self.push_owner({OWNER_POLICY: GUARD_POLICY}, tree=without)
+        self.assertEqual(d.kind, "full", d)
+        self.assertIn(f"{OWNER_POLICY} is new ({len(GUARD_POLICY.splitlines())} lines): +apiVersion: "
+                      f"admissionregistration.k8s.io/v1 | +kind: ValidatingAdmissionPolicy", d.why)
+        # a file with HEAD's own bytes changes nothing
+        d = self.push_owner({OWNER_CHECK: CHECK_FILE})
+        self.assertNotEqual(d.kind, "full", d)
+        self.assertNotIn("gives the owner", d.why)
+        # many lines: the words show OWNER_SHOWN of them, and say how many more
+        d = self.push_owner({OWNER_CHECK: CHECK_FILE + "".join(f"# note {i}\n" for i in range(45))})
+        self.assertEqual(d.kind, "full", d)
+        self.assertTrue(d.why.endswith("| and 5 lines more"), d.why[-80:])
+
+    def test_a_copy_of_one_of_their_objects_in_another_file_is_the_owner_s_card(self):
+        d = self.push_owner({"apps/core/app/zz-script.yaml": script_map()})
+        self.assertEqual(d.kind, "full", d)
+        self.assertIn(f"apps/core/app/zz-script.yaml holds {CHECK_KEYS[0]}, an object of {OWNER_CHECK}", d.why)
+        # with no namespace, where the app's own namespace makes it the same object
+        d = self.push_owner({"apps/core/app/zz-script.yaml": script_map(namespace=None)})
+        self.assertEqual(d.kind, "full", d)
+        self.assertIn(f"holds :ConfigMap:/exposure-check, an object of {OWNER_CHECK}", d.why)
+        # an object with no namespace of the owner's, in a YAML file and in a List of a JSON file
+        binding = GUARD_POLICY.split("---\n")[1].replace("[Deny]", "[Warn]")
+        d = self.push_owner({"apps/core/app/zz-guard.yaml": binding})
+        self.assertEqual(d.kind, "full", d)
+        self.assertIn(f"apps/core/app/zz-guard.yaml holds {POLICY_KEYS[1]}, an object of {OWNER_POLICY}", d.why)
+        listed = json.dumps({"apiVersion": "v1", "kind": "List", "items": [{
+            "apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "exposure-guard"},
+            "spec": {"policyName": "exposure-guard", "validationActions": ["Warn"]}}]}) + "\n"
+        d = self.push_owner({"apps/core/app/zz-list.json": listed})
+        self.assertEqual(d.kind, "full", d)
+        self.assertIn(f"apps/core/app/zz-list.json holds {POLICY_KEYS[1]}, an object of {OWNER_POLICY}", d.why)
+        # a file whose objects the door cannot read, and an object of another name, which is no copy
+        d = self.push_owner({"apps/core/app/zz.jsonnet": "{ a: 1 }\n"})
+        self.assertEqual(d.kind, "full", d)
+        self.assertIn("the door cannot read which objects apps/core/app/zz.jsonnet makes, and the repository gives "
+                      "the owner objects", d.why)
+        d = self.push_owner({"apps/core/app/zz-script.yaml": script_map(name="other")})
+        self.assertEqual(d.kind, "own", d)
+        self.assertNotIn("gives the owner", d.why)
+
+    def test_a_commit_that_touches_none_of_it_keeps_its_kind(self):
+        web = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web\ndata:\n  mode: fast\n"
+        d = self.push_owner({"apps/core/app/web.yaml": web})
+        self.assertEqual((d.kind, d.why), ("own", "apps/core/app/web.yaml: other manifest lines"), d)
+        self.assertEqual(d.plan["files"], [("apps/core/app/web.yaml", web.encode(), "100644")])
+
+    def test_a_refusal_stays_a_refusal_and_a_rule_of_a_generated_file_stays_refused(self):
+        d = self.push_owner({OWNER_CHECK: CHECK_FILE.replace("serviceAccountName: exposure-check",
+                                                             "serviceAccountName: default")})
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("a changed serviceAccountName", d.why)
+        tree = dict(GEN_TREE, **{OWNER_CHECK: CHECK_FILE, ".founderizer/door.json": json.dumps({
+            "generated": [{"path": GEN_PATH, "run": ["ruby", "tools/gen.py"], "rules": ["tools/rules.txt"]}],
+            "owner": ["tools/rules.txt", OWNER_CHECK]})})
+        d = self.push_owner({"tools/rules.txt": "private\n"}, tree=tree)
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("tools/rules.txt is named in .founderizer/door.json: the door writes", d.why)
+        # both at once: a change of the owner's file and a new entry of the generated file, in one card
+        d = self.push_owner({OWNER_CHECK: SUSPENDED, "apps/core/app/c.yaml": host_map("c", "c.example.com")}, tree=tree)
+        self.assertEqual(d.kind, "full", d)
+        self.assertIn(f"gives the owner, which is the owner's to decide, once for each change: {OWNER_CHECK}", d.why)
+        self.assertIn(f"the commit changes what the repository generates", d.why)
+        written = inventory("a.example.com", "b.example.com", "c.example.com").encode()
+        self.assertEqual(d.hash_content, GEN_PATH.encode() + b"\0" + written + b"\0")
+
+    def test_a_declaration_that_the_door_cannot_follow_refuses_every_commit(self):
+        web = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web\ndata:\n  mode: fast\n"
+        for body in ({"owner": OWNER_CHECK}, {"owner": ["../x.yaml"]}, {"owner": [OWNER_CHECK, OWNER_CHECK]},
+                     {"owners": [OWNER_CHECK]}, {}, {"owner": [f"apps/{i}.yaml" for i in range(41)]}, [OWNER_CHECK],
+                     {"owner": [OWNER_CHECK, 7]}):
+            d = self.push_owner({"apps/core/app/web.yaml": web},
+                                tree=dict(OWNER_TREE, **{".founderizer/door.json": json.dumps(body)}))
+            self.assertEqual(d.kind, "refused", (body, d))
+            self.assertIn(".founderizer/door.json at HEAD is not {generated: [0 to 4 files], owner: [0 to 40 paths]}",
+                          d.why)
+        d = self.push_owner({"apps/core/app/web.yaml": web}, render=False)
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("files that its generator writes or whose changes are the owner's, and the door has no render "
+                      "of this commit", d.why)
+
+    def test_the_box_gives_the_objects_that_each_file_holds_at_head(self):
+        scratch = tempfile.mkdtemp(prefix="door-render-test-")
+        self.addCleanup(shutil.rmtree, scratch, True)
+        tree = dict(OWNER_TREE, **{".founderizer/door.json": json.dumps(
+            {"owner": [OWNER_CHECK, OWNER_POLICY, "apps/core/app/later.yaml", "README.md"]})})
+        header = {"v": 1, "op": "render", "exposure": ACCESS["exposure"], "files": [
+            {"path": "apps/core/app/web.yaml", "size": None, "mode": "100644"}]}
+        report = door_render.answer(header, tarball(tree), [None], self.tools, scratch)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["owner"], [{"path": OWNER_CHECK, "objects": CHECK_KEYS},
+                                           {"path": OWNER_POLICY, "objects": POLICY_KEYS},
+                                           {"path": "apps/core/app/later.yaml", "objects": []},
+                                           {"path": "README.md", "objects": []}])
+        self.assertEqual(report["generated"], [])
+        # a repository with no declaration gives the owner nothing
+        report = door_render.answer(dict(header, files=[]), tarball(CLUSTER), [], self.tools, scratch + "/2")
+        self.assertEqual(report["owner"], [])
+
+
+class OwnerPath(SignedRenderDoor):
+    """A file whose changes are the owner's, on the door's whole path: the door refuses the commit with its call hash,
+    and the owner's signed yes to that hash lets the exact commit through once."""
+    tree = OWNER_TREE
+
+    def test_the_owner_s_yes_lets_the_change_through_once(self):
+        content = change((OWNER_CHECK, SUSPENDED))
+        got = self.call(ONE, GITOPS, "push", content=content)
+        self.assertEqual((got["ok"], got["kind"], got["route"]), (False, "refused", "yes"), got)
+        sha = door.call_hash(GITOPS, "push", [], content)
+        self.assertEqual(got["call"], sha)
+        self.assertIn(f"{OWNER_CHECK} loses 0 lines and gains 1: +  suspend: true", got["why"])
+        self.assertFalse([u for _m, u, _b in self.calls if u.endswith("/git/commits")])
+        self.yes(sha)
+        got = self.call(ONE, GITOPS, "push", content=content)
+        self.assertEqual((got["ok"], got["kind"]), (True, "approved"), got)
+        blobs, paths, message = self.made()
+        self.assertEqual((blobs, paths, message), ([SUSPENDED.encode()], [OWNER_CHECK], "fix"))
+        got = self.call(ONE, GITOPS, "push", content=content)          # the owner's yes was used once
+        self.assertEqual((got["ok"], got["route"]), (False, "yes"), got)
 
 
 class RenderBoxUnit(DoorCase):

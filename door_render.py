@@ -991,12 +991,64 @@ def closed(runner, trees, kind, root, kustomize, pairs, exposure):
 # hours). The box writes each one with the generator as it is at HEAD, on the tree after the commit, and door_targets
 # decides: the owner, 12 November 2026, "Me, one card each time (Recommended)". A file that only loses lines (a
 # removal) goes with the commit, and every other change of it comes to the owner as the door's card.
+#
+# The declaration can also name files whose every change is the owner's (owner): the controls of the repository, such
+# as the script of a cluster's exposure check, its CronJob and its RBAC, admission policies and their alerts. The box
+# gives the objects that each one holds at HEAD (owned), so that door_targets.owner_change also sees a commit that
+# writes such an object in another file.
 
 DECLARATION = ".founderizer/door.json"
 GEN_PROGRAMS = ("ruby",)        # TREE_PINS: a generator runs one of these, never a program of the repository
 GEN_MOST = 4                    # files that a declaration may name
 GEN_BYTES = 4 * 2 ** 20         # the largest generated file
 GEN_SHOWN = 40                  # lines of a change that the answer shows
+OWNER_MOST = 40                 # files that a declaration may give the owner
+
+
+def declaration(before):
+    """(the generated entries, the owner's paths, why) of DECLARATION at HEAD: ([], [], None) when there is none, and
+    why when the door cannot follow it. It can follow {generated: [0 to GEN_MOST files], owner: [0 to OWNER_MOST
+    paths]}, with at least one file or path and no other key: a key that the door does not know may be a rule that it
+    would not keep, so it refuses each commit until a person writes the declaration again."""
+    raw = read(before, DECLARATION, most=65536)
+    if raw is None:
+        if not os.path.lexists(os.path.join(before, *DECLARATION.split("/"))):
+            return [], [], None
+        raw = b""                       # a link, a folder or a large file: no declaration that the door can follow
+    try:
+        body = json.loads(raw.decode("utf-8"))
+        entries, owner = body.get("generated", []), body.get("owner", [])
+        if set(body) - {"generated", "owner"} or not isinstance(entries, list) or not isinstance(owner, list) or \
+                len(entries) > GEN_MOST or len(owner) > OWNER_MOST or not (entries or owner) or \
+                not all(isinstance(p, str) and safe(p) for p in owner) or len(set(owner)) < len(owner):
+            raise ValueError
+    except (ValueError, TypeError, AttributeError, RecursionError, UnicodeDecodeError):
+        return [], [], (f"{DECLARATION} at HEAD is not {{generated: [0 to {GEN_MOST} files], owner: [0 to "
+                        f"{OWNER_MOST} paths]}}, with at least one, and no other key")
+    return entries, owner, None
+
+
+def owner_docs(before):
+    "The texts of the documents of each file that DECLARATION at HEAD gives the owner, for the reader's one run."
+    _entries, owner, why = declaration(before)
+    return [] if why else [text for path in owner if path.lower().endswith((".yaml", ".yml", ".json"))
+                           for text in file_docs(read(before, path, most=READ_MAX)) or []]
+
+
+def owned(runner, before):
+    """[{path, objects}]: each file that DECLARATION at HEAD gives the owner, with the objects that it holds at HEAD,
+    each as door_targets.object_key names it (a prune's key). A file that is not there, or that no reader reads, holds
+    none that the door knows: door_targets then sees only a commit that changes the file itself. A declaration that
+    the door cannot follow gives nothing here, because generated() reports it and the door refuses the commit."""
+    import door_targets
+    _entries, owner, why = declaration(before)
+    out = []
+    for path in [] if why else owner:
+        docs = read_file(runner, read(before, path, most=READ_MAX)) \
+            if path.lower().endswith((".yaml", ".yml", ".json")) else None
+        keys = {door_targets.object_key(o) for doc in docs or [] if isinstance(doc, dict) for o in objects(doc)}
+        out.append({"path": path, "objects": sorted(k for k in keys if k)})
+    return out
 
 
 def generated(runner, before, after):
@@ -1009,18 +1061,9 @@ def generated(runner, before, after):
     a line that moves. The
     generator's rules (rules: the generator, the check and their inputs) are taken from HEAD, and HEAD's file is read
     before the run: copy_tree's hard links make the trees share each file that the commit leaves alone."""
-    raw = read(before, DECLARATION, most=65536)
-    if raw is None:
-        if not os.path.lexists(os.path.join(before, *DECLARATION.split("/"))):
-            return []
-        raw = b""                       # a link, a folder or a large file: no declaration that the door can follow
-    try:
-        entries = json.loads(raw.decode("utf-8"))["generated"]
-        if not isinstance(entries, list) or not 0 < len(entries) <= GEN_MOST:
-            raise ValueError
-    except (ValueError, KeyError, TypeError, UnicodeDecodeError):
-        return [{"path": DECLARATION, "rules": [], "status": "failed",
-                 "why": f"{DECLARATION} at HEAD is not {{generated: [1 to {GEN_MOST} files]}}"}]
+    entries, _owner, why = declaration(before)
+    if why:
+        return [{"path": DECLARATION, "rules": [], "status": "failed", "why": why}]
     out = []
     for entry in entries:
         entry = entry if isinstance(entry, dict) else {}
@@ -1123,7 +1166,8 @@ def answer(header, tar, blobs, tools, scratch, log=False):
         # Applications of both trees. The readers below find them read.
         read_yaml(runner, [text for path in yaml_names for data in (heads[path], read(after, path))
                            for text in file_docs(data) or []]
-                  + [text for k in kustomize for text in k.texts] + [text for found in app_texts for text in found[0]])
+                  + [text for k in kustomize for text in k.texts] + [text for found in app_texts for text in found[0]]
+                  + owner_docs(before))
         files = {}
         for path in commit:
             files[path] = {"head": None if heads[path] is None else base64.b64encode(heads[path]).decode(),
@@ -1199,7 +1243,8 @@ def answer(header, tar, blobs, tools, scratch, log=False):
                         pairs.append(pair)
                 units[uid] = unit_report(runner, trees, kind, root, pairs,
                                          shut=closed(runner, trees, kind, root, kustomize, pairs, exposure))
-        report = {"v": 1, "ok": True, "files": files, "units": units, "generated": generated(runner, before, after)}
+        report = {"v": 1, "ok": True, "files": files, "units": units, "generated": generated(runner, before, after),
+                  "owner": owned(runner, before)}
     except Skip as e:
         return {"v": 1, "ok": False, "skip": str(e)}
     except Late:

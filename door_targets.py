@@ -21,6 +21,7 @@ the same code, and the host refuses on its own what the door should never have s
 """
 import base64
 import calendar
+import difflib
 import fnmatch
 import importlib.machinery
 import importlib.util
@@ -1112,6 +1113,7 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
         d = gitops_files(lookups, op, target, plan, files, report)
         if d.kind != "refused":
             plan["objects"] = commit_objects(files, report, lookups)     # door.py keeps them once the commit is made
+            d = with_owner(d, report, files, plan, target)
         return with_generated(d, report, lookups, files, plan, target)
     except (KeyError, TypeError, AttributeError, ValueError, RecursionError):
         return refused("the door could not read the render of this commit", target=target, route="again")
@@ -1152,14 +1154,18 @@ def with_generated(d, report, lookups, files, plan, target):
         return d
     if report is None:
         if (lookups.get("declared") or (lambda: False))():
-            return refused(f"the repository names files that its generator writes ({DOOR_DECLARATION}), and the door "
-                           f"has no render of this commit that writes them again", target=target)
+            return refused(f"the repository names, in {DOOR_DECLARATION}, files that its generator writes or whose "
+                           f"changes are the owner's, and the door has no render of this commit that writes them "
+                           f"again or reads them", target=target)
         return d
     entries = report.get("generated") or []
     written, changes = [], []
     for g in entries:
         if g["status"] == "same":
             continue
+        if g["status"] == "failed" and g["path"] == DOOR_DECLARATION:
+            return refused(f"{g.get('why')}: the door refuses each commit of this repository until a person writes "
+                           f"it again, outside the door", target=target)
         if g["status"] == "failed":
             return refused(f"the door could not write {g['path']} again ({g.get('why')}), and a commit without it "
                            f"fails the repository's checks", target=target)
@@ -1183,6 +1189,143 @@ def with_generated(d, report, lookups, files, plan, target):
     d.why = f"{d.why}; with {', '.join(path for path, _data, _mode in written)} written again, from which entries leave"
     d.hash_content = covered
     return d
+
+
+# ---------------------------------------------------------------- the files whose changes are the owner's
+#
+# The coordinator of the DevOps plan, 16 November 2026, under D25 ("a weaker control is the owner's") and the owner's
+# answer of 12 November 2026 for exposure, "Me, one card each time (Recommended)": an agent could change the controls
+# of a GitOps repository as its own call (the script of a cluster's exposure check, its CronJob, its RBAC, admission
+# policies, their alerts), and a door sync then took the change to the cluster with no card. Now the repository's
+# declaration names such files (owner, door_render.owned), and a commit through the door that changes, adds or
+# deletes one of them, or that writes or takes away one of their objects in another file or in a chart or a Kustomize
+# folder that it renders, is the owner's: the door's existing card (kind full), with the exact change in its words,
+# and the door makes that commit once, after the owner's signed yes to its call hash. A refusal stays a refusal, and
+# a path that is also a generated file or a rule of one stays refused (declared_refusal), because the box takes those
+# from HEAD.
+
+OWNER_SHOWN = 40            # lines of a change of the owner's files that the decision's words show
+
+
+def listed_objects(doc, depth=0):
+    "The objects of one document: itself, or the items of a List, at any depth (door_render.objects)."
+    items = doc.get("items")
+    if isinstance(doc.get("kind"), str) and doc["kind"].endswith("List") and isinstance(items, list) and depth < 40:
+        return [o for item in items if isinstance(item, dict) for o in listed_objects(item, depth + 1)]
+    return [doc]
+
+
+def change_words(path, old, new):
+    """The exact change of one file as the owner's card shows it: the lines that it loses (-) and gains (+), in their
+    order, OWNER_SHOWN of them at most, each cut to GEN_LINE characters, with the count of the others."""
+    if new is None:
+        return f"{path} is deleted ({len((old or b'').splitlines())} lines at HEAD)"
+    a = [] if old is None else old.decode("utf-8", "replace").splitlines()
+    b = new.decode("utf-8", "replace").splitlines()
+    lines = [line for line in list(difflib.unified_diff(a, b, n=0, lineterm=""))[2:] if not line.startswith("@@")]
+    gained = sum(1 for line in lines if line.startswith("+"))
+    shown = " | ".join(line.strip()[:GEN_LINE] if line[1:].strip() else line[0] for line in lines[:OWNER_SHOWN])
+    more = len(lines) - OWNER_SHOWN
+    return (f"{path} is new ({gained} lines)" if old is None else
+            f"{path} loses {len(lines) - gained} lines and gains {gained}") + \
+        f": {shown}" + (f" | and {more} lines more" if more > 0 else "")
+
+
+def owner_objects(owned):
+    "[(group, kind, namespace, name, path)] of each object that a file of the owner holds at HEAD (door_render.owned)."
+    out = []
+    for o in owned:
+        for key in o.get("objects") or []:
+            group, kind, rest = key.split(":", 2)
+            namespace, _, name = rest.partition("/")
+            out.append((group, kind, namespace, name, o["path"]))
+    return out
+
+
+def owner_keys_in(keys, objects):
+    """[(key, path)]: each key of keys (object_key) that is an object of the owner's: the same group, kind and name,
+    and the same namespace, or none on one side, where an app's own namespace can make them the same object."""
+    out = []
+    for key in sorted(k for k in keys if k):
+        group, kind, rest = key.split(":", 2)
+        namespace, _, name = rest.partition("/")
+        out += [(key, path) for g, k, ns, n, path in objects
+                if (g, k, n) == (group, kind, name) and (ns == namespace or not ns or not namespace)]
+    return out
+
+
+def file_objects(path, info, old, new):
+    """The keys of the objects that a file of a commit holds at HEAD and after it, as the box's parser and the door's
+    readers read them, or None when the door cannot read which objects it makes: a Jsonnet file, which a cluster's
+    tools run. A file that is no manifest makes none."""
+    name = path.lower()
+    if name.endswith((".jsonnet", ".libsonnet")):
+        return None
+    found = set()
+    for docs in (info.get("before"), info.get("after")):
+        if isinstance(docs, list):
+            found |= {object_key(o) for doc in docs if isinstance(doc, dict) for o in listed_objects(doc)}
+    for data in (old, new):
+        found |= object_keys(path, data) or set()
+        if name.endswith(".json") and data is not None:
+            try:
+                doc = json.loads(data)
+            except (ValueError, RecursionError):
+                continue            # gitops_files refuses a JSON file that is no JSON
+            found |= {object_key(o) for o in listed_objects(doc)} if isinstance(doc, dict) else set()
+    return found
+
+
+def owner_change(report, files):
+    """What of a commit is the owner's by DOOR_DECLARATION at HEAD (the report's owner, door_render.owned), as words,
+    or []: each of its files that the declaration names and that it changes, with the exact change; each object of
+    such a file at HEAD that the commit writes or takes away in another file, or in a chart or a Kustomize folder that
+    the box rendered for it (the same object in a second place, which a cluster may take in its stead); and each file
+    of the commit whose objects the door cannot read, which could hold one."""
+    if not report:
+        return []
+    owned = report.get("owner") or []
+    if not owned:
+        return []
+    paths = {o["path"] for o in owned}
+    objects = owner_objects(owned)
+    out = []
+    for path, data, _mode in files:
+        info = (report.get("files") or {}).get(path) or {}
+        old = None if info.get("head") is None else base64.b64decode(info["head"])
+        if path in paths:
+            if old != data:
+                out.append(change_words(path, old, data))
+            continue
+        units = [report["units"][u] for u in info.get("units") or []]
+        if units and all(u.get("ok") and not u.get("closed") for u in units):
+            continue                # the render of each of its units says what it makes: the units, below
+        found = None if units else file_objects(path, info, old, data)
+        if found is None:
+            out.append(f"the door cannot read which objects {path} makes, and the repository gives the owner objects")
+            continue
+        out += [f"{path} holds {key}, an object of {owner}" for key, owner in owner_keys_in(found, objects)]
+    for _uid, unit in sorted((report.get("units") or {}).items()):
+        if not unit.get("ok") or unit.get("closed"):
+            continue                # its files are above: the door cannot read what it makes
+        for group in unit.get("changed") or []:
+            found = {object_key(o) for o in (group.get("before") or []) + (group.get("after") or [])
+                     if isinstance(o, dict)}
+            out += [f"{unit_name(unit)} renders {key}, an object of {owner}"
+                    for key, owner in owner_keys_in(found, objects)]
+    return list(dict.fromkeys(out))
+
+
+def with_owner(d, report, files, plan, target):
+    """The decision on a GitOps commit, d, with the files whose changes are the owner's: the owner's card when the
+    commit touches what they hold (owner_change), with the exact change in its words. Without a report the door
+    cannot tell, and with_generated refuses every commit of a repository that has a declaration."""
+    said = owner_change(report, files) if report else []
+    if not said:
+        return d
+    return Decision("full", f"{d.why}; and the commit changes what {DOOR_DECLARATION} gives the owner, which is "
+                    f"the owner's to decide, once for each change: {'; '.join(said)}", target=target, plan=plan,
+                    window="deploy", hash_content=d.hash_content)
 
 
 # ---------------------------------------------------------------- the door's prune (DevOps plan X3)
