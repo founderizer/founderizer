@@ -13,9 +13,11 @@ import shutil
 import stat
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+import tracemalloc
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -1376,6 +1378,49 @@ def jpeg(comment):
 
 PDF_FILE = pdf((b"", b"BT /F1 12 Tf 72 712 Td (Invoice for October) Tj ET"))
 XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+# PDFs whose pages draw their words in a font's codes (CHAT-APPS.md 20.2), as Chrome writes them: a Type0 font with
+# Identity-H, whose ToUnicode map gives the letters of glyph numbers of two bytes, A at <0024> (glyphs), in each of a
+# map's three forms (bfchar, bfrange, and bfrange with an array), and "fi" in one glyph, <00C0>, as Chrome draws it.
+CHROME_MAP = (b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n1 begincodespacerange\n<0000> <FFFF>\n"
+              b"endcodespacerange\n2 beginbfchar\n<0003> <0020>\n<00C0> <FB01>\nendbfchar\n3 beginbfrange\n"
+              b"<0010> <001D> <002D>\n<0024> <003D> [" + b" ".join(b"<%04X>" % c for c in range(0x41, 0x5B)) +
+              b"]\n<0044> <005D> <0061>\nendbfrange\nendcmap CMapName currentdict /CMap defineresource pop end end\n")
+CHROME_FONT = (b"<< /Type /Font /Subtype /Type0 /BaseFont /AAAAAA+Helvetica /Encoding /Identity-H "
+               b"/DescendantFonts [4 0 R] /ToUnicode 6 0 R >>")
+CHROME_CID = (b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /AAAAAA+Helvetica /CIDToGIDMap /Identity "
+              b"/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> >>")
+ROBIN, ROBIN_SALT = "ROBIN-fiord-7720", "robin-salt"        # a made-up key with "fi" in it
+
+
+def pdf_of(objects, root=1):
+    """A PDF of numbered objects, {number: dictionary} or {number: (dictionary, stream bytes)}: a stream is packed with
+    FlateDecode."""
+    out = [b"%PDF-1.7\n"]
+    for num, value in sorted(objects.items()):
+        if isinstance(value, tuple):
+            body = zlib.compress(value[1])
+            out.append(b"%d 0 obj\n<< %s /Filter /FlateDecode /Length %d >>\nstream\n" % (num, value[0], len(body)) +
+                       body + b"\nendstream\nendobj\n")
+        else:
+            out.append(b"%d 0 obj\n%s\nendobj\n" % (num, value))
+    out.append(b"trailer << /Root %d 0 R >>\n%%%%EOF\n" % root)
+    return b"".join(out)
+
+
+def glyphs(text):
+    """Text in the glyph numbers of CHROME_MAP, as a hex string: A is <0024>, and fi is one glyph."""
+    return b"<" + "".join("00C0" if part == "fi" else "%04X" % (ord(part) - 29)
+                          for part in re.findall("fi|.", text, re.S)).encode() + b">"
+
+
+def chrome_pdf(content, fonts=b"/F1 3 0 R", more=None):
+    """A PDF of one page that draws `content`, with the fonts `fonts` in its resources: /F1 is CHROME_FONT. `more`
+    adds objects, or puts others in their place."""
+    objects = {1: b"<< /Type /Catalog /Pages 2 0 R >>", 2: b"<< /Type /Pages /Count 1 /Kids [5 0 R] >>",
+               3: CHROME_FONT, 4: CHROME_CID, 6: (b"", CHROME_MAP), 7: (b"", content),
+               5: b"<< /Type /Page /Parent 2 0 R /Resources << /Font << %s >> >> /Contents 7 0 R >>" % fonts}
+    objects.update(more or {})
+    return pdf_of(objects)
 
 
 class AgentFiles(ChatApps):
@@ -1604,15 +1649,601 @@ class AgentFiles(ChatApps):
     def test_a_packed_stream_of_more_than_one_piece_is_read_to_its_end(self):
         """inflate_pieces: a FlateDecode stream that inflates to more than one piece, with the line break before its
         endstream as PDFs write it. zlib gives that byte back after the end of its data at every call, and the loop
-        must end there: until 16 November 2026 it ran on, and held the check of every later file."""
-        plain = b"0 0 m 1 1 l S\n" * 2000
-        out = []
-        reader = threading.Thread(target=lambda: out.append(b"".join(hub.inflate_pieces(zlib.compress(plain) + b"\n",
-                                                                                          1000))), daemon=True)
-        reader.start()
-        reader.join(30)
-        self.assertFalse(reader.is_alive(), "inflate_pieces did not end")
-        self.assertEqual(out, [plain])
+        must end there: until 16 November 2026 it ran on, and held the check of every later file. The read runs in a
+        process of its own, which the timeout stops if it runs on: no loop is left in the tests' own process."""
+        read = ("import sys, zlib, hub\nplain = b'0 0 m 1 1 l S\\n' * 2000\n"
+                "sys.exit(b''.join(hub.inflate_pieces(zlib.compress(plain) + b'\\n', 1000)) != plain)\n")
+        try:
+            done = subprocess.run([sys.executable, "-B", "-c", read], cwd=os.path.dirname(os.path.abspath(hub.__file__)),
+                                  capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            self.fail("inflate_pieces did not end")
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    # ---- the text that a PDF's pages draw (CHAT-APPS.md 20.2)
+    def test_a_pdf_that_draws_a_login_in_a_fonts_codes_is_refused(self):
+        """The owner, 15 November 2026, to reading PDF font maps: "Yes, add it". A PDF that Chrome prints draws each word
+        in a font's glyph numbers, and the hub reads them in the letters of the font's ToUnicode map: a login in them
+        is refused, as it is in a DOCX."""
+        self.canary()
+        hub.ins("INSERT INTO secrets(label,salt,hash,len) VALUES(?,?,?,?)",
+                ("robin", ROBIN_SALT, hashlib.sha256((ROBIN_SALT + ROBIN).encode()).hexdigest(), len(ROBIN)))
+        letters, names = "SPAROW-CNY931", {"-": "hyphen", "9": "nine", "3": "three", "1": "one"}   # CANARY's letters
+        differences = b"[1 " + " ".join("/" + names.get(c, c) for c in letters).encode() + b"]"
+        one_byte = (b"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n2 beginbfrange\n<01> <1A> <0041>\n"
+                    b"<1B> <1B> <002D>\nendbfrange\n")
+        head = b"3 0 5 %d\n" % (len(CHROME_FONT) + 1)
+        old_page = chrome_pdf(b"BT /F1 12 Tf 72 712 Td " + glyphs("old words") + b" Tj ET", more={
+            8: (b"", b"BT /F1 12 Tf 72 712 Td " + glyphs(CANARY) + b" Tj ET")})
+        later = zlib.compress(b"BT /F1 12 Tf 72 712 Td " + glyphs(CANARY) + b" Tj ET")
+        packed = b"5 0 " + b"<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 3 0 R >> >> /Contents 8 0 R >>"
+        drawn = b"BT /F1 12 Tf 72 712 Td " + glyphs(CANARY) + b" Tj " + b"".join(       # 13 KB packed after the key
+            b"0 -14 Td " + glyphs(hashlib.sha256(b"%d" % i).hexdigest()[:9]) + b" Tj " for i in range(1500)) + b"ET"
+        wrong = zlib.compress(drawn)
+        wrong = wrong[:-1] + bytes([wrong[-1] ^ 0xFF])                  # the last byte of the checksum
+        pack = zlib.compressobj()
+        broken = pack.compress(drawn) + pack.flush(zlib.Z_SYNC_FLUSH) + b"\x07" + bytes(20)     # a block of no type
+        cases = {
+            # an update that the file appended: the later object 7 is the page's content
+            "an appended object": old_page + b"7 0 obj\n<< /Filter /FlateDecode /Length %d >>\nstream\n" % len(later) +
+                                  later + b"\nendstream\nendobj\ntrailer << /Root 1 0 R >>\n",
+            # an object stream that the file appended: its page 5 draws stream 8, and the earlier page 5 stream 7
+            "an appended object stream": old_page + b"20 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Filter /FlateDecode "
+                                                     b"/Length %d >>\nstream\n" % len(zlib.compress(packed)) +
+                                         zlib.compress(packed) + b"\nendstream\nendobj\ntrailer << /Root 1 0 R >>\n",
+            # an object that the file appended after an object stream with the same number
+            "an object after an object stream": chrome_pdf(b"BT /F1 12 Tf 72 712 Td " + glyphs("old words") + b" Tj ET",
+                                                           more={5: b"<< >>", 8: (b"", b"BT /F1 12 Tf 72 712 Td " +
+                                                                                   glyphs(CANARY) + b" Tj ET"),
+                                                                 20: (b"/Type /ObjStm /N 1 /First 4",
+                                                                      b"5 0 << /Type /Page /Parent 2 0 R /Resources << "
+                                                                      b"/Font << /F1 3 0 R >> >> /Contents 7 0 R >>")})
+            + b"5 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 3 0 R >> >> /Contents 8 0 R >>\n"
+              b"endobj\ntrailer << /Root 1 0 R >>\n",
+            # an object stream whose header lists its objects out of the order of their offsets
+            "offsets out of order": pdf_of({1: b"<< /Type /Catalog /Pages 2 0 R >>", 2: b"<< /Type /Pages /Count 1 /Kids "
+                                                                                     b"[5 0 R] >>",
+                                            4: CHROME_CID, 6: (b"", CHROME_MAP), 7: (b"", b"BT /F1 12 Tf " +
+                                                                                       glyphs(CANARY) + b" Tj ET"),
+                                            10: (b"/Type /ObjStm /N 2 /First %d" % len(b"5 %d 3 0\n" % (len(CHROME_FONT)
+                                                                                                        + 1)),
+                                                 b"5 %d 3 0\n" % (len(CHROME_FONT) + 1) + CHROME_FONT + b"\n<< /Type "
+                                                 b"/Page /Parent 2 0 R /Resources << /Font << /F1 3 0 R >> >> /Contents "
+                                                 b"7 0 R >>")}),
+            # a page whose /Contents is an array, with the key in its second stream
+            "a second content stream": chrome_pdf(b"BT /F1 12 Tf 72 712 Td " + glyphs("first part") + b" Tj ET", more={
+                5: b"<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 3 0 R >> >> /Contents [7 0 R 8 0 R] >>",
+                8: (b"", b"BT /F1 12 Tf 72 700 Td " + glyphs(CANARY) + b" Tj ET")}),
+            # a page whose fonts are in the page tree above it
+            "fonts of the page tree": chrome_pdf(b"BT /F1 12 Tf 72 712 Td " + glyphs(CANARY) + b" Tj ET", more={
+                2: b"<< /Type /Pages /Count 1 /Kids [5 0 R] /Resources << /Font << /F1 3 0 R >> >> >>",
+                5: b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R >>"}),
+            # a form that no page draws: the look of an annotation, with fonts of its own
+            "a form that no page draws": chrome_pdf(b"BT /F1 12 Tf 72 712 Td " + glyphs("nothing") + b" Tj ET", more={
+                8: (b"/Type /XObject /Subtype /Form /BBox [0 0 100 20] /Resources << /Font << /F1 3 0 R >> >>",
+                    b"BT /F1 12 Tf 2 2 Td " + glyphs(CANARY) + b" Tj ET")}),
+            # a key that wraps at its hyphen after a paragraph of more than 1,024 letters with spaces
+            "a key that wraps after a paragraph": chrome_pdf(b"BT /F1 14 Tf 1 0 0 -1 8 235 Tm " +
+                                                             glyphs("lorem ipsum dolor sit amet " * 60 + "SPARROW-") +
+                                                             b" Tj ET\nBT /F1 14 Tf 1 0 0 -1 8 251 Tm " +
+                                                             glyphs("CANARY-9931 and more") + b" Tj ET"),
+            # a Tm that stays on the line after a run of 1,100 letters: no line break inside the key
+            "a Tm on the line after a long run": chrome_pdf(b"BT /F1 9 Tf 1 0 0 -1 8 45 Tm " +
+                                                            glyphs("x" * 1100 + "SPARROW-CAN") +
+                                                            b" Tj 1 0 0 -1 99 45 Tm " + glyphs("ARY-9931") + b" Tj ET"),
+            # Chrome: one line in BT and ET, and the key in two strings with a kerning step between them
+            "a kerning step": chrome_pdf(b"BT\n/F1 14 Tf\n1 0 0 -1 8 113 Tm\n" + glyphs("Key SPARROW-CAN") +
+                                         b" Tj\n59.137695 0 Td " + glyphs("ARY-9931 end.") + b" Tj\nET"),
+            # the same after a run of 1,100 letters with no space: a step on the line is no new line
+            "a kerning step after a long run": chrome_pdf(b"BT /F1 9 Tf 1 0 0 -1 8 45 Tm " + glyphs("x" * 1100 +
+                                                                                                "SPARROW-CAN") +
+                                                          b" Tj 59.1 0 Td " + glyphs("ARY-9931") + b" Tj ET"),
+            # the numbers of a TJ array fall inside the key
+            "TJ kerning": chrome_pdf(b"BT /F1 12 Tf 72 712 Td [" + glyphs("SPARR") + b" -12 " + glyphs("OW-CANA") +
+                                     b" 30.5 " + glyphs("RY-9931") + b"] TJ ET"),
+            # the key wraps at its hyphen onto the next line, and each line is in its own BT and ET
+            "a key that wraps": chrome_pdf(b"BT /F1 14 Tf 1 0 0 -1 8 235 Tm " + glyphs("words SPARROW-") + b" Tj ET\n"
+                                           b"BT /F1 14 Tf 1 0 0 -1 8 251 Tm " + glyphs("CANARY-9931 and more") +
+                                           b" Tj ET"),
+            # a simple font with a map of one-byte codes, literal strings with escapes, and ' and " too
+            "a one-byte map": chrome_pdf(b"BT /F2 12 Tf 72 712 Td (\\023\\020\\001\\022\\022\\017\\027\\033) Tj "
+                                         b"(\\003\\001\\016\\001\\022\\031\\033) ' 0 0 (9931) \" ET", fonts=b"/F2 8 0 R",
+                                         more={8: b"<< /Type /Font /Subtype /TrueType /BaseFont /AAAAAB+Arial "
+                                                  b"/ToUnicode 9 0 R >>", 9: (b"", one_byte)}),
+            # a standard font with no map, whose codes are its letters: here in a hex string, as pdf-lib writes them
+            "a standard font": chrome_pdf(b"BT /F3 12 Tf 72 712 Td <" + CANARY.encode().hex().encode() + b"> Tj ET",
+                                          fonts=b"/F3 8 0 R", more={8: b"<< /Type /Font /Subtype /Type1 /BaseFont "
+                                                                       b"/Helvetica /Encoding /WinAnsiEncoding >>"}),
+            # a font whose /Differences names the glyphs of its codes
+            "glyph names": chrome_pdf(b"BT /F4 12 Tf 72 712 Td <" + "".join("%02X" % (letters.index(c) + 1)
+                                                                             for c in CANARY).encode() + b"> Tj ET",
+                                      fonts=b"/F4 8 0 R", more={8: b"<< /Type /Font /Subtype /Type1 /BaseFont "
+                                                                   b"/AAAAAC+CMR10 /Encoding << /Differences %s >> >>"
+                                                                   % differences}),
+            # a font of Adobe's Korean collection with no map: its codes 1 to 95 are the ASCII letters (the Mac's print
+            # system writes such a font)
+            "a CJK font with no map": chrome_pdf(
+                b"BT /F5 12 Tf 72 712 Td <" + "".join("%04X" % (ord(c) - 31) for c in CANARY).encode() + b"> Tj ET",
+                fonts=b"/F5 8 0 R", more={8: b"<< /Type /Font /Subtype /Type0 /BaseFont /AAAAAB+AppleSDGothicNeo "
+                                             b"/Encoding /Identity-H /DescendantFonts [9 0 R] >>",
+                                          9: b"<< /Type /Font /Subtype /CIDFontType0 /BaseFont /AAAAAB+AppleSDGothicNeo "
+                                             b"/CIDSystemInfo << /Registry (Adobe) /Ordering (Korea1) /Supplement 0 >> "
+                                             b">>"}),
+            # a form that the page draws (Do), with resources of its own, and the page and the font in an object stream
+            "a form": pdf_of({1: b"<< /Type /Catalog /Pages 2 0 R >>", 2: b"<< /Type /Pages /Count 1 /Kids [5 0 R] >>",
+                              4: CHROME_CID, 6: (b"", CHROME_MAP), 7: (b"", b"q /X1 Do Q"),
+                              8: (b"/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /Font << /F1 3 0 R "
+                                  b">> >>", b"BT /F1 12 Tf 72 712 Td " + glyphs(CANARY) + b" Tj ET"),
+                              10: (b"/Type /ObjStm /N 2 /First %d" % len(head),
+                                   head + CHROME_FONT + b"\n<< /Type /Page /Parent 2 0 R /Resources << /XObject << /X1 8 "
+                                                        b"0 R >> >> /Contents 7 0 R >>")}),
+            # a form with no resources of its own draws in the fonts of the page that draws it
+            "a form in the page's fonts": chrome_pdf(b"q /X1 Do Q", fonts=b"/F1 3 0 R >> /XObject << /X1 8 0 R", more={
+                8: (b"/Type /XObject /Subtype /Form /BBox [0 0 612 792]",
+                    b"BT /F1 12 Tf 72 712 Td " + glyphs(CANARY) + b" Tj ET")}),
+            # Chrome draws "fi" in one glyph, which its map gives as U+FB01
+            "a ligature": chrome_pdf(b"BT /F1 12 Tf 72 712 Td " + glyphs("key " + ROBIN) + b" Tj ET"),
+            # a page's stream in ASCII85 over FlateDecode, as reportlab writes it
+            "a stream in ASCII85": chrome_pdf(b"", more={7: b"<< /Filter [/ASCII85Decode /FlateDecode] >>\nstream\n" +
+                                                           base64.a85encode(zlib.compress(b"BT /F1 12 Tf " +
+                                                                                          glyphs(CANARY) + b" Tj ET"))
+                                                           + b"~>\nendstream"}),
+            # a page's stream whose zlib checksum is wrong, which readers of PDFs show: read as raw deflate data
+            "a wrong checksum": chrome_pdf(b"", more={7: b"<< /Filter /FlateDecode /Length %d >>\nstream\n" %
+                                                        len(wrong) + wrong + b"\nendstream"}),
+            # a page's stream with a break near its end, long after the key: read up to the break, a KB at a time
+            "a break after the key": chrome_pdf(b"", more={7: b"<< /Filter /FlateDecode /Length %d >>\nstream\n" %
+                                                             len(broken) + broken + b"\nendstream"}),
+            # a tagged page: 70,000 sequences of marked content, each with a dictionary that closes, before the key
+            "a tagged page": chrome_pdf(b"/P <</MCID 0>> BDC EMC " * 70000 + b"BT /F1 12 Tf 72 712 Td " +
+                                        glyphs(CANARY) + b" Tj ET"),
+        }
+        for name, data in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.put(self.line(name="a.pdf")[0], data),
+                                 (422, "Not taken: the file holds a registered secret. Nothing is on the hub. Call "
+                                       "attach_file for a new line.\n"))
+        self.assertEqual(self.count("attachments"), 0)
+
+    def test_the_text_that_a_pdf_draws_and_where_its_spaces_go(self):
+        """What the hub reads of a PDF's pages (pdf_drawn_texts): the words as the page draws them, with a space only
+        where a glyph or the gap of a word puts one, and runs that stay short for the search, also in a file whose
+        strings hold no space."""
+        drawn = lambda data: "".join(hub.pdf_drawn_texts(data))
+        invoice = chrome_pdf(b"BT\n/F1 28 Tf\n1 0 0 -1 8 45 Tm\n" + glyphs("Invoice for Oct") + b" Tj\n90.5 0 Td " +
+                             glyphs("ober") + b" Tj\nET")
+        self.assertEqual(drawn(invoice), "Invoice for October")
+        # pdfTeX draws no space glyph: a TJ number of -250 or less (a quarter of the font's size) is a space, a kerning
+        # number is none; and a line goes on in the next, since a line can end inside a login
+        tex = chrome_pdf(b"BT /F3 10 Tf 72 720 Td " + b"[(W)83(ord)-333(another)-250(one)-249(two)]TJ 0 -12 Td " * 3 +
+                         b"ET", fonts=b"/F3 8 0 R", more={8: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"})
+        self.assertEqual(drawn(tex), "Word another onetwo" * 3)
+        # a file whose strings hold no space: a line break at the first new line after CHAT_FILE_WRAP letters
+        dense = chrome_pdf(b"BT /F1 9 Tf 72 720 Td " + (glyphs("x" * 64) + b" Tj 0 -10 Td ") * 3000 + b"ET")
+        text = drawn(dense)
+        self.assertEqual(text.replace("\n", ""), "x" * 192000)
+        self.assertEqual(set(map(len, text.split()[:-1])), {1024})   # a break after 16 lines of 64: 1,024 letters
+        # the same break after a long run at each kind of new line: a Tm that leaves the line, BT, T*, ', " and a form
+        x, y = glyphs("x" * 1100), glyphs("y")
+        for name, content in (("Tm", b"BT /F1 9 Tf " + x + b" Tj 1 0 0 1 9 30 Tm " + y + b" Tj ET"),
+                              ("BT", b"BT /F1 9 Tf " + x + b" Tj ET BT /F1 9 Tf " + y + b" Tj ET"),
+                              ("T*", b"BT /F1 9 Tf " + x + b" Tj T* " + y + b" Tj ET"),
+                              ("'", b"BT /F1 9 Tf " + x + b" Tj " + y + b" ' ET"),
+                              ('"', b"BT /F1 9 Tf " + x + b" Tj 0 0 " + y + b' " ET'),
+                              ("a form", b"BT /F1 9 Tf " + x + b" Tj ET /X1 Do")):
+            with self.subTest(new_line=name):
+                form = {8: (b"/Type /XObject /Subtype /Form /BBox [0 0 9 9]", b"/F1 9 Tf " + y + b" Tj")}  # no BT
+                page = chrome_pdf(content, fonts=b"/F1 3 0 R >> /XObject << /X1 8 0 R", more=form if
+                                  name == "a form" else None)
+                self.assertEqual(drawn(page), "x" * 1100 + "\ny")
+        # fonts written in each page's own dictionary, with two maps that change every two pages (the second has each
+        # letter 256 codes later), after one small dictionary: a page's dictionary is not kept, and with a cache by id
+        # alone this Mac's Python gave a later page the font of an earlier one in 133 of 400 pages
+        later = CHROME_MAP.replace(b"<0003> <0020>", b"<0103> <0020>").replace(b"<0010> <001D>", b"<0110> <011D>")
+        objects, kids = {1: b"<< /Type /Catalog /Pages 2 0 R >>", 6: (b"", CHROME_MAP), 9: (b"", later.replace(
+            b"<0024> <003D>", b"<0124> <013D>").replace(b"<0044> <005D>", b"<0144> <015D>"))}, []
+        for i in range(400):
+            shift = 0x100 * ((i // 2) % 2)
+            objects[1000 + 2 * i] = (b"<< /Type /Page /Parent 2 0 R /Group << /S /Transparency >> /Resources << /Font << "
+                                     b"/F1 << /Type /Font /Subtype /Type0 /Encoding /Identity-H /ToUnicode %d 0 R >> >> >> "
+                                     b"/Contents %d 0 R >>" % (9 if shift else 6, 1001 + 2 * i))
+            objects[1001 + 2 * i] = (b"", b"BT /F1 12 Tf <" + b"".join(b"%04X" % (ord(c) - 29 + shift) for c in CANARY)
+                                     + b"> Tj ET")
+            kids.append(b"%d 0 R" % (1000 + 2 * i))
+        objects[2] = b"<< /Type /Pages /Count 400 /Kids [%s] >>" % b" ".join(kids)
+        self.assertEqual(drawn(pdf_of(objects)).count(CANARY), 400)
+        # a form that a page draws twice, and a content stream that two pages share, are read once
+        twice = chrome_pdf(b"q /X1 Do Q q /X1 Do Q", fonts=b"/F1 3 0 R >> /XObject << /X1 8 0 R", more={
+            8: (b"/Type /XObject /Subtype /Form /BBox [0 0 612 792]", b"BT /F1 12 Tf " + glyphs("once") + b" Tj ET")})
+        self.assertEqual(drawn(twice), "once")
+        shared = chrome_pdf(b"BT /F1 12 Tf " + glyphs("once") + b" Tj ET", more={
+            2: b"<< /Type /Pages /Count 2 /Kids [5 0 R 9 0 R] >>",
+            9: b"<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 3 0 R >> >> /Contents 7 0 R >>"})
+        self.assertEqual(drawn(shared), "once")
+        repeated = chrome_pdf(b"BT /F1 12 Tf " + glyphs("once") + b" Tj ET", more={
+            5: b"<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 3 0 R >> >> /Contents [%s] >>"
+               % b" ".join([b"7 0 R"] * 1000)})
+        self.assertEqual(drawn(repeated), "once")
+        # a form begins with the font of the stream that draws it
+        inherits = chrome_pdf(b"BT /F1 12 Tf ET /X1 Do", fonts=b"/F1 3 0 R >> /XObject << /X1 8 0 R", more={
+            8: (b"/Type /XObject /Subtype /Form /BBox [0 0 612 792]", b"BT " + glyphs("KEY 42") + b" Tj ET")})
+        self.assertEqual(drawn(inherits), "KEY 42")
+        # the details of PDF syntax and of fonts that the text depends on
+        simple = b"/F3 8 0 R"
+        helvetica = {8: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"}
+        cjk = lambda ordering, encoding=b"Identity-H", tounicode=b"": chrome_pdf(
+            b"BT /F5 12 Tf <" + "".join("%04X" % (ord(c) - 31) for c in "KEY 42").encode() + b"> Tj ET",
+            fonts=b"/F5 8 0 R", more={8: b"<< /Type /Font /Subtype /Type0 /Encoding /%s %s/DescendantFonts [9 0 R] >>"
+                                         % (encoding, tounicode),
+                                      9: b"<< /Type /Font /Subtype /CIDFontType0 /CIDSystemInfo << /Registry (Adobe) "
+                                         b"/Ordering (%s) /Supplement 0 >> >>" % ordering})
+        for name, data, letters in (
+                ("an inline picture", chrome_pdf(b"BI /W 2 /H 2 /CS /G /BPC 8 ID \x00(KEY)Tj BT\x01 EI BT /F3 9 Tf (ok) Tj ET",
+                                                 fonts=simple, more=helvetica), "ok"),
+                ("ASCIIHex", chrome_pdf(b"", fonts=simple, more={**helvetica, 7: b"<< /Filter /ASCIIHexDecode >>\n"
+                                        b"stream\n" + b"BT /F3 9 Tf (hex 42) Tj ET".hex().encode() + b">\nendstream"}),
+                 "hex 42"),
+                ("a line that a literal string continues", chrome_pdf(b"BT /F3 9 Tf (SPAR\\\nROW) Tj ET", fonts=simple,
+                                                                      more=helvetica), "SPARROW"),
+                ("nested parentheses", chrome_pdf(b"BT /F3 9 Tf (a (b) \\(c) Tj ET", fonts=simple, more=helvetica),
+                 "a (b) (c"),
+                ("an odd hex string", chrome_pdf(b"BT /F3 9 Tf <41424> Tj ET", fonts=simple, more=helvetica), "AB@"),
+                ("hex strings in a TJ", chrome_pdf(b"BT /F3 9 Tf [<41424> <4 1>] TJ ET", fonts=simple, more=helvetica),
+                 "AB@A"),
+                ("WinAnsi", chrome_pdf(b"BT /F3 9 Tf <80> Tj ET", fonts=simple, more=helvetica), "\u20ac"),
+                ("Identity-V", chrome_pdf(b"BT /F1 9 Tf " + glyphs("KEY 42") + b" Tj ET", more={
+                    3: CHROME_FONT.replace(b"Identity-H", b"Identity-V")}), "KEY 42"),
+                ("Japan1", cjk(b"Japan1"), "KEY 42"), ("GB1", cjk(b"GB1"), "KEY 42"), ("CNS1", cjk(b"CNS1"), "KEY 42"),
+                ("a CJK font of Identity-V", cjk(b"Korea1", encoding=b"Identity-V"), "KEY 42"),
+                ("a CJK font with a map", cjk(b"Korea1", tounicode=b"/ToUnicode 6 0 R "), "ICW 20"),   # the map's
+                ("a CJK font with another encoding", cjk(b"Korea1", encoding=b"UniKS-UCS2-H"), "      "),
+                ("glyph names", chrome_pdf(b"BT /F4 9 Tf <0102030405> Tj ET", fonts=b"/F4 8 0 R", more={
+                    8: b"<< /Type /Font /Subtype /Type1 /Encoding << /Differences [1 /uni004B /E.sc /f_i /u1F600 /zz] >> "
+                       b">>"}), "KEfi\U0001f600 "),
+                ("a letter of one byte in a map", chrome_pdf(b"BT /F2 9 Tf <01> Tj ET", fonts=b"/F2 8 0 R", more={
+                    8: b"<< /Type /Font /Subtype /TrueType /ToUnicode 9 0 R >>",
+                    9: (b"", b"1 beginbfchar <01> <42> endbfchar")}), "B")):
+            with self.subTest(detail=name):
+                self.assertEqual(drawn(data), letters)
+        # a font whose codes have one byte or two, as its encoding's code ranges give them (Shift-JIS has such codes)
+        encoding = (b"3 begincodespacerange <00> <7F> <8140> <9FFC> <20> <30> endcodespacerange")
+        letters = (b"1 beginbfrange <41> <5A> <0041> endbfrange 1 beginbfchar <8140> <0020> endbfchar 1 beginbfrange "
+                   b"<8141> <815A> <0061> endbfrange")
+        mixed = chrome_pdf(b"BT /F6 12 Tf <4B4559814181428143> Tj ET", fonts=b"/F6 8 0 R", more={
+            8: b"<< /Type /Font /Subtype /Type0 /Encoding 9 0 R /ToUnicode 10 0 R /DescendantFonts [4 0 R] >>",
+            9: (b"/Type /CMap", encoding), 10: (b"", letters)})
+        self.assertEqual(drawn(mixed), "KEYabc")
+        with patch.object(hub, "PDF_LETTERS_KEPT", 2):                  # past the letters kept, each code in place
+            self.assertEqual(drawn(mixed), "KEYabc")
+        # pieces of about CHAT_FILE_CHUNK, each up to its last space, also where no string ends with a space
+        prose = chrome_pdf(b"".join(b"BT /F3 10 Tf 72 %d Td (the quick brown fox jumps over the lazy dog) Tj ET\n"
+                                    % (700 - 10 * (i % 60)) for i in range(300)),
+                           fonts=b"/F3 8 0 R", more={8: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"})
+        with patch.object(hub, "CHAT_FILE_CHUNK", 1000):
+            pieces = list(hub.pdf_drawn_texts(prose))
+        self.assertEqual("".join(pieces), "the quick brown fox jumps over the lazy dog" * 300)
+        self.assertGreater(len(pieces), 10)
+        self.assertTrue(all(piece[-1].isspace() and len(piece) < 1100 for piece in pieces[:-1]), pieces[:2])
+        # what the check cannot read: the glyph numbers of a font with no map
+        bare = chrome_pdf(b"BT /F1 12 Tf 72 712 Td " + glyphs(CANARY) + b" Tj ET",
+                          more={3: CHROME_FONT.replace(b" /ToUnicode 6 0 R", b"")})
+        self.assertEqual(drawn(bare).strip(), "")
+        self.canary()
+        for data in (invoice, tex, dense, bare):
+            self.assertEqual(self.put(self.line(name="a.pdf")[0], data)[0], 200)
+
+    def test_the_reader_of_a_pdfs_fonts_has_limits_and_odd_bytes_are_no_fault(self):
+        """The reader of the pages keeps at most CHAT_FILE_GLYPHS entries of fonts' maps and CHAT_FILE_OBJECTS objects,
+        takes at most CHAT_FILE_WORK steps, and what it unpacks and writes counts against a CHAT_FILE_UNPACK of its own:
+        a file past one of them is refused, never read in part. Bytes that do not parse are the file's, never a fault
+        of the hub."""
+        self.canary()
+        page = chrome_pdf(b"BT /F1 12 Tf 72 712 Td " + glyphs("Invoice") + b" Tj ET")
+        with patch.object(hub, "CHAT_FILE_GLYPHS", 20):              # CHROME_MAP holds 31 entries
+            code, said = self.put(self.line(name="a.pdf")[0], page)
+            self.assertEqual((code, "the fonts of the PDF map more codes than the hub's check reads" in said),
+                             (413, True), said)
+        with patch.object(hub, "CHAT_FILE_OBJECTS", 5):              # the page has 7 objects
+            code, said = self.put(self.line(name="a.pdf")[0], page)
+            self.assertEqual((code, "the PDF holds more objects than the hub's check reads" in said), (413, True), said)
+        # each kind of a map's entry counts against CHAT_FILE_GLYPHS: 40 code ranges, 40 codes, 40 ranges of codes
+        for entries in (b"40 begincodespacerange " + b" ".join(b"<%02X> <%02X>" % (i, i) for i in range(40)) +
+                        b" endcodespacerange",
+                        b"40 beginbfchar " + b" ".join(b"<%02X> <0041>" % i for i in range(40)) + b" endbfchar",
+                        b"40 beginbfrange " + b" ".join(b"<%02X> <%02X> <0041>" % (i, i) for i in range(40)) +
+                        b" endbfrange"):
+            with self.subTest(entries=entries[:20]), patch.object(hub, "CHAT_FILE_GLYPHS", 30):
+                code, said = self.put(self.line(name="a.pdf")[0], chrome_pdf(b"BT /F1 9 Tf <0024> Tj ET", more={
+                    6: (b"", entries)}))
+                self.assertEqual((code, "the fonts of the PDF map more codes than the hub's check reads" in said),
+                                 (413, True), said)
+        # the objects of an object stream count against CHAT_FILE_OBJECTS
+        head = b" ".join(b"%d %d" % (100 + i, 2 * i) for i in range(10)) + b" "
+        packed = pdf_of({1: b"<< /Type /Catalog >>", 2: (b"/Type /ObjStm /N 10 /First %d" % len(head),
+                                                       head + b"1 " * 10)})
+        with patch.object(hub, "CHAT_FILE_OBJECTS", 8), self.assertRaisesRegex(hub.Refusal, "more objects than"):
+            list(hub.pdf_drawn_texts(packed))
+        self.assertEqual(list(hub.pdf_drawn_texts(packed)), [])
+        # bytes whose first two are no zlib header give nothing, as in readers of PDFs, though raw deflate data with
+        # words follows them: a header whose check fails, and one that names a preset dictionary
+        for head in (b"\x78\x00", b"\x78\xbb"):
+            deflate = zlib.compressobj(wbits=-15)
+            headless = head + deflate.compress(b"BT /F1 12 Tf " + glyphs("words") + b" Tj ET") + deflate.flush()
+            with self.subTest(header=head):
+                self.assertEqual("".join(hub.pdf_drawn_texts(chrome_pdf(b"", more={
+                    7: b"<< /Filter /FlateDecode /Length %d >>\nstream\n" % len(headless) + headless +
+                       b"\nendstream"}))), "")
+        # what FlateDecode inflates counts against the reader's CHAT_FILE_UNPACK
+        with patch.object(hub, "CHAT_FILE_UNPACK", 1 << 20), self.assertRaisesRegex(hub.Refusal, "packs more than"):
+            list(hub.pdf_drawn_texts(chrome_pdf(b"q Q " * (1 << 19))))
+        # a chain of 600 forms, each with a letter: a form inside 16 others is read from the top, and the reader's
+        # depth stays small
+        chain = {8 + i: (b"/Type /XObject /Subtype /Form /Resources << /Font << /F1 3 0 R >> /XObject << /X 0 R >> >>"
+                         .replace(b"/X 0 R", b"/X %d 0 R" % (9 + i)), b"BT /F1 9 Tf " + glyphs("a") + b" Tj ET /X Do")
+                 for i in range(600)}
+        text = "".join(hub.pdf_drawn_texts(chrome_pdf(b"/X Do", fonts=b"/F1 3 0 R >> /XObject << /X 8 0 R",
+                                                      more=chain)))
+        self.assertEqual(text.replace("\n", ""), "a" * 600)
+        # each loop of the reader takes its steps: 20,000 parts of a string, tokens of syntax, numbers of syntax,
+        # tokens of a map, bytes in codes of more than one length, new codes of two bytes, simple fonts' letters,
+        # objects, and the pairs of an object stream
+        for name, data in (
+                ("parts of a string", chrome_pdf(b"BT /F1 9 Tf (" + b"\\001" * 20000 + b") Tj ET")),
+                ("tokens of syntax", chrome_pdf(b"", more={5: b"<< /Type /Page /Parent 2 0 R /X [" + b"/a " * 20000 +
+                                                             b"] /Contents 7 0 R >>"})),
+                ("numbers of syntax", chrome_pdf(b"", more={5: b"<< /Type /Page /Parent 2 0 R /X [" + b"1 " * 20000 +
+                                                              b"] /Contents 7 0 R >>"})),
+                ("numbers of syntax before a word", chrome_pdf(b"", more={
+                    5: b"<< /Type /Page /Parent 2 0 R /X [" + b"1 2 3 4 5 6 x " * 3000 + b"] /Contents 7 0 R >>"})),
+                ("tokens of a map", chrome_pdf(b"BT /F1 9 Tf <0024> Tj ET", more={6: (b"", b"x " * 20000)})),
+                ("glyph names of a map", chrome_pdf(b"BT /F1 9 Tf <0001> Tj ET", more={6: (b"", b"1000 beginbfchar " +
+                    b" ".join(b"<%04X> /uni%s" % (i, b"0041" * 29) for i in range(1000)) + b" endbfchar")})),
+                ("codes of more than one length", chrome_pdf(b"BT /F6 9 Tf <" + b"41" * 20000 + b"> Tj ET",
+                                                             fonts=b"/F6 8 0 R", more={
+                    8: b"<< /Type /Font /Subtype /Type0 /Encoding 9 0 R /DescendantFonts [4 0 R] >>",
+                    9: (b"/Type /CMap", b"1 begincodespacerange <00> <FF> endcodespacerange")})),
+                ("new codes of two bytes", chrome_pdf(b"BT /F1 9 Tf <" + b"".join(b"%04X" % c for c in range(20000)) +
+                                                      b"> Tj ET")),
+                ("simple fonts", chrome_pdf(b"BT " + b"".join(b"/F%d 9 Tf (a) Tj " % i for i in range(100)) + b"ET",
+                                            fonts=b" ".join(b"/F%d %d 0 R" % (i, 100 + i) for i in range(100)),
+                                            more={100 + i: b"<< /Type /Font /Subtype /Type1 >>" for i in range(100)})),
+                ("objects", b"%PDF-1.7\n" + b"".join(b"%d 0 obj null endobj\n" % i for i in range(1, 20001))),
+                ("pairs of an object stream", pdf_of({1: b"<< /Type /Catalog >>", 2: (
+                    b"/Type /ObjStm /N 20000 /First 200000", b"".join(b"%d 0 " % (100 + i) for i in range(20000))
+                    .ljust(200000))}))):
+            with self.subTest(steps=name), patch.object(hub, "CHAT_FILE_WORK", 10_000):
+                self.assertRaisesRegex(hub.Refusal, "draws more than", list, hub.pdf_drawn_texts(data))
+        # the reader's steps: 20,000 strings and 20,000 operators, in a stream of a few KB, are refused, not read in
+        # part; and so are 20,000 operators that draw nothing
+        for tiny in (chrome_pdf(b"BT /F1 9 Tf " + b"(a)' " * 20000 + b"ET"), chrome_pdf(b"0 0 m " * 20000)):
+            with patch.object(hub, "CHAT_FILE_WORK", 10_000):
+                code, said = self.put(self.line(name="a.pdf")[0], tiny)
+                self.assertEqual((code, "the PDF draws more than the hub's check reads" in said), (413, True), said)
+            self.assertEqual(self.put(self.line(name="a.pdf")[0], tiny)[0], 200)
+        # numbers that no operator follows: a step for each
+        with patch.object(hub, "CHAT_FILE_WORK", 10_000):
+            code, said = self.put(self.line(name="a.pdf")[0], chrome_pdf(b"1 " * 20000))
+            self.assertEqual((code, "the PDF draws more than the hub's check reads" in said), (413, True), said)
+        # the letters of codes that fonts keep: PDF_LETTERS_KEPT in all fonts, and a code past it is read where it
+        # stands, with the same letters (three fonts of 4,000 codes each)
+        many = chrome_pdf(b"".join(b"BT /F%d 9 Tf <" % i + b"".join(b"%04X" % c for c in range(4000)) + b"> Tj ET "
+                                   for i in (1, 2, 3)), fonts=b"/F1 3 0 R /F2 8 0 R /F3 9 0 R", more={
+            8: CHROME_FONT, 9: CHROME_FONT})
+        whole = "".join(hub.pdf_drawn_texts(many))
+        with patch.object(hub, "PDF_LETTERS_KEPT", 100):
+            self.assertEqual("".join(hub.pdf_drawn_texts(many)), whole)
+        self.assertEqual(self.put(self.line(name="a.pdf")[0], many)[0], 200)
+        # 1,100 simple fonts on one page, as a PDF that merges many files has them: their letters take steps only
+        fonts = b" ".join(b"/F%d %d 0 R" % (i, 100 + i) for i in range(1100))
+        merged = chrome_pdf(b"BT " + b"".join(b"/F%d 9 Tf (%s) Tj " % (i, b"ab"[i % 2:i % 2 + 1]) for i in range(1100))
+                            + b"ET", fonts=fonts, more={100 + i: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+                                                                 b"/Encoding /WinAnsiEncoding >>" for i in range(1100)})
+        self.assertEqual("".join(hub.pdf_drawn_texts(merged)), "ab" * 550)
+        self.assertEqual(self.put(self.line(name="a.pdf")[0], merged)[0], 200)
+        # the tables of simple fonts: fonts with the same /Encoding and /ToUnicode share one, made once (300 fonts and
+        # 2,000 glyph names of 119 letters); fonts with maps of their own make their own, each a step for each item of
+        # /Differences and one more for each 8 letters of a name (3 fonts); and equal letters are one string in all
+        long = b"[0 " + b" ".join([b"/uni" + b"0041" * 29] * 2000) + b"]"
+        shared = chrome_pdf(b"BT " + b"".join(b"/F%d 9 Tf (A) Tj " % i for i in range(300)) + b"ET",
+                            fonts=b" ".join(b"/F%d %d 0 R" % (i, 100 + i) for i in range(300)), more={
+            8: b"<< /Differences %s >>" % long,
+            **{100 + i: b"<< /Type /Font /Subtype /Type1 /Encoding 8 0 R >>" for i in range(300)}})
+        with patch.object(hub, "CHAT_FILE_WORK", 300_000):
+            self.assertEqual("".join(hub.pdf_drawn_texts(shared)), "A" * 29 * 300)
+        own = chrome_pdf(b"BT /F1 9 Tf (A) Tj /F2 9 Tf (A) Tj /F3 9 Tf (A) Tj ET",
+                         fonts=b"/F1 10 0 R /F2 11 0 R /F3 12 0 R", more={
+            8: b"<< /Differences %s >>" % long,
+            **{10 + i: b"<< /Type /Font /Subtype /Type1 /Encoding 8 0 R /ToUnicode %d 0 R >>" % (20 + i)
+               for i in range(3)},
+            **{20 + i: (b"", b"1 beginbfchar <42> <FB00> endbfchar") for i in range(3)}})
+        self.assertEqual("".join(hub.pdf_drawn_texts(own)), "A" * 29 * 3)
+        with patch.object(hub, "CHAT_FILE_WORK", 60_000):
+            self.assertRaisesRegex(hub.Refusal, "draws more than", list, hub.pdf_drawn_texts(own))
+        pdf = hub.PdfFile(own, [hub.CHAT_FILE_UNPACK], [hub.CHAT_FILE_GLYPHS], [hub.CHAT_FILE_WORK])
+        first, second = (pdf.font(hub.PdfRef(num)).table for num in (10, 11))
+        self.assertIsNot(first, second)
+        self.assertEqual((first[0x42], first[0x41]), ("ff", "A" * 29))
+        self.assertIs(first[0x42], second[0x42])
+        self.assertIs(first[0x41], second[0x41])
+        # a table of letters that the reader makes is a step more for each 8 of its letters: 50 fonts, each with a map
+        # of its own that gives each of its 256 codes 32 letters, are about 66,000 steps
+        tables = chrome_pdf(b"BT " + b"".join(b"/F%d 9 Tf (A) Tj " % i for i in range(50)) + b"ET",
+                            fonts=b" ".join(b"/F%d %d 0 R" % (i, 100 + i) for i in range(50)), more={
+            **{100 + i: b"<< /Type /Font /Subtype /Type1 /ToUnicode %d 0 R >>" % (200 + i) for i in range(50)},
+            **{200 + i: (b"", b"1 beginbfrange <00> <FF> <" + b"0051" * 31 + b"%04X> endbfrange" % (0x41 + i))
+               for i in range(50)}})
+        self.assertEqual(len("".join(hub.pdf_drawn_texts(tables))), 50 * 32)
+        with patch.object(hub, "CHAT_FILE_WORK", 50_000):           # a step for each 16 letters: about 40,000
+            self.assertRaisesRegex(hub.Refusal, "draws more than", list, hub.pdf_drawn_texts(tables))
+        # an encoding written in a font's own dictionary is that font's alone, and two named encodings are two
+        for fonts, letters in ((b"<< /Differences [128 /a] >>", b"<< /Differences [128 /b] >>"), "ab"), \
+                              ((b"/WinAnsiEncoding", b"/MacRomanEncoding"), "\u20ac\xc4"):
+            with self.subTest(encodings=fonts):
+                self.assertEqual("".join(hub.pdf_drawn_texts(chrome_pdf(
+                    b"BT /F1 9 Tf (\x80) Tj /F2 9 Tf (\x80) Tj ET", fonts=b"/F1 10 0 R /F2 11 0 R", more={
+                        10 + i: b"<< /Type /Font /Subtype /Type1 /Encoding %s >>" % encoding
+                        for i, encoding in enumerate(fonts)}))), letters)
+        # an array of a page's content has at most PDF_ARRAY_MOST items
+        with patch.object(hub, "PDF_ARRAY_MOST", 100), self.assertRaisesRegex(hub.Refusal, "draws more than"):
+            list(hub.pdf_drawn_texts(chrome_pdf(b"BT /F1 9 Tf [" + b"<0024> -12 " * 150 + b"] TJ ET")))
+        # a map whose literal string has no end, made of escaped parentheses: read in one pass, not one for each (
+        endless = chrome_pdf(b"BT /F1 9 Tf <0024> Tj ET", more={6: (b"", b"(" + b"\\(" * 40000)})
+        started = time.monotonic()                                  # 5 ms; 20 s when each ( scans to the end
+        self.assertEqual("".join(hub.pdf_drawn_texts(endless)), " ")
+        self.assertLess(time.monotonic() - started, 3)
+        # what the reader unpacks counts against its CHAT_FILE_UNPACK: 2 MB of a page's content that no filter packs
+        unpacked = chrome_pdf(b"", more={7: b"<< /Length 2097152 >>\nstream\n" + b"q Q " * (1 << 19) + b"\nendstream"})
+        with patch.object(hub, "CHAT_FILE_UNPACK", 1 << 20), self.assertRaisesRegex(hub.Refusal, "packs more than"):
+            list(hub.pdf_drawn_texts(unpacked))
+        # Python decodes ASCII85 itself: its bytes are steps before it runs, also when the text holds one comment
+        comment = chrome_pdf(b"", more={7: b"<< /Filter [/FlateDecode /ASCII85Decode] >>\nstream\n" +
+                                           zlib.compress(base64.a85encode(b"% " + b"x" * 60000) + b"~>") +
+                                           b"\nendstream"})
+        with patch.object(hub, "CHAT_FILE_WORK", 10_000):
+            code, said = self.put(self.line(name="a.pdf")[0], comment)
+            self.assertEqual((code, "the PDF draws more than the hub's check reads" in said), (413, True), said)
+        # one code that the map gives as 200 letters, of which the reader keeps 32, drawn 10,000 times: 320,000
+        # letters from a small stream
+        wide = chrome_pdf(b"BT /F1 12 Tf <" + b"0001" * 10000 + b"> Tj ET",
+                          more={6: (b"", b"1 beginbfchar\n<0001> <" + b"0041" * 200 + b">\nendbfchar\n")})
+        with patch.object(hub, "CHAT_FILE_UNPACK", 300_000):
+            code, said = self.put(self.line(name="a.pdf")[0], wide)
+            self.assertEqual((code, "the PDF packs more than" in said), (413, True), said)
+        self.assertEqual(self.put(self.line(name="a.pdf")[0], wide)[0], 200)
+        # one code gives 32 letters at most: the letters of a map's entry and of a glyph's name are cut to 32 before a
+        # range counts its last letter up, and a code's letters again after its ligatures become their letters; a
+        # glyph's name longer than a name of PDF can be (127 bytes) gives none, since many fonts can share one
+        # encoding's names
+        mapped = lambda entries, code: chrome_pdf(b"BT /F1 9 Tf <%s> Tj ET" % code, more={6: (b"", entries)})
+        named = lambda name: chrome_pdf(b"BT /F4 9 Tf (A) Tj ET", fonts=b"/F4 8 0 R", more={
+            8: b"<< /Type /Font /Subtype /Type1 /Encoding << /Differences [65 /%s] >> >>" % name})
+        for kind, data, letters in (
+                ("a range of a map", mapped(b"1 beginbfrange <0001> <0002> <" + b"0051" * 40 + b"> endbfrange", b"0002"),
+                 "Q" * 31 + "R"),
+                ("a glyph's name in a range", mapped(b"1 beginbfrange <0001> <0002> /" + b"_".join([b"f"] * 40) +
+                                                     b" endbfrange", b"0002"), "f" * 31 + "g"),
+                ("ligatures of a map", mapped(b"1 beginbfchar <0001> <" + b"FB03" * 20 + b"> endbfchar", b"0001"),
+                 ("ffi" * 20)[:32]),
+                ("ligatures of a simple font", named(b"uni" + b"FB03" * 20), ("ffi" * 20)[:32]),
+                ("a name of 127 bytes", named(b"uni" + b"0041" * 31), "A" * 31),
+                ("a name of 131 bytes", named(b"uni" + b"0041" * 32), " ")):
+            with self.subTest(letters=kind):
+                self.assertEqual("".join(hub.pdf_drawn_texts(data)), letters)
+        # the letters of a string are made a few codes at a time, and refused before the rest of them is made, and
+        # the strings of one TJ are counted one by one: 400,000 codes of 64 bytes each (16 letters U+1F600, the 32
+        # UTF-16 units of a map's entry) would be 25 MB. Measured on 16 November 2026: 4 to 7 MB at most; 30 to 43 MB
+        # when a string or a TJ was made whole before it was counted
+        laughs = b"<" + b"D83DDE00" * 16 + b">"
+        for kind, data in (
+                ("codes of two bytes", chrome_pdf(b"BT /F1 9 Tf <" + b"0001" * 400000 + b"> Tj ET", more={
+                    6: (b"", b"1 beginbfchar <0001> " + laughs + b" endbfchar")})),
+                ("a simple font", chrome_pdf(b"BT /F7 9 Tf (" + b"A" * 400000 + b") Tj ET", fonts=b"/F7 8 0 R", more={
+                    8: b"<< /Type /Font /Subtype /Type1 /ToUnicode 6 0 R >>",
+                    6: (b"", b"1 beginbfchar <41> " + laughs + b" endbfchar")})),
+                ("codes of more than one length", chrome_pdf(b"BT /F6 9 Tf (" + b"A" * 400000 + b") Tj ET",
+                                                             fonts=b"/F6 8 0 R", more={
+                    8: b"<< /Type /Font /Subtype /Type0 /Encoding 9 0 R /DescendantFonts [4 0 R] /ToUnicode 6 0 R >>",
+                    9: (b"/Type /CMap", b"1 begincodespacerange <00> <FF> endcodespacerange"),
+                    6: (b"", b"1 beginbfchar <41> " + laughs + b" endbfchar")})),
+                ("the strings of one TJ", chrome_pdf(b"BT /F1 9 Tf [" + (b"<" + b"0001" * 16000 + b"> -1 ") * 20 +
+                                                     b"] TJ ET", more={
+                    6: (b"", b"1 beginbfchar <0001> " + laughs + b" endbfchar")}))):
+            with self.subTest(made=kind), patch.object(hub, "CHAT_FILE_UNPACK", 3 << 20):
+                tracemalloc.start()
+                try:
+                    self.assertRaisesRegex(hub.Refusal, "packs more than", list, hub.pdf_drawn_texts(data))
+                    peak = tracemalloc.get_traced_memory()[1]
+                finally:
+                    tracemalloc.stop()
+                self.assertLess(peak, 16 << 20)
+        # pdf_joined counts the bytes of the letters that it has made, all as wide as the widest: "a" and 100 letters
+        # U+1F600 are 404 bytes, and so are 100 letters U+1F600 and "€"
+        for blocks in (["a", "\U0001F600" * 100], ["\U0001F600" * 100, "€"]):
+            self.assertRaisesRegex(hub.Refusal, "packs more than", hub.pdf_joined, iter(blocks), [403])
+            self.assertEqual(hub.pdf_joined(iter(blocks), [404]), "".join(blocks))
+        # the letters count the bytes in which they are kept, here against a budget of 1,000,000: after a stream of
+        # 400,000 bytes, 400,000 letters € (2 bytes each) are too many, and 400,000 A or é (one byte each) are not; nor
+        # are 250,000 € after their stream of 250,000 bytes. And a letter wider than those before it in its piece
+        # counts them again for the bytes that they gain, and the letters after it count as wide: 100,000 of A and
+        # one letter beyond the first plane, in either order, are too many for a budget of 400,000
+        euro = lambda letter, count=400000: chrome_pdf(b"BT /F5 9 Tf (" + letter * count + b") Tj ET",
+                                                       fonts=b"/F5 8 0 R", more={
+            8: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"})
+        wider = lambda first, last: chrome_pdf(b"BT /F8 9 Tf (" + first + b") Tj (" + last + b") Tj ET",
+                                               fonts=b"/F8 8 0 R", more={
+            8: b"<< /Type /Font /Subtype /Type1 /ToUnicode 9 0 R >>", 9: (b"", b"1 beginbfchar <80> <D83DDE00> endbfchar")})
+        with patch.object(hub, "CHAT_FILE_UNPACK", 1_000_000):
+            self.assertRaisesRegex(hub.Refusal, "packs more than", list, hub.pdf_drawn_texts(euro(b"\x80")))
+            self.assertEqual("".join(hub.pdf_drawn_texts(euro(b"\x80", 250000))), "\u20ac" * 250000)
+            self.assertEqual("".join(hub.pdf_drawn_texts(euro(b"A"))), "A" * 400000)
+            self.assertEqual("".join(hub.pdf_drawn_texts(euro(b"\xe9"))), "\xe9" * 400000)
+        with patch.object(hub, "CHAT_FILE_UNPACK", 400_000):
+            for first, last in ((b"A" * 100000, b"\x80"), (b"\x80", b"A" * 100000)):    # and the wide letter first
+                self.assertRaisesRegex(hub.Refusal, "packs more than", list, hub.pdf_drawn_texts(wider(first, last)))
+            self.assertEqual("".join(hub.pdf_drawn_texts(wider(b"A" * 100000, b"A"))), "A" * 100001)
+        # a string, a name and a text operator are 3 steps: 8,000 strings that Tj shows, in a few KB
+        with patch.object(hub, "CHAT_FILE_WORK", 16_000), self.assertRaisesRegex(hub.Refusal, "draws more than"):
+            list(hub.pdf_drawn_texts(chrome_pdf(b"BT " + b"(a) Tj " * 8000 + b"ET")))
+        # codes of two bytes past PDF_LETTERS_KEPT are read where they stand, with a step for each: ten strings of
+        # the same 150 codes 20 times; kept, they take a step for each new code only
+        same = chrome_pdf(b"BT /F1 9 Tf " + (b"<" + b"".join(b"%04X" % c for c in range(1, 151)) * 20 + b"> Tj ") * 10 +
+                          b"ET")
+        letters = "".join(hub.pdf_drawn_texts(same))
+        with patch.object(hub, "PDF_LETTERS_KEPT", 100):
+            self.assertEqual("".join(hub.pdf_drawn_texts(same)), letters)
+            with patch.object(hub, "CHAT_FILE_WORK", 20_000):
+                self.assertRaisesRegex(hub.Refusal, "draws more than", list, hub.pdf_drawn_texts(same))
+        with patch.object(hub, "CHAT_FILE_WORK", 20_000):
+            self.assertEqual("".join(hub.pdf_drawn_texts(same)), letters)
+        # the open arrays of a page's content hold PDF_ARRAY_MOST operands at most in all; an array is kept only while
+        # it is open, or as the last operand outside arrays: 20 arrays of 20,000 numbers, inside an array or outside,
+        # take about 1 MB at a time, not 17 MB
+        with patch.object(hub, "PDF_ARRAY_MOST", 1000), self.assertRaisesRegex(hub.Refusal, "draws more than"):
+            list(hub.pdf_drawn_texts(chrome_pdf(b"BT /F1 9 Tf [" + b"-1 " * 600 + b"[" + b"-1 " * 600 + b"] ] TJ ET")))
+        numbers = b"[" + b"12 " * 20000 + b"] "
+        for kind, data in (("inside an array", chrome_pdf(b"BT [" + numbers * 20 + b"] TJ ET")),
+                           ("outside arrays", chrome_pdf(b"BT " + numbers * 20 + b"TJ ET"))):
+            with self.subTest(arrays=kind):
+                tracemalloc.start()
+                try:
+                    self.assertEqual("".join(hub.pdf_drawn_texts(data)), "")
+                    peak = tracemalloc.get_traced_memory()[1]
+                finally:
+                    tracemalloc.stop()
+                self.assertLess(peak, 8 << 20)
+        odd = {
+            "a string with no end": chrome_pdf(b"BT /F1 12 Tf (no end <0024> Tj"),
+            "hex strings of odd digits": chrome_pdf(b"BT /F1 12 Tf <0024002> Tj <00 24 0> Tj ET"),
+            "deep arrays": chrome_pdf(b"[" * 100000 + b"(x) Tj ] TJ"),
+            "a page that is its own content": chrome_pdf(b"", more={5: b"<< /Type /Page /Parent 2 0 R /Contents 5 0 R "
+                                                                       b"/Resources 5 0 R >>"}),
+            "a form that draws itself": chrome_pdf(b"/X1 Do", more={
+                5: b"<< /Type /Page /Parent 2 0 R /Resources << /XObject << /X1 8 0 R >> >> /Contents 7 0 R >>",
+                8: (b"/Type /XObject /Subtype /Form /Resources << /XObject << /X1 8 0 R >> /Font << /F1 3 0 R >> >>",
+                    b"/X1 Do BT /F1 9 Tf <0024> Tj ET")}),
+            "a broken map": chrome_pdf(b"BT /F1 12 Tf <002400250026> Tj ET", more={6: (b"", (
+                b"beginbfchar <0024 <0041> endbfchar beginbfrange <0030> <0010> <0041> <0102030405> <0102030406> "
+                b"<0041> <01> <02> [<0041> endbfrange begincodespacerange <00> endcodespacerange 2 beginbfchar "
+                b"<0025> /nonesuch <0026> <D800> endbfchar"))}),
+            "odd operands": chrome_pdf(b"BT /F1 Tf 1 2 3 Tm (x) 5 Td [<0024> [1 2] /N null] TJ /F9 12 Tf <0024> Tj "
+                                       b"\" ' T* ET ET BT 1\x00 0 Td"),
+            "an inline picture": chrome_pdf(b"BI /W 2 /H 2 /CS /G /BPC 8 ID \x00BT(\xff)Tj\x01 EI BT /F1 9 Tf <0024> Tj "
+                                            b"ET"),
+            "an object stream that does not parse": pdf_of({1: b"<< /Type /Catalog /Pages 2 0 R >>",
+                                                            10: (b"/Type /ObjStm /N 3 /First 99", b"1 x 5")}),
+            "resources that are a number": chrome_pdf(b"BT /F1 12 Tf <0024> Tj ET", more={
+                5: b"<< /Type /Page /Parent 2 0 R /Resources 42 /Contents 7 0 R >>"}),
+            "odd differences": chrome_pdf(b"BT /F4 12 Tf <0102FF> Tj ET", fonts=b"/F4 8 0 R", more={
+                8: b"<< /Type /Font /Subtype /Type1 /Encoding << /BaseEncoding [1] /Differences [300 /a -5 /b /c (x) "
+                   b"2] >> >>"}),
+            "an escape that is no octal": chrome_pdf(b"BT /F1 12 Tf (\\8\\9) Tj ET"),
+            "a number of 5,000 digits": pdf_of({1: b"<< /Type /Catalog /Pages 2 0 R >>",
+                                                3: (b"/Type /ObjStm /N 1 /First 5003", b"9" * 5000 + b" 0 << /A 1 >>")}),
+        }
+        for name, data in odd.items():
+            with self.subTest(name):
+                code, said = self.put(self.line(name="a.pdf")[0], data)
+                self.assertEqual(code, 200, said)
 
     def test_only_a_session_with_a_shell_gets_attach_file(self):
         names = lambda agent, context: {t["name"] for t in hub.tools_for(agent, context)}

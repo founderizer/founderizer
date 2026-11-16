@@ -20265,9 +20265,10 @@ def chat_file_texts(data, mime):
     """The texts of an agent's file that the secret search reads, a piece at a time, and the type's own checks on the
     way: a Refusal when the bytes are not of the type, an Office file holds a macro, an ActiveX control, an OLE object,
     a template from another computer or a DDE field, a PDF is encrypted, runs code, carries a file or launches a
-    program, or the file packs more text than CHAT_FILE_UNPACK. Only text is read, never a picture's pixels or a font:
-    the search hashes every window of a long run, and a binary run is long. A piece ends at a space or a line break,
-    which no login holds, so no login lies across two pieces, and a large file holds one piece in memory at a time."""
+    program, or the file packs more text than CHAT_FILE_UNPACK. Only text is read, never a picture's pixels or a font's
+    program (a PDF's text is also read in its fonts' letters, pdf_drawn_texts): the search hashes every window of a
+    long run, and a binary run is long. A piece ends at a space or a line break, which no login holds, so no login
+    lies across two pieces, and a large file holds one piece in memory at a time."""
     kind = CHAT_FILE_KINDS[mime]
     if mime in ("text/csv", "text/plain"):
         try:
@@ -20391,7 +20392,7 @@ def a85_bytes(raw, most=None):
     if not text.endswith(b"~>"):
         return None
     body = text[:-2] if most is None else text[:-2][:most * 2]
-    compact = re.sub(rb"[ \t\r\n\x0b\x0c\x00]", b"", body)
+    compact = body.translate(None, SPACES)          # not re.sub, which makes an object for each space
     if not re.fullmatch(rb"[!-uz]*", compact):
         return None
     if most is not None:                    # whole groups only: five characters, or one z
@@ -20411,7 +20412,7 @@ def hex_bytes(raw):
     text = raw.rstrip(SPACES)
     if not text.endswith(b">") or not re.fullmatch(rb"[0-9A-Fa-f \t\r\n\x0b\x0c\x00]*", text[:-1]):
         return None
-    compact = re.sub(rb"[ \t\r\n\x0b\x0c\x00]", b"", text[:-1])
+    compact = text[:-1].translate(None, SPACES)     # not re.sub, which makes an object for each space
     return bytes.fromhex((compact + b"0" * (len(compact) % 2)).decode("ascii"))
 
 
@@ -20435,22 +20436,32 @@ PDF_ENCRYPT = pdf_name_pattern(b"Encrypt")
 PDF_OBJECTS = pdf_name_pattern(b"ObjStm")
 
 
-def pdf_texts(data):
-    """The texts of a PDF that the search reads: its syntax outside the streams (the dictionaries, the strings and the
-    metadata), and each stream whose bytes are text, inflated when it inflates and decoded from ASCII85 or hex first
-    when it is written so (reportlab writes [/ASCII85Decode /FlateDecode]); a stream's first 64 KB decide. An object
-    stream holds the PDF's own dictionaries, so it is always read and searched for PDF_RISKS, whatever its first bytes;
-    one that cannot be read as text is refused. Refused too: an encrypted PDF, which the hub cannot read; a PDF that
-    names PDF_RISKS in its syntax or an object stream; more than CHAT_FILE_UNPACK of text."""
-    outside, risky, left, at = [], False, CHAT_FILE_UNPACK, 0
+def pdf_stream_spans(data):
+    """(start, begin, end) of each stream of a PDF, in order: the syntax before it ends at `start`, where its stream
+    keyword is, and its bytes run from `begin` to `end`, where its endstream keyword is, or where the file ends."""
+    at = 0
     for m in re.finditer(rb"stream\r?\n", data):
         if m.start() < at or (m.start() >= 3 and data[m.start() - 3:m.start()] == b"end"):
             continue
         end = data.find(b"endstream", m.end())
         end = len(data) if end < 0 else end
-        objects = bool(PDF_OBJECTS.search(data, at, m.start()))     # this stream's dictionary is in the syntax before it
-        outside.append(data[at:m.start()])
-        raw, at = data[m.end():end], end
+        yield m.start(), m.end(), end
+        at = end
+
+
+def pdf_texts(data):
+    """The texts of a PDF that the search reads: its syntax outside the streams (the dictionaries, the strings and the
+    metadata), each stream whose bytes are text, inflated when it inflates and decoded from ASCII85 or hex first
+    when it is written so (reportlab writes [/ASCII85Decode /FlateDecode]), where a stream's first 64 KB decide; and
+    last the text that its pages draw in their fonts' letters (pdf_drawn_texts). An object stream holds the PDF's own
+    dictionaries, so it is always read and searched for PDF_RISKS, whatever its first bytes; one that cannot be read
+    as text is refused. Refused too: an encrypted PDF, which the hub cannot read; a PDF that names PDF_RISKS in its
+    syntax or an object stream; more than CHAT_FILE_UNPACK of text."""
+    outside, risky, left, at = [], False, CHAT_FILE_UNPACK, 0
+    for start, begin, end in pdf_stream_spans(data):
+        objects = bool(PDF_OBJECTS.search(data, at, start))     # this stream's dictionary is in the syntax before it
+        outside.append(data[at:start])
+        raw, at = data[begin:end], end
         source = hex_bytes(raw)
         if source is None:
             sample = a85_bytes(raw, most=65536)
@@ -20483,6 +20494,959 @@ def pdf_texts(data):
         raise Refusal(415, "a PDF that runs a script, carries a file or launches a program cannot go to a chat")
     for piece in space_pieces(syntax):
         yield piece.decode("latin-1")
+    yield from pdf_drawn_texts(data)
+
+
+# ---- the words that the pages of a PDF draw (CHAT-APPS.md 20.2)
+# The owner, 15 November 2026, to "Shall the key check read PDF font maps, so that it also checks PDFs that Chrome
+# made?": "Yes, add it". A PDF draws its words as codes of a font: a string's bytes are those codes, and only the font
+# says which letters they are. Chrome writes glyph numbers through an Identity-H font (<002C0051> Tj), and the font's
+# /ToUnicode map gives their letters. So the check also reads each page as a reader of PDFs does, for its text: the
+# font that Tf selects, the strings of Tj, TJ, ' and " in that font's letters (PdfFont), each form that a page draws
+# (Do) and then each other form of the file, once each; and it gives that text to the search as one more text of the
+# file (PdfWords says where a space or a line break goes). It cannot read the codes of a font that are glyph numbers
+# and that no map names (an Identity-H font with no /ToUnicode, outside Adobe's CJK collections), words drawn as
+# shapes, or words in a picture.
+PDF_REGULAR = rb"[^\s\x00\[\]()<>{}/%]"         # a character of a name, a number or an operator
+PDF_NUMBER = rb"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)"
+# The tokens of PDF syntax, by the number of their group: 1 numbers and the operator that follows them (2), which the
+# content of a page is mostly made of (18.3 0 Td, x y m), read in one match; 3 a hex string (4) or a literal string with
+# no parenthesis or backslash in it (5) that Tj shows, read in one match too; 6 numbers that no operator follows, up to
+# 1,024 in one match (a run is read once: a match of one number would look ahead for an operator at each of them),
+# 7 a name, 8 << or >>, 9 a hex string, 10 the ( of a literal string, 11 [ or ], 12 an operator or a keyword, 13 a
+# character that is none of these.
+PDF_TOKEN = re.compile(
+    rb"(?:[\s\x00]+(?![\s\x00])|%[^\r\n]*(?![^\r\n]))*"         # white space and comments, read in one way only
+    rb"(?:(?P<numop>(?:" + PDF_NUMBER + rb"(?![0-9.])[\s\x00]+){1,32}(?P<after>[A-Za-z'\"*]" + PDF_REGULAR + rb"*))(?!"
+    + PDF_REGULAR + rb")|(?P<show>(?:<(?P<hexed>[0-9A-Fa-f]*)>|\((?P<plain>[^()\\]*)\))[\s\x00]*Tj)(?!" + PDF_REGULAR
+    + rb")|(?P<nums>" + PDF_NUMBER + rb"(?!" + PDF_REGULAR + rb")(?:[\s\x00]+" + PDF_NUMBER + rb"(?!" + PDF_REGULAR
+    + rb")){0,1023})|(?P<name>/" + PDF_REGULAR + rb"*)"
+    rb"|(?P<dict><<|>>)|(?P<hex><[^<>]*>)|(?P<lit>\()|(?P<arr>[\[\]])|(?P<op>" + PDF_REGULAR + rb"+)"
+    rb"|(?P<bad>[^\s\x00]))")
+PDF_LITERAL_PART = re.compile(rb"[^()\\]+|\\(?:[0-7]{1,3}|\r\n|.)|[()]", re.S)
+PDF_ESCAPES = {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"b": b"\b", b"f": b"\f", b"\r\n": b"", b"\r": b"", b"\n": b""}
+# The tokens of a CMap that pdf_cmap reads: a hex string, [, ], a name, a word, and a comment. A literal string (only
+# a CMap's CIDSystemInfo has one) is no token: its parentheses are passed over and its words are read as words.
+PDF_CMAP_TOKEN = re.compile(rb"<([0-9A-Fa-f\s\x00]*)>|(\[)|(\])|/(" + PDF_REGULAR + rb"*)|(" + PDF_REGULAR + rb"+)"
+                            rb"|%[^\r\n]*")
+PDF_HEADER = re.compile(rb"(?<![0-9])([0-9]{1,10})[\s\x00]+[0-9]{1,5}[\s\x00]+obj(?!" + PDF_REGULAR + rb")")
+PDF_IMAGE_END = re.compile(rb"[\s\x00]EI(?!" + PDF_REGULAR + rb")")
+PDF_DIGITS = re.compile(rb"[0-9]+")
+PDF_PAGE = pdf_name_pattern(b"Page")
+PDF_FORM = pdf_name_pattern(b"Form")
+PDF_PARSE_TOKENS = 1 << 17      # tokens of one object's syntax that the check parses: more ends its value there
+PDF_NESTED = 64                 # arrays and dictionaries inside each other that the check reads
+PDF_FORMS_NESTED = 16           # forms inside forms that the check follows
+PDF_TEXT_OPS = {b"TJ", b"Tj", b"'", b'"', b"Tf", b"Td", b"TD", b"Tm", b"T*", b"BT", b"ID", b"Do"}  # draw acts on these
+PDF_WORD_GAP = 250              # a TJ number of -250 or less moves a quarter of the font's size or more: a word gap
+PDF_ADOBE_CJK = (b"Japan1", b"GB1", b"CNS1", b"Korea1")      # whose codes 1 to 95 are the ASCII letters
+PDF_ENCODINGS = {"WinAnsiEncoding": "cp1252", "MacRomanEncoding": "mac_roman"}          # any other is read as latin-1
+PDF_NO_MAP = ((), {}, (), (), ())               # PdfFile.cmap of a font with no map
+PDF_NOT_HEX = bytes(b for b in range(256) if b not in b"0123456789abcdefABCDEF")
+PDF_LETTERS_KEPT = 1 << 18      # letters of codes that fonts keep in all, so that each code is read once; then in place
+PDF_ARRAY_MOST = 1 << 16        # operands in the open arrays of a page's content: more is refused, a TJ holds a line
+PDF_CODE_LETTERS = 32           # letters of one code of a font: a map or a glyph's name that gives more is cut there
+PDF_NAME_MOST = 127             # bytes of a name in PDF at most (ISO 32000-1, C.2): a longer glyph's name is no letter
+PDF_BLOCK = 4096                # codes of a string whose letters are made at a time, and counted before more are made
+# The letters of the glyph names of a font's /Differences and of a map that names glyphs: the printable ASCII
+# characters, the letters as themselves, uniXXXX and uXXXX, and a ligature as its letters (pdf_glyph).
+PDF_GLYPH_NAMES = dict(zip(
+    "space exclam quotedbl numbersign dollar percent ampersand quotesingle parenleft parenright asterisk plus comma "
+    "hyphen period slash zero one two three four five six seven eight nine colon semicolon less equal greater question "
+    "at bracketleft backslash bracketright asciicircum underscore grave braceleft bar braceright asciitilde quoteright "
+    "quoteleft minus ff fi fl ffi ffl".split(),
+    list(" !\"#$%&'()*+,-./0123456789:;<=>?@[\\]^_`{|}~\u2019\u2018-") + ["ff", "fi", "fl", "ffi", "ffl"]))
+PDF_LIGATURES = {0xFB00: "ff", 0xFB01: "fi", 0xFB02: "fl", 0xFB03: "ffi", 0xFB04: "ffl", 0xFB05: "st", 0xFB06: "st"}
+# The limits of the reader of the pages, besides a CHAT_FILE_UNPACK of its own for what it unpacks and the letters that
+# it writes (pdf_texts counts its own): a run of drawn text that is this long ends at the next new line, with a line
+# break (PdfWords); the entries of fonts' maps (a code, a range of codes and a codespace range are one each), and the
+# objects of one PDF, that it keeps in memory at most; and the steps that it takes for one PDF, at most. A step is one
+# token of a page's content (an operator with the numbers just before it is one) or of the syntax (where each number
+# is one), one part of a literal string, one token of a font's map, one item of a simple font's /Differences (a glyph's
+# name there or in a map one more for each 8 of its letters), one byte of a string in a font whose codes have more than
+# one length, one new code of two bytes, five bytes of ASCII85, or one object; a string, a name, an array, a dictionary
+# and a text operator are 3, and a simple font is 256 (the letters of its codes, made or shared), with one more for each
+# 8 letters of a table of letters that it makes. A step cost at most 0.84 microseconds of one core on a busy Mac in the
+# files that we measured (16 November 2026), so the limit is about 5 seconds; 3,000 dense pages that Chrome prints take
+# 4.1 million steps, and 43 MB of a chart's lines 2.4 million. A token of many bytes costs more for its bytes, which the
+# reader reads once, and which are at most what it unpacks: 60 MB of a page's operators after 6 numbers each, the
+# dearest bytes that we found, take 1.9 seconds and 1.6 million steps.
+CHAT_FILE_WRAP = 1024
+CHAT_FILE_GLYPHS = 1 << 18
+CHAT_FILE_OBJECTS = 1 << 18
+CHAT_FILE_WORK = 6_000_000
+PDF_TOO_MUCH = "the PDF draws more than the hub's check reads: send a smaller file"
+
+
+class PdfRef:
+    """An indirect reference of PDF syntax (12 0 R): the number of its object."""
+    __slots__ = ("num",)
+
+    def __init__(self, num):
+        self.num = num
+
+
+class PdfString(bytes):
+    """A string of a content stream, apart from the bytes of a number."""
+    __slots__ = ()
+
+
+def pdf_take(budget, size):
+    """Count `size` of what the check unpacks or writes against its limit: `budget` is a list of one number, what it
+    may still take of CHAT_FILE_UNPACK."""
+    budget[0] -= size
+    if budget[0] < 0:
+        raise Refusal(413, f"the PDF packs more than {CHAT_FILE_UNPACK >> 20} MB")
+
+
+def pdf_kept(glyphs, count):
+    """Count `count` entries that the reader keeps against CHAT_FILE_GLYPHS: `glyphs` is a list of one number, the
+    entries that it may still keep, of fonts' maps and of the letters of codes that it has read."""
+    glyphs[0] -= count
+    if glyphs[0] < 0:
+        raise Refusal(413, "the fonts of the PDF map more codes than the hub's check reads: send a smaller file")
+
+
+def pdf_steps(work, count):
+    """Count `count` steps of the reader against its limit: `work` is a list of one number, the steps that it may still
+    take of CHAT_FILE_WORK; past them the PDF is refused, never read in part."""
+    work[0] -= count
+    if work[0] < 0:
+        raise Refusal(413, PDF_TOO_MUCH)
+
+
+def pdf_literal(data, at, work):
+    """(the bytes, where it ends) of the literal string whose ( is just before `at`, with its escapes read: its
+    nested parentheses stay in it, and a string with no end runs to the end of the bytes. Each part is a step."""
+    out, depth = [], 1
+    for m in PDF_LITERAL_PART.finditer(data, at):
+        work[0] -= 1
+        if work[0] < 0:
+            raise Refusal(413, PDF_TOO_MUCH)
+        part = m.group()
+        if part == b"(":
+            depth += 1
+        elif part == b")":
+            depth -= 1
+            if not depth:
+                return b"".join(out), m.end()
+        elif part[0] == 0x5C:                       # a backslash and what it escapes
+            rest = part[1:]
+            part = bytes([int(rest, 8) & 0xFF]) if 0x30 <= rest[0] <= 0x37 else PDF_ESCAPES.get(rest, rest)
+        out.append(part)
+    return b"".join(out), len(data)
+
+
+def pdf_hex(token):
+    """The bytes of a hex string token (<0041 0042>): what is not a hex digit goes, and an odd last digit is
+    followed by 0."""
+    try:
+        return bytes.fromhex(token[1:-1].decode("latin-1"))
+    except ValueError:                              # a space inside a pair, an odd digit, or what is no digit
+        digits = token[1:-1].translate(None, PDF_NOT_HEX)
+        return bytes.fromhex((digits + b"0" * (len(digits) % 2)).decode("ascii"))
+
+
+def pdf_name(token):
+    """A name token as a str, without its slash and with its #xx escapes read (/Pa#67e is Page)."""
+    return re.sub(rb"#([0-9A-Fa-f]{2})", lambda m: bytes([int(m.group(1), 16)]), token[1:]).decode("latin-1")
+
+
+def pdf_number(token):
+    """A number token as an int or a float."""
+    try:
+        return int(token)
+    except ValueError:
+        return float(token)
+
+
+def pdf_value(data, start, stop, work):
+    """The first value of the PDF syntax in data[start:stop], as Python values: a dictionary is a dict whose keys
+    are names, an array a list, a name a str, a string bytes, a number an int or a float, a reference a PdfRef, and
+    true, false and null True, False and None. Syntax that does not parse ends the value where it is, and so do the
+    keyword stream or endobj and more than PDF_PARSE_TOKENS tokens; it raises only the refusal of the steps (work)."""
+    open_, top, pos = [], [], start
+    for _ in range(PDF_PARSE_TOKENS):
+        m = PDF_TOKEN.match(data, pos, stop)
+        if not m:
+            break
+        work[0] -= 1
+        if work[0] < 0:
+            raise Refusal(413, PDF_TOO_MUCH)
+        pos, kind = m.end(), m.lastgroup
+        token = m.group(kind)
+        if kind == "numop":                         # numbers, then a keyword: 12 0 R, or a number before endobj
+            numbers = token.replace(b"\0", b" ").split()[:-1]                    # NUL is white space too
+            pdf_steps(work, len(numbers))           # a step for each number, which the value keeps
+            top.extend(map(pdf_number, numbers))
+            kind, token = "op", m.group("after")
+        if kind == "nums":
+            numbers = token.replace(b"\0", b" ").split()
+            pdf_steps(work, len(numbers) - 1)       # a step for each number
+            top.extend(map(pdf_number, numbers))
+            continue                                # numbers that a reference (12 0 R) may continue
+        if kind == "name":
+            top.append(pdf_name(token))
+        elif kind == "hex":
+            top.append(pdf_hex(token))
+        elif kind == "lit":
+            value, pos = pdf_literal(data, pos, work)
+            top.append(value)
+        elif token in (b"[", b"<<"):
+            if len(open_) >= PDF_NESTED:
+                break
+            open_.append((top, token))
+            top = []
+        elif token in (b"]", b">>"):
+            if not open_:
+                break
+            items, (top, opened) = top, open_.pop()
+            top.append(pdf_dict(items) if opened == b"<<" else items)
+        elif kind == "op" and token == b"R" and len(top) >= 2 and type(top[-1]) is int and type(top[-2]) is int:
+            del top[-1]
+            top[-1] = PdfRef(top[-1])
+        elif kind == "op" and token not in (b"stream", b"endobj", b"obj"):
+            top.append({b"true": True, b"false": False}.get(token))
+        else:
+            break
+        if not open_:
+            break                                   # one whole value
+    while open_:                                    # an array or a dictionary with no end: closed where it stands
+        items, (top, opened) = top, open_.pop()
+        top.append(pdf_dict(items) if opened == b"<<" else items)
+    return top[0] if top else None
+
+
+def pdf_dict(items):
+    """The dictionary of a list of keys and values; a key that is not a name and its value go."""
+    return {items[i]: items[i + 1] for i in range(0, len(items) - 1, 2) if isinstance(items[i], str)}
+
+
+def pdf_cmap(text, glyphs, work):
+    """(spaces, single, ranges) of a CMap, a font's /ToUnicode map or the codes of its /Encoding: spaces holds (bytes,
+    low, high) of each codespace range, single the letters of each code (bfchar, and bfrange with an array), and
+    ranges (low, high, letters) of each other bfrange, whose last letter counts up from its low code; both lists
+    sorted. A code is its number, whatever bytes write it, as PDF readers take it. `glyphs` is a list of one number,
+    the entries that the check may still keep (CHAT_FILE_GLYPHS): a code, a range of codes and a codespace range are
+    one each, and a map that would hold more is refused. Each token is a step (work)."""
+    spaces, single, ranges, section, args, array = [], {}, [], None, [], None
+    for m in PDF_CMAP_TOKEN.finditer(text):
+        work[0] -= 1
+        if work[0] < 0:
+            raise Refusal(413, PDF_TOO_MUCH)
+        digits, opened, closed, name, word = m.groups()
+        if word is not None:
+            if word in (b"begincodespacerange", b"beginbfchar", b"beginbfrange"):
+                section, args, array = word, [], None
+            elif word.startswith(b"end"):
+                section, args, array = None, [], None
+            continue
+        if section is None or (digits, opened, closed, name) == (None, None, None, None):
+            continue
+        if opened is not None:
+            array = []
+            continue
+        if closed is not None:
+            if array is not None:
+                args.append(array)
+            array = None
+        else:
+            if name is not None:
+                pdf_steps(work, len(name) >> 3)     # a glyph's name: a step more for each 8 of its letters
+            value = pdf_hex(b"<" + digits + b">") if digits is not None else pdf_name(b"/" + name)
+            if array is not None:
+                array.append(value)
+                continue
+            args.append(value)
+        if section == b"begincodespacerange" and len(args) == 2:
+            low, high = args
+            if isinstance(low, bytes) and isinstance(high, bytes) and 1 <= len(low) == len(high) <= 4:
+                spaces.append((len(low), int.from_bytes(low, "big"), int.from_bytes(high, "big")))
+                glyphs[0] -= 1
+            args = []
+        elif section == b"beginbfchar" and len(args) == 2:
+            if isinstance(args[0], bytes) and 1 <= len(args[0]) <= 4:
+                single[int.from_bytes(args[0], "big")] = pdf_letters(args[1])
+                glyphs[0] -= 1
+            args = []
+        elif section == b"beginbfrange" and len(args) == 3:
+            low, high, letters = args
+            if isinstance(low, bytes) and isinstance(high, bytes) and 1 <= len(low) == len(high) <= 4:
+                first, last = int.from_bytes(low, "big"), int.from_bytes(high, "big")
+                if isinstance(letters, list):
+                    for i, each in enumerate(letters[:max(0, last - first + 1)]):
+                        single[first + i] = pdf_letters(each)
+                    glyphs[0] -= len(letters)
+                elif first <= last:
+                    ranges.append((first, last, pdf_letters(letters)))
+                    glyphs[0] -= 1
+            args = []
+        pdf_kept(glyphs, 0)
+    ranges.sort(key=lambda r: r[0])
+    return sorted(spaces), single, ranges
+
+
+def pdf_letters(value):
+    """The letters that a map's destination writes: UTF-16BE bytes (a single byte is a letter by itself), the first
+    PDF_CODE_LETTERS of them, or a glyph's name."""
+    if isinstance(value, str):
+        return pdf_glyph(value)
+    if not isinstance(value, bytes) or not value:
+        return " "
+    if len(value) == 1:
+        return chr(value[0])
+    return value[:min(len(value), 2 * PDF_CODE_LETTERS) & ~1].decode("utf-16-be", "surrogatepass")
+
+
+def pdf_glyph(name):
+    """The letters of a glyph's name: PDF_GLYPH_NAMES, a single ASCII letter, uniXXXX (one or more) and uXXXX, with a
+    suffix gone (a.sc is a) and the parts of a ligature joined (f_i is fi), the first PDF_CODE_LETTERS of them; a
+    space for a name that it does not know, or that is longer than a name of PDF can be (PDF_NAME_MOST): many fonts
+    can share one encoding, and each font reads its names again."""
+    if len(name) > PDF_NAME_MOST:
+        return " "
+    letters = []
+    for part in name.split(".", 1)[0].split("_"):
+        if part in PDF_GLYPH_NAMES:
+            letters.append(PDF_GLYPH_NAMES[part])
+        elif len(part) == 1 and part.isascii() and part.isalpha():
+            letters.append(part)
+        elif re.fullmatch(r"uni(?:[0-9A-F]{4})+", part):
+            letters.append("".join(chr(int(part[i:i + 4], 16)) for i in range(3, len(part), 4)))
+        elif re.fullmatch(r"u[0-9A-F]{4,6}", part) and int(part[1:], 16) <= 0x10FFFF:
+            letters.append(chr(int(part[1:], 16)))
+        else:
+            return " "
+    return "".join(letters)[:PDF_CODE_LETTERS] or " "
+
+
+def pdf_plain(letters):
+    """Letters as the search reads them: a control character, NUL and U+FFFD (a letter that a map could not give) are
+    a space, which no login holds, and a ligature is its letters (Chrome draws "fi" as one glyph, U+FB01)."""
+    if letters.isascii() and letters.isprintable():
+        return letters
+    return "".join(PDF_LIGATURES.get(ord(c), " " if c < " " or c in "\x7f\ufffd" else c) for c in letters)
+
+
+def pdf_kind(text):
+    """The bytes in which Python keeps each letter of `text`: 1 when all of its letters are Latin-1, 2 when all are in
+    the first plane of Unicode, else 4."""
+    if text.isascii():
+        return 1
+    widest = max(text)
+    return 1 if widest < "\u0100" else 2 if widest < "\U00010000" else 4
+
+
+def pdf_cut(raw, size):
+    """The bytes of a string in blocks of `size` bytes: one block, the bytes themselves, when they are no longer."""
+    return (raw,) if len(raw) <= size else (raw[at:at + size] for at in range(0, len(raw), size))
+
+
+def pdf_joined(blocks, budget):
+    """The letters of one string, joined from `blocks`, which make them a few codes at a time: as soon as the bytes of
+    the letters made (pdf_kind) would be more than the budget leaves, the string is refused, and no more of it is
+    made. PdfWords.add counts at least as much, and one code makes PDF_CODE_LETTERS letters at most, so a string of a
+    few bytes cannot make a large one."""
+    made, size, kind = [], 0, 1
+    for block in blocks:
+        made.append(block)
+        size += len(block)
+        if not block.isascii():
+            kind = max(kind, pdf_kind(block))
+        if kind * size > budget[0]:
+            raise Refusal(413, f"the PDF packs more than {CHAT_FILE_UNPACK >> 20} MB")
+    return "".join(made)
+
+
+class PdfFont:
+    """The letters of one font's codes. Its /ToUnicode map comes first. A simple font has one byte for each code, and
+    gives a code that its map does not hold the letter of its /Encoding: WinAnsi, MacRoman, or the ASCII letters of
+    Standard, with the glyph names of /Differences on top. A composite font (Type0) has codes of two bytes (Identity-H
+    and Identity-V), or of the lengths of its encoding's code ranges; a code of it that its map does not hold is a
+    glyph number, which only the font's own program could name, so it is a space. Only Adobe's CJK collections name
+    their codes: codes 1 to 95 of such an Identity-H font are the ASCII letters (the Mac's print system writes a Korean
+    font so, with no map)."""
+
+    def __init__(self, pdf, font):
+        import bisect
+        import struct
+        font = font if isinstance(font, dict) else {}
+        letters = pdf.cmap(font.get("ToUnicode")) or PDF_NO_MAP
+        self.single, self.ranges, self.lows = letters[1], letters[2], letters[3]
+        self.cache, self.table, self.width, self.find, self.unpack = {}, None, 1, bisect.bisect_right, struct.unpack
+        self.work, self.kept, self.lengths, self.budget = pdf.work, pdf.kept, (), pdf.budget
+        composite = font.get("Subtype") == "Type0"
+        if composite:
+            encoding = font.get("Encoding")
+            identity = encoding in ("Identity-H", "Identity-V")
+            coded = pdf.cmap(encoding) if isinstance(encoding, PdfRef) else None
+            self.lengths = coded[4] if coded and coded[0] else () if identity else letters[4]
+            self.width = None if self.lengths else 2
+            kids = pdf.resolve(font.get("DescendantFonts"))
+            kid = pdf.resolve(kids[0]) if isinstance(kids, list) and kids else None
+            info = pdf.resolve(kid.get("CIDSystemInfo")) if isinstance(kid, dict) else None
+            if (identity and not self.single and not self.ranges and isinstance(info, dict)
+                    and info.get("Registry") == b"Adobe" and info.get("Ordering") in PDF_ADOBE_CJK):
+                self.ranges, self.lows = [(1, 95, " ")], [1]
+        if not composite:
+            pdf_steps(self.work, 256)               # the letters of its 256 codes, made or shared
+            self.table = pdf.table(font, self.lookup)
+
+    def lookup(self, code):
+        """The letters that the map gives for one code, or None."""
+        letters = self.single.get(code)
+        if letters is None and self.ranges:
+            at = self.find(self.lows, code) - 1
+            if at >= 0:
+                low, high, first = self.ranges[at]
+                point = ord(first[-1]) + code - low if code <= high and first else -1
+                letters = first[:-1] + chr(point) if 0 <= point <= 0x10FFFF else None
+        return letters
+
+    def fresh(self, code):
+        """The letters of one code as the search reads them (pdf_plain), PDF_CODE_LETTERS at most."""
+        return pdf_plain(self.lookup(code) or " ")[:PDF_CODE_LETTERS]
+
+    def letters(self, code):
+        known = self.cache.get(code)
+        if known is None:
+            known = self.fresh(code)
+            if self.kept[0] > 0:                    # PDF_LETTERS_KEPT in all fonts; then each code where it stands
+                self.kept[0] -= 1
+                self.cache[code] = known
+        return known
+
+    def text(self, raw):
+        """The letters of a string's bytes, drawn in this font: made PDF_BLOCK codes at a time, and refused before
+        they are made past the budget (pdf_joined)."""
+        if self.table is not None:
+            return pdf_joined(map(self.simple, pdf_cut(raw, PDF_BLOCK)), self.budget)
+        if self.width == 2:
+            return pdf_joined(map(self.pairs, pdf_cut(raw, 2 * PDF_BLOCK)), self.budget)
+        return pdf_joined(self.coded(raw), self.budget)
+
+    def simple(self, raw):
+        """The letters of codes of one byte, from the simple font's table."""
+        return "".join(map(self.table.__getitem__, raw))
+
+    def pairs(self, raw):
+        """The letters of codes of two bytes (an odd last byte is no code)."""
+        codes = self.unpack(">%dH" % (len(raw) // 2), raw[:len(raw) & ~1])
+        new = set(codes).difference(self.cache)    # at most 65,536 codes of two bytes in all
+        pdf_steps(self.work, len(new))
+        if len(new) <= self.kept[0]:
+            self.kept[0] -= len(new)
+            for code in new:
+                self.cache[code] = self.fresh(code)
+            return "".join(map(self.cache.__getitem__, codes))
+        pdf_steps(self.work, len(codes))            # no room to keep their letters: each code is read where it stands
+        return "".join([self.cache.get(code) or self.fresh(code) for code in codes])
+
+    def coded(self, raw):
+        """The letters of codes of the lengths of the font's code ranges, a block of PDF_BLOCK codes at a time."""
+        out, at = [], 0
+        pdf_steps(self.work, len(raw))              # a step for each byte: at least one for each code
+        while at < len(raw):
+            size = 1
+            for n, lows, highs in self.lengths:     # the shortest code whose range holds these bytes
+                if at + n <= len(raw):
+                    code = int.from_bytes(raw[at:at + n], "big")
+                    i = self.find(lows, code) - 1
+                    if i >= 0 and code <= highs[i]:
+                        size = n
+                        break
+            out.append(self.letters(int.from_bytes(raw[at:at + size], "big")))
+            at += size
+            if len(out) == PDF_BLOCK:
+                yield "".join(out)
+                out = []
+        yield "".join(out)
+
+
+def pdf_code_lengths(spaces):
+    """The codespace ranges of a CMap, (bytes, low, high), as [(bytes, lows, highs)] for each length of code, shortest
+    first, with the ranges of one length joined where they meet, so that a code is found by bisection however many
+    ranges the CMap writes."""
+    out = []
+    for n in sorted({n for n, _, _ in spaces}):
+        joined = []
+        for low, high in sorted((low, high) for m, low, high in spaces if m == n and low <= high):
+            if joined and low <= joined[-1][1] + 1:
+                joined[-1] = (joined[-1][0], max(joined[-1][1], high))
+            else:
+                joined.append((low, high))
+        out.append((n, [low for low, _ in joined], [high for _, high in joined]))
+    return out
+
+
+def pdf_key(value):
+    """What an object that fonts can share is known by: a reference's number, a name, or () when there is none; None
+    for a value written in the font's own dictionary, which no other font shares."""
+    if isinstance(value, PdfRef):
+        return value.num
+    if value is None or isinstance(value, str):
+        return value or ()
+    return None
+
+
+def pdf_simple_table(pdf, encoding):
+    """The 256 letters of a simple font's /Encoding: its base encoding, with the glyph names of its /Differences on
+    top. Each item of /Differences is a step, and a glyph's name a step more for each 8 of its letters."""
+    encoding = pdf.resolve(encoding)
+    base = encoding.get("BaseEncoding") if isinstance(encoding, dict) else encoding
+    codec = PDF_ENCODINGS.get(base, "latin-1") if isinstance(base, str) else "latin-1"
+    table = list(bytes(range(256)).decode(codec, "replace"))
+    differences = pdf.resolve(encoding.get("Differences")) if isinstance(encoding, dict) else None
+    differences = differences if isinstance(differences, list) else ()
+    pdf_steps(pdf.work, len(differences) + sum(len(item) for item in differences if isinstance(item, str)) // 8)
+    code = None
+    for item in differences:
+        if type(item) is int:
+            code = item
+        elif isinstance(item, str) and code is not None:
+            if 0 <= code < 256:
+                table[code] = pdf_glyph(item)
+            code += 1
+    return table
+
+
+class PdfWords:
+    """The text that the pages draw, for the search, in pieces of about CHAT_FILE_CHUNK that end at a space or a line
+    break. The strings that one line draws join with nothing between them, since a kerning step can fall inside a
+    login: Chrome draws "zq-F" and "AKE-..." of one word with a step between them. Inside a TJ array, a number joins
+    its strings too, and only a gap of a word (PDF_WORD_GAP) is a space: pdfTeX draws no space between two words. A
+    new line (BT, a Td or TD that leaves the line, T*, ', ", a Tm that leaves it, a form) joins as well while the run
+    of text before it is shorter than CHAT_FILE_WRAP, since a login that wraps goes on in the next line; after a
+    longer run it is a line break, so that a file whose strings hold no space does not become one run that the
+    search would hash whole."""
+
+    def __init__(self, budget):
+        self.parts, self.size, self.run, self.budget, self.kind = [], 0, 0, budget, 1
+
+    def add(self, text):
+        """Keep `text`, counted against the budget as the bytes that its letters take in the piece that piece() joins:
+        1, 2 or 4 for each letter, as the widest letter of the piece needs (pdf_kind). A letter wider than those before
+        it widens them in that join too, so they count again for the bytes that they gain."""
+        if not text:
+            return
+        kind = 1 if text.isascii() else pdf_kind(text)
+        if kind > self.kind:
+            pdf_take(self.budget, (kind - self.kind) * self.size)
+            self.kind = kind
+        pdf_take(self.budget, self.kind * len(text))
+        self.parts.append(text)
+        self.size += len(text)
+        if text[-1].isspace():
+            self.run = 0
+        else:
+            words = text.rsplit(None, 1)
+            self.run = len(words[-1]) if len(words) == 2 or text[0].isspace() else self.run + len(text)
+
+    def line(self):
+        if self.run >= CHAT_FILE_WRAP:
+            self.parts.append("\n")
+            self.size += 1
+            self.run = 0
+
+    def piece(self, last=False):
+        """The text so far up to its last space or line break once it is CHAT_FILE_CHUNK or more, or all of it when it
+        is the last; else None. The run at its end stays for the next piece, since the next string can go on with it."""
+        if not self.parts or (not last and (self.size < CHAT_FILE_CHUNK or self.run >= self.size)):
+            return None
+        text = "".join(self.parts)
+        cut = len(text) if last else len(text) - self.run
+        self.parts, self.size = ([text[cut:]], len(text) - cut) if cut < len(text) else ([], 0)
+        self.kind = pdf_kind(self.parts[0]) if self.parts else 1
+        return text[:cut]
+
+
+class PdfFile:
+    """The objects of a PDF, each read when the check needs it: its own syntax, and the objects of its object
+    streams. Of two objects with one number, the later in the file is the one (an update that the PDF appended)."""
+
+    def __init__(self, data, budget, glyphs, work):
+        self.data, self.budget, self.glyphs, self.work, self.kept = data, budget, glyphs, work, [PDF_LETTERS_KEPT]
+        self.where, self.values, self.fonts, self.maps, self.tables, self.pool = {}, {}, {}, {}, {}, {}
+        at, packed, spans = 0, [], pdf_stream_spans(data)
+        while True:
+            start, begin, end = next(spans, (len(data), None, None))
+            head = None
+            for following in PDF_HEADER.finditer(data, at, start):
+                if head is not None:
+                    self.place(head, following.start(), None)
+                head = following
+            if head is not None and self.place(head, start, None if begin is None else (begin, end)):
+                packed.append(int(head.group(1)))
+            if end is None:
+                break
+            at = end
+        for num in dict.fromkeys(packed):           # an object stream once, however often its header comes
+            self.unpack(num)
+
+    def place(self, head, stop, stream):
+        """Keep where the object of the header `head` is: its syntax up to `stop` or to its endobj, and the stream that
+        follows it (begin, end), if it has one; True when that stream is an object stream."""
+        pdf_steps(self.work, 1)
+        cut = self.data.find(b"endobj", head.end(), stop)
+        stream = stream if cut < 0 else None
+        self.where[int(head.group(1))] = (self.data, head.end(), stop if cut < 0 else cut, stream, head.start())
+        self.count()
+        return bool(stream) and bool(PDF_OBJECTS.search(self.data, head.end(), stop))
+
+    def count(self):
+        if len(self.where) > CHAT_FILE_OBJECTS:
+            raise Refusal(413, "the PDF holds more objects than the hub's check reads: send a smaller file")
+
+    def unpack(self, num):
+        """Take in the objects of the object stream `num`, unless the file has a later object of the same number."""
+        stream = self.stream(num)
+        if not stream:
+            return
+        info, body = stream
+        first, count = self.resolve(info.get("First")), self.resolve(info.get("N"))
+        if type(first) is not int or type(count) is not int or not 0 <= first <= len(body):
+            return
+        header, most = [], 2 * min(max(0, count), CHAT_FILE_OBJECTS + 1)
+        for m in PDF_DIGITS.finditer(body, 0, first):
+            if len(header) >= most:
+                break
+            try:
+                header.append(int(m.group()))
+            except ValueError:                      # more than 4,300 digits, which Python does not read as a number
+                break
+        pairs = sorted(zip(header[::2], header[1::2]), key=lambda pair: pair[1])    # spans that do not overlap
+        place = self.where[num][4]
+        for i, (member, offset) in enumerate(pairs):
+            pdf_steps(self.work, 1)
+            stop = pairs[i + 1][1] if i + 1 < len(pairs) else len(body) - first
+            known = self.where.get(member)
+            if known is None or known[4] < place:
+                self.where[member] = (body, first + offset, first + max(offset, stop), None, place)
+                self.count()
+
+    def get(self, num):
+        """The value of object `num`, or None."""
+        if num not in self.values:
+            where = self.where.get(num)
+            self.values[num] = None                 # an object that names itself reads as nothing
+            self.values[num] = pdf_value(*where[:3], self.work) if where else None
+        return self.values[num]
+
+    def resolve(self, value):
+        """A value, with a reference followed to its object."""
+        for _ in range(8):
+            if not isinstance(value, PdfRef):
+                return value
+            value = self.get(value.num)
+        return None
+
+    def stream(self, ref):
+        """(dictionary, bytes) of the stream object that `ref` names (a reference or a number), with its filters
+        undone, or None when it is no stream or a filter is not FlateDecode, ASCII85Decode or ASCIIHexDecode. Its bytes
+        count against the budget."""
+        num = ref.num if isinstance(ref, PdfRef) else ref
+        where = self.where.get(num) if type(num) is int else None
+        info = (self.values[num] if num in self.values else pdf_value(*where[:3], self.work)) if where and where[3] else None
+        if not isinstance(info, dict):
+            return None
+        raw = self.data[where[3][0]:where[3][1]]
+        length = info.get("Length")
+        if type(length) is int and 0 <= length <= len(raw):
+            raw = raw[:length]
+        filters = self.resolve(info.get("Filter"))
+        for name in [filters] if isinstance(filters, str) else filters if isinstance(filters, list) else []:
+            text = raw.rstrip(SPACES)
+            if name in ("FlateDecode", "Fl"):
+                raw = pdf_inflate(raw, self.budget)
+            elif name in ("ASCII85Decode", "A85"):
+                pdf_steps(self.work, len(text) // 5)   # Python decodes about 6 MB of ASCII85 a second
+                raw = a85_bytes(text if text.endswith(b"~>") else text + b"~>")
+            elif name in ("ASCIIHexDecode", "AHx"):
+                raw = hex_bytes(text if text.endswith(b">") else text + b">")
+            else:
+                return None
+            if raw is None:
+                return None
+        pdf_take(self.budget, len(raw))
+        return info, raw
+
+    def cmap(self, ref):
+        """pdf_cmap of the stream that a font names, read once for each stream and shared by the fonts that name it,
+        with the low code of each range and its pdf_code_lengths: (spaces, single, ranges, lows, lengths), or None."""
+        if not isinstance(ref, PdfRef):
+            return None
+        if ref.num not in self.maps:
+            self.maps[ref.num] = None
+            stream = self.stream(ref)
+            if stream:
+                spaces, single, ranges = pdf_cmap(stream[1], self.glyphs, self.work)
+                self.maps[ref.num] = (spaces, single, ranges, [low for low, _, _ in ranges], pdf_code_lengths(spaces))
+        return self.maps[ref.num]
+
+    def font(self, ref):
+        """The PdfFont of a font that a /Font dictionary names, read once for each font. A font written in that
+        dictionary itself is known by its own dictionary, which the cache keeps: a page's dictionary is not kept, and
+        the id of one that is gone can be another's."""
+        key = ref.num if isinstance(ref, PdfRef) else id(ref)
+        held = self.fonts.get(key)
+        if held is None or (not isinstance(ref, PdfRef) and held[0] is not ref):
+            held = self.fonts[key] = (ref, PdfFont(self, self.resolve(ref)))
+        return held[1]
+
+    def table(self, font, lookup):
+        """The 256 letters of a simple font's codes: its /ToUnicode map's (lookup) first, then its /Encoding's, with a
+        step for each 8 of them when it makes them. Fonts with the same /Encoding and /ToUnicode share one table, and
+        the same letters are one string in all tables
+        (pool, of PDF_LETTERS_KEPT strings at most, so that it costs little when each font has other letters), so that
+        a PDF of many fonts keeps little for each."""
+        key = (pdf_key(font.get("Encoding")), pdf_key(font.get("ToUnicode")))
+        table = self.tables.get(key)
+        if table is None:
+            base, pool, table = pdf_simple_table(self, font.get("Encoding")), self.pool, []
+            for letters in (pdf_plain(lookup(b) or base[b])[:PDF_CODE_LETTERS] for b in range(256)):
+                known = pool.get(letters)
+                if known is None and len(pool) < PDF_LETTERS_KEPT:
+                    known = pool[letters] = letters
+                table.append(known or letters)
+            pdf_steps(self.work, sum(map(len, table)) >> 3)    # a step for each 8 letters of a table that it makes
+            if None not in key:
+                self.tables[key] = table
+        return table
+
+    def inherited(self, page, key):
+        """A page's value of `key`, or its nearest parent's (/Resources is inherited)."""
+        for _ in range(32):
+            if not isinstance(page, dict):
+                return None
+            if key in page:
+                return self.resolve(page[key])
+            page = self.resolve(page.get("Parent"))
+        return None
+
+    def words(self):
+        """The text that the pages draw, in file order, then that of each form that no page drew (the look of an
+        annotation or a form field), in pieces (PdfWords)."""
+        out, done = PdfWords(self.budget), set()
+        nums = sorted(self.where, key=lambda n: self.where[n][4])
+        for num in nums:
+            source, start, stop, stream, _ = self.where[num]
+            if stream is None and PDF_PAGE.search(source, start, stop):
+                page = self.values.get(num) or pdf_value(source, start, stop, self.work)      # read once: not kept
+                if not isinstance(page, dict) or page.get("Type") != "Page":
+                    continue
+                listed = self.resolve(page.get("Contents"))
+                refs = list({r.num: r for r in (listed if isinstance(listed, list) else [page.get("Contents")])
+                             if isinstance(r, PdfRef) and r.num not in done}.values())     # each stream once
+                done.update(r.num for r in refs)
+                parts = [stream[1] for stream in map(self.stream, refs) if stream]
+                if parts:
+                    yield from self.draw(b"\n".join(parts), self.inherited(page, "Resources"), out, done, 0)
+        for num in nums:
+            source, start, stop, stream, _ = self.where[num]
+            if stream is not None and num not in done and PDF_FORM.search(source, start, stop):
+                info = self.get(num)
+                if isinstance(info, dict) and info.get("Subtype") == "Form":
+                    yield from self.form(num, None, out, done, 0)
+        text = out.piece(last=True)
+        if text:
+            yield text
+
+    def form(self, num, resources, out, done, depth, font=None):
+        """The text of a form, with its own resources, or the resources of the page that draws it, and at first the
+        font of the stream that draws it. A form inside PDF_FORMS_NESTED others is not read there: the sweep of forms
+        that no page drew reads it from the top."""
+        if depth >= PDF_FORMS_NESTED:
+            return
+        done.add(num)
+        stream = self.stream(num)
+        if stream:
+            own = self.resolve(stream[0].get("Resources"))
+            out.line()
+            yield from self.draw(stream[1], own if isinstance(own, dict) else resources, out, done, depth + 1, font)
+            out.line()
+
+    def draw(self, content, resources, out, done, depth, font=None):
+        """The text of one content stream, read as a reader of PDFs reads it: the strings of Tj, TJ, ' and " in the
+        letters of the font that Tf selected, and the forms that Do draws."""
+        resources = resources if isinstance(resources, dict) else {}
+        fonts, shapes = (self.resolve(resources.get(key)) for key in ("Font", "XObject"))
+        fonts, shapes = (x if isinstance(x, dict) else {} for x in (fonts, shapes))
+        stack, nested, outer, pos, line = [], [], 0, 0, (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        match, size, work = PDF_TOKEN.match, len(content), self.work   # outer: operands in the arrays around stack
+        while pos < size:
+            m = match(content, pos)
+            if not m:
+                break
+            work[0] -= 1                            # a step for each token (CHAT_FILE_WORK)
+            if work[0] < 0:
+                raise Refusal(413, PDF_TOO_MUCH)
+            pos, group = m.end(), m.lastindex      # the groups of PDF_TOKEN
+            if group == 1:
+                if m.group(2) not in PDF_TEXT_OPS:
+                    stack.clear()
+                    continue
+                stack.extend(m.group(1).replace(b"\0", b" ").split()[:-1])         # NUL is white space too
+                kind, token = "op", m.group(2)
+            elif group == 6:                        # numbers, a step for each
+                numbers = m.group(6).replace(b"\0", b" ").split()
+                pdf_steps(work, len(numbers) - 1)
+                stack.extend(numbers)
+                if len(stack) + outer > 128:
+                    pdf_trim(stack, nested, outer)
+                continue
+            elif group == 13 or (group == 12 and m.group(12) not in PDF_TEXT_OPS):
+                stack.clear()                       # an operator that draws no text, or what is no token
+                continue
+            else:
+                kind, token = m.lastgroup, m.group(group)
+            pdf_steps(work, 2)                      # a string, a name, an array, a dictionary or a text operator: 3
+            if group == 3:                          # a string and its Tj
+                raw = m.group(5)
+                raw = bytes.fromhex(m.group(4).decode("latin-1") + "0" * (len(m.group(4)) % 2)) if raw is None else raw
+                stack.clear()
+                shown = font.text(raw) if font else pdf_plain(raw.decode("latin-1"))
+                if shown:
+                    out.add(shown)
+                    text = out.piece()
+                    if text:
+                        yield text
+                continue
+            if group in (9, 10, 7):                 # a hex string, a literal string, a name
+                if group == 9:
+                    stack.append(PdfString(pdf_hex(m.group(9))))
+                elif group == 10:
+                    value, pos = pdf_literal(content, pos, work)
+                    stack.append(PdfString(value))
+                else:
+                    stack.append(pdf_name(m.group(7)))
+                if len(stack) + outer > 128:
+                    pdf_trim(stack, nested, outer)
+                continue
+            if kind in ("arr", "dict"):
+                if token in (b"[", b"<<"):
+                    if len(nested) < PDF_NESTED:
+                        nested.append(stack)
+                        outer += len(stack)
+                        stack = []
+                elif nested:
+                    items, stack = stack, nested.pop()
+                    outer -= len(stack)
+                    if token == b"]" and not nested:
+                        stack = [items]             # TJ's array: an operator takes no operand before an array
+                    else:
+                        stack.append(None)          # a dictionary, or an array in an array: no text operator reads it
+                        if len(stack) + outer > 128:
+                            pdf_trim(stack, nested, outer)
+                continue
+            shown = None
+            if kind != "op":
+                pass
+            elif token == b"TJ" and stack and isinstance(stack[-1], list):
+                shown = pdf_joined(self.shown(stack[-1], font), self.budget)   # counted as its strings are made
+            elif token in (b"Tj", b"'", b'"') and stack and isinstance(stack[-1], PdfString):
+                if token != b"Tj":
+                    out.line()
+                shown = font.text(stack[-1]) if font else pdf_plain(stack[-1].decode("latin-1"))
+            elif token == b"Tf" and len(stack) >= 2 and isinstance(stack[-2], str):
+                font = self.font(fonts[stack[-2]]) if stack[-2] in fonts else None
+            elif token in (b"Td", b"TD"):
+                moved = pdf_numbers(stack[-2:], 2)
+                if moved:
+                    (tx, ty), (a, b, c, d, e, f) = moved, line
+                    line = (a, b, c, d, e + tx * a + ty * c, f + tx * b + ty * d)
+                    if ty:
+                        out.line()
+            elif token == b"Tm":
+                matrix = pdf_numbers(stack[-6:], 6)
+                if matrix:
+                    if matrix[:4] != line[:4] or matrix[5] != line[5]:
+                        out.line()
+                    line = matrix
+            elif token in (b"T*", b"BT"):
+                out.line()
+                if token == b"BT":
+                    line = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+            elif token == b"ID":                    # an inline picture's bytes, up to its EI
+                end = PDF_IMAGE_END.search(content, pos)
+                pos = end.end() if end else size
+            elif token == b"Do" and stack and isinstance(stack[-1], str):
+                ref = shapes.get(stack[-1])
+                if isinstance(ref, PdfRef) and ref.num not in done:
+                    info = self.get(ref.num)
+                    if isinstance(info, dict) and info.get("Subtype") == "Form":
+                        yield from self.form(ref.num, resources, out, done, depth, font)
+            stack.clear()
+            if shown:
+                out.add(shown)
+                text = out.piece()
+                if text:
+                    yield text
+
+
+    @staticmethod
+    def shown(items, font):
+        """The letters of the strings of a TJ array, one string at a time, with a space for a word's gap
+        (PDF_WORD_GAP); its other numbers join its strings."""
+        for item in items:
+            if isinstance(item, PdfString):
+                yield font.text(item) if font else pdf_plain(item.decode("latin-1"))
+            elif isinstance(item, bytes) and pdf_number(item) <= -PDF_WORD_GAP:
+                yield " "
+
+
+def pdf_trim(stack, nested, outer):
+    """Keep the operands of a content stream small: outside arrays only the last 64 count, since an operator takes 6
+    at most; the open arrays and dictionaries hold PDF_ARRAY_MOST operands at most in all (`outer` of them are in the
+    ones around `stack`), and an array or a dictionary inside one is a single operand, kept as nothing: more is
+    refused, never read in part."""
+    if not nested:
+        del stack[:-64]
+    elif len(stack) + outer > PDF_ARRAY_MOST:
+        raise Refusal(413, PDF_TOO_MUCH)
+
+
+def pdf_numbers(items, count):
+    """`count` operands of a content stream as floats, or None when there are fewer or one is not a number."""
+    if len(items) != count or set(map(type, items)) != {bytes}:
+        return None
+    return tuple(map(float, items))
+
+
+def pdf_inflate(raw, budget):
+    """What FlateDecode bytes inflate to: at most what the budget leaves (a refusal past it). Bytes that zlib does not
+    take whole, for a wrong checksum at their end or a break in the middle, are read again as raw deflate data after
+    zlib's header of two bytes, which has no checksum, a KB at a time up to a break: readers of PDFs show them so.
+    Bytes with no zlib header give nothing, as they do in those readers."""
+    inflate, out, left = zlib.decompressobj(), [], max(0, budget[0]) + 1
+    try:
+        whole = inflate.decompress(raw, left)
+    except zlib.error:
+        if len(raw) < 2 or raw[0] & 0x0F != 8 or (raw[0] << 8 | raw[1]) % 31 or raw[1] & 0x20:
+            return b""                              # no zlib header, or one that names a preset dictionary
+        inflate = zlib.decompressobj(-15)
+    else:
+        if len(whole) >= left or inflate.unconsumed_tail:
+            raise Refusal(413, f"the PDF packs more than {CHAT_FILE_UNPACK >> 20} MB")
+        return whole
+    for at in range(2, len(raw), 1024):
+        try:
+            block = inflate.decompress(raw[at:at + 1024], left)
+        except zlib.error:
+            break                                   # a break: what came before it stays
+        out.append(block)
+        left -= len(block)
+        if left <= 0 or inflate.unconsumed_tail:
+            raise Refusal(413, f"the PDF packs more than {CHAT_FILE_UNPACK >> 20} MB")
+        if inflate.eof:
+            break
+    return b"".join(out)
+
+
+def pdf_drawn_texts(data):
+    """The text that the pages of a PDF draw (PdfFile.words), in pieces for the search, with limits of its own:
+    CHAT_FILE_UNPACK of bytes that it unpacks and of the bytes of the letters that it writes (PdfWords.add),
+    CHAT_FILE_GLYPHS of entries of fonts' maps, CHAT_FILE_OBJECTS of objects and CHAT_FILE_WORK of steps."""
+    yield from PdfFile(data, [CHAT_FILE_UNPACK], [CHAT_FILE_GLYPHS], [CHAT_FILE_WORK]).words()
 
 
 # What an Office file must not hold: code that runs. A macro (its parts and its content types), an ActiveX control,
