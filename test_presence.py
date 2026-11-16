@@ -196,7 +196,7 @@ class ManagerRings(test_runtime.Runtime):
     fleet cannot put it right itself. The flag shows on the board, in /ui/health and in /ui/state as before; only its
     notification waits for the event that ends its hold. The bodies are the helper's own (fleet.Helper.signal and
     manager_start_failed), and a poll is its own poll with its window list (fleet.cmd_run)."""
-    DOWN = "Fleet hub: The manager session is not running. Start it again."
+    DOWN = "Fleet hub: The manager session is not running."
     SILENT = "Fleet hub: The manager did not take a message it was given twice."
 
     def setUp(self):
@@ -236,8 +236,7 @@ class ManagerRings(test_runtime.Runtime):
         conversation), and the owner was told "not running" for a session that was back seconds later."""
         self.poll("manager")
         self.poll()                                         # its session ended: its helper starts it again by itself
-        self.assertEqual(self.shown(), ("down", ["manager_down"], "down",
-                                        "The manager session is not running. Start it again."))
+        self.assertEqual(self.shown(), ("down", ["manager_down"], "down", "The manager session is not running."))
         hub.tick()
         self.poll("manager")                                # and it is back
         self.assertEqual(self.shown(), (None, [], None, None))
@@ -247,16 +246,21 @@ class ManagerRings(test_runtime.Runtime):
         self.poll("manager")
         self.poll()
         self.assertEqual(self.rings(), [])
-        self.assertEqual(self.dialog(kind="start_failed", reason="the session did not start or ended at its start"),
-                         200)
+        why = "the session did not start or ended at its start (tmux: command too long)"
+        self.assertEqual(self.dialog(kind="start_failed", reason=why), 200)
         self.assertEqual(self.rings(), [self.DOWN])        # the helper's own try did not help
         self.assertEqual(self.shown()[:3], ("down", ["manager_down"], "down"))
+        # and its own words are the warning's detail, until the window is back (16 November 2026)
+        down = next(w for w in hub.health_view()["warnings"] if w["kind"] == "manager_down")
+        self.assertEqual(down["detail"], f"Its server's helper could not start it, twice in a row: {why}.")
+        self.assertEqual(self.call("GET", "/ui/state")[1]["manager_warning"]["cause"], "not_running")
         self.dialog(kind="start_failed", reason="the session did not start or ended at its start")
         self.poll()
         hub.tick()
         self.assertEqual(self.rings(), [self.DOWN])        # once for the episode
         self.poll("manager")                                # a list after its word shows the window: it runs again
         self.assertIsNone(hub.kv_get("mgr_start_failed"))
+        self.assertIsNone(hub.kv_get("mgr_start_failed_why"))
         self.assertIsNone(hub.kv_get("mgr_flag_kind"))
         self.poll()                                         # the next end of it is its helper's to start again
         self.assertEqual(hub.kv_get("mgr_flag_kind"), "down")
@@ -302,6 +306,8 @@ class ManagerRings(test_runtime.Runtime):
         self.assertRegex(hub.kv_get("mgr_flag"), r"^The manager's server has been silent since \d\d:\d\d; a message "
                                                  r"waits\.$")
         self.assertEqual(len([t for t in self.rings() if "server has been silent" in t]), 1)
+        # a down of a silent server is no session that its helper starts again: its band keeps the manager's page
+        self.assertEqual(hub.manager_warning()["cause"], "server_silent")
 
     # ---- case 2: silent
     def test_a_line_that_its_helper_starts_fresh_for_shows_silent_and_rings_nobody(self):

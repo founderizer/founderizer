@@ -35741,6 +35741,13 @@ TICK_WARN = 60
 MANAGER_START_FAILS = "manager_start_fails"
 
 
+# The manager_down flag while its helper answers and its window is gone. No "Start it again.": its helper starts it
+# again by itself, and no button of the owner's could help while this stands (the owner, 16 November 2026, of the
+# band's Start the session and Open buttons: "they are useless"). Why its helper's own start failed is the warning's
+# detail (health_view).
+MANAGER_NOT_RUNNING = "The manager session is not running."
+
+
 def manager_flag_update(t0):
     """The manager's own warning (`mgr_flag`), which the hub tells the owner itself. The tick runs it, and so do the
     moments its inputs change — the manager's status report, its window list, its helper's presence and its screen —
@@ -35811,11 +35818,12 @@ def manager_flag_update(t0):
         if failed and listed(row) and row["alive_ts"] > float(failed) and "manager" in windows:
             with area("quiet"):
                 kv_set("mgr_start_failed", None)
+                kv_set("mgr_start_failed_why", None)
             failed = None
         # A window list from before the end of a switch can still lack the new session's window (switch_ended).
         if listed(row) and online and "manager" not in windows and row["alive_ts"] > switch_ended(mgr):
             kind = "down"
-            flag = "The manager session is not running. Start it again."
+            flag = MANAGER_NOT_RUNNING
             held = not failed and not stuck and MANAGER_START_FAILS in helper_features(mgr)
         elif row and row["last_seen"] and not online and pending:
             kind, held = "down", False
@@ -44148,9 +44156,17 @@ def save_tool(body):
 
 
 def manager_warning():
-    """The current manager warning episode: its kind and when that kind started (owner API 1.3)."""
+    """The current manager warning episode: its kind and when that kind started (owner API 1.3). A `down` says which
+    one it is in `cause` (16 November 2026): `not_running`, its helper answers and its window is gone, which its
+    helper starts again by itself, so the owner's apps give it Report a problem; or `server_silent`, its server went
+    silent with a message waiting, whose band keeps the manager's page."""
     kind, since = kv_get("mgr_flag_kind"), kv_get("mgr_flag_since")
-    return {"kind": kind, "since": float(since)} if kind and since else None
+    if not (kind and since):
+        return None
+    warning = {"kind": kind, "since": float(since)}
+    if kind == "down":
+        warning["cause"] = "not_running" if kv_get("mgr_flag") == MANAGER_NOT_RUNNING else "server_silent"
+    return warning
 
 
 CHECK_WAIT = 60      # seconds a requested machine check may take before it counts as failed or offline
@@ -46600,11 +46616,19 @@ def health_view():
              "Pick a server of its own in its Needs-you item.", agent=manager_name())
     flag = manager_warning()
     if flag:
-        # A session that is not running is the one manager warning that a button settles: the app asks that
-        # machine's helper to start it (owner feature manager_start). The others — a usage limit, a question on its
-        # own screen, a silence, a switch that has not finished — are put right where its session is.
-        warn("manager_" + flag["kind"], kv_get("mgr_flag"),
-             f"Start the session of {manager} again." if flag["kind"] == "down" else
+        # A session that is not running: its helper starts it again by itself, so no fix of the owner's puts it right,
+        # and the owner's apps give its warning Report a problem (the owner's choice of 16 November 2026). Its detail
+        # is why its helper's own start failed, in the helper's own words, when the helper said so: that day tmux
+        # refused every start with "command too long", and the warning said only that the session was not running.
+        # The others — a usage limit, a question on its own screen, a silence, a switch that has not finished — are
+        # put right where its session is.
+        # The reason lives until a window list shows the session again, so after a rename, a move or a runtime switch
+        # of a session that never came back it can be the earlier helper's, until the new helper says its own.
+        why = (kv_get("mgr_start_failed_why") or "").rstrip(". ") \
+            if kv_get("mgr_flag") == MANAGER_NOT_RUNNING and kv_get("mgr_start_failed") else ""
+        warn("manager_" + flag["kind"],
+             f"Its server's helper could not start it, twice in a row: {why}." if why else kv_get("mgr_flag"),
+             None if flag["kind"] == "down" else
              f"Open {manager} and sign it in." if flag["kind"] == "signed_out" else
              "Open its session and answer the question." if flag["kind"] == "screen" else
              # runtime gaps C1: a helper with stuck_screens starts a session that shows the limit menu again itself
@@ -51149,7 +51173,12 @@ class Handler(BaseHTTPRequestHandler):
         It asks and nothing more: the event only makes the start due, and the helper reads its windows again under
         the start lock, so a session that runs is never closed, replaced or fought over. So pressing it twice, or
         pressing it after the session came back, changes nothing. The standing session is the manager's alone, so
-        the route refuses every other agent instead of asking a helper that has none."""
+        the route refuses every other agent instead of asking a helper that has none.
+
+        Since 16 November 2026 no button of the owner's apps sends it (the owner, of the band's Start the session:
+        "useless"): the helper starts a missing session by itself within ten seconds and tries again at every round
+        while its start fails, so this asks for the start that it makes anyway. It stays for the owner's own agent
+        (`start_manager_session`)."""
         def read(data):
             return {"agent": agent}
 
@@ -55917,6 +55946,7 @@ class Handler(BaseHTTPRequestHandler):
             why = text_field(self.form().get("reason"), 300, False)
             with area("quiet"):
                 kv_set("mgr_start_failed", now())
+                kv_set("mgr_start_failed_why", why or None)     # the manager_down warning's detail (health_view)
             log("hub", f"{agent}'s helper could not start the manager session, twice in a row" + (f": {why}" if why
                                                                                                     else ""))
             manager_flag_update(now())

@@ -121,7 +121,7 @@ class Health(OwnerAPI):
         hub.TEAM["hub"] = {"machine": "hub", "port": 8765}
         hub.kv_set("integrity", "row 3 missing from index")
         hub.kv_set("schema_problems", json.dumps(["CREATE UNIQUE INDEX one: UNIQUE constraint failed"]))
-        hub.kv_set("mgr_flag", "The manager session is not running. Start it again.")
+        hub.kv_set("mgr_flag", hub.MANAGER_NOT_RUNNING)
         hub.kv_set("mgr_flag_kind", "down")
         hub.kv_set("mgr_flag_since", hub.now())
         hub.TEAM["addresses"]["vps"] = "127.0.0.3"
@@ -136,7 +136,7 @@ class Health(OwnerAPI):
         self.assertEqual(sorted(warnings), ["backup_missing", "disk_low", "helper_offline", "integrity",
                                             "machine_stale", "manager_down", "schema", "vault_behind"])
         for kind, w in warnings.items():
-            if kind in ("backup_missing", "helper_offline", "machine_stale"):
+            if kind in ("backup_missing", "helper_offline", "machine_stale", "manager_down"):
                 self.assertIsNone(w["fix"], kind)
             else:
                 self.assertTrue(w["fix"].strip(), kind)
@@ -153,8 +153,21 @@ class Health(OwnerAPI):
         self.assertEqual(warnings["backup_missing"]["detail"], "None saved yet.")     # the title: No copy of your fleet
         self.assertEqual(warnings["helper_offline"]["detail"], "Silent since the hub started.")
         self.assertEqual(warnings["machine_stale"]["detail"], "No status for ten minutes.")
-        # A session that is not running is the one manager warning a button settles (owner feature manager_start).
-        self.assertIn("Start the session", warnings["manager_down"]["fix"])
+        # A session that is not running: its helper starts it again by itself, so it has no fix of the owner's, and
+        # the app's button is Report a problem (16 November 2026). Its detail is the flag until the helper says why
+        # its own start failed, and then the helper's own words, until a window list shows the session again.
+        self.assertEqual(warnings["manager_down"]["detail"], "The manager session is not running.")
+        hub.kv_set("mgr_start_failed", hub.now())
+        hub.kv_set("mgr_start_failed_why", "the session did not start or ended at its start (tmux: command too long)")
+        down = next(w for w in self.health()["warnings"] if w["kind"] == "manager_down")
+        self.assertEqual((down["detail"], down["fix"]),
+                         ("Its server's helper could not start it, twice in a row: the session did not start or ended "
+                          "at its start (tmux: command too long).", None))
+        hub.kv_set("mgr_flag", "The manager's server has been silent since 12:00; a message waits.")
+        down = next(w for w in self.health()["warnings"] if w["kind"] == "manager_down")
+        self.assertEqual(down["detail"], "The manager's server has been silent since 12:00; a message waits.")
+        hub.kv_set("mgr_start_failed", None)
+        hub.kv_set("mgr_start_failed_why", None)
         hub.kv_set("mgr_flag_kind", "limited")
         hub.kv_set("mgr_flag", "The manager reached its usage limit.")
         limited = next(w for w in self.health()["warnings"] if w["kind"] == "manager_limited")
