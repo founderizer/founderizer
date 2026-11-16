@@ -360,6 +360,13 @@ server that joined before, it is off until root switches it on.
   broker's socket for the proxy, which the broker makes only after it loads the part `swap`, in its runtime folder,
   which systemd removes at each stop of the broker; and it reads that the proxy's service runs (`vault.py`,
   `SWAPS_FROM`).
+- **A broker that starts again.** The step restarts the broker when it changes the configuration, and so does
+  each release that changes `vault.py`. The broker's socket is gone for that moment: for less than 0.4 seconds on a
+  test server. On a Linux machine whose broker is installed, each call to the broker (a session's read of its keys,
+  a sign-in, a handover, a new login, an API request, a delivery, the doctor) looks for the socket again for up to
+  2 seconds, so a restart is not a refusal. Nothing goes to the broker before the connection, so no request goes two
+  times (`fleet.py`, `broker_wait`). The machine report does not wait for a missing socket, because its next round
+  reads again.
 - **An older program.** A vault program from before the key swap does not start on a configuration with that part
   (`vault.py`). The root command that brings the program of a release, `fleet-vault-program`, puts back the program
   that was serving when the new one does not start. The root step `hubsetup.py vault` with an older program leaves

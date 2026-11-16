@@ -8489,6 +8489,36 @@ def vault_socket():
     return "/run/fleet-vault/vault.sock"
 
 
+BROKER_PROGRAM = "/usr/local/lib/fleet-vault/vault.py"     # a Linux machine's installed broker (WORKER-INSTALL.md)
+BROKER_WAIT = 2.0       # seconds that a call looks for this machine's broker while it starts again
+BROKER_LOOK = 0.1       # seconds between two looks
+
+
+def broker_wait():
+    """How long a call looks for this machine's vault broker while it starts again: BROKER_WAIT on a Linux machine
+    whose broker is installed, else 0.
+
+    A broker starts again at each release that changes vault.py and at each change of its configuration (the key
+    swap's switch, an owner key that the owner's app adds). Its unit's runtime folder goes at each stop, so its socket
+    is gone for that moment: for less than 0.4 seconds on a test server (16 November 2026). Without the wait, a call in
+    that moment was refused at once. A machine with no broker installed has no socket to wait for, and a Mac's vault is
+    the app's signed helper, so both answer at once, as before."""
+    return BROKER_WAIT if sys.platform != "darwin" and os.path.exists(BROKER_PROGRAM) else 0.0
+
+
+def broker_ready():
+    """True when this machine's vault broker has its socket. While the broker starts again it has none, so this looks
+    again every BROKER_LOOK seconds for up to broker_wait() seconds. A step of the work that reads the broker's status
+    first (broker_job_request, a new login, an API request) calls it before that read, so that it finds the broker
+    that starts again and not "no broker". The machine report does not: its next round reads again."""
+    end = time.monotonic() + broker_wait()
+    while not os.path.exists(vault_socket()):
+        if time.monotonic() >= end:
+            return False
+        time.sleep(BROKER_LOOK)
+    return True
+
+
 def vault_mode(agent):
     """What opens this agent's logins, from team.json: "broker", its machine's vault broker, which holds the fleet's
     own store; or "none", no credential access at all (owner API 1.12).
@@ -8519,9 +8549,10 @@ def broker_status(timeout=5):
 def broker_job_request(agent, request, timeout=90):
     """A job request to this machine's vault broker. When the broker serves callers (its status says callers: true)
     and this agent has a key, the request names the agent and carries its key, which the broker uses for the hub
-    calls of this request only. An older broker never gets these fields (shared broker callers)."""
+    calls of this request only. An older broker never gets these fields (shared broker callers). It waits for a
+    broker that starts again (broker_ready), so that a request in that moment goes with its fields."""
     key = load_agent_key(agent)
-    status = broker_status() if key else None
+    status = broker_status() if key and broker_ready() else None
     if key and status and status.get("callers") is True:
         request = dict(request, agent=agent, agent_key=key)
     return vault_call(request, timeout=timeout)
@@ -8539,20 +8570,45 @@ class Unknown(Refused):
     can have reached the service, and it is never sent again."""
 
 
+def broker_socket(path, timeout, end):
+    """A stream socket connected to the vault broker at `path`. A connection that is refused, or whose socket is gone,
+    is tried again every BROKER_LOOK seconds until `end` (of time.monotonic): a broker that starts again."""
+    while True:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.settimeout(timeout)
+            s.connect(path)
+            return s
+        except (FileNotFoundError, ConnectionRefusedError):
+            s.close()
+            if time.monotonic() >= end:
+                raise
+        except BaseException:
+            s.close()
+            raise
+        time.sleep(BROKER_LOOK)
+
+
 def vault_call(request, timeout=90):
-    """One request to this machine's vault broker: a job number goes in, an outcome or a locked copy comes back."""
-    path = vault_socket()
-    try:
-        info = os.stat(path)
-    except OSError:
-        raise Refused("this machine's vault broker is not running; ask your requester") from None
+    """One request to this machine's vault broker: a job number goes in, an outcome or a locked copy comes back.
+
+    While the broker starts again, its socket is gone or refuses: the call looks again every BROKER_LOOK seconds for up
+    to broker_wait() seconds. Nothing goes to the broker before the connection, so a look again never sends a request
+    two times."""
+    path, end = vault_socket(), time.monotonic() + broker_wait()
+    while True:
+        try:
+            info = os.stat(path)
+            break
+        except OSError as e:
+            if not isinstance(e, FileNotFoundError) or time.monotonic() >= end:
+                raise Refused("this machine's vault broker is not running; ask your requester") from None
+        time.sleep(BROKER_LOOK)
     if sys.platform != "darwin" and info.st_uid == os.getuid():
         raise Refused("this machine's vault broker runs as the agents' user, so it keeps nothing apart; ask your requester")
     sent = False
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout)
-            s.connect(path)
+        with broker_socket(path, timeout, end) as s:
             sent = True
             s.sendall((json.dumps(dict(request, v=2)) + "\n").encode())
             data = b""
@@ -9088,7 +9144,7 @@ def do_save(agent, job, op):
     password; for a capture it reads the key from the Chrome page itself. It sends at most one create call."""
     if vault_mode(agent) != "broker":
         raise Refused("a new login is made only by this machine's vault broker, and this agent has no broker access")
-    status = broker_status()
+    status = broker_status() if broker_ready() else None
     if not (status and status.get("callers") is True and status.get(SAVES[op]) is True) or not load_agent_key(agent):
         raise Refused("this machine's vault cannot " + ("save a key" if op == "capture" else "make a login"))
     done = broker_job_request(agent, {"op": op, "job": broker_job(agent, job)})
@@ -9105,7 +9161,7 @@ def do_request(agent, job, limit=None):
     proved that nothing went out, or it was not asked. Unknown: the request can have gone out."""
     if vault_mode(agent) != "broker":
         raise Refused("an API request is sent only by this machine's vault broker, and this agent has no broker access")
-    status = broker_status()
+    status = broker_status() if broker_ready() else None
     if not (status and status.get("callers") is True and status.get("requests") is True) or not load_agent_key(agent):
         raise Refused("this machine's vault cannot send an API request")
     # the vault answers after its curl, which has the request's own time: this waits for that and the vault's steps
