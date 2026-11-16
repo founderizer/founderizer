@@ -1273,6 +1273,73 @@ class HubRoutes(OwnerAPI):
             self.finish()
         self.assertGreater(self.releases_state()["last_check"]["at"], first)
 
+    def test_a_release_that_a_check_finds_to_take_is_taken_at_the_next_tick_and_only_once(self):
+        """A check with "take" (owner API 1.194) that finds a release that no run has tried lets the sweep take it at
+        its next tick, and not at its next poll, up to RELEASE_POLL later (16 November 2026: the publisher's release
+        job sends it after each release that it sends to the early track). The owner's own Check, with no "take",
+        changes nothing, as before; the sweep's own poll finds nothing for itself; a found release makes one sweep and
+        not a loop; and the key is quiet: no app wakes for it."""
+        self.assertEqual(self.press("entitlement", token=self.token())[0], 200)
+        with self.channel(manifest("a" * 40, hold=True)):
+            hub.release_sweep(hub.now())                # the sweep's own poll: its gate is closed for RELEASE_POLL
+            self.finish()
+        self.assertIsNone(hub.kv_get("releases_found"))
+        with self.channel(manifest("b" * 40, version="2026.10.3")):
+            self.assertEqual(self.press("check")[0], 200)          # the owner's own Check
+            self.finish()
+        self.assertEqual([one["state"] for one in self.releases_state()["releases"] if one["revision"] == "b" * 40],
+                         ["verified"])
+        self.assertIsNone(hub.kv_get("releases_found"))
+        for take in ("yes", 1):                                     # only true itself is a take
+            with self.channel(manifest("b" * 40, version="2026.10.3")):
+                self.assertEqual(self.press("check", take=take)[0], 200)
+                self.finish()
+            self.assertIsNone(hub.kv_get("releases_found"))
+        with self.channel(manifest("b" * 40, version="2026.10.3")):
+            self.assertEqual(self.press("check", take=True)[0], 200)
+            self.finish()
+        self.assertTrue(hub.kv_get("releases_found"))
+        self.assertIn("releases_found", hub.QUIET_KEYS)
+        taken = []
+        with patch.object(hub, "start_release_work", lambda applying, automatic=False, fetch=None:
+                          taken.append((applying, automatic))):
+            hub.release_sweep(hub.now())
+            self.assertEqual(taken, [(True, True)])
+            hub.release_sweep(hub.now())
+            self.assertEqual(taken, [(True, True)], "a found release made the sweep poll again")
+        self.assertGreaterEqual(float(hub.kv_get("releases_swept")), float(hub.kv_get("releases_found")))
+
+    def test_the_sweep_waits_for_the_thread_that_runs_and_loses_no_poll(self):
+        """The sweep waits until a check or an update that runs has ended: a sweep beside it would be refused (a run is
+        going), and would close its gate for RELEASE_POLL with nothing taken. That holds for a release that a check
+        found, and for the regular poll whose time came while the thread ran."""
+        taken = []
+        with self.installed(), patch.object(hub, "start_release_work",
+                                            lambda applying, automatic=False, fetch=None: taken.append(automatic)):
+            hub.kv_set("releases_swept", hub.now())
+            hub.kv_set("releases_found", hub.now() + 1)
+            with patch.object(hub, "release_running", lambda: True):
+                hub.release_sweep(hub.now() + 2)
+            self.assertEqual(taken, [])
+            hub.release_sweep(hub.now() + 2)
+            self.assertEqual(taken, [True])                         # the found release
+            due = hub.now() + hub.RELEASE_POLL + 10
+            with patch.object(hub, "release_running", lambda: True):
+                hub.release_sweep(due)
+            self.assertEqual(taken, [True])
+            self.assertLess(float(hub.kv_get("releases_swept")), due - hub.RELEASE_POLL)    # the gate stays open
+            hub.release_sweep(due)
+            self.assertEqual(taken, [True, True])                   # the regular poll, when the thread has ended
+
+    def test_a_check_to_take_finds_nothing_for_a_fleet_that_takes_no_release_by_itself(self):
+        """With automatic updates off, a check with "take" records what it found and starts no sweep, as a check
+        always did."""
+        self.assertEqual(self.press("auto", automatic=False)[0], 200)
+        with self.channel(manifest("b" * 40, version="2026.10.3")):
+            self.assertEqual(self.press("check", take=True)[0], 200)
+            self.finish()
+        self.assertIsNone(hub.kv_get("releases_found"))
+
     # ---- the entitlement
 
     def test_the_entitlement_is_kept_as_it_was_issued_and_shown_to_the_owner(self):

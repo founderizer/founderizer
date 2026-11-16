@@ -461,6 +461,7 @@ class Turns(test_releases.HubUpdates):
             self.finish()
             self.assertEqual(self.newest()["state"], "verified")       # offered, not kept: it waits
             self.assertEqual(hub.release_waiting()["revision"], released)
+            self.assertIsNone(hub.kv_get("releases_found"))     # the sweep's own poll finds nothing for itself
             self.assertTrue(hub.release_holds_starts())
             later = self.task_for()
             self.assertEqual(self.delivered("task"), [], "a session started while a release waits")

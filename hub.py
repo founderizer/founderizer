@@ -917,7 +917,7 @@ def kv_get(k, default=None):
 
 
 # Times the hub keeps for itself, which no screen of the owner's shows: their writes are quiet (live_changes).
-QUIET_KEYS = ("tick_ok", "releases_swept", "bridge_seen", "bridge_code")
+QUIET_KEYS = ("tick_ok", "releases_swept", "releases_found", "bridge_seen", "bridge_code")
 
 
 def kv_set(k, v):
@@ -48587,8 +48587,9 @@ def poll_release(fetch=None):
     return answer, row
 
 
-def start_release_work(applying, automatic=False, fetch=None):
-    """Start the poll — and, when `applying`, the update that follows it — in a thread of its own.
+def start_release_work(applying, automatic=False, fetch=None, take=False):
+    """Start the poll — and, when `applying`, the update that follows it — in a thread of its own. `take`: a check
+    whose release the automatic sweep takes at its next tick (release_work, POST /ui/releases/check).
 
     Called under LOCK, so it only checks what is cheap and starts the thread: an update takes a minute or more,
     because `selftest.py` and `fleet.py verify` run on the released code before anything is published."""
@@ -48601,7 +48602,7 @@ def start_release_work(applying, automatic=False, fetch=None):
                 raise Refusal(409, "this fleet is working, and an update waits until no turn runs: "
                                    + (", ".join(tref(t) for t in busy[:6]) if busy else "a check runs now"))
         thread = threading.Thread(target=release_work, name="release-update", daemon=True,
-                                  args=(applying, automatic, fetch))
+                                  args=(applying, automatic, fetch, take))
         _release["thread"], _release["applying"] = thread, bool(applying)       # before start: see release_applying
         thread.start()
     changed()                   # a run that goes on is on the owner's Updates page at once (live_changes)
@@ -48609,10 +48610,13 @@ def start_release_work(applying, automatic=False, fetch=None):
             "revision": kit_revision(), "channel": release_channel()}
 
 
-def release_work(applying, automatic=False, fetch=None):
+def release_work(applying, automatic=False, fetch=None, take=False):
     """The thread. Nothing in it holds LOCK while it waits for the network, for git, or for a check."""
     try:
         answer, row = poll_release(fetch)
+        if take and not applying and row is not None and row["state"] == "verified" and releases_automatic():
+            with LOCK:
+                kv_set("releases_found", now())         # a check found a release no run has tried: release_sweep
         if applying and automatic and (row is None or row["state"] in (releases.DONE, PASSED)):
             with LOCK:
                 kv_set("release_waits", None)           # plan P0: nothing to take, so nothing waits
@@ -49244,7 +49248,17 @@ def release_sweep(t0):
     asked, which is all the gate is about.
 
     Plan P0: the sweep polls also while turns run. A release that no run has tried yet then waits (release_wait),
-    and every tick looks for the first moment no turn runs, past the gate, to take it."""
+    and every tick looks for the first moment no turn runs, past the gate, to take it.
+
+    **A release that a check found to take is taken at the next tick** (16 November 2026, owner API 1.194). A check
+    with `"take": true` that finds a release that no run has tried, while automatic updates are on, writes
+    `releases_found` (release_work). The sweep then polls and takes it at its first tick after that check's thread
+    has ended, with the waits of this poll, and not at the next poll, up to RELEASE_POLL later. The publisher's
+    release job asks each early hub for that check after each release that it sends to the early track: on that day
+    a release waited 6 minutes on average and 13 at most for this poll. The owner's own Check sends no `take`, and
+    changes nothing here. The sweep's own poll writes no `releases_found`, and the sweep writes `releases_swept` past
+    it, so a found release makes one poll and never a loop. While a check or an update runs, the sweep waits for its
+    end: a poll beside it would be refused, and would close the gate for RELEASE_POLL with nothing taken."""
     token = entitlement_token()
     if not releases_automatic() or not (token or installed_hub()):
         if release_waiting():
@@ -49256,9 +49270,12 @@ def release_sweep(t0):
         except Refusal:
             pass
         return
-    if t0 - float(kv_get("releases_swept") or 0) < RELEASE_POLL:
+    if release_running():
+        return                  # the poll comes at the first tick after the check or the update that runs now
+    swept, found = float(kv_get("releases_swept") or 0), float(kv_get("releases_found") or 0)
+    if t0 - swept < RELEASE_POLL and found <= swept:
         return
-    kv_set("releases_swept", t0)         # a channel that hangs is not polled again at every tick
+    kv_set("releases_swept", max(t0, found))        # a channel that hangs is not polled again at every tick
     if not token and config_branch() != CONFIG_BRANCH:
         return          # no release can be merged into this checkout; the next look is one RELEASE_POLL later
     try:
@@ -52171,8 +52188,12 @@ class Handler(BaseHTTPRequestHandler):
         return self.json(200, scrub(dict(db=generation, time=now(), **view)), {"Cache-Control": "no-store"})
 
     def ui_release_check(self):
-        """POST /ui/releases/check: ask the channel now. It records what it learned and changes nothing else."""
-        return self.ui_command("releases/check", lambda data: {}, lambda body: start_release_work(False))
+        """POST /ui/releases/check: ask the channel now. It records what it learned and changes nothing else. With
+        `"take": true` (owner API 1.194), which the publisher's release job sends after each release that it sends to
+        the early track and no app sends, a release that it finds and that no run has tried is then taken by the
+        automatic sweep at its next tick, with that sweep's waits (release_sweep). Any other value is no `take`."""
+        return self.ui_command("releases/check", lambda data: {"take": True} if data.get("take") is True else {},
+                               lambda body: start_release_work(False, take=bool(body.get("take"))))
 
     def ui_release_update(self):
         """POST /ui/releases/update: the owner's one click. It answers as soon as the run has started, because the
