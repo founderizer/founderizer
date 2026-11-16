@@ -1598,6 +1598,19 @@ class AgentFiles(ChatApps):
             self.assertEqual((code, said), (413, "Not taken: a file is at most 0 MB.\n"))
         self.assertEqual(self.count("attachments"), 0)
 
+    def test_a_packed_stream_of_more_than_one_piece_is_read_to_its_end(self):
+        """inflate_pieces: a FlateDecode stream that inflates to more than one piece, with the line break before its
+        endstream as PDFs write it. zlib gives that byte back after the end of its data at every call, and the loop
+        must end there: until 16 November 2026 it ran on, and held the check of every later file."""
+        plain = b"0 0 m 1 1 l S\n" * 2000
+        out = []
+        reader = threading.Thread(target=lambda: out.append(b"".join(hub.inflate_pieces(zlib.compress(plain) + b"\n",
+                                                                                          1000))), daemon=True)
+        reader.start()
+        reader.join(30)
+        self.assertFalse(reader.is_alive(), "inflate_pieces did not end")
+        self.assertEqual(out, [plain])
+
     def test_only_a_session_with_a_shell_gets_attach_file(self):
         names = lambda agent, context: {t["name"] for t in hub.tools_for(agent, context)}
         self.assertIn("attach_file", names("manager", None))

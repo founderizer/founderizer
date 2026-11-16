@@ -20250,7 +20250,10 @@ def space_pieces(data, size=None):
 
 def inflate_pieces(data, size=None):
     """What a FlateDecode stream inflates to, in pieces that end after a space or a line break, read a piece at a time:
-    a stream of many megabytes is never held whole. A break in the middle ends it there."""
+    a stream of many megabytes is never held whole. A break in the middle ends it there, and so does the end of its zlib
+    data: a PDF's stream keeps the line break before its endstream, and zlib gives that byte back as an unconsumed tail
+    at every call after the end, so a stream of more than one piece never ended (until 16 November 2026, with
+    CHAT_FILE_CHECKS held for every later file)."""
     size, inflate, rest, tail = size or CHAT_FILE_CHUNK, zlib.decompressobj(), data, b""
     while True:
         try:
@@ -20258,7 +20261,7 @@ def inflate_pieces(data, size=None):
         except zlib.error:
             out, rest = b"", b""
         else:
-            rest = inflate.unconsumed_tail
+            rest = b"" if inflate.eof else inflate.unconsumed_tail
         block = tail + out
         if not rest and not out:
             if block:
