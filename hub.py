@@ -39154,18 +39154,25 @@ KEY_SWAP_CARD_ANSWERS = ("Switch it on", "Leave it off")
 
 
 def key_swap_waits(server, team=None):
-    """[{"agent", "keys"}] of the agents of this Linux server whose sessions get a key that the key swap would turn
-    into a placeholder (key_swap: the rule, which a server's word does not change), sorted. [] when none, and for a
-    server that is not Linux. The app switches such a server only on the owner's yes (C31)."""
+    """[{"agent", "keys"}] of the agents of this Linux server whose vault is its broker and that read a key that the
+    key swap would turn into a placeholder (key_swap: the rule, which a server's word does not change), sorted. [] when
+    none, and for a server that is not Linux. The app switches such a server only on the owner's yes (C31).
+
+    These are the keys of the vault's read (read_secrets), as helper_vault_read gives them, for a session and for a
+    check alike. So an agent whose Shell box is off waits too: its sessions get no key, but its checks read its keys,
+    and on a server that swaps they get the placeholder (patch 1c of Part B; the manager's finding of 16 November 2026
+    on worker-1). A key that an agent only uses (call_api, the level "use") makes no wait: the rule takes a read
+    grant only, so the hub's confirmation of a request names no site for it, and the vault sends it as before
+    (vault.swap_call)."""
     team = team or TEAM
     if ((team.get("servers") or {}).get(server) or {}).get("kind") != "linux":
         return []
     out = []
     for name, a in sorted((team.get("agents") or {}).items()):
-        if a.get("machine") != server:
+        if a.get("machine") != server or a.get("vault") != "broker":
             continue
         with contextlib.suppress(Exception):    # an entry that cannot be read names no key
-            keys = sorted({env for ref, env in session_variables(name) if key_swap(name, ref)})
+            keys = sorted({env for ref, env in read_secrets(name) if key_swap(name, ref)})
             if keys:
                 out.append({"agent": name, "keys": keys})
     return out
@@ -39266,8 +39273,9 @@ def server_key_swap_reading(server, body):
     if waits:                           # the server's agents with a key with a site: their checks run once now
         keys = "; ".join(f"{shown_role(w['agent'])} ({w['agent']}): {', '.join(w['keys'])}" for w in waits)
         emit(manager_name(), "say", f"[hub] The vault of {server} swaps keys now, by the Mac app's reading: the "
-                                    f"sessions there hold a placeholder of these keys ({keys}). Have each check of "
-                                    f"these agents run once now, and tell the owner only of one that stopped.")
+                                    f"sessions and the checks there hold a placeholder of these keys ({keys}). Have "
+                                    f"each check of these agents run once now, and tell the owner only of one that "
+                                    f"stopped.")
     return {"server": server, "key_swap": swaps, "reason": reason, "changed": done is not None,
             "revision": done[0] if done else rev, "sha256": done[1] if done else current}
 

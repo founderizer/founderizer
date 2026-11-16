@@ -58,6 +58,7 @@ def load_tests(loader, _tests, _pattern):
     suite.addTests(Delivery(name) for name in Delivery.__dict__ if name.startswith("test_"))
     suite.addTests(Fact(name) for name in Fact.__dict__ if name.startswith("test_"))
     suite.addTests(Wish(name) for name in Wish.__dict__ if name.startswith("test_"))
+    suite.addTests(ChecksWait(name) for name in ChecksWait.__dict__ if name.startswith("test_"))
     return suite
 
 
@@ -1544,6 +1545,22 @@ class BrokerPart(test_vault.VaultBroker):
         self.assertEqual(both["env"], {"OTHER_KEY": other, "SHOP_API_KEY": name})
         self.assertEqual(both["swap"]["names"], {"SHOP_API_KEY": HOST})
 
+    def test_a_check_of_an_agent_whose_shell_box_is_off_gets_the_placeholder(self):
+        """Patch 1c of Part B, the hub's and the broker's half of proof 2 for an agent like iris on worker-1: its
+        Shell box is off, so a session's read gets no key, and its check's read gets the placeholder of a key with a
+        site, with the proxy's facts. So such an agent waits for the owner's word too (key_swap_waits)."""
+        self.started()
+        with patch.dict(hub.TEAM["agents"]["vps"], {"can": ["web"]}):
+            self.assertTrue(hub.shell_off("vps"))
+            for request in ({"op": "read"}, {"op": "read", "for": "session"}):
+                with self.subTest(request), self.assertRaisesRegex(fleet.Refused, "gets no key: its Shell box is off"):
+                    fleet.vault_call(request)
+            raw = fleet.vault_call({"op": "read", "for": "check"})
+        name = raw["env"]["SHOP_API_KEY"]
+        self.assertRegex(name, r"^vaultswap_[0-9a-f]{40}$")
+        self.assertEqual(raw["swap"]["names"], {"SHOP_API_KEY": HOST})
+        self.assertNotIn(self.VALUE, json.dumps(raw))
+
     def test_the_proxy_gets_the_value_for_this_user_this_host_and_this_form_only(self):
         self.started()
         name = fleet.vault_call({"op": "read"})["env"]["SHOP_API_KEY"]
@@ -2331,13 +2348,14 @@ class Fact(test_grants.Grants):
     it has a shell and the web."""
     SITE = "https://" + HOST
     KEY, BARE = test_grants.KEY, test_grants.NEW            # OPENAI_API_KEY with a site, SHOP_API_KEY with none
+    CAN = ("shell", "web")                                  # alpha's Tools boxes
 
     def setUp(self):
         team = json.loads(json.dumps(test_grants.TEAM))
         team["servers"] = {"box": {"kind": "linux", "user": "fleet"}, "lone": {"kind": "mac", "user": "fleet"}}
         team["logins"][self.KEY]["site"] = self.SITE
         team["logins"][self.BARE] = {"title": "SHOP_API_KEY", "kind": "api_key", "env": "SHOP_API_KEY"}
-        team["agents"]["alpha"].update(can=["shell", "web"], title="Developer",
+        team["agents"]["alpha"].update(can=list(self.CAN), title="Developer",
                                        secrets={self.KEY: "read", self.BARE: "read"})
         with patch.object(test_grants, "TEAM", team):
             super().setUp()
@@ -2719,6 +2737,56 @@ class Wish(Fact):
         self.assertEqual([hub.kv_get(prefix + "box") for prefix in hub.KEY_SWAP_KV], [None] * 3)
         self.assertEqual([hub.kv_get(prefix + "box-two") for prefix in hub.KEY_SWAP_KV], ['{"at": 1}'] * 3)
         self.assertEqual([r["key_swap_server"] for r in hub.q("SELECT key_swap_server FROM needs")], ["box-two"])
+
+
+class ChecksWait(Wish):
+    """Patch 1c of Part B: an agent whose Shell box is off waits too. Its sessions get no key, but its checks read its
+    keys (helper_vault_read), and on a server that swaps they get the placeholder. Here alpha has the web and no
+    shell, as iris on worker-1 has (the manager's finding of 16 November 2026), so the app must not switch box by
+    itself: the state, the ask, the card's details and the hub's message after the switch all name alpha."""
+    CAN = ("web",)
+
+    def told(self):
+        return [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' AND text LIKE ? ORDER BY id",
+                                          ("[hub] The vault of box swaps keys now%",))]
+
+    def test_an_agent_whose_shell_box_is_off_waits_by_its_checks(self):
+        self.assertTrue(hub.shell_off("alpha"))
+        self.assertEqual(hub.session_variables("alpha"), [])                # its sessions get no key
+        self.assertEqual([env for _ref, env in hub.read_secrets("alpha")], ["OPENAI_API_KEY", "SHOP_API_KEY"])
+        self.assertEqual(self.row()["key_swap_waits"], [{"agent": "alpha", "keys": ["OPENAI_API_KEY"]}])
+        self.assertIsNone(hub.key_swap_state("box", hub.TEAM))             # no reading of the app yet
+        self.says("box", False)                                             # the app's first reading: box waits
+        self.assertIsNotNone(hub.key_swap_state("box", hub.TEAM))
+        asks = self.asks()
+        self.assertEqual(len(asks), 1)
+        self.assertIn('key_swap_server "box"', asks[0])
+        self.assertIn("Developer (alpha): OPENAI_API_KEY", asks[0])
+        said, error = self.raise_item()
+        self.assertFalse(error, said)
+        need = hub.q1("SELECT * FROM needs WHERE key_swap_server='box' AND answer IS NULL")
+        self.assertEqual(need["details"], hub.key_swap_card_details("box"))
+        self.assertIn("The keys with a site on box:\n- Developer: OPENAI_API_KEY\n", need["details"])
+        self.assertEqual(self.press(need["id"], choice=0)[0], 200)          # the owner presses Switch it on
+        self.assertEqual(self.committed()["servers"]["box"].get("key_swap_wish"), "on")
+        self.says("box", True)                                              # the app switched it: the new word
+        told = self.told()
+        self.assertEqual(len(told), 1)
+        self.assertIn("the sessions and the checks there hold a placeholder of these keys (Developer (alpha): "
+                      "OPENAI_API_KEY). Have each check of these agents run once now", told[0])
+
+    def test_no_broker_or_only_a_use_grant_makes_no_wait(self):
+        with patch.dict(hub.agents()["alpha"], {"vault": "none"}):         # its vault does not read its keys
+            self.assertEqual(self.row()["key_swap_waits"], [])
+        # A key that alpha only uses (call_api): the rule takes a read grant only, so the hub's confirmation of a
+        # request names no site for it, and a vault that swaps sends it as before.
+        with patch.dict(hub.agents()["alpha"], {"secrets": {self.KEY: "use"}}):
+            self.assertEqual(self.row()["key_swap_waits"], [])
+            self.assertIsNone(hub.key_swap("alpha", self.KEY))
+        self.assertTrue(vault.swap_call({"_swap": {}}, {"login": self.KEY}, {"auth": "header"},
+                                        {"url": "https://other.example.com"}))
+        self.assertFalse(vault.swap_call({"_swap": {}}, {"login": self.KEY, "site": self.SITE, "form": "bearer"},
+                                         {"auth": "header"}, {"url": "https://other.example.com"}))
 
 
 def proxy_asks(path, **request):
@@ -3137,8 +3205,9 @@ class Configure(unittest.TestCase):
     def test_a_broker_that_does_not_stay_up_gets_its_configuration_back(self):
         machine = Machine(dict(self.BROKER))
         machine.broker_stays = False
-        with self.assertRaisesRegex(vault.ConfigureStop, "the configuration is as it was"):
+        with self.assertRaisesRegex(vault.ConfigureStop, "the configuration is as it was") as said:
             self.step(machine, swap="on")
+        self.assertTrue(said.exception.undone)                              # put back: its JSON line says so
         self.assertEqual((machine.conf, machine.state["broker"]), (self.BROKER, "active"))
         self.assertFalse([s for s in machine.changes() if vault.SWAP_UNIT_PATH in s])   # the proxy was not installed
 
@@ -3154,8 +3223,9 @@ class Configure(unittest.TestCase):
                 else:
                     machine.socket_comes = False
                 with self.assertRaisesRegex(vault.ConfigureStop,
-                                            "put the configuration back as it was and stopped the proxy"):
+                                            "put the configuration back as it was and stopped the proxy") as said:
                     self.step(machine, swap="on")
+                self.assertTrue(said.exception.undone)
                 self.assertEqual(machine.conf, self.BROKER)
                 self.assertEqual((machine.state["broker"], machine.state["socket"], machine.state["active"],
                                   machine.state["enabled"]), ("active", "", "inactive", "disabled"))
@@ -3165,8 +3235,9 @@ class Configure(unittest.TestCase):
         machine.state["unit"] = "0" * 64                    # another unit: the proxy starts again, and stays down
         machine.proxy_stays = False
         with self.assertRaisesRegex(vault.ConfigureStop, "journalctl -u fleet-vault-swap.*keeps the part, which it "
-                                                         "had before this step"):
+                                                         "had before this step") as said:
             self.step(machine, swap="on")
+        self.assertFalse(said.exception.undone)                             # nothing was put back
         self.assertEqual(machine.conf, dict(self.BROKER, swap=self.PART))
         self.assertFalse([s for s in machine.changes() if "disable --now" in s or s.startswith("install") and
                           s.splitlines()[0].endswith(vault.VAULT_CONF_PATH)])
@@ -3278,6 +3349,11 @@ class Configure(unittest.TestCase):
                 with patch.object(vault, "unchangeable"):
                     self.assertEqual(said(euid=0, program=vault.INSTALLED), (0, {"ok": True, "state": "there"}))
                 self.assertEqual(step.call_args.args, (vault.VAULT_CONF_PATH, [], None, "on", False))
+                for stop, line in ((vault.ConfigureStop("Put back.", undone=True),
+                                    {"ok": False, "reason": "Put back.", "undone": True}),
+                                   (vault.ConfigureStop("No broker."), {"ok": False, "reason": "No broker."})):
+                    with patch.object(vault, "unchangeable"), patch.object(vault, "configure", side_effect=stop):
+                        self.assertEqual(said(euid=0, program=vault.INSTALLED), (1, line))
         with patch.object(vault, "configure_main", return_value=0) as main:
             vault.main(["configure", "--swap", "off", "--add-owner-key", "x", "--fleet", self.FLEET])
         parsed = main.call_args.args[0]

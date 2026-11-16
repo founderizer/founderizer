@@ -359,7 +359,9 @@ server that joined before, it is off until root switches it on.
   cannot ask the broker itself, because the broker's socket admits only the agents' users. So the step reads the
   broker's socket for the proxy, which the broker makes only after it loads the part `swap`, in its runtime folder,
   which systemd removes at each stop of the broker; and it reads that the proxy's service runs (`vault.py`,
-  `SWAPS_FROM`).
+  `SWAPS_FROM`). When the step put the configuration of before back (a broker that did not stay up on the new one,
+  or a switch to on that ended badly), its line says `"undone": true` beside `ok` and `reason`: a try again restarts
+  the broker two times and ends in the same way while the machine runs the same program.
 - **A broker that starts again.** The step restarts the broker when it changes the configuration, and so does
   each release that changes `vault.py`. The broker's socket is gone for that moment: for less than 0.4 seconds on a
   test server. On a Linux machine whose broker is installed, each call to the broker (a session's read of its keys,
@@ -418,7 +420,10 @@ server that joined before, it is off until root switches it on.
   route of that reading writes it, and it says only what the reading found. The owner's wish, `key_swap_wish`: the
   owner's own yes or no for the server, with the tool `server_key_swap` of the owner's MCP server (`owner_mcp.py`),
   or with the answer of a Needs-you item. A server where an agent reads a key that has a site waits for the owner's
-  yes: the hub asks the fleet manager for one item about it, whose title and two answers are the hub's words. The
+  yes: the hub asks the fleet manager for one item about it, whose title and two answers are the hub's words. An
+  agent whose Shell box is off waits too: its sessions get no key, but its checks read its keys and get the
+  placeholder there. A key that an agent only uses (`call_api`) makes no wait, because the vault sends it as before
+  (`hub.py`, `key_swap_waits`; `vault.py`, `swap_call`). The
   hub reads no report of a machine for these records. It uses the word only for what it says. The settings check
   does not count a key that swaps there as a key in the agent's sessions. The start text of an agent whose sessions
   get the variable says that the variable holds a placeholder, which begins with `vaultswap_`, and not the key

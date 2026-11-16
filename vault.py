@@ -4157,7 +4157,15 @@ SWAPS_FROM = "the socket for the proxy of the broker that runs now, and the prox
 
 
 class ConfigureStop(Exception):
-    """Why configure changed nothing more: one sentence, which the owner's app shows on the server's row."""
+    """Why configure changed nothing more: one sentence, which the owner's app shows on the server's row. `undone`:
+    this step put the configuration of before back (a broker that did not stay up on the new one, or a switch to on
+    that ended badly), and its JSON line says so (`"undone": true`). Each such try restarts the broker two times and
+    ends in the same way while the machine runs the same program, so the owner's app makes no try of its own again
+    on that server until the program changes, the owner presses Try again or the owner's wish changes (app patch 2)."""
+
+    def __init__(self, reason, undone=False):
+        super().__init__(reason)
+        self.undone = undone
 
 
 def root_shell(script, timeout=120):
@@ -4327,7 +4335,7 @@ def configure_locked(config, owner_keys, fleet, swap, check, run, read, settle):
                                     "the configuration is as it was. Read `journalctl -u fleet-vault -n 30` on this "
                                     "machine." if conf_new else
                                     "The vault broker of this machine did not stay up after its start. Read "
-                                    "`journalctl -u fleet-vault -n 30` on this machine.")
+                                    "`journalctl -u fleet-vault -n 30` on this machine.", undone=conf_new)
         if proxy_again or proxy_enable:
             script = ("install -o root -g root -m 644 %s %s\nsystemctl daemon-reload\n"
                       % (shlex.quote(service), SWAP_UNIT_PATH)) if unit_new else ""
@@ -4363,7 +4371,7 @@ def configure_locked(config, owner_keys, fleet, swap, check, run, read, settle):
                                 "the key swap is not switched on, and each key reaches a session as a value, as "
                                 "before." + ("" if back.get("broker") == "active" else
                                              " The vault broker did not come up again on it: read `journalctl -u "
-                                             "fleet-vault -n 30` on this machine."))
+                                             "fleet-vault -n 30` on this machine."), undone=True)
         if fault:
             raise ConfigureStop(fault + " The configuration keeps the part, which it had before this step, so a key "
                                         "that has a site is not given to a session until this is repaired.")
@@ -4393,7 +4401,7 @@ def configure_main(args, euid=None, program=None):
             raise ConfigureStop(str(e)) from None
         answer = configure(args.config, args.add_owner_key, args.fleet, args.swap, args.check)
     except ConfigureStop as e:
-        print(json.dumps({"ok": False, "reason": str(e)}))
+        print(json.dumps(dict({"ok": False, "reason": str(e)}, **({"undone": True} if e.undone else {}))))
         return 1
     print(json.dumps(answer))
     return 0
