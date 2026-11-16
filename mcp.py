@@ -26,15 +26,17 @@ TOOLS_MAX = 200                     # the most tool names that the hub keeps
 LIFE = 400 * 24 * 3600              # the longest access-token life that the hub takes from a server (400 days)
 LOST = "the answer of the MCP server was lost: the request can have reached it"
 GRANTS = ("authorization_code", "refresh_token")
+NO_OAUTH = "this MCP server has no OAuth metadata"      # a server that needs no Connect (hub: why "no_oauth")
 
 
 class McpError(Exception):
     """An MCP or OAuth call without its result. The text is safe to show: it never holds a token, a secret, a code or
     a request body. status: the HTTP status, or None. reason: the server's short reason (invalid_grant, ...), or None.
-    unknown: True only when the request can have arrived and its answer was lost."""
-    def __init__(self, message, status=None, reason=None, unknown=False):
+    unknown: True only when the request can have arrived and its answer was lost. why: Fleet's own code of what it
+    found, which the hub passes on in its refusal's `why` (no_oauth), or None."""
+    def __init__(self, message, status=None, reason=None, unknown=False, why=None):
         super().__init__(message)
-        self.status, self.reason, self.unknown = status, reason, unknown
+        self.status, self.reason, self.unknown, self.why = status, reason, unknown, why
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -139,16 +141,20 @@ def _json(method, url, access=None, body=None, form=None, headers=None):
 # OAuth: where the server sends the owner, and the hub's own client
 
 
-def _metadata(url, path):
+def _metadata(url, path, unsure=None):
     """The metadata document at one well-known path of url's host, or None. Both forms are tried: the path of RFC 8414
-    (the well-known part first) and the plain one, which many servers use."""
+    (the well-known part first) and the plain one, which many servers use. unsure: a list that gets each failure that
+    is not a plain absence (no 404 or 410: an outage, a refusal, a timeout), so that a caller can tell "this server
+    has none" from "this server did not answer now"."""
     parts = urllib.parse.urlsplit(url)
     base = f"{parts.scheme}://{parts.netloc}"
     folder = parts.path.rstrip("/")
     for place in ([f"{base}/.well-known/{path}{folder}"] if folder else []) + [f"{base}/.well-known/{path}"]:
         try:
             answer, _ = _json("GET", place, headers={"Accept": "application/json"})
-        except McpError:
+        except McpError as e:
+            if unsure is not None and e.status not in (404, 410):
+                unsure.append(e)
             continue
         if answer:
             return answer
@@ -162,12 +168,15 @@ def discover(url):
     authorization server, so the hub sends a secret or a token to no other host."""
     if not address(url):
         raise McpError("the address of the MCP server must be https (http only on 127.0.0.1)")
-    resource = _metadata(url, "oauth-protected-resource") or {}
+    unsure = []         # an outage of the resource's document too: it may name an authorization server elsewhere
+    resource = _metadata(url, "oauth-protected-resource", unsure) or {}
     servers = [s for s in resource.get("authorization_servers") or [] if address(s)]
     issuer = servers[0] if servers else f"{urllib.parse.urlsplit(url).scheme}://{urllib.parse.urlsplit(url).netloc}"
-    found = _metadata(issuer, "oauth-authorization-server") or _metadata(issuer, "openid-configuration")
+    found = _metadata(issuer, "oauth-authorization-server", unsure) or _metadata(issuer, "openid-configuration", unsure)
+    if not found and unsure:            # no plain absence: the server did not answer now, which says nothing of OAuth
+        raise McpError(f"the OAuth metadata of this MCP server cannot be read now: {unsure[0]}")
     if not found:
-        raise McpError("this MCP server has no OAuth metadata: it needs no Connect, or it is not an OAuth server")
+        raise McpError(NO_OAUTH + ": it needs no Connect, or it is not an OAuth server", why="no_oauth")
     host = _host(issuer)
     ends = {}
     for key in ("authorization_endpoint", "token_endpoint", "registration_endpoint"):

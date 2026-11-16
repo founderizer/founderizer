@@ -1615,6 +1615,10 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "account_email", "secrets", "login_create", "login_capture", "api_request",
                "owner_knowledge", "secret_grants", "integrations", "chat_apps", "people", "conversations",
                "agent_messages", "google", "mcp", "mcp_check", "mcp_program", "servers", "responsibilities",
+               # the owner, 15 November 2026 ("Yes, all three", "The hub"): a program server of npm or PyPI that
+               # the agent's helper installs, with arguments and plain settings, and POST /ui/mcp/package
+               "mcp_packages",
+               "mcp_find",          # the same answers: Find a server, POST /ui/mcp/find over the official MCP Registry
                "server_prepare",
                "mobile", "attachments", "resource_grants", "machine_signin",
                "mobile_ended",      # owner API 1.166: GET /ui/mobile/ended and the ended_mark of GET /ui/mobile
@@ -26690,14 +26694,15 @@ def resource_parts(rid):
     return (kind, what) if kind in RESOURCE_LEVELS and what else (None, None)
 
 
-def resource_known(kind, what, team):
+def resource_known(kind, what, team, carried=()):
     """True when team.json can see this resource: a secret of the catalog, a tool of the catalog, a repository name, or
     an email for a Google service. A repository and an account are not listed anywhere else, so their form is the
-    check: the owner's entry is what says that the fleet holds them."""
+    check: the owner's entry is what says that the fleet holds them. carried: the owner's MCP servers that a write
+    carries on as they are (validate_team's kept), which a rule that came later leaves out of the catalog."""
     if kind == "secret":
         return what in (team.get("logins") or {})
     if kind == "tool":
-        return what in tool_catalog(team)
+        return what in tool_catalog(team) or what in carried
     if kind == "repo":
         return bool(REPO_NAME.fullmatch(what))
     if kind == "server":
@@ -26705,14 +26710,14 @@ def resource_known(kind, what, team):
     return bool(google_account(what))
 
 
-def resource_entry(rid, entry, team):
+def resource_entry(rid, entry, team, carried=()):
     """One checked entry of team.json "resources": the id and what the owner says about that resource. ValueError with
-    the reason, in the owner's words."""
+    the reason, in the owner's words. carried: as for resource_known."""
     kind, what = resource_parts(rid)
     if not kind or rid != rid.lower():
         raise ValueError(f"resource {rid!r} must be <kind>:<what> in lower case, with a kind of "
                          f"{', '.join(sorted(RESOURCE_LEVELS))}")
-    if not resource_known(kind, what, team):
+    if not resource_known(kind, what, team, carried):
         raise ValueError(f"resource {rid!r}: {what!r} is no email address" if kind in ("drive", "gmail") else
                          f"resource {rid!r}: {what!r} is no {RESOURCE_WORDS[kind]} that this team has")
     if kind == "server":
@@ -26729,17 +26734,18 @@ def resource_entry(rid, entry, team):
     return {"max": entry["max"], "to": RESOURCE_AUDIENCE}
 
 
-def validate_resources(team):
+def validate_resources(team, carried=()):
     """team.json "resources": up to RESOURCE_LIMIT entries, each a resource that this team has and the owner's policy
     for it. A policy says that the manager may hand that resource out, up to a level and to an audience; there is no
-    other kind of entry, and no action is held back for the owner afterwards (the comment above the constants)."""
+    other kind of entry, and no action is held back for the owner afterwards (the comment above the constants).
+    carried: the MCP servers that validate_team carries on as they are, whose entries stay."""
     pool = team.get("resources", {})
     if not isinstance(pool, dict) or len(pool) > RESOURCE_LIMIT:
         raise ValueError(f"resources must map up to {RESOURCE_LIMIT} resource IDs to their standing")
     for rid, entry in pool.items():
         if str(rid).startswith("target:"):
             continue        # Targets left the hub (24 October 2026): read as it is, and it gives nothing
-        resource_entry(rid, entry, team)
+        resource_entry(rid, entry, team, carried)
 
 
 def resource_title(kind, what, team=None):
@@ -26906,8 +26912,9 @@ def take_resource(body):
     kind, what = resource_parts(rid)
     if agent not in agents():
         raise Refusal(404, code="no_such_agent")
-    if not resource_known(kind, what, TEAM):
-        raise Refusal(404, f"the fleet does not hold {rid}")
+    servers = TEAM.get("mcp") if isinstance(TEAM.get("mcp"), dict) else {}
+    if not resource_known(kind, what, TEAM, servers):      # a take-back is always safe, also of a server that a
+        raise Refusal(404, f"the fleet does not hold {rid}")    # rule which came later leaves out of the catalog
     if kind == "server":        # DevOps plan C4 and "Yes, by business": the app gives a server and takes it back
         raise Refusal(409, "A server goes with its business: the owner's app gives each server to the DevOps agent of "
                            "the business whose Tailscale tag it carries, or to the manager while the business has "
@@ -31474,7 +31481,8 @@ def board_html():
     if CFG.get("team_problem"):
         p.append(f"<p class='warn'><b>The hub is running a file it would refuse:</b> {esc(CFG['team_problem'])}. "
                  f"It runs team.json as it is, and every owner write of that file is refused until the rule is "
-                 f"met.</p>")
+                 f"met, except that a write may carry an MCP server of the owner on as it is: no session gets that "
+                 f"server.</p>")
     # The same shape for the schema: the hub starts without a step its own records refused (build_schema), so this
     # is the fourth place that says which one, beside /ui/health, the hub's output and the log.
     for says in json.loads(kv_get("schema_problems") or "[]"):
@@ -35040,6 +35048,7 @@ def tick():
         step(mac_desktop_sweep)             # what only hands at a Mac can put right
         step(first_message_sweep, t0)       # the owner, 4 November 2026: a new fleet's manager writes first, once
         step(agent_first_message_sweep, t0)     # the owner, 12 November 2026: and so does each new agent
+        step(mcp_renew_sweep, t0)           # the owner, 15 November 2026: an MCP server's access ends (Needs you)
         step(stop_finished_sessions, t0)
         step(offline_sweep, t0)
         step(trigger_sweep, t0)
@@ -36673,8 +36682,12 @@ def capp_public_url(url, name):
         port in (None, 443)
 
 
-def validate_team(team):
-    """A team.json that the hub can run: one manager, known runtimes, an IP address for every machine."""
+def validate_team(team, kept=None):
+    """A team.json that the hub can run: one manager, known runtimes, an IP address for every machine. kept: the MCP
+    servers that it may carry on as they are without the check of today's rules (None: those of the running team), so
+    that a rule which came later never refuses the owner's other changes. No session gets such a server
+    (lifecycle.tool_catalog leaves it out and the start text says its rule), and team_problem passes {}, so the board
+    says the rule until the owner changes or removes it."""
     import ipaddress
     if not isinstance(team, dict) or not isinstance(team.get("agents"), dict) or not team["agents"]:
         raise ValueError("team.json needs agents")
@@ -36754,8 +36767,14 @@ def validate_team(team):
         raise ValueError(f"mcp must map up to {MCP_LIMIT} MCP server names to their server")
     names = TAILNET_NAMES.get("names") or ()
     own = str(names[0]).rstrip(".").lower() if names else None
+    kept = TEAM.get("mcp") if kept is None else kept
+    kept = kept if isinstance(kept, dict) else {}
+    carried = set()             # the servers that this team carries on as they are, which an agent may still hold
     for server, entry in servers.items():
-        mcp_server(server, entry)           # ValueError with the reason
+        if isinstance(entry, dict) and server in kept and kept[server] == entry:
+            carried.add(server)
+        else:
+            mcp_package_soon(mcp_server(server, entry))     # ValueError with the reason; no as_of in the future
         # the connected apps (the MCP address build spec, threat "An agent connects itself"): the hub's own public
         # MCP address is the owner's, so no agent session gets it as a server. Only that address: https, the hub's
         # full DNS name, no port or 443, any path. An owner's own MCP server on the hub machine (another port, the
@@ -36894,10 +36913,10 @@ def validate_team(team):
                 isinstance(r, str) and REPO_NAME.fullmatch(r) and v in REPO_ACCESS for r, v in repos.items()):
             raise ValueError(f"agent {name}: repos must map up to {REPOS_MOST} GitHub repositories (owner/name in "
                              f"lower case) to {', '.join(REPO_ACCESS)}")
-        if not isinstance(tools, list) or not all(isinstance(t, str) and t in catalog for t in tools) or \
-                len(set(tools)) != len(tools):
+        if not isinstance(tools, list) or not all(isinstance(t, str) and (t in catalog or t in carried)
+                                                  for t in tools) or len(set(tools)) != len(tools):
             raise ValueError(f"agent {name}: tools must be different names of the catalog and of the owner's MCP "
-                             f"servers: {', '.join(catalog)}")
+                             f"servers: {', '.join(list(catalog) + sorted(carried - set(catalog)))}")
         if a["role"] == "manager" and (repos or tools):
             raise ValueError("the manager has no repos or tools: they reach task sessions only")
         server_holds(name, a)               # DevOps plan C4: Read or Fix on a server, through the door
@@ -36999,7 +37018,7 @@ def validate_team(team):
     # "projects" is gone (the owner's decision of 18 October 2026). A team.json that a running fleet still has one
     # in is read as it is: the key is not checked, not written and not read anywhere. The same holds for "targets"
     # and an agent's "targets" since Targets left the hub (the owner, 24 October 2026).
-    validate_resources(team)        # owner feature resource_grants: the grantable pool and the owner's ceiling
+    validate_resources(team, carried)       # owner feature resource_grants: the grantable pool and the owner's ceiling
     account_resources_rule(team)    # the AI providers build: no pool holds an account's key
     validate_door(team)             # DevOps plan C4: the door, when this fleet has one
     validate_chat_apps(team)
@@ -37020,7 +37039,7 @@ def team_problem(team):
     It reads the rules and changes nothing. validate_team raises ValueError for every rule it has; a file broken
     in a way no rule reaches is named by its exception instead of ending the hub."""
     try:
-        validate_team(team)
+        validate_team(team, kept={})        # every MCP server by today's rules, also one that a write carried on
     except Exception as e:
         reason = e if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"
         return f"team.json does not validate: {reason}"
@@ -41747,7 +41766,7 @@ def save_repo_reached(body, _waited):
 MCP_FILE = os.path.expanduser("~/.fleet/mcp.json")
 MCP_PENDING = 900               # seconds that a Connect waits for its finish
 MCP_REFRESH = 300               # seconds: an access token with less time left is refreshed first
-MCP_STALE = "This Connect expired, or another one took its place. Start Connect again."
+MCP_STALE = refusal_words.words("connect_stale")     # the one sentence of Google's Connect too: one code (rule 8)
 MCP_NO_OAUTH = "This MCP server does not use the hub's Connect: its auth is not oauth."
 MCP_UNCONNECTED = "The owner has not connected this MCP server yet."
 MCP_ENDED = "The access of this MCP server ended. Connect it again."
@@ -41755,6 +41774,20 @@ MCP_PROBE_WAIT = 15             # seconds the hub waits for a machine's answer a
 MCP_PROBE_STEP = 0.25           # seconds between two looks for that answer
 MCP_PROBE_MAX = 8               # machines that one check asks; the rest are named as not asked
 MCP_PROBE_FEATURE = "mcp_program"       # the helper step that answers it: an older helper reports it not
+MCP_PACKAGE_FEATURE = "mcp_packages"    # the helper step that installs a package and answers whether it is in place
+MCP_LOOKUP_MOST = 32 << 20      # bytes of a registry's record of one package that the hub reads (POST /ui/mcp/package)
+MCP_LOOKUP_WAIT = 20            # seconds for that read
+NPM_RECORDS = "https://registry.npmjs.org/"
+PYPI_RECORDS = "https://pypi.org/pypi/"
+MCP_REGISTRY = "https://registry.modelcontextprotocol.io/v0/servers"     # the official MCP Registry (POST /ui/mcp/find)
+MCP_FIND_MOST = 20              # servers that one search answers
+MCP_FIND_WORDS = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._@/-]{0,59}")       # what the owner types into Find a server
+# The endings of a name of this machine or of a private network: no remote of Find a server has one (the app holds the
+# same list)
+MCP_PRIVATE_HOSTS = (".local", ".localhost", ".localdomain", ".internal", ".lan", ".home.arpa", ".intranet", ".corp")
+MCP_RENEW_SOON = 14 * 86400     # seconds before an access that cannot renew ends, when the manager is told
+MCP_RENEW_EVERY = 600           # seconds between two looks of mcp_renew_sweep
+MCP_DEFINITE_ENDS = ("invalid_grant", "invalid_client", "unauthorized_client")   # a refused refresh that is no outage
 # Only in the hub's memory: each server's access token (with the SHA-256 of the refresh token that it came from), the
 # problem of each server whose refresh the server refused, the pending Connect, and the program checks of
 # POST /ui/mcp/check that wait for a machine's answer. A restart ends them all.
@@ -41859,6 +41892,8 @@ def mcp_access(name):
     except mcp.McpError as e:
         with MCP_LOCK:
             MCP["problems"][name] = f"{mcp_why(e)}. Connect this server again."
+            if e.status in (400, 401) and e.reason in MCP_DEFINITE_ENDS:     # not an outage: the access ended
+                MCP.setdefault("ended", {})[name] = True
         changed()
         log("owner", f"the MCP server {name} refused the saved access: {mcp_why(e)}")
         raise Refusal(502, f"the MCP server {name} refused the saved access: {mcp_why(e)}") from None
@@ -41873,6 +41908,7 @@ def mcp_access(name):
     with MCP_LOCK:
         MCP["tokens"][name] = {"access_token": got["access_token"], "expires_at": got["expires_at"],
                                "refresh_sha256": print_name}
+        MCP.setdefault("ended", {}).pop(name, None)
         if MCP["problems"].pop(name, None) is not None:
             changed()
     return got["access_token"], got["expires_at"]
@@ -41883,7 +41919,7 @@ def mcp_state(team):
     the tools of the last check and the problem of a refused refresh. No token and no secret."""
     saved, bad = mcp_saved()
     with MCP_LOCK:
-        problems = dict(MCP["problems"])
+        problems, ended = dict(MCP["problems"]), dict(MCP.get("ended") or {})
     state = {}
     for name, entry in ((team.get("mcp") or {})).items():
         if (entry or {}).get("auth") != "oauth":
@@ -41891,10 +41927,18 @@ def mcp_state(team):
         kept = mcp_connection(saved, name) or {}
         ends = kept.get("access_expires_at") if not kept.get("refresh_token") else None
         over = MCP_ENDED if isinstance(ends, (int, float)) and ends - now() <= MCP_REFRESH else None
+        try:                            # the renewal's mark keeps an end of this connection across a restart
+            mark = json.loads(kv_get(f"mcp_renew:{name}") or "{}")
+        except ValueError:
+            mark = {}
+        kept_end = isinstance(mark, dict) and mark.get("event") == "ended" and kept and \
+            mark.get("connected_at") == kept.get("connected_at")
         state[name] = {"connected": bool(kept), "connected_at": kept.get("connected_at"),
                        "scopes": list(kept.get("scopes") or []), "server": kept.get("server"),
                        "tools": list(kept.get("tools") or []), "access_ends": ends,
-                       "problem": problems.get(name) or bad or over}
+                       "problem": problems.get(name) or bad or over,
+                       # a definite end (mcp_renew_sweep's): Sign in again helps, which no outage needs
+                       "ended": bool(kept) and bool(ended.get(name) or over or kept_end)}
     return state
 
 
@@ -41934,11 +41978,13 @@ def mcp_probe_answer(agent, token, found, path):
         return True
 
 
-def mcp_probe(names, command):
+def mcp_probe(names, command, package=None):
     """Ask each of these agents' machines whether it has this program, and wait once for all the answers. Nobody
     runs the program: the helper resolves the name as a task session does (PATH, then ~/.local/bin) and sends back
     what it found. A machine that has not checked in, and one whose Fleet is older than this check, are not asked at
-    all, so the hub waits only for a machine that can answer. One row for each agent, in the order given."""
+    all, so the hub waits only for a machine that can answer. One row for each agent, in the order given. package:
+    the package of a program server that the helper installs (owner feature mcp_packages); then the helper says
+    whether that package is in place, and a machine whose Fleet cannot install one is not asked."""
     t0, rows, waiting = now(), [], {}
 
     def label(agent):
@@ -41954,14 +42000,15 @@ def mcp_probe(names, command):
     for agent in names[:MCP_PROBE_MAX]:
         if not helper_online(agent, t0):
             row(agent, "not_asked", "not asked, this server has not checked in.")
-        elif MCP_PROBE_FEATURE not in helper_features(agent):
+        elif MCP_PROBE_FEATURE not in helper_features(agent) or (
+                package is not None and MCP_PACKAGE_FEATURE not in helper_features(agent)):
             row(agent, "not_asked", "not asked, this server's Founderizer is older than this check.")
         else:
             token = secrets.token_urlsafe(16)
             with MCP_LOCK:
                 MCP["probes"][token] = {"agent": agent, "command": command, "asked": t0, "answer": None}
             emit(agent, "mcp_program", f"Does this machine have the program {command}?",
-                 extra={"probe": token, "command": command})
+                 extra=dict({"probe": token, "command": command}, **({"package": package} if package else {})))
             waiting[token] = row(agent, "asked", "asked.")
     for agent in names[MCP_PROBE_MAX:]:
         row(agent, "not_asked", f"not asked, one check asks at most {MCP_PROBE_MAX} servers.")
@@ -41975,9 +42022,11 @@ def mcp_probe(names, command):
             if not got:
                 continue
             made = waiting.pop(token)
+            missing = (f"{command} is not installed yet: its next task session installs it." if package else
+                       f"no {command} on its PATH or in ~/.local/bin.")
             made.update(state="found" if got["found"] else "missing", path=got["path"],
                         says=f"{label(made['agent'])}: " + (f"{command} is at {got['path']}." if got["found"]
-                             else f"no {command} on its PATH or in ~/.local/bin."))
+                             else missing))
     for made in waiting.values():
         made.update(state="no_answer",
                     says=f"{label(made['agent'])}: no answer in {MCP_PROBE_WAIT} seconds.")
@@ -42003,26 +42052,33 @@ def check_mcp_server(name, entry, agent=None, new=False):
     of a new write (lifecycle.mcp_server, D33)."""
     made = mcp_server(name, entry, new=new)         # ValueError with the reason
     needs = [v for v in tool_needs(made) if v != mcp_variable(name)]
-    result = {"name": name, "kind": "url" if "url" in made else "command", "checked": False, "answers": None,
+    kind = "url" if "url" in made else "package" if "package" in made else "command"
+    result = {"name": name, "kind": kind, "checked": False, "answers": None,
               "needs": None, "says": "", "server": None, "version": None, "tools": [], "note": None,
               "machines": [], "keys": {"needs": needs, "missing": sorted(set(needs) - mcp_key_names())}}
-    if result["kind"] == "command":
-        where = mcp_probe(mcp_probe_candidates(name, agent), made["command"])
+    if kind in ("command", "package"):
+        package = made.get("package")
+        program = made["command"] if package is None else (package["bin"] or package["name"].rsplit("/", 1)[-1])
+        if package is not None:
+            result["version"] = package["version"]
+        where = mcp_probe(mcp_probe_candidates(name, agent), program, package)
         answered = [w for w in where if w["state"] in ("found", "missing")]
         open_ones = [w for w in where if w["state"] not in ("found", "missing")]
         result["machines"] = where
         said = " ".join(w["says"] for w in where)
+        what = (f"{package['name']} {package['version']} from {package['registry']} is a program that each agent's "
+                f"server installs itself at its first task session with this server, so the hub never runs it"
+                if package else f"{program} is a program of the agent's own server, so the hub never runs it")
         if not answered:
             result.update(needs="machine", says=(
-                f"{made['command']} is a program of the agent's own server, so the hub never runs it, and no "
-                f"server answered this check. " + (said or f"No agent has {name} yet, so there was no server to "
-                f"ask: give {name} to an agent, or name one.") +
+                f"{what}, and no server answered this check. " + (said or f"No agent has {name} yet, so there was "
+                f"no server to ask: give {name} to an agent, or name one.") +
                 " The session's start text says it when the program is not installed."))
             return result
         missing = any(w["state"] == "missing" for w in answered)
-        result.update(checked=True, answers=not missing, needs="machine" if missing or open_ones else None,
-                      says=f"{made['command']} is a program of the agent's own server: each server resolved the "
-                           f"name itself and nobody ran it. {said}")
+        result.update(checked=True, answers=bool(package) or not missing,
+                      needs=None if package and not open_ones else "machine" if missing or open_ones else None,
+                      says=f"{what}: each server answered for itself and nobody ran it. {said}")
         return result
     access, url = None, made["url"]
     if made["auth"] == "oauth":
@@ -42064,6 +42120,320 @@ def check_mcp_server(name, entry, agent=None, new=False):
     return result
 
 
+def mcp_package_day(today=None):
+    """The newest as_of that an owner's write may give a package now: PACKAGE_DAYS before today, in UTC."""
+    day = today or datetime.datetime.now(datetime.timezone.utc).date()
+    return (day - datetime.timedelta(days=lifecycle.PACKAGE_DAYS)).isoformat()
+
+
+def mcp_package_age(made, today=None):
+    """ValueError when the package of this checked server (mcp_server) takes the registry as of a day less than
+    PACKAGE_DAYS ago: the owner's rule that Fleet installs no package newer than that. The helper checks it again by
+    its own clock before an install."""
+    package = made.get("package")
+    if package and package["as_of"] > mcp_package_day(today):
+        raise ValueError(f"the MCP server's package {package['name']} is taken as of {package['as_of']}, less than "
+                         f"{lifecycle.PACKAGE_DAYS} days ago: use {mcp_package_day(today)} or an earlier day")
+
+
+def mcp_package_soon(made, today=None):
+    """ValueError for a package whose as_of is a day after today (UTC), for every write of team.json (validate_team).
+    The 7-day window itself is checked at the owner's write and by the helper before an install, so a clock that
+    steps back blocks no write of an entry that was right."""
+    package = made.get("package")
+    day = today or datetime.datetime.now(datetime.timezone.utc).date()
+    if package and package["as_of"] > day.isoformat():
+        raise ValueError(f"the MCP server's package {package['name']} is taken as of {package['as_of']}, a day that "
+                         f"has not come")
+
+
+def mcp_prerelease(registry, version):
+    """True for a version that its registry marks as a test release: npm's 1.2.3-beta.1, PyPI's 1.2rc1 or 1.2.dev3."""
+    return "-" in version if registry == "npm" else bool(re.search(r"[A-Za-z]", version.split("+")[0].replace(
+        "post", "")))
+
+
+def mcp_version_key(version):
+    """A sort key of a version by its numbers, which is enough to find the newest of a registry's releases."""
+    return [int(x) for x in re.findall(r"[0-9]+", re.split(r"[-+]", version)[0])[:6]]
+
+
+def mcp_lookup_open(request, timeout):
+    """One read of a registry's record for mcp_package_lookup (a seam for the tests)."""
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+def mcp_package_lookup(registry, name, version=None, today=None, fetch=None):
+    """What POST /ui/mcp/package answers: the version of a package that Fleet may install now, and the day as of which
+    every dependency is taken (the owner's rule: nothing newer than PACKAGE_DAYS). With a version: that version, when it
+    was published before that day. Without one: the newest release that was, not a test release. The hub reads the
+    registry's own record (npm's registry, PyPI's JSON API), at most MCP_LOOKUP_MOST bytes. ValueError (Coded): no
+    such package or version, or only newer ones; Refusal 502 with its code: the registry did not answer (rule 8 of
+    COORDINATION.md)."""
+    as_of = mcp_package_day(today)
+    lifecycle.mcp_package("package", {"registry": registry, "name": name, "version": version or "0", "as_of": as_of})
+    if registry == "npm":
+        url = NPM_RECORDS + urllib.parse.quote(name, safe="@")
+    else:
+        url = PYPI_RECORDS + re.sub(r"[-_.]+", "-", name).lower() + "/json"
+    try:
+        with (fetch or mcp_lookup_open)(urllib.request.Request(
+                url, headers={"User-Agent": mcp.AGENT, "Accept": "application/json"}), timeout=MCP_LOOKUP_WAIT) as r:
+            raw = r.read(MCP_LOOKUP_MOST + 1)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise refusal_words.Coded("package_unknown", registry=registry, name=name) from None
+        raise Refusal(502, code="package_unread", names={"registry": registry, "name": name,
+                                                         "http_status": e.code}) from None
+    except (urllib.error.URLError, OSError, http.client.HTTPException):
+        raise Refusal(502, code="package_registry_away", names={"registry": registry}) from None
+    if len(raw) > MCP_LOOKUP_MOST:
+        raise Refusal(502, code="package_record_large", names={"name": name, "registry": registry,
+                                                               "megabytes": MCP_LOOKUP_MOST >> 20})
+    try:
+        record = json.loads(raw)
+    except ValueError:
+        record = None
+    if not isinstance(record, dict):
+        raise Refusal(502, code="package_no_record", names={"registry": registry, "name": name})
+    published, bins = {}, {}
+    if registry == "npm":
+        times, versions = record.get("time") or {}, record.get("versions") or {}
+        for v, made in versions.items() if isinstance(versions, dict) else ():
+            if isinstance(v, str) and isinstance(times.get(v), str) and lifecycle.PACKAGE_VERSION.fullmatch(v):
+                published[v] = times[v][:19]
+                given = made.get("bin") if isinstance(made, dict) else None
+                bins[v] = sorted([name.rsplit("/", 1)[-1]] if isinstance(given, str) else
+                                 [k for k in given if isinstance(k, str)] if isinstance(given, dict) else [])
+    else:
+        for v, files in (record.get("releases") or {}).items():
+            times = [f.get("upload_time_iso_8601") for f in files or [] if isinstance(f, dict) and not f.get("yanked")]
+            times = [x for x in times if isinstance(x, str)]
+            if isinstance(v, str) and times and lifecycle.PACKAGE_VERSION.fullmatch(v):
+                published[v] = min(times)[:19]
+    old_enough = {v: at for v, at in published.items() if at < as_of + "T00:00:00"}
+    if version:
+        if version not in published:
+            raise refusal_words.Coded("package_no_version", registry=registry, version=version, name=name)
+        if version not in old_enough:
+            ready = [v for v in old_enough if not mcp_prerelease(registry, v)]
+            newest = max(ready, key=mcp_version_key) if ready else None
+            if newest:
+                raise refusal_words.Coded("package_too_new_older", name=name, version=version,
+                                          day=published[version][:10], days=lifecycle.PACKAGE_DAYS, newest=newest)
+            raise refusal_words.Coded("package_too_new", name=name, version=version, day=published[version][:10],
+                                      days=lifecycle.PACKAGE_DAYS)
+        chosen = version
+    else:
+        ready = [v for v in old_enough if not mcp_prerelease(registry, v)]
+        if not ready:
+            raise refusal_words.Coded("package_none_old", name=name, days=lifecycle.PACKAGE_DAYS)
+        chosen = max(ready, key=mcp_version_key)
+    releases = [v for v in published if not mcp_prerelease(registry, v)]
+    newest = max(releases, key=mcp_version_key) if releases else chosen
+    return {"registry": registry, "name": name, "version": chosen, "as_of": as_of,
+            "published": published[chosen][:10], "newest": newest, "bins": bins.get(chosen, [])}
+
+
+def mcp_registry_publisher(record):
+    """Who publishes a server of the MCP Registry, from the namespace of its name, which the registry checks when a
+    server is published (com.acme/x is acme.com; io.github.acme/x is github.com/acme). Its site and repository are
+    the publisher's own words, so they say nothing here."""
+    space = str(record.get("name") or "").split("/")[0].split(".")
+    if space[:2] == ["io", "github"] and len(space) > 2:
+        return "github.com/" + space[2][:40]
+    return ".".join(reversed(space))[:60]
+
+
+def mcp_registry_words(value, most):
+    """One line of a registry record's own words for the owner's page: no control or format character (no
+    right-to-left mark can turn a title around), white space as single spaces, at most `most` characters."""
+    text = "".join(" " if unicodedata.category(c) == "Cc" else c for c in str(value or "")
+                   if unicodedata.category(c) not in ("Cf", "Co", "Cs"))
+    return " ".join(text.split())[:most]
+
+
+def mcp_registry_remote(remote):
+    """True for a remote of a registry record that Fleet can reach: streamable HTTP at https with a public DNS name
+    (mcp_public_name: no address in any form, no name of this machine or of a private network), whose only required
+    or secret header is Authorization. A record is anybody's words, so the hub takes no address of its own network
+    from one; a public name that resolves to such an address is still possible, and TLS's name check limits it."""
+    if not isinstance(remote, dict) or remote.get("type") != "streamable-http":
+        return False
+    url = remote.get("url")
+    host = urllib.parse.urlsplit(url).hostname if isinstance(url, str) and lifecycle.mcp_address(url) else None
+    if not host or urllib.parse.urlsplit(url).scheme != "https" or not mcp_public_name(host):
+        return False
+    headers = remote.get("headers") or []
+    return isinstance(headers, list) and all(
+        isinstance(h, dict) and (str(h.get("name")).lower() == "authorization" or not (h.get("isSecret") or
+                                                                                         h.get("isRequired")))
+        for h in headers)
+
+
+def mcp_public_name(host):
+    """True for a host name of the public DNS: with a dot, no address in any form (dotted, hexadecimal, octal or IPv6,
+    which a resolver takes as an address), not localhost, and no private ending (MCP_PRIVATE_HOSTS), after a trailing
+    dot. A name can still resolve to a private address; TLS's name check is what limits that."""
+    import ipaddress
+    name = host.strip("[]").rstrip(".").lower()
+    if not name.isascii():              # a full-width or other form that a resolver turns into ASCII: check that form
+        try:
+            name = name.encode("idna").decode("ascii").rstrip(".").lower()
+        except UnicodeError:
+            return False
+    try:
+        ipaddress.ip_address(name)
+        return False
+    except ValueError:
+        pass
+    labels = name.split(".")
+    if len(labels) < 2 or name == "localhost" or name.endswith(MCP_PRIVATE_HOSTS) or \
+            all(re.fullmatch(r"(?:0x[0-9a-f]*|[0-9]+)", label) for label in labels):
+        return False
+    return True
+
+
+def mcp_registry_server(record):
+    """One server of the MCP Registry as Find a server shows it and as the form takes it, or None for one that Fleet
+    cannot run: a remote server that mcp_registry_remote takes (auth key when it has a secret Authorization header,
+    else oauth), or a program of npm or PyPI over stdio that needs no argument of its own. A program's environment
+    variables are its settings, and those that the record marks secret, or that have a secret's name
+    (lifecycle.secret_name), are its keys. A record that does not have this shape is no server."""
+    if not isinstance(record, dict) or not isinstance(record.get("name"), str):
+        return None
+    title = mcp_registry_words(record.get("title") or record["name"].rsplit("/", 1)[-1], 60)
+    about = {"id": record["name"][:200], "title": title or mcp_registry_words(record["name"], 60),
+             "publisher": mcp_registry_publisher(record),
+             "description": mcp_registry_words(record.get("description"), 200),
+             "version": mcp_registry_words(record.get("version"), 40)}
+    for remote in record.get("remotes") or []:
+        if mcp_registry_remote(remote):
+            secret = any(isinstance(h, dict) and h.get("isSecret") for h in remote.get("headers") or [])
+            return dict(about, kind="remote", url=remote["url"], auth="key" if secret else "oauth", package=None,
+                        settings=[], keys=[], args=[])
+    for package in record.get("packages") or []:
+        if not isinstance(package, dict) or package.get("registryType") not in lifecycle.MCP_REGISTRIES or \
+                not isinstance(package.get("transport") or {}, dict) or \
+                (package.get("transport") or {}).get("type", "stdio") != "stdio":
+            continue
+        arguments = [a for a in package.get("packageArguments") or [] if isinstance(a, dict) and a.get("isRequired")]
+        if any(not isinstance(a.get("value"), str) or not a["value"] for a in arguments):
+            continue                    # it needs an argument of its own, which the form does not ask for
+        fixed = [w for a in arguments for w in ([a["name"], a["value"]] if a.get("type") == "named" and
+                                                isinstance(a.get("name"), str) else [a["value"]])]
+        if not all(lifecycle.plain_value(w, lifecycle.MCP_ARG_MOST) and w for w in fixed) or \
+                len(fixed) > lifecycle.MCP_ARGS_MOST:
+            continue
+        name, version = package.get("identifier"), package.get("version")
+        try:
+            lifecycle.mcp_package("found", {"registry": package["registryType"], "name": name,
+                                            "version": version if isinstance(version, str) else "0",
+                                            "as_of": "2026-01-01"})
+        except ValueError:
+            continue
+        settings, keys = [], []
+        for variable in package.get("environmentVariables") or []:
+            own = variable.get("name") if isinstance(variable, dict) else None
+            if not lifecycle.setting_name(own):
+                continue
+            row = {"name": own, "description": mcp_registry_words(variable.get("description"), 200),
+                   "required": variable.get("isRequired") is True}
+            if variable.get("isSecret") is True or lifecycle.secret_name(own):
+                keys.append(row)
+            else:
+                default = variable.get("default")
+                settings.append(dict(row, default=default if lifecycle.plain_value(default, lifecycle.MCP_SETTING_MOST)
+                                     else None))
+        return dict(about, kind="program", url=None, auth="none", settings=settings[:16], keys=keys[:8], args=fixed,
+                    package={"registry": package["registryType"], "name": name,
+                             "version": version if isinstance(version, str) and
+                             lifecycle.PACKAGE_VERSION.fullmatch(version) else None})
+    return None
+
+
+def mcp_registry_find(words, fetch=None):
+    """What POST /ui/mcp/find answers: the servers of the official MCP Registry whose name has these words, in their
+    newest version, as mcp_registry_server makes them, at most MCP_FIND_MOST. The registry is a list that anybody can
+    publish to: the result names who publishes each server, and the owner decides. A record that breaks the reading is
+    left out, and the search goes on. Refusal 502 with its code: the registry did not answer."""
+    query = urllib.parse.urlencode({"search": words, "limit": 50, "version": "latest"})
+    try:
+        with (fetch or mcp_lookup_open)(urllib.request.Request(
+                f"{MCP_REGISTRY}?{query}", headers={"User-Agent": mcp.AGENT, "Accept": "application/json"}),
+                timeout=MCP_LOOKUP_WAIT) as r:
+            raw = r.read(MCP_LOOKUP_MOST + 1)
+    except (urllib.error.URLError, OSError, http.client.HTTPException):
+        raise Refusal(502, code="mcp_registry_away") from None
+    try:
+        answer = json.loads(raw) if len(raw) <= MCP_LOOKUP_MOST else None
+    except ValueError:
+        answer = None
+    if not isinstance(answer, dict) or not isinstance(answer.get("servers"), list):
+        raise Refusal(502, code="mcp_registry_no_list")
+    found, seen = [], set()
+    for item in answer["servers"]:
+        try:
+            made = mcp_registry_server(item.get("server") if isinstance(item, dict) else None)
+        except (ValueError, TypeError, AttributeError, KeyError):
+            made = None
+        if made and made["id"] not in seen:
+            seen.add(made["id"])
+            found.append(made)
+    return {"servers": found[:MCP_FIND_MOST], "more": len(found) > MCP_FIND_MOST}
+
+
+def mcp_renew_sweep(t0):
+    """The owner's "Row and Needs you" (15 November 2026): the fleet manager hears once when the access of an owner
+    server with Connect ended (the server refused the saved access for good: invalid_grant, invalid_client or
+    unauthorized_client, or an access token that cannot renew ran out), and once when such an access ends within
+    MCP_RENEW_SOON, so that it asks the owner on Needs you to sign in again in Settings, Apps. An outage is no end.
+    The message has fixed words and the server's title only: a server's own error text never reaches the manager.
+    Each mark keeps the connection it is about (connected_at), so the same end is told once also after a restart of
+    the hub, and a new Connect clears it; the mark of a server that is gone goes too. At most every MCP_RENEW_EVERY
+    seconds, and nothing at all in a fleet without a server with Connect."""
+    servers = {n: e for n, e in (TEAM.get("mcp") or {}).items() if isinstance(e, dict) and e.get("auth") == "oauth"}
+    marks = {r["k"][len("mcp_renew:"):]: r["k"] for r in q("SELECT k FROM kv WHERE k LIKE 'mcp_renew:%'")}
+    if not servers and not marks:
+        return
+    if t0 - float(kv_get("mcp_renew_at", 0) or 0) < MCP_RENEW_EVERY:
+        return
+    with area("quiet"):
+        kv_set("mcp_renew_at", t0)
+    state = mcp_state(TEAM) if servers else {}
+    with MCP_LOCK:
+        ended = dict(MCP.get("ended") or {})
+    for name in sorted(set(marks) - set(state)):
+        with area("quiet"):
+            kv_set(marks[name], None)
+    for name, entry in sorted(state.items()):
+        title = (servers.get(name) or {}).get("title") or name
+        ends, since = entry.get("access_ends"), entry.get("connected_at")
+        try:
+            mark = json.loads(kv_get(f"mcp_renew:{name}") or "{}")
+        except ValueError:
+            mark = {}
+        mark = mark if isinstance(mark, dict) else {}
+        if entry.get("connected") and (ended.get(name) or entry.get("problem") == MCP_ENDED):
+            event, words = "ended", "ended: the server does not take the saved access any more"
+        elif entry.get("connected") and isinstance(ends, (int, float)) and ends - t0 <= MCP_RENEW_SOON:
+            event, words = f"soon:{int(ends)}", (f"ends on {time.strftime('%d %B %Y', time.gmtime(ends))}, and this "
+                                                 f"server gives no renewal")
+        else:
+            if mark and mark.get("connected_at") != since:       # a new Connect: its next end is told again
+                with area("quiet"):
+                    kv_set(f"mcp_renew:{name}", None)
+            continue
+        if mark.get("connected_at") == since and mark.get("event") in (event, "ended"):
+            continue                    # told already; an end is not told again as "soon" for the same connection
+        text = (f"[hub] The access of the MCP server {title} ({name}) {words}. Ask the owner on Needs you to sign in "
+                f"again: Settings, Apps, MCP servers, Sign in again on its row. Agents get no token of it until then.")
+        with transaction():             # the mark and the message together: a crash loses neither alone
+            event_rows([(manager_name(), "say", None, text, None)], t0)
+            DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                       (f"mcp_renew:{name}", json.dumps({"event": event, "connected_at": since}, sort_keys=True)))
+
+
 def save_mcp(body):
     """One owner change of team.json "mcp": a new server, a changed one, or a delete, which also takes the server from
     every agent that had it."""
@@ -42102,6 +42472,7 @@ def save_mcp(body):
                 mcp_store(dict(saved, servers={k: v for k, v in saved["servers"].items() if k != name}))
             with MCP_LOCK:
                 MCP["tokens"].pop(name, None)
+                MCP.setdefault("ended", {}).pop(name, None)       # a new Connect or no server: no end
                 if MCP["problems"].pop(name, None) is not None:
                     changed()
         emit(manager_name(), "say", f"[hub] The owner {what}. An agent gets it in its next task session.")
@@ -42147,7 +42518,8 @@ def integrations_view(team, lines):
         next(iter(sorted(((team.get("door") or {}).get("github_apps") or {}).items())), (None, None))[1]
     state = mcp_state(team)
     tools = {name: dict({k: v for k, v in tool.items()
-                         if k in ("title", "command", "args", "url", "runtimes", "custom", "auth")},
+                         if k in ("title", "command", "args", "url", "runtimes", "custom", "auth") or
+                         tool.get("custom") and k in ("package", "settings", "env")},
                         needs=tool_needs(tool), **state.get(name, {}))
              for name, tool in tool_catalog(team).items()}
     unreached = github_unreached(r for line in lines for r in line["repos"]) if app else {}
@@ -44190,7 +44562,9 @@ def restored_team(bundle, reset=None):
         if TEAM.get("hub"):
             team["hub"] = TEAM["hub"]
         own_vault_store(team, reset if reset is not None else [])     # the hub's own server: this machine's vault
-        validate_team(team)
+        # the copy's own MCP servers, as its hub took them: a rule that came later refuses no restore (team_problem
+        # says it on the board, and no session gets such a server)
+        validate_team(team, kept=team.get("mcp"))
     except (ValueError, KeyError, TypeError, AttributeError) as e:
         raise Refusal(422, f"this copy and this server do not make a team.json the hub can run: {e}") from None
     return json.dumps(team, indent=2).encode() + b"\n"
@@ -50189,7 +50563,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("delete must be true, without server")
                 return {"base_sha256": base, "name": name, "delete": True}
             server = data.get("server")
-            mcp_server(name, server, new=True)      # ValueError with the reason; new: the owner's write (D33)
+            mcp_package_age(mcp_server(name, server, new=True))     # ValueError with the reason; new: the owner's write (D33)
             return {"base_sha256": base, "name": name, "server": server}
         return self.ui_command("team/mcp", read, save_mcp)
 
@@ -50235,8 +50609,9 @@ class Handler(BaseHTTPRequestHandler):
             entry = (TEAM.get("mcp") or {})[name]
             try:
                 found = mcp.discover(entry["url"])
-            except mcp.McpError as e:
-                raise Refusal(502, f"the MCP server {name} gave no OAuth endpoints: {mcp_why(e)}") from None
+            except mcp.McpError as e:      # why no_oauth: the app saves such a found server with no sign-in
+                raise Refusal(502, code="mcp_no_endpoints", names={"server": name, "reason": mcp_why(e)},
+                              extra={"why": [e.why]} if e.why else None) from None
             client = made.get("client")
             if not client:
                 if not found["registration_endpoint"]:
@@ -50282,7 +50657,7 @@ class Handler(BaseHTTPRequestHandler):
             with MCP_LOCK:
                 p = MCP["pending"]
                 if not p or p["expires_at"] < now() or not hmac.compare_digest(p["state"], made["state"]):
-                    raise Refusal(409, MCP_STALE)
+                    raise Refusal(409, code="connect_stale")
                 MCP["pending"] = None
             name, found, client = p["name"], p["found"], p["client"]
             entry = (TEAM.get("mcp") or {}).get(name)
@@ -50320,6 +50695,7 @@ class Handler(BaseHTTPRequestHandler):
                 if got["refresh_token"]:
                     MCP["tokens"][name] = {"access_token": got["access_token"], "expires_at": got["expires_at"],
                                            "refresh_sha256": hashlib.sha256(got["refresh_token"].encode()).hexdigest()}
+                MCP.setdefault("ended", {}).pop(name, None)       # a new Connect or no server: no end
                 if MCP["problems"].pop(name, None) is not None:
                     changed()
             log("owner", f"connected the MCP server {name}" + (" again" if replaced else "") +
@@ -50350,6 +50726,7 @@ class Handler(BaseHTTPRequestHandler):
                 mcp_store(dict(saved, servers={k: v for k, v in saved["servers"].items() if k != name}))
             with MCP_LOCK:
                 MCP["tokens"].pop(name, None)
+                MCP.setdefault("ended", {}).pop(name, None)       # a new Connect or no server: no end
                 if MCP["problems"].pop(name, None) is not None:
                     changed()
             log("owner", f"disconnected the MCP server {name}")
@@ -50390,6 +50767,42 @@ class Handler(BaseHTTPRequestHandler):
             return {"name": name, "server": entry, "agent": who}
 
         return self.ui_command("mcp/check", read, lambda body: got["result"])
+
+    def ui_mcp_package(self):
+        """POST /ui/mcp/package (owner feature mcp_packages): which version of an npm or PyPI package the owner's next
+        program server may take now, and the day as of which its dependencies are taken (mcp_package_lookup). The
+        form shows it before Add, and Add writes exactly that. Nothing is written; the registry is read in `read`,
+        before the hub takes its lock, as for POST /ui/mcp/check. A registry that does not answer is a 502. Each refusal
+        that the form shows has its code (mcp_package_lookup)."""
+        got = {}
+
+        def read(data):
+            self.only(data, ("registry", "name", "version"))
+            registry, name, version = data.get("registry"), data.get("name"), data.get("version")
+            if registry not in lifecycle.MCP_REGISTRIES:
+                raise ValueError(f"registry must be {' or '.join(lifecycle.MCP_REGISTRIES)}")
+            if version is not None and not (isinstance(version, str) and lifecycle.PACKAGE_VERSION.fullmatch(version)):
+                raise ValueError("version must be one exact version, such as 1.2.3, or left out")
+            got["result"] = mcp_package_lookup(registry, name, version)
+            return {"registry": registry, "name": name, "version": version}
+
+        return self.ui_command("mcp/package", read, lambda body: got["result"])
+
+    def ui_mcp_find(self):
+        """POST /ui/mcp/find (owner feature mcp_find): Find a server, over the official MCP Registry
+        (mcp_registry_find). Nothing is written; the registry is read before the hub takes its lock."""
+        got = {}
+
+        def read(data):
+            self.only(data, ("words",))
+            words = data.get("words")
+            if not isinstance(words, str) or not MCP_FIND_WORDS.fullmatch(words.strip()):
+                raise ValueError("words must be 1 to 60 letters, digits, spaces or . _ @ / -")
+            got["result"] = mcp_registry_find(words.strip())        # a Refusal 502 with its code, or the servers
+            return {"words": words.strip()}
+
+        return self.ui_command("mcp/find", read, lambda body: got["result"],
+                               keep=lambda result: {"servers": len(result["servers"]), "more": result["more"]})
 
     def ui_google_connect(self):
         """POST /ui/google/connect: a new pending Connect, which takes the place of the earlier one. It uses
@@ -53415,7 +53828,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_resource()
         if parts == ["ui", "resources", "take"]:
             return self.ui_resource_take()
-        if len(parts) == 3 and parts[:2] == ["ui", "mcp"] and parts[2] in ("connect", "finish", "disconnect", "check"):
+        if len(parts) == 3 and parts[:2] == ["ui", "mcp"] and parts[2] in ("connect", "finish", "disconnect", "check",
+                                                                         "package", "find"):
             return getattr(self, "ui_mcp_" + parts[2])()
         if len(parts) == 3 and parts[:2] == ["ui", "google"] and parts[2] in ("connect", "finish", "disconnect"):
             return getattr(self, "ui_google_" + parts[2])()
@@ -54114,8 +54528,10 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             try:
                 access, ends = mcp_access(name)
-            except Refusal as e:
-                problems.append(f"The MCP server {name} is not loaded: {e}.")
+            except Refusal as e:            # Fleet's own words, or fixed words: a server's text reaches no session
+                why = str(e) if str(e) in (MCP_UNCONNECTED, MCP_ENDED) else \
+                    "the server did not give an access now; the owner can sign in again in Settings, Apps"
+                problems.append(f"The MCP server {name} is not loaded: {why}.")
                 continue
             servers[mcp_variable(name)] = access
             log(agent, f"an access token of the MCP server {name} for a task session, for "
@@ -55587,7 +56003,8 @@ def main():
     # until the hub has printed 8 KiB of other things: an operator reads it at the start or not at all.
     if CFG["team_problem"]:
         print(f"WARNING: {CFG['team_problem']}. The hub runs this file as it is, and every owner write of "
-              f"team.json is refused until the rule is met. It says so on the board.", flush=True)
+              f"team.json is refused until the rule is met, except that a write may carry an MCP server of the "
+              f"owner on as it is: no session gets that server. It says so on the board.", flush=True)
     if schema_problems:
         print(f"WARNING: this database refused {len(schema_problems)} schema step(s), and the hub runs without "
               f"them. /ui/health says so (warning: schema). " + " | ".join(schema_problems), flush=True)

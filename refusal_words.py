@@ -81,6 +81,22 @@ WORDS = {
     "google_refused": "Google refused: {reason}. Start Connect again.",
     "google_revoked_during": "A Disconnect of this account came during this Connect, so nothing was connected. Start "
                              "Connect again.",
+    # the package of a program server, as its registry gives it (POST /ui/mcp/package, UI-API.md 1.187)
+    "package_unknown": "{registry} has no package {name}",
+    "package_unread": "{registry} did not give the record of {name} ({http_status})",
+    "package_registry_away": "{registry} cannot be reached now",
+    "package_record_large": "the record of {name} at {registry} is larger than {megabytes} MB",
+    "package_no_record": "{registry} gave no record of {name}",
+    "package_no_version": "{registry} has no version {version} of {name}",
+    "package_too_new": "{name} {version} was published on {day}, less than {days} days ago",
+    "package_too_new_older": "{name} {version} was published on {day}, less than {days} days ago; the newest version "
+                             "that is older is {newest}",
+    "package_none_old": "{name} has no release that is at least {days} days old",
+    # the official MCP Registry (POST /ui/mcp/find)
+    "mcp_registry_away": "the MCP Registry cannot be reached now",
+    "mcp_registry_no_list": "the MCP Registry gave no list of servers",
+    # an MCP server's Connect (POST /ui/mcp/connect)
+    "mcp_no_endpoints": "the MCP server {server} gave no OAuth endpoints: {reason}",
 }
 
 

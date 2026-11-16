@@ -252,6 +252,11 @@ OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect
 NOT_TOOLS = {
     "/ui/releases/entitlement": "the subscription token of this fleet",
     "/ui/github-app": "the GitHub App's private key",
+    "/ui/mcp/package": "the lookup of a program server's package of npm or PyPI, for the form of the app, where "
+                       "such a server is added: save_mcp_server takes no package and no settings yet (its tool table "
+                       "and the app's copy of it change together)",
+    "/ui/mcp/find": "Find a server of the app's form, a search of the official MCP Registry; the owner's agent "
+                    "reads that registry itself and adds a remote server with save_mcp_server",
     "/ui/door": "the door's address, which the app writes by itself when it finds the door by its tag",
     "/ui/door/secrets": "the hub's two secrets for the door, which the app makes on the door by itself",
     "/ui/door/mode": "a server's mode, Auto or Full access: a statement signed with the owner's own key, which only "

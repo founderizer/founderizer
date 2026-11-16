@@ -3106,7 +3106,9 @@ class Boundary(WithServer):
     owner's machine. That line is asserted here, beside the server it protects, because nothing else tied the two
     together and a later change could have taken it out with every check still passing."""
 
-    ADMIN = {"title": "Founderizer admin", "command": "python3"}     # an owner server takes no args (plan 0.2)
+    # A command server takes no args (plan 0.2), and no interpreter is a command (lifecycle.MCP_RUNNERS, 15 November
+    # 2026), so the stand-in is a launcher program of this server, as a person would put one on the PATH.
+    ADMIN = {"title": "Founderizer admin", "command": "founderizer-admin"}
 
     def live(self):
         """The team.json the hub has now, which validates as it stands: then one changed field is the whole cause of

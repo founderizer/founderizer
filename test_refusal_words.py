@@ -65,6 +65,20 @@ OLD = {
     "google_refused": "Google refused: {reason}. Start Connect again.",
     "google_revoked_during": "A Disconnect of this account came during this Connect, so nothing was connected. Start "
                              "Connect again.",
+    # the lane "Any MCP server: install and sign-in" (UI-API.md 1.187)
+    "package_unknown": "{registry} has no package {name}",
+    "package_unread": "{registry} did not give the record of {name} ({http_status})",
+    "package_registry_away": "{registry} cannot be reached now",
+    "package_record_large": "the record of {name} at {registry} is larger than {megabytes} MB",
+    "package_no_record": "{registry} gave no record of {name}",
+    "package_no_version": "{registry} has no version {version} of {name}",
+    "package_too_new": "{name} {version} was published on {day}, less than {days} days ago",
+    "package_too_new_older": "{name} {version} was published on {day}, less than {days} days ago; the newest version "
+                             "that is older is {newest}",
+    "package_none_old": "{name} has no release that is at least {days} days old",
+    "mcp_registry_away": "the MCP Registry cannot be reached now",
+    "mcp_registry_no_list": "the MCP Registry gave no list of servers",
+    "mcp_no_endpoints": "the MCP server {server} gave no OAuth endpoints: {reason}",
 }
 
 # The places of hub.py that were converted to a code, by the function that holds each: the scan of 16 November 2026
@@ -83,6 +97,10 @@ SITES = {
     'knowledge_content': {'login_as_text': 1},
     'knowledge_delete': {'revision_unreadable': 1},
     'knowledge_replace': {'revision_unreadable': 1},
+    'mcp_package_lookup': {'package_no_record': 1, 'package_no_version': 1, 'package_none_old': 1,
+                           'package_record_large': 1, 'package_registry_away': 1, 'package_too_new': 1,
+                           'package_too_new_older': 1, 'package_unknown': 1, 'package_unread': 1},
+    'mcp_registry_find': {'mcp_registry_away': 1, 'mcp_registry_no_list': 1},
     'move_agent': {'agent_mid_turn': 1, 'agent_open_signin': 1, 'no_such_agent': 1, 'no_such_server': 1,
                    'server_no_service': 1, 'server_silent': 1, 'team_changed': 1},
     'phone_chat': {'hub_changed': 1, 'no_such_agent': 1},
@@ -141,6 +159,8 @@ SITES = {
     'ui_machine_update': {'no_such_agent': 1, 'revision_unreadable': 1},
     'ui_machines': {'hub_changed': 1},
     'ui_mcp_check': {'login_as_text': 1},
+    'ui_mcp_connect': {'mcp_no_endpoints': 1},
+    'ui_mcp_finish': {'connect_stale': 1},
     'ui_memory': {'hub_changed': 1, 'no_such_agent': 1},
     'ui_notes': {'hub_changed': 1, 'no_such_agent': 1},
     'ui_owner_device_recovery_read': {'hub_changed': 1},
@@ -169,10 +189,7 @@ SITES = {
 }
 # The one place that writes a sentence of the table and has no code yet: a registered login that a batch of the secrets
 # import refuses, which is an entry's `error` in an answer that succeeded, and no refusal of the whole command.
-LEFT = {"a registered login cannot be sent as text": 1,
-        # The MCP Connect's finish writes the sentence of connect_stale by hand (MCP_STALE): its lane gives it that
-        # code when it converts its refusals, as Google's Connect did (UI-API.md 1.185).
-        "This Connect expired, or another one took its place. Start Connect again.": 1}
+LEFT = {"a registered login cannot be sent as text": 1}
 # The names that a call's own parameters use, which a hole cannot take
 RESERVED = {"code", "names", "table", "extra", "status", "message", "self", "cls"}
 
@@ -402,7 +419,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 142)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 155)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

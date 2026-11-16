@@ -33,6 +33,7 @@ This is a throwaway test kit, not the product.
 import argparse
 import base64
 import contextlib
+import datetime
 import fcntl
 import glob
 import plistlib
@@ -1176,6 +1177,18 @@ def team_catalog():
         return tool_catalog(TEAM)
 
 
+def team_refused():
+    """The rule that each of the owner's MCP servers in this checkout's team.json breaks, by its name
+    (lifecycle.tool_catalog): the start text says it of a server that the hub gave and that no session gets."""
+    refused = {}
+    try:
+        with open(os.path.join(KIT, "team.json"), encoding="utf-8") as f:
+            tool_catalog(json.load(f), refused)
+    except (OSError, ValueError, TypeError):
+        tool_catalog(TEAM, refused)
+    return refused
+
+
 def integration_env(agent, conf, keys=None, place=None, closed=False, attempt=None):
     """A task session's GitHub repositories and tools, as the hub gives them at its start (owner feature integrations):
     FLEET_REPOS, GH_TOKEN and git's credentials for them (FLEET_GIT_TOKENS, GIT_CONFIG_*), FLEET_TOOLS with the
@@ -1236,11 +1249,13 @@ def integration_env(agent, conf, keys=None, place=None, closed=False, attempt=No
     values.update({k: v for k, v in (data.get("mcp") or {}).items()
                    if isinstance(k, str) and k.startswith("FLEET_MCP_") and isinstance(v, str) and v and "\0" not in v})
     notes += [str(x)[:300] for x in data.get("mcp_problems") or [] if isinstance(x, str)]
-    catalog, tools = team_catalog(), []
+    catalog, tools, waits, refused = team_catalog(), [], [], None
     for name in (t for t in data.get("tools") or [] if isinstance(t, str)):
         tool = catalog.get(name)
-        if not tool:
-            notes.append(f"The tool {name} is not loaded: this machine's Fleet does not have it yet.")
+        if not tool:        # a server that a rule of this Fleet refuses says its rule: the hub's own words
+            refused = team_refused() if refused is None else refused
+            notes.append(f"The tool {name} is not loaded: " + (refused[name][:400] if name in refused else
+                                                               "this machine's Fleet does not have it yet") + ".")
             continue
         have = dict(keys or {}, **values)       # the variables that this session has: its API keys and these values
         need = tool_needs(tool)
@@ -1254,11 +1269,16 @@ def integration_env(agent, conf, keys=None, place=None, closed=False, attempt=No
                           " The owner gives the agent that API key on the Secrets page."))
         elif tool.get("command") and not exe(tool["command"]):
             notes.append(f"The tool {name} is not loaded: {tool['command']} is not installed on this machine.")
-        elif not all(key_env(var) for var in tool.get("env") or {}):
+        elif not all((lifecycle.key_variable if tool.get("custom") else key_env)(var) for var in tool.get("env") or {}):
             notes.append(f"The tool {name} is not loaded: its variables must be names of keys.")      # plan 0.2
+        elif tool.get("package") and not package_waits(name, tool["package"], notes, waits):
+            continue
         else:
-            values.update({var: have[source] for var, source in (tool.get("env") or {}).items()})
+            if not tool.get("custom"):      # an owner's program server gets its keys through mcp-start (program_start)
+                values.update({var: have[source] for var, source in (tool.get("env") or {}).items()})
             tools.append(name)
+    if waits:           # every missing program installs now, each in its thread, and the start waits for them
+        raise waits[0]
     if tools:
         values["FLEET_TOOLS"] = " ".join(tools)
     if notes:
@@ -1704,6 +1724,11 @@ def claude_server(name, catalog=None, values=None):
     if tool.get("url"):
         return dict({"type": "http", "url": tool["url"]},
                     **({"headers": {"Authorization": "Bearer " + value(tool["bearer"])}} if tool.get("bearer") else {}))
+    if tool.get("custom"):          # one of the owner's program servers: through mcp-start, with its own values only
+        command, args = program_start(tool)
+        return {"type": "stdio", "command": command, "args": args,
+                "env": dict({k: v for k, v in (tool.get("settings") or {}).items()},
+                            **{source: value(source) for source in (tool.get("env") or {}).values()})}
     return {"type": "stdio", "command": exe(tool["command"]) or tool["command"], "args": list(tool.get("args") or []),
             "env": {var: value(var) for var in tool.get("env") or {}}}
 
@@ -1715,6 +1740,12 @@ def codex_server(name, catalog=None):
     if tool.get("url"):
         options = [key + "url=" + json.dumps(tool["url"])] + \
             ([key + "bearer_token_env_var=" + json.dumps(tool["bearer"])] if tool.get("bearer") else [])
+    elif tool.get("custom"):        # one of the owner's program servers: through mcp-start (claude_server)
+        command, args = program_start(tool)
+        sources = sorted(set((tool.get("env") or {}).values()))
+        options = [key + "command=" + json.dumps(command), key + "args=" + json.dumps(args)] + \
+            [key + f"env.{k}=" + json.dumps(v) for k, v in sorted((tool.get("settings") or {}).items())] + \
+            ([key + "env_vars=" + json.dumps(sources)] if sources else [])
     else:
         options = [key + "command=" + json.dumps(exe(tool["command"]) or tool["command"]),
                    key + "args=" + json.dumps(list(tool.get("args") or []))] + \
@@ -1892,6 +1923,12 @@ def acp_server(name, catalog, values):
         bearer = values.get(tool["bearer"]) if tool.get("bearer") else None
         return {"type": "http", "name": name, "url": tool["url"],
                 "headers": [{"name": "Authorization", "value": "Bearer " + bearer}] if bearer else []}
+    if tool.get("custom"):          # one of the owner's program servers: through mcp-start (claude_server)
+        command, args = program_start(tool)
+        sources = sorted(set((tool.get("env") or {}).values()))
+        return {"name": name, "command": command, "args": args,
+                "env": [{"name": k, "value": v} for k, v in sorted((tool.get("settings") or {}).items())] +
+                       [{"name": var, "value": values[var]} for var in sources if values.get(var)]}
     return {"name": name, "command": exe(tool["command"]) or tool["command"], "args": list(tool.get("args") or []),
             "env": [{"name": var, "value": values[var]} for var in tool.get("env") or {} if values.get(var)]}
 
@@ -5675,6 +5712,8 @@ class Helper:
                     # AUTONOMY.md P10: no start and no new credential while its runtime downloads; the hub holds the
                     # message, and the first poll after the install starts the window
                     raise Installing(f"{window} waits for Claude Code {installing}, which this helper installs")
+                if (self.conversation_modes or {}).get(cid) == "tools":
+                    programs_wait(self.agent)       # its MCP programs install first: no start, no credential yet
                 if not self.conversation_may_start(window, self.newest.get(window, ev["id"])):
                     return
                 code, data = http("POST", f"/helper/conversations/{self.agent}/{cid}/start", {})
@@ -5684,14 +5723,19 @@ class Helper:
                     # AUTONOMY.md P2: a role with tools on runs with this agent's own tools, as a task session does,
                     # with a session id by which its records reach the hub
                     session = str(uuid.uuid4())
-                    self.start(window, lambda: conversation_work_command(
-                        self.agent, self.run_conf(), extra["generation"], cid, data.get("token"), data.get("prompt"),
-                        session, env=session_env(self.agent, self.conf, "task",
-                                                 task_place(self.agent, extra["generation"], window),
-                                                 closed=isinstance(data.get("shell_off"), dict)),
-                        opening=data.get("opening"), rules=data.get("rules"),
-                        closed=data.get("shell_off")),     # support plan F1
-                        cid, extra["generation"], session, needs="none")
+                    try:
+                        self.start(window, lambda: conversation_work_command(
+                            self.agent, self.run_conf(), extra["generation"], cid, data.get("token"),
+                            data.get("prompt"), session, env=session_env(
+                                self.agent, self.conf, "task", task_place(self.agent, extra["generation"], window),
+                                closed=isinstance(data.get("shell_off"), dict)),
+                            opening=data.get("opening"), rules=data.get("rules"),
+                            closed=data.get("shell_off")),     # support plan F1
+                            cid, extra["generation"], session, needs="none")
+                    except Installing:      # an MCP program installs: no window started, so the guard counts none
+                        last, count = self.conversation_starts[window]
+                        self.conversation_starts[window] = (last, count - 1)
+                        raise
                 else:
                     if data.get("mode") is not None and data.get("mode") != "closed" and \
                             not narrowed_mode(data.get("mode")):
@@ -5749,6 +5793,7 @@ class Helper:
                     # A start that this machine's own files refuse asks nobody first: not the hub, the vault, GitHub
                     # or a mint server (decision D24). Its cause is told once (report_start), as before.
                     start_refusal(self.agent, conf)
+                    programs_wait(self.agent)       # its MCP programs install first: no credential, no vault read yet
                     token = session_credential(self.agent, "task", extra.get("generation", ""), task=task,
                                                attempt=extra.get("attempt", 1))
                     env = session_env(self.agent, self.conf, "task",
@@ -5874,12 +5919,21 @@ class Helper:
         mcp_program, the hub's POST /ui/mcp/check). The helper resolves the name exactly as the start of a task
         session resolves it — this machine's PATH, then ~/.local/bin — and never runs the program. The owner waits
         for this answer, so it goes back at once and in this loop."""
-        probe, command = extra.get("probe"), extra.get("command")
+        probe, command, package = extra.get("probe"), extra.get("command"), extra.get("package")
         if not (isinstance(probe, str) and isinstance(command, str) and MCP_PROGRAM.fullmatch(command)):
             raise Refused("invalid MCP program check")
-        found = exe(command)
-        self.say(f"MCP server program {command}: " + (f"this machine has it at {found}" if found else
-                                                      "not on this machine's PATH or in ~/.local/bin"))
+        if package is not None:         # a package that the helper installs itself (owner feature mcp_packages)
+            try:
+                ready = package_ready(lifecycle.mcp_package(command, package))
+            except ValueError:
+                raise Refused("invalid MCP package check") from None
+            found = ready["program"][-1] if ready else None
+            self.say(f"MCP server package {package.get('name')} {package.get('version')}: " +
+                     (f"in place at {found}" if found else "not installed yet; the next task session installs it"))
+        else:
+            found = exe(command)
+            self.say(f"MCP server program {command}: " + (f"this machine has it at {found}" if found else
+                                                          "not on this machine's PATH or in ~/.local/bin"))
         code, _ = http("POST", f"/helper/mcp/program/{self.agent}",
                        {"probe": probe, "found": bool(found), "path": found}, timeout=10)
         if code != 200:
@@ -7928,6 +7982,413 @@ def start_gh(conf):
     return True
 
 
+# The programs of the owner's MCP servers (owner feature mcp_packages; the owner's choice of 15 November 2026,
+# ~/dev/founderizer-plans/any-mcp-design.md). A server of team.json with a package is a program of npm or PyPI that
+# the helper installs itself, as the agent's own OS user, at the first task session that has the server: with Fleet's
+# pinned Node for npm and Fleet's pinned uv for PyPI, each held to the SHA-256 of its vendor's build, into
+# ~/.fleet/programs. The package is the exact version that team.json names, and every dependency is taken as the
+# registry was on its as_of day, at least lifecycle.PACKAGE_DAYS back (npm --before and --min-release-age, uv
+# --exclude-newer): the owner's rule that no package is newer than seven days. npm runs no install script. A folder
+# is in place only with its ready.json, which the install writes last, so an install that stopped is made again.
+
+
+def programs_dir():
+    """~/.fleet/programs of this OS user, read at each use (HOME), and its empty folder `run`, where every program
+    server starts (lifecycle.mcp_start)."""
+    return os.path.join(HOME, "programs")
+
+
+PROGRAM_SYSTEMS = {"Linux": "linux", "Darwin": "macOS"}
+UV_VERSION = "0.13.7"           # Astral's release of 3 November 2026
+UV_RELEASES = "https://github.com/astral-sh/uv/releases/download"
+UV_BUILDS = {   # gh_platform's name for a system: (the archive's target, its SHA-256, which the release's .sha256 says)
+    "linux_amd64": ("x86_64-unknown-linux-gnu", "c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83"),
+    "linux_arm64": ("aarch64-unknown-linux-gnu", "71279f8d3c67241e807b9d8db872d1bf541579fb9f08b7d1eb1682196d1e57dc"),
+    "macOS_amd64": ("x86_64-apple-darwin", "20c47e4c1f630b8abaff8c291fa9b9aa300fef92c4fbff95adf198b55287cda7"),
+    "macOS_arm64": ("aarch64-apple-darwin", "81b811b57e4624df7ed3aac148e0359100d9962f3d9dce00aec533dc2e086731"),
+}
+NODE_VERSION = "26.13.0"        # the Node.js long-term-support release of 28 October 2026
+NODE_DIST = "https://nodejs.org/dist"
+NODE_BUILDS = {  # (the archive's target, its SHA-256 in the release's SHASUMS256.txt)
+    "linux_amd64": ("linux-x64", "5848553868b402d3fabb5b09270649977780a390f832155721025a08b5104455"),
+    "linux_arm64": ("linux-arm64", "439e9c438acdf6a6ffe47418da709153d66c4bed812e30a473faacb107dd2791"),
+    "macOS_amd64": ("darwin-x64", "525c9b29bb0263d687de60a4cec0e2a6db876a8eb032369e5795eca71e7c358e"),
+    "macOS_arm64": ("darwin-arm64", "d38bd5e5a2ddce6bbb5ce45e46e208337da4d51fffe611e567fd32073d6439f6"),
+}
+PROGRAM_ARCHIVE_MOST = 160 << 20    # bytes of the archive of uv (about 17 MB) or of Node (about 55 MB)
+PROGRAM_ROOM = 2 << 30          # bytes free on the disk of ~/.fleet before an install: Node, a Python and packages
+PROGRAM_WAIT = 600              # seconds that one install of a package may take
+PYPI_INDEX = "https://pypi.org/simple"
+PYPI_PYTHON = ">=3.10,<3.14"   # the Pythons that uv may take for a PyPI program: maintained, with wheels for most
+NPM_REGISTRY = "https://registry.npmjs.org/"
+PROGRAM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"      # the PATH of an installed program, after its own folder
+
+
+def program_tool(kind, fetch=None, run=subprocess.run):
+    """The folder of Fleet's pinned uv ("uv") or Node ("node") for this system, which the helper installs once for
+    this OS user under ~/.fleet/programs/tools. The archive is held to its pinned SHA-256 in memory and unpacked
+    with tarfile's data filter, or with the same checks where this Python has none, so no member leaves the folder.
+    Refused where the vendor builds nothing for this system or where the disk is nearly full."""
+    platform = gh_platform(run)
+    builds, version = (UV_BUILDS, UV_VERSION) if kind == "uv" else (NODE_BUILDS, NODE_VERSION)
+    if platform not in builds:
+        raise Refused(f"Founderizer installs no {kind} for {os.uname().sysname} {os.uname().machine}")
+    target, digest = builds[platform]
+    folder = os.path.join(programs_dir(), "tools", f"{kind}-{version}-{target}")
+    if os.path.exists(os.path.join(folder, "ready")):
+        return folder
+    os.makedirs(os.path.dirname(folder), mode=0o700, exist_ok=True)
+    with open(os.path.join(programs_dir(), "tools.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if os.path.exists(os.path.join(folder, "ready")):
+            return folder                       # another helper of this user installed it a moment ago
+        if shutil.disk_usage(programs_dir()).free < PROGRAM_ROOM:
+            raise Refused(f"the disk of {programs_dir()} has less than {PROGRAM_ROOM >> 20} MB free")
+        name = f"uv-{target}" if kind == "uv" else f"node-v{version}-{target}"
+        url = f"{UV_RELEASES}/{version}/{name}.tar.gz" if kind == "uv" else f"{NODE_DIST}/v{version}/{name}.tar.gz"
+        archive, got, size = io.BytesIO(), hashlib.sha256(), 0
+        with (fetch or urllib.request.urlopen)(urllib.request.Request(url, headers={"User-Agent": OUTSIDE_AGENT}),
+                                               timeout=120) as r:
+            for block in iter(lambda: r.read(1 << 20), b""):
+                size += len(block)
+                if size > PROGRAM_ARCHIVE_MOST:
+                    raise Refused(f"the archive of {kind} {version} is larger than {PROGRAM_ARCHIVE_MOST >> 20} MB")
+                got.update(block)
+                archive.write(block)
+        if got.hexdigest() != digest:
+            raise Refused(f"the download of {kind} {version} does not match its pinned SHA-256")
+        shutil.rmtree(folder, ignore_errors=True)       # an earlier try that stopped before its mark
+        archive.seek(0)
+        with tarfile.open(fileobj=archive, mode="r:gz") as tar:
+            for member in tar.getmembers():
+                parts = member.name.split("/")
+                if member.name.startswith("/") or ".." in parts or not (member.isfile() or member.isdir() or
+                                                                         member.issym()):
+                    raise Refused(f"the archive of {kind} {version} holds {member.name!r}, which it may not")
+            if hasattr(tarfile, "data_filter"):
+                tar.extractall(folder, filter="data")
+            else:                               # a Python from before the filter: the checks above, and no link out
+                for member in tar.getmembers():
+                    if member.issym() and (member.linkname.startswith("/") or ".." in os.path.normpath(
+                            os.path.join(os.path.dirname(member.name), member.linkname)).split("/")):
+                        raise Refused(f"the archive of {kind} {version} links {member.name!r} out of its folder")
+                tar.extractall(folder)
+        with open(os.path.join(folder, "ready"), "w") as f:
+            f.write(f"{kind} {version} {digest}\n")
+    return folder
+
+
+def package_folder(package):
+    """The folder of one package of a program server: ~/.fleet/programs/<registry>/<name>/<version>@<as_of>, with
+    +<bin> when team.json names the program to run, so that another choice of it is another install."""
+    return os.path.join(programs_dir(), package["registry"], package["name"].replace("/", "+"),
+                        f"{package['version']}@{package['as_of']}" + (f"+{package['bin']}" if package.get("bin") else ""))
+
+
+def package_ready(package):
+    """What a package that is in place runs, from its ready.json: {"program": [the interpreter, its options, the
+    program], "path": the PATH of the program}, or None while it is not in place."""
+    try:
+        with open(os.path.join(package_folder(package), "ready.json"), encoding="utf-8") as f:
+            ready = json.load(f)
+    except (OSError, ValueError):
+        return None
+    program = ready.get("program") if isinstance(ready, dict) else None
+    if not (isinstance(program, list) and program and all(isinstance(x, str) for x in program) and
+            os.path.isabs(program[0]) and isinstance(ready.get("path"), str)):
+        return None
+    return {"program": program, "path": ready["path"]}
+
+
+def package_bin(package, offered):
+    """The program of a package to run, as npx and uvx choose it: the one that team.json names, else the one with the
+    package's own name (without its scope), else the package's only program. Refused when that is not one of
+    offered."""
+    own = package["name"].rsplit("/", 1)[-1]
+    if package.get("bin"):
+        chosen = package["bin"] if package["bin"] in offered else None
+    else:
+        chosen = own if own in offered else (offered[0] if len(offered) == 1 else None)
+    if chosen is None:
+        raise Refused(f"{package['name']} {package['version']} has the programs {', '.join(offered) or 'none'}; "
+                      f"name the one to run" if offered else f"{package['name']} {package['version']} has no program")
+    return chosen
+
+
+def program_run(argv, env, what):
+    """One step of an install with its own environment only, PROGRAM_WAIT seconds at most. Refused with the last
+    lines that it wrote when it fails."""
+    try:
+        done = subprocess.run(argv, env=env, cwd=programs_dir(), capture_output=True, text=True, timeout=PROGRAM_WAIT,
+                              stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise Refused(f"{what} took more than {PROGRAM_WAIT} seconds") from None
+    if done.returncode != 0:
+        said = " ".join(" ".join((done.stderr or done.stdout or "").strip().splitlines()[-3:]).split())[:300]
+        raise Refused(f"{what} failed: {said or f'exit {done.returncode}'}")
+    return done
+
+
+def ensure_package(package, fetch=None, run=subprocess.run, today=None):
+    """The package of a program server in place for this OS user (package_ready), installed now when it is not.
+    One install at a time for each registry; another helper of this user that waits for it finds it in place. Refused,
+    with the reason, when its as_of is less than PACKAGE_DAYS back by this machine's clock, when the registry has no
+    such version on that day, or when a step fails."""
+    package = lifecycle.mcp_package("server", package)          # ValueError: no such package reaches an install
+    ready = package_ready(package)
+    if ready:
+        return ready
+    day = today or datetime.datetime.now(datetime.timezone.utc).date()     # the hub's day too (mcp_package_day)
+    if datetime.date.fromisoformat(package["as_of"]) > day - datetime.timedelta(days=lifecycle.PACKAGE_DAYS):
+        raise Refused(f"{package['name']} is taken as of {package['as_of']}, less than {lifecycle.PACKAGE_DAYS} days "
+                      f"ago: Founderizer installs no package newer than that")
+    folder = package_folder(package)
+    os.makedirs(os.path.dirname(folder), mode=0o700, exist_ok=True)
+    with open(os.path.join(programs_dir(), f"{package['registry']}.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        ready = package_ready(package)
+        if ready:
+            return ready
+        if shutil.disk_usage(programs_dir()).free < PROGRAM_ROOM:
+            raise Refused(f"the disk of {programs_dir()} has less than {PROGRAM_ROOM >> 20} MB free")
+        shutil.rmtree(folder, ignore_errors=True)       # an install that stopped before its ready.json
+        os.makedirs(folder, mode=0o700)
+        home = os.path.expanduser("~")
+        what = f"the install of {package['name']} {package['version']}"
+        if package["registry"] == "pypi":
+            uv = os.path.join(program_tool("uv", fetch, run), f"uv-{UV_BUILDS[gh_platform(run)][0]}", "uv")
+            env = {"HOME": home, "PATH": PROGRAM_PATH, "UV_NO_CONFIG": "1", "UV_PYTHON_PREFERENCE": "only-managed",
+                   "UV_TOOL_DIR": os.path.join(folder, "tool"), "UV_TOOL_BIN_DIR": os.path.join(folder, "bin"),
+                   "UV_CACHE_DIR": os.path.join(programs_dir(), "cache", "uv"),
+                   "UV_PYTHON_INSTALL_DIR": os.path.join(programs_dir(), "tools", "python"),
+                   "UV_PYTHON_BIN_DIR": os.path.join(programs_dir(), "tools", "python", "bin")}
+            # uv's own Python (held to the checksums in uv itself), so an upgrade of the machine's Python breaks no
+            # install; a maintained version with wheels for most packages; and wheels only, so no build runs here
+            program_run([uv, "tool", "install", "--no-config", "--quiet", "--no-build", "--python", PYPI_PYTHON,
+                         "--index-url", PYPI_INDEX, "--exclude-newer", f"{package['as_of']}T00:00:00Z",
+                         f"{package['name']}=={package['version']}"], env, what)
+            tools = [d for d in sorted(os.listdir(os.path.join(folder, "tool"))) if not d.startswith(".")]
+            offered = sorted(n for n in os.listdir(os.path.join(folder, "bin")) if MCP_PROGRAM.fullmatch(n))
+            if len(tools) != 1:
+                raise Refused(f"{what} left {len(tools)} environments, not one")
+            venv = os.path.join(folder, "tool", tools[0])
+            program = [os.path.join(venv, "bin", "python"), "-I",
+                       os.path.join(venv, "bin", package_bin(package, offered))]
+            path = os.path.join(venv, "bin") + ":" + PROGRAM_PATH
+        else:
+            node = os.path.join(program_tool("node", fetch, run),
+                                f"node-v{NODE_VERSION}-{NODE_BUILDS[gh_platform(run)][0]}")
+            empty = os.path.join(folder, ".npmrc")
+            open(empty, "w").close()
+            # The options also as npm's own variables, which an npm that npm starts for a dependency inherits, and
+            # no git: a dependency from git is refused before anything of it is fetched or prepared.
+            env = {"HOME": home, "PATH": os.path.join(node, "bin") + ":" + PROGRAM_PATH,
+                   "npm_config_ignore_scripts": "true", "npm_config_registry": NPM_REGISTRY,
+                   "npm_config_userconfig": empty, "npm_config_cache": os.path.join(programs_dir(), "cache", "npm"),
+                   "npm_config_before": package["as_of"], "npm_config_min_release_age": str(lifecycle.PACKAGE_DAYS),
+                   "npm_config_git": "/usr/bin/false", "npm_config_update_notifier": "false",
+                   "npm_config_fund": "false", "npm_config_audit": "false"}
+            npm = [os.path.join(node, "bin", "npm")]
+            common = ["--prefix", folder, "--ignore-scripts", "--omit=dev", "--no-audit", "--no-fund",
+                      "--no-update-notifier", f"--registry={NPM_REGISTRY}", f"--userconfig={empty}",
+                      f"--cache={os.path.join(programs_dir(), 'cache', 'npm')}"]
+            # First the lock alone, as the registry was on as_of: a dependency from git or from another address is
+            # not held to that day, and its preparation could run a script, so the lock must name only the
+            # registry's own files before anything is fetched. Then npm ci installs exactly that lock.
+            program_run(npm + ["install", "--package-lock-only", "--save-exact", f"--before={package['as_of']}",
+                               f"--min-release-age={lifecycle.PACKAGE_DAYS}"] + common +
+                        [f"{package['name']}@{package['version']}"], env, what)
+            npm_lock_check(folder, package)
+            program_run(npm + ["ci"] + common, env, what)
+            root = os.path.join(folder, "node_modules", *package["name"].split("/"))
+            try:
+                with open(os.path.join(root, "package.json"), encoding="utf-8") as f:
+                    declared = json.load(f).get("bin")
+            except (OSError, ValueError, AttributeError):
+                raise Refused(f"{what} left no package.json of {package['name']}") from None
+            if isinstance(declared, str):
+                declared = {package["name"].rsplit("/", 1)[-1]: declared}
+            declared = {k: v for k, v in (declared or {}).items() if isinstance(k, str) and MCP_PROGRAM.fullmatch(k)
+                        and isinstance(v, str)} if isinstance(declared, dict) else {}
+            chosen = os.path.realpath(os.path.join(root, declared[package_bin(package, sorted(declared))]))
+            if not chosen.startswith(os.path.realpath(root) + os.sep):
+                raise Refused(f"the program of {package['name']} is outside its package")
+            program = [os.path.join(node, "bin", "node"), chosen]
+            path = os.path.join(node, "bin") + ":" + PROGRAM_PATH
+        ready = {"program": program, "path": path}
+        with open(os.path.join(folder, "ready.json"), "w", encoding="utf-8") as f:
+            json.dump(ready, f)
+        # one line for each install that ran (a package in place returned above), as soon as it is in place: the log
+        # says what came onto the machine, also when the removal of older versions below fails
+        print(time.strftime("%H:%M:%S"), f"MCP: {package['name']} {package['version']} of {package['registry']} is "
+              f"installed for this agent's program servers", flush=True)
+        drop_old_packages(package, team_catalog())
+    return ready
+
+
+def npm_lock_check(folder, package):
+    """Refused unless the lock of an npm install names only files of the npm registry, each with its integrity: no
+    git, no tarball of another address, no folder or link. Such a dependency is not held to the as_of day."""
+    try:
+        with open(os.path.join(folder, "package-lock.json"), encoding="utf-8") as f:
+            entries = json.load(f).get("packages") or {}
+    except (OSError, ValueError, AttributeError):
+        raise Refused(f"the install of {package['name']} {package['version']} left no lock") from None
+    for where, made in entries.items():
+        if not where:
+            continue                    # the folder's own entry
+        if not (isinstance(made, dict) and isinstance(made.get("resolved"), str) and
+                made["resolved"].startswith(NPM_REGISTRY) and isinstance(made.get("integrity"), str)) or \
+                made.get("link"):
+            raise Refused(f"{package['name']} {package['version']} needs {where.rsplit('node_modules/', 1)[-1]} from "
+                          f"outside the npm registry, which Founderizer does not install")
+
+
+# The installs that run now, one per package folder, as for pinned programs (pinned_program): {folder: {"thread",
+# "error"}}. A start that finds an install running waits (Installing); one that finds it failed says so and starts
+# without the server, and the start after it tries again.
+PACKAGE_INSTALLS = {}
+
+
+def package_thread(package, install):
+    """One install of a package in a thread of its own (ensure_package), its failure kept for the next start."""
+    try:
+        ensure_package(package)
+    except Exception as e:              # the next start says it; a failure here must not end the helper
+        install["error"] = str(e) if isinstance(e, (Refused, ValueError)) else type(e).__name__
+        print(time.strftime("%H:%M:%S"), f"MCP: {package.get('name')} {package.get('version')}: "
+              f"{install['error']}", flush=True)
+
+
+def package_install(package):
+    """The install of this package, started in a thread when none runs and none failed: its record of
+    PACKAGE_INSTALLS."""
+    folder = package_folder(package)
+    install = PACKAGE_INSTALLS.get(folder)
+    if not (install and (install["error"] or install["thread"].is_alive())):
+        install = {"error": None}
+        install["thread"] = threading.Thread(target=package_thread, args=(package, install), daemon=True,
+                                             name=f"install-{package['registry']}-{package['name']}")
+        PACKAGE_INSTALLS[folder] = install
+        install["thread"].start()
+    return install
+
+
+def programs_wait(agent):
+    """Before a task or a tools-on conversation of this agent starts anything (its credential, the vault's read, the
+    hub's tokens): Installing while a package of its servers in this checkout's team.json is not in place yet, with
+    each missing install started. An install that failed does not wait here: the start says it (package_in_place)."""
+    catalog, missing = team_catalog(), []
+    for name in checkout_conf(agent).get("tools") or []:
+        tool = catalog.get(name) if isinstance(name, str) else None
+        if not (tool and tool.get("package")) or package_ready(tool["package"]):
+            continue
+        install = PACKAGE_INSTALLS.get(package_folder(tool["package"]))
+        if install and install["error"]:
+            continue
+        package_install(tool["package"])
+        missing.append(f"{tool['package']['name']} {tool['package']['version']}")
+    if missing:
+        raise Installing(f"the MCP program{'s' if len(missing) > 1 else ''} {', '.join(missing)} "
+                         f"{'are' if len(missing) > 1 else 'is'} being installed on this machine")
+
+
+PACKAGE_FAILED_STARTS = 3       # starts that say a failed install before the next start tries it again
+
+
+def package_in_place(name, package, notes):
+    """True when the package of the owner's program server `name` is in place for this OS user. While its install
+    runs, in a thread of its own, the start waits (Installing), so the helper's loop never waits for a download. An
+    install that failed is the reason in notes for this start, which starts without the server, and the next start
+    tries again."""
+    try:
+        package = lifecycle.mcp_package(name, package)
+    except ValueError as e:
+        notes.append(f"The tool {name} is not loaded: {e}.")
+        return False
+    if package_ready(package):
+        return True
+    folder = package_folder(package)
+    install = PACKAGE_INSTALLS.get(folder)
+    if install and install["error"]:
+        install["told"] = install.get("told", 0) + 1        # a count, not a clock: the third start tries again
+        if install["told"] >= PACKAGE_FAILED_STARTS:
+            PACKAGE_INSTALLS.pop(folder)
+        notes.append(f"The tool {name} is not loaded: its program {package['name']} {package['version']} could not "
+                     f"be installed on this machine: {install['error']}.")
+        return False
+    package_install(package)
+    raise Installing(f"the program {package['name']} {package['version']} of the MCP server {name} is being "
+                     f"installed on this machine")
+
+
+def package_waits(name, package, notes, waits):
+    """package_in_place for one server of a session's start: an install that runs goes into waits (Installing), so
+    that every missing program of the start installs at once."""
+    try:
+        return package_in_place(name, package, notes)
+    except Installing as e:
+        waits.append(e)
+        return False
+
+
+def drop_old_packages(package, catalog):
+    """The folders of other versions of this package that no server of this checkout's catalog names any more."""
+    kept = {package_folder(t["package"]) for t in catalog.values() if t.get("package")} | {package_folder(package)}
+    parent = os.path.dirname(package_folder(package))
+    others = sorted((p for p in (os.path.join(parent, n) for n in os.listdir(parent)) if p not in kept and
+                     os.path.isdir(p) and not os.path.basename(p).startswith(".")),
+                    key=os.path.getmtime) if os.path.isdir(parent) else []
+    kept |= set(others[-1:])        # the newest earlier one stays, for a session that still runs it
+    for left in os.listdir(parent) if os.path.isdir(parent) else ():
+        path = os.path.join(parent, left)
+        if path not in kept and os.path.isdir(path) and not left.startswith("."):
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def start_programs(agent, conf):
+    """At the start of the helper of a worker or a lead: the packages of the owner's program servers that this
+    checkout's team.json gives the agent, installed in a thread of their own (ensure_package), so that its first
+    task session finds them in place. A failure is a line of the helper's log; the session's start tries again and
+    says it. The thread, or None when there is nothing to install."""
+    if conf.get("role") not in ("worker", "lead"):
+        return None
+    catalog = team_catalog()
+    packages = [(name, catalog[name]["package"]) for name in checkout_conf(agent).get("tools") or []
+                if isinstance(name, str) and (catalog.get(name) or {}).get("package")]
+    if not packages:
+        return None
+
+    def install():
+        for _, package in packages:
+            with contextlib.suppress(ValueError):
+                package = lifecycle.mcp_package("server", package)
+                if not package_ready(package):
+                    package_install(package)["thread"].join()
+    thread = threading.Thread(target=install, name="mcp-programs", daemon=True)
+    thread.start()
+    return thread
+
+
+def program_start(tool):
+    """(command, args) of one of the owner's program servers in a session's MCP configuration: Python runs
+    `lifecycle.py mcp-start`, which gives the program its own settings and keys only, in ~/.fleet/programs/run. A
+    package's program is the one that its install left (package_ready); a command is found as a task session finds
+    it, with the helper's own PATH. keep: each setting by its name, and each key as the program's variable=the key's
+    session variable, so the session itself never holds a variable of the program's own name."""
+    keep = sorted(tool.get("settings") or {}) + [own if own == source else f"{own}={source}"
+                                                for own, source in sorted((tool.get("env") or {}).items())]
+    if tool.get("package"):
+        ready = package_ready(tool["package"]) or {"program": [], "path": PROGRAM_PATH}
+        program, path = ready["program"], ready["path"]
+    else:
+        program = [exe(tool["command"]) or tool["command"]]
+        path = os.environ.get("PATH") or PROGRAM_PATH
+    return sys.executable, ["-E", "-s", os.path.join(KIT, "lifecycle.py"), "mcp-start"] + \
+        [f"--keep={k}" for k in keep] + [f"--path={path}", "--folder=" + os.path.join(programs_dir(), "run"), "--"] + \
+        program + list(tool.get("args") or [])
+
+
 def cmd_run(args):
     agent, conf = args.agent, agent_conf(args.agent)
     if not shutil.which("tmux"):
@@ -7948,6 +8409,7 @@ def cmd_run(args):
     ready_codex_trust(conf.get("runtime"))      # and Codex's own; a switch to Codex starts a new helper too
     ensure_ops()                    # DevOps plan C1: the door's command on this box
     start_gh(conf)                  # and the GitHub CLI of its task sessions
+    start_programs(agent, conf)     # and the programs of its MCP servers, so that its first session does not wait
     h.manager_due = conf.get("role") == "manager" and h.manager_first()
     print(f"helper for {agent} is running; persistent inbox delivery; sessions in {h.session}", flush=True)
     collector = Collector(KIT, agent, conf["runtime"],

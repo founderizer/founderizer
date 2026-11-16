@@ -266,6 +266,10 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "app_server_tasks",     # helper abilities that the hub may use; app_server_tasks: app_server_task below
             "manager_switch",       # the manager's helper closes its previous runtime's session after a switch
             "mcp_program",          # it resolves a command MCP server's program for POST /ui/mcp/check
+            # it installs an MCP server's npm or PyPI program itself and starts every program server through
+            # `lifecycle.py mcp-start` with its settings, arguments and keys only (the owner's choice of 15 November
+            # 2026, ~/dev/founderizer-plans/any-mcp-design.md), and it says whether a package is in place
+            "mcp_packages",
             "secret_deposits",      # it carries a sealed copy of the owner's into this machine's vault (deposit)
             "secret_withdrawals",   # it has this machine's vault take back a secret nobody here holds (withdraw)
             "task_outputs",         # it sends a delivered task's outputs folder to the hub (fleet.collect_outputs)
@@ -1040,7 +1044,63 @@ MCP_RUNTIMES = tuple(sorted(runtimes_with("mcp_servers")))   # the runtimes whos
 # and only the "token" of the answer reaches that session's MCP file.
 MCP_AUTH = ("none", "oauth", "key", "mint")
 MCP_PROGRAM = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")    # a stdio server's program, on PATH or in ~/.local/bin
-MCP_FIELDS = {"title", "url", "command", "env", "auth", "key", "runtimes", "mint", "mint_field"}    # no args: plan 0.2
+# A program server is a program of the machine (command) or a package that Fleet installs from npm or PyPI (package).
+# Both take plain settings; only a package takes arguments. DevOps plan 0.2 had taken arguments away, because a line
+# that team.json writes is code. On 15 November 2026 the owner chose that a write of the owner API is enough to make
+# an agent's server install and run a program ("The hub", ~/dev/founderizer-plans/any-mcp-design.md), and so a
+# package takes arguments again. A command keeps no arguments, and no runner, shell or interpreter is a command
+# (MCP_RUNNERS): `npx -y x@latest`, `uvx x` or `bash -c ...` would fetch and run a program around the pinned install
+# and its rule that nothing is newer than PACKAGE_DAYS. What stays for every value: it cannot pull a variable of the
+# session in (no "$": Claude Code expands ${NAME} in its MCP file), no setting changes how a runtime starts or where
+# its traffic goes (SETTING_REFUSED), a setting with a secret's name or a URL with a password is no plain setting
+# (secret_name, plain_value), and a program gets only its own settings and keys (mcp_start).
+MCP_FIELDS = {"title", "url", "command", "package", "args", "settings", "env", "auth", "key", "runtimes", "mint",
+              "mint_field"}
+MCP_REGISTRIES = ("npm", "pypi")
+# The programs that fetch, wrap or interpret another program: never a command server (the app holds the same list)
+MCP_RUNNERS = ("npx", "npm", "pnpm", "pnpx", "yarn", "yarnpkg", "corepack", "bun", "bunx", "deno", "node", "nodejs",
+               "uv", "uvx", "pip", "pip3", "pipx", "poetry", "conda", "mamba", "micromamba", "pixi", "nix", "go",
+               "cargo", "docker", "podman", "nerdctl", "env", "sudo", "doas", "sh", "bash", "zsh", "dash", "fish",
+               "ksh", "csh", "tcsh", "python", "python3", "ruby", "perl", "php", "java", "osascript", "xargs")
+MCP_RUNNER = re.compile(r"(?:python|pypy)[0-9.]*|node[0-9.]*|ruby[0-9.]*|perl[0-9.]*|php[0-9.]*")
+# The parts of a name that say it holds a secret, besides a key's ending (KEY_SUFFIXES): such a setting goes in env,
+# from an API key of the Secrets page (the app holds the same list)
+SECRET_WORDS = ("KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "PASS", "PWD", "PAT", "CREDENTIAL",
+                "CREDENTIALS", "COOKIE", "AUTH", "AUTHORIZATION", "DSN", "PRIVATE", "BEARER")
+# A flag of an argument (--access-token, --api-key, -p): a flag whose words (between - and _) hold one of SECRET_WORDS
+# names a secret, and its value after "=" or as the next argument goes in env (secret_flag)
+FLAG = re.compile(r"--?[A-Za-z0-9][A-Za-z0-9_-]*")
+NPM_PACKAGE = re.compile(r"(?:@[a-z0-9][a-z0-9._~-]{0,99}/)?[a-z0-9][a-z0-9._~-]{0,99}")
+PYPI_PACKAGE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?")
+PACKAGE_VERSION = re.compile(r"[0-9][0-9A-Za-z.+!_-]{0,63}")    # one exact version (npm's semver, PEP 440)
+PACKAGE_DAY = re.compile(r"20[0-9]{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])")     # as_of, a day in UTC
+PACKAGE_DAYS = NPM_DAYS         # the youngest version and dependency that Fleet installs, in days (the owner's rule)
+MCP_ARGS_MOST, MCP_ARG_MOST = 16, 300           # arguments of a package server, and characters of each
+MCP_KEYS_MOST = 8                               # keys of a program server (its env)
+CREDENTIAL_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://(?:[^/@\s]+|[^@\s]*:[^@\s]*)@")   # a user part, or a password
+MCP_SETTINGS_MOST, MCP_SETTING_MOST = 16, 500   # plain settings of a program server, and characters of each value
+SETTING_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,59}")
+# The names that change how a program's runtime starts, what it loads, or where its traffic goes: the session's own
+# (ENV_RESERVED), the loaders, the interpreters' and package tools' options, proxies and trust stores. A setting of
+# these names is refused, whatever the server says it reads, and so is a program's variable that takes a key, unless
+# it has a key's ending (key_variable).
+SETTING_REFUSED = re.compile(
+    r"(?:FLEET|BWS|LD|DYLD|ANTHROPIC|CLAUDE|CODEX|XAI|NODE|NPM_CONFIG|UV|PIP|PIPX|POETRY|CONDA|VIRTUAL_ENV|GIT|"
+    r"OPENSSL|CURL|REQUESTS|HTTPLIB2|GCONV|MALLOC|GLIBC|JAVA|JDK|_JAVA|GEM|BUNDLE|DENO|BUN|ELECTRON|GRPC|"
+    r"XDG)(?:_[A-Z0-9_]*)?|PYTHON[A-Z0-9_]*|PERL[A-Z0-9_]*|RUBY[A-Z0-9_]*|SSL[A-Z0-9_]*|"
+    r"[A-Z0-9_]*_PROXY|[A-Z0-9_]*_CA_BUNDLE|"
+    r"PATH|HOME|SHELL|USER|LOGNAME|TMPDIR|TEMP|TMP|TERM|TERMINFO|TERMCAP|PWD|OLDPWD|IFS|ENV|BASH_ENV|ZDOTDIR|CDPATH|"
+    r"GLOBIGNORE|SHELLOPTS|BASHOPTS|PROMPT_COMMAND|PS[1-4]|HISTFILE|INPUTRC|LANG|LANGUAGE|LC_[A-Z_]*|TZ|TZDIR|"
+    r"LOCPATH|NLSPATH|HOSTALIASES|RES_OPTIONS|LOCALDOMAIN|CLASSPATH|BROWSER|EDITOR|VISUAL|PAGER|LESSOPEN|LESSCLOSE|"
+    r"MANPAGER", re.IGNORECASE)
+# The keys that Fleet itself puts in a task session (fleet.integration_env): GH_TOKEN, the hub's GitHub App token for
+# gh, and the variables of Fleet's own tools (TOOL_CATALOG: the GitHub tool's GITHUB_PERSONAL_ACCESS_TOKEN, which holds
+# that token too). No owner's program server takes its key from one: the session's own value wins over an API key of
+# the same name, so the program would get the fleet's token (the reviews of 15 and 16 November 2026).
+FLEET_KEYS = ("GH_TOKEN",) + tuple(sorted({own for tool in TOOL_CATALOG.values() for own in tool.get("env") or {}}))
+# What mcp_start passes on from its own environment besides a server's own variables, and the most of those.
+MCP_START_KEEPS = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ")
+MCP_START_MOST = 40
 MINT_PATH = re.compile(r"/[A-Za-z0-9._~!$&'()*+,;=:@%/-]{0,199}")      # the mint's path at the key's site, no query
 MINT_FIELD = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,39}")                  # the field of its body that names the case
 
@@ -1086,6 +1146,78 @@ def mcp_address(value):
     return value
 
 
+def setting_name(name):
+    """True for the name of a program server's own variable (a plain setting; the variable that takes a key may also
+    be a key's name, key_variable): A-Z a-z 0-9 _, at most 60 characters, and none that changes how a runtime starts
+    (SETTING_REFUSED)."""
+    return isinstance(name, str) and bool(SETTING_NAME.fullmatch(name)) and not SETTING_REFUSED.fullmatch(name)
+
+
+def key_variable(name):
+    """True for a program server's own variable that takes a key (env): a setting name (setting_name), or a key's name
+    (key_env), which every server of team.json had before 15 November 2026, so that an upgrade keeps each server that
+    the hub took then (NODE_AUTH_TOKEN, UV_PUBLISH_TOKEN). A key's ending (_KEY, _TOKEN, _SECRET, _PASSWORD, _PAT) is the
+    ending of no variable that changes how a runtime starts or what it loads."""
+    return setting_name(name) or key_env(name)
+
+
+def plain_value(value, most):
+    """True for a plain value of a program server (a setting or an argument): a string of at most `most` characters
+    with no control character, no $ (so that no MCP file expands it into another variable of the session), no
+    character above U+FFFF (Codex's -c values are TOML, which takes no surrogate pair), and no URL with a password."""
+    if not (isinstance(value, str) and len(value) <= most and "$" not in value and value.isprintable() and
+            all(ord(c) <= 0xFFFF for c in value)):
+        return False
+    return not CREDENTIAL_URL.search(value)
+
+
+def secret_name(name):
+    """True for a variable whose name says that it holds a secret: a key's ending (KEY_SUFFIXES) or one of
+    SECRET_WORDS among the words of its name, split as a flag's (flag_words: DB_PASS, X_AUTH, SENTRY_DSN, API_KEY_ID,
+    apiToken, clientSecret)."""
+    return str(name).upper().endswith(KEY_SUFFIXES) or any(word in SECRET_WORDS for word in flag_words(str(name)))
+
+
+def flag_words(flag):
+    """The words of a flag's name, in capitals: split at - and _ and where a lower case letter or a digit meets a
+    capital (--access-token, --api_key and --accessToken all give ACCESS and TOKEN or API and KEY)."""
+    return [w.upper() for w in re.split(r"[-_]+|(?<=[a-z0-9])(?=[A-Z])", flag) if w]
+
+
+def secret_flag(flag):
+    """True for a flag of an argument that names a secret: one of SECRET_WORDS among the words of its name."""
+    return bool(FLAG.fullmatch(flag)) and any(word in SECRET_WORDS for word in flag_words(flag))
+
+
+def mcp_runner(command):
+    """True for a program that fetches, wraps or interprets another one (MCP_RUNNERS): never a command server."""
+    return str(command).lower() in MCP_RUNNERS or bool(MCP_RUNNER.fullmatch(str(command).lower()))
+
+
+def mcp_package(name, package):
+    """The package of a program server that Fleet installs, checked: {registry, name, version, as_of, bin}. registry is
+    npm or pypi; version is one exact version; as_of is the day (UTC) whose state of the registry every dependency is
+    taken from, at least PACKAGE_DAYS before the owner's write (the hub checks that day at the write, and the helper
+    again before an install); bin is the program of the package to run, or None for the package's own (npx and uvx
+    choose it the same way). ValueError with the reason."""
+    if not isinstance(package, dict) or set(package) - {"registry", "name", "version", "as_of", "bin"}:
+        raise ValueError(f"the MCP server {name}: package takes registry, name, version, as_of and bin")
+    registry, called = package.get("registry"), package.get("name")
+    if registry not in MCP_REGISTRIES:
+        raise ValueError(f"the MCP server {name}: package registry must be {' or '.join(MCP_REGISTRIES)}")
+    if not isinstance(called, str) or not (NPM_PACKAGE if registry == "npm" else PYPI_PACKAGE).fullmatch(called):
+        raise ValueError(f"the MCP server {name}: {called!r} is not the name of a package of {registry}")
+    if not isinstance(package.get("version"), str) or not PACKAGE_VERSION.fullmatch(package["version"]):
+        raise ValueError(f"the MCP server {name}: package version must be one exact version, such as 1.2.3")
+    if not isinstance(package.get("as_of"), str) or not PACKAGE_DAY.fullmatch(package["as_of"]):
+        raise ValueError(f"the MCP server {name}: package as_of must be a day, YYYY-MM-DD")
+    run = package.get("bin")
+    if run is not None and not (isinstance(run, str) and MCP_PROGRAM.fullmatch(run)):
+        raise ValueError(f"the MCP server {name}: package bin must be the name of one program of the package")
+    return {"registry": registry, "name": called, "version": package["version"], "as_of": package["as_of"],
+            "bin": run}
+
+
 # The names of the programs whose sessions put a server's name before the names of its tools, and deny that name's
 # tools: OpenCode names each tool of a server `<server>_<tool>`, and its sessions deny the pattern `opencode_*`
 # (acp_programs.OpenCode.config, the coordinator's decision D32), so a server named opencode would give an OpenCode
@@ -1098,11 +1230,14 @@ def mcp_server(name, entry, new=False):
     with the reason. new: the owner's write of this server (POST /ui/team/mcp, and the check of a server before its
     save), which refuses a name of MCP_PROGRAM_NAMES too; team.json's own entries are read without it (validate_team,
     tool_catalog), because one refused name there refuses the whole team, so a fleet whose file has one would stop
-    taking each write and each reload. A url server has url and, for auth "oauth" or "key", bearer: the session variable that holds its
-    token. A stdio server has command and env ({the server's variable: the session variable whose value it gets}), and
-    no arguments (DevOps plan 0.2: a command line that team.json writes is code), so its args are always []. Each
-    variable has the shape of a key's name (key_env). A session that lacks one of these variables gets no such
-    server."""
+    taking each write and each reload. A url server has url and, for auth "oauth" or "key", bearer: the session
+    variable that holds its token. A program server has command (a program of the machine) or package (a program that
+    Fleet installs from npm or PyPI, mcp_package), and args (its arguments), settings ({its own variable: a plain
+    value}) and env ({its own variable: the session variable of the API key whose value it gets}). Its own variables
+    are setting names (setting_name; a key's own variable may also be a key's name, key_variable), and each session
+    variable has the shape of a key's name (key_env) and is none of Fleet's own (FLEET_KEYS). A session that lacks one
+    of these keys gets no such server. Arguments and settings came back on 15 November 2026 (the owner's "The hub";
+    MCP_FIELDS)."""
     if not isinstance(name, str) or not MCP_NAME.fullmatch(name):
         raise ValueError(f"the MCP server name {name!r} must be 1 to 31 characters a-z 0-9 - that start with a letter")
     if name in TOOL_CATALOG or name == "fleet":
@@ -1121,16 +1256,11 @@ def mcp_server(name, entry, new=False):
     if not isinstance(runtimes, list) or not runtimes or len(set(runtimes)) != len(runtimes) or \
             any(r not in MCP_RUNTIMES for r in runtimes):
         raise ValueError(f"the MCP server {name}: runtimes must be different names of {', '.join(MCP_RUNTIMES)}")
-    variables = entry.get("env") or {}
-    if not isinstance(variables, dict) or len(variables) > 8 or not all(
-            key_env(k) and key_env(v) for k, v in variables.items()):
-        raise ValueError(f"the MCP server {name}: env maps up to 8 of its own variable names to the names of API keys "
-                         f"that the agent reads, each the name of a key (A-Z 0-9 _, ending in "
-                         f"{', '.join(KEY_SUFFIXES)}) and not a name that a session sets itself")
     made = {"title": title.strip(), "runtimes": sorted(runtimes), "custom": True, "auth": auth}
-    if ("url" in entry) == ("command" in entry):
-        raise ValueError(f"the MCP server {name} needs a url (a remote server) or a command (a program on the "
-                         f"machine), not both")
+    kinds = [kind for kind in ("url", "command", "package") if kind in entry]
+    if len(kinds) != 1:
+        raise ValueError(f"the MCP server {name} needs a url (a remote server), a command (a program on the "
+                         f"machine) or a package (a program that Fleet installs): one of them, not both")
     if "url" in entry:
         if not mcp_address(entry["url"]):
             raise ValueError(f"the MCP server {name}: url must be an https address (http only on 127.0.0.1) with a "
@@ -1159,19 +1289,56 @@ def mcp_server(name, entry, new=False):
             made.update(bearer=mcp_variable(name), mint={"key": key, "path": path, "field": field})
         if auth != "mint" and ("mint" in entry or "mint_field" in entry):
             raise ValueError(f"the MCP server {name}: mint and mint_field are for auth \"mint\"")
-        if variables:
-            raise ValueError(f"the MCP server {name}: env is for a command server; a url server uses key")
+        for field in ("env", "args", "settings"):
+            if entry.get(field):        # an empty one is none, as team.json had it before 15 November 2026
+                raise ValueError(f"the MCP server {name}: {field} is for a program server; a url server takes only "
+                                 f"a key")
+        return made
+    if auth != "none":
+        raise ValueError(f"the MCP server {name}: a program server has no auth; give its key in env")
+    if "key" in entry:
+        raise ValueError(f"the MCP server {name}: key is for a url server with auth \"key\"")
+    if "mint" in entry or "mint_field" in entry:
+        raise ValueError(f"the MCP server {name}: mint and mint_field are for a url server with auth \"mint\"")
+    variables, settings, args = entry.get("env") or {}, entry.get("settings") or {}, entry.get("args") or []
+    if not isinstance(variables, dict) or len(variables) > MCP_KEYS_MOST or not all(
+            key_variable(k) and key_env(v) and v not in FLEET_KEYS for k, v in variables.items()):
+        raise ValueError(f"the MCP server {name}: env maps up to {MCP_KEYS_MOST} of its own variable names to the names "
+                         f"of API keys that the agent reads: its own name A-Z a-z 0-9 _ and none that changes how a "
+                         f"program starts, and the key's name A-Z 0-9 _ ending in {', '.join(KEY_SUFFIXES)}, which is "
+                         f"no key of Fleet's own ({', '.join(FLEET_KEYS)})")
+    if not isinstance(settings, dict) or len(settings) > MCP_SETTINGS_MOST or not all(
+            setting_name(k) and plain_value(v, MCP_SETTING_MOST) for k, v in settings.items()):
+        raise ValueError(f"the MCP server {name}: settings maps up to {MCP_SETTINGS_MOST} of its own variable names "
+                         f"(A-Z a-z 0-9 _, none that changes how a program starts, such as NODE_OPTIONS, PYTHONPATH "
+                         f"or a proxy) to plain values of at most {MCP_SETTING_MOST} characters, with no control "
+                         f"character and no $")
+    keyed = sorted(k for k in settings if secret_name(k) or k in variables)
+    if keyed:
+        raise ValueError(f"the MCP server {name}: {', '.join(keyed)} has the name of a secret, so it goes in env, "
+                         f"from an API key of the Secrets page, and never in settings as plain text")
+    if args and "package" not in entry:
+        raise ValueError(f"the MCP server {name}: args is for a package that Fleet installs; a command takes none")
+    if not isinstance(args, list) or len(args) > MCP_ARGS_MOST or not all(
+            plain_value(a, MCP_ARG_MOST) and a for a in args):
+        raise ValueError(f"the MCP server {name}: args takes up to {MCP_ARGS_MOST} arguments of 1 to {MCP_ARG_MOST} "
+                         f"characters, with no control character and no $; it is no shell line")
+    for i, arg in enumerate(args):
+        flag, given, value = arg.partition("=")
+        if secret_flag(flag) and (given and value or i + 1 < len(args) and not args[i + 1].startswith("-")):
+            raise ValueError(f"the MCP server {name}: the argument {flag} takes a secret, which goes in env, from an "
+                             f"API key of the Secrets page, and never in args as plain text")
+    made.update(args=list(args), env=dict(sorted(variables.items())), settings=dict(sorted(settings.items())))
+    if "package" in entry:
+        made["package"] = mcp_package(name, entry["package"])
+    elif not isinstance(entry["command"], str) or not MCP_PROGRAM.fullmatch(entry["command"]):
+        raise ValueError(f"the MCP server {name}: command must be the name of a program on the machine (1 to 64 "
+                         f"characters A-Z a-z 0-9 . _ -), which the machine has on its PATH or in ~/.local/bin")
+    elif mcp_runner(entry["command"]):
+        raise ValueError(f"the MCP server {name}: {entry['command']} fetches or runs another program, so it is no "
+                         f"command server: give the server's npm or PyPI package, which Fleet installs itself")
     else:
-        if auth != "none":
-            raise ValueError(f"the MCP server {name}: a command server has no auth; give its key in env")
-        if "key" in entry:
-            raise ValueError(f"the MCP server {name}: key is for a url server with auth \"key\"")
-        if "mint" in entry or "mint_field" in entry:
-            raise ValueError(f"the MCP server {name}: mint and mint_field are for a url server with auth \"mint\"")
-        if not isinstance(entry["command"], str) or not MCP_PROGRAM.fullmatch(entry["command"]):
-            raise ValueError(f"the MCP server {name}: command must be the name of a program on the machine (1 to 64 "
-                             f"characters A-Z a-z 0-9 . _ -), which the machine has on its PATH or in ~/.local/bin")
-        made.update(command=entry["command"], args=[], env=dict(sorted(variables.items())))
+        made["command"] = entry["command"]
     return made
 
 
@@ -1183,16 +1350,62 @@ def tool_needs(tool):
                   ({tool["bearer"]} if tool.get("bearer") and not tool.get("mint") else set()))
 
 
-def tool_catalog(team):
+def tool_catalog(team, refused=None):
     """The catalog of this team: Fleet's own tools and the owner's MCP servers of team.json "mcp". A server that does
-    not pass mcp_server is left out, so a hand-written entry can never reach a session."""
+    not pass mcp_server is left out, so a hand-written entry can never reach a session; refused, a dict, gets the
+    reason of each one, so that the start text can say it."""
     catalog = {name: dict(tool, custom=False, auth="none") for name, tool in TOOL_CATALOG.items()}
     for name, entry in sorted(((team or {}).get("mcp") or {}).items()):
         try:
             catalog[name] = mcp_server(name, entry)
-        except ValueError:
-            continue
+        except ValueError as e:
+            if refused is not None:
+                refused[name] = str(e)
     return catalog
+
+
+def mcp_start(keep, path, folder, program, environ=None, execve=os.execve):
+    """`python3 -E -s lifecycle.py mcp-start`: the start of every program server of the owner (owner feature
+    mcp_packages). The program gets a new environment with only these variables: its own settings and keys (keep:
+    "NAME" passes the variable NAME on, "NAME=SOURCE" gives the program NAME with the value of SOURCE, the session
+    variable of a key), the few of MCP_START_KEEPS that its runtime needs, and PATH as given. So it gets no GH_TOKEN,
+    no other key of the session, no proxy and no option of its runtime. It starts in a new empty folder of
+    its own under folder (named by its process, whose number stays when the program replaces this one), because some
+    programs read a .env file of their working folder (mcp-server-odoo does), and a shared folder can hold one that
+    another program wrote; the folders of starts whose program ended go at the next start. Python runs it with -E -s, so no PYTHONPATH of the session changes this file.
+    ValueError for a name that no program server may have."""
+    environ = os.environ if environ is None else environ
+    if not program or not os.path.isabs(program[0]) or len(keep) > MCP_START_MOST:
+        raise ValueError("mcp-start needs the absolute path of a program and at most "
+                         f"{MCP_START_MOST} variables")
+    env = {name: environ[name] for name in MCP_START_KEEPS if name in environ}
+    env.setdefault("HOME", os.path.expanduser("~"))
+    for item in keep:
+        own, _, source = item.partition("=")
+        source = source or own
+        if not (key_variable(own) and SETTING_NAME.fullmatch(source)) or source in FLEET_KEYS:    # a setting, a key
+            raise ValueError(f"mcp-start passes no variable {item!r} on")
+        if source in environ:
+            env[own] = environ[source]
+    env["PATH"] = path
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    for left in os.listdir(folder):     # the folders of starts whose program ended
+        pid = left.split("-", 1)[0]
+        if pid.isdigit() and int(pid) != os.getpid() and not process_alive(int(pid)):
+            shutil.rmtree(os.path.join(folder, left), ignore_errors=True)
+    os.chdir(tempfile.mkdtemp(prefix=f"{os.getpid()}-", dir=folder))       # mode 700, this start's alone
+    execve(program[0], list(program), env)
+
+
+def process_alive(pid):
+    """True while a process of this number runs (one of another user counts as running)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def app_server_task(conf, needs):
@@ -3829,7 +4042,10 @@ def main(argv=None):
     """`python3 lifecycle.py may-take [--floor FILE] KIT TARGET`: may_take for a mover written in shell (join.sh,
     hub.sh, and what onboard.py and owner_mcp.py run on a machine). It raises this user's floor to the release that KIT
     runs, then answers with its exit status: 0 when KIT may move onto TARGET, else 1 and the one reason on standard
-    error. The caller makes the move itself, with `git merge --ff-only TARGET`."""
+    error. The caller makes the move itself, with `git merge --ff-only TARGET`.
+
+    `python3 -E -s lifecycle.py mcp-start --keep NAME[=SOURCE] ... --path PATH --folder FOLDER -- PROGRAM ARGS`: the
+    start of one program server (mcp_start)."""
     import argparse
     parser = argparse.ArgumentParser(prog="lifecycle.py", description="The one check of every move of a checkout")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -3838,6 +4054,20 @@ def main(argv=None):
                        help="this user's release floor (default ~/.fleet/release-floor)")
     check.add_argument("kit", help="the checkout")
     check.add_argument("target", help="the commit it would move onto")
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["mcp-start"]:       # its program's own arguments follow "--", and argparse reads none of them
+        rest = argv.index("--") if "--" in argv else len(argv)
+        start = argparse.ArgumentParser(prog="lifecycle.py mcp-start")
+        start.add_argument("--keep", action="append", default=[], help="NAME or NAME=SOURCE, once for each")
+        start.add_argument("--path", required=True, help="the PATH of the program")
+        start.add_argument("--folder", required=True, help="the empty folder where it starts")
+        given = start.parse_args(argv[1:rest])
+        try:
+            mcp_start(given.keep, given.path, given.folder, argv[rest + 1:])
+        except (ValueError, OSError) as e:
+            print(f"lifecycle.py mcp-start: {e}", file=sys.stderr)
+            return 2
+        return 0
     args = parser.parse_args(argv)
     kit = os.path.abspath(args.kit)
     keep_floor(kit, args.floor)
