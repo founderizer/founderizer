@@ -45,7 +45,8 @@ SHELLS = [sh for sh in ("/bin/sh", "/bin/dash") if os.access(sh, os.X_OK)]     #
 def load_tests(loader, _tests, _pattern):
     return unittest.TestSuite(cls(name) for cls in (Admin, Boundary, FromNothing, McpServers, Refusals,
                                                     Install, Progress, RootThroughSudo, NoSecret, Shape, Table,
-                                                    Parity, SecretGive, VaultReading)
+                                                    Parity, SecretGive, ShareStanding, ShareStandingNoWorker,
+                                                    VaultReading)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -3218,6 +3219,7 @@ class SecretGive(WithServer):
     BROKERS = {"vps": "vps", "lead": "vps", "studio": "mac-studio", "aide": "hub"}       # each agent's machine
     ONE = ["ui_vault", "ui_secret_grant"]                       # a give that the page of the vault settles
     TWO = ["ui_vault", "ui_team", "ui_secret_grant"]            # and one that needs the team too
+    ROUTED = ("ui_vault", "ui_team", "ui_secret_grant")         # the routes whose requests go into `routes`
 
     def setUp(self):
         catalog = {self.REF: {"title": "SHOP_API_KEY", "kind": "api_key", "env": "SHOP_API_KEY"},
@@ -3240,7 +3242,7 @@ class SecretGive(WithServer):
             hub.q("INSERT INTO machine_status(agent,data,reported) VALUES(?,?,?) ON CONFLICT(agent) DO UPDATE SET "
                   "data=excluded.data, reported=excluded.reported", (agent, json.dumps(data), hub.now()))
         self.routes, self.pages = [], []
-        for name in ("ui_vault", "ui_team", "ui_secret_grant"):
+        for name in self.ROUTED:
             self.route(name)
         view = hub.vault_view
         self.patched(hub, "vault_view", lambda *args, **kw: self.pages.append(view(*args, **kw)) or self.pages[-1])
@@ -3493,6 +3495,228 @@ class SecretGive(WithServer):
             self.assertNotIn("ui_vault", self.routes, resource)
         self.assertEqual(self.pages, [])
         self.assertEqual(self.origin_team()["agents"]["vps"]["repos"], {"acme/web": "write"})
+
+
+class ShareStanding(SecretGive):
+    """**A standing for a secret from which no give could reach a server is not sent** (`owner_mcp.standing_reaches`),
+    against the real owner API of hub.py, on the fleet of `SecretGive` (whose own tests do not run here again: the
+    suite takes the tests of each class's own body). A standing that is sent is the hub's own entry of team.json
+    "resources", read back from the commit. `routes` has each request of the vault's page, the team's page and
+    `POST /ui/resources`, in its order."""
+
+    ROUTED = ("ui_vault", "ui_team", "ui_resource")
+    JUDGED = ["ui_vault", "ui_team", "ui_resource"]     # a standing for a secret: the vault's page, the team, the command
+    UNJUDGED = ["ui_team", "ui_resource"]               # an end, and a standing of another kind
+
+    def share(self, client, ref=None, most="use", resource=None):
+        return client.call("share_resource", resource=resource or "secret:" + (ref or self.REF), max=most)
+
+    def standing(self):
+        """team.json "resources", as the hub committed it."""
+        return self.origin_team().get("resources") or {}
+
+    def sent(self, client, routes, most="use", ref=None, resource=None):
+        """The standing goes after exactly these requests, and the hub's own entry is in team.json."""
+        self.routes.clear()
+        rid = resource or "secret:" + (ref or self.REF)
+        self.assertTrue(self.share(client, ref=ref, most=most, resource=resource)["changed"])
+        self.assertEqual(self.routes, routes)
+        self.assertEqual(self.standing().get(rid.strip().lower()), {"max": most, "to": "workers"})
+
+    def refused(self, client, most="use", ref=None, resource=None):
+        """The standing is refused in the one fixed sentence, which names no secret, after the two reads, and no command
+        reached the hub: team.json did not change."""
+        before = self.count("ui_controls"), self.standing()
+        self.routes.clear()
+        with self.assertRaises(Refused) as caught:
+            self.share(client, ref=ref, most=most, resource=resource)
+        self.assertEqual(str(caught.exception), owner_mcp.SHARE_NOT_SIGNED)
+        self.assertNotIn("bws://", str(caught.exception))
+        self.assertEqual(self.routes, ["ui_vault", "ui_team"])
+        self.assertEqual((self.count("ui_controls"), self.standing()), before)
+
+    # ---- step 1: the page of the vault cannot judge, so the standing goes as before, after that one read more
+    def test_a_hub_with_no_page_of_the_vault_gets_the_standing(self):
+        self.route("ui_vault", lambda handler: handler.json(404, {"error": "not found"}))
+        self.sent(self.started(), self.JUDGED)
+
+    def test_a_read_of_the_vault_that_the_hub_refuses_does_not_stop_the_standing(self):
+        self.route("ui_vault", lambda handler: handler.json(500, {"error": "the hub could not read its records"}))
+        self.sent(self.started(), self.JUDGED)
+
+    def test_a_fleet_with_no_central_vault_gets_the_standing(self):
+        with hub.CENTRAL_LOCK:
+            hub.CENTRAL.update(tried_at=hub.now(), error="no central vault answers on this hub")
+        self.sent(self.started(), self.JUDGED, most="read")
+        self.assertEqual((self.pages[-1]["central"], self.pages[-1]["error"]),
+                         (None, "no central vault answers on this hub"))
+
+    def test_a_vault_with_no_good_reading_gets_the_standing(self):
+        client = self.started()
+        self.central(ok=False)
+        self.sent(client, self.JUDGED, most="read")
+        self.assertIs(self.pages[-1]["central"]["ok"], False)
+        self.central()
+        with hub.CENTRAL_LOCK:
+            hub.CENTRAL.update(error="the central vault did not answer in 5 seconds")
+        self.sent(client, self.JUDGED, most="use")
+        self.assertEqual((self.pages[-1]["central"]["pool"], self.pages[-1]["error"]),
+                         ([], "the central vault did not answer in 5 seconds"))
+
+    def test_a_hub_that_does_not_answer_the_read_of_the_vault_stops_the_standing(self):
+        self.central()
+        self.route("ui_vault", lambda handler: setattr(handler, "close_connection", True))      # no answer at all
+        with self.assertRaises(Refused) as caught:
+            self.share(self.started())
+        self.assertRegex(str(caught.exception), r"\AThe (call to the hub at \S+ was lost|hub at \S+ did not answer)")
+        self.assertEqual((self.routes, self.standing(), self.count("ui_controls")), (["ui_vault"], {}, 0))
+
+    def test_a_generation_that_moved_two_times_at_the_read_of_the_vault_stops_the_standing(self):
+        self.central()
+        self.route("ui_vault", lambda handler: handler.json(409, {"error": "hub generation changed; refresh state"}))
+        with self.assertRaises(Refused) as caught:
+            self.share(self.started())
+        self.assertEqual(str(caught.exception),
+                         "The hub refused a read of the vault (409): hub generation changed; refresh state")
+        self.assertEqual((self.routes, self.standing(), self.count("ui_controls")),
+                         (["ui_vault", "ui_vault"], {}, 0))
+
+    # ---- step 2: the pool, with the resource as the hub reads it
+    def test_a_secret_of_the_pool_gets_the_standing(self):
+        self.central(pool=[self.REF])
+        self.sent(self.started(), self.JUDGED, resource="  Secret:bws://" + self.REF[6:].upper() + " ")
+        self.assertEqual(self.pages[-1]["central"]["pool"], [self.REF])
+        self.assertEqual(self.standing(), {"secret:" + self.REF: {"max": "use", "to": "workers"}})
+
+    # ---- step 3: what the team's page says, each in the state that refuses a standing of REF
+    def test_a_secret_that_the_catalog_does_not_have_and_a_max_that_does_not_fit_get_the_hubs_own_words(self):
+        self.central()
+        client = self.started()
+        for ref, most, words in ((self.ABSENT, "use", "is no secret that this team has"),
+                                 (self.REF, "write", "max must be one of use, read"),
+                                 (self.REF, 7, "max must be one of use, read"),
+                                 (self.REF, "", "max must be one of use, read")):
+            self.routes.clear()
+            with self.assertRaises(Refused) as caught:
+                self.share(client, ref=ref, most=most)
+            self.assertIn(words, str(caught.exception), (ref, most))
+            self.assertNotIn("central vault", str(caught.exception), (ref, most))
+            self.assertEqual(self.routes, self.JUDGED, (ref, most))
+        self.assertEqual(self.standing(), {})
+        self.refused(client, ref=self.LOGIN, most="read")       # a login of the catalog is judged at each level
+
+    def test_a_secret_that_an_agent_made_is_not_judged(self):
+        self.central()
+        hub.ins("INSERT INTO jobs(agent,task,kind,login,created,finished,ok) VALUES('lead',1,'create',?,?,?,1)",
+                (self.MADE, hub.now(), hub.now()))          # as the hub keeps a create_login that ended well
+        made = self.request("/ui/team?db=test-generation", source=OWNER)[1]["created_logins"]
+        self.assertEqual([(m["login"], m["agent"], m["state"]) for m in made], [(self.MADE, "lead", "created")])
+        client = self.started()
+        self.sent(client, self.JUDGED, ref=self.MADE)
+        self.assertEqual((self.pages[-1]["central"]["pool"], self.pages[-1]["held"]["vps"]), ([], []))
+        self.refused(client, ref=self.LOGIN)                # a login that no agent made is judged
+
+    # ---- steps 4, 5 and 6: what the owner signed for any server, what any server's vault holds, and a server that
+    # takes no deliveries now
+    def test_a_grant_signed_for_any_server_is_enough(self):
+        self.central(grants=[self.signed("studio", "mac-studio")])
+        self.sent(self.started(), self.JUDGED)
+        self.assertEqual(self.pages[-1]["central"]["grants"], [self.signed("studio", "mac-studio")])
+
+    def test_a_grant_signed_only_for_the_door_does_not_count(self):
+        """The door is no server that an agent works on: its grant stands under the hub's own name for it, and no
+        give of the manager reaches it."""
+        self.assertEqual(owner_mcp.DOOR_MACHINE, hub.DOOR_PIN)
+        self.central(grants=[self.signed("door", hub.DOOR_PIN)])
+        client = self.started()
+        self.refused(client)
+        self.central(grants=[self.signed("door", hub.DOOR_PIN), self.signed("studio", "mac-studio")])
+        self.sent(client, self.JUDGED)      # and a grant for a server beside it is enough
+
+    def test_a_copy_in_the_vault_of_any_server_is_enough(self):
+        self.central()
+        self.holds("mac-studio", "studio")
+        self.sent(self.started(), self.JUDGED, most="read")
+        self.assertEqual(self.pages[-1]["held"], {"hub": [], "mac-studio": [self.REF], "vps": []})
+
+    def test_a_server_that_takes_no_deliveries_now_is_not_judged(self):
+        self.central(pins={machine: key for machine, key in self.KEYS.items() if machine != "vps"})
+        client = self.started()
+        self.sent(client, self.JUDGED)                      # the owner's pin of vps is not there
+        self.assertEqual(self.machine("vps")["missing"], ["not_pinned"])
+        self.central()
+        self.refused(client, ref=self.LOGIN)                # every server takes deliveries again, so it is judged
+
+    # ---- step 7, and what the rule never touches
+    def test_a_standing_that_the_reading_shows_as_useless_is_refused_and_nothing_reaches_the_hub(self):
+        """A secret of the catalog that no agent made, nothing signed, no copy, and every server takes deliveries:
+        the one standing that is refused, at each level, and also for a resource with spaces and capitals."""
+        self.central()
+        client = self.started()
+        for most in ("use", "read"):
+            self.refused(client, most=most)
+        self.refused(client, resource=" SECRET:" + self.REF.upper() + "  ")
+        page = self.pages[-1]
+        self.assertEqual((page["central"]["pool"], page["central"]["grants"], page["error"],
+                          [m["missing"] for m in page["machines"]], page["held"]),
+                         ([], [], None, [[], [], []], {"hub": [], "mac-studio": [], "vps": []}))
+        team = self.request("/ui/team?db=test-generation", source=OWNER)[1]
+        self.assertEqual((team["logins"][self.REF]["kind"], team["created_logins"]), ("api_key", []))
+        self.assertNotIn("resources", self.origin_team())
+        self.assertEqual(self.count("ui_controls"), 0)
+
+    def test_taking_the_entry_back_goes_with_no_read_of_the_vault_in_the_state_that_refuses_a_standing(self):
+        self.central()
+        # The standing is in team.json by the hub's own route, which takes it from each process of the owner's
+        # computer: the program's check is no gate (OWNER-MCP-BOUNDARY.md section 7).
+        status, receipt = self.owner("/ui/resources", resource="secret:" + self.REF,
+                                     policy={"max": "use", "to": "workers"}, base_sha256=self.team_sha())
+        self.assertEqual((status, receipt.get("changed")), (200, True), receipt)
+        client = self.started()
+        self.refused(client, ref=self.LOGIN)
+        self.routes.clear()
+        self.pages.clear()
+        self.assertTrue(self.share(client, most=None)["changed"])
+        self.assertEqual((self.routes, self.pages, self.standing()), (self.UNJUDGED, [], {}))
+
+    def test_a_standing_for_a_repository_a_tool_and_a_google_service_reads_no_page_of_the_vault(self):
+        self.central()                      # the state that refuses a standing for a secret
+        client = self.started()
+        for resource, most in (("repo:acme/web", "write"), ("tool:github", "use"),
+                               ("gmail:ada@example.com", "read"), ("drive:ada@example.com", "read")):
+            self.routes.clear()
+            try:
+                self.share(client, resource=resource, most=most)
+            except Refused:
+                pass                        # the hub's own words for a tool that it does not have
+            self.assertEqual(self.routes, self.UNJUDGED, resource)
+        self.assertEqual(self.pages, [])
+        self.assertEqual(self.standing()["repo:acme/web"], {"max": "write", "to": "workers"})
+
+
+class ShareStandingNoWorker(ShareStanding):
+    """The fleet of a customer's first day (`fresh_fleet`: one manager, no worker and no lead), with the catalog of
+    `SecretGive`: the page of the vault lists no server, so with nothing signed a standing for a secret is refused.
+    The real check on the test network runs on such a fleet."""
+
+    def setUp(self):
+        super().setUp()
+        team = self.fresh_fleet()
+        team["logins"] = {self.REF: {"title": "SHOP_API_KEY", "kind": "api_key", "env": "SHOP_API_KEY"}}
+        (self.kit / "team.json").write_text(json.dumps(team, indent=2) + "\n")
+        test_servers.git("commit", "-q", "-am", "the catalog", cwd=self.kit)
+        test_servers.git("push", "-q", "origin", "HEAD", cwd=self.kit)
+        hub._revision_cache.update(at=0.0, value=None)
+        hub.TEAM = team
+
+    def test_a_fleet_with_no_worker_and_no_lead_and_nothing_signed_is_refused(self):
+        self.central()
+        client = self.started()
+        self.refused(client)
+        self.assertEqual((self.pages[-1]["machines"], self.pages[-1]["held"]), ([], {}))
+        self.assertEqual([a.get("role") for a in self.origin_team()["agents"].values()], ["manager"])
+        self.central(pool=[self.REF])       # once the owner signed it into the pool, it goes
+        self.sent(client, self.JUDGED)
 
 
 class VaultReading(unittest.TestCase):
@@ -3938,6 +4162,93 @@ def parity_cases():
     case("share_resource: with max", "share_resource", {"resource": "repo:acme/web", "max": "write"})
     case("share_resource: with max and to", "share_resource", {"resource": "tool:github", "max": "use", "to": "workers"})
     case("share_resource: without max", "share_resource", {"resource": "repo:acme/web"})
+    # share_resource, a standing for a secret: each step of its rule (owner_mcp.standing_reaches). A standing that is
+    # judged makes two reads (the vault's page, the team, whose one read also gives the command its base) and the
+    # command; the stand-in takes each command that reaches it.
+    share = {"resource": "secret:" + PARITY_SECRET, "max": "use"}
+    # Step 1: the page of the vault cannot judge the standing, so it is sent.
+    case("share_resource: a secret, a hub with no page of the vault", "share_resource", share,
+         vault_page(parity_json(404, {"error": "not found"})))
+    case("share_resource: a secret, a hub that refuses the read of the vault", "share_resource", share,
+         vault_page(parity_json(403, {"error": "is not owner's machine"})))
+    case("share_resource: a secret, a fleet with no central vault", "share_resource", share,
+         vault_page(parity_json(200, dict(parity_vault(), central=None, error="no central vault answers on this hub"))))
+    case("share_resource: a secret, a vault with no good reading", "share_resource", share, vault(ok=False))
+    case("share_resource: a secret, a page whose newest read of the vault failed", "share_resource", share,
+         vault_page(parity_json(200, dict(parity_vault(), error="the central vault does not answer"))))
+    case("share_resource: a secret, a page of the vault with no object", "share_resource", share,
+         vault_page(parity_json(200, ["central"])))
+    # Step 2: the pool. The resource is read as the hub reads it: with spaces around it and in capitals.
+    case("share_resource: a secret of the pool", "share_resource", share, vault(pool=[PARITY_SECRET]))
+    case("share_resource: a secret of the pool, a resource with spaces and capitals", "share_resource",
+         dict(share, resource=" \tSECRET:bws://" + PARITY_SECRET[6:].upper() + " "), vault(pool=[PARITY_SECRET]))
+    case("share_resource: a secret of the pool, which the hub names in upper case", "share_resource", share,
+         vault(pool=["bws://" + PARITY_SECRET[6:].upper()]))
+    # Step 3a: the hub answers in its own words.
+    case("share_resource: a secret that the catalog does not have", "share_resource",
+         dict(share, resource="secret:" + PARITY_ABSENT), vault())
+    case("share_resource: a secret with no reference", "share_resource", dict(share, resource="secret:"), vault())
+    for what, most in (("a word that is no level of a secret", "write"), ("an empty text", ""), ("a number", 7),
+                       ("true", True), ("a list", ["use"])):
+        case(f"share_resource: a secret, a max that is {what}", "share_resource", dict(share, max=most), vault())
+    for what, team in (("no catalog", team_without("logins")),
+                       ("a catalog that is a list", dict(PARITY_SERVERS, logins=[PARITY_SECRET])),
+                       ("an entry of the catalog that is no object",
+                        dict(PARITY_SERVERS, logins={PARITY_SECRET: "SHOP_API_KEY"}))):
+        case(f"share_resource: a secret, a team's page with {what}", "share_resource", share, vault(team=team))
+    # Step 3b: a secret that an agent made is not judged, and a team's page with no list of them cannot judge.
+    case("share_resource: a secret that an agent made", "share_resource",
+         dict(share, resource="secret:" + PARITY_MADE), vault())
+    for what, team in (("no list of the logins that agents made", team_without("created_logins")),
+                       ("such a list that is an object", dict(PARITY_SERVERS, created_logins={})),
+                       ("an entry of that list that is no object",
+                        dict(PARITY_SERVERS, created_logins=[PARITY_LOGIN]))):
+        case(f"share_resource: a secret, a team's page with {what}", "share_resource", share, vault(team=team))
+    # Steps 4, 5 and 6: for any server.
+    case("share_resource: a secret, a grant signed for any server", "share_resource", share,
+         vault(grants=[signed("worker-3", "web-2")]))
+    case("share_resource: a secret, a grant signed only for the door", "share_resource", share,
+         vault(grants=[signed("door", "door")]))
+    case("share_resource: a secret, a grant for the door and one for a server", "share_resource", share,
+         vault(grants=[signed("door", "door"), signed("worker-3", "web-2")]))
+    case("share_resource: a secret, a copy in the vault of any server", "share_resource", share,
+         vault(held={"web-2": ["bws://" + PARITY_SECRET[6:].upper()]}))
+    for what, lacks in (("without its pin", ["not_pinned"]), ("with another pin", ["pin_mismatch"])):
+        case(f"share_resource: a secret, a server {what}", "share_resource", share, vault(missing={"web-2": lacks}))
+    # Step 7: refused. A fleet with no worker and no lead has no server in the page of the vault.
+    case("share_resource: a secret, nothing signed and no copy", "share_resource", share, vault())
+    case("share_resource: a secret at read, nothing signed and no copy", "share_resource", dict(share, max="read"),
+         vault())
+    case("share_resource: a secret that is a login, nothing signed and no copy", "share_resource",
+         dict(share, resource="secret:" + PARITY_LOGIN), vault())
+    case("share_resource: a secret, a resource with spaces and capitals, nothing signed", "share_resource",
+         dict(share, resource=" Secret:BWS://" + PARITY_SECRET[6:].upper()), vault())
+    case("share_resource: a secret, a fleet with no worker and no lead", "share_resource", share, vault(machines=()))
+    case("share_resource: a secret, entries of the list of made logins that name no reference", "share_resource",
+         share, vault(team=dict(PARITY_SERVERS, created_logins=[{"login": 7}, {"agent": "worker-2"}])))
+    # What the rule never touches, in the state that refuses a standing: taking the entry back, another kind, and a
+    # resource that is no text.
+    case("share_resource: a secret, no max in the state that refuses a standing", "share_resource",
+         {"resource": share["resource"]}, vault())
+    case("share_resource: a secret, null max in the state that refuses a standing", "share_resource",
+         dict(share, max=None), vault())
+    for resource, most in (("repo:acme/web", "write"), ("tool:github", "use"), ("drive:ada@example.com", "read"),
+                           ("gmail:ada@example.com", "read"), ("secrets:" + PARITY_SECRET, "use")):
+        case(f"share_resource: {resource.partition(':')[0]} in the state that refuses a standing", "share_resource",
+             {"resource": resource, "max": most}, vault())
+    case("share_resource: a resource that is no text", "share_resource", {"resource": 7, "max": "use"}, vault())
+    # The two reads, when they fail, and a team's page with no base.
+    case("share_resource: a secret, a new generation at the read of the vault, read again once", "share_resource",
+         share, lambda s, r: (s.update(db="g2", moved=1), parity_json(409, {"error": "hub generation changed; "
+                                                                                     "refresh state"}))[1]
+         if r["path"] == "/ui/vault" and not s.get("moved") else None)
+    case("share_resource: a secret, a second new generation at the read of the vault", "share_resource", share,
+         vault_page(parity_json(409, {"error": "hub generation changed; refresh state"})))
+    case("share_resource: a secret, a hub that refuses the read of the team", "share_resource", share,
+         lambda s, r: parity_json(200, parity_vault()) if r["path"] == "/ui/vault" else
+         parity_json(403, {"error": "is not owner's machine"}) if r["path"] == "/ui/team" else None)
+    case("share_resource: a secret of the pool, a team's page with no base", "share_resource", share,
+         vault(pool=[PARITY_SECRET], team=team_without("sha256")))
     # attach_file.
     files = {"note.txt": "hello\n", "a.png": "png", "b.PNG": "png", "c.jpg": "jpg", "d.jpeg": "jpeg", "e.gif": "gif",
              "f.pdf": "pdf", "g.md": "# md\n", "h.csv": "a,b\n", "i.json": "{}", "j.zip": "zip", "k.qqq": "qqq",

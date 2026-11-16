@@ -806,6 +806,36 @@ words of that read: nothing is sent then. A give that the programs send can stil
 value. This is each program's own check and no gate of the fleet (OWNER-MCP-BOUNDARY.md section 7,
 which also has what this check cannot see).
 
+**A standing for a secret from which no give would reach a server.** `share_resource` writes the
+owner's standing for a secret into the fleet's list (`POST /ui/resources`) with no signature, and
+the fleet manager can then give the secret itself; only the owner's app signs the secret into the
+pool, and its own control does that before it writes the standing. So since 16 November 2026 both
+programs judge a standing for a secret (a resource whose kind, as the hub reads it with spaces
+around it and in any case, is `secret`, and a `max` that is not null) by the same reading, for
+every server at once, because a standing names no agent. It is sent when one of these holds, in
+this order, and it is refused otherwise:
+
+1. `GET /ui/vault` cannot judge, as in step 1 above.
+2. The reference is in `central.pool`.
+3. After the read of `GET /ui/team`: a. the catalog (`logins`) does not have the secret, `max` is
+   not `use` or `read`, or the page has no `logins` object, and the hub answers in its own words;
+   b. `created_logins` names the reference, or is no list of objects.
+4. `central.grants` has a grant of this reference for any machine but the door (`door`): no give
+   of the manager reaches the door.
+5. `held` has the reference for any machine.
+6. An entry of `machines` has a `missing` that is not empty.
+
+So a fleet with no worker and no lead (`machines` empty), with nothing signed, gets the refusal.
+A standing that is judged makes two reads, the vault's page and the team, and the command, because
+the one read of the team also gives the command its `base_sha256`. Taking the entry back (`max`
+null or absent) and a standing of every other kind make no read of the vault and are never
+refused here: they read the team once and send the command. The refusal is one fixed sentence that
+quotes no reference and sends the owner to the app (on Secrets, the secret's card, "Who may give
+it"), which signs the pool statement and writes the standing itself. A hub that does not answer, and a generation that moved two times, at
+the read of the vault are the program's own errors, and a read of the team that the hub refuses
+stops the standing in the words of that read: nothing is sent then (OWNER-MCP-BOUNDARY.md section
+7).
+
 **What it does as this server does, and what it does besides.**
 
 - The hub's address is the app's own setting (`hubAddress` of `com.founderizer.app`), read only,
@@ -1013,7 +1043,7 @@ would read as an empty fleet instead of as a mistake.
 | `check_mcp_server` | `/ui/mcp/check` | Does this MCP server answer? Asked before it is saved, and of a machine for a `command` server. Writes nothing. |
 | `save_mcp_server` | `/ui/team/mcp` | Add one of the owner's own MCP servers, change it, or remove it. An agent loads it only once it also holds `tool:<name>`. |
 | `grant_access` | `/ui/team/repos`, `/ui/team/tools`, `/ui/team/google`, `/ui/secrets/grant` | One agent's hold of one resource, as `<kind>:<what>` and a level. Before it gives a secret it reads `GET /ui/vault`, and `GET /ui/team` when that page does not settle it: a give that the hub's reading of the central vault shows as one whose value reaches no server is refused ("A give of a secret that would reach no server"). |
-| `share_resource` / `take_resource` | `/ui/resources`, `/ui/resources/take` | The pool's standing; and end one hold. |
+| `share_resource` / `take_resource` | `/ui/resources`, `/ui/resources/take` | The pool's standing; and end one hold. Before it sends a standing for a secret, `share_resource` reads `GET /ui/vault`, and `GET /ui/team`, whose one read also gives the command its base: a standing from which, by the hub's reading of the central vault, no give of the manager could bring the value to a server is refused ("A standing for a secret from which no give would reach a server"). |
 | `save_account` | `/ui/team/accounts` | One runtime account: its provider and the owner's title for it. |
 | `save_login` | `/ui/team/logins` | The owner's title for one vault login, by its `bws://` reference. The label only. For an API key also its `site` and its `form` (the key swap, `VAULT.md`). |
 | `machine_access` | `/ui/team/access` | How the fleet reaches a machine: its SSH user, port, Screen Sharing. |
