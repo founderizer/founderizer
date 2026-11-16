@@ -71,6 +71,10 @@ TREE_PINS = {
         "arm64": {"archive": "8e99050efd36456f4740f1c5f048b75290dd646554b0c1b153eb831a9ae1e3e8",
                   "program": "cc8afeed9680585b0846a4c59dd935330b2b27623724d34fc224e0c4ab347903"}},
 }
+# The flags that a pinned program of TREE_PINS starts with in the box: Ruby with no RubyGems (the coordinator of the
+# DevOps plan, 16 November 2026), whose classes are the known chains from a YAML tag to a program's own commands. The
+# standard library still loads: a generator's json, yaml, digest and set are in it.
+TREE_FLAGS = {"ruby": ["--disable-gems"]}
 # What the box must not reach: the door's two folders and its Teleport bot's token (door.py ETC, STATE, AWS_TOKEN_FILE)
 KEY_PATHS = ("/etc/fleet-door", "/var/lib/fleet-door", "/opt/machine-id")
 RUN_SECONDS = 30                    # one run of a program
@@ -1051,7 +1055,58 @@ def owned(runner, before):
     return out
 
 
-def generated(runner, before, after):
+# The YAML tags of a commit's files (the coordinator of the DevOps plan, 16 November 2026): a tag outside YAML's core
+# schema can make a reader build an object of its own program, as Psych's !ruby/object and PyYAML's !!python/object
+# do, and the generator of a declaration, the repository's checks and its people's tools are such readers. The pinned
+# Ruby's parser reads each YAML file of the commit, builds no object, and gives each tag as the parser resolves it (a
+# %TAG directive, the !! shorthand and an escaped character included), and each %TAG directive. door_targets refuses
+# the commit (tag_refusal), and the box runs no generator on its tree. A file that the parser cannot read gives
+# "unread": no reader of that grammar builds an object from it, and door_targets still reads its text.
+YAML_NAMES = (".yaml", ".yml", ".json")
+TAG_SCAN = r"""
+require "json"
+require "psych"
+core = %w[str int float bool null seq map].map { |name| "tag:yaml.org,2002:#{name}" }
+out = {}
+ARGV.each do |path|
+  found = []
+  begin
+    Psych.parse_stream(File.binread(path).force_encoding("UTF-8")).each do |node|
+      if node.is_a?(Psych::Nodes::Document)
+        found << "%TAG" unless node.tag_directives.empty?
+      elsif node.respond_to?(:tag) && node.tag && !core.include?(node.tag)
+        found << node.tag
+      end
+    end
+    out[path] = {"tags" => found.uniq.first(20)}
+  rescue Psych::Exception, ArgumentError, EncodingError => e
+    out[path] = {"unread" => e.class.name}
+  end
+end
+puts JSON.generate(out)
+"""
+
+
+def yaml_tags(runner, tree, paths):
+    """{path: {tags: [the tags outside the core schema, and %TAG]} or {unread: why}} of these files of a tree, from
+    the pinned Ruby's parser (TAG_SCAN), or None when the box cannot read them: no pinned Ruby yet, or a run that
+    failed. door_targets then reads only the text of each file."""
+    paths = [p for p in paths if p.lower().endswith(YAML_NAMES)]
+    program = tree_tool_path("ruby")
+    if not paths or not os.access(program, os.X_OK):
+        return None if paths else {}
+    runner.tools.setdefault("yaml-tags", [program] + TREE_FLAGS["ruby"] + ["-e", TAG_SCAN])
+    try:
+        said = json.loads(runner.run("yaml-tags", ["--"] + paths, cwd=tree))
+    except (Failed, ValueError, RecursionError):
+        return None
+    if not isinstance(said, dict) or set(said) != set(paths):
+        return None
+    return {p: {"tags": [t for t in v["tags"] if isinstance(t, str)][:20]} if isinstance(v.get("tags"), list) else
+            {"unread": str(v.get("unread"))[:80]} for p, v in said.items() if isinstance(v, dict)}
+
+
+def generated(runner, before, after, stop=None):
     """[{path, rules, status, why, content, added, gained, removed}]: each file that DECLARATION at HEAD names,
     written again by its generator on the tree after the commit. status: same (no change), removes (it only loses
     lines: each line of the new file is a line of HEAD's, as often), changes (any other change: content, the first
@@ -1060,7 +1115,8 @@ def generated(runner, before, after):
     lines only when entries leave it: an entry that narrows changes its digest line, and so is a change too, and so is
     a line that moves. The
     generator's rules (rules: the generator, the check and their inputs) are taken from HEAD, and HEAD's file is read
-    before the run: copy_tree's hard links make the trees share each file that the commit leaves alone."""
+    before the run: copy_tree's hard links make the trees share each file that the commit leaves alone. stop: why the
+    box runs no generator on this tree (a YAML tag in the commit, yaml_tags), and each file is failed with it."""
     entries, _owner, why = declaration(before)
     if why:
         return [{"path": DECLARATION, "rules": [], "status": "failed", "why": why}]
@@ -1076,12 +1132,15 @@ def generated(runner, before, after):
             continue
         tool = run[0]
         rules = item["rules"] = rules + [a for a in run[1:] if a not in rules]   # the generator's own script is a rule
+        if stop:
+            out.append(dict(item, status="failed", why=stop))
+            continue
         if tool not in runner.tools:
             program = tree_tool_path(tool)
             if not os.access(program, os.X_OK):
                 out.append(dict(item, status="failed", why=f"the pinned {tool} is not on the door yet"))
                 continue
-            runner.tools[tool] = [program]
+            runner.tools[tool] = [program] + TREE_FLAGS.get(tool, [])
         old = read(before, path, most=GEN_BYTES)
         work = os.path.join(runner.scratch, f"generate-{len(out) + 1}")
         try:
@@ -1243,8 +1302,12 @@ def answer(header, tar, blobs, tools, scratch, log=False):
                         pairs.append(pair)
                 units[uid] = unit_report(runner, trees, kind, root, pairs,
                                          shut=closed(runner, trees, kind, root, kustomize, pairs, exposure))
-        report = {"v": 1, "ok": True, "files": files, "units": units, "generated": generated(runner, before, after),
-                  "owner": owned(runner, before)}
+        tags = yaml_tags(runner, after, [p for p in commit if read(after, p) is not None])
+        held = sorted(p for p, v in (tags or {}).items() if v.get("tags"))
+        stop = f"{held[0]} of the commit holds a YAML tag outside the core schema, so the box ran no generator" \
+            if held else None
+        report = {"v": 1, "ok": True, "files": files, "units": units, "tags": tags,
+                  "generated": generated(runner, before, after, stop=stop), "owner": owned(runner, before)}
     except Skip as e:
         return {"v": 1, "ok": False, "skip": str(e)}
     except Late:

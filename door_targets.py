@@ -1096,6 +1096,9 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
         why = gitops_path_refused(path, access)
         if why:
             return refused(why, target=target)
+    why = tag_text_refusal(files)              # before the box: no generator there reads such a file
+    if why:
+        return refused(why, target=target)
     # What the commit makes a cluster apply (door_render.py): the door gives the lookup only where its render box is.
     # With no report, every file keeps the rules that need no render, as before the box.
     report = (lookups.get("render") or (lambda files: None))(files)
@@ -1107,7 +1110,7 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
                            route="again" if report.get("again") else None)
         report = None
     try:
-        why = declared_refusal(report, files)      # before the rules of the files: it is the reason
+        why = tag_scan_refusal(report) or declared_refusal(report, files)   # before the rules of the files
         if why:
             return refused(why, target=target)
         d = gitops_files(lookups, op, target, plan, files, report)
@@ -1189,6 +1192,58 @@ def with_generated(d, report, lookups, files, plan, target):
     d.why = f"{d.why}; with {', '.join(path for path, _data, _mode in written)} written again, from which entries leave"
     d.hash_content = covered
     return d
+
+
+# ---------------------------------------------------------------- YAML tags
+#
+# The coordinator of the DevOps plan, 16 November 2026, after the generator of a declaration was found to read the
+# commit's manifests with Ruby's YAML.load_stream: a YAML tag outside the core schema can make a reader build an object
+# of its own program (Psych's !ruby/object, PyYAML's !!python/object/apply), and the render box's generator, the
+# repository's checks and its people's tools are such readers. No manifest needs one, so a GitOps commit through the
+# door holds none in a YAML or JSON file: refused also where the same text is at HEAD. Two readings, each enough to
+# refuse: the forms below in the text, before the box (a local !ruby/ or !python/ tag, the !! shorthand outside the
+# core schema, a verbatim tag, an escaped character in a tag, a %TAG directive), and every tag outside the core schema
+# as the box's own YAML parser resolves it (door_render.yaml_tags). The text check reads no context, so a script in a
+# block scalar that holds such a form is refused too; a shebang (#!) and a ! in a word, after a tag, before a space or
+# before a quote are no tag.
+
+TAG_CHAR = r"[0-9A-Za-z\-#;/?:@&=+$_.~*'()%]"      # what a tag holds after its !: YAML's ns-tag-char
+TAG_AT = r"(?<![#\w!])!"                           # a ! where a tag can start
+CORE_TAGS = r"(?:str|int|float|bool|null|seq|map)"
+TAG_FORMS = (
+    ("a %TAG directive", re.compile(r"^%TAG(?=[ \t])", re.M)),
+    ("a verbatim tag (!<...>)", re.compile(TAG_AT + r"<")),
+    ("a tag of the !! shorthand outside the core schema",
+     re.compile(TAG_AT + r"!(?!" + CORE_TAGS + r"(?!" + TAG_CHAR + r"))(?=" + TAG_CHAR + r")")),
+    ("a tag that names Ruby or Python", re.compile(TAG_AT + TAG_CHAR + r"*?(?:ruby|python)", re.I)),
+    ("a tag with an escaped character", re.compile(TAG_AT + TAG_CHAR + r"*?%[0-9A-Fa-f]{2}")),
+)
+TAG_WHY = ", which no GitOps commit through the door holds: a YAML reader can build an object of its own program from it"
+
+
+def tag_text_refusal(files):
+    "Why a commit refuses for a form of a YAML tag in the text of one of its YAML or JSON files (TAG_FORMS), or None."
+    for path, data, _mode in files:
+        if data is None or not path.lower().endswith((".yaml", ".yml", ".json")):
+            continue
+        text = data.decode("utf-8", "replace")
+        for what, pattern in TAG_FORMS:
+            found = pattern.search(text)
+            if found:
+                line = text.count("\n", 0, found.start()) + 1
+                return f"{path} holds {what} on line {line}{TAG_WHY}"
+    return None
+
+
+def tag_scan_refusal(report):
+    """Why a commit refuses for a YAML tag outside the core schema that the box's parser found in one of its files
+    (door_render.yaml_tags), or None."""
+    for path, found in sorted(((report or {}).get("tags") or {}).items()):
+        tags = found.get("tags") if isinstance(found, dict) else None
+        if tags:
+            shown = re.sub(r"[^\w.:/%!<>-]", "?", str(tags[0]))[:80]
+            return f"{path} holds the YAML tag {shown}, outside the core schema{TAG_WHY}"
+    return None
 
 
 # ---------------------------------------------------------------- the files whose changes are the owner's

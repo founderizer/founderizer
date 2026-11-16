@@ -120,7 +120,7 @@ def load_tests(loader, _tests, _pattern):
                                                     WorkKeys,
                                                     Workflows, RunnerNew, Probe, CallerGone, Rendered, RenderPath,
                                                     GeneratedFiles, GeneratedPath, OwnerFiles, OwnerPath,
-                                                    RenderBoxUnit, RenderBoxLive)
+                                                    YamlTags, RenderBoxUnit, RenderBoxLive)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -2343,6 +2343,36 @@ def listing_line(prune, lb=(), app="shop"):
     return "2026-11-12T17:00:00.0000000Z DOOR-PRUNE-LIST " + base64.b64encode(body.encode()).decode() + "\n"
 
 
+def listing_stubs(case):
+    """The listing run of a sync with prune, as GitHub gives it to a door test (case.answers from github_stubs): the
+    run's jobs, the log of its listing job with case.line in it, and no pauses. case.late: log addresses that GitHub
+    does not give yet, one read each."""
+    for p in (patch.object(door, "RUN_POLL", 0), patch.object(door, "LOG_PAUSE", 0)):
+        p.start()
+        case.addCleanup(p.stop)
+    case.line = listing_line([])
+    # the jobs of a listing run as GitHub gives them: the sync job is skipped and has no log (GitHub answers 404)
+    case.answers[("GET", "https://api.github.com/repos/one-org/cluster/actions/runs/4242/jobs?per_page=50")] = \
+        (200, {"jobs": [{"id": 97, "name": "Verify the caller", "conclusion": "success"},
+                        {"id": 99, "name": "List what Argo CD wants to prune", "conclusion": "success"},
+                        {"id": 98, "name": "Sync the application", "conclusion": "skipped"}]})
+    case.late = []
+    logs = {"https://logs.example/97": lambda: b"the caller may run this workflow\n",
+            "https://logs.example/99": lambda: case.line.encode()}
+
+    def log(method, url, headers, limit, timeout=120):
+        if url in case.late:
+            case.late.remove(url)
+            return 404, b""
+        return (200, logs[url]()) if url in logs else (599, b"")
+    for p in (patch.object(door, "http_redirect", lambda method, url, headers, timeout=30:
+                           (302, "https://logs.example/" + url.split("/")[-2]) if url.endswith(
+                               ("/actions/jobs/97/logs", "/actions/jobs/99/logs")) else (404, "")),
+              patch.object(door, "http_raw", log)):
+        p.start()
+        case.addCleanup(p.stop)
+
+
 class PruneParts(unittest.TestCase):
     """The pure parts of the door's prune (DevOps plan X3): the objects of a file and of a commit, the listing line,
     and the decision, with the owner's answer of 12 November 2026."""
@@ -2868,30 +2898,7 @@ class Prunes(Signed, DoorCase):
         github, self.yeses = self.door.http, []
         self.door.http = lambda method, url, headers, body: (200, {"approvals": self.yeses, "devices": []}) \
             if url.endswith("/door/approvals") else github(method, url, headers, body)
-        patcher = patch.object(door, "RUN_POLL", 0)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        self.line = listing_line([])
-        # the jobs of a listing run as GitHub gives them: the sync job is skipped and has no log (GitHub answers 404)
-        self.answers[("GET", f"{self.API}/repos/one-org/cluster/actions/runs/4242/jobs?per_page=50")] = \
-            (200, {"jobs": [{"id": 97, "name": "Verify the caller", "conclusion": "success"},
-                            {"id": 99, "name": "List what Argo CD wants to prune", "conclusion": "success"},
-                            {"id": 98, "name": "Sync the application", "conclusion": "skipped"}]})
-        self.late = []          # log addresses that GitHub does not give yet, one read each
-        logs = {"https://logs.example/97": lambda: b"the caller may run this workflow\n",
-                "https://logs.example/99": lambda: self.line.encode()}
-
-        def log(method, url, headers, limit, timeout=120):
-            if url in self.late:
-                self.late.remove(url)
-                return 404, b""
-            return (200, logs[url]()) if url in logs else (599, b"")
-        for p in (patch.object(door, "http_redirect", lambda method, url, headers, timeout=30:
-                               (302, "https://logs.example/" + url.split("/")[-2]) if url.endswith(
-                                   ("/actions/jobs/97/logs", "/actions/jobs/99/logs")) else (404, "")),
-                  patch.object(door, "http_raw", log), patch.object(door, "LOG_PAUSE", 0)):
-            p.start()
-            self.addCleanup(p.stop)
+        listing_stubs(self)
 
     def yes(self, call, need=9):
         said = vault.canonical({"v": 1, "kind": "door-call", "fleet": "fleet-1", "need": need, "call": call,
@@ -6524,6 +6531,23 @@ class GeneratedFiles(RenderCase):
         report = door_render.answer(dict(header, files=[]), tarball(CLUSTER), [], self.tools, scratch + "/2")
         self.assertEqual(report["generated"], [])
 
+    def test_the_box_starts_the_pinned_ruby_with_no_rubygems(self):
+        "Each run of the pinned Ruby that the box takes itself has --disable-gems (door_render.TREE_FLAGS)."
+        folder = tempfile.mkdtemp(prefix="door-ruby-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        said, ruby = os.path.join(folder, "argv"), os.path.join(folder, "ruby")
+        with open(ruby, "w") as f:       # a stand-in for the pinned Ruby: it notes its arguments and runs Python
+            f.write(f'#!/bin/sh\necho "$*" >> "{said}"\n[ "$1" = --disable-gems ] && shift\n'
+                    f'exec "{sys.executable}" -I "$@"\n')
+        os.chmod(ruby, 0o755)
+        self.tools = {k: v for k, v in self.tools.items() if k != "ruby"}
+        with patch.object(door_render, "tree_tool_path", lambda name: ruby):
+            d = self.push_gen({"apps/core/app/b.yaml": None})
+        self.assertEqual(d.kind, "own", d)
+        self.assertIn(f"with {GEN_PATH} written again, from which entries leave", d.why)
+        with open(said) as f:
+            self.assertEqual(f.read().splitlines(), ["--disable-gems tools/gen.py"])
+
     def test_a_door_with_no_render_refuses_a_repository_that_generates_files(self):
         d = self.push_gen({"apps/core/app/b.yaml": None}, render=False)
         self.assertEqual(d.kind, "refused", d)
@@ -6795,6 +6819,112 @@ class OwnerPath(SignedRenderDoor):
         self.assertEqual((blobs, paths, message), ([SUSPENDED.encode()], [OWNER_CHECK], "fix"))
         got = self.call(ONE, GITOPS, "push", content=content)          # the owner's yes was used once
         self.assertEqual((got["ok"], got["route"]), (False, "yes"), got)
+
+    def test_a_card_commit_and_then_its_prune(self):
+        """The owner's yes lets a commit that deletes a file of the owner's through once, the door keeps what it
+        removed, and the prune after it is the agent's own call for objects with a namespace, and the owner's card for
+        objects with none (the first review of 16 November 2026: no test held the two together)."""
+        listing_stubs(self)
+
+        def retire(path, need):
+            content = json.dumps({"message": "retire", "files": [{"path": path, "delete": True}]}).encode()
+            got = self.call(ONE, GITOPS, "push", content=content)
+            self.assertEqual((got["ok"], got["route"]), (False, "yes"), got)
+            self.assertIn(f"{path} is deleted", got["why"])
+            self.yes(got["call"], need=need)
+            got = self.call(ONE, GITOPS, "push", content=content)
+            self.assertEqual((got["ok"], got["kind"]), (True, "approved"), got)
+
+        retire(OWNER_CHECK, 9)
+        removed = json.loads(slurp(self.root + door.REMOVED_FILE, "r"))["one-org/cluster"]
+        self.assertEqual(sorted(removed), CHECK_KEYS)
+        self.line = listing_line(CHECK_KEYS, app="core")
+        got = self.call(ONE, GITOPS, "sync", "core", "prune")
+        self.assertEqual((got["ok"], got["kind"]), (True, "own"), got)
+        pruned = [d["inputs"] for m, u, d in self.calls if u.endswith("/sync-app.yml/dispatches")][-1]
+        self.assertEqual(pruned, {"app": "core", "prune": "yes", "prune_owner_yes": "false",
+                                  "prune_objects": "\n".join(CHECK_KEYS)})
+        # an admission policy and its binding have no namespace: after the owner's yes to the commit, their prune is
+        # the owner's card too
+        retire(OWNER_POLICY, 10)
+        self.line = listing_line(POLICY_KEYS, app="core")
+        got = self.call(ONE, GITOPS, "sync", "core", "prune")
+        self.assertEqual((got["ok"], got["route"]), (False, "yes"), got)
+        self.assertIn(f"{POLICY_KEYS[0]} has no namespace", got["why"])
+
+
+class YamlTags(RenderCase):
+    """No YAML tag outside the core schema in a GitOps commit (the coordinator of the DevOps plan, 16 November 2026):
+    each form of one in the text is refused before the box, also in a file of several documents and in a List; the
+    box's own YAML parser finds every other tag; core tags and a ! in a script pass; and the box runs no generator on
+    a commit that holds one."""
+    FORMS = {"a tag that names Ruby or Python": "!ruby/object:Object {}",
+             "a tag of the !! shorthand outside the core schema": "!!python/object/apply:os.system [echo]",
+             "a verbatim tag (!<...>)": "!<tag:yaml.org,2002:python/object/apply:os.system> [echo]",
+             "a tag with an escaped character": "!r%75by/object:Object {}"}
+    PATH = "apps/core/app/zz.yaml"
+
+    def ruby(self):
+        "The box's YAML parser, with this machine's Ruby in the place of the pinned one."
+        found = shutil.which("ruby")
+        if not found:
+            self.skipTest("this machine has no ruby")
+        p = patch.object(door_render, "tree_tool_path", lambda name: found)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_each_form_is_refused_before_the_box_in_one_document_in_several_and_in_a_list(self):
+        def places(value):
+            one = f"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\ndata:\n  v: {value}\n"
+            return {"one document": one,
+                    "the second of several": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: a\n---\n" + one,
+                    "a List": "apiVersion: v1\nkind: List\nitems:\n  - apiVersion: v1\n    kind: ConfigMap\n"
+                              f"    metadata:\n      name: x\n    data:\n      v: {value}\n"}
+        cases = [(what, where, text) for what, value in self.FORMS.items() for where, text in places(value).items()]
+        directive = "%TAG !e! tag:example.com,2000:\n---\n"
+        cases += [("a %TAG directive", where, directive + text.replace("v: x", "v: !e!x 1"))
+                  for where, text in places("x").items()]
+        for what, where, text in cases:
+            with self.subTest(what=what, where=where):
+                self.last = "no render"
+                d = self.push({self.PATH: text})
+                self.assertEqual(d.kind, "refused", d)
+                self.assertIn(f"{self.PATH} holds {what} on line ", d.why)
+                self.assertIn("a YAML reader can build an object of its own program from it", d.why)
+                self.assertEqual(self.last, "no render")          # the box never read it
+        d = self.push({"apps/core/app/zz.json": json.dumps({"apiVersion": "v1", "kind": "ConfigMap",
+                                                            "metadata": {"name": "x"}, "data": {"v": "!!python/x"}})})
+        self.assertIn("holds a tag of the !! shorthand outside the core schema", d.why)
+
+    def test_core_tags_and_a_bang_in_a_script_pass(self):
+        text = ("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web\ndata:\n  port: !!str 8080\n"
+                "  ids: [!!int 1, !!int 2]\n  run.sh: |\n    #!/usr/bin/python3\n    if a != b: print('done!')\n"
+                "    [ ! -f x ] && sudo !! ; echo \"!!\" '!%s'\n")
+        d = self.push({"apps/core/app/web.yaml": text})
+        self.assertEqual(d.kind, "own", d)
+        self.assertNotIn("YAML", d.why)
+
+    def test_the_box_parser_finds_every_tag_outside_the_core_schema(self):
+        self.ruby()
+        d = self.push({self.PATH: "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\ndata:\n  v: !foo 1\n"})
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn(f"{self.PATH} holds the YAML tag !foo, outside the core schema", d.why)
+        self.assertEqual(self.last["tags"], {self.PATH: {"tags": ["!foo"]}})
+        # core tags only; and a file that the parser cannot read, which no reader of that grammar builds an object from
+        d = self.push({self.PATH: "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\ndata:\n  v: !!str 1\n"})
+        self.assertEqual((d.kind, self.last["tags"]), ("own", {self.PATH: {"tags": []}}), d)
+        self.push({self.PATH: "a: {{ .x }\n"})
+        self.assertEqual(self.last["tags"], {self.PATH: {"unread": "Psych::SyntaxError"}})
+
+    def test_the_box_runs_no_generator_on_a_commit_that_holds_a_tag(self):
+        self.ruby()
+        self.tools = dict(self.tools, ruby=[sys.executable, "-I"])     # the generator's stand-in, as GeneratedFiles
+        d = self.push({"apps/core/app/c.yaml": host_map("c", "c.example.com") + "  note: !foo x\n"}, tree=GEN_TREE)
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("apps/core/app/c.yaml holds the YAML tag !foo", d.why)
+        [g] = self.last["generated"]
+        self.assertEqual((g["status"], g["why"]), ("failed", "apps/core/app/c.yaml of the commit holds a YAML tag "
+                                                            "outside the core schema, so the box ran no generator"))
 
 
 class RenderBoxUnit(DoorCase):
