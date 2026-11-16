@@ -656,7 +656,7 @@ class HelperSide(unittest.TestCase):
                 self.assertEqual(config["headers"], {"Authorization": "Bearer " + token})
         self.assertIn("mcp_servers.fleet.bearer_token_env_var", cases[1][1])
         self.assertIn('"http://hub:8765/mcp/manager"', (self.home / "sessions" / next(
-            n for n in self.files() if n.startswith("manager."))).read_text())
+            n for n in self.files() if n.startswith("manager.") and n.endswith(".json"))).read_text())
         self.assertIn("--strict-mcp-config --mcp-config", cases[3][1])
         legacy = fleet.session_command("alpha", self.conf("claude"), "Go.", task="T-3", generation="g", session="s")
         self.assertNotIn(fleet.SESSIONS, legacy)                    # without a credential: as before

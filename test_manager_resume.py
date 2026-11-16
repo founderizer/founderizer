@@ -11,6 +11,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -28,6 +29,19 @@ SESSION = "11111111-2222-4333-8444-555555555555"
 OTHER = "99999999-8888-4777-8666-555555555555"
 TOKEN = "standing-credential-" + "s" * 24
 PROMPT = fleet.MANAGER_START.format(agent="manager", resume=fleet.MANAGER_COLD)
+# The standing Claude session's first prompt, as its command names it: a file that its window's shell reads and removes
+# (fleet.file_prompt), and the file's own name, which is new at each start.
+FILE_PROMPT = re.compile(r"\$\(cat (\S+); rm -f (\S+)\)")
+PROMPT_FILE = re.compile(r"manager\.manager\.[0-9a-f]{16}\.md")
+
+
+def first_prompt(words):
+    """The first prompt that a start gives its program: the text of the file that its last word reads, or that word."""
+    found = FILE_PROMPT.fullmatch(words[-1])
+    if not found:
+        return words[-1]
+    assert found.group(1) == found.group(2), words[-1]
+    return Path(shlex.split(found.group(1))[0]).read_text()
 
 
 def setUpModule():
@@ -70,10 +84,48 @@ class ManagerResume(unittest.TestCase):
     def test_a_first_start_is_a_new_conversation_with_the_first_prompt_and_its_record(self):
         words, session, record, note = self.words()
         self.assertEqual(words[words.index("--session-id") + 1], session)
-        self.assertEqual(words[-1], PROMPT)
+        self.assertEqual(first_prompt(words), PROMPT)
+        self.assertNotIn(PROMPT, words)                                 # from its file: never a word of the command
         self.assertNotIn("--resume", words)
         self.assertEqual((record["generation"], record["session"], note), ("g1", session, ""))
         self.assertFalse(self.record.exists())                          # saved by the start, when its window runs
+
+    def test_a_brief_longer_than_a_tmux_command_can_carry_reaches_the_session_whole(self):
+        """The hub's brief grows with the fleet, and a tmux command must stay under 16 KiB: on 16 November 2026 a
+        brief of about 14,400 bytes made a start command of 16,419, tmux refused every start with "command too long",
+        and the manager stayed down. Its window's shell reads the brief from its own file now (fleet.file_prompt): the
+        command is as long with any brief, the program gets the whole brief as its one first prompt, whatever words it
+        holds, and the file is gone before the program runs."""
+        ran = self.tmp / "ran"
+        # one line that would write a file if a shell ran it, then lines of a fixed size: the brief's size must not
+        # depend on the folder of the test (Linux takes one argument of at most 128 KiB)
+        tricky = f"T-6 `touch {ran}` $(touch {ran})\n" + \
+            "Where the fleet stands: T-7 \"quoted\" 'single' $HOME `true` $(true) \\ @/etc/hosts; exit 3\n" * 600
+        brief = tricky + "\n\n"
+        prompt = fleet.MANAGER_START.format(agent="manager", resume=brief)
+        self.assertGreater(len(prompt.encode()), 3 * 16384)
+        short, _, _, _ = fleet.manager_start("manager", MANAGER, "g1", TOKEN)
+        with patch.object(fleet, "manager_resume", return_value=brief):
+            command, _, _, _ = fleet.manager_start("manager", MANAGER, "g1", TOKEN)
+        self.assertEqual(len(command), len(short))                      # the brief is no part of the command
+        self.assertLess(len(fleet.in_checkout(command).encode()), 8192)
+        words = shlex.split(command)
+        self.assertEqual(first_prompt(words), prompt)
+        path = Path(shlex.split(FILE_PROMPT.fullmatch(words[-1]).group(1))[0])
+        self.assertEqual((path.parent, oct(path.stat().st_mode & 0o777)), (Path(fleet.SESSIONS), "0o600"))
+        # the window's shell, with a stand-in program that keeps what it was given
+        bin_dir, given = self.tmp / "bin", self.tmp / "argv.json"
+        bin_dir.mkdir()
+        (bin_dir / "claude").write_text(f"#!{sys.executable}\nimport json, sys\n"
+                                        f"open({str(given)!r}, 'w').write(json.dumps(sys.argv[1:]))\n")
+        (bin_dir / "claude").chmod(0o755)
+        subprocess.run(["sh", "-c", fleet.in_checkout(command)], check=True, timeout=60,
+                       env={"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(self.tmp)})
+        argv = json.loads(given.read_text())
+        self.assertEqual(argv[-1], prompt)
+        self.assertEqual(argv.count(prompt), 1)
+        self.assertFalse(path.exists())                                 # read and removed before the program ran
+        self.assertFalse(ran.exists())                                  # and none of its words ran
 
     def test_a_restart_continues_the_recorded_conversation_with_the_same_settings_and_no_prompt(self):
         fresh, new, _, _ = self.words()
@@ -84,9 +136,11 @@ class ManagerResume(unittest.TestCase):
         self.assertEqual(again[again.index("--resume") + 1], SESSION)
         for word in ("--session-id", "--fork-session", PROMPT):
             self.assertNotIn(word, again)
+        self.assertFalse([w for w in again if FILE_PROMPT.fullmatch(w)])     # and no file of a first prompt
+        self.assertEqual(first_prompt(fresh), PROMPT)
         # everything else is the command of a new start: permissions, settings, model, MCP configuration, credential
         self.assertEqual([w for w in again if w not in ("--resume", SESSION)],
-                         [w for w in fresh if w not in ("--session-id", new, PROMPT)])
+                         [w for w in fresh[:-1] if w not in ("--session-id", new)])
         self.assertEqual(self.said, [("mcp", "manager", "manager", "http://hub:8765/mcp/manager", TOKEN)] * 2)
         self.assertEqual(self.record.read_bytes(), saved)               # a continued conversation keeps its record
 
@@ -108,7 +162,7 @@ class ManagerResume(unittest.TestCase):
             self.assertEqual(helper.manager_text_changed(), "its rules or its profile changed")
             words, new, kept, note = self.words()
         self.assertNotIn("--resume", words)
-        self.assertEqual((words[words.index("--session-id") + 1], words[-1]), (new, PROMPT))
+        self.assertEqual((words[words.index("--session-id") + 1], first_prompt(words)), (new, PROMPT))
         self.assertNotEqual(new, session)
         self.assertEqual((kept["session"], kept["text"]), (new, "another-text"))
         self.assertIn("its rules or its profile are not the ones that it began with", note)
@@ -167,7 +221,7 @@ class ManagerResume(unittest.TestCase):
         self.conversation()
         words, session, record, note = self.words(generation="g1")
         self.assertNotEqual(session, SESSION)
-        self.assertEqual((words[-1], record["generation"]), (PROMPT, "g1"))
+        self.assertEqual((first_prompt(words), record["generation"]), (PROMPT, "g1"))
         self.assertNotIn("--resume", words)
         self.assertEqual(note, "a new conversation: the recorded one is of another hub database")
 
@@ -175,7 +229,7 @@ class ManagerResume(unittest.TestCase):
         saved = self.save()                                             # a Claude record is not this runtime's
         self.conversation()
         words, session, record, note = self.words(CODEX)
-        self.assertEqual(words[-1], PROMPT + "\n\n" + fleet.MARKER.format(session))     # its rollout carries the marker
+        self.assertEqual(first_prompt(words), PROMPT + "\n\n" + fleet.MARKER.format(session))  # its rollout's marker
         self.assertEqual((record["generation"], record["marker"], record["session"], note), ("g1", session, None, ""))
         self.assertNotIn("resume", words)
         self.assertNotIn(SESSION, words)
@@ -209,7 +263,8 @@ class ManagerResume(unittest.TestCase):
         (name, command, kw), (cli_name, cli_command, _) = seen["helper"], seen["cli"]
         new, cli_new = kw["session"], option["@fleet_session"]       # set with the window's start
         self.assertEqual((name, cli_name, list(option)), ("manager", "manager", ["@fleet_session"]))
-        self.assertEqual(command.replace(new, "ID"), cli_command.replace(cli_new, "ID"))      # but for the new id
+        self.assertEqual(PROMPT_FILE.sub("FILE", command.replace(new, "ID")),           # but for the new id and the
+                         PROMPT_FILE.sub("FILE", cli_command.replace(cli_new, "ID")))   # new file of its first prompt
         self.assertEqual(json.loads(first)["session"], new)
         self.assertEqual(json.loads(self.record.read_bytes())["session"], cli_new)
         self.assertEqual(said, "manager: session started")

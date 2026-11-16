@@ -357,6 +357,18 @@ def session_file(agent, window, ext, text):
     return path
 
 
+def file_prompt(agent, window, text):
+    """A first prompt as one word of a window command: the window's shell reads it from a mode-600 file and removes
+    the file before the program starts. A tmux command must stay under 16 KiB (CHAT_PROMPT_MAX), and a prompt that
+    grows with the fleet cannot ride in it: on 16 November 2026 the manager's brief of about 14,400 bytes made a start
+    command of 16,419, tmux refused it with "command too long" at every try, and the standing session stayed down.
+    The next limit is the program's: Linux takes one argument of at most 128 KiB (MAX_ARG_STRLEN), so a brief about
+    nine times that one would stop the start again, with exec's "Argument list too long" in a pane that closes. The
+    hub's brief has no bound of its own (hub.manager_resume_text)."""
+    path = shlex.quote(session_file(agent, window, "md", text))
+    return f'"$(cat {path}; rm -f {path})"'
+
+
 def mcp_config_file(agent, window, url, token, servers=None):
     """Claude Code (owner API 1.12): a mode-600 MCP configuration with the session credential in its header. The
     helper removes it after its window has ended. servers: the session's catalog tools (owner feature integrations)."""
@@ -2152,8 +2164,12 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     # throttle. A bounded mitigation, not MCP readiness: a slower server still gives a first turn without the Fleet
     # tools, and the unread task event brings the signal again.
     idle = task and conf.get("runtime") == "claude"
+    # A standing session's first prompt is the hub's brief, which grows with the fleet: its window's shell reads it
+    # from its own file (file_prompt), on each runtime, and the stable start of a Codex session reads its file below.
+    standing = not task and not resume
     first = (shlex.quote(session) if conf.get("runtime") == "codex" else "") if resume else \
-        ("--append-system-prompt " if idle else "") + shlex.quote(prompt)
+        ("--append-system-prompt " if idle else "") + (file_prompt(agent, "manager", prompt)
+                                                       if standing and stable is None else shlex.quote(prompt))
     if stable is not None:
         # The stable text first, then what is this session's own: its repositories' line, and for Codex its task.
         # Claude's task comes with its first read_messages, so no task text is in its start at all; the standing
@@ -2162,7 +2178,7 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         window = task or "manager"
         if opening == "read":
             first = "--append-system-prompt-file " + shlex.quote(session_file(agent, window, "md", stable)) + \
-                ("" if task or resume else " " + shlex.quote(prompt))
+                (" " + file_prompt(agent, window, prompt) if standing else "")
         elif resume:
             first = f"-c project_doc_max_bytes={codex_rules_limit()} " + shlex.quote(session)   # its thread
         else:
@@ -5090,9 +5106,13 @@ class Helper:
             return True
         except Updating:                # a Fleet update runs now: this helper or the restarted one starts it
             return True
-        except subprocess.CalledProcessError:       # tmux refused or did not answer, or its program ended at once
-            self.say_manager("manager: the session did not start or ended at its start; the helper tries again")
-            self.manager_start_failed("the session did not start or ended at its start")
+        except subprocess.CalledProcessError as e:  # tmux refused or did not answer, or its program ended at once
+            # tmux's own words go with it when it gave some: on 16 November 2026 they were "command too long", which
+            # neither the log nor the hub said, and the cause had to be traced on the machine
+            said = " ".join(str(e.stderr or "").split())[:120]
+            why = "the session did not start or ended at its start" + (f" (tmux: {said})" if said else "")
+            self.say_manager(f"manager: {why}; the helper tries again")
+            self.manager_start_failed(why)
             return True
 
     def keep_started(self, session, note, again=False):

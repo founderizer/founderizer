@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import time
@@ -26,6 +27,7 @@ CLAUDE = {"role": "manager", "runtime": "claude", "machine": "hub", "can": ["she
 CODEX = dict(CLAUDE, runtime="codex", start="codex --no-daemon --sandbox danger-full-access --ask-for-approval never {prompt}")
 TOKEN = "standing-credential-" + "s" * 24
 PROMPT = fleet.MANAGER_START.format(agent="manager", resume=fleet.MANAGER_COLD)
+
 CLAUDE_SESSION = "11111111-2222-4333-8444-555555555555"
 MARKER = "22222222-3333-4444-8555-666666666666"
 THREAD = "019a0000-1111-7222-8333-444444444444"
@@ -41,6 +43,13 @@ CODEX_END = {"type": "event_msg", "payload": {"type": "task_complete", "turn_id"
 CODEX_LIMIT_END = {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t2", "last_agent_message": None,
                                                     "error": {"message": "You've hit your usage limit.",
                                                               "codex_error_info": "usage_limit_exceeded"}}}
+
+
+def first_prompt(words):
+    """A standing start's first prompt: its window's shell reads it from its own file (fleet.file_prompt)."""
+    read = re.fullmatch(r"\$\(cat (\S+); rm -f \1\)", words[-1])
+    assert read, words[-1]
+    return Path(shlex.split(read.group(1))[0]).read_text()
 
 
 def setUpModule():
@@ -137,7 +146,7 @@ class Records(Base):
     def test_a_codex_manager_continues_its_thread_with_the_options_of_a_new_start(self):
         new, marker, record, _ = self.words(CODEX)
         self.assertIn(APPROVE, new)                                     # its Fleet tools need no machine configuration
-        self.assertEqual(new[-1], PROMPT + "\n\n" + fleet.MARKER.format(marker))
+        self.assertEqual(first_prompt(new), PROMPT + "\n\n" + fleet.MARKER.format(marker))
         self.assertEqual((record["marker"], record["session"]), (marker, None))
         fleet.save_chat_record("manager", record, "codex", "manager")
         self.codex_rollout(marker=marker)
@@ -178,7 +187,7 @@ class Records(Base):
         words, marker, record, note = self.words(CODEX)
         self.assertEqual((note, record["session"]), ("a new conversation: the recorded start never began one", None))
         self.assertNotEqual(marker, MARKER)
-        self.assertEqual(words[-1], PROMPT + "\n\n" + fleet.MARKER.format(marker))
+        self.assertEqual(first_prompt(words), PROMPT + "\n\n" + fleet.MARKER.format(marker))
         self.assertNotIn("resume", words)
 
 
@@ -525,6 +534,19 @@ class OwnerContact(StandIn):
             self.assertTrue(h.start_manager())
         self.assertEqual(self.reports(), [failed, {"kind": "start_failed",
                                                    "reason": "the session did not start or ended at its start"}])
+
+    def test_a_failed_start_says_what_tmux_said(self):
+        """On 16 November 2026 tmux refused every start of the standing session with "command too long", and the
+        helper's log and the hub said only that the session did not start: the cause was traced on the machine."""
+        h = self.helper(windows={"home": ("", "bash")})
+        refused = subprocess.CalledProcessError(1, ["tmux", "new-window"], "", "command too long\n")
+        with patch.object(h, "start", side_effect=refused), patch.object(h, "say") as say:
+            self.assertTrue(h.start_manager())
+            self.assertTrue(h.start_manager())
+        why = "the session did not start or ended at its start (tmux: command too long)"
+        self.assertEqual(self.reports(), [{"kind": "start_failed", "reason": why}])
+        self.assertEqual([c.args[0] for c in say.call_args_list if c.args[0].startswith("manager: the session")],
+                         [f"manager: {why}; the helper tries again"])           # the same words once in five minutes
 
     def test_another_start_that_holds_the_lock_is_no_failure_of_its_own(self):
         h = self.helper(windows={"home": ("", "bash")})
