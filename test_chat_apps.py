@@ -527,13 +527,16 @@ class ChatApps(OwnerAPI):
         self.assertEqual([rows[text] for text in answers],
                          [(first["request_id"], None), (None, sent["request_id"]), (second["request_id"], None),
                           (None, None)])
-        reports = self.request()[1]["reports"]                          # what the apps read: the links, and no turn
-        self.assertEqual([r["in_reply_to"] for r in reports],
-                         [None, first["request_id"], None, second["request_id"], None])
-        self.assertEqual([key for r in reports for key in r if key == "turn"], [])
+        # What the apps read: the links, and the turn only as its own field (owner API 1.190), which places the row
+        # of what the owner asked for and is never the link of a reply.
+        reports = self.request()[1]["reports"]
+        self.assertEqual([(r["in_reply_to"], r["turn"]) for r in reports],
+                         [(None, None), (first["request_id"], None), (None, sent["request_id"]),
+                          (second["request_id"], None), (None, None)])
         code, chat = self.request("/ui/mobile/chat/manager?db=test-generation")
         self.assertEqual(code, 200, chat)
-        self.assertNotIn(sent["request_id"], json.dumps([i for i in chat["items"] if i["kind"] == "report"]))
+        self.assertEqual([(i["in_reply_to"], i["turn"]) for i in chat["items"] if i["kind"] == "report"],
+                         [(r["in_reply_to"], r["turn"]) for r in reports])
 
     def test_a_report_that_names_a_chat_app_message_that_was_not_read_goes_to_no_chat(self):
         """about can name a message that the manager has not read. The report is not its answer, so it does not go

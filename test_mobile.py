@@ -751,6 +751,44 @@ class Devices(OwnerAPI):
         hub.q("UPDATE tasks SET ask=NULL")
         self.assertEqual(self.call("/ui/mobile")[1]["asked"], {})
 
+    def test_the_apps_turn_is_only_the_words_of_the_turn_that_read_the_message(self):
+        """Owner API 1.190: the Fleet Manager's report that names no message takes the turn of the oldest message from
+        the app that waits (owner_reports.turn, the hub's own). The apps get it as turn, with no link, only when the
+        words came in the runtime turn that read the message (turn_word): words of a later turn, after a turn that
+        carried the message out with its tools and no words, are about something else, and the row of what the owner
+        asked for must not move under them."""
+        def said(text):
+            return hub.q1("SELECT request_id FROM ui_requests WHERE text=?", (text,))["request_id"]
+
+        def call(name, args):
+            text, error = hub.call_tool("manager", name, args, None)
+            self.assertFalse(error, text)
+
+        def send(text):
+            status, receipt = self.call("/ui/messages", self.command(text=text))
+            self.assertEqual(status, 200, receipt)
+
+        send("Move the images.")
+        call("read_messages", {})
+        call("tell_owner", {"text": "The developer has it.", "about": "the images"})
+        send("Pin the base image.")
+        call("read_messages", {})
+        hub.kv_set("turn_ended:manager", str(hub.now() + 1))     # that turn ended, with no words
+        call("tell_owner", {"text": "A standing item ended.", "about": "standing"})
+        first, second = said("Move the images."), said("Pin the base image.")
+        rows = hub.q("SELECT text, turn, turn_word FROM owner_reports WHERE text IN (?, ?) ORDER BY id",
+                     ("The developer has it.", "A standing item ended."))
+        self.assertEqual([tuple(r) for r in rows], [("The developer has it.", first, first),
+                                                    ("A standing item ended.", second, None)])
+        words = {"The developer has it.": first, "A standing item ended.": None}
+        state = [r for r in self.call("/ui/state")[1]["reports"] if r["text"] in words]
+        self.assertEqual([(r["text"], r["in_reply_to"], r["turn"]) for r in state],
+                         [(text, None, turn) for text, turn in words.items()])
+        self.assertNotIn("turn_word", state[0])
+        items = [i for i in self.call("/ui/mobile/chat/manager")[1]["items"] if i["text"] in words]
+        self.assertEqual([(i["text"], i["in_reply_to"], i["turn"]) for i in items],
+                         [(text, None, turn) for text, turn in words.items()])
+
     def test_a_task_page_holds_its_subtasks_and_its_parent(self):
         """Owner API 1.163: the heads of its subtasks by id, an ended one too, and the head of its parent; a task with
         neither has an empty list and null."""

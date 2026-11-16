@@ -489,9 +489,10 @@ class SameBytes(StateCase):
         self.assertEqual(hub.AGENT_SEEN, ("last_seen", "alive", "alive_ts", "client", "client_seen"))
         self.assertEqual({tuple(a) for a in state["agents"]}, {tuple(state["agents"][0])})    # also with no agents row
         self.assertEqual(state["reports"][0]["delivery"]["state"], "sent")
-        self.assertEqual([(r["pushed"], "turn" in r, r["delivery"] and r["delivery"]["outbound"])
+        self.assertEqual([(r["pushed"], r["turn"], r["delivery"] and r["delivery"]["outbound"])
                           for r in state["reports"]],
-                         [(True, False, 1), (False, False, 2), (True, False, 3), (False, False, None)])
+                         [(True, None, 1), (False, None, 2), (True, None, 3), (False, None, None)])
+        # the hub's own turn stays its own; the apps' turn is turn_word, which these reports have not (owner API 1.190)
         # The five tables have no twin of before: their rows, in their order and with the logins masked, are the
         # database's own.
         for table, key in FIVE:

@@ -3017,7 +3017,8 @@ def mobile_chat(agent, since):
     reports = q("SELECT * FROM owner_reports WHERE agent=? AND created>? ORDER BY id", (agent, since))
     carried = carried_files("report", [r["id"] for r in reports])      # CHAT-APPS.md 20: an agent's files
     items += [{"kind": "report", "ts": r["created"], "id": r["id"], "text": r["text"], "about": r["about"],
-               "in_reply_to": r["in_reply_to"], "pushed": bool(r["pushed"]), "attachments": carried.get(r["id"], [])}
+               "in_reply_to": r["in_reply_to"], "pushed": bool(r["pushed"]), "attachments": carried.get(r["id"], []),
+               "turn": r["turn_word"]}                  # owner API 1.190: as GET /ui/state's, no link
               for r in reports]
     items.sort(key=lambda i: i["ts"])
     return items[:MOBILE_CHAT] if since else items[-MOBILE_CHAT:]
@@ -3958,7 +3959,11 @@ def migrate():
                           "pushed": "INTEGER NOT NULL DEFAULT 0",      # chat apps round 2: message_owner
                           # 10 November 2026: the request id of the owner's message from the app whose turn this
                           # report of the manager took, with no link to it (t_tell_owner)
-                          "turn": "TEXT"},
+                          "turn": "TEXT",
+                          # owner API 1.190: that turn, when the report's words came in the runtime turn that read the
+                          # message (no turn end since its read), or a worker's sentence before its task: the apps'
+                          # `turn`, which places the row of what the owner asked for (ChatAskPlaces) and nothing else
+                          "turn_word": "TEXT"},
         "chat_out": {"recipient": "TEXT",           # chat apps round 2: a Discord user ID when chat is null
                      "files": "TEXT",               # CHAT-APPS.md 20: the attachment ids of a message, as JSON
                      "begun": "REAL"},              # and when the bridge said that it begins the item (chat_sweep)
@@ -13042,7 +13047,7 @@ def unanswered_owner_message(agent):
     A report that names no message is then for the next one that waits, which can be the owner's first message from
     a new number. With the turn kept, that report was the answer to an old message, and the owner's newest one got
     its answer one report late."""
-    for row in q("SELECT u.request_id, u.origin, u.created FROM ui_requests u JOIN events e ON e.id=u.event_id "
+    for row in q("SELECT u.request_id, u.origin, u.created, e.read_at FROM ui_requests u JOIN events e ON e.id=u.event_id "
                  "WHERE u.recipient=? AND u.kind='message' AND u.need_id IS NULL AND e.read_at IS NOT NULL "
                  "AND NOT EXISTS (SELECT 1 FROM owner_reports r WHERE r.agent=u.recipient AND r.in_reply_to=u.request_id) "
                  "AND NOT EXISTS (SELECT 1 FROM owner_reports r WHERE r.agent=u.recipient AND r.turn=u.request_id) "
@@ -13089,7 +13094,7 @@ def early_word_rows(agent, request_id):
     in_transaction("early_word_rows")
     if DB.execute("SELECT 1 FROM owner_reports WHERE agent=? AND in_reply_to=?", (agent, request_id)).fetchone():
         return False
-    return DB.execute("UPDATE owner_reports SET in_reply_to=?, turn=NULL WHERE id=(SELECT MIN(id) FROM owner_reports "
+    return DB.execute("UPDATE owner_reports SET in_reply_to=?, turn=NULL, turn_word=NULL WHERE id=(SELECT MIN(id) FROM owner_reports "
                       "WHERE agent=? AND in_reply_to IS NULL AND turn=?)", (request_id, agent, request_id)).rowcount > 0
 
 
@@ -13255,7 +13260,7 @@ def t_tell_owner(agent, a):
     # - the manager's newest report again, with the same words and `about` and no message of the owner's read since
     #   it, is the same call again: it is told as saved, and nothing is saved or sent twice. With a message read since,
     #   the same words are a report of their own.
-    note, also, turn = "", None, None
+    note, also, turn, word = "", None, None, None
     if role == "manager":
         if isinstance(reply, str) and not reply.strip():
             reply = None        # an empty field is no name
@@ -13291,6 +13296,9 @@ def t_tell_owner(agent, a):
         if waits:
             # from a chat app: linked, and so sent there, as before; from the app: its turn alone, with no link
             reply, turn = (waits["request_id"], None) if waits["origin"] else (None, waits["request_id"])
+            # The apps' turn (owner API 1.190): only words of the runtime turn that read the message. A turn that
+            # ended since its read did the work with tools and no words, and these words are about something later.
+            word = turn if turn and turn_ended(agent) <= (waits["read_at"] or 0) else None
     if reply is not None:
         try:
             reply = str(uuid.UUID(reply))
@@ -13326,6 +13334,7 @@ def t_tell_owner(agent, a):
                         f"not call start_task for it again.")
             else:
                 reply, also, turn = None, reply, reply
+                word = turn
                 note = (" It is not the reply to the owner's message yet: call start_task with the same in_reply_to "
                         "now, which makes it the reply. If you open no task, reply with tell_owner without "
                         "before_task.")
@@ -13333,8 +13342,8 @@ def t_tell_owner(agent, a):
     t0 = now()
     rows = chat_files_rows(agent, ids, chat["origin"]["app"] if chat else None, t0)
     with transaction():
-        rid = DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to,turn) VALUES(?,?,?,?,?,?)",
-                         (text, about, t0, agent, reply, turn)).lastrowid
+        rid = DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to,turn,turn_word) "
+                         "VALUES(?,?,?,?,?,?,?)", (text, about, t0, agent, reply, turn, word)).lastrowid
         files = chat_files_carry(rows, t0, report=rid)
         failure = queued_failure(chat_answer(agent, chat, rid, text, t0, files)) if chat else None
     if failure:
@@ -49456,8 +49465,11 @@ class Handler(BaseHTTPRequestHandler):
         reported = {}                           # CHAT-APPS.md 20: the files that an agent's report carries
         for r in report_files:
             reported.setdefault(r["report"], []).append(attachment_view(r))
-        result["reports"] = [dict({k: r[k] for k in r.keys() if k != "turn"}, pushed=bool(r["pushed"]),
-                                  delivery=delivery.get(r["id"]),            # turn: the hub's own (t_tell_owner)
+        # turn (owner API 1.190): the owner's message whose turn the report took in the runtime turn that read it
+        # (turn_word), which is no link and never in_reply_to: the apps place the row of what the owner asked for under
+        # it (ChatAskPlaces), and nothing else. The hub's own turn stays its own (t_tell_owner).
+        result["reports"] = [dict({k: r[k] for k in r.keys() if k not in ("turn", "turn_word")}, pushed=bool(r["pushed"]),
+                                  delivery=delivery.get(r["id"]), turn=r["turn_word"],
                                   attachments=reported.get(r["id"], []))
                              for r in reports]
         result["knowledge"] = [knowledge_public(k) for k in knowledge_entries()]
