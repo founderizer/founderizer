@@ -1677,9 +1677,12 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # (UI-API.md 1.142)
                "diagnostics",       # the owner, 14 November 2026, to the pictures C0, E1, E2 and E3: GET
                                     # /ui/diagnostics, the hub's own faults and refused calls (UI-API.md 1.167)
-               "owner_key"]         # the owner, 14 November 2026 ("it needs to be tested and verified"): the owner's
+               "owner_key",         # the owner, 14 November 2026 ("it needs to be tested and verified"): the owner's
                                     # computer sends a key with its address, and POST /ui/owner/key registers it
                                     # (UI-API.md 1.169)
+               "asks"]              # the owner, 15 November 2026 ("the thing I asked for", then "Both places"): a
+                                    # task names the owner's message that it comes from, tasks[].ask, with that
+                                    # message's messages[].asked and a Needs-you item's needs[].ask of GET /ui/state
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -3830,7 +3833,10 @@ def migrate():
                   "source_conversation": "INTEGER", "source_message": "INTEGER",
                   # person access plan, section 2: the person whose list holds for a conversation task of a narrowed
                   # pair, written when the task is born (conversation_task_rows) and never taken away
-                  "scope_person": "INTEGER"},
+                  "scope_person": "INTEGER",
+                  # owner feature asks: the owner's own message that this task comes from, as its request UUID
+                  # (ui_requests.request_id), written when the task is born and never changed (task_ask)
+                  "ask": "TEXT"},
         # manager_as_lead: which step of the plan next_step came from, so a split step whose parts have all ended
         # counts as no next step, exactly as a single ended task does.
         "goals": {"next_step_id": "INTEGER"},
@@ -3872,7 +3878,10 @@ def migrate():
         "ui_requests": {"recipient": "TEXT NOT NULL DEFAULT 'manager'", "replaces_request_id": "TEXT",
                         "origin": "TEXT",           # owner feature chat_apps: the chat app message, as JSON
                         "edits": "TEXT",            # edit_in_place: each edit of this message, as JSON
-                        "connection": "INTEGER"},   # the connected app that sent it (capp_connections.id)
+                        "connection": "INTEGER",    # the connected app that sent it (capp_connections.id)
+                        # owner feature asks: what the owner asked for in this message, as the few words that their
+                        # apps show for it, written by the first task that names the message (ask_name_row)
+                        "asked": "TEXT"},
         # the resource that a blocked ask names (needs_access), the level of it that the task needs (needs_level:
         # null when any level does), and what the asker said it would go on with when it asked without stopping
         # (asking_and_waiting): the record of what was decided by default
@@ -3894,6 +3903,7 @@ def migrate():
                   "answered_by": "TEXT",      # null is the owner; "P-<id> <name>" is the deputy of that conversation
                   "secret": "TEXT",           # owner feature secret_requests: what request_secret asks for, no value
                   "question": "INTEGER",      # the question that the manager took to the owner (raise_needs_you)
+                  "ask": "TEXT",              # owner feature asks: the owner's message whose work waits for this item
                   # DevOps plan 5.4 (D11, D22): the door call that the owner's yes lets through once, and his signed
                   # yes to it, which only the door reads (GET /door/approvals)
                   "door_call": "TEXT", "approval": "TEXT",
@@ -4296,7 +4306,9 @@ START_READ = ("The start of this task attempt: the text that this session began 
               "list_my_tasks gives the task again.")
 OWNER_CHAT_GUIDANCE = ("Owner-chat guidance: answer greetings and casual questions naturally with tell_owner. Do not "
                        "turn a greeting into tasks or list tests, task inventories or pilot history unless asked. Name a "
-                       "task, a duty or a case by what it is about, never by its code (T-61, R-3).\n\n")
+                       "task, a duty or a case by what it is about, never by its code (T-61, R-3). When you make "
+                       "work of an owner message, give create_task ask=M-<n> of that message, and on its first task "
+                       "asked: the thing to be done, as a short verb phrase.\n\n")
 
 
 # ---------------------------------------------------------------- what an agent holds, and what it has left
@@ -7962,10 +7974,200 @@ def authority(actor, target, action):
     return True, None
 
 
-def check_task(agent, a):
+# ---------------------------------------------------------------- what the owner asked for (owner feature asks)
+#
+# The owner, 15 November 2026: "I am not interested in the specific individual tasks to be done but in the thing I
+# asked for to be done", and "if I ask something new, it gets registered too". One message of theirs often becomes
+# several tasks (the manager's task for a lead, the lead's for a worker, a follow-up after a result), and nothing
+# said which message a task came from: the manager's create_task named none, and a worker's start_task kept it only
+# in its receipt. So the owner's apps could show each task, and never the thing that they asked for.
+#
+# There is no new kind of record. What they asked for is their own message (ui_requests, kind 'message'), and a task
+# names it in tasks.ask, by its request UUID. The few words that the apps show for it are that message's own `asked`,
+# written once, by the first task that names it. A task that follows another, and a subtask of a task, take the ask
+# of that task by themselves, so the agent names the message once, when the work begins. Work that no message of the
+# owner's began (a wake-up, a case, a review) has no ask. The hub decides nothing about an ask's state: the apps read
+# it from the states of its tasks, with the rules of their Tasks page.
+ASKED_CHARS = 48                # characters of the name of what the owner asked for: one line of the panel of a
+#                                 chat, 380 points wide, at 13 points
+ASK_REF = re.compile(r"(?i)^\s*M-?(\d+)\s*$")
+ASK_NEED_REF = re.compile(r"(?i)^\s*N-?(\d+)\s*$")
+ASK_NAME_CODES = re.compile(r"(?:" + NEED_CODES.pattern + r")\s*[:;,]?")    # a code with the mark that stood after it
+ASK_CORRECTIONS = 50            # corrections of one message that ask_message follows back, so no loop can hold it
+
+
+def asked_words(asked):
+    """What is wrong with the name of what the owner asked for, or None: one short line that they read in their own
+    list, in plain words, as a Needs-you title is (need_words)."""
+    if len(asked) > ASKED_CHARS:
+        return (f"asked is at most {ASKED_CHARS} characters: the thing to be done, as a short verb phrase. This one "
+                f"has {len(asked)}.")
+    if any(c in asked for c in "\r\n") or any(ord(c) < 32 or ord(c) == 127 for c in asked):
+        return "asked is one line of plain text."
+    code = NEED_CODES.search(asked)
+    if code:
+        return (f"Say {code.group(0)} in plain words: the owner reads asked in their own list, and they read what a "
+                f"thing is about, never a code.")
+    return None
+
+
+def ask_message(agent, ref):
+    """The owner's own message that `ref` names for this agent, as its ui_requests row, or a ToolError: M-<n>, the
+    number that read_messages gave with it, or its request UUID. It is a message of the owner's to this agent that
+    the agent has read, as start_task asks (owner_message): no agent files its work under words that another agent
+    got. The owner's answer to a Needs-you item, and that item as N-<id>, name the ask of the item. A correction names
+    the first message of its chain of corrections, so the list in the owner's apps gets no second line for it."""
+    read = "SELECT u.*,e.read_at FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE "
+    found, card = ASK_REF.match(str(ref)), ASK_NEED_REF.match(str(ref))
+    if card:
+        row, need = None, q1("SELECT id, ask FROM needs WHERE id=?", (int(card.group(1)),))
+        if not need:
+            raise ToolError(f"There is no Needs-you item N-{int(card.group(1))}.")
+    else:
+        if found:
+            row = q1(read + "u.event_id=?", (int(found.group(1)),))
+        else:
+            try:
+                row = q1(read + "u.request_id=?", (str(uuid.UUID(str(ref).strip())),))
+            except (ValueError, AttributeError, TypeError):
+                raise ToolError("ask is the owner's message that this work comes from: M-<n>, the number that "
+                                "read_messages gave with it, or its request UUID; or N-<id>, a Needs-you item of that "
+                                "work that the owner answered.") from None
+        # The owner's answer to a Needs-you item is no ask of its own ("Yes", "Blue"): it goes on with the ask that its
+        # item named, which is what the manager has at hand when the work goes on after that answer.
+        need = q1("SELECT id, ask FROM needs WHERE id=?", (row["need_id"],)) \
+            if row and row["kind"] == "answer" and row["recipient"] == agent and row["read_at"] is not None else None
+    if need:
+        row = q1(read + "u.request_id=?", (need["ask"],)) if need["ask"] else None
+        if not row:
+            raise ToolError(f"N-{need['id']} names no message of the owner's that work is filed under, so nothing "
+                            f"can take one from it: give ask as the M-<n> of the owner's message that the work "
+                            f"comes from, or leave ask out.")
+        return row
+    if not row or row["recipient"] != agent or row["kind"] != "message" or row["read_at"] is None:
+        raise ToolError("ask names a message of the owner's own to you that you have read. Another agent's message "
+                        "and a message to another agent cannot be named: for work that goes on from an earlier task, "
+                        "give follows, and the task takes that task's ask.")
+    # A message and its corrections are one ask, under the first message of them: a correction of a correction, and
+    # a task that names the first message after one that named its correction, must not make a second line.
+    for _ in range(ASK_CORRECTIONS):
+        earlier = q1(read + "u.request_id=?", (row["replaces_request_id"],)) if row["replaces_request_id"] else None
+        if not earlier or earlier["recipient"] != agent or earlier["kind"] != "message":
+            break
+        row = earlier
+    return row
+
+
+def task_ask(agent, a, follows, parent, goal_id=None):
+    """(the ask of a new task, the name that the task gives that ask or None), or a ToolError. The caller names the
+    owner's message with `ask`, and with `asked` when it is the first task of that message. Without `ask`, the task
+    takes the ask of the task that it follows, or else of the task that it is a subtask of, or else of its goal's
+    first task that has one: so a follow-up, a lead's subtask and a later task of a goal need no field. A lead's one
+    task for its team's results has no ask, and gives none."""
+    ref, name = a.get("ask"), " ".join(str(a.get("asked") or "").split())
+    if ref in (None, ""):
+        if name:
+            raise ToolError("asked names what the owner asked for in the message that ask gives: give ask too, the "
+                            "M-<n> of that message.")
+        for source in (follows, parent):
+            row = q1("SELECT ask FROM tasks WHERE id=?", (source,)) if source else None
+            if row and row["ask"]:
+                return row["ask"], None
+        # A goal that the manager wrote from a message of the owner's: its later tasks, given over days with the goal
+        # alone, are work of that same message. The goal has the ask of its first task that has one.
+        row = q1("SELECT ask FROM tasks WHERE goal_id=? AND ask IS NOT NULL ORDER BY id LIMIT 1", (goal_id,)) \
+            if goal_id is not None else None
+        return (row["ask"] if row else None), None
+    message = ask_message(agent, ref)
+    if message["asked"]:
+        return message["request_id"], None      # the name that its first task gave it stays
+    if not name:
+        raise ToolError(f"This is the first task of the owner's message M-{message['event_id']}: give asked too, "
+                        f"the thing to be done as a short verb phrase of at most {ASKED_CHARS} characters, for "
+                        f"example \"Move the shop to the new server\": never the message's first words, a yes, a "
+                        f"code or an agent's name. The owner reads it as the name of this work in their apps.")
+    wrong = asked_words(name)
+    if wrong:
+        raise ToolError(wrong)
+    return message["request_id"], name
+
+
+def ask_name_of(title):
+    """The name of an ask from the title of its first task, for a start_task that gives no name: the title with no
+    code in it, on one line, cut to the length of a name. A worker's title is written for its task's session, so the
+    tool asks for a name; this is what the owner reads when the agent gave none."""
+    plain = "".join(c if ord(c) >= 32 and ord(c) != 127 else " " for c in title)
+    for _ in range(ASKED_CHARS):        # a code that a mark or another code hid: "-T-12 fix", "T-12-T-13"
+        cleaned = " ".join(ASK_NAME_CODES.sub(" ", plain).split()).strip(" :;,.-")
+        if cleaned == plain:
+            break
+        plain = cleaned
+    if len(plain) > ASKED_CHARS:
+        plain = cut_whole(plain, ASKED_CHARS - 3).rstrip(" :;,.-") + "..."
+    return plain if plain.strip(" .") and not asked_words(plain) else "Work"
+
+
+def ask_name_row(request_id, asked):
+    """Inside the caller's transaction: the name of what the owner asked for in this message, written once. A second
+    task of the same message keeps the name that the first one gave."""
+    in_transaction("ask_name_row")
+    DB.execute("UPDATE ui_requests SET asked=? WHERE request_id=? AND asked IS NULL", (asked, request_id))
+
+
+def ask_said(request_id):
+    """One sentence for the agent that filed a task under an ask: which message, and the name that the owner reads."""
+    row = q1("SELECT event_id, asked FROM ui_requests WHERE request_id=?", (request_id,))
+    return (f" It is part of what the owner asked for in M-{row['event_id']}, which their apps show as "
+            f"\"{row['asked']}\".") if row and row["asked"] else ""
+
+
+def ask_missed(agent, tid):
+    """One sentence for the manager after a task that names no message, when a message of the owner's that it has
+    read has no work filed under it yet, or "". It refuses nothing (the owner, 26 October 2026: no unnecessary gates):
+    the task stands, as a card of its own on the owner's Tasks page, and the manager files the next task of that work.
+    It comes once for each message, the newest one: the hub keeps the number of the last message that it named
+    (kv ask_missed), and no time and no other task decides it. The tasks that the hub makes with the manager as their
+    requester (a wake-up's run, a worker's start_task) are many on a busy fleet, so they are no measure of it."""
+    told = int(kv_get("ask_missed") or 0)
+    m = q1("SELECT u.event_id, u.text FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE u.recipient=? AND "
+           "u.kind='message' AND u.asked IS NULL AND e.read_at IS NOT NULL AND u.event_id>? "
+           "ORDER BY u.event_id DESC LIMIT 1", (agent, told))
+    if not m:
+        return ""
+    kv_set("ask_missed", str(m["event_id"]))
+    return (f" This task names no message of the owner's. If it is work that they asked for in M-{m['event_id']} "
+            f"(\"{clip(m['text'], 60)}\"), give the next task of that work ask=M-{m['event_id']} and asked, so that "
+            f"their apps show it as one thing.")
+
+
+def need_ask(agent, ref):
+    """raise_needs_you's `ask`: the ask whose work waits for the owner's answer to the item, as its request UUID, or
+    None. T-<id> names a task of that work, which is what the manager has at hand, and M-<n> the owner's message
+    itself (ask_message). A task with no ask gives none: the item is then about work that the owner did not ask
+    for, and it stands in Needs you alone, as before."""
+    if ref in (None, ""):
+        return None
+    task = re.fullmatch(r"(?i)\s*T-?(\d+)\s*", str(ref))
+    if not task:
+        message = ask_message(agent, ref)
+        if not message["asked"]:
+            raise ToolError(f"No work is filed under M-{message['event_id']} yet, so no item can wait for it: name a "
+                            f"task of the work that waits for this item (T-<id>), or leave ask out.")
+        return message["request_id"]
+    row = q1("SELECT ask FROM tasks WHERE id=?", (int(task.group(1)),))
+    if not row:
+        raise ToolError(f"There is no task {tref(int(task.group(1)))}: ask names a task of the work that waits for "
+                        f"this item, or the owner's message M-<n> that the work comes from.")
+    return row["ask"]
+
+
+def check_task(agent, a, by_goal=False):
     """The admission rules of create_task, also used by trigger runs (owner API 1.7): the checked fields of a task
     that `agent` requests, or a ToolError that says why not. A lead's subtask belongs to the task of its session;
-    another task takes the goal that the caller named. authority() decides who may give it."""
+    another task takes the goal that the caller named. authority() decides who may give it. by_goal: a task with no
+    ask of its own takes the ask of its goal (task_ask); true for an agent's create_task only, because the runs of a
+    wake-up rule with a goal would otherwise join that ask for ever, and it would never end. A lead's subtask takes none
+    from the goal either: the subtasks of each run of a lead's wake-up rule would join it in the same way."""
     owner = str(a.get("owner") or "").strip()
     title = str(a.get("title") or "").strip()
     done_when = str(a.get("done_when") or "").strip()
@@ -7996,7 +8198,9 @@ def check_task(agent, a):
         raise ToolError(f"There is no task {tref(follows)} to follow.")
     if len(why) > 300:
         raise ToolError("why is at most 300 characters.")
-    guard(agent, title, done_when, details, goal, why)
+    # owner feature asks. The goal gives its ask to a task that hangs on no other: a lead's subtask has its task's.
+    ask, asked = task_ask(agent, a, follows, parent, goal_id if by_goal and parent is None else None)
+    guard(agent, title, done_when, details, goal, why, asked or "")
     case_id, duty_case = a.get("case_id"), None
     if case_id and CASE_REF.match(str(case_id)):
         # A duty's case: the manager gives a case's work to the agent that suits it and keeps the case (RULES.md),
@@ -8017,7 +8221,8 @@ def check_task(agent, a):
     return {"owner": owner, "title": title, "details": details, "done_when": done_when, "needs": needs, "goal": goal,
             "goal_id": goal_id, "parent": parent, "step": step, "follows": follows, "case_id": case_id,
             "duty_case": duty_case["id"] if duty_case else None,
-            "responsibility": duty_case["responsibility"] if duty_case else None, "why": why or None}
+            "responsibility": duty_case["responsibility"] if duty_case else None, "why": why or None,
+            "ask": ask, "asked": asked}
 
 
 def split_step(agent, value, goal_id, parent):
@@ -8056,12 +8261,14 @@ def admit_task(requester, f, trigger_id=None, trigger_run=None):
     generation = DB.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()
     t0 = now()
     tid = DB.execute("INSERT INTO tasks(id,title,details,done_when,needs,goal,goal_id,parent,step,owner,requester,"
-                     "state,follows,created,last_activity,case_id,trigger_id,trigger_run,why,responsibility,duty_case) "
-                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     "state,follows,created,last_activity,case_id,trigger_id,trigger_run,why,responsibility,duty_case,"
+                     "ask) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                      (unused_id("tasks"), f["title"], f["details"], f["done_when"], f["needs"], f["goal"], f["goal_id"],
                       f["parent"], f.get("step"), f["owner"], requester, "submitted", f["follows"], t0, t0,
                       f["case_id"], trigger_id, trigger_run, f.get("why"), f.get("responsibility"),
-                      f.get("duty_case"))).lastrowid
+                      f.get("duty_case"), f.get("ask"))).lastrowid
+    if f.get("ask") and f.get("asked"):         # owner feature asks: the first task of a message names the ask
+        ask_name_row(f["ask"], f["asked"])
     DB.execute("INSERT INTO attempts(task,attempt,created,reason) VALUES(?,1,?,'created')", (tid, t0))
     opening = stable_opening(f["owner"], f["needs"])
     start = start_text(f["owner"], tid, opening=opening)
@@ -8080,7 +8287,7 @@ def admit_task(requester, f, trigger_id=None, trigger_run=None):
 
 
 def t_create_task(agent, a):
-    f = check_task(agent, a)
+    f = check_task(agent, a, by_goal=True)
     with transaction():             # the task, its first attempt and its start event: all three or none
         tid = admit_task(agent, f)
     owner = f["owner"]
@@ -8110,6 +8317,10 @@ def t_create_task(agent, a):
                 + (", with " + ", ".join(f"{tref(r['id'])} ({r['owner']})" for r in others) if others else
                    ", its first part") + ". The step is done when every part is, and the goal will not close while "
                 "one of them is open.")
+    if f.get("ask"):
+        said += ask_said(f["ask"])
+    elif role_of(agent) == "manager" and not f.get("duty_case") and not f.get("follows"):
+        said += ask_missed(agent, tid)
     return said + late
 
 
@@ -10549,6 +10760,7 @@ def t_raise_needs_you(agent, a):
     if mine:
         raise ToolError(mine)
     guard(agent, title, why, todo, details, *(json.loads(options) if options else ()))
+    ask = need_ask(agent, a.get("ask"))     # owner feature asks: the ask whose work waits for this item
     with LOCK:                  # lane L2: an id that no removed item had (unused_id)
         old = need_replaced(agent, replaces) if replaces else None
         qu = need_question(agent, a.get("question_id"), ignore=old["id"] if old else None)
@@ -10563,6 +10775,16 @@ def t_raise_needs_you(agent, a):
                   (unused_id("needs"), title, why, todo, now(), agent, options, qu["id"] if qu else None, door_call,
                    door_host, github_app, 1 if add_device else None, github_key, details or None,
                    1 if multi else None, door_script, door_task, asking["id"] if asking else None))
+        # owner feature asks: the ask that the agent named, else the ask of the item that this one replaces, else the
+        # ask of the task whose question it carries to the owner
+        if not ask and old:
+            ask = old["ask"]
+        for source in (qu["task"] if qu else None, asking["id"] if asking else None):
+            if not ask and source:      # the task whose question it carries, or whose run the door refused
+                asking_task = q1("SELECT ask FROM tasks WHERE id=?", (source,))
+                ask = asking_task["ask"] if asking_task else None
+        if ask:
+            q("UPDATE needs SET ask=? WHERE id=?", (ask, nid))
         if old:                 # the old item leaves Needs you, and the record of an earlier discussion moves along
             q("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
               (f"Replaced by {agent} with a new item: {title}", now(), agent, old["id"]))
@@ -12843,13 +13065,23 @@ def t_start_task(agent, a):
     chat_fence(agent)
     source = owner_message(agent, a.get("in_reply_to"))
     title, done_when = str(a.get("title") or "").strip(), str(a.get("done_when") or "").strip()
-    guard(agent, title, done_when)
+    asked = " ".join(str(a.get("asked") or "").split())     # owner feature asks: the name of this work for the owner
+    guard(agent, title, done_when, asked)
+    # asked is no part of the receipt's body: the same message again is the same task, whatever name comes with it
     command, stored = agent_write(agent, "start_task", {"request_id": source["request_id"]},
                                   {"title": title, "done_when": done_when})
     if stored:
         return stored["text"]
     if not title or not done_when:
         raise ToolError("A task needs a title and a done_when line.")
+    wrong = asked_words(asked) if asked else None
+    if wrong:
+        raise ToolError(wrong)
+    # The message is the ask of its task, under the name that the agent gave or else one made from the task's own
+    # title (ask_name_of): start_task asked for no name before, and it refuses no title now. A correction of a
+    # message that is an ask already belongs to that ask (ask_message).
+    ask = ask_message(agent, source["request_id"])["request_id"]
+    asked = asked or ask_name_of(title)
     route, why_not = wakeups.wake_route(wake_org(), agent)        # authority() and the agent active, at each step
     if route is None or route["kind"] != "task":
         raise ToolError(f"No task can be opened for you: {why_not or 'there is no line to request it'}")
@@ -12865,7 +13097,7 @@ def t_start_task(agent, a):
         parent = lead_batch_rows(requester, t0) if route["parent"] else None    # plan P9.11: the lead's one task
         tid = admit_task(requester, {"owner": agent, "title": title, "details": details, "done_when": done_when,
                                      "needs": "none", "goal": "", "goal_id": None, "parent": parent, "step": None,
-                                     "follows": None, "case_id": None, "why": why})
+                                     "follows": None, "case_id": None, "why": why, "ask": ask, "asked": asked})
         # **The sentence before the task becomes the reply now** (after_task_words; the chat's rules since 13
         # November 2026, fleet.chat_command): a request for work got its first words only after this call, which
         # the model wrote for 5 to 8 seconds.
@@ -28635,6 +28867,11 @@ TOOLS = [
      "see this conversation, so link the goal, and put in details anything else the owner said that limits this "
      "work. "
      "Say in why, in one line, why this agent suits the task. "
+     "When the work comes from a message of the owner's own to you, set ask to that message (M-<n>), and on the "
+     "first task of that message set asked to the thing to be done, as a short verb phrase: their apps then show "
+     "one line for the thing they asked for, with every task of it behind that line. When the work goes on after "
+     "the owner's answer to a Needs-you item, set ask to that answer's M-<n>. A task that follows another, a "
+     "subtask and a later task of the same goal take the ask by themselves. "
      "Work too much for one agent is one step of the goal's plan (update_goal), and each part of it a task with "
      "goal=G-<id> and step=<n>, for an agent that suits that part: rules/manager.md, \"Work that is too much for "
      "one agent\".",
@@ -28651,7 +28888,17 @@ TOOLS = [
         "step": {"type": "integer", "description": "The number of the step of goal's plan that this task is one "
                                                    "part of, when one piece of work is split across agents"},
         "why": {"type": "string", "description": "One line, at most 300 characters: why this agent suits the task "
-                                                 "(expertise, access, availability)"}},
+                                                 "(expertise, access, availability)"},
+        "ask": {"type": "string", "description": "M-<n> of the owner's own message to you that this work comes "
+                                                 "from, as read_messages gave it; or of their answer to a Needs-you "
+                                                 "item of that work. Leave it out for work that no message of the "
+                                                 "owner's began, and for a task with follows"},
+        "asked": {"type": "string", "description": "Only on the first task of that message: the thing to be done, "
+                                                   "as a short verb phrase of at most 48 characters, for example "
+                                                   "\"Move the shop to the new server\". Never the message's first "
+                                                   "words, a yes, a code or an agent's name. A message that asks "
+                                                   "for more than one thing: name them together. The owner reads "
+                                                   "it as the name of this work"}},
        ["owner", "title", "done_when"])),
     ("manager", "cancel_task", t_cancel_task,
      "Cancel a task you requested that is not finished yet.",
@@ -28878,6 +29125,10 @@ TOOLS = [
         "question_id": {"type": "string", "description": "The question with you that only the owner can settle, "
                         "for example Q-4: the item quotes its asker, the owner's answer goes back to it as the answer, "
                         "and the item closes by itself when the question is answered another way or its task ends"},
+        "ask": {"type": "string", "description": "When work that the owner asked for waits for this item: a task "
+                "of that work, for example T-12, or the owner's message M-<n> itself when a task names it already. "
+                "The owner's apps then show that the thing they asked for waits for them. An item with a "
+                "question_id needs none"},
         "door_call": {"type": "string", "description": "The call hash that the door gave with its refusal of a "
                       "call that is the owner's (a delete of what no agent made through the door, an AWS delete, or "
                       "a host's run: a root script with no box): the owner's yes then lets that exact call through "
@@ -29509,7 +29760,13 @@ TOOLS = [
      S({"title": STR, "done_when": {"type": "string", "description": "The line a stranger could test the result "
                                                                    "against"},
         "in_reply_to": {"type": "string", "description": "The request UUID of the owner's message that asks for the "
-                                                         "work: the one that your sentence before this call named"}},
+                                                         "work: the one that your sentence before this call named"},
+        "asked": {"type": "string", "description": "Give it: the thing to be done, as a short verb phrase of at "
+                                                   "most 48 characters, for example \"Check the disk of the shop's "
+                                                   "server\", with no code and no agent's name. The owner reads it "
+                                                   "as the name of this work in their apps; the title is for the "
+                                                   "task's own session. Without it, the hub makes the name from "
+                                                   "the title"}},
        ["title", "done_when", "in_reply_to"])),
     ("all", "message_agent", t_message_agent,
      "Send a message to another agent: a question, an answer or coordination. It has your authority, never the "
@@ -53424,7 +53681,8 @@ def leak_scan():
               # a job: also the texts of create_login and save_key, and the request and the answer of call_api
               "jobs": ("login", "result", "label", "username", "url", "selector", "source_url", "path", "body", "auth",
                        "headers", "response"),
-              "sealed": ("label", "task"), "ui_requests": ("text", "edits"), "owner_reports": ("text", "about"),
+              "sealed": ("label", "task"), "ui_requests": ("text", "edits", "asked"),
+              "owner_reports": ("text", "about"),
               "agent_messages": ("text",), "thread_events": ("data",), "holds": ("note", "detail"),
               "outcomes": ("title", "note"),
               "duty_reports": ("summary",), "report_questions": ("words",),       # a Shell-off session's own words
