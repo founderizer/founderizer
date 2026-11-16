@@ -423,7 +423,8 @@ class Columns(unittest.TestCase):
         "deliver_running:": "a task", "desktop_click:": "a Mac", "desktop_seen:": "a Mac", "desktop_told:": "a Mac",
         "door_mode:": "a server of the door",
         "history:": "a stream of the history", "knowledge_asked:": "a knowledge file", "lead_unread:": "an unread item",
-        "lost:": "a task", "name_told:": "a machine", "owner_pin:": "a machine", "park_ended:": "a reminder",
+        "lost:": "a task", "mcp_renew:": "an MCP server: the manager's notice that its access ended or ends soon",
+        "name_told:": "a machine", "owner_pin:": "a machine", "park_ended:": "a reminder",
         "row_floor:": "a table", "screen_frozen:": "a task", "screen_limit:": "a task", "screen_question:": "a task",
         "screen_restart:": "a task", "standing_told:": "a conversation", "start_failed:": "a task",
         "stuck_notice:": "a task", "turn_ack:": "a task", "turn_checked:": "a task", "turn_empty:": "a task"}

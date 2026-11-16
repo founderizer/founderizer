@@ -718,6 +718,11 @@ LATER_TEAM = {"hub": {"machine": "hub", "port": 8765},
 LINES_CHECK = {"form": "lines", "code": "saved", "sha256": "a" * 64, "bytes": 10, "code_by": "vps",
                "args": {}, "timeout_seconds": 60}
 UNKNOWN_CHECK = dict(LINES_CHECK, form="no-release-knows-this")     # a form that no release reads
+# A read check as save_trigger stores it since the lane "Wake on events" (wakeups.read_check), as literal values: the
+# rollback read runs this file against a release that has no such function. Its path names no file, its commit is 40
+# zeros, and it has no `code`.
+READ_CHECK = {"form": "read", "read": "gmail_label", "args": {"labels": ["INBOX"], "hours": 48},
+              "path": "checks/no_file_read_by_the_hub.py", "commit": "0" * 40, "sha256": "b" * 64}
 SAVED = "bws://aaaaaaaa-1111-4222-8333-444444444444"     # the login that a waiting task's owner saved
 
 
@@ -892,6 +897,17 @@ def later_data(t0=None):
             "VALUES(?,1,?,0,'quiet',?,?,'[]',7)", (made["lines_rule"], t0 - 2000, t0 - 2600, t0 - 2000))  # 7 quiet runs
     for key, value in ((f"check_fails:{made['lines_rule']}", str(made["wake"])), ("lead_batch:manager", "999999")):
         hub.q("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, value))
+    # The lane "Wake on events": a rule with a read check as save_trigger stores it (wakeups.read_check: the form
+    # "read", and the path, commit and sha256 that the installed apps' decoders need), and its base run (read_base_rows)
+    made["read_rule"] = hub.ins("INSERT INTO triggers(agent,state,revision,schedule,check_spec,task,late_minutes,"
+                                "max_tasks_per_day,anchor,next_due,created,updated,request_id,created_by) "
+                                "VALUES('vps','active',1,?,?,?,0,0,?,?,?,?,'rule-3','vps')",
+                                (json.dumps({"kind": "every", "minutes": 1}), json.dumps(READ_CHECK),
+                                 json.dumps({"title": "New mail", "details": "", "done_when": "each mail is answered",
+                                             "needs": "none", "goal_id": None}), t0 - 60, t0 + 60, t0, t0))
+    hub.ins("INSERT INTO trigger_runs(trigger_id,revision,due,manual,state,reason,created,finished,lines) "
+            "VALUES(?,1,?,0,'quiet',?,?,?,?)", (made["read_rule"], t0 - 60, "The base of the read: what is there "
+                                               "wakes nobody.", t0 - 60, t0 - 60, json.dumps([f"t1 m1 {int(t0 - 60)}"])))
     # Lane L8's start event of a session that opens with its stable text (hub.stable_extra) and the last note that
     # deliver_result keeps (plan P9.2, P9.4)
     hub.q("INSERT INTO events(agent,kind,task,text,created,extra) VALUES('vps','task',?,?,?,?)",
@@ -1179,6 +1195,24 @@ class RollbackReads(HubFixture):
         start = hub.conversation_start("vps", self.talk)
         self.assertEqual((start["closed"], start["tools"]), (False, list(hub.CONVERSATION_WORK_TOOLS)))
         self.assertTrue(set(hub.CONVERSATION_WORK_TOOLS) <= set(hub.conversation_tools("vps", context)))
+
+    def test_a_read_check_opens_no_run_and_pauses_nothing(self):
+        """The lane "Wake on events": a rule with a read check. The release that knows the form marks it for its read
+        thread, and a release from before it does not know the form: for both, a due time opens no run, writes no
+        work for a helper, pauses nothing, and only moves the rule's next time. Neither asks for an execution grant,
+        because the stored check has no `code`."""
+        rule = hub.q1("SELECT * FROM triggers WHERE request_id='rule-3'")
+        runs = hub.q("SELECT id, state FROM trigger_runs WHERE trigger_id=?", (rule["id"],))
+        hub.q("UPDATE triggers SET next_due=? WHERE id=?", (hub.now() - 1, rule["id"]))
+        self.tick()
+        after = hub.q1("SELECT * FROM triggers WHERE id=?", (rule["id"],))
+        self.assertEqual((after["state"], after["paused_by"]), ("active", None))
+        self.assertGreater(after["next_due"], hub.now())
+        self.assertEqual(hub.q("SELECT id, state FROM trigger_runs WHERE trigger_id=?", (rule["id"],)), runs)
+        self.assertEqual(hub.q("SELECT * FROM events WHERE kind='trigger_check'"), [])
+        self.assertTrue(hub.wakeups.still_valid(hub.wake_org(), hub.trigger_view(after, hub.now()))[0])
+        for kept in getattr(hub, "READ", {}).values():          # the marks of this release's tick, which no thread takes here
+            kept.clear()
 
     def test_a_check_of_an_unknown_form_reads_as_quiet(self):
         hub.q("UPDATE triggers SET check_spec=? WHERE id=?", (json.dumps(UNKNOWN_CHECK), self.rule))

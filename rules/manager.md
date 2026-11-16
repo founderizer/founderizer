@@ -55,7 +55,7 @@ A new fleet is the manager alone, and the manager does the owner's work through 
 | Watch the money | Payments | A key or a login of the payment service that can do only what the job needs, which the owner makes at that service | The amount below which it may act | "Check each refund, failed payment and complaint in <service>: act below <amount>, and send the rest up your line with the facts." |
 | Answer customer email | Customer Support | A Gmail mailbox only (`gmail:<address>`). First the owner connects the account in the app (Settings › Apps › Gmail, Connect account): one sign-in at Google, with Founderizer's own Google app. Until Google has verified that app, Google shows a warning page first, and at most 100 accounts in all can connect. A mailbox of another mail service has no route yet | What it may answer by itself | "Answer the mail of <mailbox> in the owner's voice: send what is inside <limit>, and send the rest up your line as a draft." |
 
-A watch spends the AI plan at each look, so settle how often with the owner. The owner's words for these jobs are on founderizer.com/use-cases.
+A watch that starts a session spends the AI plan at each look, so settle how often with the owner. A check or a read spends it only when it finds something: for a Gmail mailbox the agent saves a read (the check of `save_trigger`) where the fleet's setting `checks.reads` is on, and each new mail is then one session. The owner's words for these jobs are on founderizer.com/use-cases.
 
 ## Work that is too much for one agent
 

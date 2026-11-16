@@ -529,6 +529,36 @@ def gmail_attachment(access, message_id, attachment_id):
     return _b64(str(found.get("data") or ""))
 
 
+# A read check of a Gmail label (the wake-on-events design, step 1): ids only, for the hub's read of a wake-up rule.
+# No message is read, so no sender, subject or text of a mail comes back from these two.
+
+def gmail_labels_by_name(access):
+    """{name: id} of every label of the account, a system label under its id (INBOX) and a user label under its
+    name: users.messages.list takes ids, and an id belongs to one mailbox."""
+    return {str(x.get("name")): str(x.get("id")) for x in _labels(access) if x.get("id") and x.get("name")}
+
+
+def gmail_ids(access, label_ids, after, before=None, limit=500):
+    """([(thread id, message id)], whole): the messages that have all of label_ids and that are newer than the
+    second `after` (and older than `before`), at most `limit` of them. whole is False when Gmail has more, so that
+    the caller can refuse the answer: a cut answer is never used. One call of 5 quota units for each page of 500. A
+    list that does not end in 20 pages is a GoogleError."""
+    query = f"after:{int(after)}" + (f" before:{int(before)}" if before is not None else "")
+    found, page = [], None
+    for _ in range(20):         # a bound on the pages, also for short ones: a list that never ends is an error
+        answer = _gmail(access, "GET", "/messages", {"labelIds": list(label_ids), "q": query,
+                                                    "maxResults": min(500, limit + 1 - len(found)), "pageToken": page})
+        for m in answer.get("messages") or []:
+            if isinstance(m, dict) and m.get("id") and m.get("threadId"):
+                found.append((str(m["threadId"]), str(m["id"])))
+        page = answer.get("nextPageToken")
+        if len(found) > limit or (page and len(found) >= limit):
+            return found[:limit], False
+        if not page:
+            return found, True
+    raise GoogleError("Gmail's list of messages did not end")      # no answer to use: not "more than the limit"
+
+
 def mime_message(to, cc, bcc, subject, body, reply=None):
     """The base64url raw of a plain-text UTF-8 email without From (Gmail sets the owner's address). reply: a dict of
     gmail_message, which the email answers in its thread. A header value with a line break is a ValueError."""
