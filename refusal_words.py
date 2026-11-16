@@ -97,6 +97,9 @@ WORDS = {
     "mcp_registry_no_list": "the MCP Registry gave no list of servers",
     # an MCP server's Connect (POST /ui/mcp/connect)
     "mcp_no_endpoints": "the MCP server {server} gave no OAuth endpoints: {reason}",
+    # a server whose name in Tailscale is the door's name in the central vault (UI-API.md 1.188)
+    "server_name_kept": "This server is called {name} in Tailscale, and Fleet keeps that name for itself. Rename this "
+                        "server in Tailscale, then run the line again.",
 }
 
 

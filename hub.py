@@ -11802,6 +11802,10 @@ def deposit_machines(team=None, t0=None):
             groups.setdefault(a["machine"], []).append(name)
     out = {}
     for machine, names in sorted(groups.items()):
+        if machine == DOOR_PIN:     # the door's name in the central vault (C49): no copy, and no trust of the app
+            out[machine] = {"machine": machine, "agents": names, "carrier": None, "recipient": None,
+                            "missing": ["machine_name_kept"]}
+            continue
         key, brokers = store_key(team, machine), [n for n in names if team["agents"][n].get("vault") == "broker"]
         carrier, fresh, missing = None, -1, ["no_broker_access"] if not brokers else [] if key else ["no_vault_store"]
         for n in brokers if key else []:
@@ -35358,6 +35362,9 @@ def tailnet_rename_wait(machine, new, t0):
     somebody, so the manager hears it; any other passes by itself, and the rename comes at a later read."""
     if not SERVER_NAME.fullmatch(new) or new == "owner":
         return f"{new} is no name a server can have in Fleet: 2 to 31 characters a-z 0-9 -, starting with a letter", True
+    if new == DOOR_PIN:
+        return (f"{new} is the name under which the central vault keeps the door's pin and grants, so no server can "
+                f"have it"), True
     if new in (TEAM.get("addresses") or {}) or q1("SELECT 1 FROM server_keys WHERE server=?", (new,)):
         return f"the fleet has a server named {new}", True
     if central_ok(t0):
@@ -35376,6 +35383,20 @@ def tailnet_rename_wait(machine, new, t0):
     return None
 
 
+def door_name_told():
+    """Inside LOCK: a server of team.json named `door` (DOOR_PIN), from before the join refused that name (C49): the
+    fleet manager hears once, across restarts, what the owner must do. Its vault gets nothing from the central vault
+    meanwhile (deposit_machines), so the door's pin and grants stay the door's."""
+    if not manager_name() or kv_get("door_name_told"):
+        return
+    kv_set("door_name_told", "1")
+    emit(manager_name(), "say", f"[hub] The server {DOOR_PIN} has the name under which the central vault keeps the "
+                                f"door's pin and grants, so the central vault gives its vault nothing and the owner's "
+                                f"app does not trust it. It must leave Fleet and join again under another name: move its "
+                                f"agents to another server, have the owner remove it, rename it in Tailscale, and run "
+                                f"a new join line on it.")
+
+
 def follow_tailnet_names(status, t0):
     """Inside LOCK: each machine of team.json whose address has had another name in Tailscale for two reads in a row
     takes that name (rename_machine), unless it must wait (tailnet_rename_wait): a name that one read catches in the
@@ -35385,6 +35406,8 @@ def follow_tailnet_names(status, t0):
     names, before, waits = tailnet_machines(status), MACHINE_NAMES["names"], MACHINE_NAMES["waits"]
     MACHINE_NAMES["names"] = names
     for machine, ip in list((TEAM.get("addresses") or {}).items()):
+        if machine == DOOR_PIN:
+            door_name_told()
         new = names.get(ip)
         if machine == "owner" or not new or new == machine:
             waits.pop(machine, None)
@@ -39005,6 +39028,8 @@ def join_server(src, body):
         raise Refusal(409, f"This server is called {name} in Tailscale, and a server's name in Fleet has 2 to 31 "
                            f"characters a-z 0-9 -, starting with a letter. Rename this server in Tailscale, then run "
                            f"the line again.")
+    if name == DOOR_PIN:                # the central vault keeps the door's pin and grants under this name (C49)
+        raise Refusal(409, code="server_name_kept", names={"name": name})
     if name in team["addresses"] or q1("SELECT 1 FROM server_keys WHERE server=?", (name,)):
         raise Refusal(409, f"Your fleet has a server named {name}. Rename one of the two in Tailscale, then run the "
                            f"line again.")

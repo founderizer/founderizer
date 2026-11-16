@@ -79,6 +79,8 @@ OLD = {
     "mcp_registry_away": "the MCP Registry cannot be reached now",
     "mcp_registry_no_list": "the MCP Registry gave no list of servers",
     "mcp_no_endpoints": "the MCP server {server} gave no OAuth endpoints: {reason}",
+    "server_name_kept": "This server is called {name} in Tailscale, and Fleet keeps that name for itself. Rename this "
+                        "server in Tailscale, then run the line again.",
 }
 
 # The places of hub.py that were converted to a code, by the function that holds each: the scan of 16 November 2026
@@ -92,6 +94,7 @@ SITES = {
     'enroll_new_device': {'not_owner_device_no_code': 1},
     'google_file_refusal': {'google_file_mode': 1, 'google_file_unreadable': 1},
     'grant_server': {'no_such_agent': 1},
+    'join_server': {'server_name_kept': 1},       # a server named door (C49)
     'key_swap_entry': {'no_such_server': 1},      # Part B of the key swap: the 404 of both of its routes
     'knowledge_add': {'revision_unreadable': 1},
     'knowledge_content': {'login_as_text': 1},
@@ -419,7 +422,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 155)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 156)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one
