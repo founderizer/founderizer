@@ -822,9 +822,12 @@ owner nothing ("No touch"), has no value part, and shows nothing on the app's sc
   list gives the secret to, now and after each give of the manager, where that server's vault takes
   deliveries, at the hub's next pass (usually within a minute; a delivery that failed waits up to six
   hours before the next try). For a take-back: the hub ended the standing and the app ended the pool
-  statement; the grants that the manager gave from it stay in the list, and at the hub's next pass
-  the central vault takes its copy back from each server for which the owner signed no grant of the
-  secret, where that server's vault takes withdrawals (`central_plan`, `can_withdraw`); or, when the
+  statement; the grants that the manager gave from it stay in the list, and the central vault takes
+  its copy back from each server for which the owner signed no grant of the secret, where that
+  server's vault takes withdrawals, at the first pass of the hub at which that server takes part (its
+  vault reports to the hub, and the owner's pin is its vault's key), so that a server that is off or
+  not pinned keeps its copy until then, and a withdrawal that failed waits up to six hours before the
+  next try (`central_plan`, `can_withdraw`, `CENTRAL_RETRY`); or, when the
   hub had no standing, that it changed nothing and the end of the statement went, and that if the
   secret was in the pool the central vault takes its copy back from those servers in the same way.
 - **When a write fails.** A certain refusal is the hub's own status under 500, with the tool's own
