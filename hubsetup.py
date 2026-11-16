@@ -524,6 +524,13 @@ def agent_users(team, machine, check=False, run=None):
         say(f"team.json gives the machine {machine} no agent yet, so there is no user to make. Each agent gets its "
             f"own when it is added.")
         return []
+    users = {}                  # one OS user for each agent: two agents of one user could each act as the other
+    for agent in agents:
+        user = agent_user(agent, team["agents"][agent])
+        if user in users:
+            raise Stop(f"the agents {users[user]} and {agent} would share the OS user {user} on {machine}: each agent "
+                       f"needs a user of its own")
+        users[user] = agent
     done = []
     for agent in agents:
         user = agent_user(agent, team["agents"][agent])
@@ -785,7 +792,7 @@ def agent_helper(service_user="fleet", repo=None, check=False, run=None, read=No
     bring the machine's vault broker onto the `vault.py` of a release either. This puts the two root commands in
     place that it may run, and the one sudoers file that says what it may do -- all three together, so that the
     rights and the commands they name can never be read apart. Both installers call it; nothing of it reaches a
-    Mac, which keeps one user for its agents (PRODUCT.md P2) and whose vault is the signed app the owner's Mac
+    Mac, which runs one agent as its desktop account (PRODUCT.md P2) and whose vault is the signed app the owner's Mac
     updates itself.
 
     `repo` is the address of the fleet's configuration ref, which the vault helper fetches the broker's program

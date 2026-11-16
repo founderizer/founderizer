@@ -232,6 +232,8 @@ MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "an
                                "switch_key_site",
                                "tell_owner",
                                "message_owner", "grant_access",
+                               # the owner, 10 November 2026: one OS user for each agent, the way out of a shared one
+                               "move_agent",
                                "set_duty", "change_duty", "see_history", "decide_report",
                                # AUTONOMY.md P8: the one changer of the agents with no lead
                                "set_agent_model",

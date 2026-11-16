@@ -146,17 +146,17 @@ class ServerKind(Access):
         status, answer = self.add_agent("box", "scout", "codex")
         self.assertEqual(status, 409)
         self.assertIn("Vps holds Fix on box".lower(), answer["error"].lower())
-        status, answer = self.owner("/ui/team/agents/studio/move", base_sha256=self.team_sha(), server="box")
+        # lead, which has no Mac browser or screen (one OS user for each agent: those stay on a Mac)
+        status, answer = self.owner("/ui/team/agents/lead/move", base_sha256=self.team_sha(), server="box")
         self.assertEqual(status, 409, answer)
         self.assertIn("holds Fix on box", answer["error"])
 
     def test_a_move_onto_a_server_it_holds_drops_that_grant(self):
         self.joined("box", "linux", source=OTHER, user="fleet")
-        self.grant(agent="studio", server="box", level="fix")
-        hub.q("UPDATE machine_status SET data=? WHERE agent='studio'", (json.dumps({"os": {"name": "Ubuntu"}}),))
-        status, receipt = self.owner("/ui/team/agents/studio/move", base_sha256=self.team_sha(), server="box")
+        self.grant(agent="lead", server="box", level="fix")
+        status, receipt = self.owner("/ui/team/agents/lead/move", base_sha256=self.team_sha(), server="box")
         self.assertEqual(status, 200, receipt)
-        self.assertNotIn("servers", self.origin_team()["agents"]["studio"])
+        self.assertNotIn("servers", self.origin_team()["agents"]["lead"])
 
     def test_the_start_text_names_the_servers_and_ops(self):
         self.grant(level="fix")

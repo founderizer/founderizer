@@ -699,8 +699,9 @@ class RemoveService(ServerService):
         self.assertIsNotNone(hub.q1("SELECT 1 FROM agents WHERE name='scout'"))     # the name waits for the end
 
     def test_on_a_mac_only_its_own_files_go(self):
-        """A Mac keeps one user for its agents: scout's files go by their names, and those of scout-two, whose name
-        begins as scout's does, and of ac stay."""
+        """A Mac's agent runs as the Mac's user, which also holds the service's files and those of agents from before
+        a Mac ran one agent: scout's files go by their names, and those of scout-two, whose name begins as scout's
+        does, and of ac stay."""
         self.join_by_script(self.code()["code"])
         svc = self.service(platform="darwin", answers={"launchctl print": (1, "", "not loaded")})
         self.installed_agent(svc, "claude")

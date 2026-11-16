@@ -281,10 +281,10 @@ def me(args=None):
 # ---------------------------------------------------------------- tmux
 
 def tmux(*args, check=False, timeout=15):
-    """Every target names its session whole, "=fleet-ivy:" or "=fleet-ivy:=T-1". When no session has the name, tmux
-    takes it as the start of another one ("fleet-ivy" found "fleet-ivy-lead"), and the agents of a Mac share one tmux
-    server. "=fleet-ivy" without its colon is read as a window, and its session still matches by its start (tmux 3.4
-    and 3.6a)."""
+    """Every target names its session whole, "=fleet-scout:" or "=fleet-scout:=T-1". When no session has the name,
+    tmux takes it as the start of another one ("fleet-scout" found "fleet-scout-lead"), and agents from before one OS
+    user for each agent could share one tmux server. "=fleet-scout" without its colon is read as a window, and its
+    session still matches by its start (tmux 3.4 and 3.6a)."""
     try:
         return subprocess.run(["tmux", *args], capture_output=True, text=True, check=check, timeout=timeout)
     except subprocess.TimeoutExpired:       # tmux can wait for ever on a pane someone is scrolled back in
@@ -4414,11 +4414,24 @@ class Helper:
 
     def moved_away(self):
         """The owner moved this agent to another server (hub.move_agent): its sessions here end, and so does this
-        helper's own service, which never starts again on this machine. Its files stay where they are."""
+        helper's own service, which never starts again on this machine. Its key file and its own session files go too,
+        before the service ends this helper: the hub forgot that key and revoked those sessions in the move, so they
+        open nothing, and an agent that stays on this machine keeps no copy of them (one OS user for each agent).
+        Only those files go, never a folder: on the hub's machine ~/.fleet is the hub's too. Its checkout and its logs
+        stay where they are."""
         self.say("the owner moved this agent to another server: its sessions and its service here end")
         tmux("kill-session", "-t", f"={self.session}:")
+        try:
+            names = os.listdir(SESSIONS)
+        except OSError:
+            names = []
+        for path in [key_file(self.agent)] + [os.path.join(SESSIONS, n) for n in names if n.startswith(self.agent + ".")]:
+            with contextlib.suppress(OSError):
+                if not os.path.isdir(path):
+                    os.remove(path)
         if sys.platform == "darwin":
-            plist = os.path.join(HOME, "Library", "LaunchAgents", f"com.agentfleet.{self.agent}.plist")
+            # the LaunchAgent in the user's own Library: HOME is ~/.fleet, where no LaunchAgent is
+            plist = os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents", f"com.agentfleet.{self.agent}.plist")
             with contextlib.suppress(OSError):
                 os.remove(plist)
             argv = ["launchctl", "bootout", f"gui/{os.getuid()}/com.agentfleet.{self.agent}"]
@@ -4426,6 +4439,27 @@ class Helper:
             argv = ["systemctl", "--user", "--no-block", "disable", "--now", f"fleet-{self.agent}.service"]
         with contextlib.suppress(OSError, subprocess.SubprocessError):
             subprocess.run(argv, capture_output=True, timeout=30)
+
+    def close_held(self):
+        """The hub holds this agent (the events answer's hold "os_user"): it may share its OS user with another agent,
+        so either could act as the other, and the hub starts no session of it and gives it no credential. Each of its
+        windows closes once its turn has ended, with that window's processes, so that a background command or the
+        runtime's own wake-up cannot run a session of it meanwhile. A window whose turn runs stays until that turn
+        ends; the hub opens none while the hold lasts."""
+        names = self.look_known()
+        if not names:
+            return
+        turns, at = self.hub_turns if self.hub_turns else (set(), float("inf"))
+        for window in names:
+            if not (re.fullmatch(r"T-\d+", window) or CONVERSATION_WINDOW.fullmatch(window) or window == "owner-chat"):
+                continue
+            target = f"={self.session}:={window}"
+            if window in turns or self.typed_at.get(window, float("-inf")) >= at or self.working(target):
+                continue
+            before = self.task_work(window, "", keep_runtime=False)
+            tmux("kill-window", "-t", target)
+            self.quiesce(window, "", keep_runtime=False, also=before)
+            self.say(f"{window}: closed, because the hub holds this agent until it runs in a user account of its own")
 
     def say(self, text):
         print(time.strftime("%H:%M:%S"), text, flush=True)
@@ -8499,6 +8533,8 @@ def cmd_run(args):
             h.keep_chat(data.get("chat"), data.get("db"))
             h.open_tasks = data.get("open_tasks") if isinstance(data.get("open_tasks"), list) else None
             h.poll_db = data.get("db")
+            if data.get("hold") == "os_user":
+                h.close_held()      # one OS user for each agent: no window of it runs while the hub holds it
             h.handle_events(data.get("events", []))
             h.sweep_places()
             h.doing("screen watch")

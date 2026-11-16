@@ -1500,97 +1500,25 @@ class ExistingMachine(Base):
         subprocess.run(git + ["-C", str(work), "commit", "-q", "-am", message], check=True)
         subprocess.run(git + ["-C", str(work), "push", "-q", "origin", "HEAD:" + branch], check=True)
 
-    def test_an_existing_machine_gets_one_inactive_agent_with_no_credential_access(self):
-        ob, fake, out = self.existing()
-        self.assertEqual(ob.run(), 0)
-        self.assertEqual(self.statuses(out), {sid: "done" for sid, _ in onboard.EXISTING_STEPS})
-        commit = subprocess.run(["git", "--git-dir", str(self.bare), "rev-parse", "main"],
-                                capture_output=True, text=True, check=True).stdout.strip()
-        result = self.lines(out)[-1]
-        self.assertEqual((result["type"], result["status"]), ("result", "ok"))
-        self.assertEqual(result["machine"], {"name": "vps", "host": "100.111.0.20", "port": 22, "login": "root",
-                                             "worker_user": "fleet"})
-        self.assertEqual(result["agent"], {"name": "seo", "machine": "vps", "runtime": "codex", "checkout": "~/fleet-seo",
-                                           "service": "fleet-seo.service", "registration_commit": commit,
-                                           "active": False, "vault": "none"})
-        team = self.team()
-        self.assertEqual(team["agents"]["seo"], {"start": TEAM["agents"]["vps"]["start"], "role": "worker",
-                                                 "machine": "vps", "runtime": "codex", "can": ["shell", "web"],
-                                                 "active": False, "vault": "none"})
-        self.assertNotIn("seo", team["addresses"])
-        self.assertEqual(team["agents"]["vps"], TEAM["agents"]["vps"])           # the agent already there is unchanged
-        # The key stays on the machine: only its SHA-256 went to the owner key route, once, and no output repeats it.
-        self.assertEqual([(agent, body["sha256"]) for agent, body, _ in fake.key_posts], [("seo", KEY_SHA)])
-        self.assertNotIn(KEY_SECRET, out.getvalue())
-        self.assertNotIn(KEY_SECRET, (Path(os.environ["FLEET_HOME"]) / "onboarding" / "seo.json").read_text())
-        # Everything ran as the worker user; nothing but the new checkout and its service changed on the machine.
-        scripts = "\n".join(fake.scripts)
-        self.assertTrue(all(s.startswith("if command -v runuser") and "runuser -u fleet" in s for s in fake.scripts))
-        for other in ("useradd", "apt-get", "ufw", "tailscale up", "--device-auth", "authorized_keys", "fleet-vps",
-                      "worker_install.py --agent", "loginctl"):
-            self.assertNotIn(other, scripts)
-        self.assertIn("trust_codex_checkout", scripts)                         # a Codex checkout is trusted first
-        self.assertIn("python3 fleet.py service seo", scripts)
-        self.assertIn("systemctl --user enable --now fleet-seo.service", scripts)
-        self.assertEqual(fake.server.applies, ["checkout", "service"])
-
-    def test_a_stopped_run_resumes_with_its_own_checkout_and_without_a_ready_machine(self):
-        fake = FakeSystem(Server(), "203.0.113.10", self.bare)
-        fake.server.key_fails = True
-        ob, fake, out = self.existing(fake=fake)
-        self.assertEqual(ob.run(), 1)
-        result = self.lines(out)[-1]
-        self.assertEqual((result["status"], self.statuses(out)["agent_key"]), ("failed", "failed"))
-        self.assertEqual(result["agent"]["registration_commit"], None)
-        self.assertNotIn(KEY_SECRET, out.getvalue())                           # a failed key command is not repeated
-        # The app quit; --resume continues the saved run. The checkout is the one that this run made.
-        fake.server.key_fails, fake.server.trust = False, "kept"
-        ob, fake, out = self.existing(fake=fake)
-        self.assertEqual(ob.run(), 2)
-        self.assertEqual(self.statuses(out)["checkout"], "skipped")
-        result = self.lines(out)[-1]
-        self.assertEqual(result["status"], "needs_owner")
-        self.assertIn("does not trust it", result["summary"])
-        self.assertEqual((fake.server.unit, fake.server.running), ("none", False))   # no service was written
-        # Registered and half installed, the agent makes its own machine not ready; a resume continues all the same.
-        fake.server.trust, fake.ready, fake.missing = "present", False, ["helper_offline:seo"]
-        ob, fake, out = self.existing(fake=fake)
-        self.assertEqual(ob.run(), 0)
-        statuses = self.statuses(out)
-        self.assertEqual((statuses["preflight"], statuses["checkout"], statuses["register"], statuses["worker_install"]),
-                         ("skipped", "skipped", "skipped", "done"))
-        self.assertEqual(fake.server.applies.count("checkout"), 1)
-        self.assertEqual(len(fake.key_posts), 1)                               # the same key was not sent again
-
-    def test_a_folder_that_the_run_did_not_make_stops_it(self):
-        fake = FakeSystem(Server(), "203.0.113.10", self.bare)
-        fake.server.foreign_checkout = True
-        ob, fake, out = self.existing(fake=fake)
-        self.assertEqual(ob.run(), 1)
-        self.assertIn("did not make", self.lines(out)[-1]["summary"])
-        self.assertEqual((fake.key_posts, fake.server.applies), ([], []))
-
-    def test_the_runtime_sign_in_is_read_and_unknown_is_not_absent(self):
-        for installed, signed, code, words in ((False, "yes", 1, "not installed"), (True, "no", 2, "not signed in")):
-            with self.subTest(signed=signed):
-                fake = FakeSystem(Server(), "203.0.113.10", self.bare)
-                fake.server.rt_installed, fake.server.rt_signed = installed, signed
-                ob, fake, out = self.existing(fake=fake, name="seo-" + signed)
-                self.assertEqual(ob.run(), code)
-                self.assertIn(words, self.lines(out)[-1]["summary"])
-                self.assertEqual((fake.server.applies, fake.key_posts), ([], []))  # it stopped before any change
-        fake = FakeSystem(Server(), "203.0.113.10", self.bare)
-        fake.server.rt_signed = "unknown"
-        ob, fake, out = self.existing(fake=fake)
-        self.assertEqual(ob.run(), 0)
-        detail = next(e["detail"] for e in self.lines(out) if e.get("id") == "runtime_check" and e["status"] == "done")
-        self.assertIn("sign-in status is unknown", detail)
-        self.assertIn("before activation", detail)
-        self.assertNotIn("--device-auth", "\n".join(fake.scripts))              # no sign-in was started
+    def test_a_machine_with_another_agent_takes_no_second_one_and_nothing_changes(self):
+        """One OS user for each agent (10 November 2026): this route installs a new agent under the machine's worker
+        user, which an agent that runs there already has, so it takes no second agent on any machine, a run that the
+        hub registered before that day included. Add agent on a server gives each agent its own user."""
+        for registered in (None, "c" * 40):
+            with self.subTest(registered=registered):
+                ob, fake, out = self.existing()
+                if registered:
+                    ob.state["registration_commit"] = registered
+                self.assertEqual(ob.run(), 1)
+                summary = self.lines(out)[-1]["summary"]
+                self.assertIn("vps runs vps already: a second agent there would run as the same user account", summary)
+                self.assertIn("from the Servers page", summary)
+                self.assertEqual((fake.scripts, fake.key_posts, fake.reloads), ([], [], []))
 
     def test_a_machine_that_is_not_ready_a_used_name_or_an_older_hub_changes_nothing(self):
+        # seo would run as the user of the agent vps, which runs there (one OS user for each agent)
         for name, change, words in (("seo", lambda f: setattr(f, "ready", False) or setattr(f, "missing", ["legacy_windows:vps"]),
-                                     "legacy_windows:vps"),
+                                     "would run as the same user account"),
                                     ("vps", lambda f: None, "already has an agent or machine named vps"),
                                     ("ads", lambda f: setattr(f, "features", ["machines"]), "agent_auth")):
             with self.subTest(name=name):
@@ -1606,41 +1534,6 @@ class ExistingMachine(Base):
                 self.assertEqual(ob.run(), 1)
                 self.assertIn(words, self.lines(out)[-1]["summary"])
                 self.assertEqual((fake.calls, fake.key_posts, fake.reloads), ([], [], []))
-
-    def test_a_service_of_another_checkout_stays_as_it_is_running_or_not(self):
-        for name, unit, loaded, running in (("seo", "other", "other", True), ("ads", "other", "none", False),
-                                            ("dev", "none", "other", True)):
-            with self.subTest(name=name):
-                fake = FakeSystem(Server(), "203.0.113.10", self.bare)
-                fake.server.unit, fake.server.loaded, fake.server.running = unit, loaded, running
-                ob, fake, out = self.existing(fake=fake, name=name)
-                self.assertEqual(ob.run(), 1)
-                self.assertEqual(self.statuses(out)["worker_install"], "failed")
-                self.assertIn("belongs to another checkout or agent", self.lines(out)[-1]["summary"])
-                self.assertEqual((fake.server.unit, fake.server.loaded, fake.server.running), (unit, loaded, running))
-                self.assertNotIn("fleet.py service", "\n".join(fake.scripts))
-
-    def test_a_running_service_of_this_checkout_is_kept_on_resume(self):
-        fake = FakeSystem(Server(), "203.0.113.10", self.bare)
-        ob, fake, out = self.existing(fake=fake)
-        self.assertEqual(ob.run(), 0)
-        ob, fake, out = self.existing(fake=fake)
-        self.assertEqual(ob.run(), 0)
-        self.assertEqual(self.statuses(out)["worker_install"], "skipped")
-        self.assertEqual(fake.server.applies.count("service"), 1)
-
-    def test_a_mac_uses_its_launch_agent_as_its_own_worker_user(self):
-        fake = FakeSystem(Server(), "203.0.113.10", self.bare)
-        fake.server.system = "Darwin"
-        ob, fake, out = self.existing(fake=fake, user="dana", worker_user="dana")
-        self.assertEqual(ob.run(), 0)
-        result = self.lines(out)[-1]
-        self.assertEqual(result["machine"]["login"], "dana")
-        self.assertEqual(result["agent"]["service"], "com.agentfleet.seo")
-        scripts = "\n".join(fake.scripts)
-        self.assertTrue(all(s.startswith("bash -lc ") for s in fake.scripts))   # no root and no other user
-        self.assertIn('launchctl bootstrap "gui/$(id -u)"', scripts)
-        self.assertNotIn("systemctl", scripts)
 
     def test_a_claude_agent_gets_no_codex_trust_and_its_own_sign_in_check(self):
         ob, fake, out = self.existing(runtime="claude")
@@ -1715,59 +1608,6 @@ class ExistingMachine(Base):
         fake.server.system = "Linux"
         with self.assertRaises(onboard.NeedsOwner):
             ob.s_runtime_check()
-
-    def test_a_hub_commit_before_the_push_stays_and_the_change_is_made_again_on_it(self):
-        """The hub commits by itself after a registration ("Fleet gave <agent> by default"). When that commit reaches
-        the ref between this run's clone and its push, the push is refused. A rebase onto it conflicted, left HEAD at
-        the hub's commit without the change, the next push sent nothing, and the hub reloaded a revision without the
-        agent."""
-        fake = FakeSystem(Server(), "203.0.113.10", self.bare)
-        git, raced = fake.git, []
-
-        def hub_first(args, cwd=None):
-            if args[:1] == ["push"] and not raced:
-                raced.append(True)
-                self.hub_commit(lambda team: team["agents"]["vps"].update(vault="broker"),
-                                message="Fleet gave vps by default: its machine's vault")
-            return git(args, cwd=cwd)
-        fake.git = hub_first
-        ob, fake, out = self.existing(fake=fake)
-        self.assertEqual(ob.run(), 0, self.lines(out)[-1])
-        team = self.team()
-        self.assertEqual((team["agents"]["vps"]["vault"], team["agents"]["seo"]["machine"]), ("broker", "vps"))
-        log = subprocess.run(["git", "--git-dir", str(self.bare), "log", "--format=%s", "main"], capture_output=True,
-                             text=True, check=True).stdout.split("\n")
-        self.assertEqual(log[:2], ["Register agent seo on vps", "Fleet gave vps by default: its machine's vault"])
-        self.assertEqual([body["revision"] for body, _ in fake.reloads], [ob.state["registration_commit"]])
-
-    def test_a_resume_follows_its_machine_to_the_name_that_tailscale_gave_it(self):
-        """A machine takes its name from Tailscale (release 2026.11.146), so it can be renamed under a saved run. The
-        resume finds the machine by the address that the run saved, and the agent is registered under the new name."""
-        fake = FakeSystem(Server(), "203.0.113.10", self.bare)
-        fake.server.key_fails = True
-        ob, fake, out = self.existing(fake=fake)
-        self.assertEqual(ob.run(), 1)                               # it stopped before its registration
-
-        def rename(team):
-            team["addresses"]["worker-1"] = team["addresses"].pop("vps")
-            team["agents"]["vps"]["machine"] = "worker-1"
-        rename(fake.team)
-        self.hub_commit(rename, message="vps is worker-1 in Tailscale")
-        fake.server.key_fails = False
-        ob, fake, out = self.existing(fake=fake)                    # --resume continues the saved run
-        self.assertEqual(ob.run(), 0, self.lines(out)[-1])
-        result = self.lines(out)[-1]
-        self.assertEqual((result["machine"]["name"], result["agent"]["machine"]), ("worker-1", "worker-1"))
-        self.assertEqual(self.team()["agents"]["seo"]["machine"], "worker-1")
-        self.assertEqual(self.statuses(out)["checkout"], "skipped")             # the same checkout on the same machine
-
-    def test_a_password_is_asked_once_for_the_whole_run(self):
-        fake = FakeSystem(Server(), "203.0.113.10", self.bare, password="pw-123")
-        ob, fake, out = self.existing(fake=fake, auth="password", secrets="pw-123\n")
-        self.assertEqual(ob.run(), 0)
-        self.assertEqual(sum(1 for e in self.lines(out) if e.get("kind") == "secret"), 1)
-        self.assertEqual(set(fake.askpass_reads), {"pw-123"})
-        self.assertNotIn("pw-123", out.getvalue())
 
     def test_command_line_for_an_existing_machine(self):
         base = ["run", "--json", "--existing-machine", "vps", "--name", "seo", "--auth", "agent",

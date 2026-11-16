@@ -997,6 +997,7 @@ def manager_name():
 # (door_gitops's agents) each one. A field that also takes other words (report_up's about, search_history's person)
 # changes only when its whole value names an agent.
 AGENT_NAME_FIELDS = {"create_task": ("owner",), "door_gitops": ("agents",), "grant_access": ("agent",),
+                     "move_agent": ("agent",),
                      "hand_over": ("to",), "message_agent": ("agent",), "report_up": ("about",),
                      "save_trigger": ("agent",), "search_history": ("person",), "see_earlier_work": ("agent",),
                      "see_history": ("agent",), "see_responsibilities": ("agent",), "set_agent_model": ("agent",),
@@ -1633,6 +1634,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "server_names",      # the owner, 30 October 2026: a server's name is its name in Tailscale
                "mac_setup",         # the owner, 31 October 2026: one sitting at a new Mac
                "agent_move",        # DevOps plan C7, 2 November 2026: an agent moves to an empty server
+               "agent_move_beside", # one OS user for each agent, 10 November 2026: a move also goes to the other
+                                    # kind, and to a Linux server with agents, each as its own user (UI-API.md 1.192)
                "server_access",     # DevOps plan C4: Read or Fix on a server, through the door
                "servers_for_apps",  # the owner, 11 November 2026: a server for apps, the door on the hub's server,
                                     # the manager as a holder, /ui/servers "apps" (UI-API.md 1.122)
@@ -4199,11 +4202,12 @@ def chat_wanted(agent, held):
 def chat_ready_now(agent, alive, reads=None):
     """What the app reads as `chat_ready`: True when the agent's owner chat window runs (alive: its helper's window
     list) and its session has its tools, False while its helper starts it, and None when its helper does not start
-    one by itself, the agent has no owner chat of its own, or it has no key: a session without a credential lists its
-    tools as no one, so its chat could never be called ready. reads: agent_reads(); without it, the agent reads its
-    own rows."""
+    one by itself, the agent has no owner chat of its own, it has no key (a session without a credential lists its
+    tools as no one, so its chat could never be called ready), or the hub holds it (os_user_held): its chat starts no
+    session until the hold ends, and its messages wait in the hub. reads: agent_reads(); without it, the agent reads
+    its own rows."""
     a = agents().get(agent) or {}
-    if a.get("role") not in ("worker", "lead") or not owner_chat(a) or not agent_active(agent):
+    if a.get("role") not in ("worker", "lead") or not owner_chat(a) or not agent_active(agent) or os_user_held(agent):
         return None
     if reads is None:
         if "chat_warm" not in helper_features(agent) or not agent_key(agent):
@@ -5451,6 +5455,8 @@ def live_reason(t, state):
         return "hold", held_word(hold)
     if active_limit(owner):
         return "limit", f"{owner}'s usage limit"
+    if os_user_held(owner):             # one OS user for each agent: the hub holds it, and it waits
+        return "os_user", os_user_held_words(owner)
     found = q1("SELECT id FROM reminders WHERE task=? AND done=0 ORDER BY id", (tid,))
     if found:
         return "reminder", f"R-{found['id']}"
@@ -5717,6 +5723,8 @@ def fresh_refusal(t, attempt):
         return f"{tref(t['id'])} is held"
     if active_limit(t["owner"]):
         return f"{t['owner']} is at a usage limit"
+    if os_user_held(t["owner"]):
+        return f"{t['owner']} {os_user_hold_reason(t['owner'])}, so the hub holds it"
     if q1("SELECT 1 FROM prompts WHERE task=? AND decision IS NULL LIMIT 1", (t["id"],)):
         return "a permission prompt of its session waits for a decision"
     if open_job(t["id"]):
@@ -6185,6 +6193,10 @@ def t_restart_task(agent, a):
     if lim and limit_route(lim) == "primary":
         raise ToolError(f"{t['owner']} waits for its usage limit to reset at {clock(lim['until'])}. {tref(tid)} "
                         f"continues by itself then, so it is not restarted now.")
+    if os_user_held(t["owner"]):
+        raise ToolError(f"{t['owner']} {os_user_hold_reason(t['owner'])}, so the hub holds its work. "
+                        f"{tref(tid)} continues by itself once it runs in a user account of its own, so it is not "
+                        f"restarted now.")
     kv_set(f"lost:{tid}", None)         # the requester acted: the losses since then count again from nothing
     # A count never refuses it, and it starts the count again. A task whose start failed goes the same way: its helper
     # confirms that no session runs, and only a confirmed stop starts the next attempt (plan C6).
@@ -6260,6 +6272,8 @@ def restart_continue(hold_id):
     lim = active_limit(t["owner"])
     if lim and limit_route(lim) == "primary":
         return held(f"{t['owner']} reached its usage limit, which resets at {clock(lim['until'])}.")
+    if os_user_held(t["owner"]):
+        return held(f"{t['owner']} {os_user_hold_reason(t['owner'])}, so the hub holds its work.")
     # The records of the stop once more: a hub that stopped in the middle of the helper's report kept only a part of
     # them. Each of these is safe to repeat. Then one more unknown outcome for the attempt: a failed connection, and a
     # session that was interrupted at any other point, can have cut an action whose result never came back, so the new
@@ -8337,6 +8351,9 @@ def t_create_task(agent, a):
     owner = f["owner"]
     seen = q1("SELECT last_seen FROM agents WHERE name=?", (owner,))
     late = "" if seen and now() - (seen["last_seen"] or 0) < 90 else f" Note: {owner}'s helper has not checked in recently."
+    if os_user_held(owner):             # one OS user for each agent
+        late += (f" Note: {owner} {os_user_hold_reason(owner)}, so the hub holds its work; the task "
+                 f"waits until it runs in a user account of its own.")
     lim = active_limit(owner)
     if lim:
         source = limit_source(lim)      # account_limits: an allowance another agent spent is not this one's limit
@@ -27141,6 +27158,85 @@ def grant_resource(by, rid, agent, level, phrase):
     return result
 
 
+def need_names_server(row, server):
+    """True when the owner pressed or ticked an option of this Needs-you item that names `server` as a whole name
+    (box-1 is not box-10). A typed answer names nothing here: the manager's options carry the names."""
+    options = need_options(row)
+    keys = row.keys() if hasattr(row, "keys") else ()
+    picked = [row["chosen"]] if row["chosen"] is not None else []
+    try:
+        picked += json.loads(row["chose"]) if "chose" in keys and row["chose"] else []
+    except (ValueError, TypeError):
+        pass
+    pattern = re.compile(rf"(?<![A-Za-z0-9._-]){re.escape(server)}(?![A-Za-z0-9._-])")
+    return any(isinstance(i, int) and not isinstance(i, bool) and 0 <= i < len(options) and pattern.search(options[i])
+               for i in picked)
+
+
+def t_move_agent(agent, a):
+    """The manager moves an agent that shares its OS user with another (os_user_held), or itself while it runs as the
+    hub's own user (manager_hub_user), to a server that the owner picked in the manager's own Needs-you item, raised
+    after the hold began. Its rule is inside it: a move restarts the agent and needs the owner's sign-in there, and
+    the server is the owner's choice (the owner's answers of 10 November 2026). Any other move stays the owner's."""
+    target, server = str(a.get("agent") or "").strip(), str(a.get("server") or "").strip()
+    m = re.fullmatch(r"N-?(\d{1,12})", str(a.get("need") or "").strip())
+    if target not in agents():
+        raise ToolError(f"There is no agent {target or '(none given)'}.")
+    if server not in server_names():
+        raise ToolError(f"There is no server {server or '(none given)'}.")
+    if not m:
+        raise ToolError("need is the Needs-you item in which the owner picked the server, for example N-12.")
+    row = q1("SELECT * FROM needs WHERE id=?", (int(m.group(1)),))
+    if not row or row["by"] != agent or row["answer"] is None or row["answered_by"] is not None:
+        raise ToolError(f"N-{m.group(1)} is not your own Needs-you item that the owner answered.")
+    if not need_names_server(row, server):
+        raise ToolError(f"The owner's answer to N-{m.group(1)} names no server {server}: move it only to a server that "
+                        f"the owner picked, by the exact name that its option gave.")
+    command, stored = agent_write(agent, "move_agent", a, {"agent": target, "server": server, "need": int(m.group(1))})
+    if stored:
+        return stored["text"]
+    done = f"{shown_role(target)} moves to {server}: the install job there runs now, and the hub tells you when it ends."
+    if target == agent:
+        done = f"You move to {server}: this session ends now, and your new one starts there after the owner signs you in."
+    job = q1("SELECT state, created FROM server_jobs WHERE agent=? AND server=? AND kind='install' ORDER BY id DESC "
+             "LIMIT 1", (target, server))
+    # This item's move of it to this server is done already: its install job came after the owner's answer. Before the
+    # checks of the hold, which the move itself ended.
+    moved = agents()[target].get("machine") == server and kv_get(MOVED + target) and job and \
+        job["created"] >= (row["answered"] or 0)
+    if moved and job["state"] in JOB_OPEN:
+        # a repeat whose first call reached the commit and not its receipt: what the first call would have answered,
+        # while the install of that move runs
+        with transaction():
+            keep_command(command, {"text": done}, now())
+        return done
+    if moved and job["state"] == "failed":
+        # the install of that move failed, and the hub told the manager to try again: the same item gives it again
+        done = f"The install of {shown_role(target)} on {server} goes again, and the hub tells you when it ends."
+    else:
+        if target == agent:
+            if not manager_hub_user():
+                raise ToolError("You move yourself only while you run as the hub's own user account. Any other move "
+                                "of yours is the owner's.")
+        elif not os_user_held(target):
+            raise ToolError(f"{shown_role(target)} has a user account of its own, so you do not move it: a move "
+                            f"restarts it and needs the owner's sign-in there, which stays the owner's to ask for.")
+        since = os_user_since(target)
+        if since is None or (row["raised"] or 0) < since:
+            held = "you" if target == agent else shown_role(target)
+            raise ToolError(f"N-{m.group(1)} was raised before the hub held {held}: ask the owner again in a new "
+                            f"Needs-you item.")
+    rev = kit_revision(fresh=True)
+    try:
+        result = move_agent(target, {"server": server, "base_sha256": team_view(rev)[1]}, by=agent)
+    except Refusal as e:
+        raise ToolError(f"The hub refused the move: {e}") from None
+    text = done + f" Revision {result['revision'][:12]}, job {result['job']}." if result.get("job") else done
+    with transaction():
+        keep_command(command, {"text": text}, now())
+    return text
+
+
 def t_grant_access(agent, a):
     """The manager gives one agent one resource of the grantable pool, at a level that the owner's policy allows."""
     rid = str(a.get("resource") or "").strip().lower()
@@ -29173,7 +29269,7 @@ def lead_unread_sweep(t0):
         told = kv_get(f"stuck_notice:{t['id']}")
         key = f"stuck:{t['id']}:{told}"
         if not told or t["requester"] in (None, mgr) or kv_get(f"lead_unread:{key}") or \
-                active_hold(t["id"]) or active_limit(t["owner"]) or parked(t["id"]) or \
+                active_hold(t["id"]) or active_limit(t["owner"]) or os_user_held(t["owner"]) or parked(t["id"]) or \
                 not (not_acting(t["requester"], int(told)) or lead_left(t["requester"], t)):
             continue
         lines.append(f"{tref(t['id'])} ({clip(t['title'], 60)}, owner {t['owner']}): {t['requester']} was told that "
@@ -29211,7 +29307,7 @@ def tasks_stuck(t0):
     left out whole."""
     out = []
     for t in q(f"SELECT * FROM tasks WHERE {OPEN_TASK} ORDER BY id"):
-        if active_hold(t["id"]) or active_limit(t["owner"]) or parked(t["id"]):
+        if active_hold(t["id"]) or active_limit(t["owner"]) or os_user_held(t["owner"]) or parked(t["id"]):
             continue
         told = kv_get(f"stuck_notice:{t['id']}")
         if not told or not (not_acting(t["requester"], int(told)) or (t["requester"] not in (None, manager_name())
@@ -30516,6 +30612,21 @@ TOOLS = [
         "why": {"type": "string", "description": "The one line the owner reads about this grant: what the work needs "
                 "it for"},
         "task_id": TASK_ID}, ["request_id", "agent", "resource", "level"])),
+    ("manager", "move_agent", t_move_agent,
+     "Move one agent that the hub holds because it may share its user account with another, which the hub told you "
+     "of, to a server that the owner picked: one commit of team.json, the install job there and the end of its old "
+     "session. Its tasks, memory, duties and grants stay with it; its vault starts again there, and the owner signs it "
+     "in there in the app. Ask the owner first with raise_needs_you which server takes it, with one option for each "
+     "server by its exact name, and give that item as need: the hub moves it only to a server that the owner's pressed "
+     "or ticked option names, and one item serves each move of the agents that it names. One move at a time on a "
+     "server: the hub tells you when each install ends, and the same call gives an install that failed again. You move "
+     "yourself only while you run as the hub's own user account. Every other move stays the owner's.",
+     S({"request_id": REQUEST_ID,
+        "agent": {"type": "string", "description": "The agent that moves"},
+        "server": {"type": "string", "description": "The server it moves to, by its exact name"},
+        "need": {"type": "string", "description": "Your Needs-you item in which the owner picked that server, for "
+                 "example N-12"},
+        "task_id": TASK_ID}, ["request_id", "agent", "server", "need"])),
     ("manager", "change_duty", t_change_duty,
      "Pause, resume, retire or reopen a duty. Retire is how a duty is removed: it stops, its watches stop, and "
      "its cases stay as history, so a duty that nothing needs any more is yours to retire without asking. "
@@ -32975,6 +33086,9 @@ def check_now(t, t0, command=None, wake=False):
     if read_spec(t):                    # the hub makes the read itself: no helper is asked
         return read_check_now(t, t0, command, wake)
     runner = runner_of(t)
+    if os_user_held(runner):            # one OS user for each agent: no check of it runs while the hub holds it
+        raise Refusal(409, f"{shown_role(runner)} {os_user_hold_reason(runner)}, so it runs no check until it runs in "
+                           f"a user account of its own.")
     refused = key_site_refusal(runner, json.loads(t["check_spec"]))
     if refused:
         raise Refusal(409, refused)
@@ -33468,6 +33582,8 @@ def trigger_sweep(t0):
                 print_fault()           # one broken trigger must not stop the others
 
     def due(t):
+        if os_user_held(t["agent"]):
+            return      # one OS user for each agent: no check and no task of it; once due, it runs when the hold ends
         at = latest_due(json.loads(t["schedule"]), t["anchor"], t["next_due"], t0)
         if t["check_spec"] and not wakeups.check_known(json.loads(t["check_spec"])):
             # plan P0: a check of a newer form reads as quiet. No run opens; only its next due time moves.
@@ -33484,8 +33600,13 @@ def trigger_sweep(t0):
     # plan C12: a run that waits for a task goes on when that task ends
     q(f"UPDATE trigger_runs SET retry_at=?, blocked_task=NULL WHERE state='waiting' AND blocked_task IN "
       f"(SELECT id FROM tasks WHERE state IN ({','.join(repr(s) for s in TERMINAL)}))", (t0,))
-    each(q("SELECT * FROM trigger_runs WHERE state='waiting' AND retry_at<=? ORDER BY id", (t0,)),
-         lambda r: send_check(r, t0))
+    def send(r):
+        t = trigger_row(r["trigger_id"])
+        if t is not None and os_user_held(t["agent"]):
+            return      # one OS user for each agent: the run waits until the hold ends
+        send_check(r, t0)
+
+    each(q("SELECT * FROM trigger_runs WHERE state='waiting' AND retry_at<=? ORDER BY id", (t0,)), send)
 
 
 # ---------------------------------------------------------------- agent setup (owner API 1.9)
@@ -34311,7 +34432,7 @@ def reminder_sweep(t0):
         if r["goal"] and not q1("SELECT 1 FROM goals WHERE id=? AND state IN ('active','paused')", (r["goal"],)):
             q("UPDATE reminders SET done=1 WHERE id=?", (r["id"],))     # the goal closed; nothing to look at again
             continue
-        if t and (active_hold(t["id"]) or active_limit(t["owner"])):
+        if t and (active_hold(t["id"]) or active_limit(t["owner"]) or os_user_held(t["owner"])):
             continue            # held work and an agent at its usage limit wait; the reminder waits with them
         note = (f"Reminder R-{r['id']}: {r['note']}"
                 + (f" -- carry on with {tref(t['id'])} now. First check what was already done (rule 9): never "
@@ -35264,6 +35385,15 @@ def liveness(t0):
     loop; a session that lived and worked and was then lost is recovered without spending one of them."""
     for t in q("SELECT * FROM tasks WHERE state IN ('submitted','working','input-required','auth-required')"):
         tid, owner = t["id"], t["owner"]
+        if os_user_held(owner):
+            # One OS user for each agent: deliberate quiet, with its own words, which the app draws as the orange line
+            # of the task's thread. stalled_since stays empty, so the board keeps the task's own mark, and nothing
+            # restarts it or reports it stuck. The row changes once.
+            words = os_user_held_words(owner)
+            q("UPDATE tasks SET live_path=?, stalled_reason=?, stalled_since=NULL, stall_told=0 WHERE id=? AND "
+              "(live_path IS NOT ? OR stalled_reason IS NOT ? OR stalled_since IS NOT NULL OR IFNULL(stall_told, 0) != 0)",
+              (words, words, tid, words, words))
+            continue
         if is_conversation_task(t):
             # AUTONOMY.md P2: its live path is its conversation, whose next message or reply ends it; a session of
             # that conversation that closed ends nothing, and no task session ever starts for it
@@ -35811,6 +35941,7 @@ def tick():
         step(machine_names_sweep, t0)       # the owner, 30 October 2026: a machine's name is its name in Tailscale
         step(mac_setup_sweep, t0)           # the owner, 31 October 2026: one sitting at a new Mac
         step(server_watch_sweep, t0)        # the owner, 3 November 2026: each server against its own baseline
+        step(os_user_sweep, t0)             # the owner, 10 November 2026: one OS user for each agent
         step(mac_desktop_sweep)             # what only hands at a Mac can put right
         step(first_message_sweep, t0)       # the owner, 4 November 2026: a new fleet's manager writes first, once
         step(agent_first_message_sweep, t0)     # the owner, 12 November 2026: and so does each new agent
@@ -37137,6 +37268,16 @@ def validate_status(data):
     user = ways.get("user")
     if user is not None and not (isinstance(user, str) and SSH_USER.match(user)):
         raise ValueError("access.user must be a user name")
+    uid = ways.get("uid")               # one OS user for each agent: the uid that reads this
+    if uid is not None and (isinstance(uid, bool) or not isinstance(uid, int) or not 0 <= uid < 2 ** 32):
+        raise ValueError("access.uid must be a user id")
+    ran = data.get("agents")            # a server service's reading: the user each agent of its machine runs as
+    if ran is not None and (not isinstance(ran, dict) or len(ran) > 64 or not all(
+            isinstance(n, str) and AGENT_NAME.match(n) and isinstance(v, dict) and set(v) <= {"user", "uid"} and
+            (v.get("user") is None or isinstance(v["user"], str) and SSH_USER.match(v["user"])) and
+            (v.get("uid") is None or not isinstance(v["uid"], bool) and isinstance(v["uid"], int) and
+             0 <= v["uid"] < 2 ** 32) for n, v in ran.items())):
+        raise ValueError("agents must map at most 64 agents to {user, uid}")
     runtimes = data.get("runtimes")                 # owner feature runtime_switch
     if runtimes is not None and (not isinstance(runtimes, dict) or set(runtimes) - set(SWITCH_RUNTIMES) or
                                  not all(isinstance(r, dict) for r in runtimes.values())):
@@ -37179,7 +37320,9 @@ def validate_status(data):
                         "signed_in": _optional(rt.get("signed_in"), bool)},
             "update": {"state": state, "detail": _optional(up.get("detail"), str, 500)},
             "access": {"ssh": _optional(ways.get("ssh"), bool), "screen_sharing": _optional(ways.get("screen_sharing"), bool),
-                       "user": user},
+                       "user": user, **({"uid": uid} if uid is not None else {})},
+            **({"agents": {n: v for n, v in ran.items() if n in (TEAM.get("agents") or {})}} if ran is not None
+               else {}),
             "check": _optional(data.get("check"), int), "features": sorted(set(features)), "settings": settings,
             "models": model_reading(data.get("models")), "verify": verify_items(data.get("verify")),
             "reading_age": reading_age_of(data.get("reading_age")),
@@ -37472,12 +37615,560 @@ def capp_public_url(url, name):
         port in (None, 443)
 
 
-def validate_team(team, kept=None):
+# ---- one OS user for each agent (the owner, 10 November 2026: "what needs to be fixed is how we ended up in this
+# position, and make it impossible!", and the owner's answers: one agent on each Mac, the Mac's desktop account is its
+# agent's, and the hub stops the work of agents that share one OS user)
+#
+# An agent's key, its session files and its runtime's sign-in live in the home of the OS user that it runs as, so two
+# agents of one OS user could each read what the other keeps there and act as it toward the hub, with all its grants.
+# On a Linux server each agent has its own user (hubsetup.agent_user, server.py agent_user), and the server service's
+# user can become every one of them (sudo -u). On a Mac every agent runs as the desktop account, which also runs the
+# Mac's server service and its vault: so a Mac runs one agent. A machine with no server entry (from before the servers
+# feature) gives each agent its own user (hub.sh) or the machine's one worker user (onboard.py --existing-machine),
+# and team.json does not say which.
+
+OS_USER_UNKNOWN = "*"           # the OS user of an agent on a machine with no server entry: team.json cannot say it
+
+
+def agent_os_user(team, name):
+    """(machine, OS user) that this agent runs as by team.json alone, or None for an agent with no server yet. A Linux
+    server's agent: the user it kept after a rename, else fleet-<name>. A Mac's agent: the Mac's desktop account, the
+    user of its server service. A machine with no server entry: OS_USER_UNKNOWN."""
+    a = (team.get("agents") or {}).get(name) or {}
+    if not a or a.get("placed") is False:
+        return None
+    machine = a.get("machine")
+    server = (team.get("servers") or {}).get(machine) or {}
+    if server.get("kind") == "linux":
+        return machine, a.get("user") or f"fleet-{name}"
+    if server.get("kind") == "mac":
+        return machine, server.get("user")
+    return machine, OS_USER_UNKNOWN
+
+
+def os_user_breaches(team):
+    """What team.json alone says breaks one OS user for each agent, as a set of tokens: ("pair", frozenset({a, b}),
+    user) for two agents of one OS user (two agents of one machine with no server entry among them, whose users are
+    not known, with OS_USER_UNKNOWN), ("service", a) for an agent of a Linux server that would run as that server's
+    service user, and ("hub", a) for a worker or a lead on the hub's own machine, where the central vault answers the
+    hub's user (not on a hub whose own server takes agents, hub_shared: each runs there as its own user, with that
+    server's own vault broker, as on a joined server). A token names agents and the user name, never a machine, so
+    the rename of a machine keeps every token, and a pair that goes together to another user account is a new one."""
+    out, groups = set(), {}
+    if not team_shaped(team):
+        return out                  # validate_team says what is wrong with it
+    servers, hub_machine = team.get("servers") or {}, (team.get("hub") or {}).get("machine")
+    for name, a in (team.get("agents") or {}).items():
+        key = agent_os_user(team, name)
+        if key is None:
+            continue
+        groups.setdefault(key, []).append(name)
+        server = servers.get(key[0]) or {}
+        if server.get("kind") == "linux" and key[1] == server.get("user"):
+            out.add(("service", name))
+        if key[0] == hub_machine and not hub_shared(team) and isinstance(a, dict) and \
+                a.get("role") in ("worker", "lead"):
+            out.add(("hub", name))
+    for (_machine, user), names in groups.items():
+        out |= {("pair", frozenset((x, y)), user) for i, x in enumerate(names) for y in names[i + 1:]}
+    return out
+
+
+def team_shaped(team):
+    """True when os_user_breaches can read this team: a team.json of another shape gets validate_team's own words."""
+    servers = team.get("servers") or {} if isinstance(team, dict) else None
+    return isinstance(team, dict) and isinstance(team.get("agents"), dict) and isinstance(servers, dict) and \
+        all(isinstance(a, dict) for a in team["agents"].values()) and \
+        all(isinstance(s, dict) for s in servers.values()) and isinstance(team.get("hub") or {}, dict)
+
+
+def renamed_breaches(old, new):
+    """The running team's breaches (os_user_breaches) with the agent `old` named `new`: what a rename keeps."""
+    swap = lambda n: new if n == old else n      # noqa: E731
+    return {("pair", frozenset(map(swap, t[1])), t[2]) if t[0] == "pair" else (t[0], swap(t[1]))
+            for t in os_user_breaches(TEAM)}
+
+
+def os_user_rule(team, shared_ok):
+    """Raise ValueError for a breach of one OS user for each agent (os_user_breaches) that shared_ok does not hold:
+    validate_team passes the breaches of its reference team, so a write may keep or end a breach and never add one. A
+    fleet from before this rule moves its agents out with writes that each validate the whole team."""
+    agents = team.get("agents") or {}
+    new = sorted(os_user_breaches(team) - set(shared_ok),
+                 key=lambda t: (t[0], sorted(t[1]) if t[0] == "pair" else t[1]))
+    for token in new[:1]:
+        if token[0] == "pair":
+            x, y = sorted(token[1], key=list(agents).index)
+            raise ValueError(f"{shown_role(x)} and {shown_role(y)} would run as one user account on "
+                             f"{agents[x]['machine']}, so each could read the other's key and act as it: a Mac runs one "
+                             f"agent, and on a Linux server each agent has its own user.")
+        kind, name = token
+        if kind == "service":
+            raise ValueError(f"{shown_role(name)} would run as the user of the server service on "
+                             f"{agents[name]['machine']}, which can become every agent there: each agent has its own "
+                             f"user.")
+        raise ValueError(f"{shown_role(name)} would run on the hub's own server {agents[name]['machine']}, whose vault "
+                         f"holds every login: no agent but the manager runs there.")
+
+
+SERVICE_USER = "service_user:"      # kv: an agent that its server service reported running as the service's own user
+CALLER_USER = "caller_user:"        # kv: an agent whose broker named its caller's OS user once (X-Fleet-Caller-User)
+
+
+def placement_refusal(team, server, agent, here):
+    """Why `agent` may not run on `server` beside the agents `here`, in one sentence that says what it protects, or
+    None (one OS user for each agent). A server whose own reading names the other system than the kind it joined as
+    takes no agent; a Mac runs one; and a Linux server takes no second agent beside one that its server service
+    reported running as the service's own user, which can become any agent there (service_user_agents)."""
+    recorded = ((team.get("servers") or {}).get(server) or {}).get("kind")
+    read = server_kind(server_reading(server, []))
+    if recorded and read and recorded != read:
+        return (f"{server} joined as {'a Mac' if recorded == 'mac' else 'a Linux server'}, and its own reading says "
+                f"{'macOS' if read == 'mac' else 'Linux'}: it takes no agent until it joins again as what it is.")
+    others = [n for n in here if n != agent]
+    if not others:
+        return None
+    if (recorded or read) == "mac":
+        return (f"A Mac runs one agent, and {shown_role(others[0])} runs on {server}: a second agent there would run "
+                f"as the same user account and could act as it.")
+    service = service_user_agents(others)
+    if service:
+        return (f"{shown_role(service[0])} runs as the user of the server service on {server}, which can become any "
+                f"agent there, so {server} takes no second agent until {shown_role(service[0])} moves to a server of "
+                f"its own.")
+    return None
+
+
+def move_refusal(team, agent, a, server):
+    """Why `agent` (its entry `a`) may not move to `server`, in one sentence, or None (one OS user for each agent). A
+    move between kinds is allowed: what decides is what runs on the target. A Mac target takes it only when empty; a
+    Linux target beside other agents needs what Add agent there needs (an agent key from the install, a vault for
+    both, nobody that can become it); an agent with a Mac's browser or screen stays on a Mac; and on Linux its own
+    user, fleet-<name> or the one it kept, must be a user name that Linux takes."""
+    here = [n for n in server_agents(server, team) if n != agent]
+    refused = placement_refusal(team, server, agent, here)
+    if refused:
+        return refused
+    if server_kind_of(team, server) != "linux":
+        return None
+    if {"browser", "screen"} & set(a.get("can") or []):
+        return (f"{shown_role(agent)} uses a Mac's browser and screen, which a Linux server does not have: turn them "
+                f"off in its settings, or move it to an empty Mac.")
+    if not AGENT_OS_USER.fullmatch(a.get("user") or f"fleet-{agent}"):
+        return (f"{shown_role(agent)}'s name is too long for a user account of its own on {server}: give it a name of "
+                f"at most 26 characters first.")
+    if here and INSTALL_KEY not in server_features(server):
+        return f"{server} runs an older Founderizer that cannot take a second agent: update Founderizer there first."
+    if here and not_shareable(team, here):
+        return (f"{', '.join(shown_role(n) for n in not_shareable(team, here))} on {server} cannot share it yet: an "
+                f"agent beside another needs its own agent key and a vault that serves both.")
+    return None
+
+
+def service_user_agents(names):
+    """The agents of these that their server service reported running as its own user: a Linux agent from before the
+    per-agent move, whose fleet-<agent> does not exist (server.py agent_user). Kept once seen (SERVICE_USER), until the
+    agent moves or leaves, so a later reading cannot take it back."""
+    return [n for n in names if kv_read(SERVICE_USER + n)]
+
+
+def kv_read(k):
+    """kv_get with no commit, for a reader that a transaction can reach (the hold, placement_refusal)."""
+    row = read_row("SELECT v FROM kv WHERE k=?", (k,))
+    return row["v"] if row else None
+
+
+def row_data(table, column, key):
+    """The JSON data of one reading row, {} without one; read with no commit."""
+    row = read_row(f"SELECT data FROM {table} WHERE {column}=?", (key,))
+    try:
+        data = json.loads(row["data"]) if row else {}
+    except (ValueError, TypeError):
+        data = {}
+    return data if isinstance(data, dict) else {}
+
+
+OS_USER_KEPT = "os_user_kept"       # kv: the fault groups that readings made, kept once seen: [{machine, agents, why}]
+# The events that a held agent does not get: each starts or feeds a session, or brings a login to its machine. A sign-in,
+# a control, an update and a withdrawal pass, so the agent can be moved, signed in and updated, and a login can leave.
+OS_USER_HELD_EVENTS = ("task", "say", "chat", "conversation", "request", "deposit")
+OS_USERS = {"at": 0.0, "groups": None}      # the newest os_user_faults: at the start, at each apply_team, each minute
+OS_USER_EVERY = 60                  # seconds between two passes of os_user_sweep
+OS_USER_TOLD = "os_user_told"       # kv: since when the manager knows of each held agent, and of hub_user
+INSTALL_TOLD = "install_told:"      # kv: the end of a moved agent's install job, told to the manager once
+INSTALL_TOLD_FROM = "install_told_from"     # kv: the newest job before the first pass, whose ends nobody waits for
+
+
+def os_user_groups(team):
+    """{(machine, OS user): [agents]} by agent_os_user, in team order."""
+    groups = {}
+    for name in (team.get("agents") or {}):
+        key = agent_os_user(team, name)
+        if key is not None:
+            groups.setdefault(key, []).append(name)
+    return groups
+
+
+def os_user_kept():
+    """The fault groups that readings made, which the hub keeps until an agent of the group moves or leaves."""
+    try:
+        got = json.loads(kv_read(OS_USER_KEPT) or "[]")
+    except (ValueError, TypeError):
+        got = []
+    return [g for g in got if isinstance(g, dict) and isinstance(g.get("agents"), list) and g["agents"]]
+
+
+def os_user_keep(groups):
+    """Inside a transaction: the kept fault groups are these."""
+    in_transaction("os_user_keep")
+    DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (OS_USER_KEPT,
+                                                                                         json.dumps(groups)))
+
+
+def os_user_uid(agent, machine):
+    """The uid by which the readings compared this agent with its siblings on `machine` (os_user_found): its server
+    service's reading of it where that reading names it, else its own reading; None without one."""
+    status = row_data("server_status", "server", machine) if machine else {}
+    said = status.get("agents") if isinstance(status.get("agents"), dict) else {}
+    uid = said[agent].get("uid") if isinstance(said.get(agent), dict) else \
+        (row_data("machine_status", "agent", agent).get("access") or {}).get("uid")
+    return uid if isinstance(uid, int) and not isinstance(uid, bool) else None
+
+
+def os_user_drop(agent, machine=None, uid=None):
+    """Inside a transaction: this agent left `machine` (a move) or the fleet (a remove), so it leaves every kept group.
+    A group of several agents ends when fewer than two are left; a group of one agent ends with it. A group of one
+    other agent of `machine` that its own reading made by giving `uid`, the uid by which the readings knew the agent
+    that left (why "own", os_user_uid), ends too: it compared that agent with the one that left, so the agent that stays
+    alone is held no more. Every other group of one stays as it was kept, so no later reading of its own ends it."""
+    kept = []
+    for g in os_user_kept():
+        if machine is not None and uid is not None and g.get("machine") == machine and g.get("why") == "own" and \
+                agent not in g["agents"] and os_user_uid_own(g["agents"][0]) == uid:
+            continue
+        rest = [n for n in g["agents"] if n != agent]
+        if rest and (len(rest) > 1 or len(g["agents"]) == 1):
+            kept.append(dict(g, agents=rest))
+    os_user_keep(kept)
+    OS_USERS["at"] = 0.0        # the next tick keeps again at once what the readings still show (os_user_sweep)
+
+
+def os_user_uid_own(agent):
+    """The uid of this agent's own newest reading (its helper's), or None."""
+    uid = (row_data("machine_status", "agent", agent).get("access") or {}).get("uid")
+    return uid if isinstance(uid, int) and not isinstance(uid, bool) else None
+
+
+def os_user_rename(old, new):
+    """Inside a transaction: the kept groups, and the groups that the manager heard of, name the renamed agent by its
+    new name, so a rename neither ends a kept fault nor tells the manager of it twice."""
+    in_transaction("os_user_rename")
+    os_user_keep([dict(g, agents=[new if n == old else n for n in g["agents"]]) for g in os_user_kept()])
+    try:
+        told = json.loads(kv_read(OS_USER_TOLD) or "{}")
+    except (ValueError, TypeError):
+        told = {}
+    if isinstance(told, dict) and isinstance(told.get("agents"), dict):
+        told["agents"] = {new if n == old else n: v for n, v in told["agents"].items()}
+        DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                   (OS_USER_TOLD, json.dumps(told)))
+
+
+def os_user_found(team):
+    """[{machine, agents, why}]: what the machines' own readings show now (I4), before the hub keeps it. On a Linux
+    server its server service's reading of each agent's uid (its key is the service user's, which no agent user
+    reads), and an agent that the service reported as running as the service's own user beside another agent; on a
+    machine with no server entry the agents' own readings, where every source belongs to the agents (a forged one
+    holds a sibling, the safe side); and anywhere a helper whose own reading gives another agent's uid, or the hub's on
+    the hub's machine, which holds that agent alone and never a sibling. A Mac's one agent runs as the user of the
+    server service by design, so that uid is no fault there."""
+    agents_, servers = team.get("agents") or {}, team.get("servers") or {}
+    hub_machine = (team.get("hub") or {}).get("machine")
+    by_machine = {}
+    for name, a in agents_.items():
+        if isinstance(a, dict) and a.get("placed") is not False:
+            by_machine.setdefault(a.get("machine"), []).append(name)
+    out = []
+    for machine, names in by_machine.items():
+        server = servers.get(machine) or {}
+        status = row_data("server_status", "server", machine) if server else {}
+        said = status.get("agents") if isinstance(status.get("agents"), dict) else {}
+        own = {}
+        for n in names:
+            uid = (row_data("machine_status", "agent", n).get("access") or {}).get("uid")
+            if isinstance(uid, int) and not isinstance(uid, bool):
+                own[n] = uid
+        by_uid = {}
+        if server.get("kind") == "linux":
+            for n in names:
+                uid = (said.get(n) or {}).get("uid") if isinstance(said.get(n), dict) else None
+                if isinstance(uid, int) and not isinstance(uid, bool):
+                    by_uid.setdefault(uid, []).append(n)
+            if len(names) > 1 and service_user_agents(names):
+                out.append({"machine": machine, "agents": list(names), "why": "service"})
+        elif not server:
+            for n, uid in own.items():
+                by_uid.setdefault(uid, []).append(n)
+        for uid, group in by_uid.items():
+            if len(group) > 1:
+                out.append({"machine": machine, "agents": group, "why": "server" if server else "readings"})
+        theirs = {n: (said.get(n) or {}).get("uid") if isinstance(said.get(n), dict) else own.get(n) for n in names}
+        for n, uid in own.items():
+            # A Mac's agents all run as its desktop account, and team.json alone decides there: several agents on a
+            # Mac are one group (os_user_faults), and one agent shares with nobody.
+            if any(m != n and theirs.get(m) == uid for m in names) and server.get("kind") != "mac" or \
+                    (machine == hub_machine and uid == os.getuid() and n != manager_name()):
+                out.append({"machine": machine, "agents": [n], "why": "own"})
+        if server.get("kind") and server_kind(status) not in (None, server["kind"]):
+            out.append({"machine": machine, "agents": list(names), "why": "kind"})
+    return out
+
+
+def os_user_faults(team):
+    """[{machine, agents, why}]: each group of this team's agents that run as one OS user, or one agent that may act as
+    another (I4): what team.json says (a Mac with several agents, why "team"; an agent of a Linux server named as its
+    service's user, "service"), and what the readings showed and the hub keeps (os_user_kept). A machine with no server
+    entry is read only from its readings: its agents may have users of their own (hub.sh)."""
+    agents_ = team.get("agents") or {}
+    servers = team.get("servers") or {}
+    out, seen = [], set()
+
+    def add(machine, names, why):
+        names = sorted({n for n in names if n in agents_}, key=list(agents_).index)
+        if names and frozenset(names) not in seen:
+            seen.add(frozenset(names))
+            out.append({"machine": machine, "agents": names, "why": why})
+
+    for (machine, user), names in os_user_groups(team).items():
+        if user != OS_USER_UNKNOWN and len(names) > 1:
+            add(machine, names, "team")
+    for name in agents_:
+        key = agent_os_user(team, name)
+        server = servers.get(key[0]) or {} if key else {}
+        here = [n for n in agents_ if (agents_[n] or {}).get("machine") == key[0]] if key else []
+        if key and server.get("kind") == "linux" and key[1] == server.get("user") and len(here) > 1:
+            add(key[0], here, "service")    # alone, the service's user can become nobody else
+    for g in os_user_kept():
+        add(g.get("machine"), g["agents"], g.get("why") or "readings")
+    return out
+
+
+def os_user_refresh():
+    """The hold reads this: the faults of the running team now (os_user_faults)."""
+    OS_USERS["groups"] = os_user_faults(TEAM)
+    return OS_USERS["groups"]
+
+
+def os_user_held(agent):
+    """True while this agent is in a group of os_user_faults: no new session starts for it, and no route gives a
+    credential for it (the owner, 10 November 2026: stop their work). The manager is never held: it is the owner's chat
+    and the agent that gets the others out (move_agent), and in a group with it the others are held, so no session of
+    theirs runs that could act as it."""
+    if agent not in agents() or agent == manager_name():
+        return False
+    groups = OS_USERS["groups"]
+    if groups is None:      # before the first os_user_refresh: the faults of the team that this read sees (a read
+        groups = OS_USERS["groups"] = os_user_faults(team_read())     # of the state reads it only through its moment)
+    return any(agent in g["agents"] for g in groups)
+
+
+def os_user_since(agent):
+    """When the hub first told the manager that it holds this agent, or that the manager runs as the hub's own user for
+    the manager itself: a Needs-you item for its move is raised after that. It stays while the agent stays held, also
+    when its group changes (another agent of it moved), so one item serves every move of the group. None before the
+    first pass that saw it."""
+    try:
+        told = json.loads(kv_read(OS_USER_TOLD) or "{}")
+    except (ValueError, TypeError):
+        return None
+    if agent == manager_name():
+        return told.get("hub_user")
+    since = (told.get("agents") if isinstance(told.get("agents"), dict) else {}).get(agent)
+    return since if isinstance(since, (int, float)) and not isinstance(since, bool) else None
+
+
+def os_user_hold_reason(agent):
+    """Why the hub holds this agent (os_user_held), as the end of a sentence that begins with its role: what its fault
+    groups show."""
+    groups = [g for g in (OS_USERS["groups"] or []) if agent in g["agents"]]
+    whys = {g.get("why") for g in groups}
+    if any(len(g["agents"]) > 1 and g.get("why") in ("team", "server", "readings") for g in groups):
+        return "shares its user account with another agent"
+    if "service" in whys:
+        return "runs on a server where an agent runs as the user of the server service, which can become any agent"
+    if "kind" in whys:
+        return "runs on a server whose own reading names another system than the one it joined as"
+    if "broker" in whys:
+        return "had a vault call with its key from another user account than its own"
+    return "reported the user account of another agent, or of the hub"
+
+
+def os_user_held_words(agent):
+    """The one line of a held task, which the app draws as the orange line of its thread (stalled_reason)."""
+    return f"Waits until {shown_role(agent)} runs in a user account of its own."
+
+
+def manager_hub_user(team=None):
+    """True when the manager runs as the hub's own user on the hub's machine (a fleet from before the per-agent move):
+    it could ask the central vault for every login. It is never held; the owner hears it (health_view)."""
+    team = team or TEAM
+    mgr = next((n for n, a in (team.get("agents") or {}).items() if (a or {}).get("role") == "manager"), None)
+    a = (team.get("agents") or {}).get(mgr) or {}
+    if not mgr or a.get("placed") is False or a.get("machine") != (team.get("hub") or {}).get("machine"):
+        return False
+    uid = (row_data("machine_status", "agent", mgr).get("access") or {}).get("uid")
+    return isinstance(uid, int) and not isinstance(uid, bool) and uid == os.getuid()
+
+
+def roles_phrase(names):
+    """Agents by their roles, as one phrase: "A", "A and B", "A, B and C"."""
+    roles = [shown_role(n) for n in names]
+    return roles[0] if len(roles) == 1 else ", ".join(roles[:-1]) + " and " + roles[-1] if roles else ""
+
+
+def os_user_group_words(group):
+    """A fault group as the manager reads it: the agents by their roles, and where."""
+    return roles_phrase(group["agents"]), group.get("machine") or "its server"
+
+
+def os_user_group_line(group, mgr):
+    """The manager's line about a fault group whose hold starts: what it shows, by its why, and what the hub holds."""
+    who, where = os_user_group_words(group)
+    why, agents_ = group.get("why"), group["agents"]
+    held = [n for n in agents_ if n != mgr]
+    them = "them" if len(held) > 1 else "it"
+    if why == "service":
+        user = ((TEAM.get("servers") or {}).get(group.get("machine")) or {}).get("user")
+        service = service_user_agents(agents_) or \
+            [n for n in agents_ if (agent_os_user(TEAM, n) or (None, None))[1] == user] or agents_[:1]
+        what = (f"{who} run on {where}, where {roles_phrase(service)} {'runs' if len(service) == 1 else 'run'} as the "
+                f"user of the server service, which can become any agent there.")
+    elif why == "kind":
+        what = (f"{where} joined as one kind of machine, and its own reading names the other system, so the hub cannot "
+                f"tell which user account {who} {'runs' if len(agents_) == 1 else 'run'} as there.")
+    elif why == "broker":
+        what = (f"The vault broker of {where} got a call with the key of {who} from another user account than its "
+                f"own, so another agent there may hold that key.")
+    elif len(agents_) == 1:
+        what = (f"{who}'s own reading names the user account of another agent, or of the hub, on {where}, so it could "
+                f"act as that agent.")
+    else:
+        what = f"{who} run as one user account on {where}, so each could read the others' keys and act as them."
+    return (f"[hub] {what} The hub starts no work for {roles_phrase(held)} and gives {them} no credential until "
+            f"{'each runs' if len(held) > 1 else 'it runs'} in a user account of its own.")
+
+
+def os_user_targets(group):
+    """Where the agents of a fault group can go, as the manager names them in its Needs-you options: each Linux
+    server that may take another agent, and an empty Mac for an agent that uses a Mac's browser or screen."""
+    linux, macs = [], []
+    hub_machine = (TEAM.get("hub") or {}).get("machine")
+    for name, server in sorted((TEAM.get("servers") or {}).items()):
+        if name == group.get("machine") or (name == hub_machine and not hub_shared(TEAM)):
+            continue                # the own server of a hub that takes agents (hub_shared) takes them as any other
+        here = server_agents(name)
+        if server.get("kind") == "linux" and not service_user_agents(here):
+            linux.append(name)
+        elif server.get("kind") == "mac" and not here:
+            macs.append(name)
+    desktop = [n for n in group["agents"] if {"browser", "screen"} & set((agents().get(n) or {}).get("can") or [])]
+    words = f"Linux servers that can take them: {', '.join(linux)}." if linux else \
+        "No Linux server can take them yet: the owner adds one (Add server)."
+    if desktop:
+        words += (f" {', '.join(shown_role(n) for n in desktop)} use{'s' if len(desktop) == 1 else ''} a Mac's browser "
+                  f"or screen, so {'it goes' if len(desktop) == 1 else 'they go'} to an empty Mac" +
+                  (f": {', '.join(macs)}." if macs else ", and none is free yet."))
+    return words
+
+
+def os_user_sweep(t0):
+    """Inside LOCK, once a minute (tick): keep what the machines' readings show (os_user_found) and the service-user
+    facts of the Linux servers, make the hold's faults again (os_user_refresh), and tell the manager once when the hold
+    of an agent starts and once when it ends, when the manager itself runs as the hub's own user (manager_hub_user),
+    and when the install job of a moved agent ends in any state (whoever wrote it), which is its signal for the next
+    move: it does not poll."""
+    if t0 - OS_USERS["at"] < OS_USER_EVERY:
+        return
+    OS_USERS["at"] = t0
+    team, mgr = TEAM, manager_name()
+    for machine, server in (team.get("servers") or {}).items():
+        if (server or {}).get("kind") != "linux":
+            continue
+        status = row_data("server_status", "server", machine)
+        said = status.get("agents") if isinstance(status.get("agents"), dict) else {}
+        service = (status.get("access") or {}).get("user")
+        for n in server_agents(machine, team):
+            if service and isinstance(said.get(n), dict) and said[n].get("user") == service \
+                    and not kv_read(SERVICE_USER + n):
+                kv_set(SERVICE_USER + n, "1")
+                log("hub", f"{n} runs as the user of the server service on {machine}: no second agent goes there")
+    kept = os_user_kept()
+    known = {frozenset(g["agents"]) for g in kept}
+    new = [g for g in os_user_found(team) if frozenset(g["agents"]) not in known]
+    if new:
+        with transaction():
+            os_user_keep(kept + new)
+        for g in new:
+            log("hub", f"kept a fault of one OS user ({g['why']}) on {g['machine']}: {', '.join(g['agents'])}")
+    groups = os_user_refresh()
+    try:
+        told = json.loads(kv_get(OS_USER_TOLD) or "{}")
+    except (ValueError, TypeError):
+        told = {}
+    since = told.get("agents") if isinstance(told.get("agents"), dict) else {}
+    held_now = [n for g in groups for n in g["agents"] if n != mgr and n in agents()]
+    multi = {n for g in groups if len(g["agents"]) > 1 for n in g["agents"]}
+    for g in groups:
+        if not any(n in held_now and n not in since for n in g["agents"]):
+            continue                # its agents are held already: the manager knows of them
+        if len(g["agents"]) == 1 and g["agents"][0] in multi:
+            continue                # the bigger group's line names it
+        held = [n for n in g["agents"] if n != mgr]
+        line = os_user_group_line(g, mgr)
+        emit(mgr, "say", line + f" {os_user_targets(g)} Ask the owner in a Needs-you item which server takes "
+                                f"{'them' if len(held) > 1 else 'it'}, with an option for each server by its exact "
+                                f"name, then move {'each one' if len(held) > 1 else 'it'} with move_agent(agent, "
+                                f"server, need), one at a time: the same item serves each move, each install ends with "
+                                f"the owner's sign-in there, and the hub tells you when it ended.")
+        log("hub", f"the manager heard that {', '.join(g['agents'])} run as one OS user on {g.get('machine')} "
+                   f"({g['why']})")
+    free = [n for n in since if n not in held_now and n in agents()]
+    if free:
+        emit(mgr, "say", f"[hub] {roles_phrase(free)} {'is' if len(free) == 1 else 'are'} held no more: "
+                         f"{'its' if len(free) == 1 else 'their'} work goes on.")
+    hub_user = manager_hub_user(team)
+    if hub_user and told.get("hub_user") is None:
+        emit(mgr, "say", "[hub] You run as the hub's own user account on its server, which can read every login of "
+                         "the hub's vault. Ask the owner in a Needs-you item which server takes you, with an option "
+                         "for each server by its exact name, then move yourself with move_agent(agent=\"" + mgr +
+                         "\", server, need). Your session here ends with the move, and the owner signs you in there.")
+    kv_set(OS_USER_TOLD, json.dumps({"agents": {n: since.get(n) or t0 for n in sorted(set(held_now))},
+                                     "hub_user": (told.get("hub_user") or t0) if hub_user else None}))
+    floor = kv_get(INSTALL_TOLD_FROM)
+    if floor is None:           # the ends of the jobs before this pass wait for nobody
+        top = q1("SELECT MAX(id) m FROM server_jobs")["m"] or 0
+        kv_set(INSTALL_TOLD_FROM, str(top))
+        floor = top
+    for job in q("SELECT * FROM server_jobs WHERE kind='install' AND id>? AND state IN ('done','failed','canceled') "
+                 "ORDER BY id", (int(floor),)):
+        if job["agent"] not in agents() or not kv_get(MOVED + job["agent"]) or kv_get(INSTALL_TOLD + str(job["id"])):
+            continue
+        then = "Move the next one now, if one waits." if job["state"] == "done" else \
+            "Read the server, then try the move again with move_agent and the same item." if job["state"] == "failed" \
+            else "Ask the owner in a Needs-you item what comes next."
+        emit(mgr, "say", f"[hub] The install of {shown_role(job['agent'])} on {job['server']} after its move ended: "
+                         f"{'it runs there' if job['state'] == 'done' else job['state']}. {then}")
+        kv_set(INSTALL_TOLD + str(job["id"]), "1")
+
+
+def validate_team(team, kept=None, shared_ok=None):
     """A team.json that the hub can run: one manager, known runtimes, an IP address for every machine. kept: the MCP
     servers that it may carry on as they are without the check of today's rules (None: those of the running team), so
     that a rule which came later never refuses the owner's other changes. No session gets such a server
     (lifecycle.tool_catalog leaves it out and the start text says its rule), and team_problem passes {}, so the board
-    says the rule until the owner changes or removes it."""
+    says the rule until the owner changes or removes it.
+    shared_ok: the breaches of one OS user for each agent that may stay (os_user_rule), by default those of the
+    reference team."""
     import ipaddress
     if not isinstance(team, dict) or not isinstance(team.get("agents"), dict) or not team["agents"]:
         raise ValueError("team.json needs agents")
@@ -37745,11 +38436,10 @@ def validate_team(team, kept=None):
             if name in HUB_OWN_NAMES and a["machine"] == hub_conf["machine"] and a.get("placed") is not False:
                 raise ValueError(f"agent {name}: the hub uses the name {name} itself on its own server, which takes "
                                  f"agents: the agent has another name or another server")
-    homes = {}              # owner feature agent_rename: one home, one runtime credential, one agent
-    for name, a in team["agents"].items():
-        home = (a["machine"], a.get("user") or f"fleet-{name}")
-        if homes.setdefault(home, name) != name:
-            raise ValueError(f"{homes[home]} and {name} would share the OS user {home[1]} on {a['machine']}")
+    # One OS user for each agent (os_user_rule): the breaches of the reference team pass, and no new one. In a running
+    # hub that is the team it runs; outside one (fleet.py verify, hubsetup.py, an installer) the file itself.
+    os_user_rule(team, shared_ok if shared_ok is not None else
+                 os_user_breaches(TEAM if (TEAM.get("agents") or {}) else team))
     placed = {}             # owner API 1.12: agents may share a machine, which has one name for its address
     for name, a in team["agents"].items():
         other = placed.setdefault(addresses[a["machine"]], a["machine"])
@@ -37829,7 +38519,10 @@ def team_problem(team):
     It reads the rules and changes nothing. validate_team raises ValueError for every rule it has; a file broken
     in a way no rule reaches is named by its exception instead of ending the hub."""
     try:
-        validate_team(team, kept={})        # every MCP server by today's rules, also one that a write carried on
+        # Two agents of one OS user break no rule of the file: the hub reports that state itself (os_user_faults), and
+        # a fleet from before the rule must still start, verify and take its releases.
+        # Every MCP server by today's rules, also one that a write carried on (kept={}).
+        validate_team(team, kept={}, shared_ok=os_user_breaches(team) if team_shaped(team) else None)
     except Exception as e:
         reason = e if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"
         return f"team.json does not validate: {reason}"
@@ -38003,6 +38696,7 @@ def apply_team(new, left=()):
                            f"({type(e).__name__})")
                 left = []
     CFG["team_problem"] = team_problem(TEAM)    # a write that validates takes the startup reading off the board
+    os_user_refresh()                           # the hold follows the new team at once (os_user_held)
     for name in new["agents"]:
         know(name)
     if gone:
@@ -38565,6 +39259,10 @@ def machine_readiness(team):
             if rt.get("name"):
                 m["runtimes"][rt["name"]] = {"version": rt.get("version"), "signed_in": rt.get("signed_in")}
         missing = ([] if m["ssh"] else ["no_ssh"]) + placement_missing(m["agents"], team, strict=True, t0=t0)
+        # One OS user for each agent: this is the route of onboard.py --existing-machine, which installs a new agent
+        # under the machine's worker user, the user of an agent that runs there already, on every kind of machine.
+        # Add agent on a server gives each agent its own user instead (add_server_agent).
+        missing.append("shared_os_user")
         key = store_key(team, machine)
         reports = [r for r in (broker_report(n, t0) for n in m["agents"]) if r and r.get("broker_recipient")]
         fresh = max(reports, key=lambda r: r.get("broker_read_at") or 0, default=None)
@@ -39516,9 +40214,16 @@ def servers_view():
         job = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (name,))
         # An agent there already: a new one needs a service that gives it its key, and a server where nobody else has
         # root (add_server_agent).
+        # One OS user for each agent: a Mac runs one, so a Mac with an agent says one_per_mac, and has_agent with it,
+        # by which an app of today draws no line for that normal state; a server whose agent runs as its service's
+        # user takes none, and one whose reading names the other system is refused with its own sentence when an
+        # agent goes there (placement_refusal).
+        kind = entry.get("kind") or server_kind(reading)
         why = (["hub_machine"] if name == hub_machine and not hub_shared(team) else []) + \
-            (["has_agent"] if here and INSTALL_KEY not in server_features(name) else
-             ["agent_not_ready"] if [n for n in not_shareable(team, here) if not installing(job, n)] else []) + \
+            (["one_per_mac", "has_agent"] if here and kind == "mac" else
+             ["has_agent"] if here and INSTALL_KEY not in server_features(name) else
+             ["agent_not_ready"] if [n for n in not_shareable(team, here) if not installing(job, n)] or
+             service_user_agents(here) else []) + \
             (["fix_holder"] if fix_holders(team, name) else []) + \
             (["door_caller"] if door_callers_at(team, name) else [])
         if name not in keys:
@@ -39961,7 +40666,8 @@ def server_agent_entry(team, agent, server, runtime, role, parent, account=None)
 def add_server_agent(server, body):
     """POST /ui/servers/<server>/agents: a new agent on an available server, beside the agents it has. The hub registers
     it in team.json with its profile, inactive and with no credential access, and gives the server's service the job to
-    install it under its own OS user (a Mac's agents share one), which also gives it its agent key. The same command for
+    install it under its own OS user (a Mac runs one agent, as its desktop account), which also gives it its agent
+    key. The same command for
     the agent on this server whose last install or rename failed gives that job again, and changes nothing else."""
     agent, runtime, role, parent, t0 = body["agent"], body["runtime"], body["role"], body["reports_to"], now()
     account = body.get("account")       # the AI providers build: an account with a key or a model server's address
@@ -39999,6 +40705,9 @@ def add_server_agent(server, body):
             raise Refusal(409, f"The hub uses the name {agent} itself on its own server. Choose another name.")
         if fleet_own_name(agent):           # on each server: its install would fail, or make another service
             raise Refusal(409, f"Founderizer uses the name {agent} itself on a server. Choose another name.")
+        refused = placement_refusal(team, server, agent, here)     # one OS user for each agent
+        if refused:
+            raise Refusal(409, refused)
         if here and INSTALL_KEY not in server_features(server):
             raise Refusal(409, f"{server} runs an older Founderizer that cannot add a second agent. Update Founderizer "
                                f"on {server}, then try again.")
@@ -40533,7 +41242,8 @@ AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent"
 # kv key the code builds from a value, so a new prefix is placed here or named there with what it holds.
 AGENT_KV = ("tools:", "offline_told:", "runtime_since:", "switched:", "switching:", "history_agent:", "default_vault:",
             "default_desktop:", "checks_brief:", "chat_team:", "duty_review:", "presence:", "turn_ended:",
-            "first_message:", "settings_finding:", "chat_undelivered:", "read_missing:", "read_told:")
+            "first_message:", "settings_finding:", "chat_undelivered:", "read_missing:", "read_told:",
+            "service_user:", "caller_user:")       # one OS user for each agent: SERVICE_USER and CALLER_USER
 # The same, with more after the name: `<prefix><agent>:<window, task or item>`.
 AGENT_KV_SCOPED = ("listed:", "untaken:", "chased:")
 # Columns that hold a JSON list of agents' names: the agents that passed a question up (question_passers).
@@ -40590,6 +41300,7 @@ def rename_rows(old, new, t0, key_moves=False):
     for table, column in AGENT_ROWS.items():
         DB.execute(f"DELETE FROM {table} WHERE {column}=?", (new,))
     revoke_sessions(old, t0)
+    os_user_rename(old, new)        # one OS user for each agent: a kept fault group names it by its new name
     DB.execute("DELETE FROM agent_keys WHERE agent=?", (new,))
     if key_moves:
         DB.execute("UPDATE agent_keys SET agent=? WHERE agent=?", (new, old))
@@ -40693,7 +41404,7 @@ def rename_agent(agent, body):
         raise Refusal(409, f"A profile for {new} is in the fleet already. Choose another name.")
     renamed = renamed_team(team, agent, new)
     try:
-        validate_team(renamed)
+        validate_team(renamed, shared_ok=renamed_breaches(agent, new))     # what it shared, it shares under its new name
     except ValueError as e:
         raise Refusal(400, str(e)) from None
     data = (json.dumps(renamed, indent=2) + "\n").encode()
@@ -40741,9 +41452,11 @@ def moved_away(who, src):
     return bool(old) and old != agents()[who].get("machine") and address_of_machine(old) == src
 
 
-def move_agent(agent, body):
-    """POST /ui/team/agents/<agent>/move: the agent on an empty server, which runs a server service and sent a reading
-    in the last ten minutes. Not while a turn of it runs, or while it has an open sign-in. A Mac agent moves to a Mac
+def move_agent(agent, body, by="owner"):
+    """POST /ui/team/agents/<agent>/move, and the manager's move_agent tool (by: the manager): the agent on a server
+    that runs a server service and sent a reading in the last ten minutes, with one OS user for each agent: a Mac
+    takes it only when empty, a Linux server also beside other agents (move_refusal). The text below is older than that
+    rule. Not while a turn of it runs, or while it has an open sign-in. A Mac agent moves to a Mac
     and a Linux agent to Linux, because what an agent holds there (a browser, a screen) belongs to that kind. The same
     command for an agent that is on that server already, whose install there failed, gives the install job again.
 
@@ -40783,8 +41496,8 @@ def move_agent(agent, body):
             raise Refusal(409, f"{shown_role(agent)} runs on {server} already.")
     elif server == (team.get("hub") or {}).get("machine") and not hub_shared(team):
         raise Refusal(409, "No agent runs on the hub's server.")
-    elif server_agents(server, team):
-        raise Refusal(409, f"{server} has an agent already: {', '.join(server_agents(server, team))}")
+    elif move_refusal(team, agent, a, server):           # one OS user for each agent
+        raise Refusal(409, move_refusal(team, agent, a, server))
     elif [n for n in fix_holders(team, server) if n != agent]:
         raise Refusal(409, f"{', '.join(n for n in fix_holders(team, server) if n != agent)} holds Fix on {server}: "
                            f"an agent goes to a server where no other agent has root.")
@@ -40792,11 +41505,6 @@ def move_agent(agent, body):
     if reading is None or reading["stale"]:
         raise Refusal(409, code="server_silent", names={"server": server})
     old = where
-    kinds = (server_kind_of(team, old), server_kind_of(team, server)) if old not in (None, server) else (None, None)
-    if None not in kinds and kinds[0] != kinds[1]:
-        raise Refusal(409, f"{shown_role(agent)} runs on a {'Mac' if kinds[0] == 'mac' else 'Linux server'}, and "
-                           f"{server} is {'a Mac' if kinds[1] == 'mac' else 'Linux'}: an agent moves to a server of "
-                           f"its own kind.")
     if running_turns(owner=agent, t0=t0):
         raise Refusal(409, code="agent_mid_turn", names={"agent": shown_role(agent)})
     if open_login(agent):
@@ -40811,6 +41519,8 @@ def move_agent(agent, body):
         if a.get("vault", "none") != "none":
             a["vault"] = "none"             # its vault was the old machine's (the comment above)
         a.pop("vault_recipient", None)
+        if server_kind_of(team, server) == "mac":
+            a.pop("user", None)             # a Mac's agent runs as its desktop account and records no user
         if placing:
             del a["placed"]
             if runtime != a["runtime"]:     # the manager's own form of that runtime, as the installer writes it
@@ -40824,16 +41534,20 @@ def move_agent(agent, body):
         except ValueError as e:
             raise Refusal(400, str(e)) from None
         data = (json.dumps(team, indent=2) + "\n").encode()
+        actor = "Owner" if by == "owner" else shown_name(by)
         commit = commit_kit_file("team.json", data, f"Owner gave agent {agent} its server {server}, with {runtime}"
-                                 if placing else f"Owner moved agent {agent} from {old} to server {server}")
+                                 if placing else f"{actor} moved agent {agent} from {old} to server {server}")
         digest = hashlib.sha256(data).hexdigest()
     with transaction():
         if old != server:
+            left = os_user_uid(agent, old)      # before its reading goes: the uid that its siblings were compared with
             revoke_sessions(agent, t0)
             DB.execute("DELETE FROM agent_keys WHERE agent=?", (agent,))   # the install there registers its new key
             for table in ("machine_status", "machine_updates"):
                 DB.execute(f"DELETE FROM {table} WHERE agent=?", (agent,))
-            DB.execute("DELETE FROM kv WHERE k=?", (f"default_vault:{agent}",))
+            DB.execute("DELETE FROM kv WHERE k IN (?,?,?)", (f"default_vault:{agent}", SERVICE_USER + agent,
+                                                              CALLER_USER + agent))
+            os_user_drop(agent, old, left)  # it leaves any group of the old machine that readings made (os_user_kept)
         if old not in (None, server):       # an agent with no server left no machine whose calls get `moved`
             DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                        (MOVED + agent, old))
@@ -40842,11 +41556,17 @@ def move_agent(agent, body):
         job = DB.execute("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated) VALUES(?,?,?,?,?,?,?)",
                          (server, "install", agent, a["runtime"], "queued", t0, t0)).lastrowid
         if old not in (None, server):
-            event_rows([(manager_name(), "say", None, f"[hub] The owner moved {agent} from {old} to the server "
-                                                      f"{server}. Its tasks, memory and duties stay with it. Its "
-                                                      f"session there starts when {server} has installed it and it "
-                                                      f"is signed in.", None)], t0)
-        log_row("owner", f"gave agent {agent} its server {server} with {a['runtime']} in {commit[:12]}: job {job}"
+            who = "The owner moved" if by == "owner" else "You moved"
+            event_rows([(manager_name(), "say", None, f"[hub] {who} {'yourself' if agent == by else agent} from {old} "
+                                                      f"to the server {server}. "
+                                                      + ("Your tasks, memory and duties stay with you. This session "
+                                                         "ends now, and your new one starts when " + server +
+                                                         " has installed you and the owner signed you in there."
+                                                         if agent == by else
+                                                         f"Its tasks, memory and duties stay with it. Its session "
+                                                         f"there starts when {server} has installed it and it is "
+                                                         f"signed in."), None)], t0)
+        log_row(by, f"gave agent {agent} its server {server} with {a['runtime']} in {commit[:12]}: job {job}"
                 if placing else f"moved agent {agent} from {old} to server {server} in {commit[:12]}: job {job}"
                 if old != server else f"asked server {server} again to install {agent}: job {job}")
     if old != server:
@@ -40916,12 +41636,13 @@ def removed_team(team, agent):
     return out
 
 
-def remove_rows(agent, t0):
+def remove_rows(agent, t0, machine=None):
     """Inside a transaction: what the hub holds of the agent itself, its wake-up rules and its open server jobs. Each
     line deletes what is there, so a second call after a failed removal job finds nothing more to do. Its row stays
     until its server has removed it (free_name), so the Try again of a removal never meets a new agent of that name."""
     in_transaction("remove_rows")
     revoke_sessions(agent, t0)
+    os_user_drop(agent, machine, os_user_uid(agent, machine))   # one OS user for each agent: it leaves every kept group
     for table, column in REMOVED_OWN:
         DB.execute(f"DELETE FROM {table} WHERE {column}=?", (agent,))
     keys = [prefix + agent for prefix in AGENT_KV + (MOVED,)]
@@ -40969,7 +41690,7 @@ def remove_agent(agent, body):
         if newest and newest["state"] in JOB_OPEN:
             raise job_busy(last["server"], newest)
         with transaction():
-            remove_rows(agent, t0)
+            remove_rows(agent, t0, last["server"])
             job = DB.execute("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated,user) "
                              "VALUES(?,?,?,?,?,?,?,?)", (last["server"], "remove", agent, last["runtime"], "queued", t0,
                                                          t0, last["user"])).lastrowid
@@ -41007,7 +41728,7 @@ def remove_agent(agent, body):
     for row in read_rows(f"SELECT id FROM signin_jobs WHERE agent=? AND {LOGIN_OPEN}", (agent,)):
         LIVE_LOGINS.pop(row["id"], None)
     with transaction():
-        remove_rows(agent, t0)
+        remove_rows(agent, t0, a.get("machine"))
         job = DB.execute("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated,user) "
                          "VALUES(?,?,?,?,?,?,?,?)", (server, "remove", agent, a.get("runtime"), "queued", t0, t0,
                                                      a.get("user"))).lastrowid if serviced else None
@@ -41207,6 +41928,7 @@ def rename_machine_rows(old, new):
         DB.execute("UPDATE kv SET k=? WHERE k=?", (prefix + new, prefix + old))
     DB.execute("UPDATE needs SET key_swap_server=? WHERE key_swap_server=?", (new, old))
     DB.execute("DELETE FROM kv WHERE k='machine_rename'")
+    os_user_keep([dict(g, machine=new) if g.get("machine") == old else g for g in os_user_kept()])
 
 
 def rename_machine(old, new, t0):
@@ -45418,7 +46140,9 @@ def restored_team(bundle, reset=None):
         own_vault_store(team, reset if reset is not None else [])     # the hub's own server: this machine's vault
         # the copy's own MCP servers, as its hub took them: a rule that came later refuses no restore (team_problem
         # says it on the board, and no session gets such a server)
-        validate_team(team, kept=team.get("mcp"))
+        # The owner's own copy, from before a rule perhaps: two agents of one OS user in it restore, and the hub holds
+        # their work until they run in users of their own (os_user_held).
+        validate_team(team, kept=team.get("mcp"), shared_ok=os_user_breaches(team) if team_shaped(team) else None)
     except (ValueError, KeyError, TypeError, AttributeError) as e:
         raise Refusal(422, f"this copy and this server do not make a team.json the hub can run: {e}") from None
     return json.dumps(team, indent=2).encode() + b"\n"
@@ -45868,6 +46592,12 @@ def health_view():
     for entry in pin_ends(t0):
         kind, detail, fix = pin_end_words(entry, t0)
         warn(kind, detail, fix, agent=entry["carrier"])
+    if manager_hub_user():
+        # One OS user for each agent: a manager that runs as the hub's own user account can ask the hub's vault for
+        # every login. It is never held, so the owner hears it here; its way out is its own move_agent, to the
+        # server that the owner picks in its Needs-you item. The app titles every manager_ kind and opens the manager.
+        warn("manager_hub_user", "The manager runs as the hub's own user account, which can read every login.",
+             "Pick a server of its own in its Needs-you item.", agent=manager_name())
     flag = manager_warning()
     if flag:
         # A session that is not running is the one manager warning that a button settles: the app asks that
@@ -49592,13 +50322,60 @@ class Handler(BaseHTTPRequestHandler):
             return False
         if token is not None:
             if key_matches(who, token):
-                return True
+                return self.broker_allowed(who) if broker else True
             return self.refuse(who, "key_mismatch", f"this is not {who}'s agent key") if keyed else \
                 self.refuse(who, "no_key", f"{who} has no registered agent key")
         if not shared and (broker or not keyed):
-            return True
+            return self.broker_allowed(who) if broker else True
         return self.refuse(who, "key_required", f"{who} shares its machine with other agents: send its agent key"
                            if shared else f"{who} has an agent key: send it")
+
+    def broker_allowed(self, who):
+        """A vault broker's call for `who` (allowed with broker=True), once its identity passed: one OS user for each
+        agent. A held agent (os_user_held) gets nothing from its vault, so a sibling that holds its key opens no login
+        with it; only a withdrawal passes, whose answer names the login to take out. The broker names the OS user that
+        its request came from (X-Fleet-Caller-User, read from the socket): on a Linux server that must be the agent's
+        own user (its recorded user, else the one its server service reports, else fleet-<name>), or the service's
+        user for an agent alone on its server that runs as it; any other user holds another agent's key. Any agent can
+        write the line itself (the hub cannot tell the broker's call from the agent's), so a wrong line holds only the
+        agent it names (os_user_kept, why "broker"), and a call with no line is refused once that agent's broker has
+        sent one (CALLER_USER), while the agent's vault is the broker. On a machine with no server entry the line is
+        only read, and a Mac's vault sends none."""
+        withdrawal = self.path.split("?")[0].rstrip("/").endswith(f"/helper/vault/{who}") and \
+            self.form().get("kind") == "withdraw"
+        if os_user_held(who) and not withdrawal:
+            return self.refuse(who, "os_user_shared", f"{shown_role(who)} {os_user_hold_reason(who)}, so "
+                                                      f"the hub gives its vault nothing until it runs in a user "
+                                                      f"account of its own")
+        said = self.headers.get("X-Fleet-Caller-User")
+        key = agent_os_user(TEAM, who)
+        server = (TEAM.get("servers") or {}).get(key[0]) if key else None
+        if said is None:
+            # The line is the broker's: a helper that reads its own file vault calls these routes without it.
+            if kv_get(CALLER_USER + who) and server and server.get("kind") == "linux" and \
+                    TEAM["agents"][who].get("vault") == "broker":
+                return self.refuse(who, "os_user", f"the vault broker of {key[0]} names the user account of each call "
+                                                   f"for {shown_role(who)}, and this call names none")
+            return True
+        if not server or server.get("kind") != "linux":
+            return True
+        if not kv_get(CALLER_USER + who):
+            kv_set(CALLER_USER + who, "1")
+        status = row_data("server_status", "server", key[0])
+        reported = ((status.get("agents") or {}).get(who) or {}).get("user") \
+            if isinstance(status.get("agents"), dict) else None
+        own = (TEAM["agents"][who].get("user") or reported or key[1])
+        alone = server_agents(key[0]) == [who]
+        if said == own or (said == server.get("user") and alone):
+            return True
+        with transaction():
+            kept = os_user_kept()
+            if not any(g["agents"] == [who] and g.get("why") == "broker" for g in kept):
+                os_user_keep(kept + [{"machine": key[0], "agents": [who], "why": "broker"}])
+        os_user_refresh()
+        log("hub", f"REFUSED a vault call for {who} that came from the user {said}, not its own; {who} is held")
+        return self.refuse(who, "os_user", f"this call for {shown_role(who)} came from another user account than its "
+                                           f"own, so its vault gives nothing")
 
     def works_for(self, agent):
         """From here on this request works for one agent of the fleet: its own helper or one of its sessions calls.
@@ -49654,6 +50431,10 @@ class Handler(BaseHTTPRequestHandler):
             if token else None
         if row and row["revoked"] is None and row["agent"] == agent and binding_matches(row, context):
             self.credential = row["sha256"]     # the session that calls (chat_listed)
+            if os_user_held(agent):         # one OS user for each agent: a sibling could hold this credential
+                return self.refuse(agent, "os_user_shared", f"{shown_role(agent)} {os_user_hold_reason(agent)}, "
+                                                            f"so the hub gives it no credential until it runs in a "
+                                                            f"user account of its own")
             return True
         return self.refuse(agent, "credential_invalid", "this session's credential is not valid for this route; the "
                                                         "session must start again")
@@ -50659,6 +51440,8 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError) as e:
             return self.json(400, {"error": f"invalid status: {e}"})
         reading = {k: data[k] for k in ("revision", "os", "security", "runtimes", "access", "features", "load")}
+        if data.get("agents") is not None:      # one OS user for each agent: whom each agent here runs as
+            reading["agents"] = data["agents"]
         if secret_hit(json.dumps(reading)):
             return self.json(422, {"error": "registered login refused"})
         old = q1("SELECT data FROM server_status WHERE server=?", (name,))
@@ -53778,6 +54561,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(404, {"error": "unknown agent"})
         if not self.allowed(agent):
             return
+        if os_user_held(agent):         # one OS user for each agent: no session of it starts (the manager is never held)
+            return self.refuse(agent, "os_user_shared", f"{shown_role(agent)} {os_user_hold_reason(agent)}, "
+                                                        f"so no session of it starts until it runs in a user "
+                                                        f"account of its own")
         try:
             with LOCK:
                 answer = conversation_start(agent, cid)
@@ -54347,6 +55134,7 @@ class Handler(BaseHTTPRequestHandler):
                 keep = []
                 worker = conf.get("role") in ("worker", "lead")       # a lead works like a worker
                 limited = active_limit(agent)          # the manager's own limit holds its signals too
+                shared = os_user_held(agent)           # one OS user for each agent: no session of it starts
                 held = manager_held(agent)             # owner feature runtime_switch: until its new session runs
                 pending = worker and settings_pending(agent)        # owner API 1.9: wait for the new settings
                 updating = release_applying()       # owner feature releases: an update run holds every new session
@@ -54358,6 +55146,8 @@ class Handler(BaseHTTPRequestHandler):
                     extra = json.loads(r["extra"] or "{}")
                     # LIMIT_SAY passes: the hub's own word about this limit is what tells the session why it is
                     # about to go quiet, and held until the reset it arrives stale and says nothing.
+                    if shared and r["kind"] in OS_USER_HELD_EVENTS:
+                        continue        # it shares its OS user with another agent: the event waits in the hub
                     if limited and r["kind"] in ("task", "say", "chat") and not extra.get("limit"):
                         continue        # held until the usage limit resets; the read receipt stays open
                     if r["kind"] == "conversation" and ((limited or pending or updating) or not q1(
@@ -54425,7 +55215,7 @@ class Handler(BaseHTTPRequestHandler):
                 rows = keep
                 # Owner feature chat_warm: whether this agent's owner chat should run now, before any message, and
                 # whether its session has its tools. A change ends the wait, so the chat starts as soon as it may.
-                chat = {"warm": chat_wanted(agent, limited or pending or holding),
+                chat = {"warm": chat_wanted(agent, limited or pending or holding or shared),
                         "ready": chat_session_ready(agent), "tools": chat_contract} if worker else None
                 if rows or now() >= deadline or told not in (None, chat):
                     break
@@ -54462,6 +55252,8 @@ class Handler(BaseHTTPRequestHandler):
                 # AUTONOMY.md P2: how each open conversation runs now, with contacts.v2; a window that started another
                 # way closes, because its tools were fixed at its start
                 "conversation_modes": conversation_modes(agent) if worker and contacts_v2() else None,
+                # one OS user for each agent: its helper closes its windows when their turns end (Helper.close_held)
+                **({"hold": "os_user"} if shared else {}),
                 "events": [{"id": r["id"], "kind": r["kind"], "task": tref(r["task"]) if r["task"] else None,
                             "text": r["text"], "extra": json.loads(r["extra"] or "{}"),
                             # plan C6: the helper started this attempt once; only the hub starts it again
@@ -54502,6 +55294,12 @@ class Handler(BaseHTTPRequestHandler):
                     and not (r["kind"] == "deposit" and json.loads(r["extra"] or "{}").get("deposit") not in carried)
                     and not (r["kind"] == "withdraw" and json.loads(r["extra"] or "{}").get("withdraw") not in taken)
                     and r["kind"] != "place"]       # Targets left the hub: a placement from before asks nobody
+            if os_user_held(agent):
+                # One OS user for each agent: the batch ends before the first event that the hold keeps, and the
+                # cursor stays below it, so the helper gets it again once the hold ends and nothing is lost.
+                first = next((r["id"] for r in rows if r["kind"] in OS_USER_HELD_EVENTS), None)
+                if first is not None:
+                    rows, last = [r for r in rows if r["id"] < first], first - 1
         self.json(200, {"last": last, "db": kv_get("db_id"),
                         "events": [{"id": r["id"], "kind": r["kind"], "task": tref(r["task"]) if r["task"] else None,
                                     "text": r["text"], "extra": json.loads(r["extra"] or "{}")} for r in rows]})
@@ -55310,6 +56108,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(404, {"error": "unknown agent"})
         if not self.allowed(agent):
             return
+        if os_user_held(agent):         # one OS user for each agent: no session of it starts (the manager is never held)
+            return self.refuse(agent, "os_user_shared", f"{shown_role(agent)} {os_user_hold_reason(agent)}, "
+                                                        f"so no session of it starts until it runs in a user "
+                                                        f"account of its own")
         f = self.form()
         kind, generation = f.get("kind"), f.get("generation")
         with LOCK:                      # the lock of every key change: a key replaced since allowed() issues nothing
@@ -55358,6 +56160,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(404, {"error": "unknown agent"})
         if not self.allowed(agent):
             return
+        if os_user_held(agent):             # one OS user for each agent: a sibling could hold this key
+            return self.refuse(agent, "os_user_shared", f"{shown_role(agent)} {os_user_hold_reason(agent)}, "
+                                                        f"so the hub gives it no credential until it runs in a "
+                                                        f"user account of its own")
         a = agents()[agent]
         if a.get("role") not in ("worker", "lead"):
             return self.json(409, {"error": "only a worker or a lead has task sessions"})
@@ -55410,6 +56216,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(404, {"error": "unknown agent"})
         if not self.allowed(agent):
             return
+        if os_user_held(agent):         # one OS user for each agent: no session of it starts (the manager is never held)
+            return self.refuse(agent, "os_user_shared", f"{shown_role(agent)} {os_user_hold_reason(agent)}, "
+                                                        f"so no session of it starts until it runs in a user "
+                                                        f"account of its own")
         f, a = self.form(), agents()[agent]
         tool, attempt = f.get("tool"), f.get("attempt")
         entry = tool_catalog(TEAM).get(tool) if isinstance(tool, str) else None
@@ -55479,6 +56289,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(404, {"error": "unknown agent"})
         if not self.allowed(agent):
             return
+        if os_user_held(agent):             # one OS user for each agent: a sibling could hold this key
+            return self.refuse(agent, "os_user_shared", f"{shown_role(agent)} {os_user_hold_reason(agent)}, "
+                                                        f"so the hub gives it no credential until it runs in a "
+                                                        f"user account of its own")
         f = self.form()
         token, ref, sent, unsent = f.get("outputs"), f.get("task"), f.get("files"), f.get("skipped") or []
         if not isinstance(ref, str) or not re.fullmatch(r"T-[1-9][0-9]{0,17}", ref):
@@ -56784,6 +57598,10 @@ def main():
     walled, unwalled = wal_on()             # a read of the state reads its own moment, without LOCK (state_moment)
     if walled:
         readers_for(os.path.abspath(db_path))
+    try:
+        os_user_refresh()                   # the hold of one OS user for each agent holds from the first request
+    except Exception as e:                  # a damaged row must not stop the start: the sweep makes it again
+        print(f"WARNING: the faults of one OS user for each agent could not be read: {e}")
     kv_set("schema_problems", json.dumps(schema_problems) if schema_problems else None)
     if restored:
         # A new generation, because these records came from somewhere else: no helper, session or app state from

@@ -2718,7 +2718,9 @@ def tools():
                              "to see the job end.",
              {"agent": S["text"], "name": S["text"], **rid}, ("agent", "name"),
              with_base("/ui/team/agents/{agent}/rename", ("name",), "the new name of this agent")),
-        tool("move_agent", "Move an agent to an empty server of its own kind, which joined with a join code: one "
+        tool("move_agent", "Move an agent to another server that joined with a join code: a Linux server, where each "
+                           "agent has its own user account, also beside other agents, or an empty Mac, because a Mac "
+                           "runs one agent; an agent with the browser or the screen stays on a Mac. One "
                            "commit of team.json, the install job there and the end of its old session. Its tasks, "
                            "chat, memory, duties and grants stay with it; its vault starts again on the new server, "
                            "and it signs in there. Not while a turn of it runs. Read servers to see the job end; the "

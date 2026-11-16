@@ -303,8 +303,10 @@ installer's own step for it is step 11, and three things follow from it:
 - **`verify` reads each agent as its own user** (PRODUCT.md 4.1 keeps its check ids; a
   reading it cannot take warns), which is why the root helper of step 8 exists.
 
-A Mac keeps one user for its agents: a Mac agent's service is a LaunchAgent of a desktop
-session, so a second user would have to be logged in at the screen.
+A Mac runs one agent (10 November 2026): a Mac agent's service is a LaunchAgent of the desktop
+session, so every agent there would run as the desktop account, and each could act as the others.
+The desktop account of a Mac that joins the fleet belongs to that one agent: no person keeps files
+or logins in it. More agents go to Linux servers, where each has its own user.
 
 ### The two root commands of this machine
 

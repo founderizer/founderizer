@@ -93,9 +93,9 @@ class AgentUsers(unittest.TestCase):
         self.assertIn("no agent user is made", out)
         self.assertFalse(self.ran.exists(), "it called the command although the hub has not named this machine")
 
-    def test_a_mac_keeps_one_user_for_its_agents(self):
+    def test_a_mac_makes_no_agent_user_and_runs_one_agent(self):
         """A Mac agent's service is a LaunchAgent of a desktop session, so a second user would have to be logged in
-        at the screen (PRODUCT.md P2)."""
+        at the screen (PRODUCT.md P2): a Mac runs one agent, as its desktop account (test_os_users)."""
         body = shell_function(SCRIPT, "mac")
         self.assertNotIn("agent_users", body)
         self.assertNotIn("useradd", body)

@@ -1140,7 +1140,7 @@ would read as an empty fleet instead of as a mistake.
 | `activate_agent` / `agent_settings` | `/ui/team/agents/<a>` | Turn an agent on or off; its model, effort, capabilities and host list. |
 | `agent_key` | `/ui/team/agents/<a>/key` | Register, replace or remove an agent's key, by its SHA-256. Never a key. A key that a server service registered is replaced, never removed. |
 | `rename_agent` | `/ui/team/agents/<a>/rename` | A new name for an agent: everything it has moves with it, and nobody signs in again. The manager only while it has no server yet. |
-| `move_agent` | `/ui/team/agents/<a>/move` | An agent onto an empty server of its own kind: the install job there, and its old session ends. A new fleet's manager onto its first server, with `runtime` its AI provider. |
+| `move_agent` | `/ui/team/agents/<a>/move` | An agent onto another server: a Linux server, also beside other agents (each has its own user account), or an empty Mac (a Mac runs one agent); one with the browser or the screen stays on a Mac. The install job there, and its old session ends. A new fleet's manager onto its first server, with `runtime` its AI provider. |
 | `remove_agent` | `/ui/team/agents/<a>/remove` | Delete an agent: what is its own goes, on the hub and on its server (its service, files and own OS user), and nothing of another agent. Its tasks stay as history. |
 | `switch_runtime` | `/ui/team/agents/<a>` | Switch one agent to its other runtime. A command of its own. |
 | `vault_access` | `/ui/team/agents/<a>` | Give one agent its machine's vault broker, or take it away. |

@@ -1358,6 +1358,14 @@ class Onboarding:
         if not isinstance(entry, dict):
             raise StepFailed("The hub has no machine %s. Nothing was changed." % machine)
         ours = self.state.get("registration_commit")
+        # One OS user for each agent: this route installs the new agent under the machine's worker user, which is the
+        # user of an agent that runs there, so a machine with another agent never takes one, also for a run that
+        # registered its agent before the hub said so. Add agent on a server gives each agent its own user.
+        others = [n for n in entry.get("agents") or [] if n != self.name]
+        if others:
+            raise StepFailed("%s runs %s already: a second agent there would run as the same user account and could act "
+                             "as it. Add the agent to a server from the Servers page instead. Nothing was changed."
+                             % (machine, ", ".join(others)))
         if not ours:   # after its registration, a half-installed agent makes its own machine not ready
             if self.name in machines or any(line.get("agent") == self.name for line in team.get("lines") or []):
                 raise StepFailed("The hub already has an agent or machine named %s. Choose another name." % self.name)

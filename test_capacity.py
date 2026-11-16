@@ -648,7 +648,8 @@ class Capacity(OwnerAPI):
         self.assertEqual(self.request("/ui/capacity?db=old")[0], 409)
         team = json.loads(json.dumps(TEAM))
         team["agents"]["big"]["machine"] = "vps"
-        hub.validate_team(team)                 # owner API 1.12: agents may share a machine
+        team["servers"] = {"vps": {"kind": "linux", "user": "fleet"}}
+        hub.validate_team(team)                 # a Linux server takes several agents, each with its own user
         team["addresses"]["spare"] = team["addresses"]["vps"]
         team["agents"]["big"]["machine"] = "spare"
         with self.assertRaises(ValueError) as refused:

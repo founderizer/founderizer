@@ -47,7 +47,9 @@ class Move(Servers):
         return git("--git-dir", str(self.root / "origin.git"), "rev-parse", "main")
 
     def test_the_feature_is_offered(self):
-        self.assertIn("agent_move", self.request(source=OWNER)[1]["ui_features"])
+        features = self.request(source=OWNER)[1]["ui_features"]
+        self.assertIn("agent_move", features)
+        self.assertIn("agent_move_beside", features)     # 1.192: to the other kind, and beside other agents
 
     def test_a_move_is_one_commit_an_install_job_and_the_end_of_the_old_records(self):
         team = self.origin_team()
@@ -129,11 +131,11 @@ class Move(Servers):
         status, answer = self.move(server="box")            # box has scout already
         self.assertEqual((status, answer["error"]), (409, "Scout runs on box already."))
         status, answer = self.move("vps", server="box")
-        self.assertEqual((status, answer["error"]), (409, "box has an agent already: scout"))
-        self.joined("mini", "mac", source=NEW)
-        status, answer = self.move(server="mini")
-        self.assertEqual(status, 409)
-        self.assertIn("an agent moves to a server of its own kind", answer["error"])
+        # one OS user for each agent: a Linux server takes a second agent, each with its own user, once its service
+        # gives a new agent its key (test_os_users.Moves)
+        self.assertEqual((status, answer["error"]), (409, "box runs an older Founderizer that cannot take a second "
+                                                          "agent: update Founderizer there first."))
+        # A move between kinds is allowed since 10 November 2026 (one OS user for each agent): test_os_users.Moves
         with patch.object(hub, "running_turns", lambda owner=None, t0=None: [7] if owner == "scout" else []):
             status, answer = self.move()
         self.assertEqual((status, answer["error"]), (409, "Scout is in the middle of a turn. Move it when the turn "
@@ -180,7 +182,12 @@ class OldHelper(unittest.TestCase):
         h = fleet.Helper.__new__(fleet.Helper)
         h.agent, h.session = "scout", "fleet-scout"
         tmux, runs = [], []
-        with patch.object(fleet, "tmux", lambda *args, **kw: tmux.append(args)), \
+        import tempfile
+        home = tempfile.mkdtemp(prefix="fleet-moved-")
+        self.addCleanup(__import__("shutil").rmtree, home, True)
+        with patch.object(fleet, "HOME", home + "/.fleet"), patch.object(fleet, "SESSIONS", home + "/.fleet/sessions"), \
+                patch.dict(__import__("os").environ, {"HOME": home}), \
+                patch.object(fleet, "tmux", lambda *args, **kw: tmux.append(args)), \
                 patch.object(fleet.sys, "platform", platform), \
                 patch.object(fleet.subprocess, "run", lambda argv, **kw: runs.append(argv)), \
                 patch.object(fleet.os, "remove", lambda path: runs.append(["rm", path])):
@@ -190,7 +197,9 @@ class OldHelper(unittest.TestCase):
     def test_on_linux_its_sessions_end_and_its_unit_is_disabled(self):
         tmux, runs = self.run_it("linux")
         self.assertEqual(tmux, [("kill-session", "-t", "=fleet-scout:")])
-        self.assertEqual(runs, [["systemctl", "--user", "--no-block", "disable", "--now", "fleet-scout.service"]])
+        self.assertEqual(runs[0][0], "rm")                              # its key goes first (test_os_users)
+        self.assertTrue(runs[0][1].endswith("/.fleet/agent-scout.key"))
+        self.assertEqual(runs[-1], ["systemctl", "--user", "--no-block", "disable", "--now", "fleet-scout.service"])
 
     def test_the_ops_command_is_put_on_the_box_once(self):
         """DevOps plan C1: the helper puts the door's command in ~/.local/bin, which every session's PATH carries."""
@@ -210,10 +219,12 @@ class OldHelper(unittest.TestCase):
     def test_on_a_mac_its_launch_agent_goes(self):
         tmux, runs = self.run_it("darwin")
         self.assertEqual(tmux, [("kill-session", "-t", "=fleet-scout:")])
-        self.assertEqual(runs[0][0], "rm")
-        self.assertTrue(runs[0][1].endswith("Library/LaunchAgents/com.agentfleet.scout.plist"))
-        self.assertEqual(runs[1][:2], ["launchctl", "bootout"])
-        self.assertTrue(runs[1][2].endswith("/com.agentfleet.scout"))
+        removed = [r[1] for r in runs if r[0] == "rm"]
+        # the real LaunchAgent, in the user's own Library: it looked in ~/.fleet/Library until 10 November 2026
+        self.assertTrue(any(p.endswith("/Library/LaunchAgents/com.agentfleet.scout.plist") for p in removed), removed)
+        self.assertFalse(any("/.fleet/Library/" in p for p in removed))
+        self.assertEqual(runs[-1][:2], ["launchctl", "bootout"])
+        self.assertTrue(runs[-1][2].endswith("/com.agentfleet.scout"))
 
 
 if __name__ == "__main__":

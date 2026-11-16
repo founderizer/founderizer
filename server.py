@@ -19,8 +19,9 @@ when that user is not signed in (Codex: a link and a code in Fleet; Claude Code:
 that agent, machine_signin, which the owner finishes in the app and never in a terminal). Everything of one agent is
 in that user's home at mode 700, so no other agent of the machine can read its runtime credential or its vault token. This service has no root, so the user is made by the one root command the
 installers put in place (/usr/local/sbin/fleet-agent-user, hubsetup.agent_helper) and the rest is run as that user
-through the one sudoers line beside it. A Mac keeps one user for its agents (PRODUCT.md P2), and so does an agent
-from before the move: there every step is this service's own user, as it was. prepare: the other runtime of an agent
+through the one sudoers line beside it. A Mac runs one agent, as this service's own user, the desktop account (PRODUCT.md
+P2), and an agent from before the move runs as this service's user too: there every step is this service's own user.
+The hub holds an agent of that kind beside another (one OS user for each agent). prepare: the other runtime of an agent
 on this server, before the owner switches it, with the same runtime and sign-in steps, under that agent's own user;
 it changes no agent, checkout or service. rename: an agent the owner gave a new name (agent_rename): its checkout, its
 agent key and its service move to the new name under the OS user it already has, so it keeps its runtime and its
@@ -251,12 +252,22 @@ def save_conf(conf):
     os.replace(CONF_FILE + ".new", CONF_FILE)
 
 
+def own_kind():
+    """This machine's kind, as a join must name it: a Mac's agents all run as its desktop account (one agent there),
+    and a Linux server gives each agent its own user, so a Mac that joined as Linux would give several agents one."""
+    return "mac" if sys.platform == "darwin" else "linux"
+
+
 def cmd_join(args):
     """The join: the server key, POST /join with the code from standard input, then the server service. The same
     server again (the line once more after a failed step) is a repeat for the hub."""
     code = sys.stdin.readline().strip()
     if not code:
         die("No join code. Copy the whole line from Founderizer: Settings, Servers, Add server.")
+    own = own_kind()
+    if args.kind != own:        # one OS user for each agent: a Mac's agents all run as its desktop account
+        die(f"This machine is {'a Mac' if own == 'mac' else 'Linux'}, and the line says --kind {args.kind}. Copy the "
+            f"line for {'a Mac' if own == 'mac' else 'Linux'} from Founderizer: Settings, Servers, Add server.")
     key = server_key(make=True)
     status, answer = Hub(args.hub).call("POST", "/join", {
         "code": code, "key_sha256": hashlib.sha256(key.encode()).hexdigest(), "kind": args.kind,
@@ -439,8 +450,8 @@ class Service:
 
     def agent_user(self, agent, named=None):
         """The OS user whose home holds this agent's checkout, runtime, credential and service (os_user), where that
-        user exists. None on a Mac, which keeps one user for its agents, and None for an agent from before the move,
-        whose checkout then stays where this service made it."""
+        user exists. None on a Mac, whose one agent runs as the desktop account, and None for an agent from before the
+        move, whose checkout then stays where this service made it."""
         if self.platform == "darwin":
             return None
         user = self.os_user(agent, named)
@@ -519,8 +530,35 @@ class Service:
         life = self.life
         return {"revision": self.loaded, "os": life.os_info(), "security": life.security(),
                 "runtimes": self.runtimes(), "load": lifecycle.machine_load(self.platform),
-                "access": dict(life.access(), user=pwd.getpwuid(os.getuid()).pw_name),
+                "access": dict(life.access(), user=pwd.getpwuid(os.getuid()).pw_name, uid=os.getuid()),
+                "agents": self.agent_users(),
                 "features": [JOB_HEARTBEAT, NAMES_FEATURE, KEY_FEATURE, INSTALL_KEY, MODEL_ACCOUNTS]}
+
+    def agent_users(self):
+        """{agent: {user, uid}} of this machine's agents: the OS user that each one's service runs as (agent_user), or
+        this service's own user where it has none of its own (a Mac's one agent, and a Linux agent from before the
+        per-agent move, whose checkout is in this service's own home). An agent that has neither yet (its install has
+        not made its user, or failed before) runs nowhere: {user: None, uid: None}, so the hub never takes it for one
+        that runs as this service's user. The hub compares them (one OS user for each agent): this service's key is
+        its own user's, which no agent user of a Linux server can read, so its reading is the one the hub trusts
+        there."""
+        me, out = pwd.getpwuid(os.getuid()).pw_name, {}
+        for name, entry in self.agents_here()[:64]:
+            user = self.agent_user(name, entry.get("user"))
+            found = self.users(user) if user else None
+            if found:
+                out[name] = {"user": user, "uid": found[0]}
+            elif self.platform == "darwin" or self.from_before(name):
+                out[name] = {"user": me, "uid": os.getuid()}
+            else:
+                out[name] = {"user": None, "uid": None}
+        return out
+
+    def from_before(self, agent):
+        """True for an agent from before the per-agent move: its checkout is in this service's own home, and it is not
+        this service's own checkout (~/fleet-server, which an agent named server would name)."""
+        folder = os.path.join(self.home, f"fleet-{agent}")
+        return os.path.isdir(folder) and os.path.realpath(folder) != os.path.realpath(self.kit)
 
     def runtimes(self):
         """Codex and Claude Code as this server's agent reads them: as its own OS user, in its own home and on its own
@@ -529,7 +567,7 @@ class Service:
         On Linux this service's user is not that user: each agent has a user of its own, and its runtime and its
         credential are in a home of mode 700. Read as this service, one of the owner's servers said that neither
         runtime was there and another an older Claude Code that nobody had signed in to, while the helper of each
-        agent read Claude Code signed in (27 October 2026). A Mac's agents share this service's user, and so does an
+        agent read Claude Code signed in (27 October 2026). A Mac's one agent runs as this service's user, and so does an
         agent from before the move, so there and on a server with no agent yet the reading is this service's own."""
         here, life = self.agents_here(), self.life
         if here:

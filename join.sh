@@ -475,8 +475,8 @@ mac() {
     printf '%s\n' "$code" | "$runner" "$prefix/bin/python3" "$HOME/fleet-server/server.py" join --hub "$HUB" --kind mac
     current "$HOME/fleet-server" "$runner"
     # No OS user for each agent on a Mac, and no root helper: a Mac agent's service is a LaunchAgent of a desktop
-    # session, so a second user would have to be logged in at the screen. A Mac keeps one user for its agents
-    # (PRODUCT.md P2), and its agents share that user's runtime credential.
+    # session, so a second user would have to be logged in at the screen. A Mac runs one agent, as this desktop
+    # account, which belongs to that agent (PRODUCT.md P2, and "What one OS user for each agent decided").
     mac_vault
     if [ "$runner" = as_mac_user ]; then
         say "the installer goes on from here, and it runs the checks itself"    # a minute saved for the owner

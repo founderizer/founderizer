@@ -273,8 +273,11 @@ class Shared(HubService, Servers):
         team["agents"]["git"]["machine"] = "spare"      # on another server the name is the agent's own business
         hub.validate_team(team)
         del team["hub"]["shared"]
-        team["agents"]["git"]["machine"] = "hub"        # and a hub without the word has no such rule, as before
-        hub.validate_team(team)
+        team["agents"]["git"]["machine"] = "hub"        # and a hub without the word has no such rule, as before: it
+        with self.assertRaises(ValueError) as refused:  # takes no worker there at all (one OS user for each agent)
+            hub.validate_team(team)
+        self.assertNotIn("uses the name git itself", str(refused.exception))
+        self.assertIn("no agent but the manager runs there", str(refused.exception))
         status, receipt = self.add_agent(server="hub", agent="scout", runtime="codex")
         self.assertEqual(status, 200, receipt)
         team = self.origin_team()
@@ -429,14 +432,24 @@ class Shared(HubService, Servers):
         self.assertIn("an agent that holds servers through the door runs alone on its server", refused["error"])
         self.assertNotIn("servers", self.origin_team()["agents"]["scout"])
 
-    def test_a_move_goes_to_an_empty_server_so_the_hubs_server_with_its_manager_takes_none(self):
+    def test_a_move_goes_to_the_hubs_server_beside_its_manager_as_add_agent_there_does(self):
+        """Since UI-API.md 1.192 (agent_move_beside) a move takes a Linux server that has agents, by the rules of Add
+        agent there: the own server of a hub that takes agents takes it beside its manager, each as its own user."""
         self.hub_reads()
         self.joined("spare", "linux", source=NEW, user="fleet")
         team = self.origin_team()
         team["agents"]["scout"] = {"role": "worker", "runtime": "codex", "machine": "spare", "can": ["shell"]}
         self.write_team(team)
         status, answer = self.owner("/ui/team/agents/scout/move", base_sha256=self.team_sha(), server="hub")
-        self.assertEqual((status, answer["error"]), (409, "hub has an agent already: manager"))
+        self.assertEqual(status, 200, answer)
+        self.assertEqual((answer["server"], answer["was"]), ("hub", "spare"))
+        team = self.origin_team()
+        self.assertEqual({n: a["machine"] for n, a in team["agents"].items()}, {"manager": "hub", "scout": "hub"})
+        self.assertEqual([hubsetup.agent_user(n, team["agents"][n]) for n in ("manager", "scout")],
+                         ["fleet-manager", "fleet-scout"])
+        self.assertEqual(self.service("/server/hub/jobs", key=self.key, source=HUB)[1]["jobs"],
+                         [{"id": answer["job"], "kind": "install", "agent": "scout", "runtime": "codex",
+                           "state": "queued"}])
 
 
 class Later(HubService, Servers):

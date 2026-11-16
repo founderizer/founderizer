@@ -361,13 +361,15 @@ class OneName(unittest.TestCase):
                        'hubsetup.py" runtime --runtime "$agent_runtime"'):
             self.assertIn(wanted, text)
 
-    def test_a_mac_keeps_one_user_for_its_agents(self):
+    def test_a_mac_runs_its_one_agent_as_its_desktop_account(self):
         """A Mac agent's service is a LaunchAgent of a desktop session, so a second user would have to be logged in
-        at the screen (PRODUCT.md P2). The join script says so, and server.py makes no user there."""
+        at the screen (PRODUCT.md P2), and since 10 November 2026 a Mac runs one agent (test_os_users). The join
+        script says so, and server.py makes no user there."""
         text = (KIT / "join.sh").read_text()
         self.assertIn("No OS user for each agent on a Mac", text)
+        self.assertIn("A Mac runs one agent, as this desktop", text)
         service = server.Service.__dict__
-        self.assertIn("keeps one user for its agents", service["agent_user"].__doc__)
+        self.assertIn("whose one agent runs as the desktop account", service["agent_user"].__doc__)
         self.assertIsNone(server.Service.agent_user(_Mac(), "writer"))
 
 

@@ -370,8 +370,9 @@ class Rename(Servers):
                 hub.validate_team(bad)
         twice = json.loads(json.dumps(good))
         twice["agents"]["vps"]["user"] = "fleet-lead"           # vps and lead are both on the machine vps
-        with self.assertRaisesRegex(ValueError, "would share the OS user fleet-lead on vps"):
-            hub.validate_team(twice)
+        # One OS user for each agent: the rule itself, without the running team's own breaches (test_os_users)
+        with self.assertRaisesRegex(ValueError, "would run as one user account on vps"):
+            hub.validate_team(twice, shared_ok=set())
 
     def test_team_json_takes_no_agent_named_owner_or_hub_and_no_name_with_a_final_newline(self):
         """The audit of 7 November 2026: `$` let "scout\\n" through every AGENT_NAME.match, and team.json took an
@@ -539,10 +540,10 @@ class RenameService(ServerService):
         self.assertEqual(status, 200, answer)
         return (home / ".fleet" / "agent-scout.key").read_text().strip()
 
-    def helper_is_back(self, home, key):
+    def helper_is_back(self, home, key, held=False):
         """The helper of nova on that machine: it has its key, so it asks to register nothing and leaves no pending
         key, and the hub knows it. On a shared machine a key that a helper made stays refused: the owner registers
-        those."""
+        those. `held`: nova shares its OS user with another agent, so no session of it opens (test_os_users)."""
         with patch.object(fleet, "HOME", str(home / ".fleet")), \
                 patch.object(fleet, "http", side_effect=AssertionError("a helper with its key registers nothing")):
             self.assertEqual(fleet.load_agent_key("nova"), key)
@@ -550,17 +551,20 @@ class RenameService(ServerService):
         self.assertEqual([p.name for p in (home / ".fleet").glob("agent-*")], ["agent-nova.key"])
         self.assertEqual(oct((home / ".fleet" / "agent-nova.key").stat().st_mode & 0o777), "0o600")
         headers = {"Content-Type": "application/json", "X-Fleet-Client": "test", "Authorization": "Bearer " + key}
-        for path, body in (("/events/nova?after=-1&wait=0", None),
-                           ("/helper/session/nova", {"kind": "chat", "generation": "test-generation"})):
-            status, answer = self.request(path, body, headers=headers, source=NEW)
-            self.assertEqual(status, 200, answer)
+        status, answer = self.request("/events/nova?after=-1&wait=0", None, headers=headers, source=NEW)
+        self.assertEqual(status, 200, answer)
+        status, answer = self.request("/helper/session/nova", {"kind": "chat", "generation": "test-generation"},
+                                      headers=headers, source=NEW)
+        self.assertEqual((status, answer.get("auth")), (403, "os_user_shared") if held else (200, None), answer)
         self.assertEqual(self.request("/helper/key/nova", {"sha256": sha("a key of its own")}, source=NEW),
                          (409, {"error": "this machine has several agents: the owner registers their keys"}))
         self.assertEqual(hub.q1("SELECT sha256 FROM agent_keys WHERE agent='nova'")["sha256"], sha(key))
 
     def test_on_a_shared_mac_the_key_keeps_the_agent_in_the_hub(self):
         """30 October 2026: an agent renamed on a Mac that runs five agents under one OS user. Its job ended done and
-        the agent stayed out, with "agent key not registered (409)" in its log, until a key was registered by hand."""
+        the agent stayed out, with "agent key not registered (409)" in its log, until a key was registered by hand.
+        Since 10 November 2026 a Mac runs one agent, and the agents of a Mac from before that are held until each
+        moves (test_os_users): the renamed one keeps its key all the same."""
         self.join_by_script(self.code()["code"])
         svc = self.service(platform="darwin", answers={"launchctl print": (1, "", "not loaded")})
         self.installed_agent(svc, "claude")
@@ -569,7 +573,7 @@ class RenameService(ServerService):
         self.assertEqual(status, 200, receipt)
         svc.loop(rounds=1)
         self.assertEqual(self.servers()[1]["mini"]["job"]["state"], "done")
-        self.helper_is_back(self.home, key)
+        self.helper_is_back(self.home, key, held=True)
 
     def test_on_a_shared_linux_server_the_key_moves_in_the_home_of_the_kept_user(self):
         self.join_by_script(self.code("mini", "linux")["code"], kind="linux")

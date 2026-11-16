@@ -450,6 +450,8 @@ def hub(conf, method, path, body=None):
     headers = {"Content-Type": "application/json"}
     if conf.get("agent_key"):
         headers["Authorization"] = "Bearer " + conf["agent_key"]
+    if conf.get("caller_user"):         # one OS user for each agent: whom the request came from, by the socket
+        headers["X-Fleet-Caller-User"] = conf["caller_user"]
     request = urllib.request.Request(conf["hub"].rstrip("/") + path, method=method,
                                      data=json.dumps(body).encode() if body is not None else None, headers=headers)
     try:
@@ -460,6 +462,9 @@ def hub(conf, method, path, body=None):
             data = json.loads(e.read() or b"{}")
         except ValueError:
             data = {}
+        if e.code == 403 and isinstance(data, dict) and data.get("auth") in ("os_user", "os_user_shared"):
+            raise Refused("the hub gives this agent's vault nothing now: its key came from another user account, or "
+                          "it shares its user account with another agent") from None
         if e.code == 403 and isinstance(data, dict) and data.get("auth"):      # one fixed text, as the Mac vault helper
             raise Refused("the hub did not accept this agent's key") from None
         return e.code, data
@@ -2305,6 +2310,15 @@ def central(conf, req):
     raise Refused("unknown operation")
 
 
+def caller_user(uid):
+    """The OS user of the process at the other end of the socket, by its uid (peer_uid), as the hub reads it in
+    X-Fleet-Caller-User; the uid in digits where the system has no name for it."""
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
 def caller(req):
     """The calling agent and its key (shared broker callers): both or neither. The key is used for the hub calls of
     this request only: never stored, logged or answered."""
@@ -2349,7 +2363,10 @@ def handle(conf, line, uid):
         return status
     who = caller(req)
     if who:                             # this request acts for its caller; the store does not change
-        conf = dict(conf, agent=who[0], agent_key=who[1])
+        # One OS user for each agent: every hub call of this request names the user that it came from, read from
+        # the socket, so that a key that another agent's user read from a shared home opens nothing (hub
+        # Handler.broker_allowed).
+        conf = dict(conf, agent=who[0], agent_key=who[1], caller_user=caller_user(uid))
     elif conf.get("agent") is None:     # a broker of a machine, not of one agent: nothing else says who asked
         raise Refused("this broker serves the agents of its machine, so a request must name its caller")
     if op == "create":

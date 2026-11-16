@@ -2822,8 +2822,9 @@ def cpu_seconds(text):
 
 def agent_use(agent, mark=None, run=None, now=None, pid=None, cores=None):
     """What one agent's own processes use: its helper with what it started, and every pane of its tmux session with
-    what runs there. The agents of a Mac share one user and one tmux server, so the session is what tells them apart,
-    named whole ("=fleet-ivy:"): tmux takes a name as the start of another, and "fleet-ivy" found "fleet-ivy-lead".
+    what runs there. Agents from before one OS user for each agent could share one user and one tmux server, so the
+    session is what tells them apart, named whole ("=fleet-scout:"): tmux takes a name as the start of another, and
+    "fleet-scout" found "fleet-scout-lead".
 
     Returns ({cpu_percent, memory}, the mark for the next reading). memory is their resident memory now. CPU is their
     share of the machine's cores since the mark, at most 100, and None at the first reading of a helper: each process's
@@ -3189,7 +3190,8 @@ class Lifecycle:
         return {"revision": self.running(), "os": self.os_info(), "security": self.security_reading(fast),
                 "runtime": runtimes[name] if name in runtimes else self.runtime(),
                 "runtimes": said,
-                "access": dict(self.access(), user=pwd.getpwuid(os.getuid()).pw_name),
+                # one OS user for each agent: the hub compares the uids of a machine's agents (hub.os_user_found)
+                "access": dict(self.access(), user=pwd.getpwuid(os.getuid()).pw_name, uid=os.getuid()),
                 "update": update, "features": list(FEATURES),
                 "legacy_windows": self.legacy() if self.legacy else None,
                 **(self.switch() if self.switch else {"other_runtime_windows": [], "owner_chat_bound": None}),

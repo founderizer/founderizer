@@ -772,7 +772,9 @@ class Servers(OwnerAPI):
         self.assertEqual(jobs["jobs"], [{"id": receipt["job"], "kind": "install", "agent": "scout", "runtime": "claude",
                                          "state": "queued"}])
         mini = self.servers()[1]["mini"]
-        self.assertEqual((mini["agents"], mini["available"], mini["why"]), (["scout"], False, ["has_agent", "busy"]))
+        # A Mac runs one agent (one OS user for each agent): one_per_mac, with has_agent for an app of today
+        self.assertEqual((mini["agents"], mini["available"], mini["why"]),
+                         (["scout"], False, ["one_per_mac", "has_agent", "busy"]))
         self.assertEqual(mini["job"]["state"], "queued")
 
     def test_the_start_settings_come_from_a_server_of_the_same_kind(self):
@@ -872,8 +874,10 @@ class Servers(OwnerAPI):
 
     def test_a_server_with_an_agent_takes_another_once_its_service_gives_a_new_agent_its_key(self):
         """The owner, 3 November 2026, of "No free server." under Add agent: "this is confusing, since we allow
-        multiple agents per server... right?" His fleet runs two agents on one server and five on its Mac Studio."""
-        self.joined()
+        multiple agents per server... right?" A Linux server, where each agent has its own user: since 10 November
+        2026 a Mac runs one agent (test_os_users)."""
+        self.joined("mini", "linux", user="fleet")
+        self.reading(os_name="Ubuntu 24.04.1 LTS")
         self.job_ends(self.add_agent()[1]["job"])
         mini = self.servers()[1]["mini"]
         # A service that cannot give a new agent its key: its helper could not register one beside scout
@@ -881,7 +885,7 @@ class Servers(OwnerAPI):
         status, refused = self.add_agent(agent="second")
         self.assertEqual(status, 409, refused)
         self.assertIn("older Founderizer", refused["error"])
-        self.reading(features=[hub.INSTALL_KEY])
+        self.reading(os_name="Ubuntu 24.04.1 LTS", features=[hub.INSTALL_KEY])
         # scout has no agent key of its own: beside a second agent its helper would be refused (review of the change)
         mini = self.servers()[1]["mini"]
         self.assertEqual((mini["available"], mini["why"]), (False, ["agent_not_ready"]))
@@ -1033,7 +1037,8 @@ class Servers(OwnerAPI):
         self.assertEqual(self.service("/server/mini/jobs")[1]["jobs"], [
             {"id": receipt["job"], "kind": "prepare", "agent": "scout", "runtime": "codex", "state": "queued"}])
         mini = self.servers()[1]["mini"]
-        self.assertEqual((mini["job"]["kind"], mini["job"]["state"], mini["why"]), ("prepare", "queued", ["has_agent", "busy"]))
+        self.assertEqual((mini["job"]["kind"], mini["job"]["state"], mini["why"]),
+                         ("prepare", "queued", ["one_per_mac", "has_agent", "busy"]))     # a Mac runs one agent
         path = f"/server/mini/jobs/{receipt['job']}"
         self.assertEqual(self.service(path, {"state": "running", "step": "runtime", "detail": "Installing Codex 0.160.0."})[0],
                          200)
@@ -1173,13 +1178,14 @@ class FakeLife:
     """The machine reading of the server service, with a sign-in that becomes true after `after` readings."""
     def __init__(self, signed_in=True, after=0):
         self.signed_in, self.after, self.reads = signed_in, after, 0
+        self.system = "Ubuntu 24.04.1 LTS"     # ServerService.service gives a Mac's service macOS
 
     def runtime(self, name):
         self.reads += 1
         return {"name": name, "version": "1.0.0", "signed_in": self.signed_in or self.reads > self.after}
 
     def os_info(self):
-        return {"name": "Ubuntu 24.04.1 LTS", "kernel": "6.8.0"}
+        return {"name": self.system, "kernel": "6.8.0"}
 
     def security(self):
         return {"unattended_upgrades": True, "pending_security": 0, "reboot_required": False, "firewall": "active",
@@ -1297,14 +1303,22 @@ class ServerService(Servers):
     def service(self, life=None, platform="linux", answers=None, report=True, **conf):
         conf = dict({"name": "mini", "repo": str(self.root / "origin.git")}, **conf)
         clock = [1000.0]
+        life = life or FakeLife()
+        if platform == "darwin" and isinstance(life, FakeLife):
+            life.system = "macOS 15.6"      # a server whose reading names the other system takes no agent
         svc = self.mod.Service(conf, self.hub_client(self.mod.server_key()), kit=str(self.own), home=str(self.home),
                                run=self.runner(answers), clock=lambda: clock[0], platform=platform,
-                               sleep=lambda s: clock.__setitem__(0, clock[0] + s), life=life or FakeLife(),
+                               sleep=lambda s: clock.__setitem__(0, clock[0] + s), life=life,
                                users=self.accounts, lives=lambda user: svc.life)
         svc.restart = lambda: self.restarts.append(svc.desired)
         if report:
             self.assertEqual(svc.report(), 200)              # the loop's first step: a reading
         return svc
+
+    def join_linux(self, name="mini"):
+        """The join line of a Linux server, for a test whose service runs as a Linux server's (platform linux): a
+        server whose own reading names the other system than the kind it joined as takes no agent (test_os_users)."""
+        self.join_by_script(self.code(name, "linux")["code"], kind="linux")
 
     def join_by_script(self, code, kind="mac"):
         class Client(self.mod.Hub):
@@ -1313,7 +1327,7 @@ class ServerService(Servers):
                 inner.headers = {"X-Test-Source": NEW}
         args = type("Args", (), {"hub": self.base, "kind": kind, "ssh_port": None})()
         with patch.object(self.mod, "Hub", Client), patch.object(self.mod, "install_service", lambda: "unit"), \
-                patch("sys.stdin", io.StringIO(code + "\n")):
+                patch.object(self.mod, "own_kind", lambda: kind), patch("sys.stdin", io.StringIO(code + "\n")):
             self.mod.cmd_join(args)
 
     def test_the_service_s_reading_carries_its_machine_s_load(self):
@@ -1357,7 +1371,7 @@ class ServerService(Servers):
                                                   "Founderizer: Settings, Servers, Add server.")
 
     def test_the_service_reports_and_installs_an_agent_that_is_signed_in(self):
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         svc = self.service()
         self.assertEqual(svc.desired, hub.kit_revision(fresh=True))
         mini = self.servers()[1]["mini"]
@@ -1393,7 +1407,7 @@ class ServerService(Servers):
         may not open. On one of his machines that found nothing and the reading said `signed_in: null`; on the
         other it found this service's own codex and ran it as the agent, which answered for neither of them. So
         every part of an agent's reading is taken as that agent, the look for the executable first of all."""
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         answers = {}
         svc = self.service(answers=answers)
         self.add_agent(runtime="codex")
@@ -1497,7 +1511,7 @@ class ServerService(Servers):
         """The console line is gone. The service asks the hub for this agent's own sign-in, which is machine_signin,
         the same one the Machines page starts; the prompt only says which agent and which sign-in to read, and the
         link, the code and the credential never come near this service."""
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         svc = self.service(life=FakeLife(signed_in=False, after=4))
         job = self.add_agent()[1]["job"]
         self.helper_reports()
@@ -1535,7 +1549,7 @@ class ServerService(Servers):
     def test_the_sign_in_waits_for_the_new_agents_own_helper(self):
         """The service step started that helper a moment earlier, so a hub that has not heard from it yet says 503
         and the service asks again. Every other refusal is the agent's or the runtime's and fails the step."""
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         svc = self.service(life=FakeLife(signed_in=False, after=4))
         self.add_agent()
         asked = []
@@ -1554,7 +1568,7 @@ class ServerService(Servers):
         self.assertEqual(self.servers()[1]["mini"]["job"]["state"], "done")
 
     def test_a_hub_that_refuses_the_sign_in_fails_the_step_with_its_own_words(self):
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         svc = self.service(life=FakeLife(signed_in=False, after=4))
         self.add_agent()                        # its helper never reports: the hub keeps saying 503
         svc.loop(rounds=1)
@@ -1581,7 +1595,7 @@ class ServerService(Servers):
         self.assertEqual(self.servers()[1]["mini"]["job"]["state"], "done")
 
     def test_codex_sign_in_sends_the_link_and_the_code(self):
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         class Login:
             def __init__(inner, argv, stdout=None, **_):
                 inner.argv = argv
@@ -1625,7 +1639,7 @@ class ServerService(Servers):
                                                         "Founderizer, then try again.")], kind)
 
     def test_a_folder_that_fleet_did_not_make_stops_the_job(self):
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         self.agent_user_made("fleet-scout")                 # the user is there, with a folder of that name in it
         self.checkout_of().mkdir()
         svc = self.service()
@@ -1641,7 +1655,7 @@ class ServerService(Servers):
         """The clone has five minutes. One that its timeout or a stop cut off left a folder with no mark in its
         place, and every later try said that Founderizer had not made it. It is cloned beside the folder and moved
         into place only once it is marked and at this server's own revision, so the next try makes it again."""
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         svc = self.service()
         real, cut, moved = svc.run, [], []
 
@@ -1672,7 +1686,7 @@ class ServerService(Servers):
 
     def test_an_agent_without_the_root_helper_of_the_installers_stops_the_job(self):
         """This service has no root of its own, so without the helper no agent is installed and nothing is tried."""
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         self.no_helper = True
         svc = self.service()
         self.add_agent()
@@ -1698,7 +1712,7 @@ class ServerService(Servers):
         self.addCleanup(patcher.stop)
 
     def test_a_second_agent_installs_beside_the_first_with_a_key_of_its_own(self):
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         svc = self.service()
         self.installed_agent(svc, "claude")
         svc.report()                                        # the service says it gives a new agent its key
@@ -1726,7 +1740,7 @@ class ServerService(Servers):
         return git("rev-parse", "HEAD", cwd=self.checkout_of())
 
     def test_prepare_installs_codex_trusts_the_checkout_and_signs_in(self):
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         self.runtimes("claude")
         svc = self.service()
         head = self.installed_agent(svc, "claude")
@@ -1797,7 +1811,7 @@ class ServerService(Servers):
         self.assertEqual(self.commands, [])                 # found: no installer, no trust, no service
 
     def test_prepare_needs_the_agents_checkout(self):
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         self.runtimes()
         svc = self.service()
         job = self.add_agent()[1]["job"]
@@ -1912,7 +1926,7 @@ class ServerService(Servers):
     def test_a_new_agent_checkout_starts_on_the_configuration_ref(self):
         """The hub writes the owner's team.json to the ref, so a clone on the code branch does not list the new agent
         yet. The service puts the folder on the ref, and the agent's first session reads the current team.json."""
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         branch = self.split()
         self.runtimes("claude")
         svc = self.service()
@@ -1930,7 +1944,7 @@ class ServerService(Servers):
     def test_an_agent_checkout_on_the_code_branch_moves_onto_the_configuration_ref(self):
         """A folder that an earlier install left on the code branch: the install again brings it onto the ref, in the
         place of its own pull."""
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         branch = self.split()
         self.runtimes("claude")
         svc = self.service()
@@ -1947,7 +1961,7 @@ class ServerService(Servers):
 
     def test_an_agent_checkout_that_cannot_follow_the_ref_fails_the_step(self):
         """A folder with its own changes is never moved: the step says so and the install stops there."""
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         self.split()
         self.runtimes("claude")
         svc = self.service()
@@ -2107,7 +2121,7 @@ class ServerService(Servers):
         return posted
 
     def test_a_pinned_program_comes_from_the_agents_own_checkout_and_needs_no_sign_in(self):
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         svc = self.service()
         posted = self.pinned_machine(svc)
         job = self.pinned_job(svc)
@@ -2143,7 +2157,7 @@ class ServerService(Servers):
                          [["fleet.py", "key"], ["fleet.py", "service"], ["-c", self.mod.PINNED_ANSWERS]])
 
     def test_a_program_of_that_name_on_a_path_is_never_taken(self):
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         self.present = {"claude", "codex", "grok", "opencode"}      # each one answers `command -v`, in ~/.local/bin
         svc = self.service()
         self.pinned_machine(svc)
@@ -2207,7 +2221,7 @@ class ServerService(Servers):
             self.assertIn(downloads[0][2].strip() or downloads[0][1].strip(), log.getvalue())
 
     def test_a_program_that_does_not_answer_initialize_fails_the_job_at_its_runtime_step(self):
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         svc = self.service(answers={" ".join([sys.executable, "-c", self.mod.PINNED_ANSWERS]):
                                     (1, "", "the program gave no model list: TimeoutError\n")})
         posted = self.pinned_machine(svc)
@@ -2247,7 +2261,7 @@ class ServerService(Servers):
         """His answer 12 to the AI providers' pictures (14 November 2026): the AI of such an agent is the provider
         he picked, "Gemini" or "Model server", never "OpenCode". The hub writes it into the job (`provider_label`);
         a label of another program's provider, or of none, keeps the runtime's own word."""
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         svc = self.service(answers={" ".join([sys.executable, "-c", self.mod.PINNED_ANSWERS]):
                                     (1, "", "the program gave no model list: TimeoutError\n")})
         posted = self.pinned_machine(svc)
@@ -2282,7 +2296,7 @@ class ServerService(Servers):
     def test_a_job_with_no_sign_in_runs_no_sign_in_step_for_a_runtime_that_has_one(self):
         """`"sign_in": "none"` alone keeps an agent of a key from the sign-in step of a runtime that has one: Claude
         Code here, and Grok Build once it has its own sign-in (step 4)."""
-        self.join_by_script(self.code()["code"])
+        self.join_linux()
         svc = self.service(life=FakeLife(signed_in=False, after=10 ** 6))      # a sign-in would be needed
         posted = self.pinned_machine(svc)
         self.assertTrue(self.mod.lifecycle.runtime_fact("claude", "sign_in"))
