@@ -5575,7 +5575,8 @@ class Helper:
                                           "session": None if runtime == "codex" else marker, "started": time.time(),
                                           "tools": tools, "text": text, "rules": rules}, runtime)
         self.say(f"owner-chat: {'conversation ' + resume + ' continued' if resume else 'session started'}"
-                 f"{' with the hub\'s recap of this chat' if recap else ''}; agent read and reply are still pending")
+                 + (" with the hub's recap of this chat" if recap else "")
+                 + "; agent read and reply are still pending")
 
     def keep_chat(self, chat, generation):
         """**The owner chat runs before his first message** (helper feature chat_warm). Each poll says whether this

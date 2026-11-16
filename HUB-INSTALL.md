@@ -790,7 +790,8 @@ manager as its own user, up to the owner's sign-in. The network was Tailscale wi
 control server, not the owner's tailnet.
 
 On 10 November 2026 the second claim was run in a Linux container without a network (Debian
-12, Python 3.11, git 2.39), from a copy of the tree. That container has no systemd, so a
+12, Python 3.11, git 2.39), from a copy of the tree with one line of `fleet.py` changed (the
+next paragraph says why). That container has no systemd, so a
 stand-in ran `fleet-hub` from the unit file that `fleet.py service hub` wrote, with the
 unit's own stop rule. Everything else was the installer's own: the steps `preflight`,
 `hub_user`, `repository`, `first_team` and `services` of `hub.sh` as root, the hub as
@@ -803,3 +804,13 @@ the claim and of its `runuser`, a `kill -9` of the claim, Ctrl-C, and a terminal
 each left the hub running for the owner from before, with nothing written. On the code from
 before, the same container showed the fault: `OSError: [Errno 98] Address already in use`.
 What that run did not reach: systemd itself (`systemctl --user` of a real user manager), Tailscale, and a real Mac.
+
+The changed line: from 20 October to 16 November 2026 `fleet.py` did not parse on a Python
+before 3.12, because one f-string had a backslash inside its braces. In that container the
+step `services` stopped there with a SyntaxError, so the run went on with a copy that had
+the line with no backslash. The tree itself has it so since 16 November 2026. On that day
+each published Python file compiled, and `selftest.py` passed, with the `python3` of Debian
+12 (3.11) and of Ubuntu 22.04 (3.10), each in a container; the Ubuntu container needed the
+package `tzdata` first, because its image has no time zone data and the hub reads the zone
+UTC. Since then each release is checked, before it goes out, for the forms of an f-string
+and of a statement that Python 3.10 does not take.
