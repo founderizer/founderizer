@@ -3148,6 +3148,87 @@ class NetworkStep(unittest.TestCase):
                       "to approve this machine, approve it in the fleet's Tailscale admin console.", ran.err)
 
 
+class PackageStops(unittest.TestCase):
+    """**A package step that fails stops with our own sentence** (the plan install-auto-repair of 16 November 2026,
+    part 1): the app reads it as the cause `packages` and tries the install again by itself, where the step ended
+    before with apt's own status and no sentence of ours. hub.sh's `packages` runs whole with stand-ins; join.sh's two
+    statements run as the script writes them. Under sh, and under dash where this machine has it, as Ubuntu runs the
+    installers. apt-get and dpkg-query are stand-in programs: a shell function cannot have a hyphen in its name."""
+
+    LISTS = "The package lists could not be updated: apt-get update did not finish."
+    PACKAGES = "The packages of this system could not be installed: apt-get install did not finish."
+    AGAIN = "A package mirror can fail for a moment: run the line again."
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="package-stops-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def tool(self, name, status):
+        path = self.tmp / name
+        path.write_text(f"#!/bin/sh\nexit {status}\n")
+        path.chmod(0o755)
+
+    def run_in(self, shell, text, install):
+        """`text` in `shell`, with apt-get ending as `install` says and dpkg-query finding no package."""
+        self.tool("apt-get", install)
+        self.tool("dpkg-query", 1)
+        return subprocess.run([shell, "-c", text], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+                              env=dict(os.environ, PATH=f"{self.tmp}:/usr/bin:/bin"))
+
+    @staticmethod
+    def shells():
+        return [shell for shell in ("/bin/sh", "/bin/dash") if os.path.exists(shell)]
+
+    def test_hub_sh_packages_stops_with_each_sentence(self):
+        function = shell_function(SCRIPT, "packages")
+        stubs = ('PACKAGES="git tmux"; APT_LOCK_WAIT=1200; check=no\n'
+                 "heading() { :; }; say() { :; }; plan() { :; }\n"
+                 "stop() { printf 'Founderizer install stopped: %s\\n' \"$*\" >&2; exit 1; }\n")
+        for shell in self.shells():
+            for update, install, sentence in ((100, 0, self.LISTS), (0, 100, self.PACKAGES)):
+                ran = self.run_in(shell, stubs + f"apt_update() {{ return {update}; }}\n" + function + "packages\n",
+                                  install)
+                self.assertEqual(ran.returncode, 1, (shell, ran.stderr))
+                self.assertIn(f"Founderizer install stopped: {sentence} {self.AGAIN}", ran.stderr, shell)
+            ran = self.run_in(shell, stubs + "apt_update() { return 0; }\n" + function + "packages\n", 0)
+            self.assertEqual((ran.returncode, ran.stderr), (0, ""), shell)
+
+    def test_hub_sh_preflight_git_stops_with_each_sentence(self):
+        """The preflight's own install of git, which a minimal server lacks, stops with the same two sentences."""
+        text = SCRIPT.read_text()
+        start = text.index('say "  installing git"')
+        block = text[start:text.index("\n        fi\n", start)]
+        self.assertIn("apt_update || stop", block)
+        stubs = ("APT_LOCK_WAIT=1200\n"
+                 "say() { :; }\n"
+                 "stop() { printf 'Founderizer install stopped: %s\\n' \"$*\" >&2; exit 1; }\n")
+        for shell in self.shells():
+            for update, install, sentence in ((100, 0, self.LISTS), (0, 100, self.PACKAGES)):
+                ran = self.run_in(shell, stubs + f"apt_update() {{ return {update}; }}\n" + block + "\n", install)
+                self.assertEqual(ran.returncode, 1, (shell, ran.stderr))
+                self.assertIn(f"Founderizer install stopped: {sentence} {self.AGAIN}", ran.stderr, shell)
+            ran = self.run_in(shell, stubs + "apt_update() { return 0; }\n" + block + "\n", 0)
+            self.assertEqual((ran.returncode, ran.stderr), (0, ""), shell)
+
+    def test_join_sh_stops_with_each_sentence(self):
+        text = (KIT / "join.sh").read_text()
+        quoted = r'"(?:[^"\\]|\\.)*"'
+        [update] = re.findall(r"apt_update \|\| stop " + quoted, text, re.S)
+        [install] = re.findall(r'apt-get -o "DPkg::Lock::Timeout=\$APT_LOCK_WAIT" install [^\n]*\\\n\s*\|\| stop '
+                               + quoted, text, re.S)
+        stubs = ("APT_LOCK_WAIT=1200; missing=' tmux'\n"
+                 "stop() { printf 'Founderizer join stopped: %s\\n' \"$*\" >&2; exit 1; }\n")
+        for shell in self.shells():
+            ran = self.run_in(shell, stubs + "apt_update() { return 100; }\n" + update + "\n", 0)
+            self.assertEqual(ran.returncode, 1, (shell, ran.stderr))
+            self.assertIn(f"Founderizer join stopped: {self.LISTS} {self.AGAIN}", ran.stderr, shell)
+            ran = self.run_in(shell, stubs + install + "\n", 100)
+            self.assertEqual(ran.returncode, 1, (shell, ran.stderr))
+            self.assertIn(f"Founderizer join stopped: {self.PACKAGES} {self.AGAIN}", ran.stderr, shell)
+            ran = self.run_in(shell, stubs + "apt_update() { return 0; }\n" + update + "\n" + install + "\n", 0)
+            self.assertEqual((ran.returncode, ran.stderr), (0, ""), shell)
+
+
 class AptUpdate(unittest.TestCase):
     """**Each `apt-get update` of the installers is tried again while the lock of the package lists is held.** apt
     reads DPkg::Lock::Timeout only for the lock of dpkg (apt-pkg/deb/debsystem.cc), and `update` takes the lock of the
@@ -3179,7 +3260,9 @@ class AptUpdate(unittest.TestCase):
         self.assertEqual(re.findall(r"apt-get (.*?) update", function), ['-o "DPkg::Lock::Timeout=$APT_LOCK_WAIT"'] * 2)
         for script, name in ((SCRIPT, "preflight"), (SCRIPT, "packages"), (KIT / "join.sh", "linux")):
             body = shell_function(script, name)
-            self.assertRegex(body, r"(?m)^\s*apt_update$", name)
+            # A call of its own on its line, or with the step's own stop sentence after it (the plan of 16 November
+            # 2026: a package step that fails stops with our sentence, which the app tries again by itself).
+            self.assertRegex(body, r"(?m)^\s*apt_update( \|\| stop \"|$)", name)
             self.assertNotRegex(body, r"(?m)^\s*apt-get[^\n]*\bupdate\b", name)
 
     def test_the_function_tries_again_and_says_only_its_last_words(self):
@@ -4634,7 +4717,10 @@ class CheckMode(unittest.TestCase):
         for script in (SCRIPT, KIT / "join.sh"):
             text = script.read_text()
             [wait] = re.findall(r"(?m)^APT_LOCK_WAIT=.*$", text)
-            lines = [line.strip() for line in text.splitlines() if line.lstrip().startswith("apt-get ")]
+            # An apt-get line may go on with its step's own stop sentence on the next line (`\`, then `|| stop "..."`):
+            # the call alone is what this test runs.
+            lines = [line.strip().removesuffix("\\").rstrip() for line in text.splitlines()
+                     if line.lstrip().startswith("apt-get ")]
             self.assertTrue(lines, script.name)
             calls = self.tmp / f"{script.name}.calls"
             done = subprocess.run(["sh", "-c", "\n".join([wait, "missing=' tmux'", *lines])], capture_output=True,

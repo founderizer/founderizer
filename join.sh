@@ -92,9 +92,14 @@ linux() {
     if [ -n "$missing" ]; then
         say "installing$missing"
         export DEBIAN_FRONTEND=noninteractive
-        apt_update
+        # A step that fails stops with our own sentence (InstallCause "packages"), which the app tries again by itself
+        # (InstallRetry): a mirror can fail for a moment. apt's own words stay in the lines above it.
+        apt_update || stop "The package lists could not be updated: apt-get update did not finish. A package mirror \
+can fail for a moment: run the line again."
         # shellcheck disable=SC2086
-        apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" install -y -q --no-install-recommends $missing </dev/null >/dev/null
+        apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" install -y -q --no-install-recommends $missing </dev/null >/dev/null \
+            || stop "The packages of this system could not be installed: apt-get install did not finish. A package mirror can \
+fail for a moment: run the line again."
     fi
     say "the user $WORKER: locked password, no sudo, its services run after logout"
     id -u "$WORKER" >/dev/null 2>&1 || useradd --create-home --shell /bin/bash --user-group "$WORKER"
