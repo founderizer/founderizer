@@ -2979,6 +2979,28 @@ class Admin(WithServer):
         self.assertEqual(self.team_file()["agents"]["vps"]["reports_to"], "lead")
         self.assertEqual(self.team_file()["agents"]["lead"]["role"], "lead")
 
+    def test_an_account_with_a_kind_and_an_agent_on_it_go_through_the_two_tools(self):
+        """Lane 5H (owner API 1.186): save_account gives the hub kind, address and model, and add_agent gives it
+        account with no runtime, so the hub's own rules and words decide (here a Mac, sentence 7 of round 2)."""
+        client = self.started()
+        client.call("save_account", account="spark", provider="own", title="Spark", kind="server",
+                    address="http://127.0.0.1:11434", model="own/qwen3.8-max")
+        self.assertEqual(self.team_file()["accounts"]["spark"],
+                         {"provider": "own", "title": "Spark", "kind": "server", "address": "http://127.0.0.1:11434/v1",
+                          "model": "own/qwen3.8-max"})
+        self.joined("mini", kind="mac", source=NEW)
+        with self.assertRaises(Refused) as caught:
+            client.call("add_agent", server="mini", agent="scout", account="spark", role="worker")
+        self.assertIn("mini is a Mac. An agent on Model server needs a Linux server: choose another one.",
+                      str(caught.exception))
+        self.assertNotIn("scout", self.team_file()["agents"])
+        # A key's reference goes as `login` (no tool field is named like a value): the hub's own rule refuses one
+        # that logins does not have, in its own words.
+        with self.assertRaises(Refused) as caught:
+            client.call("save_account", account="gemini", provider="google", title="Gemini", kind="key",
+                        login="bws://5b0c1d2e-0000-4000-8000-000000000001")
+        self.assertIn("account gemini: secret is the reference of an API key in logins", str(caught.exception))
+
     def test_it_writes_the_entries_of_team_json_and_the_owners_own_knowledge(self):
         client = self.started()
         client.call("save_account", account="openai-main", provider="openai", title="The main account")

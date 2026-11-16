@@ -85,7 +85,7 @@ def models(runtime, *names, efforts=("low", "medium", "high")):
 
 
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite(cls(name) for cls in (ModelAccounts, CheckReport) for name in cls.__dict__
+    return unittest.TestSuite(cls(name) for cls in (ModelAccounts, AppsRead, CheckReport) for name in cls.__dict__
                               if name.startswith("test_"))
 
 
@@ -918,7 +918,8 @@ class ModelAccounts(OwnerAPI):
         self.assertEqual(groups["account:gemini"]["agents"], ["gem-1", "gem-2"])
         self.assertEqual(groups["account:spark"]["agents"], ["own-1"])             # a model server is a group too
         self.assertEqual(groups["account:gemini"]["state"], {"state": "available", "reason": "Paid per use.",
-                                                             "until": None, "retry_at": None})
+                                                             "until": None, "retry_at": None,
+                                                             "code": "paid_per_use"})       # UI-API.md 1.186
         self.assertEqual(groups["account:spark"]["state"]["reason"], "Local model.")
         self.assertEqual(hub.account_group("gem-1")["sharers"], ["gem-2"])
         team = copy.deepcopy(TEAM)
@@ -1271,6 +1272,194 @@ class ModelAccounts(OwnerAPI):
         self.assertEqual([j["kind"] for j in self.jobs("app-2")], ["remove"])
         self.assertNotIn("sign_in", self.jobs("app-2")[0])
 
+
+
+class AppsRead(ModelAccounts):
+    """Step 5, lane 5H (the coordinator's decision D35, UI-API.md 1.186): what the owner's apps read to add an agent on
+    a key or a model server, and the words of its install, its state and a sign-in, each with its code."""
+
+    def servers(self):
+        code, view = self.request("/ui/servers?db=test-generation")
+        self.assertEqual(code, 200, view)
+        return view, {s["name"]: s for s in view["servers"]}
+
+    def record(self, tid, kind, data, seq):
+        """One record of the task's session thread, as the hub keeps it at its intake (Handler.helper_thread)."""
+        hub.q("INSERT INTO thread_events(task,attempt,session,seq,ts,type,data,created) VALUES(?,?,?,?,?,?,?,?)",
+              (tid, 1, "s-1", seq, hub.now(), kind, json.dumps(data), hub.now()))
+
+    def problem(self, agent):
+        return hub.agent_view(agent, hub.agents()[agent])["account_problem"]
+
+    def test_the_servers_page_says_which_providers_each_server_can_take(self):
+        self.assertIn("model_accounts", hub.UI_FEATURES)
+        self.service("app-6")
+        self.service("app-5", features=("install_key",))        # a service of an older release
+        self.service("mac-1", os_name="macOS 15.6")
+        view, rows = self.servers()
+        self.assertEqual(view["model_providers"], [
+            {"provider": "google", "kind": "key", "label": "Gemini", "prefix": "google", "makers": "one"},
+            {"provider": "xai", "kind": "key", "label": "Grok", "prefix": None, "makers": "one"},
+            {"provider": "opencode-go", "kind": "key", "label": "OpenCode Go", "prefix": "opencode-go",
+             "makers": "many"},
+            {"provider": "openrouter", "kind": "key", "label": "OpenRouter", "prefix": "openrouter", "makers": "many"},
+            {"provider": "ollama-cloud", "kind": "key", "label": "Ollama Cloud", "prefix": "ollama-cloud",
+             "makers": "many"},
+            {"provider": "own", "kind": "server", "label": "Model server", "prefix": "own", "makers": "many"}])
+        every = [p["provider"] for p in view["model_providers"]]
+        self.assertEqual(rows["app-6"]["model_providers"], every)
+        for name in ("app-5", "mac-1", "app-2"):        # older, a Mac, no reading at all
+            self.assertEqual(rows[name]["model_providers"], [], name)
+        # The page says what the add then takes: the same two tests as account_placement_refusal.
+        team = hub.team_read()
+        for name, row in rows.items():
+            for provider in every:
+                held = {"own": "spark", "google": "gemini", "openrouter": "router"}.get(provider)
+                if held:
+                    taken = hub.account_placement_refusal(team, held, name) is None
+                    self.assertEqual(taken, provider in row["model_providers"], (name, provider))
+
+    def test_an_install_line_names_the_provider_that_the_owner_picked_with_its_code(self):
+        def job(server, agent, runtime, detail, step="runtime", state="running"):
+            hub.q("DELETE FROM server_jobs WHERE server=?", (server,))
+            hub.q("INSERT INTO server_jobs(server,kind,agent,runtime,state,step,detail,created,updated) "
+                  "VALUES(?,?,?,?,?,?,?,?,?)", (server, "install", agent, runtime, state, step, detail, hub.now(),
+                                                hub.now()))
+            return self.servers()[1][server]["job"]
+        steps = ["user", "checkout", "runtime", "service"]
+        seen = job("app-5", "seller-1", "opencode", "Looking for OpenRouter.")
+        self.assertEqual((seen["provider_label"], seen["sign_in"], seen["steps"], seen["detail"], seen["code"],
+                          seen["names"]), ("OpenRouter", "none", steps, "Looking for OpenRouter.", "install_looking",
+                                           {"provider": "OpenRouter"}))
+        # A service of an older release wrote the program's word: the apps read the provider that he picked.
+        seen = job("app-5", "seller-1", "opencode", "OpenCode did not install: app-5 could not reach the internet. "
+                                                     "Try again when it can.", state="failed")
+        self.assertEqual((seen["detail"], seen["code"], seen["names"]), (
+            "OpenRouter did not install: app-5 could not reach the internet. Try again when it can.",
+            "install_offline", {"provider": "OpenRouter", "server": "app-5"}))
+        seen = job("app-3", "own-1", "opencode", "OpenCode did not install. Try again.", state="failed")
+        self.assertEqual((seen["provider_label"], seen["detail"], seen["code"], seen["names"]), (
+            "Model server", "Model server did not install. Try again.", "install_failed",
+            {"provider": "Model server"}))
+        seen = job("app-1", "gem-1", "opencode", "Installing Gemini.")
+        self.assertEqual((seen["detail"], seen["code"]), ("Installing Gemini.", "install_installing"))
+        # Each other line of such a job stays as the service wrote it, with no code.
+        seen = job("app-1", "gem-1", "opencode", "Getting Founderizer for gem-1.", step="checkout")
+        self.assertEqual((seen["detail"], seen["provider_label"], seen["steps"]),
+                         ("Getting Founderizer for gem-1.", "Gemini", steps))
+        self.assertNotIn("code", seen)
+        # A rename job of such an agent has no install steps.
+        hub.q("UPDATE server_jobs SET kind='rename' WHERE server='app-1'")
+        seen = self.servers()[1]["app-1"]["job"]
+        self.assertEqual((seen["provider_label"], seen["sign_in"]), ("Gemini", "none"))
+        self.assertNotIn("steps", seen)
+        # A Claude or a Codex job is as before.
+        seen = job("app-4", "dev-lead", "claude", "Claude Code did not install. Try again.", state="failed")
+        self.assertEqual(seen["detail"], "Claude Code did not install. Try again.")
+        for key in ("provider_label", "sign_in", "steps", "code", "names"):
+            self.assertNotIn(key, seen)
+
+    def test_the_four_install_lines_are_the_lines_of_the_servers_service(self):
+        """MODEL_INSTALL_LINES are server.py's own lines with the provider's label and the server's name, so a line
+        of the service always finds its code."""
+        import ast
+        import server
+        tree = ast.parse(Path(server.__file__).read_text())
+
+        def template(node):
+            return "".join(v.value if isinstance(v, ast.Constant) else "{" + ast.unparse(v.value) + "}"
+                           for v in node.values)
+        written = {template(n) for n in ast.walk(tree) if isinstance(n, ast.JoinedStr)}
+        for code, words in hub.MODEL_INSTALL_LINES.items():
+            self.assertIn(words.replace("{provider}", "{label}").replace("{server}", "{self.name}"), written, code)
+        self.assertEqual(hub.MODEL_INSTALL_STEPS[:2], ("user", "checkout"))
+
+    def test_a_key_with_no_credit_and_a_model_server_that_does_not_answer_are_the_agents_state(self):
+        gem = self.task("gem-1")
+        self.assertIsNone(self.problem("gem-1"))
+        self.record(gem, "error", {"code": "no_credit", "message": "insufficient_quota", "retryable": False,
+                                   "resets_at": None}, 1)
+        self.record(gem, "result", {"stop_reason": "error"}, 2)
+        said = self.problem("gem-1")
+        self.assertEqual((said["code"], said["error"], said["names"], said["task"]),
+                         ("key_no_credit", "The key has no credit.", {}, gem))
+        self.assertEqual(self.problem("gem-2"), said)            # the key's state: each agent on it
+        state = {a["name"]: a for a in self.request("/ui/state")[1]["agents"]}
+        self.assertEqual(state["gem-2"]["account_problem"]["code"], "key_no_credit")
+        # Each agent of the state names its account with a kind, with no secret (UI-API.md 1.186).
+        self.assertEqual(state["gem-2"]["model_account"],
+                         {"kind": "key", "provider": "google", "label": "Gemini", "address": None})
+        self.assertEqual(state["own-1"]["model_account"],
+                         {"kind": "server", "provider": "own", "label": "Model server",
+                          "address": "http://100.64.0.7:8000/v1"})
+        self.assertEqual((state["dev-lead"]["model_account"], state["manager"]["model_account"]), (None, None))
+        for agent in ("dev-lead", "own-1", "seller-1", "manager"):
+            self.assertIsNone(self.problem(agent), agent)
+        # A later turn on the same key that worked ends it: an event, never a time.
+        other = self.task("gem-2")
+        self.record(other, "result", {"stop_reason": "end_turn"}, 1)
+        self.assertIsNone(self.problem("gem-1"))
+        # A key that gives no answer is no such state: only a model server's.
+        self.record(gem, "error", {"code": "no_answer", "message": "502", "retryable": False, "resets_at": None}, 3)
+        self.assertIsNone(self.problem("gem-1"))
+        own = self.task("own-1")
+        self.record(own, "error", {"code": "no_answer", "message": "connection refused", "retryable": False,
+                                   "resets_at": None}, 1)
+        said = self.problem("own-1")
+        self.assertEqual((said["code"], said["error"]), ("server_no_answer", "Its model server does not answer."))
+        # A failed check after it does not end it; a check whose account item is ok does.
+        hub.q("INSERT INTO machine_checks(agent,requested,state,completed,detail,verify) VALUES(?,?,?,?,?,?)",
+              ("own-1", hub.now(), "completed", hub.now() + 1, "", json.dumps(
+                  [{"kind": "account", "ref": "spark", "state": "failed", "detail": lifecycle.NO_ANSWER}])))
+        self.assertEqual(self.problem("own-1")["code"], "server_no_answer")
+        hub.q("INSERT INTO machine_checks(agent,requested,state,completed,detail,verify) VALUES(?,?,?,?,?,?)",
+              ("own-1", hub.now(), "completed", hub.now() + 2, "", json.dumps(
+                  [{"kind": "account", "ref": "spark", "state": "ok", "detail": "own/qwen3.8-max"}])))
+        self.assertIsNone(self.problem("own-1"))
+
+    def test_the_state_of_an_account_with_no_allowance_has_its_code(self):
+        groups = {g["group"]: g for g in hub.capacity_view()["accounts"]}
+        self.assertEqual((groups["account:gemini"]["reason"], groups["account:gemini"]["code"]),
+                         ("Paid per use.", "paid_per_use"))
+        self.assertEqual((groups["account:spark"]["reason"], groups["account:spark"]["code"]),
+                         ("Local model.", "local_model"))
+        self.assertEqual(set(hub.MODEL_ACCOUNT_CODES), set(hub.MODEL_ACCOUNT_STATE))
+
+    def test_the_account_route_takes_login_as_the_name_of_its_secret(self):
+        """The owner MCP names no field like a value (OWNER-MCP-BOUNDARY.md), so its save_account sends the key's
+        reference as `login`, which the route keeps as `secret`."""
+        code, said = self.account("gemini-2", provider="google", title="Gemini", kind="key", login=FREE_KEY)
+        self.assertEqual(code, 200, said)
+        self.assertEqual(self.stored()["accounts"]["gemini-2"],
+                         {"provider": "google", "title": "Gemini", "kind": "key", "secret": FREE_KEY})
+        code, said = self.account("gemini-3", provider="google", title="Gemini", kind="key", login=FREE_KEY,
+                                  secret=GEMINI_KEY)
+        self.assertEqual((code, said["error"]), (400, "login and secret are one reference: give one of them"))
+        code, said = self.account("gemini-2", provider="google", title="Gemini", kind="key", login=FREE_KEY,
+                                  secret=FREE_KEY)
+        self.assertEqual(code, 200, said)
+        self.assertNotIn("gemini-3", self.stored()["accounts"])
+        # The review's M12: a refusal names the field that the write gave; a write with secret keeps its words.
+        code, said = self.account("label-1", provider="openai", title="A label", login=FREE_KEY)
+        self.assertEqual((code, said["error"]), (400, "login, address and model are only for an account with a kind"))
+        code, said = self.account("label-1", provider="openai", title="A label", secret=FREE_KEY)
+        self.assertEqual((code, said["error"]), (400, "secret, address and model are only for an account with a kind"))
+        code, said = self.account("gemini-5", provider="google", title="Gemini", kind="key", login="not-a-reference")
+        self.assertEqual((code, said["error"]), (400, "login must be a bws://<uuid> reference"))
+        code, said = self.account("gemini-5", provider="google", title="Gemini", kind="key", secret="not-a-reference")
+        self.assertEqual((code, said["error"]), (400, "secret must be a bws://<uuid> reference"))
+        code, said = self.account("gemini-2", provider="google", title="Gemini", kind="key",
+                                  login=FREE_KEY.replace("5b0c1d2e", "5B0C1D2E"), secret=FREE_KEY)
+        self.assertEqual(code, 200, said)                   # one reference, in two cases of its letters
+        # The same result for each name (the coordinator's D36): the same entry, and the same refusal with its code.
+        code, said = self.account("gemini-4", provider="google", title="Gemini", kind="key", secret=FREE_KEY)
+        self.assertEqual(code, 200, said)
+        self.assertEqual(self.stored()["accounts"]["gemini-4"], self.stored()["accounts"]["gemini-2"])
+        unknown = "bws://5b0c1d2e-0000-4000-8000-0000000000ff"
+        by_login = self.account("gemini-5", provider="google", title="Gemini", kind="key", login=unknown)
+        by_secret = self.account("gemini-5", provider="google", title="Gemini", kind="key", secret=unknown)
+        self.assertEqual(by_login, by_secret)
+        self.assertEqual((by_login[0], by_login[1]["code"]), (400, "secret"))
 
 class CheckReport(unittest.TestCase):
     """The helper's half of the coordinator's decision D12: the check of an agent on a model account sends a first

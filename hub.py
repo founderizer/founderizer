@@ -1683,9 +1683,12 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "owner_key",         # the owner, 14 November 2026 ("it needs to be tested and verified"): the owner's
                                     # computer sends a key with its address, and POST /ui/owner/key registers it
                                     # (UI-API.md 1.169)
-               "asks"]              # the owner, 15 November 2026 ("the thing I asked for", then "Both places"): a
+               "asks",              # the owner, 15 November 2026 ("the thing I asked for", then "Both places"): a
                                     # task names the owner's message that it comes from, tasks[].ask, with that
                                     # message's messages[].asked and a Needs-you item's needs[].ask of GET /ui/state
+               "model_accounts"]    # the owner, 16 November 2026 ("Yes, start", the coordinator's D35): an agent on
+                                    # a key or a model server from the owner's apps, GET /ui/servers model_providers,
+                                    # the words and codes of its install, state and refusals (UI-API.md 1.186)
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -5304,6 +5307,8 @@ def agent_view(name, config, reads=None):
                 (config["reports_to"] if config.get("reports_to") in agents() else manager_name()),
                 direct_chat=owner_chat(config),
                 local_model=local_model(config, team_read().get("accounts")),
+                # owner API 1.186: the account with a kind that it runs on, and whether that account cannot work now
+                model_account=agent_model_account(name), account_problem=account_problem(name),
                 # What its machine last said about its own provider, so the app shows a signed-out agent its sign-in in
                 # place of its chat: null when the reading is old or a local model needs none.
                 signed_in=None if local_model(config, team_read().get("accounts")) else
@@ -8870,7 +8875,8 @@ def account_state(reading, holds, t0, model=None):
              if coming or open_ended else [])
         return availability("limited", " ".join(reasons), until, max(guesses) if until is None and guesses else None)
     if model:       # the kind of an account with one (the AI providers build): no reading, and with no hold it is open
-        return availability("available", MODEL_ACCOUNT_STATE.get(model))
+        return dict(availability("available", MODEL_ACCOUNT_STATE.get(model)),
+                    **({"code": MODEL_ACCOUNT_CODES[model]} if model in MODEL_ACCOUNT_CODES else {}))
     if not reading:
         return availability("unknown", "There is no account reading.")
     if not fresh:
@@ -38357,11 +38363,14 @@ def expire_server_jobs(t0):
                                                          "is on, then try again.", job["id"]))
 
 
-def job_view(row):
-    return None if row is None else {
+def job_view(row, team=None):
+    """One job of a server as the apps read it; a job of an agent on an account with a kind with the fields of
+    model_job_view (UI-API.md 1.186)."""
+    return None if row is None else model_job_view({
         "id": row["id"], "kind": row["kind"], "agent": row["agent"], "runtime": row["runtime"], "state": row["state"],
         "step": row["step"], "detail": row["detail"], "prompt": json.loads(row["prompt"]) if row["prompt"] else None,
-        "created": row["created"], "updated": row["updated"], "timed_out": bool(row["timed_out"])}
+        "created": row["created"], "updated": row["updated"], "timed_out": bool(row["timed_out"])}, row,
+        team if team is not None else team_read())
 
 
 def join_view(row, t0):
@@ -38714,7 +38723,9 @@ def servers_view():
         out.append({"name": name, "kind": entry.get("kind") or server_kind(reading),
                     "address": team["addresses"][name], "user": entry.get("user") or (reading or {}).get("user"),
                     "hub": name == hub_machine, "joined": name in keys, "agents": here, "reading": reading,
-                    "load": load, "available": not why, "why": why, "job": job_view(job),
+                    "load": load, "available": not why, "why": why, "job": job_view(job, team),
+                    # owner API 1.186: the providers of an account with a kind that this server can take now
+                    "model_providers": server_model_providers(team, name),
                     # owner API 1.170: the hub's own read of its own server, for the app's sweep and no page
                     "hardening": hub_hardening_view(t0) if name == hub_machine else None,
                     # owner API 1.173: how the fleet reaches this server, by its own record (team.json "access"), as
@@ -38729,7 +38740,7 @@ def servers_view():
                     # reading's reason and time
                     **server_key_swap_view(name, team)})
     return {"desired_revision": desired, "servers": out, "apps": app_servers_view(team),
-            "hub_shared": hub_shared(team), "shape": shape_view(team),
+            "hub_shared": hub_shared(team), "shape": shape_view(team), "model_providers": model_providers_view(),
             "join": join_view(q1("SELECT * FROM join_codes ORDER BY id DESC LIMIT 1"), t0)}
 
 
@@ -40937,12 +40948,21 @@ def account_fields(data):
     validate_team's, which the write passes before its commit."""
     out = {}
     if "kind" not in data:
-        if set(data) & {"secret", "address", "model"}:
-            raise ValueError("secret, address and model are only for an account with a kind")
+        if set(data) & {"secret", "login", "address", "model"}:
+            # the review's M12: a write of the owner MCP names its own field, login; a write with secret, as before
+            field = "login" if "login" in data and "secret" not in data else "secret"
+            raise ValueError(f"{field}, address and model are only for an account with a kind")
         return out
     if data["kind"] not in lifecycle.ACCOUNT_KINDS:
         raise ValueError(f"kind must be {' or '.join(lifecycle.ACCOUNT_KINDS)}, or absent")
     out["kind"] = data["kind"]
+    if data.get("login") is not None:       # owner API 1.186: the owner MCP's name of the same reference
+        if not isinstance(data["login"], str) or not BWS_REF.fullmatch(data["login"]):
+            raise ValueError("login must be a bws://<uuid> reference")      # the review's M12: its own name
+        if data.get("secret") is not None and not (isinstance(data["secret"], str) and
+                                                   data["secret"].lower() == data["login"].lower()):
+            raise ValueError("login and secret are one reference: give one of them")
+        data = dict(data, secret=data["login"])
     if data.get("secret") is not None:
         if not isinstance(data["secret"], str) or not BWS_REF.fullmatch(data["secret"]):
             raise ValueError("secret must be a bws://<uuid> reference")
@@ -41135,6 +41155,117 @@ def save_account(body):
         for name in sorted(n for n, a in agents().items() if a.get("account") == body["account"]):
             account_check_due(name)     # D21: its agents' checks proved the account's model and address before
     return result
+
+
+# ---------------------------------------------------------------- model accounts: what the apps read (step 5, lane 5H)
+#
+# The owner's "Yes, start" of 16 November 2026 and the coordinator's decision D35: the hub half of the screens that he
+# approved (ai-providers-step-5-answers.md, section 2). Each sentence that an app shows for such an agent comes from
+# the hub as his approved English words, with a stable `code` and the `names` that fill it (D7, D18), so that each app
+# maps the code to its own string in the device's language. UI-API.md 1.186 is the contract with the apps.
+
+# The codes of the state of an account with a kind with no hold (MODEL_ACCOUNT_STATE's words, his yes to picture 11).
+MODEL_ACCOUNT_CODES = {"key": "paid_per_use", "server": "local_model"}
+# The steps of the install of an agent whose account has a kind, in the order of the server's service
+# (server.Service.install for a pinned program): its checkout comes before its program, and it has no sign-in.
+MODEL_INSTALL_STEPS = ("user", "checkout", "runtime", "service")
+# The four lines of that install that name the AI (lane C, server.Service.runtime_step and install), as the server's
+# service writes them with the provider that the owner picked (server.provider_label). His answer 12 of 14 November
+# 2026: the apps never name the program there. A service of an older release writes the program's word: the hub reads
+# either, and gives the line with his provider.
+MODEL_INSTALL_LINES = {
+    "install_looking": "Looking for {provider}.",
+    "install_installing": "Installing {provider}.",
+    "install_offline": "{provider} did not install: {server} could not reach the internet. Try again when it can.",
+    "install_failed": "{provider} did not install. Try again.",
+}
+# An agent's account that cannot work, by its kind: the code of the ACP runner's error record that says so
+# (acp_programs: no_credit, no_answer), and the owner's words (picture 7, "Yes, as shown"), with their code.
+ACCOUNT_PROBLEMS = {"key": ("no_credit", "key_no_credit", "The key has no credit."),
+                    "server": ("no_answer", "server_no_answer", "Its model server does not answer.")}
+ACCOUNT_PROBLEM_TASKS = 20      # the newest tasks of an account's agents whose records say whether the account works
+
+
+def model_providers_view():
+    """GET /ui/servers model_providers: each provider of an account with a kind that this release knows, in the order
+    of the cards: {provider, kind, label, prefix, makers}. label is the name that the owner picked; prefix is the
+    provider's part of a model's name in its program (None where the program has one provider only)."""
+    keys = [{"provider": p, "kind": "key", "label": e["label"], "prefix": e["program"], "makers": e["makers"]}
+            for p, e in lifecycle.KEY_PROVIDERS.items()]
+    own = lifecycle.OWN_SERVER
+    return keys + [{"provider": own["provider"], "kind": "server", "label": own["label"], "prefix": own["program"],
+                    "makers": own["makers"]}]
+
+
+def server_model_providers(team, name):
+    """The providers of model_providers_view that this server can take now: each of them on a Linux server whose
+    service's reading has model_accounts, else none. The same two tests as account_placement_refusal, which refuses
+    the add of such an agent anywhere else."""
+    if server_kind_of(team, name) != "linux" or SERVER_MODEL_ACCOUNTS not in server_features(name):
+        return []
+    return [p["provider"] for p in model_providers_view()]
+
+
+def model_job_view(view, row, team):
+    """A job of an agent whose account has a kind, as the apps read it (UI-API.md 1.186): with provider_label,
+    sign_in "none", the steps of an install, and the code and names of a line that names the AI, which then names
+    the provider that the owner picked. Each other job as it is."""
+    held = lifecycle.model_account(team, (team.get("agents") or {}).get(row["agent"]))
+    label = account_label(held) if held else None
+    if not label:
+        return view
+    # as GET /server/<name>/jobs gives it to the server's service: such an agent signs in nowhere
+    view = dict(view, provider_label=label, sign_in="none",
+                **({"steps": list(MODEL_INSTALL_STEPS)} if row["kind"] == "install" else {}))
+    said = view.get("detail")
+    named = "|".join(re.escape(w) for w in sorted({label, runtime_label(row["runtime"])}, key=len, reverse=True))
+    for code, words in MODEL_INSTALL_LINES.items():
+        pattern = re.escape(words).replace(re.escape("{provider}"), f"(?:{named})").replace(
+            re.escape("{server}"), r"(?P<server>\S+)")
+        found = re.fullmatch(pattern, said or "")
+        if found:
+            names = dict({"provider": label}, **({"server": found["server"]} if "{server}" in words else {}))
+            return dict(view, detail=words.format(**names), code=code, names=names)
+    return view
+
+
+def agent_model_account(agent, team=None):
+    """GET /ui/state agents[].model_account: {kind, provider, label, address} of an agent whose account has a kind,
+    else None, so that each page of the apps that reads the state names the provider that the owner picked and draws
+    "Key" or the model server's address. Never its secret, not even the reference."""
+    team = team if team is not None else team_read()
+    held = lifecycle.model_account(team, (team.get("agents") or {}).get(agent))
+    return {"kind": held["kind"], "provider": held["provider"], "label": account_label(held),
+            "address": held["address"]} if held else None
+
+
+def account_problem(agent, team=None):
+    """GET /ui/state agents[].account_problem (D35 (d)): {code, error, names, at, task} when the newest turn on this
+    agent's account says that the account cannot work (the ACP runner's error record, no_credit for a key, no_answer
+    for a model server), and no turn on it worked after that (a result that ended its turn), else None. For a model
+    server, a later machine check whose account item is ok ends it too. It reads the hub's own records only, and
+    commits nothing: /ui/state reads it for each agent."""
+    team = team if team is not None else team_read()
+    held = lifecycle.model_account(team, (team.get("agents") or {}).get(agent))
+    if not held or held["kind"] not in ACCOUNT_PROBLEMS:
+        return None
+    record, code, words = ACCOUNT_PROBLEMS[held["kind"]]
+    users = sorted(n for n, a in (team.get("agents") or {}).items() if a.get("account") == held["id"])
+    tasks = [r["id"] for r in read_rows(f"SELECT id FROM tasks WHERE owner IN ({','.join('?' * len(users))}) "
+                                        f"ORDER BY id DESC LIMIT ?", (*users, ACCOUNT_PROBLEM_TASKS))]
+    if not tasks:
+        return None
+    last = read_row(f"SELECT task, type, created FROM thread_events WHERE task IN ({','.join('?' * len(tasks))}) AND "
+                    "((type='error' AND json_extract(data, '$.code')=?) OR (type='result' AND "
+                    "json_extract(data, '$.stop_reason')='end_turn')) ORDER BY id DESC LIMIT 1", (*tasks, record))
+    if not last or last["type"] != "error":
+        return None
+    if held["kind"] == "server" and any(
+            account_check_passed(c["agent"], c) for c in read_rows(
+                f"SELECT * FROM machine_checks WHERE agent IN ({','.join('?' * len(users))}) AND state='completed' "
+                "AND completed>?", (*users, last["created"]))):
+        return None
+    return {"code": code, "error": words, "names": {}, "at": last["created"], "task": last["task"]}
 
 
 # ---------------------------------------------------------------- GitHub repositories and tools (owner feature integrations)
@@ -49908,7 +50039,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("title must be one line of at most 60 characters")
             # the AI providers build: kind, secret, address and model, of an account with a key or a model server
             return dict({"provider": provider, "title": title.strip()}, **account_fields(data))
-        return self.team_entry("team/accounts", "account", ACCOUNT_FIELDS, check, save_account)
+        # owner API 1.186: `login` is the owner MCP's name of `secret`, whose tools never name a field like a value
+        return self.team_entry("team/accounts", "account", ACCOUNT_FIELDS + ("login",), check, save_account)
 
     @staticmethod
     def login_reference(value):

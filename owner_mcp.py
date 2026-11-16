@@ -2668,12 +2668,18 @@ def tools():
               **rid},
              ("kind",), add_machine),
         tool("add_agent", "Put a new agent on an available server. The hub writes the agent and its profile in one "
-                          "commit and makes the install job; read servers to follow its steps.",
+                          "commit and makes the install job; read servers to follow its steps. Give runtime, or, "
+                          "for an agent on an API key or on the owner's own model server, account and no runtime: "
+                          "the agent then runs the program of that account, on a Linux server whose "
+                          "model_providers in servers names the account's provider.",
              {"server": S["text"], "agent": S["text"], "runtime": {"type": "string", "enum": ["claude", "codex"]},
+              "account": {"type": "string", "description": "The ID of an account that save_account saved with a "
+                                                           "kind (key or server)."},
               "role": {"type": "string", "enum": ["worker", "lead"]},
               "reports_to": {"type": ["string", "null"]}, **rid},
-             ("server", "agent", "runtime", "role"),
-             with_base("/ui/servers/{server}/agents", ("agent", "runtime", "role", "reports_to"), "the new agent")),
+             ("server", "agent", "role"),
+             with_base("/ui/servers/{server}/agents", ("agent", "runtime", "account", "role", "reports_to"),
+                       "the new agent")),
         tool("remove_machine", "A server with no agent leaves the fleet.",
              {"server": S["text"], **rid}, ("server",),
              with_base("/ui/servers/{server}/remove", (), "the removal of this server")),
@@ -2902,10 +2908,27 @@ def tools():
                                      "required": ["key", "title", "text"], "additionalProperties": False}},
               **rid}, ("agent", "sections"), with_profile_base),
         tool("save_account", "One runtime account of the fleet: its provider and the owner's own title for it, or "
-                             "delete true to take it out. Agents that share an account share one allowance.",
-             {"account": S["text"], "provider": S["text"], "title": S["text"], "delete": S["bool"], **rid},
-             ("account",), with_base("/ui/team/accounts", ("account", "provider", "title", "delete"),
-                                     "this runtime account")),
+                             "delete true to take it out. Agents that share an account share one allowance. With "
+                             "kind, an account that an agent added with account runs on: key, an API key in the "
+                             "vault (provider google, xai, opencode-go, openrouter or ollama-cloud), or server, the "
+                             "owner's own model server (provider own, with its address). Each write is the whole "
+                             "entry. The key itself never goes through a tool: it enters the vault only through the "
+                             "owner's app, and login takes only its bws://<uuid> reference.",
+             {"account": S["text"], "provider": S["text"], "title": S["text"],
+              "kind": {"type": "string", "enum": ["key", "server"]},
+              "login": {"type": "string", "description": "Only the bws://<uuid> reference of an API key of "
+                                                         "logins, never the key: needed for key, and for a server "
+                                                         "that has a key."},
+              "address": {"type": "string", "description": "Only for server: http:// or https://, a host, and a "
+                                                           "port and a path if it has them. Plain http only on "
+                                                           "the loopback or a Tailscale address."},
+              "model": {"type": "string", "description": "The model as its program names it: <provider>/<name> "
+                                                         "(own/<name> for server; a name with no part before it "
+                                                         "for xai). Needed for opencode-go, openrouter and "
+                                                         "ollama-cloud."},
+              "delete": S["bool"], **rid},
+             ("account",), with_base("/ui/team/accounts", ("account", "provider", "title", "kind", "login",
+                                                           "address", "model", "delete"), "this runtime account")),
         tool("save_login", "The owner's own title for one login of the vault, by its bws://<uuid> reference, or "
                            "delete true to take it out of the catalog. This is the label only: no value of a login "
                            "passes here, and the vault is not touched. For an API key also: site, the https address "

@@ -480,7 +480,9 @@ class SameBytes(StateCase):
         self.assertEqual([m["origin"] for m in state["messages"][2:]],
                          [{"app": "whatsapp", "account": "wa1", "label": "Shop phone"}] + [None] * 3)
         self.assertEqual(list(state["agents"][0]), ["name", "role", "runtime", "title", "active", "can", "usage",
-                                                    "reports_to", "direct_chat", "local_model", "signed_in",
+                                                    "reports_to", "direct_chat", "local_model",
+                                                    "model_account", "account_problem",     # UI-API.md 1.186
+                                                    "signed_in",
                                                     "chat_ready", "placed", "turn_ended_after",
                                                     "chat_undelivered", "limit",
                                                     *hub.AGENT_SEEN])
