@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 import string
+import tempfile
 import unittest
 import uuid
 from unittest.mock import patch
@@ -21,7 +22,7 @@ from unittest.mock import patch
 import hub
 import refusal_words
 from refusal_words import CODE, HOLE, WORDS, Coded, answer, fields, holes, refusal_body, shown, words
-from test_ui_api import OwnerAPI, quick
+from test_ui_api import OwnerAPI, own_files, quick
 
 KIT = os.path.dirname(os.path.abspath(__file__))
 
@@ -465,6 +466,9 @@ class Paths(unittest.TestCase):
     answers `error` alone."""
 
     def setUp(self):
+        folder = tempfile.TemporaryDirectory(prefix="fleet-refusal-paths-")
+        self.addCleanup(folder.cleanup)
+        own_files(self, folder.name)        # a handler of a test reads no file of the machine (test_ui_api.OwnFiles)
         self.before = hub.DB, hub.TEAM
         hub.DB = quick(sqlite3.connect(":memory:", check_same_thread=False))
         hub.DB.row_factory = sqlite3.Row

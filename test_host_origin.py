@@ -23,6 +23,7 @@ from http.server import ThreadingHTTPServer
 from unittest.mock import patch
 
 import hub
+from test_ui_api import own_files
 
 OWNER, HUB_MACHINE = "127.0.0.1", "127.0.0.2"
 
@@ -33,6 +34,7 @@ class LocalHub(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="fleet-host-origin-")
         self.addCleanup(self.tmp.cleanup)
+        own_files(self, self.tmp.name)      # no route of this hub reads a file of the machine (test_ui_api.OwnFiles)
         hub.DB = sqlite3.connect(self.tmp.name + "/test.db", check_same_thread=False)
         hub.DB.row_factory = sqlite3.Row
         hub.DB.executescript(hub.SCHEMA)

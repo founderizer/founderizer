@@ -17,13 +17,14 @@ import http.client
 import json
 import socket
 import socketserver
+import tempfile
 import threading
 import unittest
 from unittest.mock import patch
 
 import hub
 from test_gzip_answers import ASKS, Answers
-from test_ui_api import quick
+from test_ui_api import own_files, quick
 
 DATE = "Tue, 10 Nov 2026 19:00:00 GMT"
 
@@ -225,6 +226,11 @@ class OneWrite(Writes):
 
 class Bare(unittest.TestCase):
     """Handler.send with no server: a socket of the test's own, which can take a part of each call."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory(prefix="fleet-answer-write-")
+        self.addCleanup(folder.cleanup)
+        own_files(self, folder.name)        # a handler of a test reads no file of the machine (test_ui_api.OwnFiles)
 
     class Part:
         """A socket whose kernel takes at most `most` bytes of each call (all of it when most is None). It refuses

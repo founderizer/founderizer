@@ -620,7 +620,11 @@ class JoinScript(Shell):
         script = KIT / "join.sh"
         code, self.said = run_shell(shell_function(script, "take") + shell_function(script, "current")
                                     + f"current {self.kit} as_self\n",
-                                    extra=f"HOME={self.home}\nexport HOME\nas_self() {{ \"$@\"; }}\n")
+                                    extra=f"HOME={self.home}\nexport HOME\nas_self() {{ \"$@\"; }}\n"
+                                    # the two addresses that join.sh sets at its top, and that `take` reads (hub
+                                    # feature code_over_hub_port): this checkout's origin is neither, so it stays
+                                    "REPO_GIT=git://100.64.0.2/fleet.git\nREPO=$REPO_GIT\n"
+                                    "REPO_HTTP=http://100.64.0.2:8765/code/fleet.git\n")
         self.assertEqual(code, 0, self.said)
 
     def test_a_refusal_says_why_and_the_join_goes_on(self):

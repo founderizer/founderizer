@@ -12,7 +12,7 @@ from http.server import ThreadingHTTPServer
 from unittest.mock import patch
 
 import hub
-from test_ui_api import own_attachments
+from test_ui_api import own_files
 
 SESSION = "0b7d5a8e-3c1f-4e2a-9d6b-1f2e3d4c5b6a"
 SECRET = "Zq7Lm2Xc9Vb4Nn8K"
@@ -36,7 +36,9 @@ class Runtime(unittest.TestCase):
                                "vps": {"role": "worker", "runtime": "codex", "machine": "vps", "can": ["shell"]}}}
         hub.CFG.update(silence=180, question_wait=120, manager_silence=120, stop_after=60, offline_after=90,
                        ask_wait=1, ask_max=1, hook_wait=2, job_wait=1, tick=5)
-        own_attachments(self, self.tmp.name + "/attachments")     # hub.tick() sweeps it (resilience review, item 12)
+        # The hub's own files: hub.tick() sweeps its attachment folder (resilience review, item 12), and its routes read
+        # its Google file and key, its MCP file, its App key and the door's secrets (test_ui_api.OwnFiles).
+        own_files(self, self.tmp.name)
         hub.kv_set("db_id", "gen1")
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), hub.Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)

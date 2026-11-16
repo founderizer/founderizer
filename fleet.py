@@ -389,24 +389,79 @@ def arg_most(sysconf=os.sysconf, linux=sys.platform.startswith("linux")):
 
 
 ARG_MOST = arg_most()
+# The line that takes the place of the middle of a first prompt that one argument cannot hold (fit_argument). A cut
+# can fall in a session's stable text, which tells it that its rules and its profile are in its context (STABLE_RULES),
+# so the line names where they are.
+LEFT_OUT = ("\n\n[{cut} bytes of the middle of this text are not here: a program takes one argument of at most {most} "
+            "bytes. Your rules and your profile are in RULES.md, rules/ and profiles/ of this folder, and the fleet's "
+            "record, which your fleet tools read, keeps the rest.]\n\n")
+LINE_NEAR = 2048        # bytes that a cut moves to reach a line end, at most: a longer line is cut where its bytes end
 
 
-def file_prompt(agent, window, text):
+def fit_argument(text, most, limit=None):
+    """(text, cut): `text` in at most `most` bytes of UTF-8, and how many of its bytes were left out. limit: the
+    argument's limit, which the line names, when `most` is the room of one part of the argument (fit_prompt).
+    A longer text keeps its start and its end and loses its middle, with a line in its place that says how much went
+    (LEFT_OUT). Each side ends at a line end when one is within LINE_NEAR bytes of the cut, and is cut where its bytes
+    end when none is: one long line, as github_text is with 500 repositories, is not lost whole. The end stays because
+    a session acts on it last: the brief's last words, and the marker that binds a Codex session to its rollout
+    (threads.CodexFiles.find), whose line a final line end does not take away. No character is cut in two. `most` is
+    far more than LEFT_OUT, as ARG_MOST is."""
+    data, limit = text.encode("utf-8"), most if limit is None else limit
+    if len(data) <= most:
+        return text, 0
+    # the note with the whole size, which has at least the digits of the cut, so the text it goes into fits
+    room = max(0, most - len(LEFT_OUT.format(cut=len(data), most=limit).encode("utf-8")))
+    near = min(LINE_NEAR, room // 8)
+    end, start = room // 2, len(data) - (room - room // 2)
+    if data[end:end + 1] != b"\n" and data[end:end + 2] != b"\r\n":
+        found = data.rfind(b"\n", end - near, end)
+        end = found if found > 0 else end
+    if data[start - 1:start] != b"\n":
+        found = data.find(b"\n", start, min(start + near, len(data) - 1))
+        start = found + 1 if found >= 0 else start
+    head, tail = data[:end].decode("utf-8", "ignore"), data[start:].decode("utf-8", "ignore")
+    cut = len(data) - len(head.encode("utf-8")) - len(tail.encode("utf-8"))
+    return head + LEFT_OUT.format(cut=cut, most=limit) + tail, cut
+
+
+def fit_prompt(first, rest, most):
+    """(first + rest, cut) in at most `most` bytes (fit_argument). `first` is what a session reads before its own
+    part: its stable text, with its rules' parts, its profile and its repositories, which it is told are in its context.
+    It stays whole while it leaves `rest` a quarter of `most`, and then only `rest` loses its middle: a Codex task's own
+    block keeps its start, which names the task, and its end. A longer `first` loses its middle too, and `rest` keeps a
+    quarter of `most`, or all of itself when it is shorter."""
+    whole, own = len(first.encode("utf-8")), len(rest.encode("utf-8"))
+    if whole + own <= most:
+        return first + rest, 0
+    if most - whole >= most // 4:
+        rest, cut = fit_argument(rest, most - whole, most)
+        return first + rest, cut
+    keep = min(own, most // 4)
+    first, cut = fit_argument(first, most - keep, most)
+    rest, more = fit_argument(rest, keep, most)
+    return first + rest, cut + more
+
+
+def file_prompt(agent, window, text, first=""):
     """A first prompt as one word of a window command: the window's shell reads it from a mode-600 file and removes
     the file before the program starts, so the command is as long with any prompt. A prompt that grows with the fleet
     cannot ride in the command itself: on 16 November 2026 the manager's brief of about 14,400 bytes made a start
     command of 16,419, tmux refused it with "command too long" at every try, and the standing session stayed down.
-    The shell's $(...) drops the line ends at the end of the text, which no prompt needs.
+    The shell's $(...) drops the line ends at the end of the text, which no prompt needs. first: the session's stable
+    text, which comes before `text` (fit_prompt).
 
-    The prompt is still one argument of the program, so ARG_MOST is its limit: on Linux with pages of 4 KiB, a brief
-    about nine times that one would stop the start again. Nothing bounds the hub's brief (hub.manager_resume_text), or
-    the profile and the hub's recap in a Codex owner chat, so a longer text is refused here with its size, and the
-    helper's log and its report of the failed start say why, instead of exec's "Argument list too long" in a pane that
-    closes. Its callers write no other file of the start before this one: a refused start leaves no file of its
-    credential or its keys behind."""
-    size = len(text.encode("utf-8"))
-    if size > ARG_MOST:
-        raise Refused(f"its first prompt is {size} bytes, and a program takes one argument of at most {ARG_MOST}")
+    The prompt is still one argument of the program, so ARG_MOST is its limit. The hub bounds each part of what goes
+    here, in characters, not the whole in bytes: the brief (hub.manager_resume_text), a Codex session's stable text
+    with its rules' parts, its profile and, for a task, its repositories' list (github_text, up to 500), a task's block,
+    a Codex owner chat's profile and recap. So a longer prompt loses a middle (fit_prompt) and the session starts with
+    the rest and a line that says so, and the helper's log says how much went. A refusal there stopped every start of
+    it again, as tmux's limit had, and an exec of a longer one fails with "Argument list too long" in a pane that
+    closes."""
+    text, cut = fit_prompt(first, text, ARG_MOST)
+    if cut:
+        print(time.strftime("%H:%M:%S"), f"{window}: {cut} bytes of its first prompt are left out: a program takes one "
+              f"argument of at most {ARG_MOST} bytes", flush=True)
     path = shlex.quote(session_file(agent, window, "md", text))
     return f'"$(cat {path}; rm -f {path})"'
 
@@ -2307,13 +2362,14 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         # manager session keeps its first prompt, the brief, after it.
         stable += github_text(values, tools) if task else ""
         if opening == "read":
-            word = " " + file_prompt(agent, window, prompt) if standing else ""     # first: it may refuse the start
+            word = " " + file_prompt(agent, window, prompt) if standing else ""
             first = "--append-system-prompt-file " + shlex.quote(session_file(agent, window, "md", stable)) + word
         elif resume:
             first = f"-c project_doc_max_bytes={codex_rules_limit()} " + shlex.quote(session)   # its thread
         else:
             # Codex reads all of RULES.md as this folder's AGENTS.md.
-            first = f"-c project_doc_max_bytes={codex_rules_limit()} " + file_prompt(agent, window, stable + "\n" + prompt)
+            first = f"-c project_doc_max_bytes={codex_rules_limit()} " + file_prompt(agent, window, prompt,
+                                                                                      first=stable + "\n")
     elif conf.get("runtime") == "claude" and not idle:
         core = rules_file()                                 # the folder's CLAUDE.md loads no more
         first = " ".join(x for x in ("--append-system-prompt-file " + shlex.quote(core) if core else "", first) if x)
@@ -2356,8 +2412,8 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         env += f" {NO_TIMERS} {NO_TEAMS} {NO_FILE_MENTIONS} {MOTION}" + (f" {TODO_TOOLS}" if task else "")
     if not task and conf.get("runtime") == "claude":
         env += f" CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"
-    # Its env file last, with its credential, its keys and its catalog servers' options: a start that file_prompt
-    # refused above leaves none of them behind.
+    # Its env file last, with its credential, its keys and its catalog servers' options: a start that fails above (a
+    # file that cannot be written) leaves none of them behind.
     return f"{env_prefix(agent, window, values, served)}env {env} {cmd}"
 
 
@@ -2872,8 +2928,8 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
 
     Its start text comes from a mode-600 file in each case, and no word of the command holds it: the profile and the
     recap grow with the fleet, and a tmux command must stay under 16 KiB. Until 16 November 2026 a chat without its
-    stable text had them in its command, cut only the recap to fit, and a profile alone could pass the limit (ARG_MOST
-    says the next one)."""
+    stable text had them in its command, cut only the recap to fit, and a profile alone could pass the limit. A Codex
+    chat's first prompt is one argument of its program: past ARG_MOST its recap loses its middle (file_prompt)."""
     if not runtime_fact(conf.get("runtime"), "owner_chat"):
         raise Refused(f"a {runtime_fact(conf.get('runtime'), 'label', conf.get('runtime'))} agent has no direct chat "
                       f"yet: its tools cannot be limited to discussion")
@@ -2883,9 +2939,10 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
     opening = standing_opening(conf, rules)
     stable = stable_text(agent, opening, rules, head=prompt, skills=False) if opening else None
     if stable is None:
-        prompt += " Your profile follows:\n" + profile + ("\n\n" + recap if recap else "")
+        head, said = prompt + " Your profile follows:\n" + profile, ("\n\n" + recap if recap else "")
     else:
-        prompt = stable + ("\n" + recap if recap else "")
+        head, said = stable, ("\n" + recap if recap else "")
+    prompt = head + said            # the recap last: what a Codex chat's first prompt cuts first (file_prompt)
     url = f"{HUB}/mcp/{agent}/{generation}/owner-chat/1"
     if conf.get("runtime") == "codex":
         if resume is not None and not THREAD_ID.fullmatch(str(resume)):
@@ -2923,9 +2980,9 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
         ([NO_TIMERS, NO_TEAMS, NO_FILE_MENTIONS, f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"]
          if conf.get("runtime") == "claude" else [])
     # The window's shell reads a new Codex chat's first prompt from its file, which it removes before Codex starts.
-    # That file first, the env file with the credential after it: a start that file_prompt refuses leaves no file.
-    word = " " + file_prompt(agent, "owner-chat", prompt + ("\n\n" + MARKER.format(marker) if marker else "")) \
-        if conf.get("runtime") == "codex" and not resume else ""
+    # That file first, the env file with the credential after it: a start that fails there leaves no file of it.
+    word = " " + file_prompt(agent, "owner-chat", said + ("\n\n" + MARKER.format(marker) if marker else ""),
+                             first=head) if conf.get("runtime") == "codex" and not resume else ""
     return env_prefix(agent, "owner-chat", values) + shlex.join(words + args) + word
 
 

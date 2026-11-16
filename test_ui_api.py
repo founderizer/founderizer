@@ -20,6 +20,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -40,11 +41,13 @@ KIT = os.path.dirname(os.path.abspath(__file__))
 # does not name, so a test that ticks with no folder of its own empties the real ~/.fleet/attachments of the machine
 # that runs it. And a hub with no file of its own for an upload, the Google accounts, the GitHub App's key, the MCP
 # servers or the door's secrets reads and writes the one in ~/.fleet, and with no key file of its own for the Google
-# file the one in ~/.config/founderizer (leftovers.hub_files, for a tool's own hub).
+# file the one in ~/.config/founderizer (leftovers.hub_files, for a tool's own hub). So OwnerAPI.setUp gives each test's
+# hub all of them in the test's own folder (own_files), and the check below stops a write of a hub that has none.
 
-REAL_FILES = {key: os.path.realpath(path) for key, path in (
-    ("attachment_dir", hub.ATTACH_DIR), ("google_file", hub.GOOGLE_FILE), ("github_app", hub.GITHUB_APP),
-    ("mcp_file", hub.MCP_FILE), ("door_secrets", hub.DOOR_SECRETS_FILE), ("google_key", hub.GOOGLE_KEY_FILE))}
+# hub.py's constant of each of them: the machine's own file, which a hub with no file of its own uses
+HUB_CONSTANTS = {"attachment_dir": "ATTACH_DIR", "google_file": "GOOGLE_FILE", "github_app": "GITHUB_APP",
+                 "mcp_file": "MCP_FILE", "door_secrets": "DOOR_SECRETS_FILE", "google_key": "GOOGLE_KEY_FILE"}
+REAL_FILES = {key: os.path.realpath(getattr(hub, constant)) for key, constant in HUB_CONSTANTS.items()}
 # what the check holds: the sweep and its caller, and each function of hub.py that makes, writes or removes one of them,
 # and the reader of the Google file's key, which a test reads only as its own
 OWN_FILE_FIRST = {"tick": "attachment_dir", "attachment_sweep": "attachment_dir", "attachment_dir": "attachment_dir",
@@ -55,23 +58,46 @@ OWN_FILE_FIRST = {"tick": "attachment_dir", "attachment_sweep": "attachment_dir"
 
 
 def own_attachments(test, folder):
-    """The test's own attachment folder (hub.CFG["attachment_dir"]), until the test ends."""
+    """The test's own attachment folder (hub.CFG["attachment_dir"]), until the test ends. Alone, it is not enough for a
+    test's hub: own_files gives this folder and the hub's other files, and OwnFiles fails a class whose setUp gives
+    only this one (no test calls it since 16 November 2026)."""
     had, old = "attachment_dir" in hub.CFG, hub.CFG.get("attachment_dir")
     hub.CFG["attachment_dir"] = folder
     test.addCleanup(lambda: hub.CFG.update(attachment_dir=old) if had else hub.CFG.pop("attachment_dir", None))
 
 
+def own_files(test, folder):
+    """Each of the hub's files in `folder` (leftovers.hub_files) that the test has not set itself, until the test ends:
+    OwnerAPI.setUp's, so that no test's hub reads a file of the machine. Until 16 November 2026 that setUp gave the
+    attachment folder alone, so each test that read GET /ui/team or /ui/resources read the Google accounts of the
+    machine's ~/.fleet/google.json, and where a hub of owner API 1.202 had sealed that file, the check of its key
+    (OWN_FILE_FIRST) made such a test answer 500."""
+    for key, path in hub_files(folder).items():
+        if hub.CFG.get(key):
+            continue
+        had, old = key in hub.CFG, hub.CFG.get(key)
+        hub.CFG[key] = path
+        test.addCleanup(lambda key=key, had=had, old=old: hub.CFG.update({key: old}) if had else hub.CFG.pop(key, None))
+
+
+def stand_for_the_machine(stack, files):
+    """Until `stack` ends, `files` (leftovers.hub_files of a folder of the test) are the machine's own: hub.py's
+    constants name them, and the check of OWN_FILE_FIRST refuses them. So a check that let a test's hub through would
+    not reach the files of the machine that runs it."""
+    for key, constant in HUB_CONSTANTS.items():
+        stack.enter_context(patch.object(hub, constant, files[key]))
+    stack.enter_context(patch.dict(REAL_FILES, {key: os.path.realpath(path) for key, path in files.items()}))
+
+
 def own_file_first(function, key):
     """Each function of OWN_FILE_FIRST, in every test process that loads this module: it fails before it runs when
-    the test's hub has no file of its own for it (hub.CFG[key]; own_attachments for the folder), or has the
-    machine's own."""
+    the test's hub has no file of its own for it (hub.CFG[key]; own_files), or has the machine's own."""
     @functools.wraps(function)
     def checked(*args, **kwargs):
         path = hub.CFG.get(key)
         if not path or os.path.realpath(path) == REAL_FILES[key]:
             raise AssertionError(f"hub.{function.__name__}() would use {path or REAL_FILES[key]} of this machine: give "
-                                 f"the test its own with hub.CFG[{key!r}]"
-                                 + (" (test_ui_api.own_attachments)" if key == "attachment_dir" else ""))
+                                 f"the test its own with hub.CFG[{key!r}] (test_ui_api.own_files)")
         return function(*args, **kwargs)
     return checked
 
@@ -135,6 +161,282 @@ def hub_starts():
             for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
             if isinstance(node, ast.Call) and ast.unparse(node.func) == "subprocess.Popen" and node.args
             and re.search(r"\bhub\.py\b", ast.unparse(node.args[0]))]
+
+
+def hubs_with_no_files(texts):
+    """(the test classes that make a hub.Handler and give its hub no files of their own, how many classes make one),
+    as "module.Class" names, from `texts`: the source of each test module, by its name (OwnFiles).
+
+    A class makes a handler when code that runs for it calls one, or gives one to a server (a name that says serve or
+    server), to a class, a function or a method of a test module, to a __new__, an __init__ or functools.partial: in a
+    method of the class or of a base, in a class body, at the top of its module or in its setUpModule, or through a
+    function or a class of a test module that does. A handler is hub.Handler, a class that derives from one (also a
+    class that a function of a test defines), or a name that the module or the function gives one (also as the default
+    of a parameter). Its hub has files of its own when the setUp that runs for it calls test_ui_api.own_files. Bases
+    in Python's order, super(), self.method(), Base.method(self), a function of a test module and a method that a
+    class takes from another class or from a function (setUp = Other.setUp) are followed across the modules of
+    `texts`, as unittest runs them.
+
+    It does not follow a handler or a server that a test reaches in another way: getattr, from hub import *, an
+    attribute of another module (fleet.hub) or of a class (self.handler), a loop or an expression (h = hub.Handler if
+    x else None), a server class kept under another name, a callable of another module whose name does not say serve
+    or server, or a method of an object that a module keeps. And it reads code that never runs as code that runs: an
+    own_files call there counts."""
+    trees = {module: ast.parse(text) for module, text in texts.items()}
+    functions = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+    def dotted(node):
+        if isinstance(node, ast.Attribute):
+            inner = dotted(node.value)
+            return inner and inner + "." + node.attr
+        return node.id if isinstance(node, ast.Name) else None
+
+    def last(func):
+        return func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+
+    def given(nodes):
+        """The names that these statements give a value: name -> ("=", the value)."""
+        return {target.id: ("=", node.value) for node in nodes if isinstance(node, ast.Assign)
+                for target in node.targets if isinstance(target, ast.Name)}
+
+    hub_names, module_names, from_names, defined, top, module_scope = {}, {}, {}, {}, [], {}
+    for module, tree in trees.items():
+        hub_names[module], module_names[module], from_names[module] = set(), {}, {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "hub":
+                        hub_names[module].add(alias.asname or "hub")
+                    elif alias.name in trees:
+                        module_names[module][alias.asname or alias.name] = alias.name
+            elif isinstance(node, ast.ImportFrom) and (node.module == "hub" or node.module in trees):
+                for alias in node.names:
+                    from_names[module][alias.asname or alias.name] = (node.module, alias.name)
+        for node in tree.body:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef)):
+                defined[(module, node.name)] = node
+                top.append((module, node.name))
+        module_scope[module] = given(tree.body)
+
+    scopes, owners = {}, {}         # id of a function -> its names; a class that a function defines -> that function
+
+    def scope(module, node):
+        """The names of a function: each class that it defines (by a key of its own) and each name that it gives a
+        value. Other code has none of its own."""
+        if not isinstance(node, functions):
+            return {}
+        if id(node) not in scopes:
+            inner = [n for n in ast.walk(node) if n is not node]
+            arguments = node.args.posonlyargs + node.args.args
+            names = {a.arg: ("=", value) for a, value in [*zip(arguments[len(arguments) - len(node.args.defaults):],
+                                                                node.args.defaults),
+                                                           *zip(node.args.kwonlyargs, node.args.kw_defaults)] if value}
+            names.update(given(inner))
+            for n in inner:
+                if isinstance(n, ast.ClassDef):
+                    key = (module, n.name, id(n))
+                    defined[key], names[n.name] = n, key
+                    owners.setdefault(key, node)
+            scopes[id(node)] = names
+        return scopes[id(node)]
+
+    for module, tree in trees.items():      # so that each class that a function defines has its key in `defined`
+        for node in ast.walk(tree):
+            scope(module, node)
+
+    def resolve(module, node, local=None, depth=0):
+        """("hub", name), or the key of a class or a function that `texts` defines, or None."""
+        head, _, rest = (dotted(node) or "").partition(".")
+        if "." in rest or depth > 8:
+            return None
+        if rest:
+            if head in hub_names[module]:
+                return "hub", rest
+            return (module_names[module][head], rest) if head in module_names[module] else None
+        for names in (local or {}, module_scope[module]):
+            meant = names.get(head)
+            if meant and meant[0] == "=":
+                return resolve(module, meant[1], local if names is local else None, depth + 1)
+            if meant:
+                return meant
+        if (module, head) in defined:
+            return module, head
+        return from_names[module].get(head)
+
+    def is_class(key):
+        return isinstance(defined.get(key), ast.ClassDef)
+
+    handlers = {("hub", "Handler")}
+    while True:
+        more = {key for key, node in defined.items() if is_class(key) and key not in handlers and any(
+            resolve(key[0], base, scope(key[0], owners.get(key))) in handlers for base in node.bases)}
+        if not more:
+            break
+        handlers |= more
+
+    calls, plains = {}, {}
+
+    def calls_in(node):
+        if id(node) not in calls:
+            calls[id(node)] = [n for n in ast.walk(node) if isinstance(n, ast.Call)]
+        return calls[id(node)]
+
+    def plain(node):
+        """The statements of a class body or a module, without the functions and the classes that it defines (kept,
+        so that the caches by id stay true)."""
+        if id(node) not in plains:
+            plains[id(node)] = (node, ast.Module(body=[n for n in node.body if not isinstance(
+                n, (*functions, ast.ClassDef))], type_ignores=[]))
+        return plains[id(node)][1]
+
+    def gives_one(module, call, local):
+        """Whether a handler is in the arguments of this call, anywhere inside them."""
+        return any(resolve(module, node, local) in handlers
+                   for value in [*call.args, *(k.value for k in call.keywords)] for node in ast.walk(value))
+
+    def direct(module, call, local):
+        """Whether this call makes a handler: it calls one, or it gives one to a server (a name that says serve or
+        server: ThreadingHTTPServer, make_server, serve), a class or a function of a test module, a __new__, an
+        __init__ or functools.partial."""
+        target = resolve(module, call.func, local)
+        if target in handlers:
+            return True
+        name = last(call.func)
+        return bool(re.search(r"(?:^|_)serve|server$", name, re.I) or name in ("__new__", "__init__", "partial") or
+                    target in defined) and gives_one(module, call, local)
+
+    def tests_of(node):
+        return any(isinstance(n, functions) and n.name.startswith("test") for n in node.body)
+
+    # The functions and the classes of the test modules, other than the test classes, that make a handler when a
+    # test calls them: a function that serves one, a server of a test's own whose __init__ takes hub.Handler.
+    helpers = [key for key in top if key not in handlers and not (is_class(key) and tests_of(defined[key]))]
+    makers = set()
+    while True:
+        more = set()
+        for key in helpers:
+            if key in makers:
+                continue
+            node = defined[key]
+            inside = [node] if isinstance(node, functions) else [n for n in node.body if isinstance(n, functions)]
+            if any(direct(key[0], call, scope(key[0], f)) or resolve(key[0], call.func, scope(key[0], f)) in makers
+                   for f in inside for call in calls_in(f)):
+                more.add(key)
+        if not more:
+            break
+        makers |= more
+
+    orders = {}
+
+    def line(key, visiting=()):
+        """The classes of `key` that `texts` defines, in Python's order of its bases (C3)."""
+        if key not in orders:
+            bases = [b for b in (resolve(key[0], base) for base in defined[key].bases)
+                     if is_class(b) and b not in visiting and b != key]
+            lists = [list(line(b, visiting + (key,))) for b in bases] + [bases]
+            order = [key]
+            while any(lists):
+                lists = [rest for rest in lists if rest]
+                head = next((rest[0] for rest in lists if not any(rest[0] in other[1:] for other in lists)), None)
+                if head is None:            # Python refuses such a class: its bases count in the order written
+                    order += [k for rest in lists for k in rest if k not in order]
+                    break
+                order.append(head)
+                lists = [rest[1:] if rest[0] == head else rest for rest in lists]
+            orders[key] = order
+        return orders[key]
+
+    def own(k, name, depth):
+        """(module, function) of the method `name` that the class k defines, or takes from another class
+        (name = Other.name) or from a function of a test module (name = function), or None."""
+        for node in defined[k].body:
+            if isinstance(node, functions) and node.name == name:
+                return k[0], node
+            if isinstance(node, ast.Assign) and depth < 8:
+                targets = [t for target in node.targets for t in (target.elts if isinstance(target, ast.Tuple)
+                                                                    else [target])]
+                values = node.value.elts if isinstance(node.value, ast.Tuple) else [node.value]
+                for target, value in zip(targets, values):
+                    if not (isinstance(target, ast.Name) and target.id == name):
+                        continue
+                    if isinstance(value, ast.Attribute):
+                        owner = resolve(k[0], value.value)
+                        return lookup(owner, value.attr, depth=depth + 1) if is_class(owner) else None
+                    found = resolve(k[0], value)
+                    return (found[0], defined[found]) if isinstance(defined.get(found), functions) else None
+        return None
+
+    def lookup(key, name, start=0, depth=0):
+        """(module, function) of the method `name` that runs for an instance of `key`, from its start-th class on."""
+        for k in line(key)[start:]:
+            got = own(k, name, depth)
+            if got:
+                return got
+        return None
+
+    def reaches(key, module, node, wanted, seen=None):
+        """Whether `node` (a function that runs as a method of an instance of the class `key`, or other code of
+        `module`) makes a call that wanted(module, call, names) takes: itself, or through what it calls (super(),
+        self.method(), Base.method(self), a function of a test module)."""
+        seen = set() if seen is None else seen
+        if id(node) in seen:
+            return False
+        seen.add(id(node))
+        order = line(key) if key else []
+        local = scope(module, node)
+        for call in calls_in(node):
+            if wanted(module, call, local):
+                return True
+            func, got = call.func, None
+            found = resolve(module, func, local)            # a function of a test module: f() or module.f()
+            if isinstance(defined.get(found), functions):
+                got = found[0], defined[found]
+            elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Call) and \
+                    dotted(func.value.func) == "super":
+                here = next((i for i, k in enumerate(order) if node in defined[k].body), None)
+                got = None if here is None else lookup(key, func.attr, start=here + 1)
+            elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "self":
+                got = lookup(key, func.attr) if key else None
+            elif isinstance(func, ast.Attribute):
+                owner = resolve(module, func.value, local)
+                got = lookup(owner, func.attr) if is_class(owner) else None
+            if got and wanted is makes and gives_one(module, call, local):
+                return True             # a method or a function of a test module that is given a handler
+            if got and reaches(key, got[0], got[1], wanted, seen):
+                return True
+        return False
+
+    def makes(module, call, local):
+        return direct(module, call, local) or resolve(module, call.func, local) in makers
+
+    def gives_files(module, call, local):
+        return resolve(module, call.func, local) == ("test_ui_api", "own_files")
+
+    module_makes = {}
+    for module, tree in trees.items():
+        start = defined.get((module, "setUpModule"))
+        module_makes[module] = reaches(None, module, plain(tree), makes) or bool(
+            isinstance(start, functions) and reaches(None, module, start, makes))
+
+    without, making = [], 0
+    for key in top:
+        if not is_class(key) or key in handlers:
+            continue
+        names = {node.name for k in line(key) for node in defined[k].body if isinstance(node, functions)}
+        names |= {target.id for k in line(key) for node in defined[k].body if isinstance(node, ast.Assign)
+                  for t in node.targets for target in (t.elts if isinstance(t, ast.Tuple) else [t])
+                  if isinstance(target, ast.Name)}
+        run = {name: got for name, got in ((name, lookup(key, name)) for name in sorted(names)) if got}
+        if not any(name.startswith("test") for name in run):
+            continue
+        if not (module_makes[key[0]] or any(reaches(key, k[0], plain(defined[k]), makes) for k in line(key)) or
+                any(reaches(key, module, function, makes) for module, function in run.values())):
+            continue
+        making += 1
+        setup = run.get("setUp")
+        if not (setup and reaches(key, setup[0], setup[1], gives_files)):
+            without.append(".".join(key))
+    return sorted(without), making
 
 
 # ---- no large answer leaves while its thread holds the hub's lock, in a test whose hub OwnerAPI.setUp makes. The
@@ -259,7 +561,7 @@ class OwnerAPI(unittest.TestCase):
         self.addCleanup(no_large_answer_under_the_lock, self, len(LOCKED_SENDS))       # after tearDown
         self.tmp = tempfile.TemporaryDirectory(prefix="fleet-ui-test-")
         removed_when_gone(self.tmp.name)                    # a test process that is killed runs no tearDown
-        own_attachments(self, self.tmp.name + "/attachments")
+        own_files(self, self.tmp.name)          # its attachments, Google file and key, MCP file, App key, door secrets
         self.path = self.tmp.name + "/test.db"
         self.connect()
         hub.TEAM = {"addresses": {"owner": "127.0.0.1", "hub": "127.0.0.2"},
@@ -676,11 +978,7 @@ class AttachmentFolder(unittest.TestCase):
         machine = hub_files(os.path.join(self.tmp.name, "machine"))
         os.makedirs(os.path.join(self.tmp.name, "machine"))
         with contextlib.ExitStack() as stack:
-            for constant, key in (("ATTACH_DIR", "attachment_dir"), ("GOOGLE_FILE", "google_file"),
-                                  ("GITHUB_APP", "github_app"), ("MCP_FILE", "mcp_file"),
-                                  ("DOOR_SECRETS_FILE", "door_secrets"), ("GOOGLE_KEY_FILE", "google_key")):
-                stack.enter_context(patch.object(hub, constant, machine[key]))
-            stack.enter_context(patch.dict(REAL_FILES, {key: os.path.realpath(path) for key, path in machine.items()}))
+            stand_for_the_machine(stack, machine)
             for name, call in calls.items():
                 key = OWN_FILE_FIRST[name]
                 for setting in (None, machine[key]):
@@ -750,6 +1048,379 @@ class AttachmentFolder(unittest.TestCase):
             with self.subTest(where):
                 self.assertIn("HOME", env)
         self.assertGreater(len(hub_starts()), 3, "the scan found too few: its pattern no longer matches the tests")
+
+
+class OwnFiles(unittest.TestCase):
+    """No test's hub reads a file of the machine that runs the test: OwnerAPI.setUp gives it each of the hub's files
+    that the test does not set itself (own_files)."""
+    setUp, tearDown, connect, request = OwnerAPI.setUp, OwnerAPI.tearDown, OwnerAPI.connect, OwnerAPI.request
+
+    def test_a_tests_hub_reads_none_of_the_machines_files(self):
+        """A folder of this test stands for the machine's ~/.fleet and ~/.config/founderizer, with a Google account, an
+        MCP server's connection, a GitHub App and the door's secrets. A hub with no file of its own shows them all in
+        GET /ui/team. The hub of a test that set none shows none of them, and seals its own Google file with its own
+        key."""
+        team = {"addresses": {"owner": "127.0.0.1", "hub": "127.0.0.2"}, "door": {"address": "100.64.0.9"},
+                "agents": {"manager": {"role": "manager", "runtime": "claude", "machine": "hub", "can": []}},
+                "mcp": {"crm": {"title": "Acme CRM", "url": "https://mcp.example.org/", "auth": "oauth"}}}
+        kit = os.path.join(self.tmp.name, "kit")            # the hub's checkout: GET /ui/team reads team.json there
+        os.makedirs(kit)
+        with open(os.path.join(kit, "team.json"), "w", encoding="utf-8") as f:
+            json.dump(team, f)
+        for step in (["init", "-q"], ["add", "team.json"], ["commit", "-q", "-m", "The test's team"]):
+            subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c",
+                            "commit.gpgsign=false", *step], cwd=kit, check=True, capture_output=True,
+                           stdin=subprocess.DEVNULL)
+        hub.CFG["team_path"] = os.path.join(kit, "team.json")
+        self.addCleanup(hub.CFG.pop, "team_path", None)
+        hub.TEAM = copy.deepcopy(team)
+        machine = hub_files(os.path.join(self.tmp.name, "machine"))
+        os.makedirs(os.path.join(self.tmp.name, "machine"))
+        account = {"refresh_token": "example-refresh-token", "scopes": [], "connected_at": 1}
+        for key, text in (("google_file", json.dumps({"accounts": {"someone@example.com": account}})),
+                          ("mcp_file", json.dumps({"servers": {"crm": {
+                              "token_endpoint": "https://mcp.example.org/token", "refresh_token": "example-refresh",
+                              "connected_at": 1}}})),
+                          ("github_app", "app_id=123\nnot a key\n"),
+                          ("door_secrets", json.dumps({"token": "example-token", "record": "example-record"}))):
+            with os.fdopen(os.open(machine[key], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+                f.write(text)               # as the hub keeps them: files of this user with mode 600
+
+        def shown():
+            code, answer = self.request("/ui/team?db=test-generation")
+            self.assertEqual(code, 200, answer)
+            return {"google": [a["email"] for a in answer["google"]["accounts"]],
+                    "problem": answer["google"]["problem"], "mcp": answer["tools"]["crm"]["connected"],
+                    "app": answer["github"]["app"], "door": answer["github"]["door"]}
+
+        with contextlib.ExitStack() as stack:
+            stand_for_the_machine(stack, machine)
+            stack.enter_context(patch.dict(hub.GOOGLE_OPENED, {"last": None, "key": None, "vault": None}))
+            with patch.dict(hub.CFG):       # a hub with no file of its own: each test's hub until 16 November 2026
+                for key in HUB_FILES:
+                    hub.CFG.pop(key, None)
+                self.assertEqual(shown(), {"google": ["someone@example.com"], "problem": None, "mcp": True,
+                                           "app": True, "door": True})
+            self.assertEqual(shown(), {"google": [], "problem": None, "mcp": False, "app": False, "door": False})
+            hub.google_store({"accounts": {"other@example.com": account}})     # sealed, with a key that it makes
+            hub.GOOGLE_OPENED.update(last=None, key=None)       # so that the next read opens the file with that key
+            self.assertEqual(shown(), {"google": ["other@example.com"], "problem": None, "mcp": False, "app": False,
+                                       "door": False})
+        self.assertEqual(sorted(os.listdir(os.path.join(self.tmp.name, "machine"))),
+                         ["door.json", "github-app.pem", "google.json", "mcp.json"])
+        with open(machine["google_file"], encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"accounts": {"someone@example.com": account}})
+        self.assertTrue(os.path.isfile(os.path.join(self.tmp.name, "google-file.key")))
+
+    def test_a_file_that_the_test_set_itself_stays_and_each_setting_comes_back(self):
+        """own_files gives only what the test did not set (a setting that holds nothing is not set), and its cleanup
+        leaves hub.CFG as it found it."""
+        probe = unittest.TestCase()
+        with patch.dict(hub.CFG):
+            for key in HUB_FILES:
+                hub.CFG.pop(key, None)
+            hub.CFG.update(google_file="/the/tests/own/google.json", mcp_file=None)
+            before = dict(hub.CFG)
+            own_files(probe, "/a/folder")
+            self.assertEqual({key: hub.CFG[key] for key in HUB_FILES},
+                             dict(hub_files("/a/folder"), google_file="/the/tests/own/google.json"))
+            probe.doCleanups()
+            self.assertEqual(hub.CFG, before)
+
+    def test_each_test_class_that_makes_a_hub_handler_gives_its_hub_files_of_its_own(self):
+        """One rule for every class, so that no class depends on which routes its tests reach: a class whose hub
+        serves a request, or whose test builds a hub.Handler by hand, calls own_files in its setUp (OwnerAPI.setUp
+        does). Until 16 November 2026, 31 classes had no file of their own or only the attachment folder
+        (own_attachments), from seven setUps: test_runtime.Runtime, which the classes of test_asking, test_loose_ends,
+        test_presence and test_secret_requests.TaskWaitPaths take, test_host_origin.LocalHub, which test_gzip_answers
+        and test_answer_write take, test_screen_failure.ScreenFailure, test_app_server_tasks.AppServerTasks,
+        test_site_mfa.SiteMfa, test_answer_write.Bare and test_refusal_words.Paths. A route of such a hub read the
+        Google accounts, the MCP connections, the GitHub App and the door's secrets of the machine that ran it. The
+        made-up modules hold a class for each way to a handler that the scan follows, and a class for each way to
+        files of its own or to no handler at all; the names of the first kind are in `named`."""
+        one = textwrap.dedent('''\
+            import functools
+            import inspect
+            import unittest
+            import wsgiref.simple_server
+            from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+
+            import hub
+            from test_ui_api import own_attachments, own_files
+
+            ADDRESS = ('127.0.0.1', 0)
+            H = hub.Handler
+
+
+            def serve():
+                return ThreadingHTTPServer(ADDRESS, hub.Handler)
+
+
+            def listen(handler, owner):
+                return ThreadingHTTPServer(ADDRESS, handler)
+
+
+            def listen_by_default(handler=hub.Handler):
+                return ThreadingHTTPServer(ADDRESS, handler)
+
+
+            def give(test):
+                own_files(test, '/x')
+
+
+            class Mine(hub.Handler):
+                pass
+
+
+            class Threaded(HTTPServer):
+                pass
+
+
+            class Listening(ThreadingHTTPServer):
+                def __init__(self):
+                    super().__init__(ADDRESS, hub.Handler)
+
+
+            class Case(unittest.TestCase):
+                def test_a(self):
+                    pass
+
+
+            class ByName(Case):
+                def setUp(self):
+                    ThreadingHTTPServer(ADDRESS, H)
+
+
+            class ByLocalName(Case):
+                def setUp(self):
+                    h = hub.Handler
+                    ThreadingHTTPServer(ADDRESS, h)
+
+
+            class BySubclass(Case):
+                def setUp(self):
+                    ThreadingHTTPServer(ADDRESS, Mine)
+
+
+            class ByServerOfItsOwn(Case):
+                def setUp(self):
+                    Threaded(ADDRESS, hub.Handler)
+
+
+            class ByInit(Case):
+                def setUp(self):
+                    Listening()
+
+
+            class ByPartial(Case):
+                def setUp(self):
+                    ThreadingHTTPServer(ADDRESS, functools.partial(hub.Handler))
+
+
+            class ByKeyword(Case):
+                def setUp(self):
+                    ThreadingHTTPServer(ADDRESS, RequestHandlerClass=hub.Handler)
+
+
+            class ByHand(Case):
+                def test_b(self):
+                    hub.Handler.__new__(hub.Handler).send(204)
+
+
+            class ByCall(Case):
+                def test_b(self):
+                    hub.Handler(None, None, None)
+
+
+            class ByFunction(Case):
+                def setUp(self):
+                    serve()
+
+
+            class BySelf(Case):
+                def setUp(self):
+                    self.serve()
+
+                def serve(self):
+                    serve()
+
+
+            class ByParameter(Case):
+                def setUp(self):
+                    listen(hub.Handler, self)
+
+
+            class ByDefault(Case):
+                def setUp(self):
+                    listen_by_default()
+
+
+            class ByMethodParameter(Case):
+                def setUp(self):
+                    self.start(hub.Handler)
+
+                def start(self, handler):
+                    ThreadingHTTPServer(ADDRESS, handler)
+
+
+            class ByFactory(Case):
+                def setUp(self):
+                    wsgiref.simple_server.make_server('', 0, None, handler_class=hub.Handler)
+
+
+            class InAFunction(Case):
+                def test_b(self):
+                    class Mine(hub.Handler):
+                        pass
+                    ThreadingHTTPServer(ADDRESS, Mine)
+
+
+            class StandIn(Case):
+                def test_b(self):
+                    class Mine(BaseHTTPRequestHandler):
+                        pass
+                    ThreadingHTTPServer(ADDRESS, Mine)
+
+
+            class InTheBody(Case):
+                server = serve()
+
+
+            class OnlyAttachments(Case):
+                def setUp(self):
+                    own_attachments(self, '/x')
+                    serve()
+
+
+            class NotTheFunction(Case):
+                def setUp(self):
+                    self.own_files()
+                    serve()
+
+                def own_files(self):
+                    pass
+
+
+            class Owned(ByFunction):
+                def setUp(self):
+                    own_files(self, '/x')
+                    super().setUp()
+
+
+            class GivenByAFunction(Case):
+                def setUp(self):
+                    give(self)
+                    serve()
+
+
+            class OnceForTheClass(Case):
+                @classmethod
+                def setUpClass(cls):
+                    serve()
+
+                def setUp(self):
+                    own_files(self, '/x')
+
+
+            class Patched(Case):
+                def test_b(self):
+                    patch.object(hub.Handler, 'allowed', None)
+                    self.assertNotIn(hub.Handler, vars(hub))
+                    inspect.getmembers(hub.Handler)
+
+
+            class Files(Case):
+                def setUp(self):
+                    own_files(self, '/x')
+
+
+            class Left(Files):
+                pass
+
+
+            class Right(Files):
+                def setUp(self):
+                    serve()
+
+
+            class Both(Left, Right):
+                pass
+            ''')
+        two = textwrap.dedent('''\
+            import test_one as one
+            from test_ui_api import OwnerAPI
+
+
+            class Inherited(one.ByFunction):
+                pass
+
+
+            class Super(one.ByFunction):
+                def setUp(self):
+                    super().setUp()
+
+
+            class Taken(one.Case):
+                setUp = one.ByFunction.setUp
+
+
+            class ByBase(one.Case):
+                def setUp(self):
+                    one.BySelf.serve(self)
+
+
+            class Given(one.ByFunction):
+                def setUp(self):
+                    one.give(self)
+                    super().setUp()
+
+
+            class Owners(OwnerAPI):
+                def setUp(self):
+                    super().setUp()
+            ''')
+        three = textwrap.dedent('''\
+            import unittest
+            from http.server import ThreadingHTTPServer
+
+            import hub
+
+            SERVER = ThreadingHTTPServer(('127.0.0.1', 0), hub.Handler)
+
+
+            class AtTheTop(unittest.TestCase):
+                def test_a(self):
+                    pass
+            ''')
+        four = textwrap.dedent('''\
+            import unittest
+            from http.server import ThreadingHTTPServer
+
+            import hub
+
+
+            def setUpModule():
+                ThreadingHTTPServer(('127.0.0.1', 0), hub.Handler)
+
+
+            class InSetUpModule(unittest.TestCase):
+                def test_a(self):
+                    pass
+            ''')
+        named = ["test_one." + name for name in (
+            "ByName", "ByLocalName", "BySubclass", "ByServerOfItsOwn", "ByInit", "ByPartial", "ByKeyword", "ByHand",
+            "ByCall", "ByFunction", "BySelf", "ByParameter", "ByDefault", "ByMethodParameter", "ByFactory",
+            "InAFunction", "InTheBody", "OnlyAttachments", "NotTheFunction", "Right", "Both")] +["test_two.Inherited", "test_two.Super", "test_two.Taken", "test_two.ByBase",
+                                 "test_three.AtTheTop", "test_four.InSetUpModule"]
+        here = Path(KIT, "test_ui_api.py").read_text(encoding="utf-8")
+        self.assertEqual(hubs_with_no_files({"test_ui_api": here, "test_one": one, "test_two": two,
+                                             "test_three": three, "test_four": four})[0], sorted(named))
+        without, making = hubs_with_no_files({path.stem: path.read_text(encoding="utf-8")
+                                              for path in Path(KIT).glob("test_*.py")})
+        self.maxDiff = None                     # the name of each class
+        self.assertEqual(without, [], "a test class that makes a hub.Handler gives its hub files of its own: "
+                         "own_files(self, <a folder of the test>) in its setUp (test_ui_api.own_files)")
+        self.assertGreater(making, 300, "the scan found too few: its pattern no longer matches the tests")
 
 
 class HubProcesses(unittest.TestCase):

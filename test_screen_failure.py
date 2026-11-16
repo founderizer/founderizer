@@ -22,7 +22,7 @@ import fleet
 from leftovers import scratch_home
 import hub
 import threads
-from test_ui_api import own_attachments
+from test_ui_api import own_files
 
 SESSION = "0b7d5a8e-3c1f-4e2a-9d6b-1f2e3d4c5b6a"
 REASON = "Codex model/list has 0 default models, not one"
@@ -48,7 +48,7 @@ def result(seq, stop="error"):
 class ScreenFailure(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="fleet-screen-failure-test-")
-        own_attachments(self, self.tmp.name + "/attachments")     # hub.tick() sweeps it
+        own_files(self, self.tmp.name)      # its attachments, which hub.tick() sweeps, and the hub's other files
         hub.DB = sqlite3.connect(self.tmp.name + "/test.db", check_same_thread=False)
         hub.DB.row_factory = sqlite3.Row
         hub.DB.executescript(hub.SCHEMA)

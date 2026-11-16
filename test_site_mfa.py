@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 import fleet
 import hub
+from test_ui_api import own_files
 
 SEED = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"          # the published test key of RFC 6238: the totp of a login for it
 USER, WORD = "pilot-mfa", "synthetic-word-for-mfa-0001"         # stand-ins; never a real value
@@ -150,6 +151,7 @@ class SiteMfa(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="fleet-site-mfa-")
         self.addCleanup(self.tmp.cleanup)
+        own_files(self, self.tmp.name)      # no route of this hub reads a file of the machine (test_ui_api.OwnFiles)
         hub.DB = sqlite3.connect(self.tmp.name + "/test.db", check_same_thread=False)
         hub.DB.row_factory = sqlite3.Row
         hub.DB.executescript(hub.SCHEMA)

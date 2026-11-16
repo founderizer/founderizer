@@ -8,8 +8,11 @@ servers, an owner chat's profile and recap, a closed session's settings with its
 Each test builds one command with data of several times 16 KiB, with quotes, $, backticks and $(...), and checks that
 the command stays under 8 KiB. Then each shell that tmux may run it in (sh, bash, dash and zsh, as this machine has
 them) runs it, with a stand-in program that keeps the arguments it was given: the program gets the data whole, the
-shell ran no word of it, and each file that the shell reads is gone. And only the file of a session credential counts
-as one (fleet.holds_credential). No AI, no network, no tmux."""
+shell ran no word of it, and each file that the shell reads is gone. A first prompt longer than one argument takes
+reaches the program with its start and its end, and a line in place of its middle (fleet.fit_prompt). And only the
+file of a session credential counts as one (fleet.holds_credential). No AI, no network, no tmux."""
+import contextlib
+import io
 import json
 import os
 import re
@@ -277,31 +280,175 @@ class Sizes(unittest.TestCase):
         self.assertEqual(given["argv"], words[words.index(str(self.root / "kept" / "claude-2.1.312")) + 1:])
         self.assertEqual(json.loads(self.private(given["argv"][given["argv"].index("--settings") + 1])), settings)
 
-    def test_a_first_prompt_longer_than_one_argument_is_refused_with_its_size(self):
+    def linux_limit(self):
+        """ARG_MOST as Linux has it with pages of 4 KiB, which no machine's own limit is under, and the AGENTS.md of a
+        checkout whose Codex sessions start with their stable text (fleet.stable_text)."""
+        limit = patch.object(fleet, "ARG_MOST", 32 * 4096 - 1)
+        limit.start()
+        self.addCleanup(limit.stop)
+        (self.kit / "AGENTS.md").write_bytes((self.kit / "RULES.md").read_bytes())
+
+    def left_out(self, prompt, count=1):
+        """The parts of a prompt on each side of its LEFT_OUT lines, and the cut that each line names."""
+        line = re.compile(re.escape(fleet.LEFT_OUT).replace(r"\{cut\}", r"(\d+)")
+                          .replace(r"\{most\}", str(fleet.ARG_MOST)))
+        found = list(line.finditer(prompt))
+        self.assertEqual(len(found), count, prompt[:300])
+        sides = line.split(prompt)[::2]
+        return sides, [int(f.group(1)) for f in found]
+
+    def test_a_first_prompt_longer_than_one_argument_loses_its_middle_and_the_session_starts(self):
         """The next limit is the program's: a first prompt is one argument, and exec takes one of at most ARG_MOST
-        bytes (Linux: 32 pages; macOS: half of what all the arguments and the environment may hold). A longer one is
-        refused with its size before any file of its start is written, so no env file with the session's credential
-        and keys stays behind at each new try; and one of that size reaches the program whole."""
-        fits = "é" * (fleet.ARG_MOST // 2) + "x" * (fleet.ARG_MOST % 2)
+        bytes (Linux: 32 pages; macOS: half of what all the arguments and the environment may hold). One of that size
+        reaches the program whole. A longer one loses a middle, with a line that says how much went, and the session
+        starts: a refusal there stopped every start of the standing session again, as tmux's limit had. A stable text,
+        and a chat's instructions and profile, come first and stay whole, so the session has what it is told it has;
+        the session's own part keeps its start, which names its task, and its end: the brief's last words, and the
+        marker that binds a Codex session to its rollout. Each cut ends at a line end, and the helper's log says how
+        much went. With Linux's limit on every machine, so that the same sizes cut in the same places."""
+        self.linux_limit()
+        fits = "\u00e9" * (fleet.ARG_MOST // 2) + "x" * (fleet.ARG_MOST % 2)
         self.assertEqual(len(fits.encode()), fleet.ARG_MOST)
         given = self.run_window("codex " + fleet.file_prompt(AGENT, "manager", fits))
         self.assertEqual(given["argv"], [fits])
-        with self.assertRaises(fleet.Refused) as said:
-            fleet.file_prompt(AGENT, "manager", fits + "x")
-        self.assertIn(f"its first prompt is {fleet.ARG_MOST + 1} bytes", str(said.exception))
+        head = f"Your task, first: `touch {self.ran}` $(touch {self.ran})\n"
+        last = "Then call read_messages: its read is the receipt."
+        # a third over the limit, in numbered lines of two-byte characters with a shell's words in each
+        long = head + "".join(f"{i:06d} " + "\u00e9" * 40 + " \"q\" `true` $(true) $HOME\n"
+                              for i in range(fleet.ARG_MOST // 80)) + last
+        self.assertGreater(len(long.encode()), fleet.ARG_MOST * 6 // 5)
+        profile = (self.kit / "profiles" / f"{AGENT}.md").read_text().strip()
         keys = {"EXAMPLE_API_KEY": "example-value"}
-        for name, start in (
-                ("codex manager", lambda: fleet.session_command(AGENT, CODEX_MANAGER, fits + "x", session=SESSION,
-                                                                token=TOKEN, env=keys)),
-                ("claude manager", lambda: fleet.session_command(AGENT, MANAGER, fits + "x", session=SESSION,
-                                                                 token=TOKEN, env=keys)),
-                ("codex task", lambda: fleet.session_command(AGENT, CODEX, fits + "x", task="T-7", generation="g1",
-                                                             session=SESSION, token=TOKEN, env=self.env(**keys))),
+        marker = "\n\n" + fleet.MARKER.format(SESSION)
+        # 50 repositories: a stable text that leaves its task a quarter of the limit (the next test has 500)
+        some = dict(self.env(**keys), FLEET_REPOS=" ".join(REPOS.split()[:50]))
+        repos = ("acme/repository-000-", "acme/repository-049-")
+        for name, start, ends, whole in (
+                ("codex manager", lambda: fleet.session_command(AGENT, CODEX_MANAGER, long, session=SESSION,
+                                                                token=TOKEN, env=keys), last + marker, ()),
+                ("claude manager", lambda: fleet.session_command(AGENT, MANAGER, long, session=SESSION, token=TOKEN,
+                                                                 env=keys), last, ()),
+                # a Codex task's text without its stable text ends with its repositories and catalog servers
+                ("codex task", lambda: fleet.session_command(AGENT, CODEX, long, task="T-7", generation="g1",
+                                                             session=SESSION, token=TOKEN, env=self.env(**keys)),
+                 "Their tools are mcp__<server>__*." + marker, ()),
                 ("codex chat", lambda: fleet.chat_command(AGENT, CODEX, "g1", token=TOKEN, marker=SESSION, env=keys,
-                                                          recap=fits))):
-            with self.subTest(name), self.assertRaises(fleet.Refused):
-                start()
-            self.assertEqual(list(self.sessions.iterdir()), [], name)      # no file of it, and none before
+                                                          recap=long), last + marker, (profile,)),
+                ("codex manager, stable", lambda: fleet.session_command(AGENT, CODEX_MANAGER, long, session=SESSION,
+                                                                        token=TOKEN, env=keys, rules=[]),
+                 last + marker, (profile,)),
+                ("codex task, stable", lambda: fleet.session_command(
+                    AGENT, CODEX, long, task="T-7", generation="g1", session=SESSION, token=TOKEN, env=some,
+                    opening="prompt", rules=[]), last + marker, (profile,) + repos),
+                ("codex chat, stable", lambda: fleet.chat_command(AGENT, CODEX, "g1", token=TOKEN, marker=SESSION,
+                                                                  env=keys, recap=long, rules=[]),
+                 last + marker, (profile,))):
+            with self.subTest(name):
+                log = io.StringIO()
+                with contextlib.redirect_stdout(log):
+                    command = start()
+                self.small(command)
+                prompt = self.run_window(command)["argv"][-1]
+                self.assertLessEqual(len(prompt.encode()), fleet.ARG_MOST)
+                (before, after), (cut,) = self.left_out(prompt)
+                self.assertGreater(cut, 0)
+                self.assertIn(f"{cut} bytes of its first prompt are left out", log.getvalue())
+                self.assertTrue(after.endswith(ends), after[-200:])
+                self.assertEqual(prompt.count("\n" + last), 1)
+                for part in whole:                  # what comes first stays whole, before the cut
+                    self.assertIn(part, before)
+                # the stable subtests take the stable path, whose text says that the profile is in the context
+                self.assertEqual("do not read them again" in before, name.endswith("stable"))
+                self.assertIn(head, before)         # the session's own part keeps its start
+                self.assertTrue(before.endswith("$HOME"), before[-80:])     # a whole line on each side of the cut
+                self.assertRegex(after, r"\A\d{6} \u00e9")
+                self.assertFalse(self.ran.exists())
+
+    def test_a_stable_text_longer_than_its_room_loses_its_middle_too(self):
+        """A stable text that would leave the session's own part less than a quarter of ARG_MOST loses its middle as
+        well: the session's part keeps that quarter, with its start and its end, and the whole fits."""
+        self.linux_limit()
+        (self.kit / "profiles" / f"{AGENT}.md").write_text(
+            "# Profile\n\nPROFILE-START\n" + "A line of the profile, with $HOME and `true` in it.\n" *
+            (fleet.ARG_MOST // 50) + "PROFILE-END\n")
+        head, last = "Your task, first.\n", "Then call read_messages: its read is the receipt."
+        long = head + "Another line of the task's block.\n" * (fleet.ARG_MOST // 100) + last
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            command = fleet.session_command(AGENT, CODEX, long, task="T-7", generation="g1", session=SESSION,
+                                            token=TOKEN, env=self.env(), opening="prompt", rules=[])
+        self.small(command)
+        prompt = self.run_window(command)["argv"][-1]
+        self.assertLessEqual(len(prompt.encode()), fleet.ARG_MOST)
+        (stable, own, after), cuts = self.left_out(prompt, 2)
+        self.assertTrue(all(cuts))
+        self.assertIn(f"T-7: {sum(cuts)} bytes of its first prompt are left out", log.getvalue())
+        self.assertIn("PROFILE-START", stable)
+        self.assertNotIn("PROFILE-END", stable)             # in its own lost middle
+        self.assertIn("acme/repository-499-", own)          # the stable text's end: its repositories
+        self.assertIn(head, own)
+        self.assertTrue(after.endswith(last + "\n\n" + fleet.MARKER.format(SESSION)))
+        mine = len(own[own.index(head):].encode()) + len(fleet.LEFT_OUT.format(cut=cuts[1], most=fleet.ARG_MOST)
+                                                          .encode()) + len(after.encode())
+        self.assertLessEqual(mine, fleet.ARG_MOST // 4)                     # the task's own part: its quarter
+        self.assertGreater(mine, fleet.ARG_MOST // 4 - 2 * fleet.LINE_NEAR - 8)
+
+    def test_fit_argument_keeps_whole_characters_and_near_line_ends_within_its_limit(self):
+        """fit_argument: a text that fits, to the byte, is given back as it is. A longer one is at most `most` bytes,
+        keeps its start and its end with no character cut in two, and loses only the middle that the line names. Each
+        side ends at a line end within LINE_NEAR bytes of the cut, keeps a line that already starts or ends there, and
+        is cut where its bytes end when no line end is near: one long line is not lost whole, and a last line end does
+        not take the end away."""
+        for most in (2048, 4096):
+            for char in ("x", "\u00e9", "\u4e2d", "\U0001F600"):
+                fits = char * (most // len(char.encode()))
+                fits += "x" * (most - len(fits.encode()))
+                self.assertEqual(fleet.fit_argument(fits, most), (fits, 0))
+                fitted, cut = fleet.fit_argument(fits + "x", most)
+                self.assertTrue(cut > 0 and len(fitted.encode()) <= most, (char, most))
+            for text in ("\U0001F600" * 3000, "\u4e2d\u6587" * 2500, "ab\n" * 3000, ("\u00e9" * 37 + "\n") * 300,
+                         "line\r\n" * 2000, "\n" * 9000, "first\n" + "y" * 9000 + "\nlast", "x" * 50 + "\n" * 3):
+                for extra in ("", "z", "zz\n", "z" * 977):
+                    whole = text + extra
+                    fitted, cut = fleet.fit_argument(whole, most)
+                    size = len(whole.encode())
+                    if size <= most:
+                        self.assertEqual((fitted, cut), (whole, 0))
+                        continue
+                    self.assertLessEqual(len(fitted.encode()), most, (most, size))
+                    note = fleet.LEFT_OUT.format(cut=cut, most=most)
+                    self.assertEqual(fitted.count(note), 1)
+                    before, _, after = fitted.partition(note)
+                    self.assertEqual(len(before.encode()) + len(after.encode()) + cut, size)
+                    self.assertTrue(whole.startswith(before) and whole.endswith(after) and after)
+            room = lambda size: most - len(fleet.LEFT_OUT.format(cut=size, most=most).encode())
+            # short lines: both sides end at a line end
+            whole = "ab\n" * 3000
+            before, _, after = fleet.fit_argument(whole, most)[0].partition("\n\n[")
+            after = after.split("]\n\n", 1)[1]
+            self.assertEqual((whole[len(before)], whole[-len(after) - 1]), ("\n", "\n"))
+            # one long line at each cut: cut where its bytes end, so nearly all of the room stays
+            whole = "You are the manager.\n" + "y" * (most * 3) + "\nThen call read_messages."
+            fitted, _ = fleet.fit_argument(whole, most)
+            self.assertGreaterEqual(len(fitted.encode()), most - 4)
+            self.assertTrue(fitted.startswith("You are the manager.\n"))
+            self.assertTrue(fitted.endswith("\nThen call read_messages."))
+            # a last line end after a long last line: the end stays
+            whole = "first\n" + "z" * (most * 3) + "\n"
+            fitted, _ = fleet.fit_argument(whole, most)
+            self.assertTrue(fitted.endswith("z" * (most // 4) + "\n"), fitted[-40:])
+            # sides that already end and start at a line end keep each of their lines
+            size = most * 3
+            end, start = room(size) // 2, size - (room(size) - room(size) // 2)
+            whole = "a" * (end // 2) + "\n" + "a" * (end - end // 2 - 1) + "\n" + "b" * (start - end - 2) + "\n" + \
+                "c" * ((size - start) // 2) + "\n" + "c" * (size - start - (size - start) // 2 - 1)
+            self.assertEqual(len(whole), size)
+            fitted, cut = fleet.fit_argument(whole, most)
+            self.assertEqual(fitted, whole[:end] + fleet.LEFT_OUT.format(cut=start - end, most=most) + whole[start:])
+            # a line end of \r\n just after the cut: the head keeps that line whole, up to its \r
+            whole = "a" * (end - 10) + "\n" + "a" * 9 + "\r\n" + "b" * (size - end - 2)
+            self.assertEqual(len(whole), size)
+            self.assertEqual(fleet.fit_argument(whole, most)[0].partition("\n\n[")[0], whole[:end])
 
     def test_the_argument_limit_is_the_machines_own(self):
         """fleet.arg_most: Linux takes one argument of at most 32 pages with its closing NUL, and each machine at most

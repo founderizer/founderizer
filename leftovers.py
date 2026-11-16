@@ -144,7 +144,8 @@ def hub_files(folder):
     """The hub.CFG settings that give a hub its own files in `folder`. A hub with none of them reads and writes those
     of ~/.fleet on the machine that runs it, and its timer removes every file of ~/.fleet/attachments that its own
     database does not name. Each tool that serves a hub in its own process passes them (ui_fixture.py and the decode
-    check: test_ui_api.OwnFiles reads that), and in a test process the writers fail before they write
+    check: test_ui_api.AttachmentFolder reads that), test_ui_api.OwnerAPI.setUp gives a test's hub each one that the
+    test does not set itself (test_ui_api.own_files), and in a test process the writers fail before they write
     (test_ui_api.own_file_first). On 13 November 2026 each run of the decode check left a file of its upload in
     ~/.fleet/attachments of the owner's Mac."""
     return {key: os.path.join(folder, name) for key, name in HUB_FILES.items()}
