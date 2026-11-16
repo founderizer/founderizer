@@ -7988,8 +7988,9 @@ def authority(actor, target, action):
 # of that task by themselves, so the agent names the message once, when the work begins. Work that no message of the
 # owner's began (a wake-up, a case, a review) has no ask. The hub decides nothing about an ask's state: the apps read
 # it from the states of its tasks, with the rules of their Tasks page.
-ASKED_CHARS = 48                # characters of the name of what the owner asked for: one line of the panel of a
-#                                 chat, 380 points wide, at 13 points
+ASKED_CHARS = 40                # characters of the name of what the owner asked for: one line of the panel of a
+#                                 chat at its usual width, 380 points, at 13 points. It was 48, and the first real
+#                                 picture of that panel cut a name of 45 characters at its 40th.
 ASK_REF = re.compile(r"(?i)^\s*M-?(\d+)\s*$")
 ASK_NEED_REF = re.compile(r"(?i)^\s*N-?(\d+)\s*$")
 ASK_NAME_CODES = re.compile(r"(?:" + NEED_CODES.pattern + r")\s*[:;,]?")    # a code with the mark that stood after it
@@ -28894,7 +28895,7 @@ TOOLS = [
                                                  "item of that work. Leave it out for work that no message of the "
                                                  "owner's began, and for a task with follows"},
         "asked": {"type": "string", "description": "Only on the first task of that message: the thing to be done, "
-                                                   "as a short verb phrase of at most 48 characters, for example "
+                                                   "as a short verb phrase of at most 40 characters, for example "
                                                    "\"Move the shop to the new server\". Never the message's first "
                                                    "words, a yes, a code or an agent's name. A message that asks "
                                                    "for more than one thing: name them together. The owner reads "
@@ -29762,7 +29763,7 @@ TOOLS = [
         "in_reply_to": {"type": "string", "description": "The request UUID of the owner's message that asks for the "
                                                          "work: the one that your sentence before this call named"},
         "asked": {"type": "string", "description": "Give it: the thing to be done, as a short verb phrase of at "
-                                                   "most 48 characters, for example \"Check the disk of the shop's "
+                                                   "most 40 characters, for example \"Check the disk of the shop's "
                                                    "server\", with no code and no agent's name. The owner reads it "
                                                    "as the name of this work in their apps; the title is for the "
                                                    "task's own session. Without it, the hub makes the name from "
