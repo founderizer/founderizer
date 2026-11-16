@@ -56,6 +56,15 @@ OLD = {
     "agent_mid_turn": "{agent} is in the middle of a turn. Move it when the turn ends.",
     "agent_open_signin": "{agent} has an open sign-in. Finish it or let it run out, then try again.",
     "time_passed": "this time has passed; change the time first",
+    "google_file_mode": "the Google file of the hub must be a regular file of the hub user with mode 600",
+    "google_file_unreadable": "the Google file of the hub cannot be read: it is not a JSON object with accounts",
+    "google_no_client": "This hub's release has no Google client. Update the hub, then connect again.",
+    "google_no_secret": "Founderizer's Google app cannot be read from founderizer.com now, so nothing was started. Try "
+                        "again in a few minutes.",
+    "connect_stale": "This Connect expired, or another one took its place. Start Connect again.",
+    "google_refused": "Google refused: {reason}. Start Connect again.",
+    "google_revoked_during": "A Disconnect of this account came during this Connect, so nothing was connected. Start "
+                             "Connect again.",
 }
 
 # The places of hub.py that were converted to a code, by the function that holds each: the scan of 16 November 2026
@@ -67,6 +76,7 @@ SITES = {
     'attachment_check': {'login_as_file': 1},
     'command_run': {'command_interrupted': 1, 'command_reused': 1, 'hub_changed_sending': 1, 'login_as_text': 1},
     'enroll_new_device': {'not_owner_device_no_code': 1},
+    'google_file_refusal': {'google_file_mode': 1, 'google_file_unreadable': 1},
     'grant_server': {'no_such_agent': 1},
     'key_swap_entry': {'no_such_server': 1},      # Part B of the key swap: the 404 of both of its routes
     'knowledge_add': {'revision_unreadable': 1},
@@ -121,6 +131,8 @@ SITES = {
     'ui_door': {'hub_changed': 1},
     'ui_events': {'hub_changed': 1, 'no_such_task': 1},
     'ui_github_repos': {'hub_changed': 1},
+    'ui_google_connect': {'google_no_client': 1, 'google_no_secret': 1},
+    'ui_google_finish': {'connect_stale': 1, 'google_refused': 1, 'google_revoked_during': 1},
     'ui_goal': {'hub_changed': 1},
     'ui_health': {'hub_changed': 1},
     'ui_history': {'hub_changed': 1},
@@ -157,7 +169,10 @@ SITES = {
 }
 # The one place that writes a sentence of the table and has no code yet: a registered login that a batch of the secrets
 # import refuses, which is an entry's `error` in an answer that succeeded, and no refusal of the whole command.
-LEFT = {"a registered login cannot be sent as text": 1}
+LEFT = {"a registered login cannot be sent as text": 1,
+        # The MCP Connect's finish writes the sentence of connect_stale by hand (MCP_STALE): its lane gives it that
+        # code when it converts its refusals, as Google's Connect did (UI-API.md 1.185).
+        "This Connect expired, or another one took its place. Start Connect again.": 1}
 # The names that a call's own parameters use, which a hole cannot take
 RESERVED = {"code", "names", "table", "extra", "status", "message", "self", "cls"}
 
@@ -387,7 +402,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 135)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 142)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

@@ -969,8 +969,11 @@ other machine every owner route answers 403, and the server says so in those wor
 In or out: no password, no API key, no provider token, no entitlement, no Tailscale auth key.
 `test_owner_mcp.NoSecret` holds the server to it two ways: no tool takes an argument whose name is
 one of those things, and the owner routes that do carry a credential are **not tools of this
-server at all** — the subscription token, the GitHub App's private key, a chat bot token, Google's
-client secret, the secret catalog's fingerprints and the restore of a copy. Those stay the app's,
+server at all** — the subscription token, the GitHub App's private key, a chat bot token, the
+secret catalog's fingerprints and the restore of a copy. Google's Connect carries none since owner
+API 1.185 (the hub's release has the ID of Founderizer's own Google app, and founderizer.com gives the hub its
+secret), so `connect_google` is a tool:
+Google's code goes to the tool's own listener and on to the hub, never into a field or an answer. Those stay the app's,
 because this server would be the thing that carried the value.
 
 Two kinds of short text do pass, and both are allowed by RULES.md, "Logins":
@@ -1058,6 +1061,7 @@ would read as an empty fleet instead of as a mistake.
 | `pause_chat_apps` | `/ui/chat-apps/pause` | Pause all: every inbound message and every outbound item at once. |
 | `link_chat_app` | `/ui/chat-apps/<id>/link`, `/unlink` | Link or unlink a WhatsApp account. The QR is a read. |
 | `send_again` | `/ui/outbound/<id>/again` | Send one chat message again, for an unknown or failed one. |
+| `connect_google` | `/ui/google/connect`, `/ui/google/finish` | Connect one service (Gmail or Google Drive) of a Google account, as the app's Connect account does: Google's page in the owner's browser, the code on this server's own listener. The account then has no agent: `grant_access` gives it. The program in the app has it as `absent`. |
 | `disconnect_google` / `disconnect_mcp_server` | `/ui/google/disconnect`, `/ui/mcp/disconnect` | End a saved connection. The grants stay. |
 | `attach_file` / `read_attachment` / `keep_attachment` | `/ui/attachments*` | A file to the hub, a file back to this Mac, and keeping one. |
 | `owner_device` / `device_code` | `/ui/owner/devices[/<d>/code]` | The owner's phones, and one enrollment code. Its key is the phone's. |
@@ -1116,7 +1120,7 @@ server is not allowed to carry.
 
 1. **Bring a new credential into the fleet.** The subscription token the shop issues for this
    fleet (`POST /ui/releases/entitlement`), the GitHub App's private key, a chat app's bot token,
-   Google's Connect, a vault login (also the one an agent asks for with `request_secret`, whose
+   a vault login (also the one an agent asks for with `request_secret`, whose
    answer, `POST /ui/needs/<id>/secret`, only the app's secure form gives, once the value is in the
    vault; its decline carries no value, so `decline_secret_request` sends that one) and the
    Tailscale auth key itself. Each is the owner's account,
@@ -1131,7 +1135,9 @@ server is not allowed to carry.
    but the page in between is the provider's own, in the owner's own browser, under the terms on
    which Founderizer may host the unmodified runtime at all: each end user signs in through the
    vendor's flow, and the operator never collects or intermediates the credential. The agent gives
-   the owner the link and waits for the code.
+   the owner the link and waits for the code. Google's Connect is the same (`connect_google`, owner
+   API 1.185): the tool opens Google's page in the owner's own browser, and only the owner chooses the
+   account and presses Allow there; the code comes back to the tool's own listener, not to the agent.
 3. **Be the owner on another machine.** The authority *is* the owner's Mac. An agent that runs in
    the cloud, on a worker or on anyone else's computer gets 403 from every owner route, and no
    argument to any tool changes that. The claim can only be made from the Mac that will own the

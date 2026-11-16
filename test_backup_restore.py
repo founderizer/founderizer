@@ -369,8 +369,12 @@ class HubOnly(Fixture):
         notes = self.notes()
         self.assertNotIn("0 MCP servers", notes)
         self.assertNotIn("0 Google accounts", notes)
-        self.assertIn("no MCP server connected, so there is nothing of those to put back", notes)
-        self.assertIn("no connected account yet", notes)        # the client is there and he would need it
+        # A client alone is nothing to put back since owner API 1.185: a new hub connects with Founderizer's own
+        # Google client (its release brings the ID, founderizer.com the secret), so no step sends him to find a client
+        # file. With the empty mcp.json, this hub had nothing at all to put back.
+        self.assertIn("**Nothing else.**", notes)
+        self.assertNotIn("client file", notes)
+        self.assertNotIn("Connect Google again", notes)
 
     def test_a_file_the_hub_itself_would_refuse_is_counted_as_there_and_not_counted(self):
         """A `google.json` whose mode is wrong is one the hub will not read either. The copy says it is there,

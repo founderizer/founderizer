@@ -9,6 +9,7 @@ stand-in server of test_hub_install, also as a user who is not root. `Refusals` 
 must not do.
 """
 import contextlib
+import io
 import json
 import os
 import pathlib
@@ -26,6 +27,7 @@ import types
 import unittest
 import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 from unittest.mock import patch
 
@@ -46,7 +48,7 @@ def load_tests(loader, _tests, _pattern):
     return unittest.TestSuite(cls(name) for cls in (Admin, Boundary, FromNothing, McpServers, Refusals,
                                                     Install, Progress, RootThroughSudo, NoSecret, Shape, Table,
                                                     Parity, SecretGive, ShareStanding, ShareStandingNoWorker,
-                                                    VaultReading)
+                                                    VaultReading, GoogleConnect)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -708,8 +710,10 @@ class NoSecret(WithServer):
         # The chat-app routes are named one by one, not by their prefix: the credential is the bot token and the
         # account is not one, so POST /ui/team/chat-apps, /pause, /link and /unlink are tools here and /token is
         # not (OWNER-MCP-BOUNDARY.md section 6).
+        # Google's Connect is not among them since owner API 1.185: it carries no client secret any more, and its
+        # code goes to connect_google's own listener and on to the hub, never into a field (class GoogleConnect).
         for route in ("/ui/releases/entitlement", "/ui/github-app", "/ui/secrets/add", "/ui/secrets/fingerprints",
-                      "/ui/google/connect", "/ui/google/finish", "/ui/mcp/connect", "/ui/mcp/finish",
+                      "/ui/mcp/connect", "/ui/mcp/finish",
                       "/ui/chat-apps/{account}/token", "/token", "/ui/restore", "/ui/owner/enroll"):
             self.assertNotIn(f'"{route}"', text, route)
             self.assertNotIn(f"'{route}'", text, route)
@@ -4669,7 +4673,7 @@ class Table(unittest.TestCase):
         built = sum(1 for t in owner_mcp.tools() if getattr(t["run"], "kind", None))
         self.assertEqual(sum(len(kinds.get(k, [])) for k in self.TABLE_KINDS), built)
         self.assertEqual((len(owner_mcp.SWIFT_READS), len(owner_mcp.SWIFT_WRITES), len(owner_mcp.ABSENT), built),
-                         (4, 9, 6, 54))
+                         (4, 9, 7, 54))
         # A tool of no kind stops the dump: somebody decides which it is.
         stray = owner_mcp.tool("stray", "A tool of no kind.", {}, (), lambda _args: {})
         with self.assertRaises(ValueError) as caught:
@@ -4901,6 +4905,194 @@ class Table(unittest.TestCase):
         what = owner_mcp.PAGES["devices"][1]
         self.assertNotIn("their open enrollment codes", what)
         self.assertIn("never a code", what)
+
+
+class GoogleConnect(unittest.TestCase):
+    """`connect_google` (UI-API.md 1.185): the app's Connect, from the admin MCP. A stand-in hub answers its two
+    commands, and a stand-in browser follows Google's redirect to the tool's own listener on 127.0.0.1. No hub, no
+    Google and no real browser."""
+
+    STATE, CODE = "state-" + "s" * 37, "4/0Acode-" + "c" * 30
+    URL = "https://accounts.google.com/o/oauth2/v2/auth?client_id=456-x.apps.googleusercontent.com&state=" + "s" * 43
+
+    def connect(self, args, redirects=None, url=URL, early=False, dropped=()):
+        """(the tool's result or its Refused, the commands it sent, the pages it opened, the browser's answers).
+        early: a program of the Mac calls the listener before the hub's answer. dropped: what the finish says."""
+        sent, opened, answers = [], [], []
+        self.waits = {}
+
+        def command(route, body, what, request_id=None, timeout=None):
+            sent.append((route, dict(body)))
+            self.waits[route] = timeout
+            if route == "/ui/google/connect":
+                if early:
+                    get(body["redirect_uri"], "", {"state": "x", "code": "y"})
+                return {"url": url, "state": self.STATE, "expires_at": 1, "app": "founderizer", "verified": False}
+            return {"email": "ana@example.com", "scopes": ["gmail.modify"], "connected": True, "replaced": True,
+                    "dropped": list(dropped)}
+
+        def get(where, path, query):
+            try:
+                with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+                        where + path + "?" + urllib.parse.urlencode(query), timeout=10) as r:
+                    answers.append((r.status, r.read().decode()))
+            except urllib.error.HTTPError as e:
+                answers.append((e.code, e.read().decode()))
+
+        def browser(address):
+            opened.append(address)
+            for path, query in redirects or [("", {"state": self.STATE, "code": self.CODE})]:
+                get(sent[0][1]["redirect_uri"], path, query)
+
+        with patch.object(owner_mcp, "command", command), patch.object(owner_mcp, "open_in_browser", browser):
+            try:
+                result = owner_mcp.connect_google(args)
+            except owner_mcp.Refused as e:
+                result = e
+        return result, sent, opened, answers
+
+    def test_it_connects_through_the_hub_and_gives_back_no_code_and_no_state(self):
+        with contextlib.redirect_stderr(io.StringIO()) as said:     # the MCP client can log the server's stderr
+            result, sent, opened, answers = self.connect({"service": "gmail"})
+        self.assertNotIn(self.CODE, said.getvalue())
+        self.assertNotIn(self.STATE, said.getvalue())
+        self.assertEqual((result["dropped"], self.waits["/ui/google/finish"]), ([], owner_mcp.GOOGLE_FINISH_WAIT))
+        self.assertEqual((result["email"], result["scopes"], result["replaced"]), ("ana@example.com", ["gmail.modify"],
+                                                                                   True))
+        self.assertIn("grant_access", result["next"])
+        self.assertIn("gmail:ana@example.com", result["next"])
+        (route, body), (route2, body2) = sent
+        self.assertEqual((route, set(body), body["service"]),
+                         ("/ui/google/connect", {"redirect_uri", "service"}, "gmail"))
+        port = int(re.fullmatch(r"http://127\.0\.0\.1:(\d+)/", body["redirect_uri"]).group(1))
+        self.assertTrue(1024 <= port <= 65535, port)
+        self.assertEqual((route2, body2), ("/ui/google/finish", {"state": self.STATE, "code": self.CODE}))
+        self.assertEqual(opened, [self.URL])
+        self.assertEqual(answers, [(200, answers[0][1])])
+        self.assertIn("Founderizer is connected. You can close this tab.", answers[0][1])
+        for value in (self.CODE, self.STATE):
+            self.assertNotIn(value, json.dumps(result))
+        with self.assertRaises(OSError):                     # the listener is gone once the Connect ended
+            socket.create_connection(("127.0.0.1", port), timeout=2).close()
+        # An account to connect again: its email in lower case, as Google's login hint; Drive is a Connect of its own.
+        result, sent, _, _ = self.connect({"service": "drive", "account": " Ana@Example.com "})
+        self.assertEqual({k: sent[0][1][k] for k in ("service", "account")}, {"service": "drive",
+                                                                             "account": "ana@example.com"})
+        self.assertIn("Google Drive", result["next"])
+
+    def test_the_finish_has_its_own_wait_down_to_the_hubs_request(self):
+        """The hub's finish calls Google up to three times, so it waits longer than a command's usual wait: the real
+        command gives that wait to the request itself (the other tests here stand in for command)."""
+        scratch = pathlib.Path(tempfile.mkdtemp(prefix="fleet-google-wait-"))
+        self.addCleanup(shutil.rmtree, str(scratch), True)
+        waits, sent = {}, {}
+
+        def call(method, path, body=None, timeout=owner_mcp.TIMEOUT, **_kw):
+            waits[path], sent[path] = timeout, body
+            if path == "/ui/state":
+                return owner_mcp.Answer(200, {"db": "g1"}, b"", {})
+            if path == "/ui/google/connect":
+                return owner_mcp.Answer(200, {"url": self.URL, "state": self.STATE, "expires_at": 1,
+                                              "app": "founderizer", "verified": False}, b"", {})
+            return owner_mcp.Answer(200, {"email": "ana@example.com", "scopes": ["gmail.modify"], "connected": True,
+                                          "replaced": False, "dropped": []}, b"", {})
+
+        def browser(_address):
+            where = sent["/ui/google/connect"]["redirect_uri"] + "?" + urllib.parse.urlencode(
+                {"state": self.STATE, "code": self.CODE})
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(where, timeout=10) as r:
+                r.read()
+        owner_mcp.GENERATION["db"] = None
+        self.addCleanup(owner_mcp.GENERATION.update, db=None)
+        with patch.object(owner_mcp, "call", call), patch.object(owner_mcp, "HOME", scratch / ".founderizer"), \
+                patch.object(owner_mcp, "on_a_mac", lambda: True), patch.object(owner_mcp, "open_in_browser", browser):
+            result = owner_mcp.connect_google({"service": "gmail"})
+        self.assertEqual(result["email"], "ana@example.com")
+        self.assertEqual((waits["/ui/google/connect"], waits["/ui/google/finish"]),
+                         (owner_mcp.TIMEOUT, owner_mcp.GOOGLE_FINISH_WAIT))
+        self.assertGreater(owner_mcp.GOOGLE_FINISH_WAIT, owner_mcp.TIMEOUT)
+
+    def test_another_request_waits_on_and_a_wrong_state_or_googles_error_connects_nothing(self):
+        result, sent, _, answers = self.connect({"service": "gmail"}, redirects=[
+            ("favicon.ico", {}), ("", {"state": self.STATE}), ("", {"state": self.STATE, "code": self.CODE})])
+        self.assertEqual([a[0] for a in answers], [404, 404, 200])
+        self.assertEqual(result["email"], "ana@example.com")
+        result, sent, _, answers = self.connect({"service": "gmail"}, redirects=[("", {"state": "other", "code": "x"})])
+        self.assertIsInstance(result, owner_mcp.Refused)
+        self.assertIn("not for this Connect", str(result))
+        self.assertEqual(([r for r, _ in sent], answers[0][0]), (["/ui/google/connect"], 400))
+        result, sent, _, answers = self.connect({"service": "gmail"}, redirects=[
+            ("", {"state": self.STATE, "error": "access_denied<script>"})])
+        self.assertIn("The access was not given (access_deniedscript)", str(result))
+        self.assertIn("access_deniedscript", answers[0][1])
+        self.assertNotIn("<script>", answers[0][1])
+        self.assertEqual([r for r, _ in sent], ["/ui/google/connect"])
+
+    def test_it_opens_only_a_consent_page_of_google_and_takes_one_service(self):
+        for url in ("https://accounts.google.com.example.com/x", "http://accounts.google.com/o/oauth2/v2/auth",
+                    "https://example.com/?https://accounts.google.com/", None):
+            with self.subTest(url=url):
+                result, sent, opened, _ = self.connect({"service": "gmail"}, url=url)
+                self.assertIsInstance(result, owner_mcp.Refused)
+                self.assertEqual((opened, [r for r, _ in sent]), ([], ["/ui/google/connect"]))
+        for args in ({}, {"service": "calendar"}, {"service": "gmail", "account": ""},
+                     {"service": "drive", "account": 7}):
+            with self.subTest(args=args):
+                result, sent, opened, _ = self.connect(args)
+                self.assertIsInstance(result, owner_mcp.Refused)
+                self.assertEqual((sent, opened), ([], []))
+
+    def test_it_sends_nothing_off_a_mac_or_after_an_early_call_and_says_what_was_dropped(self):
+        with patch.object(owner_mcp, "on_a_mac", lambda: False):
+            result, sent, opened, _ = self.connect({"service": "gmail"})
+        self.assertIsInstance(result, owner_mcp.Refused)
+        self.assertEqual((sent, opened), ([], []))          # the app's waiting Connect is not replaced
+        result, sent, opened, answers = self.connect({"service": "gmail"}, early=True)
+        self.assertIsInstance(result, owner_mcp.Refused)
+        self.assertIn("before Google's page opened", str(result))
+        self.assertEqual(([r for r, _ in sent], opened, answers[0][0]), (["/ui/google/connect"], [], 400))
+        result, _, _, _ = self.connect({"service": "gmail"}, dropped=["drive"])
+        self.assertEqual(result["dropped"], ["drive"])
+        self.assertIn("Its drive stopped with this Connect", result["next"])
+        # A request that sends nothing holds no other: each has its own thread and 10 seconds, and the port is new.
+        self.assertTrue(owner_mcp.GoogleLoopback.daemon_threads)
+        self.assertFalse(owner_mcp.GoogleLoopback.block_on_close)
+        self.assertFalse(owner_mcp.GoogleLoopback.allow_reuse_address)
+        self.assertEqual(owner_mcp.GoogleLoopback.Page.timeout, 10)
+        loop = owner_mcp.GoogleLoopback()
+        try:
+            loop.state = self.STATE
+            idle = socket.create_connection(("127.0.0.1", loop.server_address[1]), timeout=5)     # sends nothing
+            self.addCleanup(idle.close)
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+                    loop.redirect_uri + "?" + urllib.parse.urlencode({"state": self.STATE, "code": self.CODE}),
+                    timeout=10) as r:
+                self.assertEqual(r.status, 200)
+            self.assertEqual(loop.code(limit=5), self.CODE)
+        finally:
+            loop.close()
+
+    def test_no_answer_within_the_time_limit_connects_nothing(self):
+        loop = owner_mcp.GoogleLoopback()
+        try:
+            loop.state = self.STATE
+            with self.assertRaises(owner_mcp.Refused) as caught:
+                loop.code(limit=0)
+            self.assertIn("within 10 minutes", str(caught.exception))
+        finally:
+            loop.close()
+
+    def test_the_tool_takes_no_code_and_no_secret_and_the_programs_copy_is_absent(self):
+        tool = next(t for t in owner_mcp.tools() if t["name"] == "connect_google")
+        self.assertEqual((set(tool["inputSchema"]["properties"]), tool["inputSchema"]["required"]),
+                         ({"service", "account"}, ["service"]))
+        self.assertFalse(tool["annotations"]["readOnlyHint"])
+        self.assertIn("Advanced, then Go to Founderizer", tool["description"])
+        self.assertIn("connect_google", owner_mcp.ABSENT)
+        entry = next(t for t in owner_mcp.dump_tools()["tools"] if t["name"] == "connect_google")
+        self.assertEqual(entry["kind"], "absent")
+        self.assertNotIn("/ui/google/connect", owner_mcp.NOT_TOOLS)
+        self.assertNotIn("/ui/google/finish", owner_mcp.NOT_TOOLS)
 
 
 if __name__ == "__main__":

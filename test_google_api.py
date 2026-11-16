@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 import urllib.parse
+from unittest.mock import patch
 
 import google
 
@@ -158,7 +159,7 @@ class GoogleApiTest(unittest.TestCase):
         self.g.close()
         for req in self.g.requests:
             self.assertEqual(req["headers"]["User-Agent"], "founderizer-hub")
-            if req["path"] in ("/token", "/revoke"):
+            if req["path"] in ("/token", "/revoke", google.CLIENT_PATH):
                 self.assertIsNone(req["headers"].get("Authorization"))
             else:
                 self.assertEqual(req["headers"]["Authorization"], "Bearer " + ACCESS)
@@ -224,6 +225,14 @@ class GoogleApiTest(unittest.TestCase):
         self.g.on("POST", "/token", {"access_token": ACCESS, "expires_in": 3599, "scope": google.SCOPES[0]})
         error = self.refused(google.exchange, "cid", SECRET, CODE, "VERIFIER", "http://127.0.0.1:53682/")
         self.assertFalse(error.unknown)
+        # A client with no secret: the form has no client_secret at all. (Google's own token address then refuses
+        # it, as it did on 15 November 2026, so Founderizer's secret comes from founderizer.com.)
+        self.g.on("POST", "/token", {"access_token": ACCESS, "expires_in": 3599, "refresh_token": REFRESH,
+                                     "scope": google.SCOPES[0]})
+        google.exchange("cid", None, CODE, "VERIFIER", "http://127.0.0.1:53682/")
+        self.assertEqual(form(self.g.requests[-1]), {"grant_type": "authorization_code", "client_id": "cid",
+                                                     "code": CODE, "code_verifier": "VERIFIER",
+                                                     "redirect_uri": "http://127.0.0.1:53682/"})
 
     def test_refresh(self):
         self.g.on("POST", "/token", {"access_token": ACCESS, "expires_in": 3599, "scope": google.SCOPES[1]})
@@ -236,6 +245,53 @@ class GoogleApiTest(unittest.TestCase):
                   400)
         error = self.refused(google.refresh, "cid", SECRET, REFRESH)
         self.assertEqual((error.status, error.reason, error.unknown), (400, "invalid_grant", False))
+        self.g.on("POST", "/token", {"access_token": ACCESS, "expires_in": 3599, "scope": google.SCOPES[1]})
+        google.refresh("cid", None, REFRESH)
+        self.assertEqual(form(self.g.requests[-1]), {"grant_type": "refresh_token", "client_id": "cid",
+                                                     "refresh_token": REFRESH})
+
+    def test_the_release_carries_founderizers_client_id_and_never_its_secret(self):
+        """google.CLIENT is Founderizer's own Desktop client (UI-API.md 1.185): every hub's release brings its client
+        ID, and never its secret, which GitHub would report from public code to Google: founderizer.com gives it."""
+        self.assertEqual(set(google.CLIENT), {"client_id", "client_secret"})
+        cid = google.CLIENT["client_id"]
+        self.assertRegex(cid, r"^[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com$")
+        self.assertIsNone(google.CLIENT["client_secret"])
+        self.assertEqual((self.saved[0]["founderizer"], google.CLIENT_PATH),       # setUp points HOSTS at the stand-in
+                         ("https://founderizer.com", "/google-client.json"))
+        self.assertIsInstance(google.VERIFIED, bool)
+
+    def test_client_secret(self):
+        """The secret of Founderizer's app from founderizer.com: only for the release's own client ID, with no
+        Authorization header, and a GoogleError for anything else."""
+        cid = google.CLIENT["client_id"]
+        self.g.on("GET", google.CLIENT_PATH, {"client_id": cid, "client_secret": SECRET})
+        self.assertEqual(google.client_secret(), SECRET)
+        req = self.g.requests[-1]
+        self.assertEqual((req["method"], req["query"], req["body"]), ("GET", {}, b""))
+        for answer, status in (({"client_id": "999-other.apps.googleusercontent.com", "client_secret": SECRET}, 200),
+                               ({"client_id": cid, "client_secret": "short"}, 200),
+                               ({"client_id": cid, "client_secret": "with space 0123"}, 200),
+                               ({"client_id": cid}, 200), ({}, 404)):
+            with self.subTest(answer=answer, status=status):
+                self.g.on("GET", google.CLIENT_PATH, answer, status)
+                self.refused(google.client_secret)
+        self.g.on("GET", google.CLIENT_PATH, b"<html>not json</html>")
+        self.refused(google.client_secret)
+        # Its words name founderizer.com, never Google, and never hold the answer.
+        self.g.on("GET", google.CLIENT_PATH, {"error": "challenge"}, 403)
+        self.assertEqual((str(self.refused(google.client_secret)), self.refused(google.client_secret).status),
+                         ("founderizer.com answered 403", 403))
+        self.g.on("GET", google.CLIENT_PATH, b"[1]")
+        self.assertEqual(str(self.refused(google.client_secret)), "founderizer.com gave no readable answer")
+        self.g.on("GET", google.CLIENT_PATH, {"client_id": cid, "client_secret": "short"})
+        self.assertEqual(str(self.refused(google.client_secret)),
+                         "founderizer.com gave no client secret of Founderizer's Google app")
+        with socket.socket() as closed:                         # a port where nothing listens
+            closed.bind(("127.0.0.1", 0))
+            port = closed.getsockname()[1]
+        with patch.dict(google.HOSTS, {"founderizer": f"http://127.0.0.1:{port}"}):
+            self.assertEqual(str(self.refused(google.client_secret)), "founderizer.com cannot be reached now")
 
     def test_revoke(self):
         self.g.on("POST", "/revoke", {})

@@ -25,8 +25,20 @@ import uuid
 
 HOSTS = {"auth": "https://accounts.google.com", "token": "https://oauth2.googleapis.com",
          "drive": "https://www.googleapis.com", "gmail": "https://gmail.googleapis.com",
-         "sheets": "https://sheets.googleapis.com"}
+         "sheets": "https://sheets.googleapis.com", "founderizer": "https://founderizer.com"}
 SCOPES = ("https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/gmail.modify")
+# Founderizer's own Google app (UI-API.md, "Founderizer's Google app"; the owner's yes of 15 November 2026): one Desktop
+# client of the project "Founderizer" for every hub, so that a customer connects with no client file. The release
+# brings its client ID. Google's token address wants its secret too (it answered 400 invalid_request and 401
+# invalid_client without one, 15 November 2026), and GitHub reports a secret of that shape in public code to Google, so
+# the secret is in no public repository: a hub asks founderizer.com for it (client_secret) and keeps it in its own
+# Google file (the owner's choice of the same day). Google's own words for such a secret: desktop apps "are public
+# clients and cannot keep secrets confidential", and the secret of an installed app "is obviously not treated as a
+# secret".
+CLIENT = {"client_id": "686555588972-bci1m25uqoil3qs9ks3pqscr4iarno6o.apps.googleusercontent.com",
+          "client_secret": None}
+CLIENT_PATH = "/google-client.json"     # on HOSTS["founderizer"]: {"client_id", "client_secret"} of CLIENT's app
+VERIFIED = False                    # True once Google has verified the app: Google then shows no warning page
 TIMEOUT = 30                        # seconds for one call
 AGENT = "founderizer-hub"
 SMALL = 5 * 1024 * 1024             # the largest multipart upload; a larger one is resumable
@@ -139,7 +151,9 @@ def _q(part):
 # OAuth
 
 def _token(path, fields):
-    """A form POST to HOSTS["token"]: the client secret goes only in this body."""
+    """A form POST to HOSTS["token"]: the client secret goes only in this body, and a field that is None (a client
+    with no secret) is left out."""
+    fields = {k: v for k, v in fields.items() if v is not None}
     return _call("POST", HOSTS["token"] + path, data=urllib.parse.urlencode(fields).encode(),
                  ctype="application/x-www-form-urlencoded")
 
@@ -172,6 +186,7 @@ def consent_url(client_id, redirect_uri, state, challenge, login_hint=None, scop
 
 
 def exchange(client_id, client_secret, code, verifier, redirect_uri):
+    """client_secret: None for a client whose token address takes the client ID and the PKCE verifier alone."""
     answer = _token("/token", {"grant_type": "authorization_code", "client_id": client_id,
                                "client_secret": client_secret, "code": code, "code_verifier": verifier,
                                "redirect_uri": redirect_uri})
@@ -190,6 +205,24 @@ def refresh(client_id, client_secret, refresh_token):
 
 def revoke(token):
     _token("/revoke", {"token": token})
+
+
+def client_secret():
+    """The secret of CLIENT's app, from founderizer.com (HOSTS["founderizer"] + CLIENT_PATH), which keeps it in no
+    public repository. The answer counts only when it names CLIENT's own client ID, so the site can give a hub no other
+    app. A GoogleError when founderizer.com cannot be reached or answers anything else, whose text names
+    founderizer.com (not Google) and never holds the answer."""
+    try:
+        answer = _call("GET", HOSTS["founderizer"] + CLIENT_PATH)
+    except GoogleError as e:
+        words = (f"founderizer.com answered {e.status}" if e.status else
+                 "founderizer.com gave no readable answer" if e.unknown else "founderizer.com cannot be reached now")
+        raise GoogleError(words, e.status) from None
+    secret = answer.get("client_secret")
+    if answer.get("client_id") != CLIENT.get("client_id") or not (
+            isinstance(secret, str) and re.fullmatch(r"[!-~]{8,200}", secret)):
+        raise GoogleError("founderizer.com gave no client secret of Founderizer's Google app")
+    return secret
 
 
 def account_email(access):

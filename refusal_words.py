@@ -71,6 +71,16 @@ WORDS = {
     "agent_open_signin": "{agent} has an open sign-in. Finish it or let it run out, then try again.",
     # a one-time rule of "On a schedule" whose time has passed: its Resume (WAKEUPS-INTERFACE.md 8)
     "time_passed": "this time has passed; change the time first",
+    # Google's Connect and Disconnect (UI-API.md 1.185)
+    "google_file_mode": "the Google file of the hub must be a regular file of the hub user with mode 600",
+    "google_file_unreadable": "the Google file of the hub cannot be read: it is not a JSON object with accounts",
+    "google_no_client": "This hub's release has no Google client. Update the hub, then connect again.",
+    "google_no_secret": "Founderizer's Google app cannot be read from founderizer.com now, so nothing was started. Try "
+                        "again in a few minutes.",
+    "connect_stale": "This Connect expired, or another one took its place. Start Connect again.",
+    "google_refused": "Google refused: {reason}. Start Connect again.",
+    "google_revoked_during": "A Disconnect of this account came during this Connect, so nothing was connected. Start "
+                             "Connect again.",
 }
 
 

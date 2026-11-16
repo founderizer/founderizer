@@ -18860,8 +18860,15 @@ GOOGLE_PROBLEM = "Google refused the saved access. Connect again."
 GOOGLE_TESTING = ("Google refused the saved access. If your Google Cloud client is in Testing, publish it, because "
                   "Google ends its sign-ins after 7 days. Then connect again.")
 GOOGLE_TESTING_AGE = 7 * 86400 - 3600   # Google's refresh tokens for a client in Testing last 7 days
-GOOGLE_STALE = "This Connect expired, or another one took its place. Start Connect again."
-GOOGLE_NO_CLIENT = "The owner has not set up Google yet. Ask your requester."
+GOOGLE_STALE = refusal_words.words("connect_stale")
+GOOGLE_NO_CLIENT = "The hub cannot read its Google file now: the owner must put it right. Ask your requester."
+GOOGLE_NO_CONNECT = refusal_words.words("google_no_client")
+GOOGLE_GONE_VIEW = "The hub no longer has the Google client that connected this account. Connect it again."
+GOOGLE_NO_SECRET = refusal_words.words("google_no_secret")
+GOOGLE_NO_SITE = "Not done: Founderizer's Google app cannot be read from founderizer.com now. Try again later."
+GOOGLE_REVOKED = refusal_words.words("google_revoked_during")
+GOOGLE_CLIENT_GONE = ("The hub no longer has the Google client that connected {email}: the owner must connect {email} "
+                      "again. Ask your requester.")
 GOOGLE_SHARED = ("This file or folder is shared with other people. A write to it reaches them, so it needs Drive "
                  "write_shared. Ask your requester.")
 GOOGLE_UNKNOWN = ("The outcome of this write is not known: it can have reached Google. Check with drive_search or "
@@ -18872,10 +18879,18 @@ GMAIL_UNKNOWN = ("The outcome of this email is not known: it can have gone out. 
 GOOGLE_LINK_ENDED = "This upload link has ended. A new upload needs a new request_id."
 GOOGLE_SECRET_FILE = "This file holds a registered secret. It was not uploaded."
 # Only in the hub's memory: each account's access token (with the SHA-256 of the refresh token that it came from), the
-# problem of each account whose refresh Google refused, the pending Connect, and the one-time links. A restart ends
-# them all.
-GOOGLE = {"tokens": {}, "problems": {}, "pending": None, "links": {}}
+# problem of each account whose refresh Google refused (with the SHA-256 of the refused refresh token: problem_for), the pending Connect, the one-time links, the secret of
+# Founderizer's Google app that founderizer.com gave or Google took (secrets: {client_id: secret}), when the hub last
+# read the site for it and what the site gave then (read_at: {client_id: time.monotonic()}, site: {client_id: secret}),
+# and how many Disconnects of each account started and ended (revokes and revoked: {email: count}), which a finish and
+# a refresh of the same account compare. A restart ends them all.
+GOOGLE = {"tokens": {}, "problems": {}, "problem_for": {}, "pending": None, "links": {}, "secrets": {}, "read_at": {},
+          "site": {}, "revokes": {}, "revoked": {}}
+# Seconds: after Google refused Founderizer's secret, the hub reads founderizer.com again at most once a minute, so a
+# site that gives a refused secret costs one small read a minute and not one at each tool call of each agent.
+GOOGLE_READ_AGAIN = 60
 GOOGLE_LOCK = threading.Lock()
+GOOGLE_READING = threading.Lock()   # one read of founderizer.com at a time: a call that comes meanwhile waits for it
 
 
 def google_account(value):
@@ -18884,29 +18899,216 @@ def google_account(value):
 
 
 def google_saved():
-    """(the saved Google file, problem or None): {} before the owner gave a client. It must be a regular file of the hub
-    user with mode 600. The hub reads it at each use, so a change needs no restart."""
+    """(the saved Google file, problem or None): {} before the first Connect. It must be a regular file of the hub user
+    with mode 600. The hub reads it at each use, so a change needs no restart."""
     path = CFG.get("google_file") or GOOGLE_FILE
     try:
         st = os.lstat(path)
     except FileNotFoundError:
         return {}, None
     if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
-        return {}, "the Google file of the hub must be a regular file of the hub user with mode 600"
+        return {}, refusal_words.words("google_file_mode")
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
         data = None
     if not isinstance(data, dict) or not isinstance(data.get("accounts", {}), dict):
-        return {}, "the Google file of the hub cannot be read: it is not a JSON object with accounts"
+        return {}, refusal_words.words("google_file_unreadable")
     return data, None
+
+
+def google_file_refusal(bad):
+    """The 409 of a Google file that the hub cannot use (google_saved's problem), with its code (refusal_words)."""
+    if bad == refusal_words.words("google_file_unreadable"):
+        return Refusal(409, code="google_file_unreadable")
+    return Refusal(409, code="google_file_mode")
 
 
 def google_entry(saved, email):
     """The saved entry of one connected account, or None."""
     entry = (saved.get("accounts") or {}).get(email)
     return entry if isinstance(entry, dict) and entry.get("refresh_token") else None
+
+
+def google_release_client(saved=None):
+    """Founderizer's own Desktop client: {client_id, client_secret}, or None for a release without its client ID. The
+    release brings the ID (google.CLIENT). The secret is in no public repository: it is the one that this hub holds in
+    memory (GOOGLE["secrets"]: its first read of founderizer.com, or a secret that Google took since), else the one
+    that its Google file keeps (`clients`, written at the first Connect), else None, and google_secret_of then reads
+    it. Memory is never older than the file, so a file that could not be written does not bring an old secret back."""
+    client = getattr(google, "CLIENT", None)
+    cid = client.get("client_id") if isinstance(client, dict) else None
+    if not (isinstance(cid, str) and len(cid) <= 200 and GOOGLE_CLIENT_ID.fullmatch(cid)):
+        return None
+    secret, kept = client.get("client_secret"), ((saved or {}).get("clients") or {})
+    if not (isinstance(secret, str) and secret):
+        with GOOGLE_LOCK:
+            secret = GOOGLE["secrets"].get(cid)
+    if not secret:
+        secret = kept.get(cid) if isinstance(kept, dict) and isinstance(kept.get(cid), str) else None
+    return {"client_id": cid, "client_secret": secret or None}
+
+
+def google_keep_secret(cid, secret):
+    """Keep a secret of Founderizer's app from founderizer.com: in memory, and in the Google file (`clients`) when the
+    file is not empty, so that a restart does not read the site again. A secret in the file gets its fingerprint, as
+    at a Connect, so that every text check masks it. (A new hub's first finish writes the file.) A file that cannot be
+    written now keeps what it had, and the call goes on."""
+    with GOOGLE_LOCK:
+        GOOGLE["secrets"][cid] = secret
+    with LOCK:
+        saved, bad = google_saved()
+        kept = saved.get("clients") if isinstance(saved.get("clients"), dict) else {}
+        if saved and not bad and kept.get(cid) != secret:
+            try:
+                google_store(dict(saved, clients=dict(kept, **{cid: secret})))
+            except OSError as e:
+                log("hub", f"could not keep the secret of Founderizer's Google app in the Google file "
+                           f"({e.strerror or type(e).__name__})")
+                return
+            google_fingerprints("", None, secret)
+
+
+def google_secret_of(client):
+    """The client with its secret: Founderizer's from founderizer.com when the hub has none yet (google.client_secret,
+    which takes only the secret of the release's client ID). One read at a time: a call that comes meanwhile waits and
+    takes its answer. A GoogleError when the site cannot give it, also for a minute after a read that gave none, so
+    that a site that is down costs one read a minute and not one at each call."""
+    if client["client_secret"]:
+        return client
+    cid = client["client_id"]
+    with GOOGLE_READING:
+        with GOOGLE_LOCK:
+            secret = GOOGLE["secrets"].get(cid)
+            recent = time.monotonic() - GOOGLE["read_at"].get(cid, float("-inf")) < GOOGLE_READ_AGAIN
+        if secret:                          # the read that this call waited for gave it
+            return dict(client, client_secret=secret)
+        if recent:
+            raise google.GoogleError("founderizer.com gave no secret less than a minute ago")
+        try:
+            secret = google.client_secret()
+        finally:
+            with GOOGLE_LOCK:               # the minute runs from the end of the read, however long it took
+                GOOGLE["read_at"][cid] = time.monotonic()
+        with GOOGLE_LOCK:
+            GOOGLE["secrets"][cid] = GOOGLE["site"][cid] = secret
+    google_keep_secret(cid, secret)
+    log("hub", "read the secret of Founderizer's Google app from founderizer.com")
+    return dict(client, client_secret=secret)
+
+
+def google_secret_again(client):
+    """After Google refused Founderizer's secret as invalid_client: the client with another secret to try once, else
+    None, and Google's refusal stands. First the secret that the hub holds now, when it is another one (a call took a
+    new one meanwhile); else the one that founderizer.com gives (Founderizer changed it): read at most once a minute,
+    one read at a time, the minute counted from the read's end. Within that minute the site's last answer, so a call
+    that comes during a read waits for it and tries its answer, also when the call that read it could not try it; an
+    answer that Google refused too is not tried again until the next read. Nothing is kept here: the caller keeps a
+    secret once Google took it (google_took), so a wrong one from the site replaces nothing, and nothing is kept as
+    refused."""
+    cid = client["client_id"]
+
+    def other(secret):
+        return dict(client, client_secret=secret) if secret and secret != client["client_secret"] else None
+
+    def held():
+        return (google_release_client(google_saved()[0]) or {}).get("client_secret")
+    found = other(held())
+    if found:
+        return found
+    failed = secret = None
+    with GOOGLE_READING:
+        with GOOGLE_LOCK:
+            recent = time.monotonic() - GOOGLE["read_at"].get(cid, float("-inf")) < GOOGLE_READ_AGAIN
+            last = GOOGLE["site"].get(cid)
+        if recent:
+            return other(last) or other(held())
+        with GOOGLE_LOCK:
+            GOOGLE["site"].pop(cid, None)
+        try:
+            secret = google.client_secret()
+        except google.GoogleError as e:
+            secret, failed = None, e
+        finally:
+            with GOOGLE_LOCK:               # the minute runs from the end of the read, however long it took
+                GOOGLE["read_at"][cid] = time.monotonic()
+                if secret:
+                    GOOGLE["site"][cid] = secret
+    if failed is not None:                  # logged here: log takes LOCK, which no read of the site may wait for
+        log("hub", f"Google refused the secret of Founderizer's app, and {failed}")
+    elif secret == client["client_secret"]:
+        log("hub", "Google refused the secret of Founderizer's app, and founderizer.com gives the same one")
+    else:
+        return dict(client, client_secret=secret)
+    return other(held())                    # a secret that another call took meanwhile, or None
+
+
+def google_took(client, refused, error=None):
+    """What the second try with a secret that google_secret_again gave says of that secret. Google took the client
+    (its call worked, or Google refused only the grant, invalid_grant, which it checks after the client: measured on
+    15 November 2026, a wrong secret gets 401 invalid_client also with a grant that is no good): keep it, only while
+    the hub still holds the refused secret, or none, so a newer one that another call took meanwhile stays. Google
+    refused it too (invalid_client): the site's last answer is not offered again within the minute."""
+    if error is not None and error.reason == "invalid_client":
+        with GOOGLE_LOCK:
+            if GOOGLE["site"].get(client["client_id"]) == client["client_secret"]:
+                del GOOGLE["site"][client["client_id"]]
+        return
+    if error is None or error.reason == "invalid_grant":
+        held = (google_release_client(google_saved()[0]) or {}).get("client_secret")
+        if held in (None, refused) and held != client["client_secret"]:
+            google_keep_secret(client["client_id"], client["client_secret"])
+            log("hub", "Google took the new secret of Founderizer's app")
+
+
+def google_refresh(saved, client, entry):
+    """Google's refresh of one account's token: (access, expires). When Google refuses Founderizer's secret
+    (invalid_client) and the hub has another one to try (google_secret_again), it tries once more with it, and keeps
+    it once Google took the client."""
+    try:
+        return google.refresh(client["client_id"], client["client_secret"], entry["refresh_token"])[:2]
+    except google.GoogleError as e:
+        if e.reason != "invalid_client" or client == google_own_client(saved):
+            raise
+        fresh = google_secret_again(client)
+        if not fresh:
+            raise
+    try:
+        got = google.refresh(fresh["client_id"], fresh["client_secret"], entry["refresh_token"])[:2]
+    except google.GoogleError as e:
+        google_took(fresh, client["client_secret"], e)
+        raise
+    google_took(fresh, client["client_secret"])
+    return got
+
+
+def google_own_client(saved):
+    """The hub's own Desktop client at the top of its Google file, which an owner put there before Founderizer had a
+    Google app (the owner's own fleet does), or None. It serves only the accounts that it connected."""
+    cid, secret = saved.get("client_id"), saved.get("client_secret")
+    return {"client_id": cid, "client_secret": secret} if isinstance(cid, str) and cid and isinstance(secret, str) \
+        and secret else None
+
+
+def google_client_of(saved, entry):
+    """The client that made an account's refresh token, which its refresh must use, or None when the hub no longer
+    has it. An entry's client_id names it; an entry without one (every entry from before Founderizer's Google app) was
+    made by the own client. Google ties a refresh token to its client, so no other client can refresh it."""
+    cid, own, release = entry.get("client_id"), google_own_client(saved), google_release_client(saved)
+    if cid is None or own and cid == own["client_id"]:
+        return own
+    return release if release and cid == release["client_id"] else None
+
+
+def google_connect_client(saved):
+    """(client, kind) of a new Connect: Founderizer's client, whose ID the release brings, for every hub and also
+    where the file holds an own client (one system for every fleet), else the own client, else (None, None)."""
+    release = google_release_client(saved)
+    if release:
+        return release, "founderizer"
+    own = google_own_client(saved)
+    return (own, "own") if own else (None, None)
 
 
 def google_store(data):
@@ -18934,14 +19136,31 @@ def google_scopes(entry):
     return [s.rsplit("/", 1)[-1] for s in (entry or {}).get("scopes") or [] if isinstance(s, str)]
 
 
-def google_fingerprints(email, refresh_token, client_secret):
-    """At Connect: the salted fingerprints of the account's refresh token and of the client secret, as for a chat app
-    token, so that every text check refuses or masks them."""
+def google_fingerprints(email, refresh_token, client_secret=None):
+    """At Connect: the salted fingerprints of the account's refresh token and of its client's secret (an own client's,
+    or Founderizer's, which founderizer.com gives and no public code holds), as for a chat app token, so that every text
+    check refuses or masks them."""
     items = []
     for kind, value in ((f"refresh-token {email}", refresh_token), ("client-secret", client_secret)):
+        if not value:
+            continue
         salt = fingerprint_salt(fingerprint_label("google", kind))
         items.append({"kind": kind, "len": len(value), "hash": hashlib.sha256((salt + value).encode()).hexdigest()})
     register_fingerprints("google", items)
+
+
+def google_token_source(entry):
+    """The SHA-256 of an entry's refresh token: what an access token and a problem of the account belong to."""
+    return hashlib.sha256(str(entry["refresh_token"]).encode()).hexdigest()
+
+
+def google_problem_of(problems, made, email, entry):
+    """An account's problem while it is for the refresh token that the file holds now: a Connect again or a Disconnect
+    after Google refused the old one leaves no old problem. A problem with no hash of its own counts as it is."""
+    problem, source = problems.get(email), made.get(email)
+    if not problem or source is None:
+        return problem
+    return problem if entry and google_token_source(entry) == source else None
 
 
 def google_view(team):
@@ -18949,13 +19168,18 @@ def google_view(team):
     saved, bad = google_saved()
     named = {g.get("account") for a in team["agents"].values() for g in (a.get("google") or {}).values()}
     with GOOGLE_LOCK:
-        problems = dict(GOOGLE["problems"])
+        problems, made = dict(GOOGLE["problems"]), dict(GOOGLE["problem_for"])
     accounts = []
     for email in sorted(set(saved.get("accounts") or {}) | named):
         entry = google_entry(saved, email)
+        # An account whose client the hub no longer has (a release that lost Founderizer's, a file that lost its own
+        # client) refuses every tool: the app shows it as a problem with Connect again, not as a working account.
+        gone = entry and not google_client_of(saved, entry)
         accounts.append({"email": email, "connected": bool(entry), "scopes": google_scopes(entry),
-                         "problem": problems.get(email), "connected_at": entry.get("connected_at") if entry else None})
-    return {"client": bool(saved.get("client_id") and saved.get("client_secret")), "problem": bad,
+                         "problem": google_problem_of(problems, made, email, entry) or
+                         (GOOGLE_GONE_VIEW if gone else None),
+                         "connected_at": entry.get("connected_at") if entry else None})
+    return {"client": google_connect_client(saved)[0] is not None, "problem": bad,
             "accounts": accounts, "levels": {s: list(v) for s, v in GOOGLE_LEVELS.items()}}
 
 
@@ -19023,39 +19247,68 @@ def google_allowed(agent, tool):
 
 def google_access(email, service):
     """An access token of one account for a tool of one service, refreshed when less than 5 minutes are left. A refresh
-    that Google refuses with invalid_grant drops the token and sets the account's problem until its next Connect."""
+    that Google refuses with invalid_grant drops the token and sets the account's problem until its next Connect, for
+    that refresh token only (a Connect again or a Disconnect meanwhile leaves no old problem). The hub keeps a new
+    access token only when no Disconnect of the account was running at the refresh's start or started during it: its
+    revoke can have ended that token too."""
     saved, bad = google_saved()
-    if bad or not (saved.get("client_id") and saved.get("client_secret")):
+    if bad:
         raise ToolError(GOOGLE_NO_CLIENT)
     entry = google_entry(saved, email)
     if not entry:
         raise ToolError(f"The Google account {email} is not connected. Ask your requester.")
     with GOOGLE_LOCK:
-        problem = GOOGLE["problems"].get(email)
+        problem = google_problem_of(GOOGLE["problems"], GOOGLE["problem_for"], email, entry)
     if problem:
         raise ToolError(google_refused(email, problem))
     if GOOGLE_SCOPES[service] not in google_scopes(entry):
         raise ToolError(f"The Google account {email} does not allow {GOOGLE_NAMES[service]}. Ask your requester.")
-    source = hashlib.sha256(str(entry["refresh_token"]).encode()).hexdigest()
+    client = google_client_of(saved, entry)     # the client that made this refresh token: no other can refresh it
+    if not client:
+        raise ToolError(GOOGLE_CLIENT_GONE.format(email=email))
+    try:
+        client = google_secret_of(client)       # a hub whose file lost Founderizer's secret reads it again
+    except google.GoogleError:
+        raise ToolError(GOOGLE_NO_SITE) from None
+    source = google_token_source(entry)
     with GOOGLE_LOCK:
         token = GOOGLE["tokens"].get(email)
         if token and token["for"] == source and token["expires"] - now() >= GOOGLE_REFRESH:
             return token["access"]
+        started, ended = GOOGLE["revokes"].get(email, 0), GOOGLE["revoked"].get(email, 0)
     try:
-        access, expires, _ = google.refresh(saved["client_id"], saved["client_secret"], entry["refresh_token"])
+        access, expires = google_refresh(saved, client, entry)
     except google.GoogleError as e:
         if e.reason != "invalid_grant":
             raise ToolError(f"Not done: Google gave no access now ({google_why(e)}). Try again later.") from None
         at = entry.get("connected_at")
-        problem = GOOGLE_TESTING if isinstance(at, int) and now() - at >= GOOGLE_TESTING_AGE else GOOGLE_PROBLEM
+        # Only an own client can be in Testing, whose sign-ins Google ends after 7 days: Founderizer's is published.
+        own = client == google_own_client(saved)
+        problem = GOOGLE_TESTING if own and isinstance(at, int) and now() - at >= GOOGLE_TESTING_AGE else GOOGLE_PROBLEM
+        # The problem is for this refresh token only (google_problem_of), and only while the file holds it. The read of
+        # the file and the record go together under GOOGLE_LOCK, so a late refusal of an older token replaces no newer
+        # problem. (A finish clears the problem after its write; a refusal of its brand-new token in that instant would
+        # be recorded again at the next call.)
         with GOOGLE_LOCK:
-            GOOGLE["tokens"].pop(email, None)
-            GOOGLE["problems"][email] = problem
+            now_saved, now_bad = google_saved()     # the file as it is now: also this call's words
+            now_entry = google_entry(now_saved, email)
+            if now_entry and google_token_source(now_entry) == source:
+                GOOGLE["problems"][email], GOOGLE["problem_for"][email] = problem, source
+            if (GOOGLE["tokens"].get(email) or {}).get("for") == source:
+                GOOGLE["tokens"].pop(email, None)
         changed()
         log("hub", f"Google refused the saved access of {email} (invalid_grant)")
+        if now_bad:
+            raise ToolError(GOOGLE_NO_CLIENT) from None
+        if not now_entry:
+            raise ToolError(f"The Google account {email} is not connected. Ask your requester.") from None
+        if now_entry["refresh_token"] != entry["refresh_token"]:
+            raise ToolError(f"Not done: the Google account {email} was connected again during this call. Try "
+                            f"again.") from None
         raise ToolError(google_refused(email, problem)) from None
-    with GOOGLE_LOCK:
-        GOOGLE["tokens"][email] = {"access": access, "for": source, "expires": expires}
+    with GOOGLE_LOCK:                       # a Disconnect that ran or started meanwhile can have revoked it: not kept
+        if GOOGLE["revokes"].get(email, 0) == started == ended:
+            GOOGLE["tokens"][email] = {"access": access, "for": source, "expires": expires}
     return access
 
 
@@ -43472,29 +43725,25 @@ def hub_only_notes(found):
     else:
         had_none.append("GitHub App")
     n = google.get("accounts")
-    # `n` is None when the hub could not read the file, and 0 on a file that holds a client and no account yet:
-    # "the 0 Google accounts you connected" is the kind of sentence that stops a man reading.
-    if google.get("present") and (n is None or n or google.get("client")):
-        client = " and the Desktop client they sign in with" if google.get("client") else ""
+    # `n` is None when the hub could not read the file, and 0 on a file that holds an own client and no account:
+    # "the 0 Google accounts you connected" is the kind of sentence that stops a man reading. A client alone is
+    # nothing to put back: a new hub connects with Founderizer's own Google client, whose ID its release brings and
+    # whose secret founderizer.com gives.
+    if google.get("present") and (n is None or n):
         lost = (" Without it every Drive and Gmail tool of every agent stops, and the agent is told that Google "
                 "refused the saved access. Your files and your mail are untouched: this is a sign-in and not a "
                 "copy of anything.")
         if n is None:
             holds = "the Google accounts you connected." + lost
-        elif not n:
-            holds = ("the Desktop client your Google accounts sign in with, and no connected account yet. "
-                     "Without it, connecting one means finding that client file first.")
         elif n == 1:
-            holds = f"the one Google account you connected{client}." + lost
+            holds = "the one Google account you connected." + lost
         else:
-            holds = f"the {n} Google accounts you connected{client}." + lost
+            holds = f"the {n} Google accounts you connected." + lost
         said.append("**Your Google sign-in.** `~/.fleet/google.json` on the hub machine holds " + holds)
         steps.append(
-            "**Connect Google again**, one account at a time, in the app under Settings › Apps. You need the "
-            "client file of the Desktop client from your Google Cloud project — Credentials, download the JSON "
-            "again — "
-            "and to be signed in to each account in the browser that opens. `config/team.json` in this copy "
-            "names the accounts and which agent had which level, so nothing has to be remembered.")
+            "**Connect Google again**, one account at a time, in the app under Settings › Apps, signed in to each "
+            "account in the browser that opens. `config/team.json` in this copy names the accounts and which agent "
+            "had which level, so nothing has to be remembered.")
     else:
         had_none.append("Google account connected")
     n = servers.get("servers")
@@ -50008,52 +50257,70 @@ class Handler(BaseHTTPRequestHandler):
         return self.ui_command("mcp/check", read, lambda body: got["result"])
 
     def ui_google_connect(self):
-        """POST /ui/google/connect: a new pending Connect, which takes the place of the earlier one. The client secret
-        stays in memory until the finish; the command receipt keeps only its SHA-256."""
-        made = {}
-
+        """POST /ui/google/connect: a new pending Connect, which takes the place of the earlier one. It uses
+        Founderizer's own Google client, whose ID the release brings (google.CLIENT) and whose secret founderizer.com
+        gives, so it takes no client: a customer has no client file, and no app sends one. A hub whose release has none
+        uses its own client of the file, as before."""
         def read(data):
-            self.only(data, ("redirect_uri", "client", "account", "service"))
-            uri, client, service = data.get("redirect_uri"), data.get("client"), data.get("service")
+            self.only(data, ("redirect_uri", "account", "service"))
+            uri, service = data.get("redirect_uri"), data.get("service")
             if service is not None and service not in GOOGLE_LEVELS:
                 raise ValueError("service must be drive or gmail")
             port = GOOGLE_REDIRECT.fullmatch(uri) if isinstance(uri, str) else None
             if not port or not 1024 <= int(port.group(1)) <= 65535:
                 raise ValueError("redirect_uri must be http://127.0.0.1:<port>/ with a port from 1024 to 65535")
-            if client is not None:
-                cid, secret = (client.get("client_id"), client.get("client_secret")) if isinstance(client, dict) else (0, 0)
-                if not isinstance(client, dict) or set(client) != {"client_id", "client_secret"} or not (
-                        isinstance(cid, str) and len(cid) <= 200 and GOOGLE_CLIENT_ID.fullmatch(cid)) or not (
-                        isinstance(secret, str) and re.fullmatch(r"[!-~]{8,200}", secret)):
-                    raise ValueError("client must be {client_id, client_secret} of a Desktop client: a client_id that "
-                                     "ends with .apps.googleusercontent.com (at most 200 characters), and a "
-                                     "client_secret of 8 to 200 visible ASCII characters")
-                made["client"] = {"client_id": cid, "client_secret": secret}
             account = None if data.get("account") is None else self.google_account_field(data["account"])
-            return {"redirect_uri": uri, "client_id": client and made["client"]["client_id"],
-                    "client_sha256": client and hashlib.sha256(made["client"]["client_secret"].encode()).hexdigest(),
-                    "account": account, "service": service}
+            return {"redirect_uri": uri, "account": account, "service": service}
 
-        def act(body):
-            saved, _ = google_saved()
-            client = made.get("client") or ({k: saved[k] for k in ("client_id", "client_secret")}
-                                            if saved.get("client_id") and saved.get("client_secret") else None)
+        def client_of(saved, bad):
+            if bad:                 # the finish could not write it: say so before the owner signs in at Google
+                raise google_file_refusal(bad)
+            client, kind = google_connect_client(saved)
             if not client:
-                raise Refusal(409, "the hub has no Google client yet: choose the client file of the Desktop client")
+                raise Refusal(409, code="google_no_client")
+            return client, kind
+
+        def outside(body):
+            """The secret of Founderizer's app from founderizer.com when the hub has none yet: a call over the network,
+            so it does not hold LOCK (a slow site would stop every other request of the hub)."""
+            client, _ = client_of(*google_saved())
+            try:
+                return google_secret_of(client)["client_secret"]
+            except google.GoogleError as e:     # its text names founderizer.com and never holds a secret
+                log("owner", f"a Google Connect got no secret of Founderizer's app: {e}")
+                raise Refusal(502, code="google_no_secret") from None
+
+        def act(body, secret):
+            saved, bad = google_saved()
+            client, kind = client_of(saved, bad)
+            client = dict(client, client_secret=client["client_secret"] or secret)
+            # One service asks Google for that service's permission only; Google keeps what the account granted before
+            # to the same project (include_granted_scopes). An account whose token another client made (an own client
+            # of an older file) granted nothing to this project yet, so the Connect asks for every service that it
+            # has: the one that it names, or, as the app names none, each account of another client in the file (only
+            # a fleet from before 1.185 has one). So a Connect of Gmail does not drop an account's Drive.
+            entries = [google_entry(saved, body["account"])] if body["account"] else \
+                [e for e in (saved.get("accounts") or {}).values() if isinstance(e, dict) and e.get("refresh_token")]
+            had = {s for e in entries
+                   if e and (google_client_of(saved, e) or {}).get("client_id") != client["client_id"]
+                   for s in google_scopes(e)}
+            scopes = [s for s in google.SCOPES if not body["service"] or s.rsplit("/", 1)[-1] in
+                      had | {GOOGLE_SCOPES[body["service"]]}]
             verifier, challenge = google.pkce()
             state, ends = secrets.token_urlsafe(32), now() + GOOGLE_PENDING
             with GOOGLE_LOCK:
                 GOOGLE["pending"] = {"state": state, "verifier": verifier, "redirect_uri": body["redirect_uri"],
-                                     "client": client, "expires_at": ends}
+                                     "client": client, "kind": kind, "service": body["service"], "expires_at": ends}
             log("owner", "started a Google Connect" + (f" of {GOOGLE_NAMES[body['service']]}" if body["service"] else "") +
-                (f" for {body['account']}" if body["account"] else ""))
-            # One service asks Google for that service's permission only; Google keeps what the account granted before.
-            scopes = [s for s in google.SCOPES if not body["service"] or
-                      s.rsplit("/", 1)[-1] == GOOGLE_SCOPES[body["service"]]]
+                (f" for {body['account']}" if body["account"] else "") + f" with the {kind} client")
+            # app: whose Google app this Connect signs in to. verified: whether Google verified Founderizer's app, so
+            # that the app knows that Google's warning page can come (UI-API.md 1.185); None for an own client, whose
+            # state the hub does not know. (The command fields have a "client" of their own: the caller's label.)
             return {"url": google.consent_url(client["client_id"], body["redirect_uri"], state, challenge,
                                               login_hint=body["account"], scopes=scopes),
-                    "state": state, "expires_at": ends}
-        return self.ui_command("google/connect", read, act)
+                    "state": state, "expires_at": ends, "app": kind,
+                    "verified": bool(getattr(google, "VERIFIED", False)) if kind == "founderizer" else None}
+        return self.ui_command("google/connect", read, act, outside=outside)
 
     def ui_google_finish(self):
         """POST /ui/google/finish: the code of the pending Connect for the account's refresh token, which the hub keeps
@@ -50070,37 +50337,100 @@ class Handler(BaseHTTPRequestHandler):
             return {"state_sha256": hashlib.sha256(state.encode()).hexdigest(),
                     "code_sha256": hashlib.sha256(code.encode()).hexdigest()}
 
-        def act(body):
-            saved, bad = google_saved()
+        def outside(body):
+            """Google's calls of the finish, which hold no LOCK (a slow Google or founderizer.com would stop every other
+            request of the hub): the pending Connect, the exchange of its code, and the account's email."""
+            bad = google_saved()[1]
             if bad:                 # a write would lose the other accounts of a file that the hub cannot read
-                raise Refusal(409, bad)
+                raise google_file_refusal(bad)
             with GOOGLE_LOCK:
                 p = GOOGLE["pending"]
                 if not p or p["expires_at"] < now() or not hmac.compare_digest(p["state"], made["state"]):
-                    raise Refusal(409, GOOGLE_STALE)
+                    raise Refusal(409, code="connect_stale")
                 GOOGLE["pending"] = None
+                revokes = (dict(GOOGLE["revokes"]), dict(GOOGLE["revoked"]))
             client = p["client"]
+            if p.get("kind") == "founderizer":     # a call took a new secret since the Connect started: that one
+                held = (google_release_client(google_saved()[0]) or {}).get("client_secret")
+                client = dict(client, client_secret=held or client["client_secret"])
             try:
-                got = google.exchange(client["client_id"], client["client_secret"], made["code"], p["verifier"],
-                                      p["redirect_uri"])
+                try:
+                    got = google.exchange(client["client_id"], client["client_secret"], made["code"], p["verifier"],
+                                          p["redirect_uri"])
+                except google.GoogleError as e:
+                    fresh = google_secret_again(client) if p.get("kind") == "founderizer" and \
+                        e.reason == "invalid_client" else None
+                    if not fresh:
+                        raise
+                    # Founderizer changed its secret: one more try with the new one. OAuth has Google check the client
+                    # before the code, so the code should still be unused; if Google spent it, this try answers
+                    # invalid_grant, and the owner starts Connect again.
+                    refused, client = client["client_secret"], fresh
+                    try:
+                        got = google.exchange(client["client_id"], client["client_secret"], made["code"],
+                                              p["verifier"], p["redirect_uri"])
+                    except google.GoogleError as again:
+                        google_took(client, refused, again)
+                        raise
+                    google_took(client, refused)
                 email = google.account_email(got["access_token"]).lower()
             except google.GoogleError as e:
                 log("owner", f"Google refused a Connect: {google_why(e)}")
-                raise Refusal(502, f"Google refused: {google_why(e)}. Start Connect again.") from None
+                raise Refusal(502, code="google_refused", names={"reason": google_why(e)}) from None
+            return {"pending": p, "client": client, "got": got, "email": email, "revokes": revokes}
+
+        def act(body, done):
+            p, client, got, email = done["pending"], done["client"], done["got"], done["email"]
+            saved, bad = google_saved()
+            if bad:                 # the file went bad meanwhile: nothing is written, and the owner connects again
+                raise google_file_refusal(bad)
+            with GOOGLE_LOCK:       # a Disconnect's revoke can end the whole grant, the token of this Connect too
+                started, ended = (counts.get(email, 0) for counts in done["revokes"])
+                if GOOGLE["revokes"].get(email, 0) != started or started != ended:
+                    raise Refusal(409, code="google_revoked_during")
             accounts = dict(saved.get("accounts") or {})
             replaced = google_entry(saved, email) is not None
+            # The scopes that this fleet keeps: the service that its Connect named (both when it named none), and what
+            # this account's own entry here had. Google gives the token every scope that the person granted to the
+            # client, also at another fleet (include_granted_scopes), and a Connect can ask for more than its service
+            # (the services of an own client's accounts, before Google says who signs in): neither is this fleet's.
+            old = google_entry(saved, email)
+            asked = {GOOGLE_SCOPES[p["service"]]} if p.get("service") else {x.rsplit("/", 1)[-1] for x in google.SCOPES}
+            asked |= set(google_scopes(old))
+            got["scopes"] = [x for x in got["scopes"] if isinstance(x, str) and x.rsplit("/", 1)[-1] in asked]
+            # client_id: the client that made this refresh token, the only one that can refresh it. The top of the
+            # file (an own client, where there is one) stays as it is, for the accounts that it made. The old token
+            # of a replaced entry is not revoked: within one project, Google revokes the account's whole grant to it,
+            # the new token included. An old token of another project (an own client's) stays valid at Google until
+            # it is unused for six months, or until the owner removes that app in his Google account.
             accounts[email] = {"refresh_token": got["refresh_token"], "connected_at": int(now()),
-                               "scopes": list(got["scopes"])}
-            google_store(dict(client, accounts=accounts))
+                               "scopes": list(got["scopes"]), "client_id": client["client_id"]}
+            top = {k: v for k, v in saved.items() if k != "accounts"}
+            if p.get("kind") == "founderizer":     # Founderizer's secret stays in the file: no fetch at each restart
+                # The secret that the hub holds now: the one that this finish used, or a newer one that a call took
+                # meanwhile, which an older one of this finish must not replace.
+                held = (google_release_client(saved) or {}).get("client_secret") or client["client_secret"]
+                top["clients"] = dict(top.get("clients") if isinstance(top.get("clients"), dict) else {},
+                                      **{client["client_id"]: held})
+                if held != client["client_secret"]:
+                    google_fingerprints("", None, held)
+            google_store(dict(top, accounts=accounts))
             google_fingerprints(email, got["refresh_token"], client["client_secret"])
             with GOOGLE_LOCK:
                 GOOGLE["tokens"].pop(email, None)
                 GOOGLE["problems"].pop(email, None)
+                GOOGLE["problem_for"].pop(email, None)
             changed()
             log("owner", f"connected the Google account {email}" + (" again" if replaced else ""))
             emit(manager_name(), "say", f"[hub] The owner connected the Google account {email}.")
-            return {"email": email, "scopes": google_scopes(accounts[email]), "connected": True, "replaced": replaced}
-        return self.ui_command("google/finish", read, act)
+            # dropped: the services that the replaced entry had and the new token has not (an account that moved from
+            # an own client, connected for one service): each one needs a Connect of its own.
+            old = google_scopes(google_entry(saved, email)) if replaced else []
+            dropped = sorted(s for s, short in GOOGLE_SCOPES.items()
+                             if short in old and short not in google_scopes(accounts[email]))
+            return {"email": email, "scopes": google_scopes(accounts[email]), "connected": True, "replaced": replaced,
+                    "dropped": dropped}
+        return self.ui_command("google/finish", read, act, outside=outside)
 
     def ui_google_disconnect(self):
         """POST /ui/google/disconnect: revoke one account's refresh token at Google and remove its entry. The client
@@ -50109,26 +50439,57 @@ class Handler(BaseHTTPRequestHandler):
             self.only(data, ("account",))
             return {"account": self.google_account_field(data.get("account"))}
 
-        def act(body):
-            saved, bad = google_saved()
-            if bad:
-                raise Refusal(409, bad)
-            account, revoked = body["account"], False
-            entry = (saved.get("accounts") or {}).get(account)
-            if google_entry(saved, account):
+        def ended(account):
+            with GOOGLE_LOCK:
+                GOOGLE["revoked"][account] = GOOGLE["revoked"].get(account, 0) + 1
+
+        def outside(body):
+            """Google's revoke, which holds no LOCK (a slow Google would stop every other request of the hub). The
+            count of this Disconnect starts with its read of the file, under LOCK, so both come wholly before a
+            finish's check and write (also under LOCK) or wholly after them; and the count ends after this
+            Disconnect's write (act). So a finish of the same account that overlaps it in any way writes no account
+            (GOOGLE_REVOKED), as the revoke can end the whole grant, a token that such a finish got too; and no
+            finish can write the entry that this Disconnect then removes."""
+            account, counted = body["account"], False
+            try:
+                with LOCK:
+                    with GOOGLE_LOCK:
+                        GOOGLE["revokes"][account] = GOOGLE["revokes"].get(account, 0) + 1
+                        counted = True
+                    saved, bad = google_saved()
+                if bad:             # nothing was revoked
+                    raise google_file_refusal(bad)
+                entry = google_entry(saved, account)
+                if not entry:
+                    return False
                 try:
                     google.revoke(entry["refresh_token"])
-                    revoked = True
+                    return True
                 except google.GoogleError as e:
                     log("owner", f"Google did not confirm the revoke of {account}: {google_why(e)}")
-            if entry is not None:
-                google_store(dict(saved, accounts={k: v for k, v in saved["accounts"].items() if k != account}))
-            with GOOGLE_LOCK:
-                GOOGLE["tokens"].pop(account, None)
+                    return False
+            except BaseException:
+                if counted:
+                    ended(account)
+                raise
+
+        def act(body, revoked):
+            account = body["account"]
+            try:
+                with GOOGLE_LOCK:   # dropped whatever the file says: the Disconnect means it goes
+                    GOOGLE["tokens"].pop(account, None)
+                saved, bad = google_saved()
+                if bad:             # the entry stays, with its token, until a Disconnect or a Connect of the account
+                    raise google_file_refusal(bad)
+                entry = (saved.get("accounts") or {}).get(account)
+                if entry is not None:
+                    google_store(dict(saved, accounts={k: v for k, v in saved["accounts"].items() if k != account}))
+            finally:
+                ended(account)
             log("owner", f"disconnected the Google account {account}" +
                 ("" if revoked else "; Google did not confirm a revoke"))
             return {"account": account, "revoked": revoked, "connected": False}
-        return self.ui_command("google/disconnect", read, act)
+        return self.ui_command("google/disconnect", read, act, outside=outside)
 
     def google_file(self, token):
         """GET and POST /google/file/<token> (owner feature google): one use of a one-time download or upload link.

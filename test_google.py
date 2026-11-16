@@ -2,6 +2,7 @@
 ten tools, their receipts and guards, and the one-time links. A fake of the google module records each call and gives
 data in the contract's shapes, so no network call happens. Temporary folders and local git repositories only; no real
 Google, hub, ~/.fleet or AI call."""
+import base64
 import hashlib
 import http.client
 import io
@@ -12,10 +13,12 @@ import re
 import shutil
 import stat
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -31,8 +34,10 @@ TEAM = {"hub": {"machine": "hub", "port": 8765},
                    "dev": {"role": "worker", "runtime": "claude", "machine": "w1", "can": ["shell"]},
                    "ops": {"role": "worker", "runtime": "claude", "machine": "w2", "can": ["shell"]},
                    "boss": {"role": "lead", "runtime": "claude", "machine": "w3", "can": ["shell"]}}}
-CLIENT_ID = "123-abc.apps.googleusercontent.com"
+CLIENT_ID = "123-abc.apps.googleusercontent.com"           # an owner's own Desktop client, of a file from before 1.185
 CLIENT_SECRET = "GOCSPX-clientsecret0123456789abcd"
+APP_ID = "456-founderizer.apps.googleusercontent.com"        # Founderizer's own client, which the release brings
+APP_SECRET = "GOCSPX-founderizerpublic0123456789"
 REFRESH = "1//refreshtoken-0123456789abcdefghijklmnopqrstuvwxyz"
 REFRESH2 = "1//secondrefresh-9876543210zyxwvutsrqponmlkjihgfedcba"
 CODE = "4/0AauthorizationCode-0123456789abcdefghij"
@@ -71,6 +76,10 @@ class FakeGoogle:
     def __init__(self):
         self.calls, self.fail, self.during, self.n = [], {}, {}, 0
         self.scopes, self.email, self.refresh_token = list(SCOPES), EMAIL, REFRESH      # what the next Connect gives
+        # google.CLIENT and google.VERIFIED of the release: Founderizer's own Google app, not verified yet. Its secret
+        # is in no public code: founderizer.com gives it (client_secret), and site_secret is what the site answers.
+        self.CLIENT, self.VERIFIED = {"client_id": APP_ID, "client_secret": None}, False
+        self.site_secret = APP_SECRET
         self.files = {f["id"]: f for f in (
             drive("doc1", "Plan", hub.DRIVE_DOC, size=None), drive("sheet1", "Costs", hub.DRIVE_SHEET, size=None),
             drive("folder1", "Work", hub.DRIVE_FOLDER, size=None), drive("pdf1", "report.pdf"),
@@ -112,6 +121,10 @@ class FakeGoogle:
 
     def revoke(self, token):
         self.note("revoke", token)
+
+    def client_secret(self):
+        self.note("client_secret")
+        return self.site_secret
 
     def account_email(self, access):
         self.note("account_email", access)
@@ -202,7 +215,8 @@ class FakeGoogle:
 
 
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite(GoogleHub(name) for name in GoogleHub.__dict__ if name.startswith("test_"))
+    return unittest.TestSuite([case(name) for case in (GoogleHub, ConnectThroughTheStandIn)
+                               for name in case.__dict__ if name.startswith("test_")])
 
 
 class GoogleHub(OwnerAPI):
@@ -227,7 +241,9 @@ class GoogleHub(OwnerAPI):
         self.fake = FakeGoogle()
         for p in (patch.object(hub.Handler, "allowed", lambda handler, who, broker=False: True),
                   patch.object(hub, "google", self.fake),
-                  patch.dict(hub.GOOGLE, {"tokens": {}, "problems": {}, "pending": None, "links": {}})):
+                  patch.dict(hub.GOOGLE, {"tokens": {}, "problems": {}, "problem_for": {}, "pending": None,
+                                          "links": {}, "secrets": {}, "read_at": {}, "site": {}, "revokes": {},
+                                          "revoked": {}})):
             p.start()
             self.addCleanup(p.stop)
         self.answers = []
@@ -254,18 +270,20 @@ class GoogleHub(OwnerAPI):
         else:
             hub.TEAM["agents"][agent].pop("google", None)
 
-    def connected(self, scopes=SCOPES, email=EMAIL, refresh=REFRESH, connected_at=1760600000):
-        """One more connected account in the Google file, as a finish writes it."""
+    def connected(self, scopes=SCOPES, email=EMAIL, refresh=REFRESH, connected_at=1760600000, client_id=None):
+        """One more connected account in the Google file. Without client_id, as a hub from before 1.185 wrote it:
+        an own client at the top, which made the entry. With client_id, as a finish writes it now."""
         saved = json.loads(self.file.read_text()) if self.file.exists() else {"client_id": CLIENT_ID,
                                                                               "client_secret": CLIENT_SECRET}
-        saved.setdefault("accounts", {})[email] = {"refresh_token": refresh, "connected_at": connected_at, "scopes": scopes}
+        saved.setdefault("accounts", {})[email] = dict(
+            {"refresh_token": refresh, "connected_at": connected_at, "scopes": scopes},
+            **({"client_id": client_id} if client_id else {}))
         hub.google_store(saved)
 
-    def begin(self, client=True, **fields):
-        body = dict(redirect_uri=REDIRECT, **fields)
-        if client:
-            body["client"] = {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET}
-        return self.owner("/ui/google/connect", **body)
+    def begin(self, **fields):
+        """POST /ui/google/connect as the app sends it: no client, since a hub has Founderizer's (its release brings
+        the ID, founderizer.com the secret)."""
+        return self.owner("/ui/google/connect", **dict(redirect_uri=REDIRECT, **fields))
 
     def finish(self, state, code=CODE):
         return self.owner("/ui/google/finish", state=state, code=code)
@@ -359,9 +377,13 @@ class GoogleHub(OwnerAPI):
         self.assertEqual(code, 200, view)
         self.assertEqual({line["agent"]: line["google"] for line in view["lines"]},
                          {"manager": {}, "dev": {}, "ops": {}, "boss": {}})
-        self.assertEqual(view["google"], {"client": False, "problem": None, "accounts": [],
+        # A new hub: no file, and a Connect can start all the same, with Founderizer's client.
+        self.assertEqual(view["google"], {"client": True, "problem": None, "accounts": [],
                                           "levels": {"drive": ["read", "write", "write_shared"],
                                                      "gmail": ["read", "write", "send"]}})
+        self.fake.CLIENT = None                                     # a release with no client, and no file
+        self.assertFalse(self.request("/ui/team?db=test-generation")[1]["google"]["client"])
+        self.fake.CLIENT = {"client_id": APP_ID, "client_secret": APP_SECRET}
         self.assertIn("google", self.request()[1]["ui_features"])
         self.connected()
         self.levels(account=EMAIL2, service="gmail", access={"dev": "send"})     # an account that is not connected
@@ -376,9 +398,10 @@ class GoogleHub(OwnerAPI):
              "connected_at": 1760600000}])
         self.assertNotIn(REFRESH, json.dumps(view))
         self.assertNotIn(CLIENT_SECRET, json.dumps(view))
+        self.assertNotIn(APP_SECRET, json.dumps(view))
         os.chmod(self.file, 0o644)
         view = self.request("/ui/team?db=test-generation")[1]["google"]
-        self.assertEqual((view["client"], [a["email"] for a in view["accounts"]]), (False, [EMAIL2]))
+        self.assertEqual((view["client"], [a["email"] for a in view["accounts"]]), (True, [EMAIL2]))
         self.assertIn("mode 600", view["problem"])
 
     def test_the_owner_gives_and_removes_the_levels_of_a_service_of_an_account(self):
@@ -423,62 +446,87 @@ class GoogleHub(OwnerAPI):
         code, data = self.owner("/ui/team/google", base_sha256="0" * 64, account=EMAIL, service="drive", access={})
         self.assertEqual((code, data["sha256"]), (409, self.sha()))
 
-    def test_connect_needs_a_client_and_a_loopback_redirect_and_keeps_no_secret(self):
-        code, data = self.begin(client=False)
-        self.assertEqual(code, 409, data)
-        self.assertIn("no Google client", data["error"])
+    def test_connect_uses_founderizers_client_of_the_release_and_takes_no_client(self):
+        # A release with no client and a hub with no file: nothing to connect with, and the hub says what to do.
+        self.fake.CLIENT = {"client_id": None, "client_secret": None}
+        code, data = self.begin()
+        self.assertEqual((code, data["error"], data["code"]), (409, hub.GOOGLE_NO_CONNECT, "google_no_client"))
+        self.assertFalse(self.request("/ui/team?db=test-generation")[1]["google"]["client"])
+        self.fake.CLIENT = {"client_id": APP_ID, "client_secret": APP_SECRET}
+        self.assertTrue(self.request("/ui/team?db=test-generation")[1]["google"]["client"])
         for uri in ("http://localhost:53111/", "http://127.0.0.1:80/", "http://127.0.0.1:1023/",
                     "http://127.0.0.1:65536/", "https://127.0.0.1:53111/", "http://127.0.0.1:53111",
                     "http://127.0.0.1:053111/", "http://127.0.0.1:53111/x", 53111, None):
             with self.subTest(uri=uri):
-                code, data = self.owner("/ui/google/connect", redirect_uri=uri,
-                                        client={"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET})
+                code, data = self.owner("/ui/google/connect", redirect_uri=uri)
                 self.assertEqual(code, 400, data)
-        for client in ({"client_id": "123-abc.example.com", "client_secret": CLIENT_SECRET},
-                       {"client_id": "x" * 190 + CLIENT_ID, "client_secret": CLIENT_SECRET},
-                       {"client_id": CLIENT_ID, "client_secret": "short"},
-                       {"client_id": CLIENT_ID, "client_secret": "with space 12345"},
-                       {"client_id": CLIENT_ID, "client_secret": "s" * 201},
-                       {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "extra": 1},
-                       {"client_id": CLIENT_ID}, "client", 7, []):
-            with self.subTest(client=client):
-                code, data = self.owner("/ui/google/connect", redirect_uri=REDIRECT, client=client)
-                self.assertEqual(code, 400, data)
+        # The field client is gone: no customer has a client file, and no app sent one.
+        code, data = self.owner("/ui/google/connect", redirect_uri=REDIRECT,
+                                client={"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET})
+        self.assertEqual((code, data["error"]), (400, "unknown field client"))
         code, data = self.begin(other=1)
         self.assertEqual((code, data["error"]), (400, "unknown field other"))
         for account in ("owner", "a b@c.co", 7):
             self.assertEqual(self.begin(account=account)[0], 400, account)
         self.assertEqual(self.fake.calls, [])
         for port in (1024, 65535):
-            self.assertEqual(self.owner("/ui/google/connect", redirect_uri=f"http://127.0.0.1:{port}/",
-                                        client={"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET})[0], 200)
+            self.assertEqual(self.owner("/ui/google/connect", redirect_uri=f"http://127.0.0.1:{port}/")[0], 200)
 
         t0 = time.time()
         code, first = self.begin()
         self.assertEqual(code, 200, first)
         self.assertEqual(len(first["state"]), 43)
         self.assertAlmostEqual(first["expires_at"], t0 + 900, delta=5)
-        self.assertEqual(self.fake.calls[-1], ("consent_url", (CLIENT_ID, REDIRECT, first["state"],
+        self.assertEqual(self.fake.calls[-1], ("consent_url", (APP_ID, REDIRECT, first["state"],
                                                                "challenge-" + "c" * 33, None, tuple(SCOPES))))
-        self.assertEqual(first["url"], f"https://accounts.google.com/o/oauth2/v2/auth?client_id={CLIENT_ID}"
+        self.assertEqual(first["url"], f"https://accounts.google.com/o/oauth2/v2/auth?client_id={APP_ID}"
                                        f"&state={first['state']}")
+        # Whose Google app this is, and that Google has not verified it yet: the app then says how to pass the
+        # warning page. The command fields keep their own client, the caller's label.
+        self.assertEqual((first["app"], first["verified"], first["client"]),
+                         ("founderizer", False, "deterministic-test"))
         row = hub.q1("SELECT body, result FROM ui_controls WHERE request_id=?", (first["request_id"],))
-        self.assertEqual(json.loads(row["body"]), {"redirect_uri": REDIRECT, "client_id": CLIENT_ID, "account": None,
-                                                   "service": None,
-                                                   "client_sha256": hashlib.sha256(CLIENT_SECRET.encode()).hexdigest()})
-        self.assertNotIn(CLIENT_SECRET, row["body"] + row["result"])
-        self.assertFalse(self.file.exists())            # the client stays in memory until the finish
+        self.assertEqual(json.loads(row["body"]), {"redirect_uri": REDIRECT, "account": None, "service": None})
+        self.assertNotIn(APP_SECRET, row["body"] + row["result"])
+        self.assertFalse(self.file.exists())            # nothing is written before the finish
         code, again = self.request("/ui/google/connect", {"request_id": first["request_id"], "db": "test-generation",
-                                                          "redirect_uri": REDIRECT, "client": {
-                                                              "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET}})
+                                                          "redirect_uri": REDIRECT})
         self.assertEqual((code, again["replayed"], again["state"]), (200, True, first["state"]))
         code, second = self.begin(account="Owner@Example.com")       # Connect again: Google offers that account first
         self.assertEqual(self.fake.calls[-1][1][4], EMAIL)
         self.assertNotEqual(second["state"], first["state"])         # it takes the place of the first one
         code, data = self.finish(first["state"])
-        self.assertEqual((code, data["error"]), (409, hub.GOOGLE_STALE))
+        self.assertEqual((code, data["error"], data["code"]), (409, hub.GOOGLE_STALE, "connect_stale"))
         self.assertEqual(self.finish(second["state"])[0], 200)
-        self.assertEqual(self.begin(client=False)[0], 200)           # the saved client serves the next Connect
+        self.fake.VERIFIED = True                                    # a release once Google has verified the app
+        self.assertEqual(self.begin()[1]["verified"], True)
+        # A file from before 1.185, with an own client: a new Connect goes through Founderizer's app all the same.
+        hub.google_store({"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "accounts": {}})
+        code, data = self.begin()
+        self.assertEqual((code, data["app"], self.fake.calls[-1][1][0]), (200, "founderizer", APP_ID))
+        # A file that the hub cannot read: the finish could not write it, so the Connect says so before the owner
+        # signs in at Google.
+        os.chmod(self.file, 0o644)
+        calls = len(self.fake.calls)
+        code, data = self.begin()
+        self.assertEqual((code, data.get("code")), (409, "google_file_mode"), data)
+        self.assertIn("mode 600", data["error"])
+        self.assertEqual(len(self.fake.calls), calls)               # no consent address was made
+        os.chmod(self.file, 0o600)
+        good = self.file.read_bytes()
+        self.file.write_text("[]")                                  # not a JSON object with accounts
+        code, data = self.begin()
+        self.assertEqual((code, data.get("code")), (409, "google_file_unreadable"), data)
+        self.file.write_bytes(good)
+        # Only a release with no client (or one that is not a Google client ID) uses the own client, as before.
+        for release in ({"client_id": None, "client_secret": None}, {"client_id": 7}, None,
+                        {"client_id": "x.example.com", "client_secret": "s"}):
+            with self.subTest(release=release):
+                self.fake.CLIENT = release
+                code, data = self.begin()
+                self.assertEqual((code, data["app"], data["verified"], self.fake.calls[-1][1][0]),
+                                 (200, "own", None, CLIENT_ID))
+        self.fake.CLIENT = {"client_id": APP_ID, "client_secret": APP_SECRET}
         # One service: Google is asked for that service's permission only.
         for service, scope in (("gmail", "https://www.googleapis.com/auth/gmail.modify"),
                                ("drive", "https://www.googleapis.com/auth/drive")):
@@ -489,7 +537,7 @@ class GoogleHub(OwnerAPI):
             self.assertEqual(json.loads(row["body"])["service"], service)
         self.assertEqual(self.begin(service="calendar")[0], 400)
 
-    def test_finish_saves_the_account_registers_the_fingerprints_and_tells_the_manager(self):
+    def test_finish_saves_the_account_with_its_client_registers_the_token_and_tells_the_manager(self):
         code, start = self.begin()
         code, data = self.finish("x" * 43)
         self.assertEqual((code, data["error"]), (409, hub.GOOGLE_STALE))
@@ -498,17 +546,22 @@ class GoogleHub(OwnerAPI):
         self.assertEqual(code, 200, data)
         self.assertEqual({k: data[k] for k in ("email", "scopes", "connected", "replaced")},
                          {"email": EMAIL, "scopes": ["drive", "gmail.modify"], "connected": True, "replaced": False})
-        self.assertIn(("exchange", (CLIENT_ID, CLIENT_SECRET, CODE, "v" * 64, REDIRECT)), self.fake.calls)
+        self.assertIn(("exchange", (APP_ID, APP_SECRET, CODE, "v" * 64, REDIRECT)), self.fake.calls)
         self.assertIn(("account_email", (ACCESS + "first",)), self.fake.calls)
         st = os.lstat(self.file)
         self.assertEqual((stat.S_IMODE(st.st_mode), stat.S_IMODE(os.lstat(self.file.parent).st_mode)), (0o600, 0o700))
         saved = json.loads(self.file.read_text())
-        self.assertEqual(saved, {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "accounts": {
-            EMAIL: {"refresh_token": REFRESH, "scopes": SCOPES, "connected_at": saved["accounts"][EMAIL]["connected_at"]}}})
+        # A new hub's file: the account and the client that made its token, no client of its own at the top, and the
+        # secret of Founderizer's app that founderizer.com gave (no public code holds it), read once.
+        self.assertEqual(saved, {"clients": {APP_ID: APP_SECRET},
+                                 "accounts": {EMAIL: {"refresh_token": REFRESH, "scopes": SCOPES, "client_id": APP_ID,
+                                                      "connected_at": saved["accounts"][EMAIL]["connected_at"]}}})
+        self.assertEqual(self.fake.names().count("client_secret"), 1)
         self.assertEqual(os.listdir(self.file.parent), ["google.json"])          # no temporary file is left
+        # The account's refresh token and the client's secret have their fingerprints.
         self.assertEqual([r["label"] for r in hub.q("SELECT label FROM secrets ORDER BY id")],
                          ["google refresh-token owner@example.com", "google client-secret"])
-        self.assertTrue(hub.secret_hit(f"token={REFRESH}") and hub.secret_hit(CLIENT_SECRET))
+        self.assertTrue(hub.secret_hit(f"token={REFRESH}") and hub.secret_hit(APP_SECRET))
         self.assertEqual(hub.mask_secrets(f"a {REFRESH} b"), f"a {hub.MASK} b")
         said = hub.q1("SELECT text FROM events WHERE agent='manager' AND kind='say' ORDER BY id DESC")["text"]
         self.assertEqual(said, f"[hub] The owner connected the Google account {EMAIL}.")
@@ -518,47 +571,756 @@ class GoogleHub(OwnerAPI):
         self.assertIsNone(hub.GOOGLE["pending"])
         self.assertEqual(self.finish(start["state"])[0], 409)          # the pending Connect is gone
 
-        # A second account, with a new client; then the same account again.
+        # A file from before 1.185: its own client at the top and an account that it made. A second account comes
+        # through Founderizer's app, and the top and the old account stay as they are.
+        old = {"refresh_token": REFRESH, "connected_at": 1760600000, "scopes": SCOPES}
+        hub.google_store({"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "accounts": {EMAIL: dict(old)}})
         self.fake.email, self.fake.refresh_token = "Dev.Agent@Example.com", REFRESH2
         hub.GOOGLE["tokens"][EMAIL2] = {"access": "old", "for": "x", "expires": time.time() + 3600}
         hub.GOOGLE["problems"][EMAIL2] = hub.GOOGLE_PROBLEM
-        code, start = self.owner("/ui/google/connect", redirect_uri=REDIRECT, client={
-            "client_id": "999-new.apps.googleusercontent.com", "client_secret": "GOCSPX-newsecret12345"})
+        code, start = self.begin()
         code, data = self.finish(start["state"])
         self.assertEqual((code, data["email"], data["replaced"]), (200, EMAIL2, False))
         saved = json.loads(self.file.read_text())
-        self.assertEqual((saved["client_id"], sorted(saved["accounts"])), ("999-new.apps.googleusercontent.com",
-                                                                           [EMAIL2, EMAIL]))
+        self.assertEqual(saved, {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
+                                 "clients": {APP_ID: APP_SECRET}, "accounts": {
+            EMAIL: old, EMAIL2: {"refresh_token": REFRESH2, "scopes": SCOPES, "client_id": APP_ID,
+                                 "connected_at": saved["accounts"][EMAIL2]["connected_at"]}}})
         self.assertNotIn(EMAIL2, hub.GOOGLE["tokens"])
         self.assertNotIn(EMAIL2, hub.GOOGLE["problems"])
         self.assertIn("google refresh-token dev.agent@example.com",
                       [r["label"] for r in hub.q("SELECT label FROM secrets ORDER BY id")])
-        self.fake.refresh_token = REFRESH2 + "x"
-        code, start = self.begin(client=False, account=EMAIL2)
+        # The old account connected again: it moves to Founderizer's client, and its old token is not revoked,
+        # because Google's revoke would take the whole grant to the project, the new token's too.
+        self.fake.email, self.fake.refresh_token = EMAIL, REFRESH + "x"
+        code, start = self.begin(account=EMAIL)
         code, data = self.finish(start["state"])
         self.assertEqual((code, data["replaced"]), (200, True))
-        self.assertEqual(json.loads(self.file.read_text())["accounts"][EMAIL2]["refresh_token"], REFRESH2 + "x")
+        entry = json.loads(self.file.read_text())["accounts"][EMAIL]
+        self.assertEqual((entry["refresh_token"], entry["client_id"]), (REFRESH + "x", APP_ID))
+        self.assertNotIn("revoke", self.fake.names())
+        # A release with no client: the own client connects, and its secret keeps its fingerprint as before.
+        self.fake.CLIENT, self.fake.email, self.fake.refresh_token = None, "third@example.com", "1//third-0123456789ab"
+        code, start = self.begin()
+        self.assertEqual(self.finish(start["state"])[0], 200)
+        self.assertIn(("exchange", (CLIENT_ID, CLIENT_SECRET, CODE, "v" * 64, REDIRECT)), self.fake.calls)
+        self.assertEqual(json.loads(self.file.read_text())["accounts"]["third@example.com"]["client_id"], CLIENT_ID)
+        self.assertTrue(hub.secret_hit(CLIENT_SECRET))
+        # The secret of Founderizer's app: from the hub's file after a restart, and from founderizer.com again only
+        # when the file has none; a Connect that cannot read it starts nothing.
+        self.fake.CLIENT, self.fake.email = {"client_id": APP_ID, "client_secret": None}, "fourth@example.com"
+        hub.GOOGLE["secrets"].clear()                               # a restart
+        hub.GOOGLE["read_at"].clear()
+        fetched = self.fake.names().count("client_secret")
+        code, start = self.begin()
+        self.assertEqual(self.finish(start["state"])[0], 200)
+        self.assertEqual(self.fake.names().count("client_secret"), fetched)          # the file's own copy
+        self.assertEqual(self.fake.calls[-2], ("exchange", (APP_ID, APP_SECRET, CODE, "v" * 64, REDIRECT)))
+        saved = json.loads(self.file.read_text())
+        hub.google_store(dict({k: v for k, v in saved.items() if k != "clients"}))    # a file with no secret
+        hub.GOOGLE["secrets"].clear()                               # and a restart
+        hub.GOOGLE["read_at"].clear()
+        self.fake.fail["client_secret"] = Err("founderizer.com cannot be reached now")
+        hub.GOOGLE["pending"] = None
+        code, data = self.begin()
+        self.assertEqual((code, data["error"], data["code"]), (502, hub.GOOGLE_NO_SECRET, "google_no_secret"))
+        self.assertIsNone(hub.GOOGLE["pending"])
+        code, data = self.begin()                                   # within a minute: no read of the site
+        self.assertEqual((code, data["error"]), (502, hub.GOOGLE_NO_SECRET))
+        self.assertEqual(self.fake.names().count("client_secret"), fetched + 1)
+        hub.GOOGLE["read_at"].clear()                               # a minute later, founderizer.com answers again
+        code, start = self.begin()
+        self.assertEqual(code, 200, start)
+        self.assertEqual(self.fake.names().count("client_secret"), fetched + 2)
 
         before = self.file.read_bytes()
         code, start = self.begin()
         self.fake.fail["exchange"] = Err("Google answered 400", 400, "invalid_grant")
         code, data = self.finish(start["state"])
-        self.assertEqual((code, data), (502, {"error": "Google refused: invalid_grant. Start Connect again."}))
+        self.assertEqual((code, data), (502, {"code": "google_refused", "names": {"reason": "invalid_grant"},
+                                              "error": "Google refused: invalid_grant. Start Connect again."}))
         self.assertEqual(self.file.read_bytes(), before)            # nothing is written
         code, start = self.begin()
         self.fake.fail["account_email"] = Err("Google cannot be reached", None, None)
         code, data = self.finish(start["state"])
-        self.assertEqual((code, data["error"]), (502, "Google refused: Google cannot be reached. Start Connect again."))
+        self.assertEqual((code, data["error"], data["names"]), (502, "Google refused: Google cannot be reached. Start "
+                                                               "Connect again.", {"reason": "Google cannot be reached"}))
         self.assertEqual(self.file.read_bytes(), before)
         code, start = self.begin()
         os.chmod(self.file, 0o644)                                  # a file that the hub cannot read is not replaced
         code, data = self.finish(start["state"])
-        self.assertEqual(code, 409, data)
+        self.assertEqual((code, data.get("code")), (409, "google_file_mode"), data)
         self.assertIn("mode 600", data["error"])
         self.assertEqual(self.file.read_bytes(), before)
         for fields in ({"state": "s", "code": CODE, "x": 1}, {"state": "s"}, {"state": "a b", "code": CODE},
                        {"state": 7, "code": CODE}):
             self.assertEqual(self.owner("/ui/google/finish", **fields)[0], 400, fields)
+
+    def test_an_account_that_moves_from_an_own_client_keeps_its_other_service(self):
+        """Google adds what an account granted before only inside one project, and Founderizer's app is a project of
+        its own: a Connect of one service asks for every service that an own client's account has (the one that it
+        names, or, as the app names none, each one of the file), and a finish that lost one says which (dropped)."""
+        self.connected()                                            # the own client's account, Drive and Gmail
+        code, start = self.begin(account=EMAIL, service="gmail")   # Connect again, as connect_google with an account
+        self.assertEqual(code, 200, start)
+        self.assertEqual(self.fake.calls[-1][1][5], tuple(SCOPES))  # both: Gmail does not drop its Drive
+        code, data = self.finish(start["state"])
+        self.assertEqual((code, data["replaced"], data["scopes"], data["dropped"]),
+                         (200, True, ["drive", "gmail.modify"], []))
+        self.assertEqual(json.loads(self.file.read_text())["accounts"][EMAIL]["client_id"], APP_ID)
+        # Inside Founderizer's project Google keeps the other service: one service is asked for, as before.
+        code, start = self.begin(account=EMAIL, service="drive")
+        self.assertEqual(self.fake.calls[-1][1][5], ("https://www.googleapis.com/auth/drive",))
+        # The app's Connect names no account: it asks for every service of the own client's accounts, so the account
+        # that signs in keeps its Drive, whichever it is.
+        self.connected(email=EMAIL2, refresh=REFRESH2)
+        code, start = self.begin(service="gmail")
+        self.assertEqual(self.fake.calls[-1][1][5], tuple(SCOPES))
+        # Google lets the owner untick a service on its page: the token then has Gmail only, and the finish says which
+        # service needs a Connect of its own.
+        self.fake.email, self.fake.refresh_token, self.fake.scopes = EMAIL2, REFRESH2, [SCOPES[1]]
+        code, data = self.finish(start["state"])
+        self.assertEqual((code, data["email"], data["dropped"]), (200, EMAIL2, ["drive"]))
+        # No account of another client is left: one service is asked for, and a new account drops nothing.
+        code, start = self.begin(service="gmail")
+        self.assertEqual(self.fake.calls[-1][1][5], (SCOPES[1],))
+        code, start = self.begin()
+        self.fake.email = "new@example.com"
+        self.assertEqual(self.finish(start["state"])[1]["dropped"], [])
+
+    def test_a_wide_ask_keeps_only_the_named_service_for_another_account(self):
+        """A Connect of Gmail in a fleet with an own client's account asks Google for both services, because the hub
+        cannot know before Google answers who signs in. Another account that signs in, and allows both, keeps Gmail
+        only: the service that the owner named, and what that account's own entry had."""
+        self.connected()                                            # the own client's account, Drive and Gmail
+        code, start = self.begin(service="gmail")
+        self.assertEqual(self.fake.calls[-1][1][5], tuple(SCOPES))  # the wide ask
+        self.fake.email, self.fake.refresh_token = "new@example.com", REFRESH2
+        code, data = self.finish(start["state"])
+        self.assertEqual((code, data["scopes"], data["dropped"]), (200, ["gmail.modify"], []))
+        # The same with a named account, when Google lets the owner choose another one.
+        code, start = self.begin(account=EMAIL, service="gmail")
+        self.assertEqual(self.fake.calls[-1][1][5], tuple(SCOPES))
+        self.fake.email, self.fake.refresh_token = "third@example.com", REFRESH + "3"
+        code, data = self.finish(start["state"])
+        self.assertEqual((code, data["scopes"]), (200, ["gmail.modify"]))
+        # The own client's account itself keeps both.
+        code, start = self.begin(service="gmail")
+        self.fake.email, self.fake.refresh_token = EMAIL, REFRESH + "x"
+        code, data = self.finish(start["state"])
+        self.assertEqual((code, data["scopes"], data["dropped"]), (200, ["drive", "gmail.modify"], []))
+
+    def test_a_fleet_keeps_only_the_services_that_it_asked_for(self):
+        """Every hub signs in to the same Founderizer app, and Google gives a token every service that the person
+        granted to that app, also at another fleet (include_granted_scopes). A fleet keeps the service that its
+        Connect named and what that account's own entry had: never the Drive that a person gave only to another
+        fleet."""
+        self.fake.scopes = list(SCOPES)                             # Drive at another fleet, Gmail here
+        code, start = self.begin(service="gmail")
+        code, data = self.finish(start["state"])
+        self.assertEqual((code, data["scopes"]), (200, ["gmail.modify"]))
+        self.assertEqual(json.loads(self.file.read_text())["accounts"][EMAIL]["scopes"], [SCOPES[1]])
+        code, start = self.begin(service="drive")                  # Drive here too: the entry keeps its Gmail
+        code, data = self.finish(start["state"])
+        self.assertEqual((code, data["scopes"], data["dropped"]), (200, ["drive", "gmail.modify"], []))
+        self.fake.scopes = [SCOPES[0]]                              # nothing that Google did not give
+        code, start = self.begin()
+        code, data = self.finish(start["state"])
+        self.assertEqual((data["scopes"], data["dropped"]), (["drive"], ["gmail"]))
+
+    def test_a_new_secret_of_founderizers_app_is_read_again_when_google_refuses_the_old_one(self):
+        """Founderizer can change its app's secret and turn the old one off. Google then refuses the old one
+        (invalid_client), and the hub reads founderizer.com once more, at most once a minute: a new secret is tried,
+        and it takes the old one's place, in the file too, only once Google took it. The same one, a wrong one or no
+        answer leaves Google's refusal and the secret that the hub had, and nothing is kept as refused: one refusal that
+        Google gives by mistake costs its own call. An own client's refusal reads nothing."""
+        new, newer = "GOCSPX-founderizer-new-0123456789", "GOCSPX-founderizer-newer-012345678"
+        refused = Err("Google answered 401: invalid_client", 401, "invalid_client")
+        self.connected()                                            # the own client's account
+        self.connected(email=EMAIL2, refresh=REFRESH2, client_id=APP_ID)
+        hub.google_store(dict(json.loads(self.file.read_text()), clients={APP_ID: APP_SECRET}))
+        self.give(drive="read", gmail=(EMAIL2, "read"))
+        self.work = self.task()
+
+        def later():                                                # a minute later, for the next read of the site
+            hub.GOOGLE["tokens"].clear()
+            hub.GOOGLE["read_at"][APP_ID] = time.monotonic() - hub.GOOGLE_READ_AGAIN
+
+        def reads():
+            return self.fake.names().count("client_secret")
+        # At a refresh: the new one, once, which the file keeps once Google took it.
+        self.fake.site_secret, self.fake.fail["refresh"] = new, refused
+        self.ok("gmail_search", {"query": "x"})
+        self.assertEqual([c for c in self.fake.calls if c[0] in ("refresh", "client_secret")],
+                         [("refresh", (APP_ID, APP_SECRET, REFRESH2)), ("client_secret", ()),
+                          ("refresh", (APP_ID, new, REFRESH2))])
+        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: new})
+        self.assertTrue(hub.secret_hit(new))
+        # Within a minute of that read, a refusal reads nothing.
+        hub.GOOGLE["tokens"].clear()
+        self.fake.fail["refresh"] = refused
+        self.assertEqual(self.refused("gmail_search", {"query": "x"}),
+                         "Not done: Google gave no access now (invalid_client). Try again later.")
+        self.assertEqual(reads(), 1)
+        # The site gives the same one: Google's refusal stands, and the next call works with that same secret.
+        later()
+        self.fake.fail["refresh"] = refused
+        self.assertIn("(invalid_client)", self.refused("gmail_search", {"query": "x"}))
+        self.assertEqual(reads(), 2)
+        self.ok("gmail_search", {"query": "x"})
+        self.assertEqual([c for c in self.fake.calls if c[0] == "refresh"][-1], ("refresh", (APP_ID, new, REFRESH2)))
+        # A wrong one from the site, which Google refuses too: the hub keeps the one that it had.
+        later()
+        self.fake.site_secret = "GOCSPX-founderizer-wrong-01234567"
+        self.fake.during["refresh"] = lambda: self.fake.fail.setdefault("refresh", refused)
+        self.assertIn("(invalid_client)", self.refused("gmail_search", {"query": "x"}))
+        del self.fake.during["refresh"]
+        self.fake.fail.pop("refresh", None)
+        self.assertEqual((json.loads(self.file.read_text())["clients"], hub.GOOGLE["secrets"][APP_ID]),
+                         ({APP_ID: new}, new))
+        self.assertFalse(hub.secret_hit("GOCSPX-founderizer-wrong-01234567"))
+        # The site cannot answer: the same.
+        later()
+        self.fake.fail.update(refresh=refused, client_secret=Err("founderizer.com cannot be reached now"))
+        self.assertIn("(invalid_client)", self.refused("gmail_search", {"query": "x"}))
+        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: new})
+        later()                                                     # the own client's secret is the owner's
+        before = reads()
+        self.fake.fail["refresh"] = refused
+        self.assertIn("(invalid_client)", self.refused("drive_search", {"words": "x"}))
+        self.assertEqual(reads(), before)
+        # At an exchange: the second try with the new secret uses the same code (the stand-in Google takes it;
+        # whether Google does is the live check's).
+        later()
+        self.fake.site_secret, self.fake.email, self.fake.refresh_token = newer, "third@example.com", REFRESH + "3"
+        code, start = self.begin()
+        self.fake.fail["exchange"] = refused
+        code, data = self.finish(start["state"])
+        self.assertEqual(code, 200, data)
+        self.assertEqual([c[1][1] for c in self.fake.calls if c[0] == "exchange"], [new, newer])
+        self.assertEqual((json.loads(self.file.read_text())["clients"], hub.GOOGLE["secrets"][APP_ID]),
+                         ({APP_ID: newer}, newer))
+        before = self.file.read_bytes()                             # the same one again: nothing is written
+        later()
+        code, start = self.begin()
+        self.fake.fail["exchange"] = refused
+        code, data = self.finish(start["state"])
+        self.assertEqual((code, data.get("error")), (502, "Google refused: invalid_client. Start Connect again."))
+        self.assertEqual(self.file.read_bytes(), before)
+        # A new secret whose exchange Google then refuses only for the code (invalid_grant): Google took the client,
+        # so the hub keeps that secret, and writes no account.
+        later()
+        newest = "GOCSPX-founderizer-newest-01234567"
+        self.fake.site_secret = newest
+        code, start = self.begin()
+        self.fake.fail["exchange"] = refused
+        self.fake.during["exchange"] = lambda: self.fake.fail.setdefault(
+            "exchange", Err("Google answered 400: invalid_grant", 400, "invalid_grant"))
+        code, data = self.finish(start["state"])
+        del self.fake.during["exchange"]
+        self.fake.fail.pop("exchange", None)
+        self.assertEqual((code, data.get("error")), (502, "Google refused: invalid_grant. Start Connect again."))
+        saved = json.loads(self.file.read_text())
+        self.assertEqual((saved["clients"], hub.GOOGLE["secrets"][APP_ID]), ({APP_ID: newest}, newest))
+        self.assertEqual(saved["accounts"], json.loads(before)["accounts"])
+        # The same when the second exchange works and the email read then fails.
+        later()
+        latest = "GOCSPX-" "founderizer-latest-0123456789"       # in two parts: no line has a key's whole shape
+        self.fake.site_secret = latest
+        code, start = self.begin()
+        self.fake.fail.update(exchange=refused, account_email=Err("Google cannot be reached now"))
+        code, data = self.finish(start["state"])
+        self.assertEqual((code, data.get("error")),
+                         (502, "Google refused: Google cannot be reached now. Start Connect again."))
+        saved = json.loads(self.file.read_text())
+        self.assertEqual((saved["clients"], hub.GOOGLE["secrets"][APP_ID]), ({APP_ID: latest}, latest))
+        self.assertEqual(saved["accounts"], json.loads(before)["accounts"])
+        # An own client's Connect (a release with no client): its refusal at the exchange reads nothing.
+        later()
+        self.fake.CLIENT = None
+        before = reads()
+        code, start = self.begin()
+        self.fake.fail["exchange"] = refused
+        code, data = self.finish(start["state"])
+        self.assertEqual((code, data.get("error")), (502, "Google refused: invalid_client. Start Connect again."))
+        self.assertEqual(reads(), before)
+        # At a refresh, a new secret that Google refuses only for the grant: the hub keeps the secret, and the
+        # account gets its problem.
+        self.fake.CLIENT = {"client_id": APP_ID, "client_secret": None}
+        later()
+        self.fake.site_secret = "GOCSPX-" "founderizer-grant-0123456789"
+        self.fake.fail["refresh"] = refused
+        self.fake.during["refresh"] = lambda: self.fake.fail.setdefault(
+            "refresh", Err("Google answered 400: invalid_grant", 400, "invalid_grant"))
+        self.assertEqual(self.refused("gmail_search", {"query": "x"}), hub.google_refused(EMAIL2, hub.GOOGLE_PROBLEM))
+        del self.fake.during["refresh"]
+        self.fake.fail.pop("refresh", None)
+        self.assertEqual(hub.GOOGLE["secrets"][APP_ID], "GOCSPX-" "founderizer-grant-0123456789")
+
+    def test_a_call_uses_the_secret_that_the_hub_holds_now(self):
+        """A Connect that started before Founderizer changed its secret holds the old one, and a refresh can start with
+        the old one while another call takes the new one. Each then goes on with the secret that the hub holds now,
+        with no read of the site. A finish writes that secret, with its fingerprint, never an older one over it; and a
+        secret from the site is kept only while the hub still holds the one that Google refused."""
+        new, newer, site = ("GOCSPX-founderizer-new-0123456789", "GOCSPX-founderizer-newer-012345678",
+                            "GOCSPX-founderizer-site-0123456789")
+        refused = Err("Google answered 401: invalid_client", 401, "invalid_client")
+        code, start = self.begin()                                  # the pending Connect holds APP_SECRET
+        hub.google_keep_secret(APP_ID, new)                         # an agent's refresh took the new one
+        reads = self.fake.names().count("client_secret")
+        code, data = self.finish(start["state"])
+        self.assertEqual(code, 200, data)
+        self.assertEqual([c[1][1] for c in self.fake.calls if c[0] == "exchange"], [new])
+        self.assertEqual(self.fake.names().count("client_secret"), reads)
+        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: new})
+        # A call takes newer while the finish runs, and its file cannot keep it: the finish writes newer, with its
+        # fingerprint, and not the new that it used.
+        code, start = self.begin()
+
+        def full(_data):
+            raise OSError(28, "No space left on device")
+
+        def meanwhile():
+            del self.fake.during["exchange"]
+            with patch.object(hub, "google_store", full):
+                hub.google_keep_secret(APP_ID, newer)
+        self.fake.during["exchange"] = meanwhile
+        self.fake.email, self.fake.refresh_token = EMAIL2, REFRESH2
+        code, data = self.finish(start["state"])
+        self.assertEqual(code, 200, data)
+        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: newer})
+        self.assertTrue(hub.secret_hit(newer))
+        # A refresh that started with newer, refused while another call took a newer one: it goes on with the
+        # hub's, and reads nothing.
+        self.give(gmail=(EMAIL2, "read"))
+        self.work = self.task()
+        reads = self.fake.names().count("client_secret")
+        hub.GOOGLE["tokens"].clear()
+        hub.GOOGLE["read_at"].clear()
+
+        def another_call():
+            del self.fake.during["refresh"]
+            hub.google_keep_secret(APP_ID, site)
+        self.fake.during["refresh"], self.fake.fail["refresh"] = another_call, refused
+        self.ok("gmail_search", {"query": "x"})
+        self.assertEqual([c[1][1] for c in self.fake.calls if c[0] == "refresh"][-2:], [newer, site])
+        self.assertEqual(self.fake.names().count("client_secret"), reads)
+        # A secret from the site, while another call takes a newer one: the newer one stays.
+        hub.GOOGLE["tokens"].clear()
+        newest = "GOCSPX-founderizer-newest-01234567"
+        self.fake.site_secret, n = "GOCSPX-founderizer-other-012345678", []
+
+        def second_refresh():
+            n.append(1)
+            if len(n) == 2:
+                hub.google_keep_secret(APP_ID, newest)
+        self.fake.during["refresh"], self.fake.fail["refresh"] = second_refresh, refused
+        self.ok("gmail_search", {"query": "x"})
+        del self.fake.during["refresh"]
+        self.assertEqual(hub.GOOGLE["secrets"][APP_ID], newest)
+
+    def test_two_calls_that_need_the_first_read_of_the_site_share_it(self):
+        """After a restart with a file that has no secret of Founderizer's app, two calls at once need the site: one
+        reads it, and the other waits for that read and takes its answer."""
+        self.connected(email=EMAIL2, refresh=REFRESH2, client_id=APP_ID)       # no clients in the file
+        self.give(gmail=(EMAIL2, "read"))
+        self.work = self.task()
+        thread, second, waiting = self.watched_reads("gmail_search", {"query": "y"})
+        with patch.object(hub, "GOOGLE_READING", waiting.lock):
+            self.ok("gmail_search", {"query": "x"})
+            thread.join(10)
+        self.assertFalse(second["error"], second["text"])
+        self.assertEqual(self.fake.names().count("client_secret"), 1)
+
+    def watched_reads(self, tool, args, meanwhile=None):
+        """A second call of `tool`, started during the next read of the site, which that read lets end only once the
+        second call waits for the hub's own GOOGLE_READING (waiting.lock watches it and stands in for it). meanwhile:
+        a step that runs then."""
+        real, event, second = hub.GOOGLE_READING, threading.Event(), {}
+
+        class Watched:
+            def __enter__(self):
+                if not real.acquire(blocking=False):
+                    event.set()
+                    real.acquire()
+
+            def __exit__(self, *_):
+                real.release()
+
+        def other():
+            second["text"], second["error"] = hub.call_tool("dev", tool, dict({"task_id": f"T-{self.work}"}, **args),
+                                                            ("test-generation", f"T-{self.work}", 1))
+        thread = threading.Thread(target=other)
+
+        def slow_site():
+            del self.fake.during["client_secret"]
+            thread.start()
+            self.assertTrue(event.wait(10))                         # the other call waits for this read
+            if meanwhile:
+                meanwhile()
+        self.fake.during["client_secret"] = slow_site
+        event.lock = Watched()
+        return thread, second, event
+
+    def test_calls_that_google_refuses_at_once_share_one_read_of_the_site(self):
+        """After Founderizer changed its secret, two calls that Google refuses at once read founderizer.com once: the
+        second one waits for the first one's read and tries its answer. Within the minute a later refused call tries
+        the site's last answer too, also when the call that read it could not try it (no answer from Google)."""
+        new, newer = "GOCSPX-founderizer-new-0123456789", "GOCSPX-founderizer-newer-012345678"
+        self.connected(email=EMAIL2, refresh=REFRESH2, client_id=APP_ID)
+        hub.google_store(dict(json.loads(self.file.read_text()), clients={APP_ID: APP_SECRET}))
+        self.give(gmail=(EMAIL2, "read"))
+        self.work = self.task()
+        real_refresh, off, lost = self.fake.refresh, {APP_SECRET}, []
+
+        def refresh(client_id, client_secret, refresh_token):
+            if client_secret in off:                                # Founderizer turned it off
+                self.fake.note("refresh", client_id, client_secret, refresh_token)
+                raise Err("Google answered 401: invalid_client", 401, "invalid_client")
+            if lost and client_secret == lost[0]:                   # the first try with it gets no answer
+                lost.pop()
+                self.fake.note("refresh", client_id, client_secret, refresh_token)
+                raise Err("Google cannot be reached now")
+            return real_refresh(client_id, client_secret, refresh_token)
+        self.fake.refresh, self.fake.site_secret = refresh, new
+
+        def long_read():                                            # this read began more than a minute ago
+            hub.GOOGLE["read_at"][APP_ID] = time.monotonic() - hub.GOOGLE_READ_AGAIN - 1
+        thread, second, waiting = self.watched_reads("gmail_search", {"query": "y"}, long_read)
+        with patch.object(hub, "GOOGLE_READING", waiting.lock):
+            self.ok("gmail_search", {"query": "x"})
+            thread.join(10)
+        self.assertFalse(second["error"], second["text"])
+        self.assertEqual(self.fake.names().count("client_secret"), 1)
+        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: new})
+        # Once more, and the call that reads the site gets no answer when it tries the new one.
+        off.add(new)
+        hub.GOOGLE["tokens"].clear()
+        hub.GOOGLE["read_at"].clear()                               # a minute later
+        self.fake.site_secret = newer
+        lost.append(newer)
+        self.assertIn("Google gave no access now", self.refused("gmail_search", {"query": "x"}))
+        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: new})
+        self.ok("gmail_search", {"query": "x"})                     # within the minute: the site's last answer
+        self.assertEqual(self.fake.names().count("client_secret"), 2)
+        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: newer})
+        # A wrong answer of the site, which Google refuses too, is not tried again within the minute.
+        wrong = "GOCSPX-founderizer-wrong-01234567"
+        off.update({newer, wrong})
+        hub.GOOGLE["tokens"].clear()
+        hub.GOOGLE["read_at"].clear()                               # a minute later
+        self.fake.site_secret = wrong
+        for _ in range(3):
+            self.assertIn("(invalid_client)", self.refused("gmail_search", {"query": "x"}))
+            hub.GOOGLE["tokens"].clear()
+        tried = [c[1][1] for c in self.fake.calls if c[0] == "refresh"]
+        self.assertEqual((tried.count(wrong), self.fake.names().count("client_secret")), (1, 3))
+
+    def test_a_read_of_the_site_that_fails_or_takes_long_stops_no_more_than_it_must(self):
+        """A first read of the site that fails after more than a minute: a call that waited for it does not read again,
+        as the minute runs from the read's end. A read after a refusal that fails while another call took a newer
+        secret: the refused call tries that one. And the failed read's log line is written after the read lock."""
+        self.connected(email=EMAIL2, refresh=REFRESH2, client_id=APP_ID)       # no clients in the file
+        self.give(gmail=(EMAIL2, "read"))
+        self.work = self.task()
+
+        def long_read():
+            hub.GOOGLE["read_at"][APP_ID] = time.monotonic() - hub.GOOGLE_READ_AGAIN - 1
+        self.fake.fail["client_secret"] = Err("founderizer.com cannot be reached now")
+        thread, second, waiting = self.watched_reads("gmail_search", {"query": "y"}, long_read)
+        with patch.object(hub, "GOOGLE_READING", waiting.lock):
+            self.assertEqual(self.refused("gmail_search", {"query": "x"}), hub.GOOGLE_NO_SITE)
+            thread.join(10)
+        self.assertTrue(second["error"])
+        self.assertEqual(second["text"], hub.GOOGLE_NO_SITE)
+        self.assertEqual(self.fake.names().count("client_secret"), 1)
+        newer, logged, real_log = "GOCSPX-founderizer-newer-012345678", [], hub.log
+        hub.google_store(dict(json.loads(self.file.read_text()), clients={APP_ID: APP_SECRET}))
+        hub.GOOGLE["read_at"].clear()
+
+        def log(agent, what):
+            if what.startswith("Google refused the secret of Founderizer's app, and"):
+                logged.append(hub.GOOGLE_READING.locked())
+            return real_log(agent, what)
+
+        def meanwhile():                                            # another call takes a newer secret
+            del self.fake.during["client_secret"]
+            hub.google_keep_secret(APP_ID, newer)
+        self.fake.during["client_secret"] = meanwhile
+        self.fake.fail.update(refresh=Err("Google answered 401: invalid_client", 401, "invalid_client"),
+                              client_secret=Err("founderizer.com cannot be reached now"))
+        with patch.object(hub, "log", log):
+            self.ok("gmail_search", {"query": "x"})
+        self.assertEqual([c[1][1] for c in self.fake.calls if c[0] == "refresh"][-2:], [APP_SECRET, newer])
+        self.assertEqual(logged, [False])
+
+    def test_a_refresh_during_a_disconnect_keeps_no_access_token(self):
+        """A refresh that runs while a Disconnect of its account revokes it: its call goes on with what it got, but the
+        hub keeps no access token that the revoke can have ended."""
+        self.connected(email=EMAIL2, refresh=REFRESH2, client_id=APP_ID)
+        hub.google_store(dict(json.loads(self.file.read_text()), clients={APP_ID: APP_SECRET}))
+        self.give(gmail=(EMAIL2, "read"))
+        self.work = self.task()
+
+        def disconnect():
+            del self.fake.during["refresh"]
+            code, data = self.owner("/ui/google/disconnect", account=EMAIL2)
+            self.assertEqual(code, 200, data)
+        self.fake.during["refresh"] = disconnect
+        self.ok("gmail_search", {"query": "x"})
+        self.assertNotIn(EMAIL2, hub.GOOGLE["tokens"])
+
+    def test_a_read_after_a_refusal_ends_with_what_the_hub_holds_now(self):
+        """A read of the site after a refusal that gives the refused secret again, while another call took a newer one:
+        the newer one is offered. A read that raises an error of another kind: that error, not one of the hub's own."""
+        newer = "GOCSPX-founderizer-newer-012345678"
+        self.connected(email=EMAIL2, refresh=REFRESH2, client_id=APP_ID)
+        hub.google_store(dict(json.loads(self.file.read_text()), clients={APP_ID: APP_SECRET}))
+        refused = {"client_id": APP_ID, "client_secret": APP_SECRET}
+
+        def meanwhile():
+            del self.fake.during["client_secret"]
+            hub.google_keep_secret(APP_ID, newer)
+        self.fake.site_secret, self.fake.during["client_secret"] = APP_SECRET, meanwhile
+        self.assertEqual(hub.google_secret_again(refused), {"client_id": APP_ID, "client_secret": newer})
+        hub.GOOGLE["read_at"].clear()
+        hub.GOOGLE["secrets"].clear()
+        hub.google_store(dict(json.loads(self.file.read_text()), clients={APP_ID: APP_SECRET}))
+        self.fake.fail["client_secret"] = ValueError("an answer that no rule of google.py knows")
+        with self.assertRaises(ValueError):
+            hub.google_secret_again(refused)
+
+    def test_a_refresh_that_starts_during_a_disconnect_keeps_no_access_token(self):
+        """A refresh that starts while a Disconnect of its account runs (its revoke out, its write not done yet) and
+        ends after it: the hub keeps no access token, as that revoke can have ended it."""
+        self.connected(email=EMAIL2, refresh=REFRESH2, client_id=APP_ID)
+        hub.google_store(dict(json.loads(self.file.read_text()), clients={APP_ID: APP_SECRET}))
+        self.give(gmail=(EMAIL2, "read"))
+        self.work = self.task()
+        refreshing, done, call = threading.Event(), threading.Event(), {}
+        self.addCleanup(lambda: thread.is_alive() and thread.join(10))
+        self.addCleanup(done.set)                                   # runs first: a failed step leaves no thread
+
+        def slow_refresh():                                         # the tool's refresh ends after the Disconnect
+            del self.fake.during["refresh"]
+            refreshing.set()
+            done.wait(10)
+
+        def tool():
+            call["text"], call["error"] = hub.call_tool(
+                "dev", "gmail_search", {"task_id": f"T-{self.work}", "query": "x"},
+                ("test-generation", f"T-{self.work}", 1))
+        thread = threading.Thread(target=tool)
+
+        def revoke():                                               # the Disconnect's revoke is out: the tool starts
+            del self.fake.during["revoke"]
+            self.fake.during["refresh"] = slow_refresh
+            thread.start()
+            self.assertTrue(refreshing.wait(10))
+        self.fake.during["revoke"] = revoke
+        code, data = self.owner("/ui/google/disconnect", account=EMAIL2)
+        self.assertEqual(code, 200, data)
+        done.set()
+        thread.join(10)
+        self.assertFalse(call["error"], call["text"])                # that call went on with what it got
+        self.assertNotIn(EMAIL2, hub.GOOGLE["tokens"])
+
+    def test_a_refused_refresh_during_a_connect_again_or_a_disconnect_leaves_no_old_problem(self):
+        """Google refuses a refresh (invalid_grant) while the owner connects the account again: the old token's problem
+        does not count for the new entry, the call says to try again, and the next call works. While a Disconnect runs:
+        the call says that the account is not connected, and no problem stays on it."""
+        self.connected(email=EMAIL2, refresh=REFRESH2, client_id=APP_ID)
+        hub.google_store(dict(json.loads(self.file.read_text()), clients={APP_ID: APP_SECRET}))
+        self.give(gmail=(EMAIL2, "read"))
+        self.work = self.task()
+        fresh, grant = "1//0fresh-token-0123456789abcdefghijklmn", Err("Google answered 400: invalid_grant", 400,
+                                                                       "invalid_grant")
+
+        def connect_again():
+            del self.fake.during["refresh"]
+            code, start = self.begin(account=EMAIL2)
+            self.fake.email, self.fake.refresh_token = EMAIL2, fresh
+            self.assertEqual(self.finish(start["state"])[0], 200)
+        self.fake.during["refresh"], self.fake.fail["refresh"] = connect_again, grant
+        self.assertEqual(self.refused("gmail_search", {"query": "x"}),
+                         f"Not done: the Google account {EMAIL2} was connected again during this call. Try again.")
+        view = {a["email"]: a for a in self.request("/ui/team?db=test-generation")[1]["google"]["accounts"]}
+        self.assertIsNone(view[EMAIL2]["problem"])
+        self.ok("gmail_search", {"query": "x"})
+        self.assertEqual([c for c in self.fake.calls if c[0] == "refresh"][-1][1][2], fresh)
+        hub.GOOGLE["tokens"].clear()
+        # A late refusal of the old token, after another call recorded the new token's own problem: that one stays.
+        newest = "1//0newest-token-0123456789abcdefghijkl"
+
+        def connect_again_and_refuse_the_new_one():
+            del self.fake.during["refresh"]
+            code, start = self.begin(account=EMAIL2)
+            self.fake.refresh_token = newest
+            self.assertEqual(self.finish(start["state"])[0], 200)
+            with hub.GOOGLE_LOCK:                                   # as another call's refusal of the new one does
+                hub.GOOGLE["problems"][EMAIL2] = hub.GOOGLE_PROBLEM
+                hub.GOOGLE["problem_for"][EMAIL2] = hashlib.sha256(newest.encode()).hexdigest()
+        self.fake.during["refresh"], self.fake.fail["refresh"] = connect_again_and_refuse_the_new_one, grant
+        self.refused("gmail_search", {"query": "x"})
+        view = {a["email"]: a for a in self.request("/ui/team?db=test-generation")[1]["google"]["accounts"]}
+        self.assertEqual(view[EMAIL2]["problem"], hub.GOOGLE_PROBLEM)
+        hub.GOOGLE["problems"].pop(EMAIL2)                          # for the next part
+        hub.GOOGLE["problem_for"].pop(EMAIL2)
+        hub.GOOGLE["tokens"].clear()
+
+        def disconnect():
+            del self.fake.during["refresh"]
+            self.assertEqual(self.owner("/ui/google/disconnect", account=EMAIL2)[0], 200)
+        self.fake.during["refresh"], self.fake.fail["refresh"] = disconnect, grant
+        self.assertEqual(self.refused("gmail_search", {"query": "x"}),
+                         f"The Google account {EMAIL2} is not connected. Ask your requester.")
+        view = {a["email"]: a for a in self.request("/ui/team?db=test-generation")[1]["google"]["accounts"]}
+        self.assertIsNone((view.get(EMAIL2) or {}).get("problem"))
+        self.assertIsNone(hub.google_problem_of(hub.GOOGLE["problems"], hub.GOOGLE["problem_for"], EMAIL2, None))
+
+    def test_a_secret_that_the_file_cannot_keep_stays_in_memory(self):
+        """Google took a new secret, and the write of google.json fails: the call goes on, and the hub uses the new
+        secret from memory until a restart, with no refusal and no read of the site at each refresh."""
+        new = "GOCSPX-founderizer-new-0123456789"
+        self.connected(email=EMAIL2, refresh=REFRESH2, client_id=APP_ID)
+        hub.google_store(dict(json.loads(self.file.read_text()), clients={APP_ID: APP_SECRET}))
+        self.give(gmail=(EMAIL2, "read"))
+        self.work = self.task()
+        self.fake.site_secret = new
+        self.fake.fail["refresh"] = Err("Google answered 401: invalid_client", 401, "invalid_client")
+
+        def full(_data):
+            raise OSError(28, "No space left on device")
+        with patch.object(hub, "google_store", full):
+            self.ok("gmail_search", {"query": "x"})
+        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: APP_SECRET})
+        self.assertEqual(hub.GOOGLE["secrets"][APP_ID], new)
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM log WHERE what LIKE ?",
+                                ("could not keep the secret of Founderizer's Google app in the Google file%",))["n"], 1)
+        hub.GOOGLE["tokens"].clear()
+        self.ok("gmail_search", {"query": "x"})
+        self.assertEqual([c[1][1] for c in self.fake.calls if c[0] == "refresh"], [APP_SECRET, new, new])
+        self.assertEqual(self.fake.names().count("client_secret"), 1)
+
+    def test_a_disconnect_that_comes_during_a_finish_write_waits_for_it(self):
+        """A Disconnect that starts while a finish of the same account checks and writes (under LOCK) counts and reads
+        the file only after that write: it then revokes the new token and removes it, and nothing stays connected."""
+        code, start = self.begin()                                  # a first Connect: no entry of EMAIL yet
+        claimed, go, moved = threading.Event(), threading.Event(), threading.Event()
+        real_run, real_store, real_saved = hub.command_run, hub.google_store, hub.google_saved
+        real_enter = hub.TeamLock.__enter__
+        armed, answers, writer, disconnecting = [True], {}, [], []
+
+        def run(route, request_id, client, db, body, act, keep=None, outside=None):
+            if route == "google/disconnect" and outside is not None:
+                inner = outside
+
+                def outside(b):
+                    disconnecting.append(threading.get_ident())
+                    claimed.set()
+                    go.wait(10)                                     # until the finish's act checked the counts
+                    return inner(b)
+            return real_run(route, request_id, client, db, body, act, keep, outside)
+
+        def store(data):
+            if armed[0] and EMAIL in (data.get("accounts") or {}):  # the finish's write, under LOCK
+                armed[0] = False
+                writer.append(threading.get_ident())
+                go.set()
+                self.assertTrue(moved.wait(10))     # the Disconnect read the file (no fix) or waits for LOCK (fix)
+            return real_store(data)
+
+        def saved():
+            got = real_saved()
+            if writer and threading.get_ident() in disconnecting:
+                moved.set()
+            return got
+
+        def enter(lock):
+            if writer and threading.get_ident() in disconnecting and lock is hub.LOCK:
+                if lock.acquire(False):
+                    return True
+                moved.set()
+            return real_enter(lock)
+
+        def disconnect():
+            answers["disconnect"] = self.owner("/ui/google/disconnect", account=EMAIL)
+        with patch.object(hub, "command_run", run), patch.object(hub, "google_store", store), \
+                patch.object(hub, "google_saved", saved), patch.object(hub.TeamLock, "__enter__", enter):
+            thread = threading.Thread(target=disconnect)
+            thread.start()
+            self.assertTrue(claimed.wait(10))
+            answers["finish"] = self.finish(start["state"])
+            thread.join(30)
+        (fc, fd), (dc, dd) = answers["finish"], answers["disconnect"]
+        self.assertEqual((fc, fd.get("connected")), (200, True))
+        self.assertEqual((dc, dd.get("revoked")), (200, True))
+        self.assertEqual(self.fake.names().count("revoke"), 1)
+        self.assertNotIn(EMAIL, json.loads(self.file.read_text()).get("accounts") or {})
+
+    def test_a_disconnect_that_ends_early_leaves_no_count_running(self):
+        """A Disconnect that stops at a file that the hub cannot read, before or after its revoke, still ends its
+        count, so a later Connect of the same account works."""
+        code, start = self.begin()
+        self.assertEqual(self.finish(start["state"])[0], 200)
+        os.chmod(self.file, 0o644)                                  # at its start: nothing is revoked
+        code, data = self.owner("/ui/google/disconnect", account=EMAIL)
+        self.assertEqual((code, data.get("code")), (409, "google_file_mode"), data)
+        self.assertNotIn("revoke", self.fake.names())
+        os.chmod(self.file, 0o600)
+        code, start = self.begin(account=EMAIL)
+        self.assertEqual(self.finish(start["state"])[0], 200)
+
+        def bad_file():                                             # after its revoke, before its write
+            del self.fake.during["revoke"]
+            os.chmod(self.file, 0o644)
+        self.fake.during["revoke"] = bad_file
+        hub.GOOGLE["tokens"][EMAIL] = {"access": "ya29.old", "for": "x", "expires": time.time() + 3600}
+        code, data = self.owner("/ui/google/disconnect", account=EMAIL)
+        self.assertEqual((code, data.get("code")), (409, "google_file_mode"), data)
+        self.assertNotIn(EMAIL, hub.GOOGLE["tokens"])               # the revoke ended it, whatever the file says
+        os.chmod(self.file, 0o600)
+        self.assertIn(EMAIL, json.loads(self.file.read_text())["accounts"])     # the entry stays
+        self.assertEqual(hub.GOOGLE["revokes"][EMAIL], hub.GOOGLE["revoked"][EMAIL])
+        code, start = self.begin(account=EMAIL)
+        self.assertEqual(self.finish(start["state"])[0], 200)
+
+    def test_a_disconnect_during_a_finish_leaves_no_dead_token(self):
+        """Google's revoke ends the account's whole grant, also the token that a finish of the same account got
+        meanwhile: that finish writes nothing and says so, and the account is not shown as connected."""
+        code, start = self.begin()
+        self.assertEqual(self.finish(start["state"])[0], 200)       # the account is connected
+        code, start = self.begin(account=EMAIL)                     # Connect again, and a Disconnect at its exchange
+        self.fake.refresh_token = REFRESH2
+
+        def disconnect():
+            del self.fake.during["exchange"]
+            code, data = self.owner("/ui/google/disconnect", account=EMAIL)
+            self.assertEqual((code, data["revoked"]), (200, True))
+        self.fake.during["exchange"] = disconnect
+        code, data = self.finish(start["state"])
+        self.assertEqual((code, data.get("error"), data.get("code")), (409, hub.GOOGLE_REVOKED, "google_revoked_during"))
+        self.assertNotIn(EMAIL, json.loads(self.file.read_text()).get("accounts") or {})
+        self.assertFalse(hub.secret_hit(REFRESH2))
+        code, start = self.begin()                                  # a later Connect works
+        self.assertEqual(self.finish(start["state"])[0], 200)
+        # The other order: a Connect again finishes while the Disconnect's revoke is out. It writes nothing, and the
+        # Disconnect removes the entry that it revoked.
+        code, start = self.begin(account=EMAIL)
+        third = "1//0third-token-0123456789abcdefghijklmnop"
+        self.fake.refresh_token, answers = third, []
+
+        def finish():
+            del self.fake.during["revoke"]
+            answers.append(self.finish(start["state"]))
+        self.fake.during["revoke"] = finish
+        code, data = self.owner("/ui/google/disconnect", account=EMAIL)
+        self.assertEqual((code, data["revoked"]), (200, True))
+        self.assertEqual([(c, d.get("error")) for c, d in answers], [(409, hub.GOOGLE_REVOKED)])
+        self.assertNotIn(EMAIL, json.loads(self.file.read_text()).get("accounts") or {})
+        self.assertFalse(hub.secret_hit(third))
+        code, start = self.begin()                                  # each Disconnect ended: a Connect works again
+        self.assertEqual(self.finish(start["state"])[0], 200)
 
     def test_a_refusal_at_the_first_connect_writes_no_file(self):
         code, start = self.begin()
@@ -566,6 +1328,26 @@ class GoogleHub(OwnerAPI):
         self.assertEqual(self.finish(start["state"])[0], 502)
         self.assertFalse(self.file.exists())
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM secrets")["n"], 0)
+
+    def test_the_calls_to_google_and_founderizer_com_hold_no_lock_of_the_hub(self):
+        """A slow Google or founderizer.com stops no other request: the Connect reads the secret, and the finish makes
+        its calls (the exchange, the read again after a refused secret, the account's email), before they take LOCK
+        for their own writes."""
+        held = []
+        for name in ("client_secret", "exchange", "account_email"):
+            self.fake.during[name] = lambda name=name: held.append((name, hub.LOCK._is_owned()))
+        code, start = self.begin()
+        self.assertEqual(code, 200, start)
+        self.fake.site_secret = "GOCSPX-founderizer-new-0123456789"
+        hub.GOOGLE["read_at"].clear()                               # a minute after the first read
+        self.fake.fail["exchange"] = Err("Google answered 401: invalid_client", 401, "invalid_client")
+        code, data = self.finish(start["state"])
+        self.assertEqual(code, 200, data)
+        self.assertEqual(held, [("client_secret", False), ("exchange", False), ("client_secret", False),
+                                ("exchange", False), ("account_email", False)])
+        self.fake.during["revoke"] = lambda: held.append(("revoke", hub.LOCK._is_owned()))
+        code, data = self.owner("/ui/google/disconnect", account=EMAIL)
+        self.assertEqual((code, data["revoked"], held[-1]), (200, True, ("revoke", False)))
 
     def test_disconnect_revokes_one_account_and_keeps_the_client_and_the_grants(self):
         self.connected()
@@ -594,7 +1376,7 @@ class GoogleHub(OwnerAPI):
         self.assertEqual(json.loads(self.file.read_text())["accounts"], {})      # removed in each case
         for fields in ({}, {"account": "owner"}, {"account": EMAIL, "extra": 1}):
             self.assertEqual(self.owner("/ui/google/disconnect", **fields)[0], 400, fields)
-        self.assertEqual(self.begin(client=False)[0], 200)            # the client stays for the next Connect
+        self.assertEqual(self.begin()[0], 200)                        # the next Connect needs nothing of the file
 
     # ---- the tools
     def test_each_level_gets_exactly_its_tools_and_never_in_a_chat_or_for_the_manager(self):
@@ -639,8 +1421,13 @@ class GoogleHub(OwnerAPI):
         for name, args in (("drive_search", {"words": "plan"}), ("drive_write", write),
                            ("gmail_send", {"request_id": str(uuid.uuid4()), "to": ["a@b.co"], "subject": "Hi",
                                            "body": "Hello"})):
-            self.assertEqual(self.refused(name, args), hub.GOOGLE_NO_CLIENT)
+            self.assertEqual(self.refused(name, args),
+                             "The Google account owner@example.com is not connected. Ask your requester.")
         self.assertIsNone(self.receipt(write["request_id"]))          # a refusal before the write leaves no receipt
+        self.connected()
+        os.chmod(self.file, 0o644)                                    # a file that the hub cannot read
+        self.assertEqual(self.refused("drive_search", {"words": "x"}), hub.GOOGLE_NO_CLIENT)
+        os.remove(self.file)
         hub.google_store({"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "accounts": {}})
         self.assertEqual(self.refused("drive_search", {"words": "x"}),
                          "The Google account owner@example.com is not connected. Ask your requester.")
@@ -681,6 +1468,76 @@ class GoogleHub(OwnerAPI):
         account, = self.request("/ui/team?db=test-generation")[1]["google"]["accounts"]
         self.assertEqual(account["problem"], hub.GOOGLE_TESTING)
         self.assertEqual(self.refused("drive_search", {"words": "x"}), refused)     # the same step until a Connect
+        # An account of Founderizer's client: its app is published, and a customer cannot publish it anyway.
+        self.connected(email=EMAIL2, refresh=REFRESH2, connected_at=int(hub.now()) - 30 * 86400, client_id=APP_ID)
+        self.give(drive=(EMAIL2, "write"))
+        self.fake.fail["refresh"] = Err("Google answered 400", 400, "invalid_grant")
+        self.assertEqual(self.refused("drive_search", {"words": "x"}), "Google refused the saved access of "
+                         "dev.agent@example.com. The owner must connect it again. Ask your requester.")
+        accounts = {a["email"]: a for a in self.request("/ui/team?db=test-generation")[1]["google"]["accounts"]}
+        self.assertEqual(accounts[EMAIL2]["problem"], hub.GOOGLE_PROBLEM)
+
+    def test_each_account_is_refreshed_with_the_client_that_made_its_token(self):
+        """Google ties a refresh token to its client, so a file can hold accounts of two clients: an own client's from
+        before 1.185 and Founderizer's since. A token is refreshed with its own client and never with another."""
+        third = "third@example.com"
+        self.connected()                                            # the own client's, with no client_id
+        self.connected(email=EMAIL2, refresh=REFRESH2, client_id=APP_ID)
+        self.connected(email=third, refresh="1//third-0123456789abcdef",
+                       client_id="789-gone.apps.googleusercontent.com")       # a client that this hub no longer has
+        view = {a["email"]: a for a in self.request("/ui/team?db=test-generation")[1]["google"]["accounts"]}
+        self.assertEqual([view[e]["problem"] for e in (EMAIL, EMAIL2, third)], [None, None, hub.GOOGLE_GONE_VIEW])
+        self.give(drive="read", gmail=(EMAIL2, "read"))
+        self.give("ops", account=third, drive="read")
+        self.work = self.task()
+        ops = self.task("ops")
+        self.ok("drive_search", {"words": "x"})
+        self.ok("gmail_search", {"query": "x"})
+        self.assertEqual([c[1] for c in self.fake.calls if c[0] == "refresh"],
+                         [(CLIENT_ID, CLIENT_SECRET, REFRESH), (APP_ID, APP_SECRET, REFRESH2)])
+        self.assertEqual(self.refused("drive_search", {"words": "x"}, task=ops, agent="ops"),
+                         hub.GOOGLE_CLIENT_GONE.format(email=third))
+        self.assertEqual(self.fake.names().count("refresh"), 2)       # no refresh with another client
+        # A hub whose file has no secret of Founderizer's app (connected() writes none) read it from founderizer.com
+        # for that refresh, once, and keeps it in the file, with its fingerprint: a restart does not read it again.
+        self.assertEqual(self.fake.names().count("client_secret"), 1)
+        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: APP_SECRET})
+        self.assertTrue(hub.secret_hit(APP_SECRET))
+        hub.GOOGLE["tokens"].clear()
+        hub.GOOGLE["secrets"].clear()                               # a restart
+        hub.GOOGLE["read_at"].clear()
+        self.ok("gmail_search", {"query": "x"})
+        self.assertEqual(self.fake.names().count("client_secret"), 1)
+        # A file that lost it reads it again, and a site that cannot answer stops only that call.
+        hub.google_store({k: v for k, v in json.loads(self.file.read_text()).items() if k != "clients"})
+        hub.GOOGLE["tokens"].clear()
+        hub.GOOGLE["secrets"].clear()
+        hub.GOOGLE["read_at"].clear()
+        self.fake.fail["client_secret"] = Err("founderizer.com cannot be reached now")
+        self.assertEqual(self.refused("gmail_search", {"query": "x"}), hub.GOOGLE_NO_SITE)
+        self.assertEqual(self.refused("gmail_search", {"query": "x"}), hub.GOOGLE_NO_SITE)     # no read in the minute
+        hub.GOOGLE["read_at"].clear()                               # a minute later
+        self.ok("gmail_search", {"query": "x"})
+        self.assertEqual([c for c in self.fake.calls if c[0] == "refresh"][-1],
+                         ("refresh", (APP_ID, APP_SECRET, REFRESH2)))
+        # A release with no client of Founderizer's: its accounts get the owner's step, the own client's go on.
+        self.fake.CLIENT = None
+        hub.GOOGLE["tokens"].clear()
+        self.assertEqual(self.refused("gmail_search", {"query": "x"}), hub.GOOGLE_CLIENT_GONE.format(email=EMAIL2))
+        self.ok("drive_search", {"words": "x"})
+        # An entry that names the own client's ID is refreshed with the own client, as one with no client_id.
+        self.connected(email=EMAIL, refresh=REFRESH, client_id=CLIENT_ID)
+        hub.GOOGLE["tokens"].clear()
+        self.ok("drive_search", {"words": "x"})
+        self.assertEqual([c for c in self.fake.calls if c[0] == "refresh"][-1],
+                         ("refresh", (CLIENT_ID, CLIENT_SECRET, REFRESH)))
+        # A file with no own client at the top: an entry of the own client has no client that can refresh it.
+        saved = json.loads(self.file.read_text())
+        hub.google_store({"accounts": saved["accounts"]})
+        hub.GOOGLE["tokens"].clear()
+        self.assertEqual(self.refused("drive_search", {"words": "x"}), hub.GOOGLE_CLIENT_GONE.format(email=EMAIL))
+        view = {a["email"]: a for a in self.request("/ui/team?db=test-generation")[1]["google"]["accounts"]}
+        self.assertEqual((view[EMAIL]["problem"], view[EMAIL]["connected"]), (hub.GOOGLE_GONE_VIEW, True))
 
     def test_each_call_uses_the_account_of_the_agents_service(self):
         self.connected()
@@ -1195,7 +2052,7 @@ class GoogleHub(OwnerAPI):
         code, start = self.begin()
         code, done = self.finish(start["state"])
         self.fake.email, self.fake.refresh_token = EMAIL2, REFRESH2
-        code, start2 = self.begin(client=False)
+        code, start2 = self.begin()
         code, done2 = self.finish(start2["state"])
         self.give(drive="write_shared", gmail=(EMAIL2, "send"))
         self.work = self.task()
@@ -1212,10 +2069,199 @@ class GoogleHub(OwnerAPI):
         code, gone = self.owner("/ui/google/disconnect", account=EMAIL)
         stored = "\n".join(hub.DB.iterdump())
         said = json.dumps([start, done, start2, done2, view, state, gone]) + "\n".join(self.answers)
-        for value in (REFRESH, REFRESH2, CLIENT_SECRET, CODE, ACCESS, "v" * 64):
+        for value in (REFRESH, REFRESH2, CLIENT_SECRET, APP_SECRET, CODE, ACCESS, "v" * 64):
             self.assertNotIn(value, stored, value)
             self.assertNotIn(value, said, value)
         self.assertIn(EMAIL, stored)                        # the emails may be shown
+
+
+class ConnectThroughTheStandIn(GoogleHub):
+    """**A new hub's whole Connect** (UI-API.md 1.185), with the real google.py against the stand-in Google server of
+    test_google_api.py: no google.json, no client in any request, the app's own requests in the app's order, Google's
+    redirect through a browser to the loopback listener, and then the agent's tools on that account. Gmail first, then
+    Drive of the same account, as a customer does it in Settings › Apps. The stand-in checks what Google checks: the
+    client, its secret where it has one, the redirect address and the PKCE verifier."""
+
+    def setUp(self):
+        super().setUp()
+        import owner_mcp
+        from test_google_api import DOC_ITEM, StandIn
+        self.Loopback, self.doc = owner_mcp.GoogleLoopback, DOC_ITEM
+        self.g = StandIn()
+        self.addCleanup(self.g.close)
+        self.secret = APP_SECRET            # what the stand-in wants as the client secret; None: no such field
+        # The release brings the client ID only; the stand-in plays founderizer.com too, which gives the secret.
+        for p in (patch.object(hub, "google", google), patch.dict(google.HOSTS, {k: self.g.url for k in google.HOSTS}),
+                  patch.object(google, "CLIENT", {"client_id": APP_ID, "client_secret": None}),
+                  patch.object(google, "VERIFIED", False), patch.object(google, "TIMEOUT", 5)):
+            p.start()
+            self.addCleanup(p.stop)
+        self.g.on("GET", google.CLIENT_PATH, {"client_id": APP_ID, "client_secret": APP_SECRET})
+        self.asked, self.granted, self.tokens = [], set(), []
+        self.g.on("GET", "/o/oauth2/v2/auth", self.consent)
+        self.g.on("POST", "/token", self.token)
+        self.g.on("GET", "/gmail/v1/users/me/profile", {"emailAddress": "Ana@Example.com"})
+        self.g.on("GET", "/gmail/v1/users/me/messages", {"messages": [{"id": "m1", "threadId": "t1"}]})
+        self.g.on("GET", "/gmail/v1/users/me/labels", {"labels": [{"id": "INBOX", "name": "INBOX", "type": "system"}]})
+        self.g.on("GET", "/gmail/v1/users/me/messages/m1", {
+            "id": "m1", "threadId": "t1", "labelIds": ["INBOX"], "snippet": "The invoice is attached",
+            "payload": {"headers": [{"name": "From", "value": "client@example.com"}, {"name": "Subject",
+                                                                                       "value": "Invoice"}]}})
+        self.g.on("GET", "/drive/v3/files", {"files": [self.doc]})
+
+    @staticmethod
+    def send(handler, status, answer, headers=None):
+        data = json.dumps(answer).encode()
+        handler.send_response(status)
+        for key, value in dict({"Content-Type": "application/json", "Content-Length": str(len(data))},
+                               **(headers or {})).items():
+            handler.send_header(key, value)
+        handler.end_headers()
+        handler.wfile.write(data)
+
+    def consent(self, handler, req):
+        """Google's consent page, where the owner chose the account and pressed Allow: Google's redirect to the
+        address that the Connect gave, with the state and a code."""
+        q = {k: v[0] for k, v in req["query"].items()}
+        self.asked.append(q)
+        if q.get("client_id") != APP_ID:
+            return self.send(handler, 400, {"error": "invalid_client"})
+        where = q["redirect_uri"] + "?" + urllib.parse.urlencode({"state": q["state"], "code": CODE})
+        handler.send_response(302)
+        handler.send_header("Location", where)
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+
+    def token(self, handler, req):
+        f = dict(urllib.parse.parse_qsl(req["body"].decode()))
+        self.tokens.append(f)
+        if f.get("client_id") != APP_ID or f.get("client_secret") != self.secret:
+            return self.send(handler, 401, {"error": "invalid_client"})
+        if f.get("grant_type") == "authorization_code":
+            q = self.asked[-1]
+            challenge = base64.urlsafe_b64encode(hashlib.sha256(f.get("code_verifier", "").encode()).digest())
+            if (f.get("code"), f.get("redirect_uri"), challenge.rstrip(b"=").decode()) != (
+                    CODE, q["redirect_uri"], q["code_challenge"]):
+                return self.send(handler, 400, {"error": "invalid_grant"})
+            self.granted |= set(q["scope"].split())         # include_granted_scopes: the account keeps both
+            return self.send(handler, 200, {"access_token": ACCESS + "c", "expires_in": 3599,
+                                            "refresh_token": REFRESH, "scope": " ".join(sorted(self.granted))})
+        if f.get("grant_type") == "refresh_token" and f.get("refresh_token") == REFRESH:
+            return self.send(handler, 200, {"access_token": ACCESS + "r", "expires_in": 3599,
+                                            "scope": " ".join(sorted(self.granted))})
+        return self.send(handler, 400, {"error": "invalid_grant"})
+
+    def browser(self, url):
+        """The owner's browser: Google's page, which redirects to the app's listener on 127.0.0.1."""
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url, timeout=10) as r:
+            return r.status, r.read().decode()
+
+    def app_connect(self, service):
+        """The app's Connect of one service (GoogleConnecting.connect): a listener, POST /ui/google/connect with
+        its address and the service, the browser, Google's code on the listener, POST /ui/google/finish."""
+        loop = self.Loopback()
+        try:
+            code, start = self.owner("/ui/google/connect", redirect_uri=loop.redirect_uri, service=service)
+            self.assertEqual(code, 200, start)
+            self.assertEqual((start["app"], start["verified"]), ("founderizer", False))   # the app's one line shows
+            loop.state = start["state"]
+            status, page = self.browser(start["url"])
+            self.assertEqual((status, page.count("Founderizer is connected. You can close this tab.")), (200, 1))
+            code, done = self.owner("/ui/google/finish", state=start["state"], code=loop.code(limit=10))
+            self.assertEqual(code, 200, done)
+            return done
+        finally:
+            loop.close()
+
+    def test_a_new_hub_connects_gmail_then_drive_and_the_agent_uses_them(self):
+        self.assertFalse(self.file.exists())                        # a new hub: no google.json, nothing by hand
+        self.assertTrue(self.request("/ui/team?db=test-generation")[1]["google"]["client"])
+        done = self.app_connect("gmail")
+        self.assertEqual((done["email"], done["scopes"], done["replaced"]),
+                         ("ana@example.com", ["gmail.modify"], False))
+        self.assertEqual(self.asked[-1]["scope"], "https://www.googleapis.com/auth/gmail.modify")
+        # The app's next write: the agent gets that service from the account at Read (UI-API.md, "The app").
+        self.levels(account="ana@example.com", service="gmail", access={"dev": "read"})
+        self.work = self.task()
+        text = self.ok("gmail_search", {"query": "invoice"})
+        self.assertIn("Data from Google Gmail of ana@example.com.", text)
+        self.assertIn("m1 |", text)
+        self.assertIn("Invoice", text)
+        # Drive of the same account: Google keeps what the account granted before, so its one token has both.
+        done = self.app_connect("drive")
+        self.assertEqual((done["email"], sorted(done["scopes"]), done["replaced"]),
+                         ("ana@example.com", ["drive", "gmail.modify"], True))
+        hub._revision_cache.update(at=0.0, value=None)
+        self.levels(account="ana@example.com", service="drive", access={"dev": "read"})
+        text = self.ok("drive_search", {"words": "plan"})
+        self.assertIn("Data from Google Drive of ana@example.com.", text)
+        self.assertIn("d1 | Plan", text)
+        saved = json.loads(self.file.read_text())
+        # No client of the hub's own: the release's, whose secret founderizer.com gave and the file keeps.
+        self.assertEqual((set(saved), saved["clients"]), ({"accounts", "clients"}, {APP_ID: APP_SECRET}))
+        entry = saved["accounts"]["ana@example.com"]
+        self.assertEqual((entry["client_id"], entry["refresh_token"], sorted(entry["scopes"])),
+                         (APP_ID, REFRESH, sorted(google.SCOPES)))
+        self.assertEqual({(t["grant_type"], t["client_id"]) for t in self.tokens},
+                         {("authorization_code", APP_ID), ("refresh_token", APP_ID)})
+        self.assertEqual(stat.S_IMODE(os.lstat(self.file).st_mode), 0o600)
+
+    def test_the_secret_comes_from_founderizer_com_once_and_only_for_founderizers_client(self):
+        """Google's token address wants the secret (400 invalid_request, 401 invalid_client without it, 15 November
+        2026), and no public code holds it: the first Connect reads it from founderizer.com, and the hub's file keeps
+        it for every later Connect and refresh, also after a restart. A site that names another client gives none."""
+        self.g.on("GET", google.CLIENT_PATH, {"client_id": "999-other.apps.googleusercontent.com",
+                                               "client_secret": "GOCSPX-another-app-0123456789"})
+        loop = self.Loopback()
+        try:
+            code, data = self.owner("/ui/google/connect", redirect_uri=loop.redirect_uri, service="gmail")
+        finally:
+            loop.close()
+        self.assertEqual((code, data.get("error")), (502, hub.GOOGLE_NO_SECRET))
+        self.g.on("GET", google.CLIENT_PATH, {"client_id": APP_ID, "client_secret": APP_SECRET})
+        hub.GOOGLE["read_at"].clear()                               # a minute later: a failed read waits that long
+        self.app_connect("gmail")
+        hub.GOOGLE["secrets"].clear()                               # a restart: the file keeps the secret
+        self.app_connect("drive")
+        self.levels(account="ana@example.com", service="gmail", access={"dev": "read"})
+        self.work = self.task()
+        self.ok("gmail_search", {"query": "invoice"})
+        self.assertEqual(len(self.g.find("GET", google.CLIENT_PATH)), 2)          # the refused one, then one
+        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: APP_SECRET})
+        self.assertTrue(self.tokens and all(t.get("client_secret") == APP_SECRET for t in self.tokens), self.tokens)
+        for req in self.g.find("GET", google.CLIENT_PATH):
+            self.assertIsNone(req["headers"].get("Authorization"))
+
+    def test_a_new_secret_of_founderizers_app_takes_the_old_ones_place(self):
+        """Founderizer changes its app's secret and turns the old one off: Google's token address refuses the old one
+        (401 invalid_client). The hub reads founderizer.com again at that refresh or exchange, and its file keeps the
+        new one. While the site still gives the old one, Google's refusal stands."""
+        self.app_connect("gmail")
+        self.levels(account="ana@example.com", service="gmail", access={"dev": "read"})
+        self.work = self.task()
+        new, newer = "GOCSPX-founderizer-new-0123456789", "GOCSPX-founderizer-newer-012345678"
+        self.secret = new                                           # Google takes only the new one now
+        # Within a minute of the Connect's read of the site, a refusal reads nothing; a minute later, the site still
+        # gives the old one.
+        self.assertIn("Google gave no access now (invalid_client)", self.refused("gmail_search", {"query": "x"}))
+        self.assertEqual(len(self.g.find("GET", google.CLIENT_PATH)), 1)
+        hub.GOOGLE["read_at"].clear()
+        self.assertIn("Google gave no access now (invalid_client)", self.refused("gmail_search", {"query": "x"}))
+        self.g.on("GET", google.CLIENT_PATH, {"client_id": APP_ID, "client_secret": new})
+        hub.GOOGLE["read_at"].clear()
+        self.assertIn("Invoice", self.ok("gmail_search", {"query": "invoice"}))
+        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: new})
+        self.secret = newer                                         # one more change, before a Connect of Drive
+        self.g.on("GET", google.CLIENT_PATH, {"client_id": APP_ID, "client_secret": newer})
+        hub.GOOGLE["read_at"].clear()
+        done = self.app_connect("drive")
+        self.assertEqual(sorted(done["scopes"]), ["drive", "gmail.modify"])
+        self.assertEqual(json.loads(self.file.read_text())["clients"], {APP_ID: newer})
+        self.assertEqual([(t["grant_type"][0], t.get("client_secret")) for t in self.tokens],
+                         [("a", APP_SECRET), ("r", APP_SECRET), ("r", APP_SECRET), ("r", APP_SECRET), ("r", new),
+                          ("a", new), ("a", newer)])
+        self.assertEqual(len(self.g.find("GET", google.CLIENT_PATH)), 4)
 
 
 if __name__ == "__main__":

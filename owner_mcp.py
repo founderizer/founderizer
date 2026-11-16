@@ -40,6 +40,7 @@ import contextlib
 import fcntl
 import hashlib
 import http.client
+import http.server
 import ipaddress
 import json
 import os
@@ -261,8 +262,6 @@ NOT_TOOLS = {
     "/ui/chat-apps/{}/token": "a Discord bot token; the app's program has save_bot_token, which takes the token "
                               "from a file or a pipe on this Mac, or has the app read the clipboard, and never as a "
                               "field",
-    "/ui/google/connect": "Google's client secret, and a browser flow of the owner's own",
-    "/ui/google/finish": "the authorization code of that flow",
     "/ui/mcp/connect": "an MCP server's OAuth client, and a browser flow of the owner's own",
     "/ui/mcp/finish": "the authorization code of that flow",
     "/ui/secrets/add": "the value of a login; for a new login or API key the app's program has save_secret, which "
@@ -784,7 +783,7 @@ def get(route, what, transfer=None, **query):
     return answer
 
 
-def command(route, body, what, request_id=None):
+def command(route, body, what, request_id=None, timeout=TIMEOUT):
     """One owner command route: `hub.py` `ui_command`'s envelope, and its answer as the hub gave it.
 
     `request_id` makes the command idempotent. This server makes one for each call, and a tool takes the owner's
@@ -800,7 +799,7 @@ def command(route, body, what, request_id=None):
     def once():
         db = generation()                   # a read: it takes no lock
         with command_lock():
-            return call("POST", route, dict(body, request_id=rid.lower(), db=db))
+            return call("POST", route, dict(body, request_id=rid.lower(), db=db), timeout=timeout)
     answer = once()
     if stale(answer):
         generation(fresh=True)
@@ -2357,6 +2356,170 @@ def add_machine(args):
                 next=then, **({"network": network} if network else {}))
 
 
+# ---- Google's Connect, with Founderizer's own Google app (UI-API.md 1.185)
+
+# The owner's "Yes, as drawn" of 15 November 2026 (`~/dev/founderizer-plans/google-for-customers-design.md`, D4): the
+# admin MCP connects a Google account as the app does. The hub's Connect takes no client any more (its release has the
+# ID of Founderizer's, and founderizer.com gives its secret), and Google's code goes from Google's redirect to this
+# server's own listener and on to the hub: it is never a field or an answer of a tool, so the agent never sees it. The
+# listener, its pages and its rules are the app's (`FleetCore/Google.swift`, `GoogleCallback` and `GoogleAnswer`).
+GOOGLE_SERVICES = ("gmail", "drive")
+GOOGLE_WAIT = 600                   # seconds for Google's answer, as the app's listener waits (`GoogleLoopback.code`)
+GOOGLE_CONSENT = "https://accounts.google.com/"
+GOOGLE_OK = "Founderizer is connected. You can close this tab."
+GOOGLE_WRONG = "This answer is not for the Connect that Founderizer started. Start Connect again in Founderizer."
+GOOGLE_DENIED = "The access was not given ({}). Start Connect again. You can close this tab."
+# Seconds for the hub's finish: it calls Google up to three times, and after a changed secret founderizer.com and Google
+# once more, each call up to 30 seconds (google.TIMEOUT). The app waits as long.
+GOOGLE_FINISH_WAIT = 160
+
+
+def on_a_mac():
+    return sys.platform == "darwin"
+
+
+class GoogleLoopback(http.server.ThreadingHTTPServer):
+    """The listener of one Connect, on 127.0.0.1 only, on a port that the system chooses. Google's answer for this
+    Connect's state ends it; an answer with another state ends it too, as a refusal; another request gets 404. Each
+    request has its own thread and 10 seconds, so a connection that sends nothing holds neither Google's answer nor
+    the end of the Connect, and the port is never one that another program listens on already."""
+
+    daemon_threads = True
+    block_on_close = False          # the end of a Connect waits for no request thread
+    allow_reuse_address = False
+
+    class Page(http.server.BaseHTTPRequestHandler):
+        timeout = 10
+
+        def do_GET(self):
+            self.server.take(self)
+
+        def log_message(self, *_args):          # nothing of a request, its code included, goes to a log
+            pass
+
+    def __init__(self):
+        super().__init__(("127.0.0.1", 0), self.Page)
+        self.state, self.end, self.done, self.lock = None, None, threading.Event(), threading.Lock()
+        self.thread = threading.Thread(target=self.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True)
+        self.thread.start()
+
+    @property
+    def redirect_uri(self):
+        return f"http://127.0.0.1:{self.server_address[1]}/"
+
+    def take(self, handler):
+        """One request: `GET /?state=…&code=…` or `GET /?state=…&error=…` from Google's redirect."""
+        parts = urllib.parse.urlsplit(handler.path)
+        query = dict(urllib.parse.parse_qsl(parts.query))
+        state = query.get("state")
+        with self.lock:
+            if parts.path != "/" or not state or not (query.get("code") or query.get("error")) or self.done.is_set():
+                kind = None
+            elif not (self.state and secrets.compare_digest(state.encode(), self.state.encode())):
+                self.end = kind, value = ("wrong", None)
+            elif query.get("error"):
+                # Google's error code keeps letters, digits, _, - and ., so that the page and the answer can show it.
+                reason = re.sub(r"[^A-Za-z0-9_.-]", "", query["error"])[:100] or "unknown"
+                self.end = kind, value = ("denied", reason)
+            else:
+                self.end = kind, value = ("code", query["code"])
+            if kind:
+                self.done.set()
+        if kind is None:
+            return self.page(handler, 404, "Not found.")
+        self.page(handler, 400 if kind == "wrong" else 200,
+                  GOOGLE_WRONG if kind == "wrong" else GOOGLE_DENIED.format(value) if kind == "denied" else GOOGLE_OK)
+
+    @staticmethod
+    def page(handler, status, words):
+        body = (f'<!doctype html><meta charset="utf-8"><title>Founderizer</title><p style="font: 15px -apple-system, '
+                f'sans-serif; margin: 40px">{words}</p>').encode()
+        handler.send_response(status)
+        for name, value in (("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body))),
+                            ("Cache-Control", "no-store"), ("Connection", "close")):
+            handler.send_header(name, value)
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    def code(self, limit=GOOGLE_WAIT):
+        """Google's code for this Connect. A wrong state, Google's error, the time limit or a cancel stops it."""
+        ends = time.monotonic() + limit
+        while not self.done.wait(1):
+            next_step("the wait for Google's answer")
+            if time.monotonic() >= ends:
+                raise Refused("No answer came from Google within 10 minutes, so nothing was connected. Call "
+                              "connect_google again when the owner is at the Mac.")
+        kind, value = self.end
+        if kind == "wrong":
+            raise Refused("The browser came back with an answer that is not for this Connect, so nothing was "
+                          "connected. Call connect_google again.")
+        if kind == "denied":
+            raise Refused(f"The access was not given ({value}), so nothing was connected. Call connect_google again "
+                          f"when the owner wants to allow it.")
+        return value
+
+    def close(self):
+        self.shutdown()
+        self.server_close()
+
+
+def open_in_browser(url):
+    """Google's page in the owner's default browser, as the app opens it (NSWorkspace): macOS `open`, with nothing on
+    this server's standard output, which is the protocol's channel."""
+    if not on_a_mac():
+        raise Refused("connect_google opens Google's page in the browser of this Mac, and this computer is no Mac.")
+    try:
+        done = subprocess.run(["/usr/bin/open", url], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        done = None
+    if done is None or done.returncode != 0:
+        raise Refused("This Mac could not open Google's page in its browser, so nothing was connected.")
+
+
+def connect_google(args):
+    """One Connect of one service of a Google account, as the app's Settings › Apps does it: the hub's start, Google's
+    page in the owner's browser, Google's answer on this server's own listener, and the hub's finish. The account
+    joins the fleet; who uses it is grant_access."""
+    service = args.get("service")
+    if service not in GOOGLE_SERVICES:
+        raise Refused("service must be gmail or drive: each is a Connect of its own.")
+    account = args.get("account")
+    if account is not None and not (isinstance(account, str) and account.strip()):
+        raise Refused("account must be the email of a Google account to connect again, or absent for a new one.")
+    if not on_a_mac():              # before the hub's start, which would take the place of the app's waiting Connect
+        raise Refused("connect_google opens Google's page in the browser of this Mac, and this computer is no Mac.")
+    loop = GoogleLoopback()
+    try:
+        body = dict({"redirect_uri": loop.redirect_uri, "service": service},
+                    **({"account": account.strip().lower()} if account else {}))
+        start = command("/ui/google/connect", body, "the start of the Google Connect")
+        url, state = start.get("url"), start.get("state")
+        if not (isinstance(url, str) and url.startswith(GOOGLE_CONSENT) and isinstance(state, str) and state):
+            raise Refused("The hub's answer to the start of the Connect is no consent page of Google, so nothing was "
+                          "opened.")
+        loop.state = state
+        if loop.done.is_set():      # a request came to the listener before the hub's answer: it is no Google's
+            raise Refused("A program of this Mac called the Connect's listener before Google's page opened, so "
+                          "nothing was opened and nothing was connected. Call connect_google again.")
+        next_step("the opening of Google's page")
+        open_in_browser(url)
+        code = loop.code()
+        next_step("the end of the Google Connect")
+        done = command("/ui/google/finish", {"state": state, "code": code}, "the end of the Google Connect",
+                       timeout=GOOGLE_FINISH_WAIT)
+    finally:
+        loop.close()
+    email = done.get("email")
+    kind = {"gmail": "Gmail", "drive": "Google Drive"}[service]
+    dropped = [s for s in done.get("dropped") or [] if s in GOOGLE_SERVICES]
+    return {"email": email, "scopes": done.get("scopes"), "replaced": done.get("replaced"), "dropped": dropped,
+            "next": f"{email} is connected for {kind}. No agent uses it yet: give it to one with grant_access, as "
+                    f"{service}:{email} and a level." + (
+                        f" Its {' and '.join(dropped)} stopped with this Connect: call connect_google for it too."
+                        if dropped else "")}
+
+
 # ---- the tools
 
 
@@ -2640,9 +2803,25 @@ def tools():
                                  "nothing.",
              {"name": S["text"], "server": MCP_ENTRY, "agent": S["text"], **rid}, ("name",),
              plain("/ui/mcp/check", ("name", "server", "agent"), "the check of this MCP server")),
+        tool("connect_google", "Connect one service of a Google account to the fleet, as the app's Connect account "
+                               "does: Gmail or Google Drive, each a Connect of its own. It opens Google's page in the "
+                               "owner's browser on this Mac and waits up to 10 minutes while the owner chooses the "
+                               "account and presses Allow there, so tell the owner first. While Google has not "
+                               "verified Founderizer's app, Google shows a warning page first: the owner presses "
+                               "Advanced, then Go to Founderizer. Google's code goes to this server's own listener and "
+                               "on to the hub, and never to you. account: the email of an account to connect again; "
+                               "leave it out for a new one. The account then has no agent: give it with grant_access, "
+                               "as gmail:<email> or drive:<email>. In a fleet that shares one Google account with "
+                               "another fleet, disconnect_google ends it in both, because Google revokes the account's "
+                               "whole grant to Founderizer's app." + ONE_CALL,
+             {"service": {"type": "string", "enum": list(GOOGLE_SERVICES)}, "account": S["text"]}, ("service",),
+             connect_google),
         tool("disconnect_google", "Revoke one Google account's connection at Google and remove its entry. The "
                                   "grants in team.json stay, so no agent reaches that account until the owner "
-                                  "connects it again in the app.",
+                                  "connects it again in the app. Google revokes the account's whole grant to the "
+                                  "Google app that connected it (Founderizer's app, for each account connected since "
+                                  "the hub has it), so a fleet that shares this Google account with another fleet "
+                                  "(a test hub, too) loses it in both.",
              {"account": S["text"], **rid}, ("account",),
              plain("/ui/google/disconnect", ("account",), "the disconnection of this Google account")),
         tool("disconnect_mcp_server", "Remove one MCP server's saved connection. The server and its grants stay, so "
@@ -2959,7 +3138,8 @@ INSTRUCTIONS = ("You run the owner's own Founderizer fleet. Every tool here is o
 SWIFT_READS = ("fleet_overview", "fleet_read", "search_history", "see_costs")
 SWIFT_WRITES = ("save_profile", "attach_file", "read_attachment", "take_backup", "grant_access", "share_resource",
                 "send_message", "answer_needs_you", "decline_secret_request")
-ABSENT = ("install_hub", "install_log", "claim_hub", "add_machine", "use_hub", "which_hub")
+ABSENT = ("install_hub", "install_log", "claim_hub", "add_machine", "use_hub", "which_hub",
+          "connect_google")      # the app's Connect account; the program's own is the agent-install plan's slice E3
 # The name in the hub's `ui_features` that gates a tool of the table, where the hub has one. The program refuses such a
 # tool on a hub whose `ui_features` lacks the name (that hub is older than the app). Only names of hub.UI_FEATURES,
 # which a hub always lists: a name that a hub lists only at times (central_vault, contact_roles) would refuse a tool
