@@ -23,6 +23,7 @@ import unittest
 import urllib.parse
 import urllib.request
 import uuid
+import warnings
 from unittest.mock import patch
 
 import channels
@@ -1722,9 +1723,55 @@ class WaLinkBuild(unittest.TestCase):
                          "no build folder is left, and no program of a failed build")
 
 
+class WaLinkBuildWithoutFilter(WaLinkBuild):
+    """The same build where tarfile has no data filter, as on Debian 12 (Python 3.11.2): go_members holds Go's archive
+    to the filter's rules."""
+
+    def setUp(self):
+        super().setUp()
+        unpack = tarfile.TarFile.extractall
+
+        def without_filter(tar, path=".", members=None, *, numeric_owner=False, **more):
+            if more:        # what Python 3.11.2 answers, so that a call with the filter fails here as there
+                raise TypeError(f"TarFile.extractall() got an unexpected keyword argument {next(iter(more))!r}")
+            return unpack(tar, path, members, numeric_owner=numeric_owner)
+        for change in (patch.object(channels, "TAR_FILTER", False), warnings.catch_warnings(),
+                       patch.object(tarfile.TarFile, "extractall", without_filter)):
+            change.__enter__()
+            self.addCleanup(change.__exit__, None, None, None)
+        warnings.simplefilter("ignore", DeprecationWarning)     # Python 3.12 and 3.13 ask for a filter
+
+    def test_the_rules_of_the_filter(self):
+        def archive(*members):
+            buffer = io.BytesIO()
+            with tarfile.open(fileobj=buffer, mode="w") as tar:
+                for name, kind, mode in members:
+                    info = tarfile.TarInfo(name)
+                    info.type, info.mode = kind, mode
+                    if kind == tarfile.SYMTYPE:
+                        info.linkname = "/etc"
+                    tar.addfile(info, io.BytesIO(b"") if kind == tarfile.REGTYPE else None)
+            buffer.seek(0)
+            return tarfile.open(fileobj=buffer)
+
+        with archive(("go", tarfile.DIRTYPE, 0o1777), ("go/bin/go", tarfile.REGTYPE, 0o6777)) as tar:
+            self.assertEqual([(m.name, m.mode) for m in channels.go_members(tar)],
+                             [("go", 0o755), ("go/bin/go", 0o755)])
+        for name, kind, why in (("go/lib", tarfile.SYMTYPE, "not a file or a folder"),
+                                ("go/lib", tarfile.LNKTYPE, "not a file or a folder"),
+                                ("go/null", tarfile.CHRTYPE, "not a file or a folder"),
+                                ("go/fifo", tarfile.FIFOTYPE, "not a file or a folder"),
+                                ("/go/bin/go", tarfile.REGTYPE, "outside its folder"),
+                                ("go/../../go", tarfile.REGTYPE, "outside its folder")):
+            with archive(("go", tarfile.DIRTYPE, 0o755), (name, kind, 0o644)) as tar:
+                with self.assertRaisesRegex(channels.BuildFailed, f"cannot be unpacked: it holds '{re.escape(name)}', "
+                                                                  f"which is {why}$"):
+                    channels.go_members(tar)
+
+
 def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
-    for case in (DiscordTests, WhatsAppTests, Functions, WaLinkBuild):
+    for case in (DiscordTests, WhatsAppTests, Functions, WaLinkBuild, WaLinkBuildWithoutFilter):
         suite.addTests(loader.loadTestsFromTestCase(case))
     if hasattr(fleet_hub, "ensure_bridge_key"):     # only RealHub's own tests, not those of OwnerAPI
         suite.addTests(RealHub(name) for name in RealHub.__dict__ if name.startswith("test_"))

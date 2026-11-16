@@ -8754,7 +8754,8 @@ def cmd_check(args):
         print(f"  {'ok  ' if good else 'FAIL'}  {what}" + (f"  ({hint})" if hint and not good else ""))
 
     print(f"Checking this machine for agent '{agent}'")
-    line(sys.version_info >= (3, 9), f"Python {sys.version.split()[0]}", "needs 3.9 or later")
+    # 3.10, as the installers ask: Ubuntu 22.04 has it, and join.sh gives a Mac its own Python when it has an older one
+    line(sys.version_info >= (3, 10), f"Python {sys.version.split()[0]}", "needs 3.10 or later")
     line(bool(conf), "agent is listed in team.json")
     table = TEAM.get("addresses") or {}
     unset = [m for m in sorted({a.get("machine", "") for a in TEAM["agents"].values()} | {"owner"}) if not table.get(m)]

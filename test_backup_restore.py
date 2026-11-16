@@ -56,6 +56,7 @@ def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
     for cls in (Copy, HubOnly, Restore, ByHand, RecordsFile):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
+    suite.addTests(ThroughAFile(name) for name in ThroughAFile.__dict__ if name.startswith("test_"))
     return suite
 
 
@@ -207,10 +208,8 @@ class Copy(Fixture):
                           "config/team.json", "fleet.json", "fleet.sqlite3"])
         self.assertEqual(zf.read("config/profiles/vps.md").decode(), PROFILE)
         self.assertEqual(json.loads(zf.read("config/team.json")), OWNER)
-        records = sqlite3.connect(":memory:")
-        self.addCleanup(records.close)
-        records.deserialize(zf.read("fleet.sqlite3"))
-        self.assertEqual(records.execute("SELECT title FROM tasks").fetchone()[0], "Write the October report")
+        with hub.image_opened(zf.read("fleet.sqlite3")) as records:      # Python 3.10 has no deserialize
+            self.assertEqual(records.execute("SELECT title FROM tasks").fetchone()[0], "Write the October report")
 
     def test_the_copy_names_the_machines_whose_vault_it_cannot_carry(self):
         """The one thing a copy cannot hold: each store key is in a folder only that machine's vault user can
@@ -243,16 +242,17 @@ class Copy(Fixture):
         self.assertEqual(hub.wal_on(), (True, None))
         self.work()
         with hub.LOCK:
-            self.assertEqual(hub.DB.serialize()[18:20], b"\x02\x02")
+            self.assertEqual(hub.records_image()[18:20], b"\x02\x02")
         code, _headers, data = self.download()
         self.assertEqual(code, 200)
         records = zipfile.ZipFile(io.BytesIO(data)).read("fleet.sqlite3")
         self.assertEqual(records[18:20], b"\x01\x01")
         self.assertEqual(hub.read_bundle(data)["manifest"]["fleet_id"], hub.fleet_id())
-        copy = sqlite3.connect(":memory:")
-        self.addCleanup(copy.close)
-        copy.deserialize(records)
-        self.assertEqual(copy.execute("SELECT title FROM tasks").fetchone()[0], "Write the October report")
+        if hub.SQLITE_IMAGES:       # the image itself, in memory, where this Python can hold one
+            copy = sqlite3.connect(":memory:")
+            self.addCleanup(copy.close)
+            copy.deserialize(records)
+            self.assertEqual(copy.execute("SELECT title FROM tasks").fetchone()[0], "Write the October report")
 
     def test_a_copy_whose_records_say_wal_mode_is_read_too(self):
         """Records with the header of WAL mode in a copy (a hub's file put in a zip by hand) pass the check of a
@@ -866,6 +866,84 @@ class Restore(Fixture):
                 ("a path outside the owner's own files", rebuilt(a_path_a_restore_may_not_write)),
                 ("no records at all", rebuilt(no_records)),
                 ("records that are not a database", rebuilt(records_that_are_not_a_database))]
+
+
+class ThroughAFile(Restore):
+    """Python 3.10, which Ubuntu 22.04 has and the installers take, has no Connection.serialize and no deserialize:
+    there a copy is made and read through a file in a folder of mode 700 that goes at once (hub.SQLITE_IMAGES). Here
+    that way runs on this Python too, through the routes, and the copies of each way are read by the other."""
+
+    def setUp(self):
+        super().setUp()
+        self.temp = os.path.join(self.tmp.name, "temp")     # where the passing files are, to see that they go
+        os.makedirs(self.temp)
+        # Each folder of a passing file, so that a test sees that the way through a file ran: on this Python the
+        # calls in memory work too, and a change back to them would pass every other check here.
+        self.passing, made = [], tempfile.mkdtemp
+
+        def mkdtemp(*args, **kwargs):
+            folder = made(*args, **kwargs)
+            if kwargs.get("prefix") == "founderizer-records-":
+                self.passing.append(folder)
+            return folder
+        for change in (patch.object(hub, "SQLITE_IMAGES", False), patch.object(tempfile, "tempdir", self.temp),
+                       patch.object(tempfile, "mkdtemp", mkdtemp)):
+            change.start()
+            self.addCleanup(change.stop)
+
+    def test_a_new_machine_becomes_the_fleet_that_was_saved(self):
+        super().test_a_new_machine_becomes_the_fleet_that_was_saved()
+        self.assertEqual(len(self.passing), 2, "the copy, and the restore's check of it")
+        self.assertEqual(os.listdir(self.temp), [])
+
+    def test_a_copy_that_is_not_what_it_says_is_refused_and_nothing_is_staged(self):
+        super().test_a_copy_that_is_not_what_it_says_is_refused_and_nothing_is_staged()
+        self.assertTrue(self.passing, "records that are not a database were opened through a file")
+        self.assertEqual(os.listdir(self.temp), [])
+
+    def test_a_copy_through_a_file_is_the_records_and_leaves_no_file(self):
+        self.assertEqual(hub.wal_on(), (True, None))
+        self.work()
+        code, _headers, data = self.download()
+        self.assertEqual(code, 200)
+        self.assertEqual(len(self.passing), 1, "the copy went through a file")
+        records = zipfile.ZipFile(io.BytesIO(data)).read("fleet.sqlite3")
+        self.assertEqual(records[18:20], b"\x01\x01", "the header of rollback mode, as with serialize")
+        self.assertEqual(hub.read_bundle(data)["manifest"]["fleet_id"], hub.fleet_id())
+        self.assertEqual(len(self.passing), 2, "and so did the restore's check of it")
+        with hub.image_opened(records) as copy:
+            self.assertEqual(copy.execute("SELECT title FROM tasks").fetchone()[0], "Write the October report")
+        self.assertEqual(os.listdir(self.temp), [])
+
+    def test_each_way_reads_the_copy_of_the_other_and_holds_the_same_pages(self):
+        if not hasattr(sqlite3.Connection, "serialize"):
+            self.skipTest("this Python has only the way through a file")
+        self.work()
+        copies = {}
+        for images in (True, False):
+            with patch.object(hub, "SQLITE_IMAGES", images):
+                copies[images] = self.download()[2]
+        for images, other in ((True, copies[False]), (False, copies[True])):
+            with patch.object(hub, "SQLITE_IMAGES", images):
+                self.assertEqual(hub.read_bundle(other)["manifest"]["fleet_id"], hub.fleet_id())
+        with hub.LOCK:          # no write between the two
+            with patch.object(hub, "SQLITE_IMAGES", True):
+                memory = hub.records_image()
+            through = hub.records_image()
+        self.assertEqual(len(memory), len(through))
+        changed = {n for n in range(len(memory)) if memory[n] != through[n]}
+        # Only the change counter, its copy and the schema cookie: those of a new file.
+        self.assertLessEqual(changed, set(range(24, 28)) | set(range(40, 44)) | set(range(92, 96)))
+        self.assertEqual(len(self.passing), 3, "a copy, a restore's check and an image, each through a file")
+        self.assertEqual(os.listdir(self.temp), [])
+
+    def test_no_copy_is_asked_for_inside_a_transaction(self):
+        """SQLite's backup answers "busy" to a source that is in a write, and Python asks it again for ever."""
+        with hub.transaction():
+            hub.DB.execute("INSERT OR REPLACE INTO kv(k,v) VALUES('a write','that waits')")
+            with self.assertRaisesRegex(RuntimeError, "outside a transaction"):
+                hub.records_image()
+        self.assertEqual(os.listdir(self.temp), [])
 
 
 # ---------------------------------------------------------------- without the app

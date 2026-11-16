@@ -139,7 +139,7 @@ notification of a Needs-you item, the chat that opens first), so with those apps
 
 1. **This server and this copy of Founderizer.** Root, the system, systemd, and that the
    copy is a Founderizer checkout with a commit.
-2. **Base packages:** `git tmux python3 curl ca-certificates ufw unattended-upgrades`.
+2. **Base packages:** `git tmux python3 curl ca-certificates ufw unattended-upgrades sudo tzdata`.
 3. **The user `fleet`:** created, password locked, out of `sudo`, `admin` and `wheel`,
    home mode 700, and lingering on, so its services run after logout and after a
    restart. It runs the hub and the git daemon, and no agent's session: each agent has
@@ -813,4 +813,5 @@ each published Python file compiled, and `selftest.py` passed, with the `python3
 12 (3.11) and of Ubuntu 22.04 (3.10), each in a container; the Ubuntu container needed the
 package `tzdata` first, because its image has no time zone data and the hub reads the zone
 UTC. Since then each release is checked, before it goes out, for the forms of an f-string
-and of a statement that Python 3.10 does not take.
+and of a statement that Python 3.10 does not take, the installers install `tzdata`, and a
+hub with no zone data still reads UTC.

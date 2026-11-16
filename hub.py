@@ -17478,18 +17478,52 @@ GOAL_STEP_STATES = ("todo", "doing", "blocked", "done", "failed")
 GOAL_PLAN_MAX = 50                  # steps in one plan: more than this is not a plan
 
 
+class UtcAlone(datetime.tzinfo):
+    """UTC on a machine with no time zone data (the package tzdata, which the installers add since 16 November 2026),
+    where zoneinfo knows no zone, not even UTC: the offset, the name and the key of zoneinfo.ZoneInfo("UTC")."""
+    key = "UTC"
+
+    def utcoffset(self, dt):
+        return datetime.timedelta(0)
+
+    def dst(self, dt):
+        return datetime.timedelta(0)
+
+    def tzname(self, dt):
+        return "UTC"
+
+    def __repr__(self):
+        return "UtcAlone()"
+
+
+UTC_ALONE = UtcAlone()
+
+
+def zone_named(name):
+    """zoneinfo.ZoneInfo(name), and UTC_ALONE for UTC where the machine has no time zone data: each sweep of the hub's
+    tick and each time that it writes reads the zone of goal_settings, so a missing package stopped them all. Another
+    name raises what ZoneInfo raises, as before."""
+    import zoneinfo
+    try:
+        return zoneinfo.ZoneInfo(name)
+    except zoneinfo.ZoneInfoNotFoundError:
+        if name == "UTC":
+            return UTC_ALONE
+        raise
+
+
 def goal_settings():
     """(sweep minutes, review hour, time zone) from team.json "goals"; 15, 9 and UTC without it."""
     import zoneinfo
     conf = TEAM.get("goals") if isinstance(TEAM.get("goals"), dict) else {}
     try:
         minutes, hour = float(conf.get("sweep_minutes", 15)), int(conf.get("review_hour", 9))
-        zone = zoneinfo.ZoneInfo(str(conf.get("timezone", "UTC")))
+        zone = zone_named(str(conf.get("timezone", "UTC")))
         if 1 <= minutes <= 1440 and 0 <= hour <= 23:
             return minutes, hour, zone
     except (ValueError, TypeError, zoneinfo.ZoneInfoNotFoundError):
         pass
-    return 15.0, 9, zoneinfo.ZoneInfo("UTC")
+    return 15.0, 9, zone_named("UTC")
 
 
 def goal_time(ts):
@@ -44800,8 +44834,9 @@ def backups_enabled():
 
     They were off until 18 October 2026, under the owner's rule that no backup, dump, snapshot, archive or copy is
     made on a host unless he asks. That rule is about **copies left on hosts**, and it is kept here exactly: the
-    hub writes nothing, keeps nothing and schedules nothing. What this serves is one copy, made in memory when the
-    owner presses the button, sent to the owner's own machine and gone from the hub the moment it is sent.
+    hub keeps nothing and schedules nothing. What this serves is one copy, made in memory when the owner presses the
+    button (on Python 3.10 through one passing file, records_image), sent to the owner's own machine and gone from
+    the hub the moment it is sent.
 
     Off by default was wrong for a product whose data has one copy on one disk. The hub finds its own corruption
     every six hours (integrity_check) and the owner could do nothing about it; the records hold every task, every
@@ -45184,28 +45219,92 @@ A copy nobody has ever put back is not a copy. Try it once on a spare machine be
 def rollback_header(records):
     """An image of a database, with the header of rollback mode where it has the one of WAL mode: bytes 18 and 19 (the
     file format's write and read versions) are 1 and 1 where WAL mode writes 2 and 2. The hub's records are in WAL mode
-    since 11 November 2026 (wal_on), and DB.serialize() copies that header. SQLite opens no image in WAL mode from
-    memory ("unable to open database file"), so read_bundle refused every such copy, and so does the restore of a hub
-    from before this change. SQLite's documentation of sqlite3_deserialize
-    (https://www.sqlite.org/c3ref/deserialize.html) says to set bytes 18 and 19 to 1 for it. The pages are the whole
-    records either way, and a hub that takes the copy puts them in WAL mode again at its start."""
+    since 11 November 2026 (wal_on), and DB.serialize() copies that header, as SQLite's backup into a file does on
+    Python 3.10 (records_image). SQLite opens no image in WAL mode from memory ("unable to open database file"), so
+    read_bundle refused every such copy, and so does the restore of a hub from before this change. SQLite's
+    documentation of sqlite3_deserialize (https://www.sqlite.org/c3ref/deserialize.html) says to set bytes 18 and 19
+    to 1 for it. The pages are the whole records either way, and a hub that takes the copy puts them in WAL mode again
+    at its start."""
     if records[18:20] == b"\x02\x02":
         records = b"".join((records[:18], b"\x01\x01", records[20:]))
     return records
 
 
+# Whether this Python holds a database image in memory: Connection.serialize and deserialize came with Python 3.11,
+# and only where SQLite has that part. Ubuntu 22.04 has Python 3.10, which the installers take, so there a copy is
+# made and read through a file (records_image, image_opened). The two ways give the same pages, and each reads the
+# copies of the other.
+SQLITE_IMAGES = hasattr(sqlite3.Connection, "serialize") and hasattr(sqlite3.Connection, "deserialize")
+
+
+def records_image():
+    """DB's records as the bytes of one database file, from one moment: what a copy carries (backup_bundle). Call it
+    under LOCK and outside a transaction. With DB.serialize() the image never touches the disk. Without it (Python
+    3.10), SQLite's backup writes the records into a file of a new folder of mode 700, which is read and removed
+    before this returns, as the copy for a release's schema check is. That file has the same pages; three numbers of
+    its first 100 bytes, the change counter, its copy and the schema cookie, are those of a new file, and no restore
+    reads them."""
+    if SQLITE_IMAGES:
+        return DB.serialize()
+    import shutil
+    import tempfile
+    if DB.in_transaction:   # SQLite's backup answers "busy" to a source in a write, and Python asks again for ever
+        raise RuntimeError("records_image runs outside a transaction")
+    folder = tempfile.mkdtemp(prefix="founderizer-records-")
+    try:
+        path = os.path.join(folder, "pilot.db")
+        with contextlib.closing(sqlite3.connect(path)) as target:
+            DB.backup(target)
+        with open(path, "rb") as f:
+            return f.read()
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def image_opened(image):
+    """A connection to the database image `image` (bytes) with the header of rollback mode (rollback_header), closed
+    at the end: in memory with Connection.deserialize, and without it (Python 3.10) from a file of a new folder of
+    mode 700, opened read-only and removed at the end. It reads the image and nothing else."""
+    image = rollback_header(image)
+    if SQLITE_IMAGES:
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.deserialize(image)
+            yield conn
+        finally:
+            conn.close()
+        return
+    import shutil
+    import tempfile
+    folder = tempfile.mkdtemp(prefix="founderizer-records-")
+    try:
+        path = os.path.join(folder, "pilot.db")
+        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f:
+            f.write(image)
+        # "file://" and an empty authority: a path that begins with "//" stays a path
+        conn = sqlite3.connect(f"file://{urllib.parse.quote(os.path.abspath(path))}?mode=ro", uri=True)
+        try:
+            yield conn
+        finally:
+            conn.close()
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def backup_bundle(central=None):
     """One copy of this fleet for the owner's own machine, as a zip: the database, the owner's configuration, a
     manifest and RESTORE.md, and the central vault's sealed store when it gave one. Call it under LOCK; nothing is
-    written on the hub machine. central: what central_backup() gave, asked before LOCK was taken, because the central
-    vault's socket is never asked under it; without it, the copy says that the central vault was not asked."""
+    written on the hub machine but, on Python 3.10, the passing file of records_image. central: what central_backup()
+    gave, asked before LOCK was taken, because the central vault's socket is never asked under it; without it, the copy
+    says that the central vault was not asked."""
     import io
     import zipfile
     export, entry = central or (None, {"in": None, "vault": False, "why": "the central vault was not asked for this "
                                                                           "copy"})
     member = json.dumps(export, indent=2, sort_keys=True).encode() if export else None
     fleet = fleet_id()          # before the records are read: it is made on first use, and the copy needs it in
-    records = rollback_header(DB.serialize())   # the records themselves: a restore reads them, not the manifest
+    records = rollback_header(records_image())  # the records themselves: a restore reads them, not the manifest
     config = owner_files()
     manifest = {"format": BACKUP_FORMAT, "made_at": now(), "fleet_id": fleet, "db_id": kv_get("db_id"),
                 "revision": kit_revision(), "hub": TEAM.get("hub"), "agents": sorted(agents()),
@@ -45270,20 +45369,17 @@ def read_bundle(data):
             if not isinstance(says, dict) or hashlib.sha256(read[name]).hexdigest() != says.get("sha256"):
                 raise Refusal(422, f"{name} in this copy is not the file its own manifest describes")
     records, central = read.pop(BACKUP_DB), read.pop(CENTRAL_MEMBER, None)
-    check = sqlite3.connect(":memory:")
     try:
-        check.deserialize(rollback_header(records))
-        bad = [str(r[0]) for r in check.execute("PRAGMA quick_check")]
-        if bad != ["ok"]:
-            raise Refusal(422, "the records in this copy do not pass SQLite's own check: " + "; ".join(bad[:3]))
-        row = check.execute("SELECT v FROM kv WHERE k='fleet_id'").fetchone()
-        if not row or not row[0]:
-            raise Refusal(422, "the records in this copy carry no fleet id, so they are not a fleet")
-        manifest["fleet_id"] = row[0]
+        with image_opened(records) as check:
+            bad = [str(r[0]) for r in check.execute("PRAGMA quick_check")]
+            if bad != ["ok"]:
+                raise Refusal(422, "the records in this copy do not pass SQLite's own check: " + "; ".join(bad[:3]))
+            row = check.execute("SELECT v FROM kv WHERE k='fleet_id'").fetchone()
+            if not row or not row[0]:
+                raise Refusal(422, "the records in this copy carry no fleet id, so they are not a fleet")
+            manifest["fleet_id"] = row[0]
     except sqlite3.Error as e:
         raise Refusal(422, f"the records in this copy cannot be opened: {e}") from None
-    finally:
-        check.close()
     return {"manifest": manifest, "records": records, "central": central,
             "config": {name[len(BACKUP_CONFIG):]: data for name, data in read.items()}}
 
@@ -46845,8 +46941,9 @@ def release_work(applying, automatic=False, fetch=None):
             return
         import shutil
         import tempfile
-        # The copy the released code's schema is checked against. It is the one copy this hub writes on its own
-        # machine, it is in a folder of mode 700, and it is gone before this function returns — which is what the
+        # The copy the released code's schema is checked against. It is a copy that this hub writes on its own
+        # machine (on Python 3.10 the owner's copy and its restore pass through one too: records_image, image_opened),
+        # it is in a folder of mode 700, and it is gone before this function returns — which is what the
         # owner's rule about copies on hosts asks of work like this. VACUUM INTO and not DB.serialize(), because
         # it streams page by page: a grown database must not be held in memory to make an update safe.
         folder = tempfile.mkdtemp(prefix="founderizer-records-")
@@ -50898,7 +50995,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def ui_backup(self, query):
         """One copy of this fleet for the owner's own machine: the records, the owner's own configuration, a
-        manifest and RESTORE.md, in one zip. Nothing is written on the hub machine."""
+        manifest and RESTORE.md, in one zip. Nothing is written on the hub machine but, on Python 3.10, the passing
+        file of records_image."""
         if not self.ui_allowed():
             return
         generation = kv_get("db_id")

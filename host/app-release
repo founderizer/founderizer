@@ -17,9 +17,10 @@ self-update keeps current), and its port and health path come from its root-owne
 deploy: the artifact and its checksum file must be regular files in the deploy user's own home, where its runner's
 workspace is, and the sha the commit's 40 hex characters. Both are copied into artifacts/incoming as root, and the
 artifact's SHA-256 is checked against the checksum file before anything reads the archive. A sha on either blocklist
-is refused. The deploy user parses the archive, with Python's data filter and no link and no special file at all, and
-gives back a clean stream through a pipe; root writes the release from that stream alone, into a folder that only root
-reaches, so root never reads a file that the deploy user could change meanwhile. The release is root:root, folders
+is refused. The deploy user parses the archive, with no name outside the release, Python's data filter where Python
+has one, and no link and no special file at all, and gives back a clean stream through a pipe; root writes the release
+from that stream alone, with the same checks, into a folder that only root reaches, so root never reads a file that the
+deploy user could change meanwhile. The release is root:root, folders
 0555, files 0444, or 0555 for a file that was executable. It writes .release.env with APP_RELEASE_SHA, the name of
 both procedures, points `previous` at the release that ran and `current` at the new one, each in one rename, restarts
 only the app's unit, and waits for the health path on the app's loopback port to answer 200 with the sha in its body.
@@ -55,19 +56,31 @@ APP = re.compile(r"[a-z][a-z0-9-]{0,23}")
 SHA = re.compile(r"[0-9a-f]{40}")
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
 # What the deploy user runs: the archive on stdin, a clean uncompressed stream of folders and regular files on stdout.
+# Each name stays inside the release, by its own check (outside, below) and by Python's data filter where Python has
+# one: Debian 12 has Python 3.11.2, whose tarfile has none. Each member leaves as a new one, with its name, its kind,
+# its bytes and its time, and a mode of its own: 0755 for a folder and for a file that its owner may run, else 0644.
+# Nothing else of the archive goes on, so no PAX header of it (an owner, uname=..., uid=...) reaches root.
 UNPACK = ("import sys, tarfile\n"
           "out = tarfile.open(fileobj=sys.stdout.buffer, mode='w|')\n"
           "with tarfile.open(fileobj=sys.stdin.buffer, mode='r|*') as t:\n"
           "    for m in t:\n"
           "        if not (m.isfile() or m.isdir()):\n"
           "            sys.exit('refused: ' + m.name + ' is a link or a special file')\n"
-          "        try:\n"
-          "            m = tarfile.data_filter(m, '/release')\n"
-          "        except tarfile.FilterError as e:\n"
-          "            sys.exit('refused: ' + str(e))\n"
-          "        m.uid, m.gid, m.uname, m.gname = 0, 0, '', ''\n"
-          "        out.addfile(m, t.extractfile(m) if m.isfile() else None)\n"
+          "        if m.name.startswith('/') or '..' in m.name.split('/'):\n"
+          "            sys.exit('refused: ' + m.name + ' is outside the release')\n"
+          "        if hasattr(tarfile, 'data_filter'):\n"
+          "            try:\n"
+          "                tarfile.data_filter(m, '/release')\n"
+          "            except tarfile.FilterError as e:\n"
+          "                sys.exit('refused: ' + str(e))\n"
+          "        n = tarfile.TarInfo(m.name)\n"
+          "        n.type = tarfile.DIRTYPE if m.isdir() else tarfile.REGTYPE\n"
+          "        n.size, n.mtime = (0 if m.isdir() else m.size), m.mtime\n"
+          "        n.mode = 0o755 if m.isdir() or m.mode & 0o100 else 0o644\n"
+          "        out.addfile(n, t.extractfile(m) if m.isfile() else None)\n"
           "out.close()\n")
+# Root's own unpack of that stream: Python's data filter where Python has one, and the check of outside in each case.
+FILTER = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
 
 
 class Refused(Exception):
@@ -166,6 +179,11 @@ def blocked(tree):
     return found
 
 
+def outside(name):
+    """Whether a member's name leads out of the folder that it is unpacked into: an absolute name, or a ".."."""
+    return name.startswith("/") or ".." in name.split("/")
+
+
 def unpack_argv(user):
     """The deploy user's own parse of the archive (UNPACK)."""
     return ["runuser", "-u", user, "--", "/usr/bin/python3", "-I", "-c", UNPACK]
@@ -186,7 +204,16 @@ def unpack_release(archive, release, sha, user):
                 for m in t:
                     if not (m.isfile() or m.isdir()):
                         raise Refused(f"{m.name} is a link or a special file")
-                    t.extract(m, P(new), filter="data")
+                    if outside(m.name):
+                        raise Refused(f"{m.name} is outside the release")
+                    # Root reads the stream as a stranger's: it takes a name, a kind, the bytes, a time and whether the
+                    # owner may run a file, and never an owner or a mode. Without the filter, tarfile gives a member the
+                    # owner that the stream names, so a stream that named the deploy user gave it the release's folder.
+                    # numeric_owner: root's own numbers, with no lookup of a name (Python 3.11.2 looks up an empty one).
+                    runs = m.isfile() and bool(m.mode & 0o100)
+                    m.uid, m.gid, m.uname, m.gname = 0, 0, "", ""
+                    m.mode = 0o700 if m.isdir() or runs else 0o600
+                    t.extract(m, P(new), numeric_owner=True, **FILTER)
                     if m.isfile():
                         files.append((m.name, m.mode))
         except (tarfile.TarError, OSError) as e:

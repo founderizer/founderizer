@@ -84,6 +84,9 @@ GO_MOST = 128 << 20         # bytes of Go's archive: they are about 70 MB
 WA_ROOM = 2 << 30           # bytes free before a build: the toolchain, the modules and the build cache
 WA_BUILD_TIMEOUT = 1800     # seconds for the build
 WA_BUILD_RETRY = 600        # seconds after a failed build before the next try by itself; a link request tries at once
+# Whether this Python's tarfile has the data filter: Python 3.12, and 3.10.12 and 3.11.4 of their own lines. Debian 12
+# has Python 3.11.2, which the installers take: there go_members holds Go's archive to the filter's rules.
+TAR_FILTER = hasattr(tarfile, "data_filter")
 WA_SOURCE = os.path.join(KIT, "wa-link")
 WA_PROGRAM = os.path.expanduser("~/.fleet/bin/wa-link")
 # The build's own commands: the kernel's out-of-memory killer takes it first (Linux), and it runs at a low priority.
@@ -1100,6 +1103,26 @@ def go_platform():
     return name if name in GO_ARCHIVES else None
 
 
+def go_members(tar):
+    """The members of Go's archive for a Python with no data filter (TAR_FILTER), held to its rules: each one a folder
+    or a regular file whose name stays inside the folder that it goes into, with no set-user-ID, set-group-ID or sticky
+    bit and no write for others. It refuses a link, which the filter takes when it stays inside: Homebrew's Go 1.27.2,
+    built from go.dev's source archive, has no link in its whole tree. The bytes are the ones whose SHA-256 go.dev
+    publishes, so this is the filter's rule again, not a defence of its own. Anything else raises BuildFailed with its
+    name."""
+    members = tar.getmembers()
+    for member in members:
+        if not (member.isfile() or member.isdir()):
+            why = "which is not a file or a folder"
+        elif member.name.startswith("/") or ".." in member.name.split("/"):
+            why = "which is outside its folder"
+        else:
+            member.mode &= 0o755
+            continue
+        raise BuildFailed(f"the archive of Go {GO_VERSION} cannot be unpacked: it holds {member.name!r}, {why}")
+    return members
+
+
 def remove_tree(path):
     """shutil.rmtree, also of Go's module cache, whose folders are read-only."""
     for root, dirs, _ in os.walk(path):
@@ -1194,7 +1217,10 @@ def build_wa_link(source, program, want, fetch=None, run=subprocess.run):
             raise BuildFailed(f"the download of Go {GO_VERSION} does not match the SHA-256 that go.dev publishes")
         try:
             with tarfile.open(archive, "r:gz") as tar:
-                tar.extractall(work, filter="data")     # nothing outside work, no device and no set-user-ID file
+                if TAR_FILTER:
+                    tar.extractall(work, filter="data")     # nothing outside work, no device and no set-user-ID file
+                else:
+                    tar.extractall(work, members=go_members(tar))
         except (tarfile.TarError, OSError, EOFError, TypeError) as e:
             raise BuildFailed(f"the archive of Go {GO_VERSION} cannot be unpacked ({type(e).__name__})") from None
         os.remove(archive)

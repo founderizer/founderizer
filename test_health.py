@@ -4,7 +4,6 @@ import io
 import json
 import os
 import re
-import sqlite3
 import unittest
 import unittest.mock
 import urllib.request
@@ -102,10 +101,8 @@ class Health(OwnerAPI):
         notes = zf.read("RESTORE.md").decode()
         self.assertIn("## What is NOT in it", notes)                    # it says what it does not carry
         self.assertIn("what no copy can carry, and what this one leaves out on purpose", notes)
-        copy = sqlite3.connect(":memory:")
-        self.addCleanup(copy.close)
-        copy.deserialize(zf.read("fleet.sqlite3"))
-        self.assertEqual(copy.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()[0], "test-generation")
+        with hub.image_opened(zf.read("fleet.sqlite3")) as copy:     # Python 3.10 has no deserialize
+            self.assertEqual(copy.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()[0], "test-generation")
         self.assertIn("backup_missing", [w["kind"] for w in self.health()["warnings"]])   # served is not saved
         self.assertEqual(self.confirm("0" * 64, len(data))[0], 409)
         code, result = self.confirm(digest, len(data))

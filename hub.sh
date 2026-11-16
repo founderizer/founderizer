@@ -84,7 +84,8 @@ ROOT_KIT=/usr/local/lib/founderizer-kit
 # script ran as the hub's user between the two runs: an older copy of this script, or a command by hand, is what
 # the mark cannot know.
 NEW_HUB_MARK=/root/.founderizer-new-hub
-PACKAGES="git tmux python3 curl ca-certificates ufw unattended-upgrades sudo"
+# tzdata: the hub reads time zones, also UTC (hub.goal_settings), and a small image of Ubuntu has no zone data.
+PACKAGES="git tmux python3 curl ca-certificates ufw unattended-upgrades sudo tzdata"
 # The Founderizer files this installer needs in the copy it runs from. The rules, the manager's parts of them and its
 # profile are in the list because the manager reads them at every start: a hub without them runs but has no manager
 # worth the name.

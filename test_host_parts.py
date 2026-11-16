@@ -10,15 +10,18 @@ import hashlib
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
 import unittest
+import warnings
 from unittest.mock import patch
 
 import door_targets
@@ -30,11 +33,14 @@ SEED = bytes(range(32))         # the test's own release key; never the product'
 
 
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite(cls(name) for cls in (Files, ModeAndLock, ScriptForms, Runners, PristineRunners,
-                                                    Accounts, SshdFolder, SshdCalls, SelfUpdate,
-                                                    Reader, Scripts, NewApp, AppUnitAndSettings, AppRunner, AppVhost,
-                                                    ReleaseHelper, Look, LookBoxLive)
-                              for name in cls.__dict__ if name.startswith("test_"))
+    suite = unittest.TestSuite(cls(name) for cls in (Files, ModeAndLock, ScriptForms, Runners, PristineRunners,
+                                                     Accounts, SshdFolder, SshdCalls, SelfUpdate,
+                                                     Reader, Scripts, NewApp, AppUnitAndSettings, AppRunner, AppVhost,
+                                                     ReleaseHelper, Look, LookBoxLive)
+                               for name in cls.__dict__ if name.startswith("test_"))
+    # The release helper again where tarfile has no data filter, as on Debian 12
+    suite.addTests(ReleaseHelperWithoutFilter(name) for name in ReleaseHelper.__dict__ if name.startswith("test_"))
+    return suite
 
 
 class HostCase(unittest.TestCase):
@@ -3824,13 +3830,18 @@ class ReleaseHelper(unittest.TestCase):
                     os.chmod(os.path.join(here, name), 0o755)
         shutil.rmtree(self.tmp, True)
 
-    def artifact(self, files, sha, link=None, wrong=False):
-        """(artifact, checksum) paths, as the deploy job leaves them in the runner's workspace."""
-        import tarfile
+    def artifact(self, files, sha, link=None, wrong=False, owner=None):
+        """(artifact, checksum) paths, as the deploy job leaves them in the runner's workspace. owner: PAX headers that
+        each member carries."""
         path = f"/home/shop-deploy/_work/out/{sha[:7]}.tar.gz"
-        with tarfile.open(self.tmp + path, "w:gz") as t:
+        with tarfile.open(self.tmp + path, "w:gz", format=tarfile.PAX_FORMAT) as t:
             for name, (body, mode) in files.items():
                 info = tarfile.TarInfo(name)
+                info.pax_headers = dict(owner or {})
+                if body is None:                # a folder, as `tar -C dist .` writes one for each
+                    info.type, info.mode = tarfile.DIRTYPE, mode
+                    t.addfile(info)
+                    continue
                 info.size, info.mode = len(body), mode
                 t.addfile(info, io.BytesIO(body))
             if link:
@@ -3931,4 +3942,86 @@ class ReleaseHelper(unittest.TestCase):
         self.assertEqual(len(left), 5)
         self.assertIn(shas[-1], left)
         self.assertIn(shas[-2], left)
+
+    def test_a_tree_with_its_folders_is_released(self):
+        """The archive of `tar -czf app.tar.gz -C dist .` names each folder. The data filter gives a folder no mode,
+        which tarfile cannot write into the stream: every such archive was refused until 16 November 2026."""
+        sha = "e" * 40
+        self.assertEqual(self.deploy(sha, files={"./": (None, 0o755), "./server.js": (b"1\n", 0o664),
+                                                 "./bin": (None, 0o2775), "./bin/start": (b"#!/bin/sh\n", 0o4755),
+                                                 "./notes.txt": (b"x\n", 0o611)}), f"shop runs {sha}")
+        release = self.tmp + f"/var/www/shop/releases/{sha}"
+        self.assertEqual({name: os.stat(f"{release}/{name}").st_mode & 0o7777
+                          for name in (".", "server.js", "bin", "bin/start", "notes.txt")},
+                         {".": 0o555, "server.js": 0o444, "bin": 0o555, "bin/start": 0o555, "notes.txt": 0o444})
+
+    def test_root_takes_no_owner_from_the_archive(self):
+        """A PAX header of the archive names an owner, and tarfile writes it again when it writes the member again.
+        Where tarfile has no filter, root's extract gave each member the owner that the stream named: the release's
+        folder to the deploy user, which could then put a link in it and have root write through it (the first review
+        of 16 November 2026)."""
+        sha, owner = "9" * 40, {"uname": "shop-deploy", "uid": "4242", "gname": "shop-deploy", "gid": "4343"}
+        files = {".": (None, 0o777), "./server.js": (b"1\n", 0o4755), "./notes.txt": (b"x\n", 0o666)}
+        path, _ = self.artifact(files, sha, owner=owner)
+        with open(self.tmp + path, "rb") as f:
+            stream = subprocess.run(REL.unpack_argv("shop-deploy"), stdin=f, capture_output=True).stdout
+        with tarfile.open(fileobj=io.BytesIO(stream)) as t:
+            self.assertEqual([(m.name, m.mode, m.uid, m.gid, m.uname, m.gname, m.pax_headers) for m in t],
+                             [(".", 0o755, 0, 0, "", "", {}), ("./server.js", 0o755, 0, 0, "", "", {}),
+                              ("./notes.txt", 0o644, 0, 0, "", "", {})])
+        # Root's side alone: a stream that keeps the archive's owner, as a deploy user that runs its own program sends.
+        keeps = ("import sys, tarfile\n"
+                 "i = tarfile.open(fileobj=sys.stdin.buffer, mode='r|*')\n"
+                 "o = tarfile.open(fileobj=sys.stdout.buffer, mode='w|', format=tarfile.PAX_FORMAT)\n"
+                 "for m in i:\n"
+                 "    o.addfile(m, i.extractfile(m) if m.isfile() else None)\n"
+                 "o.close()\n")
+        chowned = []
+        with patch.object(os, "geteuid", lambda: 0), \
+                patch.object(os, "chown", lambda name, uid, gid, **_: chowned.append((uid, gid))), \
+                patch.object(REL, "unpack_argv", lambda user: [sys.executable, "-I", "-c", keeps]):
+            self.assertEqual(self.deploy(sha, files=files, owner=owner), f"shop runs {sha}")
+        self.assertTrue(chowned)
+        self.assertLessEqual(set(chowned), {(0, 0), (-1, -1)}, "root, or no change: never the archive's owner")
+        release = self.tmp + f"/var/www/shop/releases/{sha}"
+        self.assertEqual({name: os.stat(f"{release}/{name}").st_mode & 0o7777 for name in (".", "server.js", "notes.txt")},
+                         {".": 0o555, "server.js": 0o555, "notes.txt": 0o444})
+
+    def test_root_checks_the_names_of_the_stream_itself(self):
+        """Root reads the deploy user's stream as it reads a stranger's: a name that leads out of the release is
+        refused there too, whatever the deploy user's side let through."""
+        forged = ("import io, sys, tarfile\n"
+                  "out = tarfile.open(fileobj=sys.stdout.buffer, mode='w|')\n"
+                  "info = tarfile.TarInfo(sys.argv[1])\n"
+                  "info.size = 1\n"
+                  "out.addfile(info, io.BytesIO(b'x'))\n"
+                  "out.close()\n")
+        sha = "f" * 40
+        for name in ("../evil", self.tmp + "/evil", "a/../../evil"):
+            with patch.object(REL, "unpack_argv", lambda user: [sys.executable, "-I", "-c", forged, name]):
+                with self.assertRaisesRegex(REL.Refused, "^" + re.escape(name) + " is outside the release$"):
+                    self.deploy(sha)
+            self.assertFalse(os.path.exists(self.tmp + "/evil"))
+            self.assertFalse(os.path.exists(self.tmp + "/var/www/shop/releases/evil"))
+            self.assertFalse(os.path.exists(self.tmp + f"/var/www/shop/releases/{sha}.new"))
+
+
+class ReleaseHelperWithoutFilter(ReleaseHelper):
+    """The same release helper where tarfile has no data filter, as on Debian 12 (Python 3.11.2): on the deploy user's
+    side and on root's."""
+
+    def setUp(self):
+        super().setUp()
+        argv = [sys.executable, "-I", "-c", "import tarfile\nvars(tarfile).pop('data_filter', None)\n" + REL.UNPACK]
+        unpack = tarfile.TarFile.extract
+
+        def without_filter(tar, member, path="", set_attrs=True, *, numeric_owner=False, **more):
+            if more:        # what Python 3.11.2 answers, so that a call with the filter fails here as there
+                raise TypeError(f"TarFile.extract() got an unexpected keyword argument {next(iter(more))!r}")
+            return unpack(tar, member, path, set_attrs, numeric_owner=numeric_owner)
+        for change in (patch.object(REL, "FILTER", {}), patch.object(REL, "unpack_argv", lambda user: argv),
+                       patch.object(tarfile.TarFile, "extract", without_filter), warnings.catch_warnings()):
+            change.__enter__()
+            self.addCleanup(change.__exit__, None, None, None)
+        warnings.simplefilter("ignore", DeprecationWarning)     # Python 3.12 and 3.13 ask for a filter
 

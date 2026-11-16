@@ -11,6 +11,7 @@ operator never collects, stores or intermediates the credential. So the installe
 and no Founderizer login may be a provider's own site.
 """
 import contextlib
+import datetime
 import hashlib
 import http.server
 import io
@@ -95,8 +96,8 @@ def run_shell(body, extra=""):
 def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
     for cls in (Template, Repository, Claim, SecondClaim, AgentUsers, FleetId, VerifyStep, Prompt, PromptThroughSudo,
-                CheckMode, Systems, NoProviderCredential, ProviderToolsRefuse, RuntimeInstall, Firewall, Harden, HubTcp,
-                NetworkStep, AptUpdate):
+                CheckMode, Systems, ZoneData, NoProviderCredential, ProviderToolsRefuse, RuntimeInstall, Firewall,
+                Harden, HubTcp, NetworkStep, AptUpdate):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return suite
 
@@ -4871,6 +4872,53 @@ class Systems(unittest.TestCase):
             for words in named:
                 self.assertIn("26.04", words, f"{path.name}: {words}")
                 self.assertTrue(words.endswith("Debian 12 or 13"), f"{path.name}: {words}")
+
+
+class ZoneData(unittest.TestCase):
+    """The hub reads time zones, UTC too (hub.goal_settings), and the container image of Ubuntu 22.04 has no zone data:
+    there each sweep of the hub's tick stopped with "No time zone found with key UTC". So each installer installs the
+    package tzdata, and a hub on a machine with no zone data still knows UTC."""
+
+    def test_each_package_list_names_tzdata(self):
+        import onboard
+        for script in (SCRIPT, KIT / "join.sh"):
+            lists = re.findall(r'^PACKAGES="([^"]*)"', script.read_text(), re.M)
+            self.assertEqual(len(lists), 1, script.name)
+            self.assertIn("tzdata", lists[0].split(), script.name)
+        self.assertIn("tzdata", onboard.PACKAGES.split())
+
+    def test_a_hub_with_no_zone_data_knows_utc(self):
+        import zoneinfo
+        found = []
+        for ts in (0, 86400 * 365, 1794787200.5):
+            with contextlib.suppress(zoneinfo.ZoneInfoNotFoundError):
+                found.append(f"{datetime.datetime.fromtimestamp(ts, zoneinfo.ZoneInfo('UTC')):%Y-%m-%d %H:%M:%S %Z}")
+        zoneinfo.ZoneInfo.clear_cache()
+        self.addCleanup(zoneinfo.ZoneInfo.clear_cache)
+        zoneinfo.reset_tzpath(to=[])
+        self.addCleanup(zoneinfo.reset_tzpath)
+        # nor the package of PyPI that zoneinfo reads next, also where an earlier test imported its parts
+        blocked = {name: None for name in [*sys.modules, "tzdata", "tzdata.zoneinfo"]
+                   if name == "tzdata" or name.startswith("tzdata.")}
+        with patch.dict(sys.modules, blocked):
+            with self.assertRaises(zoneinfo.ZoneInfoNotFoundError):
+                zoneinfo.ZoneInfo("UTC")
+            with patch.object(hub, "TEAM", {"goals": {"sweep_minutes": 30, "review_hour": 7, "timezone": "UTC"}}):
+                self.assertEqual(hub.goal_settings(), (30.0, 7, hub.UTC_ALONE))
+            with patch.object(hub, "TEAM", {"goals": {"sweep_minutes": 30, "timezone": "Europe/Madrid"}}):
+                self.assertEqual(hub.goal_settings(), (15.0, 9, hub.UTC_ALONE), "an unknown zone, as before")
+            with patch.object(hub, "TEAM", {}):
+                zone = hub.goal_settings()[2]
+            self.assertEqual(zone.key, "UTC")
+            said = [datetime.datetime.fromtimestamp(ts, zone).strftime("%Y-%m-%d %H:%M:%S %Z")
+                    for ts in (0, 86400 * 365, 1794787200.5)]
+            self.assertEqual(said, ["1970-01-01 00:00:00 UTC", "1971-01-01 00:00:00 UTC", "2026-11-16 00:00:00 UTC"])
+            self.assertEqual(datetime.datetime(2026, 11, 16, tzinfo=zone).timestamp(), 1794787200)
+            self.assertEqual(datetime.datetime(2026, 11, 16, 1, tzinfo=datetime.timezone.utc).astimezone(zone).hour, 1)
+            with self.assertRaises(zoneinfo.ZoneInfoNotFoundError):
+                hub.zone_named("Europe/Madrid")
+        if found:                   # where this machine has the data, ZoneInfo("UTC") says the same
+            self.assertEqual(found, said)
 
 
 class NoProviderCredential(unittest.TestCase):

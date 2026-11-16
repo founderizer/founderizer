@@ -19,8 +19,9 @@ The apps for Mac and iPhone have their own repository: <https://github.com/found
 | `knowledge/` | What the fleet knows. `knowledge/owner/` is the owner's and a release never touches it. |
 | `release-key.pub`, `entitlement-key.pub` | The public keys a release and an entitlement are checked against. The private halves are only on our website. |
 
-Python 3.9 or later, `git` and `tmux`, and nothing else: no dependency is installed from a package index. The
-installers say what they need.
+Python 3.10 or later on a server (the scripts that run on the owner's Mac, `onboard.py` and `owner_mcp.py`, also
+take 3.9), `git` and `tmux`, and nothing else: no dependency is installed from a package index. The installers say
+what they need.
 
 **Where to start.** A hub: `HUB-INSTALL.md`, or the install prompt of `INSTALL-PROMPT.md` pasted into the agent you
 already run. A Mac or a second server joining a fleet: `WORKER-INSTALL.md`.

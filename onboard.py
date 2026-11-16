@@ -133,7 +133,7 @@ PINNED = {
 }
 SECRET_MAX_BYTES = 2048
 SUPPORTED_OS = {("ubuntu", "22.04"), ("ubuntu", "24.04"), ("ubuntu", "26.04"), ("debian", "12"), ("debian", "13")}
-PACKAGES = "git tmux python3 curl ca-certificates ufw unattended-upgrades"
+PACKAGES = "git tmux python3 curl ca-certificates ufw unattended-upgrades tzdata"   # tzdata: as hub.sh
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}\Z")                # \Z: `$` lets a final newline through .match
 MACHINE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
