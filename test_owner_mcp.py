@@ -3747,6 +3747,68 @@ class ShareStandingNoWorker(ShareStanding):
         self.sent(client, self.JUDGED)
 
 
+class SignedGrantWords(unittest.TestCase):
+    """The words that send the owner's agent to `grant_secret`, the tool of the app's program with which the app
+    signs a grant (16 November 2026). This server has no such tool, because only the app holds the owner key: it
+    names the tool in the refusal of a give, in the description of `grant_access` and in the reason of the route
+    that takes a signed statement. The program inside the app says the same refusal and the same description (the
+    parity fixture and the table hold the two programs to each other). The pool's words do not change: no tool
+    signs a secret into the pool."""
+
+    GIVE = ("On this fleet the central vault sends a secret's value to a server only for a grant that the owner's app "
+            "signed for an agent on that server, or for a secret that the owner signed into the grantable pool. By the "
+            "hub's last reading, this secret is not in the pool, the owner signed no grant of it for this agent's "
+            "server, and that server's vault holds no copy of it. A grant from here would show the secret as given in "
+            "the fleet's list and, by that reading, bring its value to no server, so nothing was sent. On the Mac "
+            "where the Founderizer app runs, its program gives the secret with the owner's signature "
+            "(~/.founderizer/cli write grant_secret): the app signs the grant with the owner's key and writes it into "
+            "the list, as the owner's own Give on Secrets does, and the owner can also give it there. After either, "
+            "grant_access needs no second call. If the owner put the secret into the grantable pool a moment ago, "
+            "call grant_access again in a minute: the hub reads the vault at least once a minute.")
+
+    @staticmethod
+    def words(name):
+        return next(t["description"] for t in owner_mcp.tools() if t["name"] == name)
+
+    def test_the_refusal_of_a_give_names_grant_secret_and_keeps_each_other_sentence(self):
+        self.assertEqual(owner_mcp.GRANT_NOT_SIGNED, self.GIVE)
+        self.assertNotIn("The owner gives the secret to the agent in the Founderizer app", owner_mcp.GRANT_NOT_SIGNED)
+        self.assertNotIn("bws://", owner_mcp.GRANT_NOT_SIGNED)
+        # The same words are the app's program's, which has the tool: they say where it is, and no "from here" that
+        # would be untrue there. The one "from here" that stays is of a grant from `grant_access`, true in both.
+        self.assertNotIn("has grant_secret for this", owner_mcp.GRANT_NOT_SIGNED)
+        self.assertNotIn("needed from here", owner_mcp.GRANT_NOT_SIGNED)
+        self.assertEqual(owner_mcp.GRANT_NOT_SIGNED.count("from here"), 1)
+        self.assertIn("A grant from here would show the secret as given", owner_mcp.GRANT_NOT_SIGNED)
+        self.assertIn("(~/.founderizer/cli write grant_secret)", owner_mcp.GRANT_NOT_SIGNED)
+
+    def test_the_description_of_grant_access_names_grant_secret(self):
+        words = self.words("grant_access")
+        self.assertIn("a give that the hub's reading of the vault shows as neither, for a server whose vault holds no "
+                      "copy of it, is refused and nothing is sent: on the Mac where the Founderizer app runs, "
+                      "grant_secret of its program (~/.founderizer/cli) gives that secret with the owner's signature, "
+                      "as the owner does in the app, on Secrets. A give that the reading cannot judge is sent, and an "
+                      "end of a hold (level null) always goes.", words)
+        self.assertNotIn("and the owner gives that secret in the Founderizer app", words)
+        self.assertEqual(words.count("grant_secret"), 1)
+
+    def test_the_route_of_a_signed_statement_names_grant_secret_and_this_server_has_no_such_tool(self):
+        self.assertEqual(owner_mcp.NOT_TOOLS["/ui/vault/grant"],
+                         "a statement signed with the owner's own key, which only their app on their Mac holds; for a "
+                         "grant of a secret to an agent, or its end, the app's program on the owner's Mac has "
+                         "grant_secret (~/.founderizer/cli write grant_secret), and the app then signs it")
+        self.assertNotIn("grant_secret", [t["name"] for t in owner_mcp.tools()])
+        # The other routes of a signed statement keep their reason: this tool signs a grant and its end only.
+        for route in ("/ui/vault/pin", "/ui/vault/recovery"):
+            self.assertEqual(owner_mcp.NOT_TOOLS[route],
+                             "a statement signed with the owner's own key, which only their app on their Mac holds")
+
+    def test_the_words_of_the_pool_do_not_name_grant_secret(self):
+        self.assertNotIn("grant_secret", owner_mcp.SHARE_NOT_SIGNED)
+        self.assertNotIn("grant_secret", self.words("share_resource"))
+        self.assertIn("on Secrets", owner_mcp.SHARE_NOT_SIGNED)
+
+
 class VaultReading(unittest.TestCase):
     """`owner_mcp.vault_reading` and `lower_reference`, with no hub: the hub's page of the vault is data, so a page
     that does not say what the rule reads is no reading (None, and the give is sent), never an error of Python."""

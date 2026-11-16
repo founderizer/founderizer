@@ -654,8 +654,11 @@ server that joined before, it is off until root switches it on.
     the vault's keys, not the browser's session (`Sources/FleetVaultCore/VaultBrowser.swift`).
 13. **The owner's Mac while it is unlocked.** The app signs with the owner key with no Touch ID or password prompt
     (`Sources/FleetCore/OwnerKey.swift`). So a person or a program that controls the Mac as the owner can sign
-    statements. A copy of the app with a different signature must first get the owner's login password from macOS to
-    read the key's item (`Sources/FleetCore/OwnerKey.swift`). The hub takes each call from the Mac's address that
+    statements: with the app's own controls, or through the app's link, where the tool `grant_secret` of the
+    app's own program makes the app sign a grant of a secret to an agent, or its end, with no question to the
+    owner (`Sources/FleetOwnerAPI/OwnerGrantSecret.swift`; OWNER-MCP-BOUNDARY.md, section 7b). A copy of the app
+    with a different signature must first get the owner's login password from macOS to read the key's item
+    (`Sources/FleetCore/OwnerKey.swift`). The hub takes each call from the Mac's address that
     carries the Mac's own key for the hub, which is a file of the owner's user (`hub.py`, SECURITY.md, "How the hub
     knows the owner's computer"). So a program that runs on the Mac as the owner uses every owner route. A VM or a
     container on the Mac has the Mac's address and not that file, and the hub refuses it, unless the owner gives it

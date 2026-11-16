@@ -146,8 +146,8 @@ links a WhatsApp account to the fleet: the owner reads that QR in the app, and `
 Since 14 November 2026 `call` also takes the setup tools `setup_state` and `setup_show` by
 name (below, "The link to the running app"), and the read `setup_diagnosis` on the same link.
 `write` takes each other tool that the
-program has: the nine below, the 54 of the table, and `save_bot_token`, `prepare_problem_report` and
-`save_secret` on the link. A read through `write` is refused, and a write
+program has: the nine below, the 54 of the table, and `save_bot_token`, `prepare_problem_report`,
+`save_secret` and `grant_secret` on the link. A read through `write` is refused, and a write
 through `call` is refused, each with words that name the right verb; a tool that the program does
 not have gets the words of the MCP form. The JSON is one word of the shell, an object of the tool's
 fields; none means `{}`.
@@ -194,9 +194,9 @@ file can name a `swift` tool that an older program does not have: that program r
 own pages do that work and its own setting says which hub it reads: `install_hub`, `install_log`,
 `claim_hub`, `add_machine`, `use_hub` and `which_hub`. Three more are the program's own and are not
 in the table or in this server: `setup_state`, `setup_show` and `setup_diagnosis`, on the link to
-the running app (below). Three more, `save_bot_token`, `prepare_problem_report` and `save_secret`,
-write on the same link (below). So `tools/list` gives 73 tools: the 54 of the table, the thirteen,
-the three reads of the link and its three writes.
+the running app (below). Four more, `save_bot_token`, `prepare_problem_report`, `save_secret` and
+`grant_secret`, write on the same link (below). So `tools/list` gives 74 tools: the 54 of the table,
+the thirteen, the three reads of the link and its four writes.
 
 **The link to the running app.** Some work only the running app can do: its first run, its pages,
 and in later slices its keys and its engine. So the program asks the app on a local socket, the
@@ -659,14 +659,116 @@ site itself.
   server only for a grant that the app signs with the owner's own key for an agent on that server
   (`POST /ui/vault/grant`, which is no tool), or for a secret that the owner signed into the
   grantable pool. A new secret is in no pool, no grant of it is signed and no server's vault holds
-  a copy of it, so a grant from the program would bring its value to no server. Since 16 November
-  2026 `grant_access` refuses that give when the hub's reading of the vault shows it, and writes
-  nothing then ("A give of a secret that would reach no server", below), and the guide tells the
-  agent not to try it: the owner gives the secret to an agent in the Founderizer app, on Secrets.
+  a copy of it, so a grant from `grant_access` would bring its value to no server. Since 16
+  November 2026 `grant_access` refuses that give when the hub's reading of the vault shows it, and
+  writes nothing then ("A give of a secret that would reach no server", below), and the guide tells
+  the agent not to try it. Since the same day the app's program has `grant_secret` (below), which
+  makes the app sign the grant with the owner's key and write it into the list, as the owner's own
+  Give in the Founderizer app, on Secrets, does.
 
 No command lock: the app does the write, as its form does. What any process of the owner's user
 can do with the tool, and what a refusal tells of a file that a caller names:
 OWNER-MCP-BOUNDARY.md section 7b.
+
+**`grant_secret`** (a write, so `founderizer-cli write` and the MCP form take it, and `call` does
+not; the owner, 16 November 2026: "Yes, build it"): one secret of the fleet's list to one agent
+with the owner's signature, or its end, as Give and Take back on the app's Secrets page do. The
+app signs the owner's statement of the grant with the owner key of this Mac and sends it
+(`POST /ui/vault/grant`), and the hub writes the grant into the fleet's list
+(`POST /ui/secrets/grant`). It asks the owner nothing (the owner, 15 November 2026, to "Should
+every change that your agent makes the app sign need your touch (Touch ID)?": "No touch"). It has
+no value part: no secret's value passes it, and no answer has one. Nothing of it shows on the
+app's screen.
+
+- **Its fields**, all three required, and no other: `login` (the secret's reference as the fleet's
+  list has it: `bws://` and a UUID in lower case, never with `secret:` before it), `agent` (the
+  agent's name as the team has it) and `level` (`use`, `read`, or null to take the secret back). A
+  call with no `level` is refused: a field that was forgotten takes no access back. The program
+  checks the fields and sends them, and the app checks them again itself.
+- **What must hold before anything is sent**, in this order, each with its own fixed sentence that
+  ends "Nothing was sent.": the app's reading of the fleet is current, and its hub serves the
+  Secrets page with its grants; the hub lists `signed_grants` (on a hub without it the sentence
+  names `grant_access`, which gives a secret there); one read of the team and one read of the
+  vault's page went; the page names the fleet; the hub has a reading of a central vault; the hub's
+  newest read of that vault did not fail; and this Mac holds the fleet's owner key (only the Mac
+  that set up Founderizer Vault signs). **For a give** also: the list has the secret; the fleet
+  has the agent; the agent is a worker or a lead; the hub names a server for it; `read` only for
+  an API key; and no second API key of one variable name read by one agent (the hub's own rule,
+  said before the signature goes; the sentence sends the agent to the owner for which of the two
+  keys that agent reads, and names no take-back). **A take-back** makes none of the checks of a
+  give: an end goes for whatever the list has, and the hub answers in its own words for an agent
+  or a secret that it does not know. The door is never a holder of this tool: its name is
+  refused, in a give and in a take-back, as an agent that the fleet does not have.
+- **The vault's state, from the page's `central` and `error`** (`GET /ui/vault`). The hub keeps a
+  reading of the central vault only after a read that the vault answered, and a later read that
+  fails keeps that reading and sets `error` (`hub.py` `central_read`). So `central.ok` says
+  nothing by itself, and the tool reads three cases. No `central` (with an `error` or with none):
+  the hub has no reading. That is a fleet with no central vault, or a fleet whose vault the hub
+  has not read since it started, and the page does not tell the two apart: the sentence asks for
+  the same call in a minute, then for the owner's word on whether the fleet has Founderizer
+  Vault, and it names `grant_access` only for a fleet that has none. A `central` and an `error`
+  (or an `ok` that is not true): the hub's last reading failed, and the sentence asks for the same
+  call in a minute. A `central` with `ok` true and no `error`: the call goes on.
+- **One call writes at a time.** A call that comes while another one is at its writes is refused,
+  and sends nothing: two calls that cross could end with a grant in the list whose signature the
+  other call ended. The app's own pages are not in that line.
+- **The order of the writes** keeps the vault the narrower of the two, as the page's own does. A
+  give: the signed `grant` for the agent's server, and then the hub's grant. A take-back: the hub's
+  end of the grant, and then the signed `ungrant`. A call whose caller went away before its first
+  write sends nothing. From its first write on, a call goes to its end also when its caller went
+  away: its writes run in a task of the app's own, which takes no cancel from the call, so a give
+  leaves no signature without its grant and a take-back no ended grant with its signature. Each
+  request ends by the time limit of its own client.
+- **Its answer** when each write went: `login`, `agent`, `level`, `signed` true, `server` (a give:
+  the server that the grant was signed for), `changed` (the hub's receipt: false for a grant that
+  the list had already at this level, which is how a grant that `grant_access` wrote with no
+  signature is repaired), `vault` (the agent's vault access when the receipt has it: `before`,
+  `after`, and `missing` with the hub's own codes) and `note`, of fixed English sentences: what the
+  Secrets page's own note says after a grant, and for a give when the value arrives: when the
+  central vault holds the value and that server's vault takes deliveries, the central vault sends
+  it at the hub's next pass, usually within a minute (the hub's reconciler delivers only a secret
+  that the central vault has, `central_plan`, and a delivery that failed waits up to six hours
+  before the next try, `CENTRAL_RETRY`), and `fleet_read` with the page `vault` then lists the
+  secret under `held` for that server.
+- **When a write fails.** A certain refusal is the hub's own status under 500: the tool's own
+  sentence comes first, and the hub's words after it, as `grant_access` gives them (they can hold
+  a reference, an agent's name or a variable's name, never a value). No answer, an answer that
+  could not be read and a status of 500 or more are "not known".
+  - A give that the app could not sign (the owner key's item could not be read, as on a locked
+    Mac, or the key made no signature): nothing was sent, and it is never "not known". The
+    sentence says that this Mac held an owner key a moment ago and that the app could not sign
+    with it now, and asks for the same call later.
+  - A give, the signed statement refused: nothing was changed. Not known: call again in the same
+    way (a second signature of the same grant is no error: the vault keeps the newer one).
+  - A give, the statement taken, then the hub's grant refused: the app reads the team one time
+    more and decides by that read alone, because the owner's own Give in the app can have made the
+    grant since the call's first read. No grant of this secret for this agent in that read: the
+    app signs the `ungrant` and sends it, and the refusal says that nothing is changed; when that
+    `ungrant` fails, it says that a signed grant stays in the vault with no grant in the list, and
+    that `grant_secret` with `level` null ends it. A grant there, at any level: no `ungrant`; the
+    list's grant stays as it is, and the signature stands for it. A read that failed: no
+    `ungrant`; the sentence sends the agent to the team's page first. When the list has no grant
+    of this secret for this agent, `grant_secret` with `level` null ends the signed grant; when it
+    has one, the agent changes nothing, because the signature stands for it (the owner's own Give
+    can have made that grant, and a take-back would end it). A status of 409 from
+    `POST /ui/secrets/grant` is a certain
+    refusal as each other status under 500: that route takes no base version of `team.json`.
+  - A give, the statement taken, then the hub's grant not known: the app signed the grant, and
+    whether the list has it is not known. Call again in the same way, or read the team's page.
+  - A take-back, the hub's end refused: nothing was changed. Not known: call again in the same way.
+  - A take-back, the hub's end taken, then the `ungrant` failed in either way: the list's grant is
+    ended, so the agent's access is ended, and the owner's signed grant stays in the vault. The
+    same call again ends it: the hub's end is then no change, and the signature's end is sent
+    again.
+  - No answer of the app at all (the program's own words): what the app signed and wrote is not
+    known. The same call again is safe for a give and for a take-back, and `fleet_read` with the
+    pages `team` and `vault` shows the list's grant and the signed grants.
+- **What it does not do:** the pool (`share_resource` signs nothing, and only the owner's app
+  signs a secret into the pool), the door, an answer to a secret request, a replace of a value,
+  and a grant on a fleet with no central vault, which `grant_access` gives.
+
+No command lock: the app does the writes, as its page does. What any process of the owner's user
+can do with the tool, its traces and its limits: OWNER-MCP-BOUNDARY.md section 7b.
 
 **`prepare_problem_report`** (a write, so `founderizer-cli write` and the MCP form take it, and `call`
 does not): the owner's own agent writes a problem report, and the owner sends it (the owner, 15 November
@@ -753,7 +855,9 @@ error of Python, and the program left such a line out and sent the map without i
 **A give of a secret that would reach no server.** On a fleet with a central vault, a server's
 vault gets a secret only when the owner signed a grant of it for an agent on that server, or signed
 it into the grantable pool (`vault.py` `sealable`), and only the owner's app signs
-(`POST /ui/vault/grant`, which is no tool). `POST /ui/secrets/grant` writes the grant into the
+(`POST /ui/vault/grant`, which is no tool: the owner's own Give on Secrets signs, and since 16
+November 2026 the app also signs a grant for `grant_secret` of its program, above).
+`POST /ui/secrets/grant` writes the grant into the
 fleet's list with no signature, so until 16 November 2026 `grant_access` could show a secret as
 given whose value no server would get. Since then both programs read the hub's own reading before
 they give a secret (a `level` that is not null). They refuse only what that reading shows as never
@@ -761,8 +865,9 @@ delivered, and they send each give that it cannot judge. The give is sent when o
 in this order, and it is refused otherwise:
 
 1. `GET /ui/vault` cannot judge: the hub has no such page or refuses the read, the answer has
-   another shape than the one that the rule reads, the fleet has no central vault (`central` is
-   null or absent), or the vault has no good reading (`central.ok` is not true, or the page's
+   another shape than the one that the rule reads, the hub has no reading of a central vault
+   (`central` is null or absent: a fleet with none, or a hub that has not read its vault since
+   it started), or the vault has no good reading (`central.ok` is not true, or the page's
    `error` is set: the hub's newest read of the vault failed, and the page still has the last good
    `central`, however old).
 2. The reference is in `central.pool`. The team is not read for it.
@@ -796,8 +901,11 @@ give. So a give that is sent makes as few reads as it can: one read on a fleet w
 vault and for a secret of the pool, and two for each other give. References are compared in lower
 case, as the vault compares them. An end of a hold (`level` null) makes neither read and is never
 refused. The refusal is one fixed sentence that quotes no reference, no agent's name and no word of
-the hub. It sends the agent to the owner, who gives the secret in the app: the app signs the grant
-and writes it into the list itself, so no second call is needed then. Only for a secret that the
+the hub. It says where the give with a signature is, in words that are true in both programs (this
+server has no such tool): on the Mac where the Founderizer app runs, its program gives the secret
+with the owner's signature (`~/.founderizer/cli write grant_secret`), the app signs the grant and
+writes it into the list, as the owner's own Give on Secrets does, and the owner can also give it
+there; after either, `grant_access` needs no second call. Only for a secret that the
 owner put into the pool a moment ago does it say to call `grant_access` again in a minute: the hub
 reads the vault at least once a minute, and soon after a signed statement. A hub that does not
 answer, and a generation that moved two times, are the program's own errors, as for each of its
