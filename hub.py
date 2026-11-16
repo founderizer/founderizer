@@ -1698,9 +1698,12 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "model_accounts",    # the owner, 16 November 2026 ("Yes, start", the coordinator's D35): an agent on
                                     # a key or a model server from the owner's apps, GET /ui/servers model_providers,
                                     # the words and codes of its install, state and refusals (UI-API.md 1.186)
-               "need_run"]          # the owner, 16 November 2026 ("Yes, as drawn"): Run on the command of a hand
+               "need_run",          # the owner, 16 November 2026 ("Yes, as drawn"): Run on the command of a hand
                                     # step, needs[].run_command and run_on, and its answer, POST /ui/needs/<id> ran
                                     # (UI-API.md 1.197)
+               "owner_profile"]     # the owner, 16 November 2026 ("bots should talk in Spanish", "your profile
+                                    # with the user name"): the settings owner.language and owner.name, which the
+                                    # owner's Mac sets from its own language and account (UI-API.md 1.200)
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -3110,7 +3113,7 @@ def mobile_state(generation, at=None):
     answered = [need_view(r) for r in q("SELECT * FROM needs WHERE answer IS NOT NULL ORDER BY id DESC LIMIT ?",
                                         (MOBILE_ANSWERED,))]
     return {"schema_version": 1, "db": generation, "time": now() if at is None else at,
-            "manager_flag": kv_get("mgr_flag"), "manager_warning": manager_warning(), "ui_features": ui_features(),
+            "manager_flag": manager_flag_shown(), "manager_warning": manager_warning(), "ui_features": ui_features(),
             "agents": [mobile_agent(name, config) for name, config in agents().items()],
             "needs": needs, "answered_needs": list(reversed(answered)), "tasks": tasks,
             "recent": list(reversed(recent)), "ended_mark": mark, "asked": asked,
@@ -4525,7 +4528,9 @@ def chat_team_once(agent):
     if kv_get(f"chat_team:{agent}") == listed:
         return ""
     kv_set(f"chat_team:{agent}", listed)
-    team = team_start_text(agent).strip()
+    # An agent whose Shell box is off has no team directory (support plan F1), and its chat still answers the owner
+    # (tell_owner, message_owner): it gets the owner's name and language alone.
+    team = (owner_start_text() if shell_off(agent) else team_start_text(agent)).strip()
     return team + "\n\n" if team else ""
 
 
@@ -4722,10 +4727,15 @@ def team_start_text(agent):
     opens every session kind: a task's start, the manager's brief and the owner chat's start. message_agent's
     description carried it until then, and so every duty given changed the fixed text of every session.
 
+    The owner's language opens it (owner_start_text), in each of those three kinds, and also where it lists no
+    colleague: the manager of a new fleet writes the owner its first message alone.
+
     Reads only (read_rows, and git for the profiles): start_text runs inside admit_task's transaction. "" for an agent
-    whose Shell box is off: no session of it reaches a colleague (support plan F1)."""
+    whose Shell box is off: no session of it reaches a colleague (support plan F1), and only its owner chat writes to
+    the owner, which reads the owner's lines alone (chat_team_once)."""
     if shell_off(agent):
         return ""
+    owner = owner_start_text()
     rev, duties = kit_revision(), {}
     for r in read_rows("SELECT agent, text FROM responsibilities WHERE state!='retired' ORDER BY id"):
         duties.setdefault(r["agent"], []).append(duty_name(r["text"]))
@@ -4744,8 +4754,8 @@ def team_start_text(agent):
         else:
             left += 1
     if not kept:
-        return ""
-    return ("\nYOUR TEAM, from the fleet's own record and not from profiles: " + " | ".join(kept)
+        return owner
+    return owner + ("\nYOUR TEAM, from the fleet's own record and not from profiles: " + " | ".join(kept)
             + (f" | and {left} more, which {manager_name()} knows" if left else "")
             + (". Work that needs a colleague's access or machine: name the thing in ask_my_requester's needs_access "
                "and say who you think holds it; your requester reads the holder itself" if agent != manager_name()
@@ -4753,6 +4763,24 @@ def team_start_text(agent):
             + ". A question for one of them: message_agent: a message between linked tasks reaches the colleague's "
               "task, and any other its chat, which can talk and not act. A colleague's role, in brackets, reaches it "
               "in every tool as its name does. None of this gives you their access.\n")
+
+
+def owner_start_text():
+    """The owner's name and language (the settings owner.name and owner.language), a line each, which open the team
+    directory (team_start_text): so every session that can write what the owner reads -- a task's start, the
+    manager's brief and the owner chat's first read -- calls the owner by that name and writes in that language. The
+    owner, 16 November 2026: "when the fleet is setup on an app with spanish language, bots should talk in Spanish",
+    and "something like your profile with the user name so the fleet can address them properly". No line for an empty
+    value, and none for English, which the rules and the tools are already. A tag with no name in LANGUAGE_NAMES
+    stands as it is. Reads no row."""
+    name, tag = setting("owner.name"), setting("owner.language")
+    base = tag.split("-")[0].lower()
+    said = f"{LANGUAGE_NAMES[base]} ({tag})" if base in LANGUAGE_NAMES else f"the language of the tag {tag}"
+    return (f"\nTHE OWNER'S NAME is {name}: use it where a colleague would use a name.\n" if name else "") + \
+        (f"\nTHE OWNER'S LANGUAGE is {said}: write in it every text that the owner's apps show -- your replies and "
+         f"messages to the owner, Needs-you items, the titles of goals, tasks and duties, your notes on them and your "
+         f"results. Code, commands, commit messages, and the codes and names of things stay as they are. Any other "
+         f"person gets your answer in the language that they write in.\n" if tag and base != "en" else "")
 
 
 def contacts_start_text(agent):
@@ -32849,7 +32877,7 @@ def board_html():
          f"<title>Founderizer board</title><style>{CSS}</style></head><body>",
          "<h1>Founderizer board</h1>",
          f"<div class='muted'>Refreshes every 5 seconds, except while you type. Hub time {time.strftime('%H:%M:%S')}.</div>"]
-    flag = kv_get("mgr_flag")
+    flag = manager_flag_shown()
     if flag:
         p.append(f"<p class='warn'><b>The hub is telling you itself:</b> {esc(flag)}</p>")
     # The hub starts on a team.json that does not validate, so this is where it says the rule (PRODUCT.md 4.8).
@@ -36936,9 +36964,10 @@ def manager_flag_update(t0):
 
     **The owner's phone rings only for what the fleet cannot put right itself** (owner-contact plan B3, 6 November
     2026). From 24 October to 6 November it rang six times about the manager, and the two `down` rings were sessions
-    that their helper had closed itself and started again seconds later. The flag shows as before on the board, in
-    /ui/health, /ui/state and the app; only its notification can be held, and a held kind rings later in the same
-    episode, at the event that ends its hold:
+    that their helper had closed itself and started again seconds later. **Since 16 November 2026 a held kind shows
+    nowhere either** (the owner: "the warning banner is showing with 2 different error messages for a while, until it
+    disappears and the manager writes his first message", and "Always" for every later restart): not on the board,
+    in /ui/health, /ui/state or the apps. It shows and rings at the event that ends its hold:
     - `down` while its helper is online: that helper starts a missing session by itself (fleet.Helper.manage), so it
       rings when the helper says that its own start failed twice in a row (`mgr_start_failed`), or when the helper's
       loop is inside one step with a message behind it and starts nothing. A helper without MANAGER_START_FAILS
@@ -36992,19 +37021,40 @@ def manager_flag_update(t0):
         if shown or asks:           # it stays until the question goes or the manager reads (plan C10: no 90 s life)
             kind, held = "screen", False
             flag = "The manager's session shows a question on its own screen."
-        # B3: its helper's word that its start failed counts until a window list after that word shows the window
+        # B3: its helper's word that its start failed counts until its standing session came up after that word: it
+        # listed its tools on the window "manager" since then, the helper's own end of a run of failed starts (fleet.
+        # Helper.manager_came_up), which says no more while that run goes on. A window list alone ended it until 16
+        # November 2026, and since a held down shows nowhere, a session that ends before it comes up, again and again,
+        # then showed nothing after its first episode; a read is no such fact either, because a task or a conversation
+        # of the manager reads too (the reviews of that day). The run is its manager's: another manager's ends it (a
+        # new one, or one that the owner removed and added again). A count below its base went with a removal, and a
+        # word that a release before this kept has no count of its own: the count of now is the base of both.
         windows = (row["alive"] or "").split(",") if row else []
         failed = kv_get("mgr_start_failed")
-        if failed and listed(row) and row["alive_ts"] > float(failed) and "manager" in windows:
-            with area("quiet"):
-                kv_set("mgr_start_failed", None)
-                kv_set("mgr_start_failed_why", None)
-            failed = None
-        # A window list from before the end of a switch can still lack the new session's window (switch_ended).
-        if listed(row) and online and "manager" not in windows and row["alive_ts"] > switch_ended(mgr):
-            kind = "down"
-            flag = MANAGER_NOT_RUNNING
-            held = not failed and not stuck and MANAGER_START_FAILS in helper_features(mgr)
+        if failed:
+            base, count = kv_get("mgr_start_failed_listed"), int(kv_get(f"listed:{mgr}:manager") or 0)
+            if kv_get("mgr_start_failed_agent") not in (None, mgr) or base is not None and count > int(base):
+                with area("quiet"):
+                    for k in ("mgr_start_failed", "mgr_start_failed_why", "mgr_start_failed_listed",
+                              "mgr_start_failed_agent"):
+                        kv_set(k, None)
+                failed = None
+            elif base is None or count < int(base):
+                with area("quiet"):
+                    kv_set("mgr_start_failed_listed", count)
+        # A window list from before the end of a switch can still lack the new session's window (switch_ended). While a
+        # run of failed starts goes on, a window of a list after its helper's word that has not come up is that run
+        # too, where no other warning stands (a question on its screen keeps its own words): one episode, which rings
+        # once, and not one at each window that comes and ends.
+        if listed(row) and online and ("manager" not in windows or failed and row["alive_ts"] > float(failed) and
+                                       kind is None) and row["alive_ts"] > switch_ended(mgr):
+            # A session that its helper starts again changes nothing of a warning that stands already -- a limit, a
+            # frozen or untaken line, a question on its screen -- which keeps its words, its hold and its episode
+            # (the review of 16 November 2026: a held down in its place ended the episode, and a limit rang twice).
+            if failed or stuck or MANAGER_START_FAILS not in helper_features(mgr) or kind is None:
+                kind = "down"
+                flag = MANAGER_NOT_RUNNING
+                held = not failed and not stuck and MANAGER_START_FAILS in helper_features(mgr)
         elif row and row["last_seen"] and not online and pending:
             kind, held = "down", False
             flag = f"The manager's server has been silent since {owner_clock(row['last_seen'], t0)}; a message waits."
@@ -37032,6 +37082,18 @@ def manager_flag_update(t0):
             else:
                 kind = "switching"
                 flag = f"The manager switches to {runtime}. Its messages wait until it runs."
+        # **No warning that its helper puts right by itself** (the owner, 16 November 2026: "when a manager has just
+        # been added, the warning banner is showing with 2 different error messages for a while, until it disappears
+        # and the manager writes his first message", and "Always" to the same two warnings at a later restart of its
+        # session). A held kind is a session that its helper starts again -- after a sign-in, for new tools, after a
+        # cold close -- or a fresh session for a line that the session did not take: as it rang nobody (B3), it shows
+        # nowhere (manager_flag_shown, manager_warning). Its episode goes on as before, so a kind that rang does not
+        # ring again after a hold, and a hold that ends rings once, at that event (the review of that day: an episode
+        # that a hold ended rang twice). A start that failed twice in a row, a fresh session that left its line
+        # untaken too, a stuck helper, a silent server, a sign-out, a limit, a question on its screen and a switch
+        # show as before.
+        if (kv_get("mgr_flag_held") is not None) != bool(kind and held):
+            kv_set("mgr_flag_held", "1" if kind and held else None)
         if kind != kv_get("mgr_flag_kind"):
             kv_set("mgr_flag_kind", kind)
             kv_set("mgr_flag", flag)
@@ -38548,6 +38610,52 @@ def reboot_times_check(value):
     return list(value)
 
 
+# owner.language: a BCP 47 tag as Apple's preferred languages give it ("es-ES", "pt-BR", "zh-Hans-CN")
+LANGUAGE_TAG = re.compile(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,3}")
+# The English names of the languages that the agents' start line names (owner_start_text); any other tag stands as it
+# is, which a model reads as well. English is not here: the rules and the tools are English, and it needs no line.
+LANGUAGE_NAMES = {
+    "ar": "Arabic", "bg": "Bulgarian", "ca": "Catalan", "cs": "Czech", "da": "Danish", "de": "German", "el": "Greek",
+    "es": "Spanish", "et": "Estonian", "eu": "Basque", "fi": "Finnish", "fr": "French", "ga": "Irish",
+    "gl": "Galician", "he": "Hebrew", "hi": "Hindi", "hr": "Croatian", "hu": "Hungarian", "id": "Indonesian",
+    "it": "Italian", "ja": "Japanese", "ko": "Korean", "lt": "Lithuanian", "lv": "Latvian", "ms": "Malay",
+    "nb": "Norwegian", "nl": "Dutch", "no": "Norwegian", "pl": "Polish", "pt": "Portuguese", "ro": "Romanian",
+    "ru": "Russian", "sk": "Slovak", "sl": "Slovenian", "sr": "Serbian", "sv": "Swedish", "th": "Thai",
+    "tr": "Turkish", "uk": "Ukrainian", "vi": "Vietnamese", "zh": "Chinese",
+}
+
+
+def language_check(value):
+    """owner.language: the language that the owner reads, as a BCP 47 tag of at most 35 characters."""
+    if not isinstance(value, str) or len(value) > 35 or not LANGUAGE_TAG.fullmatch(value):
+        raise ValueError('must be a language tag (BCP 47) of at most 35 characters, for example "es" or "es-ES"')
+    return value
+
+
+# owner.name: letters and their marks of any script, spaces and . ' ’ - -- what stands in each session's start, so no
+# other sign: no line break, no colon, no character that is invisible or turns the text around
+OWNER_NAME_SIGNS = " .'’-"
+OWNER_NAME_MAX = 40
+# The variation selectors, which choose a letter's form (an input method can write a Japanese name with one): a name
+# keeps its letters without them. The other letters and marks that Unicode makes invisible (Default_Ignorable_Code_Point,
+# the fillers) are refused.
+OWNER_NAME_FORMS = frozenset([0x180F, *range(0x180B, 0x180E), *range(0xFE00, 0xFE10), *range(0xE0100, 0xE01F0)])
+OWNER_NAME_HIDDEN = frozenset([0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x3164, 0xFFA0])
+
+
+def name_check(value):
+    """owner.name: what the agents call the owner, at most 40 letters and marks (Unicode categories L and M: "रवि" has
+    a mark), spaces and . ' ’ -, with its spaces made one; "" is no name, which the owner chose (the Mac gives its
+    account's name only to a fleet that has none set)."""
+    if not isinstance(value, str):
+        raise ValueError('must be a name, for example "Alex", or "" for none')
+    value = " ".join(unicodedata.normalize("NFC", "".join(c for c in value if ord(c) not in OWNER_NAME_FORMS)).split())
+    if len(value) > OWNER_NAME_MAX or not all(c in OWNER_NAME_SIGNS or unicodedata.category(c)[0] in "LM" and
+                                              ord(c) not in OWNER_NAME_HIDDEN for c in value):
+        raise ValueError("must be a name of at most 40 letters, spaces and . ' -, or \"\" for none")
+    return value
+
+
 # Each setting of the fleet: its default, the check of a value (it gives the value back, or raises ValueError with
 # what the value must be), and what it does, in one line. team.json "settings" holds only what the owner set, and
 # GET/POST /ui/settings and the admin MCP read and write it. A lane adds its key here in the commit that reads it,
@@ -38599,6 +38707,16 @@ SETTINGS = {
                              "gets the first one that no server of the fleet has, and its join installs the fleet "
                              "patch policy with it. Empty: a server takes security updates only and never restarts "
                              "by itself."),
+    # the owner, 16 November 2026: "when the fleet is setup on an app with spanish language, bots should talk in
+    # Spanish". The owner's Mac app sets it from the Mac's own language (owner feature owner_profile), with no control.
+    "owner.language": ("", language_check,
+                       "The language that the owner reads, as a BCP 47 tag: every agent writes in it what the owner's "
+                       "apps show. Empty: the agents write as before. The owner's Mac sets it from its own language."),
+    # the owner, 16 November 2026: "something like your profile with the user name so the fleet can address them
+    # properly", and to its picture, "Mac account + Settings row": Settings › General › Your profile › Name
+    "owner.name": ("", name_check,
+                   "The name that the agents call the owner by. Empty: none. The owner's Mac sets it from its account "
+                   "while it is not set, and Settings › General › Your profile changes it."),
 }
 
 
@@ -38733,16 +38851,20 @@ def runtime_facts_changes(facts):
     return facts
 
 
-def save_settings(changes, facts=None):
+def save_settings(changes, facts=None, only_unset=False):
     """POST /ui/settings: the owner's values of some settings, None for the default, and of some runtime facts, None
     for the table's, in one commit of team.json that is applied at once. It needs no base: it moves only the keys it
-    names, and keeps every other one."""
+    names, and keeps every other one. only_unset: only the settings that team.json does not hold yet, read here, in
+    the write itself -- the owner's Mac fills his name and language so, and never takes back his own (owner API
+    1.200)."""
     for name, facts_of in (facts or {}).items():
         if facts_of.get("default_model") is not None:
             default_model_check(name, facts_of["default_model"])
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     before = team.get("settings") if isinstance(team.get("settings"), dict) else {}
+    if only_unset:
+        changes = {key: value for key, value in changes.items() if key not in before}
     after = dict(before)
     for key, value in changes.items():
         if value is None:
@@ -45335,13 +45457,19 @@ def save_tool(body):
     return dict(result, tool=tool, agents=chosen)
 
 
+def manager_flag_shown():
+    """The manager's warning words as the owner's screens show them (the board, GET /ui/state and /ui/mobile): none for a
+    held kind, which its helper puts right by itself (manager_flag_update)."""
+    return None if kv_get("mgr_flag_held") else kv_get("mgr_flag")
+
+
 def manager_warning():
     """The current manager warning episode: its kind and when that kind started (owner API 1.3). A `down` says which
     one it is in `cause` (16 November 2026): `not_running`, its helper answers and its window is gone, which its
     helper starts again by itself, so the owner's apps give it Report a problem; or `server_silent`, its server went
     silent with a message waiting, whose band keeps the manager's page."""
     kind, since = kv_get("mgr_flag_kind"), kv_get("mgr_flag_since")
-    if not (kind and since):
+    if not (kind and since) or kv_get("mgr_flag_held"):     # held: its helper puts it right (manager_flag_update)
         return None
     warning = {"kind": kind, "since": float(since)}
     if kind == "down":
@@ -52228,7 +52356,7 @@ class Handler(BaseHTTPRequestHandler):
             # The rows, the token and the team of one moment (state_moment): LOCK is held for that moment only. A write
             # after it is not in this answer, and it moves the token past this answer's (live_changes).
             result = {"schema_version": 1, "db": kv_get("db_id"), "time": at, "token": token,
-                      "manager_flag": kv_get("mgr_flag"),
+                      "manager_flag": manager_flag_shown(),
                       "manager_warning": manager_warning(),
                       "ui_features": ui_features(), "repository": repository}
             for table, key in (("tasks", "tasks"), ("notes", "notes"),
@@ -55718,7 +55846,9 @@ class Handler(BaseHTTPRequestHandler):
     def ui_settings_save(self):
         """POST /ui/settings: the owner's own value of one setting or more, or null for its default."""
         def read(data):
-            self.only(data, ("settings", "runtime_facts"))
+            self.only(data, ("settings", "runtime_facts", "only_unset"))
+            if not isinstance(data.get("only_unset", False), bool):
+                raise ValueError("only_unset is true or false")
             changes = data.get("settings", {})
             if not isinstance(changes, dict) or not changes and "runtime_facts" not in data:
                 raise ValueError("settings must map one setting or more to a value, or to null for its default")
@@ -55731,8 +55861,9 @@ class Handler(BaseHTTPRequestHandler):
                     except ValueError as e:
                         raise ValueError(f"{key} {e}") from None
             facts = runtime_facts_changes(data["runtime_facts"]) if "runtime_facts" in data else {}
-            return {"settings": changes, "runtime_facts": facts}
-        return self.ui_command("settings", read, lambda body: save_settings(body["settings"], body["runtime_facts"]))
+            return {"settings": changes, "runtime_facts": facts, "only_unset": data.get("only_unset", False)}
+        return self.ui_command("settings", read, lambda body: save_settings(body["settings"], body["runtime_facts"],
+                                                                            body["only_unset"]))
 
     def ui_conversations(self, query):
         """GET /ui/conversations: every conversation between an agent and a person, newest first. agent= and person=
@@ -57174,6 +57305,10 @@ class Handler(BaseHTTPRequestHandler):
             with area("quiet"):
                 kv_set("mgr_start_failed", now())
                 kv_set("mgr_start_failed_why", why or None)     # the manager_down warning's detail (health_view)
+                # the count of its tool listings now: a later one ends the run of failed starts (manager_flag_update),
+                # which is this manager's alone
+                kv_set("mgr_start_failed_listed", int(kv_get(f"listed:{agent}:manager") or 0))
+                kv_set("mgr_start_failed_agent", agent)
             log("hub", f"{agent}'s helper could not start the manager session, twice in a row" + (f": {why}" if why
                                                                                                     else ""))
             manager_flag_update(now())

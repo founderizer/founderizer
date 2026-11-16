@@ -3034,9 +3034,10 @@ def tools():
                               "list) -- or to null for the table's value, for when a provider changes its prices, "
                               "its cache or its models. fleet_read(page=\"settings\") gives every "
                               "setting and fact with its value and its default. One commit of team.json, applied "
-                              "at once.",
-             {"settings": {"type": "object"}, "runtime_facts": {"type": "object"}, **rid}, (),
-             plain("/ui/settings", ("settings", "runtime_facts"), "these settings")),
+                              "at once. only_unset true sets only the settings that the fleet has not set yet, as "
+                              "the owner's Mac fills owner.name and owner.language.",
+             {"settings": {"type": "object"}, "runtime_facts": {"type": "object"}, "only_unset": S["bool"], **rid}, (),
+             plain("/ui/settings", ("settings", "runtime_facts", "only_unset"), "these settings")),
         tool("person_handle", "One chat handle of one person: add it, or remove it with delete true. A handle "
                               "belongs to one person only, and never to the owner.",
              {"person": S["int"], "app": S["text"], "handle": S["text"], "name": S["text"], "delete": S["bool"],

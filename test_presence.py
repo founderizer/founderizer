@@ -193,11 +193,13 @@ class ScreenWatch(test_runtime.Runtime):
 
 class ManagerRings(test_runtime.Runtime):
     """Owner-contact plan B3 (6 November 2026): the owner's phone rings about the manager's own health only when the
-    fleet cannot put it right itself. The flag shows on the board, in /ui/health and in /ui/state as before; only its
-    notification waits for the event that ends its hold. The bodies are the helper's own (fleet.Helper.signal and
+    fleet cannot put it right itself, and since 16 November 2026 (the owner: "Always") a held kind shows nowhere
+    either: not on the board, in /ui/health or in /ui/state, until the event that ends its hold. The bodies are the
+    helper's own (fleet.Helper.signal and
     manager_start_failed), and a poll is its own poll with its window list (fleet.cmd_run)."""
     DOWN = "Fleet hub: The manager session is not running."
     SILENT = "Fleet hub: The manager did not take a message it was given twice."
+    QUIET = (None, [], None, None)
 
     def setUp(self):
         super().setUp()
@@ -225,24 +227,27 @@ class ManagerRings(test_runtime.Runtime):
         return [t for t in self.said("owner", "notify") if t.startswith("Fleet hub: ")]
 
     def shown(self):
-        """The flag as the owner's screens show it: its kind, /ui/health's warning, and /ui/state's kind and words."""
+        """The flag as the owner's screens show it: its kind (none while it is held, which its episode keeps), /ui/health's
+        warning, and /ui/state's kind and words."""
         warnings = [w["kind"] for w in hub.health_view()["warnings"] if w["kind"].startswith("manager_")]
         state = self.call("GET", "/ui/state")[1]
-        return hub.kv_get("mgr_flag_kind"), warnings, (state["manager_warning"] or {}).get("kind"), state["manager_flag"]
+        kind = None if hub.kv_get("mgr_flag_held") else hub.kv_get("mgr_flag_kind")
+        return kind, warnings, (state["manager_warning"] or {}).get("kind"), state["manager_flag"]
 
     # ---- case 1: down
-    def test_a_window_that_its_helper_starts_again_shows_down_and_rings_nobody(self):
+    def test_a_window_that_its_helper_starts_again_shows_nothing_and_rings_nobody(self):
         """28 October and 6 November 2026: the helper closed its manager session itself (new tools, then a new
-        conversation), and the owner was told "not running" for a session that was back seconds later."""
+        conversation), and the owner was told "not running" for a session that was back seconds later. Since 16
+        November 2026 it shows nowhere either (the owner: "Always")."""
         self.poll("manager")
         self.poll()                                         # its session ended: its helper starts it again by itself
-        self.assertEqual(self.shown(), ("down", ["manager_down"], "down", "The manager session is not running."))
+        self.assertEqual(self.shown(), self.QUIET)
         hub.tick()
         self.poll("manager")                                # and it is back
         self.assertEqual(self.shown(), (None, [], None, None))
         self.assertEqual(self.rings(), [])
 
-    def test_a_start_that_failed_twice_in_a_row_rings_once_until_its_window_is_back(self):
+    def test_a_start_that_failed_twice_in_a_row_rings_once_until_its_session_came_up(self):
         self.poll("manager")
         self.poll()
         self.assertEqual(self.rings(), [])
@@ -258,13 +263,100 @@ class ManagerRings(test_runtime.Runtime):
         self.poll()
         hub.tick()
         self.assertEqual(self.rings(), [self.DOWN])        # once for the episode
-        self.poll("manager")                                # a list after its word shows the window: it runs again
+        self.poll("manager")                                # its window is back, and its session is not up yet:
+        self.assertEqual(self.shown()[:3], ("down", ["manager_down"], "down"))       # the run goes on (B3)
+        hub.listed_window("manager", None)                  # its session came up: it listed its tools
+        hub.tick()
         self.assertIsNone(hub.kv_get("mgr_start_failed"))
         self.assertIsNone(hub.kv_get("mgr_start_failed_why"))
         self.assertIsNone(hub.kv_get("mgr_flag_kind"))
         self.poll()                                         # the next end of it is its helper's to start again
-        self.assertEqual(hub.kv_get("mgr_flag_kind"), "down")
+        self.assertEqual((self.shown(), hub.kv_get("mgr_flag_kind")), (self.QUIET, "down"))     # held: its episode
         self.assertEqual(self.rings(), [self.DOWN])
+
+    def test_a_run_of_starts_that_end_before_they_come_up_stays_one_warning_that_rings_once(self):
+        """The reviews of 16 November 2026: after its helper's word, a window that shows and ends before its session
+        came up is one more failed start to that helper, which says no more; a window list ended the run here, and the
+        next missing window was held and showed nothing. Only the standing session's tool listing ends it: a read is
+        no such fact, because a task or a conversation of the manager reads too. A question on its screen during the
+        run keeps its own words."""
+        self.poll("manager")
+        self.poll()
+        self.dialog(kind="start_failed", reason="its session ended before it came up")
+        self.assertEqual(self.rings(), [self.DOWN])
+        for _ in range(3):
+            self.poll("manager")                            # its next start shows a window
+            self.assertEqual(self.shown()[:3], ("down", ["manager_down"], "down"))
+            self.poll()                                     # which ends before its session came up
+            self.assertEqual(self.shown()[:3], ("down", ["manager_down"], "down"))
+        hub.tick()
+        self.assertEqual(self.rings(), [self.DOWN])
+        self.poll("manager")
+        self.unread()
+        hub.t_read_messages("manager", {})                  # a read ends no run
+        hub.tick()
+        self.assertEqual(self.shown()[:3], ("down", ["manager_down"], "down"))
+        self.assertEqual(self.dialog(kind="shown"), 200)    # a question on the screen of the starting session
+        self.assertEqual(self.shown()[:3], ("screen", ["manager_screen"], "screen"))
+        self.assertEqual(self.dialog(kind="gone"), 200)
+        self.assertEqual(self.shown()[:3], ("down", ["manager_down"], "down"))
+        hub.listed_window("manager", None)                  # it came up: it listed its tools
+        hub.tick()
+        self.assertEqual(self.shown(), self.QUIET)
+        self.assertIsNone(hub.kv_get("mgr_start_failed"))
+        self.assertEqual(len(self.rings()), 2)              # the question rang once, the run once
+
+    def test_a_failed_start_that_a_release_before_kept_has_the_count_of_now_as_its_base(self):
+        """The review of 16 November 2026: a word of a release that kept no count of its own ended at once, and the
+        next missing window was held and showed nothing."""
+        self.poll("manager")
+        hub.listed_window("manager", None)
+        with hub.LOCK:
+            hub.kv_set("mgr_start_failed", hub.now())       # as a release before this one kept it
+        self.poll()
+        self.assertEqual(self.shown()[:3], ("down", ["manager_down"], "down"))
+        self.assertEqual(hub.kv_get("mgr_start_failed_listed"), "1")
+        hub.listed_window("manager", None)
+        self.poll("manager")
+        self.assertIsNone(hub.kv_get("mgr_start_failed"))
+
+    def test_a_run_is_its_manager_s_and_its_base_follows_counts_that_went(self):
+        """The review of 16 November 2026: the run's keys are the fleet's, and a manager that the owner removed and added
+        again lists from 0, so an old count was a base that it never passed, and its start showed "not running"."""
+        self.poll("manager")
+        hub.listed_window("manager", None)
+        hub.listed_window("manager", None)
+        self.poll()
+        self.dialog(kind="start_failed", reason="its session ended before it came up")
+        self.assertEqual((hub.kv_get("mgr_start_failed_listed"), hub.kv_get("mgr_start_failed_agent")), ("2", "manager"))
+        with hub.LOCK:
+            hub.kv_set("listed:manager:manager", None)      # as its removal leaves its counts
+        hub.tick()
+        self.assertEqual(hub.kv_get("mgr_start_failed_listed"), "0")       # the count of now is its base
+        self.assertIsNotNone(hub.kv_get("mgr_start_failed"))
+        hub.listed_window("manager", None)                  # the manager added again came up
+        hub.tick()
+        self.assertIsNone(hub.kv_get("mgr_start_failed"))
+        self.dialog(kind="start_failed", reason="its session ended before it came up")
+        with hub.LOCK:
+            hub.kv_set("mgr_start_failed_agent", "nova")    # the word of another manager's helper
+        hub.tick()
+        self.assertEqual([hub.kv_get(k) for k in ("mgr_start_failed", "mgr_start_failed_listed", "mgr_start_failed_agent")],
+                         [None, None, None])
+
+    def test_a_session_that_its_helper_starts_again_keeps_a_warning_that_stands(self):
+        """The review of 16 November 2026: a held down in the place of a frozen screen, a limit or a question on its
+        screen ended that episode, and it rang a second time when the window was back."""
+        self.poll("manager")
+        self.assertEqual(self.dialog(kind="frozen"), 200)
+        moved = lambda: [t for t in self.rings() if "has not moved since" in t]
+        self.assertEqual(len(moved()), 1)
+        self.poll()                                         # its helper starts its session again
+        self.assertEqual(self.shown()[:3], ("silent", ["manager_silent"], "silent"))
+        self.poll("manager")
+        hub.tick()
+        self.assertEqual(self.shown()[:3], ("silent", ["manager_silent"], "silent"))
+        self.assertEqual(len(moved()), 1)
 
     def test_a_list_from_before_the_helper_s_word_does_not_end_it(self):
         """The session that its helper started last showed in a list, and ended before it came up: that was its
@@ -310,18 +402,17 @@ class ManagerRings(test_runtime.Runtime):
         self.assertEqual(hub.manager_warning()["cause"], "server_silent")
 
     # ---- case 2: silent
-    def test_a_line_that_its_helper_starts_fresh_for_shows_silent_and_rings_nobody(self):
+    def test_a_line_that_its_helper_starts_fresh_for_shows_nothing_and_rings_nobody(self):
         self.poll("manager")
         self.unread()
         self.assertEqual(self.dialog(kind="untaken", fresh="yes"), 400)
         self.assertEqual(self.dialog(kind="untaken", fresh=True), 200)
         hub.tick()
-        self.assertEqual(self.shown(), ("silent", ["manager_silent"], "silent",
-                                        "The manager did not take a message it was given twice."))
+        self.assertEqual(self.shown(), self.QUIET)
         self.poll()                                         # its helper closed that idle session
-        self.assertEqual(hub.kv_get("mgr_flag_kind"), "down")
+        self.assertEqual(self.shown(), self.QUIET)
         self.poll("manager")                                # and started it on a new conversation
-        self.assertEqual(hub.kv_get("mgr_flag_kind"), "silent")
+        self.assertEqual(self.shown(), self.QUIET)
         hub.t_read_messages("manager", {})                  # the fresh session reads
         hub.tick()
         self.assertEqual(self.shown(), (None, [], None, None))
@@ -370,6 +461,52 @@ class ManagerRings(test_runtime.Runtime):
         self.assertIsNone(hub.kv_get("mgr_flag_kind"))
         self.assertEqual(self.dialog(kind="shown", still=True), 200)
         self.assertEqual(self.rings()[-1], "Fleet hub: The manager's session shows a question on its own screen.")
+
+    # ---- case 4: a new manager's start (the owner, 16 November 2026)
+    def test_a_new_manager_s_start_shows_no_warning_that_its_helper_puts_right(self):
+        """The owner, 16 November 2026: "when a manager has just been added, the warning banner is showing with 2
+        different error messages for a while, until it disappears and the manager writes his first message". Its
+        helper starts its session again after the sign-in, and a fresh session takes the line that the starting one
+        did not take: the two warnings of case 1 and case 2, which stood in turn."""
+        with hub.LOCK:
+            hub.kv_set(hub.FIRST_MESSAGE, "told")           # placed on its first server, and asked for that message
+        self.poll("manager")
+        self.poll()                                         # its helper starts it again after the sign-in
+        self.assertEqual(self.shown(), self.QUIET)
+        self.poll("manager")
+        self.unread()                                       # the hub's ask for its first message
+        self.assertEqual(self.dialog(kind="untaken", fresh=True), 200)
+        hub.tick()
+        self.assertEqual(self.shown(), self.QUIET)
+        self.poll()                                         # its helper closed that session
+        self.assertEqual(self.shown(), self.QUIET)
+        self.poll("manager")                                # and started a fresh one, which reads
+        self.assertEqual(self.shown(), self.QUIET)
+        hub.t_read_messages("manager", {})
+        hub.tick()
+        self.assertEqual((self.shown(), self.rings()), (self.QUIET, []))
+        # what its helper cannot put right shows and rings as before: a start that failed twice in a row
+        self.poll()
+        self.assertEqual(self.dialog(kind="start_failed", reason="the session did not start or ended at its start"),
+                         200)
+        self.assertEqual(self.shown()[:3], ("down", ["manager_down"], "down"))
+        self.assertEqual(self.rings(), [self.DOWN])
+
+    def test_a_sign_out_and_a_stuck_helper_show_as_before(self):
+        self.poll("manager")
+        self.status(signed_in=False)
+        self.poll()
+        self.assertEqual(self.shown()[:3], ("signed_out", ["manager_signed_out"], "signed_out"))
+        self.status(signed_in=True)
+        self.poll("manager")
+        self.assertEqual(self.shown(), self.QUIET)
+        t0 = hub.now()
+        event = hub.emit("manager", "say", "[owner] unread")
+        hub.q("UPDATE events SET created=? WHERE id=?", (t0 - 5, event))
+        with hub.LOCK:
+            hub.presence_ping("manager", "manage", None, t0 - 20, t0)
+            hub.presence_ping("manager", "manage", None, t0 - 20, t0 + 1)
+        self.assertEqual(self.shown()[:3], ("silent", ["manager_silent"], "silent"))
 
 
 class StuckScreens(test_runtime.Runtime):

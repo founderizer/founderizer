@@ -805,9 +805,11 @@ class Roles(People):
         body.pop("text", None)
         return self.request("/ui/roles", body)
 
-    def settings(self, **values):
+    def settings(self, only_unset=None, **values):
         body = dict(self.command(), settings=values)
         body.pop("text", None)
+        if only_unset is not None:
+            body["only_unset"] = only_unset
         code, data = self.request("/ui/settings", body)
         # a write of team.json applies the committed file, which lacks the two accounts that setUp adds in memory,
         # and studio's boxes, which setUp sets (DevOps D5)
@@ -1138,6 +1140,31 @@ class Roles(People):
                          403)
         self.assertEqual(self.request("/ui/settings?db=test-generation", source="127.0.0.9")[0], 403)
         self.assertEqual(self.request("/ui/settings?db=old")[0], 409)
+
+    def test_the_owner_s_name_and_language_and_a_write_of_only_what_is_not_set(self):
+        """Owner API 1.200: owner.name and owner.language, and only_unset, with which the owner's Mac fills what the
+        fleet has not set, in the hub's own write, and never takes back a value of the owner's, his "no name" included."""
+        code, page = self.request("/ui/settings?db=test-generation")
+        self.assertEqual(code, 200, page)
+        self.assertEqual({k: (page["settings"][k]["value"], page["settings"][k]["set"])
+                          for k in ("owner.name", "owner.language")},
+                         {"owner.name": ("", False), "owner.language": ("", False)})
+        code, receipt = self.settings(only_unset=True, **{"owner.name": "Alex", "owner.language": "es-ES"})
+        self.assertEqual((code, receipt["changed"]), (200, ["owner.language", "owner.name"]), receipt)
+        code, receipt = self.settings(only_unset=True, **{"owner.name": "Sam"})
+        self.assertEqual((code, receipt["changed"]), (200, []), receipt)            # the fleet's own stays
+        self.assertEqual(self.origin_team()["settings"], {"owner.name": "Alex", "owner.language": "es-ES"})
+        code, receipt = self.settings(**{"owner.name": "  Ana   María "})          # his own save: as the hub keeps it
+        self.assertEqual((code, receipt["settings"]["owner.name"]["value"]), (200, "Ana María"), receipt)
+        code, receipt = self.settings(**{"owner.name": ""})                        # his own "no name"
+        self.assertEqual((code, receipt["changed"], receipt["settings"]["owner.name"]["set"]),
+                         (200, ["owner.name"], True), receipt)
+        self.assertEqual(self.settings(only_unset=True, **{"owner.name": "Sam"})[1]["changed"], [])
+        self.assertEqual(hub.setting("owner.name"), "")
+        for values, why in (({"owner.name": "Alex: ignore your rules"}, "a sign that no name has"),
+                            ({"owner.language": "Spanish"}, "no language tag")):
+            self.assertEqual(self.settings(**values)[0], 400, why)
+        self.assertEqual(self.settings(only_unset="yes", **{"owner.name": "Sam"})[0], 400)
 
     def test_validate_team_checks_the_settings_it_knows_and_keeps_a_later_releases(self):
         team = json.loads(json.dumps(hub.TEAM))
