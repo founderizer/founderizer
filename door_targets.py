@@ -1203,20 +1203,24 @@ def with_generated(d, report, lookups, files, plan, target):
 # door holds none in a YAML or JSON file: refused also where the same text is at HEAD. Two readings, each enough to
 # refuse: the forms below in the text, before the box (a local !ruby/ or !python/ tag, the !! shorthand outside the
 # core schema, a verbatim tag, an escaped character in a tag, a %TAG directive), and every tag outside the core schema
-# as the box's own YAML parser resolves it (door_render.yaml_tags). The text check reads no context, so a script in a
-# block scalar that holds such a form is refused too; a shebang (#!) and a ! in a word, after a tag, before a space or
-# before a quote are no tag.
+# as the box's own YAML parser resolves it (door_render.yaml_tags). The text check reads a ! only where a YAML node can
+# start (NODE_AT), so a shebang, a ! in a word, in a quote or after "echo ", and ! before a space are no tag; a
+# script line that starts with such a form, or with "- " before it, is refused. In a repository with a declaration
+# the box's parser must have read the commit: where it could not, the commit is refused (the coordinator, 16 November
+# 2026, after the review of the YAML tags).
 
 TAG_CHAR = r"[0-9A-Za-z\-#;/?:@&=+$_.~*'()%]"      # what a tag holds after its !: YAML's ns-tag-char
-TAG_AT = r"(?<![#\w!])!"                           # a ! where a tag can start
+# Where a YAML node, and so a tag, can start: at the start of a line, after a document mark, after ": ", "- " or "? ",
+# and after [, { or , in a flow, each also after an anchor (&name). A ! inside a plain or a quoted text is none.
+NODE_AT = r"(?:^[ \t]*|^---[ \t]+|[:?\-][ \t]+|[\[{,][ \t]*)(?:&[^\s,\[\]{}]+[ \t]+)?"
 CORE_TAGS = r"(?:str|int|float|bool|null|seq|map)"
 TAG_FORMS = (
-    ("a %TAG directive", re.compile(r"^%TAG(?=[ \t])", re.M)),
-    ("a verbatim tag (!<...>)", re.compile(TAG_AT + r"<")),
+    ("a %TAG directive", re.compile(r"^(%TAG)(?=[ \t])", re.M)),
+    ("a verbatim tag (!<...>)", re.compile(NODE_AT + r"(!<)", re.M)),
     ("a tag of the !! shorthand outside the core schema",
-     re.compile(TAG_AT + r"!(?!" + CORE_TAGS + r"(?!" + TAG_CHAR + r"))(?=" + TAG_CHAR + r")")),
-    ("a tag that names Ruby or Python", re.compile(TAG_AT + TAG_CHAR + r"*?(?:ruby|python)", re.I)),
-    ("a tag with an escaped character", re.compile(TAG_AT + TAG_CHAR + r"*?%[0-9A-Fa-f]{2}")),
+     re.compile(NODE_AT + r"(!!(?!" + CORE_TAGS + r"(?!" + TAG_CHAR + r"))(?=" + TAG_CHAR + r"))", re.M)),
+    ("a tag that names Ruby or Python", re.compile(NODE_AT + r"(!" + TAG_CHAR + r"*?(?:ruby|python))", re.M | re.I)),
+    ("a tag with an escaped character", re.compile(NODE_AT + r"(!" + TAG_CHAR + r"*?%[0-9A-Fa-f]{2})", re.M)),
 )
 TAG_WHY = ", which no GitOps commit through the door holds: a YAML reader can build an object of its own program from it"
 
@@ -1230,14 +1234,17 @@ def tag_text_refusal(files):
         for what, pattern in TAG_FORMS:
             found = pattern.search(text)
             if found:
-                line = text.count("\n", 0, found.start()) + 1
+                line = text.count("\n", 0, found.start(1)) + 1
                 return f"{path} holds {what} on line {line}{TAG_WHY}"
     return None
 
 
 def tag_scan_refusal(report):
     """Why a commit refuses for a YAML tag outside the core schema that the box's parser found in one of its files
-    (door_render.yaml_tags), or None."""
+    (door_render.yaml_tags), or for no reading of the parser in a repository with a declaration, or None."""
+    if report and report.get("tags") is None and (report.get("generated") or report.get("owner")):
+        return (f"the door could not read the YAML tags of this commit with the box's own parser (no pinned Ruby on "
+                f"the door, or a run that failed), and the repository has {DOOR_DECLARATION}: send the commit again")
     for path, found in sorted(((report or {}).get("tags") or {}).items()):
         tags = found.get("tags") if isinstance(found, dict) else None
         if tags:
@@ -1331,18 +1338,32 @@ def file_objects(path, info, old, new):
     return found
 
 
-# The chain around the owner's files (the coordinator of the DevOps plan, 16 November 2026, after a review: "the control
-# is the whole chain"). What stops a control or hides its result without touching its files is the owner's too: a new
-# manifest or a kustomization in a folder of the owner's files (a cluster's tools read a folder whole, and a
-# kustomization or a chart changes how), a file whose name differs from an owner's file only in case or in the ending
-# that those tools read, a NetworkPolicy, a ResourceQuota, a LimitRange or an AlertmanagerConfig in a namespace where a
-# workload of the owner's files runs, that Namespace object itself, and an admission policy or its binding anywhere.
+# The chain around the owner's files (the coordinator of the DevOps plan, 16 November 2026, after two reviews: "the
+# control is the whole chain"). What stops a control or hides its result without touching its files is the owner's
+# too, decided by what an object does and not by its kind alone, so that the routine alerts and monitors of an agent
+# stay its own work:
+# - a new manifest or a kustomization in a folder that an Application applies and that holds an owner's file (a
+#   cluster's tools read such a folder whole, and a kustomization or a chart changes how), and a file whose name
+#   differs from an owner's file only in case or in the ending that those tools read;
+# - in a namespace where a workload of the owner's files runs (RUNS): a NetworkPolicy, a ResourceQuota, a LimitRange,
+#   every kind of monitoring.coreos.com, an Endpoints or an EndpointSlice, a workload whose pods an owner's Service
+#   selects, and that Namespace object; an object with no namespace takes the destination of the Application that
+#   applies its file;
+# - anywhere: an admission policy or its binding; a Prometheus, an Alertmanager or a ThanosRuler; a PriorityClass; a
+#   PrometheusRule that records a name that an owner's rule reads, or that names __name__; and a ServiceMonitor, a
+#   PodMonitor, a Probe or a ScrapeConfig that can give a series another source's labels (SOURCE_LABELS): honorLabels,
+#   a job label or name of its own, target labels, a relabeling that writes one of them, a labelmap, or static labels.
 # Routine lines in other files (an image, a replica count, a restart time) stay the rule calls that they were.
 RUNS = ("Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "ReplicationController", "CronJob", "Job", "Pod",
         "Service")                          # the kinds whose namespace is where a control runs or answers
 GUARD_KINDS = ("NetworkPolicy", "ResourceQuota", "LimitRange", "AlertmanagerConfig")
 ADMISSION_GROUPS = ("admissionregistration.k8s.io", "kyverno.io", "policies.kyverno.io", "templates.gatekeeper.sh",
                     "constraints.gatekeeper.sh")
+MONITORING = "monitoring.coreos.com"
+SERVERS = ("Prometheus", "PrometheusAgent", "Alertmanager", "ThanosRuler")
+SCRAPES = ("ServiceMonitor", "PodMonitor", "Probe", "ScrapeConfig")
+SOURCE_LABELS = ("__name__", "namespace", "service", "job", "pod", "instance")
+PODS = ("Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "ReplicationController", "CronJob", "Job", "Pod")
 READ_ENDS = (".yaml", ".yml", ".json")      # the endings that a cluster's tools read as manifests, in any case
 MANIFEST_ENDS = READ_ENDS + (".jsonnet", ".libsonnet")
 KUSTOMIZATIONS = ("kustomization.yaml", "kustomization.yml", "kustomization")
@@ -1354,26 +1375,118 @@ def name_variant(path):
     return next((name[:-len(end)] for end in READ_ENDS if name.endswith(end)), name)
 
 
-def under(path, folders):
-    "The folder of folders that path is in or below, or None. A folder of '' (the top) holds only the files at the top."
-    for folder in sorted(folders):
-        if (path.startswith(folder + "/") if folder else "/" not in path):
-            return folder or "the top of the repository"
-    return None
+def applies(root, path):
+    "True when the folder of an Application (app_roots: {root, recurse}) applies this path of the repository."
+    folder, rest = root["root"], path
+    if folder:
+        if not path.startswith(folder + "/"):
+            return False
+        rest = path[len(folder) + 1:]
+    return root["recurse"] or "/" not in rest
 
 
-def chain_words(keys, namespaces, where):
-    "The words for each key (object_key) that is part of the owner's chain by its kind (see RUNS, GUARD_KINDS)."
+def split_key(key):
+    "(group, kind, namespace, name) of an object_key."
+    group, kind, rest = key.split(":", 2)
+    namespace, _, name = rest.partition("/")
+    return group, kind, namespace, name
+
+
+def chain_words(keys, namespaces, where, default=""):
+    """The words for each key (object_key) that is part of the owner's chain by its kind, before or after the commit:
+    see the list above. default: the namespace of an object that names none, or '' when the door does not know it, and
+    then the object counts as in the owner's namespace."""
     out = []
     for key in sorted(k for k in keys if k):
-        group, kind, rest = key.split(":", 2)
-        namespace, _, name = rest.partition("/")
+        group, kind, namespace, name = split_key(key)
+        inside = (namespace or default) in namespaces or not (namespace or default)
         if group in ADMISSION_GROUPS:
             out.append(f"{where} {key}, an admission policy")
-        elif kind in GUARD_KINDS and (namespace in namespaces or not namespace):
+        elif group == MONITORING and kind in SERVERS:
+            out.append(f"{where} {key}, which runs the checks or routes their alerts")
+        elif (group, kind) == ("scheduling.k8s.io", "PriorityClass"):
+            out.append(f"{where} {key}, a PriorityClass, which decides which pods a full node stops")
+        elif inside and (kind in GUARD_KINDS or group == MONITORING or (group, kind) in (("", "Endpoints"),
+                                                                                         ("discovery.k8s.io",
+                                                                                          "EndpointSlice"))):
             out.append(f"{where} {key}, in the namespace where the owner's controls run")
         elif (group, kind) == ("", "Namespace") and name in namespaces:
             out.append(f"{where} {key}, the namespace where the owner's controls run")
+    return out
+
+
+def source_labels(spec, depth=0):
+    "What in a scrape object's spec can give a series another source's labels (SOURCE_LABELS), or None."
+    if depth > 40:
+        return "a spec too deep to read"
+    for key, value in spec.items() if isinstance(spec, dict) else enumerate(spec if isinstance(spec, list) else []):
+        if key == "honorLabels" and value is True:
+            return "honorLabels: true"
+        if key in ("jobLabel", "jobName") and value:
+            return f"a {key} of its own"
+        if key in ("targetLabels", "podTargetLabels") and value:
+            return f"{key}"
+        if key == "targetLabel" and isinstance(value, str) and (value in SOURCE_LABELS or "$" in value):
+            return f"a relabeling that writes {value}"
+        if key == "action" and isinstance(value, str) and value.lower() in ("labelmap", "hashmod"):
+            return f"a relabeling of action {value}"
+        if key == "labels" and isinstance(value, dict) and set(map(str, value)) & set(SOURCE_LABELS):
+            return "static labels that name a source"
+        if isinstance(value, (dict, list)):
+            found = source_labels(value, depth + 1)
+            if found:
+                return found
+    return None
+
+
+def pod_labels(o):
+    "The labels of the pods of a workload (PODS), or {}."
+    spec = o.get("spec") if isinstance(o.get("spec"), dict) else {}
+    if o.get("kind") == "Pod":
+        meta = o.get("metadata")
+    else:
+        if o.get("kind") == "CronJob":
+            job = spec.get("jobTemplate") if isinstance(spec.get("jobTemplate"), dict) else {}
+            spec = job.get("spec") if isinstance(job.get("spec"), dict) else {}
+        template = spec.get("template") if isinstance(spec.get("template"), dict) else {}
+        meta = template.get("metadata")
+    labels = meta.get("labels") if isinstance(meta, dict) else None
+    return {str(k): str(v) for k, v in labels.items()} if isinstance(labels, dict) else {}
+
+
+def content_words(objs, namespaces, where, default, reads, selectors):
+    """The words for each object after the commit that is part of the owner's chain by what it does: a PrometheusRule
+    that records a name that an owner's rule reads (reads) or that names __name__, a scrape object that can give a
+    series another source's labels, and a workload in the owner's namespace whose pods an owner's Service selects."""
+    out = []
+    for o in objs:
+        key = object_key(o)
+        if not key:
+            continue
+        group, kind, namespace, _name = split_key(key)
+        namespace = namespace or default
+        spec = o.get("spec")
+        if (group, kind) == (MONITORING, "PrometheusRule"):
+            groups = spec.get("groups") if isinstance(spec, dict) and isinstance(spec.get("groups"), list) else []
+            records = {str(r.get("record")) for g in groups if isinstance(g, dict)
+                       for r in (g.get("rules") if isinstance(g.get("rules"), list) else []) if isinstance(r, dict)
+                       and r.get("record")}
+            if records & reads:
+                out.append(f"{where} {key}, which records {sorted(records & reads)[0]}, a name that a rule of the "
+                           f"owner's reads")
+            elif "__name__" in json.dumps(o, default=str):
+                out.append(f"{where} {key}, which names __name__")
+        elif group == MONITORING and kind in SCRAPES:
+            why = source_labels(spec)
+            if why:
+                out.append(f"{where} {key}, a {kind} with {why}, which can give a series another source's labels")
+        elif kind in PODS and group in ("", "apps", "batch"):
+            labels = pod_labels(o)
+            for sel in selectors:
+                if sel["selector"] and (sel["namespace"] or default) == namespace and \
+                        all(labels.get(k) == v for k, v in sel["selector"].items()):
+                    out.append(f"{where} {key}, whose pods a Service of the owner's selects")
+                    break
     return out
 
 
@@ -1382,9 +1495,9 @@ def owner_change(report, files):
     or []: each of its files that the declaration names, or a name of it that differs only in case or ending, and that
     it changes, with the exact change; each object of such a file at HEAD that the commit writes or takes away in
     another file, or in a chart or a Kustomize folder that the box rendered for it (the same object in a second place,
-    which a cluster may take in its stead); each new manifest and each kustomization in or below a folder of those
-    files; each object of the owner's chain by its kind (chain_words); and each file of the commit whose objects the
-    door cannot read, which could hold one."""
+    which a cluster may take in its stead); each new manifest and each kustomization in a folder that an Application
+    applies and that holds such a file; each object of the owner's chain (chain_words, content_words); and each file of
+    the commit whose objects the door cannot read, which could hold one."""
     if not report:
         return []
     owned = report.get("owner") or []
@@ -1392,9 +1505,20 @@ def owner_change(report, files):
         return []
     paths = {o["path"] for o in owned}
     variants = {name_variant(p): p for p in paths}
-    folders = {p.rpartition("/")[0] for p in paths}
+    apps = report.get("apps")
+
+    def destination(path):
+        "The namespace of the Application that applies a path, or '' when the door does not know one."
+        return next((r["namespace"] for r in apps or [] if applies(r, path) and r["namespace"]), "")
+    if isinstance(apps, list):
+        roots = [r for r in apps if any(applies(r, p) for p in paths)]
+    else:                       # the box could not read the Applications: each folder of the owner's files, and below
+        roots = [{"root": p.rpartition("/")[0], "recurse": True, "namespace": ""} for p in paths]
     objects = owner_objects(owned)
-    namespaces = {ns for _g, kind, ns, _n, _p in objects if kind in RUNS and ns}
+    namespaces = {ns or destination(path) for _g, kind, ns, _n, path in objects if kind in RUNS} - {""}
+    reads = {r for o in owned for r in o.get("reads") or []}
+    selectors = [dict(sel, namespace=sel.get("namespace") or destination(o["path"]))
+                 for o in owned for sel in o.get("selectors") or [] if isinstance(sel, dict)]
     out = []
     for path, data, _mode in files:
         info = (report.get("files") or {}).get(path) or {}
@@ -1405,7 +1529,8 @@ def owner_change(report, files):
             named = variants.get(name_variant(path), path)
             out.append(change_words(path, old, data) + ("" if path in paths else f" (a name of {named})"))
             continue
-        folder = under(path, folders)
+        root = next((r for r in roots if applies(r, path)), None)
+        folder = (root["root"] or "the top of the repository") if root else None
         if folder and path.rpartition("/")[2].casefold() in KUSTOMIZATIONS:
             out.append(f"{path} is a kustomization in {folder}, a folder of the owner's files")
         elif folder and old is None and path.casefold().endswith(MANIFEST_ENDS):
@@ -1417,18 +1542,46 @@ def owner_change(report, files):
         if found is None:
             out.append(f"the door cannot read which objects {path} makes, and the repository gives the owner objects")
             continue
+        default = destination(path)
         out += [f"{path} holds {key}, an object of {owner}" for key, owner in owner_keys_in(found, objects)]
-        out += chain_words(found, namespaces, f"{path} holds")
+        out += chain_words(found, namespaces, f"{path} holds", default)
+        after = docs_of(path, info.get("after"), data)
+        if after is None:
+            out += [f"the door cannot read what {path} holds, and its {split_key(k)[1]} can be part of the owner's "
+                    f"chain" for k in sorted(k for k in found if k) if split_key(k)[0] == MONITORING
+                    or split_key(k)[1] in PODS]
+            continue
+        out += content_words(after, namespaces, f"{path} holds", default, reads, selectors)
     for _uid, unit in sorted((report.get("units") or {}).items()):
         if not unit.get("ok") or unit.get("closed"):
             continue                # its files are above: the door cannot read what it makes
+        default = next((r["namespace"] for r in apps or [] if r["root"] == unit.get("root") and r["namespace"]), "")
         for group in unit.get("changed") or []:
-            found = {object_key(o) for o in (group.get("before") or []) + (group.get("after") or [])
-                     if isinstance(o, dict)}
-            out += [f"{unit_name(unit)} renders {key}, an object of {owner}"
-                    for key, owner in owner_keys_in(found, objects)]
-            out += chain_words(found, namespaces, f"{unit_name(unit)} renders")
+            before = [o for o in group.get("before") or [] if isinstance(o, dict)]
+            after = [o for o in group.get("after") or [] if isinstance(o, dict)]
+            found = {object_key(o) for o in before + after}
+            where = f"{unit_name(unit)} renders"
+            out += [f"{where} {key}, an object of {owner}" for key, owner in owner_keys_in(found, objects)]
+            out += chain_words(found, namespaces, where, default)
+            out += content_words(after, namespaces, where, default, reads, selectors)
     return list(dict.fromkeys(out))
+
+
+def docs_of(path, docs, data):
+    """The objects of one file after the commit, each as a dict (the items of a List too): the box's reading of a YAML
+    file, the door's of a JSON file, [] for a file that is gone or no manifest, or None when the door cannot read them
+    whole."""
+    if data is None or not path.lower().endswith(READ_ENDS):
+        return []
+    if path.lower().endswith(".json"):
+        try:
+            value = json.loads(data)
+        except (ValueError, RecursionError):
+            return None
+        return listed_objects(value) if isinstance(value, dict) else []
+    if not isinstance(docs, list):
+        return None                 # a stream that no reader splits
+    return [o for d in docs if isinstance(d, dict) for o in listed_objects(d)]
 
 
 def with_owner(d, report, files, plan, target):

@@ -5781,6 +5781,11 @@ class RenderCase(unittest.TestCase):
     def setUp(self):
         if not self.tools:
             self.skipTest("this machine has no helm, or no kustomize and no kubectl")
+        # the box's YAML tag scan needs the pinned Ruby: a stand-in that finds no tag, which YamlTags.ruby() stops
+        self.scan = patch.object(door_render, "yaml_tags", lambda runner, tree, paths: {
+            p: {"tags": []} for p in paths if p.lower().endswith(door_render.YAML_NAMES)})
+        self.scan.start()
+        self.addCleanup(self.scan.stop)
 
     def lookup(self, tree=None, links=None):
         "The door's render lookup for one tree at HEAD."
@@ -6661,6 +6666,26 @@ POLICY_KEYS = ["admissionregistration.k8s.io:ValidatingAdmissionPolicy:/exposure
 SUSPENDED = CHECK_FILE.replace("  schedule: '7 * * * *'\n", "  schedule: '7 * * * *'\n  suspend: true\n")
 
 
+OWNER_GATEWAY = "apps/core/app/gateway.yaml"
+GATEWAY_FILE = ("apiVersion: v1\nkind: Service\nmetadata:\n  name: pushgateway\n  namespace: core\nspec:\n"
+                "  selector:\n    app: pushgateway\n  ports:\n    - port: 9091\n---\n"
+                "apiVersion: monitoring.coreos.com/v1\nkind: PrometheusRule\nmetadata:\n  name: exposure-alerts\n"
+                "  namespace: core\nspec:\n  groups:\n    - name: exposure\n      rules:\n        - alert: CheckStale\n"
+                "          expr: time() - max(check_last_success_seconds{job=\"check\"}) > 5400\n")
+EXTRA_APP = ("apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: extra\nspec:\n  source:\n"
+             "    repoURL: ssh://git@github.com/one-org/cluster.git\n    path: apps/extra\n  destination:\n"
+             "    namespace: core\n")
+CHAIN_TREE = dict(OWNER_TREE, **{".founderizer/door.json": json.dumps({"owner": [OWNER_CHECK, OWNER_POLICY,
+                                                                                  OWNER_GATEWAY]}),
+                                 OWNER_GATEWAY: GATEWAY_FILE, "_config/cluster/extra-argocd.yaml": EXTRA_APP})
+
+
+def monitor(kind, spec, namespace="web", name="m", api="monitoring.coreos.com/v1"):
+    "A manifest of one object, in block style, with this spec (block style text)."
+    return (f"apiVersion: {api}\nkind: {kind}\nmetadata:\n  name: {name}\n"
+            + (f"  namespace: {namespace}\n" if namespace else "") + "spec:\n" + spec)
+
+
 def script_map(name="exposure-check", namespace="core", mode="off"):
     return (f"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {name}\n"
             + (f"  namespace: {namespace}\n" if namespace else "") + f"data:\n  mode: {mode}\n")
@@ -6784,6 +6809,99 @@ class OwnerFiles(RenderCase):
         self.assertEqual(d.kind, "own", d)
         self.assertNotIn("gives the owner", d.why)
 
+    def test_what_fakes_or_hides_the_result_is_the_owner_s_card(self):
+        """The second review of 16 November 2026: the alerts read the real result only through its source's labels, so
+        what can write a series with those labels, or record a name that an owner's rule reads, is the owner's card
+        anywhere; in the owner's namespace so is every monitoring kind, an Endpoints, an EndpointSlice and a workload
+        whose pods an owner's Service selects; and a Prometheus, an Alertmanager, a ThanosRuler and a PriorityClass
+        anywhere."""
+        honor = "  endpoints:\n    - port: metrics\n      honorLabels: true\n  selector:\n    matchLabels:\n      app: x\n"
+        relabel = ("  endpoints:\n    - port: metrics\n      relabelings:\n        - targetLabel: job\n"
+                   "          replacement: check\n  selector:\n    matchLabels:\n      app: x\n")
+        plain = "  endpoints:\n    - port: metrics\n  selector:\n    matchLabels:\n      app: x\n"
+        record = ("  groups:\n    - name: g\n      rules:\n        - record: check_last_success_seconds\n"
+                  "          expr: vector(time())\n")
+        named = ("  groups:\n    - name: g\n      rules:\n        - alert: A\n"
+                 "          expr: label_replace(vector(1), \"__name__\", \"x\", \"\", \"\")\n")
+        workload = ("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: fake\n  namespace: core\nspec:\n"
+                    "  selector:\n    matchLabels:\n      app: pushgateway\n  template:\n    metadata:\n      labels:\n"
+                    "        app: pushgateway\n    spec:\n      containers:\n        - name: x\n"
+                    "          image: registry.example.com/x:1.0.0\n")
+        cases = [
+            ("apps/web/record.yaml", monitor("PrometheusRule", record), "which records check_last_success_seconds"),
+            ("apps/web/named.yaml", monitor("PrometheusRule", named), "which names __name__"),
+            ("apps/web/honor.yaml", monitor("ServiceMonitor", honor), "a ServiceMonitor with honorLabels: true"),
+            ("apps/web/relabel.yaml", monitor("ServiceMonitor", relabel), "with a relabeling that writes job"),
+            ("apps/web/joblabel.yaml", monitor("PodMonitor", "  jobLabel: app\n" + plain.replace("endpoints",
+                                                                                                "podMetricsEndpoints")),
+             "a PodMonitor with a jobLabel of its own"),
+            ("apps/web/probe.yaml", monitor("Probe", "  jobName: check\n  prober:\n    url: x:9115\n"),
+             "a Probe with a jobName of its own"),
+            ("apps/web/scrape.yaml", monitor("ScrapeConfig", "  staticConfigs:\n    - targets: [x:9091]\n"
+                                                             "      labels:\n        job: check\n",
+                                             api="monitoring.coreos.com/v1alpha1"), "static labels that name a source"),
+            ("apps/web/prom.yaml", monitor("Prometheus", "  replicas: 1\n"),
+             "monitoring.coreos.com:Prometheus:web/m, which runs the checks or routes their alerts"),
+            ("apps/web/am.yaml", monitor("Alertmanager", "  replicas: 1\n"),
+             "monitoring.coreos.com:Alertmanager:web/m, which runs the checks or routes their alerts"),
+            ("apps/web/ruler.yaml", monitor("ThanosRuler", "  replicas: 1\n"),
+             "monitoring.coreos.com:ThanosRuler:web/m, which runs the checks or routes their alerts"),
+            ("apps/web/priority.yaml", "apiVersion: scheduling.k8s.io/v1\nkind: PriorityClass\nmetadata:\n"
+                                       "  name: first\nvalue: 1000000\n", "a PriorityClass"),
+            ("apps/extra/monitor.yaml", monitor("ServiceMonitor", plain, namespace=None),
+             "monitoring.coreos.com:ServiceMonitor:/m, in the namespace where the owner's controls run"),
+            ("apps/extra/endpoints.yaml", "apiVersion: v1\nkind: Endpoints\nmetadata:\n  name: pushgateway\n"
+                                          "  namespace: core\nsubsets: []\n",
+             ":Endpoints:core/pushgateway, in the namespace where the owner's controls run"),
+            ("apps/extra/slice.yaml", "apiVersion: discovery.k8s.io/v1\nkind: EndpointSlice\nmetadata:\n"
+                                      "  name: pushgateway-x\n  namespace: core\naddressType: IPv4\nendpoints: []\n",
+             "discovery.k8s.io:EndpointSlice:core/pushgateway-x, in the namespace where"),
+            ("apps/extra/fake.yaml", workload, "apps:Deployment:core/fake, whose pods a Service of the owner's selects"),
+            ("apps/extra/np.yaml", "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: deny\n"
+                                   "spec:\n  podSelector: {}\n  policyTypes: [Egress]\n",
+             "networking.k8s.io:NetworkPolicy:/deny, in the namespace where the owner's controls run"),
+        ]
+        for path, text, words in cases:
+            with self.subTest(path=path):
+                d = self.push_owner({path: text}, tree=CHAIN_TREE)
+                self.assertEqual(d.kind, "full", d)
+                self.assertIn(words, d.why)
+
+    def test_routine_alerts_monitors_and_workloads_stay_the_agent_s_own(self):
+        """What an agent adds to see the next event stays its own work: an alert that records no name of the owner's,
+        a ServiceMonitor with no honorLabels and no relabeling, outside the owner's namespace, and a workload in it
+        whose pods no owner's Service selects; and a folder that no Application applies makes no folder card."""
+        alert = ("  groups:\n    - name: g\n      rules:\n        - alert: WebDown\n"
+                 "          expr: up{job=\"web\"} == 0\n")
+        plain = "  endpoints:\n    - port: metrics\n  selector:\n    matchLabels:\n      app: web\n"
+        other = ("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: core\nspec:\n"
+                 "  selector:\n    matchLabels:\n      app: web\n  template:\n    metadata:\n      labels:\n"
+                 "        app: web\n    spec:\n      containers:\n        - name: web\n"
+                 "          image: registry.example.com/web:1.0.0\n")
+        for path, text in (("apps/web/alerts.yaml", monitor("PrometheusRule", alert)),
+                           ("apps/web/monitor.yaml", monitor("ServiceMonitor", plain)),
+                           ("apps/extra/web.yaml", other),
+                           ("apps/web/np.yaml", "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n"
+                                                "  name: deny\n  namespace: web\nspec:\n  podSelector: {}\n")):
+            with self.subTest(path=path):
+                d = self.push_owner({path: text}, tree=CHAIN_TREE)
+                self.assertEqual(d.kind, "own", d)
+                self.assertNotIn("gives the owner", d.why)
+        # a folder of an owner's file that no Application applies: a new file there is no card
+        tree = dict(CHAIN_TREE, **{".founderizer/door.json": json.dumps({"owner": [OWNER_CHECK, "notes/limits.yaml"]}),
+                                   "notes/limits.yaml": "a: 1\n"})
+        d = self.push_owner({"notes/more.yaml": "b: 2\n"}, tree=tree)
+        self.assertNotIn("a folder of the owner's files", d.why)
+
+    def test_a_declared_repository_needs_the_box_s_tag_scan(self):
+        "Where the box could not read a commit's YAML tags, a repository with a declaration refuses the commit."
+        with patch.object(door_render, "yaml_tags", lambda runner, tree, paths: None):
+            d = self.push_owner({"apps/web/x.yaml": script_map(name="x", namespace="web")})
+            self.assertEqual(d.kind, "refused", d)
+            self.assertIn("could not read the YAML tags of this commit with the box's own parser", d.why)
+            d = self.push({"apps/web/x.yaml": script_map(name="x", namespace="web")})      # no declaration
+            self.assertNotEqual(d.kind, "refused", d)
+
     def test_a_commit_that_touches_none_of_it_keeps_its_kind(self):
         web = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web\ndata:\n  mode: fast\n"
         d = self.push_owner({"apps/core/app/web.yaml": web})
@@ -6833,10 +6951,18 @@ class OwnerFiles(RenderCase):
             {"path": "apps/core/app/web.yaml", "size": None, "mode": "100644"}]}
         report = door_render.answer(header, tarball(tree), [None], self.tools, scratch)
         self.assertTrue(report["ok"], report)
-        self.assertEqual(report["owner"], [{"path": OWNER_CHECK, "objects": CHECK_KEYS},
-                                           {"path": OWNER_POLICY, "objects": POLICY_KEYS},
-                                           {"path": "apps/core/app/later.yaml", "objects": []},
-                                           {"path": "README.md", "objects": []}])
+        none = {"selectors": [], "reads": []}
+        self.assertEqual(report["owner"], [dict(none, path=OWNER_CHECK, objects=CHECK_KEYS),
+                                           dict(none, path=OWNER_POLICY, objects=POLICY_KEYS),
+                                           dict(none, path="apps/core/app/later.yaml", objects=[]),
+                                           dict(none, path="README.md", objects=[])])
+        self.assertEqual(sorted(report["apps"], key=lambda r: r["root"]), [
+            {"root": "apps/core/app", "recurse": True, "namespace": "core"},
+            {"root": "monitoring/stack", "recurse": False, "namespace": "monitoring"}])
+        report = door_render.answer(header, tarball(CHAIN_TREE), [None], self.tools, scratch + "/3")
+        [gate] = [o for o in report["owner"] if o["path"] == OWNER_GATEWAY]
+        self.assertEqual(gate["selectors"], [{"namespace": "core", "selector": {"app": "pushgateway"}}])
+        self.assertIn("check_last_success_seconds", gate["reads"])
         self.assertEqual(report["generated"], [])
         # a repository with no declaration gives the owner nothing
         report = door_render.answer(dict(header, files=[]), tarball(CLUSTER), [], self.tools, scratch + "/2")
@@ -6941,6 +7067,7 @@ class YamlTags(RenderCase):
         found = shutil.which("ruby")
         if not found:
             self.skipTest("this machine has no ruby")
+        self.scan.stop()
         p = patch.object(door_render, "tree_tool_path", lambda name: found)
         p.start()
         self.addCleanup(p.stop)
@@ -6964,14 +7091,15 @@ class YamlTags(RenderCase):
                 self.assertIn(f"{self.PATH} holds {what} on line ", d.why)
                 self.assertIn("a YAML reader can build an object of its own program from it", d.why)
                 self.assertEqual(self.last, "no render")          # the box never read it
+        # a quoted text that holds such a form is no tag (the review of 16 November 2026: no shell text refused)
         d = self.push({"apps/core/app/zz.json": json.dumps({"apiVersion": "v1", "kind": "ConfigMap",
                                                             "metadata": {"name": "x"}, "data": {"v": "!!python/x"}})})
-        self.assertIn("holds a tag of the !! shorthand outside the core schema", d.why)
+        self.assertEqual(d.kind, "own", d)
 
     def test_core_tags_and_a_bang_in_a_script_pass(self):
         text = ("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web\ndata:\n  port: !!str 8080\n"
                 "  ids: [!!int 1, !!int 2]\n  run.sh: |\n    #!/usr/bin/python3\n    if a != b: print('done!')\n"
-                "    [ ! -f x ] && sudo !! ; echo \"!!\" '!%s'\n")
+                "    [ ! -f x ] && sudo !! ; echo \"!!\" '!%s'\n    echo !python \"!ruby/x\" && x!ruby/y\n")
         d = self.push({"apps/core/app/web.yaml": text})
         self.assertEqual(d.kind, "own", d)
         self.assertNotIn("YAML", d.why)

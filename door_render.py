@@ -1039,19 +1039,56 @@ def owner_docs(before):
                            for text in file_docs(read(before, path, most=READ_MAX)) or []]
 
 
+PROMQL_WORD = re.compile(r"[A-Za-z_:][A-Za-z0-9_:]*")      # a name in a rule's expression: a metric, a label, a word
+
+
 def owned(runner, before):
-    """[{path, objects}]: each file that DECLARATION at HEAD gives the owner, with the objects that it holds at HEAD,
-    each as door_targets.object_key names it (a prune's key). A file that is not there, or that no reader reads, holds
-    none that the door knows: door_targets then sees only a commit that changes the file itself. A declaration that
-    the door cannot follow gives nothing here, because generated() reports it and the door refuses the commit."""
+    """[{path, objects, selectors, reads}]: each file that DECLARATION at HEAD gives the owner, with the objects that
+    it holds at HEAD, each as door_targets.object_key names it (a prune's key); the selector of each Service of it
+    ({namespace, selector}), whose pods a workload with those labels would join; and every name in the expressions of
+    each PrometheusRule of it, which a recording rule elsewhere could write in the place of the real series. A file
+    that is not there, or that no reader reads, holds none that the door knows: door_targets then sees only a commit
+    that changes the file itself. A declaration that the door cannot follow gives nothing here, because generated()
+    reports it and the door refuses the commit."""
     import door_targets
     _entries, owner, why = declaration(before)
     out = []
     for path in [] if why else owner:
         docs = read_file(runner, read(before, path, most=READ_MAX)) \
             if path.lower().endswith((".yaml", ".yml", ".json")) else None
-        keys = {door_targets.object_key(o) for doc in docs or [] if isinstance(doc, dict) for o in objects(doc)}
-        out.append({"path": path, "objects": sorted(k for k in keys if k)})
+        found = [o for doc in docs or [] if isinstance(doc, dict) for o in objects(doc)]
+        keys = {door_targets.object_key(o) for o in found}
+        selectors, reads = [], set()
+        for o in found:
+            meta = o.get("metadata") if isinstance(o.get("metadata"), dict) else {}
+            spec = o.get("spec") if isinstance(o.get("spec"), dict) else {}
+            namespace = meta.get("namespace") if isinstance(meta.get("namespace"), str) else ""
+            if o.get("kind") == "Service" and o.get("apiVersion") == "v1" and isinstance(spec.get("selector"), dict):
+                selectors.append({"namespace": namespace, "selector": {str(k): str(v) for k, v in
+                                                                       spec["selector"].items()}})
+            if o.get("kind") == "PrometheusRule":
+                for group in spec.get("groups") if isinstance(spec.get("groups"), list) else []:
+                    for rule in group.get("rules") or [] if isinstance(group, dict) else []:
+                        if isinstance(rule, dict) and isinstance(rule.get("expr"), (str, int, float)):
+                            reads |= set(PROMQL_WORD.findall(str(rule["expr"])))
+        out.append({"path": path, "objects": sorted(k for k in keys if k), "selectors": selectors,
+                    "reads": sorted(reads)})
+    return out
+
+
+def app_roots(found):
+    """[{root, recurse, namespace}]: each folder of the repository that an Application or an ApplicationSet at HEAD
+    applies as a source (a plain folder, a Kustomize folder or a chart of the repository), whether it reads the folders
+    below it too, and its namespace of destination ('' when it names none or names it from a template)."""
+    out = []
+    for app, _rel in found:
+        for _name, namespace, source, _every, _patched in sources(app):
+            root = inside("", source.get("path")) if "chart" not in source else None
+            if root is None or "{{" in root:
+                continue
+            directory = source.get("directory") if isinstance(source.get("directory"), dict) else {}
+            out.append({"root": root, "recurse": directory.get("recurse") is True,
+                        "namespace": namespace if isinstance(namespace, str) and "{{" not in namespace else ""})
     return out
 
 
@@ -1307,7 +1344,8 @@ def answer(header, tar, blobs, tools, scratch, log=False):
         stop = f"{held[0]} of the commit holds a YAML tag outside the core schema, so the box ran no generator" \
             if held else None
         report = {"v": 1, "ok": True, "files": files, "units": units, "tags": tags,
-                  "generated": generated(runner, before, after, stop=stop), "owner": owned(runner, before)}
+                  "generated": generated(runner, before, after, stop=stop), "owner": owned(runner, before),
+                  "apps": None if apps[0][1] else app_roots(apps[0][0])}
     except Skip as e:
         return {"v": 1, "ok": False, "skip": str(e)}
     except Late:
