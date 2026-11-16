@@ -140,6 +140,31 @@ as_mac_user() { # The command as that Mac user, when the installer runs this scr
 reach() {
     curl -fsS -m 10 "$HUB/health" >/dev/null 2>&1 || stop "This machine cannot reach the Founderizer hub at $HUB. Check that \
 Tailscale is connected, and the Tailscale access rules for the hub's ports 8765 and 9418."
+    code_reach
+}
+
+code_reach() {  # The fleet's code comes from the hub's port 9418 (git). A Tailscale access rule that lets this machine
+                # reach the hub's port 8765 and not 9418 drops each packet there, and each of the two clones of
+                # `checkout` then waits about two minutes for TCP before the join stops (a customer's join of 16
+                # November 2026 stopped after about four). One plain request, which git daemon ends at once, says it in
+                # seconds: curl ends with 28 and no connect time only when the connection itself timed out. A refused
+                # port, a port that answers and a curl without that request all go on to the clone, which says what it
+                # meets. -q first: no .curlrc; no proxy: git does not use one for git://.
+    case "$REPO" in git://*) ;; *) return 0 ;; esac
+    git_at=${REPO#git://}
+    git_at=${git_at%%/*}
+    case "$git_at" in
+        \[*\]) git_at="$git_at:9418" ;;     # an IPv6 address with no port
+        \[*|*:*) ;;                         # an address with its port
+        *) git_at="$git_at:9418" ;;
+    esac
+    git_tried=0
+    git_connect=$(curl -q -s --noproxy '*' -o /dev/null --connect-timeout 10 -m 15 -w '%{time_connect}' \
+        "http://$git_at/" </dev/null 2>/dev/null) || git_tried=$?
+    case "$git_tried:$git_connect" in
+        28:0.000000|28:0,000000) stop "Could not get the Founderizer repository from $REPO: this machine reaches the hub, \
+but not its port 9418. Check the Tailscale access rules for the hub's port 9418." ;;
+    esac
 }
 
 take() {        # $1: the checkout; $2: how to run a command as the user of the service. The checkout's own ref, fetched,

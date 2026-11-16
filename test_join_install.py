@@ -691,5 +691,64 @@ class MacVault(unittest.TestCase):
                           if "sudo" in shell_function(SCRIPT, n)], [])
 
 
+class CodeReach(unittest.TestCase):
+    """The hub's port 9418 in the first check (`code_reach`, after the hub's health in `reach`): a Tailscale rule that
+    drops that port stops the join in seconds, where the two clones of `checkout` waited about two minutes each (a
+    customer's join of 16 November 2026). Only a connection that timed out stops it: curl ends with 28 and no connect
+    time. The stand-in curl answers as a real one did on this machine: git daemon ends the request at once (56), a
+    closed port refuses it (7), and a dropped one times out (28)."""
+
+    def run_check(self, repo="git://100.64.0.2/fleet.git", ended=56, connect="0.000179"):
+        with tempfile.TemporaryDirectory() as folder:
+            ran = Path(folder) / "ran"
+            stubs = (f"REPO={repo}\nRAN={ran}\n"
+                     f'curl() {{ printf "curl %s\\n" "$*" >> "$RAN"; printf "%s" "{connect}"; return {ended}; }}\n')
+            code, out = run_step("code_reach", "code_reach\necho went-on", stubs)
+            return code, out, ran.read_text() if ran.exists() else ""
+
+    def test_only_a_connection_that_timed_out_stops_the_join(self):
+        for connect in ("0.000000", "0,000000"):
+            code, out, _ = self.run_check(ended=28, connect=connect)
+            self.assertEqual(code, 1, out)
+            self.assertIn("Could not get the Founderizer repository from git://100.64.0.2/fleet.git: this machine "
+                          "reaches the hub, but not its port 9418. Check the Tailscale access rules for the hub's port "
+                          "9418.", out)
+            self.assertNotIn("went-on", out)
+        # git daemon that ends the request, a refused port, a port that answered and then took the whole time, and a
+        # curl that cannot make the request: the join goes on, and the clone says what it meets.
+        for ended, connect in ((56, "0.000179"), (52, "0.004000"), (7, "0.000000"), (28, "0.004000"), (1, "0.000000"),
+                               (0, "0.000412")):
+            with self.subTest(ended=ended, connect=connect):
+                code, out, _ = self.run_check(ended=ended, connect=connect)
+                self.assertEqual(code, 0, out)
+                self.assertIn("went-on", out)
+
+    def test_it_asks_the_port_of_the_code_with_no_curlrc_and_no_proxy_and_a_short_time(self):
+        for repo, url in (("git://100.64.0.2/fleet.git", "http://100.64.0.2:9418/"),
+                          ("git://100.64.0.2:9419/fleet.git", "http://100.64.0.2:9419/"),
+                          ("git://[fd7a:115c:a1e0::2]/fleet.git", "http://[fd7a:115c:a1e0::2]:9418/"),
+                          ("git://[fd7a:115c:a1e0::2]:9419/fleet.git", "http://[fd7a:115c:a1e0::2]:9419/")):
+            with self.subTest(repo=repo):
+                code, out, ran = self.run_check(repo=repo)
+                self.assertEqual(code, 0, out)
+                self.assertEqual(ran.split(), ["curl", "-q", "-s", "--noproxy", "*", "-o", "/dev/null",
+                                               "--connect-timeout", "10", "-m", "15", "-w", "%{time_connect}", url])
+
+    def test_a_code_that_is_not_the_hubs_git_is_not_asked(self):
+        for repo in ("/home/fleet/fleet.git", "https://example.com/founderizer.git"):
+            with self.subTest(repo=repo):
+                code, out, ran = self.run_check(repo=repo, ended=28, connect="0.000000")
+                self.assertEqual((code, ran), (0, ""), out)
+
+    def test_the_first_check_asks_it_after_the_hubs_health(self):
+        body = shell_function(SCRIPT, "reach")
+        self.assertLess(body.index("/health"), body.index("code_reach"))
+        for path in ("linux", "mac"):
+            self.assertIn("    reach\n", shell_function(SCRIPT, path))
+        # The sentence of the stop is the clone's own start, so an app reads it as the same cause (InstallCause's
+        # row "could not get the founderizer repository").
+        self.assertIn('stop "Could not get the Founderizer repository from $REPO: ', shell_function(SCRIPT, "code_reach"))
+
+
 if __name__ == "__main__":
     unittest.main()
