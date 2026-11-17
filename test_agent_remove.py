@@ -460,6 +460,75 @@ class Spent(Remove):
         self.assertIsNone(hub.q1("SELECT 1 FROM session_tokens WHERE agent='scout'"))
         self.assertEqual(self.period(7, 0), now)
 
+    def test_a_new_agent_of_its_name_lists_none_of_its_model_changes_and_checks(self):
+        """The costs reading reads an agent's model changes and its checks by its name. The first scout's model change,
+        its check that the delete deleted and the check that it had deleted itself go with its sessions under the one
+        name that no agent can have, so the costs of a new agent of its name list none of them. They list the new
+        agent's own, a check that it deleted included. The same rows of vps stay its own, and the owner's page of a
+        moved rule names its agent as it was named, as the apps read an agent's name."""
+        t0 = hub.now()
+
+        def change(agent, effort):
+            return hub.ins('INSERT INTO model_changes(agent,by,"from","to",why,at) VALUES(?,?,?,?,?,?)',
+                           (agent, "manager", json.dumps({"model": None, "effort": None}),
+                            json.dumps({"model": None, "effort": effort}), "routine work", t0 - DAY))
+
+        def check(agent, state, run):
+            """A check of the agent, in that state, with one run a day ago, quiet or failed: neither starts a task."""
+            rule = hub.ins("INSERT INTO triggers(agent,state,revision,schedule,task,late_minutes,max_tasks_per_day,"
+                           "anchor,created,updated,request_id,created_by) VALUES(?,?,1,'{}','{}',5,10,?,?,?,?,?)",
+                           (agent, state, t0 - 3 * DAY, t0 - 3 * DAY, t0 - 3 * DAY, f"r-{agent}-{state}-{run}",
+                            agent))
+            hub.ins("INSERT INTO trigger_runs(trigger_id,revision,due,state,created,finished) VALUES(?,1,?,?,?,?)",
+                    (rule, t0 - DAY, run, t0 - DAY, t0 - DAY))
+            return rule
+
+        def costs(agent="scout"):
+            """The agent's costs of the last 7 days: (check, quiet runs, failed runs), the efforts that its model
+            changes set, and see_history's words."""
+            view = hub.costs_view([agent], t0 - 7 * DAY, hub.now())
+            return ([(c["trigger"], c["now"]["quiet"], c["now"]["failed"]) for c in view["checks"]],
+                    [m["to"]["effort"] for m in view["model_changes"]], "\n".join(hub.costs_text(view, 7, "manager")))
+
+        self.spend("scout", ("s-now", 1, 1000))
+        first = change("scout", "low")
+        active, deleted = check("scout", "active", "quiet"), check("scout", "deleted", "error")
+        theirs, their_check = change("vps", "medium"), check("vps", "deleted", "quiet")
+        checks, changes, text = costs()
+        self.assertEqual((checks, changes), ([(active, 1, 0), (deleted, 0, 1)], ["low"]))
+        self.assertIn(f"check {active} of scout", text)
+        self.assertIn("manager set scout to its default model, low", text)
+        status, receipt = self.remove()
+        self.assertEqual(status, 200, receipt)
+        self.job("box", receipt["job"], "done", "user")
+        self.assertIsNone(hub.q1("SELECT 1 FROM agents WHERE name='scout'"))   # it did no work: its name is free
+        status, answer = self.add_agent("box", "scout", "codex")
+        self.assertEqual(status, 200, answer)
+        checks, changes, text = costs()
+        self.assertEqual((checks, changes), ([], []))
+        for old in (f"check {active} of scout", f"check {deleted} of scout", "set scout to"):
+            self.assertNotIn(old, text)
+        # they stay, under the name of the first scout's sessions, and its two checks stay deleted
+        gone = hub.q1("SELECT agent FROM session_tokens WHERE session_id='s-now'")["agent"]
+        self.assertTrue(gone.startswith("scout:deleted:"), gone)
+        self.assertEqual(hub.q1("SELECT agent FROM model_changes WHERE id=?", (first,))["agent"], gone)
+        self.assertEqual([tuple(r) for r in hub.q("SELECT agent, state FROM triggers WHERE id IN (?,?)",
+                                                  (active, deleted))], [(gone, "deleted")] * 2)
+        # vps's own stay its own
+        self.assertEqual((hub.q1("SELECT agent FROM model_changes WHERE id=?", (theirs,))["agent"],
+                          hub.q1("SELECT agent FROM triggers WHERE id=?", (their_check,))["agent"]), ("vps", "vps"))
+        self.assertEqual(costs("vps")[:2], ([(their_check, 1, 0)], ["medium"]))
+        # the owner's page of a moved rule names its agent as it was named: the apps refuse a name that is no agent's
+        status, page = self.request(f"/ui/triggers/{active}?db=test-generation", source=OWNER)
+        self.assertEqual((status, page["trigger"]["agent"], page["trigger"]["state"]), (200, "scout", "deleted"), page)
+        # the new scout's own model change and its own check, which it deleted, are in its costs
+        change("scout", "high")
+        own = check("scout", "deleted", "quiet")
+        checks, changes, text = costs()
+        self.assertEqual((checks, changes), ([(own, 1, 0)], ["high"]))
+        self.assertIn(f"check {own} of scout", text)
+        self.assertIn("manager set scout to its default model, high", text)
+
 
 class Leaving(Remove):
     """A call of an agent that is under way when the owner deletes or renames that agent. The command holds the hub's

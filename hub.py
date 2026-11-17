@@ -33962,7 +33962,9 @@ def run_fields(r):
 def trigger_view(t, t0):
     last = q1("SELECT * FROM trigger_runs WHERE trigger_id=? ORDER BY id DESC LIMIT 1", (t["id"],))
     task = q1("SELECT id FROM tasks WHERE trigger_id=? ORDER BY id DESC LIMIT 1", (t["id"],))
-    return {"id": t["id"], "agent": t["agent"], "state": t["state"], "paused_by": t["paused_by"],
+    # A deleted agent's rule whose name free_name freed is kept under spent_name, which is no agent's name: its view
+    # names the agent as it was named, because the apps refuse a rule whose agent is not an agent's name.
+    return {"id": t["id"], "agent": t["agent"].split(":", 1)[0], "state": t["state"], "paused_by": t["paused_by"],
             "paused_reason": t["paused_reason"], "revision": t["revision"], "schedule": json.loads(t["schedule"]),
             "check": json.loads(t["check_spec"]) if t["check_spec"] else None, "task": json.loads(t["task"]),
             "next_due": t["next_due"],
@@ -43762,7 +43764,13 @@ def move_agent(agent, body, by="owner"):
 # in it, gave its points to the agents beside it on that account. Its sessions in `session_tokens` stay, and count in
 # both. Its usage reading (`agent_usage`) goes: that is what its helper read last, its limits and its newest totals,
 # and not a record of a period. While its row keeps its name, its sessions keep that name; free_name gives them a name
-# that no agent can have (spent_name), so the sessions of a new agent of that name start at zero.
+# that no agent can have (spent_name), so the sessions of a new agent of that name start at zero. Its model changes
+# (`model_changes`) and its deleted wake-up rules (remove_rows deletes each one that was not) go to that name with them:
+# the costs reading (costs_view) reads both by the agent's name, and until then it listed the old agent's model changes
+# and checks, with their quiet and failed runs, as a new agent's own. Only a rule in the state `deleted` moves: a rule
+# in another state is not one that a delete left. The view of such a rule (trigger_view) still names the agent as it
+# was named. A name that a release before this one freed keeps those rows: free_name moves them only at the moment
+# that it frees the name.
 REMOVED_OWN = (("agent_usage", "name"), ("agent_limits", "agent"), ("machine_checks", "agent"),
                ("mac_setups", "agent"), ("session_credentials", "agent"),
                ("ui_requests", "recipient"), ("owner_reports", "agent"), ("events", "agent"),
@@ -43835,20 +43843,23 @@ def remove_rows(agent, t0, machine=None):
 
 
 def spent_name(agent, t0):
-    """The name that a deleted agent's sessions keep once its own name is free (free_name): `<name>:deleted:<time>`.
-    AGENT_NAME has no ":", so no agent ever reads them as its own, and the time keeps apart two agents of one name that
-    were each deleted."""
+    """The name that a deleted agent's sessions, model changes and deleted wake-up rules keep once its own name is free
+    (free_name): `<name>:deleted:<time>`. AGENT_NAME has no ":", so no agent ever reads them as its own, and the time
+    keeps apart two agents of one name that were each deleted."""
     return f"{agent}:deleted:{t0:.6f}"
 
 
 def free_name(agent):
     """Inside a transaction: a removed agent's row goes once nothing is left of it on a server and no history names it,
-    and with it the name is free for a new agent (add_server_agent). Its sessions stay, under a name that no agent can
-    have (spent_name)."""
+    and with it the name is free for a new agent (add_server_agent). Its sessions, its model changes and its deleted
+    wake-up rules stay, under one name that no agent can have (spent_name)."""
     in_transaction("free_name")
     if agent not in agents() and not has_history(agent):
+        gone = spent_name(agent, now())
         DB.execute("DELETE FROM agents WHERE name=?", (agent,))
-        DB.execute("UPDATE session_tokens SET agent=? WHERE agent=?", (spent_name(agent, now()), agent))
+        DB.execute("UPDATE session_tokens SET agent=? WHERE agent=?", (gone, agent))
+        DB.execute("UPDATE model_changes SET agent=? WHERE agent=?", (gone, agent))
+        DB.execute("UPDATE triggers SET agent=? WHERE agent=? AND state='deleted'", (gone, agent))
 
 
 def remove_agent(agent, body):
