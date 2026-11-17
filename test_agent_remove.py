@@ -260,6 +260,76 @@ class Remove(Servers):
         self.assertEqual((status, answer["error"]), (409, "An agent named scout was in this fleet before, and its "
                                                           "records are still here. Choose another name."))
 
+    def held_by_its_limit(self):
+        """scout and vps spend one provider account, so a usage limit that scout's helper reports holds vps's work
+        too, in a row whose cause is scout's row (account_limits). Then the owner deletes scout, which takes scout's
+        row (REMOVED_OWN), and vps's row stays: vps waits for the reset all the same. Returns (vps's row, its task)."""
+        later, key = hub.now() + 600, "openai:" + "a" * 32
+        for agent, used in (("scout", 100), ("vps", 40)):
+            limits = {"collected_at": hub.now(), "source": "test", "plan": "pro", "account_key": key, "error": None,
+                      "windows": [{"id": "w0", "label": "codex / 7 days", "used_percent": used, "resets_at": later,
+                                   "window_minutes": 10080}]}
+            hub.q("INSERT OR REPLACE INTO agent_usage(name,data) VALUES(?,?)",
+                  (agent, json.dumps({"tokens": None, "limits": limits})))
+        hub.t_create_task("manager", {"owner": "vps", "title": "Send the note once", "done_when": "outbox has it"})
+        tid = hub.q1("SELECT MAX(id) id FROM tasks WHERE owner='vps'")["id"]
+        hub.q("UPDATE tasks SET state='working', started=? WHERE id=?", (hub.now() - 100, tid))
+        status, answer = self.request("/helper/limit/scout", {"resets_at": later}, source=OTHER)
+        self.assertEqual(status, 200, answer)
+        held, cause = hub.active_limit("vps"), hub.active_limit("scout")
+        self.assertEqual(held["cause"], cause["id"])
+        status, receipt = self.remove()
+        self.assertEqual(status, 200, receipt)
+        self.assertIsNone(hub.q1("SELECT 1 FROM agent_limits WHERE id=?", (cause["id"],)))
+        self.assertEqual(hub.active_limit("vps")["id"], held["id"])
+        hub.q("UPDATE agent_limits SET until=?", (hub.now() - 1,))          # the reset passes
+        return held, tid
+
+    def resumed(self, held, tid):
+        """end_limits, in two passes: (vps's row's resumed, its task's attempt and restarts, the manager's resets)."""
+        for _ in range(2):
+            with hub.LOCK:
+                hub.end_limits(hub.now())
+        task = hub.q1("SELECT attempt, restarts FROM tasks WHERE id=?", (tid,))
+        return (hub.q1("SELECT resumed FROM agent_limits WHERE id=?", (held["id"],))["resumed"],
+                (task["attempt"], task["restarts"]),
+                [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' AND text LIKE '%has reset%'")])
+
+    def test_the_agents_that_its_usage_limit_held_resume_once_at_the_reset(self):
+        """vps's held work resumes one time, with no restart spent, as it does while scout is in the fleet. Until 17
+        November 2026 it never resumed: end_limits took a held row only when its cause row had resumed, and a row
+        that the delete took never resumes."""
+        held, tid = self.held_by_its_limit()
+        resumed, task, resets = self.resumed(held, tid)
+        self.assertIsNotNone(resumed)
+        self.assertEqual(task, (2, 0))                                      # one new session, and no restart spent
+        self.assertEqual(len(resets), 1, resets)
+        self.assertIn(f"vps: T-{tid} (new session)", resets[0])
+
+    def test_a_pass_that_ended_its_row_and_failed_before_the_resume_leaves_it_to_the_next(self):
+        """A fault in the pass that ends the row (here in its own resume; a fault in an earlier episode of that pass,
+        or a hub that stops between its two loops, leaves the same row) ends it with no resume. The next pass resumes
+        it, one time."""
+        held, tid = self.held_by_its_limit()
+        with patch.object(hub, "resume_held", side_effect=RuntimeError("a fault in the pass")), hub.LOCK:
+            self.assertRaises(RuntimeError, hub.end_limits, hub.now())
+        self.assertIsNone(hub.q1("SELECT resumed FROM agent_limits WHERE id=?", (held["id"],))["resumed"])
+        resumed, task, resets = self.resumed(held, tid)
+        self.assertIsNotNone(resumed)
+        self.assertEqual(task, (2, 0))
+        self.assertEqual(len(resets), 1, resets)
+
+    def test_a_held_row_of_this_kind_from_before_the_fix_is_settled_at_the_first_pass_and_not_resumed(self):
+        """A row of this kind from before 17 November 2026 ended at its reset, long ago, and never resumed. To resume
+        it now would act on vps's work of today, so the first pass of end_limits in the release settles it, one time,
+        as resumed when it ended, and no pass resumes it."""
+        held, tid = self.held_by_its_limit()
+        ended = hub.now() - 86400
+        hub.q("UPDATE agent_limits SET until=?, ended=? WHERE id=?", (ended - 1, ended, held["id"]))
+        hub.kv_set(hub.LIMIT_ORPHANS_SETTLED, None)            # a hub before its first pass of that release
+        self.assertEqual(self.resumed(held, tid), (ended, (1, 0), []))
+        self.assertIsNotNone(hub.kv_get(hub.LIMIT_ORPHANS_SETTLED))
+
     def test_its_open_install_and_its_sign_in_end(self):
         t0 = hub.now()
         install = hub.ins("INSERT INTO server_jobs(server,kind,agent,runtime,state,step,created,updated) "

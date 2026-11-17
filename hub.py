@@ -6886,6 +6886,11 @@ def resume_held(lim, t0):
     return done
 
 
+# kv: when the first pass of end_limits in the release that resumes a held row whose reported row a delete took (17
+# November 2026) settled the rows of that kind that had ended before it.
+LIMIT_ORPHANS_SETTLED = "limit_orphans_settled"
+
+
 def end_limits(t0):
     """At the reset, held messages flow again, and each held task is read at once (plan C9): a turn that runs needs
     nothing, an idle session gets the resume message, and a lost session gets a new attempt.
@@ -6893,15 +6898,27 @@ def end_limits(t0):
     One episode of one account is one reported row and a row for each other agent it holds (account_limits), and it
     ends as one thing: every agent's work resumes exactly once, and the manager reads one message for the episode
     and not one for each agent. The rows of an episode carry one `until`, which start_limit moves together."""
+    if not kv_get(LIMIT_ORPHANS_SETTLED):
+        # The second loop below resumes a held row whose reported row a delete took, since 17 November 2026. One that
+        # ended before this release ended at a reset long past, and never resumed: to resume it now would act on that
+        # agent's work of today. So the first pass of this release settles those one time, as resumed when they
+        # ended, and resumes nothing. Quiet: no app shows a row that has ended.
+        with area("quiet"):
+            q("UPDATE agent_limits SET resumed=ended WHERE ended IS NOT NULL AND resumed IS NULL AND cause IS NOT NULL "
+              "AND cause NOT IN (SELECT id FROM agent_limits)")
+            kv_set(LIMIT_ORPHANS_SETTLED, t0)
     for lim in q("SELECT * FROM agent_limits WHERE ended IS NULL AND until<=?", (t0,)):
         q("UPDATE agent_limits SET ended=? WHERE id=?", (t0, lim["id"]))
         log("hub", f"{lim['agent']}'s usage limit reset")
     # The reported row of each episode, and a derived row whose reported row is already resumed: a second report by
     # the agent that caused this one closes its own rows and leaves that one behind, and the work it holds still has
-    # to resume exactly once.
+    # to resume exactly once. So does a derived row whose reported row is gone: the owner deleted the agent that
+    # reported it (REMOVED_OWN), and a row that is gone never resumes. Each such row resumes alone, so the manager
+    # reads one message for each held agent of that episode, in the pass that ends it or, after a fault in that
+    # pass, in the next.
     for lim in q("SELECT l.* FROM agent_limits l LEFT JOIN agent_limits c ON c.id=l.cause "
                  "WHERE l.ended IS NOT NULL AND l.resumed IS NULL AND l.until<=? "
-                 "AND (l.cause IS NULL OR c.resumed IS NOT NULL) ORDER BY l.id", (t0,)):
+                 "AND (l.cause IS NULL OR c.id IS NULL OR c.resumed IS NOT NULL) ORDER BY l.id", (t0,)):
         episode = [lim] + q("SELECT * FROM agent_limits WHERE cause=? AND resumed IS NULL AND ended IS NOT NULL "
                             "ORDER BY id", (lim["id"],))
         told = []
