@@ -426,7 +426,8 @@ class Spent(Remove):
     """What a deleted agent spent stays, and a new agent that takes its name later starts with no sessions. Until 17
     November 2026 a delete took the agent's sessions' tokens: the tokens of the goals that it worked on read too low,
     the window points of the agents beside it on its account read too high, and the rows of each period that it worked
-    in lost its sessions."""
+    in lost its sessions. The reading of the whole fleet lists a deleted agent that spent in its periods on a line of
+    its own (owner API 1.212)."""
 
     def spend(self, agent, *sessions, used=40.0):
         """One usage report of the agent's helper, as the hub takes it (record_session_tokens): its sessions, each
@@ -441,8 +442,8 @@ class Spent(Remove):
         hub.record_session_tokens(agent, rows, "codex", reading)
 
     def period(self, since_days, until_days):
-        """The rows of that period under any name: what every session that spent in it cost, whichever agent it was.
-        No reader of the hub sums them so; this reads the table itself."""
+        """The rows of that period under any name, read from the table itself: what every session that spent in it
+        cost, whichever agent it was."""
         t0 = hub.now()
         rows = hub.read_rows("SELECT * FROM session_tokens WHERE last_activity>=? AND last_activity<?",
                              (t0 - since_days * DAY, t0 - until_days * DAY))
@@ -460,7 +461,9 @@ class Spent(Remove):
         before, now = self.period(14, 7), self.period(7, 0)
         self.assertEqual((before["sessions"], before["input"], now["sessions"], now["input"]), (1, 3000, 2, 4000))
         self.assertIsNotNone(before["cost"])
+        t1 = hub.now()
         status, receipt = self.remove()
+        t2 = hub.now()
         self.assertEqual(status, 200, receipt)
         self.assertEqual(self.period(14, 7), before)
         self.job("box", receipt["job"], "done", "user")
@@ -476,6 +479,21 @@ class Spent(Remove):
         start, end = hub.now() - 7 * DAY, hub.now()
         costs = hub.costs_view(["scout"], start, end)["agents"][0]
         self.assertEqual((costs["now"]["sessions"], costs["before"]["sessions"], costs["kinds"]), (0, 0, []))
+        # the reading of the whole fleet lists the first scout on a line of its own, as its mock drew it, with the time
+        # of its delete and not of the job that freed its name, and its agents add up to all that each period spent
+        whole = hub.costs_view(list(hub.agents()), start, end)
+        old = [a for a in whole["agents"] if "deleted" in a]
+        self.assertEqual([(a["agent"], a["runtime"], a["now"]["sessions"], a["before"]["sessions"], a["kinds"])
+                          for a in old], [("scout", "codex", 1, 1, [])])
+        self.assertTrue(t1 <= old[0]["deleted"] <= t2, (t1, old[0]["deleted"], t2))
+        self.assertEqual([sum(a[p]["input"] for a in whole["agents"]) for p in ("now", "before")],
+                         [now["input"], before["input"]])
+        day, money, cost = hub.costs_day(old[0]["deleted"]), hub.costs_money, old[0]["before"]["cost"]
+        self.assertIn(f"  scout (codex, deleted on {day}): {money(old[0]['now']['cost'])} in 1 session (1 before); "
+                      f"{money(cost)} before", hub.costs_text(whole, 7, "manager"))
+        earlier = hub.costs_view(list(hub.agents()), start - 2 * DAY, end - 2 * DAY)        # before s-now
+        self.assertIn(f"  scout (codex, deleted on {day}): $0.00 in 0 sessions (1 before); {money(cost)} before",
+                      hub.costs_text(earlier, 7, "manager"))
         self.spend("scout", ("n-now", 1, 500))
         costs = hub.costs_view(["scout"], start, end)["agents"][0]
         self.assertEqual((costs["now"]["sessions"], costs["now"]["input"], costs["before"]["sessions"]), (1, 500, 0))
@@ -490,6 +508,9 @@ class Spent(Remove):
         self.assertEqual(sorted(spent.values()), [1, 2])
         self.assertEqual([name for name in spent if hub.AGENT_NAME.match(name)], [])
         self.assertEqual((self.period(14, 7)["input"], self.period(7, 0)["input"]), (3000, 4500))
+        whole = hub.costs_view(list(hub.agents()), start, hub.now())        # each scout on its own line
+        self.assertEqual(sorted((a["agent"], a["now"]["sessions"], a["before"]["sessions"]) for a in whole["agents"]
+                                if "deleted" in a), [("scout", 1, 0), ("scout", 1, 1)])
 
     def test_the_goals_that_it_worked_on_keep_its_tokens_and_its_name_keeps_its_sessions(self):
         t0 = hub.now()
@@ -505,6 +526,33 @@ class Spent(Remove):
         self.assertIsNotNone(hub.q1("SELECT 1 FROM agents WHERE name='scout'"))     # its work keeps its name
         self.assertEqual((hub.goal_tokens(7)[0], hub.all_goal_tokens()[7][0]), (5000, 5000))
         self.assertEqual(hub.q1("SELECT COUNT(*) c FROM session_tokens WHERE agent='scout'")["c"], 1)
+
+    def test_the_reading_of_the_whole_fleet_lists_a_deleted_agent_that_keeps_its_name(self):
+        """Its work keeps its name (has_history), and its sessions keep it too. The owner's GET /ui/costs and the fleet
+        manager's see_history list it on a line of its own, with the time of its delete; a reading of one agent and a
+        worker's own reading do not. An agent that left before owner API 1.212 has no time, and its line says so."""
+        hub.ins("INSERT INTO tasks(title,owner,requester,state,created) VALUES('a report','scout','manager',"
+                "'completed',?)", (hub.now(),))
+        self.spend("scout", ("s-now", 2, 5000))
+        t1 = hub.now()
+        status, receipt = self.remove()
+        t2 = hub.now()
+        self.assertEqual(status, 200, receipt)
+        self.job("box", receipt["job"], "done", "user")
+        at = hub.q1("SELECT deleted FROM agents WHERE name='scout'")["deleted"]
+        self.assertTrue(t1 <= at <= t2, (t1, at, t2))
+        status, view = self.request("/ui/costs?db=test-generation", source=OWNER)
+        self.assertEqual(status, 200, view)
+        self.assertEqual([(a["agent"], a["deleted"], a["now"]["input"]) for a in view["agents"] if "deleted" in a],
+                         [("scout", at, 5000)])
+        status, view = self.request("/ui/costs?db=test-generation&agent=vps", source=OWNER)
+        self.assertEqual((status, [a["agent"] for a in view["agents"]]), (200, ["vps"]), view)
+        self.assertIn(f"  scout (codex, deleted on {hub.costs_day(at)}): ",
+                      hub.t_see_history("manager", {"what": "costs", "window": 7}))
+        for agent, narrowed in (("manager", {"agent": "vps"}), ("vps", {})):
+            self.assertNotIn("deleted on", hub.t_see_history(agent, dict(narrowed, what="costs", window=7)))
+        hub.q("UPDATE agents SET deleted=NULL WHERE name='scout'")      # as an agent that left before 1.212
+        self.assertIn("  scout (codex, deleted): ", hub.t_see_history("manager", {"what": "costs", "window": 7}))
 
     def test_a_delete_with_no_server_job_frees_the_name_at_once_and_keeps_what_it_spent(self):
         """vps runs on a machine with no Founderizer service, so its delete gives no server a job, and free_name runs
@@ -522,6 +570,7 @@ class Spent(Remove):
         now = self.period(7, 0)
         status, receipt = self.remove()
         self.assertEqual(status, 200, receipt)
+        deleted = hub.q1("SELECT deleted FROM agents WHERE name='scout'")["deleted"]
         self.job("box", receipt["job"], "failed", "user", "Scout's account on box could not be removed.")
         status, again = self.remove()
         self.assertEqual(status, 200, again)
@@ -529,6 +578,9 @@ class Spent(Remove):
         self.job("box", again["job"], "done", "user")
         self.assertIsNone(hub.q1("SELECT 1 FROM session_tokens WHERE agent='scout'"))
         self.assertEqual(self.period(7, 0), now)
+        # its spent name keeps the time of the delete, not of the removal again or of the job that freed the name
+        self.assertEqual(hub.q1("SELECT agent FROM session_tokens WHERE session_id='s-now'")["agent"],
+                         hub.spent_name("scout", deleted))
 
     def test_a_new_agent_of_its_name_lists_none_of_its_model_changes_and_checks(self):
         """The costs reading reads an agent's model changes and its checks by its name. The first scout's model change,

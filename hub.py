@@ -4334,6 +4334,9 @@ def migrate():
                          "runs": "INTEGER"},   # plan P8: the quiet runs that one folded row stands for (NULL: one)
         # plan P4: the task whose session saved a revision, and how much outside text that session had read
         "trigger_history": {"saved_by_task": "INTEGER", "outside_reads": "INTEGER"},
+        # agent_remove: when the agent whose row keeps its name left team.json (forget_removed_agents), which the costs
+        # reading of the whole fleet says (costs_deleted)
+        "agents": {"deleted": "REAL"},
     }.items():
         try:
             have = {r["name"] for r in q(f"PRAGMA table_info({table})")}
@@ -30659,10 +30662,33 @@ def costs_kinds(agent, since, until, book):
     return out
 
 
+def costs_deleted(before, start, end, book):
+    """The entries of a reading of the whole fleet for the agents that the owner deleted and that spent in [before, end)
+    (the owner's yes of 17 November 2026 to its mock: "Yes, as drawn"): the name that each had, the time of its delete,
+    and its sessions of each period, which keep its name while its row does and go under spent_name once the name is
+    free. Its kinds of work, checks, model changes and points of a window are not listed. With them, the agents of the
+    reading add up to what every session of each period spent."""
+    team, gone = list(agents()), {}
+    for r in read_rows(f"SELECT * FROM session_tokens WHERE last_activity>=? AND last_activity<? AND agent NOT IN "
+                       f"({','.join('?' * len(team))}) ORDER BY last_activity", (before, end, *team)):
+        gone.setdefault(r["agent"], []).append(r)
+    out = []
+    for stored, rows in sorted(gone.items()):
+        name, _, at = stored.partition(":deleted:")
+        out.append({"agent": name, "deleted": float(at) if at else deleted_at(name),
+                    # a session from before AUTONOMY.md P8 has no runtime
+                    "runtime": next((r["runtime"] for r in reversed(rows) if r["runtime"]), None),
+                    "now": costs_sums([r for r in rows if r["last_activity"] >= start], book),
+                    "before": costs_sums([r for r in rows if r["last_activity"] < start], book), "kinds": []})
+    return out
+
+
 def costs_view(names, start, end, minimum=COSTS_MINIMUM):
     """What the work of these agents cost in [start, end), each number with the period of the same length before it
     (AUTONOMY.md P8): for each agent and each kind of its work, for each check, and for each account they spend
-    from. GET /ui/costs answers it, and see_history what="costs" says it."""
+    from. GET /ui/costs answers it, and see_history what="costs" says it. A reading of every agent of the team is a
+    reading of the whole fleet, so it has the agents that the owner deleted too (costs_deleted): GET /ui/costs with no
+    agent, and the fleet manager's see_history with none. A lead's team never holds the manager."""
     t0, before, book = now(), start - (end - start), price_book()
     out = {"from": start, "to": end, "before": before, "minimum": minimum, "unit": "list dollars",
            "prices": book, "agents": [], "checks": [], "accounts": [], "model_changes": [],
@@ -30682,6 +30708,8 @@ def costs_view(names, start, end, minimum=COSTS_MINIMUM):
                               "now": costs_sums([r for r in rows if r["last_activity"] >= start], book),
                               "before": costs_sums([r for r in rows if r["last_activity"] < start], book),
                               "kinds": kinds})
+    if set(names) == set(agents()):
+        out["agents"] += costs_deleted(before, start, end, book)
     marks = ",".join("?" * len(names))
     quiet = "runs" in {c["name"] for c in read_rows("PRAGMA table_info(trigger_runs)")}       # lane L4's count
     for t in read_rows(f"SELECT id, agent FROM triggers WHERE agent IN ({marks}) ORDER BY id", tuple(names)):
@@ -30732,6 +30760,13 @@ def costs_size(n):
     return f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}K" if n >= 1e3 else str(n)
 
 
+def costs_day(ts):
+    """A day as a line of the costs names it ("18 Nov"), in the fleet's own time zone."""
+    import datetime
+    at = datetime.datetime.fromtimestamp(ts, goal_settings()[2])
+    return f"{at.day} {at.strftime('%b')}"
+
+
 def costs_kind_name(kind, task_kind):
     """A kind of work as a line names it."""
     if kind == "standing":
@@ -30757,6 +30792,9 @@ def costs_text(view, days, viewer):
     """see_history what="costs": the view as lines a session reads, each number with the period before it."""
     def was(now_v, before_v, show):
         return show(now_v) + (f" ({show(before_v)} before)" if before_v is not None else " (none before)")
+
+    def spent(sums):            # a deleted agent's line, as its mock drew it: no session is $0.00
+        return costs_money(sums["cost"]) if sums["sessions"] else "$0.00"
     out = [f"WHAT THE WORK COST, the last {days} days against the {days} before them, at the list prices of the "
            f"runtime facts now, so a price change does not read as a change of work. On a subscription account a list "
            f"price is a weight, not money spent: its usage window is the real cost. Rework, not acceptance, judges a "
@@ -30764,6 +30802,12 @@ def costs_text(view, days, viewer):
            f"it."]
     for a in view["agents"]:
         n, b = a["now"], a["before"]
+        if "deleted" in a:      # costs_deleted: one line, with no kinds of work
+            said = [a["runtime"]] if a["runtime"] else []
+            said.append(f"deleted on {costs_day(a['deleted'])}" if a["deleted"] else "deleted")
+            out.append(f"  {a['agent']} ({', '.join(said)}): {spent(n)} in {costs_count(n['sessions'], 'session')} "
+                       f"({b['sessions']} before); {spent(b)} before")
+            continue
         if not n["sessions"] and not b["sessions"] and not a["kinds"]:
             continue
         out.append(f"  {a['agent']} ({a['runtime']}): {was(n['cost'], b['cost'], costs_money)} in "
@@ -40754,11 +40798,13 @@ def forget_removed_agents(names, t0):
     marks that its default access ended (default_access_sweep). An agent moved to another server by removal and Add
     agent (30 October 2026) could not register the key of its new machine ("only the owner replaces it"), its
     install's sign-in read "signed in" from the old machine, and it never got its new machine's vault. Its tasks,
-    messages, memory and other records stay; a rename moves them first (rename_rows). Returns the names of which it
-    deleted anything."""
+    messages, memory and other records stay; a rename moves them first (rename_rows). Its row in `agents` keeps the
+    time that it left (deleted_at), the owner's delete and a reload of a team.json without it alike. Returns the names
+    of which it deleted anything."""
     in_transaction("forget_removed_agents")
     forgot = []
     for name in names:
+        DB.execute("UPDATE agents SET deleted=? WHERE name=?", (t0, name))
         revoke_sessions(name, t0)
         deleted = sum(DB.execute(f"DELETE FROM {table} WHERE agent=?", (name,)).rowcount
                       for table in ("agent_keys", "machine_status", "machine_updates"))
@@ -43877,18 +43923,26 @@ def remove_rows(agent, t0, machine=None):
 
 def spent_name(agent, t0):
     """The name that a deleted agent's sessions, model changes and deleted wake-up rules keep once its own name is free
-    (free_name): `<name>:deleted:<time>`. AGENT_NAME has no ":", so no agent ever reads them as its own, and the time
-    keeps apart two agents of one name that were each deleted."""
+    (free_name): `<name>:deleted:<time of the delete>`. AGENT_NAME has no ":", so no agent ever reads them as its own,
+    and the time keeps apart two agents of one name that were each deleted."""
     return f"{agent}:deleted:{t0:.6f}"
+
+
+def deleted_at(agent):
+    """When the agent whose row keeps this name left team.json (forget_removed_agents): by the owner's delete, or by a
+    reload of a team.json without it. None for an agent that left before owner API 1.212, which wrote no time."""
+    row = read_row("SELECT deleted FROM agents WHERE name=?", (agent,))
+    return row["deleted"] if row else None
 
 
 def free_name(agent):
     """Inside a transaction: a removed agent's row goes once nothing is left of it on a server and no history names it,
     and with it the name is free for a new agent (add_server_agent). Its sessions, its model changes and its deleted
-    wake-up rules stay, under one name that no agent can have (spent_name)."""
+    wake-up rules stay, under one name that no agent can have (spent_name), which keeps the time of the delete: a
+    server can report the removal done days after it, when the owner gave it again."""
     in_transaction("free_name")
     if agent not in agents() and not has_history(agent):
-        gone = spent_name(agent, now())
+        gone = spent_name(agent, deleted_at(agent) or now())
         DB.execute("DELETE FROM agents WHERE name=?", (agent,))
         DB.execute("UPDATE session_tokens SET agent=? WHERE agent=?", (gone, agent))
         DB.execute("UPDATE model_changes SET agent=? WHERE agent=?", (gone, agent))
