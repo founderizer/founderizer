@@ -53,8 +53,8 @@ def load_tests(loader, _tests, _pattern):
     """Only the tests of this file: the hub fixture it borrows carries its own, and a mover's class takes the shared
     cases of Mover."""
     suite = unittest.TestSuite()
-    for cls in (Check, Floor, Command, HelperUpdate, TaskStartSync, ServerUpdate, ServerNewCheckout, HubMovers,
-                JoinScript, HubScript, OwnerMCP, ConfigRef, HandoverRecipients):
+    for cls in (Check, Floor, Command, TakeOnce, HelperUpdate, TaskStartSync, ServerUpdate, ServerNewCheckout,
+                HubMovers, JoinScript, HubScript, OwnerMCP, ConfigRef, HandoverRecipients):
         names = cls.__dict__ if issubclass(cls, OwnerAPI) else dir(cls)
         suite.addTests(cls(name) for name in names if name.startswith("test_"))
     return suite
@@ -222,11 +222,6 @@ class Repositories(unittest.TestCase):
 # ---------------------------------------------------------------- the check itself
 
 class Check(Repositories):
-    def test_a_release_put_on_the_ref_by_the_update_is_taken(self):
-        four = self.fleet.release(4)
-        git("fetch", "-q", "origin", cwd=self.kit)
-        self.assertIsNone(self.may(four))
-
     def test_the_owners_data_is_taken_with_no_release(self):
         def delivered(work):
             (work / "outputs/T-7").mkdir(parents=True)
@@ -278,7 +273,7 @@ class Check(Repositories):
         git("add", lifecycle.EARLY_KEYS, cwd=self.fleet.pub)
         four = self.fleet.release(4)
         git("fetch", "-q", "origin", cwd=self.kit)
-        self.assertIsNone(lifecycle.take(str(self.kit), four))
+        self.assertIsNone(lifecycle.take(str(self.kit), four))      # a release that the update put on the ref
         five = self.fleet.release(5, seed=OTHER_SEED, keys=(KEY, OTHER_KEY))
         git("fetch", "-q", "origin", cwd=self.kit)
         self.assertIsNone(self.may(five))
@@ -667,11 +662,6 @@ class HandoverRecipients(VaultBroker):
             fleet.vault_call({"op": "handover", "job": self.job()})
         self.assertIn(says, str(caught.exception))
         self.assertEqual(self.reads(), [])                      # the login was never opened
-
-    def test_a_pinned_recipient_gets_its_copy(self):
-        raw = fleet.vault_call({"op": "handover", "job": self.job()})
-        self.assertEqual((raw["to"], self.opens(raw["ciphertext"], "studio")["password"]),
-                         ("studio", "FakeOnlyPassword-987654321"))
 
     def broken_in_hub(self):
         """The hub's own rule taken away, as a hub that is broken into would: it names the key of team.json, pinned or

@@ -83,7 +83,8 @@ class Service(ThreadingHTTPServer):
         super().__init__(("127.0.0.1", 0), Answer)
         self.seen, self.release = [], threading.Event()
         self.base = f"http://127.0.0.1:{self.server_port}"
-        threading.Thread(target=self.serve_forever, daemon=True).start()
+        # a short poll: close()'s shutdown() waits for the loop's next look, which was up to 0.5 s in each test
+        threading.Thread(target=self.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
 
     def close(self):
         self.release.set()

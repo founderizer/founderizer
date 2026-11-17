@@ -45,6 +45,16 @@ def load_tests(loader, _tests, _pattern):
 # `anything.commit()` is a commit, whatever the connection is called.
 
 COMMIT = ("", "c", "commit")
+PARSED = {}         # source text -> its tree (parsed); Structure.tearDownClass empties it
+
+
+def parsed(source):
+    """The tree of `source`, parsed once: the hub's code is 100,000 lines and one parse of it took 3.5 s, which the
+    Structure tests did five times over (17 November 2026). The checks only read a tree, so they share one copy."""
+    tree = PARSED.get(source)
+    if tree is None:
+        tree = PARSED[source] = ast.parse(source)
+    return tree
 
 
 def hub_sources(start="hub"):
@@ -60,7 +70,7 @@ def hub_sources(start="hub"):
             continue
         with open(path) as f:
             sources[name] = f.read()
-        for node in ast.walk(ast.parse(sources[name])):
+        for node in ast.walk(parsed(sources[name])):
             if isinstance(node, ast.Import):
                 todo += [a.name for a in node.names]
             elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
@@ -150,8 +160,10 @@ def commit_paths(sources, start="hub"):
     same defect wearing the other hat."""
     if isinstance(sources, str):
         sources = {start: sources}
-    trees = {m: ast.parse(src) for m, src in sources.items()}
-    funcs, methods, named, scope = {}, {}, {}, {}
+    trees = {m: parsed(src) for m, src in sources.items()}
+    # a cache of calls_in for this call only: the trees are shared, and another call can read one of them with
+    # other modules beside it
+    funcs, methods, named, scope, seen = {}, {}, {}, {}, {}
     for module, tree in trees.items():
         f, m, n = definitions(tree, module)
         funcs.update(f)
@@ -162,7 +174,7 @@ def commit_paths(sources, start="hub"):
     for kind, table in (("f", funcs), ("m", methods)):
         for (module, name), bodies in table.items():
             key = (module, kind, name)
-            edges[key] = {k for b in bodies for k, _ in calls_in(b, module, *scope[module])}
+            edges[key] = {k for b in bodies for k, _ in calls_in(b, module, *scope[module], seen)}
             if COMMIT in edges[key]:
                 commits.add(key)
     growing = True
@@ -191,7 +203,7 @@ def commit_paths(sources, start="hub"):
             for body in bodies:
                 for block in transactions(body):
                     for statement in block.body:
-                        for key, call in calls_in(statement, module, *scope[module]):
+                        for key, call in calls_in(statement, module, *scope[module], seen):
                             if key in commits:
                                 found.add((module, call.lineno, named.get(id(body), name), block.lineno, key[2],
                                            " -> ".join(k[2] if k != COMMIT else "commit()"
@@ -219,7 +231,7 @@ def unlocked_writes(source):
     `transaction()` or a `committed()` of its own code, nor after an `in_transaction(...)` or `held(...)` of its own
     function. All threads write through the one connection, and only LOCK keeps one thread's write out of another
     thread's open transaction. It sees statements that start with literal text, and not a statement in a variable."""
-    tree = ast.parse(source)
+    tree = parsed(source)
     holding = set()
     for w in ast.walk(tree):
         if isinstance(w, ast.With) and any(
@@ -246,6 +258,10 @@ def unlocked_writes(source):
 class Structure(unittest.TestCase):
     """The hub's own code as text. No database, no fixture, no clock: this one holds whatever the suites drive."""
 
+    @classmethod
+    def tearDownClass(cls):
+        PARSED.clear()          # the trees of the hub's code took about 300 MB
+
     def test_every_raw_write_holds_the_lock_or_a_transaction(self):
         """The audit of 7 November 2026: 13 writers wrote with a plain DB.execute and relied on a docstring for the
         lock. Each holds it now, or refuses without it (in_transaction, held), and so must the next one."""
@@ -260,7 +276,7 @@ class Structure(unittest.TestCase):
         a fifth state in TERMINAL would leave each of them reading that task as open. Every list that names
         'completed' and 'rejected' is TERMINAL, or TERMINAL without 'canceled': the ends with a result to check."""
         with open(hub.__file__) as f:
-            tree = ast.parse(f.read())
+            tree = parsed(f.read())
         ends, lists = set(hub.TERMINAL), []
         for n in ast.walk(tree):
             if isinstance(n, ast.Constant) and isinstance(n.value, str):

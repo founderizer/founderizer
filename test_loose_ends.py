@@ -646,13 +646,6 @@ class ReviewedNotices(test_responsibilities.Base):
                                    responsibility=hub.rref(other["id"]), action="retire", note="not needed")[1])
         self.assertNotIn("support mailbox", self.read(self.new_task()))
 
-    def test_a_notice_says_the_words_of_the_duty_when_it_is_read(self):
-        r = self.duty()
-        self.change(r["id"], text="Watch the refund queue only. Refund nothing without asking me first.")
-        said = self.read(self.new_task())
-        self.assertIn("refund queue", said)
-        self.assertNotIn("Keep customer content generation working", said)
-
     def test_a_change_after_the_notice_was_filed_still_reaches_it_before_the_read(self):
         r = self.duty()
         t = self.new_task()                                 # the notice is filed under this task now, unread

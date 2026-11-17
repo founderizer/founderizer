@@ -101,7 +101,8 @@ class WithGate(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
         self.sock = os.path.join(self.dir, "hub.sock")
         self.hub = StandInHub(self.sock)
-        threading.Thread(target=self.hub.serve_forever, daemon=True).start()
+        # a short poll: the cleanup's shutdown() waits for the loop's next look, which was up to 0.5 s in each test
+        threading.Thread(target=self.hub.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
         self.addCleanup(self.hub.server_close)
         self.addCleanup(self.hub.shutdown)
         self.lines = []

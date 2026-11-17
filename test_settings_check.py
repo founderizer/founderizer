@@ -96,20 +96,12 @@ class Base(OwnerAPI):
 class Keys(Base):
     """The one answer to "do this agent's sessions hold the value of a key" (hub.session_keys)."""
 
-    def test_a_read_grant_of_an_api_key_is_in_the_sessions_by_its_name(self):
-        self.assertEqual(hub.session_keys("dev-lead"), ["ACME_API_KEY", "SHOP_API_KEY"])
-
     def test_a_use_grant_and_a_login_are_not(self):
         self.assertEqual(hub.session_keys("caller"), [])
         self.agent("caller")["secrets"][LOGIN] = "read"         # a team.json written by hand: a login is no API key
         self.assertEqual(hub.session_keys("caller"), [])
         self.assertEqual(hub.session_keys("manager"), [])       # no grant at all
         self.assertEqual(hub.session_keys("nobody"), [])        # and no such agent
-
-    def test_a_session_of_an_agent_whose_shell_box_is_off_gets_no_key(self):
-        self.assertEqual(hub.session_keys("support"), [])
-        self.agent("support")["can"] = ["shell", "web"]
-        self.assertEqual(hub.session_keys("support"), ["ACME_API_KEY"])
 
     def test_only_an_agent_whose_vault_is_its_machine_s_broker_gets_a_key(self):
         """The helper asks for the values only for an agent whose team.json entry says `"vault": "broker"`

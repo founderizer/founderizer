@@ -83,7 +83,8 @@ class BrokerRequests(VaultBroker):
     def setUp(self):
         super().setUp()
         self.service = Service()
-        threading.Thread(target=self.service.serve_forever, daemon=True).start()
+        # a short poll: end_service's shutdown() waits for the loop's next look, which was up to 0.5 s in each test
+        threading.Thread(target=self.service.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
         self.addCleanup(self.end_service)
         self.site = f"http://127.0.0.1:{self.service.server_port}"
         self.login = dict(LOGIN, url=self.site + "/login")

@@ -16,34 +16,18 @@
 
 </div>
 
-The code a Founderizer fleet runs: the hub, the helper of each machine, the installers and the rules every agent
-reads. This repository is what a customer's hub carries as the git remote `upstream` and fetches a release from, so
-everything here is public and everything here is in the clone of every machine of every fleet.
+<p align="center">The team works day and night, with the Claude or ChatGPT plan that you already pay for.</p>
 
-| File | What it is |
-| --- | --- |
-| `hub.py` | The hub: the team tools of each agent, the tasks, the duties, the timers and the owner's own API. Runs on the always-on machine. |
-| `fleet.py` | The helper of every machine: the sessions, the logins, the checks and `verify`. |
-| `hub.sh` | The hub installer. One line turns a fresh Ubuntu or Debian server into a working hub. |
-| `join.sh`, `install-worker.sh` | A second server, and a Mac, joining a fleet that exists. |
-| `selftest.py` | Checks the hub on its own in about a minute. A release is not applied until it passes. |
-| `RULES.md` | The rules every agent reads at every start. |
-| `profiles/` | One profile for each agent: what it is for, and what its owner lets it do. The owner's own, and a release never touches them, so a profile never says how to call a tool. |
-| `team.json` | The machines, the agents and how each session starts. The installer writes this fleet's own; the one here is a placeholder. |
-| `knowledge/` | What the fleet knows. `knowledge/owner/` is the owner's and a release never touches it. |
-| `release-key.pub`, `entitlement-key.pub` | The public keys a release and an entitlement are checked against. The private halves are only on our website. |
+<p align="center">
+  <a href="https://founderizer.com/features"><img src="https://raw.githubusercontent.com/founderizer/founderizer-apps/main/.github/features/feature-team.webp" alt="The team does the work: the manager splits one sentence into three tasks, for Nora, Theo and Ada" width="270"></a>
+  <a href="https://founderizer.com/features"><img src="https://raw.githubusercontent.com/founderizer/founderizer-apps/main/.github/features/feature-decide.webp" alt="The decisions stay yours: the manager asks before a refund of 240 euros, and you press Refund" width="270"></a>
+  <a href="https://founderizer.com/features"><img src="https://raw.githubusercontent.com/founderizer/founderizer-apps/main/.github/features/feature-iphone.webp" alt="Answer from your iPhone: a notification from the manager on the lock screen" width="270"></a>
+  <a href="https://founderizer.com/features"><img src="https://raw.githubusercontent.com/founderizer/founderizer-apps/main/.github/features/feature-chats.webp" alt="WhatsApp and Discord: you ask Nora on WhatsApp whether a customer got her refund" width="270"></a>
+  <a href="https://founderizer.com/features"><img src="https://raw.githubusercontent.com/founderizer/founderizer-apps/main/.github/features/feature-logins.webp" alt="Logins without passwords: Ada signs in to the shop's admin and never sees the password or the code" width="270"></a>
+  <a href="https://founderizer.com/features"><img src="https://raw.githubusercontent.com/founderizer/founderizer-apps/main/.github/features/feature-servers.webp" alt="On servers you own: Hetzner, DigitalOcean, Vultr or Akamai, and a new server in your fleet" width="270"></a>
+</p>
 
-Python 3.10 or later on a server (the scripts that run on the owner's Mac, `onboard.py` and `owner_mcp.py`, also
-take 3.9), `git` and `tmux`, and nothing else: no dependency is installed from a package index. The installers say
-what they need.
-
-**Where to start.** A hub: `HUB-INSTALL.md`, or the install prompt of `INSTALL-PROMPT.md` pasted into the agent you
-already run. A Mac or a second server joining a fleet: `WORKER-INSTALL.md`.
-
-**What is not here.** Our own development repository holds the product documents, the owner's own fleet and the live
-records of it, and the few tests that read them or that test how this repository is published. None of that is needed
-to run a fleet, and none of it is published. The other tests are here: the `test_*.py` files, `leftovers.py`, which
-stops what a test started and removes what it made, and `ui_fixture.py`, a hub with made-up data for the apps.
+<p align="center"><a href="https://founderizer.com/features"><b>See all 31 features</b></a></p>
 
 **License.** The Apache License, Version 2.0. Its text is in `LICENSE`. `NOTICE` holds the copyright notice and the
 credit, and section 4 of the license says how a copy that you share keeps them. Every version published in this
