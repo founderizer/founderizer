@@ -87,11 +87,14 @@ page. Finish restarts the Mac, and the hub then proves the browser with a real t
 nobody at the Mac. The manager tells you in one line.
 
 Keep that Mac behind a locked door: it stays signed in, and anyone who touches it acts
-as your agents. Sign accounts in that Chrome that are made for the agents. Give each Mac
-a Claude account of its own, and never sign that account in on your own Chrome: the
-extension's link is account-wide, so an agent could reach the Chrome of another Mac or
-your own browser. The sitting goes on only when that Mac's own Chrome has opened a page
-that only that Mac can reach.
+as your agents. In that Chrome, the only sign-in by hand is Claude's extension. Do not
+sign in to a website there for the agents: a website login goes into the vault, with Add
+secret in Founderizer or in the secure form that Founderizer shows when an agent asks
+for a login (`request_secret`), and the agent's helper signs in with it (`sign_in`).
+Give each Mac a Claude account of its own, and never sign that account in on your own
+Chrome: the extension's link is account-wide, so an agent could reach the Chrome of
+another Mac or your own browser. The sitting goes on only when that Mac's own Chrome has
+opened a page that only that Mac can reach.
 
 ## Linux VPS or a new checkout
 

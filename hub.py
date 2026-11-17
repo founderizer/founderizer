@@ -11067,11 +11067,12 @@ def need_is_notice(*texts):
     if not hit:
         return None
     return (f'Not raised: this item says "{hit.group(0)}", so it is a notice and not a Needs-you item. Needs you is '
-            f"only for what the owner must do or decide now: a change only they can make, a sign-in only they can "
-            f"complete, money, or a choice they kept. A warning, a status or an FYI goes to tell_owner, which posts "
-            f"it with no notification, or nowhere. If you will carry on with a default when the owner says nothing, "
-            f"it does not need them: go on with it, and tell_owner what you chose if they would want to read it. If "
-            f"the owner truly must do or decide something now, raise it again saying only that.")
+            f"only for what the owner must do or decide now: a change only they can make, their own sign-in to an AI "
+            f"provider's account (Claude, ChatGPT), money, or a choice they kept. A warning, a status or an FYI goes "
+            f"to tell_owner, which posts it with no notification, or nowhere. If you will carry on with a default when "
+            f"the owner says nothing, it does not need them: go on with it, and tell_owner what you chose if they "
+            f"would want to read it. If the owner truly must do or decide something now, raise it again saying only "
+            f"that.")
 
 
 # A key, a password or a token is never asked for in words (owner feature secret_requests). The hub masks only the
