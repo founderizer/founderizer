@@ -565,6 +565,41 @@ class Spent(Remove):
         self.assertIsNone(hub.q1("SELECT 1 FROM session_tokens WHERE agent='vps'"))
         self.assertEqual(self.period(7, 0), now)
 
+    def test_a_name_stays_with_the_history_that_the_tick_has_not_taken_in_yet(self):
+        """vps's delete gives no server a job, so its name goes free inside the delete itself, before the tick takes in
+        the records of vps's last seconds. A Needs-you item that vps raised a moment before is such history, and the
+        name stays with it, so Add agent refuses the name and no new agent reads it. So do the other records of that
+        kind that a delete leaves, each as the history search names its agents: a message of a person's conversation,
+        a duty and a line on one, a report, and a question for the agent that holds it and the one that answered it;
+        a Needs-you item that a conversation raised is that conversation's, and no agent's."""
+        t0 = hub.now()
+        hub.ins("INSERT INTO needs(title,why,todo,raised,by) VALUES('Choose a label','vps asks','say which',?,'vps')",
+                (t0,))
+        status, receipt = self.remove("vps")
+        self.assertEqual((status, receipt["job"]), (200, None), receipt)
+        self.assertIsNotNone(hub.q1("SELECT 1 FROM agents WHERE name='vps'"))
+        status, answer = self.add_agent("box", "vps", "codex")
+        self.assertEqual((status, answer["error"]), (409, "An agent named vps was in this fleet before, and its records "
+                                                         "are still here. Choose another name."))
+        person = hub.ins("INSERT INTO people(name,role,added) VALUES('Dana','customer',?)", (t0,))
+        chat = hub.ins("INSERT INTO conversations(person,agent,account,chat,state,created,last) "
+                       "VALUES(?,'ann','discord-1','chat-1','open',?,?)", (person, t0, t0))
+        hub.ins("INSERT INTO conversation_messages(conversation,who,text,created) VALUES(?,'person','hello',?)",
+                (chat, t0))
+        duty = hub.ins("INSERT INTO responsibilities(agent,text,state,revision,created,updated,created_by,request_id) "
+                       "VALUES('bea','watch the inbox','retired',1,?,?,'owner','d-bea')", (t0, t0))
+        hub.ins("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,'fay','edited','')", (duty, t0))
+        hub.ins("INSERT INTO reports(from_agent,to_agent,kind,text,severity,delivered,created,request_id) "
+                "VALUES('manager','dan','fact','the queue grows','info','delivered',?,'r-dan')", (t0,))
+        hub.ins("INSERT INTO questions(task,asker,requester,text,asked,answer,answered,answered_by) "
+                "VALUES(NULL,'manager','hal','which one?',?,'the blue one',?,'eve')", (t0, t0))
+        hub.ins("INSERT INTO needs(title,why,todo,raised,by,conversation) VALUES('Choose a label','gus asks','say "
+                "which',?,'gus',?)", (t0, chat))
+        names = ("ann", "bea", "fay", "dan", "hal", "eve", "gus", "cid")
+        self.assertEqual({name: hub.has_history(name) for name in names},
+                         {"ann": True, "bea": True, "fay": True, "dan": True, "hal": True, "eve": True, "gus": False,
+                          "cid": False})
+
     def test_the_removal_again_after_a_failed_job_keeps_what_it_spent(self):
         self.spend("scout", ("s-now", 1, 1000))
         now = self.period(7, 0)
@@ -582,12 +617,13 @@ class Spent(Remove):
         self.assertEqual(hub.q1("SELECT agent FROM session_tokens WHERE session_id='s-now'")["agent"],
                          hub.spent_name("scout", deleted))
 
-    def test_a_new_agent_of_its_name_lists_none_of_its_model_changes_and_checks(self):
-        """The costs reading reads an agent's model changes and its checks by its name. The first scout's model change,
-        its check that the delete deleted and the check that it had deleted itself go with its sessions under the one
-        name that no agent can have, so the costs of a new agent of its name list none of them. They list the new
-        agent's own, a check that it deleted included. The same rows of vps stay its own, and the owner's page of a
-        moved rule names its agent as it was named, as the apps read an agent's name."""
+    def test_a_new_agent_of_its_name_reads_none_of_the_old_agents_records(self):
+        """The hub's readers take an agent's records by its name. The first scout's records go with its sessions under
+        the one name that no agent can have, so a new agent of its name reads none of them as its own: not its model
+        changes and checks in its costs, not its refused calls, not its install as its own sign-in, not its rename as
+        its own old name, and not its files of the last hour against its own. The new agent reads its own records, a
+        check that it deleted included. The same rows of vps stay its own, and the owner's page of a moved rule names
+        its agent as it was named, as the apps read an agent's name."""
         t0 = hub.now()
 
         def change(agent, effort):
@@ -612,10 +648,35 @@ class Spent(Remove):
             return ([(c["trigger"], c["now"]["quiet"], c["now"]["failed"]) for c in view["checks"]],
                     [m["to"]["effort"] for m in view["model_changes"]], "\n".join(hub.costs_text(view, 7, "manager")))
 
+        def held(agent):
+            """How many of the agent's calls, server jobs and files hold this name."""
+            return {table: hub.q1(f"SELECT COUNT(*) c FROM {table} WHERE agent=?", (agent,))["c"]
+                    for table in ("calls", "server_jobs", "attachments")}
+
+        def left(agent):
+            """What the agent left outside a task: a call that the hub refused it, and the files of the last hour that
+            no message took, as many as attach_file takes."""
+            hub.ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail) VALUES(?,?,NULL,NULL,'grant_access',"
+                    "'{}',0,?)", (t0 - DAY, agent, f"{agent} may not grant access"))
+            for n in range(hub.CHAT_FILE_LOOSE):
+                hub.ins("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client,agent) "
+                        "VALUES(?,'notes.txt','text/plain',5,?,?,'agent',?)",
+                        (f"up-{agent}-{n}", "0" * 64, t0 - 60, agent))
+
         self.spend("scout", ("s-now", 1, 1000))
         first = change("scout", "low")
         active, deleted = check("scout", "active", "quiet"), check("scout", "deleted", "error")
         theirs, their_check = change("vps", "medium"), check("vps", "deleted", "quiet")
+        left("scout")
+        left("vps")
+        # scout was rookie once, on box; and vps has a job of its own there
+        hub.ins("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated,was) VALUES('box','rename',"
+                "'scout','codex','done',?,?,'rookie')", (t0 - DAY, t0 - DAY))
+        hub.ins("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated) VALUES('box','install','vps',"
+                "'codex','done',?,?)", (t0 - DAY, t0 - DAY))
+        vps = held("vps")
+        self.assertEqual(vps, {"calls": 1, "server_jobs": 1, "attachments": hub.CHAT_FILE_LOOSE})
+        self.assertIn(("rookie", "scout"), hub.agent_old_names())
         checks, changes, text = costs()
         self.assertEqual((checks, changes), ([(active, 1, 0), (deleted, 0, 1)], ["low"]))
         self.assertIn(f"check {active} of scout", text)
@@ -630,26 +691,41 @@ class Spent(Remove):
         self.assertEqual((checks, changes), ([], []))
         for old in (f"check {active} of scout", f"check {deleted} of scout", "set scout to"):
             self.assertNotIn(old, text)
+        # nor its refused call, its install, its rename or its files
+        refused = "\n".join(hub.history_refusals({"agent": "scout"}, 7, t0 - 7 * DAY, t0 - 14 * DAY))
+        self.assertIn("Nothing was refused in this window.", refused)
+        # the manager's reading of the whole fleet names the old call as a deleted agent's
+        fleet = "\n".join(hub.history_refusals({}, 7, t0 - 7 * DAY, t0 - 14 * DAY))
+        self.assertIn("scout (deleted) / grant_access: 1 (none before)", fleet)
+        self.assertIsNone(hub.signed_in_now("scout", "codex"))
+        self.assertNotIn(("rookie", "scout"), hub.agent_old_names())
+        with patch.dict(hub.CHAT_FILE_UPLOADS):
+            self.assertIn("Send the file up one time", hub.t_attach_file("scout", {"name": "report.pdf"}))
         # they stay, under the name of the first scout's sessions, and its two checks stay deleted
         gone = hub.q1("SELECT agent FROM session_tokens WHERE session_id='s-now'")["agent"]
         self.assertTrue(gone.startswith("scout:deleted:"), gone)
         self.assertEqual(hub.q1("SELECT agent FROM model_changes WHERE id=?", (first,))["agent"], gone)
         self.assertEqual([tuple(r) for r in hub.q("SELECT agent, state FROM triggers WHERE id IN (?,?)",
                                                   (active, deleted))], [(gone, "deleted")] * 2)
+        self.assertEqual(held(gone), {"calls": 1, "server_jobs": 3, "attachments": hub.CHAT_FILE_LOOSE})
         # vps's own stay its own
         self.assertEqual((hub.q1("SELECT agent FROM model_changes WHERE id=?", (theirs,))["agent"],
                           hub.q1("SELECT agent FROM triggers WHERE id=?", (their_check,))["agent"]), ("vps", "vps"))
         self.assertEqual(costs("vps")[:2], ([(their_check, 1, 0)], ["medium"]))
+        self.assertEqual(held("vps"), vps)
         # the owner's page of a moved rule names its agent as it was named: the apps refuse a name that is no agent's
         status, page = self.request(f"/ui/triggers/{active}?db=test-generation", source=OWNER)
         self.assertEqual((status, page["trigger"]["agent"], page["trigger"]["state"]), (200, "scout", "deleted"), page)
-        # the new scout's own model change and its own check, which it deleted, are in its costs
+        # the new scout's own model change and its own check, which it deleted, are in its costs, and its own install
+        # signs it in
         change("scout", "high")
         own = check("scout", "deleted", "quiet")
         checks, changes, text = costs()
         self.assertEqual((checks, changes), ([(own, 1, 0)], ["high"]))
         self.assertIn(f"check {own} of scout", text)
         self.assertIn("manager set scout to its default model, high", text)
+        self.job("box", answer["job"], "done", "sign_in")
+        self.assertIs(hub.signed_in_now("scout", "codex"), True)
 
 
 class Leaving(Remove):

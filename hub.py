@@ -30534,7 +30534,9 @@ def history_refusals(a, days, start, before):
     for key, rows in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:HISTORY_ROWS]:
         rows.sort(key=lambda r: r["id"])
         tasks = sorted({tref(r["task"]) for r in rows if r["task"]})
-        out.append(f"  {key[0]} / {key[1]}: {moved(len(rows), old.get(key))}"
+        # the calls of a deleted agent whose name went free are under spent_name, which is no agent's name
+        who = key[0] if ":" not in key[0] else f"{key[0].split(':', 1)[0]} (deleted)"
+        out.append(f"  {who} / {key[1]}: {moved(len(rows), old.get(key))}"
                    + (f" on {', '.join(tasks[:4])}" if tasks else "")
                    + f": {refusal_said(key[0], rows[-1]['detail'], HISTORY_DETAIL * 3)}")
     if len(out) == 1:
@@ -43843,13 +43845,20 @@ def move_agent(agent, body, by="owner"):
 # in it, gave its points to the agents beside it on that account. Its sessions in `session_tokens` stay, and count in
 # both. Its usage reading (`agent_usage`) goes: that is what its helper read last, its limits and its newest totals,
 # and not a record of a period. While its row keeps its name, its sessions keep that name; free_name gives them a name
-# that no agent can have (spent_name), so the sessions of a new agent of that name start at zero. Its model changes
-# (`model_changes`) and its deleted wake-up rules (remove_rows deletes each one that was not) go to that name with them:
-# the costs reading (costs_view) reads both by the agent's name, and until then it listed the old agent's model changes
-# and checks, with their quiet and failed runs, as a new agent's own. Only a rule in the state `deleted` moves: a rule
-# in another state is not one that a delete left. The view of such a rule (trigger_view) still names the agent as it
-# was named. A name that a release before this one freed keeps those rows: free_name moves them only at the moment
-# that it frees the name.
+# that no agent can have (spent_name), so the sessions of a new agent of that name start at zero.
+#
+# Its other records that a reader takes by the agent's name go to that name with them, because each one was read as a
+# new agent's own: its model changes (`model_changes`) and its deleted wake-up rules (remove_rows deletes each one that
+# was not), which the costs reading (costs_view) listed with their quiet and failed runs; its calls (`calls`), whose
+# refusals the refusals reading (history_refusals) listed; its server jobs (`server_jobs`), whose install
+# finished_sign_in took for the new agent's sign-in and whose renames agent_old_names took for its old names; and its
+# files (`attachments`), which attach_file counted against the new agent's hour. Only a rule in the state `deleted`
+# moves: a rule in another state is not one that a delete left. The view of such a rule (trigger_view) still names the
+# agent as it was named; a job's view (job_view) gives the spent name, because the apps compare a job's agent with an
+# agent's name, and the old agent's removal is no job of a new agent of the name. Its key, its machine's reading and
+# its update went when it left team.json (forget_removed_agents). has_history reads the agent's last records where
+# they are written, so that its name never goes free before the history search has taken them in. A name freed
+# before these steps keeps those rows: free_name moves them only at the moment that it frees the name.
 REMOVED_OWN = (("agent_usage", "name"), ("agent_limits", "agent"), ("machine_checks", "agent"),
                ("mac_setups", "agent"), ("session_credentials", "agent"),
                ("ui_requests", "recipient"), ("owner_reports", "agent"), ("events", "agent"),
@@ -43860,10 +43869,27 @@ REMOVED_OWN = (("agent_usage", "name"), ("agent_limits", "agent"), ("machine_che
 
 def has_history(agent):
     """Whether the fleet's history names this agent: a task it did or asked for, a message with another agent, or a
-    row of the history search. Its name then stays with that history (remove_agent)."""
+    row of the history search. Its name then stays with that history (remove_agent). A record that the history search
+    takes in a few seconds after it is written, and that a delete leaves, counts from the moment that it is written: a
+    delete with no server job frees the name in its own request, and the records of the agent's last seconds then went
+    into the search after its name was free, as the history of the next agent of that name. As the search's builders
+    name the agent in them, they are a message of a person's conversation with it (history_conversation), a Needs-you
+    item that it raised and that no conversation raised (history_need), a report from it or to it (history_report), a
+    question that it asked, holds or answered (history_question, history_answer), and a duty that it held or a line
+    that it wrote on one (history_duty; each duty has its own lines). The delete takes the agent's other such records
+    (REMOVED_OWN), the rest belong to its tasks, and free_name moves its calls under spent_name, where the search names
+    nobody."""
     return bool(read_row("SELECT 1 FROM tasks WHERE owner=? OR requester=? LIMIT 1", (agent, agent)) or
                 read_row("SELECT 1 FROM agent_messages WHERE sender=? OR recipient=? LIMIT 1", (agent, agent)) or
-                read_row("SELECT 1 FROM history WHERE agent=? LIMIT 1", (agent,)))
+                read_row("SELECT 1 FROM history WHERE agent=? LIMIT 1", (agent,)) or
+                read_row("SELECT 1 FROM conversation_messages m JOIN conversations c ON c.id=m.conversation "
+                         "WHERE c.agent=? LIMIT 1", (agent,)) or
+                read_row("SELECT 1 FROM needs WHERE by=? AND conversation IS NULL LIMIT 1", (agent,)) or
+                read_row("SELECT 1 FROM reports WHERE from_agent=? OR to_agent=? LIMIT 1", (agent, agent)) or
+                read_row("SELECT 1 FROM questions WHERE asker=? OR requester=? OR answered_by=? LIMIT 1",
+                         (agent, agent, agent)) or
+                read_row("SELECT 1 FROM responsibilities WHERE agent=? LIMIT 1", (agent,)) or
+                read_row("SELECT 1 FROM duty_history WHERE by=? LIMIT 1", (agent,)))
 
 
 def removed_team(team, agent):
@@ -43922,9 +43948,9 @@ def remove_rows(agent, t0, machine=None):
 
 
 def spent_name(agent, t0):
-    """The name that a deleted agent's sessions, model changes and deleted wake-up rules keep once its own name is free
-    (free_name): `<name>:deleted:<time of the delete>`. AGENT_NAME has no ":", so no agent ever reads them as its own,
-    and the time keeps apart two agents of one name that were each deleted."""
+    """The name that a deleted agent's records keep once its own name is free (free_name):
+    `<name>:deleted:<time of the delete>`. AGENT_NAME has no ":", so no agent ever reads them as its own, and the time
+    keeps apart two agents of one name that were each deleted."""
     return f"{agent}:deleted:{t0:.6f}"
 
 
@@ -43937,15 +43963,15 @@ def deleted_at(agent):
 
 def free_name(agent):
     """Inside a transaction: a removed agent's row goes once nothing is left of it on a server and no history names it,
-    and with it the name is free for a new agent (add_server_agent). Its sessions, its model changes and its deleted
-    wake-up rules stay, under one name that no agent can have (spent_name), which keeps the time of the delete: a
-    server can report the removal done days after it, when the owner gave it again."""
+    and with it the name is free for a new agent (add_server_agent). Its records stay, under one name that no agent can
+    have (spent_name), which keeps the time of the delete: its sessions, model changes, deleted wake-up rules, calls,
+    server jobs and files. A server can report the removal done days after the delete, when the owner gave it again."""
     in_transaction("free_name")
     if agent not in agents() and not has_history(agent):
         gone = spent_name(agent, deleted_at(agent) or now())
         DB.execute("DELETE FROM agents WHERE name=?", (agent,))
-        DB.execute("UPDATE session_tokens SET agent=? WHERE agent=?", (gone, agent))
-        DB.execute("UPDATE model_changes SET agent=? WHERE agent=?", (gone, agent))
+        for table in ("session_tokens", "model_changes", "calls", "server_jobs", "attachments"):
+            DB.execute(f"UPDATE {table} SET agent=? WHERE agent=?", (gone, agent))
         DB.execute("UPDATE triggers SET agent=? WHERE agent=? AND state='deleted'", (gone, agent))
 
 
