@@ -43580,8 +43580,15 @@ def move_agent(agent, body, by="owner"):
 # and the log. While such history is there, the name stays with it (its row in `agents`), and Add agent and a rename
 # refuse that name, so a new agent never takes over an old one's work. An agent with none, like one added by mistake,
 # leaves its name free.
+#
+# What it spent stays too. Until 17 November 2026 a delete took its sessions' tokens: the tokens of the goals that it
+# worked on (goal_tokens) read too low, and window_shares, which splits an account's window over the fleet's sessions
+# in it, gave its points to the agents beside it on that account. Its sessions in `session_tokens` stay, and count in
+# both. Its usage reading (`agent_usage`) goes: that is what its helper read last, its limits and its newest totals,
+# and not a record of a period. While its row keeps its name, its sessions keep that name; free_name gives them a name
+# that no agent can have (spent_name), so the sessions of a new agent of that name start at zero.
 REMOVED_OWN = (("agent_usage", "name"), ("agent_limits", "agent"), ("machine_checks", "agent"),
-               ("mac_setups", "agent"), ("session_tokens", "agent"), ("session_credentials", "agent"),
+               ("mac_setups", "agent"), ("session_credentials", "agent"),
                ("ui_requests", "recipient"), ("owner_reports", "agent"), ("events", "agent"),
                ("signin_jobs", "agent"), ("agent_notes", "agent"), ("memories", "agent"), ("rules", "agent"),
                ("standing", "agent"), ("reminders", "agent"), ("resource_grants", "agent"),
@@ -43651,12 +43658,21 @@ def remove_rows(agent, t0, machine=None):
                (f"Closed: {shown_role(agent)} was deleted.", t0, NEED_CLOSED_BY, agent))
 
 
+def spent_name(agent, t0):
+    """The name that a deleted agent's sessions keep once its own name is free (free_name): `<name>:deleted:<time>`.
+    AGENT_NAME has no ":", so no agent ever reads them as its own, and the time keeps apart two agents of one name that
+    were each deleted."""
+    return f"{agent}:deleted:{t0:.6f}"
+
+
 def free_name(agent):
     """Inside a transaction: a removed agent's row goes once nothing is left of it on a server and no history names it,
-    and with it the name is free for a new agent (add_server_agent)."""
+    and with it the name is free for a new agent (add_server_agent). Its sessions stay, under a name that no agent can
+    have (spent_name)."""
     in_transaction("free_name")
     if agent not in agents() and not has_history(agent):
         DB.execute("DELETE FROM agents WHERE name=?", (agent,))
+        DB.execute("UPDATE session_tokens SET agent=? WHERE agent=?", (spent_name(agent, now()), agent))
 
 
 def remove_agent(agent, body):

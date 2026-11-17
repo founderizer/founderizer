@@ -24,8 +24,8 @@ from test_ui_api import PATIENCE
 
 
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite(cls(name) for cls in (Remove, Leaving, RemoveService, Helper) for name in cls.__dict__
-                              if name.startswith("test_"))
+    return unittest.TestSuite(cls(name) for cls in (Remove, Spent, Leaving, RemoveService, Helper)
+                              for name in cls.__dict__ if name.startswith("test_"))
 
 
 class Remove(Servers):
@@ -346,6 +346,119 @@ class Remove(Servers):
         self.assertIn("sha256", answer)
         self.assertEqual(self.remove(extra="x")[0], 400)
         self.assertIn("scout", self.origin_team()["agents"])
+
+
+DAY = 86400
+ACCOUNT = "openai:" + "b" * 32      # the account that scout and vps spend from
+
+
+class Spent(Remove):
+    """What a deleted agent spent stays, and a new agent that takes its name later starts with no sessions. Until 17
+    November 2026 a delete took the agent's sessions' tokens: the tokens of the goals that it worked on read too low,
+    the window points of the agents beside it on its account read too high, and the rows of each period that it worked
+    in lost its sessions."""
+
+    def spend(self, agent, *sessions, used=40.0):
+        """One usage report of the agent's helper, as the hub takes it (record_session_tokens): its sessions, each
+        (session id, days ago, input tokens), and a reading of the account, whose week window is `used` percent used."""
+        t0 = hub.now()
+        rows = [dict(session_id=sid, total=tokens, last_activity=t0 - days * DAY, input=tokens, cache_read=0,
+                     cache_write=0, output=0, calls=1, model="gpt-6.1-sol", first_cache_share=0.0)
+                for sid, days, tokens in sessions]
+        reading = {"collected_at": t0, "account_key": ACCOUNT, "error": None,
+                   "windows": [{"label": "7 days", "used_percent": used, "resets_at": t0 + 3 * DAY,
+                                "window_minutes": 7 * 24 * 60}]}
+        hub.record_session_tokens(agent, rows, "codex", reading)
+
+    def period(self, since_days, until_days):
+        """The rows of that period under any name: what every session that spent in it cost, whichever agent it was.
+        No reader of the hub sums them so; this reads the table itself."""
+        t0 = hub.now()
+        rows = hub.read_rows("SELECT * FROM session_tokens WHERE last_activity>=? AND last_activity<?",
+                             (t0 - since_days * DAY, t0 - until_days * DAY))
+        return {k: v for k, v in hub.costs_sums(rows, hub.price_book()).items() if k in ("sessions", "input", "cost")}
+
+    def share(self, agent, sid):
+        return hub.q1("SELECT window_share FROM session_tokens WHERE agent=? AND session_id=?", (agent, sid))[0]
+
+    def test_what_it_spent_stays_and_a_new_agent_of_its_name_starts_at_zero(self):
+        self.spend("scout", ("s-before", 10, 3000), ("s-now", 1, 1000))
+        self.spend("vps", ("v-now", 1, 3000))
+        self.spend("scout", ("s-now", 1, 1000))
+        # the week's 40 points are split by cost over the fleet's sessions in it: scout 10, vps 30
+        self.assertEqual((self.share("scout", "s-now"), self.share("vps", "v-now")), (10.0, 30.0))
+        before, now = self.period(14, 7), self.period(7, 0)
+        self.assertEqual((before["sessions"], before["input"], now["sessions"], now["input"]), (1, 3000, 2, 4000))
+        self.assertIsNotNone(before["cost"])
+        status, receipt = self.remove()
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual(self.period(14, 7), before)
+        self.job("box", receipt["job"], "done", "user")
+        self.assertIsNone(hub.q1("SELECT 1 FROM agents WHERE name='scout'"))   # it did no work: its name is free
+        self.assertEqual((self.period(14, 7), self.period(7, 0)), (before, now))
+        # vps's next report: its points stay 30, and do not take the 10 of the deleted agent's session
+        self.spend("vps", ("v-now", 1, 3000))
+        self.assertEqual(self.share("vps", "v-now"), 30.0)
+        # the sessions are no longer under the name, so a new agent of the name starts at zero
+        self.assertIsNone(hub.q1("SELECT 1 FROM session_tokens WHERE agent='scout'"))
+        status, answer = self.add_agent("box", "scout", "codex")
+        self.assertEqual(status, 200, answer)
+        start, end = hub.now() - 7 * DAY, hub.now()
+        costs = hub.costs_view(["scout"], start, end)["agents"][0]
+        self.assertEqual((costs["now"]["sessions"], costs["before"]["sessions"], costs["kinds"]), (0, 0, []))
+        self.spend("scout", ("n-now", 1, 500))
+        costs = hub.costs_view(["scout"], start, end)["agents"][0]
+        self.assertEqual((costs["now"]["sessions"], costs["now"]["input"], costs["before"]["sessions"]), (1, 500, 0))
+        self.assertEqual(self.period(14, 7), before)
+        # the new scout is deleted too: its session goes under a name of its own, beside the first scout's two
+        self.job("box", answer["job"], "done", "sign_in")
+        status, receipt = self.remove()
+        self.assertEqual(status, 200, receipt)
+        self.job("box", receipt["job"], "done", "user")
+        spent = {r["agent"]: r["n"] for r in hub.q("SELECT agent, COUNT(*) n FROM session_tokens WHERE agent LIKE "
+                                                    "'scout:%' GROUP BY agent")}
+        self.assertEqual(sorted(spent.values()), [1, 2])
+        self.assertEqual([name for name in spent if hub.AGENT_NAME.match(name)], [])
+        self.assertEqual((self.period(14, 7)["input"], self.period(7, 0)["input"]), (3000, 4500))
+
+    def test_the_goals_that_it_worked_on_keep_its_tokens_and_its_name_keeps_its_sessions(self):
+        t0 = hub.now()
+        task = hub.ins("INSERT INTO tasks(title,owner,requester,state,created,goal_id) VALUES('a report','scout',"
+                       "'manager','completed',?,7)", (t0,))
+        hub.ins("INSERT INTO thread_events(task,attempt,session,seq,ts,type,data,created) VALUES(?,1,'s',1,?,"
+                "'session',?,?)", (task, t0, json.dumps({"runtime": "codex", "session_id": "s-goal"}), t0))
+        self.spend("scout", ("s-goal", 2, 5000))
+        self.assertEqual((hub.goal_tokens(7)[0], hub.all_goal_tokens()[7][0]), (5000, 5000))
+        status, receipt = self.remove()
+        self.assertEqual(status, 200, receipt)
+        self.job("box", receipt["job"], "done", "user")
+        self.assertIsNotNone(hub.q1("SELECT 1 FROM agents WHERE name='scout'"))     # its work keeps its name
+        self.assertEqual((hub.goal_tokens(7)[0], hub.all_goal_tokens()[7][0]), (5000, 5000))
+        self.assertEqual(hub.q1("SELECT COUNT(*) c FROM session_tokens WHERE agent='scout'")["c"], 1)
+
+    def test_a_delete_with_no_server_job_frees_the_name_at_once_and_keeps_what_it_spent(self):
+        """vps runs on a machine with no Founderizer service, so its delete gives no server a job, and free_name runs
+        inside the delete itself."""
+        self.spend("vps", ("v-now", 1, 3000))
+        now = self.period(7, 0)
+        status, receipt = self.remove("vps")
+        self.assertEqual((status, receipt["job"]), (200, None), receipt)
+        self.assertIsNone(hub.q1("SELECT 1 FROM agents WHERE name='vps'"))
+        self.assertIsNone(hub.q1("SELECT 1 FROM session_tokens WHERE agent='vps'"))
+        self.assertEqual(self.period(7, 0), now)
+
+    def test_the_removal_again_after_a_failed_job_keeps_what_it_spent(self):
+        self.spend("scout", ("s-now", 1, 1000))
+        now = self.period(7, 0)
+        status, receipt = self.remove()
+        self.assertEqual(status, 200, receipt)
+        self.job("box", receipt["job"], "failed", "user", "Scout's account on box could not be removed.")
+        status, again = self.remove()
+        self.assertEqual(status, 200, again)
+        self.assertEqual(hub.q1("SELECT COUNT(*) c FROM session_tokens WHERE agent='scout'")["c"], 1)
+        self.job("box", again["job"], "done", "user")
+        self.assertIsNone(hub.q1("SELECT 1 FROM session_tokens WHERE agent='scout'"))
+        self.assertEqual(self.period(7, 0), now)
 
 
 class Leaving(Remove):
