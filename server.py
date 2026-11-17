@@ -836,15 +836,15 @@ class Service:
     def own_files(self, agent):
         """The files of one agent in this service's own home, each by its whole name, so that removing `scout` leaves
         the files of `scout-two`: its checkout (only one that this service made), its helper's files in ~/.fleet as
-        fleet.py names them (its key, its usage reading, its chat and manager records and locks, its log, its
-        checkout's mark), its session credentials, an onboarding record, and the transcripts that Claude Code keeps
-        for its checkout."""
+        fleet.py and lifecycle.py name them (its key, its usage reading, its slow reading, its sign-in reading, its
+        chat and manager records and locks, its log, its checkout's mark), its session credentials, an onboarding
+        record, and the transcripts that Claude Code keeps for its checkout."""
         fleet, folder = os.path.join(self.home, ".fleet"), os.path.join(self.home, f"fleet-{agent}")
         real = os.path.realpath(folder)
         paths = [os.path.join(fleet, name) for name in (
             f"agent-{agent}.key", f"usage-{agent}.json", f"helper-{agent}.lock", f"{agent}.log", f"{agent}.err",
-            "checkout-" + hashlib.sha256(real.encode()).hexdigest()[:16])]
-        paths += [os.path.join(fleet, "onboarding", f"{agent}.json"),
+            f"slow-{agent}.json", "checkout-" + hashlib.sha256(real.encode()).hexdigest()[:16])]
+        paths += [lifecycle.signed_in_path(self.home, agent), os.path.join(fleet, "onboarding", f"{agent}.json"),
                   os.path.join(self.home, ".claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", real))]
         named = ((fleet, re.compile(rf"(?:chat|manager)-{re.escape(agent)}\.[a-z.]+")),
                  (os.path.join(fleet, "sessions"), re.compile(rf"{re.escape(agent)}\.[^/]+")))

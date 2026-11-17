@@ -461,6 +461,7 @@ class OnTheHub(OwnerAPI):
         class Stub(hub.Handler):
             def __init__(self, fails, answered):
                 self.fails, self.started, self.sent, self.path = fails, answered, [], "/ui/state"
+            def body_sent(self): return False         # do_GET's first check since 3f7c2b15
             def funnel_refused(self): return False
             def host_allowed(self): return True
             def site_allowed(self): return True

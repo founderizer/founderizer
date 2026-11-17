@@ -537,7 +537,8 @@ class BrokerRequests(VaultBroker):
         self.assertNotIn("requests", self.call({"op": "status"}, to=self.conf))
         status = self.call({"op": "status"})
         self.assertEqual(set(status), {"ok", "v", "agent", "store", "user", "recipient", "callers", "requests",
-                                       "backend", "source", "deposits", "withdrawals"})       # no journal: the first broker has it
+                                       "backend", "source", "deposits", "withdrawals", "replaces"})
+        # no journal ("creates"): the first broker has it; "replaces" is in every broker's status since 015ad2a2
         self.assertIs(status["requests"], True)
         job = self.request_job()
         self.assertEqual(self.call({"op": "request", "job": job, "agent": "vps", "agent_key": KEY}, to=self.conf),

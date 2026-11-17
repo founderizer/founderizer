@@ -710,9 +710,9 @@ class RemoveService(ServerService):
         (fleet_dir / "onboarding").mkdir(exist_ok=True)
         mine = ["agent-scout.key", "usage-scout.json", "chat-scout.json", "chat-scout.claude.json",
                 "manager-scout.lock", "helper-scout.lock", "scout.log", "scout.err", "sessions/scout.T-4.ab12.json",
-                "onboarding/scout.json"]
+                "onboarding/scout.json", "slow-scout.json", "signed-in-scout.json"]
         theirs = ["agent-scout-two.key", "scout-two.log", "chat-scout-two.claude.json", "sessions/scout-two.T-1.cd.json",
-                  "agent-ac.key", "server.key", "server.json"]
+                  "slow-scout-two.json", "signed-in-scout-two.json", "agent-ac.key", "server.key", "server.json"]
         for name in mine + theirs:
             path = fleet_dir / name
             if not path.exists():
