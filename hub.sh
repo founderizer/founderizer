@@ -216,9 +216,11 @@ if [ "$check" = yes ]; then
 fi
 
 home="$root/home/$HUB_USER"
-# The one name of the hub's repository and of its checkout. Nothing else holds the name: the hub gives it to its
-# machines (hub.py served_repository).
-repo_name=fleet-pilot
+# The one name of the hub's repository and of its checkout: founderizer on a new hub. A hub made before this name
+# has fleet-pilot, and a second run of this installer there keeps that name, so nothing of that fleet moves.
+# Nothing else holds the name: the hub gives it to its machines (hub.py served_repository).
+repo_name=founderizer
+if [ ! -e "$home/$repo_name.git" ] && [ -d "$home/fleet-pilot.git" ]; then repo_name=fleet-pilot; fi
 bare="$home/$repo_name.git"
 kit="$home/$repo_name"
 tree=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

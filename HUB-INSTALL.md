@@ -90,7 +90,7 @@ vCPU, 4 GB): UI-API.md 1.171 says what it proved.
    repository is made from that copy, so a folder of loose files is not enough:
 
    ```sh
-   rsync -a --exclude .claude ~/fleet-pilot/ root@<server>:/root/fleet-kit/
+   rsync -a --exclude .claude ~/founderizer/ root@<server>:/root/fleet-kit/
    ```
 
    A `git clone`, a `git bundle` or `--source` (below) does the same. Uncommitted
@@ -172,10 +172,10 @@ notification of a Needs-you item, the chat that opens first), so with those apps
    succeed. A server that waits for an admin to approve it in Tailscale has an address
    already, but nothing on the private network reaches it. On such a server the step stops,
    and the server keeps its public SSH.
-6. **The Founderizer repository on this hub.** `~fleet/fleet-pilot.git` is the bare
+6. **The Founderizer repository on this hub.** `~fleet/founderizer.git` is the bare
    repository and the origin of the whole fleet: `fleet-git` serves it read-only over
    `git://`, and every worker and joined server fetches its code from it.
-   `~fleet/fleet-pilot` is the hub's own checkout and it stands on `config`, the
+   `~fleet/founderizer` is the hub's own checkout and it stands on `config`, the
    configuration ref — the branch the hub writes and nothing else writes (PILOT.md,
    "The configuration ref"). Both refs start at the commit of the copy you ran, so the
    code the hub serves is the code it runs. For a hub that this install makes (step 3
@@ -186,7 +186,12 @@ notification of a Needs-you item, the chat that opens first), so with those apps
    `/root/fleet-kit` is. From any other copy the step says so and the install goes on,
    because the hub works without the clone. On any other hub the step runs `kit-clone`
    with no `--first`, which takes the hub's signed release and makes no clone without
-   one.
+   one. **A hub made before the name `founderizer`** has the name `fleet-pilot` for its
+   repository and its checkout, and a second run of the installer keeps that name: on such
+   a hub, read `fleet-pilot` wherever this document names `~fleet/founderizer`. Nothing else
+   holds the name: the hub gives its machines the address of its repository (the join
+   answer, the join script and `GET /ui/state`), and `fleet-git` serves the origin of the
+   hub's checkout.
 7. **The first `team.json`, and the owner's own Mac.** One manager on this machine, or,
    when the app that starts the install gives the manager its own server
    (`FLEET_MANAGER_SERVER=later`, Founderizer 0.1.112 and later), one manager with no
@@ -227,7 +232,7 @@ notification of a Needs-you item, the chat that opens first), so with those apps
     (the hub's own line in its log gives them, as one line, with this server's values):
 
     ```
-    runuser -u fleet -- env XDG_RUNTIME_DIR=/run/user/$(id -u fleet) python3 /home/fleet/fleet-pilot/fleet.py service hub
+    runuser -u fleet -- env XDG_RUNTIME_DIR=/run/user/$(id -u fleet) python3 /home/fleet/founderizer/fleet.py service hub
     runuser -u fleet -- env XDG_RUNTIME_DIR=/run/user/$(id -u fleet) systemctl --user restart fleet-hub
     ```
 
@@ -604,7 +609,7 @@ because it has an address and a key of its own. The central vault keeps the owne
 Mac from before until a `central-vault` run from the new Mac replaces it ("The central
 vault", below).
 
-**The claim always runs from the hub's own checkout** (`~fleet/fleet-pilot/hubsetup.py`),
+**The claim always runs from the hub's own checkout** (`~fleet/founderizer/hubsetup.py`),
 which follows the fleet's releases, so an old copy in `/root/fleet-kit` gets all of the above
 too. The other steps of the line run from that copy, as in every second run, so bring it up
 to date first when it is old.
@@ -612,9 +617,11 @@ to date first when it is old.
 **The claim alone**, with no other step of the installer, as root:
 
 ```sh
-cd /home/fleet && runuser -u fleet -- env HOME=/home/fleet python3 fleet-pilot/hubsetup.py claim \
-    --reclaim --commit --address "$(tailscale ip -4 | head -n 1)" --out /home/fleet/fleet-pilot/team.json
+cd /home/fleet && runuser -u fleet -- env HOME=/home/fleet python3 founderizer/hubsetup.py claim \
+    --reclaim --commit --address "$(tailscale ip -4 | head -n 1)" --out /home/fleet/founderizer/team.json
 ```
+
+On a hub made before the name `founderizer`, write `fleet-pilot` in place of it in both places.
 
 It needs nothing afterwards, and no restart of `fleet-hub`: the claim starts the hub itself,
 after its commit. Three things it does need:
@@ -640,7 +647,7 @@ sudo python3 /usr/local/lib/founderizer-kit/hubsetup.py central-vault --owner-ke
 ```
 
 **Root's own clone first.** The vault is installed as root, so it is never installed from a
-folder that the hub's user can change, such as the hub's own checkout `~fleet/fleet-pilot`,
+folder that the hub's user can change, such as the hub's own checkout `~fleet/founderizer`,
 or from a path that the hub names. `kit-clone` keeps root's own clone of the published
 repository in `/usr/local/lib/founderizer-kit`, owned by root and writable by nobody else,
 at the revision of the release that the hub runs: the hub's `release.json` is that release's
@@ -648,8 +655,10 @@ signed manifest, and one of the release keys of the clone itself must have signe
 release that does not descend from the clone's own revision is refused, so no older release
 comes back, and a second run with nothing new changes nothing. `--source` names another
 copy of the published repository (default: `https://github.com/founderizer/founderizer.git`);
-the signature names the commit, so it is the same commit from any copy. `central-vault`
-refuses to run from anywhere else.
+the signature names the commit, so it is the same commit from any copy. `kit-clone` reads
+the hub's `release.json` in the hub's checkout, which it finds as `~fleet/founderizer` or as
+`~fleet/fleet-pilot`, and it follows no link to it. `central-vault` refuses to run from
+anywhere else.
 
 **Who makes the first clone** (since 15 November 2026; before that day nothing made it, and
 each root step of the app stopped on a new hub at its first command). A new hub runs the
@@ -755,7 +764,7 @@ that the owner gives, and it takes no value under a removed name again (UI-API.m
 - **The apps.** The Mac app and the iPhone app are installed on the owner's own
   machines, not here.
 - **Backups.** The records are `~fleet/.fleet/pilot.db` and the repository is
-  `~fleet/fleet-pilot.git`; the owner decides how they are kept. The hub puts the
+  `~fleet/founderizer.git`; the owner decides how they are kept. The hub puts the
   records in WAL mode when it starts: the newest commits can be in `pilot.db-wal`
   beside them, so a copy of `pilot.db` alone can lack them. The app's copy of the
   fleet has them all, and so does `sqlite3 ~fleet/.fleet/pilot.db ".backup <file>"`.

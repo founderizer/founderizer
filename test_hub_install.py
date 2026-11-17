@@ -4467,7 +4467,7 @@ class CheckMode(unittest.TestCase):
         out = self.run_check("--manager-name", "juno")
         self.assertIn("would name the manager juno: its entry in team.json, and its profile", out)
         self.assertNotIn("name the manager", self.run_check("--manager-name", "juno", "--reclaim"))   # it names none
-        self.assertIn("/home/fleet/fleet-pilot/profiles/juno.md", out)
+        self.assertIn("/home/fleet/founderizer/profiles/juno.md", out)
         self.assertEqual([line for line in out.splitlines() if "juno" not in line],
                          [line for line in plain.splitlines() if "juno" not in line])
         for bad in ("Juno", "j", "owner", "hub", "ju no", "9lives", "a" * 27, "jüno", "juno;id",
@@ -4500,7 +4500,7 @@ class CheckMode(unittest.TestCase):
         self.assertEqual((steps[steps.index(vault) - 1], steps[steps.index(vault) + 1]),
                          ("one OS user for each agent of this machine",
                           "the services fleet-hub, fleet-git and fleet-channels"))
-        self.assertIn("/home/fleet/fleet-pilot/hubsetup.py vault --hub http://100.64.0.1:8765 --kit ", out)
+        self.assertIn("/home/fleet/founderizer/hubsetup.py vault --hub http://100.64.0.1:8765 --kit ", out)
         self.assertIn("/home/fleet/fleet-server/hubsetup.py hub-server --team", out)
         self.assertIn("would run no join with a join code: the hub refuses a join from its own address", out)
         self.assertIn("     on this server or on a server of its own.", out)
@@ -4743,7 +4743,7 @@ class CheckMode(unittest.TestCase):
         out = self.run_check()
         self.assertIn("check only: nothing on this machine changes", out)
         self.assertIn("check only: nothing on this machine changed", out)
-        for wanted in ("would run", "fleet-pilot.git", "config", "vault\": \"none\"",
+        for wanted in ("would run", "founderizer.git", "config", "vault\": \"none\"",
                        "tailscale up --reset --auth-key=file:", "--accept-dns=false --timeout=300s",
                        "systemctl --user enable --now fleet-hub fleet-git", "hubsetup.py check",
                        "sign in to nothing", "paste in Founderizer"):
@@ -4870,6 +4870,30 @@ class CheckMode(unittest.TestCase):
         (home / "founderizer").unlink()
         (home / "founderizer").mkdir()
         self.assertEqual(hubsetup.hub_checkout(str(home)), str(home / "founderizer"))
+
+    def test_a_new_hub_gets_the_name_founderizer_and_a_hub_of_before_keeps_its_own(self):
+        """The one name of the hub's repository and checkout (hub.sh repo_name): founderizer on a new hub, in each
+        place of the plan, and fleet-pilot on a hub made before that name, where a second run of the installer
+        changes no name. hubsetup.HUB_CHECKOUTS, which root's own step reads, holds the same two in the same order."""
+        out = self.run_check()
+        home = self.tmp / "home" / "fleet"
+        for wanted in (f"make the bare repository {home}/founderizer.git", f"clone it to {home}/founderizer,",
+                       "clone git://", "founderizer.git on the configuration ref", f"python3 {home}/founderizer/fleet.py",
+                       "agent-helper --user fleet --repo git://"):
+            self.assertIn(wanted, out)
+        self.assertNotIn("fleet-pilot", out)
+        (home / "fleet-pilot.git").mkdir(parents=True)
+        out = self.run_check()
+        self.assertIn(f"make the bare repository {home}/fleet-pilot.git", out)
+        self.assertIn("fleet-pilot.git on the configuration ref", out)
+        self.assertNotIn("founderizer.git", out)
+        (home / "founderizer.git").mkdir()             # a hub with both: the new name is its name
+        self.assertNotIn("fleet-pilot.git", self.run_check())
+        text = SCRIPT.read_text()
+        self.assertIn(f"\nrepo_name={hubsetup.HUB_CHECKOUTS[0]}\n", text)
+        self.assertIn(f'[ -d "$home/{hubsetup.HUB_CHECKOUTS[1]}.git" ]; then repo_name={hubsetup.HUB_CHECKOUTS[1]}; fi',
+                      text)
+        self.assertEqual(len(hubsetup.HUB_CHECKOUTS), 2)
 
     def test_the_plan_reads_the_system_it_is_given(self):
         self.assertIn("Ubuntu 24.04", self.run_check())
