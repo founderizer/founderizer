@@ -979,6 +979,22 @@ class ChatApps(OwnerAPI):
         self.assertLess(time.time() - start, 3)
         self.assertEqual(self.bridge("/bridge/out?wait=x")[0], 400)
 
+    def test_a_stop_of_the_hub_answers_the_long_poll_at_once(self):
+        """The owner's "Yes, build both" of 16 November 2026: a restart of the hub in its own process waits for the
+        open requests, so the bridge's poll answers as soon as the hub stops (hub.STOPPING), as at the end of its
+        wait, and the bridge asks again on a new connection, which the new code takes."""
+        self.own()
+        self.addCleanup(hub.STOPPING.clear)
+        result = {}
+        poll = threading.Thread(target=lambda: result.update(answer=self.bridge("/bridge/out?wait=20")))
+        poll.start()
+        time.sleep(0.5)
+        self.assertEqual(result, {})                        # it waits
+        hub.STOPPING.set()
+        poll.join(5)
+        code, data = result["answer"]
+        self.assertEqual((code, data["items"]), (200, []))
+
     def test_pause_all_holds_the_outbound_queue(self):
         self.own()
         self.inbound("/whoami")

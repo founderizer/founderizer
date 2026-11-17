@@ -930,6 +930,22 @@ class JobRuns(CallApi):
         self.assertEqual(self.api(), ('HTTP 201.\n{"id": 7}', False))   # the same call reads the stored answer
         self.assertEqual(self.api(timeout_seconds=0)[1], True)
 
+    def test_a_stop_of_the_hub_answers_a_call_that_waits_for_its_job_still_running_at_once(self):
+        """The owner's "Yes, build both" of 16 November 2026: a restart of the hub in its own process waits for the
+        open requests (hub.calls_drained). A call whose job goes on by itself answers "still running" as soon as the
+        hub stops (hub.STOPPING), as at the end of its wait, and its outcome comes as a message, from the new code."""
+        self.addCleanup(hub.STOPPING.clear)
+        with patch.object(hub, "JOB_CALL_WAIT", 60):
+            hub.STOPPING.set()
+            began = time.monotonic()
+            text, error = self.api(timeout_seconds=600)
+            self.assertFalse(error, text)
+            self.assertIn("Still running on this machine: call_api POST /v1/orders?dry=0", text)
+            text, error = self.call("seo", "sign_in", {"login": LOGIN_A}, self.task)
+            self.assertIn(f"Still running on this machine: sign_in with {LOGIN_A}", text)
+            self.assertLess(time.monotonic() - began, 4)
+        self.assertIsNone(self.job()["finished"])           # no clock and no stop marked it failed
+
     def test_a_sign_in_that_ends_after_the_call_is_done_and_not_failed(self):
         text, error = self.call("seo", "sign_in", {"login": LOGIN_A}, self.task)
         self.assertFalse(error, text)

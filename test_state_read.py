@@ -963,7 +963,7 @@ class OtherCallers(StateCase):
         at = [n for n, step in enumerate(body) if isinstance(step, ast.Expr)
               and ast.unparse(step.value) == "sys.setswitchinterval(SWITCH_INTERVAL)"]
         starts = [n for n, step in enumerate(body)
-                  if any(word in ast.unparse(step) for word in ("threading.Thread(", "HubServer(", "serve_forever("))]
+                  if any(word in ast.unparse(step) for word in ("threading.Thread(", "hub_server(", "serve_forever("))]
         self.assertEqual(len(at), 1)
         self.assertTrue(starts)
         self.assertLess(at[0], min(starts))

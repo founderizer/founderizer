@@ -3,6 +3,7 @@
 Real tmux on a socket of this test, a stand-in command in every window, and no hub, no runtime and no AI call. The
 helper's conf is this file's own, so no agent of the live team.json is read.
 """
+import inspect
 import os
 import shutil
 import subprocess
@@ -17,6 +18,7 @@ from leftovers import scratch_home, tmux_socket
 WORKER = {"role": "worker", "runtime": "claude", "machine": "mac-studio", "can": ["shell"],
           "start": "claude --permission-mode bypassPermissions --tools default {settings} {prompt}"}
 POLLS = fleet.CHAT_PROOF_POLLS
+BLIND = {"warm": True, "ready": False, "tools": []}     # the poll's word on a chat that should run and has no tools
 
 
 def setUpModule():
@@ -81,6 +83,88 @@ class ChatProof(unittest.TestCase):
         if gone:
             self.chat()
         return gone
+
+    def blind(self, count, chat=BLIND, events=()):
+        """So many polls whose word on the chat is `chat` (BLIND: it should run, and its session has no tools)."""
+        for _ in range(count):
+            self.helper.chat_proof(list(events), dict(chat) if isinstance(chat, dict) else chat)
+
+    def test_a_chat_whose_session_never_listed_its_tools_is_replaced_at_the_same_count(self):
+        """16 November 2026: an agent's owner chat asked for its tools while the hub restarted, and Claude Code never
+        asked again. Its session could read no message, and the owner could send none, because his app showed
+        "Setting up" in place of a chat with no tools: it stood so for 6.4 hours. The polls at which the hub says
+        that the chat should run and has no tools count on the one count, and its repair is the same one."""
+        self.chat()
+        with patch.object(fleet, "load_agent_key", return_value="the agent's key"):
+            self.blind(POLLS - 1)
+            self.assertFalse(self.repaired())
+            self.blind(1)
+            self.assertIn(f"its session has listed no tools after {POLLS} polls", self.said[-1])
+            self.assertTrue(self.repaired())
+            self.assertIsNone(self.helper.chat_started)     # and counts as no start that ended
+            self.blind(2 * POLLS - 1)                       # the next one at twice the count, as for a message
+            self.assertFalse(self.repaired())
+            self.blind(1, chat=dict(BLIND, ready=True))     # the new session listed its tools: the count ends
+            self.assertEqual(self.helper.chat_wait, {})
+            self.blind(POLLS - 1)
+            self.assertFalse(self.repaired())               # and begins from nothing at a next chat with none
+            self.blind(1)
+            self.assertTrue(self.repaired())
+        self.hub.assert_not_called()                        # the hub hears nothing: it counts it at the new start
+
+    def test_a_chat_that_the_hub_does_not_want_or_says_nothing_of_or_that_has_no_key_gets_no_count(self):
+        """Only the hub's own word counts: a hub from before chat_warm gives no `chat`, a chat held by a limit or a
+        sign-in is not warm, and an agent with no key starts its chat with no credential, whose listing the hub never
+        records, so its chat is never ready and is no chat with no tools."""
+        self.chat()
+        with patch.object(fleet, "load_agent_key", return_value="the agent's key"):
+            for chat in (None, {}, "ready", dict(BLIND, warm=False), dict(BLIND, ready=None), dict(BLIND, ready=True),
+                         {"warm": True}, dict(BLIND, warm=1), dict(BLIND, ready=0)):
+                with self.subTest(chat=chat):
+                    self.blind(3 * POLLS, chat=chat)
+                    self.assertEqual(self.helper.chat_wait, {})
+            self.helper.worker = False                      # the manager's standing session is no owner chat
+            self.blind(3 * POLLS)
+            self.assertEqual(self.helper.chat_wait, {})
+            self.helper.worker = True
+        with patch.object(fleet, "load_agent_key", return_value=None):
+            self.blind(3 * POLLS)
+        self.assertEqual((self.helper.chat_wait, self.said), ({}, []))
+        self.assertFalse(self.repaired())
+
+    def test_a_count_with_no_message_and_no_chat_window_repairs_nothing_and_keeps_the_start_guard(self):
+        """A chat that cannot start (its runtime ends at once, or waits at a screen that the hub does not see) has no
+        window, and the hub still says that it should run with no tools. start_chat stops after two starts that
+        ended, until a sign-in, a settings change or a runtime change: the count must not undo that guard at each
+        stage of its doubling (the reviewer's point of 16 November 2026). It starts again from nothing."""
+        self.helper.chat_started = ("g1", 2)
+        with patch.object(fleet, "load_agent_key", return_value="the agent's key"):
+            self.blind(3 * POLLS)
+        self.assertEqual(self.helper.chat_started, ("g1", 2))
+        self.assertNotIn("chat_fresh", self.helper.__dict__)
+        self.assertEqual((self.said, self.helper.chat_wait["stage"], self.helper.chat_wait["polls"]), ([], 0, 0))
+
+    def test_the_helpers_loop_gives_the_count_the_polls_word_on_the_chat(self):
+        """Without it the count of a chat with no tools never runs, and every test of it above still passes."""
+        loop = inspect.getsource(fleet.cmd_run)
+        self.assertIn('h.chat_proof(data.get("events", []), data.get("chat"))', loop)
+        self.assertLess(loop.index("h.chat_proof("), loop.index("h.keep_chat("))     # the repair, then the start
+
+    def test_a_message_to_a_chat_with_no_tools_goes_on_with_its_count(self):
+        """A message that comes while the chat has no tools cannot be read either: the count goes on, and is the
+        message's count from then on."""
+        self.chat()
+        unread = [{"id": 7, "kind": "chat", "read": False}]
+        with patch.object(fleet, "load_agent_key", return_value="the agent's key"):
+            self.blind(POLLS - 5)
+            self.blind(4, events=unread)
+            self.assertFalse(self.repaired())
+            self.blind(1, events=unread)
+            self.assertIn(f"M-7 is unread after {POLLS} polls", self.said[-1])
+            self.assertTrue(self.repaired())
+            self.polls(1, read=True)                        # read by the new chat: a later message has its own count
+            self.helper.chat_proof([{"id": 9, "kind": "chat", "read": False}], dict(BLIND, ready=True))
+            self.assertEqual((self.helper.chat_wait["id"], self.helper.chat_wait["polls"]), (9, 1))
 
     def test_a_name_that_two_windows_have_is_repaired_by_their_ids_at_the_count(self):
         """12 November 2026: a second owner chat window started beside the first. tmux types into no window whose

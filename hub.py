@@ -39,6 +39,7 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import socketserver
 import sqlite3
 import stat
@@ -4467,6 +4468,20 @@ def chat_listed(credential):
     """An owner chat session listed its tools with this credential: it runs and can answer now. Once per credential,
     so a later listing writes nothing."""
     q("UPDATE session_credentials SET ready=? WHERE sha256=? AND kind='chat' AND ready IS NULL", (now(), credential))
+
+
+def chat_without_tools():
+    """Count, as a fault of the hub's (the lane "Bug reports"), an owner chat whose session never listed its tools
+    before a new chat of the same agent took its place: helper_session calls it when it revokes such a credential.
+    The helper starts a new chat for such a session (fleet.Helper.chat_proof), and a chat's start that failed after
+    its credential, or that a new helper closed before its listing, counts too: each count is a chat session that
+    never had its tools. The class is ConnectionError, a name of diagnostics.CLASSES, and the place is this line:
+    every such chat counts as one kind, with no words. On 16 November 2026 the session's ask for its tools met the
+    hub's restart, and the chat stood 6.4 hours with no tools (restart_in_place)."""
+    try:
+        raise ConnectionError("an owner chat session listed no tools")
+    except ConnectionError:
+        diagnostics.record("hub")
 
 
 def listed_window(agent, context):
@@ -10613,7 +10628,7 @@ def save_job(agent, a, kind):
     emit(agent, kind, f"{'save a key' if kind == 'capture' else 'make a login'} ({label})", task=tid, extra={"job": jid})
     runs = JOB_RUNS in helper_features(agent)
     deadline = now() + (JOB_CALL_WAIT if runs else CFG["job_wait"])
-    while now() < deadline:
+    while now() < deadline and not (runs and STOPPING.is_set()):     # a stop: still_running, the job goes on
         row = q1("SELECT finished, unknown FROM jobs WHERE id=?", (jid,))
         if row["finished"] or row["unknown"]:
             break
@@ -10922,7 +10937,7 @@ def t_call_api(agent, a):
     runs = JOB_RUNS in helper_features(agent)
     wait = JOB_CALL_WAIT if runs else CFG.get("request_wait", API_WAIT)
     deadline = now() + wait
-    while now() < deadline:
+    while now() < deadline and not (runs and STOPPING.is_set()):     # a stop: still_running, the job goes on
         row = q1("SELECT finished, unknown FROM jobs WHERE id=?", (jid,))
         if row["finished"] or row["unknown"]:
             break
@@ -10983,7 +10998,7 @@ def helper_job(agent, tid, kind, login, target=""):
     emit(agent, kind, f"{kind} with {login}", task=tid, extra={"job": jid, "login": login, "to": target})
     runs = JOB_RUNS in helper_features(agent)
     deadline = now() + (JOB_CALL_WAIT if runs else CFG["job_wait"])
-    while now() < deadline:
+    while now() < deadline and not (runs and STOPPING.is_set()):     # a stop: still_running, the job goes on
         row = q1("SELECT finished, unknown FROM jobs WHERE id=?", (jid,))
         if row["finished"] or row["unknown"]:
             break
@@ -50226,7 +50241,10 @@ def restart_hub_soon(pinned, reached, always=False):
     what it can and records what it cannot (build_schema), so the worst a schema surprise costs is a warning on a
     hub that still answers. A release that changed no Fleet file restarts nothing.
 
-    `always` is the restore's restart: there is no revision to compare, and the records only change at a start."""
+    `always` is the restore's restart: there is no revision to compare, and the records only change at a start.
+
+    The restart of the hub's own service (HUB_RESTART) runs in this process where it can (restart_in_place), so
+    that the port stays open; else, and for a fleet's own restart command, it runs the command as before."""
     if not always and same_code(pinned, reached):
         return None
     argv = CFG.get("hub_restart", HUB_RESTART)
@@ -50242,6 +50260,8 @@ def restart_hub_soon(pinned, reached, always=False):
         if old_bridge:
             with contextlib.suppress(OSError, subprocess.SubprocessError):
                 subprocess.run(BRIDGE_RESTART, capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+        if argv == HUB_RESTART and restart_in_place():
+            return                      # main() runs the new code in this process, on the same open port
         try:
             done = subprocess.run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
             code, says = done.returncode, (done.stderr or done.stdout or "").strip()
@@ -50253,6 +50273,295 @@ def restart_hub_soon(pinned, reached, always=False):
                            f"{' '.join(argv)} by hand.")
     threading.Thread(target=run, name="release-restart", daemon=True).start()
     return argv
+
+
+# **The hub keeps its port open through its own restart** (the owner's "Yes, build both", 16 November 2026). A release
+# restarted the hub with `systemctl --user restart fleet-hub`: systemd ended the process, which cut every request that
+# was open, and the port stayed closed until the new process had started, about 1.5 seconds on his hub, which
+# restarted so 20 to 36 times a day (its journal, 9 to 16 November). On 16 November an agent's owner chat started 0.7
+# seconds before such a restart: Claude Code 2.1.325 asked for its tools, met a reset and then two refused
+# connections, stopped asking after 0.9 seconds, and the chat ran 6.4 hours with no tools while the app showed
+# "Setting up" in place of it. So the hub now restarts in its own process: it stops taking new connections, every long
+# wait answers at once (STOPPING), the kept connections that wait end, it waits for the requests that are open
+# (calls_drained), and it runs the new code with execve, which keeps the listening socket open. The kernel holds each
+# new connection in the socket's queue until the new code takes it: a client waits for the new code's start, a few
+# seconds, and is refused nothing; a request that is still open after DRAIN_MOST holds the queue that long. systemd
+# sees no restart, because the process stays the same one. A stop of the service (SIGTERM) closes the port at once,
+# waits for the open requests in the same way, and then ends the process by that signal, as it ended before. What
+# keeps the old gap: a crash, a restart of the service by hand, and the restart through systemd of a release that
+# changes the text of the hub's unit (unit_follows_code), whose queue the end of the process resets.
+LISTEN_FD = "FLEET_HUB_LISTEN_FD"       # the number of the listening socket, in the new code's environment
+CHILDREN = "FLEET_HUB_CHILDREN"         # the child processes of the code before it, which the new code waits for
+EXEC_AT = "FLEET_HUB_EXEC_AT"           # the moment of the exec, when the new code began (code_started)
+KEEPS_PORT = b'LISTEN_FD = "FLEET_HUB_LISTEN_FD"'   # the line of a code that takes the socket (code_keeps_port)
+DRAIN_MOST = 5          # seconds that a stop waits for the open requests, and then for LOCK (TimeoutStopSec is 15)
+FRESH_MOST = 1          # seconds that it waits for a connection that it accepted and that has sent no request yet
+REAP_EVERY = 5          # seconds between two looks at the child processes of the code before (reap_children)
+STOPPING = threading.Event()                # the hub takes no new connection: a long wait answers now
+SERVING = {"server": None, "exec": False, "exit": False}    # main()'s server; a restart in place; a stop (SIGTERM)
+CALLS = threading.Condition()
+CALLS_OPEN = [0]        # the requests that a Handler reads or answers now (Handler.parse_request)
+CALLS_FRESH = [0]       # the connections that the hub's server accepted and that sent no request yet (Handler.setup)
+CONNECTIONS = set()     # the Handler of each open connection, with its state: fresh, busy or idle (under CALLS)
+CLOSING = threading.Event()     # the stop ended the silent connections: one that comes to its Handler later ends too
+
+
+def code_started():
+    """When this code began to run, for main()'s read-back of what it compiled (compiled_checked): the moment of the
+    exec that started it in this process (EXEC_AT), else the start of the process (process_started). An exec keeps
+    the process and its start time, so without it the new code would read back every file that the process had
+    compiled since its first start, and keep their memory. The name leaves the environment."""
+    try:
+        return float(os.environ.pop(EXEC_AT))
+    except (KeyError, ValueError):
+        return process_started()
+
+
+def calls_begin(fresh=False):
+    with CALLS:
+        (CALLS_FRESH if fresh else CALLS_OPEN)[0] += 1
+
+
+def calls_end(fresh=False):
+    with CALLS:
+        (CALLS_FRESH if fresh else CALLS_OPEN)[0] -= 1
+        CALLS.notify_all()
+
+
+def calls_drained(most=DRAIN_MOST, fresh=FRESH_MOST):
+    """True when no request is open and no accepted connection waits for its first request, at the latest after
+    `most` seconds. A request that is still open then is cut, as every open request was cut before: a tool call that
+    waits for a helper's job, or a clone of the fleet's code; its client asks again, and the new code answers it. A
+    connection that has sent nothing counts only for its first `fresh` seconds: one that came just before the stop
+    sends its request in that time, and one that a client opens and leaves silent (a browser's) holds no stop."""
+    begun = time.monotonic()
+    with CALLS:
+        while True:
+            fresh_left = begun + fresh - time.monotonic()
+            if CALLS_OPEN[0] <= 0 and (CALLS_FRESH[0] <= 0 or fresh_left <= 0):
+                return True
+            left = begun + most - time.monotonic()
+            if left <= 0:
+                return False
+            CALLS.wait(min(left, fresh_left) if CALLS_FRESH[0] > 0 and fresh_left > 0 else left)
+
+
+def stop_serving():
+    """The restart in place begins (restart_in_place, in the thread of the release): the server takes no new
+    connection, and each long wait gives the answer that it gives at its end, now (STOPPING): the helpers' poll of
+    their events, GET /ui/wait, the bridge's poll, a hook's poll, and a tool call that waits for a helper's job that
+    goes on by itself. The listening socket stays open, so a new connection waits in the kernel's queue. It returns
+    at once: the end of serve_forever waits for that loop, so a thread of its own waits. False when no server serves
+    in this process."""
+    server = SERVING["server"]
+    if server is None:
+        return False
+    SERVING["exec"] = True
+    STOPPING.set()
+    threading.Thread(target=server.shutdown, name="hub-stop", daemon=True).start()
+    return True
+
+
+def code_keeps_port(path=None):
+    """True when the hub's code on the disk now, which the next start runs, takes the socket by LISTEN_FD. A release
+    that goes back to code from before this one does not: that code would bind the port that this process holds,
+    fail, and leave the hub down until systemd started it again."""
+    try:
+        with open(path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "hub.py"), "rb") as f:
+            return KEEPS_PORT in f.read()
+    except OSError:
+        return False
+
+
+def restart_in_place():
+    """The release's restart of the hub in this process, with its port open (the lines above this function). True
+    when the server stops for it: main() then runs the new code (after_serving). False where it cannot be so, and the
+    caller restarts the service as before: no server serves in this process (a test's hub, or a start that has not
+    come so far), this Python does not say how it was started (sys.orig_argv, since Python 3.10), or the code on the
+    disk does not take the socket (code_keeps_port)."""
+    if SERVING["server"] is None or not getattr(sys, "orig_argv", None) or not code_keeps_port():
+        return False
+    return stop_serving()
+
+
+def inherited_listener(host, port, environ=None):
+    """The listening socket that the code before this one gave (LISTEN_FD), when it listens at the address that this
+    start serves (host and port); else None, and a socket that it gave is closed, so that the bind finds the port
+    free. The name leaves the environment at once, and the socket is not inherited further, so no program that the
+    hub starts gets either."""
+    environ = os.environ if environ is None else environ
+    given = environ.pop(LISTEN_FD, None)
+    try:
+        sock = socket.socket(fileno=int(given))
+    except (TypeError, ValueError, OSError):
+        return None                     # no name, no number, or no socket by that number: nothing was given
+    try:
+        sock.set_inheritable(False)
+        wanted = {info[4][:2] for info in socket.getaddrinfo(host, port, sock.family, socket.SOCK_STREAM)}
+        if sock.type == socket.SOCK_STREAM and sock.getsockname()[:2] in wanted:
+            # It listens, and with the hub's queue: listen() again keeps the connections that wait. macOS answers no
+            # question of SO_ACCEPTCONN (ENOPROTOOPT, measured on 16 November 2026), so this asks none.
+            sock.listen(HubServer.request_queue_size)
+            return sock
+    except OSError:
+        pass
+    sock.close()
+    return None
+
+
+def hub_server(host, port, listener=None):
+    """main()'s server: on the socket that the code before this one gave (inherited_listener), else on a new bind of
+    host and port, as always."""
+    if listener is None:
+        return HubServer((host, port), Handler)
+    server = HubServer((host, port), Handler, bind_and_activate=False)
+    server.socket.close()
+    server.socket = listener
+    server.server_address = listener.getsockname()[:2]
+    server.server_name, server.server_port = host, server.server_address[1]
+    return server
+
+
+def children_now():
+    """The ids of this process's child processes, read from /proc (Linux), or from `ps` where there is no /proc (a hub
+    that runs by hand on a Mac); none when neither answers."""
+    me, kids = os.getpid(), []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        try:
+            ps = subprocess.Popen(["ps", "-A", "-o", "pid=,ppid="], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  stdin=subprocess.DEVNULL, text=True)
+        except OSError:
+            return kids
+        try:
+            listed = ps.communicate(timeout=10)[0]
+        except subprocess.SubprocessError:
+            ps.kill()
+            ps.wait()
+            return kids
+        pairs = [line.split() for line in listed.splitlines()]
+        return [int(p[0]) for p in pairs if len(p) == 2 and p[1] == str(me) and p[0].isdigit() and int(p[0]) != ps.pid]
+    for name in names:
+        if name.isdigit():
+            try:
+                with open(f"/proc/{name}/stat", "rb") as f:
+                    if int(f.read().rpartition(b")")[2].split()[1]) == me:     # the parent's id, after the name
+                        kids.append(int(name))
+            except (OSError, ValueError, IndexError):
+                continue
+    return kids
+
+
+def reap_children(environ=None):
+    """The child processes that the code before this one left running (CHILDREN). This process is still their parent,
+    and nothing of this code waits for them, so each would stay a zombie until the hub ends: a thread waits for
+    exactly those ids, and for no child of this code's own. The thread, or None when there are none."""
+    environ = os.environ if environ is None else environ
+    pids = {int(p) for p in environ.pop(CHILDREN, "").split(",") if p.isdigit()}
+    if not pids:
+        return None
+
+    def reap():
+        while pids:
+            for pid in list(pids):
+                try:
+                    if os.waitpid(pid, os.WNOHANG)[0]:
+                        pids.discard(pid)
+                except ChildProcessError:
+                    pids.discard(pid)       # no child of this process (any more): nothing to wait for
+            if pids:
+                time.sleep(REAP_EVERY)
+    thread = threading.Thread(target=reap, name="children-before", daemon=True)
+    thread.start()
+    return thread
+
+
+def exec_again(server):
+    """The new code in this process, started as this code was (sys.orig_argv), with the listening socket open and
+    named in LISTEN_FD, the moment of the exec in EXEC_AT, and the child processes named in CHILDREN. Every file that
+    the hub opened is closed by the exec (Python opens them so), and with it the records' lock (hub_lock), which the
+    new code takes again; the files that the process got at its start stay open (systemd's output, and a test's
+    --parent-pipe). Returns only when execve failed, by raising OSError."""
+    fd = server.socket.fileno()
+    os.set_inheritable(fd, True)
+    environ = dict(os.environ, **{LISTEN_FD: str(fd), EXEC_AT: repr(time.time())})
+    environ.pop(CHILDREN, None)
+    kids = children_now()
+    if kids:
+        environ[CHILDREN] = ",".join(str(pid) for pid in kids)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execve(sys.executable, list(sys.orig_argv), environ)
+
+
+def on_stop_signal(signum, frame):
+    """SIGTERM, systemd's stop of the service. A handler runs in the main thread between two steps of whatever that
+    thread does, which can hold a lock (Thread.start in process_request takes one), so it only sets three values and
+    takes no lock and starts no thread: STOPPING, a stop, and the flag that ends serve_forever within its half second
+    of polling, as server.shutdown() sets it without its wait. after_serving does the rest, and ends the process by
+    this signal."""
+    SERVING["exit"] = True
+    STOPPING.set()          # Event.set takes only the Event's own lock, which no step of the main thread holds
+    if SERVING["server"] is not None:
+        SERVING["server"]._BaseServer__shutdown_request = True
+
+
+def quiet_connections_end(fresh):
+    """The kept connections that wait for their next request end now (shutdown), and with `fresh` also the accepted
+    ones that have sent nothing yet: no request can then begin on a connection of this code, also not while the
+    stop waits for LOCK, where a request that took LOCK first could write and then lose its answer at the exec. Their
+    clients see the end of the connection and send their next request on a new one, which waits in the queue. A
+    request that arrives at the same moment is cut, as at any stop. The hub's port only: the connected apps' socket
+    takes no new request after the stop's start (after_serving), and its open ones are not waited for."""
+    with CALLS:
+        quiet = [h for h in CONNECTIONS if h.conn_state == "idle" or fresh and h.conn_state == "fresh"]
+        for h in quiet:
+            h.late = True       # Linux still reads what waits in the socket after a shutdown: parse_request refuses it
+    for h in quiet:
+        with contextlib.suppress(OSError):
+            h.connection.shutdown(socket.SHUT_RDWR)
+
+
+def after_serving(server):
+    """The end of the stop, after serve_forever. A stop of the service (SIGTERM) closes the listening socket at once:
+    the process ends, and a client that waited in its queue would only be reset after the drain, where it is refused
+    now and finds the next process, as before. Then the kept connections that wait end (quiet_connections_end), the
+    open requests end (calls_drained), the accepted connections that are still silent end, and this thread takes
+    LOCK, so that no write that holds it is cut halfway; each wait has its DRAIN_MOST seconds. Then the hub runs its
+    new code in this process (exec_again), unless a stop came meanwhile, or it ends by SIGTERM, as systemd's stop
+    ended it before. From the last check of a stop on, SIGTERM has its default action, so a stop at that moment ends
+    the process, or the new code's start before its handler is in place. An exec that fails ends the process, and
+    its service starts it again."""
+    with CHANGES:
+        CHANGES.notify_all()            # GET /ui/wait reads STOPPING when it wakes
+    capp = CONNECT["server"]            # once: another thread can set it to None (capp_close)
+    if capp is not None:                # the connected apps' socket takes no new request either; its own loop ends
+        capp._BaseServer__shutdown_request = True       # as shutdown() ends it, without its wait
+    if SERVING["exit"]:
+        server.socket.close()
+    quiet_connections_end(fresh=False)
+    if not calls_drained():
+        print(f"The hub stops with {CALLS_OPEN[0]} request(s) still open after {DRAIN_MOST} seconds.", flush=True)
+    if SERVING["exit"]:
+        server.socket.close()           # a stop that came during the drain of a restart in place
+    with CALLS:
+        CLOSING.set()                   # a connection whose thread comes to its Handler after this ends there
+    quiet_connections_end(fresh=True)
+    LOCK.acquire(timeout=DRAIN_MOST)
+    if SERVING["exit"]:
+        server.socket.close()           # a stop that came during the wait for LOCK
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    if SERVING["exec"] and not SERVING["exit"]:
+        try:
+            exec_again(server)
+        except OSError as e:
+            print(f"WARNING: the hub could not run its new code in its own process ({type(e).__name__}: {e}), so it "
+                  f"ends, and its service starts it again.", flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.kill(os.getpid(), signal.SIGTERM)
+    os._exit(128 + signal.SIGTERM)      # not reached where the signal ends the process, as it does
 
 
 TEAM_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "team.json")      # main()'s --team
@@ -50690,6 +50999,15 @@ class HubServer(ThreadingHTTPServer):
     dozen routes or more at once, and a connection that finds the backlog full is refused: the app reads that as a
     failed read and shows its reading as old ("Last reading") while the hub is well (29 October 2026)."""
     request_queue_size = 64
+    counts_connections = True       # a stop waits for a connection from its accept on (Handler.setup)
+
+    def process_request(self, request, client_address):
+        calls_begin(fresh=True)         # in the thread that accepted it, before its own thread starts
+        try:
+            super().process_request(request, client_address)
+        except BaseException:           # no thread started for it, so no Handler ends the count
+            calls_end(fresh=True)
+            raise
 
     def handle_error(self, request, client_address):
         """A client that ended its connection is no error of the hub's. do_GET and do_POST say so for an answer that
@@ -52578,8 +52896,87 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "FleetPilotHub/0.1"
 
+    # A connection's values before setup sets them, for a stand-in setup of a test that does not call this one
+    # (test_answer_write): not in CONNECTIONS, and conn_fresh None says "as the server counted it" (fresh_ends).
+    conn_fresh, in_call, conn_state, late = None, False, "idle", False
+
     def log_message(self, fmt, *args):
         pass
+
+    def setup(self):
+        """Each connection is in CONNECTIONS until it ends, with its state: `fresh` from the accept of the hub's own
+        server (HubServer.process_request counts it then) until its first request begins, so that one that came just
+        before a stop is answered whether or not its thread has read its request yet; `busy` while a request is read
+        and answered; `idle` while a kept connection waits for its next request, which a stop ends
+        (quiet_connections_end). Another server counts from the first line of a request (parse_request)."""
+        self.conn_fresh = bool(getattr(self.server, "counts_connections", False))
+        self.in_call, self.conn_state, self.late = False, "fresh" if self.conn_fresh else "idle", False
+        try:
+            super().setup()
+        except BaseException:           # socketserver calls finish() only after a setup that ended well
+            self.fresh_ends()
+            raise
+        with CALLS:
+            CONNECTIONS.add(self)
+            self.late = CLOSING.is_set()
+        if self.late:   # its thread came after the stop ended the silent ones (after_serving): no request begins now
+            with contextlib.suppress(OSError):
+                self.connection.shutdown(socket.SHUT_RDWR)
+
+    def fresh_ends(self):
+        fresh = self.conn_fresh
+        if fresh is None:               # setup did not run: HubServer.process_request counted it all the same
+            fresh = bool(getattr(getattr(self, "server", None), "counts_connections", False))
+        self.conn_fresh = False
+        if fresh:
+            calls_end(fresh=True)
+
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            with CALLS:
+                CONNECTIONS.discard(self)
+            self.fresh_ends()           # a connection that ended before its first request
+            if self.in_call:
+                self.in_call = False
+                calls_end()
+
+    def parse_request(self):
+        """A request is open from its first line on, until handle_one_request ends: a stop of the hub waits for it
+        (calls_drained). The wait of a kept connection for its next request is no request. A connection that the stop
+        ended (late) begins no request: Linux gives the bytes that came before its shutdown to the next read, and a
+        request that ran then could write and lose its answer at the exec (the reviewer's point of 16 November 2026).
+        It gets no answer, and its client sends the request again on a new connection."""
+        if self.late:
+            self.close_connection = True
+            return False
+        if not self.in_call:
+            calls_begin()               # before the fresh count ends, so that the two never read as none
+            self.in_call = True
+        self.conn_state = "busy"
+        self.fresh_ends()
+        return super().parse_request()
+
+    def handle_one_request(self):
+        """One request of a connection. While the hub stops (STOPPING), the connection ends after its answer, so that
+        the client's next request goes on a new connection, which the new code takes."""
+        try:
+            super().handle_one_request()
+        finally:
+            if self.in_call:
+                self.in_call = False
+                calls_end()
+            self.conn_state = "idle"
+            if STOPPING.is_set():
+                self.close_connection = True
+
+    def send_response(self, code, message=None):
+        """And while the hub stops, each answer says so: `Connection: close`, so that no client sends a next request
+        on a connection that ends (send_header of http.server then ends it after the answer)."""
+        super().send_response(code, message)
+        if STOPPING.is_set() and not self.close_connection:
+            self.send_header("Connection", "close")
 
     def send(self, code, body=b"", ctype="application/json", headers=None):
         if isinstance(body, str):
@@ -54330,7 +54727,8 @@ class Handler(BaseHTTPRequestHandler):
         with CHANGES:
             CHANGE_WAITS[0] += 1
             try:
-                news = CHANGES.wait_for(lambda: boot != CHANGE["boot"] or state != str(CHANGE["state"]), timeout=wait)
+                news = CHANGES.wait_for(lambda: boot != CHANGE["boot"] or state != str(CHANGE["state"])
+                                        or STOPPING.is_set(), timeout=wait)     # a stop answers now (stop_serving)
             finally:
                 CHANGE_WAITS[0] -= 1
         if news and wait:
@@ -56376,7 +56774,7 @@ class Handler(BaseHTTPRequestHandler):
         while True:
             with LOCK:
                 items = chat_give(now(), files=files)
-            if items or now() >= deadline:
+            if items or now() >= deadline or STOPPING.is_set():      # a stop answers now (stop_serving)
                 break
             time.sleep(0.5)
         return self.json(200, {"db": kv_get("db_id"), "version": chat_version(), "items": items},
@@ -57852,7 +58250,7 @@ class Handler(BaseHTTPRequestHandler):
                 # whether its session has its tools. A change ends the wait, so the chat starts as soon as it may.
                 chat = {"warm": chat_wanted(agent, limited or pending or holding or shared),
                         "ready": chat_session_ready(agent), "tools": chat_contract} if worker else None
-                if rows or now() >= deadline or told not in (None, chat):
+                if rows or now() >= deadline or told not in (None, chat) or STOPPING.is_set():
                     break
                 told = chat
                 time.sleep(0.5)
@@ -57909,7 +58307,7 @@ class Handler(BaseHTTPRequestHandler):
             deadline = now() + wait
             while True:
                 rows = q("SELECT * FROM events WHERE agent=? AND id>? ORDER BY id", (agent, after))
-                if rows or now() >= deadline:
+                if rows or now() >= deadline or STOPPING.is_set():      # a stop answers now (stop_serving)
                     break
                 time.sleep(0.5)
             last = rows[-1]["id"] if rows else after
@@ -58787,6 +59185,9 @@ class Handler(BaseHTTPRequestHandler):
             # removal leaves a credential without it, and it can stop no start
             first_session(agent, t0)
             with transaction():
+                if kind == "chat" and DB.execute("SELECT 1 FROM session_credentials WHERE agent=? AND kind='chat' AND "
+                                                 "revoked IS NULL AND ready IS NULL LIMIT 1", (agent,)).fetchone():
+                    chat_without_tools()        # the chat that this one replaces never had its tools
                 DB.execute("UPDATE session_credentials SET revoked=? WHERE agent=? AND kind=? AND revoked IS NULL AND "
                            "(? IS NULL OR (task=? AND attempt=?))", (t0, agent, kind, task, task, attempt))
                 DB.execute("INSERT INTO session_credentials(sha256,agent,kind,generation,task,attempt,created) "
@@ -59908,7 +60309,7 @@ class Handler(BaseHTTPRequestHandler):
                      task=tid or None)
         deadline = now() + (HOOK_POLL if poll else CFG["hook_wait"])
         while now() < deadline:
-            if q1("SELECT decision FROM prompts WHERE id=?", (pid,))["decision"]:
+            if q1("SELECT decision FROM prompts WHERE id=?", (pid,))["decision"] or poll and STOPPING.is_set():
                 break
             time.sleep(0.5)
         with LOCK:      # decide and expire under one lock, so a late decision is refused, never lost
@@ -60184,7 +60585,7 @@ def stop_with_parent(fd):
 
 def main():
     global DB
-    for name in compiled_checked(process_started()):    # first: the next start reads what this one compiled and kept
+    for name in compiled_checked(code_started()):   # first: the next start reads what this one compiled and kept
         print(f"WARNING: The hub could not read back the compiled file __pycache__/{name} and removed it. The "
               f"next start compiles it again.", file=sys.stderr, flush=True)
     # Before the parser, because an update run calls this on the *released* code and must get the same two words
@@ -60235,6 +60636,8 @@ def main():
     CFG["team_problem"] = team_problem(TEAM)
     host, port = hub_address()
     host, port = args.host or host or "127.0.0.1", args.port or port
+    listener = inherited_listener(host, port)   # the open port, from the code before this one (restart_in_place)
+    reap_children()                             # and the child processes that it left
     db_path = os.path.expanduser(args.db)
     CFG["db_path"] = db_path
     if os.path.dirname(db_path):
@@ -60324,7 +60727,7 @@ def main():
     threading.Thread(target=history_indexer, name="history-index", daemon=True).start()
     TAILNET_NAMES["names"] = tailnet_names()        # devops task 1.1: the names that a client may call this hub by
     capp_sync_later()           # the connected apps' socket, with guard 6(b) (nothing runs while it cannot be on)
-    server = HubServer((host, port), Handler)
+    server = hub_server(host, port, listener)
     server.daemon_threads = True
     print(f"Founderizer hub on http://{host}:{port}  board: http://{host}:{port}/board")
     print(f"It answers the Host values: {', '.join(sorted(allowed_hosts(server.server_address)))}.", flush=True)
@@ -60359,10 +60762,14 @@ def main():
                  if address_checked() else "Calls under those names are accepted from anywhere.")
               + " Run: python3 fleet.py addresses ...", flush=True)
     memory_given_back()         # what the compile of this file and the start's own steps no longer use
+    SERVING["server"] = server
+    signal.signal(signal.SIGTERM, on_stop_signal)       # a stop of the service ends the open requests first
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped")
+        return
+    after_serving(server)       # the new code in this process, or the end of it (stop_serving)
 
 
 if __name__ == "__main__":

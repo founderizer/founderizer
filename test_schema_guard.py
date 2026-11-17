@@ -1255,7 +1255,7 @@ class UnitFollowsCode(unittest.TestCase):
         check = source[source.index("[START_CHECK]"):source.index("diagnostics.code_id()")]
         self.assertIn("print(os.path.realpath(__file__))", check)
         self.assertIn("return 0", check)
-        self.assertLess(source.index("compiled_checked(process_started())"), source.index("[START_CHECK]"))
+        self.assertLess(source.index("compiled_checked(code_started())"), source.index("[START_CHECK]"))
 
     def test_the_hub_does_it_first_at_its_start_and_only_as_its_service_starts_it(self):
         """In main(): after the options are read (a hub with --restore or --check-schema is no service start) and
@@ -1375,7 +1375,7 @@ class Compiled(unittest.TestCase):
         goes to the error output, which neither the schema check nor the proof of a start line reads as an
         answer."""
         source = inspect.getsource(hub.main)
-        first = source.index("for name in compiled_checked(process_started()):")
+        first = source.index("for name in compiled_checked(code_started()):")
         for later in ('sys.argv[1] == "--check-schema"', "[START_CHECK]", "argparse.ArgumentParser", "hub_lock("):
             self.assertLess(first, source.index(later), later)
         self.assertEqual(source.count("compiled_checked("), 1)

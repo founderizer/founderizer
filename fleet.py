@@ -5650,12 +5650,21 @@ class Helper:
                 return False
         return True
 
-    def chat_proof(self, events):
+    def chat_proof(self, events, chat=None):
         """**A message to the owner chat is delivered when its session read it, and one count stands on that proof.**
         One round of the helper's loop, before the chat is kept and the poll's events are handled: events is that
         poll's list, in which the hub says of each chat message whether its session read it ("read"). A hub from
         before that says nothing, and nothing is counted: a message that was read and waits for its reply would
         count as unread there.
+
+        **A chat that cannot read counts on the same count** (16 November 2026): `chat` is the poll's word on the
+        chat (keep_chat), and while it says that the chat should run and that its session has not listed its tools
+        (chat_blind), the polls count as for an unread message. Such a session can never read one, and the owner
+        cannot send one, because his app shows "Setting up" in place of a chat that has no tools. On that day a
+        chat's ask for its tools met the hub's restart, Claude Code never asked again, and the chat stood 6.4 hours
+        so. A message that comes meanwhile goes on with the count, which is then the message's own; a session that
+        lists its tools ends the count while no message waits unread. A count with no message repairs only a chat
+        window that runs: with none, keep_chat starts one, under its own guard.
 
         The count is the polls at which the oldest unread chat message is still unread. It asks for no cause and
         reads no screen, so a turn that runs counts too: an owner chat answers or opens a task, and a turn that
@@ -5686,13 +5695,16 @@ class Helper:
         its task), as when a session ends in a turn for any other reason. The count is this helper's memory: a new
         helper starts it again, and types the line again."""
         unread = sorted(ev["id"] for ev in events if ev.get("kind") == "chat" and ev.get("read") is False)
-        if not unread:
+        first = unread[0] if unread else None
+        if first is None and not self.chat_blind(chat):
             self.chat_wait = {}
             return
         wait = self.chat_wait
-        if wait.get("id") != unread[0]:     # the one before it was read: this one has its own count
-            wait = self.chat_wait = {"id": unread[0], "polls": 0, "stage": 0, "newest": 0}
-        if unread[-1] > wait["newest"]:
+        if not wait or wait["id"] not in (None, first):     # the one before it was read: this one has its own count
+            wait = self.chat_wait = {"id": first, "polls": 0, "stage": 0, "newest": 0}
+        elif first is not None:
+            wait["id"] = first          # a message to a chat with no tools: the count goes on
+        if unread and unread[-1] > wait["newest"]:
             self.lines.pop("owner-chat", None)      # a new message: the session that stands there is told of it
             wait["newest"], wait["stage"] = unread[-1], min(wait["stage"], 1)
         wait["polls"] += 1
@@ -5700,14 +5712,29 @@ class Helper:
             return
         named = self.windows_named()
         same = [wid for wid, _ in (named or {}).get("owner-chat", [])]
+        if named is not None and not same and wait["id"] is None:
+            # No chat runs that has no tools: keep_chat starts one, and its own guard counts starts that keep ending
+            # (start_chat). The count begins again, and resets no guard, so a chat that cannot start is not started
+            # at each stage of the doubling.
+            wait["polls"] = 0
+            return
         if named is None or not all([tmux("kill-window", "-t", wid).returncode == 0 for wid in same]):
             return                      # tmux carried out no repair: the next poll tries again
         self.chat_fresh, self.chat_started = True, None     # a new conversation, and no start that ended
-        self.say(f"owner-chat: M-{unread[0]} is unread after {wait['polls']} polls" +
+        self.say(f"owner-chat: " + (f"M-{wait['id']} is unread" if wait["id"] is not None else
+                                    "its session has listed no tools") + f" after {wait['polls']} polls" +
                  (f", {wait['stage']} repair(s) after its first" if wait["stage"] else "") +
                  f"; the helper closed {', '.join(same) or 'no window (none is listed)'}, and the chat starts a new "
                  f"conversation with the hub's recap")
         wait["stage"], wait["polls"] = wait["stage"] + 1, 0
+
+    def chat_blind(self, chat):
+        """True when the poll says that this agent's owner chat should run now and that its newest session has not
+        listed its tools (keep_chat: `warm` and `ready`), for an agent with a key, whose chat starts with a session
+        credential: the hub records a listing only for one (hub.chat_listed), so the chat of an agent without a key
+        is never ready, and is no chat with no tools. A hub that says neither, or anything else, says nothing."""
+        return bool(self.worker and isinstance(chat, dict) and chat.get("warm") is True
+                    and chat.get("ready") is False and load_agent_key(self.agent))
 
     def handle_events(self, events):
         """The pending events of one poll. An event that fails stays pending, and the next poll tries it again: some
@@ -8701,7 +8728,7 @@ def cmd_run(args):
             h.conversation_modes = data.get("conversation_modes") \
                 if isinstance(data.get("conversation_modes"), dict) else None
             h.close_revoked(data.get("revoked"), names)    # owner API 1.12: a key change revoked their credential
-            h.chat_proof(data.get("events", []))    # the one count on a chat message's proof, its read
+            h.chat_proof(data.get("events", []), data.get("chat"))  # the one count on the proof: a read, its tools
             h.keep_chat(data.get("chat"), data.get("db"))
             h.open_tasks = data.get("open_tasks") if isinstance(data.get("open_tasks"), list) else None
             h.poll_db = data.get("db")

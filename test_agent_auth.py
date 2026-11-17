@@ -240,6 +240,32 @@ class Routes(OwnerAPI):
                                    source=SOLO)[0], 409)          # an agent without a key gets none
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM session_credentials")["n"], 1)
 
+    def test_a_chat_whose_session_never_listed_its_tools_counts_as_a_fault_when_a_new_chat_replaces_it(self):
+        """16 November 2026: an owner chat's ask for its tools met the hub's restart, and the chat stood 6.4 hours
+        with none. Its helper now starts a new chat for such a session (fleet.Helper.chat_proof), and the hub counts
+        each one in its own record of faults (hub.chat_without_tools), with no words: Report a problem and the
+        System status show it. A chat that listed its tools is replaced with no count."""
+        import diagnostics
+        self.register("alpha")
+        diagnostics.pending()                               # what other tests of this process counted
+        first = self.credential("alpha", BOX, kind="chat")[1]["token"]
+        self.assertEqual(diagnostics.pending(), [])         # the first chat replaces none
+        second = self.credential("alpha", BOX, kind="chat")[1]["token"]
+        faults = diagnostics.pending()
+        self.assertEqual([(f["kind"], f["program"], f["name"], f["count"]) for f in faults],
+                         [("fault", "hub", "ConnectionError", 1)])
+        raised = inspect.getsourcelines(hub.chat_without_tools)
+        line = raised[1] + next(i for i, text in enumerate(raised[0]) if text.strip().startswith("raise "))
+        self.assertEqual(faults[0]["frames"], [["hub.py", line]])
+        code, answer = self.mcp("/mcp/alpha/test-generation/owner-chat/1", BOX, token=second)
+        self.assertEqual(code, 200, answer)                 # the second chat listed its tools
+        self.credential("alpha", BOX, kind="chat")
+        self.assertEqual(diagnostics.pending(), [])
+        self.credential("alpha", BOX, kind="task", task=f"T-{self.task('alpha')}", attempt=1)
+        self.credential("alpha", BOX, kind="task", task=f"T-{self.task('alpha')}", attempt=1)
+        self.assertEqual(diagnostics.pending(), [])         # a task's session has no such record
+        self.assertNotEqual(first, second)
+
     def test_a_key_change_revokes_every_credential_and_never_restores_the_address_rule(self):
         self.register("alpha", "beta")
         t = self.task("alpha")

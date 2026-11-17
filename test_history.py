@@ -847,7 +847,7 @@ class Keeping(Base):
         self.assertNotIn("history_held", [r["name"] for r in hub.q("SELECT name FROM sqlite_temp_master")])
         start = inspect.getsource(hub.main)         # the start runs it after the schema, before the hub answers
         self.assertLess(start.index("build_schema()"), start.index("settle_history_index()"))
-        self.assertLess(start.index("settle_history_index()"), start.index("HubServer("))
+        self.assertLess(start.index("settle_history_index()"), start.index("hub_server("))
         self.assertLess(start.index("settle_history_index()"), start.index("target=history_indexer"))
 
     def test_a_damaged_index_still_answers_and_diagnostics_counts_it(self):

@@ -789,6 +789,21 @@ class PromptPolls(Tools, Runtime):
         self.assertEqual(tuple(hub.q1("SELECT state, waiting_on FROM tasks WHERE id=?", (tid,))), ("working", None))
         self.assertEqual(sum("expired" in t for t in self.said("studio") + self.said("manager")), 0)
 
+    def test_a_stop_of_the_hub_answers_the_hooks_ask_pending_at_once_and_ends_no_prompt(self):
+        """The owner's "Yes, build both" of 16 November 2026: a restart of the hub in its own process waits for the
+        open requests, so a hook's ask answers `pending` as soon as the hub stops (hub.STOPPING), as at the end of
+        its wait: the hook asks again, the new code answers, and the prompt waits for its decision as before."""
+        tid = self.task()
+        self.addCleanup(hub.STOPPING.clear)
+        with patch.object(hub, "HOOK_POLL", 30):
+            hub.STOPPING.set()
+            began = time.monotonic()
+            self.assertEqual(self.ask(tid), {"pending": True, "prompt": "P-1"})
+            self.assertLess(time.monotonic() - began, 4)
+        self.assertIsNone(hub.q1("SELECT decision FROM prompts WHERE id=1")["decision"])
+        self.assertEqual(tuple(hub.q1("SELECT state, waiting_on FROM tasks WHERE id=?", (tid,))),
+                         ("input-required", "P-1"))
+
     def test_a_hold_a_new_attempt_and_the_end_of_the_task_each_end_a_waiting_prompt(self):
         tid = self.task()
         self.ask(tid)

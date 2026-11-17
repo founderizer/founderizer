@@ -123,7 +123,7 @@ class SealAtStart(unittest.TestCase):
         seal = next(i for i, line in enumerate(lines) if "google_start()" in line)
         self.assertEqual(lines[seal], "try:\n    google_start()\nexcept Exception:\n    print_fault()")
         first_thread = next(i for i, line in enumerate(lines) if line.startswith("threading.Thread(target=timers"))
-        server = next(i for i, line in enumerate(lines) if "HubServer(" in line)
+        server = next(i for i, line in enumerate(lines) if "hub_server(" in line)
         self.assertLess(seal, first_thread)
         self.assertLess(seal, server)
 
