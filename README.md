@@ -1,10 +1,24 @@
+<div align="center">
+
+<a href="https://founderizer.com"><img src="https://raw.githubusercontent.com/founderizer/founderizer-apps/main/founderizer-mark.svg" alt="" width="64" height="64"></a>
+
 # Founderizer
+
+**Your own team of AI agents, on servers you own.**
+
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![Python 3.10 or later](https://img.shields.io/badge/python-3.10%2B-blue)](HUB-INSTALL.md)
+[![The last release](https://img.shields.io/github/last-commit/founderizer/founderizer/main?label=last%20release&color=blue)](https://github.com/founderizer/founderizer/commits/main)
+
+[Website](https://founderizer.com) · [Download&nbsp;for&nbsp;Mac&nbsp;and&nbsp;iPhone](https://founderizer.com/download) · [Install&nbsp;a&nbsp;hub](HUB-INSTALL.md) · [Source&nbsp;of&nbsp;the&nbsp;apps](https://github.com/founderizer/founderizer-apps)
+
+<a href="https://founderizer.com"><img src="https://raw.githubusercontent.com/founderizer/founderizer-apps/main/.github/founderizer-mac-iphone.webp" alt="Founderizer on a Mac and an iPhone, with an example team of four agents: the Tasks board on the Mac, the chats on the iPhone" width="860"></a>
+
+</div>
 
 The code a Founderizer fleet runs: the hub, the helper of each machine, the installers and the rules every agent
 reads. This repository is what a customer's hub carries as the git remote `upstream` and fetches a release from, so
 everything here is public and everything here is in the clone of every machine of every fleet.
-
-The apps for Mac and iPhone have their own repository: <https://github.com/founderizer/founderizer-apps>.
 
 | File | What it is |
 | --- | --- |
@@ -40,14 +54,7 @@ License (FSL-1.1-ALv2) or with no license file.
 them (section 6). You can say that your work is based on Founderizer. A changed copy that you share uses a different
 name and a different logo.
 
-**Changes from outside.** Issues and pull requests are welcome. This repository is a copy that we publish from our
-own repository, so we do not merge a pull request here. We apply its change to our repository, run our whole test
-suite on it, and the next release carries it. Then we close the pull request with a link to that release. The release
-commit names you as co-author, so GitHub lists you as a contributor. Under section 5 of the license, what you send is
-under the Apache License 2.0.
+**Changes from outside.** Issues and pull requests are welcome. [CONTRIBUTING.md](.github/CONTRIBUTING.md) says how a
+change gets in, and how to test it before you send it.
 
-Before you send a change, run `python3 selftest.py` and the tests of the files that you changed, one file at a time,
-from the folder of this repository: for example `python3 -m unittest test_servers`. The tests of a file are the
-`test_*.py` files that import it. Use `unittest` and not `pytest`: each test file keeps only its own checks. A test
-makes its own hubs, folders and git repositories in a temporary folder and removes them at its end. All of them, one
-file after the other, take about an hour on a Mac: `for f in test_*.py; do python3 -m unittest "${f%.py}"; done`.
+**Credit.** Created by Miguel Pieras, <https://x.com/mpieras>. Copyright 2026 Amura Ventures SL.
