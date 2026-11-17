@@ -275,7 +275,10 @@ NOT_TOOLS = {
     "/ui/secrets/import": "the values of an import's logins, as /ui/secrets/add",
     "/ui/secrets/fingerprints": "the owner's own secret catalog",
     "/ui/needs/{}/secret": "a secret request's answer with a login, which the app's secure form gives once the value "
-                           "is in a vault; its decline carries no value, and decline_secret_request sends that",
+                           "is in a vault, and for a secret that the fleet's list has, the app's program on the "
+                           "owner's Mac has answer_secret_request (~/.founderizer/cli write answer_secret_request): "
+                           "the app then signs the gives of the call and answers; its decline carries no value, and "
+                           "decline_secret_request sends that",
     "/ui/vault/intake": "a value sealed to the central vault, which only the owner's own app or vault makes; for a new "
                         "login or API key the app's program has save_secret, and the app then makes that sealed "
                         "copy and sends it",

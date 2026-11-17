@@ -3806,6 +3806,20 @@ class SignedGrantWords(unittest.TestCase):
             self.assertEqual(owner_mcp.NOT_TOOLS[route],
                              "a statement signed with the owner's own key, which only their app on their Mac holds")
 
+    def test_the_route_of_a_secret_requests_answer_names_answer_secret_request(self):
+        """The answer of a secret request with a login is no tool of this server: the app's form gives it, and since
+        16 November 2026 `answer_secret_request` of the app's program, which makes the app sign the gives first. The
+        decline stays this server's own tool."""
+        self.assertEqual(owner_mcp.NOT_TOOLS["/ui/needs/{}/secret"],
+                         "a secret request's answer with a login, which the app's secure form gives once the value "
+                         "is in a vault, and for a secret that the fleet's list has, the app's program on the "
+                         "owner's Mac has answer_secret_request (~/.founderizer/cli write answer_secret_request): "
+                         "the app then signs the gives of the call and answers; its decline carries no value, and "
+                         "decline_secret_request sends that")
+        names = [t["name"] for t in owner_mcp.tools()]
+        self.assertNotIn("answer_secret_request", names)
+        self.assertIn("decline_secret_request", names)
+
     def test_the_words_of_the_pool_do_not_name_grant_secret(self):
         self.assertNotIn("grant_secret", owner_mcp.SHARE_NOT_SIGNED)
         self.assertNotIn("grant_secret", self.words("share_resource"))

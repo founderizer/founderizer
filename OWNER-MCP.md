@@ -147,8 +147,9 @@ Since 14 November 2026 `call` also takes the setup tools `setup_state` and `setu
 name (below, "The link to the running app"), and the read `setup_diagnosis` on the same link.
 `write` takes each other tool that the
 program has: the nine below, the 54 of the table, and `save_bot_token`, `prepare_problem_report`,
-`save_secret`, `grant_secret` and `share_secret` on the link. A read through `write` is refused, and
-a write through `call` is refused, each with words that name the right verb; a tool that the program does
+`save_secret`, `grant_secret`, `share_secret` and `answer_secret_request` on the link. A read
+through `write` is refused, and a write through `call` is refused, each with words that name the
+right verb; a tool that the program does
 not have gets the words of the MCP form. The JSON is one word of the shell, an object of the tool's
 fields; none means `{}`.
 
@@ -194,9 +195,10 @@ file can name a `swift` tool that an older program does not have: that program r
 own pages do that work and its own setting says which hub it reads: `install_hub`, `install_log`,
 `claim_hub`, `add_machine`, `use_hub` and `which_hub`. Three more are the program's own and are not
 in the table or in this server: `setup_state`, `setup_show` and `setup_diagnosis`, on the link to
-the running app (below). Five more, `save_bot_token`, `prepare_problem_report`, `save_secret`,
-`grant_secret` and `share_secret`, write on the same link (below). So `tools/list` gives 75 tools: the
-54 of the table, the thirteen, the three reads of the link and its five writes.
+the running app (below). Six more, `save_bot_token`, `prepare_problem_report`, `save_secret`,
+`grant_secret`, `share_secret` and `answer_secret_request`, write on the same link (below). So
+`tools/list` gives 76 tools: the 54 of the table, the thirteen, the three reads of the link and its
+six writes.
 
 **The link to the running app.** Some work only the running app can do: its first run, its pages,
 and in later slices its keys and its engine. So the program asks the app on a local socket, the
@@ -906,6 +908,70 @@ owner nothing ("No touch"), has no value part, and shows nothing on the app's sc
   a fleet with no central vault, which `share_resource` sets.
 
 No command lock: the app does the writes, as its page does. What any process of the owner's user
+can do with the tool, its traces and its limits: OWNER-MCP-BOUNDARY.md section 7b.
+
+**`answer_secret_request`** (a write, so `founderizer-cli write` and the MCP form take it, and
+`call` does not; the owner, 16 November 2026, to "Should I build the signed answer to an agent's
+secret request next?": "Yes, build it"): the answer to one request of an agent for a secret, with a
+secret that the fleet's list has already, as "Answer with it" does in the app's form of that request
+on Needs you. The app gives the secret to each agent of the call with the owner's signed grant, as
+`grant_secret` gives it (the signed `grant` for the agent's server, then the hub's grant), and then
+the hub answers the request (`POST /ui/needs/<need>/secret` with the reference): the agent that
+asked gets the hub's own words, which name the secret, its reference and who holds it, and never a
+value. The gives come first, so that the hub's answer names the agents that hold the secret, and a
+task that waits on the request goes on with it when the agent that asked holds the secret then. It
+asks the owner nothing, moves no value, and reads no file and not the standard input: a new value
+goes into the vault first with `save_secret`.
+
+- **The fields**, all three required: `need`, the id of the Needs-you item as `fleet_overview`
+  gives it under `needs_you`, a JSON integer from 1 to 2147483647; `login`, the secret's reference
+  (`bws://` and a UUID in lower case); `give`, an object of at most 12 agents (the hub's bound of a
+  request's proposal), each agent's name with `use` or `read`, where `{}` answers and gives the
+  secret to no agent. The agent that asked gets the secret only when `give` names it or when it
+  holds the secret already; the answer closes the request either way. No refusal of the fields
+  quotes anything of the request.
+- **What the app checks, in this order, before it sends anything:** a current reading of a hub that
+  serves Secrets; only for a call with a give, that the hub lists `signed_grants`; one read of the
+  hub's state for the request, one of the fleet's list, and only for a call with a give one of the
+  vault's page. Then the request: it is of the database that the app reads, it is there, it asks
+  for a secret, it has no answer, and it is not for the door (its `secret` has `door`, or its
+  proposal `give` names the door: the app's form then gives the door the secret with a signed grant
+  of its own, which this tool does not sign, so the owner answers such a request in the app). Then
+  the secret: the list has it, and it fits the request as in the form's own list (the same kind; an
+  API key of the request's variable name; a login whose title starts with the request's host). Then,
+  only for a call with a give, what `grant_secret` checks for a give: the fleet's id, the central
+  vault's reading, the owner key of this Mac, and for each agent, in the byte order of the names,
+  that it is a worker or a lead with a server, `read` only for an API key, and no second key of one
+  variable name read by that agent. A refusal about one agent names that agent, whose name passed
+  the form of an agent's name; nothing else of the request is quoted.
+- **One line of writes with `grant_secret`.** Both tools write grants, and two calls whose grant
+  writes cross can end with a grant in the list whose signature the other call ended. So one call
+  of either tool writes at a time, and a call that comes meanwhile is refused with one sentence
+  that names both tools. A call whose caller went away before its first write sends nothing; from
+  its first write on it goes to its end without its caller.
+- **A give that fails stops the call.** The gives go in the byte order of the agents' names. The
+  first one that does not end in a grant stops the call: no later give goes, and this call does
+  not answer the request. The refusal names the agent, the agents that got the secret before it,
+  and that this call did not answer the request (the owner, an agent or the hub can have closed it
+  meanwhile), with the meaning of `grant_secret`'s own sentence for that failure. The same call
+  again is safe: a give that went is given again with no change.
+- **The answer's own outcomes.** Taken: the result has `need`, `login`, `answered` true, `given`
+  (for each agent `agent`, `level`, `server`, `changed`, `vault` when the hub says it, and `note`)
+  and `note`; no free text of the hub is in it. Refused because the request has an answer already
+  (the hub's code `request_answered`): the app reads the request one time more and says which it is:
+  this secret, from an answer before this one; or a close that came first: the owner's decline or
+  another secret, or a close by an agent or the hub. The gives of the call stand then, and **the
+  tool takes none back**: the request was closed first, so the words send the caller to the owner,
+  who says whether those agents keep the secret (`grant_secret` with `level` null takes it back
+  from one). Every other certain refusal (one is for a request that is gone): this call did not
+  answer the request, with the hub's words after the tool's sentence, the gives that stand, and the
+  same ask of the owner. Not known: the same call again, which says that the request has its answer
+  with this secret, and sends nothing, when the answer went.
+- **What it does not do:** a new value (`save_secret` first), a replace of a value, a decline
+  (`decline_secret_request`), a request for the door, a take-back, and a give on a fleet with no
+  central vault, where `grant_access` gives the secret and this tool then answers with `give` `{}`.
+
+No command lock: the app does the writes, as its form does. What any process of the owner's user
 can do with the tool, its traces and its limits: OWNER-MCP-BOUNDARY.md section 7b.
 
 **`prepare_problem_report`** (a write, so `founderizer-cli write` and the MCP form take it, and `call`
