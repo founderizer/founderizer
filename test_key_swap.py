@@ -50,7 +50,7 @@ OPENSSL = shutil.which("openssl") or "/usr/bin/openssl"
 
 def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
-    for case in (Reading, Rule, Proxy, Start, Configure, Installer, Helper):
+    for case in (Reading, Rule, Proxy, Start, Configure, Installer, Helper, HubSilence):
         suite.addTests(loader.loadTestsFromTestCase(case))
     suite.addTests(Configuration(name) for name in Configuration.__dict__ if name.startswith("test_"))
     suite.addTests(BrokerPart(name) for name in BrokerPart.__dict__ if name.startswith("test_"))
@@ -1346,7 +1346,9 @@ class Start(unittest.TestCase):
 
         def high():
             low = real()
-            ends = tuple(fcntl.fcntl(fd, fcntl.F_DUPFD, 1100) for fd in low)
+            # not inherited, as os.pipe's own ends: Popen takes this pipe too for the word of its exec, and a copy of
+            # that end in the child held the parent for the child's 30 seconds (17 November 2026)
+            ends = tuple(fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 1100) for fd in low)
             for fd in low:
                 os.close(fd)
             return ends

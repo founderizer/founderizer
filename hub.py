@@ -5787,6 +5787,11 @@ def live_reason(t, state):
         return "limit", f"{owner}'s usage limit"
     if os_user_held(owner):             # one OS user for each agent: the hub holds it, and it waits
         return "os_user", os_user_held_words(owner)
+    if sign_in_waits(t):
+        # It waits for its agent's sign-in, or for the machine's word after a turn that its provider refused for want
+        # of it (the record asked for that word: status_now), or for its fresh start after it (liveness). Not a
+        # decision: turn_end_check leaves the turn undecided, and decides it again once this is over.
+        return "sign_in", f"{owner}'s sign-in"
     found = q1("SELECT id FROM reminders WHERE task=? AND done=0 ORDER BY id", (tid,))
     if found:
         return "reminder", f"R-{found['id']}"
@@ -5837,8 +5842,13 @@ def turn_end_check(t, state, t0, force=False):
     key = f"{attempt}:{state['turns']}"
     if not force and kv_get(f"turn_checked:{tid}") == key:
         return None
-    kv_set(f"turn_checked:{tid}", key)
     reason = live_reason(t, state)
+    if reason and reason[0] == "sign_in":
+        # A wait for the agent's sign-in decides nothing yet: the turn stays undecided, and the tick decides it again
+        # (turn_end_sweep) when the wait is over. A decision now would leave a turn that ended with nothing waiting
+        # without its "nothing is waiting" for ever, after a sign-in as before it. Nothing is written meanwhile.
+        return "sign_in"
+    kv_set(f"turn_checked:{tid}", key)
     stretch = json.loads(kv_get(f"turn_empty:{tid}") or "null")
     if stretch and stretch.get("attempt") != attempt:
         stretch = None
@@ -6055,6 +6065,8 @@ def fresh_refusal(t, attempt):
         return f"{t['owner']} is at a usage limit"
     if os_user_held(t["owner"]):
         return f"{t['owner']} {os_user_hold_reason(t['owner'])}, so the hub holds it"
+    if waits_for_sign_in(t):
+        return f"{t['owner']} is not signed in"
     if q1("SELECT 1 FROM prompts WHERE task=? AND decision IS NULL LIMIT 1", (t["id"],)):
         return "a permission prompt of its session waits for a decision"
     if open_job(t["id"]):
@@ -8684,6 +8696,9 @@ def t_create_task(agent, a):
     if os_user_held(owner):             # one OS user for each agent
         late += (f" Note: {owner} {os_user_hold_reason(owner)}, so the hub holds its work; the task "
                  f"waits until it runs in a user account of its own.")
+    if runtime_signed_out(owner) and own_runtime_task(agents()[owner], f["needs"]):
+        late += (f" Note: {owner} is not signed in to {runtime_label(agents()[owner].get('runtime'))}, so no session "
+                 f"of it can work; the task waits until the owner signs it in.")
     lim = active_limit(owner)
     if lim:
         source = limit_source(lim)      # account_limits: an allowance another agent spent is not this one's limit
@@ -9529,9 +9544,12 @@ def capacity_view(names=None, expertise=None, needs=None, login=None):
                   if t0 - seen > CFG.get("offline_after", 90) else
                   # This route's own runtime said that it is signed out, or it named another account than its kept
                   # reading. Another route's fresh reading of that account is the account's allowance, not this
-                  # route's: the route cannot work now, or its own allowance is not known yet.
+                  # route's: the route cannot work now, or its own allowance is not known yet. The machine's own
+                  # reading says it too, and sooner: a usage reading that fails keeps its last words, and an agent
+                  # signed out after a move read "available" for seven hours (16 November 2026).
                   availability("unknown", f"The {runtime} runtime of this route is signed out: {SIGN_IN_REQUIRED}")
-                  if own.get("error") == SIGN_IN_REQUIRED else
+                  if own.get("error") == SIGN_IN_REQUIRED or group is not None and
+                  not group.startswith(ACCOUNT_GROUP) and signed_in_now(name, runtime) is False else
                   availability("unknown", f"The account of this route's {runtime} runtime changed; its own allowance is "
                                           f"not known yet.")
                   if own.get("error") == IDENTITY_CHANGED else
@@ -31032,7 +31050,7 @@ def lead_unread_sweep(t0):
         key = f"stuck:{t['id']}:{told}"
         if not told or t["requester"] in (None, mgr) or kv_get(f"lead_unread:{key}") or \
                 active_hold(t["id"]) or active_limit(t["owner"]) or os_user_held(t["owner"]) or parked(t["id"]) or \
-                not (not_acting(t["requester"], int(told)) or lead_left(t["requester"], t)):
+                waits_for_sign_in(t) or not (not_acting(t["requester"], int(told)) or lead_left(t["requester"], t)):
             continue
         lines.append(f"{tref(t['id'])} ({clip(t['title'], 60)}, owner {t['owner']}): {t['requester']} was told that "
                      f"it is stuck")
@@ -31065,15 +31083,16 @@ def tasks_stuck(t0):
     owner is told only what the manager (or a lead) already had in front of it and did not settle: a lead's goes to
     the manager first (lead_unread_sweep), and shows here only when the manager left it unread too.
 
-    **Deliberate quiet is not stuckness**: a held task, a task whose agent is at its usage limit and a parked task are
-    left out whole."""
+    **Deliberate quiet is not stuckness**: a held task, a task whose agent is at its usage limit or waits for its
+    sign-in and a parked task are left out whole."""
     out = []
     for t in q(f"SELECT * FROM tasks WHERE {OPEN_TASK} ORDER BY id"):
         if active_hold(t["id"]) or active_limit(t["owner"]) or os_user_held(t["owner"]) or parked(t["id"]):
             continue
         told = kv_get(f"stuck_notice:{t['id']}")
-        if not told or not (not_acting(t["requester"], int(told)) or (t["requester"] not in (None, manager_name())
-                                                                     and lead_left(t["requester"], t))) or \
+        if not told or waits_for_sign_in(t) or \
+                not (not_acting(t["requester"], int(told)) or (t["requester"] not in (None, manager_name())
+                                                              and lead_left(t["requester"], t))) or \
                 not up_unread(t["requester"], f"stuck:{t['id']}:{told}"):        # a lead's: the manager's first
             continue
         if not t["live_path"] and t["stalled_since"]:      # liveness found it with no path
@@ -37165,6 +37184,13 @@ def liveness(t0):
     own agent named to come back to it. A task with none is recovered with a new session or reported to its
     requester once. The three restarts (SESSION_RESTARTS) bound the sessions that died young, which is the crash
     loop; a session that lived and worked and was then lost is recovered without spending one of them."""
+    known = {}
+
+    def signed_out_now(agent):          # needs_sign_in, read once for each agent in this pass
+        if agent not in known:
+            known[agent] = needs_sign_in(agent)
+        return known[agent]
+
     for t in q("SELECT * FROM tasks WHERE state IN ('submitted','working','input-required','auth-required')"):
         tid, owner = t["id"], t["owner"]
         if os_user_held(owner):
@@ -37175,6 +37201,18 @@ def liveness(t0):
             q("UPDATE tasks SET live_path=?, stalled_reason=?, stalled_since=NULL, stall_told=0 WHERE id=? AND "
               "(live_path IS NOT ? OR stalled_reason IS NOT ? OR stalled_since IS NOT NULL OR IFNULL(stall_told, 0) != 0)",
               (words, words, tid, words, words))
+            continue
+        if not is_conversation_task(t) and sign_in_restart_due(t) and not parked(tid) and \
+                fresh_refusal(t, t["attempt"]) is None:
+            # Its session was refused for want of the sign-in, and its agent is signed in since: a new session, which
+            # the messages that waited for it reach (the delivery kept them from the old one). Not counted: no crash
+            # loop. fresh_refusal keeps a running turn, a prompt, a job and a background command.
+            runtime = runtime_label((agents().get(owner) or {}).get("runtime"))
+            new_attempt(t, SIGNED_IN, f"You were not signed in to {runtime}, and you are signed in again. Continue "
+                        f"{tref(tid)}: the turns of your last session ended at \"Not logged in\" and did nothing. First "
+                        f"check what was already done (rule 9): never repeat an outside action that already happened.")
+            kv_set(SIGN_IN_REFUSED + str(tid), None)
+            log("hub", f"{tref(tid)} starts again in a new session on {owner}: its turns ended at the sign-in")
             continue
         if is_conversation_task(t):
             # AUTONOMY.md P2: its live path is its conversation, whose next message or reply ends it; a session of
@@ -37230,6 +37268,11 @@ def liveness(t0):
             path = (f"waiting for the usage limit of the account {owner} shares with {source} to reset at "
                     f"{clock(lim['until'])}" if source else
                     f"waiting for {owner}'s usage limit to reset at {clock(lim['until'])}")
+        # A sign-out comes before a live window: a session that runs signed out ends each turn at "Not logged in"
+        # (16 November 2026, seven hours of "live session" while no turn of the agent worked), and the delivery keeps
+        # its messages and starts until the sign-in (runtime_signed_out). Read once for each agent in a pass.
+        elif online and signed_out_now(owner) and own_runtime_task(agents().get(owner) or {}, t["needs"]):
+            path = f"waiting for {owner} to be signed in"
         elif park and not woken:
             path = (f"waiting {park_said(park)}, as {owner} asked (R-{park['id']})"
                     if park["ci_open"] and ci_of(park) else
@@ -37250,8 +37293,6 @@ def liveness(t0):
                     f"waiting for N-{secret['id']} to reach {owner}'s machine")
         elif release_holds_starts():        # plan P0: also while a release waits for the running turns
             path = "waiting for the Fleet update to finish"         # plan C6: a known cause restarts nothing
-        elif online and signed_in_now(owner, (agents().get(owner) or {}).get("runtime")) is False:
-            path = f"waiting for {owner} to be signed in"
         elif once and settings_pending(owner):
             path = f"waiting for {owner} to load its new settings"
         else:
@@ -37510,6 +37551,108 @@ def offline_sweep(t0):
                 stuck_told(r["id"], event)
         log("hub", f"{name} went offline (last check-in {clock(seen)}); the manager was told"
                    + (" quietly: nothing happened on it since its last notice" if quiet else ""))
+
+
+def signed_out_sweep(t0):
+    """A worker or a lead whose own runtime is signed out (runtime_signed_out): its line hears it once for each time it
+    is, and again, quietly, when it is signed in. Meanwhile the hub holds its work by itself (the delivery), so nothing
+    else would say so: its tasks wait "to be signed in" (liveness), which is no stall, and no session of it ends a turn.
+
+    - The manager hears the whole of it: the agent, its open tasks and the tasks that wait for its answer, and that only
+      the owner signs it in, from its page in the app (a Needs-you item).
+    - Each other requester of one of its open tasks (a lead, most often) hears it in that task, where a lead reads the
+      news of its team's work (filed_under), because a worker or a lead reads nothing that is filed under no task.
+      Whoever gives it new work meanwhile reads it in create_task's answer.
+    - A time that comes back with nothing new on the agent since the last word is told quietly (machine_news), as a
+      machine that goes offline again is (offline_sweep).
+    - At the sign-in, the tasks whose sessions its provider refused start again in new sessions (liveness,
+      sign_in_restart_due), and the manager's quiet word names them.
+
+    Nothing is told while a sign-in of it is open or its install has not ended (its last step is the sign-in, which
+    waits for the owner), for an agent in setup, or for one whose machine is silent (offline_sweep) or whose reading is
+    old. The end of a moved agent's install that failed at its sign-in tells this word itself when this sweep has not
+    (os_user_sweep), so the manager reads one instruction, whichever comes first.
+
+    The owner, 16 November 2026: "the lead/manager needs to be aware of the status of their agents". That day an agent
+    that a move left signed out worked on nothing for seven hours, and its manager heard of it from the owner."""
+    mgr = manager_name()
+    if not mgr:
+        return
+    accounts = team_read().get("accounts")
+    for name, conf in agents().items():
+        told = kv_get("signed_out_told:" + name)
+        if conf.get("role") not in ("worker", "lead") or local_model(conf, accounts):
+            if told:            # an agent that this sweep no longer reads: its time ends with nothing said
+                kv_set("signed_out_told:" + name, None)
+            continue
+        if not runtime_signed_out(name):
+            if told and signed_in_now(name, conf.get("runtime")) is True:
+                signed_in_again(name, conf, float(told), t0)
+            continue
+        if told or not agent_active(name) or not helper_online(name, t0) or open_login(name) or install_open(name):
+            continue
+        signed_out_told(name, conf, t0)
+
+
+def signed_out_told(name, conf, t0):
+    """signed_out_sweep's word that this agent is not signed in, and the mark of its time."""
+    mgr, who = manager_name(), agent_with_title(name)
+    tasks = q(f"SELECT * FROM tasks WHERE owner=? AND {OPEN_TASK} ORDER BY id", (name,))
+    waiting = [f"{tref(r['sender_task'])} (AM-{r['id']})" for r in q(
+        "SELECT id, sender_task FROM agent_messages WHERE recipient=? AND waits=1 AND wait_end IS NULL ORDER BY id",
+        (name,))]
+    last = kv_get("signed_out_last:" + name)
+    quiet = QUIET_SAY if last and not machine_news(name, float(last)) else None
+    runtime = runtime_label(conf.get("runtime"))
+    emit(mgr, "say", f"[hub] {who} is not signed in to {runtime} on {conf.get('machine')}: no session of it can work. "
+         f"The hub starts no session of it and keeps the messages for its tasks, its chat and the conversations that "
+         f"run on {runtime} until it is signed in. Its open tasks: {', '.join(tref(t['id']) for t in tasks) or 'none'}. "
+         + (f"Waiting for its answer: {', '.join(waiting)}. " if waiting else "") +
+         f"Only the owner can sign it in: unless a Needs-you item for it is open, raise one that asks the owner to "
+         f"open {shown_role(name)} in the app and sign it in. Give it no new work until the hub says that it is signed "
+         f"in again.", extra=quiet)
+    for t in tasks:
+        if t["requester"] not in (None, mgr, name) and own_runtime_task(conf, t["needs"]):
+            emit(t["requester"], "say", f"[hub] {tref(t['id'])} ({t['title']}, owner {name}) waits: {name} is not "
+                 f"signed in to {runtime}, so no session of it can work until the owner signs it in. The manager asks "
+                 f"the owner for it, and the hub tells you here when the task goes on.", task=t["id"], extra=quiet)
+    kv_set("signed_out_told:" + name, t0)
+    kv_set("signed_out_last:" + name, t0)
+    log("hub", f"{name} is not signed in; its line was told" + (" quietly: nothing new since the last time" if quiet
+                                                                 else ""))
+
+
+def signed_in_again(name, conf, told, t0):
+    """The end of a time that signed_out_sweep told (`told`: when): the line hears it quietly, the manager with the
+    tasks that started again in new sessions since, because their turns ended at the sign-in (liveness)."""
+    mgr, who = manager_name(), agent_with_title(name)
+    tasks = q(f"SELECT * FROM tasks WHERE owner=? AND {OPEN_TASK} ORDER BY id", (name,))
+    again = [tref(r["task"]) for r in q(
+        f"SELECT a.task FROM attempts a JOIN tasks t ON t.id=a.task WHERE t.owner=? AND a.reason=? AND a.created>=? "
+        f"AND {OPEN_TASK.replace('state', 't.state')} ORDER BY a.task", (name, SIGNED_IN, told))]
+    emit(mgr, "say", f"[hub] {who} is signed in again: the messages that waited for it go on" +
+         (f", and {', '.join(again)} {'starts' if len(again) == 1 else 'start'} again in a new session, because "
+          f"{'its' if len(again) == 1 else 'their'} turns ended at the sign-in" if again else "") + ".", extra=QUIET_SAY)
+    for t in tasks:
+        if t["requester"] not in (None, mgr, name) and own_runtime_task(conf, t["needs"]):
+            emit(t["requester"], "say", f"[hub] {tref(t['id'])} goes on: {name} is signed in again.", task=t["id"],
+                 extra=QUIET_SAY)
+    kv_set("signed_out_told:" + name, None)
+    log("hub", f"{name} is signed in again; its line was told")
+
+
+def agent_with_title(name):
+    """An agent as the hub's words to other agents name it: its name, and its role in brackets when it has one."""
+    title = " ".join(str((agents().get(name) or {}).get("title") or "").split())
+    return f"{name} ({title})" if title else name
+
+
+def install_open(agent):
+    """True while an install of this agent on its own runtime has not ended: its last step is the sign-in, which waits
+    for the owner (server.py sign_in_step)."""
+    a = agents().get(agent) or {}
+    return bool(q1("SELECT 1 FROM server_jobs WHERE agent=? AND kind='install' AND runtime=? AND state IN (%s) LIMIT 1"
+                   % ",".join("?" * len(JOB_OPEN)), (agent, a.get("runtime"), *JOB_OPEN)))
 
 
 # How long the hub's own timers may be silent before the owner's screen asks about them (tick_heartbeat). A pass
@@ -37772,6 +37915,7 @@ def tick():
         step(mcp_renew_sweep, t0)           # the owner, 15 November 2026: an MCP server's access ends (Needs you)
         step(stop_finished_sessions, t0)
         step(offline_sweep, t0)
+        step(signed_out_sweep, t0)          # the owner, 16 November 2026: the line knows when an agent cannot work
         step(trigger_sweep, t0)
         step(report_notices, t0)            # support plan F4: the covered tickets that waited for a place
         step(report_question_sweep, t0)     # and the questions about a report that waited for one
@@ -40019,8 +40163,14 @@ def os_user_sweep(t0):
                    f"({g['why']})")
     free = [n for n in since if n not in held_now and n in agents()]
     if free:
+        # A move ends this hold at its commit, and the install that it starts holds the work again until its last step,
+        # the owner's sign-in (needs_sign_in): "goes on" alone was untrue then (16 November 2026).
+        installing = [n for n in free if install_open(n)]
         emit(mgr, "say", f"[hub] {roles_phrase(free)} {'is' if len(free) == 1 else 'are'} held no more: "
-                         f"{'its' if len(free) == 1 else 'their'} work goes on.")
+                         f"{'its' if len(free) == 1 else 'their'} work goes on"
+                         + (f" when the install of {roles_phrase(installing)} on "
+                            f"{'its' if len(installing) == 1 else 'their'} new server has ended with the owner's "
+                            f"sign-in there" if installing else "") + ".")
     hub_user = manager_hub_user(team)
     if hub_user and told.get("hub_user") is None:
         emit(mgr, "say", "[hub] You run as the hub's own user account on its server, which can read every login of "
@@ -40038,11 +40188,37 @@ def os_user_sweep(t0):
                  "ORDER BY id", (int(floor),)):
         if job["agent"] not in agents() or not kv_get(MOVED + job["agent"]) or kv_get(INSTALL_TOLD + str(job["id"])):
             continue
+        # A failed install says where and why, in its job's own words: the manager cannot read the server itself, and
+        # "Read the server" alone sent it to the owner for a cause that the job had (16 November 2026: a sign-in that
+        # nobody gave within its wait).
+        failed, agent = job["state"] == "failed", job["agent"]
+        conf = agents().get(agent) or {}
+        # One that failed at its last step, the sign-in, leaves the agent installed there with only the owner's sign-in
+        # missing, whatever stopped it (a wait that nobody answered, a sign-in that did not start). The owner gives it
+        # on the agent's page in the app, whose press runs this install again (the app's AgentSetupFlow.start,
+        # installAgain), as a second move_agent would. For a worker or a lead, signed_out_sweep's word says so, to the
+        # manager and to the requesters of its tasks: this one tells it when that sweep has not yet (signed_out_told),
+        # so the manager reads one instruction, whichever comes first.
+        sign_in = failed and job["step"] == "sign_in"
+        swept = conf.get("role") in ("worker", "lead") and not local_model(conf, team_read().get("accounts"))
+        signed = signed_in_now(agent, conf.get("runtime")) is True
         then = "Move the next one now, if one waits." if job["state"] == "done" else \
-            "Read the server, then try the move again with move_agent and the same item." if job["state"] == "failed" \
+            "It is signed in there since, and its work goes on." if sign_in and signed else \
+            "It is installed there, and only its sign-in is missing, which only the owner gives: the hub's word that " \
+            "it is not signed in says what to do." if sign_in and swept else \
+            (f"It is installed there, and only its sign-in is missing, which only the owner gives: unless a Needs-you "
+             f"item for it is open, raise one that asks the owner to open {shown_role(agent)} in the app and sign it "
+             f"in.") if sign_in else \
+            "Read the server, then try the move again with move_agent and the same item." if failed \
             else "Ask the owner in a Needs-you item what comes next."
-        emit(mgr, "say", f"[hub] The install of {shown_role(job['agent'])} on {job['server']} after its move ended: "
-                         f"{'it runs there' if job['state'] == 'done' else job['state']}. {then}")
+        why = " ".join(str(job["detail"] or "").split())
+        emit(mgr, "say", f"[hub] The install of {shown_role(agent)} on {job['server']} after its move ended: "
+                         + ("it runs there" if job["state"] == "done" else
+                            "failed" + (f" at its step {job['step']}" if job["step"] else "")
+                            + (f" ({cut_whole(why, 300).rstrip('.')})" if why else "") if failed else job["state"])
+                         + f". {then}")
+        if sign_in and swept and not signed and not kv_get("signed_out_told:" + agent):
+            signed_out_told(agent, conf, t0)
         kv_set(INSTALL_TOLD + str(job["id"]), "1")
 
 
@@ -43230,7 +43406,7 @@ AGENT_COLUMNS = (
 AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent", "machine_updates": "agent"}
 # The hub's own notes about one agent in kv, each kept under a prefix and the agent's name. test_rename reads every
 # kv key the code builds from a value, so a new prefix is placed here or named there with what it holds.
-AGENT_KV = ("tools:", "offline_told:", "runtime_since:", "switched:", "switching:", "history_agent:", "default_vault:",
+AGENT_KV = ("tools:", "offline_told:", "signed_out_told:", "signed_out_last:", "runtime_since:", "switched:", "switching:", "history_agent:", "default_vault:",
             "default_desktop:", "checks_brief:", "chat_team:", "duty_review:", "presence:", "turn_ended:",
             "first_message:", "settings_finding:", "chat_undelivered:", "read_missing:", "read_told:",
             "service_user:", "caller_user:")       # one OS user for each agent: SERVICE_USER and CALLER_USER
@@ -48864,6 +49040,152 @@ def signed_in_now(agent, runtime, reads=None):
     if done and done > (read_at or 0) and now() - done <= MACHINE_STALE:
         return True
     return said
+
+
+# The code of a turn's error record when the provider refused it for want of a sign-in: Claude Code's own `error` of
+# its message, which threads.py keeps. Read on the first fleet's hub on 16 November 2026, in the records of a task of
+# an agent that a move had left signed out: {"type": "error", "code": "authentication_failed", "message": "Not logged
+# in · Please run /login", "retryable": false}.
+AUTH_FAILED = "authentication_failed"
+SIGNED_IN = "signed in again"       # the reason of the new attempt of a task whose turns ended at its sign-in
+
+
+def needs_sign_in(agent):
+    """True when no session of this agent can work for want of its own runtime's sign-in: its machine says that the
+    runtime is signed out (signed_in_now False), or it has said nothing yet while its install, which ends with that
+    sign-in, has not ended (a move deletes the old machine's reading, and the new machine's helper can poll before its
+    first report). Unknown is no sign-out: an old reading or a silent machine is offline_sweep's. An agent on a local
+    model or on the owner's own model server signs in nowhere: its runtime's own status says "not signed in" and its
+    sessions work.
+
+    Why (16 November 2026): an agent that a move left signed out on its new server was active for seven hours. The hub
+    started a session for each of its tasks and typed each message into it, every turn ended at once with "Not logged
+    in", its tasks read "live session", and nobody was told: the manager heard it from the owner."""
+    a = agents().get(agent) or {}
+    if not a or local_model(a, team_read().get("accounts")):
+        return False
+    said = signed_in_now(agent, a.get("runtime"))
+    return said is False or said is None and install_open(agent)
+
+
+def own_runtime_task(conf, needs):
+    """True when a task with these needs runs on the agent's own runtime (team.json `runtime`), whose sign-in
+    needs_sign_in reads: every task but a screen task of an agent whose runtime is not the screen runtime, which runs
+    in screen_runner.py on that one (app_server_task), whose failure pauses it (screen_failed)."""
+    return needs != "screen" or conf.get("runtime") == APP_SERVER_RUNTIME
+
+
+def waits_for_sign_in(t):
+    """True when the session of task row `t` cannot work until its owner's own runtime is signed in: deliberate quiet,
+    as a usage limit is, so nothing calls it stuck or starts it fresh meanwhile."""
+    return needs_sign_in(t["owner"]) and own_runtime_task(agents().get(t["owner"]) or {}, t["needs"])
+
+
+def conversation_runtime(agent, conversation):
+    """The runtime that a conversation of this agent runs on (conversation_refusal): a closed one on the runtime that
+    conversations.closed_runtime names, every other one (with tools, narrowed, or from before contacts.v2) on the
+    agent's own."""
+    row = q1("SELECT person FROM conversations WHERE id=?", (conversation,)) if conversation else None
+    person = q1("SELECT * FROM people WHERE id=?", (row["person"],)) if row else None
+    if person is not None and conversation_mode(person, agent) == "closed":
+        return setting("conversations.closed_runtime")
+    return (agents().get(agent) or {}).get("runtime")
+
+
+def runtime_signed_out(agent):
+    """needs_sign_in for a worker or a lead: the hub starts no session of it and types nothing into one (the helper's
+    delivery), and its manager and the requesters of its tasks hear it (signed_out_sweep). The manager is never held:
+    its own warning goes to the owner (manager_flag_update), and it is the owner's chat."""
+    return role_of(agent) in ("worker", "lead") and needs_sign_in(agent)
+
+
+SIGN_IN_REFUSED = "sign_in_refused:"     # kv, with a task's id after it: sign_in_refusal's mark
+
+
+def sign_in_refusal(t):
+    """The refusal of the newest turn of task row `t`'s current attempt by its provider for want of a sign-in
+    (AUTH_FAILED), with no turn that worked after it: {"attempt", "at": when the hub stored it, "worked": whether a turn
+    of that attempt had worked before it}, or None. helper_events writes the mark when such a record arrives and takes
+    it away when a turn of that attempt works, so that no reader scans an attempt's records, which have no limit.
+    read_row only."""
+    row = read_row("SELECT v FROM kv WHERE k=?", (SIGN_IN_REFUSED + str(t["id"]),))
+    try:
+        mark = json.loads(row["v"]) if row else None
+    except ValueError:
+        mark = None
+    return mark if isinstance(mark, dict) and mark.get("attempt") == t["attempt"] else None
+
+
+def sign_in_refusal_note(tid, attempt, records, t0):
+    """helper_events, for the batch of records of task `tid`'s current attempt that it stored: the mark of
+    sign_in_refusal when the newest of its refusals and its turns that worked is a refusal, and none when it is a turn
+    that worked. A batch with neither leaves the mark as it is."""
+    newest = None
+    for _, _, kind, data in records:
+        if kind == "error" and data.get("code") == AUTH_FAILED:
+            newest = "refused"
+        elif kind == "result" and data.get("stop_reason") != "error":
+            newest = "worked"
+    key = SIGN_IN_REFUSED + str(tid)
+    if newest == "refused":
+        worked = bool(read_row("SELECT 1 FROM thread_events WHERE task=? AND attempt=? AND type='result' AND "
+                               "json_extract(data, '$.stop_reason')<>'error' LIMIT 1", (tid, attempt)))
+        kv_set(key, json.dumps({"attempt": attempt, "at": t0, "worked": worked}))
+    elif newest == "worked" and kv_get(key) is not None:
+        kv_set(key, None)
+
+
+def signed_in_after(agent, at):
+    """True when the agent's own runtime was found signed in after `at`: a reading of its machine taken after it says
+    so (machine_said dates a reading by when it was taken), or a sign-in of it finished after it."""
+    runtime = (agents().get(agent) or {}).get("runtime")
+    said, read_at = machine_said(agent, runtime)
+    done = finished_sign_in(agent, runtime)
+    return bool(said is True and read_at is not None and read_at > at or done and done > at)
+
+
+def sign_in_restart_due(t):
+    """True when the session of task row `t` was refused for want of a sign-in and its agent is signed in since: it
+    starts again in a new session (liveness), because a session that ran signed out is not trusted to take the new
+    credential, and the messages that wait for it go there. A sign-in that finished after the refusal always counts.
+    The machine's word alone does not count for a session that the hub started that way and that never had a turn that
+    worked: that is a sign-in that the provider ended while the machine says that it is signed in, which a new session
+    does not put right, and its empty turns reach its requester as any others do (turn_end_check)."""
+    refused = sign_in_refusal(t)
+    a = agents().get(t["owner"]) or {}
+    if refused is None or not own_runtime_task(a, t["needs"]):
+        return False
+    done = finished_sign_in(t["owner"], a.get("runtime"))
+    if done and done > refused["at"]:
+        return True
+    if not refused.get("worked"):
+        started = read_row("SELECT reason FROM attempts WHERE task=? AND attempt=?", (t["id"], t["attempt"]))
+        if started is not None and started["reason"] == SIGNED_IN:
+            return False
+    return signed_in_after(t["owner"], refused["at"])
+
+
+def refusal_waits(t):
+    """True while task row `t`'s session waits after its provider refused its newest turn for want of a sign-in: for
+    the machine's next word, while its newest report is from before the refusal and still fresh (status_now asked for
+    it; a machine that stops reporting ends the wait); or for its fresh start, while that is due and can come now
+    (liveness: not while the task is parked, or while fresh_refusal keeps its session for a running turn, a prompt,
+    a job or a background command, whose lines then go to it as before). Every other case ends the wait, and the
+    task's turn is decided as any other's."""
+    refused = sign_in_refusal(t)
+    if refused is None:
+        return False
+    _, read_at = machine_said(t["owner"], (agents().get(t["owner"]) or {}).get("runtime"))
+    if read_at is not None and read_at <= refused["at"]:
+        return True
+    return sign_in_restart_due(t) and not parked(t["id"]) and fresh_refusal(t, t["attempt"]) is None
+
+
+def sign_in_waits(t):
+    """True while task row `t`'s session waits for its agent's sign-in: its runtime is signed out (waits_for_sign_in),
+    or its newest turn was refused for want of it (refusal_waits). Deliberate quiet: no "nothing is waiting" goes into
+    it (live_reason), and no line of the delivery either."""
+    return waits_for_sign_in(t) or refusal_waits(t)
 
 
 def finished_sign_in(agent, runtime, installed=False, reads=None):
@@ -57367,6 +57689,32 @@ class Handler(BaseHTTPRequestHandler):
                 if agent in agents():
                     raise               # an error of the hub's own
                 return self.json(404, {"error": "unknown agent"})       # it left while its tool list was read
+            # Read once for this call, and not at each round: its machine's word changes at a report, minutes apart, and
+            # a sign-in that lands during the wait reaches the next call.
+            signed_out = runtime_signed_out(agent)
+            waits = {}          # task id: its refused session waits for the machine's word or its fresh start
+
+            def sign_in_holds(r, t, conf):
+                """True when the sign-in holds this event (needs_sign_in): a session of the runtime that is signed out,
+                or of a task whose session waits for its sign-in or its fresh start after it."""
+                if r["kind"] in ("task", "say") and t is not None and is_conversation_task(t):
+                    # its conversation's own session reads it (event_window), on that conversation's runtime
+                    return signed_out and conversation_runtime(agent, t["source_conversation"]) == conf.get("runtime")
+                if r["kind"] in ("task", "say") and t is not None and conf.get("role") in ("worker", "lead"):
+                    if signed_out and own_runtime_task(conf, t["needs"]):
+                        return True
+                    if t["id"] not in waits:        # one read of its mark when its session was never refused
+                        waits[t["id"]] = refusal_waits(t)
+                    return waits[t["id"]]   # also once signed in: a line to the old session would race its fresh start
+                if not signed_out:
+                    return False
+                if r["kind"] == "chat":
+                    return True         # the owner chat runs the agent's own runtime (owner_chat)
+                if r["kind"] == "conversation":
+                    return conversation_runtime(agent, json.loads(r["extra"] or "{}").get("conversation")) == \
+                        conf.get("runtime")
+                return r["kind"] in ("task", "say") and (t is None or own_runtime_task(conf, t["needs"]))
+
             while True:
                 # The owner can delete or rename this agent while its helper's call waits here, or waits for the lock
                 # that the change holds: its name is unknown then, as at the start of a call. It was a KeyError and a
@@ -57403,6 +57751,11 @@ class Handler(BaseHTTPRequestHandler):
                         continue        # it shares its OS user with another agent: the event waits in the hub
                     if limited and r["kind"] in ("task", "say", "chat") and not extra.get("limit"):
                         continue        # held until the usage limit resets; the read receipt stays open
+                    if sign_in_holds(r, t, conf):
+                        # A session of it would end each turn at "Not logged in": the event waits for the sign-in. A
+                        # screen task can run another runtime (own_runtime_task), and so can a closed conversation
+                        # (conversation_runtime).
+                        continue
                     if r["kind"] == "conversation" and ((limited or pending or updating) or not q1(
                             "SELECT 1 FROM conversations WHERE id=? AND state='open'",
                             (extra.get("conversation"),))):
@@ -59251,7 +59604,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(409, {"error": "no such task attempt for this agent"})
         records = [r for r in (clean_record(e) for e in events) if r]
         key = (tid, attempt, session)
-        limits, stored = [], 0
+        limits, stored, signed_out, taken = [], 0, False, []
         error, failed = None, None      # the error of the turn that is read now; (seq, error) of a turn that failed
         with LOCK:
             last = q1("SELECT COALESCE(MAX(seq),0) m FROM thread_events WHERE task=? AND attempt=? AND session=?", key)["m"]
@@ -59265,6 +59618,9 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     if kind == "error" and data["code"] == "usage_limit":
                         limits.append(data)
+                    if kind == "error" and data["code"] == AUTH_FAILED:
+                        signed_out = True
+                    taken.append((seq, ts, kind, data))
                     if kind == "error":
                         error = data
                     elif kind == "result":
@@ -59281,6 +59637,13 @@ class Handler(BaseHTTPRequestHandler):
                     activity(tid)
             for data in limits:
                 start_limit(agent, data["resets_at"], tid)
+            if attempt == t["attempt"] and t["state"] not in TERMINAL:
+                sign_in_refusal_note(tid, attempt, taken, now())
+            if signed_out:
+                # A turn that its provider refused for want of a sign-in: the machine's reading says so on its own
+                # clock, up to five minutes later, and the hold and the line's word wait for that reading
+                # (runtime_signed_out). So it is asked for now.
+                status_now(agent)
             same = (before or {}).get("session") == session
             started = not (before or {}).get("running") and (state.get("running") or
                                                                state["turns"] > ((before or {}).get("turns", 0) if same else 0))

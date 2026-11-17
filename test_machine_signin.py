@@ -634,7 +634,8 @@ class HubRestart(Machines):
         self.until(met, "the machine met the hub away")
         self.server = ThreadingHTTPServer(("127.0.0.1", port), SourceHandler)
         self.server.busy, self.server.idle, self.server.machines = 0, threading.Condition(), True
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        # a short poll: tearDown's shutdown() waits for the loop's next look, which was up to 0.5 s in each test
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
         self.thread.start()
 
     def test_a_sign_in_survives_a_restart_of_the_hub_in_the_middle_of_the_code_wait(self):

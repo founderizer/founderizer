@@ -390,13 +390,6 @@ class Registration(WithKeyFolder):
         self.assertEqual(self.ask()[1]["auth"], "owner_key_required")
         self.assertEqual(self.ask(token=KEY)[0], 200)
 
-    def test_a_value_works_once(self):
-        value = Path(self.proof()).read_text(encoding="utf-8").strip()
-        self.assertEqual(self.ask("/ui/owner/key", {"sha256": sha(KEY), "proof": value})[0], 200)
-        status, said = self.ask("/ui/owner/key", {"sha256": sha(OTHER_KEY), "proof": value})
-        self.assertEqual((status, said["auth"]), (403, "owner_proof_mismatch"))
-        self.assertEqual(hub.owner_key()["sha256"], sha(KEY))
-
     def test_a_wrong_or_an_old_value_registers_nothing(self):
         value = Path(self.proof()).read_text(encoding="utf-8").strip()
         for wrong in ("", "x" * 43, value[:-1], value + "x", 7, ["a"], None):

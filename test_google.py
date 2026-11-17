@@ -288,7 +288,7 @@ class FakeGoogle:
 
 
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite([case(name) for case in (GoogleHub, ConnectThroughTheStandIn)
+    return unittest.TestSuite([case(name) for case in (GoogleHub, ConnectThroughTheStandIn, SealAtStart)
                                for name in case.__dict__ if name.startswith("test_")])
 
 

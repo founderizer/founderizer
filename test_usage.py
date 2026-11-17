@@ -13,9 +13,6 @@ import usage
 from test_ui_api import OwnerAPI
 
 
-real_codex_limits = usage.codex_limits     # the reader itself, for a test that patches the name
-
-
 def tokens(runtime="claude"):
     return dict(input=10, output=20, cache_read=30, cache_write=40, total=100,
                 sessions=2, since=1000, last_activity=2000, collected_at=3000,

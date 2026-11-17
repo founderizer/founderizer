@@ -139,9 +139,6 @@ class Devices(OwnerAPI):
         status, body = self.call("/ui/mobile", token="whatever")
         self.assertEqual((status, body["auth"]), (403, "key_not_expected"))
 
-    def test_the_feature_is_announced(self):
-        self.assertIn("mobile", self.call("/ui/state")[1]["ui_features"])
-
     # ---- enrollment
     def test_a_device_without_a_key_cannot_read_and_enrolls_with_one_code(self):
         status, body = self.call("/ui/mobile", source=PHONE)

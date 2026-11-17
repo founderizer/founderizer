@@ -66,6 +66,11 @@ FEATURES = ("trigger_check", "trigger_code", "check_lines", "shell_box", "api_re
 
 def setUpModule():
     scratch_home()      # no test of this file reads or writes the real home folder (leftovers.scratch_home)
+    # No helper of these tests sends a task's files, so a delivery takes the late path of deliver_outputs at once, not
+    # after OUTPUTS_WAIT: four deliveries waited 30 seconds each, 120 of the module's 164 (17 November 2026).
+    waits = patch.object(hub, "OUTPUTS_WAIT", 0)
+    waits.start()
+    unittest.addModuleCleanup(waits.stop)
 
 
 def load_tests(loader, _tests, _pattern):

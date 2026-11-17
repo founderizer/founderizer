@@ -569,7 +569,8 @@ class OwnerAPI(unittest.TestCase):
         hub.kv_set("db_id", "test-generation")
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), SourceHandler)
         self.server.busy, self.server.idle = 0, threading.Condition()      # the requests that run now (SourceHandler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        # a short poll: tearDown's shutdown() waits for the loop's next look, which was up to 0.5 s in each test
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
         self.thread.start()
         self.base = "http://127.0.0.1:" + str(self.server.server_port)
 

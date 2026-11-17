@@ -41,7 +41,8 @@ class Runtime(unittest.TestCase):
         own_files(self, self.tmp.name)
         hub.kv_set("db_id", "gen1")
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), hub.Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        # a short poll: tearDown's shutdown() waits for the loop's next look, which was up to 0.5 s in each test
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
         self.thread.start()
         self.base = "http://127.0.0.1:" + str(self.server.server_port)
 

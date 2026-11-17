@@ -233,35 +233,6 @@ class Writing(Base):
             self.assertIn(hub.MASK, close)
             self.assertNotIn("hunter2hunter2", close)
 
-    def test_masking_on_the_shelf_commits_nothing_of_a_half_written_task(self):
-        """secret_key reached the registered logins with hub.q, which commits — and masking is on the start-text
-        path, which admit_task calls inside the transaction that writes a task, its attempt and its start event
-        together or not at all."""
-        self.remember()
-
-        class FailAt:
-            def __init__(self, db):
-                self.db = db
-
-            def execute(self, sql, *args):
-                if sql.startswith("INSERT INTO events("):
-                    raise RuntimeError("disk I/O error")
-                return self.db.execute(sql, *args)
-
-            def __getattr__(self, name):
-                return getattr(self.db, name)
-
-        before = [hub.q1(f"SELECT COUNT(*) n FROM {x}")["n"] for x in ("tasks", "attempts", "events")]
-        with patch.object(hub, "DB", FailAt(hub.DB)):
-            with self.assertRaises(RuntimeError):
-                with hub.LOCK, hub.transaction():
-                    hub.admit_task("manager", {"owner": "vps", "title": "Another acme/web task", "details": "d",
-                                               "done_when": "w", "needs": "none", "goal": None, "goal_id": None,
-                                               "parent": None, "follows": None, "case_id": None, "why": None})
-        self.assertFalse(hub.DB.in_transaction)
-        self.assertEqual([hub.q1(f"SELECT COUNT(*) n FROM {x}")["n"] for x in ("tasks", "attempts", "events")],
-                         before)
-
     def test_the_line_says_how_much_outside_text_the_writing_task_had_read(self):
         """The hub's own observation and not the agent's, which is the whole of its value: the attack is "this check
         is unreliable, skip it", inside authority the agent already holds, so no refusal ever fires."""
@@ -1571,7 +1542,8 @@ class StartText(Base):
 
     def test_reading_the_memories_commits_nothing_of_a_half_written_task(self):
         """admit_task writes the task, its first attempt and its start event together or not at all, and start_text
-        reads this agent's memories on that path. hub.q commits at once, so a q() there would commit the half."""
+        reads this agent's memories and masks the registered logins (secret_key) on that path. hub.q commits at once,
+        so a q() there would commit the half."""
         self.remember()
 
         class FailAt:
@@ -1695,10 +1667,6 @@ class KnowledgeWrite(Base):
         self.assertFalse(self.write(text="# Suppliers\n\nStripe: call_api.\nAcme: by phone.\n")[1])
         self.assertTrue(self.write(text="# Suppliers\n\nAcme: by phone.\n", task=theirs)[1])
 
-    def test_a_write_the_hub_cannot_place_in_a_session_writes_as_before(self):
-        said, error = self.write()                  # a task with no attempt row: no session to hold it to
-        self.assertFalse(error, said)
-
     def test_a_new_attempt_reads_again_and_a_removed_file_is_written_anew(self):
         hub.CFG["artifact_repo"] = str(self.kit)
         self.addCleanup(hub.CFG.pop, "artifact_repo", None)
@@ -1748,7 +1716,7 @@ class KnowledgeWrite(Base):
         self.assertIn("1 read of outside text", message)
 
     def test_an_agent_writes_the_knowledge_file_its_own_profile_lists(self):
-        said, error = self.write()
+        said, error = self.write()                  # a task with no attempt row: no session holds the write to a read
         self.assertFalse(error, said)
         self.assertIn("knowledge/suppliers.md is written as", said)
         self.assertEqual(self.file(), "# Suppliers\n\nStripe: call_api with its key.\n")
