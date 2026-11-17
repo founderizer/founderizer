@@ -20,7 +20,6 @@ import fleet
 from leftovers import scratch_home
 import hub
 import lifecycle
-import onboard
 import threads
 import vault
 from test_ui_api import OwnerAPI
@@ -691,18 +690,6 @@ class Helper(unittest.TestCase):
         with patch.object(vault, "hub", lambda *a, **k: (409, {"error": "this job has ended"})), \
                 self.assertRaises(vault.Refused):
             vault.probe(conf, 7)
-
-    def test_a_new_worker_starts_in_setup_without_another_agents_vault(self):
-        kit = Path(self.tmp)
-        (kit / "team.json").write_text(json.dumps({"addresses": {"vps": "100.64.0.3"}, "agents": {
-            "manager": {"role": "manager", "runtime": "claude", "machine": "hub"},
-            "vps": {"role": "worker", "machine": "vps", "runtime": "codex", "can": ["shell", "web"], "start": START,
-                    "vault": "broker", "vault_recipient": "age1" + "q" * 58, "reports_to": "lead1",
-                    "model": "gpt-6-luna", "effort": "low"}}}))
-        onboard.register_in_kit(kit, "worker9", "codex", "100.64.0.9")
-        self.assertEqual(json.loads((kit / "team.json").read_text())["agents"]["worker9"],
-                         {"role": "worker", "machine": "worker9", "runtime": "codex", "can": ["shell", "web"],
-                          "start": START, "active": False})
 
 
 if __name__ == "__main__":

@@ -404,8 +404,6 @@ class Servers(OwnerAPI):
         self.assertIsNone(hub.ONE_MACHINE_TAG.fullmatch("tag:founderizer"))
         self.assertIsNone(hub.ONE_MACHINE_TAG.fullmatch("tag:founderizer-hub-2"))
         self.assertIsNotNone(hub.ONE_MACHINE_TAG.fullmatch("tag:founderizer-hub"))
-        import onboard
-        self.assertEqual(onboard.ONE_MACHINE_TAG.pattern, hub.ONE_MACHINE_TAG.pattern)
 
     def test_a_hub_with_no_tag_asks_for_the_product_tag_only_where_the_tailnet_has_it(self):
         """A hub that the app put on the network carries tag:founderizer already. A hub with no tag asks for it only

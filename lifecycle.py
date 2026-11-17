@@ -2062,7 +2062,7 @@ def may_take(kit, target, run=None, floor=None, head="HEAD"):
     floor, and the others take theirs after it. They stayed where they were for every release after that (3 November
     2026: the Mac Studio's server service and a support agent on worker-1, at the revisions of that morning). Every
     mover of a checkout calls this first: the helper's update and task-start sync, the server service, the hub, both
-    installers, onboard.py and the owner's MCP server (the shell ones as `lifecycle.py may-take`)."""
+    installers and the owner's MCP server (the shell ones as `lifecycle.py may-take`)."""
     import releases                     # here and not at the top: releases imports this module
     old, new = _commit(kit, run, head), _commit(kit, run, target)
     if not old or not new:
@@ -4042,7 +4042,7 @@ class Lifecycle:
 
 def main(argv=None):
     """`python3 lifecycle.py may-take [--floor FILE] KIT TARGET`: may_take for a mover written in shell (join.sh,
-    hub.sh, and what onboard.py and owner_mcp.py run on a machine). It raises this user's floor to the release that KIT
+    hub.sh, and what owner_mcp.py runs on a machine). It raises this user's floor to the release that KIT
     runs, then answers with its exit status: 0 when KIT may move onto TARGET, else 1 and the one reason on standard
     error. The caller makes the move itself, with `git merge --ff-only TARGET`.
 

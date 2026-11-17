@@ -6,8 +6,8 @@ a release key signed: the release's `release.json` on the ref, a revision that d
 runs and from its user's floor, and that revision's own tree outside the data.
 
 What it proves, for each mover of a checkout (the helper's update and task-start sync, the server service's update and
-a new agent's first checkout, the hub's reload, write and rename, both installers, onboard.py, the owner's MCP server
-and config-ref.sh): a forged commit and an old signed release move no checkout, and a real release does. The releases
+a new agent's first checkout, the hub's reload, write and rename, both installers, the owner's MCP server and
+config-ref.sh): a forged commit and an old signed release move no checkout, and a real release does. The releases
 are made by `releases.Update` itself, in temporary repositories; nothing here reaches a network or a real fleet, and
 every test has its own HOME, so no floor of this computer's own is read or written.
 """
@@ -28,7 +28,6 @@ from unittest.mock import patch
 import fleet
 import hub
 import lifecycle
-import onboard
 import owner_mcp
 import releases
 import server
@@ -55,7 +54,7 @@ def load_tests(loader, _tests, _pattern):
     cases of Mover."""
     suite = unittest.TestSuite()
     for cls in (Check, Floor, Command, HelperUpdate, TaskStartSync, ServerUpdate, ServerNewCheckout, HubMovers,
-                JoinScript, HubScript, Onboard, OwnerMCP, ConfigRef, HandoverRecipients):
+                JoinScript, HubScript, OwnerMCP, ConfigRef, HandoverRecipients):
         names = cls.__dict__ if issubclass(cls, OwnerAPI) else dir(cls)
         suite.addTests(cls(name) for name in names if name.startswith("test_"))
     return suite
@@ -640,12 +639,6 @@ class HubScript(Shell):
                                     + f"take {self.kit} as_self || say could not update\n",
                                     extra=f"HOME={self.home}\nexport HOME\nas_self() {{ \"$@\"; }}\n")
         self.assertEqual(code, 0, self.said)
-
-
-class Onboard(Shell):
-    """onboard.py moves a worker's checkout over SSH with onboard.TAKE, in that checkout."""
-    def move(self, target):
-        self.shell(f"cd {self.kit} && {onboard.TAKE}")
 
 
 class OwnerMCP(Shell):

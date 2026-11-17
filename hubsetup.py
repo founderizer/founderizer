@@ -952,7 +952,7 @@ def firewall(check=False, run=None):
     `tailscale ip -4` and a `tailscale status` that succeeds, as in the installers' network steps. An address alone is
     not enough. Tailscale gives one to a machine that waits for an admin of the tailnet to approve it
     (NeedsMachineAuth), and nothing on the private network reaches that machine until then. Neither read proves that
-    the owner's Mac reaches SSH on that address: onboard.py's firewall step proves that over SSH first.
+    the owner's Mac reaches SSH on that address.
     A machine whose firewall was off keeps open the ports that answered from the internet before
     (`public_listeners`): a VPS that a customer already uses keeps its website.
     Safe to run again. Returns "set" or "would set"."""

@@ -39509,8 +39509,8 @@ def capp_public_url(url, name):
 # On a Linux server each agent has its own user (hubsetup.agent_user, server.py agent_user), and the server service's
 # user can become every one of them (sudo -u). On a Mac every agent runs as the desktop account, which also runs the
 # Mac's server service and its vault: so a Mac runs one agent. A machine with no server entry (from before the servers
-# feature) gives each agent its own user (hub.sh) or the machine's one worker user (onboard.py --existing-machine),
-# and team.json does not say which.
+# feature) gives each agent its own user (hub.sh) or the machine's one worker user (onboard.py --existing-machine, until
+# executor 2.0.0 removed that route), and team.json does not say which.
 
 OS_USER_UNKNOWN = "*"           # the OS user of an agent on a machine with no server entry: team.json cannot say it
 
@@ -41144,9 +41144,9 @@ def machine_readiness(team):
             if rt.get("name"):
                 m["runtimes"][rt["name"]] = {"version": rt.get("version"), "signed_in": rt.get("signed_in")}
         missing = ([] if m["ssh"] else ["no_ssh"]) + placement_missing(m["agents"], team, strict=True, t0=t0)
-        # One OS user for each agent: this is the route of onboard.py --existing-machine, which installs a new agent
-        # under the machine's worker user, the user of an agent that runs there already, on every kind of machine.
-        # Add agent on a server gives each agent its own user instead (add_server_agent).
+        # One OS user for each agent: this was the route of onboard.py --existing-machine, which installed a new agent
+        # under the machine's worker user, the user of an agent that runs there already, on every kind of machine,
+        # until executor 2.0.0 removed it. Add agent on a server gives each agent its own user (add_server_agent).
         missing.append("shared_os_user")
         key = store_key(team, machine)
         reports = [r for r in (broker_report(n, t0) for n in m["agents"]) if r and r.get("broker_recipient")]
@@ -41262,7 +41262,6 @@ TAILNET_TAG = re.compile(r"tag:[a-z0-9][a-z0-9-]{0,62}")    # a tag as the app r
 # A tag of one machine's part is no tag of every machine. The hub's own tag of the connected apps (the Mac app's
 # TailscaleFleetKey.hubTag) gives the hub's machine alone the right to publish an address with Tailscale Funnel: a
 # server that joined with it would ask Tailscale for a tag that its join key does not carry, or would get that right.
-# onboard.ONE_MACHINE_TAG is the same pattern.
 ONE_MACHINE_TAG = re.compile(r"tag:(founderizer-hub)")
 JOB_OPEN = ("queued", "running", "needs_owner")
 JOB_STEPS = ("user", "runtime", "checkout", "service", "sign_in",       # `user`: the agent's own OS user, on Linux
@@ -42311,8 +42310,8 @@ def served_repository():
 
 
 def repo_address(ip=None):
-    """The address from which each machine of this fleet clones and fetches the hub's repository (join.sh, onboard.py,
-    hub.sh): git:// on the hub's private address, with the path of served_repository()."""
+    """The address from which each machine of this fleet clones and fetches the hub's repository (join.sh, hub.sh):
+    git:// on the hub's private address, with the path of served_repository()."""
     return f"git://{ip or hub_address()[0]}/{served_repository()}"
 
 
@@ -53743,7 +53742,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.json(200, {"ok": True, "state": update["state"]})
 
     def ui_team_reload(self):
-        """Apply team.json from a pushed revision without a restart (used by onboarding registration)."""
+        """Apply team.json from a pushed revision without a restart (the owner MCP's reload_team)."""
         def read(data):
             rev = data.get("revision")
             if not isinstance(rev, str) or not REVISION.match(rev.lower()):

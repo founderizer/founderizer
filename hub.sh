@@ -94,8 +94,8 @@ NEEDED="hub.py fleet.py hubsetup.py selftest.py config-ref.sh team.json RULES.md
 # its first boot, and they hold it (hubsetup.py's APT_LOCK_WAIT).
 APT_LOCK_WAIT=1200
 # Seconds that `tailscale up` waits for the private network with the owner's key. With no limit it waits for ever on a
-# tailnet that approves each new machine by hand, and the install waits with it (as onboard.py's TAILSCALE_UP_WAIT
-# and the Mac app's InstallPlan.tailscaleUpWait).
+# tailnet that approves each new machine by hand, and the install waits with it (as the Mac app's
+# InstallPlan.tailscaleUpWait).
 TAILSCALE_UP_WAIT=300
 
 check=no

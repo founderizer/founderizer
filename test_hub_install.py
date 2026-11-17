@@ -59,8 +59,8 @@ STEPS = ["this server and this copy of Founderizer", "base packages", "the user 
          "the checks the owner can act on", "this fleet's own id", "security updates", "this server's own hardening",
          "the network: a kept connection keeps its speed", "verify: is this machine of the fleet healthy?"]
 PROMPT = KIT / "INSTALL-PROMPT.md"      # the text a customer pastes into the agent they already run
-# The systems a VPS may run, as `ID` and `VERSION_ID` of its /etc/os-release: both installers and the setup executor
-# take these, and the words after them are how each of them names the list to a server that runs another system.
+# The systems a VPS may run, as `ID` and `VERSION_ID` of its /etc/os-release: both installers take these, and the words
+# after them are how each of them names the list to a server that runs another system.
 SYSTEMS = {("ubuntu", "22.04"), ("ubuntu", "24.04"), ("ubuntu", "26.04"), ("debian", "12"), ("debian", "13")}
 SYSTEMS_SAID = "Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13"
 
@@ -2220,7 +2220,7 @@ class Firewall(unittest.TestCase):
         self.assertIn('python3 "$1/hubsetup.py" firewall', join)
         self.assertIn('firewall "/home/$WORKER/fleet-server"', shell_function(KIT / "join.sh", "linux"))
         self.assertIn('python3 "$tree/hubsetup.py" firewall', shell_function(SCRIPT, "firewall"))
-        for script in (SCRIPT, KIT / "join.sh", KIT / "hubsetup.py", KIT / "onboard.py"):
+        for script in (SCRIPT, KIT / "join.sh", KIT / "hubsetup.py"):
             self.assertNotRegex(script.read_text(), r"ufw allow [^\n]*/tcp",
                                 f"{script.name} still opens a TCP port to the whole internet")
             self.assertNotRegex(script.read_text(), r"comment 'fleet ssh'", script.name)
@@ -3236,8 +3236,8 @@ class AptUpdate(unittest.TestCase):
     reads DPkg::Lock::Timeout only for the lock of dpkg (apt-pkg/deb/debsystem.cc), and `update` takes the lock of the
     lists with one try (apt-pkg/acquire.cc): so it stops at once while the first updates of a new server read their
     lists. hub.sh and join.sh have one function for it, the same in both, which shows the words of its last try only;
-    hubsetup.py's age install and onboard.py have one loop each. Until 11 November 2026 none of them tried again. Each
-    runs as root on a StandInServer, whose apt-get plays that lock (`hold_lists_lock`)."""
+    hubsetup.py's age install has one loop. Until 11 November 2026 none of them tried again. Each runs as root on a
+    StandInServer, whose apt-get plays that lock (`hold_lists_lock`)."""
 
     def run_on(self, text, stops):
         """`text` as root on a new StandInServer whose next `stops` tries of `apt-get update` find the lock of the
@@ -3275,20 +3275,16 @@ class AptUpdate(unittest.TestCase):
             self.assertEqual((ran.status, server.slept()), (100, [15] * 9), script.name)
             self.assertEqual(ran.err.count("Could not get lock /var/lib/apt/lists/lock"), 1, ran.err)
 
-    def test_the_age_install_and_the_setup_executor_try_again(self):
-        import onboard
-        for name, text in (("hubsetup.APT_UPDATE", hubsetup.APT_UPDATE), ("onboard.APT_UPDATE", onboard.APT_UPDATE)):
-            server, ran = self.run_on(text + "\n", 9)
-            self.assertEqual((ran.status, server.slept()), (0, [15] * 9), name + ": " + ran.err)
-            server, ran = self.run_on(text + "\n", 10)
-            self.assertEqual((ran.status, server.slept()), (100, [15] * 9), name + ": " + ran.err)
-            self.assertIn("Could not get lock /var/lib/apt/lists/lock", ran.err.splitlines()[-2], name)
+    def test_the_age_install_tries_again(self):
+        server, ran = self.run_on(hubsetup.APT_UPDATE + "\n", 9)
+        self.assertEqual((ran.status, server.slept()), (0, [15] * 9), ran.err)
+        server, ran = self.run_on(hubsetup.APT_UPDATE + "\n", 10)
+        self.assertEqual((ran.status, server.slept()), (100, [15] * 9), ran.err)
+        self.assertIn("Could not get lock /var/lib/apt/lists/lock", ran.err.splitlines()[-2])
         self.assertIn(hubsetup.APT_UPDATE, hubsetup.AGE_INSTALL)
-        self.assertIn(onboard.APT_UPDATE, onboard.TAILSCALE_INSTALL)
-        for module in (hubsetup, onboard):
-            loose = [line for line in Path(module.__file__).read_text().splitlines()
-                     if "update -q" in line and "_UPDATE_ONCE =" not in line]
-            self.assertEqual(loose, [], module.__name__)
+        loose = [line for line in Path(hubsetup.__file__).read_text().splitlines()
+                 if "update -q" in line and "_UPDATE_ONCE =" not in line]
+        self.assertEqual(loose, [])
 
 
 class Prompt(unittest.TestCase):
@@ -4933,8 +4929,8 @@ class CheckMode(unittest.TestCase):
 
 
 class Systems(unittest.TestCase):
-    """The systems a VPS may run. The hub's installer, the join and the setup executor take the same ones, so a server
-    that one of them takes is never refused by the next, and every line that names them names all of them."""
+    """The systems a VPS may run. The hub's installer and the join take the same ones, so a server that one of them
+    takes is never refused by the other, and every line that names them names all of them."""
 
     @staticmethod
     def taken(script):
@@ -4944,15 +4940,12 @@ class Systems(unittest.TestCase):
         patterns = lines[at + 1].strip().split(")")[0]
         return {tuple(p.strip('"').split(" ")) for p in patterns.split("|")}
 
-    def test_both_installers_and_the_setup_executor_take_the_same_systems(self):
-        import onboard
+    def test_both_installers_take_the_same_systems(self):
         self.assertEqual(self.taken(SCRIPT), SYSTEMS)
         self.assertEqual(self.taken(KIT / "join.sh"), SYSTEMS)
-        self.assertEqual(onboard.SUPPORTED_OS, SYSTEMS)
 
     def test_every_line_that_names_the_systems_names_all_of_them(self):
-        for path in (SCRIPT, KIT / "join.sh", KIT / "onboard.py", KIT / "owner_mcp.py", KIT / "HUB-INSTALL.md",
-                     KIT / "INSTALL-PROMPT.md"):
+        for path in (SCRIPT, KIT / "join.sh", KIT / "owner_mcp.py", KIT / "HUB-INSTALL.md", KIT / "INSTALL-PROMPT.md"):
             text = re.sub(r"\\\n\s*", "", path.read_text())       # a shell line goes on after a backslash
             text = re.sub(r"\s*\n[#\s]*", " ", text)              # a comment or a paragraph on its next line
             named = re.findall(r"Ubuntu 22\.04(?:[^.]|\.(?=\d))*?Debian 12(?: or 13)?", text)
@@ -4968,12 +4961,10 @@ class ZoneData(unittest.TestCase):
     package tzdata, and a hub on a machine with no zone data still knows UTC."""
 
     def test_each_package_list_names_tzdata(self):
-        import onboard
         for script in (SCRIPT, KIT / "join.sh"):
             lists = re.findall(r'^PACKAGES="([^"]*)"', script.read_text(), re.M)
             self.assertEqual(len(lists), 1, script.name)
             self.assertIn("tzdata", lists[0].split(), script.name)
-        self.assertIn("tzdata", onboard.PACKAGES.split())
 
     def test_a_hub_with_no_zone_data_knows_utc(self):
         import zoneinfo
