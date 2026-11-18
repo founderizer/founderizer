@@ -98,7 +98,7 @@ def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
     for cls in (Template, Repository, Claim, SecondClaim, AgentUsers, FleetId, VerifyStep, Prompt, PromptThroughSudo,
                 CheckMode, Systems, ZoneData, NoProviderCredential, ProviderToolsRefuse, RuntimeInstall, Firewall,
-                Harden, HubTcp, NetworkStep, PackageStops, AptUpdate):
+                Harden, HardenMemory, HubTcp, NetworkStep, PackageStops, PackageLists, AptUpdate):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return suite
 
@@ -2274,6 +2274,11 @@ class Harden(unittest.TestCase):
     KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyOfTheOwnerForThisTest owner@mac\n"
     HARDENED = "passwordauthentication no\nkbdinteractiveauthentication no\nx11forwarding no\npermitrootlogin " \
                "prohibit-password\n"
+    # The two lines of the memory parts where the kernel's files are not there, as in this fixture until a test of
+    # HardenMemory puts them there: both parts then read nothing and run nothing.
+    NO_MEMORY_FILES = ["swap stays as it is: this system does not say what swap it has",
+                       "no memory limit for the users' processes: this system has no memory group for them that it "
+                       "can set"]
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="fleet-harden-"))
@@ -2357,7 +2362,7 @@ class Harden(unittest.TestCase):
         self.assertEqual(lines, ["SSH takes keys only, with no X11 forwarding",
                                  "made npm take no package version newer than seven days (/etc/npmrc, "
                                  "/home/fleet/.npmrc)",
-                                 "Tailscale updates itself"])
+                                 "Tailscale updates itself", *self.NO_MEMORY_FILES])
 
     def test_a_second_run_writes_nothing_new(self):
         self.harden()
@@ -2489,7 +2494,7 @@ class Harden(unittest.TestCase):
         self.assertEqual(lines, ["would make SSH take keys only, with no X11 forwarding",
                                  "would make npm take no package version newer than seven days (/etc/npmrc, "
                                  "/home/fleet/.npmrc)",
-                                 "would turn on Tailscale's own updates"])
+                                 "would turn on Tailscale's own updates", *self.NO_MEMORY_FILES])
 
     def test_the_join_takes_it_after_its_firewall_as_the_one_hardening_command(self):
         join = shell_function(KIT / "join.sh", "linux")
@@ -2540,7 +2545,8 @@ class Harden(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertNotIn("ran ", out)
         self.assertNotIn("would run", out)
-        self.assertIn("Founderizer:   would leave this server's SSH, npm and Tailscale settings as they are", out)
+        self.assertIn("Founderizer:   would leave this server's SSH, npm and Tailscale settings, its swap and its "
+                      "memory limit as they are", out)
 
     def test_sshds_words_come_as_one_line_and_keep_their_end(self):
         """sshd says a fault of its files in two lines, and a long path makes them long. The join's line gives them
@@ -2810,7 +2816,8 @@ class Harden(unittest.TestCase):
                 self.hardening.unlink()
             npm = ("made npm take no package version newer than seven days (/etc/npmrc, /home/fleet/.npmrc)"
                    if slow == ("journalctl",) else "npm takes no package version newer than seven days already")
-            self.assertEqual(self.harden(), [self.HARDENS, npm, "Tailscale updates itself"], slow)
+            self.assertEqual(self.harden(), [self.HARDENS, npm, "Tailscale updates itself", *self.NO_MEMORY_FILES],
+                             slow)
         self.assertEqual({self.waits[script] for script in self.ran if script.startswith(("journalctl", "loginctl"))},
                          {30}, "each read of the log has 30 seconds")
 
@@ -2877,6 +2884,418 @@ class Harden(unittest.TestCase):
             self.assertFalse(self.hardening.exists(), above)
             self.assertFalse(self.sshd_run.exists(), above)
             self.assertFalse((self.root / "etc/npmrc").exists(), above)
+
+
+class HardenMemory(unittest.TestCase):
+    """The memory parts of hubsetup.py harden (the owner, 17 November 2026, after three servers of 4 GB with no swap ran
+    out of memory and each repair came to the owner as a root command): a swap file as a reserve, and one limit for all
+    users' processes together, so that a job that takes all the memory is ended and the server still answers. The
+    kernel's files and the server's own are under a folder of the test's own, and each command answers from a
+    stand-in that does what the real one leaves behind."""
+
+    GIB = 1 << 30
+    FSTAB = "LABEL=cloudimg-rootfs\t/\t ext4\tdiscard,commit=30,errors=remount-ro\t0 1\n"
+    HEAD = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n"
+    LIMITED = "3473678336\n"
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="fleet-memory-"))
+        self.addCleanup(shutil.rmtree, str(self.root), True)
+        for folder in ("proc", "etc", "sys/fs/cgroup/user.slice"):
+            (self.root / folder).mkdir(parents=True)
+        (self.root / "proc/swaps").write_text(self.HEAD)
+        (self.root / "proc/meminfo").write_text("MemTotal:        3910656 kB\nMemFree:          171428 kB\n")
+        (self.root / "etc/fstab").write_text(self.FSTAB)
+        self.limit = self.root / "sys/fs/cgroup/user.slice/memory.max"
+        self.limit.write_text("max\n")
+        self.ran, self.fails, self.system, self.free = [], {}, "ext2/ext3\n", 30 * self.GIB
+        self.slow, self.made = (), None
+        patcher = patch.object(hubsetup, "disk_free", lambda path: self.free)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_cmd(self, script, timeout=120):
+        """Each command as the real one leaves the server: swapon puts the file into the kernel's list, swapoff takes
+        it out, and systemd's reload makes the kernel's limit follow the file that is written."""
+        self.ran.append(script)
+        if script.split()[0] in self.slow:
+            raise subprocess.TimeoutExpired(script, timeout)
+        if script.startswith("fallocate "):     # the file as the first command finds it: there, and for root only
+            self.made = (self.root / "swapfile").stat().st_mode & 0o777
+        if script.split()[0] in self.fails:
+            return self.fails[script.split()[0]]
+        if script == "stat -f -c %T /":
+            return 0, self.system, ""
+        if script == "swapon /swapfile":
+            (self.root / "proc/swaps").write_text(self.HEAD + "/swapfile  file\t\t4194300\t\t0\t\t-2\n")
+        if script == "swapoff /swapfile":
+            (self.root / "proc/swaps").write_text(self.HEAD)
+        if script == "systemctl daemon-reload" and (self.root / hubsetup.MEMORY_LIMIT.lstrip("/")).exists():
+            self.limit.write_text(self.LIMITED)
+        return 0, "", ""
+
+    def swap(self, check=False):
+        return hubsetup.harden_swap(check, self.run_cmd, str(self.root))
+
+    def memory(self, check=False):
+        return hubsetup.harden_memory(check, self.run_cmd, str(self.root))
+
+    def file(self, path):
+        return (self.root / path.lstrip("/")).read_text()
+
+    def mode(self, path):
+        return (self.root / path.lstrip("/")).stat().st_mode & 0o777
+
+    def test_a_server_with_no_swap_gets_a_file_as_large_as_its_memory_and_keeps_it_over_a_start(self):
+        self.assertEqual(self.swap(), "added a swap file of 4 GiB (/swapfile), as a reserve")
+        self.assertEqual(self.ran, ["stat -f -c %T /", f"fallocate -l {4 * self.GIB} /swapfile", "mkswap -q /swapfile",
+                                    "swapon /swapfile", "sysctl -q -p /etc/sysctl.d/60-fleet-swap.conf"])
+        self.assertEqual((self.made, self.mode("/swapfile")), (0o600, 0o600), "for root only, from before it has any size")
+        self.assertEqual(self.file("/etc/fstab"), self.FSTAB + "/swapfile none swap sw 0 0\n")
+        self.assertEqual(self.file(hubsetup.SWAP_SYSCTL), hubsetup.SWAP_SYSCTL_TEXT)
+        self.assertIn("\nvm.swappiness = 10\n", hubsetup.SWAP_SYSCTL_TEXT)
+        self.assertEqual(self.mode(hubsetup.SWAP_SYSCTL), 0o644)
+        # A second run reads the kernel's list and changes nothing.
+        del self.ran[:]
+        self.assertEqual(self.swap(), "this server has swap already (/swapfile)")
+        self.assertEqual((self.ran, self.file("/etc/fstab").count("swap sw")), ([], 1))
+
+    def test_the_file_is_the_memory_in_whole_gib_and_4_gib_at_most(self):
+        for kb, gib in ((954000, 1), (1048576, 1), (1048577, 2), (3910656, 4), (16311184, 4)):
+            with self.subTest(kb=kb):
+                (self.root / "proc/meminfo").write_text(f"MemTotal:       {kb} kB\n")
+                self.assertEqual(self.swap(check=True), f"would add a swap file of {gib} GiB (/swapfile)")
+        self.assertEqual(self.ran, ["stat -f -c %T /"] * 5, "the check only reads")
+        self.assertFalse((self.root / "swapfile").exists())
+        self.assertEqual(self.file("/etc/fstab"), self.FSTAB)
+
+    def test_an_fstab_with_no_last_line_end_gets_one_before_the_swap_line(self):
+        (self.root / "etc/fstab").write_text(self.FSTAB.rstrip("\n"))
+        os.chmod(self.root / "etc/fstab", 0o640)
+        self.swap()
+        self.assertEqual(self.file("/etc/fstab"), self.FSTAB + hubsetup.SWAP_LINE + "\n")
+        self.assertEqual(self.mode("/etc/fstab"), 0o640, "the table keeps its mode")
+
+    def test_a_server_keeps_the_swap_that_it_has_or_names(self):
+        """Swap that is on, a swap line of the server's own in /etc/fstab that is not on, a file at the name, and a
+        system that does not say: each keeps what it has, and no command runs."""
+        cases = []
+        (self.root / "proc/swaps").write_text(self.HEAD + "/dev/sda2  partition\t2097148\t0\t-2\n")
+        cases.append(self.swap())
+        (self.root / "proc/swaps").write_text(self.HEAD)
+        (self.root / "etc/fstab").write_text(self.FSTAB + "# /old none swap sw 0 0\nUUID=1a2b none swap sw 0 0\n")
+        cases.append(self.swap())
+        (self.root / "etc/fstab").write_text(self.FSTAB + "# /swapfile none swap sw 0 0\n")       # a comment is no line
+        (self.root / "swapfile").write_text("")
+        cases.append(self.swap())
+        (self.root / "swapfile").unlink()
+        os.symlink("/etc/shadow", self.root / "swapfile")       # a link at the name is a file at the name
+        cases.append(self.swap())
+        (self.root / "swapfile").unlink()
+        (self.root / "proc/swaps").unlink()
+        cases.append(self.swap())
+        self.assertEqual(cases, ["this server has swap already (/dev/sda2)",
+                                 "swap stays as it is: /etc/fstab names a swap of this server's own, which is not on",
+                                 "swap stays as it is: /swapfile is there and is not swap now",
+                                 "swap stays as it is: /swapfile is there and is not swap now",
+                                 "swap stays as it is: this system does not say what swap it has"])
+        self.assertEqual(self.ran, [])
+
+    def test_a_disk_or_a_file_system_that_cannot_take_the_file_gets_none(self):
+        self.free = 9 * self.GIB        # 4 GiB of file and 5 GiB that stay free need 9: just enough
+        self.assertEqual(self.swap(check=True), "would add a swap file of 4 GiB (/swapfile)")
+        self.free = 9 * self.GIB - 1
+        self.assertEqual(self.swap(), "no swap file: the disk has 8 GiB free, and a file of 4 GiB needs 9")
+        self.free, self.system = 30 * self.GIB, "btrfs\n"
+        self.assertEqual(self.swap(), "no swap file: the file system of / (btrfs) needs a way of its own for one")
+        self.fails["stat"] = (1, "", "stat: cannot read file system information")
+        self.assertEqual(self.swap(), "no swap file: the file system of / (not read) needs a way of its own for one")
+        (self.root / "proc/meminfo").write_text("")
+        self.assertEqual(self.swap(), "no swap file: this system does not say how much memory it has")
+        self.assertFalse((self.root / "swapfile").exists())
+        self.assertEqual(self.file("/etc/fstab"), self.FSTAB)
+        self.assertFalse((self.root / hubsetup.SWAP_SYSCTL.lstrip("/")).exists())
+
+    def test_a_step_that_fails_takes_the_file_away_and_leaves_the_table(self):
+        """In a container the kernel refuses swapon, and a full disk refuses fallocate: the file leaves again, nothing
+        names it, and the words are the command's own."""
+        for step, said in (("swapon", "swapon: /swapfile: swapon failed: Operation not permitted"),
+                           ("fallocate", "fallocate: fallocate failed: No space left on device"), ("mkswap", "")):
+            with self.subTest(step=step):
+                self.fails = {step: (255 if step == "swapon" else 1, "", said + "\n")}
+                self.assertEqual(self.swap(), f"no swap file: {step} did not work ({said or 1})")
+                self.assertEqual(self.ran[-1], "swapoff /swapfile")
+                self.assertFalse((self.root / "swapfile").exists())
+                self.assertEqual(self.file("/etc/fstab"), self.FSTAB)
+                self.assertFalse((self.root / hubsetup.SWAP_SYSCTL.lstrip("/")).exists())
+
+    def test_whatever_stops_a_step_takes_the_swap_and_the_file_away(self):
+        """A command that runs out of its time, and a table that cannot be written after the swap is on: neither
+        leaves a file that nothing names, which every later run would read as "a file at the name"."""
+        for slow in ("fallocate", "mkswap", "swapon"):
+            with self.subTest(slow=slow):
+                self.slow = (slow,)
+                self.assertRegex(self.swap(), r"^no swap file: a step stopped \(TimeoutExpired: Command '" + slow)
+                self.assertEqual(self.ran[-1], "swapoff /swapfile")
+                self.assertFalse((self.root / "swapfile").exists())
+                self.assertEqual(self.file("/etc/fstab"), self.FSTAB)
+        self.slow = ()
+        real = hubsetup.put_file
+
+        def full(path, text, mode, uid=None, gid=None):
+            if path.endswith("/etc/fstab"):
+                raise OSError(28, "No space left on device")
+            return real(path, text, mode, uid, gid)
+        with patch.object(hubsetup, "put_file", full):
+            self.assertEqual(self.swap(), "no swap file: a step stopped (OSError: [Errno 28] No space left on device)")
+        self.assertEqual(self.ran[-2:], ["swapon /swapfile", "swapoff /swapfile"])
+        self.assertFalse((self.root / "swapfile").exists())
+        self.assertEqual((self.file("/etc/fstab"), self.file("/proc/swaps")), (self.FSTAB, self.HEAD))
+        self.assertFalse((self.root / hubsetup.SWAP_SYSCTL.lstrip("/")).exists())
+        # A stop of the whole run takes the file away too, and goes on as the stop that it is.
+        def stopped(script, timeout=120):
+            if script.startswith("mkswap"):
+                raise KeyboardInterrupt
+            return self.run_cmd(script, timeout)
+        with self.assertRaises(KeyboardInterrupt):
+            hubsetup.harden_swap(False, stopped, str(self.root))
+        self.assertFalse((self.root / "swapfile").exists())
+
+    def test_a_setting_of_the_kernel_that_cannot_be_written_takes_nothing_back(self):
+        real = hubsetup.put_file
+
+        def refused(path, text, mode, uid=None, gid=None):
+            if path.endswith(hubsetup.SWAP_SYSCTL):
+                raise PermissionError(13, "Permission denied")
+            return real(path, text, mode, uid, gid)
+        with patch.object(hubsetup, "put_file", refused):
+            self.assertEqual(self.swap(), "added a swap file of 4 GiB (/swapfile), as a reserve; the kernel's setting "
+                                          "for it (/etc/sysctl.d/60-fleet-swap.conf) was not written (PermissionError: "
+                                          "[Errno 13] Permission denied)")
+        self.assertEqual(self.file("/etc/fstab"), self.FSTAB + hubsetup.SWAP_LINE + "\n")
+        self.assertIn("/swapfile", self.file("/proc/swaps"))
+
+    def test_a_table_keeps_each_byte_that_is_no_utf_8_and_one_that_cannot_be_read_gets_no_file(self):
+        odd = self.FSTAB.encode() + b"# caf\xe9 \xff\n"
+        (self.root / "etc/fstab").write_bytes(odd)
+        self.assertEqual(self.swap(), "added a swap file of 4 GiB (/swapfile), as a reserve")
+        self.assertEqual((self.root / "etc/fstab").read_bytes(), odd + b"/swapfile none swap sw 0 0\n")
+        # No table: the file is not made at all, so nothing has to be taken away.
+        (self.root / "proc/swaps").write_text(self.HEAD)
+        (self.root / "swapfile").unlink()
+        (self.root / "etc/fstab").unlink()
+        del self.ran[:]
+        self.assertEqual(self.swap(), "no swap file: /etc/fstab cannot be read (No such file or directory)")
+        self.assertEqual(self.ran, ["stat -f -c %T /"])
+        self.assertFalse((self.root / "swapfile").exists())
+
+    def test_a_part_that_stops_takes_no_other_parts_line_with_it(self):
+        """Through harden itself: a part that raises says so in its own line, and the parts after it still run."""
+        (self.root / "etc/ssh/sshd_config.d").mkdir(parents=True)
+        self.slow = ("mkswap",)
+
+        def breaks(check, run):
+            raise RuntimeError("tailscale\nis not well")
+        with patch.object(hubsetup, "harden_tailscale", breaks), contextlib.redirect_stdout(io.StringIO()) as said:
+            lines = hubsetup.harden(run=self.run_cmd, root=str(self.root), account=None)
+        self.assertEqual(lines[2], "Tailscale stays as it is: this part stopped (RuntimeError: tailscale is not well)")
+        self.assertRegex(lines[3], r"^no swap file: a step stopped \(TimeoutExpired: ")
+        self.assertRegex(lines[4], r"^the users' processes together get at most 85% of the memory: ")
+        self.assertEqual(len(said.getvalue().splitlines()), 5)
+        self.assertEqual(hubsetup.harden_part("swap", lambda: 1 / 0),
+                         "swap stays as it is: this part stopped (ZeroDivisionError: division by zero)")
+
+    LIMIT_SET = ("the users' processes together get at most 85% of the memory: the kernel ends the largest of them "
+                 "when that and their part of the swap are full, and SSH and Tailscale keep the rest")
+
+    def test_all_users_together_get_one_limit_that_systemd_takes_at_once(self):
+        self.assertEqual(self.memory(), self.LIMIT_SET)
+        self.assertEqual(self.ran, ["systemctl daemon-reload"])
+        self.assertEqual(self.file(hubsetup.MEMORY_LIMIT), hubsetup.MEMORY_TEXT)
+        self.assertEqual(self.mode(hubsetup.MEMORY_LIMIT), 0o644)
+        self.assertEqual(hubsetup.MEMORY_LIMIT, "/etc/systemd/system/user.slice.d/00-fleet-memory.conf")
+        # systemd takes a unit's drop-ins in the order of their names, and the last one decides: this file's name is
+        # before each name that a server's own file is likely to have, so that file decides, also one that comes later.
+        for other in ("00-site.conf", "10-site.conf", "50-MemoryMax.conf", "50-memory-cap.conf", "memory.conf"):
+            self.assertLess(os.path.basename(hubsetup.MEMORY_LIMIT), other)
+        self.assertTrue(hubsetup.MEMORY_TEXT.endswith("[Slice]\nMemoryAccounting=yes\nMemoryMax=85%\n"
+                                                      "MemorySwapMax=50%\n"),
+                        "percents, which systemd reads at each start, so they follow a server that grows")
+        # The text has its numbers as plain words (the app holds a copy of it): they are the two constants.
+        self.assertIn(f"\nMemoryMax={hubsetup.MEMORY_SHARE}%\nMemorySwapMax={hubsetup.MEMORY_SWAP_SHARE}%\n",
+                      hubsetup.MEMORY_TEXT)
+        self.assertIn(f"at most {hubsetup.MEMORY_SHARE}% of this server's memory", hubsetup.MEMORY_TEXT)
+        for text in (hubsetup.MEMORY_TEXT, hubsetup.SWAP_SYSCTL_TEXT):
+            self.assertTrue(text.startswith("# Founderizer writes this file (hubsetup.py harden)"),
+                            "both installers write it, not the join alone")
+        # A second run reads the kernel's file and changes nothing.
+        del self.ran[:]
+        self.assertEqual(self.memory(), "the users' processes together have at most 85% of the memory already")
+        self.assertEqual(self.ran, [])
+
+    def test_a_limit_of_the_servers_own_stays(self):
+        """A server whose owner set a limit in a file of their own (one server of this fleet had 3 GiB from 13 November
+        2026): the kernel says a number and this step's file is not there, so nothing is written."""
+        self.limit.write_text("3221225472\n")
+        self.assertEqual(self.memory(), "the users' processes have a memory limit of this server's own already")
+        self.assertEqual(self.ran, [])
+        self.assertFalse((self.root / hubsetup.MEMORY_LIMIT.lstrip("/")).exists())
+
+    def test_a_system_with_no_group_for_the_users_gets_no_file(self):
+        self.limit.unlink()
+        self.assertEqual(self.memory(), "no memory limit for the users' processes: this system has no memory group for "
+                                        "them that it can set")
+        self.assertEqual(self.ran, [])
+        self.assertFalse((self.root / hubsetup.MEMORY_DIR.lstrip("/")).exists())
+
+    def test_the_file_of_an_earlier_text_is_written_again_and_one_that_systemd_did_not_take_is_read_again(self):
+        path = self.root / hubsetup.MEMORY_LIMIT.lstrip("/")
+        path.parent.mkdir(parents=True)
+        path.write_text("[Slice]\nMemoryMax=80%\n")
+        self.limit.write_text(self.LIMITED)
+        self.assertIn("get at most 85%", self.memory())
+        self.assertEqual(path.read_text(), hubsetup.MEMORY_TEXT)
+        # The file is right and the kernel has no limit: systemd reads its files again, and nothing is written.
+        self.limit.write_text("max\n")
+        before = path.stat().st_ino
+        self.assertIn("get at most 85%", self.memory())
+        self.assertEqual((self.ran, path.stat().st_ino), (["systemctl daemon-reload"] * 2, before))
+
+    def test_a_reload_that_fails_says_that_the_limit_waits_for_the_next_start(self):
+        self.fails["systemctl"] = (1, "", "Failed to connect to bus: No such file or directory\n")
+        self.assertEqual(self.memory(), "the memory limit of the users' processes is written and not in force yet: "
+                                        "systemd takes it when it reads its files again (Failed to connect to bus: No "
+                                        "such file or directory)")
+        self.assertEqual(self.file(hubsetup.MEMORY_LIMIT), hubsetup.MEMORY_TEXT)
+
+    def test_a_file_of_the_servers_own_that_sets_a_limit_decides_also_before_systemd_read_it(self):
+        """The owner wrote a limit and did not make systemd read it yet, so the kernel still says none: this step's
+        file would win by its name and put its own number over the owner's. And a limit that `systemctl set-property`
+        wrote, in the place that systemd reads first. With such a file, nothing is written, with this step's own file
+        beside it too, and the line names the file."""
+        own = self.root / "etc/systemd/system/user.slice.d/10-site.conf"
+        own.parent.mkdir(parents=True)
+        own.write_text("[Slice]\n  MemoryMax = 3G\n")
+        self.assertEqual(self.memory(), "the users' processes keep this server's own setting of their memory limit "
+                                        "(/etc/systemd/system/user.slice.d/10-site.conf)")
+        self.assertEqual((self.ran, sorted(p.name for p in own.parent.iterdir())), ([], ["10-site.conf"]))
+        (own.parent / "00-fleet-memory.conf").write_text(hubsetup.MEMORY_TEXT)
+        self.limit.write_text(self.LIMITED)
+        self.assertIn("keep this server's own setting of their memory limit", self.memory())
+        own.unlink()
+        self.assertEqual(self.memory(), "the users' processes together have at most 85% of the memory already")
+        (own.parent / "00-fleet-memory.conf").unlink()
+        self.limit.write_text("max\n")
+        control = self.root / "etc/systemd/system.control/user.slice.d/50-MemoryMax.conf"
+        control.parent.mkdir(parents=True)
+        control.write_text("# This is a drop-in unit file extension, created via \"systemctl set-property\"\n[Slice]\n"
+                           "MemoryMax=infinity\n")
+        self.assertEqual(hubsetup.own_memory_limits(str(self.root)),
+                         ["/etc/systemd/system.control/user.slice.d/50-MemoryMax.conf"])
+        self.assertIn("(/etc/systemd/system.control/user.slice.d/50-MemoryMax.conf)", self.memory())
+        # A file that sets another thing of the slice, a comment, and a file whose name starts with a dot (systemd
+        # does not read one) are no limit.
+        control.write_text("[Slice]\n# MemoryMax=1G\nMemoryHigh=2G\nTasksMax=4096\n")
+        (control.parent / ".hidden.conf").write_text("[Slice]\nMemoryMax=1G\n")
+        self.assertEqual(hubsetup.own_memory_limits(str(self.root)), [])
+        # A file for every slice (slice.d), and the limit's old name.
+        every = self.root / "etc/systemd/system/slice.d/10-all.conf"
+        every.parent.mkdir(parents=True)
+        for line in ("MemoryMax=2G", "MemoryLimit=2G"):
+            every.write_text(f"[Slice]\n{line}\n")
+            self.assertEqual(hubsetup.own_memory_limits(str(self.root)), ["/etc/systemd/system/slice.d/10-all.conf"])
+            self.assertIn("(/etc/systemd/system/slice.d/10-all.conf)", self.memory())
+        every.unlink()
+        self.assertEqual(self.memory(), self.LIMIT_SET)
+
+    def test_a_stop_of_the_program_in_the_middle_takes_the_file_away_first(self):
+        """The session that runs the step hangs up, or the program is told to stop, between the file's making and
+        the table's line: the program ends as it was told to, and the file is gone before it does. Afterwards each
+        signal has its earlier handling again."""
+        before = {number: signal.getsignal(number) for number in (signal.SIGHUP, signal.SIGTERM)}
+        for number in before:
+            with self.subTest(signal=number):
+                def stopped(script, timeout=120, number=number):
+                    if script.startswith("mkswap"):
+                        os.kill(os.getpid(), number)
+                        time.sleep(1)       # the signal's own handler ends this wait
+                    return self.run_cmd(script, timeout)
+                with self.assertRaises(SystemExit) as ended:
+                    hubsetup.harden_swap(False, stopped, str(self.root))
+                self.assertEqual(ended.exception.code, 128 + number)
+                self.assertEqual(self.ran[-1], "swapoff /swapfile")
+                self.assertFalse((self.root / "swapfile").exists())
+                self.assertEqual(self.file("/etc/fstab"), self.FSTAB)
+                self.assertEqual({n: signal.getsignal(n) for n in before}, before)
+
+    def test_a_stop_takes_the_file_away_only_while_the_table_does_not_name_it(self):
+        """The two ends of the step. A stop while the file is being made, before the step knows that it has one:
+        the file goes. A stop just after the table's line is written: the swap is whole, so the file and the line
+        both stay, where a cleanup would leave a line for a file that is gone and no later run would make swap
+        again. And a file that is at the name when the step comes to make its own is not this step's: it stays."""
+        make, put = hubsetup.make_swap_file, hubsetup.put_file
+
+        def made_then_stops(path):
+            make(path)
+            os.kill(os.getpid(), signal.SIGHUP)
+            time.sleep(1)       # the signal's own handler ends this wait
+        with patch.object(hubsetup, "make_swap_file", made_then_stops), self.assertRaises(SystemExit):
+            self.swap()
+        self.assertFalse((self.root / "swapfile").exists())
+        self.assertEqual(self.file("/etc/fstab"), self.FSTAB)
+
+        def written_then_stops(path, text, mode, uid=None, gid=None):
+            put(path, text, mode, uid, gid)
+            if path.endswith("/etc/fstab"):
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(1)
+        del self.ran[:]
+        with patch.object(hubsetup, "put_file", written_then_stops), self.assertRaises(SystemExit):
+            self.swap()
+        self.assertTrue((self.root / "swapfile").exists())
+        self.assertEqual(self.file("/etc/fstab"), self.FSTAB + hubsetup.SWAP_LINE + "\n")
+        self.assertNotIn("swapoff /swapfile", self.ran)
+        self.assertIn("/swapfile", self.file("/proc/swaps"))
+        self.assertTrue(hubsetup.swap_line_there(str(self.root)))
+        self.assertFalse(hubsetup.swap_line_there(str(self.root / "nowhere")))
+        # A line that only starts like the step's own is not the step's line.
+        (self.root / "etc/fstab").write_text(self.FSTAB + "/swapfile none swap sw,pri=5 0 0\n# /swapfile none swap sw 0 0\n")
+        self.assertFalse(hubsetup.swap_line_there(str(self.root)))
+
+        # Another program made a file at the name in the same moment: it is not this step's to take away.
+        (self.root / "proc/swaps").write_text(self.HEAD)
+        (self.root / "swapfile").unlink()
+        (self.root / "etc/fstab").write_text(self.FSTAB)
+
+        def taken(path):
+            Path(path).write_text("somebody else's")
+            make(path)
+        del self.ran[:]
+        with patch.object(hubsetup, "make_swap_file", taken):
+            self.assertEqual(self.swap(), "no swap file: /swapfile cannot be made (File exists)")
+        self.assertEqual((self.root / "swapfile").read_text(), "somebody else's")
+        self.assertEqual(self.ran, ["stat -f -c %T /"])
+
+    def test_the_check_says_what_both_parts_would_do_and_writes_nothing(self):
+        self.assertEqual((self.swap(check=True), self.memory(check=True)),
+                         ("would add a swap file of 4 GiB (/swapfile)",
+                          "would give the users' processes together at most 85% of the memory"))
+        self.assertEqual(self.ran, ["stat -f -c %T /"])
+        self.assertEqual(sorted(p.name for p in (self.root / "etc").iterdir()), ["fstab"])
+        self.assertFalse((self.root / "swapfile").exists())
+
+    def test_the_hardening_takes_both_parts_after_tailscale_and_a_fault_of_one_stops_nothing(self):
+        """Through harden itself, as both installers call it: the two lines come last, and a swap that the kernel
+        refuses leaves the limit, which protects the server alone."""
+        (self.root / "etc/ssh/sshd_config.d").mkdir(parents=True)
+        self.fails["swapon"] = (255, "", "swapon: /swapfile: swapon failed: Operation not permitted\n")
+        self.fails["sshd"] = (0, "", "")
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            lines = hubsetup.harden(run=self.run_cmd, root=str(self.root), account=None)
+        self.assertEqual(lines[3:], ["no swap file: swapon did not work (swapon: /swapfile: swapon failed: Operation not "
+                                     "permitted)", self.LIMIT_SET])
+        self.assertEqual(said.getvalue().splitlines()[3:], ["Founderizer: " + line for line in lines[3:]])
+        self.assertEqual(len(lines), 5)
 
 
 class HubTcp(unittest.TestCase):
@@ -4486,9 +4905,10 @@ class CheckMode(unittest.TestCase):
         records are there. Without the word the plan has none of them, as before. The word does not go with the word
         for a manager with no server yet."""
         plain = self.run_check()
-        self.assertNotIn("shared", plain)
-        self.assertNotIn("fleet-server", plain)
-        self.assertNotIn("hubsetup.py vault", plain)
+        words = plain.replace(str(KIT), "<copy>")         # the plan names the copy's folder, which has any name
+        self.assertNotIn("shared", words)
+        self.assertNotIn("fleet-server", words)
+        self.assertNotIn("hubsetup.py vault", words)
         self.assertIn("     on its own server.", plain)
         out = self.run_check(more_env={"FLEET_HUB_SERVER": "shared"})
         self.assertIn('would write "hub": {"shared": true} and this server\'s own entry in "servers" there', out)

@@ -40099,6 +40099,7 @@ def validate_status(data):
                          **{k: v for k, v in (("unattended_upgrades", _optional(sec.get("unattended_upgrades"), bool)),
                                               ("ssh_keys_only", _optional(sec.get("ssh_keys_only"), bool)),
                                               ("npm_rule", _optional(sec.get("npm_rule"), bool)),
+                                              ("memory_guard", _optional(sec.get("memory_guard"), bool)),
                                               ("upgraded_at", upgraded),
                                               ("macos_update", macos_update_status(sec.get("macos_update"))))
                             if k in sec}},
@@ -42908,12 +42909,12 @@ def server_troubles(reading, joined, restart_since, t0):
 # them with (lifecycle.hardening), on Linux only. That function runs systemctl, which can wait for systemd, so a thread
 # reads them outside LOCK, one at a time, and the watch and GET /ui/servers read what it left.
 HUB_KIND = "mac" if sys.platform == "darwin" else "linux"      # the hub's own machine: a hub runs on Linux or on a Mac
-HUB_HARDENING = {"read": None, "thread": None}  # the newest read ({ssh_keys_only, npm_rule, at}), and the thread
+HUB_HARDENING = {"read": None, "thread": None}  # the newest read (lifecycle.hardening's facts and `at`), and the thread
 HUB_CLAIM = "hub_claim"         # kv: the owner's address that the hub's claim wrote into team.json, and since when
 
 
 def hub_hardening_read(t0):
-    """Outside LOCK, in its own thread: the two facts of the hub's own server as the hub's own user reads them
+    """Outside LOCK, in its own thread: the facts of the hub's own server as the hub's own user reads them
     (lifecycle.hardening), with the time of the pass that asked for them."""
     HUB_HARDENING["read"] = dict(lifecycle.hardening(), at=t0)
 

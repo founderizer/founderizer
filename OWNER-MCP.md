@@ -704,11 +704,14 @@ app's screen.
   newest read of that vault did not fail; and this Mac holds the fleet's owner key (only the Mac
   that set up Founderizer Vault signs). **For a give** also: the list has the secret; the fleet
   has the agent; the agent is a worker or a lead; the hub names a server for it; `read` only for
-  an API key; and no second API key of one variable name read by one agent (the hub's own rule,
+  an API key; no second API key of one variable name read by one agent (the hub's own rule,
   said before the signature goes; the sentence sends the agent to the owner for which of the two
-  keys that agent reads, and names no take-back). **A take-back** makes none of the checks of a
-  give: an end goes for whatever the list has, and the hub answers in its own words for an agent
-  or a secret that it does not know. The door is never a holder of this tool: its name is
+  keys that agent reads, and names no take-back); and, last, the hub answered the app in this
+  launch, and its clock and this Mac's do not differ by more than an hour (the rule of the app's own
+  controls that sign; before that answer, and while the app shows another hub, the call is not
+  ready). **A take-back** makes none of the checks of a give, and does not wait for the clocks: an
+  end goes for whatever the list has, and the hub answers in its own words for an agent or a secret
+  that it does not know. The door is never a holder of this tool: its name is
   refused, in a give and in a take-back, as an agent that the fleet does not have.
 - **The vault's state, from the page's `central` and `error`** (`GET /ui/vault`). The hub keeps a
   reading of the central vault only after a read that the vault answered, and a later read that
@@ -809,9 +812,10 @@ owner nothing ("No touch"), has no value part, and shows nothing on the app's sc
   read of the vault's page went; the page names the fleet; the hub has a reading of a central vault;
   the hub's newest read of that vault did not fail (the three cases of `grant_secret`'s, with
   `share_resource` in the place of `grant_access`); and this Mac holds the fleet's owner key. **For a
-  standing** also: the list and the resources have the secret (one sentence for both), and `read`
-  only for an API key. **A take-back** makes no check of the secret: an end goes for whatever the hub
-  has, and the hub answers in its own words.
+  standing** also: the list and the resources have the secret (one sentence for both); `read`
+  only for an API key; and, last, this Mac's clock and the hub's do not differ by more than an hour,
+  as for a give of `grant_secret`. **A take-back** makes no check of the secret and does not wait for
+  the clocks: an end goes for whatever the hub has, and the hub answers in its own words.
 - **One call writes at a time**, in a line of the tool's own: a call that comes while another one
   is at its writes is refused, and sends nothing. The app's own pages and `grant_secret` are not in
   that line.
@@ -949,7 +953,9 @@ goes into the vault first with `save_secret`.
   only for a call with a give, what `grant_secret` checks for a give: the fleet's id, the central
   vault's reading, the owner key of this Mac, and for each agent, in the byte order of the names,
   that it is a worker or a lead with a server, `read` only for an API key, and no second key of one
-  variable name read by that agent. A refusal about one agent names that agent, whose name passed
+  variable name read by that agent; and, last, that this Mac's clock and the hub's do not differ by
+  more than an hour, as for a give of `grant_secret` (a call with `give` `{}` signs nothing and does
+  not wait for the clocks). A refusal about one agent names that agent, whose name passed
   the form of an agent's name; nothing else of the request is quoted.
 - **A request for the door** (since 17 November 2026; the owner, that day, of the steps that their own
   agent left to them, among them a press of Full access on one of their servers: "why can't you press

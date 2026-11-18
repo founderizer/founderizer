@@ -656,7 +656,8 @@ class HardeningRead(unittest.TestCase):
         self.etc = Path(folder.name)
         (self.etc / "sshd_config.d").mkdir()
         (self.etc / "sshd_config").write_text("Include sshd_config.d/*.conf\nKbdInteractiveAuthentication no\n")
-        for name, value in (("SSHD_CONFIG", str(self.etc / "sshd_config")), ("NPMRC", str(self.etc / "npmrc"))):
+        for name, value in (("SSHD_CONFIG", str(self.etc / "sshd_config")), ("NPMRC", str(self.etc / "npmrc")),
+                            ("USER_SLICE_MAX", str(self.etc / "memory.max"))):
             patcher = patch.object(lifecycle, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -674,33 +675,48 @@ class HardeningRead(unittest.TestCase):
 
     def test_openssh_from_its_socket_or_its_service_is_read_from_its_files(self):
         for says in ("inactive\nactive\n", "active\nactive\n", "active\ninactive\n"):
-            self.assertEqual(lifecycle.hardening(self.run_says(says)), {"ssh_keys_only": False, "npm_rule": True})
+            self.assertEqual(lifecycle.hardening(self.run_says(says)),
+                             {"ssh_keys_only": False, "npm_rule": True, "memory_guard": None})
         (self.etc / "sshd_config.d" / "10-fleet-hardening.conf").write_text("PasswordAuthentication no\n")
         self.assertEqual(lifecycle.hardening(self.run_says("inactive\nactive\n", code=3)),
-                         {"ssh_keys_only": True, "npm_rule": True})
+                         {"ssh_keys_only": True, "npm_rule": True, "memory_guard": None})
         self.assertEqual(self.asked[0], ["systemctl", "is-active", "ssh.service", "ssh.socket"])
         self.assertEqual(self.npm, [str(self.etc / "npmrc")] * 4)
 
     def test_openssh_that_does_not_run_says_nothing_of_its_files(self):
         """Masked or stopped, as on a hub that Tailscale's own SSH serves: systemctl's answer, a state for each unit."""
         for says in ("inactive\ninactive\n", "failed\ninactive\n", "activating\ninactive\n"):
-            self.assertEqual(lifecycle.hardening(self.run_says(says, 3)), {"ssh_keys_only": None, "npm_rule": True})
+            self.assertEqual(lifecycle.hardening(self.run_says(says, 3)),
+                             {"ssh_keys_only": None, "npm_rule": True, "memory_guard": None})
 
     def test_a_systemctl_with_no_answer_leaves_the_fact_out(self):
         """systemd answers nothing for a second or two while it starts itself again (an update of systemd or libc6), and
         _run gives the same for a call that runs out of time: such a read cannot say, so it leaves ssh_keys_only out,
         where a null would end a fault that still stands. Also half an answer. npm's fact is its own."""
-        bus = self.run_says("", 1)
-        self.assertEqual(lifecycle.hardening(bus), {"npm_rule": True})
+        bus, rest = self.run_says("", 1), {"npm_rule": True, "memory_guard": None}
+        self.assertEqual(lifecycle.hardening(bus), rest)
         late = lambda argv, timeout=20, cwd=None: lifecycle._run(["sleep", "5"], timeout=0.2)      # the real _run
         self.assertEqual(late(["systemctl"])[:2], (1, ""))
-        self.assertEqual(lifecycle.hardening(late), {"npm_rule": True})
-        self.assertEqual(lifecycle.hardening(self.run_says("inactive\n", 3)), {"npm_rule": True})
+        self.assertEqual(lifecycle.hardening(late), rest)
+        self.assertEqual(lifecycle.hardening(self.run_says("inactive\n", 3)), rest)
         # And a server's own reading, which takes the same function: the fact is left out of it too.
         life = lifecycle.Lifecycle("/kit", None, {"role": "worker", "runtime": "claude"}, None, None, run=bus,
                                    platform_name="linux")
         self.assertNotIn("ssh_keys_only", life.security())
         self.assertIs(life.security()["npm_rule"], True)
+
+    def test_the_memory_limit_of_all_users_is_read_from_the_kernels_own_file(self):
+        """True for a number of bytes, False for the kernel's "max", and None when the file cannot say: it is not
+        there (a Mac, a system with no memory groups of this kind) or holds another word."""
+        limit = self.etc / "memory.max"
+        self.assertIsNone(lifecycle.memory_guard(str(limit)))
+        for word, says in (("max\n", False), ("3473678336\n", True), ("\n", None), ("many\n", None)):
+            limit.write_text(word)
+            self.assertIs(lifecycle.memory_guard(str(limit)), says, word)
+            self.assertIs(lifecycle.hardening(self.run_says("active\ninactive\n"))["memory_guard"], says, word)
+        # A read that systemctl does not answer leaves SSH's fact out, and keeps this one, which is the kernel's own.
+        limit.write_text("max\n")
+        self.assertEqual(lifecycle.hardening(self.run_says("", 1)), {"npm_rule": True, "memory_guard": False})
 
     def test_a_server_s_own_reading_takes_the_same_function(self):
         life = lifecycle.Lifecycle("/kit", None, {"role": "worker", "runtime": "claude"}, None, None,

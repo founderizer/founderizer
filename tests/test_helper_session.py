@@ -806,3 +806,37 @@ class WindowStartCommand(unittest.TestCase):
         self.assertEqual(spaced, "cd '/Users/dana/my checkout' && exec env claude")
         self.assertEqual(fleet.launch_words(spaced), ["claude"])
         self.assertEqual(fleet.launch_words(shlex.quote(spaced)), ["claude"])     # as tmux shows a quoted command
+
+
+class SessionScore(unittest.TestCase):
+    """An agent's sessions are the system's first choice when memory runs out, before the hub and the fleet's other
+    services (score_server): a tmux server that the helper makes gets the score SESSION_OOM_SCORE, which each window
+    that it starts takes. A higher score stays, and where the system has no such file (a Mac) the session is made."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def tmux(self, *args, check=False, timeout=15):
+        if args[0] == "has-session":
+            return subprocess.CompletedProcess(args, 1, "", "can't find session: fleet-ivy")
+        return subprocess.CompletedProcess(args, 0, self.pid + "\n" if args[0] == "display-message" else "", "")
+
+    def made(self, pid, score=None):
+        """The score file of the server `pid` after the helper made its session, or None when it has no such file."""
+        self.pid, path = pid, os.path.join(self.tmp, pid)
+        if score is not None:
+            with open(path, "w") as f:
+                f.write(f"{score}\n")
+        with patch.object(fleet, "tmux", side_effect=self.tmux), \
+                patch.object(fleet, "OOM_SCORE_FILE", os.path.join(self.tmp, "{pid}")):
+            self.assertTrue(fleet.ensure_session("fleet-ivy"))
+        if os.path.exists(path):
+            with open(path) as f:
+                return f.read().strip()
+        return None
+
+    def test_a_server_that_the_helper_makes_gets_the_score_of_a_session_and_keeps_a_higher_one(self):
+        self.assertEqual(self.made("4242", 200), "500")     # systemd's score for each user's units, the hub's too
+        self.assertEqual(self.made("4243", 1000), "1000")   # the checks of a release, which go first
+        self.assertIsNone(self.made("4244"))                # a Mac

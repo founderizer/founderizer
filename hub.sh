@@ -715,8 +715,9 @@ no work"
 }
 
 harden() {      # this server's own hardening, the same as each server that joins gets (join.sh): SSH takes keys only
-                # with no X11 forwarding, npm takes no package version newer than seven days, and Tailscale updates
-                # itself (hubsetup.py harden). Each part checks first and says what it did. A part that cannot be done
+                # with no X11 forwarding, npm takes no package version newer than seven days, Tailscale updates
+                # itself, and the memory gets a swap file and one limit for all users' processes together
+                # (hubsetup.py harden). Each part checks first and says what it did. A part that cannot be done
                 # leaves the server as it was, and none of them stops the install. It comes after the security
                 # updates, as in the join. As root, it runs the copy this script runs from, as the firewall does, and
                 # never the hub user's checkout. Until 14 November 2026 only the join had this step, so the first
@@ -726,8 +727,8 @@ harden() {      # this server's own hardening, the same as each server that join
     heading "this server's own hardening"
     if [ "$reclaim" = yes ]; then
         if [ "$check" = yes ]; then
-            plan "leave this server's SSH, npm and Tailscale settings as they are: a second claim changes the owner's \
-address and nothing else"
+            plan "leave this server's SSH, npm and Tailscale settings, its swap and its memory limit as they are: a \
+second claim changes the owner's address and nothing else"
         else
             say "  a second claim leaves this server's own settings as they are; the line with no --reclaim takes \
 this step"
@@ -740,7 +741,10 @@ this step"
 checks before it reloads (not where no account of this server has an SSH key, not when the session that runs it \
 logged in over SSH with a password, and not where OpenSSH does not run); \
 make npm take no package version newer than seven days, in npm's file for every user and in $HUB_USER's own, each \
-where no such rule is; and turn on Tailscale's own updates. A part that cannot be done leaves this server as it was"
+where no such rule is; turn on Tailscale's own updates; add a swap file (/swapfile, as large as the memory and 4 GiB \
+at most, with its line in /etc/fstab) where this server has no swap and its disk has the room; and give all users' \
+processes together at most 85% of the memory, through one file of systemd's for user.slice, where this server sets \
+no such limit itself. A part that cannot be done leaves this server as it was"
         return 0
     fi
     python3 "$tree/hubsetup.py" harden --user "$HUB_USER" </dev/null \

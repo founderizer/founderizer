@@ -33,7 +33,9 @@ Standard library only, and it reads no credential of a model provider.
                                                     included, and no public SSH rule of an earlier installer
     python3 hubsetup.py harden [--user NAME] [--check]
                                                     as root: SSH takes keys only with no X11 forwarding, npm takes no
-                                                    package version newer than seven days, Tailscale updates itself
+                                                    package version newer than seven days, Tailscale updates itself,
+                                                    and the memory gets a swap file and one limit for all users'
+                                                    processes together
     python3 hubsetup.py check --address IP [--port N] [--kit PATH] [--no-selftest]
                                                     the end checks on this machine: selftest.py and GET /health;
                                                     --no-selftest for a caller that runs verify next
@@ -1059,11 +1061,12 @@ NPM_RULE_LINE = re.compile(r"^\s*min-release-age\s*=", re.M)
 
 
 def put_file(path, text, mode, uid=None, gid=None):
-    """The whole file at once, as root: a new file beside it, then renamed over it, so a reader never sees half."""
+    """The whole file at once, as root: a new file beside it, then renamed over it, so a reader never sees half.
+    `text` as bytes is written as it is, for a file whose bytes are not all UTF-8."""
     folder = os.path.dirname(path)
     fd, temp = tempfile.mkstemp(dir=folder, prefix=".fleet-")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with (os.fdopen(fd, "wb") if isinstance(text, bytes) else os.fdopen(fd, "w", encoding="utf-8")) as f:
             f.write(text)
         os.chmod(temp, mode)
         if uid is not None:
@@ -1303,14 +1306,305 @@ def harden_tailscale(check, run):
     return "Tailscale updates itself"
 
 
+# Memory (the owner, 17 November 2026: "I dont want to be doing devops work on the fleet", after three servers of 4 GB
+# with no swap ran out of memory in five days and each repair came to the owner as a root command or a click at the
+# provider). Two parts. A swap file, as a reserve for a moment of full memory. And one limit for all users' processes
+# together: the agents' sessions, their helpers and each login are in systemd's user.slice, and SSH, Tailscale and the
+# system's own services are not. With the limit, the kernel ends the largest process of that group when the group is
+# full, one of an agent's session first (fleet.score_server), and the rest of the server keeps its memory. With no
+# limit the whole server takes the fault: on 17 November 2026 one server stayed at 95% of its memory for 55 minutes
+# and then for 22, the kernel ended no process, and nothing answered until a restart at the provider. Measured on
+# Ubuntu 24.04 (4 GB, cgroup v2, systemd 255) that this step hardened: a job that takes all the memory was ended after
+# 9 seconds with the swap off and after 21 with it, and a program of the system, one of the service user and one of a
+# second agent's user had no silence over 0.3 s.
+SWAP_FILE = "/swapfile"
+SWAP_LINE = SWAP_FILE + " none swap sw 0 0"
+SWAP_MOST = 4 << 30                     # the largest swap file that the step makes: the memory, 4 GiB at most
+SWAP_SPARE = 5 << 30                    # the free disk space that stays beside it
+SWAP_SYSTEMS = ("ext2/ext3", "ext4")    # `stat -f -c %T /`: where a file that fallocate made can be swap
+FSTAB = "/etc/fstab"
+SWAP_SYSCTL = "/etc/sysctl.d/60-fleet-swap.conf"
+SWAP_SYSCTL_TEXT = (
+    "# Founderizer writes this file (hubsetup.py harden) with its swap file, /swapfile: the kernel takes that swap\n"
+    "# as a reserve for a moment of full memory, and not as working memory.\n"
+    "# To undo both: swapoff /swapfile, delete /swapfile, its line in /etc/fstab and this file, then run\n"
+    "# sysctl -w vm.swappiness=60\n"
+    "vm.swappiness = 10\n")
+MEMORY_SHARE = 85                       # percent of the server's memory for all users' processes together
+MEMORY_SWAP_SHARE = 50                  # and of swap, as a percent of the memory: a job that leaks ends sooner
+MEMORY_DIR = "/etc/systemd/system/user.slice.d"
+# The file's name sorts before the usual names of such files (10-..., 50-..., a word) on purpose. systemd takes the
+# drop-ins of a unit from all the places that it reads in the order of their file names, whatever their folder, and
+# the last one that sets a value decides. So a file of the server's own that sets MemoryMax decides over this one,
+# also one that comes after this step ran, unless its name sorts before this one's (0-..., 00-a...).
+MEMORY_LIMIT = MEMORY_DIR + "/00-fleet-memory.conf"
+# The text has its two numbers as plain words, so that the app's own copy of it is compared with it byte for byte
+# (ServerMemoryTests in app/); test_hub_install holds them to MEMORY_SHARE and MEMORY_SWAP_SHARE.
+MEMORY_TEXT = (
+    "# Founderizer writes this file (hubsetup.py harden): all users' processes together (the agents' sessions and\n"
+    "# their helpers, the fleet's own services, each login) get at most 85% of this server's memory, and of its\n"
+    "# swap as much as half of the memory. When both are full, the kernel ends the largest process of that group.\n"
+    "# SSH, Tailscale and the system's own services are not in the group and keep the rest, so the server still\n"
+    "# takes a login. systemd reads the percents at each start, so they follow a server that grows.\n"
+    "# A file of this server's own that sets MemoryMax for user.slice decides over this one when its name sorts\n"
+    "# after this file's: systemd takes such files in the order of their names, and the last one decides.\n"
+    "# To undo it: delete this file, then run  systemctl daemon-reload\n"
+    "[Slice]\n"
+    "MemoryAccounting=yes\n"
+    "MemoryMax=85%\n"
+    "MemorySwapMax=50%\n")
+# The places where systemd reads a unit's files and its drop-ins. A file of the server's own in any of them that
+# sets a limit for user.slice is the server's choice: harden_memory then writes nothing, and where this step's file
+# is there too, the other file decides by its name (MEMORY_LIMIT).
+MEMORY_PLACES = ("/etc/systemd/system.control", "/run/systemd/system.control", "/run/systemd/transient",
+                 "/etc/systemd/system", "/run/systemd/system", "/usr/local/lib/systemd/system",
+                 "/usr/lib/systemd/system", "/lib/systemd/system")
+
+
+def swap_now(root=""):
+    """The swap that the kernel uses now, by the names in /proc/swaps, or None when that file cannot be read."""
+    try:
+        with open(root + "/proc/swaps", encoding="utf-8", errors="replace") as f:
+            return [line.split()[0] for line in f.read().splitlines()[1:] if line.split()]
+    except OSError:
+        return None
+
+
+def fstab_swap(root=""):
+    """Whether /etc/fstab has a line for swap: a line that is no comment, with `swap` as its type."""
+    try:
+        with open(root + FSTAB, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return False
+    return any(len(fields) > 2 and fields[2] == "swap" for fields in
+               (line.split() for line in lines if not line.lstrip().startswith("#")))
+
+
+def memory_bytes(root=""):
+    """The server's memory in bytes, by /proc/meminfo, or None when it cannot be read."""
+    try:
+        with open(root + "/proc/meminfo", encoding="ascii", errors="replace") as f:
+            found = re.search(r"^MemTotal:\s+(\d+) kB", f.read(), re.M)
+    except OSError:
+        return None
+    return int(found.group(1)) * 1024 if found else None
+
+
+class SwapStep(Exception):
+    """A command of the swap file's making that did not work, with the words for the step's line."""
+
+
+def make_swap_file(path):
+    """The swap file before it has any size: a new file for root only, and only where nothing is at its name, a
+    link included."""
+    os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+
+
+def swap_line_there(root=""):
+    """Whether /etc/fstab holds the swap file's own line (SWAP_LINE), as a whole line. A table that cannot be read
+    says no."""
+    try:
+        with open(root + FSTAB, "rb") as f:
+            return SWAP_LINE.encode("ascii") in f.read().splitlines()
+    except OSError:
+        return False
+
+
+def disk_free(path):
+    """The free bytes of the disk that holds `path`, as a user that is not root has them."""
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize
+
+
+def harden_swap(check, run, root=""):
+    """A swap file for a server that has no swap: as large as its memory, 4 GiB at most, with its line in /etc/fstab
+    and the kernel told to keep it as a reserve. A server that has swap, names one in /etc/fstab or has a file at that
+    name keeps what it has, and so does one whose disk or file system cannot take the file: the limit of harden_memory
+    protects that server alone. The file is made for root only before it has any size, and only where nothing is at
+    its name; whatever stops a later step takes the swap and the file away again, and the table's line is written
+    last and whole. The words of what it did."""
+    active = swap_now(root)
+    if active is None:
+        return "swap stays as it is: this system does not say what swap it has"
+    if active:
+        return f"this server has swap already ({', '.join(active)})"
+    if fstab_swap(root):
+        return f"swap stays as it is: {FSTAB} names a swap of this server's own, which is not on"
+    path = root + SWAP_FILE
+    if os.path.lexists(path):
+        return f"swap stays as it is: {SWAP_FILE} is there and is not swap now"
+    memory = memory_bytes(root)
+    if not memory:
+        return "no swap file: this system does not say how much memory it has"
+    size = min(SWAP_MOST, -(-memory // (1 << 30)) << 30)
+    code, out, _err = run("stat -f -c %T /")
+    if code != 0 or out.strip() not in SWAP_SYSTEMS:
+        return f"no swap file: the file system of / ({out.strip() or 'not read'}) needs a way of its own for one"
+    try:
+        free = disk_free(root or "/")
+    except OSError:
+        return "no swap file: the free space of the disk cannot be read"
+    if free < size + SWAP_SPARE:
+        return (f"no swap file: the disk has {free >> 30} GiB free, and a file of {size >> 30} GiB needs "
+                f"{(size + SWAP_SPARE) >> 30}")
+    try:                # the table as its bytes are: a byte that is no UTF-8 stays as it is
+        with open(root + FSTAB, "rb") as f:
+            table = f.read()
+        st = os.stat(root + FSTAB)
+    except OSError as e:
+        return f"no swap file: {FSTAB} cannot be read ({e.strerror or e})"
+    if check:
+        return f"would add a swap file of {size >> 30} GiB ({SWAP_FILE})"
+    # From the file's making on, whatever stops a step, also a command that runs out of its time, a table that
+    # cannot be written, a hang-up of the session or a stop of the program (stops_raise), takes the swap and the
+    # file away again, so that no start finds a file that nothing names and no later run finds "a file at the
+    # name". The table's line is the last step, and it is written whole. What nothing can catch (the server loses
+    # its power, the program is killed outright) can leave the file with no line: every later run then leaves the
+    # swap as it is, the limit of harden_memory still protects the server, and deleting /swapfile lets the next run
+    # make it again.
+    # The cleanup takes the file away only while the table does not name it (swap_line_there): a stop that comes
+    # just after the table's line is written leaves a swap that is whole, and never a line for a file that is gone.
+    with stops_raise():
+        made = None     # None while the file is being made: a stop in that moment may have left it
+        try:
+            try:
+                make_swap_file(path)
+            except OSError as e:    # something is at the name, or the file cannot be made: nothing to take away
+                made = False
+                return f"no swap file: {SWAP_FILE} cannot be made ({e.strerror or e})"
+            made = True
+            for step in (f"fallocate -l {size} {SWAP_FILE}", f"mkswap -q {SWAP_FILE}", f"swapon {SWAP_FILE}"):
+                code, out, err = run(step)
+                if code != 0:
+                    raise SwapStep(f"{step.split()[0]} did not work ({one_line(err) or one_line(out) or code})")
+            put_file(root + FSTAB, table + (b"" if not table or table.endswith(b"\n") else b"\n")
+                     + SWAP_LINE.encode("ascii") + b"\n", stat.S_IMODE(st.st_mode),
+                     st.st_uid if not root else None, st.st_gid if not root else None)
+        except BaseException as e:
+            if made is not False and not swap_line_there(root):
+                with contextlib.suppress(Exception):
+                    run(f"swapoff {SWAP_FILE}")
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+            if not isinstance(e, Exception):    # a stop of the whole run: it goes on, with the server as one whole
+                raise
+            return "no swap file: " + (str(e) if isinstance(e, SwapStep) else
+                                       f"a step stopped ({type(e).__name__}: {one_line(str(e)) or 'no words'})")
+    try:                # the swap is on and the table names it: a fault of the kernel's setting takes nothing back
+        os.makedirs(os.path.dirname(root + SWAP_SYSCTL), mode=0o755, exist_ok=True)
+        put_file(root + SWAP_SYSCTL, SWAP_SYSCTL_TEXT, 0o644, *((0, 0) if not root else ()))
+        run(f"sysctl -q -p {SWAP_SYSCTL}")
+    except Exception as e:
+        return (f"added a swap file of {size >> 30} GiB ({SWAP_FILE}), as a reserve; the kernel's setting for it "
+                f"({SWAP_SYSCTL}) was not written ({type(e).__name__}: {one_line(str(e)) or 'no words'})")
+    return f"added a swap file of {size >> 30} GiB ({SWAP_FILE}), as a reserve"
+
+
+def own_memory_limits(root=""):
+    """The files of this server's own that set the memory limit of all users' processes: each file of systemd's for
+    user.slice (a drop-in, or the unit itself) and each drop-in for every slice (slice.d), in each place that
+    systemd reads (MEMORY_PLACES), other than this step's own file, that has a line `MemoryMax=` or, by its old
+    name, `MemoryLimit=`. Also one that systemd has not read yet, one that `systemctl set-property` wrote, and one
+    that says `infinity`: each is the server's own setting, whatever it sets. As systemd does, a file whose name
+    starts with a dot is not read (glob)."""
+    found = []
+    for place in MEMORY_PLACES:
+        here = glob.escape(root + place)
+        for path in sorted(glob.glob(here + "/user.slice.d/*.conf")) + [root + place + "/user.slice"] + \
+                sorted(glob.glob(here + "/slice.d/*.conf")):
+            if path == root + MEMORY_LIMIT:
+                continue
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            if re.search(r"(?m)^\s*Memory(Max|Limit)\s*=", text) and path[len(root):] not in found:
+                found.append(path[len(root):])
+    return found
+
+
+@contextlib.contextmanager
+def stops_raise():
+    """While a step must not be cut in the middle: a hang-up of the session that runs it (SIGHUP) and a stop
+    (SIGTERM) raise SystemExit where the program is, so that the step's own cleanup runs before the program ends.
+    Each signal has its earlier handling again at the end. Outside the main thread, where Python sets no handler,
+    nothing changes."""
+    def stop(number, _frame):
+        raise SystemExit(128 + number)
+    kept = {}
+    try:
+        for number in (signal.SIGHUP, signal.SIGTERM):
+            try:
+                kept[number] = signal.signal(number, stop)
+            except ValueError:
+                pass
+        yield
+    finally:
+        for number, handler in kept.items():
+            signal.signal(number, handler)
+
+
+def harden_memory(check, run, root=""):
+    """One memory limit for all users' processes together (MEMORY_TEXT), through one file of systemd's own for
+    user.slice, which systemd takes at once. A server that sets such a limit in a file of its own keeps it
+    (own_memory_limits), also where systemd has not read that file yet, and so does one whose kernel says a limit
+    with no file of this step's. Where the kernel has no file for that group, nothing is written. The words of what
+    it did."""
+    live, path = root + lifecycle.USER_SLICE_MAX, root + MEMORY_LIMIT
+    try:
+        with open(path, encoding="utf-8") as f:
+            before = f.read()
+    except OSError:
+        before = None
+    limited = lifecycle.memory_guard(live)
+    if limited is None:
+        return "no memory limit for the users' processes: this system has no memory group for them that it can set"
+    own = own_memory_limits(root)
+    if own:
+        return f"the users' processes keep this server's own setting of their memory limit ({own[0]})"
+    if limited and before is None:
+        return "the users' processes have a memory limit of this server's own already"
+    if limited and before == MEMORY_TEXT:
+        return f"the users' processes together have at most {MEMORY_SHARE}% of the memory already"
+    if check:
+        return f"would give the users' processes together at most {MEMORY_SHARE}% of the memory"
+    if before != MEMORY_TEXT:
+        os.makedirs(root + MEMORY_DIR, mode=0o755, exist_ok=True)
+        put_file(path, MEMORY_TEXT, 0o644, *((0, 0) if not root else ()))
+    code, out, err = run("systemctl daemon-reload")
+    if code != 0 or not lifecycle.memory_guard(live):
+        return ("the memory limit of the users' processes is written and not in force yet: systemd takes it when it "
+                f"reads its files again ({one_line(err) or one_line(out) or 'the kernel still says no limit'})")
+    return (f"the users' processes together get at most {MEMORY_SHARE}% of the memory: the kernel ends the largest "
+            "of them when that and their part of the swap are full, and SSH and Tailscale keep the rest")
+
+
+def harden_part(name, part, *args):
+    """One part of the hardening, which never takes the other parts' lines with it: its own line, or a line that
+    says what stopped it. A command that runs out of its time and a file that cannot be written are faults of that
+    part alone."""
+    try:
+        return part(*args)
+    except Exception as e:
+        return f"{name} stays as it is: this part stopped ({type(e).__name__}: {one_line(str(e)) or 'no words'})"
+
+
 def harden(service_user="fleet", check=False, run=None, root="", account=None):
     """The server's own hardening, which the join takes after its firewall (the owner, 3 November 2026: Add server
     ends at the baseline, for any user): SSH takes keys only with no X11 forwarding, npm takes no package version
-    newer than seven days, and Tailscale updates itself. Each part checks first, so a second run changes nothing. A
-    part that cannot be done says why and leaves the server as it was: none of them stops the join, and the server's
-    own reading (lifecycle.Lifecycle.security) tells the hub what holds. Returns the lines that it said."""
+    newer than seven days, Tailscale updates itself, and the server's memory has a reserve and a limit (a swap file,
+    and one limit for all users' processes together). Each part checks first, so a second run changes nothing. A
+    part that cannot be done says why and leaves the server as it was, and a part that stops says so and stops no
+    other part (harden_part): none of them stops the join, and the server's own reading
+    (lifecycle.Lifecycle.security) tells the hub what holds. Returns the lines that it said."""
     run = run or _shell
-    said = [harden_ssh(check, run, root), harden_npm(service_user, check, root, account), harden_tailscale(check, run)]
+    said = [harden_part("SSH", harden_ssh, check, run, root),
+            harden_part("npm's rule", harden_npm, service_user, check, root, account),
+            harden_part("Tailscale", harden_tailscale, check, run),
+            harden_part("swap", harden_swap, check, run, root),
+            harden_part("the memory limit", harden_memory, check, run, root)]
     for line in said:
         say(line)
     return said

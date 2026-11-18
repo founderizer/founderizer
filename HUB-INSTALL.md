@@ -262,10 +262,19 @@ notification of a Needs-you item, the chat that opens first), so with those apps
     with a key, and the server's console, take the step. sshd also checks its files once before
     the write: a server whose own files already fail that check gets no file, and the step's line
     gives sshd's words. npm takes no package version newer than seven days, for every user and
-    for `fleet`, each where no such rule is. Tailscale updates itself. Each part says what it
-    did, a part that cannot be done leaves the server as it was, and none of them stops the
-    install. Until 14 November 2026 only the join had this step. A second claim (`--reclaim`)
-    leaves it out.
+    for `fleet`, each where no such rule is. Tailscale updates itself. The server's memory gets
+    a reserve and a limit: a swap file (`/swapfile`, as large as the memory, 4 GiB at most)
+    where the server has no swap, and one limit for all users' processes together, of 85% of
+    the memory and of swap as much as half of the memory
+    (`/etc/systemd/system/user.slice.d/00-fleet-memory.conf`). The agents' sessions, the hub
+    and the fleet's other services and each login are in that group; when it is full, the
+    kernel ends the largest process of an agent's session first (from the helper's start,
+    each helper gives the sessions that it starts a higher score than the fleet's own
+    services), and SSH and Tailscale, which are not in it, keep the rest, so the server
+    still takes a login. A server that has swap, or a limit of its own, keeps it. Each part
+    says what it did, a part that cannot be done leaves the server as it was, and none of
+    them stops the install. Until 14 November 2026 only the join had this step. A second
+    claim (`--reclaim`) leaves it out.
 16. **A kept connection keeps its speed** (`hubsetup.py tcp`). The Mac app reads the hub's
     state every 3 seconds on one kept connection, and after a pause Linux starts each answer
     from a window of 10 packets again: a state of 474 KB took 6 round trips (0.29 s at a round
@@ -499,12 +508,16 @@ the checkout and the service of an agent that was added since.
   sudo python3 /usr/local/lib/founderizer-kit/hubsetup.py harden --user fleet
   ```
 
-  `harden --check` says what the second would do. It prints one line for SSH, one for npm and
-  one for Tailscale. A session that is open keeps going. Run them from an SSH session that logged
+  `harden --check` says what the second would do. It prints one line for SSH, one for npm, one
+  for Tailscale, one for swap and one for the memory limit. A session that is open keeps going. Run them from an SSH session that logged
   in with a key, or in the provider's console: from a session that logged in with a password, SSH
   keeps password login, and its line says so; where SSH takes keys only already, the line tells
   you to add a key of your own before you log out. To undo the SSH part: delete
-  `/etc/ssh/sshd_config.d/10-fleet-hardening.conf`, then `systemctl reload ssh`.
+  `/etc/ssh/sshd_config.d/10-fleet-hardening.conf`, then `systemctl reload ssh`. To undo the
+  memory limit: delete `/etc/systemd/system/user.slice.d/00-fleet-memory.conf`, then
+  `systemctl daemon-reload`. To undo the swap file: `swapoff /swapfile`, delete `/swapfile`,
+  its line in `/etc/fstab` and `/etc/sysctl.d/60-fleet-swap.conf`, then
+  `sysctl -w vm.swappiness=60`.
 - **The owner's Mac is lost, or it has a new address.** Run the line with `--reclaim`: it
   makes a new code, waits for the new Mac, and changes only `addresses.owner` and the key
   of the owner's Mac. The hub is away for the time of the claim; the part below says what

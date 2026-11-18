@@ -323,11 +323,43 @@ def windows(session, *, checked=False):
     return unlisted
 
 
+# An agent's sessions, and all that they start, are the system's first choice when memory runs out, before the fleet's
+# own services. systemd gives each user's units one score (oom_score_adj 200: read on a server of the owner's fleet,
+# Ubuntu 24.04 and systemd 255, 17 November 2026), so the one memory limit of all users' processes
+# (hubsetup.harden_memory) ends the largest process of the group, whichever it is: on a hub's own server that can be
+# the hub, which then starts again in a group that is still full. Each window is a child of its tmux server and takes
+# the server's score, so the helper raises the server's. The checks of a release (1000) still go first, and the
+# fleet's own services, the helper among them, keep theirs. A raise needs no right.
+SESSION_OOM_SCORE = 500
+OOM_SCORE_FILE = "/proc/{pid}/oom_score_adj"
+
+
+def score_server(session):
+    """Give the tmux server of `session` the score SESSION_OOM_SCORE, so that each window that it starts from now on
+    has it. Nothing where the system has no such file (a Mac) or tmux does not answer; a higher score stays, and a
+    window that runs already keeps its own."""
+    r = tmux("display-message", "-p", "-t", f"={session}:", "#{pid}")
+    pid = r.stdout.strip()
+    if r.returncode != 0 or not pid.isdigit():
+        return
+    path = OOM_SCORE_FILE.format(pid=pid)
+    try:
+        with open(path) as f:
+            if int(f.read()) >= SESSION_OOM_SCORE:
+                return
+        with open(path, "w") as f:
+            f.write(str(SESSION_OOM_SCORE))
+    except (OSError, ValueError):
+        pass
+
+
 def ensure_session(session):
-    """Make this agent's tmux session if it is not there. True when it had to be made."""
+    """Make this agent's tmux session if it is not there. True when it had to be made, with its server's score raised
+    (score_server): a server that ran before this helper gets it at the helper's start."""
     if tmux("has-session", "-t", f"={session}:").returncode == 0:
         return False
     tmux("new-session", "-d", "-s", session, "-n", "home", "-c", KIT, check=True)
+    score_server(session)
     return True
 
 
@@ -8786,7 +8818,8 @@ def cmd_run(args):
     claim_checkout(agent)
     h = Helper(agent, conf)
     threading.Thread(target=empty_trash, args=(agent,), name="empty-trash", daemon=True).start()
-    ensure_session(h.session)
+    if not ensure_session(h.session):
+        score_server(h.session)     # a server from before this helper: each window that it starts from now on
     # The helper's start runs the manager session once. With a key it needs its credential, so the start waits in the
     # loop below until the hub answers; a session that runs already, or one closed later, is left as it is.
     ready_runtime_config()          # before the first session: nobody is there to answer the runtime's first screen

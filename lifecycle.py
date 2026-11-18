@@ -104,6 +104,27 @@ def npm_rule(path=NPMRC, system="/usr/local/bin:/usr/bin:/bin"):
     return bool(days) and int(days[-1]) >= NPM_DAYS
 
 
+# The kernel's own file for the most memory that all users' processes of a server may hold together: the agents'
+# sessions, their helpers and each login are in systemd's user.slice. Any user reads it.
+USER_SLICE_MAX = "/sys/fs/cgroup/user.slice/memory.max"
+
+
+def memory_guard(path=USER_SLICE_MAX):
+    """Whether all users' processes of this server together have a memory limit, which the join's hardening sets
+    (hubsetup.py harden): True for a number of bytes, False for the kernel's "max", which is no limit, and None when
+    the file cannot say (a system with no memory groups of this kind, a Mac, a word that is neither).
+
+    With no limit, a job that takes all the memory takes it from SSH, Tailscale and the server's own services too, and
+    the server answers nothing until somebody restarts it at its provider (17 November 2026, a server of 4 GB: 55
+    minutes and then 22 minutes at 95% of its memory, and the kernel ended no process in either)."""
+    try:
+        with open(path, encoding="ascii") as f:
+            word = f.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return False if word == "max" else True if word.isdigit() else None
+
+
 def upgraded_at(path=UPGRADE_STAMP):
     """When apt's daily run last ended a security upgrade well, or None when it has not yet."""
     try:
@@ -116,9 +137,10 @@ SSH_UNITS = ("ssh.service", "ssh.socket")      # OpenSSH runs when either is act
 
 
 def hardening(run=None):
-    """The two facts of the join's hardening that any user reads in a moment, with the names that a reading gives them:
-    `ssh_keys_only` (sshd_keys_only), None where OpenSSH does not run, because neither its service nor its socket is
-    active and it then lets nobody in with a password (a server that Tailscale's own SSH serves), and `npm_rule`. A
+    """The three facts of the join's hardening that any user reads in a moment, with the names that a reading gives
+    them: `ssh_keys_only` (sshd_keys_only), None where OpenSSH does not run, because neither its service nor its socket
+    is active and it then lets nobody in with a password (a server that Tailscale's own SSH serves), `npm_rule`, and
+    `memory_guard` (memory_guard), None where the kernel's own file cannot say. A
     server's own service reads them for its reading (Lifecycle.security), and the hub reads them of its own server,
     which has no service (hub.hub_hardening_read): one function, so that the two never read them in two ways.
 
@@ -127,7 +149,7 @@ def hardening(run=None):
     and _run gives the same for a call that ran out of time. Such a read cannot say, so the hub keeps what was said of
     it (server_watch_sweep), where a null would end a fault that still stands (14 November 2026, measured)."""
     _code, out, _err = (run or _run)(["systemctl", "is-active", *SSH_UNITS])
-    states, facts = out.split(), {"npm_rule": npm_rule(NPMRC)}
+    states, facts = out.split(), {"npm_rule": npm_rule(NPMRC), "memory_guard": memory_guard(USER_SLICE_MAX)}
     if len(states) == len(SSH_UNITS):
         facts["ssh_keys_only"] = sshd_keys_only(SSHD_CONFIG) if "active" in states else None
     return facts
