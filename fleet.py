@@ -826,6 +826,36 @@ CODEX_UNATTENDED = CODEX_NO_ASKING + ["-c", "notice.hide_rate_limit_model_nudge=
 # tool (4 November 2026). A task keeps its plan there (RULES.md), which the owner's app shows while the task runs
 # (threads.py), in the terminal and in the app-server (screen_runner.py). A standing session is no task.
 CODEX_PLAN = ["-c", "tools.update_plan.enabled=true"]
+# Codex reads no AGENTS.md of its folder in a Fleet session, which gets RULES.md as its developer instructions
+# (codex_rules): the published repository's AGENTS.md is for the coding agent of a person who changes its code, and
+# it would reach every Codex session of every fleet's checkout (the owner's "Yes, build it" of 17 November 2026).
+# Codex 0.163 with this option leaves the folder's file out and changes nothing else of what the model gets (`codex
+# debug prompt-input`, 17 November 2026); the AGENTS.md of its CODEX_HOME still loads, as no option takes it away.
+CODEX_NO_FOLDER_RULES = ["-c", "project_doc_max_bytes=0"]
+
+
+def rules_text():
+    """This checkout's RULES.md as a session holds it, or "" when this checkout has none or it cannot be read."""
+    try:
+        with open(os.path.join(KIT, "RULES.md"), encoding="utf-8") as f:
+            return f.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def codex_rules():
+    """The words that give a Codex session RULES.md as its developer instructions, or none when this checkout has no
+    RULES.md. Codex 0.163 puts that text first in the first message of a thread, before the environment with its date
+    and before the first prompt, where the folder's AGENTS.md was until 17 November 2026 (the same start, `codex debug
+    prompt-input`), and builds it again with the rest of its instructions when it compacts a thread. The value is a
+    TOML string, which is how Codex reads a -c value: JSON writes each character that TOML must have escaped, but the
+    one control character that it leaves as it is (U+007F). The words are one argument of the program, about 36 KB
+    with the RULES.md of that day, so a session takes them from its env file (env_prefix) and never from its window's
+    command, which tmux takes up to about 16 KiB."""
+    text = rules_text()
+    if not text:
+        return []
+    return ["-c", "developer_instructions=" + json.dumps(text, ensure_ascii=False).replace("\x7f", "\\u007f")]
 
 
 def in_checkout(command):
@@ -1996,8 +2026,8 @@ def codex_server(name, catalog=None):
 # text is the fleet's rules (RULES.md, and the parts of rules/ that hub.rules_parts names for this agent) and the
 # agent's profile, all from this checkout, which the helper brought up to date just before the start. Claude reads it
 # as its appended system prompt, from a file, and takes no CLAUDE.md of the folder (--setting-sources ''); its task
-# is the first answer of read_messages. Codex reads RULES.md as the folder's AGENTS.md, which the published tree
-# carries as RULES.md itself (publish.COPIED), and the parts, its profile and then its task as its first prompt.
+# is the first answer of read_messages. Codex gets RULES.md as its developer instructions (codex_rules) and reads no
+# AGENTS.md of the folder (CODEX_NO_FOLDER_RULES), and the parts, its profile and then its task as its first prompt.
 RULES_PARTS = ("lead", "manager", "conversations", "logins", "github")     # hub.RULES_PARTS, in that order
 STABLE_TASK = ('You are agent "{agent}" in Founderizer, in a session for one task of yours. {where} Your helper '
                'brought this folder up to date just before this session; do not pull at the start. ')
@@ -2005,14 +2035,13 @@ STABLE_RULES = "{rules} are in your context, so do not read them again."
 STABLE_WHERE = {"read": ("The task is the first answer of read_messages.",
                          "The fleet's rules for you (RULES.md and your parts of rules/) and your profile follow: they"),
                 "prompt": ("The task is at the end of this text.",
-                           "RULES.md is the AGENTS.md of this folder, and your parts of rules/ and your profile follow: "
+                           "RULES.md is your developer instructions, and your parts of rules/ and your profile follow: "
                            "they"),
                 # An ACP program (the AI providers spec, 3.5.1): the stable text is its session's system text, and
                 # its task is the first prompt. No ACP program reads RULES.md as its folder's AGENTS.md.
                 "system": ("The task is your first message.",
                            "The fleet's rules for you (RULES.md and your parts of rules/) and your profile follow: "
                            "they")}
-CODEX_RULES_BYTES = 32 * 1024   # Codex's own default project_doc_max_bytes, which a longer AGENTS.md would be cut at
 
 
 PROFILE_SECTION = re.compile(r"^\*\*([^*\n]+?)\.\*\*[ \t]*(.*)$")        # hub.SECTION_LINE: one section's title line
@@ -2053,9 +2082,9 @@ def knowledge_texts(agent):
 
 def stable_text(agent, opening, parts, head=None, skills=True, knowledge=False):
     """The stable start of a session of `agent` whose runtime reads its rules by `opening` (plan P9.2), or None when
-    this checkout cannot give it: a file is missing, or for a session that reads RULES.md as its folder's AGENTS.md,
-    that AGENTS.md is not RULES.md byte for byte (a checkout of the code repository, whose AGENTS.md is the
-    developers'). head: what comes first, a task session's line by default, the owner chat's instructions, or ""
+    this checkout cannot give it: a file is missing. With the opening "prompt" (Codex) RULES.md is not in it, because
+    the session gets RULES.md as its developer instructions (codex_rules), but this checkout must have it all the same.
+    head: what comes first, a task session's line by default, the owner chat's instructions, or ""
     for the standing manager session, whose first prompt says who it is. The same files give the same bytes.
     skills: the list of the agent's own skills comes last (design v4 D3, helper feature stable_skills), so a new
     skill leaves the rules and the profile in the cache; the owner chat, which reads no file, has none. knowledge:
@@ -2066,8 +2095,6 @@ def stable_text(agent, opening, parts, head=None, skills=True, knowledge=False):
             return f.read().strip()
     try:
         core = read("RULES.md")
-        if opening == "prompt" and read("AGENTS.md") != core:
-            return None
         texts = ([core] if opening in ("read", "system") else []) + \
             [read(f"rules/{part}.md") for part in RULES_PARTS if part in parts] + [read(f"profiles/{agent}.md")]
     except OSError:
@@ -2110,8 +2137,9 @@ def standing_text(agent, rules, head=""):
 def rules_file():
     """The file that gives a Claude start without its stable text (an older hub's event, a hub that could not be
     reached, a missing file, a standing session that continues its conversation) the rules that it read from the
-    folder's CLAUDE.md before --setting-sources '': this checkout's RULES.md, which a release leaves as that CLAUDE.md's
-    AGENTS.md. Claude Code joins it with what --append-system-prompt gives. None when this checkout has no RULES.md."""
+    folder's CLAUDE.md before --setting-sources '': this checkout's RULES.md. The folder's CLAUDE.md and AGENTS.md are
+    for a person's coding agent since 17 November 2026, and no Fleet session reads them. Claude Code joins it with what
+    --append-system-prompt gives. None when this checkout has no RULES.md."""
     path = os.path.join(KIT, "RULES.md")
     return path if os.path.isfile(path) else None
 
@@ -2122,11 +2150,6 @@ def standing_opening(conf, rules):
     opening = runtime_fact(conf.get("runtime"), "task_opening")
     return opening if isinstance(rules, list) and opening in STABLE_WHERE and \
         runtime_fact(conf.get("runtime"), "driver") == "terminal" else None
-
-
-def codex_rules_limit():
-    """Codex's project_doc_max_bytes for a session that reads all of RULES.md as this folder's AGENTS.md."""
-    return max(CODEX_RULES_BYTES, os.path.getsize(os.path.join(KIT, "AGENTS.md")) + 4096)
 
 
 def stable_start(conf, needs, opening, rules):
@@ -2353,8 +2376,10 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         [t for t in values.get("FLEET_TOOLS", "").split() if t in catalog and (t in minted or not catalog[t].get("mint"))]
     # A Codex session's catalog servers are -c options, which grow with the owner's servers: a program server's
     # settings and arguments alone can be thousands of characters (lifecycle.MCP_SETTINGS_MOST). They come from its
-    # env file, and the command gives them to Codex where it names ARGS (env_prefix).
-    served = [w for t in tools for w in shlex.split(codex_server(t, catalog))] if runtime == "codex" else []
+    # env file, and the command gives them to Codex where it names ARGS (env_prefix). Its rules come from there too, as
+    # its developer instructions (codex_rules), in each Codex start: with its stable text or without, new or resumed.
+    served = codex_rules() + [w for t in tools for w in shlex.split(codex_server(t, catalog))] \
+        if runtime == "codex" else []
     window = task or "manager"
     if task:
         stable = stable_text(agent, opening, rules) if stable_start(conf, needs, opening, rules) else None
@@ -2420,11 +2445,10 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
             word = " " + file_prompt(agent, window, prompt) if standing else ""
             first = "--append-system-prompt-file " + shlex.quote(session_file(agent, window, "md", stable)) + word
         elif resume:
-            first = f"-c project_doc_max_bytes={codex_rules_limit()} " + shlex.quote(session)   # its thread
+            first = shlex.quote(session)                    # its thread
         else:
-            # Codex reads all of RULES.md as this folder's AGENTS.md.
-            first = f"-c project_doc_max_bytes={codex_rules_limit()} " + file_prompt(agent, window, prompt,
-                                                                                      first=stable + "\n")
+            # Codex has RULES.md as its developer instructions (served), and the rest of its stable text first here.
+            first = file_prompt(agent, window, prompt, first=stable + "\n")
     elif conf.get("runtime") == "claude" and not idle:
         core = rules_file()                                 # the folder's CLAUDE.md loads no more
         first = " ".join(x for x in ("--append-system-prompt-file " + shlex.quote(core) if core else "", first) if x)
@@ -2435,7 +2459,8 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         cmd = cmd.replace("codex ", "codex --no-daemon ", 1)
     if conf.get("runtime") == "codex":
         cmd = cmd.replace("codex ", "codex " + shlex.join(CODEX_NO_UPDATE_CHECK + CODEX_UNATTENDED +
-                                                           (CODEX_PLAN if task else []) + codex_env(env)) + " ", 1)
+                                                           CODEX_NO_FOLDER_RULES + (CODEX_PLAN if task else []) +
+                                                           codex_env(env)) + " ", 1)
     # A task's own route; the standing session's route with its credential, and a standing Codex session's also
     # without one: Codex would otherwise use only its machine's configuration, which a runtime switch did not write.
     if task or token or conf.get("runtime") == "codex":
@@ -2799,8 +2824,8 @@ def account_now(agent, runtime):
 
 
 # A Claude session's start puts RULES.md in its context (stable_text, rules_file), so a session that also read it was
-# given its 17,000 tokens twice; a Codex session reads it. The first 60 characters find a session from before session ids
-# (manager_windows), so they stay as they were.
+# given its 17,000 tokens twice; a Codex session has it as its developer instructions (codex_rules). The first 60
+# characters find a session from before session ids (manager_windows), so they stay as they were.
 MANAGER_START = ('You are the manager in Founderizer. Read RULES.md and profiles/{agent}.md in this folder '
                  'first, but RULES.md only if your context does not hold it yet: your helper gives it with your '
                  'start. {resume}On every new-message signal call read_messages; its read is the receipt. Messages that start with [hub] come from the hub and '
@@ -2999,6 +3024,10 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
         head, said = stable, ("\n" + recap if recap else "")
     prompt = head + said            # the recap last: what a Codex chat's first prompt cuts first (file_prompt)
     url = f"{HUB}/mcp/{agent}/{generation}/owner-chat/1"
+    # A Codex chat's rules are its developer instructions (codex_rules), with its stable text or without, new or
+    # resumed: they come from its env file, as the program's words where its command names ARGS, before its thread.
+    developer = codex_rules() if conf.get("runtime") == "codex" else []
+    tail = []
     if conf.get("runtime") == "codex":
         if resume is not None and not THREAD_ID.fullmatch(str(resume)):
             raise Refused("a Codex chat resumes only a thread id")
@@ -3007,8 +3036,8 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
             CODEX_UNATTENDED + codex_env(env) + ["-c", "mcp_servers.fleet.url=" + json.dumps(url)] + \
             (["-c", CODEX_BEARER_OPTION] if token else []) + \
             ["-c", "features.multi_agent=false", "-c", 'web_search="disabled"'] + shlex.split(model_flags(conf)) + \
-            (["-c", f"project_doc_max_bytes={codex_rules_limit()}"] if stable is not None else []) + \
-            ([resume] if resume else [])        # a new chat's prompt: last, from its file (below)
+            CODEX_NO_FOLDER_RULES
+        tail = [resume] if resume else []       # a new chat's prompt: last, from its file (below)
     elif conf.get("runtime") == "claude":
         if resume is not None and not THREAD_ID.fullmatch(str(resume)):
             raise Refused("a Claude chat resumes only a session id")
@@ -3038,7 +3067,8 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
     # That file first, the env file with the credential after it: a start that fails there leaves no file of it.
     word = " " + file_prompt(agent, "owner-chat", said + ("\n\n" + MARKER.format(marker) if marker else ""),
                              first=head) if conf.get("runtime") == "codex" and not resume else ""
-    return env_prefix(agent, "owner-chat", values) + shlex.join(words + args) + word
+    return env_prefix(agent, "owner-chat", values, developer) + shlex.join(words + args) + \
+        (" " + ARGS if developer else "") + (" " + shlex.join(tail) if tail else "") + word
 
 
 # The Fleet tools that a closed conversation session may call, MCP context conversation (CHAT-APPS 9.4): the hub offers

@@ -91,6 +91,11 @@ def reason(error):
     return str(error.get("message") or "") if isinstance(error, dict) else str(error or "")
 
 
+# What a thread reads between the rules and its instruction, which says to read RULES.md: the rules are already in its
+# context (the words of a stable start, fleet.STABLE_RULES)
+RULES_ABOVE = "The fleet's rules (RULES.md) are above, in your context, so do not read that file again."
+
+
 def primary_instruction(agent, task, needs):
     """The thread instruction of a primary task ("none" or "browser"). It adds only what this route needs: the task,
     the agent's profile, RULES.md and the agent's current permissions decide all else. A lead keeps its Fleet team
@@ -336,10 +341,16 @@ class Runner:
             )
             if self.needs != "screen":      # a primary task: its own instruction, not the screen task's limits
                 instruction = primary_instruction(self.agent, self.task, self.needs)
-            # The owner's direction excludes full Chrome DevTools Protocol access for the browser tools.
+            # The rules first, whole, as every Codex session of the fleet has them (fleet.codex_rules): until 17
+            # November 2026 the thread read them as the folder's AGENTS.md, which Codex cut at 32 KiB. The words after
+            # them still say to read RULES.md, which a thread without them does.
+            rules = fleet.rules_text()
+            instruction = rules + "\n\n" + RULES_ABOVE + "\n\n" + instruction if rules else instruction
+            # The owner's direction excludes full Chrome DevTools Protocol access for the browser tools. No AGENTS.md
+            # of the folder (fleet.CODEX_NO_FOLDER_RULES): the published one is for a person's coding agent.
             config = {"mcp_servers.fleet.url":url,"mcp_servers.fleet.tool_timeout_sec":120,
                       "mcp_servers.fleet.default_tools_approval_mode":"approve","features.multi_agent":False,
-                      "features.browser_use_full_cdp_access":False}
+                      "features.browser_use_full_cdp_access":False,"project_doc_max_bytes":0}
             if os.environ.get("FLEET_SESSION_TOKEN"):     # owner API 1.12: the session credential, from the environment
                 config["mcp_servers.fleet.bearer_token_env_var"] = "FLEET_SESSION_TOKEN"
             # A primary task's thread is a saved session of the primary Codex, which the primary usage reading counts

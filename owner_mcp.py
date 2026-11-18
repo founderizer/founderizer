@@ -997,8 +997,18 @@ def whole_number(args, field):
     return number
 
 
+# **Files go with words only, as in the app** (`NeedRequestCard`: its staged files go with an answer in words or
+# alone, and a press of an option sends none). The program inside the app has the same sentence and the same rule
+# (`OwnerTools.filesWithAChoice`), which it checks before its route of a door card's press, so that no file is left
+# behind in silence there.
+FILES_WITH_A_CHOICE = ("A choice or choices carries no file, as in the Founderizer app. Send the choice alone, or "
+                       "send the files with an answer in words. An item takes one answer.")
+
+
 def answer_need(args):
-    body = {k: args[k] for k in ("answer", "choice", "choices") if args.get(k) is not None}
+    if args.get("attachments") and (args.get("choice") is not None or args.get("choices") is not None):
+        raise Refused(FILES_WITH_A_CHOICE)
+    body = {k: args[k] for k in ("answer", "choice", "choices", "attachments") if args.get(k) is not None}
     return command(f"/ui/needs/{whole_number(args, 'need')}", body, "the answer", args.get("request_id"))
 
 
@@ -1075,7 +1085,7 @@ def with_profile_base(args):
 def attach_file(args):
     """`POST /ui/attachments`: one file of this Mac to the hub, before the message that carries it. Its own
     `request_id` is a header here and not a field, because the body is the file itself, so a repeat is one file and
-    never a second one. Give the id it answers with to `send_message`."""
+    never a second one. Give the id it answers with to `send_message` or `answer_needs_you`."""
     where = args.get("path")
     if not isinstance(where, str) or not where.strip():
         raise Refused("path must be the file on this Mac to send.")
@@ -2890,7 +2900,7 @@ def tools():
              {"id": S["text"], "account": {"type": ["object", "null"]}, **rid}, ("id", "account"),
              with_base("/ui/team/chat-apps", ("id", "account"), "this chat app account")),
         tool("attach_file", "Send one file of this Mac to the hub, so a message can carry it. Give the id it "
-                            "answers with to send_message. At most 25 MiB.",
+                            "answers with to send_message or answer_needs_you. At most 25 MiB.",
              {"path": S["text"], "mime": S["text"], **rid}, ("path",), attach_file),
         tool("save_mcp_server", "Add one of the owner's own MCP servers, change it, or remove it with delete true. "
                                 "An agent loads it only once it also holds tool:<name> — share_resource puts that "
@@ -3132,9 +3142,13 @@ def tools():
         tool("answer_needs_you", "Answer one Needs-you item: the words, or choice, the index of one option the item "
                                  "offers, or choices, the indexes of the options it lets the owner tick together "
                                  "(its multi). Words that ask something back are an answer too: the item closes, "
-                                 "and the manager replies with a new item.",
+                                 "and the manager replies with a new item. attachments: at most four ids from "
+                                 "attach_file. They go with an answer in words, or alone, as in the Founderizer "
+                                 "app. A choice or choices carries no file. An item whose answer goes into a "
+                                 "conversation takes none.",
              {"need": S["int"], "answer": S["text"], "choice": S["int"],
-              "choices": {"type": "array", "items": {"type": "integer"}}, **rid}, ("need",), answer_need),
+              "choices": {"type": "array", "items": {"type": "integer"}},
+              "attachments": {"type": "array", "items": {"type": "integer"}}, **rid}, ("need",), answer_need),
         tool("decline_secret_request", "Decline one Needs-you item that asks for a secret, a key or a login: the "
                                        "request ends, and the agent that asked reads that it is not given, with "
                                        "the reason if there is one. A decline carries no value. A value goes in "

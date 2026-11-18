@@ -321,8 +321,7 @@ free text of an agent or a person). Its one field, `after`, is optional. The ans
   `machine`, `install`, `key`, `token`, `vps`, `again` (or `add_server`; `again` is "Start again" on the manager's
   server pages, which forgets the fleet on this Mac: no list of the guide and no list of `setup_show` has it);
   `add_agent.<step>` with step
-  `server`, `name`, `progress` (or `add_agent`); `connect_key`; `shape_change` (the wizard of a later change of the fleet's shape, from the
-  slider of Settings › Servers; its own pages have no name yet); `first_run.<page>` with the page
+  `server`, `name`, `progress` (or `add_agent`); `connect_key`; `first_run.<page>` with the page
   of `first_run` (or `first_run`); `waiting` (the hub answered this Mac before, and the app has no
   reading now); `none`. An agent's or a server's name has only small letters, digits and "-", 2 to
   31 characters; another name is left out, and the place is then `agent`, `server` or `task`
@@ -497,7 +496,7 @@ page, with the store's own state and the windows of that moment (`SetupChannel.s
   `settings.servers` (with the connected apps on it makes a code on the hub when it shows, its
   devices make a device's code that a Needs-you answer asked for, and its going ends a stop of
   Turn on) and `settings.backup` (not decided: its row "Where" looks for iCloud Drive on the disk
-  when it draws). **Never a target:** `add_server`, `add_agent`, `shape_change`, `connect_key`,
+  when it draws). **Never a target:** `add_server`, `add_agent`, `connect_key`,
   `server.<name>`, `app.<app>`, `agent.<name>.rule`, and each place of an agent's setup, "Setting
   up" or sign-in.
 - **It changes the page only from these places** (`SetupShow.fromForms`): `tasks`, `agents`, and
@@ -1491,7 +1490,7 @@ would read as an empty fleet instead of as a mistake.
 | `owner_device` / `device_code` | `/ui/owner/devices[/<d>/code]` | The owner's phones, and one enrollment code. Its key is the phone's. |
 | `reload_team` | `/ui/team/reload` | Apply `team.json` from a pushed revision without restarting the hub. |
 | `send_message` | `/ui/messages` | Say something to an agent. **This is how a goal or a duty is set.** |
-| `answer_needs_you` | `/ui/needs/<id>` | Answer a Needs-you item, in words, by choosing an option, or by ticking the options of an item that lets them combine (`choices`). A secret request takes neither: the app's secure form answers it. |
+| `answer_needs_you` | `/ui/needs/<id>` | Answer a Needs-you item, in words, by choosing an option, or by ticking the options of an item that lets them combine (`choices`). A secret request takes neither: the app's secure form answers it. Since 18 November 2026 it also takes files (the owner's "Yes, build it" to "Should your agent be able to attach files to its answers on Needs you?"). `attachments` holds at most four ids that `attach_file` gave, and they go with an answer in words or alone, as the files that the owner drops on the item in the app do. Beside a `choice` or `choices` they are refused before any request, with one sentence in both programs, so that a door card's press never leaves a file behind. An item whose answer goes into a conversation takes no file, and the hub says so. |
 | `decline_secret_request` | `/ui/needs/<id>/secret` | Decline a secret request, with a reason or none. A decline carries no value, so this server sends it; an answer with a value stays the app's secure form. |
 | `control_task` / `steer_task` | `/ui/tasks/<id>/control`, `/steer` | Pause, stop, resume; steer an open task. |
 | `goal_state` / `duty_state` / `trigger_state` | `/ui/goals/<id>/state` and the two beside it | Pause, resume, finish, drop. |

@@ -464,8 +464,9 @@ def web_hosts(value):
 #                     owner, 13 October 2026; decision 41): the ones that ask a person on a screen that nobody reads
 #   task_opening      how a task session that opens with its stable text first (helper feature stable_start, plan
 #                     P9.2) gets its task: "read", in its first read_messages answer, because the rules and the
-#                     profile are its appended system prompt; "prompt", at the end of its first prompt, because it
-#                     reads RULES.md as its folder's AGENTS.md; None where Fleet starts none so
+#                     profile are its appended system prompt; "prompt", at the end of its first prompt, after its
+#                     parts of the rules and its profile, because it has RULES.md as its developer instructions
+#                     (fleet.codex_rules); None where Fleet starts none so
 #   token_weights     its list prices in dollars per million tokens, {model key: {input, cache_read, cache_write,
 #                     output}}, so that the cost of a session compares across providers (AUTONOMY.md P8, P10); on a
 #                     subscription account they are weights, not money spent. A session's model takes the entry

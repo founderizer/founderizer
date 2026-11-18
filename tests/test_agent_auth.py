@@ -676,7 +676,11 @@ class HelperSide(unittest.TestCase):
             self.assertIn(token, text, name)
             if kind == "env":
                 self.assertTrue(command.startswith(f". {path} && rm -f {path} && exec env "), name)
-                self.assertEqual(text, f"export FLEET_SESSION_TOKEN={token}\n")
+                # the credential, and beside it only the words of a Codex program (its rules, fleet.codex_rules)
+                first, *rest = text.splitlines()
+                self.assertEqual(first, f"export FLEET_SESSION_TOKEN={token}", name)
+                self.assertTrue(all(line.startswith("set -- ") for line in rest), name)
+                self.assertEqual(text.count(token), 1, name)
             else:
                 config = json.loads(text)["mcpServers"]["fleet"]
                 self.assertEqual(config["headers"], {"Authorization": "Bearer " + token})

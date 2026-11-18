@@ -13,7 +13,3 @@ are in `tests/`, and the tests of a file are the `test_*.py` files there that im
 `pytest`: each test file keeps only its own checks. A test makes its own hubs, folders and git repositories in a
 temporary folder and removes them at its end. All of them, one file after the other, take about an hour on a Mac:
 `for f in tests/test_*.py; do python3 -m unittest discover -s tests -p "${f#tests/}"; done`.
-
-**With a coding agent.** `AGENTS.md` and `CLAUDE.md` in this repository are the rules that the agents of a fleet read at
-every start, because each machine of a fleet runs a clone of this repository. They are not instructions for your coding
-agent. Tell it so before it starts, and give it this file instead.

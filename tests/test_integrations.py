@@ -646,7 +646,10 @@ class HelperSide(unittest.TestCase):
             with patch.object(fleet, "checkout_conf", return_value={"repos": {}}), patch.object(fleet, "http", http):
                 command = fleet.session_command("dev", conf, "Do T-3.", task="T-3", generation="g", session=SESSION,
                                                 env=fleet.session_env("dev", conf, "task"))
-            self.assertTrue(command.startswith("env FLEET_ATTEMPT="))       # no env file without a variable
+            if conf is CLAUDE:
+                self.assertTrue(command.startswith("env FLEET_ATTEMPT="))   # no env file without a variable
+            else:       # a Codex session's env file holds its rules (fleet.codex_rules) and no variable
+                self.assertEqual(self.env_file(command), {"$@": fleet.codex_rules()})
             self.assertNotIn("github", command.lower())
             self.assertEqual("--strict-mcp-config" in command, conf is CLAUDE)    # only Fleet's MCP servers
         with patch.object(fleet, "checkout_conf", return_value={"repos": {"acme/web": "read"}}), \

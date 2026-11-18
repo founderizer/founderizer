@@ -29,7 +29,7 @@ from unittest.mock import patch
 import fleet
 import lifecycle
 import screen_runner
-from leftovers import removed_when_gone, scratch_home
+from leftovers import ROOT, removed_when_gone, scratch_home
 
 AGENT = "dev-lead"
 SESSION = "11111111-2222-4333-8444-555555555555"
@@ -182,9 +182,10 @@ class Sizes(unittest.TestCase):
                          (sorted(["fleet", *SERVERS]), {"type": "http", "url": "http://hub.test:8765/mcp/dev-lead/g1/T-7/1"}))
 
     def test_a_codex_task_reads_its_prompt_and_its_mcp_servers_from_files(self):
-        """A Codex task's prompt is its first argument, and its catalog servers are -c options of Codex: each of the most
-        servers with the most settings is thousands of characters. The window's shell reads the prompt from its file
-        and the options from its env file, as the positional parameters that "$@" gives Codex in their place."""
+        """A Codex task's prompt is its first argument, and its rules and its catalog servers are -c options of Codex:
+        its developer instructions are all of RULES.md (fleet.codex_rules), and each of the most servers with the most
+        settings is thousands of characters. The window's shell reads the prompt from its file and the options from
+        its env file, as the positional parameters that "$@" gives Codex in their place."""
         prompt, env = self.tricky("Task"), self.env(EXAMPLE_API_KEY="example-value")
         command = fleet.session_command(AGENT, CODEX, prompt, task="T-7", attempt=2, generation="g1", session=SESSION,
                                         token=TOKEN, env=env)
@@ -192,7 +193,8 @@ class Sizes(unittest.TestCase):
         files = self.shell_files(command)
         self.assertEqual(len(files), 2)
         given = self.run_window(command)
-        options = [w for t in SERVERS for w in shlex.split(fleet.codex_server(t, self.catalog))]
+        options = fleet.codex_rules() + [w for t in SERVERS for w in shlex.split(fleet.codex_server(t, self.catalog))]
+        self.assertEqual(options[:2], ["-c", "developer_instructions=" + json.dumps("# Rules\n\nFLEET-RULES-MARKER")])
         bearer = given["argv"].index(fleet.CODEX_BEARER_OPTION)
         self.assertEqual(given["argv"][bearer + 1:bearer + 1 + len(options)], options)   # where "$@" stood, whole
         self.assertEqual(given["argv"][-1], prompt + fleet.github_text(env, list(SERVERS)) + "\n\n" +
@@ -200,6 +202,15 @@ class Sizes(unittest.TestCase):
         self.assertEqual(given["argv"][:bearer + 1], words[words.index("codex") + 1:words.index("$@")])
         self.assertEqual(given["env"].get("FLEET_SESSION_TOKEN"), TOKEN)
         self.assertFalse([f for f in files if f.exists()])         # both read and removed before Codex ran
+
+    def test_a_codex_session_s_rules_fit_in_one_argument_on_linux(self):
+        """A Codex session's developer instructions are all of this checkout's RULES.md in one argument of the program
+        (fleet.codex_rules), and Linux takes one of at most 131,071 bytes with pages of 4 KiB: a RULES.md that grew
+        past it would end every Codex start on Linux with "Argument list too long", in a pane that closes."""
+        with patch.object(fleet, "KIT", ROOT):
+            words = fleet.codex_rules()
+        self.assertEqual(words[0], "-c")
+        self.assertLess(len(words[1].encode("utf-8")), 32 * 4096 - 1)
 
     def test_a_runner_task_reads_its_prompt_from_a_file_that_it_removes(self):
         """A task in the runner (screen_runner.py) had its prompt, with the list of its repositories, as one word of
@@ -281,12 +292,10 @@ class Sizes(unittest.TestCase):
         self.assertEqual(json.loads(self.private(given["argv"][given["argv"].index("--settings") + 1])), settings)
 
     def linux_limit(self):
-        """ARG_MOST as Linux has it with pages of 4 KiB, which no machine's own limit is under, and the AGENTS.md of a
-        checkout whose Codex sessions start with their stable text (fleet.stable_text)."""
+        """ARG_MOST as Linux has it with pages of 4 KiB, which no machine's own limit is under."""
         limit = patch.object(fleet, "ARG_MOST", 32 * 4096 - 1)
         limit.start()
         self.addCleanup(limit.stop)
-        (self.kit / "AGENTS.md").write_bytes((self.kit / "RULES.md").read_bytes())
 
     def left_out(self, prompt, count=1):
         """The parts of a prompt on each side of its LEFT_OUT lines, and the cut that each line names."""

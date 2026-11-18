@@ -540,9 +540,16 @@ class FromNothing(WithServer):
         self.assertIn("founderizer-mcp/1/", receipt["client"])
         self.assertIn("one paying customer this month", hub.t_read_messages("manager", {}))
 
-        answered = client.call("answer_needs_you", need=need, answer="The company card.")
+        # The answer carries a file, as a file that the owner drops on the item in the app does.
+        source = pathlib.Path(tempfile.mkdtemp(prefix="fleet-answer-")) / "card.txt"
+        self.addCleanup(shutil.rmtree, str(source.parent), True)
+        source.write_bytes(b"Notes for the answer.\n")
+        sent = client.call("attach_file", path=str(source))
+        answered = client.call("answer_needs_you", need=need, answer="The company card.", attachments=[sent["id"]])
         self.assertTrue(answered["ok"])
         self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (need,))["answer"], "The company card.")
+        self.assertEqual(hub.q1("SELECT r.need_id FROM attachments a JOIN ui_requests r ON r.request_id = a.message "
+                                "WHERE a.id=?", (sent["id"],))["need_id"], need)
 
         self.assertEqual(client.call("goal_state", id=goal, action="pause", note="later")["goal"]["state"], "paused")
         self.assertEqual(client.call("duty_state", id=duty, action="pause")["responsibility"]["state"], "paused")
@@ -4161,6 +4168,24 @@ def parity_cases():
     case("answer_needs_you: a choice", "answer_needs_you", {"need": 4, "choice": 1})
     case("answer_needs_you: choices", "answer_needs_you", {"need": 4.0, "choices": [0, 2]})
     case("answer_needs_you: words", "answer_needs_you", {"need": "5", "answer": "Yes, but later."})
+    # Files go with words or alone, as in the app; beside a choice or choices they are refused before any request, and
+    # an empty list is no file (Python's truth, which the program inside the app copies).
+    case("answer_needs_you: words with files", "answer_needs_you",
+         {"need": 5, "answer": "Here it is.", "attachments": [11, 12]})
+    case("answer_needs_you: files alone", "answer_needs_you", {"need": 5, "attachments": [11]})
+    case("answer_needs_you: a choice with a file", "answer_needs_you", {"need": 4, "choice": 0, "attachments": [11]})
+    case("answer_needs_you: choices with a file", "answer_needs_you",
+         {"need": 4, "choices": [0, 2], "attachments": [11]})
+    case("answer_needs_you: a choice with an empty list", "answer_needs_you",
+         {"need": 4, "choice": 1, "attachments": []})
+    # A file id that is no list is a file too (truth, not form), a choice of null is no choice, and the refusal of a
+    # file beside a choice comes before the refusal of a need that is no number.
+    case("answer_needs_you: a choice with a file id that is no list", "answer_needs_you",
+         {"need": 4, "choice": 0, "attachments": 11})
+    case("answer_needs_you: words with files and a choice of null", "answer_needs_you",
+         {"need": 5, "answer": "Here.", "choice": None, "attachments": [11]})
+    case("answer_needs_you: a need that is no number, with a choice and a file", "answer_needs_you",
+         {"need": "five", "choice": 0, "attachments": [11]})
     case("answer_needs_you: a need that is no number", "answer_needs_you", {"need": "five", "answer": "x"})
     case("decline_secret_request", "decline_secret_request", {"need": 6, "reason": "Not now."})
     case("decline_secret_request: no reason", "decline_secret_request", {"need": 6})
