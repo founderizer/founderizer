@@ -220,7 +220,7 @@ the exact command their download page gives, and use that command and no other.
     ssh "$SSHUSER@$HOST" 'sh /root/fleet-kit/hub.sh --check'
 
 This changes nothing. It prints every step the install would take. Read it, and give the owner the
-steps as a short list. If it says the system is not one of the three, or that the copy is not a
+steps as a short list. If it says the system is not one of the five, or that the copy is not a
 Founderizer repository, stop there.
 
 ### A5. Start the install, and keep its output

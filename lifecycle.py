@@ -250,8 +250,8 @@ def unit_of_a_release(text, kit, python, home):
 OWNER_ONLY = re.compile(r"(?:^|/)(?:test_[^/]*|ui_fixture|selftest|verify|pilot|vault|place)\.py$")  # never loaded here
 TICK = 15                   # seconds between idle checks
 RESTART_GRACE = 120         # seconds this process may live on after it asked for its own restart
-CONFIG_BRANCH = "config"    # the configuration ref that the fleet runs: the hub writes it, the code branch waits
-                            # for a deployment (RULES.md "Where work goes")
+CONFIG_BRANCH = "config"    # the configuration ref that the fleet runs: the hub writes it, and new code reaches it
+                            # only as a signed release (RULES.md "Where work goes")
 BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,100}")
 # An agent's own skills (runtime gaps, design v4 D): skills/<agent>/<name>/SKILL.md on the configuration ref, and a few
 # small files beside it, which the hub writes for that agent and nothing else writes. A script among them is no Fleet
@@ -973,6 +973,11 @@ def no_sign_in(runtime, where="this"):
 
 
 SWITCH_RUNTIMES = runtimes_with("switch")   # the runtimes an owner can switch between (owner feature runtime_switch)
+# An agent's own browser on a Linux server and its screen-sharing server, each a unit of its own OS user's systemd
+# (build plan 04, D5, D7 and D11): the helper starts and stops them, and the server service stops them where the port
+# rule is gone. Their names have a "_", which no agent's name has: never the unit of an agent's helper,
+# fleet-<agent>.service (an agent can be named "browser").
+BROWSER_UNITS = ("fleet_browser.service", "fleet_vnc.service")
 # The one runtime the fleet drives over its own app-server protocol: a screen task runs on it (screen_runner.py),
 # and so does a worker or a lead whose start policy is exactly APP_SERVER. None when no entry carries the fact.
 APP_SERVER_RUNTIME = (runtimes_with("app_server") or (None,))[0]

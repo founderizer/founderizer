@@ -43,6 +43,7 @@ import io
 import ipaddress
 import json
 import os
+import pwd
 import re
 import secrets
 import shlex
@@ -1305,6 +1306,28 @@ GENERATION = re.compile(r"[0-9a-f]{12}")        # the hub's database generation 
 PLACE_AGENT = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 PLACES_EVERY = 600      # seconds between two sweeps of the task clones that no open task holds (Helper.sweep_places)
 PLACES_TOLD = set()     # the task places whose clones could not keep their commits, told once (drop_place)
+BROWSER_TOLD = set()    # the failures of a stop of the browser units, each told once (stop_browser_units)
+
+
+def stop_browser_units(run=None):
+    """This OS user's browser and screen-sharing units (lifecycle.BROWSER_UNITS) stop, each one queued (`--no-block`),
+    so that nothing waits for them. True where systemd took each stop or has no such unit (exit 5); False otherwise,
+    with systemd's words in the helper's log, each failure once."""
+    done_well = True
+    for unit in lifecycle.BROWSER_UNITS:
+        try:
+            done = (run or subprocess.run)(["systemctl", "--user", "--no-block", "stop", unit], capture_output=True,
+                                           text=True, timeout=10)
+            said = None if done.returncode in (0, 5) else \
+                f"the stop of {unit} failed ({done.returncode}): {(done.stderr or '').strip()[:200]}"
+        except (OSError, subprocess.SubprocessError) as e:
+            said = f"the stop of {unit} did not run: {e}"
+        if said:
+            done_well = False
+            if said not in BROWSER_TOLD:
+                BROWSER_TOLD.add(said)
+                print(said, flush=True)
+    return done_well
 
 
 def task_work():
@@ -4552,6 +4575,7 @@ class Helper:
         # the unfinished tasks of this agent (T-<id>) and the hub's database generation, from the hub's last poll:
         # False before the first, None from a hub that does not say (sweep_places)
         self.open_tasks, self.poll_db, self.places_at = False, None, 0.0
+        self.browser_at = None          # when sweep_browser last swept; None: not yet in this start of the helper
         self.outside, self.outside_lock = 0, threading.Lock()      # checks and login jobs that run now
         self.logins = set()             # the sign-ins that run now, by id (begin_signin)
         self.loop_wake = threading.Event()      # ends the loop's pause, so an owner's request acts at once
@@ -4592,6 +4616,8 @@ class Helper:
         stay where they are."""
         self.say("the owner moved this agent to another server: its sessions and its service here end")
         tmux("kill-session", "-t", f"={self.session}:")
+        if sys.platform != "darwin" and self.own_user():
+            stop_browser_units()    # its browser and its screen-sharing server here end too (build plan 04, S2a)
         try:
             names = os.listdir(SESSIONS)
         except OSError:
@@ -5031,6 +5057,40 @@ class Helper:
                     drop_place(os.path.join(folder, window), self.say)
             with contextlib.suppress(OSError):
                 os.rmdir(folder)        # only when it is empty
+
+    def own_user(self):
+        """True where this helper runs as its agent's own OS user: the `user` of its team entry (an agent keeps its user
+        after a rename), else fleet-<agent> (hub.agent_os_user). Units of a user's systemd are that user's: two agents
+        of one user would share them, and an agent from before one OS user for each agent runs as the server's own."""
+        with contextlib.suppress(KeyError):
+            return pwd.getpwuid(os.getuid()).pw_name == (self.conf.get("user") or f"fleet-{self.agent}")
+        return False
+
+    def sweep_browser(self, stop=None):
+        """**This agent's browser and screen-sharing units (lifecycle.BROWSER_UNITS) stop where no open task holds
+        them** (build plan 04, S2a): at the first poll of each start of the helper, and then at most every PLACES_EVERY
+        seconds. A live window of an open browser task holds them, and so does a window of an open task whose needs
+        tmux did not take. So a helper that started again, a task that ended while the helper did not run or under a
+        release that took the browser back, and an agent that moved away (moved_away) leave no Chrome running and no
+        memory taken for long; and nothing of an open browser task stops. On Linux only, and only where the helper
+        runs as its agent's own OS user (own_user). Nothing is decided before the first poll (False), on a list that a
+        worker's hub does not give (None; a manager's hub names none, and a manager runs no browser task), or on a
+        tmux that does not answer; a session or a tmux server that is not there is an answer: no window. A stop that
+        systemd did not take is tried again in a minute (stop_browser_units)."""
+        if self.open_tasks is False or (self.open_tasks is None and self.worker) or sys.platform == "darwin" or \
+                (self.browser_at is not None and time.monotonic() - self.browser_at < PLACES_EVERY) or \
+                not self.own_user():
+            return
+        r = tmux("list-windows", "-t", f"={self.session}:", "-F", "#{window_name}\t#{@fleet_needs}")
+        if r.returncode != 0 and not (r.returncode == 1 and any(w in r.stderr for w in NO_SESSION)):
+            return              # tmux did not answer: a list that cannot be read decides nothing (plan C6)
+        self.browser_at = time.monotonic()
+        lines = r.stdout.splitlines() if r.returncode == 0 else []
+        # a window whose needs tmux did not take (a start that ran out of time) may be a browser task's: it holds them
+        if any(line.split("\t") in ([name, "browser"], [name, ""]) for name in self.open_tasks or [] for line in lines):
+            return
+        if not stop_browser_units(stop):
+            self.browser_at -= PLACES_EVERY - 60
 
     def report_start(self, task, reason):
         """Why the start of a task's session failed (plan C6), told to the hub once for each distinct reason: the hub
@@ -8804,6 +8864,7 @@ def cmd_run(args):
             h.poll_db = data.get("db")
             if data.get("hold") == "os_user":
                 h.close_held()      # one OS user for each agent: no window of it runs while the hub holds it
+            h.sweep_browser()       # before this round's starts: a unit that no open task holds goes first
             h.handle_events(data.get("events", []))
             h.sweep_places()
             h.doing("screen watch")

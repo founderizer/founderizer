@@ -619,6 +619,14 @@ class Turns(test_releases.HubUpdates):
         self.assertIsNone(hub.switch_busy("vps"))               # a run that waits for its helper runs nothing yet
         hub.q("UPDATE trigger_runs SET state='sent' WHERE id=?", (run,))
         self.assertEqual(hub.switch_busy("vps")["checks"], [run])
+        # A credential job counts while its helper can still run it. One with an unknown outcome runs nowhere (its
+        # helper lost it) and only a report finishes it: it kept its agent from a switch with no end.
+        hub.q("UPDATE trigger_runs SET state='waiting' WHERE id=?", (run,))
+        job = hub.ins("INSERT INTO jobs(agent,task,kind,login,target,created) VALUES('vps',?,'signin','bws://x','',?)",
+                      (task, hub.now()))
+        self.assertEqual(hub.switch_busy("vps")["jobs"], [job])
+        hub.q("UPDATE jobs SET unknown=? WHERE id=?", (hub.now(), job))
+        self.assertIsNone(hub.switch_busy("vps"))
 
 
 class HelperUpdate(unittest.TestCase):
@@ -684,6 +692,8 @@ LATER_COLUMNS = (("tasks", "source_conversation", "INTEGER"), ("tasks", "source_
                  # questions up the line (29 October 2026): who passed a question up, who answered it, and the
                  # Needs-you item that took it to the owner
                  ("questions", "passed", "TEXT"), ("questions", "answered_by", "TEXT"), ("needs", "question", "INTEGER"),
+                 # owner feature need_takeover (16 November 2026): the task that asked for a step on its screen
+                 ("needs", "takeover_task", "INTEGER"),
                  ("duty_cases", "opened_in", "INTEGER"),     # one event, one case (3 November 2026)
                  ("tasks", "scope_person", "INTEGER"))       # the person access plan (11 November 2026)
 LATER = """
@@ -990,6 +1000,13 @@ def later_data(t0=None):
                t0 if answer else None))
     hub.q("INSERT INTO deposits(login,machine,agent,recipient,sha256,request_id,created) VALUES(?,?,?,?,?,?,?)",
           (SAVED, "vps", "vps", "age1later", "0" * 64, "d-later", t0))
+    # owner feature need_takeover (16 November 2026), as t_request_takeover writes them: a browser task that waits on
+    # its open take-over, the one step on its own screen that it asked the owner for
+    made["takeover_task"] = hub.ins("INSERT INTO tasks(title,details,done_when,needs,owner,requester,state,waiting_on,"
+                                    "created,attempt) VALUES('Read the supplier report','From the owner.','read',"
+                                    "'browser','studio','manager','input-required','N-93',?,1)", (t0,))
+    hub.q("INSERT INTO needs(id,title,why,todo,raised,by,kind,takeover_task) VALUES(93,?,'','',?,'studio','takeover',?)",
+          ("Solve the CAPTCHA on its screen", t0, made["takeover_task"]))
     # One event, one case (3 November 2026), as hub.t_open_case writes them: two cases that one task opened, so it
     # carries neither, and another duty that joined the first of them, with the line of its history that says so
     duty = "INSERT INTO responsibilities(agent,text,state,revision,created,updated,created_by,request_id) " \
@@ -1118,6 +1135,20 @@ class RollbackReads(HubFixture):
         self.first_ask = made["first_ask"]
         self.asking, self.saved = made["asking"], made["saved"]
         self.joiner = made["joiner"]
+        self.takeover_task = made["takeover_task"]
+
+    def test_an_open_take_over_shows_and_takes_his_answer(self):
+        """need_takeover: a task's open request for one step on its screen (N-93). Any release shows it as an item and
+        takes his answer. A release before 1.217 gives that answer to no session and leaves the task waiting until it
+        is restarted or ends: the known limit of a rollback, which UI-API.md 1.217 names."""
+        code, state = self.request("/ui/state")
+        self.assertEqual(code, 200, state)
+        item = next(n for n in state["needs"] if n["id"] == 93)
+        self.assertEqual(item["kind"], "takeover")
+        code, body = self.request("/ui/needs/93", {"request_id": "5f0c3e0e-7a51-4c8e-9a1d-6b2f4c7d8e93", "db": "test-generation",
+                                                   "answer": "Done"})
+        self.assertEqual(code, 200, body)
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=93")["answer"], "Done")
 
     def test_a_task_that_waits_on_the_owners_secret_keeps_its_wait(self):
         """secret_requests: a task waits on its open request, and on its saved secret until a delivery reaches its

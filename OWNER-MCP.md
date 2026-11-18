@@ -198,7 +198,8 @@ of a newer version of this
 file can name a `swift` tool that an older program does not have: that program refuses it with
 "not in this version of the app yet" and does not list it. Never in the program, because the app's
 own pages do that work and its own setting says which hub it reads: `install_hub`, `install_log`,
-`claim_hub`, `add_machine`, `use_hub` and `which_hub`. Three more are the program's own and are not
+`claim_hub`, `add_machine`, `use_hub`, `which_hub` and `connect_google`. Three more are the
+program's own and are not
 in the table or in this server: `setup_state`, `setup_show` and `setup_diagnosis`, on the link to
 the running app (below). Six more, `save_bot_token`, `prepare_problem_report`, `save_secret`,
 `grant_secret`, `share_secret` and `answer_secret_request`, write on the same link (below). So

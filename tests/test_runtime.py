@@ -12,6 +12,7 @@ from http.server import ThreadingHTTPServer
 from unittest.mock import patch
 
 import hub
+import usage
 from test_ui_api import own_files
 
 SESSION = "0b7d5a8e-3c1f-4e2a-9d6b-1f2e3d4c5b6a"
@@ -616,6 +617,38 @@ class Runtime(unittest.TestCase):
         reset = hub.now() + 120
         self.records(tid, [{"seq": 3, "type": "error", "code": "usage_limit", "resets_at": reset}], agent="vps")
         self.assertEqual(round(hub.active_limit("vps")["until"]), round(reset))     # a known reset replaces the guess
+
+    def test_only_a_reading_from_after_the_limit_ends_a_hold_that_has_no_reset_time(self):
+        """Plan C9: a hold with no reset time ends at the first usage reading that says more (limit_reading). The
+        helper sends its last reading again with each report, and one from just before the limit shows every window
+        open: it ended each new hold at once, so the session started, met the limit and was held again, until the
+        next reading. A reset that has passed says nothing either, and the reading is of the primary runtime only.
+        The readings by their time come as the helper's own report (POST /helper/usage), the route that hands the
+        reading on. That time is of the helper's clock, which the hub takes up to 60 seconds ahead of its own: so a
+        reading with a time less than that after the hold began can be from before it, and ends nothing."""
+        def reading(collected, used, reset):
+            return {"collected_at": collected, "error": None, "windows": [{"used_percent": used, "resets_at": reset}]}
+
+        def reports(collected, used, reset):
+            window = {"id": "w0", "label": "codex / 7 days", "used_percent": used, "resets_at": reset, "window_minutes": 10080}
+            limits = {"collected_at": collected, "source": usage.LIMIT_SOURCES["codex"], "plan": "pro",
+                      "account_key": "openai:" + "a" * 32, "windows": [window], "error": None}
+            self.assertEqual(self.call("POST", "/helper/usage/vps", {"tokens": None, "limits": limits}, client=None)[0], 200)
+        tid, screen = self.task(owner="vps"), self.task()
+        hub.q("UPDATE tasks SET needs='screen' WHERE id=?", (screen,))
+        hub.start_limit("vps", None, tid)
+        hub.start_limit("studio", None, screen)             # the account of studio's screen runtime, not its own
+        hub.q("UPDATE agent_limits SET since=since-120, until=until-120")               # two minutes ago, both
+        since = hub.active_limit("vps")["since"]
+        reports(since - 20, 99, since + 500)                                            # read before the limit
+        reports(since + 30, 99, since + 500)                # and so can this one be, by a clock that is ahead
+        hub.limit_reading("vps", reading(hub.now(), 100, since - 5), hub.now())         # a reset that has passed
+        hub.limit_reading("studio", reading(hub.now(), 40, since + 500), hub.now())
+        for agent in ("vps", "studio"):
+            lim = hub.active_limit(agent)
+            self.assertEqual((round(lim["until"] - lim["since"]), lim["reset_known"]), (3600, 0), agent)
+        reports(hub.now(), 40, since + 500)                                             # read after it: open again
+        self.assertLessEqual(hub.active_limit("vps")["until"], hub.now())
 
     # ---- 4. live paths
     def test_a_task_with_an_offline_helper_is_reported_once(self):

@@ -44,11 +44,11 @@ with the missing command's name; it does not run downloaded code or use sudo.
 
 ## macOS
 
-Clone the shared repository, then double-click **Install Founderizer Worker.command**.
-Enter the registered worker name. The installer builds and signs **Founderizer Worker**,
+Clone the shared repository, then double-click **Install Fleet Worker.command**.
+Enter the registered worker name. The installer builds and signs **Fleet Worker**,
 installs the LaunchAgent, and starts it. It opens the macOS screen permission flow
 for a screen worker. In System Settings → Privacy & Security → Screen & System
-Audio Recording, allow **Founderizer Worker**. No audio is captured. Rebuilding the app
+Audio Recording, allow **Fleet Worker**. No audio is captured. Rebuilding the app
 can require this permission again.
 
 From Terminal, the same installation is:
@@ -494,8 +494,13 @@ of `hubsetup.py vault` adds the key again.
 An API key that an agent reads is a variable in its sessions. With the key swap, a key
 that has a site stays out of them: the session holds a placeholder, and the vault's
 swap proxy puts the key into the `Authorization` header of an HTTPS request to that
-site only (VAULT.md, "The key swap"). **No install switches it on.** Root does, for one
-machine, in a checkout at the release:
+site only (VAULT.md, "The key swap"). **A new Linux server's install switches it on**
+(`join.sh`; `hub.sh` only where the owner chose one server for all,
+`FLEET_HUB_SERVER=shared`). On a server that joined before, the owner's Mac app
+switches it on where no agent reads a key that has a site, while the owner's Mac holds
+the owner keys of the central vault and no put-back of a switch holds the fleet's
+switches. Where an agent does, the server waits for the owner's wish (below). Root can
+also switch it on by hand, for one machine, in a checkout at the release:
 
 ```bash
 python3 hubsetup.py vault --hub http://100.80.1.2:8765 --kit "$PWD" --swap --check   # says what it would make
@@ -539,9 +544,18 @@ reads it, and the agent's program is Claude Code or Codex. Its next session then
 the placeholder. On such a machine the vault also sends that key in a `call_api`
 request only to that site, in the `Authorization` header and in the key's own form.
 
-The hub does not know that this machine swaps keys, and it reads no report of a machine
-for that. So after the step, the owner tells the hub: the tool `server_key_swap` of the
-owner MCP server with `on: true` (`POST /ui/servers/<server>/key-swap`). From then on
+The hub reads no report of a machine for the key swap. The owner's Mac app reads each
+joined Linux server of the fleet but the hub's own machine: it runs the vault's own step there
+as root and sends what the step read (`POST /ui/servers/<server>/key-swap-reading`). The
+hub's word that a machine swaps keys comes only from that reading. After a switch by
+hand, the word follows at the app's next reading of this server, which the owner's wish
+on (below) brings while the owner's Mac holds the owner keys of the central vault.
+
+The owner's wish for a server is the tool `server_key_swap` of the owner MCP server
+(`POST /ui/servers/<server>/key-swap`): `wish: "on"`, `wish: "off"`, or `wish: "rule"`,
+which removes the wish. While the owner's Mac holds the owner keys of the central vault,
+the app reads the server and switches it to the wish. The word follows what the app
+reads, never the wish. With the word,
 the settings check does not count a key that swaps here as a key in the agent's
 sessions, and the start text of an agent whose sessions get the variable says that it
 holds a placeholder. The word opens nothing. Without it the key swap works the same:
@@ -561,8 +575,12 @@ line into its log, goes on with its own program, and tries the new one again lat
 `systemctl restart fleet-vault-swap` makes the proxy start from the installed program
 at once. A session that holds no placeholder does not use the proxy.
 
-To undo: first the owner takes the word back (`server_key_swap` with `on: false`), or
-the hub goes on saying that the keys of this machine's agents are placeholders. Then,
-as root: `systemctl disable --now fleet-vault-swap`, take the part `"swap"` out of
+To undo: the owner gives the wish off (`server_key_swap` with `wish: "off"`). While the
+wish is not off, the owner's Mac app can switch this machine on again. With the wish
+off, the app switches the machine off, and the hub's word follows the app's reading.
+Where the owner's Mac does not hold the owner keys of the central vault, the app
+switches nothing. There, give the wish off first, so that the app never switches the
+machine on again, and then root does it by hand:
+`systemctl disable --now fleet-vault-swap`, take the part `"swap"` out of
 `/etc/fleet-vault/vault.json`, `systemctl restart fleet-vault`. The next sessions get
 each key as a variable again. A session that holds a placeholder must start again.

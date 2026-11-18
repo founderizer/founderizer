@@ -249,6 +249,25 @@ class Copy(Fixture):
         zf = zipfile.ZipFile(io.BytesIO(self.download()[2]))
         self.assertEqual({one.date_time for one in zf.infolist()}, {(1980, 1, 1, 0, 0, 0)})
 
+    def test_the_hub_holds_its_lock_while_it_reads_a_copy_and_not_while_it_packs_it(self):
+        """While LOCK is held the hub answers nobody, and the sums and the compression of a copy take seconds: 7.4
+        for 358 MB of records (measured on 17 November 2026). So the route holds the lock for the reads only, which
+        must be of one moment. And it makes one copy at a time, under a lock of its own (BACKUP_LOCK): two requests
+        that pack at the same time hold two images of the records in memory."""
+        calls = []          # each call of the two parts, in order: a second pack inside the lock is seen too
+
+        def watched(name):
+            real = getattr(hub, name)
+
+            def call(*args):        # LOCK: of the thread that serves the request; BACKUP_LOCK: of this one request
+                calls.append((name, hub.LOCK._is_owned(), hub.BACKUP_LOCK.locked()))
+                return real(*args)
+            return patch.object(hub, name, call)
+        with watched("backup_read"), watched("backup_packed"):
+            self.assertEqual(self.download()[0], 200)
+        self.assertEqual(calls, [("backup_read", True, True), ("backup_packed", False, True)])
+        self.assertFalse(hub.BACKUP_LOCK.locked())
+
     def test_a_copy_of_records_in_wal_mode_is_records_that_a_restore_opens(self):
         """The hub keeps its records in WAL mode since 11 November 2026 (hub.wal_on), and DB.serialize() copies the
         header of that mode, which SQLite opens from no image in memory: a restore refused such a copy as records that

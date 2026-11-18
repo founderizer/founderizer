@@ -224,6 +224,7 @@ class RestartTask(Dying, Capacity):
             self.assertIn(part, start["text"])
         asked = hub.q1("SELECT * FROM questions WHERE id=?", (question,))
         self.assertEqual(asked["answer"], hub.RESTART_ANSWER.format(by="pma", task=f"T-{self.task}"))
+        self.assertIsNone(asked["answered_by"])     # nobody answered it: a take-over's stop stays (t_request_takeover)
         self.assertFalse([text for text in self.told("seo") if "Answer to your question" in text])
         self.assertIn(f"T-{self.task} (Work for seo) runs again in a new session, as attempt 2", self.told("pma")[-1])
         self.assertEqual(hub.desktop_busy("seo")["id"], self.task)

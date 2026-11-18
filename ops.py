@@ -92,6 +92,11 @@ def route_line(answer, target):
         return "route: the owner's window. Send the same call again when the window allows it."
     if route == "again":
         return "route: the same call again later. The door could not check it now."
+    if route == "none" and answer.get("why") == f"{target} is no host of the door":
+        # the owner, 17 November 2026: a card asked him for a tag that the server carried, while a hold kept it out
+        return (f"route: none at the door, which has no host {target}. Check the name first. If it is right, ask your "
+                f"requester with ask_my_requester and needs_access server:{target}: the hub names the agent that holds "
+                f"it, or the hold that keeps it out of the door.")
     if route == "none":
         return ("route: none. No grant and no yes of the owner lets this call through: change the call, or plan "
                 "another way.")

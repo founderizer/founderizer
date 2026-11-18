@@ -2713,10 +2713,25 @@ class Wish(Fact):
         said, error = self.raise_item()
         self.assertTrue(error)
         self.assertIn("is open already", said)
-        code, receipt = self.press(need["id"], choice=0)                   # the owner presses Switch it on
-        self.assertEqual(code, 200, receipt)
+        real_run, failed = subprocess.run, []
+
+        def run(argv, *args, **kwargs):                                     # the first push fails: a short fault
+            if "push" in argv and not failed:
+                failed.append(argv)
+                return subprocess.CompletedProcess(argv, 128, "", "fatal: unable to access the repository")
+            return real_run(argv, *args, **kwargs)
+        with patch.object(subprocess, "run", run):
+            code, receipt = self.press(need["id"], choice=0)               # the owner presses Switch it on
+            self.assertEqual(code, 200, receipt)
+            self.assertEqual((len(failed), self.committed()["servers"]["box"].get("key_swap_wish")), (1, None))
+            self.assertIsNotNone(hub.kv_get(hub.KEY_SWAP_ANSWERED + "box"))   # the fault keeps his press
+            self.assertFalse(hub.key_swap_ask("box"))                      # and no second card asks him again
+            hub.key_swap_answered()                                        # the hub's next start writes it
         self.assertEqual(self.committed()["servers"]["box"].get("key_swap_wish"), "on")
         self.assertIsNone(hub.kv_get(hub.KEY_SWAP_ANSWERED + "box"))
+        hub.kv_set(hub.KEY_SWAP_ANSWERED + "nowhere", json.dumps({"wish": "on", "need": need["id"], "at": 1}))
+        hub.key_swap_answered()                                            # a server that left the fleet: it goes
+        self.assertIsNone(hub.kv_get(hub.KEY_SWAP_ANSWERED + "nowhere"))
         self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (need["id"],))["answer"], "Switch it on")
         self.wish("box", "rule")
         for answer, wish in (({"answer": "Ask me again next week"}, None), ({"choice": 1}, "off")):
@@ -2727,6 +2742,12 @@ class Wish(Fact):
                 nid = hub.q1("SELECT MAX(id) n FROM needs")["n"]
                 self.assertEqual(self.press(nid, **answer)[0], 200)
                 self.assertEqual(self.committed()["servers"]["box"].get("key_swap_wish"), wish)   # words set none
+        hub.kv_set(hub.KEY_SWAP_ANSWERED + "box", json.dumps({"wish": "on", "need": nid, "at": 1}))   # a kept press
+        failed.clear()
+        with patch.object(subprocess, "run", run):                         # his newer word, another way, fails too
+            self.assertEqual(self.wish("box", "rule")[0], 502)
+        hub.key_swap_answered()
+        self.assertEqual(self.committed()["servers"]["box"].get("key_swap_wish"), "off")   # the older press stays out
 
     def test_no_connected_app_answers_it_and_a_rename_moves_its_records(self):
         self.assertIn("key_swap_server", hub.CAPP_NEED_OWN_ROUTE)

@@ -3,8 +3,8 @@
 #
 # The fleet keeps its configuration (team.json, profiles/, knowledge/) on the branch "config" and its code on
 # "main". The hub commits the owner's changes to "config" and nothing else writes it, so a developer's push to
-# "main" can no longer refuse an owner write with 409. Code reaches the fleet when a deployment merges "main"
-# into "config".
+# "main" can no longer refuse an owner write with 409. New code reaches the fleet only as a signed release, which
+# the hub merges into "config" (releases.py).
 #
 #   sh config-ref.sh --check [<checkout>]    say what it would do, change nothing
 #   sh config-ref.sh [<checkout>]            do it

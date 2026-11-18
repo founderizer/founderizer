@@ -15,7 +15,7 @@
 # Its steps: base packages, the user fleet with lingering, the private network (Tailscale), the firewall, the bare
 # repository and the hub's checkout on the configuration ref, the first team.json with the owner's own Mac proved by
 # a one-time code, the root helper that makes an agent's OS user, one OS user for each agent of this machine,
-# the fleet-hub and fleet-git user services, each agent of this machine under its own OS user (its checkout,
+# the fleet-hub, fleet-git and fleet-channels user services, each agent of this machine under its own OS user (its checkout,
 # its runtime and its service), the end checks, this fleet's own id, security updates, this server's own hardening
 # (SSH keys only, npm's seven days, Tailscale's own updates), the TCP window of a kept connection, and verify.
 #

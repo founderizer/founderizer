@@ -1892,7 +1892,7 @@ class GoogleHub(OwnerAPI):
         real_enter = hub.TeamLock.__enter__
         armed, answers, writer, disconnecting = [True], {}, [], []
 
-        def run(route, request_id, client, db, body, act, keep=None, outside=None):
+        def run(route, request_id, client, db, body, act, keep=None, outside=None, **more):
             if route == "google/disconnect" and outside is not None:
                 inner = outside
 
@@ -1901,7 +1901,7 @@ class GoogleHub(OwnerAPI):
                     claimed.set()
                     go.wait(10)                                     # until the finish's act checked the counts
                     return inner(b)
-            return real_run(route, request_id, client, db, body, act, keep, outside)
+            return real_run(route, request_id, client, db, body, act, keep, outside, **more)
 
         def store(data):
             if armed[0] and EMAIL in (data.get("accounts") or {}):  # the finish's write, under LOCK

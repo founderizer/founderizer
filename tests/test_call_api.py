@@ -946,6 +946,33 @@ class JobRuns(CallApi):
             self.assertLess(time.monotonic() - began, 4)
         self.assertIsNone(self.job()["finished"])           # no clock and no stop marked it failed
 
+    def test_a_job_that_was_still_running_at_a_stop_is_still_its_helper_s_after_the_next_start(self):
+        """A stop answers each call that waits "still running: its outcome comes to this task as a message". The start
+        of the next hub (settle_stopped_calls) ended those jobs as "the hub restarted" with no message, and the
+        helper's real report got 409, which a helper takes for "the hub has it": the outcome was lost. The job stays
+        open over the start, the report is taken, and the task reads the outcome once."""
+        self.allow()                                        # the owner's permission: seo may make logins
+        self.addCleanup(hub.STOPPING.clear)
+        hub.STOPPING.set()
+        for text, _ in (self.api(timeout_seconds=600), self.call("seo", "sign_in", {"login": LOGIN_A}, self.task),
+                        self.ask()):
+            self.assertIn("Still running on this machine", text)
+        hub.STOPPING.clear()
+        request, made, signin = self.job()["id"], self.job(RID)["id"], hub.q1("SELECT id FROM jobs WHERE kind='signin'")["id"]
+        # the vault took the request and the new login before the stop, so each can have taken effect
+        self.assertEqual((self.asks(request)[0], self.confirm(made)[0]), (200, 200))
+        hub.settle_stopped_calls()                          # the next hub starts
+        self.assertEqual([tuple(j) for j in hub.q("SELECT finished, unknown FROM jobs ORDER BY id")], [(None, None)] * 3)
+        self.assertEqual(self.outcomes(), [])               # and the hub made no outcome of its own for the request
+        for code, data in (self.says(request, ok=True, status=201, text="HTTP 201", body='{"id": 7}'),
+                           self.request(f"/helper/job/seo/{signin}", {"ok": True, "text": "Signed in."}),
+                           self.created(made), self.done(made)):
+            self.assertEqual(code, 200, data)               # each report is taken: 409 would drop it for good
+        said = self.said("seo")
+        for outcome in ('finished: HTTP 201. {"id": 7}', f"sign_in with {LOGIN_A} is done: Signed in.",
+                        f"Saved a new login as {MADE}"):
+            self.assertEqual(sum(outcome in t for t in said), 1, outcome)
+
     def test_a_sign_in_that_ends_after_the_call_is_done_and_not_failed(self):
         text, error = self.call("seo", "sign_in", {"login": LOGIN_A}, self.task)
         self.assertFalse(error, text)

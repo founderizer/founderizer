@@ -6,6 +6,7 @@ registration) because `commit_kit_file` compared the hub checkout with `origin/m
 moved. `test_the_one_branch_shape_refused_the_write` keeps that behaviour under a test, so the two shapes stand
 side by side.
 """
+import ast
 import inspect
 import json
 import os
@@ -14,8 +15,10 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest import mock
+import uuid
 
 import hub
 from test_ui_api import OwnerAPI
@@ -207,9 +210,10 @@ class ConfigRef(OwnerAPI):
     # ---- a write whose push landed and whose fast-forward did not (7 November 2026)
 
     def settings(self, **change):
-        """The owner's settings write of vps (save_agent_settings) on the team.json that the hub reads now, under LOCK
-        as every owner command runs. It commits, then applies the team and asks the machine of vps to follow."""
-        with hub.LOCK:
+        """The owner's settings write of vps (save_agent_settings) on the team.json that the hub reads now, as its
+        owner command runs it: in the turn of the hub's writes, with its git outside LOCK (ui_command unlocked). It
+        commits, then applies the team and asks the machine of vps to follow."""
+        with hub.kit_lock(), hub.kit_turn(True):
             _, current, _ = hub.team_view(hub.kit_revision(fresh=True))
             return hub.save_agent_settings("vps", dict(change, base_sha256=current))
 
@@ -428,6 +432,162 @@ class ConfigRef(OwnerAPI):
                                      more={"profiles/vps.md": PROFILE.replace("Careful.", "Quick.").encode()})
         self.assertEqual(self.ref(hub.CONFIG_BRANCH), commit)
         self.assertIn("Quick.", (self.kit / "profiles/vps.md").read_text())
+
+    # ---- an owner write runs its git outside LOCK (17 November 2026)
+
+    def held(self, step):
+        """subprocess.run and hub.git_kit with `step` of the hub's git held until the test lets it go: "push", or the
+        "fetch" after the push. Gives (it is held now, let it go)."""
+        holding, go = threading.Event(), threading.Event()
+        real_run, real_git = subprocess.run, hub.git_kit
+
+        def run(argv, *args, **kwargs):
+            if step == "push" and "push" in argv and not holding.is_set():
+                holding.set()
+                go.wait(30)
+            return real_run(argv, *args, **kwargs)
+
+        def git_kit(*args, **kwargs):
+            if step == "fetch" and args[:1] == ("fetch",) and not holding.is_set() and \
+                    self.ref(hub.CONFIG_BRANCH) != self.seeded:
+                holding.set()
+                go.wait(30)
+            return real_git(*args, **kwargs)
+        for patch in (mock.patch.object(subprocess, "run", run), mock.patch.object(hub, "git_kit", git_kit)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(go.set)
+        return holding, go
+
+    def in_thread(self, path, body):
+        """One owner command over HTTP, in a thread of its own as the app's request is: gives the thread and its
+        answers."""
+        answers = []
+        thread = threading.Thread(target=lambda: answers.append(self.request(path, dict(
+            body, request_id=str(uuid.uuid4()), db="test-generation"))))
+        thread.start()
+        self.addCleanup(thread.join, 30)
+        return thread, answers
+
+    def test_an_owner_write_lets_the_state_read_in_while_its_git_runs(self):
+        """The owner, 17 November 2026: his Mac read the state while an Add secret ran its git under LOCK (a fetch, a
+        clone, a commit and a push, about 4 seconds), the read waited, and his app said that its reading of the fleet
+        was old. An owner command whose route lets it (ui_command unlocked) runs that git without LOCK: while its push
+        hangs, the state read answers, and the command still answers as before, keeps its receipt and applies its
+        change."""
+        holding, go = self.held("push")
+        _, current, _ = hub.team_view(hub.kit_revision(fresh=True))
+        thread, answers = self.in_thread("/ui/team/agents/vps", {"base_sha256": current, "title": "Checks"})
+        try:
+            self.assertTrue(holding.wait(10))
+            status, state = self.request("/ui/state")      # within the class's patience, while the push hangs
+            self.assertEqual((status, state["db"]), (200, "test-generation"))
+            self.assertIsNone(hub.agents()["vps"].get("title"))         # the team that the hub runs until the commit
+        finally:
+            go.set()                # before tearDown, which waits for the request
+        thread.join(30)
+        (status, answer), = answers
+        self.assertEqual((status, answer["changed"]), (200, [{"field": "title", "before": None, "after": "Checks"}]))
+        self.assertEqual({answer["revision"], self.ref(hub.CONFIG_BRANCH)}, {git("rev-parse", "HEAD", cwd=self.kit)})
+        self.assertEqual(hub.agents()["vps"]["title"], "Checks")
+        kept = hub.q1("SELECT result FROM ui_controls WHERE route='team/agents/vps'")["result"]
+        self.assertEqual(json.loads(kept)["revision"], answer["revision"])
+        self.assertIsNone(hub.FLIGHT["thread"])
+
+    def test_two_owner_writes_at_once_run_one_after_the_other(self):
+        """Two settings saves of the owner at the same moment, each a read of team.json, a change of one key and a
+        commit. While the first runs its git without LOCK, the second waits for its turn (KIT): it reads the first's
+        team.json, so both answer 200 and team.json keeps both keys. Without the turn, the second read the same
+        team.json, and its commit either lost the push to the first (409) or undid the first's key."""
+        holding, go = self.held("push")
+        first, firsts = self.in_thread("/ui/settings", {"settings": {"memory.start_chars": 2000}})
+        try:
+            self.assertTrue(holding.wait(10))
+            second, seconds = self.in_thread("/ui/settings", {"settings": {"checks.run_seconds": 30}})
+            second.join(2)
+            self.assertEqual(seconds, [])           # it waits for its turn while the first one's push hangs
+        finally:
+            go.set()
+        first.join(30)
+        second.join(30)
+        self.assertEqual([status for status, _ in firsts + seconds], [200, 200])
+        settings = json.loads(git("show", f"{hub.CONFIG_BRANCH}:team.json", cwd=self.root / "origin.git"))["settings"]
+        self.assertEqual(settings, {"memory.start_chars": 2000, "checks.run_seconds": 30})
+        self.assertEqual(hub.TEAM["settings"], settings)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=self.kit), self.ref(hub.CONFIG_BRANCH))
+
+    def test_no_write_comes_between_an_owner_write_s_push_and_its_fast_forward(self):
+        """While an owner write runs its git without LOCK, its commit can stand on the ref and not yet in the hub
+        checkout, marked as the hub's own (KIT_PUSHED). A writer that holds LOCK and no turn (a tick's sweep, a
+        tool) would take that commit back as a write that a cut left there: it is refused and writes nothing, the
+        hub's start step waits for the turn, and the owner's write ends as it would alone."""
+        holding, go = self.held("fetch")
+        thread, answers = self.in_thread("/ui/settings", {"settings": {"memory.start_chars": 2000}})
+        settled = threading.Thread(target=hub.settle_kit_push)
+        try:
+            self.assertTrue(holding.wait(10))
+            pushed = self.ref(hub.CONFIG_BRANCH)
+            self.assertTrue(hub.LOCK.acquire(timeout=5))        # the write lets go of LOCK while its git runs
+            try:
+                self.assertEqual(hub.kv_get(hub.KIT_PUSHED), pushed)
+                with self.assertRaises(hub.Refusal) as caught:
+                    hub.commit_kit_file("knowledge/owner/brand.md", b"# Brand\n\nGreen.\n", "Owner changed brand.md")
+            finally:
+                hub.LOCK.release()
+            self.assertEqual((caught.exception.status, str(caught.exception)), (409, hub.KIT_BUSY))
+            settled.start()
+            settled.join(0.5)
+            self.assertTrue(settled.is_alive())                 # it waits for the turn
+            self.assertEqual(self.ref(hub.CONFIG_BRANCH), pushed)
+        finally:
+            go.set()
+            if settled.ident:
+                settled.join(30)
+        thread.join(30)
+        self.assertEqual(answers[0][0], 200)
+        self.assertEqual((self.ref(hub.CONFIG_BRANCH), git("rev-parse", "HEAD", cwd=self.kit)), (pushed, pushed))
+        self.assertEqual(hub.TEAM["settings"], {"memory.start_chars": 2000})
+        self.assertIsNone(hub.kv_get(hub.KIT_PUSHED))
+
+    def test_every_writer_that_takes_the_lock_from_outside_takes_the_turn(self):
+        """A writer that holds LOCK without the turn (KIT) is refused while an owner write runs its git (KIT_BUSY), and
+        a caller can read that refusal as final: the first review of 17 November 2026 found an owner's key swap answer
+        dropped so, and a restore answered "try again". So an owner route whose act can reach commit_kit_file passes
+        kit or unlocked to ui_command; any other `with LOCK:` around such a call is `with kit_lock():`; and the tick,
+        which holds LOCK for each pass, calls kit_flying() first in each sweep that can commit."""
+        tree = ast.parse(Path(hub.__file__).read_text())
+        defs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+        def names(node):         # the module's functions that a node names, and not a local of the same name
+            bound = {c.id for c in ast.walk(node) if isinstance(c, ast.Name) and isinstance(c.ctx, ast.Store)} | \
+                {a.arg for c in ast.walk(node) if isinstance(c, ast.arguments) for a in c.args + c.kwonlyargs}
+            return {c.id for c in ast.walk(node) if isinstance(c, ast.Name) and isinstance(c.ctx, ast.Load)
+                    and c.id in defs and c.id not in bound}
+        used = {name: names(node) for name, node in defs.items()}
+        writes = {"commit_kit_file", "move_kit", "undo_kit_push"}       # a commit, a move, an undo of the checkout
+        while True:     # settle_kit_push takes the turn itself, as commit_kit_file does for a caller with no LOCK
+            more = {name for name, them in used.items() if them & writes} - writes - {"settle_kit_push"}
+            if not more:
+                break
+            writes |= more
+        handler = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Handler")
+        missing = []
+        for method in (m for m in handler.body if isinstance(m, ast.FunctionDef)):
+            for call in ast.walk(method):
+                if isinstance(call, ast.Call) and getattr(call.func, "attr", None) == "ui_command" and \
+                        names(method) & writes and not {k.arg for k in call.keywords} & {"kit", "unlocked"}:
+                    missing.append(f"{method.name}: ui_command {ast.unparse(call.args[0])}")
+        for owner in [*defs.values(), *(m for m in handler.body if isinstance(m, ast.FunctionDef))]:
+            for block in ast.walk(owner):
+                if not (isinstance(block, ast.With) and "LOCK" in [ast.unparse(i.context_expr) for i in block.items]):
+                    continue
+                reach = names(ast.Module(body=block.body, type_ignores=[])) & writes
+                if owner.name != "tick" and reach:
+                    missing.append(f"{owner.name}: with LOCK at line {block.lineno} reaches {sorted(reach)[0]}")
+                for sweep in sorted(reach) if owner.name == "tick" else []:
+                    if "kit_flying" not in used[sweep]:
+                        missing.append(f"tick: {sweep} can commit and does not ask kit_flying()")
+        self.assertEqual(missing, [])
 
     # ---- the reload follows the same ref
 

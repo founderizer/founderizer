@@ -17,5 +17,6 @@
 - If the tool says the vault refused, you are not allowed that login. Do not look for another way. Ask your requester.
 
 - If the login holds an authenticator seed, `sign_in` also types the authenticator code; you never see it.
-- A text-message code, a passkey or a CAPTCHA: stop and ask your requester.
+- In a browser or screen task, ask the owner with `request_takeover` to solve a CAPTCHA on your screen, and wait. A text-message code goes to your requester, as `sign_in` says. Elsewhere, stop and ask your requester.
+- Do not ask the owner to type a password, a key or a card number, to use a passkey or to sign in (single sign-on, an AI provider's page), with `request_takeover` or in words: `sign_in` types a login that your vault holds, and `request_secret` asks for a login or a key that it does not hold. For a passkey, a card number or an AI provider's page, stop and ask your requester.
 - A `sealed:<number>` handover works for one task: the task that first opens it. When that task ends, it is gone.

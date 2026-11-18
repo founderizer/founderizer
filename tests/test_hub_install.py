@@ -291,8 +291,8 @@ class Template(unittest.TestCase):
             self.assertNotIn("vault_create", agent)
 
     def test_a_hub_without_a_proved_owner_is_no_team_the_hub_can_run(self):
-        """Why the claim exists at all: the owner is an address and no token, so the hub refuses to run without one
-        and the installer must prove the address before it finishes."""
+        """Why the claim exists at all: the owner is one computer, known first by its address, so the hub refuses to
+        run without that address and the installer must prove it before it finishes."""
         with self.assertRaises(ValueError) as refused:
             hub.validate_team(hubsetup.template(HUB_IP))
         self.assertIn("owner", str(refused.exception))

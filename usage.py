@@ -20,6 +20,8 @@ import time
 import lifecycle
 
 POLL_SECONDS = 300
+READING_AHEAD = 60                  # seconds that a reading's time may be ahead of the hub's clock, which is another
+#                                     machine's (validate_usage; hub.limit_reading asks the same of a hold's start)
 SCAN_SECONDS = 30
 SCAN_TIME = 10                      # seconds that one scan reads, and MAX_BYTES its bytes: a scan that needs more
 MAX_BYTES = 256 * 1024 * 1024       # goes on at the next one (Scan), and none gives a partial total
@@ -874,7 +876,7 @@ def validate_usage(data, runtime, screen=False):
                     validate_models(row)
         if value["error"] is not None and value["error"] not in ERRORS:
             raise ValueError("invalid error")
-        if value["collected_at"] is not None and number(value["collected_at"]) > time.time() + 60:
+        if value["collected_at"] is not None and number(value["collected_at"]) > time.time() + READING_AHEAD:
             raise ValueError("invalid time")
         source = SCREEN_SOURCE if screen and kind == "tokens" else \
             (SOURCES if kind == "tokens" else LIMIT_SOURCES).get(runtime)

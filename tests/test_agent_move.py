@@ -178,7 +178,7 @@ class Move(Servers):
 class OldHelper(unittest.TestCase):
     """fleet.Helper.moved_away: what the helper on the machine that the agent left does with the answer `moved`."""
 
-    def run_it(self, platform):
+    def run_it(self, platform, own=False):
         h = fleet.Helper.__new__(fleet.Helper)
         h.agent, h.session = "scout", "fleet-scout"
         tmux, runs = [], []
@@ -188,8 +188,9 @@ class OldHelper(unittest.TestCase):
         with patch.object(fleet, "HOME", home + "/.fleet"), patch.object(fleet, "SESSIONS", home + "/.fleet/sessions"), \
                 patch.dict(__import__("os").environ, {"HOME": home}), \
                 patch.object(fleet, "tmux", lambda *args, **kw: tmux.append(args)), \
-                patch.object(fleet.sys, "platform", platform), \
-                patch.object(fleet.subprocess, "run", lambda argv, **kw: runs.append(argv)), \
+                patch.object(fleet.sys, "platform", platform), patch.object(h, "own_user", lambda: own, create=True), \
+                patch.object(fleet.subprocess, "run",
+                             lambda argv, **kw: runs.append(argv) or fleet.subprocess.CompletedProcess(argv, 0, "", "")), \
                 patch.object(fleet.os, "remove", lambda path: runs.append(["rm", path])):
             h.moved_away()
         return tmux, runs
@@ -200,6 +201,13 @@ class OldHelper(unittest.TestCase):
         self.assertEqual(runs[0][0], "rm")                              # its key goes first (test_os_users)
         self.assertTrue(runs[0][1].endswith("/.fleet/agent-scout.key"))
         self.assertEqual(runs[-1], ["systemctl", "--user", "--no-block", "disable", "--now", "fleet-scout.service"])
+        # An agent with an OS user of its own: its browser and its screen-sharing server here stop too (build plan 04,
+        # S2a), and never a unit of another name.
+        _tmux, runs = self.run_it("linux", own=True)
+        self.assertEqual([r for r in runs if r[0] == "systemctl"],
+                         [["systemctl", "--user", "--no-block", "stop", "fleet_browser.service"],
+                          ["systemctl", "--user", "--no-block", "stop", "fleet_vnc.service"],
+                          ["systemctl", "--user", "--no-block", "disable", "--now", "fleet-scout.service"]])
 
     def test_the_ops_command_is_put_on_the_box_once(self):
         """DevOps plan C1: the helper puts the door's command in ~/.local/bin, which every session's PATH carries."""

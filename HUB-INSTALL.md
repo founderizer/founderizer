@@ -176,8 +176,8 @@ notification of a Needs-you item, the chat that opens first), so with those apps
    repository and the origin of the whole fleet: `fleet-git` serves it read-only over
    `git://`, and every worker and joined server fetches its code from it.
    `~fleet/founderizer` is the hub's own checkout and it stands on `config`, the
-   configuration ref — the branch the hub writes and nothing else writes (PILOT.md,
-   "The configuration ref"). Both refs start at the commit of the copy you ran, so the
+   configuration ref — the branch the hub writes and nothing else writes (`config-ref.sh`,
+   its first lines). Both refs start at the commit of the copy you ran, so the
    code the hub serves is the code it runs. For a hub that this install makes (step 3
    made the user `fleet` itself), the step also makes root's own clone of that code in
    `/usr/local/lib/founderizer-kit` (`hubsetup.py kit-clone --first`, from the copy you
@@ -207,7 +207,8 @@ notification of a Needs-you item, the chat that opens first), so with those apps
    `/usr/local/sbin/fleet-agent-user`, `/usr/local/sbin/fleet-vault-program` and
    `/etc/sudoers.d/fleet-agents`.
 9. **One OS user for each agent of this machine**, below.
-10. **The services** `fleet-hub` and `fleet-git`, as systemd user services of `fleet`,
+10. **The services** `fleet-hub`, `fleet-git` and `fleet-channels` (the chat apps
+    bridge), as systemd user services of `fleet`,
     enabled and started. No agent's service is here any more: each one belongs to its
     own user, in the next step.
 
@@ -345,8 +346,11 @@ root, which is the one thing a root right of it must not become.
 
 ### The claim: the owner's own Mac
 
-In Founderizer the owner is a private-network address and no token (`hub.py`,
-`allowed("owner")`). A hub with the wrong `addresses.owner` would serve the owner's
+In Founderizer the owner is one computer: its private-network address and, after that
+computer registered its key with the hub, that key too (`hub.py`, `allowed("owner")`;
+SECURITY.md, "How the hub knows the owner's computer"). A hub that holds no key of the
+owner's computer yet keeps the address rule alone. A hub with the wrong
+`addresses.owner` would serve the owner's
 pages to the wrong machine, and one with none would serve them to nobody and could not
 start at all. So the installer proves the address before it finishes, with the same
 one-time code `join.sh` uses, the other way round.
@@ -511,15 +515,19 @@ the checkout and the service of an agent that was added since.
   registers the key by itself over its SSH connection to this server. A Mac that has no
   such connection gets its key with the same line, `--reclaim`: the Mac that sends the code
   back makes a new key and sends its SHA-256 with the code.
-- **New code for the fleet.** This is a deployment, not an install: fetch, merge `main`
-  into `config`, check `import hub`, push `config`, restart `fleet-hub` (COORDINATION.md,
-  "The configuration ref"). The hub serves the new code to every machine from its own
-  bare repository.
+- **New code for the fleet.** This is a release, not an install, and never a merge by
+  hand: new code comes only as a signed release. The hub asks the release channel and
+  checks the release against its release keys. It merges and tests the release in a
+  temporary clone, moves `config` to the result (`releases.py`) and, when the release
+  changed the code, restarts itself. It does so by itself, or when the owner takes the
+  release (the tool `take_release` of the owner MCP server). Each machine
+  refuses a commit that changes the code and carries no signed release (`lifecycle.py`,
+  `may_take`). The hub serves the new code to every machine from its own bare repository.
 - **Remove the services** and keep everything else:
 
   ```sh
-  runuser -u fleet -- systemctl --user disable --now fleet-hub fleet-git
-  rm -f ~fleet/.config/systemd/user/fleet-hub.service ~fleet/.config/systemd/user/fleet-git.service
+  runuser -u fleet -- systemctl --user disable --now fleet-hub fleet-git fleet-channels
+  rm -f ~fleet/.config/systemd/user/fleet-hub.service ~fleet/.config/systemd/user/fleet-git.service ~fleet/.config/systemd/user/fleet-channels.service
   runuser -u fleet -- systemctl --user daemon-reload
   ```
 

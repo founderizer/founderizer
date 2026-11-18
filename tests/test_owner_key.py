@@ -41,7 +41,7 @@ HUB_IP, CODE, SHOWN = "100.64.0.9", "ABCDEFGHJKLM", "ABCD-EFGH-JKLM"
 # Each owner route that is older than /ui and asks the owner's rule itself, with a body for the writes. The last one
 # takes the owner's name from its path, and asked for the address alone until the review of 14 November 2026.
 OLDER = (("GET", "/", None), ("GET", "/board", None), ("GET", "/board.txt", None), ("GET", "/records", None),
-         ("GET", "/events/owner?after=0&wait=0", None),
+         ("GET", "/leakcheck", None), ("GET", "/events/owner?after=0&wait=0", None),
          ("POST", "/cases", {"case_id": "c-1", "run_id": "r-1"}), ("POST", "/evidence", {"case_id": "c-1", "kind": "k"}),
          ("POST", "/say", {"text": "an order that the owner did not give"}), ("POST", "/needs/1", {"answer": "yes"}),
          ("POST", "/secrets", {"label": "a login", "text": "Pr4ct!ce-Login#2026"}))
@@ -157,7 +157,8 @@ class Rule(WithKeyFolder):
 
     def test_the_older_owner_routes_ask_for_the_key_too(self):
         """The board, the records and the five writes beside them asked for the address alone: a guest read every
-        record there and wrote to the manager as the owner."""
+        record there and wrote to the manager as the owner. The leak check asked nobody at all: each agent's shell
+        could start its scan of every table, and read from its answer which rows hold a login."""
         hub.keep_owner_key(sha(KEY))
         before = {table: self.count(table) for table in ("events", "cases", "evidence")}
         for method, path, body in OLDER:
@@ -167,8 +168,10 @@ class Rule(WithKeyFolder):
             self.assertEqual((status, said and said.get("auth")), (403, "owner_key_mismatch"), f"{method} {path}")
         for table in ("events", "cases", "evidence"):
             self.assertEqual(self.count(table), before[table], table)
-        for path in ("/", "/board", "/board.txt", "/records", "/events/owner?after=0&wait=0"):
+        for path in ("/", "/board", "/board.txt", "/records", "/leakcheck", "/events/owner?after=0&wait=0"):
             self.assertEqual(self.ask(path, token=KEY)[0], 200, path)
+        self.assertEqual(self.ask("/leakcheck", token=KEY, source=STRANGER)[0], 403)        # an agent's machine
+        self.assertEqual(self.ask("/leakcheck", token=KEY)[1], {"hits": []})
         self.assertIsNone(hub.q1("SELECT 1 FROM agents WHERE name='owner' AND alive='guest'"))
 
     def test_a_guest_cannot_read_or_mark_the_owner_s_events(self):

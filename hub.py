@@ -14,7 +14,9 @@ address is refused wherever team.json pins any agent's machine to one. An agent 
 key (owner API 1.12) also sends that key on its helper routes, and its sessions
 send their own session credential on their MCP routes; on a machine with several
 agents the address alone names nobody. An agent without a key, alone on its address, keeps
-the address rule, and owner routes use only the owner's address. Keys and
+the address rule, and owner routes ask for the owner's address and for the key
+of the owner's computer (owner API 1.169; the address alone only while that
+computer has registered no key). Keys and
 credentials do not separate processes of one OS user, so keep the hub on a
 private (Tailscale) network.
 """
@@ -56,7 +58,7 @@ import uuid
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from usage import IDENTITY_CHANGED, IDENTITY_ERRORS, SIGN_IN_REQUIRED, local_model, validate_usage
+from usage import IDENTITY_CHANGED, IDENTITY_ERRORS, READING_AHEAD, SIGN_IN_REQUIRED, local_model, validate_usage
 from lifecycle import EDITABLE_FACTS, TOKEN_KINDS, facts_now, token_price     # AUTONOMY.md P8, P10: lane L7
 from vault import owner_signed      # owner feature door_calls: a phone's yes, with the central vault's own check
 import wakeups
@@ -4265,7 +4267,10 @@ def migrate():
                   # owner feature need_run (the owner's "Yes, as drawn", 16 November 2026): the one command of a hand
                   # step that the owner's app runs at his press, the Mac it runs on (NEED_RUN_MAC or a machine of the
                   # fleet), and, once he pressed Run, its exit status and the end of its output, masked
-                  "run_command": "TEXT", "run_on": "TEXT", "run_status": "INTEGER", "run_output": "TEXT"},
+                  "run_command": "TEXT", "run_on": "TEXT", "run_status": "INTEGER", "run_output": "TEXT",
+                  # owner feature need_takeover (the owner's "Yes, as drawn", 16 November 2026): the browser or screen
+                  # task whose session asked him for one step on its own screen, and which waits for his answer
+                  "takeover_task": "INTEGER"},
         "owner_reports": {"agent": "TEXT NOT NULL DEFAULT 'manager'", "in_reply_to": "TEXT",
                           "pushed": "INTEGER NOT NULL DEFAULT 0",      # chat apps round 2: message_owner
                           # 10 November 2026: the request id of the owner's message from the app whose turn this
@@ -4373,6 +4378,18 @@ def migrate():
         "CREATE UNIQUE INDEX IF NOT EXISTS sealed_job ON sealed(job) WHERE job IS NOT NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS jobs_request ON jobs(agent, request_id) WHERE request_id IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS event_task ON events(task, kind)",          # owner API 1.12: desktop_busy
+        # The helper's delivery poll (Handler.events): the events of one agent that still wait, asked twice a second
+        # for each helper with the hub's lock held. With no index on the agent it read all of `events` each time.
+        # The id comes second, so the entries of one agent are in id order: the poll sorts nothing, a wait from a
+        # cursor (agent=? AND id>?) is a range of the index, and a read by agent with no ORDER BY gives its rows
+        # in the order of a scan, as before. kind, read_at and helper_ack are tested there, before a row is fetched.
+        "CREATE INDEX IF NOT EXISTS event_agent ON events(agent, id, kind, read_at, helper_ack)",
+        # The request of one event: the same poll asks for it at each owner chat message, to find the reply.
+        "CREATE INDEX IF NOT EXISTS ui_request_event ON ui_requests(event_id)",
+        # The tasks of one wake-up rule, which GET /ui/triggers reads several times for each rule (trigger_view).
+        "CREATE INDEX IF NOT EXISTS task_trigger ON tasks(trigger_id) WHERE trigger_id IS NOT NULL",
+        # The notes of one task: the board's newest note of each open task, task_in_full and the phone's task page.
+        "CREATE INDEX IF NOT EXISTS note_task ON notes(task, id)",
         # The tasks of a duty's case and the subtasks of a task, which the timers ask about on every pass
         # (case_left_open in duty_sweep, waits_on_parts in the silence loop). Both are migrated columns, so here.
         "CREATE INDEX IF NOT EXISTS task_duty_case ON tasks(duty_case) WHERE duty_case IS NOT NULL",
@@ -5430,7 +5447,8 @@ DOING_FLEET = {
     "answer": "Answering a question", "see_team": "Reading its team", "see_capacity": "Reading who can take work",
     "read_knowledge": "Reading a knowledge file", "search_knowledge": "Searching the knowledge files",
     "write_knowledge": "Writing a knowledge file", "raise_needs_you": "Asking you",
-    "request_secret": "Asking you for a key", "start_task": "Starting a task", "tell_owner": "Writing to you",
+    "request_secret": "Asking you for a key", "request_takeover": "Asking you for a step on its screen",
+    "start_task": "Starting a task", "tell_owner": "Writing to you",
     "message_owner": "Writing to you", "message_agent": "Writing to a colleague",
     "message_contact": "Writing to a person", "see_responsibilities": "Reading its duties",
     "remind": "Setting a reminder for a person",
@@ -6834,20 +6852,30 @@ def start_limit(agent, resets_at, task_id=None):
 def limit_reading(agent, reading, t0):
     """A usage limit that came with no reset time ends at the first usage reading that says more (plan C9): one that
     gives a reset sets it, and one that shows every window open ends the hold now. Without a reading it keeps its
-    hour. The whole episode moves together, as in start_limit."""
+    hour. The whole episode moves together, as in start_limit.
+
+    What a reading can say is narrower than that. `reading` is the one of the agent's primary runtime, so it says
+    nothing of a hold on the account of its screen runtime (limit_route). A reset counts only while it is still to
+    come: one that has passed would end the hold at the next pass of end_limits. And open windows end the hold only
+    in a reading that was collected after the hold began. The helper sends its last reading again with each report,
+    every 30 seconds, and reads a new one every 300: a reading from just before the limit shows the windows open as
+    they were then. It ended each new hold at once, the session started and met the limit again, and so on until the
+    next reading. `collected_at` is the time of the helper's clock, which the hub takes up to READING_AHEAD seconds
+    ahead of its own (validate_usage): a reading from just before the limit, of a clock that is ahead, has a time
+    after the hold began. So a reading is from after the hold only when its time is that much after it."""
     lim = active_limit(agent)
-    if not lim or lim["reset_known"] or not reading or reading.get("error"):
+    if not lim or lim["reset_known"] or not reading or reading.get("error") or limit_route(lim) != "primary":
         return
-    windows = reading.get("windows") or []
-    if not windows or t0 - (reading.get("collected_at") or 0) > USAGE_STALE:
+    windows, collected = reading.get("windows") or [], reading.get("collected_at") or 0
+    if not windows or t0 - collected > USAGE_STALE:
         return
-    resets = [w["resets_at"] for w in windows if w.get("used_percent", 0) >= 100 and w.get("resets_at")]
+    resets = [w["resets_at"] for w in windows if w.get("used_percent", 0) >= 100 and (w.get("resets_at") or 0) > t0]
     root = lim["cause"] or lim["id"]
     if resets:
         q("UPDATE agent_limits SET until=?, reset_known=1 WHERE ended IS NULL AND (id=? OR cause=?)",
           (max(resets), root, root))
         log("hub", f"{agent}'s usage limit resets at {clock(max(resets))}, as its reading says")
-    elif all(w.get("used_percent", 0) < 100 for w in windows):
+    elif collected > lim["since"] + READING_AHEAD and all(w.get("used_percent", 0) < 100 for w in windows):
         q("UPDATE agent_limits SET until=? WHERE ended IS NULL AND (id=? OR cause=?)", (t0, root, root))
         log("hub", f"{agent}'s usage reading shows its windows open; its limit ends now")
 
@@ -7753,6 +7781,15 @@ def access_route(asker, rid, requester, want=None, restarts=None):
         # A question outlives its asker and its kind: a line that is shown long after the ask never raises.
         return f"ACCESS NEEDED: {rid[:200]}, which the hub cannot read any more: team.json has no such asker or kind."
     want = want if want in RESOURCE_LEVELS[kind] else None
+    hold_words = door_hold_note(what) if kind == "server" else ""
+    if hold_words and door_hold_of(what) == "parts":
+        # the owner, 17 November 2026: a card asked him for a tag that the server carried, while the manager's hold
+        # kept it out. While it stands, no grant, restart or step of the owner's lets the work through the door. A
+        # rule-only server stays in the door, and its holder still runs the rule calls: its route comes below.
+        return " ".join([f"ACCESS NEEDED: {asker} needs {resource_phrase(kind, what)} ({rid})" +
+                         (f" at {want}" if want else "") + ".", hold_words] +
+                        ([] if role_of(requester) == "manager" else
+                         ["Pass the question up with answer(..., pass_up=true): only the manager ends the hold."]))
     held = resource_holders(kind, what)
     mine = next((h["level"] for h in held if h["agent"] == asker), None)
     enough = level_at_least(kind, mine, want)
@@ -7780,6 +7817,8 @@ def access_route(asker, rid, requester, want=None, restarts=None):
            (f"at {mine} already, so its next session has it: a running session keeps what it started with, so "
             f"{restart}." if enough else
             f"at {mine} only, which does not reach {want}." if mine else "none of it.")]
+    if hold_words:          # rule-only: the route below stands, and the hold says why an agent's own calls fail there
+        out.append(hold_words)
     in_team = False
     if others:
         holder = others[0]["agent"]
@@ -11411,7 +11450,11 @@ def t_withdraw_need(agent, a):
     No notification goes. The reason is the item's answer, where an answered item keeps the owner's words, and
     answered_by names the manager, so the record says who closed it and why. An item that takes a question to the
     owner closes when the question is answered, an item of a conversation is that person's answer, and a secret request
-    that tasks wait on closes with them or with the owner's answer: those three are refused here."""
+    that tasks wait on closes with them or with the owner's answer: those three are refused here.
+
+    Another agent's item is refused too, but for one kind (the owner, 17 November 2026, after a key request from an
+    agent's chat waited ten days for nothing): the manager closes another agent's key or login request that no task
+    waits on, from its second look at the open cards (need_look_sweep), after it asked that agent with message_agent."""
     nid = parse_id(a.get("need"), "Needs-you item")
     why = str(a.get("why") or "").strip()
     if not why:
@@ -11422,8 +11465,9 @@ def t_withdraw_need(agent, a):
         need = DB.execute("SELECT * FROM needs WHERE id=?", (nid,)).fetchone()
         if not need:
             raise ToolError(f"There is no Needs-you item N-{nid}.")
-        if need["by"] != agent:
-            raise ToolError(f"N-{nid} is {need['by']}'s: only the agent that raised an item withdraws it.")
+        if need["by"] != agent and need["kind"] != "secret":
+            raise ToolError(f"N-{nid} is {need['by']}'s: only the agent that raised an item withdraws it. The one "
+                            f"exception is another agent's key or login request that no task waits on.")
         if need["answer"] is not None:
             raise ToolError(f"N-{nid} is closed already: {clip(need['answer'], 200)}")
         if need["question"]:
@@ -11441,8 +11485,12 @@ def t_withdraw_need(agent, a):
                    (f"Withdrawn by {agent}: {why}", t0, agent, nid))
         DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)",
                    (t0, agent, f"withdrew N-{nid} {clip(need['title'] or '', 80)}: {clip(why, 240)}"))
+    # Another agent's request came from its owner chat, which reads only the owner's messages and agents' messages: the
+    # hub writes it nothing, and the manager tells it with message_agent when its work should know.
+    theirs = need["by"] if need["by"] != agent else None
     return (f"Withdrew N-{nid}. It left the owner's Needs you with no notification, and its record keeps your reason. "
-            f"Raise a new item only when the owner must do or decide something now.")
+            + (f"{theirs} is not told: tell it with message_agent when its work should know. " if theirs else "") +
+            "Raise a new item only when the owner must do or decide something now.")
 
 
 ITEMS_NAMED = 5                 # open items that one accept names; the rest are a count
@@ -11468,6 +11516,217 @@ def open_items_line(agent, t):
     return (f" Your Needs-you items about {gref(t['goal_id'])} are still open: {named}{more}. If this result did what "
             f"one of them asks, answer its question now with what was done: the item then closes by itself, and the "
             f"owner does not do the same work again.")
+
+
+# ---------------------------------------------------------------- a second look at the owner's open cards
+# The owner, 17 November 2026: "does the manager or the Needs You task owner review it from time to time, in case it
+# can be closed or there is any new info on it?" Nothing did. A card closed when its question was answered, when the
+# task that waited on it ended, or when the manager happened to learn that nothing needed it: an agent's key request
+# from its chat waited ten days, and a card asked him for a Tailscale tag that its server carried already, because the
+# door held that server out. Then "Yes, build it". So the hub names each open card to the manager again, a day after it
+# was raised, then after two, four and at most seven days more, with what the hub itself knows of it now; the manager
+# reads the live state and closes, replaces or keeps the card. No clock closes a card: the hub closes only an agent's
+# own key request from its chat, once that agent holds the key, which is the event that the request waited for.
+NEED_LOOK_FIRST = 86400         # seconds from a card's raise to its first look
+NEED_LOOK_MOST = 7 * 86400      # the longest wait between two looks at one card
+NEED_LOOK_SOON = 12 * 3600      # a card due within this time comes in the same message, so the looks come together
+NEED_LOOK_EVERY = 60            # seconds between two passes of the sweep, whose waits are days
+NEED_LOOK_NAMED = 12            # cards that one message names; the others come at the next pass
+NEED_HELD_WAIT = 3600           # seconds that an agent holds what its chat request asks for before the hub closes it
+
+
+def need_look_gap(looks):
+    """The wait from a card's raise, or from its last look, to its next look, after `looks` looks: a day, two days,
+    four days, then seven days each time."""
+    return min(NEED_LOOK_FIRST * 2 ** min(int(looks), 8), NEED_LOOK_MOST)
+
+
+def need_age(seconds):
+    """How long a card has been open, in words: "10 days", "1 day", "13 hours"."""
+    days, hours = int(max(0, seconds) // 86400), int(max(0, seconds) // 3600)
+    if days:
+        return f"{days} day" + ("" if days == 1 else "s")
+    return f"{hours} hour" + ("" if hours == 1 else "s")
+
+
+def door_hold_of(host):
+    """The door's hold on `host` by its owner-facing name, parts or rule-only (door_hold), or None."""
+    stored = ((TEAM.get("door") or {}).get("holds") or {}).get(host)
+    return DOOR_HOLD_NAMES.get(stored, stored) if stored else None
+
+
+def door_hold_note(host):
+    """The words about the door's hold on `host` (door_hold), or "" when the door holds it out of nothing: since when,
+    why, and who ends it. While a hold of parts stands, no agent gets the server through the door, whatever Tailscale
+    tag it carries, so a refusal there ("no host of the door") is the hold's, and a card that asks the owner for a tag
+    asks for the wrong step. The reason is the one in the hub's log of the door_hold that set it. read_row only, so it
+    is safe where access_route runs inside a transaction."""
+    hold = door_hold_of(host)
+    if not hold:
+        return ""
+    row = read_row("SELECT ts, what FROM log WHERE what LIKE ? ORDER BY id DESC LIMIT 1",
+                   (f"the door holds {host}: {hold} (%",))
+    since = why = ""
+    if row:
+        day = datetime.datetime.fromtimestamp(row["ts"], datetime.timezone.utc)
+        since = f" since {day.day} {day.strftime('%b %Y')}"
+        why = re.sub(r"\) in [0-9a-f]{7,40}$", "", row["what"].split(" (", 1)[1]) if " (" in row["what"] else ""
+    if hold == "parts":
+        head, effect = (f"The door holds {host} out of its hosts", f"no agent gets {host} through the door, whatever "
+                                                                    f"Tailscale tag it carries")
+    else:
+        head, effect = (f"The door holds {host} at rule-only", f"only the door's rule calls run on {host}, and no call "
+                                                              f"of an agent's own")
+    return (f"{head}{since}" + (f": {clip(why, 240)}" if why else "") + f". While that hold stands, {effect}: only the "
+            f"manager ends it, with door_hold {host} none, once its reason is gone.")
+
+
+def need_key_held(r):
+    """The reference of the key or the login that open card row `r` asks for, when `r` is a worker's or a lead's own
+    request from its chat and that agent holds such a secret now, given another way; else None. Only such a request:
+    a task's request ends its own way (the owner's answer wakes the task), a key for the door is the owner's to give
+    in the app, and the manager's request is for other agents. request_secret refuses a request for what the agent
+    holds already, so a fitting secret that it holds now came after the request. The grants of team.json only: the
+    logins of a profile need a read of the hub's checkout, which a sweep of every minute does not make."""
+    spec = need_secret(r)
+    if not spec or "tasks" in spec or spec.get("door") or role_of(r["by"]) not in ("worker", "lead"):
+        return None
+    catalog = logins()
+    for ref in sorted(secret_grants(r["by"])):
+        e = catalog.get(ref) or {}
+        if spec.get("kind") == "api_key":
+            if e.get("kind") == "api_key" and spec.get("env") and e.get("env") == spec["env"]:
+                return ref
+        elif e.get("kind", "login") != "api_key" and spec.get("site") and \
+                str(e.get("title") or "").split(" · ")[0] == secret_site_host(spec["site"]):
+            return ref
+    return None
+
+
+def need_look_hints(r):
+    """What the hub knows of open card row `r` now, for the manager's second look: how it closes, a key of the fleet's
+    list that answers it, and the door's hold on a server that its words name. read_row only."""
+    hints, spec = [], need_secret(r)
+    if r["question"]:
+        hints.append(f"it takes Q-{r['question']} to the owner: when the work has settled it, answer Q-{r['question']} "
+                     f"and the card closes")
+    if spec is not None:
+        waiters = [t for t in spec.get("tasks") or []
+                   if read_row(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (t,))]
+        if waiters:
+            hints.append(f"{', '.join(tref(t) for t in waiters)} wait on it: it closes with them, or with the owner's "
+                         f"answer")
+        elif r["by"] != manager_name():
+            hints.append(f"no task waits on it: ask {r['by']} with message_agent whether its work still needs it, and "
+                         f"if not, withdraw_need closes it")
+        have = next((ref for ref, e in sorted(logins().items())
+                     if e.get("kind") == "api_key" and spec.get("env") and e.get("env") == spec["env"]), None) \
+            if spec.get("kind") == "api_key" else None
+        # a grant releases no task that waits on the card: only the owner's answer, or the task's end, does
+        top = (resource_pool().get(f"secret:{have}") or {}).get("max") \
+            if have and not spec.get("door") and not waiters else None
+        if have and top:
+            hints.append(f"the fleet's list holds {spec['env']} already, as {have}, in the grantable pool: "
+                         f"grant_access gives it, with no step of the owner's" +
+                         (f"; then tell {r['by']} with message_agent, and the hub closes the card an hour later"
+                          if "tasks" not in spec and r["by"] != manager_name() else
+                          "; then withdraw_need closes the card" if r["by"] == manager_name() else ""))
+        elif have:
+            hints.append(f"the fleet's list holds {spec['env']} already, as {have}: the owner can answer the card with "
+                         f"that key and type nothing")
+    if r["door_task_id"] and not read_row(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (r["door_task_id"],)):
+        hints.append(f"the task that asked for the door's yes, {tref(r['door_task_id'])}, has ended")
+    text = " ".join(str(r[k] or "") for k in ("title", "why", "todo", "details"))
+    for host in sorted((TEAM.get("door") or {}).get("holds") or {}):
+        if r["door_host"] == host or re.search(rf"(?<![A-Za-z0-9._-]){re.escape(host)}(?!\.?[A-Za-z0-9_-])", text):
+            hints.append(door_hold_note(host))
+    return hints
+
+
+def need_look_sweep(t0):
+    """A second look at the owner's open cards, from the hub tick, at most once a minute (the owner, 17 November 2026).
+    First the hub closes, with no notification, each worker's or lead's own key request from its chat whose agent has
+    held that key for NEED_HELD_WAIT (need_key_held, need_held in kv: {id: first seen}): the owner's own answer in the
+    app gives the key a moment before it answers, and that answer must not find the card closed. Then, when a card is
+    due, one message to the manager, which waits for its next read,
+    an hour at most (LATER_SAY): every card due now or within NEED_LOOK_SOON, each with whose it is, how long it has
+    been open and what the hub knows of it. A card is due a day after its raise, then two, four and at most seven days
+    after its last look (need_looks in kv: {id: [last look, looks]}). A card of a conversation is the person's: the
+    owner answers it, and nobody else closes it, so it is not named; nor is a card that only the hub or the owner's
+    phone closes (a GitHub App key's renewal, a key swap, a phone to add), where the manager has nothing to do."""
+    since = t0 - float(kv_get("need_look_sweep_at") or 0)
+    if 0 <= since < NEED_LOOK_EVERY:        # a clock that was set back runs the sweep at once, not hours later
+        return
+    kv_set("need_look_sweep_at", t0)
+    mgr, rows, closed = manager_name(), [], []
+    held_before = kv_get("need_held")
+    try:
+        seen = json.loads(held_before or "{}")
+    except ValueError:
+        seen = {}
+    seen, held = seen if isinstance(seen, dict) else {}, {}
+    for r in q("SELECT * FROM needs WHERE answer IS NULL AND conversation IS NULL AND github_key IS NULL AND "
+               "key_swap_server IS NULL AND COALESCE(add_device, 0)=0 ORDER BY id"):
+        ref = need_key_held(r)
+        first = seen.get(str(r["id"])) if isinstance(seen.get(str(r["id"])), (int, float)) else t0
+        first = min(first, t0)          # a time kept while the clock ran fast does not lengthen the hour
+        if not ref or t0 - first < NEED_HELD_WAIT:
+            rows.append(r)
+            if ref:
+                held[str(r["id"])] = first
+            continue
+        with transaction():
+            if DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
+                          (f"Closed by the hub: {r['by']} holds {secret_asked(need_secret(r))} now ({ref}), given "
+                           f"another way.", t0, NEED_CLOSED_BY, r["id"])).rowcount:
+                log_row("hub", f"closed N-{r['id']} {clip(r['title'] or '', 80)}: {r['by']} holds {ref} now")
+                closed.append(f"N-{r['id']} ({r['by']}: {secret_asked(need_secret(r))})")
+    if closed and mgr:      # the agent's owner chat reads no word of the hub's: only the manager can tell it
+        emit(mgr, "say", f"[hub] The hub closed {', '.join(closed)} on the owner's Needs you: the agent that asked "
+                         f"holds it now, given another way. When that agent's chat waits on it to start its work, "
+                         f"tell it with message_agent.", extra=LATER_SAY)
+    held_now = json.dumps(held, sort_keys=True) if held else None
+    if held_now != held_before:
+        kv_set("need_held", held_now)
+    stored = kv_get("need_looks")
+    try:
+        looks = json.loads(stored or "{}")
+    except ValueError:
+        looks = {}
+    looks = looks if isinstance(looks, dict) else {}
+
+    def last(r):
+        got = looks.get(str(r["id"]))
+        if isinstance(got, list) and len(got) == 2 and all(isinstance(x, (int, float)) for x in got):
+            return min(float(got[0]), t0), int(got[1])     # nor does a look kept while it ran fast
+        return float(r["raised"] or t0), 0
+
+    kept = {str(r["id"]): list(last(r)) for r in rows if str(r["id"]) in looks}
+    left = {r["id"]: last(r)[0] + need_look_gap(last(r)[1]) - t0 for r in rows}
+    if mgr and any(v <= 0 for v in left.values()):
+        due = [r for r in rows if left[r["id"]] <= NEED_LOOK_SOON]
+        lines = []
+        for r in due[:NEED_LOOK_NAMED]:
+            spec = need_secret(r)
+            whose = ("yours" if r["by"] == mgr else
+                     f"{r['by']}'s " + ("key request" if spec.get("kind") == "api_key" else "login request") +
+                     (" from its chat" if "tasks" not in spec else "") if spec is not None else f"{r['by']}'s")
+            hints = need_look_hints(r)
+            line = (f"- N-{r['id']} \"{clip(r['title'] or '', 80)}\", {whose}, open "
+                    f"{need_age(t0 - float(r['raised'] or t0))}" + (": " + "; ".join(hints) if hints else ""))
+            lines.append(line if line.endswith(".") else line + ".")
+            kept[str(r["id"])] = [t0, last(r)[1] + 1]
+        more = len(due) - NEED_LOOK_NAMED
+        emit(mgr, "say", "[hub] A second look at the owner's open cards. Each card below has waited a while, and what "
+             "it rests on may have changed. For each one, read the live state that it rests on now: its task, the "
+             "agent's record, the server, the vault, the access. Nothing in it needed now: close it with withdraw_need "
+             "and the reason. New facts on a plain card of yours: raise it again with raise_needs_you and replaces. "
+             "Still the same: leave it, and the hub names it again after a longer wait. The words after a card say what "
+             "the hub knows of it and how it closes.\n" + "\n".join(lines) +
+             (f"\nAnd {more} more, at the next pass." if more > 0 else ""), extra=LATER_SAY)
+    new = json.dumps(kept, sort_keys=True) if kept else None
+    if new != stored:
+        kv_set("need_looks", new)
 
 
 # ---------------------------------------------------------------- secret requests (owner feature secret_requests)
@@ -11989,6 +12248,110 @@ def t_request_secret(agent, a):
             f"holds it, never its value. Never ask the owner for it in words in the meantime.")
 
 
+# Take over one step (owner feature need_takeover; the owner's "Yes, as drawn" of 16 November 2026 to the pictures of
+# ~/dev/founderizer-plans/superbot-ideas/02-take-over-design.md). A step on a screen that only a person can do stopped
+# the agent until now (rules/logins.md). Its browser or screen task now asks the owner for that one step on its own
+# screen: a Needs-you item on which the Mac app shows Take over, which opens the agent's screen in Screen Sharing. The
+# answer, the owner's words or a quick reply, comes to the task's session as a message, and the task waits for it with
+# no clock: the answer or the task's end (secret_waits_end) ends the wait. The agent raises the item itself, as a
+# worker's secret request is.
+#
+# A CAPTCHA only, for now. What the owner types on the agent's screen is in the agent's hands (its browser, an
+# extension, the shared clipboard), so a password, a key, a card number, a passkey or a sign-in is never a take-over
+# (the owner's rule of 1 November 2026). A one-time code is not one either, yet: both vaults report a sign-in that
+# ends on a code page as failed, and send a text-message code to the requester (fleet.py do_sign_in, VaultBrowser), and
+# a code typed on a screen that the agent drives can sign in somewhere else (a code relay). The agent names the step,
+# and the hub writes the card's title in the owner's language: no word of it is the agent's (review of 17 November
+# 2026: the title "Type the portal's password on my screen" passed the hub, and no list of refused words holds in
+# every language and wording).
+TAKEOVER_NEEDS = ("browser", "screen")
+TAKEOVER_TITLES = {"en": {"captcha": "Solve the CAPTCHA on its screen"},
+                   "es": {"captcha": "Resuelve el CAPTCHA en su pantalla"}}
+# The whole answer after which a task asks the owner again at once: the quick reply "Done", "OK", a thumb (any skin
+# tone) or a tick, or their words in Spanish, with only a dot, a "!" or a thumb or a tick after them, and "\u00a1"
+# before. Any other answer ("Not now", "Tell me more",
+# "Done? No, stop asking", the owner's own words) ends the task's asks until a question that the task asked after it
+# gets a real answer (answered_by: a restart closes the open questions with none): an event, never a clock (review of
+# 17 November 2026: after "Not now" a session could raise a new card and a new notification at once, and the iPhone and
+# an edited quick reply send other words).
+TAKEOVER_TICK = r"(?:\U0001F44D[\U0001F3FB-\U0001F3FF]?|[\u2705\u2714\u2611]\uFE0F?)"
+TAKEOVER_DONE = re.compile(r"\s*\u00a1?(?:(?:done|ok|okay|hecho|listo|resuelto|ya|ya est[a\u00e1])[\s.!]*"
+                           + TAKEOVER_TICK + r"?|" + TAKEOVER_TICK + r")[\s.!]*", re.I)
+
+
+def takeover_title(step):
+    """The card's title for `step`, in the owner's language (Spanish, else English)."""
+    tag = str(setting("owner.language") or "").split("-")[0].lower()
+    return TAKEOVER_TITLES.get(tag, TAKEOVER_TITLES["en"])[step]
+
+
+def takeover_way(agent):
+    """True when the owner's Mac app can open this agent's screen: its machine has an address and a Screen Sharing way
+    in team.json (access.<machine> with screen_sharing and an ssh_user), as the machine's page reads it for its
+    Screen Sharing button (GET /ui/machines `access.screen_sharing`). Take over shows only then, so a card is never
+    raised that he cannot act on with it."""
+    machine = (agents().get(agent) or {}).get("machine")
+    ways = (TEAM.get("access") or {}).get(machine) or {}
+    return bool(machine and (TEAM.get("addresses") or {}).get(machine) and ways.get("screen_sharing") is True and
+                ways.get("ssh_user"))
+
+
+def t_request_takeover(agent, a):
+    """request_takeover: in the session of an open browser or screen task, ask the owner to solve a CAPTCHA on the
+    agent's own screen. One open request for each task: a second call names the first one."""
+    if role_of(agent) not in ("worker", "lead"):
+        raise ToolError("request_takeover is for a worker or a lead, in the session of a browser or screen task.")
+    if chat_context(agent) or contact_session(agent):
+        raise ToolError("You have no tool named request_takeover.")
+    tid = parse_task(a.get("task_id") or (getattr(CALL, "context", None) or ("", ""))[1])
+    t = read_row("SELECT * FROM tasks WHERE id=?", (tid,)) if tid else None
+    if not t or t["owner"] != agent or t["state"] in TERMINAL:
+        raise ToolError("request_takeover is called in the session of your own open browser or screen task.")
+    if t["needs"] not in TAKEOVER_NEEDS:
+        raise ToolError("Only a browser or screen task works on a screen that the owner can take over. A step that "
+                        "only a person can do in other work: ask your requester with ask_my_requester.")
+    if not takeover_way(agent):
+        raise ToolError("The owner's app has no Screen Sharing way to your machine, so they cannot take over your "
+                        "screen. Ask your requester with ask_my_requester.")
+    step = a.get("step")
+    if not isinstance(step, str) or step not in TAKEOVER_TITLES["en"]:
+        raise ToolError("step is \"captcha\": a take-over is only for a CAPTCHA on your screen. A text-message code "
+                        "goes to your requester, as sign_in says. A password, a key, a card number, a passkey or a "
+                        "sign-in is never a take-over: sign_in types a login that your vault holds, request_secret "
+                        "asks for a login or a key that it does not hold, and for anything else you stop and ask your "
+                        "requester with ask_my_requester.")
+    title = takeover_title(step)
+    waits = ("This task waits for the owner's answer: end your turn. Their answer comes to this session as a "
+             "message. Then look at the screen before you go on, and do not do their step again.")
+    # the read and the write under one lock: two calls of one session at the same moment raise one card, and a task
+    # that ended meanwhile (its end took its requests out of Needs you already) raises none
+    with LOCK:                  # lane L2: an id that no removed item had (unused_id)
+        if (q1("SELECT state FROM tasks WHERE id=?", (tid,)) or {"state": "deleted"})["state"] in TERMINAL:
+            raise ToolError("request_takeover is called in the session of your own open browser or screen task.")
+        open_one = q1("SELECT id, title FROM needs WHERE kind='takeover' AND answer IS NULL AND takeover_task=? "
+                      "ORDER BY id LIMIT 1", (tid,))
+        # an answer other than "Done" to the task's last take-over ends its asks until a question that the task asked
+        # after it gets a real answer (TAKEOVER_DONE). The items of a task come one after another: the last id is the
+        # last answer. A restart closes the open questions with no answered_by: no answer, and the stop stays.
+        last = None if open_one else q1("SELECT id, answer, answered FROM needs WHERE kind='takeover' AND "
+                                        "takeover_task=? AND answer IS NOT NULL ORDER BY id DESC LIMIT 1", (tid,))
+        if last and not TAKEOVER_DONE.fullmatch(last["answer"] or "") and not q1(
+                "SELECT 1 FROM questions WHERE task=? AND answer IS NOT NULL AND answered_by IS NOT NULL AND asked>? "
+                "LIMIT 1", (tid, last["answered"] or 0)):
+            raise ToolError(f"The owner did not answer \"Done\" to N-{last['id']}, your last take-over in this task: "
+                            f"ask your requester with ask_my_requester, without a default, before you ask the owner "
+                            f"again. Once your requester answers, this task can ask again.")
+        if not open_one:
+            nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,kind,takeover_task) VALUES(?,?,?,?,?,?,?,?)",
+                      (unused_id("needs"), title, "", "", now(), agent, "takeover", tid))
+    if open_one:
+        return f"N-{open_one['id']} already asks the owner for a step on your screen: {open_one['title']}. {waits}"
+    secret_parked(tid, nid)
+    emit("owner", "notify", f"Needs you: {title}")
+    ping_need(nid)
+    return f"Asked the owner as N-{nid}: \"{title}\". {waits}"
+
+
 def secret_answer_text(ref, entry, spec, worker=False, task=False):
     """The words that answer a secret request, read from the catalog and team.json at the moment of the answer: the
     secret's name, its reference and who holds it. Never a value: the hub has none. A worker's or a lead's answer
@@ -12099,10 +12462,14 @@ SECRET_WAITS = ("n.kind='secret' AND (n.answer IS NULL OR (json_extract(n.secret
 
 
 def secret_wait(task_id):
-    """The first secret request that this task waits on: open, or saved and not yet woken (secret_wakes). It reads
-    with DB.execute only, so it commits nothing inside a caller's transaction."""
+    """The first secret request that this task waits on: open, or saved and not yet woken (secret_wakes); else its
+    open take-over, the one step on its own screen that it asked the owner for (owner feature need_takeover). Its
+    callers need only the item's N-id. It reads with DB.execute only, so it commits nothing inside a caller's
+    transaction."""
     return DB.execute(f"SELECT n.* FROM needs n, json_each(n.secret, '$.tasks') j WHERE {SECRET_WAITS} AND "
-                      f"j.value=? ORDER BY n.id LIMIT 1", (task_id,)).fetchone()
+                      f"j.value=? ORDER BY n.id LIMIT 1", (task_id,)).fetchone() or \
+        DB.execute("SELECT * FROM needs WHERE kind='takeover' AND answer IS NULL AND takeover_task=? ORDER BY id "
+                   "LIMIT 1", (task_id,)).fetchone()
 
 
 def secret_rewait(task_id):
@@ -12218,6 +12585,14 @@ def secret_waits_end(task_id):
             if left or r["answer"] is not None:
                 DB.execute("UPDATE needs SET secret=? WHERE id=?", (json.dumps(dict(spec, tasks=left)), r["id"]))
                 continue
+            DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                       ("row_floor:needs", str(unused_id("needs") - 1)))
+            DB.execute("DELETE FROM needs WHERE id=?", (r["id"],))
+            DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)",
+                       (now(), "hub", f"N-{r['id']} left Needs you: {tref(task_id)}, the task that asked, ended"))
+        # owner feature need_takeover: a step on the screen of a task that ended is nothing for him to do any more
+        for r in DB.execute("SELECT id FROM needs WHERE kind='takeover' AND answer IS NULL AND takeover_task=?",
+                            (task_id,)).fetchall():
             DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                        ("row_floor:needs", str(unused_id("needs") - 1)))
             DB.execute("DELETE FROM needs WHERE id=?", (r["id"],))
@@ -14054,6 +14429,11 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
         asker = need_question_rows(need, value, t0)        # a question the manager took to him gets his words
         if asker:
             text += f" The hub gave it to {asker} as the answer to Q-{need['question']}: do not pass it on again."
+    # owner feature need_takeover: his answer to a step on an agent's screen goes to the session of the task that
+    # asked and waits for it, and that wait ends with it (secret_wait_moved)
+    takeover = need is not None and need["kind"] == "takeover" and need["takeover_task"] is not None
+    if takeover and task is None:
+        task = need["takeover_task"]
     generation = DB.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()
     generation = generation["v"] if generation else None
     extra = json.dumps({"generation": generation} if worker_chat else
@@ -14064,6 +14444,8 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
                            extra)).lastrowid
     if worker_chat:     # this message's own wait starts: the one before it is the late one no longer (chat_late_sweep)
         DB.execute("DELETE FROM kv WHERE k=?", ("chat_undelivered:" + recipient,))
+    if takeover:        # its next owner wait holds the task, else it works again
+        secret_wait_moved(task)
     DB.execute("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient,"
                "replaces_request_id,origin,connection) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                (request_id, kind, need["id"] if need is not None else None, value, event_id, t0, client, recipient,
@@ -15090,6 +15472,7 @@ CONVERSATION_CLOSED_TOOLS = ("read_messages", "reply", "ask_team", "remind")
 CONVERSATION_NOT_WORK = ("deliver_result", "ask_my_requester", "set_reminder", "create_task", "cancel_task",
                          "restart_task", "answer", "check_result", "decide_permission", "decide_report", "write_skill",
                          "request_secret",         # no contact makes the owner type a secret (secret_requests)
+                         "request_takeover",       # nor do a step on the agent's screen (need_takeover)
                          "ask_reporter")           # the task that works a report asks about it, and waits for it
 # The helper feature of conversations with contacts.v2: a session with the agent's own tools, a closed one on the
 # chosen runtime at its pinned version, and the records of both kinds (lifecycle.FEATURES)
@@ -19130,9 +19513,69 @@ def move_kit(target):
 
 
 # kv: the commit of team.json or a profile that commit_kit_file pushes, from before its push until the hub checkout
-# has it, or until a commit that undoes it is on the ref. Every write of those files holds LOCK, so at most one is
-# open at a time. Its writes are quiet: no screen of the owner's shows it (live_changes).
+# has it, or until a commit that undoes it is on the ref. Every write of those files holds LOCK or its turn (KIT), so
+# at most one is open at a time. Its writes are quiet: no screen of the owner's shows it (live_changes).
 KIT_PUSHED = "kit_pushed"
+
+# The turn of a write of the hub's own files (commit_kit_file). A writer takes KIT before LOCK, so two writes run one
+# after the other, as they did when LOCK held each of them for its whole git work. A thread that holds LOCK never waits
+# for KIT, because the write that holds KIT can wait for LOCK: such a thread writes in LOCK, and is refused while
+# another write runs its git without LOCK (kit_flying). An owner command whose route says so (ui_command `unlocked`)
+# runs the fetch, the clone, the commit and the push of its write without LOCK, in its turn: an Add secret held LOCK
+# for about 4 seconds of git, and the owner's state read, every tool call, every helper poll and the tick waited for
+# it (17 November 2026).
+KIT = threading.RLock()
+KIT_TURN = threading.local()        # .unlocked: the owner command that this thread runs lets its git go without LOCK
+FLIGHT = {"thread": None}           # the thread whose commit_kit_file runs its git without LOCK now; under LOCK
+KIT_BUSY = "The hub is saving another change of its files now. Nothing was written: try again in a few seconds."
+
+
+@contextlib.contextmanager
+def kit_lock():
+    """KIT, then LOCK: for a writer of the hub's files that holds neither, so that it waits for a write in its turn
+    instead of meeting it. A thread that holds LOCK already takes LOCK alone (it never waits for KIT)."""
+    if LOCK._is_owned() and not KIT._is_owned():
+        with LOCK:
+            yield
+        return
+    with KIT, LOCK:
+        yield
+
+
+@contextlib.contextmanager
+def kit_turn(unlocked):
+    """The act of one owner command (command_run): unlocked lets the git work of its commit_kit_file run without
+    LOCK. The act keeps the turn (KIT) from its first read of the hub's files to its last step after the commit."""
+    before = getattr(KIT_TURN, "unlocked", False)
+    KIT_TURN.unlocked = bool(unlocked)
+    try:
+        yield
+    finally:
+        KIT_TURN.unlocked = before
+
+
+def kit_flying():
+    """True while another thread's commit_kit_file runs its git without LOCK: between its push and its fast-forward,
+    the ref holds a commit of the hub's own (KIT_PUSHED) that the checkout does not, and nothing may take it back or
+    write past it. Read under LOCK."""
+    return FLIGHT["thread"] not in (None, threading.get_ident())
+
+
+class KitOutside:
+    """One stretch of commit_kit_file's git work. In an unlocked turn it lets go of LOCK, at each depth that this thread
+    holds it, and takes it back at its end, also when the stretch raises; else it changes nothing."""
+    def __init__(self, on):
+        self.on, self.depth = on, 0
+
+    def __enter__(self):
+        while self.on and LOCK._is_owned():
+            LOCK.release()
+            self.depth += 1
+
+    def __exit__(self, *exc):
+        while self.depth:
+            LOCK.acquire()              # an owner command works for no agent (CALL.agent), so it is never Left
+            self.depth -= 1
 
 
 def undo_kit_push(remote):
@@ -19149,6 +19592,8 @@ def undo_kit_push(remote):
     with LOCK:                  # two writes never undo it at once
         if kv_get(KIT_PUSHED) != remote:
             return None
+        if kit_flying():        # another write's own commit, pushed and not yet taken in: that write takes it in
+            return "another write of the hub's own files runs now"
         # The caller read the checkout before LOCK: a reload onto the ref (reload_team) or the end of a server's
         # rename (finish_machine_rename) can have taken the commit in since, with its steps. That is never undone.
         if git_kit("merge-base", "--is-ancestor", remote, "HEAD")[0] == 0:
@@ -19194,7 +19639,22 @@ def settle_kit_push():
     tip: the hub's own commit of team.json or a profile that is the tip of the configuration ref and not in the hub
     checkout (KIT_PUSHED) is undone (undo_kit_push). A mark whose commit never reached the ref, or that the checkout
     holds, is forgotten, and only that mark: a write's new one can come meanwhile. One that cannot be checked now
-    stays for the next write. It raises nothing, because a hub that cannot start cannot be reached."""
+    stays for the next write. It raises nothing, because a hub that cannot start cannot be reached. In the turn of the
+    hub's writes (KIT), so that a write whose push landed and whose fast-forward comes next is never taken back."""
+    with contextlib.nullcontext() if LOCK._is_owned() else KIT:
+        settle_kit_mark()
+
+
+def kit_own(tip):
+    """releases.Update's `own`: `tip` is a write of the hub's own whose steps never ran (KIT_PUSHED). Asked in the turn
+    of the hub's writes, so that a write whose push landed and whose fast-forward comes next is no such write: the
+    release run follows its commit (catch_up), as it did when that write held LOCK to its end."""
+    with contextlib.nullcontext() if LOCK._is_owned() else KIT:
+        return tip == kv_get(KIT_PUSHED)
+
+
+def settle_kit_mark():
+    """settle_kit_push in its turn."""
     mark = kv_get(KIT_PUSHED)
     if not mark:
         return
@@ -19236,92 +19696,122 @@ def commit_kit_file(path, data, message, more=None, author=None, allow=None, che
     A write of team.json or a profile marks its commit (KIT_PUSHED) before the push: a fast-forward that fails after
     the push, or a stop of the hub in between, leaves the commit on the ref and not in the checkout, and the next write
     or the hub's start undoes it on the ref (undo_kit_push). Before that, every later write of those files was refused
-    as code that the hub does not run (7 November 2026), and the steps of the write after its commit were lost."""
+    as code that the hub does not run (7 November 2026), and the steps of the write after its commit were lost.
+
+    Each write runs in its turn (KIT, which a write from outside LOCK takes here). In the turn of an owner command whose
+    route lets it (ui_command `unlocked`), the git work runs in two stretches without LOCK (KitOutside): the checks and
+    the fetch, then the clone, the commit, the push and the fetch after it. LOCK is held for the rest: the take-in of
+    origin's newer commits, the mark (kv_set takes it), the fast-forward of the checkout and the act's steps around
+    the write. So the checkout still moves only under LOCK, and while the stretches run, a writer that holds LOCK
+    without a turn is refused (kit_flying) and nothing takes the pushed commit back (undo_kit_push)."""
     import shutil
     import tempfile
     for one in [path, *(more or {})]:
         if not (allow or CONFIG_FILES).match(one):
             raise Refusal(500, f"{one} is not a configuration file: the hub writes team.json, a profile and the "
                                "owner's knowledge, and nothing else")
+    if not KIT._is_owned():
+        if not LOCK._is_owned():
+            with KIT:                   # an agent's knowledge or skill, a task's output: after a write in its turn
+                return commit_kit_file(path, data, message, more, author, allow, check)
+        if kit_flying():                # LOCK alone never waits for KIT: refused, before it reads or writes anything
+            raise Refusal(409, KIT_BUSY)
+    unlocked = KIT._is_owned() and LOCK._is_owned() and getattr(KIT_TURN, "unlocked", False) and check is None \
+        and not getattr(TX, "open", 0)
+    out = KitOutside(unlocked)
     fleet = any(fleet_code(one) for one in [path, *(more or {})])
-    rev = kit_revision(fresh=True)
-    if git_kit("status", "--porcelain", "--untracked-files=no")[1]:
-        raise Refusal(409, "the hub checkout has local changes")
-    code, _, err = git_kit("fetch", "-q", "origin", timeout=60)
-    if code != 0:
-        raise Refusal(502, "the hub could not fetch its repository: " + err[-200:])
-    branch = config_ref()
-    code, remote, _ = git_kit("rev-parse", f"origin/{branch}")
-    if code != 0:
-        raise Refusal(409, f"origin has no {branch} ref: the hub's configuration ref is missing")
-    # The hub's own write, whose push landed and whose steps after it never ran, is taken back before anything else.
-    if remote != rev and remote == kv_get(KIT_PUSHED) and git_kit("merge-base", "--is-ancestor", rev, remote)[0] == 0:
-        problem = undo_kit_push(remote)
-        if problem:
-            raise Refusal(409, f"origin/{branch} ends with a write of the hub's own that the hub could not take back: "
-                               f"{problem}")
-        rev = kit_revision(fresh=True)
-        code, remote, _ = git_kit("rev-parse", f"origin/{branch}")
-        if code != 0:
-            raise Refusal(409, f"origin has no {branch} ref: the hub's configuration ref is missing")
-    if remote != rev:
-        ahead = git_kit("merge-base", "--is-ancestor", rev, remote)[0] == 0
-        if not (ahead and same_code(rev, remote)):
-            raise Refusal(409, f"origin/{branch} " + ("carries changes that the hub does not run" if ahead else
-                                                      "lacks commits that the hub has"))
-        problem = move_kit(remote)
-        if problem:
-            raise Refusal(409, f"the hub could not take in origin/{branch}: {problem}")
-        rev = kit_revision(fresh=True)
-        if rev != remote:
-            raise Refusal(409, f"the hub checkout did not reach origin/{branch}")
-    if check:
-        check(rev)
-    code, url, _ = git_kit("remote", "get-url", "origin")
-    tmp = tempfile.mkdtemp(prefix="fleet-profile-")
+    if unlocked:
+        FLIGHT["thread"] = threading.get_ident()
     try:
-        name, mail = (f"Fleet agent {author}", f"{author}@fleet.invalid") if author else ("Fleet owner", "owner@fleet.invalid")
+        with out:
+            rev = kit_revision(fresh=True)      # no write moves the checkout outside its turn: LOCK adds nothing
+            if git_kit("status", "--porcelain", "--untracked-files=no")[1]:
+                raise Refusal(409, "the hub checkout has local changes")
+            code, _, err = git_kit("fetch", "-q", "origin", timeout=60)
+            if code != 0:
+                raise Refusal(502, "the hub could not fetch its repository: " + err[-200:])
+            branch = config_ref()
+            code, remote, _ = git_kit("rev-parse", f"origin/{branch}")
+            if code != 0:
+                raise Refusal(409, f"origin has no {branch} ref: the hub's configuration ref is missing")
+            # The hub's own write, whose push landed and whose steps after it never ran, is taken back before anything
+            # else.
+            if remote != rev and remote == kv_get(KIT_PUSHED) and \
+                    git_kit("merge-base", "--is-ancestor", rev, remote)[0] == 0:
+                problem = undo_kit_push(remote)
+                if problem:
+                    raise Refusal(409, f"origin/{branch} ends with a write of the hub's own that the hub could not take "
+                                       f"back: {problem}")
+                rev = kit_revision(fresh=True)
+                code, remote, _ = git_kit("rev-parse", f"origin/{branch}")
+                if code != 0:
+                    raise Refusal(409, f"origin has no {branch} ref: the hub's configuration ref is missing")
+        if remote != rev:
+            ahead = git_kit("merge-base", "--is-ancestor", rev, remote)[0] == 0
+            if not (ahead and same_code(rev, remote)):
+                raise Refusal(409, f"origin/{branch} " + ("carries changes that the hub does not run" if ahead else
+                                                          "lacks commits that the hub has"))
+            problem = move_kit(remote)
+            if problem:
+                raise Refusal(409, f"the hub could not take in origin/{branch}: {problem}")
+            rev = kit_revision(fresh=True)
+            if rev != remote:
+                raise Refusal(409, f"the hub checkout did not reach origin/{branch}")
+        if check:
+            check(rev)
+        with out:
+            code, url, _ = git_kit("remote", "get-url", "origin")
+            tmp = tempfile.mkdtemp(prefix="fleet-profile-")
+            try:
+                name, mail = (f"Fleet agent {author}", f"{author}@fleet.invalid") if author else \
+                    ("Fleet owner", "owner@fleet.invalid")
 
-        def tgit(*args):
-            r = subprocess.run(["git", "-C", tmp + "/kit", "-c", "user.name=" + name, "-c", "user.email=" + mail,
-                                *args], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
-            return r.returncode, r.stdout.strip(), r.stderr.strip()
-        r = subprocess.run(["git", "clone", "-q", "--shared", kit_dir(), tmp + "/kit"], capture_output=True, text=True,
-                           timeout=60, stdin=subprocess.DEVNULL)
-        if r.returncode != 0 or tgit("checkout", "-q", rev)[0] != 0:
-            raise Refusal(500, "the hub could not prepare the change")
-        staged = True
-        for one, content in [(path, data), *(more or {}).items()]:
-            if content is None:
-                staged = staged and tgit("rm", "-q", "--", one)[0] == 0
-            else:
-                os.makedirs(os.path.dirname(os.path.join(tmp, "kit", one)), exist_ok=True)
-                with open(os.path.join(tmp, "kit", one), "wb") as f:
-                    f.write(content)
-                staged = staged and tgit("add", one)[0] == 0
-        if not staged or tgit("commit", "-q", "-m", message)[0] != 0:
-            raise Refusal(500, f"the hub could not commit {path}")
-        commit = tgit("rev-parse", "HEAD")[1]
-        if fleet:               # before the push: one that lands with no answer is the hub's own all the same
+                def tgit(*args):
+                    r = subprocess.run(["git", "-C", tmp + "/kit", "-c", "user.name=" + name, "-c",
+                                        "user.email=" + mail, *args], capture_output=True, text=True, timeout=60,
+                                       stdin=subprocess.DEVNULL)
+                    return r.returncode, r.stdout.strip(), r.stderr.strip()
+                r = subprocess.run(["git", "clone", "-q", "--shared", kit_dir(), tmp + "/kit"], capture_output=True,
+                                   text=True, timeout=60, stdin=subprocess.DEVNULL)
+                if r.returncode != 0 or tgit("checkout", "-q", rev)[0] != 0:
+                    raise Refusal(500, "the hub could not prepare the change")
+                staged = True
+                for one, content in [(path, data), *(more or {}).items()]:
+                    if content is None:
+                        staged = staged and tgit("rm", "-q", "--", one)[0] == 0
+                    else:
+                        os.makedirs(os.path.dirname(os.path.join(tmp, "kit", one)), exist_ok=True)
+                        with open(os.path.join(tmp, "kit", one), "wb") as f:
+                            f.write(content)
+                        staged = staged and tgit("add", one)[0] == 0
+                if not staged or tgit("commit", "-q", "-m", message)[0] != 0:
+                    raise Refusal(500, f"the hub could not commit {path}")
+                commit = tgit("rev-parse", "HEAD")[1]
+                if fleet:               # before the push: one that lands with no answer is the hub's own all the same
+                    with area("quiet"):
+                        kv_set(KIT_PUSHED, commit)
+                code, _, err = tgit("push", "-q", url, f"HEAD:{branch}")
+                if code != 0:
+                    raise Refusal(409 if "rejected" in err or "non-fast-forward" in err else 502,
+                                  "the push failed: " + err[-200:])
+            except subprocess.TimeoutExpired:
+                raise Refusal(502, "git did not answer in time")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+            fetched = git_kit("fetch", "-q", "origin", timeout=60)[0] == 0
+        if not fetched or move_kit(commit):
+            raise Refusal(500, f"{path} is in origin as {commit[:12]}, but the hub checkout did not fast-forward: "
+                               + ("the hub takes that commit back, so make the change again" if fleet else
+                                  "the hub takes it in at its next write"))
+        if fleet:
             with area("quiet"):
-                kv_set(KIT_PUSHED, commit)
-        code, _, err = tgit("push", "-q", url, f"HEAD:{branch}")
-        if code != 0:
-            raise Refusal(409 if "rejected" in err or "non-fast-forward" in err else 502, "the push failed: " + err[-200:])
-    except subprocess.TimeoutExpired:
-        raise Refusal(502, "git did not answer in time")
+                q("DELETE FROM kv WHERE k=? AND v=?", (KIT_PUSHED, commit))
+        kit_revision(fresh=True)
+        changed()                   # a profile, a knowledge file or team.json: not in the database (live_changes)
+        return commit
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    if git_kit("fetch", "-q", "origin", timeout=60)[0] != 0 or move_kit(commit):
-        raise Refusal(500, f"{path} is in origin as {commit[:12]}, but the hub checkout did not fast-forward: "
-                           + ("the hub takes that commit back, so make the change again" if fleet else
-                              "the hub takes it in at its next write"))
-    if fleet:
-        with area("quiet"):
-            q("DELETE FROM kv WHERE k=? AND v=?", (KIT_PUSHED, commit))
-    kit_revision(fresh=True)
-    changed()                   # a profile, a knowledge file or team.json: not in the database (live_changes)
-    return commit
+        if unlocked:
+            FLIGHT["thread"] = None     # under LOCK: each stretch took it back at its end
 
 
 def save_profile(agent, base, sections):
@@ -32094,7 +32584,8 @@ TOOLS = [
      "fix is live, or the work found another route. It leaves the owner's Needs you with no notification, and why "
      "stays in its record as its answer. Do it as soon as you know, so the owner never answers an item that needs "
      "nothing. An item that takes a question to the owner closes when you answer that question, and a secret request "
-     "that tasks wait on closes with them.",
+     "that tasks wait on closes with them. Another agent's key or login request that no task waits on is yours to "
+     "close too: ask that agent with message_agent first, as the hub does not tell it.",
      S({"need": {"type": "string", "description": "The item, for example N-12"},
         "why": {"type": "string", "description": "What made it unnecessary, in plain words"}},
        ["need", "why"])),
@@ -32224,6 +32715,19 @@ TOOLS = [
                                                   "that holds servers through the door asks for one: the door knows "
                                                   "no other agent."}},
        ["why", "site"])),
+    # owner feature need_takeover: one step on the agent's own screen that only a person can do
+    ("worker", "request_takeover", t_request_takeover,
+     "In a browser or screen task, ask the owner to solve a CAPTCHA on your own screen: step \"captcha\", the only "
+     "step of a take-over for now. The hub writes the owner's card. A text-message code goes to your requester, as "
+     "sign_in says. Never ask the owner to type a password, a key or a card number, to use a passkey or to sign in "
+     "(single sign-on, an AI provider's page), with this tool or in words: sign_in types a login that your vault "
+     "holds, request_secret asks for a login or a key that it does not hold, and for a passkey, a card number or an "
+     "AI provider's page you stop and ask your requester. The owner opens your screen from the card, solves the "
+     "CAPTCHA and answers. This task waits for the answer: end your turn. The answer comes to this session as a "
+     "message: look at the screen before you go on, and do not do their step again. One open request for each task. "
+     "After an answer that is not \"Done\", ask your requester (without a default) before you ask the owner again.",
+     S({"step": {"type": "string", "enum": ["captcha"], "description": "captcha: a CAPTCHA on your screen."}},
+       ["step"])),
     # owner API 1.13: the standing duties of an agent (RESPONSIBILITIES.md)
     ("all", "see_responsibilities", t_see_responsibilities,
      "See the duties that you hold: their watches, their open cases and what is not in order. A duty stays; it "
@@ -33225,6 +33729,8 @@ def tools_for(agent, context=None):
              not (role in ("worker", "lead") and name in WORKER_CHAT_ONLY) and name not in CONVERSATION_ONLY + CHAT_ONLY) and
             # owner feature secret_requests: a task that a conversation opened, or a part of one, asks him for none
             (name != "request_secret" or not contact_session(agent, context)) and
+            # owner feature need_takeover: nor a step on the agent's screen
+            (name != "request_takeover" or not contact_session(agent, context)) and
             # AUTONOMY.md P2: message_contact only once contacts.v2 is on. It writes only to a role with tools on, which
             # DevOps D5 lets reach any agent (contact_reach), so a Shell-off task session has it too (shell_tools)
             (name != "message_contact" or contacts_v2()) and
@@ -33362,6 +33868,12 @@ def stale_instructions(name, extra):
             f"the instructions you followed name a field that is gone.")
 
 
+# The tools whose function commits team.json under call_tool's LOCK (save_integration, save_grant, move_agent,
+# switch_key_site). A tool left out of it is refused while an owner's write runs its git (KIT_BUSY), and writes nothing.
+KIT_TOOLS = ("grant_access", "move_agent", "set_agent_model", "switch_key_site", "door_rollout", "door_hold",
+             "door_gitops", "request_secret")
+
+
 def call_tool(agent, name, args, context=None):
     role = agents()[agent].get("role")
     args = dict(args) if isinstance(args, dict) else {}
@@ -33429,7 +33941,9 @@ def call_tool(agent, name, args, context=None):
                     # (set_reminder ci reads the commit's runs once, and takes LOCK for its own write: ci_reminder)
                     text = fn(agent, args)
                 else:
-                    with LOCK:
+                    # A tool that commits team.json takes the turn of the hub's writes first (KIT_TOOLS), so that it
+                    # waits for an owner's write that runs its git now instead of being refused (kit_flying).
+                    with kit_lock() if name in KIT_TOOLS else LOCK:
                         if conversation_context(agent, context):
                             conversation_fence(agent, context)
                         elif chat_context(agent, context):
@@ -36188,7 +36702,12 @@ def switch_busy(name):
     that its helper runs now, and its open credential jobs. Checks and jobs run in the helper outside every task window,
     and a switch restarts the helper. After the switch the helper also waits for a running turn of the old chat to end.
     The manager's owner messages do not count: they carry no request id, so its replies name none, and a switch keeps
-    its unread messages for its new session (manager_held)."""
+    its unread messages for its new session (manager_held).
+
+    A job is open here as for open_job: not finished, and its outcome not unknown. A job with an unknown outcome is
+    one that its helper lost (lost_jobs), which runs nowhere, or one whose answer did not come in time, which stays
+    unknown when a switch loses its late report, and that is true. Only a report finishes such a job, so it kept
+    its agent busy for a switch with no end."""
     tasks = [tref(i) for i in running_turns(owner=name)]
     chats = 0 if role_of(name) == "manager" else q1(
         "SELECT COUNT(*) c FROM ui_requests u WHERE u.kind='message' AND u.recipient=? AND NOT EXISTS "
@@ -36197,7 +36716,8 @@ def switch_busy(name):
     desk = desktop_busy(name)
     desk = tref(desk["id"]) if desk and desk["owner"] == name else None
     checks = checks_running(runner=name, online=False)
-    jobs = [r["id"] for r in q("SELECT id FROM jobs WHERE agent=? AND finished IS NULL ORDER BY id", (name,))]
+    jobs = [r["id"] for r in q("SELECT id FROM jobs WHERE agent=? AND finished IS NULL AND unknown IS NULL ORDER BY id",
+                               (name,))]
     return {"open_tasks": tasks, "chats_waiting": chats, "desktop": desk, "checks": checks, "jobs": jobs} \
         if tasks or chats or desk or checks or jobs else None
 
@@ -38041,6 +38561,7 @@ def tick():
         step(liveness, t0, restarts=True)
         step(restart_sweep, t0, restarts=True)
         step(goal_sweep, t0)
+        step(need_look_sweep, t0)           # the owner, 17 November 2026: a second look at the open cards
         step(duty_sweep, t0)                # owner API 1.13: the duties that are not in order
         step(circle_sweep, t0)              # what looks like running in circles
         step(lead_unread_sweep, t0)         # what a lead left unread, to the manager before the owner's screen
@@ -38357,7 +38878,10 @@ NAMES_FEATURE = "server_names"  # a server service that takes its new name from 
 def machine_names_sweep(t0):
     """Inside LOCK: a machine's name in Fleet is its name in Tailscale, so a machine renamed there is renamed here, by
     itself. Every MACHINE_NAMES_EVERY seconds a thread reads the status outside LOCK (returned, else None); the next
-    tick follows it."""
+    tick follows it. A pass while an owner's write runs its git (kit_flying) waits for the next tick: its fetch and
+    its commit go after that write."""
+    if kit_flying():
+        return None
     finish_machine_rename(t0)
     seen, MACHINE_NAMES["seen"] = MACHINE_NAMES["seen"], None
     if seen:
@@ -38951,7 +39475,7 @@ def refresh_page(entry):
     content = knowledge_content(entry["title"], url, "fetched", text)
     if content.decode().split("\n\n", 2)[2] == parts[2]:
         return None
-    with LOCK:
+    with kit_lock():                    # after an owner's write in its turn (KIT), never beside its git
         rev = kit_revision(fresh=True)
         before = git_blob(rev, entry["path"]) if rev else None
         if before is None:
@@ -41315,8 +41839,9 @@ DEFAULT_ACCESS = {"at": 0.0, "retry": {}}       # the last pass, and when an age
 
 def default_access_sweep(t0):
     """Give each worker and lead the defaults it lacks (give_defaults). A vault that cannot serve the agent yet and a
-    machine of no known kind wait for a later pass; a default with nothing left to give ends for that agent."""
-    if t0 - DEFAULT_ACCESS["at"] < DEFAULT_ACCESS_EVERY:
+    machine of no known kind wait for a later pass; a default with nothing left to give ends for that agent. A pass
+    while an owner's write runs its git (kit_flying) waits for the next tick."""
+    if t0 - DEFAULT_ACCESS["at"] < DEFAULT_ACCESS_EVERY or kit_flying():
         return
     DEFAULT_ACCESS["at"] = t0
     for name, a in list(agents().items()):
@@ -41906,7 +42431,10 @@ def mac_setup_proved(row):
 
 
 def mac_setup_sweep(t0):
-    """Each pass moves each open setup one step, from what the hub reads. Nothing here waits on a clock."""
+    """Each pass moves each open setup one step, from what the hub reads. Nothing here waits on a clock. No pass runs
+    while an owner's write runs its git (kit_flying): its commit would be refused, and a refusal stops a setup."""
+    if kit_flying():
+        return
     for row in q("SELECT * FROM mac_setups WHERE state IN ('add','waiting','finished','checking','proving')"):
         try:
             if row["state"] == "add":
@@ -43394,6 +43922,8 @@ def server_key_swap(server, body):
     wish = body["wish"]
     said = (f"The owner's wish for the key swap of {server}: " +
             {"on": "switch it on", "off": "keep it off", None: "none, the rule decides"}[wish])
+    kv_set(KEY_SWAP_ANSWERED + server, None)    # his newer word: a press that a fault kept never comes after it,
+                                                # also when this commit fails
     done = key_swap_commit(team, entry, server, "key_swap_wish", wish, said, "owner")
     if done is None:
         return {"server": server, "key_swap_wish": wish, "changed": False, "revision": rev, "sha256": current}
@@ -43432,9 +43962,11 @@ def server_key_swap_reading(server, body):
 def key_swap_state(server, team):
     """The digest of what this server waits for, or None when it waits for nothing: an agent of it reads a key that has
     a site, the word is off, the owner gave no wish, and the app has read the server (so an app before Part B, which
-    would not act on a wish, makes the hub ask nothing)."""
+    would not act on a wish, makes the hub ask nothing). A press of his that a fault kept from team.json is a wish:
+    he is not asked again while key_swap_answered tries to write it."""
     entry = (team.get("servers") or {}).get(server) or {}
-    if entry.get("key_swap") is True or entry.get("key_swap_wish") in KEY_SWAP_WISHES or key_swap_read(server) is None:
+    if entry.get("key_swap") is True or entry.get("key_swap_wish") in KEY_SWAP_WISHES or key_swap_read(server) is None \
+            or kv_get(KEY_SWAP_ANSWERED + server):
         return None
     waits = key_swap_waits(server, team)
     return hashlib.sha256(json.dumps(waits, sort_keys=True).encode()).hexdigest()[:16] if waits else None
@@ -43524,7 +44056,7 @@ def key_swap_answered():
     """Each press of an answer of an item about a server's key swap that is not in team.json yet, written as the
     owner's wish: after the answer's own transaction, and at the hub's start for one that a stop cut. A server that
     left the fleet, or that is no Linux server any more, takes no wish, and its press goes. A fault stops neither
-    the answer nor the start: the next start tries again."""
+    the answer nor the start, and it keeps the press (a refused push too): the next press or start tries again."""
     try:
         key_swap_answered_now()
     except Exception as e:
@@ -43533,7 +44065,7 @@ def key_swap_answered():
 
 
 def key_swap_answered_now():
-    with LOCK:                          # every write needs the lock, and a command's team.json commit holds it too
+    with kit_lock():                    # every write needs the lock; a team.json commit, its turn too (KIT)
         for row in read_rows("SELECT k, v FROM kv WHERE k>=? AND k<?",
                              (KEY_SWAP_ANSWERED, KEY_SWAP_ANSWERED[:-1] + ";")):
             server = row["k"][len(KEY_SWAP_ANSWERED):]
@@ -43541,13 +44073,16 @@ def key_swap_answered_now():
                 pressed = json.loads(row["v"])
                 rev = kit_revision(fresh=True)
                 team, _current, _ = team_view(rev)
-                entry = key_swap_entry(server, team)
+                try:
+                    entry = key_swap_entry(server, team)
+                except Refusal:         # no such server, or not Linux: the press goes
+                    kv_set(row["k"], None)
+                    continue
                 said = (f"The owner's wish for the key swap of {server}, by the answer of N-{pressed['need']}: " +
                         ("switch it on" if pressed["wish"] == "on" else "keep it off"))
                 key_swap_commit(team, entry, server, "key_swap_wish", pressed["wish"], said, "owner")
-            except Refusal:
-                pass                    # no such server, or not Linux: the press goes
-            except Exception as e:      # the next start tries again
+            except Exception as e:      # a fault (git's fetch or push, another write that runs its git now): the press
+                                        # stays, and the next press or start tries again
                 print(f"WARNING: the owner's answer for the key swap of {server} is not in team.json yet: "
                       f"{type(e).__name__}: {e}", flush=True)
                 continue
@@ -47980,6 +48515,7 @@ def door_deliver(login, sealed, t0=None):
 STARTED = time.time()
 BACKUP_WARN = 26 * 3600             # an owner backup older than this, or none, is a health warning
 BACKUP_MAX = 256 * 1024 * 1024      # a larger database is backed up on the hub machine, not through the API
+BACKUP_LOCK = threading.Lock()      # one copy in the making at a time (ui_backup): taken before LOCK, never under it
 INTEGRITY_EVERY = 6 * 3600          # seconds between quick integrity checks of the database
 DISK_LOW = 2 * 1024 ** 3
 
@@ -48457,37 +48993,49 @@ def image_opened(image):
         shutil.rmtree(folder, ignore_errors=True)
 
 
-def backup_bundle(central=None):
-    """One copy of this fleet for the owner's own machine, as a zip: the database, the owner's configuration, a
-    manifest and RESTORE.md, and the central vault's sealed store when it gave one. Call it under LOCK; nothing is
-    written on the hub machine but, on Python 3.10, the passing file of records_image. central: what central_backup()
-    gave, asked before LOCK was taken, because the central vault's socket is never asked under it; without it, the copy
-    says that the central vault was not asked."""
-    import io
-    import zipfile
+def backup_read(central=None):
+    """What a copy of this fleet reads from the hub, at one moment: the records, the owner's configuration and the
+    facts of the manifest. Call it under LOCK; nothing is written on the hub machine but, on Python 3.10, the passing
+    file of records_image. central: what central_backup() gave, asked before LOCK was taken, because the central
+    vault's socket is never asked under it; without it, the copy says that the central vault was not asked. What it
+    returns is for backup_packed, which needs no lock."""
     export, entry = central or (None, {"in": None, "vault": False, "why": "the central vault was not asked for this "
                                                                           "copy"})
-    member = json.dumps(export, indent=2, sort_keys=True).encode() if export else None
     fleet = fleet_id()          # before the records are read: it is made on first use, and the copy needs it in
     records = rollback_header(records_image())  # the records themselves: a restore reads them, not the manifest
     config = owner_files()
-    manifest = {"format": BACKUP_FORMAT, "made_at": now(), "fleet_id": fleet, "db_id": kv_get("db_id"),
-                "revision": kit_revision(), "hub": TEAM.get("hub"), "agents": sorted(agents()),
-                "vault": vault_holders(),
-                # What this hub had on its own disk and this copy has not, in counts only: RESTORE.md turns it
-                # into the paragraph that names what stops working. Never a value (hub_only_files).
-                "hub_only": hub_only_files(),
-                # What the last six-hourly check said about these records. A copy of a corrupt database is worth
-                # taking and is not worth trusting, and a restore refuses one, so the copy says which it is.
-                "integrity": kv_get("integrity"),
-                # Owner feature central_vault: whether this copy carries the central vault's sealed store, and if
-                # not, why, in one line (central_backup). Public keys and a count, never a value.
-                "central_vault": entry,
-                "files": {BACKUP_DB: {"bytes": len(records), "sha256": hashlib.sha256(records).hexdigest()},
-                          **{BACKUP_CONFIG + path: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
-                             for path, data in config.items()},
-                          **({CENTRAL_MEMBER: {"bytes": len(member), "sha256": hashlib.sha256(member).hexdigest()}}
-                             if member else {})}}
+    facts = {"format": BACKUP_FORMAT, "made_at": now(), "fleet_id": fleet, "db_id": kv_get("db_id"),
+             "revision": kit_revision(), "agents": sorted(agents()),
+             # a copy: backup_packed writes these facts with no lock, and this one is TEAM's own object
+             "hub": json.loads(json.dumps(TEAM.get("hub"))),
+             "vault": vault_holders(),
+             # What this hub had on its own disk and this copy has not, in counts only: RESTORE.md turns it
+             # into the paragraph that names what stops working. Never a value (hub_only_files).
+             "hub_only": hub_only_files(),
+             # What the last six-hourly check said about these records. A copy of a corrupt database is worth
+             # taking and is not worth trusting, and a restore refuses one, so the copy says which it is.
+             "integrity": kv_get("integrity"),
+             # Owner feature central_vault: whether this copy carries the central vault's sealed store, and if
+             # not, why, in one line (central_backup). Public keys and a count, never a value.
+             "central_vault": entry}
+    return export, records, config, facts
+
+
+def backup_packed(read):
+    """(the zip, its manifest) from what backup_read gave: the SHA-256 of each file, RESTORE.md and the compression.
+    It reads nothing of the hub, neither its records nor its files, so it runs with LOCK free: for 358 MB of records
+    the sums and the compression took 7.4 seconds, and with the lock held the hub answered nobody in that time
+    (measured on 17 November 2026)."""
+    import io
+    import zipfile
+    export, records, config, facts = read
+    member = json.dumps(export, indent=2, sort_keys=True).encode() if export else None
+    manifest = dict(facts,
+                    files={BACKUP_DB: {"bytes": len(records), "sha256": hashlib.sha256(records).hexdigest()},
+                           **{BACKUP_CONFIG + path: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+                              for path, data in config.items()},
+                           **({CENTRAL_MEMBER: {"bytes": len(member), "sha256": hashlib.sha256(member).hexdigest()}}
+                              if member else {})})
     notes = restore_notes(manifest).encode()
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -48499,6 +49047,14 @@ def backup_bundle(central=None):
             info.compress_type = zipfile.ZIP_DEFLATED
             zf.writestr(info, data)
     return buffer.getvalue(), manifest
+
+
+def backup_bundle(central=None):
+    """One copy of this fleet for the owner's own machine, as a zip: the database, the owner's configuration, a
+    manifest and RESTORE.md, and the central vault's sealed store when it gave one. Call it under LOCK, as
+    backup_read, whose arguments it takes. A caller that serves others meanwhile holds LOCK for backup_read only
+    (ui_backup)."""
+    return backup_packed(backup_read(central))
 
 
 def read_bundle(data):
@@ -50292,7 +50848,7 @@ def release_work(applying, automatic=False, fetch=None, take=False):
             result = releases.Update(kit_dir(), manifest, origin=origin, upstream=release_upstream(),
                                      database=path, floor=kit_floor(),
                                      pushed=lambda merged: release_pushed(row["id"], merged),
-                                     own=lambda tip: tip == kv_get(KIT_PUSHED)).apply()
+                                     own=kit_own).apply()
         finally:
             shutil.rmtree(folder, ignore_errors=True)
         with LOCK:
@@ -51648,16 +52204,21 @@ def command_kept(route, request_id, client, keep, result):
     return result
 
 
-def command_run(route, request_id, client, db, body, act, keep=None, outside=None):
+def command_run(route, request_id, client, db, body, act, keep=None, outside=None, kit=False, unlocked=False):
     """The receipt logic of one owner command (Handler.ui_command), after its caller checked who calls, the request's
     shape, its request_id (a UUID, lowercase) and its client, and read its body: (status, answer). An exact repeat
     returns the first result; a refused command leaves no record. keep(result): what the hub keeps of a result that
     must not be stored whole (a link code); a repeat returns that. outside(body): a call that must not run under LOCK
-    (Handler.ui_command says how)."""
+    (Handler.ui_command says how). kit: the act can write the hub's files (commit_kit_file) or move its checkout, so
+    each part under LOCK runs in the turn of the hub's writes (kit_lock), after any write that runs now. unlocked: True,
+    or a function of the body that says it, when the act lets the git work of its commit_kit_file run without LOCK
+    (Handler.ui_command says when); it is a kit command too."""
     if secret_hit(json.dumps(body)):
         return 422, refusal_words.answer("login_as_text")
     canonical = json.dumps(body, sort_keys=True)
-    with LOCK:
+    turn = kit_lock if kit or unlocked else lambda: LOCK
+    unlocked = unlocked(body) if callable(unlocked) else unlocked
+    with turn(), kit_turn(unlocked):
         if db != kv_get("db_id"):
             return 409, refusal_words.answer("hub_changed_sending")
         old = q1("SELECT * FROM ui_controls WHERE request_id=?", (request_id,))
@@ -51679,7 +52240,7 @@ def command_run(route, request_id, client, db, body, act, keep=None, outside=Non
     if outside is not None:
         try:
             answer = outside(body)
-            with LOCK:
+            with turn(), kit_turn(unlocked):
                 result = command_kept(route, request_id, client, keep, act(body, answer))
         except Refusal as e:
             q("DELETE FROM ui_controls WHERE request_id=?", (request_id,))
@@ -52028,13 +52589,14 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
                 if yes is not None:
                     DB.execute("UPDATE needs SET approval=? WHERE id=?",
                                (json.dumps({"statement": yes, "signature": signed}), need["id"]))
-        if need is not None and not edited and need["key_swap_server"]:
-            key_swap_answered()         # the owner's press of an answer of a server's key swap item: the wish
-        return (200, dict(ok=True, request_id=request_id, event_id=event_id,
+        answer = (200, dict(ok=True, request_id=request_id, event_id=event_id,
    created=created, read_at=None, replayed=False, client=client, edited=edited,
    message_request_id=previous["request_id"] if edited else request_id,
    recipient=recipient, replaces_request_id=replaces, attachments=[r["id"] for r in rows],
    chosen=choice))
+    if need is not None and not edited and need["key_swap_server"]:
+        key_swap_answered()     # the owner's press of a server's key swap item: after LOCK, in the turn (kit_lock)
+    return answer
 
 
 # ---------------------------------------------------------------- connected apps: the socket, the endpoints, the tools
@@ -53488,7 +54050,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def owner_allowed(self):
         """The owner's own computer: its address and its key, both (allowed). The name that the owner's routes outside
-        ui_allowed ask by: the board, the records and the older writes beside them."""
+        ui_allowed ask by: the board, the records, the leak check and the older writes beside them."""
         return self.allowed("owner")
 
     def owner_key_allowed(self):
@@ -53663,7 +54225,8 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(data.get("on"), bool):
                 raise ValueError("on must be true or false")
             return {"on": data["on"]}
-        return self.ui_command("connect/settings", read, lambda body: save_connect(body["on"]))
+        # a stop ends the connections before its commit: no new one may come between the two
+        return self.ui_command("connect/settings", read, lambda body: save_connect(body["on"]), kit=True)
 
     def ui_owner_device(self):
         """POST /ui/owner/devices: save or remove one owner device. The owner's Mac only."""
@@ -53682,7 +54245,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(address, str) or not address.strip():
                 raise ValueError("address must be the device's own address on the private network")
             return {"base_sha256": base, "device": device, "label": label.strip(), "address": address.strip()}
-        return self.ui_command("owner/devices", read, save_owner_device)
+        return self.ui_command("owner/devices", read, save_owner_device, kit=True)
 
     def ui_owner_new_code(self):
         """POST /ui/owner/devices/code (owner feature device_by_code): one enrollment code for a phone that team.json
@@ -53799,7 +54362,7 @@ class Handler(BaseHTTPRequestHandler):
             signing = device_signing(self.form())      # checked first, so that a wrong one burns no code
             kind = device_kind(self.form())             # and so is the kind of app (owner API 1.149)
             if device is None:          # a phone that the owner's Mac added with a code alone (device_by_code)
-                with LOCK:
+                with kit_lock():        # it commits team.json, in the turn of the hub's writes (KIT)
                     result = enroll_new_device(self.client_address[0], self.form().get("code"), signing, kind)
             else:
                 result = enroll_device(device, self.form().get("code"), signing, kind)
@@ -54316,7 +54879,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("reports_to must be the manager, a lead or null")
             return dict({"server": server, "base_sha256": base, "agent": agent, "runtime": runtime, "role": role,
                          "reports_to": parent}, **({"account": account} if account is not None else {}))
-        return self.ui_command(f"servers/{server}/agents", read, lambda body: add_server_agent(server, body))
+        return self.ui_command(f"servers/{server}/agents", read, lambda body: add_server_agent(server, body), kit=True)
 
     def ui_server_prepare(self, server):
         """POST /ui/servers/<server>/prepare: the other runtime of an agent on this server, before its switch."""
@@ -54342,7 +54905,7 @@ class Handler(BaseHTTPRequestHandler):
             if step not in SHAPE_STEPS:
                 raise ValueError("step must be one, two or each")
             return {"base_sha256": base, "step": step}
-        return self.ui_command("servers/shape", read, set_shape)
+        return self.ui_command("servers/shape", read, set_shape, kit=True)
 
     def ui_servers_grant(self):
         """POST /ui/servers/grant (owner feature server_access): Read or Fix on one server for one agent, or null."""
@@ -54358,7 +54921,7 @@ class Handler(BaseHTTPRequestHandler):
             if level is not None and level not in SERVER_LEVELS:
                 raise ValueError("level must be read, fix or null")
             return {"agent": agent, "server": server, "level": level}
-        return self.ui_command("servers/grant", read, grant_server)
+        return self.ui_command("servers/grant", read, grant_server, kit=True)
 
     def door_route(self, act):
         """A route of the door's own (DevOps plan C4): answered only to the door's address, which act() checks."""
@@ -54374,7 +54937,7 @@ class Handler(BaseHTTPRequestHandler):
             if not (isinstance(base, str) and re.fullmatch(r"[0-9a-f]{64}", base)):
                 raise ValueError("base_sha256 must be the SHA-256 of team.json")
             return {"server": server, "base_sha256": base}
-        return self.ui_command(f"servers/{server}/remove", read, lambda body: remove_server(server, body))
+        return self.ui_command(f"servers/{server}/remove", read, lambda body: remove_server(server, body), kit=True)
 
     def ui_server_key_swap(self, server):
         """POST /ui/servers/<server>/key-swap: the owner's wish for this server's key swap (server_key_swap)."""
@@ -54383,7 +54946,7 @@ class Handler(BaseHTTPRequestHandler):
             if not (isinstance(base, str) and re.fullmatch(r"[0-9a-f]{64}", base)):
                 raise ValueError("base_sha256 must be the SHA-256 of team.json")
             return {"server": server, "base_sha256": base, "wish": key_swap_wish_body(data)}
-        return self.ui_command(f"servers/{server}/key-swap", read, lambda body: server_key_swap(server, body))
+        return self.ui_command(f"servers/{server}/key-swap", read, lambda body: server_key_swap(server, body), kit=True)
 
     def ui_server_key_swap_reading(self, server):
         """POST /ui/servers/<server>/key-swap-reading: what the owner's Mac app read as root of this server's vault
@@ -54400,7 +54963,7 @@ class Handler(BaseHTTPRequestHandler):
             return {"server": server, "base_sha256": base, "swaps": swaps,
                     "reason": " ".join(reason.split()) if reason else None}
         return self.ui_command(f"servers/{server}/key-swap-reading", read,
-                               lambda body: server_key_swap_reading(server, body))
+                               lambda body: server_key_swap_reading(server, body), kit=True)
 
     def server_caller(self, name):
         """A call of a server service: from a server's own address, with that server's key. The server's name, or None
@@ -54546,7 +55109,7 @@ class Handler(BaseHTTPRequestHandler):
         body["name"] = MACHINE_NAMES["names"].get(src)
         for fresh in (False, True):
             try:
-                with LOCK:
+                with kit_lock():        # its team.json commit waits for a write in its turn (KIT), never meets it
                     result = join_server(src, body)
                 return self.json(200, result)
             except Refusal as e:
@@ -54706,7 +55269,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("revision must be a commit id")
             return {"revision": rev.lower()}
 
-        return self.ui_command("team/reload", read, lambda body: reload_team(body["revision"]))
+        return self.ui_command("team/reload", read, lambda body: reload_team(body["revision"]), kit=True)
 
     def ui_goal(self, goal_id, query):
         """One goal with its recorded spending and history (owner API 1.3)."""
@@ -54940,8 +55503,14 @@ class Handler(BaseHTTPRequestHandler):
         if not backups_enabled():
             return self.json(403, {"error": "owner backups are turned off on this hub"})
         central = central_backup()          # owner feature central_vault: its socket is never asked under LOCK
-        with LOCK:
-            data, manifest = backup_bundle(central)
+        # One copy in the making at a time. Each holds an image of the records and its zip in memory, and LOCK keeps
+        # a second request (the app and a tool, or a retry) waiting only while the first one reads. So the second
+        # waits here for the whole of the first, with LOCK free for everybody else.
+        with BACKUP_LOCK:
+            with LOCK:
+                read = backup_read(central)
+            data, manifest = backup_packed(read)    # the sums and the compression: seconds, so with LOCK free
+            del read                                # the records' image: not kept while the answer goes out
         if len(data) > BACKUP_MAX:
             return self.json(413, {"error": "the copy is larger than 256 MiB; take it on the hub's server"})
         digest, t0 = hashlib.sha256(data).hexdigest(), now()
@@ -54985,7 +55554,7 @@ class Handler(BaseHTTPRequestHandler):
         # copy is a different command and is refused, as every other owner command's body is (ui_command).
         asked = json.dumps({"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data), "replace": replace},
                            sort_keys=True)
-        with LOCK:
+        with kit_lock():                # it commits the copy's files, in the turn of the hub's writes (KIT)
             old = q1("SELECT * FROM ui_controls WHERE request_id=?", (request_id,))
             if old:
                 if (old["route"], old["body"], old["client"]) != ("restore", asked, client):
@@ -55090,7 +55659,9 @@ class Handler(BaseHTTPRequestHandler):
                     for l in lines):
                 raise ValueError("lines must be a list of {agent, role, reports_to}")
             return {"base_sha256": base, "lines": lines}
-        return self.ui_command("team/lines", read, lambda body: save_lines(body["base_sha256"], body["lines"]))
+        # a change of role refuses for the agent's open tasks, which must still be so when the commit lands
+        return self.ui_command("team/lines", read, lambda body: save_lines(body["base_sha256"], body["lines"]),
+                               kit=True)
 
     def ui_team_agent(self, agent):
         """One agent's model, effort, capabilities and activation (owner API 1.9), committed like the reporting lines."""
@@ -55173,10 +55744,14 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("give active, model, effort, can, title, expertise, account, screen, web_hosts, vault, "
                                  "runtime or vault_create")
             return body
+        # A switch of runtime, a stop (active false) and a host list each refuse for the agent's open or running
+        # work, which must still be so when their commit lands: they keep LOCK for it (ui_command, unlocked).
         return self.ui_command(f"team/agents/{agent}", read, lambda body: save_vault(agent, body) if "vault" in body
                                else save_runtime(agent, body) if "runtime" in body
                                else save_vault_create(agent, body) if "vault_create" in body
-                               else save_agent_settings(agent, body))
+                               else save_agent_settings(agent, body),
+                               unlocked=lambda body: not {"runtime", "web_hosts"} & set(body) and
+                               body.get("active") is not False)
 
     def team_entry(self, route, what, fields, check, save, ident=None):
         """POST /ui/team/accounts and /ui/team/logins: create or replace, or {"delete": true}.
@@ -55197,7 +55772,7 @@ class Handler(BaseHTTPRequestHandler):
             if extra:
                 raise ValueError(f"unknown field {extra[0]}")
             return dict({"base_sha256": base, what: eid}, **({"delete": True} if deleting else check(data)))
-        return self.ui_command(route, read, save)
+        return self.ui_command(route, read, save, unlocked=True)
 
     def ui_team_account(self):
         def check(data):
@@ -55277,7 +55852,7 @@ class Handler(BaseHTTPRequestHandler):
                     "access": dict(sorted(access.items()))}
         return self.ui_command("team/repos", read, save_repo_reached,
                                outside=lambda body: github_reach(GITHUB_REACH_WAIT if body.get("access") or
-                                                                 body.get("level") else 0))
+                                                                 body.get("level") else 0), unlocked=True)
 
     def ui_team_tool(self):
         """POST /ui/team/tools (owner feature integrations): the agents that get one tool of the catalog."""
@@ -55290,7 +55865,7 @@ class Handler(BaseHTTPRequestHandler):
                     len(set(names)) != len(names):
                 raise ValueError("agents must be a list of different agent names")
             return {"base_sha256": base, "tool": tool, "agents": sorted(names)}
-        return self.ui_command("team/tools", read, save_tool)
+        return self.ui_command("team/tools", read, save_tool, unlocked=True)
 
     @staticmethod
     def google_account_field(value, what="account"):
@@ -55312,7 +55887,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError(f"access must map agent names to {', '.join(GOOGLE_LEVELS[service])}; {{}} removes "
                                  f"{service} of this account from every agent")
             return {"base_sha256": base, "account": account, "service": service, "access": dict(sorted(access.items()))}
-        return self.ui_command("team/google", read, save_google)
+        return self.ui_command("team/google", read, save_google, kit=True)
 
     def ui_team_access(self):
         """POST /ui/team/access (owner feature machine_access): how the fleet reaches one machine -- its SSH user,
@@ -55342,7 +55917,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("screen_sharing must be true or false")
             return {"base_sha256": base, "machine": machine, "ssh_user": user.strip(), "ssh_port": port,
                     "screen_sharing": sharing}
-        return self.ui_command("team/access", read, save_access)
+        return self.ui_command("team/access", read, save_access, unlocked=True)
 
     def ui_team_mcp(self):
         """POST /ui/team/mcp (owner feature mcp): one of the owner's own MCP servers, new, changed or deleted. The
@@ -55360,7 +55935,7 @@ class Handler(BaseHTTPRequestHandler):
             server = data.get("server")
             mcp_package_age(mcp_server(name, server, new=True))     # ValueError with the reason; new: the owner's write (D33)
             return {"base_sha256": base, "name": name, "server": server}
-        return self.ui_command("team/mcp", read, save_mcp)
+        return self.ui_command("team/mcp", read, save_mcp, unlocked=True)
 
     def mcp_name_field(self, data, team=None):
         """The name of one owner MCP server with auth oauth, as the applied team.json has it now."""
@@ -56006,7 +56581,7 @@ class Handler(BaseHTTPRequestHandler):
             if refused:
                 raise Refusal(503, refused)
             return self.secret_fields({k: v for k, v in data.items() if k not in ("request_id", "db")})
-        return self.ui_command("secrets/add", read, save_secret)
+        return self.ui_command("secrets/add", read, save_secret, unlocked=True)
 
     def secret_fields(self, data):
         """The checked fields of one catalog entry with its fingerprints, as POST /ui/secrets/add takes it and each entry
@@ -56083,7 +56658,7 @@ class Handler(BaseHTTPRequestHandler):
                                          or holds_value(e["env"], own)):
                     entries[n] = {"login": e["login"], "error": "a registered login cannot be sent as text", "status": 422}
             return {"secrets": entries}
-        return self.ui_command("secrets/import", read, save_secrets, limit=SECRETS_IMPORT_MAX * 2048)
+        return self.ui_command("secrets/import", read, save_secrets, limit=SECRETS_IMPORT_MAX * 2048, unlocked=True)
 
     def ui_need_secret(self, need_id):
         """POST /ui/needs/<id>/secret (owner feature secret_requests): the answer of one request_secret, from the app's
@@ -56106,7 +56681,7 @@ class Handler(BaseHTTPRequestHandler):
         def act(body):
             return answer_secret(body, str(self.form()["request_id"]).lower(),
                                  self.headers.get("X-Fleet-Client", "").strip())
-        return self.ui_command(f"needs/{need_id}/secret", read, act)
+        return self.ui_command(f"needs/{need_id}/secret", read, act, kit=True)
 
     def ui_secret_grant(self):
         """POST /ui/secrets/grant (owner feature secrets): one agent's grant of one secret: use, read or null."""
@@ -56119,7 +56694,8 @@ class Handler(BaseHTTPRequestHandler):
             if "grant" not in data or data["grant"] not in ("use", "read", None):
                 raise ValueError("grant must be use, read or null")
             return {"login": self.login_reference(data.get("login")), "agent": data["agent"], "grant": data["grant"]}
-        return self.ui_command("secrets/grant", read, save_grant)
+        # the door's grant drops its unfetched copies after the commit: a fetch between the two must not come
+        return self.ui_command("secrets/grant", read, save_grant, unlocked=lambda body: body["agent"] != "door")
 
     def ui_vault(self, query):
         """GET /ui/vault (owner feature central_vault; served without it too, because the app needs `fleet` to install
@@ -56158,7 +56734,7 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
                 raise ValueError("port is a port number")
             return {"address": address, "port": port}
-        return self.ui_command("door", read, save_door_entry)
+        return self.ui_command("door", read, save_door_entry, kit=True)
 
     def ui_door_secrets(self):
         """POST /ui/door/secrets (owner feature door_setup): the hub's two door secrets, which the app made on the
@@ -56231,7 +56807,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(app_id, str) or not re.fullmatch(r"[1-9][0-9]{0,11}", app_id):
                 raise ValueError("app_id is the App's ID, as GitHub gave it")
             return {"owner": owner, "app_id": app_id}
-        return self.ui_command("door/github-app", read, save_door_github_app)
+        return self.ui_command("door/github-app", read, save_door_github_app, kit=True)
 
     def ui_vault_intake(self):
         """POST /ui/vault/intake (owner feature central_vault): one secret of the catalog, sealed in the owner's app to
@@ -56412,7 +56988,7 @@ class Handler(BaseHTTPRequestHandler):
             if policy is not None and not isinstance(policy, dict):
                 raise ValueError('policy must be {"max", "to"}, or null, which takes the entry out')
             return {"base_sha256": base, "resource": rid.strip().lower(), "policy": policy}
-        return self.ui_command("resources", read, save_resource)
+        return self.ui_command("resources", read, save_resource, kit=True)
 
     def ui_resource_take(self):
         """POST /ui/resources/take (owner feature resource_grants): one agent's hold of one resource ends, whoever gave
@@ -56427,7 +57003,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(agent, str) or not AGENT_NAME.match(agent):
                 raise ValueError("agent must be an agent name")
             return {"resource": rid.strip().lower(), "agent": agent}
-        return self.ui_command("resources/take", read, take_resource)
+        return self.ui_command("resources/take", read, take_resource, kit=True)
 
     def ui_notes(self, agent, query):
         """One agent's own working notes and every version of them. The agent writes these, not the owner: the
@@ -56468,7 +57044,8 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(name, str) or not re.fullmatch(SKILL_NAME, name):
                 raise ValueError("name must be a skill's name: a-z, 0-9 and -, with a letter or a digit first")
             return {"agent": agent, "name": name}
-        return self.ui_command("skills/remove", read, lambda body: skill_remove(body["agent"], body["name"]))
+        return self.ui_command("skills/remove", read, lambda body: skill_remove(body["agent"], body["name"]),
+                               unlocked=True)
 
     def ui_memory(self, agent, query):
         """GET /ui/memory/<agent> (owner feature agent_memory): one agent's lessons that stand, each with the hub's
@@ -56655,7 +57232,7 @@ class Handler(BaseHTTPRequestHandler):
             if unknown:
                 raise Refusal(400, f"{unknown[0]} is not in the knowledge catalog")
             return save_profile(agent, body["base_sha256"], body["sections"])
-        return self.ui_command(f"profiles/{agent}", read, act)
+        return self.ui_command(f"profiles/{agent}", read, act, unlocked=True)
 
     def ui_knowledge(self, query):
         """One owner knowledge file with its text (owner feature owner_knowledge): /ui/state lists the files without
@@ -56752,7 +57329,9 @@ class Handler(BaseHTTPRequestHandler):
                                (now(), body["path"], body["attachment"]))
                 added = dict(added, attachment=body["attachment"])
             return added
-        return self.ui_command("knowledge", read, act, limit=4 * MIB)
+        # A kept attachment is checked before the commit and marked after it, and the sweep of old attachments must
+        # not take it between the two: that one keeps LOCK (ui_command, unlocked).
+        return self.ui_command("knowledge", read, act, limit=4 * MIB, unlocked=lambda body: "attachment" not in body)
 
     def helper_status(self, agent):
         """A helper's machine status report; the answer says whether an update is requested."""
@@ -56802,7 +57381,7 @@ class Handler(BaseHTTPRequestHandler):
                                          next=events[-1]["id"] if events else after, more=len(rows) > limit)),
                          {"Cache-Control": "no-store"})
 
-    def ui_command(self, route, read, act, limit=65536, keep=None, outside=None):
+    def ui_command(self, route, read, act, limit=65536, keep=None, outside=None, kit=False, unlocked=False):
         """Owner task controls. The same UUID, generation and client rules as owner messages.
         An exact repeat returns the first result; a refused command leaves no record. keep(result): what the hub keeps
         of a result that must not be stored whole (a link code); a repeat returns that.
@@ -56810,6 +57389,21 @@ class Handler(BaseHTTPRequestHandler):
         outside(body): a call that must not run under LOCK, which is the central vault's socket (central_call). It
         runs after the claim, with LOCK released, and act then takes its answer under LOCK: act(body, answer). A
         Refusal from either leaves no record, as one from act always did, and a command without it runs as before.
+
+        kit: act can write the hub's files (commit_kit_file) or move the hub checkout. It then runs in the turn of
+        those writes (KIT), after a write that runs its git now. A command that writes no such file takes no turn, so
+        that it never waits for an agent's knowledge write or a delivery's files, which take it without LOCK.
+
+        unlocked (True, or a function of the body): act's commit_kit_file runs its fetch, clone, commit and push
+        without LOCK, so that the state read and every other caller do not wait for git (commit_kit_file). Only for
+        an act whose steps stay right when other callers run between its reads before the commit and its steps after
+        it: it reads the hub's files and writes them in its turn (KIT), which no other write enters, and nothing that
+        it checks in the records (no open task, no running job, an agent that is not being removed) is what it must
+        find unchanged after the commit. A delete or a rename of an agent holds LOCK for its whole commit (TeamLock),
+        and an act that refuses for an open task keeps LOCK too. Such a command takes effect when its commit lands,
+        before its answer, as before: a call that comes during its git reads the team before it, as a call that came
+        a moment before the command does. So a grant taken back or a switch turned off stops new calls from its
+        answer on, a few seconds later than when other calls waited for its git.
 
         act() is not a database write alone: it commits team.json, it reaches a helper, it fetches a page. So it
         cannot join the transaction that keeps the receipt, and the receipt used to be written after it with a
@@ -56843,7 +57437,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(400, refusal_body(e))
         except Refusal as e:
             return self.json(e.status, refusal_body(e))
-        return self.json(*command_run(route, request_id, client, data.get("db"), body, act, keep, outside))
+        return self.json(*command_run(route, request_id, client, data.get("db"), body, act, keep, outside,
+                                      kit=kit, unlocked=unlocked))
 
     def ui_control(self, task_id):
         return self.ui_command(f"tasks/{task_id}/control", lambda data: task_control_read(task_id, data),
@@ -57160,7 +57755,7 @@ class Handler(BaseHTTPRequestHandler):
             if account is not None and isinstance(account.get("label"), str):
                 account = dict(account, label=account["label"].strip())
             return {"base_sha256": base, "id": aid, "account": account}
-        return self.ui_command("team/chat-apps", read, save_chat_app)
+        return self.ui_command("team/chat-apps", read, save_chat_app, kit=True)
 
     def ui_chat_pause(self):
         """POST /ui/chat-apps/pause: Pause all stops every inbound message and every outbound item at once."""
@@ -57655,7 +58250,7 @@ class Handler(BaseHTTPRequestHandler):
             facts = runtime_facts_changes(data["runtime_facts"]) if "runtime_facts" in data else {}
             return {"settings": changes, "runtime_facts": facts, "only_unset": data.get("only_unset", False)}
         return self.ui_command("settings", read, lambda body: save_settings(body["settings"], body["runtime_facts"],
-                                                                            body["only_unset"]))
+                                                                            body["only_unset"]), unlocked=True)
 
     def ui_conversations(self, query):
         """GET /ui/conversations: every conversation between an agent and a person, newest first. agent= and person=
@@ -58200,6 +58795,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(200, {"id": sid, "ciphertext": row["ciphertext"], "label": row["label"],
                                    "job": row["job"], "source": row["login"]})
         if parts == ["leakcheck"]:
+            # The owner only, as the records: the scan reads every table, and its answer names the rows that hold a
+            # login. It answered each caller that reached the port, so an agent's shell could start it at will.
+            if not self.owner_allowed():
+                return
             return self.json(200, {"hits": leak_scan()})
         if parts == ["site", "login"]:
             return self.send(200, site_page("Pilot site: sign in", LOGIN_FORM), "text/html; charset=utf-8")
@@ -58954,8 +59553,13 @@ class Handler(BaseHTTPRequestHandler):
                         asker = need_question_rows(row, answer, t0)
                         passed = f" The hub gave it to {asker} as the answer to Q-{row['question']}: do not pass it " \
                                  f"on again." if asker else ""
-                        event_rows([(row["by"], "say", None, f"[owner] Answer to Needs-you N-{nid} ({row['title']}): "
-                                     f"{answer}{passed}", None)], t0)
+                        # owner feature need_takeover: the answer to a step on an agent's screen goes to the task that
+                        # waits for it, and ends that wait, as owner_message_rows does it
+                        takeover = row["takeover_task"] if row["kind"] == "takeover" else None
+                        event_rows([(row["by"], "say", takeover, f"[owner] Answer to Needs-you N-{nid} "
+                                     f"({row['title']}): {answer}{passed}", None)], t0)
+                        if takeover is not None:
+                            secret_wait_moved(takeover)
                         key_swap_answered_rows(row, chosen, t0)     # a press of a server's key swap item
                     log("owner", f"answered N-{nid}")
             if row and row["key_swap_server"]:
@@ -59632,7 +60236,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("name must be 2 to 31 characters a-z 0-9 -, starting with a letter, and not owner "
                                  "or hub")
             return {"agent": agent, "base_sha256": base, "name": name}
-        return self.ui_command(f"team/agents/{agent}/rename", read, lambda body: rename_agent(agent, body))
+        return self.ui_command(f"team/agents/{agent}/rename", read, lambda body: rename_agent(agent, body), kit=True)
 
     def ui_agent_move(self, agent):
         """POST /ui/team/agents/<agent>/move (owner feature agent_move): the agent on an empty server. runtime (owner
@@ -59649,7 +60253,7 @@ class Handler(BaseHTTPRequestHandler):
             if runtime is not None and runtime not in SWITCH_RUNTIMES:
                 raise ValueError("runtime must be codex or claude")
             return {"agent": agent, "base_sha256": base, "server": server, "runtime": runtime}
-        return self.ui_command(f"team/agents/{agent}/move", read, lambda body: move_agent(agent, body))
+        return self.ui_command(f"team/agents/{agent}/move", read, lambda body: move_agent(agent, body), kit=True)
 
     def ui_agent_remove(self, agent):
         """POST /ui/team/agents/<agent>/remove (owner feature agent_remove): the agent leaves the fleet, with all that
@@ -59662,7 +60266,7 @@ class Handler(BaseHTTPRequestHandler):
             if not (isinstance(base, str) and re.fullmatch(r"[0-9a-f]{64}", base)):
                 raise ValueError("base_sha256 must be the SHA-256 of team.json")
             return {"agent": agent, "base_sha256": base}
-        return self.ui_command(f"team/agents/{agent}/remove", read, lambda body: remove_agent(agent, body))
+        return self.ui_command(f"team/agents/{agent}/remove", read, lambda body: remove_agent(agent, body), kit=True)
 
     def helper_vault_fingerprints(self, agent):
         """A broker registers salted fingerprints of a login that it opened for a confirmed, still open job, before
@@ -60307,8 +60911,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(400, {"error": "runtime must be a runtime name or null"})
         with LOCK:
             # The helper reads the manager's whole transcript again after a restart, so a report can be of an episode
-            # that the hub held or ended already: that one starts nothing (plan C1, in place of the helper's 15-minute
-            # age test, which dropped a limit the helper saw late).
+            # that the hub held or ended already: with a reset time, that one starts nothing (plan C1, in place of the
+            # helper's 15-minute age test, which dropped a limit the helper saw late). With no reset time nothing names
+            # the episode: its report starts nothing while its hold is open (start_limit), and the helper sends such a
+            # record only while it is less than 900 seconds old (fleet.py, report_limit). So one case starts a second
+            # hold of an hour: a usage reading ended the hold early, and the helper started again in that time. The
+            # next reading that shows the windows open ends that hold too (limit_reading).
             seen = reset is not None and q1("SELECT 1 FROM agent_limits WHERE agent=? AND until=? AND reset_known=1",
                                             (agent, reset))
             if (runtime is None or runtime == agents()[agent].get("runtime")) and not seen:
@@ -60732,13 +61340,20 @@ def settle_stopped_calls():
     # new request_id -- a payment twice. Its outcome is unknown instead, as when its helper does not answer in time:
     # the job stays open, the vault's report is still taken, and a request gets the unknown outcome that gates a
     # second send. A job with an unknown outcome already stays as it is. Only what the vault never took is not done.
+    #
+    # All of that is for a call that the stop cut. A job whose call was answered "still running" (plan C7: `returned`)
+    # is not one: its agent was told that the outcome comes as a message, its helper sends the report until a hub
+    # takes it, and a helper that lost the job says so in its poll (lost_jobs). So a start leaves it open, with no
+    # outcome of the hub's own. It was ended here as "the hub restarted" with no word to its task, and the helper's
+    # report then got 409, which a helper reads as "the hub has it" and drops. A stop gives that answer to each call
+    # that waits on such a helper (STOPPING), so that was every one of its jobs that was open at a stop.
     for job in q("SELECT * FROM jobs WHERE finished IS NULL AND unknown IS NULL AND released IS NOT NULL "
-                 "AND kind='request'"):
+                 "AND returned IS NULL AND kind='request'"):
         request_unknown(job, "the hub restarted while the vault had this request.")
     q("UPDATE jobs SET unknown=?, result=? WHERE finished IS NULL AND unknown IS NULL AND released IS NOT NULL "
-      "AND kind IN ('create','capture')", (now(), "the hub restarted while the vault had this item."))
-    q("UPDATE jobs SET ok=0, result='the hub restarted', finished=? WHERE finished IS NULL AND unknown IS NULL",
-      (now(),))
+      "AND returned IS NULL AND kind IN ('create','capture')", (now(), "the hub restarted while the vault had this item."))
+    q("UPDATE jobs SET ok=0, result='the hub restarted', finished=? WHERE finished IS NULL AND unknown IS NULL "
+      "AND returned IS NULL", (now(),))
 
 
 HUB_LOCK = []           # the open lock file of this process's records (hub_lock), held until the process ends

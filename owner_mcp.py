@@ -3206,9 +3206,9 @@ INSTRUCTIONS = ("You run the owner's own Founderizer fleet. Every tool here is o
 
 # The tools that the program writes in Swift because each has logic of its own (kind `swift` in the table): the four
 # reads, which its verb `call` takes, and the nine that write (slice A2, 14 November 2026), which its verb `write`
-# takes. The parity check holds each of them to the function here (test_owner_mcp.Parity). The six of ABSENT the
-# program never has: the app's own pages do that work (the install, the claim, a new machine), and the app's own
-# setting says which hub it reads. A program that reads a table with a `swift` tool that its own code does not have
+# takes. The parity check holds each of them to the function here (test_owner_mcp.Parity). The tools of ABSENT the
+# program never has: the app's own pages do that work (the install, the claim, a new machine, Google's Connect), and
+# the app's own setting says which hub it reads. A program that reads a table with a `swift` tool that its own code does not have
 # refuses that tool in words (an app older than the table).
 SWIFT_READS = ("fleet_overview", "fleet_read", "search_history", "see_costs")
 SWIFT_WRITES = ("save_profile", "attach_file", "read_attachment", "take_backup", "grant_access", "share_resource",

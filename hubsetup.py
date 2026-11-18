@@ -3917,7 +3917,7 @@ def cmd_vault(args):
         raise Stop("--owner-key and --fleet go together: the owner's public keys and the fleet's 16-character ID")
     vault_install(kit=args.kit or KIT, hub_address=args.hub, check=args.check, system=platform.system(),
                   owner_keys=args.owner_key, fleet=args.fleet)
-    if args.swap and platform.system() == "Linux":      # only when asked: no install gives a machine the key swap
+    if args.swap and platform.system() == "Linux":      # only with --swap: without it this step switches none on
         swap_install(check=args.check)
     elif args.swap:
         say("the key swap is for a Linux server: nothing was switched on for it on this machine")
